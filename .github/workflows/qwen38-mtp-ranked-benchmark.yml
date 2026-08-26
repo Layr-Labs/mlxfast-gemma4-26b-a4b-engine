@@ -1,0 +1,68 @@
+# qwen3.8-27b-mtp-v1 RANKED BENCHMARK -- STUB, NOT PROVISIONED.
+#
+# benchmark.json's runner.workflow names this file so the manifest resolves to a
+# real workflow and passes schema validation. It is NOT a pipeline. It exists to
+# make the gap explicit and to fail closed if anyone dispatches it.
+#
+# Deliberately absent, and each one is a separate piece of work:
+#   - secrets of any kind (no R2 credentials, no HF token, no signing key)
+#   - R2 / hidden-golden download and sha256+bytes pin verification
+#   - self-hosted runner labels (the ranked box is an M5; `runs-on` here is the
+#     hosted ubuntu image ON PURPOSE, so a mis-dispatch cannot land on the fleet)
+#   - the paired measurement dispatch, the cool gate, the seal and the upload of
+#     benchmark-results-<run_id>/score.json
+#   - the floor / ceiling enforcement that benchmark.json's scoring block
+#     documents but does not itself enforce (0.90 / 5.0 must be pinned HERE)
+#
+# There is no `push`, `pull_request` or `schedule` trigger: workflow_dispatch only,
+# so nothing runs by accident.
+
+name: qwen3.8 MTP ranked benchmark (NOT PROVISIONED)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  refuse:
+    name: fail closed
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse to run
+        run: |
+          echo "::error title=Ranked runner not provisioned::parity-repo ranked runner not yet provisioned"
+          cat >&2 <<'EOF'
+          parity-repo ranked runner not yet provisioned.
+
+          This workflow is a stub. benchmark.json (runner.workflow) names it so the
+          Yukon manifest is schema-complete, but no ranked pipeline exists in this
+          repository yet. Nothing was measured and nothing was scored.
+
+          Still to build before this file can rank anything:
+            1. hidden-golden provisioning from R2, sha256 + byte-count pin-verified
+               before use (read-only mirror; pins live in
+               fixtures/qwen3_8_27b_mtp_track.json timed_prompt_pool[]).
+            2. self-hosted M5 runner labels and the box measurement wrapper.
+            3. WIRING the editable-path overlay and the submission static review
+               into a ranked job. Both now EXIST in this repo (restored by issue
+               #16): .github/scripts/overlay-editable-paths.sh and
+               .github/scripts/submission-static-review-checks.sh, with the
+               launch-time byte budget in
+               Sources/MLXFastTrustedHarness/EditableSurfaceByteBudget.swift and
+               tools/test-submission-security.sh in front of all three. What is
+               missing here is the dispatch that calls them, plus the LLM bypass
+               judge (credential + network) and the three gates
+               docs/submission-restriction-spec.md section 9 lists as deferred.
+            4. floor / ceiling enforcement pinned EQUAL to benchmark.json
+               scoring.decodeSpeedupFloor (0.90) and scoring.decodeSpeedupCeiling
+               (5.0). The manifest documents them; this workflow must enforce them.
+            5. the v1.1 free-run timed_mode tag on every emitted score record, so
+               PROTOCOL-v1.1.md section 5 (new series, never comparable to the
+               qwen3.6 v1 teacher-forced board) is machine-checked and not a
+               convention.
+
+          Refusing with exit 1.
+          EOF
+          exit 1

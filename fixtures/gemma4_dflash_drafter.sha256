@@ -1,0 +1,35 @@
+# SHA256 manifest for the Gemma 4 26B A4B DFlash draft model (dflash arm),
+# track gemma4-26b-a4b-mlx-v1.
+#
+# Provenance: the upstream published tree of
+#   z-lab/gemma-4-26B-A4B-it-DFlash @ 77d4202772dfe50b2396ec7bac9cfffc7b9e7057
+# (the short form 77d42027 is what docs/gemma4-port-notes.md section 4.3 cites).
+# Public repository, anonymous fetch. Staged by setup-gemma4-dflash.sh into
+# ./dflash-head/ as the organizer DFlash default, the mirror of what
+# setup-gemma4-assistant.sh does for the MTP assistant at ./mtp-head/.
+#
+# UNLIKE the Laguna DFlash drafter (fixtures/dflash_laguna_xs_2_1_drafter.sha256)
+# these records are the UPSTREAM published bytes, not an MLX repack: no
+# conversion step exists for this drafter yet, so there is nothing repacked to
+# pin. Vendor/mlx-swift-lm/scripts/convert_laguna_dflash.py is Laguna-specific
+# (it splits a fused qkv tensor this checkpoint does not carry). If and when a
+# Gemma 4 BF16 MLX conversion lands, this manifest is re-derived from the
+# repacked artifact and this comment is what tells you the pin moved.
+#
+# The two records below are the whole load-bearing surface: config.json and the
+# single BF16 model.safetensors shard, matching the Laguna drafter manifest's
+# own two-record shape. The published tree also carries README.md,
+# .gitattributes and two assets/*.png files; none is loaded, none is pinned.
+#
+# HOW THESE WERE OBTAINED (laptop-side-legitimate, same class as
+# fixtures/gemma4_26b_a4b_config.json): config.json was downloaded whole and
+# hashed locally; model.safetensors is an LFS object, so its byte count and
+# sha256 are Hugging Face's own published LFS metadata for the pinned revision
+# (`x-linked-size` / `x-linked-etag` on the resolve endpoint) rather than a
+# local hash of an 859 MB download. setup-gemma4-dflash.sh re-verifies both
+# records against the real downloaded bytes, so a wrong pin here fails the
+# stage rather than silently passing.
+#
+# Format: <sha256> <byte_count> <relative_path>
+713004fd22d3b912f2c9dba03b37349594804110d74427b2062dab25a8a4ba24 1095 config.json
+7313aab43989496a6ce51e6e95ed353b9b1bfab722ffc5699d2138c14e96ead4 859384328 model.safetensors

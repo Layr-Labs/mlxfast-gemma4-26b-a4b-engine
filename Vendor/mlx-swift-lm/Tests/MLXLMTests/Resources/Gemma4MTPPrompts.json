@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "description": "Fixed prompt set for Gemma 4 MTP parity tests. Committed alongside the tests so Swift and Python reference runs use byte-identical inputs.",
+  "short": [
+    "What is the capital of France?",
+    "Name three primary colors.",
+    "What is 7 times 8?",
+    "Who wrote Hamlet?",
+    "What planet do we live on?"
+  ],
+  "medium": [
+    "Explain the difference between a list and a tuple in Python, giving one concrete example of when you would use each.",
+    "Write a short paragraph describing the water cycle, including evaporation, condensation, and precipitation.",
+    "Describe the main events of the Battle of Hastings in 1066 in three or four sentences.",
+    "Outline the key principles of object-oriented programming, naming each principle and giving a one-sentence description.",
+    "Explain photosynthesis at a level suitable for a high-school biology student, mentioning the reactants and products.",
+    "Describe the general structure of a DNA molecule, including the role of the four nucleotide bases.",
+    "Summarize the plot of Romeo and Juliet in five or six sentences, without spoilers for the final act.",
+    "Explain what causes seasons on Earth, referencing the axial tilt and orbit.",
+    "Describe the basic function of the human circulatory system and name its three major components.",
+    "Compare and contrast renewable and non-renewable energy sources, giving two examples of each."
+  ],
+  "long": [
+    "Consider the following scenario: a software team is trying to decide between using a monolithic architecture and a microservices architecture for their new e-commerce platform. The team has ten engineers, expects to handle around ten thousand transactions per day initially, and anticipates scaling to one hundred thousand transactions per day within two years. Some team members argue that a monolith is simpler to deploy and debug, while others insist that microservices are the modern approach and will make scaling easier. Provide a thoughtful analysis of the trade-offs, discussing at least four specific technical or organizational factors that should influence this decision. Conclude with a concrete recommendation.",
+    "Imagine you are teaching an introductory class on machine learning. Your students have programming experience but no background in statistics. Write the first few paragraphs of your lecture, introducing the concept of supervised learning. Your explanation should motivate why supervised learning is useful, describe the general structure of a training dataset (features and labels), give an intuitive example of a simple prediction task, and briefly mention how the model's performance can be evaluated. Aim for a tone that is clear and engaging but technically correct.",
+    "You are writing documentation for a new distributed key-value store. The system provides strong consistency, is partition-tolerant, and trades availability during network partitions. Explain the CAP theorem to a reader who has heard the term but never really understood it. Then, using the specific design choices of this key-value store as a running example, walk the reader through what would happen during a network partition: which operations succeed, which fail, and why. Use concrete examples rather than abstract descriptions, and avoid mathematical formalism.",
+    "A senior engineer at your company has written a code review that you disagree with. The review criticizes your decision to extract a utility function into a shared module, arguing that premature abstraction is worse than duplication. You believe the abstraction is justified because the logic appears in three places and is likely to appear in more. Write a respectful, evidence-based response to the reviewer that acknowledges their general principle, explains the specific reasons your case differs, and proposes a concrete path forward. The tone should be collegial but firm.",
+    "Explain the concept of recursion in programming to a student who has written simple loops but never recursive functions. Begin with an intuitive example unrelated to programming, then introduce the idea of a function calling itself, then walk through a concrete code example (use a small one, like computing a factorial or reversing a string). Address the common confusion about base cases and why missing them causes infinite recursion. End with one practical piece of advice about when recursion is the right tool versus when a loop is simpler."
+  ]
+}

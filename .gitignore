@@ -1,0 +1,132 @@
+# The pinned benchctl measurement binary, resolved by tools/fetch-benchd.sh
+# against ./benchd.pin. A FETCHED ARTIFACT, never repository content: the pin
+# (branch/commit/sha256/bytes) is what is reviewed and committed, and the bytes
+# are re-verified on every resolve, so committing them here would add a 2 MB
+# blob to the history that carries no authority the pin does not already carry.
+/benchd-bin/
+
+# Build artifacts
+*.so
+build/
+dist/
+.build/
+.build-worker/
+.build-ci/
+# CI tees `swift build` here for tools/ci-swift-warning-gate.sh to read.
+swift-build.log
+# CI tees tools/test-submission-security.sh here so the non-vacuity floor can be
+# re-checked against its printed trailer from outside the suite file.
+submission-security.log
+.tools/
+.mlxfast-cache/
+.mlxfast-private/
+.cache/
+
+# Reference weights are large and downloaded by setup.sh
+reference_weights/*
+!reference_weights/.gitkeep
+
+# Participant transformed weights are gitignored by default; opt in if needed
+#
+# NO .gitkeep HERE, unlike reference_weights/ above. The transform publishes
+# weights/ by ATOMIC DIRECTORY REPLACEMENT -- it fills a sibling staging
+# directory and then replaceItemAt()s the whole thing into place
+# (Sources/MLXFastTransform/Transform.swift) -- so nothing checked in UNDER
+# weights/ can survive the documented `mlxfast-swift transform --output weights`
+# step. A tracked weights/.gitkeep therefore came back as a deletion in
+# `git status` after every documented setup, which is a dirty tree no
+# participant can clean without re-adding a file the next transform deletes
+# again. reference_weights/ keeps its .gitkeep because it is filled file by
+# file by a downloader that never replaces the directory.
+#
+# The directory does not need to pre-exist: the transform creates it, and
+# weights/ is not a benchmark.json editablePaths entry, so the submission
+# archiver never looks for it on disk. The harness's tolerance of a stray
+# .gitkeep inside weights/ (ignoredRelativePaths in the runtime benchmark and
+# TransformVerification) is unaffected and stays correct for anyone who puts
+# one back by hand.
+weights/*
+
+# The DFlash drafter staged by setup-gemma4-dflash.sh (~860 MB, organizer-pinned
+# and downloaded, never authored here) -- a FETCHED ARTIFACT, the same reason
+# /benchd-bin/ is ignored above: the pin (repo/revision + the sha256/size
+# records in fixtures/gemma4_dflash_drafter.sha256) is what is reviewed and
+# committed, it is re-verified on every stage, and committing the bytes would
+# add 859 MB to the history that carries no authority the pin does not.
+#
+# NOT a blanket ban on content here. dflash-head/ is an `optionalEditablePaths`
+# entry -- the twin of mtp-head/ -- so a participant MAY declare an in-branch
+# drafter (`"source": "in_branch"` in dflash-head.manifest.json) and add it
+# with `git add -f`. And dflash-head/README.md is CHECKED IN on purpose: the
+# submission archiver fails on an editablePaths entry that is absent on disk,
+# so the README keeps the directory present while shipping no weights. Ignore
+# the directory's CONTENTS and re-include that one file. The blunter
+# `dflash-head/` cannot express this: git does not descend into an excluded
+# directory, so a `!dflash-head/README.md` negation under it never takes
+# effect and the checked-in README is reported ignored.
+dflash-head/*
+!dflash-head/README.md
+
+# The assistant (MTP) head staged by setup-gemma4-assistant.sh (~256 MB), for
+# every reason the dflash-head block above gives -- the two directories are
+# declared twins in benchmark.json (both `editablePaths` AND
+# `optionalEditablePaths`, both exempt from the editable-surface byte budget),
+# and both are filled by a stager that downloads organizer-pinned bytes and
+# verifies them against a checked-in manifest
+# (fixtures/gemma4_assistant.sha256). Only dflash-head/ was listed when that
+# block landed, so the documented `./setup.sh && ./setup-gemma4-assistant.sh`
+# path left ~256 MB of downloaded weights plus setup.sh's own .complete markers
+# and .mlxfast-reference-cache.lock sitting in `git status` as untracked files,
+# one `git add -A` away from being committed into an editable path. Same shape
+# as its twin: ignore the staged CONTENTS, re-include the checked-in README
+# that keeps the optional editable path present on disk for `yukon submit`, and
+# leave an in-branch head an explicit `git add -f` opt-in.
+mtp-head/*
+!mtp-head/README.md
+
+# Local results log
+results.tsv
+m5_artifacts/
+
+# Benchmark contract outputs
+score.json
+score.json.tmp
+# Every local run also writes a checksum sidecar and an integrity record, and
+# --local-iterate writes its own score/integrity names (benchmark.sh:112,:190).
+# Leaving them untracked-but-not-ignored made the tree permanently dirty, so a
+# `git add -A` swept repo-root artifacts into a submission diff -- which
+# enforce-modifiable-surface.sh then rejects as outside editablePaths.
+score.json.sha256
+score.local-*.json
+score.local-*.json.sha256
+score*.baseline.json
+benchmark-integrity.json
+benchmark-integrity.local-*.json
+correctness_golden.json
+correctness_golden*.json
+local_correctness_golden.json
+private_prompts.json
+private_prompts*.json
+gpqa_reference_cases.json
+gpqa_reference_cases*.json
+correctness_prompts/*correctness_golden*.json
+correctness_prompts/*golden_prompt*.json
+correctness_prompts/*golden_prompt*.txt
+correctness_prompts/*private*.json
+correctness_prompts/*private*.txt
+correctness_prompts/*gpqa_reference_cases*.json
+
+# IDE
+.vscode/
+.idea/
+.serena/
+*.swp
+*.swo
+.DS_Store
+
+# Local-only working docs (not part of the benchmark)
+local-docs/
+__pycache__/
+
+# Operator-local environment: endpoints and credentials belong here, never in the repo
+.env

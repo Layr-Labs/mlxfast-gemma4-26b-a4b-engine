@@ -1,0 +1,413 @@
+# Engine CI -- the automated gate this repository had none of.
+#
+# Scope, deliberately: BUILD AND TEST ONLY.
+#   - no credential of any kind, and a step below trips if a workflow in this
+#     tree starts referencing one, inheriting the caller's, or asking for a
+#     write permission;
+#   - no artifact upload FROM CI, same self-check -- this repository can receive
+#     organizer-material fixtures, and an artifact is a way out of the runner.
+#     The ranked pipeline's score.json upload is the one narrow exception, and
+#     the scan checks it (pinned action, score.json only, if-no-files-found:
+#     error) rather than exempting it. That scan is a named-pattern tripwire
+#     over .github/, not a proof of confinement: see the header of
+#     tools/ci-workflow-egress-scan.sh for exactly what it does and does not
+#     detect;
+#   - no submodule checkout: this repository has none since benchd became a
+#     pinned prebuilt (./benchd.pin). The setting is retained so a reintroduced
+#     private submodule cannot pull a credential into this pipeline, which is
+#     required to hold none;
+#   - no model weights, no R2, no network fetch beyond the SwiftPM dependency
+#     graph, and nothing that would want the ranked box.
+#
+# What that leaves uncovered is not left silent. GitHub-hosted macOS runners
+# never run ./setup.sh, so they carry neither the built Metal kernels nor the
+# ~21.6 GB reference checkpoint; every test behind
+# MLXFAST_RUN_MLX_RUNTIME_TESTS / _QWEN_REFERENCE_PARITY /
+# _LAGUNA_UPSTREAM_EQUIVALENCE is box-only. docs/ci-coverage.md names them,
+# tools/ci-box-only-inventory.sh --check fails the run if that list drifts from
+# the sources, and the last step of the swift job prints the list into the run
+# log as a notice.
+#
+# The ranked pipeline is NOT in this file and must never be. This track's is
+# .github/workflows/benchmark.yml (workflow_dispatch only, self-hosted, no
+# credential); the qwen track's
+# .github/workflows/qwen38-mtp-ranked-benchmark.yml stays a fail-closed stub on
+# purpose. A ranked dispatch does not consult this file.
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint (repo hygiene, hosted)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          submodules: false
+          persist-credentials: false
+
+      - name: No workflow takes a credential or ships a file out
+        # The tripwire under the constraint that keeps organizer material
+        # inside the runner. The scan lives in tools/ so its patterns are not
+        # inside the directory it scans.
+        run: tools/ci-workflow-egress-scan.sh
+
+      - name: actionlint
+        # A pinned release BINARY, hash-verified before it is allowed to run.
+        # This step used to be `docker://rhysd/actionlint@sha256:b1934ee5...`,
+        # and could not stay one: the org's Actions policy admits GitHub-owned
+        # actions by 40-hex SHA plus an explicit pattern allow-list, and a
+        # `docker://` reference is on neither list. The SOURCE is what is
+        # disallowed, so digest-pinning it does not rescue it -- a container
+        # reference here makes the ENTIRE workflow a startup_failure, with zero
+        # jobs created, before any of the gates below get to run.
+        #
+        # The property the digest pin bought is kept, by the same means in a
+        # different shape. A mutable reference would be a remote party's
+        # ability to change what executes in this job, so: the version is
+        # fixed, the release tarball's sha256 is hardcoded here, and the binary
+        # runs ONLY if the hash it actually has matches. A swapped, tampered,
+        # or truncated asset fails the step instead of executing. The version
+        # below is 1.7.12 -- the same one the retired digest resolved to, so
+        # this is a mechanism change and not a version change.
+        #
+        # 1.7.7 and older do not know the macos-26 runner label and reject the
+        # swift job's runs-on, hence the floor on the version. Bump the version
+        # and the checksum together; the checksum is the matching line from
+        # that release's actionlint_<version>_checksums.txt.
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          # linux amd64 because this job is `runs-on: ubuntu-latest`. Pick the
+          # asset that matches the runner if that ever changes.
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+
+          workdir="$(mktemp -d)"
+          tarball="${workdir}/actionlint.tar.gz"
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+
+          curl --fail --silent --show-error --location --retry 3 -o "${tarball}" "${url}"
+
+          # Fail closed, and verify BEFORE extracting or executing anything:
+          # an unverified binary must never get a chance to run.
+          if ! printf '%s  %s\n' "${ACTIONLINT_SHA256}" "${tarball}" | sha256sum --check --status; then
+            echo "::error::actionlint ${ACTIONLINT_VERSION} tarball does not match its pinned sha256; refusing to execute it" >&2
+            echo "  expected ${ACTIONLINT_SHA256}" >&2
+            echo "  actual   $(sha256sum "${tarball}" | cut -d ' ' -f 1)" >&2
+            exit 1
+          fi
+          echo "ok: actionlint ${ACTIONLINT_VERSION} matches its pinned sha256"
+
+          tar -xzf "${tarball}" -C "${workdir}" actionlint
+          chmod +x "${workdir}/actionlint"
+
+          # The same invocation the container ran: the image's entrypoint IS
+          # actionlint, and `-color` was the whole of its `args:`.
+          "${workdir}/actionlint" -color
+
+      - name: Install zsh
+        # Three tracked scripts (Vendor/mlx-swift/tools/*.sh) declare a zsh
+        # shebang and the ubuntu image ships no zsh, so the syntax loop below
+        # would exit 127 on them. Installed rather than skipped: an unparsed
+        # script is an unchecked script.
+        #
+        # The `update` is not optional: the image ships a stale package index
+        # and `install` against it fails on a 404 once the pinned versions age
+        # out of the mirror.
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends zsh
+
+      - name: Shell syntax
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' script; do
+            case "$(head -n 1 "${script}")" in
+              '#!/usr/bin/env bash'|'#!/bin/bash')
+                bash -n "${script}"
+                ;;
+              '#!/usr/bin/env sh'|'#!/bin/sh')
+                sh -n "${script}"
+                ;;
+              '#!/usr/bin/env zsh'|'#!/bin/zsh')
+                zsh -n "${script}"
+                ;;
+              *)
+                echo "unsupported shell script interpreter: ${script}" >&2
+                exit 1
+                ;;
+            esac
+          done < <(git ls-files -z '*.sh')
+
+      - name: Benchmark manifest lint
+        run: |
+          set -euo pipefail
+          # --gitlink-targets report downgrades a command target missing ONLY
+          # because its submodule is not checked out. Since benchd became a
+          # pinned PREBUILT there is no submodule and every command target lives
+          # in this repository, so nothing is downgraded and all three commands
+          # are fully verified here. See docs/ci-coverage.md.
+          python3 tools/lint-benchmark-manifest.py --gitlink-targets report
+
+      - name: Box-only inventory is current
+        run: tools/ci-box-only-inventory.sh --check
+
+      - name: Runtime-worker staging revert-proof
+        # Asserts setup.sh stages the scored worker + its mlx.metallib as a
+        # sibling pair into the .build/release location benchd resolves. Fully
+        # hermetic (no toolchain, weights, GPU, or network): each case copies the
+        # real tool into a throwaway root and drives it with stub files.
+        run: tools/test-runtime-worker-staging.sh
+
+  swift:
+    name: swift build + test (hosted macOS, no GPU)
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      # Explicit, not incidental: the GPU-dependent tests are OFF on this
+      # runner and the coverage doc says where they run instead.
+      MLXFAST_RUN_MLX_RUNTIME_TESTS: "0"
+      # Keep the clang module cache inside the workspace. Shared under $HOME it
+      # is a cross-build coupling: another build invalidating it silently forces
+      # a full recompile of the vendored MLX C++ here. (Carried over from the
+      # pre-strip ci.yml, which set it for the same reason.)
+      CLANG_MODULE_CACHE_PATH: ${{ github.workspace }}/.build/clang-module-cache
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          submodules: false
+          persist-credentials: false
+
+      - name: Toolchain preflight
+        run: |
+          set -euo pipefail
+          swift --version
+          xcodebuild -version
+          developer_dir="$(xcode-select -p)"
+          echo "DEVELOPER_DIR=${developer_dir}"
+
+          # swift-testing (`import Testing`, which every test file in this
+          # package uses) ships inside Xcode, NOT inside the Command Line
+          # Tools. A CLT-only selection compiles the library targets fine and
+          # then fails the test target with "no such module 'Testing'", which
+          # reads like a package problem and is not one.
+          case "${developer_dir}" in
+            *CommandLineTools*)
+              echo "::error::xcode-select points at the Command Line Tools; swift-testing needs a full Xcode" >&2
+              exit 1
+              ;;
+          esac
+
+          # Package.swift declares swift-tools-version 6.3. An older SwiftPM
+          # cannot parse the manifest at all, so fail here with the reason
+          # rather than there with a parse error.
+          have="$(swift -version | sed -n 's/.*Apple Swift version \([0-9][0-9.]*\).*/\1/p' | head -n 1)"
+          want="6.3"
+          if [ "$(printf '%s\n%s\n' "${want}" "${have}" | sort -V | head -n 1)" != "${want}" ]; then
+            echo "::error::Swift ${have} is older than the ${want} this package's tools-version requires" >&2
+            exit 1
+          fi
+          echo "ok: Swift ${have} >= ${want}"
+
+      - name: Submission-security suite (HARD GATE)
+        # tools/test-submission-security.sh was written as a HARD GATE -- "must be
+        # green before any real submission is dispatched" (its own header) -- and
+        # had no automated run at all until this step. What this step buys is
+        # COVERAGE, not an interlock. THIS PIPELINE IS ADVISORY BY RULING (David
+        # 2026-08-20 -- the two-session red-team is the de facto merge gate): no
+        # status check in this file is required, because branch protection is
+        # unavailable on this repository's plan (403), and there is no
+        # CODEOWNERS. A red run blocks neither a merge nor a dispatch -- the
+        # ranked workflow is a fail-closed stub that never calls the suite, and a
+        # RANKED workflow_dispatch does not consult this file. (This workflow
+        # does have a workflow_dispatch trigger of its own, for re-running CI by
+        # hand; that is a different thing and is not a ranked dispatch.)
+        # Dispatch-time gating lands with the ranked runner
+        # (docs/submission-restriction-spec.md section 9). Do not describe any
+        # job here as required.
+        #
+        # It is here, in the swift job and not the ubuntu lint job, for one
+        # reason: it compiles the REAL byte-budget enforcer out of
+        # Sources/MLXFastTrustedHarness with swiftc rather than re-stating its
+        # rules, so it needs the macOS toolchain.
+        #
+        # Placed BEFORE the SwiftPM build deliberately: it costs ~10 s against the
+        # engine build's minutes, and a security regression should fail the run
+        # without first waiting for the vendored MLX C++ to compile. It needs no
+        # DEVELOPER_DIR of its own -- the preflight above already refused a
+        # Command-Line-Tools selection, and swiftc follows xcode-select.
+        #
+        # Nothing in it is box-dependent: no weights, no GPU, no network, no
+        # submodule. Every case synthesizes its own fixture (its own git repos
+        # included) under $TMPDIR, so there is no split to gate and no assertion
+        # skipped here. The only host requirements are the tools asserted below.
+        #
+        # The tee is what the NEXT step reads; keep the pipefail so the suite's
+        # own non-zero exit still reds this step.
+        run: |
+          set -euo pipefail
+          for tool in swiftc jq python3 tar git; do
+            if ! command -v "${tool}" >/dev/null 2>&1; then
+              echo "::error::submission-security suite needs ${tool}, which this runner does not have" >&2
+              exit 1
+            fi
+          done
+          tools/test-submission-security.sh 2>&1 | tee submission-security.log
+
+      - name: Submission-security suite did not shrink
+        # THE NON-VACUITY FLOOR, RESTATED FROM OUTSIDE THE FILE IT GUARDS.
+        #
+        # Exit status is not the whole gate: a section that stops running leaves
+        # every remaining assertion green. The suite carries its own
+        # EXPECTED_MIN_ASSERTIONS floor for that, but it cannot be the only one:
+        # the suite runs `set -uo pipefail` WITHOUT `-e`, and its floor check
+        # sits in its own trailer, so truncating the file or inserting an early
+        # `exit 0` deletes the floor along with the assertions and the step above
+        # goes green having run a gate that proved nothing.
+        #
+        # So the floor is restated here, against the suite's PRINTED trailer,
+        # following this repository's own precedent: tools/ci-swift-warning-gate.sh
+        # guards the build from a different file than the build, and
+        # tools/ci-workflow-egress-scan.sh keeps its patterns outside the
+        # directory it scans. A gate whose only floor lives inside the thing it
+        # measures is not a floor.
+        #
+        # CI_MIN_ASSERTIONS below is the ONE place this workflow states the
+        # number. It is cross-checked against the suite's own
+        # EXPECTED_MIN_ASSERTIONS so the two cannot drift apart silently -- raise
+        # BOTH in the same commit that adds assertions.
+        #
+        # THREAT MODEL, stated so this step is not read as more than it is: it
+        # guards against the gate SHRINKING -- a section that stops running, a
+        # truncated file, a floor deleted along with the assertions it guarded,
+        # a count quietly lowered. It does NOT defend against someone who can
+        # edit this workflow, who can simply delete the step; and the trailer it
+        # reads is printed by the very file it is measuring, so a suite rewritten
+        # to print a trailer it did not earn would satisfy it. The ok-line
+        # cross-check below closes the cheap version of that (print the trailer,
+        # exit early) by requiring one 'ok    ' line per counted assertion, but
+        # a sufficiently deliberate forgery of both is not in scope. What is in
+        # scope is accident and drift, which is what actually happens.
+        env:
+          CI_MIN_ASSERTIONS: "287"
+        run: |
+          set -euo pipefail
+
+          # Drift check first: if the suite's declared floor and this workflow's
+          # disagree, neither number can be trusted as the gate's size.
+          suite_floor="$(sed -n 's/^EXPECTED_MIN_ASSERTIONS=\([0-9][0-9]*\)$/\1/p' \
+            tools/test-submission-security.sh | head -n 1)"
+          if [ -z "${suite_floor}" ]; then
+            echo "::error::tools/test-submission-security.sh declares no EXPECTED_MIN_ASSERTIONS -- the suite's own floor was removed" >&2
+            exit 1
+          fi
+          if [ "${suite_floor}" != "${CI_MIN_ASSERTIONS}" ]; then
+            echo "::error::floor drift: the suite declares ${suite_floor} assertions, this workflow expects ${CI_MIN_ASSERTIONS}; raise both together" >&2
+            exit 1
+          fi
+
+          # Then the trailer the suite actually printed. Anchored: the count is
+          # read out of the line, not pattern-matched into a range.
+          trailer="$(sed -n 's/^submission-security: \([0-9][0-9]*\) passed, \([0-9][0-9]*\) failed$/\1 \2/p' \
+            submission-security.log | tail -n 1)"
+          if [ -z "${trailer}" ]; then
+            echo "::error::the submission-security suite printed no result trailer -- it did not run to completion" >&2
+            exit 1
+          fi
+          passed="${trailer% *}"
+          failed="${trailer#* }"
+          if [ "${failed}" -ne 0 ]; then
+            echo "::error::submission-security suite reported ${failed} failed assertions" >&2
+            exit 1
+          fi
+          if [ "${passed}" -lt "${CI_MIN_ASSERTIONS}" ]; then
+            echo "::error::submission-security suite ran only ${passed} assertions, expected at least ${CI_MIN_ASSERTIONS} -- the gate shrank" >&2
+            exit 1
+          fi
+
+          # The trailer is printed BY the file this step is measuring, so on its
+          # own it is a self-report. Cross-check it against the work actually
+          # shown in the log: the suite prints exactly one 'ok    ' line per
+          # passing assertion (its assert helpers, tools/test-submission-security.sh),
+          # so the two counts must agree. A suite that printf'd a trailer and
+          # exited early would satisfy the count above and fail here.
+          ok_lines="$(grep -c '^ok    ' submission-security.log || true)"
+          if [ "${ok_lines}" != "${passed}" ]; then
+            echo "::error::trailer claims ${passed} passed but the log shows ${ok_lines} 'ok' lines -- the suite's trailer does not match the assertions it printed" >&2
+            exit 1
+          fi
+          echo "ok: ${passed} assertions passed, 0 failed, ${ok_lines} ok-lines (floor ${CI_MIN_ASSERTIONS})"
+
+      - name: Restore SwiftPM cache
+        id: restore_swiftpm_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          # Checkouts only. The compiled products are not cached: the vendored
+          # MLX C++ dominates the build and caching object files across
+          # toolchain or source changes is a correctness risk this gate cannot
+          # take.
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: swiftpm-engine-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            swiftpm-engine-v1-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build (library, both executables, and the test bundle)
+        run: |
+          set -euo pipefail
+          # --force-resolved-versions on every invocation: the dependency graph
+          # is frozen and a bare build can silently rewrite Package.resolved.
+          # The tee is what the warning gate reads; keep the pipefail.
+          swift build --build-tests --force-resolved-versions 2>&1 | tee swift-build.log
+
+      - name: First-party warnings are errors
+        run: tools/ci-swift-warning-gate.sh swift-build.log
+
+      - name: Frozen dependency graph is unchanged
+        run: |
+          set -euo pipefail
+          # If this fails the build re-resolved the graph, which ./setup.sh
+          # refuses to build over. Restore with: git checkout -- Package.resolved
+          git diff --exit-code -- Package.swift Package.resolved
+
+      - name: Unit tests (no Metal runtime, no checkpoint)
+        run: swift test --force-resolved-versions
+
+      - name: Declare what this run did NOT cover
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "Box-only tests, NOT executed by this run (no GPU, no checkpoint):"
+          tools/ci-box-only-inventory.sh
+          echo "::notice title=Box-only coverage::$(tools/ci-box-only-inventory.sh | wc -l | tr -d ' ') test files are gated off hosted CI; see docs/ci-coverage.md"
+
+      - name: Save SwiftPM cache
+        if: steps.restore_swiftpm_cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/checkouts
+            .build/repositories
+            .build/artifacts
+            .build/workspace-state.json
+          key: ${{ steps.restore_swiftpm_cache.outputs.cache-primary-key }}

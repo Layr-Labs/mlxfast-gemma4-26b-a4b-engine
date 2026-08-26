@@ -1,0 +1,260 @@
+# gemma4-26b-a4b-mlx-v1 RANKED BENCHMARK.
+#
+# benchmark.json's runner.workflow names this file. Yukon dispatches it once per
+# submission; the two jobs below are the whole ranked pipeline. A hosted
+# no-credential surface check runs first, and only if it passes does the
+# measurement reach the box.
+#
+# NO SECRET, ANYWHERE, BY DESIGN -- NOT AS A GAP. This file references no
+# repository secret, inherits none, and asks for no write permission, and it
+# never will: hidden material for this track (the 8 timed-pool tapes, the
+# token-fidelity oracle, the reference baseline workspace) is STAGED ONTO THE
+# BOX out of band by the organizer. A box receives bundles, never keys
+# (bundles-no-keys, ruled 2026-08-21). What replaces the credential is
+# verification: tools/ranked-box-preflight.sh re-checks every staged asset
+# against fixtures/gemma4_26b_a4b_track.json's own {sha256, bytes} pins --
+# byte count first, then digest -- before ./setup.sh runs, and refuses on any
+# miss. The contract fixture is trusted-side (not an editable path), so a
+# submission cannot move the pins it is measured against.
+#
+# THE STAGING CONVENTION IS THE EXISTING ONE. The ranked steps read
+# MLXFAST_GEMMA4_GOLDEN_DIR and MLXFAST_GEMMA4_BASELINE_WORKSPACE out of the
+# self-hosted runner's own process environment -- the same two names
+# tools/gemma4-measure-and-score.sh already documents and reads
+# (docs/participant-contract.md section 6). No new path or variable is coined
+# here.
+#
+# THE RUNNER LABEL IS THE TRACK ID. `runs-on: [self-hosted, macOS,
+# gemma4-26b-a4b-mlx-v1]` -- branch, track and label are one string
+# (the canonical decoder-neutral naming construction). It replaces an earlier
+# placeholder label. tools/box-runner/box-runner.env's RUNNER_LABELS must
+# carry the same label: that value is the entire coupling surface between this
+# file and the runner side, and a mismatch strands a dispatch with no runner
+# rather than failing it.
+#
+# ONE RUN ON THE BOX AT A TIME. The ranked job takes a dedicated concurrency
+# group with cancel-in-progress: false, so a second dispatch QUEUES behind the
+# in-flight measurement instead of cancelling it mid-flight. Cancelling a timed
+# run mid-window destroys the measurement and leaves the GPU hot for the next
+# one.
+#
+# FAIL-CLOSED INVENTORY -- each of these aborts before a score.json can exist,
+# and none of them has a degraded path:
+#   1. benchd pin mismatch. ./tools/fetch-benchd.sh accepts only bytes matching
+#      ./benchd.pin {sha256, bytes}; it never returns an unverified binary and
+#      never falls back to a PATH benchctl or a source build.
+#   2. Unarmed pool. A PENDING-ORGANIZER sentinel, a pool that is not 8 entries,
+#      or any entry whose sha256 is not 64 hex / bytes is not positive: refused,
+#      because there would be no pin to verify a staged file against.
+#   3. Missing staged asset. MLXFAST_GEMMA4_GOLDEN_DIR unset or absent, a tape
+#      missing, or MLXFAST_GEMMA4_BASELINE_WORKSPACE unset, absent, or equal to
+#      the candidate workspace.
+#   4. Hash mismatch on a staged asset, in either half of the pin, on any tape
+#      or on a box-named MLXFAST_CORRECTNESS_GOLDEN_PATH. An unpinned extra
+#      *.json in the staging directory is also refused: every *.json there is
+#      passed as a --golden, so one more file is one more cohort member.
+#   5. Credential or override in the job environment. R2 keys, an R2 signer, a
+#      dist token, BENCHCTL (which bypasses the benchd pin check),
+#      MLXFAST_SKIP_WEIGHTS_DOWNLOAD / SKIP_MODEL_DOWNLOAD,
+#      MLXFAST_LOCAL_COOL_GATE, MLXFAST_LOCAL_ALLOW_GOLDEN_DRIFT.
+#   6. Model absent and unfetchable. ./setup.sh verifies the reference
+#      checkpoint against fixtures/reference_gemma4_26b_a4b_qat4bit.sha256 and
+#      exits non-zero rather than proceed without it; the preflight above
+#      refuses the two environment variables that would let it skip the
+#      download instead.
+#   7. No composite. .github/scripts/emit-gemma4-score.sh refuses rather than
+#      substitute the raw_ratio_of_means diagnostic for the ruled per-stream
+#      composite, so no score.json is written while benchd seals composite as
+#      None.
+# A refusal is always a non-zero exit and never a written score: nothing in
+# this pipeline emits a placeholder, a fallback, or a partial score file. The
+# upload step below runs `if: always()` with `if-no-files-found: error`, so a
+# refused run ends with a red job and NO artifact rather than an empty one.
+#
+# EDITABLE PATHS ARE UNTRUSTED INPUT. The dispatched commit carries the
+# submission's editablePaths; the hosted surface-check job static-reviews them
+# before the box is reached, and the ranked box then builds and executes
+# participant Swift inside the sandboxed runtime worker -- the accepted design
+# for this track family, matching the qwen precedent.
+#
+# WHAT MUST EXIST BEFORE A DISPATCH CAN GO GREEN (each is external to this
+# file, and each is David-gated):
+#   - organization Actions enabled for this repository (dispatch is refused at
+#     the API today);
+#   - a registered self-hosted runner on the box advertising the three labels
+#     below (tools/box-runner/ owns that side);
+#   - box staging: the 8 pinned tapes in MLXFAST_GEMMA4_GOLDEN_DIR, the pinned
+#     baseline workspace, benchd-bin/benchctl matching ./benchd.pin (the box has
+#     no Rust toolchain and this job holds no dist token, so the binary is
+#     placed there out of band), and the reference checkpoint;
+#   - the track ARMED: fixtures/gemma4_26b_a4b_track.json still sets
+#     official_scoring_enabled to false, and the pinned measure-job refuses to
+#     seal an official scoring artifact while it is false (or absent). The
+#     pinned measure-job DOES emit per_cohort[].composite -- the score path is
+#     not what is missing here, the arm flag and the box-only goldens are.
+#
+# Trigger: workflow_dispatch ONLY. There is deliberately no `pull_request`,
+# `push` or `schedule` trigger -- Yukon dispatches a submission explicitly, and
+# a pull_request trigger would run every submission twice on the one box.
+
+name: gemma4 26B A4B MLX ranked benchmark
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Real, hosted, no-GPU, no-credential checks: the same class of check
+  # ci.yml's own `lint` job already runs against this manifest on every push
+  # to main, reproduced here so a ranked-workflow dispatch also self-checks
+  # before the dispatch to the ranked box.
+  surface-check:
+    name: editable-surface + static review (hosted, no GPU, no credential)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          submodules: false
+          persist-credentials: false
+
+      - name: Benchmark manifest lint
+        run: |
+          set -euo pipefail
+          # --gitlink-targets report downgrades a command target missing ONLY
+          # because its submodule is not checked out. Since benchd became a
+          # pinned PREBUILT there is no submodule and every command target lives
+          # in this repository, so nothing is downgraded and all three commands
+          # are fully verified here. The flag is kept for the next submodule --
+          # see docs/ci-coverage.md.
+          python3 tools/lint-benchmark-manifest.py --gitlink-targets report
+
+      - name: Submission static review (whole-surface, self-check)
+        run: |
+          set -euo pipefail
+          # whole-surface mode reads benchmark.json from the WORK TREE. That is
+          # safe here because the dispatched commit's benchmark.json is trusted
+          # side -- it is not an editablePath, so a submission overlay cannot
+          # widen it. See the script's own header for the self-widening hazard
+          # this mode is an explicit opt-in against.
+          CONTRACT_PATH=benchmark.json \
+          MLXFAST_SUBMISSION_REVIEW_MODE=whole-surface \
+            .github/scripts/submission-static-review-checks.sh
+
+      - name: Score emitter unit test
+        run: tools/test-gemma4-score-emitter.sh
+
+  # The ranked measurement. `needs: surface-check` so a submission that fails
+  # the static review never reaches the box at all.
+  ranked:
+    name: ranked measurement (self-hosted, gemma4-26b-a4b-mlx-v1 box)
+    needs: surface-check
+    # The third label IS the track id (= the branch name = the R2 key prefix).
+    # tools/box-runner/box-runner.env RUNNER_LABELS must advertise it.
+    runs-on: [self-hosted, macOS, gemma4-26b-a4b-mlx-v1]
+    # A cold run fetches the ~15.6 GB checkpoint before it measures anything.
+    timeout-minutes: 180
+    concurrency:
+      # Dedicated to this box. Distinct from ci.yml's `ci-<ref>` group, and
+      # .github/workflows/qwen38-mtp-ranked-benchmark.yml declares no group at
+      # all, so nothing else can serialize against or evict this one.
+      group: gemma4-26b-a4b-mlx-v1-ranked-box
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          # The DISPATCHED commit, per the Yukon workflow author guide -- not
+          # the branch tip, which can move between dispatch and pickup while a
+          # run is queued behind the in-flight measurement.
+          ref: ${{ github.sha }}
+          submodules: false
+          # This job must hold no credential, and a persisted checkout token
+          # would be one.
+          persist-credentials: false
+
+      - name: Ranked box preflight (staged assets, contract pins, no credential)
+        # Items 2-5 of the fail-closed inventory in this file's header. Runs
+        # before ./setup.sh, so a mis-staged box is refused before it spends
+        # anything on a checkpoint download or a build.
+        run: ./tools/ranked-box-preflight.sh
+
+      - name: Resolve the pinned benchctl (sha256 + bytes, no credential)
+        # First half of benchmark.json's setupCommand. mlxfast-bench's dist is
+        # not anonymously readable and this job holds no token, so the resolve
+        # is expected to take fetch-benchd.sh's OFFLINE path: an operator-placed
+        # benchd-bin/benchctl, accepted only when it matches ./benchd.pin. A
+        # binary that fails the pin is a hard refusal, never a replacement.
+        run: ./tools/fetch-benchd.sh
+
+      - name: Setup (toolchain, Metal kernels, pinned checkpoint)
+        # Second half of benchmark.json's setupCommand, verbatim. setup.sh
+        # verifies the reference checkpoint against
+        # fixtures/reference_gemma4_26b_a4b_qat4bit.sha256 and refuses without
+        # it; the preflight above already refused the environment variables
+        # that would let it skip the download.
+        run: ./setup.sh
+
+      - name: Stage the organizer heads into BOTH workspaces
+        # David's second ruling of 2026-08-26. benchd's write-divergence gate
+        # hashes every file under the candidate AND the baseline workspace --
+        # gitignored content included, since it excludes only .git and .build --
+        # and refuses anything added, changed or deleted outside editablePaths.
+        # mtp-head/ and dflash-head/ left that list when custom head uploads were
+        # removed, so a head staged into one workspace and absent from the other
+        # is now a divergence outside the modifiable surface and the run dies
+        # pre-GPU. This step puts the same organizer-pinned bytes in both trees
+        # and verifies, file by file, that they match.
+        #
+        # ORDER IS THE POINT. It runs after ./setup.sh (which builds the tools
+        # the stagers reuse) and before the Benchmark step below (which is where
+        # measure-job makes the comparison). A stage that ran after the
+        # comparison would do nothing at all.
+        #
+        # It reads MLXFAST_GEMMA4_BASELINE_WORKSPACE out of the runner's own
+        # process environment -- the same variable the Benchmark step passes to
+        # `measure-job --baseline`, already existence-checked by the preflight
+        # above. No new path or variable is coined here.
+        run: ./tools/stage-ranked-heads.sh
+
+      - name: Record the dispatched candidate sha (author-at-seal)
+        # FROM THE BOX (2026-08-26 evidence run). benchd's official seal
+        # AUTHORS the sha it publishes, and it fails closed without a dispatch
+        # context: it reads the recorded sha from the file named by
+        # MLXFAST_CANDIDATE_SHA_FILE, and cross-checks the untrusted proposal in
+        # MLXFAST_COMMIT_SHA. Neither was set anywhere in this repository, so an
+        # official run refused at the seal -- after the whole measurement.
+        #
+        # THIS is the dispatch lane, so this is where the context exists. Both
+        # values are the FULL 40-hex sha (`github.sha`), never the short form:
+        # the seal compares them for equality and an abbreviation is not equal.
+        # Written here rather than in the stager because it is dispatch context,
+        # not a staged box path -- the stager owns paths it has verified on disk.
+        run: |
+          printf '%s\n' "${GITHUB_SHA}" > "${RUNNER_TEMP}/candidate.sha"
+          {
+            printf 'MLXFAST_CANDIDATE_SHA_FILE=%s\n' "${RUNNER_TEMP}/candidate.sha"
+            printf 'MLXFAST_COMMIT_SHA=%s\n' "${GITHUB_SHA}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Benchmark (benchd measure-job, then score conversion)
+        # benchmark.json's benchmarkCommand, character for character. The
+        # golden pool and the baseline workspace come from the runner
+        # environment, which the preflight has already pin-verified; the head
+        # directories, the trusted oracle worker and the dispatch sha come from
+        # the two steps above via GITHUB_ENV.
+        run: MLXFAST_SCORE_PATH=score.json ./tools/gemma4-measure-and-score.sh
+
+      - name: Upload score artifact
+        # Matches benchmark.json scoreArtifact `benchmark-results-<run_id>/score.json`.
+        # `if: always()` so a failure after a written score still publishes it,
+        # and `if-no-files-found: error` so a refused run is loud and artifact-less
+        # instead of quietly uploading nothing.
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: benchmark-results-${{ github.run_id }}
+          path: score.json
+          if-no-files-found: error

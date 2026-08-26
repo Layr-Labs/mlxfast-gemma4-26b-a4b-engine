@@ -1,0 +1,202 @@
+{
+  "schema_version": 1,
+  "track_id": "gemma4-26b-a4b-mlx-v1",
+  "track_name": "Gemma 4 26B A4B MLX -- composite cohort speedup",
+  "official_scoring_enabled": true,
+  "allowed_modes": [
+    "serial",
+    "mtp",
+    "dflash"
+  ],
+  "benchmark_name": "mlxfast-gemma4-26b-a4b",
+  "kv_backend": "contiguous",
+  "scored_batch_size": 8,
+  "scored_exponents": {
+    "prefill_gain_exponent": 0.25,
+    "decode_gain_exponent": 0.75
+  },
+  "timed_prompt_pool": [
+    {
+      "r2_path": "correctness_prompts/gemma4-26b-a4b-mlx-v1/gemma4-26b-a4b-pool-beagle.json",
+      "sha256": "6ba38856ecef64fb3639ce03813c830c933e4df38d91f7137c115883bd964aa3",
+      "bytes": 42561,
+      "noop_decode_speedup": 0.9659076685695553,
+      "noop_decode_speedup_pairs": 4,
+      "noop_decode_speedup_spread_pct": 0.07921177324584408
+    },
+    {
+      "r2_path": "correctness_prompts/gemma4-26b-a4b-mlx-v1/gemma4-26b-a4b-pool-botany.json",
+      "sha256": "c9a19bd40452a7692f8db6217fe74108093d0009d10c995046ff3a488cdfb40d",
+      "bytes": 42754,
+      "noop_decode_speedup": 0.9672233717356309,
+      "noop_decode_speedup_pairs": 4,
+      "noop_decode_speedup_spread_pct": 0.3281332294838767
+    },
+    {
+      "r2_path": "correctness_prompts/gemma4-26b-a4b-mlx-v1/gemma4-26b-a4b-pool-drama.json",
+      "sha256": "36ac43c73946b0d40aae4c32dbb63af777db32bf6ce216a3756a43737ca61554",
+      "bytes": 41957,
+      "noop_decode_speedup": 0.9542032095143029,
+      "noop_decode_speedup_pairs": 4,
+      "noop_decode_speedup_spread_pct": 0.1365527976834957
+    },
+    {
+      "r2_path": "correctness_prompts/gemma4-26b-a4b-mlx-v1/gemma4-26b-a4b-pool-essays.json",
+      "sha256": "e983ae70c9aa5d240aa55a9a6d698618829b9b5e12d27769267a6e7b73b770f3",
+      "bytes": 41811,
+      "noop_decode_speedup": 0.966264446405455,
+      "noop_decode_speedup_pairs": 4,
+      "noop_decode_speedup_spread_pct": 0.3207508821544359
+    },
+    {
+      "r2_path": "correctness_prompts/gemma4-26b-a4b-mlx-v1/gemma4-26b-a4b-pool-medicine.json",
+      "sha256": "0438b42f650a3bc7cf8e77813c569315932df7a524b82694f3549174177464a8",
+      "bytes": 41936,
+      "noop_decode_speedup": 0.9543218076127202,
+      "noop_decode_speedup_pairs": 4,
+      "noop_decode_speedup_spread_pct": 0.190269141358382
+    },
+    {
+      "r2_path": "correctness_prompts/gemma4-26b-a4b-mlx-v1/gemma4-26b-a4b-pool-plutarch.json",
+      "sha256": "e3790acf2a038fbbcf68e6081d7ac057ba19bf0d5797a43dff6dd8f0c1fa3ad1",
+      "bytes": 42057,
+      "noop_decode_speedup": 0.9422828997032457,
+      "noop_decode_speedup_pairs": 4,
+      "noop_decode_speedup_spread_pct": 0.30289745392598405
+    },
+    {
+      "r2_path": "correctness_prompts/gemma4-26b-a4b-mlx-v1/gemma4-26b-a4b-pool-republic.json",
+      "sha256": "a1fe9efa1140b921e1cee89d6964a8102073746f2f1dc7e3ca9a6a0417f7b609",
+      "bytes": 41538,
+      "noop_decode_speedup": 0.9546950531812264,
+      "noop_decode_speedup_pairs": 4,
+      "noop_decode_speedup_spread_pct": 0.03840065026861005
+    },
+    {
+      "r2_path": "correctness_prompts/gemma4-26b-a4b-mlx-v1/gemma4-26b-a4b-pool-travel.json",
+      "sha256": "0a42c33a45330002a3d0e72e96789ab1add03a98521e245a44137c83baac89a4",
+      "bytes": 41655,
+      "noop_decode_speedup": 0.9549038416651543,
+      "noop_decode_speedup_pairs": 4,
+      "noop_decode_speedup_spread_pct": 0.16457709107943816
+    }
+  ],
+  "hidden_correctness_golden": {
+    "sha256": "f8eb3e0faf960154eacef498aa5f1c0be19d11e08054af37cc59a4f28ca5911b",
+    "bytes": 16692
+  },
+  "mlx_swift_lm_revision": "ed55bee83beb0623152f4c2e70f0cf99ad379e35",
+  "target": {
+    "upstream_model_id": "mlx-community/gemma-4-26B-A4B-it-qat-4bit",
+    "upstream_revision": "0e3cbab38ce568cf6e23543010d08d03b731910c",
+    "model_type": "gemma4_text",
+    "num_hidden_layers": 30,
+    "hidden_size": 2816,
+    "intermediate_size": 2112,
+    "vocab_size": 262144,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 8,
+    "num_global_key_value_heads": 2,
+    "head_dim": 256,
+    "global_head_dim": 512,
+    "sliding_window": 1024,
+    "full_attention_layer_indices": [
+      5,
+      11,
+      17,
+      23,
+      29
+    ],
+    "num_experts": 128,
+    "num_experts_per_tok": 8,
+    "moe_intermediate_size": 704,
+    "attention_k_eq_v": true,
+    "final_logit_softcapping": 30.0,
+    "tie_word_embeddings": true,
+    "max_position_embeddings": 262144,
+    "raw_checkpoint_tensor_count": 1697,
+    "raw_checkpoint_shard_count": 3,
+    "raw_checkpoint_total_size_bytes": 15608614044,
+    "text_tower_tensor_count": 1339,
+    "manifest_path": "fixtures/reference_gemma4_26b_a4b_qat4bit.sha256",
+    "quantization": {
+      "mode": "affine",
+      "group_size": 64,
+      "bits": 4,
+      "mixed_precision": true
+    }
+  },
+  "assistant": {
+    "role": "spec_decode_assistant_head",
+    "upstream_model_id": "mlx-community/gemma-4-26B-A4B-it-qat-assistant-4bit",
+    "upstream_revision": "bb94eae1b70a80dac16cbf959bb4b7d56bd1fb8c",
+    "compatibility_verified_2026_08_22": {
+      "backbone_hidden_size": {
+        "assistant": 2816,
+        "target_hidden_size": 2816,
+        "verdict": "pass"
+      },
+      "vocab_size": {
+        "assistant": 262144,
+        "target": 262144,
+        "verdict": "pass"
+      },
+      "sliding_window": {
+        "assistant": 1024,
+        "target": 1024,
+        "verdict": "pass"
+      },
+      "sliding_head_dim": {
+        "assistant": 256,
+        "target": 256,
+        "verdict": "pass"
+      },
+      "sliding_num_key_value_heads": {
+        "assistant": 8,
+        "target": 8,
+        "verdict": "pass"
+      },
+      "full_global_head_dim": {
+        "assistant": 512,
+        "target": 512,
+        "verdict": "pass"
+      },
+      "full_attention_k_eq_v": {
+        "assistant": true,
+        "target": true,
+        "verdict": "pass"
+      },
+      "full_effective_kv_heads": {
+        "assistant": 2,
+        "target": 2,
+        "verdict": "pass"
+      },
+      "model_type_vs_supported_model_type": {
+        "assistant": "gemma4_assistant",
+        "target_validator": "gemma4_assistant",
+        "verdict": "pass"
+      }
+    }
+  },
+  "protocol": {
+    "mtp_envelope_constants_from_darkbloom": {
+      "fixed_depth": 1,
+      "rectangular_cap": "B * (1 + k) <= 8 on M3 and later"
+    }
+  },
+  "scoring_semantics": {
+    "ruling_verbatim": [
+      "we want to score gemma's benchmark on prefill gains ^ .25 * decode ^ .75. The numbers used will be the aggregate across all 8 (summed)",
+      "so when we get a baseline from the 8 baseline prompts, we add their numbers together",
+      "same with the 8 golden prompts"
+    ],
+    "formula": "composite = prefill_gain ^ 0.25 * decode_gain ^ 0.75. Per component: gain = baseline_aggregate / candidate_aggregate (serial-anchored -- a faster candidate scores > 1, matching the family's standing convention). aggregate = the PER-STREAM SUM, i.e. each of the 8 concurrent streams' own elapsed time added together -- for prefill and decode separately, on both the baseline (serial control) leg and the candidate leg, over the SAME cohort."
+  },
+  "license": {
+    "spdx": "gemma",
+    "url": "https://ai.google.dev/gemma/terms",
+    "verified_repositories": [
+      "mlx-community/gemma-4-26B-A4B-it-qat-assistant-4bit"
+    ]
+  }
+}

@@ -85,6 +85,9 @@ extension EngineLoopV2 {
     /// Break the chained fast path when the next step must seed or verify.
     func mtpWantsStep(ids: [CBv2RequestID]) -> Bool {
         guard let mtp else { return false }
+        // Target-only policy: no seed or verify step can ever be wanted, so
+        // the chained decode fast path is never broken on MTP's account.
+        if mtp.isTargetOnlyPolicy { return false }
         let rows = ids.compactMap { scheduler.record(for: $0) }
         let withinBatchGate = ids.count <= mtp.config.maxSpeculativeBatch
         let canSpeculate = withinBatchGate && rows.count == ids.count
@@ -117,6 +120,16 @@ extension EngineLoopV2 {
     /// Chunked-prefill neighbors do not change the controller batch bucket.
     func beginMTPPlan() {
         guard let mtp else { return }
+        // Target-only policy: `planDepth` can only be 0, so everything below
+        // is per-step host bookkeeping for speculation that cannot be planned
+        // — two `scheduler.running` filter allocations, the eligibility
+        // sweeps, the no-op carry invalidation loop, and a locked rebuild of
+        // the controller metric snapshot. Skipping it leaves `planDecision` at
+        // its inactive default (depth 0, bucket 0) and both mark sets empty,
+        // which is exactly the state the full path would have produced: no
+        // carry is ever stored without a round, so the invalidation loop has
+        // nothing to drop.
+        if mtp.isTargetOnlyPolicy { return }
         let rows = scheduler.running.filter {
             !$0.isPaused && !$0.cancelRequested && $0.isDecodeReady
         }

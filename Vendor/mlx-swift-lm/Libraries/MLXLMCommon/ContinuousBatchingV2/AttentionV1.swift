@@ -4,6 +4,13 @@ import MLX
 
 enum CBv2AttentionV1 {
 
+    private static let fusedRingWriteEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_FUSED_RING_WRITE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     static let queryBlockSize: Int = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_ATTN_QUERY_BLOCK"],
@@ -64,7 +71,9 @@ enum CBv2AttentionV1 {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?, softcap: Float? = nil,
         spanContexts: [CBv2SpanChunkContext?]? = nil,
-        serializeQueries: Bool = false
+        serializeQueries: Bool = false,
+        decodeRingWriteFence: CBv2DecodeRingWriteFence? = nil,
+        allowFusedRingWrite: Bool = false
     ) -> MLXArray {
         let B = queries.dim(0)
         let L = queries.dim(2)
@@ -114,6 +123,31 @@ enum CBv2AttentionV1 {
                 if windowedRows.count == B
                     && windowedRows.allSatisfy(\.canUseFullDecodeRing)
                 {
+                    if fusedRingWriteEnabled, allowFusedRingWrite,
+                        let decodeRingWriteFence
+                    {
+                        let rings = windowedRows.compactMap {
+                            $0.fullDecodeRingBeforeWrite()
+                        }
+                        if rings.count == B,
+                            let result = CBv2RaggedTwoPassDecodeAttentionV1
+                                .attendRingWriting(
+                                    queries: queries,
+                                    newKeys: keys, newValues: values,
+                                    keys: rings.map(\.keys),
+                                    values: rings.map(\.values),
+                                    starts: rings.map(\.start),
+                                    previousWriteFence: decodeRingWriteFence.value,
+                                    scale: scale)
+                        {
+                            for row in windowedRows {
+                                row.advanceFullDecodeRingWithoutWrite()
+                            }
+                            decodeRingWriteFence.value = result.nextWriteFence
+                            return result.output
+                        }
+                    }
+
                     var starts: [Int] = []
                     starts.reserveCapacity(B)
                     for (index, row) in windowedRows.enumerated() {

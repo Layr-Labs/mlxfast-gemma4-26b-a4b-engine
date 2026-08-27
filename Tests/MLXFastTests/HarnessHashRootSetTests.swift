@@ -25,9 +25,9 @@ import MLXFastCore
 // "Sources/..." by relative path), so the ambient-CWD assertions below observe
 // exactly what the real benchmark process observes.
 //
-// Scope note: no MLX device work, no weights, no GPU, no network, and the pinned
-// benchctl is NOT required to be resolved (benchd-bin/ need not exist) -- the
-// proxy is asserted by its static content, never executed.
+// Scope note: no MLX device work, no weights, no GPU, no network, and the
+// channel benchctl is NOT required to be resolved (benchd-bin/ need not exist)
+// -- the proxy is asserted by its static content, never executed.
 
 private enum HarnessHashRootFixture {
     /// The 9-root set, taken from the REAL array Gemma4Runtime.harnessHash() hashes
@@ -64,26 +64,6 @@ private enum HarnessHashRootFixture {
     /// Lowercase-hex SHA256 of `data`, for byte-parity failure diagnostics.
     static func sha256Hex(_ data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-    }
-
-    /// The LIVE pin file, so assertions about "the proxy must not hardcode the
-    /// pin" can name the value that is actually pinned right now.
-    static let pinFile: URL = repoRoot.appendingPathComponent("benchd.pin")
-
-    /// A value read out of benchd.pin by key. Deliberately the same shape the
-    /// shell fetcher parses (values-only JSON, one key per line) rather than a
-    /// full JSON decode, so a pin this helper can read is a pin
-    /// tools/fetch-benchd.sh can read.
-    static func pinValue(_ key: String) throws -> String {
-        let body = try String(contentsOf: pinFile, encoding: .utf8)
-        for line in body.split(separator: "\n") {
-            let parts = line.split(separator: ":", maxSplits: 1).map(String.init)
-            guard parts.count == 2 else { continue }
-            let name = parts[0].trimmingCharacters(in: CharacterSet(charactersIn: " \t\""))
-            guard name == key else { continue }
-            return parts[1].trimmingCharacters(in: CharacterSet(charactersIn: " \t\","))
-        }
-        return ""
     }
 
     /// SHA256 of zero bytes -- the digest harnessHash() returns when NONE of its
@@ -130,18 +110,19 @@ func harnessHashRootSetResolvesBenchmarkShellAtTopLevel() {
     #expect(HarnessHashRootFixture.rootsPresent(under: nil) == HarnessHashRootFixture.roots.count)
 }
 
-// Test B -- the restored benchmark.sh is a THIN PROXY that resolves the pinned
+// Test B -- the restored benchmark.sh is a THIN PROXY that resolves the verified
 // benchctl and execs the facade at tools/benchmark.sh forwarding all args.
 // Static-content smoke only; the real benchmark is never run.
 //
-// UPDATED for the prebuilt-benchctl change. benchd was a SHA-pinned SOURCE
-// submodule and this proxy used to run `git submodule update --init` and compare
-// the checkout against `rev-parse HEAD:benchd`. It now resolves a pinned PREBUILT
-// binary through tools/fetch-benchd.sh (./benchd.pin -> benchd-bin/benchctl),
-// which is a STRONGER pin, not a relaxed one: the gitlink comparison bound the
-// checked-out COMMIT and said nothing about the working-tree bytes, whereas the
-// sha256 fetch-benchd.sh enforces binds the bytes that actually run. The
-// assertions below moved with it rather than being dropped.
+// UPDATED for the pin-removal ruling (David 2026-08-27). benchd was first a
+// SHA-pinned SOURCE submodule (`git submodule update --init` + a gitlink
+// compare), then a PREBUILT binary frozen by ./benchd.pin. The pin file is now
+// GONE: tools/fetch-benchd.sh resolves the bench branch's dist channel and
+// verifies the binary against the channel's benchctl.manifest.json
+// ({branch, source_commit, sha256, bytes}) -- provenance is RECORDED per run
+// rather than frozen in this repo. What this proxy must still never do is
+// carry a harness identity of its own: no submodule revival, no from-source
+// build, and no hardcoded commit/sha literal that would shadow the manifest.
 @Test
 func rootBenchmarkShellIsThinProxyToBenchd() throws {
     let proxy = HarnessHashRootFixture.repoRoot.appendingPathComponent("benchmark.sh")
@@ -164,29 +145,29 @@ func rootBenchmarkShellIsThinProxyToBenchd() throws {
     #expect(body.contains(#"SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)""#))
     #expect(body.contains(#"BENCHD_ENTRY="${SCRIPT_DIR}/tools/benchmark.sh""#))
 
-    // Resolves the measurement binary through the hash-verifying fetcher ...
+    // Resolves the measurement binary through the manifest-verifying fetcher ...
     #expect(body.contains("tools/fetch-benchd.sh"))
     // ... and never reintroduces the submodule path it replaced ...
     #expect(!body.contains("submodule update --init"))
     #expect(!body.contains("submodule update --remote"))
-    // ... nor hardcodes a pin value (those live in ./benchd.pin, read at run time).
+    // ... nor the pin file the fetcher replaced (the pin-removal ruling deleted
+    // ./benchd.pin; a proxy that re-grows a pin path re-freezes the harness) ...
+    #expect(!body.contains("benchd.pin"))
     //
     // 98f44fa is the RETIRED submodule gitlink: a fixed historical value that
     // must never reappear, so it is spelled literally.
     #expect(!body.contains("98f44fa"))
-    // The CURRENT pin, by contrast, moves every time the dist is re-cut. Read it
-    // from benchd.pin instead of pasting a prefix: a pasted one keeps passing
-    // after the pin advances while no longer guarding anything, which is the
-    // silent-decay failure this assertion exists to prevent. Guarding the live
-    // value also means a proxy that inlines the pin reds immediately.
-    let pinSha = try HarnessHashRootFixture.pinValue("sha256")
-    let pinCommit = try HarnessHashRootFixture.pinValue("commit")
-    #expect(pinSha.count == 64, "benchd.pin sha256 unreadable; the needle below would guard nothing")
-    #expect(pinCommit.count == 40, "benchd.pin commit unreadable; the needle below would guard nothing")
-    #expect(!body.contains(pinSha))
-    #expect(!body.contains(String(pinSha.prefix(8))))
-    #expect(!body.contains(pinCommit))
-    #expect(!body.contains(String(pinCommit.prefix(8))))
+    // With the pin file gone there is no repo-side identity to compare against,
+    // so the anti-inlining guard generalizes: the proxy must contain NO
+    // commit-or-sha-shaped hex literal AT ALL (40 hex chars covers a git commit;
+    // a sha256 is 64 and matches the same scan). A proxy that inlines the
+    // resolved identity would shadow the channel manifest -- the run would keep
+    // "verifying" bytes the channel has since moved past -- and reds here
+    // immediately.
+    #expect(
+        body.range(of: "[0-9a-fA-F]{40}", options: .regularExpression) == nil,
+        "proxy hardcodes a commit/sha-shaped hex literal; harness identity lives in the channel manifest"
+    )
     // ... and never falls back to building benchd from source: the ranked box has
     // no Rust toolchain, and a from-source fallback would silently defeat the pin.
     // (Spelled as a literal the proxy must not contain -- including in prose, which

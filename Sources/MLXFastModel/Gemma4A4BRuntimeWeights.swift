@@ -109,7 +109,13 @@ public final class Gemma4A4BRuntimeWeightCache {
                    startupEnvironment["DARKBLOOM_QWEN_MTP_POST_WIRE_COMMAND_BUFFER"]
            )
         {
-            setenv("MLX_MAX_MB_PER_BUFFER", "512", 1)
+            // Kept in step with the same literal in
+            // `RuntimeStartupMemoryPolicy.installGemma4MTPFullProfileCommandBufferDefaults`.
+            // Both call `setenv` with overwrite=1, so whichever runs last decides
+            // the encoder's byte cap; they must agree or the value depends on load
+            // order. See that function for why the byte cap, not the operation
+            // cap, is what ends a command buffer on this model.
+            setenv("MLX_MAX_MB_PER_BUFFER", "4096", 1)
             Memory.cacheLimit = 32 << 30
         }
 

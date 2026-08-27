@@ -102,7 +102,25 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
         // stock 50 MiB MLX default. overwrite=0 left that in place and the
         // 512 MiB post-wire budget never landed. overwrite=1 makes the
         // promoted Laguna M5-Max command-buffer profile actually apply.
-        setenv("MLX_MAX_MB_PER_BUFFER", "512", 1)
+        // The referenced-byte cap, not the operation cap, is what ends a command
+        // buffer on this model. `CommandEncoder::needs_commit()` in the vendored
+        // MLX metal backend is
+        //
+        //     (buffer_ops_ > max_ops) || ((buffer_sizes_ >> 20) > max_mb)
+        //
+        // and `buffer_sizes_` accumulates `a.data_size()` for every array the
+        // encoder references. One Gemma MoE gather-GEMM references its layer's
+        // whole packed expert tensor: 128 experts x (704 x 2816 x 3 projections)
+        // at 4 bits is about 380 MiB in a single operation. Against a 512 MiB
+        // cap that admits roughly one such operation per command buffer, so the
+        // 50-operation cap never becomes the binding constraint and the encoder
+        // commits on bytes almost every time it touches a sparse layer.
+        //
+        // Raising only the byte cap lets the operation cap bind instead, which is
+        // the wall this profile already declares it wants ("the stock
+        // 50-operation cap remains the outer safety wall"). `max_ops` is left at
+        // 50 so exactly one input changes.
+        setenv("MLX_MAX_MB_PER_BUFFER", "4096", 1)
         setenv("MLX_MAX_OPS_PER_BUFFER", "50", 1)
     }
 

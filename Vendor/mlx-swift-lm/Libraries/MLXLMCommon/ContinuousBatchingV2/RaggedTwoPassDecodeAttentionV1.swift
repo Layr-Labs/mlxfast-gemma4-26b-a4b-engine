@@ -32,19 +32,40 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     private static let headDim = 256
     private static let sequenceLength = 1024
 
-    /// Mirrors `sdpa_vector_2pass` at N=1024 and qL=1/GQA=2. Honor the same
-    /// diagnostic override so a process can never run mismatched partitions.
+    /// Block partition for the two-pass decode attention.
+    ///
+    /// This used to mirror `sdpa_vector_2pass`'s architecture switch (`s` -> 64,
+    /// `d` -> 128, otherwise 32). That switch is upstream MLX's heuristic for the
+    /// UNFUSED, one-row-per-dispatch vector SDPA, where the only way to fill the
+    /// GPU is to raise the block count. This kernel is the batch-8 fused form: its
+    /// pass-A grid is `(kvHeads*32, batch*gqa, BLOCKS)` over a `(32, gqa, 1)`
+    /// threadgroup, i.e. `64 * BLOCKS` threadgroups, already eight times what the
+    /// unfused heuristic assumed. At BLOCKS=32 that is 2,048 threadgroups per
+    /// sliding layer, which saturates the ranked geometry on its own.
+    ///
+    /// The cost the inherited switch does not price is the pass-A -> pass-B partial
+    /// round trip. `partials` is `[8, 16, 1, BLOCKS, 256]` bf16 = 65,536 * BLOCKS
+    /// bytes, written by pass A and read by pass B, on each of the 25 sliding
+    /// layers of every decode step:
+    ///
+    ///   BLOCKS=32  -> 2.1 MB/layer -> ~105 MB/step round trip
+    ///   BLOCKS=64  -> 4.2 MB/layer -> ~210 MB/step
+    ///   BLOCKS=128 -> 8.4 MB/layer -> ~419 MB/step
+    ///
+    /// against a pass-A K/V read of ~1.6 GiB/step. Pass B's per-threadgroup merge
+    /// loop is `BLOCKS / simd_width` iterations, so it scales the same way.
+    ///
+    /// The partition is pinned to 32 for every architecture. Both pass-A entry
+    /// points and pass B read this one value, so the two passes can never disagree
+    /// on the partition. `MLX_SDPA_BLOCKS` still overrides it, unchanged, so a
+    /// process can pin the previous value for a controlled comparison.
     private static let blocks: Int = {
         if let raw = ProcessInfo.processInfo.environment["MLX_SDPA_BLOCKS"],
             let value = Int(raw), value > 0
         {
             return value
         }
-        switch MLX.GPU.deviceInfo().architecture.last {
-        case "s": return 64
-        case "d": return 128
-        default: return 32
-        }
+        return 32
     }()
 
     private static let passAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(

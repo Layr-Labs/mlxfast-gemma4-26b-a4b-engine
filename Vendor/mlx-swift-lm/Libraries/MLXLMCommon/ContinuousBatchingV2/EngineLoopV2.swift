@@ -1,54 +1,16 @@
-// Copyright © 2026 Eigen Labs.
-//
-// ContinuousBatchingV2 — WS-B: the execution loop.
-//
-// Single engine thread (serial GCD queue, the EngineCore idiom): the loop
-// does graph-build + `asyncEval` ONLY. Tokenization/detokenization state
-// machines are pluggable (WS-E), prefix-cache donation and SSD I/O live
-// elsewhere. Decode is rectangular [B, 1]; prefill runs per-request
-// [1, chunk] under the shared token budget. There is no left padding, no
-// shared frontier, and no batch-wide trim anywhere in this file.
-//
-// Chained async decode (SGLang-MLX pattern, report 09 §7): step N+1's [B, 1]
-// forward is built ON TOP of step N's still-lazy sampled-token array and
-// `asyncEval`ed BEFORE the loop blocks on step N's tokens for stop detection.
-// Tokens are therefore inspected one step late; a finished request wastes at
-// most one slot-step, and its extra token + KV tail are rolled back
-// (`CBv2SequenceKV.rollback(1)`). The chain breaks on ANY membership change
-// (prefill completion into a different set, finish, cancel, join, pause).
 
 import Foundation
 import MLX
 
-// MARK: - Model interface (WS-F adapters / WS-G fixtures conform)
 
-/// Minimal steppable-model surface the loop drives. `tokens` is [B, L] int32
-/// ([B, 1] decode, [1, chunk] prefill); `caches` has one entry per model
-/// layer with rows matching batch rows. Returns logits [B, L, vocab].
 public protocol CBv2SteppableModel: AnyObject {
     func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray
 }
 
-/// Builds per-layer batch-facing cache views for a set of rows
-/// (`rowStates[b][layer]`, row order == batch row order). WS-A's
-/// `LayerCacheV2` conforms; see CONTRACT-ISSUES-B-scheduler.md §1.
 public protocol CBv2LayerCacheProvider: AnyObject {
     func layerCaches(rowStates: [[CBv2SequenceKV?]]) -> [CBv2AttendingLayerCache]
-    /// True when EVERY cache this provider vends honors span-mask contexts
-    /// (`CBv2SpanMaskBinding`), so vision prefill chunks can carry their
-    /// causal-plus-bidirectional-within-span masks. Fail-safe default is
-    /// false: providers that cannot vouch (paged backend, custom caches)
-    /// reject multimodal requests at submit rather than silently serving
-    /// them with plain causal masks.
     var supportsMultimodalSpans: Bool { get }
-    /// True only when EVERY layer cache this provider vends keeps rows
-    /// independent under a rectangular `[B > 1, L > 1]` prompt pass, so
-    /// equal-length text chunks may be coalesced into one layer-major
-    /// forward. Fail-safe default false (paged/custom providers).
     var supportsPackedPrefill: Bool { get }
-    /// True only when every layer cache can bind one optional span context
-    /// per rectangular row. This is stricter than single-row multimodal
-    /// support and fails closed for paged/custom providers.
     var supportsPackedMultimodalSpans: Bool { get }
 }
 
@@ -58,30 +20,8 @@ extension CBv2LayerCacheProvider {
     public var supportsPackedMultimodalSpans: Bool { false }
 }
 
-// MARK: - Sampler interface (WS-E's CBv2DefaultSampler is the production impl)
 
-/// Samples next tokens from last-position logits [B, vocab] → lazy token
-/// array [B] (int32). MUST NOT host-sync; see
-/// CONTRACT-ISSUES-B-scheduler.md §2 and CONTRACT-DECISIONS.md.
-///
-/// Stateful samplers (penalties, keyed RNG) reconfigure on membership
-/// change using `rowContext` and track per-request progress:
-///  - `params`/`requestIDs`: per-row, row order == logits row order.
-///  - `stepIndex`: global engine step (telemetry only — per-request RNG must
-///    key on per-request progress, never on this).
-///  - `pendingSampledTokens`: lazy [B] tokens sampled for exactly these rows
-///    by the still-in-flight previous step (chained decode), row-aligned;
-///    nil when every row's history is fully confirmed. A sampler that
-///    reconfigures from `rowContext` (confirmed history only) must fold
-///    these in on-device to stay exact.
-///  - `rowContext`: materializes full per-row context (id, params, prompt,
-///    CONFIRMED output tokens). Copies token arrays — only call it on
-///    membership change, never on the chained fast path.
 public protocol CBv2StepSampler: AnyObject {
-    /// True only when this sampler implements the full token-constraint
-    /// lifecycle: configure, hard-mask, confirm, failure reporting, and
-    /// request-id retirement. EngineV2 rejects constrained requests unless
-    /// the installed sampler opts in.
     var supportsTokenConstraints: Bool { get }
 
     func sample(
@@ -90,32 +30,12 @@ public protocol CBv2StepSampler: AnyObject {
         rowContext: () -> [CBv2SamplerRow]
     ) -> MLXArray
 
-    /// Consume the LAZY logprob gather built by the immediately preceding
-    /// `sample` call (raw pre-transform logprobs; contract rule), or nil when
-    /// no row of that call requested `topLogprobs > 0`. Graph-only handles:
-    /// the loop adds them to the step's `asyncEval` set and materializes them
-    /// at the finalize boundary alongside the sampled tokens — never an extra
-    /// host sync on the chained decode path. Called at most once per `sample`
-    /// (take semantics). Default: nil (samplers without logprob support).
     func takeStepLogprobs() -> CBv2StepLogprobs?
 
-    /// The request left the engine for good (finish, cancel, error). Its id
-    /// may legally be REUSED by a FUTURE request, so stateful samplers must
-    /// drop any per-request configured state: without this, a later request
-    /// whose row-id fingerprint matches the retired one exactly (e.g. the
-    /// same id resubmitted solo) would skip reconfiguration and inherit the
-    /// finished request's penalty counts and RNG step index (PR#62 review).
-    /// NOT called on preemption — a preempted request is the SAME request
-    /// and its sampler state remains a pure function of its history.
-    /// Default: no-op (stateless samplers).
     func requestDidFinish(_ id: CBv2RequestID)
 
-    /// Confirm host-materialized samples at the existing finalization
-    /// boundary. Stateful token constraints advance here; unconstrained
-    /// samplers use the no-op default.
     func confirmSampledTokens(_ tokens: [Int], requestIDs: [CBv2RequestID])
 
-    /// Typed constraint failure latched while masking or advancing a row.
     func tokenConstraintFailure(for id: CBv2RequestID) -> String?
 }
 
@@ -127,10 +47,6 @@ extension CBv2StepSampler {
     public func tokenConstraintFailure(for id: CBv2RequestID) -> String? { nil }
 }
 
-/// Greedy stub — vectorized argmax, batch-composition invariant by
-/// construction (per-row reduction, no cross-row ops). Kept as the
-/// deterministic fallback for scheduler/loop tests; production uses
-/// `CBv2DefaultSampler`.
 public final class CBv2GreedySampler: CBv2StepSampler {
     private let constraintSampler = CBv2TokenConstraintSampler()
     private var configuredIDs: [CBv2RequestID] = []
@@ -171,16 +87,10 @@ public final class CBv2GreedySampler: CBv2StepSampler {
     }
 }
 
-// MARK: - Detokenizer interface (WS-E conforms; null stub until then)
 
-/// Incremental per-request detokenizer with UTF-8 + stop-string holdback.
-/// See CONTRACT-ISSUES-B-scheduler.md §3.
 public protocol CBv2IncrementalDetokenizer: AnyObject {
-    /// Append confirmed tokens; returns text now safe to emit.
     func push(_ tokens: [Int]) -> String
-    /// True once a stop string has matched (engine finishes with `.stop`).
     var matchedStopString: Bool { get }
-    /// Held-back text still emittable at finish (excludes matched stop text).
     func flush() -> String
 }
 
@@ -188,8 +98,6 @@ public protocol CBv2DetokenizerFactory: AnyObject {
     func makeDetokenizer(stopStrings: [String]) -> CBv2IncrementalDetokenizer
 }
 
-/// Default until WS-E lands: deltas carry token ids with empty text, stop
-/// strings never match (stop tokens / maxTokens / deadlines still work).
 public final class CBv2NullDetokenizerFactory: CBv2DetokenizerFactory {
     final class NullDetokenizer: CBv2IncrementalDetokenizer {
         let matchedStopString = false
@@ -202,61 +110,20 @@ public final class CBv2NullDetokenizerFactory: CBv2DetokenizerFactory {
     }
 }
 
-// MARK: - Loop configuration
 
 public struct CBv2EngineLoopConfig: Sendable {
-    /// LEGACY single total-lifetime wall (seconds), used ONLY when
-    /// `useLegacyRequestTimeout` is true (the rollback kill-switch). In the
-    /// default new-lease behavior this value is inert — the monotonic
-    /// admission/prefill/decode/backpressure leases and the safety ceiling
-    /// below govern request lifetime instead. See `CBv2DeadlineLeases.swift`.
     public var requestTimeout: TimeInterval
-    /// Kill-switch: when true, restore the legacy behavior — one
-    /// `requestTimeout`-second wall over the entire engine lifetime, expiring
-    /// with the original `.error("request exceeded Ns deadline")` string.
-    /// Default false = the new independent monotonic leases.
     public var useLegacyRequestTimeout: Bool
-    /// Admission-only lease (seconds): bounds time before the request begins
-    /// engine work. Ends permanently at first admission; never re-arms after
-    /// preemption. Expiry cause `.admissionTimeout`.
     public var admissionLease: TimeInterval
-    /// Prefill progress lease (seconds): expires a prompt prefill that stops
-    /// making confirmed finalized progress. Cause `.prefillStall`.
     public var prefillProgressLease: TimeInterval
-    /// Decode progress lease (seconds): expires decode that stops producing
-    /// confirmed token progress. A generation that keeps producing tokens
-    /// NEVER expires. Cause `.decodeStall`.
     public var decodeProgressLease: TimeInterval
-    /// Backpressure lease (seconds): bounds how long a request may sit paused
-    /// on downstream buffer pressure. Health-neutral. Cause
-    /// `.backpressureTimeout`.
     public var backpressureLease: TimeInterval
-    /// Conservative decode throughput floor (tokens/second) for the absolute
-    /// request-derived safety ceiling. Deliberately far below any real model
-    /// (~30–120 tok/s) so the ceiling only catches pathology, never a healthy
-    /// long generation. Cause `.safetyDeadline`.
     public var safetyCeilingDecodeFloorTPS: Double
-    /// Injectable monotonic clock. Production uses `ContinuousClock`; tests
-    /// inject a fake to drive lease expiry with no real sleeps. Never `Date`.
     public var clock: CBv2Clock
-    /// Single-step watchdog: a step (graph build + blocking eval) exceeding
-    /// this marks the engine unhealthy, terminal-finishes all live streams
-    /// with cause `.watchdog` (carrying the reconciled usage observed before
-    /// the wedge), and fires `onStepWedge`.
     public var stepTimeout: TimeInterval
-    /// Watchdog polling interval.
     public var watchdogInterval: TimeInterval
-    /// Idle re-check interval when there is no work.
     public var idleRecheckInterval: TimeInterval
-    /// Per-request event buffer before backpressure pauses scheduling.
     public var eventBufferCapacity: Int
-    /// Upper bound on a graceful drain. `shutdown()` waits for running
-    /// requests to finish naturally; if the engine queue is wedged (a step
-    /// blocked inside an eval), the drain would otherwise never complete —
-    /// after this timeout every live stream is force-finished with
-    /// `.error` and `shutdown()` returns. The wedged step may still be
-    /// executing in the background; the process-level owner decides
-    /// whether to exit.
     public var shutdownTimeout: TimeInterval
 
     public init(
@@ -287,47 +154,21 @@ public struct CBv2EngineLoopConfig: Sendable {
     }
 }
 
-// MARK: - In-flight step
 
-/// One launched-but-not-finalized step. Its sampled tokens are still lazy;
-/// finalization materializes them (the ONE host sync per step, overlapped
-/// with the next step's GPU work when chained).
 final class CBv2InFlightStep {
-    /// Every request that computed anything this step (KV release for any of
-    /// these must be deferred until finalization — see CONTRACT-ISSUES §4).
     let participants: Set<CBv2RequestID>
-    /// Rows that sampled a token, in plan order (== row order of
-    /// `sampledTokens`).
     let sampledRows: [CBv2RequestID]
-    /// Lazy [K] int32, or nil when no row sampled (all mid-prefill chunks).
     let sampledTokens: MLXArray?
-    /// Cheap handles that force evaluation of non-sampling prefill chunks.
     let evalTargets: [MLXArray]
-    /// Rows finished/cancelled AFTER launch: their sampled token is
-    /// discarded at finalization (the ≤1 wasted slot-step).
     var discard: Set<CBv2RequestID> = []
-    /// Lazy per-step logprob gathers (rows that requested topLogprobs > 0
-    /// exist in the batch). Graph-only until finalization, where they are
-    /// materialized at the SAME boundary as the sampled tokens.
     var logprobSegments: [CBv2StepLogprobs] = []
-    /// Host wall clock captured before graph construction for controller
-    /// attribution at the existing finalize boundary.
     let wallStartedNanos: UInt64
     var mtpMeasurement: CBv2MTPStepMeasurement?
-    /// KV states whose release is fenced behind this step's completion.
-    /// `rollbackOne` scrubs the wasted-token KV tail before release;
-    /// `donation` (non-nil for natural finishes with prefix caching on)
-    /// routes the retired state through the donation queue.
     fileprivate var deferredReleases:
         [(
             id: CBv2RequestID, state: [CBv2SequenceKV?], rollbackOne: Bool,
             donation: CBv2DonationIntent?
         )] = []
-    /// Non-nil marks this step as an MTP round (verify and/or seed work,
-    /// finalized by `finalizeMTPRound`). MTP rounds NEVER chain: the
-    /// chained path's finalize loop and `deferredReleases` assume exactly
-    /// one sample per row, so `engineStep` guards on this before offering
-    /// the step as a chain base.
     var mtpRound: CBv2MTPRoundInFlight?
 
     init(
@@ -343,33 +184,16 @@ final class CBv2InFlightStep {
     }
 }
 
-// MARK: - Prefix adoption handoff
 
-/// A prefix-cache hit prepared on the submit thread (lookup + graph-only
-/// slicing) and applied on the engine thread at enqueue. The typed plan owns
-/// M/C/R, backend support, and accounting facts. Ordinary safe layouts carry
-/// full snapshots through C; frozen-full layouts carry them through M while
-/// sliding rows begin empty at C. The lookup's in-use pin is
-/// balanced by exactly one `endAdoption(tokens:matched:)` when the adoption
-/// is consumed or abandoned.
-/// `@unchecked Sendable`: immutable value handed off exactly once, submit
-/// thread → engine queue; the MLXArray views are graph-only until adopted.
 struct CBv2PrefixAdoption: @unchecked Sendable {
-    /// Correlation identity used by the lookup that owns this pin. This is
-    /// the request's receipt id when supplied, otherwise its scheduler id.
     let requestID: CBv2RequestID
     let tokens: [Int]
     let matched: Int
     let plan: CBv2PrefixReusePlan
     let prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?]
-    /// Request-scoped salt the lookup used (TB-007); the pin release and any
-    /// fallback paths must carry the SAME salt or the pin leaks.
     let cacheSalt: String?
 }
 
-/// Submit-thread lookup result handed to the engine queue. `outcome` is
-/// provisional when `adoption != nil`; `applyAdoption` resolves it to a real
-/// hit or a precise adoption failure before usage is emitted.
 struct CBv2PrefixLookup: @unchecked Sendable {
     let adoption: CBv2PrefixAdoption?
     let outcome: CBv2PrefixCacheOutcome
@@ -393,16 +217,12 @@ struct CBv2PrefixUsage {
         boundarySplits: 0)
 }
 
-/// A request's donation intent: which exact token prefix to donate and under
-/// which salt scope (TB-007 — the entry must be indexed with the same salt
-/// its donor request carried, or a differently-salted request could hit it).
 struct CBv2DonationIntent {
     let requestID: CBv2RequestID
     let tokens: [Int]
     let cacheSalt: String?
 }
 
-/// Single-consumer cross-queue handoff of engine-owned values (KV state,
 /// donation snapshots). Safe by ownership transfer: the sender never
 /// touches the value after enqueueing.
 private struct CBv2Handoff<Value>: @unchecked Sendable {
@@ -652,10 +472,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         // MTP: the scheduler consults the loop for 1+k decode assignments.
         // `unowned` is safe (and cycle-free): the loop owns the scheduler
         // and both live exactly as long as the engine.
-        // Left nil under a target-only controller policy: the hook would
-        // return 0 for every row, so not installing it keeps the scheduler on
-        // its plain-decode path with no per-row call.
-        if self.mtp?.isTargetOnlyPolicy == false {
+        if mtp != nil {
             scheduler.speculationPlanner = { [unowned self] rec in
                 self.mtpPlanSpeculation(for: rec)
             }

@@ -176,6 +176,16 @@ jobs:
         # real tool into a throwaway root and drives it with stub files.
         run: tools/test-runtime-worker-staging.sh
 
+      - name: DFlash arm selection seam
+        # Asserts the trusted wrapper turns the submission's declared `arm`
+        # into the matching --candidate-spec, and NOTHING else: the mtp and
+        # absent cases are compared byte-for-byte against the pre-seam argv,
+        # and every malformed declaration refuses before benchctl is reached.
+        # Fully hermetic (no toolchain, weights, GPU, network, or benchd): the
+        # real wrapper runs in a throwaway root against a stub that records
+        # its argv.
+        run: tools/test-gemma4-arm-selection.sh
+
   swift:
     name: swift build + test (hosted macOS, no GPU)
     runs-on: macos-26

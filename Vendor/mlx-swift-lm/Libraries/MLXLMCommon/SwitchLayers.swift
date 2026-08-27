@@ -483,7 +483,8 @@ public class SwitchGLU: Module {
         guard fuseSortedReduction && isProductionPrefill,
             supportsWeightedExpertUnsort(x, indices, weights: weights)
         else {
-            return weightedExpertSum(callAsFunction(x, indices), weights)
+            return legacyWeightedReduction(
+                projectExperts(x, indices), indices: indices, weights: weights)
         }
 
         let projected = projectExperts(x, indices)

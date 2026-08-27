@@ -318,19 +318,20 @@ inline void qdot_affine4_pair(
     thread U& out1) {
   U accum0 = 0;
   U accum1 = 0;
-  const device uint16_t* ws = (const device uint16_t*)w;
+  const ushort2 packed = as_type<ushort2>(
+      *reinterpret_cast<const device uint*>(w));
   for (int i = 0; i < (values_per_thread / 4); i++) {
-    const uint16_t packed = ws[i];
+    const ushort word = packed[i];
     accum0 +=
-        (x0[4 * i] * (packed & 0x000f) +
-         x0[4 * i + 1] * (packed & 0x00f0) +
-         x0[4 * i + 2] * (packed & 0x0f00) +
-         x0[4 * i + 3] * (packed & 0xf000));
+        (x0[4 * i] * (word & 0x000f) +
+         x0[4 * i + 1] * (word & 0x00f0) +
+         x0[4 * i + 2] * (word & 0x0f00) +
+         x0[4 * i + 3] * (word & 0xf000));
     accum1 +=
-        (x1[4 * i] * (packed & 0x000f) +
-         x1[4 * i + 1] * (packed & 0x00f0) +
-         x1[4 * i + 2] * (packed & 0x0f00) +
-         x1[4 * i + 3] * (packed & 0xf000));
+        (x1[4 * i] * (word & 0x000f) +
+         x1[4 * i + 1] * (word & 0x00f0) +
+         x1[4 * i + 2] * (word & 0x0f00) +
+         x1[4 * i + 3] * (word & 0xf000));
   }
   out0 = scale * accum0 + sum0 * bias;
   out1 = scale * accum1 + sum1 * bias;

@@ -1125,12 +1125,24 @@ private class Gemma4Attention: Module {
             lastQueryCache == nil
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
-        queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: queryPositionOffset)
 
         let kRaw = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
         var k = kNorm(kRaw)
         k = k.transposed(0, 2, 1, 3)
-        k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
+        // Same offset and last-dim rotation: one RoPE over concatenated heads.
+        if lastQueryCache == nil, queries.dim(2) == k.dim(2),
+            queries.dim(3) == k.dim(3), queries.dtype == k.dtype
+        {
+            let nQ = queries.dim(1)
+            let rotated = gemma4ApplyRotaryPosition(
+                rope, to: concatenated([queries, k], axis: 1), offset: captured)
+            queries = rotated[0..., ..<nQ, 0..., 0...]
+            k = rotated[0..., nQ..., 0..., 0...]
+        } else {
+            queries = gemma4ApplyRotaryPosition(
+                rope, to: queries, offset: queryPositionOffset)
+            k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
+        }
 
         // K-eq-V (`attention_k_eq_v: true` on Gemma 4 26B/31B): values reuse
         // the raw key projection (pre-norm) through their own vNorm — same as

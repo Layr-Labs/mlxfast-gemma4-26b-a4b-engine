@@ -188,20 +188,7 @@ enum CBv2AttentionV1 {
         return .causal
     }
 
-    /// Update each row with this step's K/V and attend.
-    ///
-    /// - queries/keys/values: `[B, heads, L, headDim]` with `L == 1` for
-    ///   decode, `B == 1` for a singleton prefill chunk, or rectangular
-    ///   `[B > 1, L > 1]` packed prefill / MTP verification. Every row
-    ///   dispatches against its own KV and optional span context.
-    /// - softcap: construction-time attention-logit soft cap
-    ///   (`cap * tanh(qk / cap)` before softmax, Gemma-2 style). When set,
-    ///   BOTH phases take the composed reference path (SDPA cannot express
-    ///   softcapping) — still one pinned path per phase.
-    /// - spanContexts: when bound, one optional context per row. Non-nil
-    ///   entries select that row's vision overlay; nil entries retain q=128
-    ///   query-block causal/window semantics in the same rectangular call.
-    /// - Returns `[B, queryHeads, L, headDim]`.
+    /// Update each row with this step's K/V and attend. Returns `[B, qH, L, D]`.
     static func updateAndAttend(
         rows: [CBv2SequenceKV], kind: CBv2LayerKind,
         queries: MLXArray, keys: MLXArray, values: MLXArray,
@@ -352,26 +339,8 @@ enum CBv2AttentionV1 {
         }
     }
 
-    /// One batched SDPA for a packed `[B > 1, L > 1]` pass whose rows all hold
-    /// the SAME committed K/V length and carry no span overlay.
-    ///
-    /// Why this is the same computation, not an approximation of it:
-    /// `maskMode` is a pure function of `(L, kL, window)` and
-    /// `attendQueryBlocks` derives each block's key span from
-    /// `(historyCount, offset, count, window)` alone — `historyCount` being
-    /// `kL - L`. Equal `kL` across rows therefore means every row would be
-    /// handed the IDENTICAL mask and slice the IDENTICAL key columns, so the
-    /// only thing separating B one-row calls from one B-row call is the batch
-    /// extent. SDPA reduces independently per `(batch, head, query)`, so no
-    /// row's sum acquires a term from a batchmate and none of them is
-    /// re-ordered. What it buys is dispatches: an 8-row, 8-block prompt layer
-    /// goes from 64 SDPA launches to 8.
-    ///
-    /// Returns nil — and the caller keeps the per-row decomposition — when the
-    /// rows are NOT interchangeable this way: unequal committed lengths (mixed
-    /// prefix reuse or continuation offsets), a mismatched head count/head dim
-    /// /dtype, any bound span context, or a restack that would exceed
-    /// ``packedBatchKVBudgetBytes``.
+    /// Batched SDPA when every packed row has equal committed K/V length.
+    /// Nil falls back to per-row dispatch.
     private static func batchedPackedAttention(
         kind: CBv2LayerKind, queries: MLXArray,
         cachedKeys: [MLXArray], cachedValues: [MLXArray],
@@ -810,39 +779,7 @@ enum CBv2AttentionV1 {
         }
     }
 
-    /// Attend a prompt chunk in QUERY BLOCKS, slicing K/V to each block's own
-    /// visible span instead of computing the whole `[L, kL]` rectangle and
-    /// masking the excess away.
-    ///
-    /// Two things this buys, both of which matter:
-    ///
-    /// 1. WORK. A sliding-window layer's chunk attention today evaluates
-    ///    `L x (window - 1 + L)` score positions to use `L x window` of them:
-    ///    a `(window - 1 + L)/window` ratio, i.e. 1.499x at L=512/window=1024
-    ///    and 2.67x at L=2048. Per block the ratio collapses to
-    ///    `(window - 1 + q)/window` — 1.062x at q=128 — because a block only
-    ///    ever reads the keys its own queries can see.
-    /// 2. MEMORY. The composed attention path (which Gemma 4 always takes:
-    ///    MLX's fused kernel supports head_dim 64/80/128 and Gemma 4 uses
-    ///    256/512) MATERIALIZES the `[B, heads, L, kL]` score tensor. Blocking
-    ///    pins that at `[B, heads, q, kL]`, making it O(1) in chunk length —
-    ///    which is what lets `prefillChunkSize` grow without the flat 3 GiB
-    ///    activation reserve in `UnifiedMemoryCap` becoming a lie. At 124k
-    ///    context a full-attention layer drops from 2.04 GB to 0.51 GB.
-    ///
-    /// Numerics: NOT bit-identical to the single-call path. The same non-zero
-    /// terms are summed (masked entries contribute `exp(-inf) = 0`), but a
-    /// different `kL` changes the reduction tiling and may select a different
-    /// kernel specialization, so results can differ in the last ulp.
-    ///
-    /// Scope: this applies to every multi-token prompt call that reaches
-    /// `updateAndAttendRow` / `borrowAndAttendRow`, including rectangular
-    /// packed prefill. Vision rows keep the same q=128 blocking; each query
-    /// block expands its K/V slice only as needed to include complete image
-    /// spans touched by that block, then composes causal/window and
-    /// bidirectional-span masks. Decode (`L == 1`) remains outside this path.
-    ///
-    /// `blockSize == 1` reproduces the MTP serial-query path exactly.
+    /// Prefill query-block attention. Decode (`L == 1`) does not use this.
     private static func attendQueryBlocks(
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         newTokenCount: Int, window: Int?, scale: Float,

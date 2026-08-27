@@ -1,89 +1,22 @@
 // PagedSeamContract.swift
-//
-// The frozen seam between the three hottest files of the paged backend:
-//
-//     PagedKVPool  <->  PagedSequenceKV  <->  PagedLayerCache
-//
-// This file is DECLARATIONS, CONSTANTS AND ADMISSION RULES. It adds no
-// backend behaviour and changes none. What lives here is the arithmetic and
-// the refusals the seam is DEFINED by, in one place precisely so that two
-// files cannot end up maintaining two versions of them:
-//
-//   * `CBv2PagedSpeculation.maxSpeculativeSpan` — validated against the MTP
-//     draft bound on first read, in every build configuration;
-//   * `CBv2PagedRingGeometry` — the windowed ring formula, which
-//     `PagedKVPool.ringPageCount` must reproduce exactly;
-//   * `CBv2PagedWindowSnapshot` — a donated sliding window and the single
-//     absolute boundary at which it may be installed;
-//   * `CBv2MTPRectangularSerializing` — the capability marker MTP
-//     rectangular verification degrades on.
-//
-// It began as a coordination register for concurrently developed tracks, and
-// carried a long comment-only block of signatures those tracks agreed to
-// implement. Those authors have integrated, and the register had drifted:
-// two of its three frozen ROW signatures were never implemented at all and
-// the shipped adoption route is a byte write on the BACKEND rather than the
-// page-refcount swap it promised. It is gone. What survives is the
-// executable declarations above and the arguments that are load-bearing
-// rather than historical — the ring-geometry derivation here, and the
-// three-precondition argument for the 65-page ring, which lives with the
-// shipping formula in `PagedKVPool.ringPageCount`.
+// Declarations and admission rules for the paged KV seam. Behaviour lives
+// in PagedKVPool / PagedSequenceKV / PagedLayerCache.
 
 import Foundation
 import MLX
 
 // MARK: - Speculative span
 
-/// The maximum number of token positions a single speculative round can write
-/// past a row's confirmed frontier.
-///
-/// **This constant exists so that ring sizing and headroom checking cannot
-/// disagree.** Two work items consume it and they live in different files:
-///
-///  - `PagedKVPool.ringPageCount` must reserve space for it, so that a
-///    windowed ring can never alias a live in-window entry during a round
-///    (WS-3.1). It does: `PagedKVPool.ringPageCount` sizes the ring as
-///    `max(PagedSequenceKV.maxWindowExposure(window:) + maxSpeculativeSpan,
-///    maxPrefillChunk)` rounded up to whole pages, and
-///    `PagedKVPool.checkedRingPageCount` refuses to build a pool whose ring
-///    cannot hold the exposure plus one round.
-///  - `PagedSequenceKV.supportsSpeculativeWrites` must test against it rather
-///    than returning a blanket `windowSize == nil` (WS-3.3). It does.
-///
-/// Derivation: a round writes the target column plus `maxDraftTokens` drafted
-/// columns, so the span is `CBv2MTPConfig.testedMaxDraftTokens + 1`. It is
-/// stated as a LITERAL rather than computed from the MTP bound, so that
-/// raising that bound cannot silently re-size every windowed ring in the
-/// process — the memory consequence has to be looked at by a human. The
-/// literal is then mechanically checked; see `maxSpeculativeSpan`.
+/// Max extra positions one speculative round may write past the frontier.
+/// Ring sizing and `supportsSpeculativeWrites` must agree on this literal.
 public enum CBv2PagedSpeculation {
 
-    /// The frozen literal. Consumers read `maxSpeculativeSpan`, never this —
-    /// that is the property carrying the validation.
+    /// Frozen literal. Consumers read `maxSpeculativeSpan`.
     static let declaredSpan = 8
 
     /// Worst-case positions written beyond the confirmed frontier in one
-    /// round.
-    ///
-    /// **The MTP relationship is enforced HERE, on the shipping path**
-    /// (PR#86 review, `:50`). The check used to live in a
-    /// `assertSpanCoversMTPBound()` that nothing called, and `assert` is
-    /// compiled out under `-O`, so raising `CBv2MTPConfig.testedMaxDraftTokens`
-    /// past 7 would have under-sized every windowed ring in a release build
-    /// with no diagnostic anywhere. Now the validation runs the first time
-    /// ANY ring is sized, because sizing reads this property.
-    ///
-    /// Swift cannot make it a build-time error. The two operands are separate
-    /// `static let`s and the mandatory constant folder does not propagate
-    /// across global initialisers, so the usual "force a `UInt` underflow in
-    /// a constant expression" trick compiles clean at both `-Onone` and `-O`
-    /// (measured on this toolchain, both configurations, with the bound
-    /// deliberately violated). A `precondition` in this initialiser is the
-    /// strongest mechanism the language actually offers: unlike `assert` it
-    /// is live in every configuration except `-Ounchecked`.
-    /// `CBv2PagedSeamContractTests.speculativeSpanCoversMTPDraftBound` is the
-    /// always-run CI copy, so drift is caught in a test run rather than by a
-    /// daemon trapping in the field.
+    /// round. Validated on first read so a larger MTP bound cannot silently
+    /// undersize the ring (`precondition` stays live except `-Ounchecked`).
     public static let maxSpeculativeSpan: Int = {
         assertSpanCoversMTPBound()
         return declaredSpan
@@ -122,79 +55,14 @@ public enum CBv2PagedSpeculation {
 
 // MARK: - Windowed ring geometry
 
-/// The windowed ring formula, in code.
+/// Windowed ring formula. Must match `PagedKVPool.ringPageCount`.
 ///
-/// `PagedKVPool.ringPageCount(window:config:)` is the shipping
-/// implementation; this is the contract's statement of the same rule. They
-/// are bound by `CBv2PagedSeamContractTests.ringFormulaMatchesPagedKVPool`,
-/// which compares them across a matrix of windows, chunks and page sizes and
-/// fails on any divergence — so the frozen contract and the shipping code
-/// cannot drift apart silently, which is exactly what they had done (PR#86
-/// review).
-///
-/// The pool keeps its own copy rather than calling this one because its
-/// construction path (`PagedKVPool.checkedRingPageCount`) has to
-/// overflow-check every intermediate and turn a hostile operator config into
-/// `CBv2KVError.backendIneligible` instead of a trap. This copy is the plain
-/// arithmetic that the checked one must agree with.
-///
-/// ## THE RING SIZE IS A CONSEQUENCE, NOT A CONSTANT
-///
-/// gemma-4's windowed layers ring at 65 pages (1,040 tokens) for a
-/// 1,024-token window. A 65-page ring was ALSO tried in an earlier wave and
-/// REVERTED, because it aborted the daemon in ordinary windowed prefill —
-/// reproduced from the row side, not theorised. The number did not become
-/// safe; the code around it changed. Three preconditions hold it up, and 65
-/// is wrong again the moment any one of them stops being true:
-///
-///  1. **The layer gathers before it writes.** `PagedLayerCache.prefillKV`
-///     assembles `gather(pre-write window history) ++ chunk` and only then
-///     calls `row.write`. Gathering AFTER the write asks the ring for
-///     `window - 1 + chunk` (1,535 tokens out of 1,040) and trips
-///     `PagedSequenceKV.gatherRange`'s "gather of evicted window range"
-///     precondition. THAT is the abort that got the first attempt reverted.
-///  2. **The row gathers before it writes.** `PagedSequenceKV.update` does
-///     the same thing on the `CBv2SequenceKV` protocol path — tests and
-///     `PagedDecodeProfiler`, not the serving path, which is (1) — and that
-///     is what collapses `retainedCount` to
-///     `min(written, window)` and removes `maxPrefillChunk` from
-///     `attendableTokens`. `PagedSequenceKV.maxWindowExposure(window:)` is
-///     the single declaration of that promise: `retainedCount` clamps to it
-///     and `ringPageCount` sizes from it, so a change that re-widens the
-///     row's exposure grows the ring instead of out-running it.
-///  3. **Reads publish a fence back-edge.** `PagedKVPool.gather` folds the
-///     gathered arrays back into the group's `writeFence`, so a later
-///     in-place write cannot overtake a pre-write gather that has not
-///     materialised. Without it the gather and the write are graph SIBLINGS
-///     (both merely consume `writeFence`). At 1,552 tokens that was benign,
-///     because a chunk's history and the chunk itself never shared a ring
-///     slot; at 1,040 tokens they do, and the loser of the race is the
-///     chunk's own earliest queries reading their own tail as history — a
-///     silent wrong answer with no crash and no telemetry.
-///
-/// DIRECT WRITERS, for the next person who has to audit this. Callers that
-/// reach `PagedSequenceKV.write` without the layer cache are bounded by
-/// `maxPrefillChunk` and nothing else — that is `attendableTokens`' ROW half.
-/// Today they are the kernel differential harness
-/// (`CBv2PagedKernelTests.Fixture.addRow`) and `PagedDecodeProfiler`. Prefix
-/// ADOPTION is NOT one of them, despite appearances:
-/// `PagedKVBackend.makeSequenceState(adopting:)` writes only FULL rows,
-/// behind `precondition(state.windowSize == nil)`, and its windowed half
-/// goes through `fastForward` plus engine replay through the layer cache.
+/// Gather-before-write plus the gather fence keep a 65-page / 1024-window
+/// ring valid. Changing either without resizing the ring is a revert.
 public enum CBv2PagedRingGeometry {
 
-    /// The widest range a windowed row can be asked to GATHER at once.
-    ///
-    /// `window`, not `window - 1 + maxPrefillChunk`, and the difference is
-    /// preconditions (1) and (2) above. `PagedSequenceKV.retainedCount` is
-    /// `min(written, PagedSequenceKV.maxWindowExposure(window:))` — phase
-    /// independent, and the same figure `CBv2WindowedSequenceKV` reports.
-    ///
-    /// The chunk's earliest query still sees its whole window; it just does
-    /// not come from the ring. `window - 1` positions of it are gathered
-    /// BEFORE the chunk is written, and the rest is the chunk tensor the
-    /// caller already holds. A row therefore RETURNS up to `window - 1 + n`
-    /// columns from `update` while only ever asking storage for `window`.
+    /// Widest gather a windowed row can be asked for: `window`, not
+    /// `window - 1 + maxPrefillChunk`.
     public static func attendableTokens(window: Int) -> Int {
         PagedSequenceKV.maxWindowExposure(window: window)
     }

@@ -240,7 +240,8 @@ public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, M
     let m = indices.dim(-1)
     let indices = indices.flattened()
     let order = argSort(indices)
-    let inverseOrder = argSort(order)
+    let inverseOrder = MLXArray.zeros([order.size], dtype: order.dtype)
+    inverseOrder[order] = MLXArray.arange(order.size, dtype: order.dtype)
 
     return (
         x.flattened(start: 0, end: -3)[order.floorDivide(m)],

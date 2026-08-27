@@ -167,20 +167,21 @@ enum CBv2AttentionV1 {
                 return concatenated(outputs, axis: 0)
             }
 
-            var outputs: [MLXArray] = []
-            outputs.reserveCapacity(B)
+            var cachedKeyRows: [MLXArray] = []
+            var cachedValueRows: [MLXArray] = []
+            cachedKeyRows.reserveCapacity(B)
+            cachedValueRows.reserveCapacity(B)
             for (index, row) in rows.enumerated() {
                 let (cachedKeys, cachedValues) = row.update(
                     keys: keys[index ..< (index + 1)],
                     values: values[index ..< (index + 1)])
-                outputs.append(
-                    attend(
-                        queries: queries[index ..< (index + 1)],
-                        keys: cachedKeys, values: cachedValues, scale: scale,
-                        L: 1, kL: cachedKeys.dim(2), window: nil,
-                        sinks: effectiveSinks, softcap: softcap))
+                cachedKeyRows.append(cachedKeys)
+                cachedValueRows.append(cachedValues)
             }
-            return concatenated(outputs, axis: 0)
+            return batchedDecodeAttend(
+                queries: queries, cachedKeyRows: cachedKeyRows,
+                cachedValueRows: cachedValueRows, scale: scale,
+                sinks: effectiveSinks, softcap: softcap)
         }
 
         if serializeQueries {
@@ -221,6 +222,43 @@ enum CBv2AttentionV1 {
                 sinks: effectiveSinks, softcap: softcap,
                 spanContext: spanContexts?[index])
         }
+    }
+
+    /// Equal-kL B>1 decode: one SDPA over stacked K/V instead of B row-local
+    /// launches. Axis 0 is independent; `maskMode(L:1)` is `.none` on both
+    /// paths. Mismatched lengths keep the established per-row loop.
+    private static func batchedDecodeAttend(
+        queries: MLXArray,
+        cachedKeyRows: [MLXArray],
+        cachedValueRows: [MLXArray],
+        scale: Float,
+        sinks: MLXArray?,
+        softcap: Float?
+    ) -> MLXArray {
+        let batch = cachedKeyRows.count
+        let decodeKL = cachedKeyRows[0].dim(2)
+        if batch > 1,
+            cachedKeyRows.allSatisfy({ $0.dim(2) == decodeKL }),
+            cachedValueRows.allSatisfy({ $0.dim(2) == decodeKL })
+        {
+            return attend(
+                queries: queries,
+                keys: concatenated(cachedKeyRows, axis: 0),
+                values: concatenated(cachedValueRows, axis: 0),
+                scale: scale, L: 1, kL: decodeKL, window: nil,
+                sinks: sinks, softcap: softcap)
+        }
+        var outputs: [MLXArray] = []
+        outputs.reserveCapacity(batch)
+        for index in 0 ..< batch {
+            outputs.append(
+                attend(
+                    queries: queries[index ..< (index + 1)],
+                    keys: cachedKeyRows[index], values: cachedValueRows[index],
+                    scale: scale, L: 1, kL: cachedKeyRows[index].dim(2),
+                    window: nil, sinks: sinks, softcap: softcap))
+        }
+        return concatenated(outputs, axis: 0)
     }
 
     private static func batchedPackedAttention(
@@ -503,9 +541,11 @@ enum CBv2AttentionV1 {
             return concatenated(outputs, axis: 0)
         }
 
-        var outputs: [MLXArray] = []
-        outputs.reserveCapacity(B)
-        for (index, row) in sourceRows.enumerated() {
+        var cachedKeyRows: [MLXArray] = []
+        var cachedValueRows: [MLXArray] = []
+        cachedKeyRows.reserveCapacity(B)
+        cachedValueRows.reserveCapacity(B)
+        for row in sourceRows {
             let cachedKeys: MLXArray
             let cachedValues: MLXArray
             if let windowed = row as? CBv2WindowedSequenceKV {
@@ -513,14 +553,19 @@ enum CBv2AttentionV1 {
             } else {
                 (cachedKeys, cachedValues, _) = row.snapshot()
             }
-            outputs.append(
-                attend(
-                    queries: B == 1 ? queries : queries[index ..< (index + 1)],
-                    keys: cachedKeys, values: cachedValues, scale: scale,
-                    L: 1, kL: cachedKeys.dim(2), window: nil,
-                    sinks: effectiveSinks, softcap: softcap))
+            cachedKeyRows.append(cachedKeys)
+            cachedValueRows.append(cachedValues)
         }
-        return B == 1 ? outputs[0] : concatenated(outputs, axis: 0)
+        if B == 1 {
+            return attend(
+                queries: queries, keys: cachedKeyRows[0], values: cachedValueRows[0],
+                scale: scale, L: 1, kL: cachedKeyRows[0].dim(2), window: nil,
+                sinks: effectiveSinks, softcap: softcap)
+        }
+        return batchedDecodeAttend(
+            queries: queries, cachedKeyRows: cachedKeyRows,
+            cachedValueRows: cachedValueRows, scale: scale,
+            sinks: effectiveSinks, softcap: softcap)
     }
 
     private static func borrowAndAttendRow(

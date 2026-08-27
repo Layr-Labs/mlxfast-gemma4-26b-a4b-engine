@@ -468,11 +468,11 @@ public class SwitchGLU: Module {
 
     /// Always-called expert projection + weighted reduction entry point.
     ///
-    /// When the experiment is enabled, only the exact sorted production Gemma
-    /// prefill contract reduces directly to `[tokens, hidden]`. Disabled,
-    /// decode/small-assignment, generic, custom-activation, dtype/layout, and
-    /// near-geometry calls retain scatter/unsort followed by
-    /// ``weightedExpertSum``.
+    /// When the experiment is enabled, the exact sorted production Gemma
+    /// prefill contract and the exact eight-row decode cohort reduce directly
+    /// to `[tokens, hidden]`. Smaller decode cohorts, rectangular speculative
+    /// verification, generic/custom-activation, dtype/layout, and near-geometry
+    /// calls retain scatter/unsort followed by ``weightedExpertSum``.
     public func callAndWeightedReduce(
         _ x: MLXArray,
         _ indices: MLXArray,
@@ -480,7 +480,13 @@ public class SwitchGLU: Module {
         fuseSortedReduction: Bool,
         isProductionPrefill: Bool = true
     ) -> MLXArray {
-        guard fuseSortedReduction && isProductionPrefill,
+        // At B=8 decode there are exactly 64 assignments (8 rows x top-k 8),
+        // which is the sorting threshold and the minimum geometry accepted by
+        // weightedExpertUnsort.  Keep the decode gate exact so MTP rectangles
+        // and smaller serving cohorts remain on their established reduction.
+        let isEightRowDecode =
+            !isProductionPrefill && x.dim(0) == 8 && indices.size == 64
+        guard fuseSortedReduction && (isProductionPrefill || isEightRowDecode),
             supportsWeightedExpertUnsort(x, indices, weights: weights)
         else {
             return weightedExpertSum(callAsFunction(x, indices), weights)

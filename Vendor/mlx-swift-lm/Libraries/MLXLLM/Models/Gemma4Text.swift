@@ -78,9 +78,21 @@ private let gemma4PrefillTailRows: Int = {
     return max(0, value)
 }()
 
-/// Parse the independent direct expert-reduction control.
+/// Parse the independent direct expert-reduction control, which is ON by
+/// default: the coupled weighted-unsort + safe-R1 pair is what was measured
+/// faster, and the ranked box sets no environment.
+///
+/// R1 is selected by MLX itself for the sorted expert QMM whenever the
+/// checkpoint satisfies the selector's contract, so on the production
+/// checkpoint the weighted half was the only part still left on the table.
+/// `MLX_GEMMA4_FUSED_WEIGHTED_UNSORT=0` (or `false`/`no`/`off`) is the kill
+/// switch back to scatter-unsort + `weightedExpertSum`.
+/// `gemma4SupportsCoupledExpertOptimizations` still has the final say, so a
+/// checkpoint that categorically cannot run safe R1 never reaches the
+/// weighted-only state the comment below warns about.
 func gemma4FusedWeightedUnsortFlag(_ raw: String?) -> Bool {
-    gemma4TruthyFlag(raw)
+    guard let raw else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
 }
 
 /// The retained weighted/R1 pair is measured only on scheduled CBv2 prefill.

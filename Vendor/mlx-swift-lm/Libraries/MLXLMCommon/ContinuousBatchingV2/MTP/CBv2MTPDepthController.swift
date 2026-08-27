@@ -43,6 +43,8 @@ final class CBv2MTPDepthController {
     private static let baseProbeInterval = 8
     private static let maxProbeInterval = 256
 
+    static let speculationEnabled = false
+
     private struct CostState {
         var samples = 0
         var ewmaNanos = 0.0
@@ -195,11 +197,8 @@ final class CBv2MTPDepthController {
         buckets[decodeRowBucket] = state
     }
 
-    /// A depth-zero baseline is only comparable with verify steps when it is
-    /// finalized before another graph is constructed. One such probe is
-    /// required per bucket; ordinary target-only steps may keep chaining
-    /// after the baseline exists.
     func requiresNonChainedDepthZeroProbe(_ decision: CBv2MTPDepthDecision) -> Bool {
+        guard Self.speculationEnabled else { return false }
         guard decision.depth == 0, decision.decodeRowBucket > 0 else { return false }
         return buckets[decision.decodeRowBucket]?.costs[0] == nil
     }
@@ -290,6 +289,13 @@ final class CBv2MTPDepthController {
             return finish(
                 CBv2MTPDepthDecision(
                     depth: 0, decodeRowBucket: 0, reason: "no_decode_rows",
+                    isExploration: false),
+                mutate: mutate)
+        }
+        guard Self.speculationEnabled else {
+            return finish(
+                CBv2MTPDepthDecision(
+                    depth: 0, decodeRowBucket: bucket, reason: "policy_target_only",
                     isExploration: false),
                 mutate: mutate)
         }

@@ -304,6 +304,10 @@ final class CBv2MTPRoundDriver {
         depthController.requiresNonChainedDepthZeroProbe(decision)
     }
 
+    var isTargetOnlyPolicy: Bool {
+        !CBv2MTPDepthController.speculationEnabled || depthController.maxDepth == 0
+    }
+
     var planDepth: Int { planDecision.depth }
     var planDecodeRowBucket: Int { planDecision.decodeRowBucket }
 

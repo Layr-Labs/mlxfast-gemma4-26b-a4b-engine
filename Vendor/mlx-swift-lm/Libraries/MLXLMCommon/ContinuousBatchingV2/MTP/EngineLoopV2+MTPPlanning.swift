@@ -85,6 +85,7 @@ extension EngineLoopV2 {
     /// Break the chained fast path when the next step must seed or verify.
     func mtpWantsStep(ids: [CBv2RequestID]) -> Bool {
         guard let mtp else { return false }
+        if mtp.isTargetOnlyPolicy { return false }
         let rows = ids.compactMap { scheduler.record(for: $0) }
         let withinBatchGate = ids.count <= mtp.config.maxSpeculativeBatch
         let canSpeculate = withinBatchGate && rows.count == ids.count
@@ -117,6 +118,7 @@ extension EngineLoopV2 {
     /// Chunked-prefill neighbors do not change the controller batch bucket.
     func beginMTPPlan() {
         guard let mtp else { return }
+        if mtp.isTargetOnlyPolicy { return }
         let rows = scheduler.running.filter {
             !$0.isPaused && !$0.cancelRequested && $0.isDecodeReady
         }

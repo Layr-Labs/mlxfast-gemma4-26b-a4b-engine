@@ -233,11 +233,6 @@ The declaration files stay editable: `mtp-head.manifest.json` and
 has a 2 GiB declaration cap (`max_bytes` = 2147483648); a declaration may lower
 it and may not raise it.
 
-`dflash-head.manifest.json` also carries the `arm` key, which selects the
-speculative arm the ranked run measures. `mtp-head.manifest.json` does not: an
-`arm` there is refused, because nothing reads it. See "Scoring" below and
-`docs/participant-contract.md` section 5.1.1.
-
 A re-quantization happens ON LOAD, in memory. Nothing on disk changes. Each
 head loader already calls `quantize(model:)` while it binds the checkpoint, and
 both files that hold that call are editable:
@@ -262,28 +257,10 @@ head.
 
 ### Batch size and draft depth
 
-> **NOTE — batch size is locked. Draft depth is not.**
-> The batch size stays 8. You may not tune it.
->
-> The draft depth is a free lever on BOTH speculative arms, and neither is
-> pinned at 1. Your drafter code sets it, and that code is editable. A request
-> above an arm's ceiling is clamped, not refused.
->
-> **MTP** — select 1, 2 or 3. The non-editable MTP envelope clamps at 3
-> (`maxDraftTokens` 3; `maxAutomaticRectangularTokens` 32 at batch 8). benchd
-> measures at depth 2 when the invocation names no depth; an `mtp` block with no
-> `depth` key resolves to the ceiling of 3.
->
-> **DFlash** — select `depth` in the spec's `dflash` block, up to the drafter's
-> own ceiling (its recommended block size minus one, capped by the engine at 15).
-> An ABSENT `dflash` depth means "use everything the drafter supports" — the
-> ceiling, not 1.
->
-> The `fixed_depth = 1` constant in the track fixture is a darkbloom reference
-> constant for stateless Gemma. It is not a limit on your draft depth.
->
-> Every run seals what actually ran: `effective_spec` for the declared arm and
-> depth, `effective_mean_draft_len` for the realized draft length.
+> **NOTE — two levers are locked.**
+> The batch size stays 8. The draft depth stays 1 (`fixed_depth = 1` for
+> stateless Gemma). You may not tune either one. Make the forward passes
+> faster instead.
 
 The rectangular cap is `B * (1 + k) <= 8` on M3 and later.
 
@@ -495,23 +472,10 @@ measured `noop_decode_speedup`. `hidden_correctness_golden` also holds a real
 The DFlash arm is a first-class scored mode. `allowed_modes` declares `serial`,
 `mtp` and `dflash`, and a submission runs whichever its own code drives.
 
-Declare the arm in `dflash-head.manifest.json`:
-
-```json
-{ "version": 1, "source": "pinned", "arm": "dflash", "max_bytes": 2147483648 }
-```
-
-`"arm": "mtp"`, or no `arm` key, or no file at all, runs the MTP arm — the
-behavior this track had before the key existed. Any other value is refused by
-name before any measurement.
-
 It runs single-stream only — the engine refuses the batched DFlash path by name
 — so a DFlash submission is measured in the single-stream series and is not
-scored by the B=8 cohort composite above. Its score is the even-n median of the
-per-prompt raw ratio-of-means (`aggregate.raw_decode_speedup_median`, series
-tag `free_run_v1_1`), serial-anchored, floor 0.90, ceiling 5.0, over the same
-pinned 8-prompt pool. The two arms are separate values and are never pooled.
-The cohort DFlash work is deferred, not deleted.
+scored by the B=8 cohort composite above. The two arms are separate values and
+are never pooled. The cohort DFlash work is deferred, not deleted.
 
 The repositories stay private until launch.
 

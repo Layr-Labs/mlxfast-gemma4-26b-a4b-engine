@@ -86,14 +86,9 @@ The editable surface has five groups.
 `optionalEditablePaths` lists `mtp-head.manifest.json` and
 `dflash-head.manifest.json`.
 
-`dflash-head.manifest.json` carries one more key than the MTP declaration
-does: `arm`, which selects the speculative arm the ranked run measures. See
-section 5.1.1.
-
 A submission archive has REPLACE semantics over `editablePaths`. An absent head
-declaration means the organizer-pinned head, and an absent `arm` means the MTP
-arm. The overlay therefore skips a missing optional path instead of failing
-closed.
+declaration means the organizer-pinned head. The overlay therefore skips a
+missing optional path instead of failing closed.
 `.github/scripts/overlay-editable-paths.sh` reads this list from the trusted
 contract, never from the submission.
 
@@ -389,47 +384,10 @@ DFlash became a first-class scored mode on this track on 2026-08-26. The track
 fixture declares it: `allowed_modes` is `["serial", "mtp", "dflash"]`, and a
 submission runs whichever of those modes its own code drives.
 
-**Declare the arm in `dflash-head.manifest.json`, key `arm`.**
-
-| `arm` | What runs |
-|---|---|
-| absent, or the file is absent | The MTP arm |
-| `"mtp"` | The MTP arm |
-| `"dflash"` | The DFlash arm |
-
-Any other value is refused by name before any measurement. So is a value that
-is not a string, and so is an `arm` key in `mtp-head.manifest.json`, which is
-the wrong file. A broken declaration never falls back to the other arm.
-
-`tools/gemma4-measure-and-score.sh` reads the key and passes the matching
-candidate spec to the benchmarker. That script is trusted side and is not an
-editable path, so a submission states an arm and never states a spec. Declaring
-`"mtp"`, or declaring nothing, produces the exact invocation this track ran
-before the key existed.
-
 DFlash is **single-stream only**. The cohort driver refuses it by name, so a
 DFlash submission cannot run the B=8 cohort and is therefore **not** scored by
 the composite above. It is measured in the single-stream v1.1 free-run series,
 and its score is that series' aggregation over the same pinned 8-prompt pool.
-
-#### The DFlash series, precisely
-
-| Quantity | Value |
-|---|---|
-| Series tag (`results.timed_mode`) | `free_run_v1_1` |
-| Published value | `aggregate.raw_decode_speedup_median` |
-| Aggregation | Even-n median of the per-prompt raw ratio-of-means |
-| Anchor | Serial = 1.0 |
-| Floor | 0.90 |
-| Ceiling | 5.0 |
-| Pool | The same pinned 8 prompts |
-
-The composite is a cohort quantity, and a single-stream run has no cohort:
-`per_cohort` is absent from its results file entirely. The two series are
-never pooled, averaged, or compared. `.github/scripts/emit-gemma4-score.sh`
-selects the field by the sealed `results.timed_mode` and refuses a record whose
-series and shape disagree, so a DFlash number cannot be emitted under a cohort
-field name.
 
 The benchmarker enforces this rather than trusting it. A DFlash candidate keeps
 the single-stream regime even though this fixture pins `scored_batch_size: 8`,
@@ -608,46 +566,9 @@ organizer-hosted mirror for this checkpoint, so
 Participants never supply the target weights. Substituting or re-deriving the
 target is a failure.
 
-The rectangular cap is `B * (1 + k) <= 8` on M3 and later. Batch size is locked
-at 8.
-
-You can select the draft depth. Both speculative arms permit this. Neither arm
-is pinned at 1.
-
-Your drafter code sets the depth. That code is an editable path, so the depth is
-a free lever on both arms. Each arm has its own ceiling. A request above a
-ceiling is clamped to that ceiling. It is not refused.
-
-**The MTP arm.** The permitted values are 1, 2 and 3. The MTP envelope limits
-the depth to 3. The envelope is trusted code and is not an editable path:
-`maxDraftTokens` is 3, and `maxAutomaticRectangularTokens` is 32 at batch
-size 8.
-
-**The DFlash arm.** Select the depth with `depth` in the spec `dflash` block.
-The ceiling is the drafter's own: its recommended block size minus one. The
-engine caps that ceiling at 15 (`experimentalDFlashMaxBlockSize` is 16). The
-DFlash ceiling is therefore much larger than the MTP ceiling of 3.
-
-Absent depths do not mean 1. Three layers supply a depth when a request does not
-name one. Do not confuse them.
-
-| Request | Result |
-|---|---|
-| benchd invocation gives no `--mtp-depth` | benchd measures at depth 2 |
-| the `mtp` block has no `depth` key | the envelope uses its ceiling of 3 |
-| the `dflash` block has no `depth` key | the drafter uses its full ceiling |
-
-An absent `dflash` depth means "use everything the drafter supports". It does
-not mean 1.
-
-The `fixed_depth = 1` constant in the track fixture is a darkbloom reference
-constant. It records the stateless-Gemma protocol value that this track
-inherited. It is not a limit on your draft depth.
-
-Every run seals the depth that operated. Read `effective_spec` for the arm and
-the depth the run declared. Read `effective_mean_draft_len` for the draft length
-that the run realized. The two can differ: a run can declare depth 2 and realize
-a mean draft length near 1.
+The speculative-decode protocol constants are `fixed_depth = 1` for stateless
+Gemma, and the rectangular cap `B * (1 + k) <= 8` on M3 and later. Draft depth
+is not participant-tunable on this track. Batch size is locked at 8.
 
 ## 8. Prohibited techniques
 

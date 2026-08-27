@@ -40,20 +40,6 @@ import MLXFastCore
 // posture. Rather than a second copy of this parser, the head KIND is a
 // parameter: one gate, two manifests, no way for the two to drift apart.
 
-// THE DECLARATION ALSO CARRIES THE ARM (2026-08-26). `dflash-head.manifest.
-// json` gained an `arm` key, and this parser gained a KNOWN key to match. The
-// parser used to read six keys and ignore every other one, which is the right
-// posture for a key nothing consumes and the wrong one for a key that decides
-// which arm is scored. `arm` is therefore parsed by `parseArm` and REFUSES on
-// an unknown value, a non-string value, and presence on the manifest that does
-// not declare the arm -- see `DeclaredArm`.
-//
-// The reader that ACTS on the arm is `tools/gemma4-measure-and-score.sh`: it is
-// the trusted wrapper that composes the benchmarker's argv, so it is the only
-// place a declaration can become a `--candidate-spec`. This file owns the
-// VOCABULARY and the fail-closed parse; `tools/test-gemma4-arm-selection.sh`
-// holds the two in step.
-
 /// Which replaceable head a declaration is about. The kind decides only the
 /// manifest filename, the staged directory, and how refusals name the head --
 /// never the gate, which is byte-for-byte identical for both.
@@ -93,55 +79,6 @@ public enum ReplaceableHeadKind: String, Equatable, CaseIterable, Sendable {
 /// read as.
 public typealias ReplaceableHeadDeclaration = Gemma4MTPHeadDeclaration
 
-/// THE SELECTION CHANNEL (2026-08-26). Which speculative arm the submission
-/// declares it wants MEASURED.
-///
-/// `benchmark.json`, `docs/participant-contract.md` section 5.1.1, `README.md`
-/// and `TASK.md` all say "a submission runs whichever mode its own code
-/// drives". Until this type existed there was no way for a submission to say
-/// which one: the mode reached the benchmarker only through an operator's
-/// `--candidate-spec` / `--mtp-depth` flag, and `tools/gemma4-measure-and-
-/// score.sh` -- the ONLY thing `benchmark.json` runs -- passed neither. Every
-/// ranked run therefore measured the MTP default no matter what the submission
-/// contained. This enum is the vocabulary of the channel that closes that gap.
-///
-/// WHERE IT IS DECLARED: the `arm` key of `dflash-head.manifest.json`, which is
-/// an `editablePaths` AND `optionalEditablePaths` entry -- a file a submission
-/// can actually write. (`benchmark.json` itself is trusted-side, so the ruled
-/// design's literal "a field on the workspace manifest" is unimplementable as
-/// written on this track.)
-///
-/// WHERE IT IS ENFORCED: `tools/gemma4-measure-and-score.sh`, the TRUSTED
-/// wrapper, is the reader that turns a declared arm into a `--candidate-spec`
-/// argument. Participant code never composes that argument and cannot reach
-/// the benchmarker's CLI at all. This type is the SHARED VOCABULARY that reader
-/// is drift-checked against (`tools/test-gemma4-arm-selection.sh`), and the
-/// fail-closed parse any other reader of a declaration inherits.
-///
-/// WHY IT IS NOT `ReplaceableHeadKind`: the two enums happen to spell the same
-/// two words today, but they answer different questions. `ReplaceableHeadKind`
-/// asks "which head is this manifest about"; this asks "which spec mode should
-/// the candidate leg run". The mode vocabulary is the benchmarker's
-/// (`serial` / `mtp` / `dflash`), and a track that later admits a declared
-/// `serial` arm would extend this and not that.
-public enum DeclaredArm: String, Equatable, CaseIterable, Sendable {
-    /// The stateless assistant MTP arm. THE DEFAULT, and what an absent `arm`
-    /// key -- and an absent manifest -- mean.
-    case mtp
-    /// The z-lab DFlash drafter arm. Single-stream only.
-    case dflash
-
-    /// What an absent declaration selects. Stated once, here, so no reader
-    /// spells the default itself.
-    public static let absentDefault = DeclaredArm.mtp
-
-    /// The manifest that carries the declaration. ONE file, named once: a
-    /// track with two head manifests must not leave a participant guessing
-    /// which of them the arm goes in, and the other one REFUSES an `arm` key
-    /// rather than ignoring it (see `parse`).
-    public static let declaringHeadKind = ReplaceableHeadKind.dflash
-}
-
 /// One parsed head declaration (`mtp-head.manifest.json` or, for the same
 /// mechanism aimed at the DFlash drafter, `dflash-head.manifest.json`).
 public struct Gemma4MTPHeadDeclaration: Equatable, Sendable {
@@ -165,10 +102,6 @@ public struct Gemma4MTPHeadDeclaration: Equatable, Sendable {
     public let maxBytes: Int
     /// Which replaceable head this declaration is about.
     public let kind: ReplaceableHeadKind
-    /// THE DECLARED ARM. Meaningful only on `DeclaredArm.declaringHeadKind`'s
-    /// manifest; on every other kind an `arm` key is a REFUSAL, so this is
-    /// always `absentDefault` there rather than quietly something else.
-    public let arm: DeclaredArm
 
     public init(
         source: Source,
@@ -177,8 +110,7 @@ public struct Gemma4MTPHeadDeclaration: Equatable, Sendable {
         sha256: String? = nil,
         bytes: Int = 0,
         maxBytes: Int = Gemma4MTPHeadDeclaration.defaultMaxBytes,
-        kind: ReplaceableHeadKind = .mtp,
-        arm: DeclaredArm = .absentDefault
+        kind: ReplaceableHeadKind = .mtp
     ) {
         self.source = source
         self.sourceURL = sourceURL
@@ -187,7 +119,6 @@ public struct Gemma4MTPHeadDeclaration: Equatable, Sendable {
         self.bytes = bytes
         self.maxBytes = maxBytes
         self.kind = kind
-        self.arm = arm
     }
 
     /// 2 GiB. Mirrored in `mtp-head.manifest.json` and
@@ -264,7 +195,6 @@ public struct Gemma4MTPHeadDeclaration: Equatable, Sendable {
         let path = root["path"] as? String
         let sha256 = (root["sha256"] as? String)?.lowercased()
         let bytes = (root["bytes"] as? NSNumber)?.intValue ?? 0
-        let arm = try parseArm(root: root, origin: origin, kind: kind)
 
         // REQUANT-ONLY (David ruling, 2026-08-26). `pinned` is the ONLY source
         // this track accepts. Both speculative heads are the organizer's own
@@ -333,72 +263,9 @@ public struct Gemma4MTPHeadDeclaration: Equatable, Sendable {
             sha256: sha256,
             bytes: bytes,
             maxBytes: maxBytes,
-            kind: kind,
-            arm: arm
+            kind: kind
         )
     }
-
-    /// Parse the `arm` selection key, FAILING CLOSED.
-    ///
-    /// `arm` is the SIXTH-key-plus-one. The five keys above it (`source`,
-    /// `source_url`, `path`, `sha256`, `bytes`, `max_bytes`) are read with
-    /// `as?` casts that treat an absent key and a wrong-typed key alike, and
-    /// every OTHER key in the object is simply not read -- the parser's
-    /// unknown-key tolerance. That tolerance is harmless for a key nothing
-    /// consumes and is NOT harmless for a key that selects which arm gets
-    /// scored: a participant who writes `"arm": "dsparkk"`, or writes `arm`
-    /// into the wrong manifest, would have been scored on the other arm and
-    /// never told. So `arm` is handled by its own function with its own
-    /// refusals rather than by a sixth `as?`.
-    ///
-    /// The three refusals, all pre-GPU and all named:
-    ///   * present on a manifest that does not declare the arm;
-    ///   * present but not a JSON string;
-    ///   * a string outside `DeclaredArm`'s vocabulary (case-sensitive: the
-    ///     benchmarker's mode strings are lowercase, so `"MTP"` is a typo and
-    ///     is told so, not silently normalized).
-    ///
-    /// ABSENT is the ONLY silent path, and it selects
-    /// `DeclaredArm.absentDefault` -- today's behaviour, unchanged.
-    private static func parseArm(
-        root: [String: Any],
-        origin: String,
-        kind: ReplaceableHeadKind
-    ) throws -> DeclaredArm {
-        guard let raw = root[armKey] else {
-            return .absentDefault
-        }
-        let declaringKind = DeclaredArm.declaringHeadKind
-        guard kind == declaringKind else {
-            throw MLXFastError.invalidInput(
-                "the \(kind.declarationNoun) head declaration at \(origin) sets "
-                    + "'\(armKey)', but the arm is declared in "
-                    + "\(declaringKind.manifestRelativePath) only; move the key "
-                    + "there rather than leaving it here, where nothing reads it")
-        }
-        guard let text = raw as? String else {
-            throw MLXFastError.invalidInput(
-                "the \(kind.declarationNoun) head declaration at \(origin) sets "
-                    + "'\(armKey)' to a non-string value; it must be one of "
-                    + DeclaredArm.allCases.map { "'\($0.rawValue)'" }
-                    .joined(separator: ", "))
-        }
-        guard let arm = DeclaredArm(rawValue: text) else {
-            throw MLXFastError.invalidInput(
-                "the \(kind.declarationNoun) head declaration at \(origin) "
-                    + "declares \(armKey) '\(text)', which is not a mode this "
-                    + "track admits; expected one of "
-                    + DeclaredArm.allCases.map { "'\($0.rawValue)'" }
-                    .joined(separator: ", ")
-                    + ", or omit the key to run "
-                    + "'\(DeclaredArm.absentDefault.rawValue)'")
-        }
-        return arm
-    }
-
-    /// The declaration key that selects the arm. Named once; the trusted
-    /// wrapper reads the same string and is drift-checked against this file.
-    public static let armKey = "arm"
 
     /// Read the declaration of one head kind next to a contract root, treating
     /// ABSENCE as the pinned default and everything else as parse-or-refuse.

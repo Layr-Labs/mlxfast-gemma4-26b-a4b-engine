@@ -323,6 +323,31 @@ inline void qdot_affine4_pair(
   out1 = scale * accum1 + sum1 * bias;
 }
 
+// Two independent affine-8 dot products over one unpacked weight vector. Each
+// accumulator retains the scalar qdot operation order; only the weight-byte
+// load is shared between the paired input rows.
+template <typename U, int values_per_thread>
+inline void qdot_affine8_pair(
+    const device uint8_t* w,
+    const thread U* x0,
+    const thread U* x1,
+    U scale,
+    U bias,
+    U sum0,
+    U sum1,
+    thread U& out0,
+    thread U& out1) {
+  U accum0 = 0;
+  U accum1 = 0;
+  for (int i = 0; i < values_per_thread; i++) {
+    const uint8_t weight = w[i];
+    accum0 += x0[i] * weight;
+    accum1 += x1[i] * weight;
+  }
+  out0 = scale * accum0 + sum0 * bias;
+  out1 = scale * accum1 + sum1 * bias;
+}
+
 template <typename U, int values_per_thread, int bits>
 inline U qdot_safe(
     const device uint8_t* w,
@@ -747,7 +772,6 @@ METAL_FUNC void qmv_quad_impl(
   thread U x_thread[values_per_thread];
   thread U result[results_per_quadgroup] = {0};
 
-  // Adjust positions
   const int in_vec_size_w = in_vec_size / pack_factor;
   const int in_vec_size_g = in_vec_size / group_size;
   const int out_row = tid.y * quads_per_simd * results_per_quadgroup + quad_gid;
@@ -808,7 +832,6 @@ METAL_FUNC void qmv_fast_impl(
   thread U x_thread[values_per_thread];
   thread U result[results_per_simdgroup] = {0};
 
-  // Adjust positions
   const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
   const int in_vec_size_g = in_vec_size / group_size;
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
@@ -847,13 +870,6 @@ METAL_FUNC void qmv_fast_impl(
   }
 }
 
-// Exact-order affine4/g64 multi-row QMV. The frozen host launches M x-groups
-// for each 8-output tile. Pair adjacent input rows in one group while keeping
-// the stock two-simdgroup by four-output-row layout. Each active group caches a
-// weight tile once and applies the stock arithmetic independently to one or two
-// inputs; unused host groups return without reading weights. load_vector, the
-// qdot expression, K accumulation order, and simd_sum remain identical to
-// qmv_fast_impl for every output element.
 template <typename U>
 inline U qdot_affine4_loaded(
     const thread uint16_t* ws,
@@ -990,15 +1006,6 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
   }
 }
 
-// Wider row sharing for the affine4/g64 multi-row QMV. Same contract as
-// qmv_fast_crossrow_affine4_g64: the frozen host launches M x-groups for each
-// 8-output tile, so a group that claims NA adjacent input rows lets the
-// remaining host groups return without reading weights. NA up to 4 shares one
-// nibble mask and one integer-to-float conversion across NA inputs while
-// holding only four x values per input live at a time, so the register
-// footprint stays near the two-input kernel's. load_vector, the qdot
-// expression, the K accumulation order and simd_sum are unchanged for every
-// output element.
 template <typename T, int NA, bool DIRECT_NIBBLES = false>
 METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
     const device uint32_t* w,
@@ -1058,8 +1065,6 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
           xc[1] = static_cast<float>(xm[1]);
           xc[2] = static_cast<float>(xm[2]);
           xc[3] = static_cast<float>(xm[3]);
-          // Preserve the incumbent BF16 expression tree used for the affine
-          // bias correction; only the qdot nibble extraction changes.
           sums[m] += xm[0] + xm[1] + xm[2] + xm[3];
         } else {
           sums[m] += load_vector<T, float, 4, 4>(xm, xc);
@@ -1099,21 +1104,6 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
   }
 }
 
-// Single-row (M == 1) affine2/g64 fast QMV for the coarse compact draft
-// readout (out_vec_size == 98_336, bits == 2) of the promoted draft-rerank
-// scheme, at 32 values per lane: each lane loads ONE uint64 (32 packed
-// 2-bit values) per row per k-block, halving load count and k-blocks versus
-// the generic 16-value form. Duo values are extracted by shift and
-// multiplied by the UNSCALED activation: (x / 4^k) * (w & (3 << 2k)) and
-// x * ((w >> 2k) & 3) are the same real product (power-of-two scaling is
-// exact in FP32), so every elementary product equals the generic
-// qmv_fast_impl<T, 64, 2> value; the wider lane coverage reassociates the
-// FP32 partial sums, which is safe for this stage because the coarse
-// shortlist is approximate by design and the exact affine-4 rerank plus
-// target verification decide every emitted token. The serial leg runs no
-// 2-bit matmul (all its projections are affine-4), and out_vec_size ==
-// 98_336 exists only in the compact draft readout, so the dispatch gate
-// below cannot touch the serial numerator or the denominator band.
 template <typename T>
 METAL_FUNC void qmv_fast_singlerow_affine2_g64(
     const device uint32_t* w,
@@ -1149,7 +1139,6 @@ METAL_FUNC void qmv_fast_singlerow_affine2_g64(
       const device uint8_t* ws = reinterpret_cast<const device uint8_t*>(w) +
           row * in_vec_size_w + k / 4 + simd_lid * bytes_per_lane;
       packed[r] = *reinterpret_cast<const device ulong*>(ws);
-      // 32 values per lane = half of one 64-value group.
       const int group_index =
           row * in_vec_size_g + k / 64 + (simd_lid * values_per_thread) / 64;
       scale_local[r] = scales[group_index];
@@ -1185,8 +1174,6 @@ METAL_FUNC void qmv_fast_singlerow_affine2_g64(
   }
 }
 
-// IPG = ceil(M / ceil(M / 4)): the fewest weight streams reachable at NA <= 4,
-// with the remainder spread evenly so no group runs a one-row tail.
 template <typename T, int M, int IPG, bool DIRECT_NIBBLES = false>
 METAL_FUNC void qmv_fast_crossrow_affine4_g64_m(
     const device uint32_t* w,
@@ -1248,7 +1235,6 @@ METAL_FUNC void qmv_impl(
   thread U x_thread[values_per_thread];
   thread U result[results_per_simdgroup] = {0};
 
-  // Adjust positions
   const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
   const int in_vec_size_g = in_vec_size / group_size;
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
@@ -1259,8 +1245,6 @@ METAL_FUNC void qmv_impl(
     return;
   }
 
-  // In this case we need to properly guard all our reads because there isn't
-  // even 1 tile in the matrix
   if (out_vec_size < (num_simdgroups * results_per_simdgroup)) {
     ws +=
         out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
@@ -1323,7 +1307,6 @@ METAL_FUNC void qmv_impl(
     }
   }
 
-  // In this case the last tile is moved back to redo some output values
   else {
     ws += used_out_row * in_vec_size_w +
         simd_lid * packs_per_thread * bytes_per_pack;
@@ -1476,6 +1459,101 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
 }
 
 template <typename T, const int group_size, const int bits>
+METAL_FUNC void qmv_affine8_g64_pair_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x0,
+    const device T* x1,
+    device T* y0,
+    device T* y1,
+    const constant int& in_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 4;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 16;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread float x0_thread[values_per_thread];
+  thread float x1_thread[values_per_thread];
+  thread float result0[results_per_simdgroup] = {0};
+  thread float result1[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x0 += simd_lid * values_per_thread;
+  x1 += simd_lid * values_per_thread;
+  y0 += out_row;
+  y1 += out_row;
+
+  int k = 0;
+  for (; k < in_vec_size - block_size; k += block_size) {
+    float sum0 = load_vector<T, float, values_per_thread, 8>(x0, x0_thread);
+    float sum1 = load_vector<T, float, values_per_thread, 8>(x1, x1_thread);
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      const device T* sl = scales + row * in_vec_size_g;
+      const device T* bl = biases + row * in_vec_size_g;
+      float dot0;
+      float dot1;
+      qdot_affine8_pair<float, values_per_thread>(
+          wl, x0_thread, x1_thread, sl[0], bl[0], sum0, sum1, dot0, dot1);
+      result0[row] += dot0;
+      result1[row] += dot1;
+    }
+
+    ws += block_size;
+    scales += block_size / 64;
+    biases += block_size / 64;
+    x0 += block_size;
+    x1 += block_size;
+  }
+
+  const int remaining = clamp(
+      static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
+      0,
+      values_per_thread);
+  if (remaining > 0) {
+    float sum0 = load_vector_safe<T, float, values_per_thread, 8>(
+        x0, x0_thread, remaining);
+    float sum1 = load_vector_safe<T, float, values_per_thread, 8>(
+        x1, x1_thread, remaining);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      const device T* sl = scales + row * in_vec_size_g;
+      const device T* bl = biases + row * in_vec_size_g;
+      float dot0;
+      float dot1;
+      qdot_affine8_pair<float, values_per_thread>(
+          wl, x0_thread, x1_thread, sl[0], bl[0], sum0, sum1, dot0, dot1);
+      result0[row] += dot0;
+      result1[row] += dot1;
+    }
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result0[row] = simd_sum(result0[row]);
+    result1[row] = simd_sum(result1[row]);
+    if (simd_lid == 0) {
+      y0[row] = static_cast<T>(result0[row]);
+      y1[row] = static_cast<T>(result1[row]);
+    }
+  }
+}
+
+template <typename T, const int group_size, const int bits>
 METAL_FUNC void qvm_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1511,7 +1589,6 @@ METAL_FUNC void qvm_impl(
   thread U bias = 0;
   thread U x_local = 0;
 
-  // Adjust positions
   const int out_vec_size_w = out_vec_size * bytes_per_pack / pack_factor;
   const int out_vec_size_g = out_vec_size / group_size;
   int out_col = pack_factor * tn * (tid.y * num_simdgroups + simd_gid);
@@ -1525,7 +1602,6 @@ METAL_FUNC void qvm_impl(
     return;
   }
 
-  // Loop over in_vec in blocks of block_size
   int remaining = in_vec_size % block_size;
   if (remaining == 0) {
     for (int i = 0; i < in_vec_size; i += block_size) {
@@ -1570,13 +1646,11 @@ METAL_FUNC void qvm_impl(
         (thread uint8_t*)&w_local, x_local, scale, bias, result);
   }
 
-// Accumulate in the simdgroup
 #pragma clang loop unroll(full)
   for (int k = 0; k < tn * pack_factor; k++) {
     result[k] = simd_sum(result[k]);
   }
 
-  // Store the result
   if (simd_lid == 0) {
 #pragma clang loop unroll(full)
     for (int k = 0; k < tn * pack_factor; k++) {
@@ -1621,7 +1695,6 @@ METAL_FUNC void qmm_t_impl(
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  // Instantiate the appropriate BlockMMA and Loader
   using mma_t = mlx::steel::
       BlockMMA<T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
   using loader_x_t =
@@ -1636,7 +1709,6 @@ METAL_FUNC void qmm_t_impl(
       group_size,
       bits>;
 
-  // Set the block
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
   const int y_row = tid.y * BM;
@@ -1650,7 +1722,6 @@ METAL_FUNC void qmm_t_impl(
   biases += y_col * K_g;
   y += y_row * static_cast<int64_t>(N) + y_col;
 
-  // Make the x loader and mma operation
   const short num_els = min(BM, M - y_row);
   const short num_outs = min(BN, N - y_col);
   loader_x_t loader_x(x, K, Xs, simd_gid, simd_lid);
@@ -1704,7 +1775,6 @@ METAL_FUNC void qmm_t_impl(
     }
   }
 
-  // Store results to device memory
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (num_els < BM || num_outs < BN) {
     mma_op.store_result_safe(y, N, short2(num_outs, num_els));
@@ -1748,7 +1818,6 @@ METAL_FUNC void qmm_n_impl(
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   constexpr int BN_padded = (BN + 16 / sizeof(T));
 
-  // Instantiate the appropriate BlockMMA and Loader
   using mma_t = mlx::steel::
       BlockMMA<T, T, BM, BN, BK, WM, WN, false, false, BK_padded, BN_padded>;
   using loader_x_t = mlx::steel::
@@ -1765,7 +1834,6 @@ METAL_FUNC void qmm_n_impl(
 
   auto wl = (const device uint8_t*)w;
 
-  // Set the block
   const int y_row = tid.y * BM;
   const int y_col = tid.x * BN;
   x += y_row * static_cast<int64_t>(K);
@@ -1774,7 +1842,6 @@ METAL_FUNC void qmm_n_impl(
   biases += y_col / group_size;
   y += y_row * static_cast<int64_t>(N) + y_col;
 
-  // Make the x loader and mma operation
   const short num_els = min(BM, M - y_row);
   loader_x_t loader_x(x, K, Xs, simd_gid, simd_lid);
   loader_w_t loader_w(wl, scales, biases, N, Ws, simd_gid, simd_lid);
@@ -1840,7 +1907,6 @@ METAL_FUNC void qmm_n_impl(
     }
   }
 
-  // Store results to device memory
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (num_els < BM) {
     mma_op.store_result_safe(y, N, short2(BN, num_els));
@@ -1866,7 +1932,6 @@ METAL_FUNC void adjust_matrix_offsets(
     const constant int64_t* s_strides,
     const constant int64_t* b_strides,
     uint3 tid [[threadgroup_position_in_grid]]) {
-  // Set the input/output matrices
   uint32_t x_idx = tid.z;
   uint32_t w_idx = tid.z;
   if (x_batch_ndims == 1) {
@@ -1911,7 +1976,6 @@ METAL_FUNC void adjust_matrix_offsets(
     const constant int64_t* s_strides,
     const constant int64_t* b_strides,
     uint3 tid [[threadgroup_position_in_grid]]) {
-  // Set the input/output matrices
   uint32_t x_idx;
   uint32_t w_idx;
   if (batch_ndims == 1) {
@@ -2036,8 +2100,6 @@ template <typename T, int group_size, int bits, bool batched>
   }
   if (!batched && group_size == 64 && bits == 2 && out_vec_size == 98336 &&
       ntg.x == 1) {
-    // M == 1 coarse draft readout (draft-rerank scheme): the ONE 2-bit shape
-    // in the scored path; proposal-only by construction (see kernel header).
     qmv_fast_singlerow_affine2_g64<T>(
         w, scales, biases, x, y, in_vec_size, out_vec_size, tid, simd_gid,
         simd_lid);
@@ -2045,9 +2107,6 @@ template <typename T, int group_size, int bits, bool batched>
   }
   if (!batched && group_size == 64 && bits == 4 && out_vec_size >= 1024) {
     if (out_vec_size >= 4096) {
-      // Wide row sharing needs enough output tiles to keep the machine fed;
-      // below 4096 outputs the reduced x-group count thins the grid, so the
-      // promoted pair kernel is kept there byte-for-byte.
       switch (ntg.x) {
         case 2:
           qmv_fast_crossrow_affine4_g64<T, 2>(
@@ -2080,19 +2139,6 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 8:
-          // 3+3+2, not 4+4. M = 8 is the only hot width whose EVEN split needs
-          // two simultaneous vec<float,4> accumulators in every active worker;
-          // M = 9 uses three-lane vectors and profiles CHEAPER despite more work
-          // (319 / 437 / 216 us for M = 7 / 8 / 9 in the public cross-row study)
-          // — a register cliff, not work scaling.
-          // Exact: these lanes carry INDEPENDENT input rows and are never reduced
-          // across (simd_sum reduces along K WITHIN a row), so moving a row from
-          // lane 3 of a four-wide vector to lane 0 of a two-wide one cannot
-          // reorder its scalar chain. Template admits it: M in [3,9], 8 % 3 == 2
-          // (no one-row tail), IPG 3 inside the wide helper's [2,4].
-          // Receipts: 85d5bca3 2.91143, yzxoi 2.92675.
-          // SYNERGY with the streak gate above, which is why they ship together:
-          // gate 2 reaches the width-8 verify SOONER, so this kernel fires MORE.
           qmv_fast_crossrow_affine4_g64_m<T, 8, 4, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
@@ -2230,6 +2276,27 @@ template <typename T, const int group_size, const int bits, bool batched>
         simd_lid);
     return;
   }
+  if (!batched && group_size == 64 && bits == 8 && ntg.x == 8 &&
+      ntg.z == 1 && in_vec_size % 64 == 0 && out_vec_size >= 8 &&
+      out_vec_size % 8 == 0) {
+    const int first_m = int(tid.x) * 2;
+    if (first_m >= 8) {
+      return;
+    }
+    qmv_affine8_g64_pair_impl<T, 64, 8>(
+        w,
+        scales,
+        biases,
+        x + first_m * in_vec_size,
+        x + (first_m + 1) * in_vec_size,
+        y + first_m * out_vec_size,
+        y + (first_m + 1) * out_vec_size,
+        in_vec_size,
+        tid,
+        simd_gid,
+        simd_lid);
+    return;
+  }
   qmv_impl<T, group_size, bits>(
       w,
       scales,
@@ -2335,11 +2402,9 @@ template <typename T, const int group_size, const int bits, int split_k = 32>
       b_strides,
       tid);
 
-  // When (in_vec_size % split_k != 0) the final block needs to be smaller
   int in_vec_size_adj =
       tid.z % split_k == split_k - 1 ? final_block_size : in_vec_size;
 
-  // The in_vec_stride is the full K dimension, not the partition size
   int in_vec_stride = (split_k - 1) * in_vec_size + final_block_size;
 
   qvm_impl<T, group_size, bits>(
@@ -2654,7 +2719,6 @@ template <typename T, int group_size, int bits>
       run_offset++;
     }
 
-    // Odd positions are produced by the immediately preceding pair leader.
     if ((run_offset & 1) != 0) {
       return;
     }
@@ -2991,7 +3055,6 @@ template <
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[transpose ? BN * BK_padded : BK * BN_padded];
 
-  // Compute the block
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
   const int N_w = N * bytes_per_pack / pack_factor;
@@ -3004,17 +3067,14 @@ template <
   const size_t y_row_long = size_t(y_row);
   const size_t y_col_long = size_t(y_col);
 
-  // Prepare threadgroup bounds
   const short tgp_bm = align_M ? BM : short(min(BM, M - y_row));
   const short tgp_bn = align_N ? BN : short(min(BN, N - y_col));
 
-  // Calculate the final tiles in the case that K is not aligned
   const int k_remain = K - K_it * BK;
   const short2 tile_x = short2(k_remain, tgp_bm);
   const short2 tile_w =
       transpose ? short2(k_remain, tgp_bn) : short2(tgp_bn, k_remain);
 
-  // Move x and output to the correct block
   auto wl = (const device uint8_t*)w;
   x += y_row_long * K;
   y += y_row_long * N + y_col_long;
@@ -3022,7 +3082,6 @@ template <
   scales += transpose ? y_col_long * K_g : y_col / group_size;
   biases += transpose ? y_col_long * K_g : y_col / group_size;
 
-  // Do as many matmuls as necessary
   uint32_t index;
   short offset;
   uint32_t index_next = indices[y_row];
@@ -3042,10 +3101,8 @@ template <
     }
     threadgroup_barrier(mem_flags::mem_none);
 
-    // Prepare threadgroup mma operation
     thread mma_t mma_op(simd_group_id, simd_lane_id);
 
-    // Prepare threadgroup loading operations
     thread loader_x_t loader_x(x, K, Xs, simd_group_id, simd_lane_id);
     thread loader_w_t loader_w(
         wl + index * stride_w,
@@ -3056,7 +3113,6 @@ template <
         simd_group_id,
         simd_lane_id);
 
-    // Matrices are all aligned check nothing
     if (align_M && align_N) {
       gemm_loop_aligned(Xs, Ws, mma_op, loader_x, loader_w, K_it);
       if (!align_K) {
@@ -3064,7 +3120,6 @@ template <
         gemm_loop_finalize(Xs, Ws, mma_op, loader_x, loader_w, tile_x, tile_w);
       }
 
-      // Store results to device memory
       if (offset_next - offset == BM) {
         mma_op.store_result(y, N);
       } else {
@@ -3072,7 +3127,6 @@ template <
             y, N, short2(0, offset), short2(BN, offset_next));
       }
     } else {
-      // Tile aligned so check outside of the hot loop
       if ((align_M || tgp_bm == BM) && (align_N || tgp_bn == BN)) {
         gemm_loop_aligned(Xs, Ws, mma_op, loader_x, loader_w, K_it);
         if (!align_K) {
@@ -3081,7 +3135,6 @@ template <
               Xs, Ws, mma_op, loader_x, loader_w, tile_x, tile_w);
         }
 
-        // Store results to device memory
         if (offset_next - offset == BM) {
           mma_op.store_result(y, N);
         } else {
@@ -3090,7 +3143,6 @@ template <
         }
       }
 
-      // Tile partially aligned check rows
       else if (align_N || tgp_bn == BN) {
         gemm_loop_unaligned<false, true, transpose>(
             Xs, Ws, mma_op, loader_x, loader_w, K_it, tgp_bm, tgp_bn, BK);
@@ -3103,7 +3155,6 @@ template <
             y, N, short2(0, offset), short2(BN, offset_next));
       }
 
-      // Tile partially aligned check cols
       else if (align_M || tgp_bm == BM) {
         gemm_loop_unaligned<true, false, transpose>(
             Xs, Ws, mma_op, loader_x, loader_w, K_it, tgp_bm, tgp_bn, BK);
@@ -3116,7 +3167,6 @@ template <
             y, N, short2(0, offset), short2(tgp_bn, offset_next));
       }
 
-      // Nothing aligned so check both rows and cols
       else {
         gemm_loop_unaligned<false, false, transpose>(
             Xs, Ws, mma_op, loader_x, loader_w, K_it, tgp_bm, tgp_bn, BK);
@@ -3185,7 +3235,6 @@ template <typename T, const int group_size, const int bits>
   scale = at_zero ? scale : edge / q0;
   float bias = at_zero ? 0 : edge;
 
-  // Write out the scales and biases
   size_t gindex = in_index / group_size;
   if (in_index % group_size == 0) {
     scales[gindex] = static_cast<T>(scale);

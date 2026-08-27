@@ -1173,6 +1173,118 @@ public enum Gemma4RouterProbe {
         ((_ expertScores: MLXArray, _ topKIndices: MLXArray) -> Void)?
 }
 
+// MARK: - Token-Granular Activation Recalibration (TGAR)
+
+/// Inference-time, per-token additive bias on MoE gate logits.
+/// For every MoE layer in the last_n trailing layers, the policy:
+///   1. computes a temperature-scaled softmax distribution `p` over experts;
+///   2. measures per-token routing entropy `H(p)` and a top-1 confidence `c`;
+///   3. gates the effect with an entropy floor: tokens below it pass through
+///      unchanged;
+///   4. within the active set, splits between already-confident tokens
+///      (amplified toward the existing top-K) and high-entropy under-routed
+///      tokens (spread toward the un-selected experts);
+///   5. keeps only the top `keepRatio` fraction by entropy, concentrating the
+///      effect on the most uncertain half of the batch's tokens.
+///
+/// The bias is a single additive term added to the gate logits BEFORE the
+/// top-K selection. No top-k replacement, no retraining, no kernel changes,
+/// no new parameters.
+internal struct Gemma4TGARPolicy: Sendable {
+    let enabled: Bool
+    let lastN: Int
+    let temperature: Float
+    let entropyFloor: Float
+    let underRoutedTop1: Float
+    let amplify: Float
+    let spread: Float
+    let keepRatio: Float
+
+    static let resolved: Gemma4TGARPolicy = {
+        let env = ProcessInfo.processInfo.environment
+        let enabledFlag = env["DARKBLOOM_GEMMA4_TGAR_ENABLE"].map {
+            ["1", "true", "yes", "on"].contains($0.lowercased())
+        } ?? false
+        guard enabledFlag else {
+            return Gemma4TGARPolicy(
+                enabled: false, lastN: 0, temperature: 1.0,
+                entropyFloor: 0.0, underRoutedTop1: 0.0,
+                amplify: 0.0, spread: 0.0, keepRatio: 1.0)
+        }
+        let lastN = Int(env["DARKBLOOM_GEMMA4_TGAR_LAST_N"] ?? "8")
+        let temperature = Float(env["DARKBLOOM_GEMMA4_TGAR_TAU"] ?? "0.85")
+        let entropyFloor = Float(env["DARKBLOOM_GEMMA4_TGAR_ENTROPY_FLOOR"] ?? "0.5")
+        let underRoutedTop1 = Float(env["DARKBLOOM_GEMMA4_TGAR_UNDER_TOP1"] ?? "0.25")
+        let amplify = Float(env["DARKBLOOM_GEMMA4_TGAR_AMPLIFY"] ?? "0.5")
+        let spread = Float(env["DARKBLOOM_GEMMA4_TGAR_SPREAD"] ?? "0.5")
+        let keepRatio = Float(env["DARKBLOOM_GEMMA4_TGAR_KEEP_RATIO"] ?? "0.5")
+        return Gemma4TGARPolicy(
+            enabled: true,
+            lastN: max(0, lastN),
+            temperature: temperature > 0 ? temperature : 1.0,
+            entropyFloor: entropyFloor,
+            underRoutedTop1: underRoutedTop1,
+            amplify: amplify,
+            spread: spread,
+            keepRatio: min(max(keepRatio, 0.0), 1.0))
+    }()
+
+    func shouldApply(layerIdx: Int, numHiddenLayers: Int) -> Bool {
+        guard enabled, lastN > 0, numHiddenLayers > 0 else { return false }
+        return layerIdx >= numHiddenLayers - lastN
+    }
+}
+
+@inline(__always)
+private func gemma4TGARMaybeRecalibrate(
+    _ scores: MLXArray,
+    layerIdx: Int,
+    numHiddenLayers: Int
+) -> MLXArray {
+    let policy = Gemma4TGARPolicy.resolved
+    guard policy.shouldApply(layerIdx: layerIdx, numHiddenLayers: numHiddenLayers) else {
+        return scores
+    }
+    let E = scores.dim(-1)
+    guard E > 1 else { return scores }
+
+    let probs = MLX.softmax(scores / policy.temperature, axis: -1, precise: true)
+    let logProbs = MLX.log(probs + 1e-20)
+    let entropy = (-probs * logProbs).sum(axis: -1)
+    let maxEntropy = log(Float(E))
+    let normEntropy = entropy / maxEntropy
+    let top1Conf = probs.max(axis: -1).reshaped(scores.shape.dropLast())
+
+    let activeGate = (normEntropy .> MLXArray(policy.entropyFloor)).asType(.float32)
+    let underRouted = (top1Conf .< MLXArray(policy.underRoutedTop1)).asType(.float32)
+    var confidentMask = activeGate * (MLXArray(1.0) - underRouted)
+    var spreadMask = activeGate * underRouted
+
+    let flatEntropy = entropy.reshaped([-1])
+    let numTokens = flatEntropy.dim(0)
+    let keepCount = max(1, min(numTokens, Int(Float(numTokens) * policy.keepRatio)))
+    if keepCount < numTokens {
+        let kth = numTokens - keepCount
+        let partIdx = MLX.argPartition(flatEntropy, kth: kth, axis: -1)
+        let threshold = MLX.takeAlong(flatEntropy, partIdx[kth...], axis: -1).min(axis: -1)
+        let keepMask = (flatEntropy .>= threshold).asType(.float32)
+        let keepMaskShape = keepMask.reshaped(scores.shape.dropLast())
+        confidentMask = confidentMask * keepMaskShape
+        spreadMask = spreadMask * keepMaskShape
+    }
+
+    let uniform = MLXArray(1.0 / Float(E))
+    let deviation = probs - uniform
+    let direction = confidentMask - spreadMask
+    let strength = MLX.expandedDimensions(
+        confidentMask * MLXArray(policy.amplify)
+        + spreadMask * MLXArray(policy.spread),
+        axis: -1)
+    let bias = MLX.expandedDimensions(direction, axis: -1) * strength * deviation
+
+    return scores + bias
+}
+
 /// Expert router. Norms `x` with a learnable scale, projects to expert
 /// scores, and returns top-K (indices, weights) where weights are
 /// softmax-normalized and scaled by a per-expert scalar.
@@ -1184,8 +1296,10 @@ private class Gemma4Router: Module {
     let topK: Int
     let eps: Float
     let rootSize: Float
+    let numHiddenLayers: Int
+    let layerIdx: Int
 
-    init(_ config: Gemma4TextConfiguration) {
+    init(_ config: Gemma4TextConfiguration, layerIdx: Int) {
         precondition(
             config.numExperts != nil && config.topKExperts != nil,
             "Gemma4Router requires num_experts and top_k_experts in the config"
@@ -1194,6 +1308,8 @@ private class Gemma4Router: Module {
         self.topK = config.topKExperts ?? 0
         self.eps = config.rmsNormEps
         self.rootSize = pow(Float(config.hiddenSize), -0.5)
+        self.numHiddenLayers = config.numHiddenLayers
+        self.layerIdx = layerIdx
 
         self._proj.wrappedValue = Linear(config.hiddenSize, numExperts, bias: false)
         self._scale.wrappedValue = MLXArray.ones([config.hiddenSize])
@@ -1203,7 +1319,9 @@ private class Gemma4Router: Module {
 
     func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
         let normed = MLXFast.rmsNorm(x, weight: scale * rootSize, eps: eps)
-        let expertScores = proj(normed)
+        var expertScores = proj(normed)
+        expertScores = gemma4TGARMaybeRecalibrate(
+            expertScores, layerIdx: layerIdx, numHiddenLayers: numHiddenLayers)
 
         let kth = expertScores.dim(-1) - topK
         var topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
@@ -1213,9 +1331,6 @@ private class Gemma4Router: Module {
         topKWeights = MLX.softmax(topKWeights, axis: -1, precise: true)
         topKWeights = topKWeights * perExpertScale[topKIndices]
 
-        // Diagnostic-only observability (nil in production; see
-        // `Gemma4RouterProbe`). Recording the PRE-selection scores and the
-        // selection itself, never altering either.
         Gemma4RouterProbe.recorder?(expertScores, topKIndices)
 
         return (topKIndices, topKWeights)
@@ -1354,7 +1469,7 @@ public class Gemma4DecoderLayer: Module {
             dimensions: config.hiddenSize, eps: config.rmsNormEps)
 
         if config.enableMoeBlock {
-            self._router.wrappedValue = Gemma4Router(config)
+            self._router.wrappedValue = Gemma4Router(config, layerIdx: layerIdx)
             self._experts.wrappedValue = Gemma4Experts(
                 config,
                 fuseWeightedUnsort: fuseWeightedUnsort)

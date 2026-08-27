@@ -41,6 +41,12 @@ cat > "${WORK}/results-with-composite.json" <<'EOF'
       "serial_seconds_per_token_mean": 0.012,
       "candidate_seconds_per_token_mean": 0.010,
       "raw_ratio_of_means": 1.2,
+      "prefill_token_total": 512,
+      "decode_token_total": 1024,
+      "serial_prefill_window_seconds_mean": 0.284,
+      "candidate_prefill_window_seconds_mean": 0.271,
+      "serial_decode_window_seconds_mean": 12.31,
+      "candidate_decode_window_seconds_mean": 10.42,
       "effective_mean_draft_len": 1.008,
       "non_drafting_round_count": 119,
       "effective_spec": { "mode": "mtp", "mtp": { "depth": 2 } },
@@ -68,6 +74,20 @@ if "${EMITTER}" "${WORK}/results-with-composite.json" "${WORK}/score-1.json" >"$
   # confirm the emitted file is valid JSON with a numeric (not string) score.
   if ! jq -e '.score | type == "number"' "${WORK}/score-1.json" >/dev/null 2>&1; then
     fail "case 1: score field is not a JSON number"
+  fi
+  # The aggregate PerCohort diagnostics are carried into metrics VERBATIM (benchd
+  # field names, forwarded from per_cohort[0]). Compared NUMERICALLY so the
+  # fixture's literal spelling is not pinned.
+  if ! jq -e '.metrics.serial_seconds_per_token_mean == 0.012
+              and .metrics.candidate_seconds_per_token_mean == 0.010
+              and .metrics.prefill_token_total == 512
+              and .metrics.decode_token_total == 1024
+              and .metrics.serial_prefill_window_seconds_mean == 0.284
+              and .metrics.candidate_prefill_window_seconds_mean == 0.271
+              and .metrics.serial_decode_window_seconds_mean == 12.31
+              and .metrics.candidate_decode_window_seconds_mean == 10.42' \
+       "${WORK}/score-1.json" >/dev/null 2>&1; then
+    fail "case 1: cohort aggregate diagnostics missing or wrong in metrics: $(jq -c '.metrics' "${WORK}/score-1.json")"
   fi
 else
   fail "case 1: emitter exited nonzero on a valid composite; output: $(cat "${WORK}/case1.out")"
@@ -271,7 +291,28 @@ cat > "${WORK}/results-single-stream.json" <<'EOF'
   "timed_mode": "free_run_v1_1",
   "mtp_depth": 1,
   "per_prompt": [
-    { "effective_spec": { "mode": "dflash", "dflash": {} }, "effective_mean_draft_len": 1.0 }
+    {
+      "prompt_index": 0,
+      "prompt_sha256": "aaaa000000000000000000000000000000000000000000000000000000000001",
+      "prompt_sha256_source": "contract-pool-match",
+      "parity_ok": true,
+      "accepted_pair_count": 3,
+      "serial_seconds_per_token_mean": 0.0180,
+      "mtp_seconds_per_token_mean": 0.0129,
+      "raw_ratio_of_means": 1.395,
+      "effective_spec": { "mode": "dflash", "dflash": {} },
+      "effective_mean_draft_len": 1.0
+    },
+    {
+      "prompt_index": 1,
+      "prompt_sha256": "bbbb000000000000000000000000000000000000000000000000000000000002",
+      "prompt_sha256_source": "golden-bytes",
+      "parity_ok": true,
+      "accepted_pair_count": 4,
+      "serial_seconds_per_token_mean": 0.0176,
+      "mtp_seconds_per_token_mean": 0.0121,
+      "raw_ratio_of_means": 1.455
+    }
   ],
   "aggregate": {
     "raw_decode_speedup_median": 1.42,
@@ -311,6 +352,33 @@ if "${EMITTER}" "${WORK}/results-single-stream.json" "${WORK}/score-6.json" >"${
   fi
   if ! jq -e '.metrics.published_speedup_ceiling == 5.0' "${WORK}/score-6.json" >/dev/null 2>&1; then
     fail "case 6: metrics.published_speedup_ceiling missing or wrong"
+  fi
+  # The single-stream metrics carry a per_prompt array, one object per sealed
+  # per_prompt record, projecting benchd's field names VERBATIM (never a
+  # qwen-style rename). Length matches the fixture, and each record carries the
+  # seven projected keys and only those.
+  if [[ "$(jq -r '.metrics.per_prompt | length' "${WORK}/score-6.json")" != "2" ]]; then
+    fail "case 6: metrics.per_prompt should have one entry per sealed per_prompt record"
+  fi
+  if ! jq -e '.metrics.per_prompt[0] == {
+                prompt_index: 0,
+                prompt_sha256: "aaaa000000000000000000000000000000000000000000000000000000000001",
+                parity_ok: true,
+                accepted_pair_count: 3,
+                serial_seconds_per_token_mean: 0.0180,
+                mtp_seconds_per_token_mean: 0.0129,
+                raw_ratio_of_means: 1.395
+              }' "${WORK}/score-6.json" >/dev/null 2>&1; then
+    fail "case 6: metrics.per_prompt[0] does not project the sealed benchd fields verbatim: $(jq -c '.metrics.per_prompt[0]' "${WORK}/score-6.json")"
+  fi
+  # benchd names the candidate leg mtp_seconds_per_token_mean on the single-stream
+  # series; a qwen-style rename (e.g. candidate_seconds_per_token_mean) would be a
+  # silent schema drift, so its ABSENCE is asserted alongside the correct key.
+  if [[ "$(jq -r '.metrics.per_prompt[1] | has("mtp_seconds_per_token_mean")' "${WORK}/score-6.json")" != "true" ]]; then
+    fail "case 6: per_prompt entries must carry benchd's mtp_seconds_per_token_mean"
+  fi
+  if [[ "$(jq -r '.metrics.per_prompt[1] | has("candidate_seconds_per_token_mean")' "${WORK}/score-6.json")" != "false" ]]; then
+    fail "case 6: per_prompt must NOT rename to the cohort-side candidate_seconds_per_token_mean"
   fi
   # The score is NOT clamped to the floor/ceiling here -- the overlay applies
   # them. 1.42 sits between the two, so this case cannot detect clamping; the

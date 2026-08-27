@@ -238,7 +238,15 @@ case "${timed_mode}" in
       cohort_sha256: .per_cohort[0].cohort_sha256,
       parity_ok: .per_cohort[0].parity_ok,
       accepted_pair_count: .per_cohort[0].accepted_pair_count,
-      raw_ratio_of_means: .per_cohort[0].raw_ratio_of_means
+      raw_ratio_of_means: .per_cohort[0].raw_ratio_of_means,
+      serial_seconds_per_token_mean: .per_cohort[0].serial_seconds_per_token_mean,
+      candidate_seconds_per_token_mean: .per_cohort[0].candidate_seconds_per_token_mean,
+      prefill_token_total: .per_cohort[0].prefill_token_total,
+      decode_token_total: .per_cohort[0].decode_token_total,
+      serial_prefill_window_seconds_mean: .per_cohort[0].serial_prefill_window_seconds_mean,
+      candidate_prefill_window_seconds_mean: .per_cohort[0].candidate_prefill_window_seconds_mean,
+      serial_decode_window_seconds_mean: .per_cohort[0].serial_decode_window_seconds_mean,
+      candidate_decode_window_seconds_mean: .per_cohort[0].candidate_decode_window_seconds_mean
     }' "${RESULTS_JSON}")"
     # DRAFTING-DEPTH OBSERVABILITY (David 2026-08-26) -- cohort series sources.
     # PerCohort seals these from the FIRST ACCEPTED PAIR and omits them on a
@@ -299,7 +307,8 @@ case "${timed_mode}" in
       prompt_count: (.aggregate.raw_ratios | length),
       decode_speedup_floor: .aggregate.decode_speedup_floor,
       decode_speedup_floor_met: .aggregate.decode_speedup_floor_met,
-      published_speedup_ceiling: .aggregate.published_speedup_ceiling
+      published_speedup_ceiling: .aggregate.published_speedup_ceiling,
+      per_prompt: [.per_prompt[] | {prompt_index, prompt_sha256, parity_ok, accepted_pair_count, serial_seconds_per_token_mean, mtp_seconds_per_token_mean, raw_ratio_of_means}]
     }' "${RESULTS_JSON}")"
     # DRAFTING-DEPTH OBSERVABILITY (David 2026-08-26) -- single-stream sources.
     # This series seals no cohort record, so the equivalents come from

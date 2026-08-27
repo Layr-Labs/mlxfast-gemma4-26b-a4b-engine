@@ -27,6 +27,74 @@ import Foundation
 import MLX
 import MLXRandom
 
+private let cbv2GreedyArgmax262144Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "cbv2_greedy_argmax_b8_v262144_f32_v1",
+    inputNames: ["input"],
+    outputNames: ["output"],
+    source: """
+        const uint lid = uint(thread_position_in_threadgroup.x);
+        const uint lane = uint(thread_index_in_simdgroup);
+        const uint simdgroup = uint(simdgroup_index_in_threadgroup);
+        const uint row = uint(threadgroup_position_in_grid.y);
+
+        float best_value = -3.402823466e+38F;
+        uint best_index = 0;
+        for (uint base = lid * 4; base < 262144; base += 4096) {
+            for (uint i = 0; i < 4; ++i) {
+                const uint index = base + i;
+                const float value = input[row * 262144 + index];
+                if (value > best_value) {
+                    best_value = value;
+                    best_index = index;
+                }
+            }
+        }
+
+        for (uint offset = 16; offset > 0; offset >>= 1) {
+            const float other_value = simd_shuffle_down(best_value, offset);
+            const uint other_index = simd_shuffle_down(best_index, offset);
+            if (other_value > best_value ||
+                (other_value == best_value && other_index < best_index)) {
+                best_value = other_value;
+                best_index = other_index;
+            }
+        }
+
+        threadgroup float group_values[32];
+        threadgroup uint group_indices[32];
+        if (lane == 0) {
+            group_values[simdgroup] = best_value;
+            group_indices[simdgroup] = best_index;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simdgroup == 0) {
+            best_value = group_values[lane];
+            best_index = group_indices[lane];
+            for (uint offset = 16; offset > 0; offset >>= 1) {
+                const float other_value = simd_shuffle_down(best_value, offset);
+                const uint other_index = simd_shuffle_down(best_index, offset);
+                if (other_value > best_value ||
+                    (other_value == best_value && other_index < best_index)) {
+                    best_value = other_value;
+                    best_index = other_index;
+                }
+            }
+            if (lane == 0) {
+                output[row] = int(best_index);
+            }
+        }
+    """,
+    ensureRowContiguous: true)
+
+@inline(__always)
+private func cbv2GreedyArgmax262144(_ logits: MLXArray) -> MLXArray? {
+    guard logits.dtype == .float32 && logits.shape == [8, 262_144] else { return nil }
+    return cbv2GreedyArgmax262144Kernel(
+        [logits], grid: (1024, 8, 1), threadGroup: (1024, 1, 1),
+        outputShapes: [[8]], outputDTypes: [.int32])[0]
+}
+
 public final class SamplerV2 {
 
     /// Temperatures below this are treated as greedy (matches vLLM and
@@ -89,7 +157,10 @@ public final class SamplerV2 {
 
         // Fast path: every row greedy ⇒ one argMax, bit-identical to the
         // legacy vectorized greedy decode.
-        let greedyTokens = argMax(logits, axis: -1).asType(.int32)
+        let greedyTokens = allGreedy
+            ? cbv2GreedyArgmax262144(logits)
+                ?? argMax(logits, axis: -1).asType(.int32)
+            : argMax(logits, axis: -1).asType(.int32)
         if allGreedy {
             return greedyTokens
         }

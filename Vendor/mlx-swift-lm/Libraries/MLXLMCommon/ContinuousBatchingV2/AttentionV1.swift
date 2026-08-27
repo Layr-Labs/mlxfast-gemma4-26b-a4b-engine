@@ -167,6 +167,63 @@ enum CBv2AttentionV1 {
                 return concatenated(outputs, axis: 0)
             }
 
+            if canUseRaggedTwoPassFullDecode(
+                batch: B, cacheKind: kind, queryKind: kind,
+                scale: scale, sinks: effectiveSinks, softcap: softcap)
+            {
+                var kernelKeys: [MLXArray] = []
+                var kernelValues: [MLXArray] = []
+                var fallbackKeys: [MLXArray] = []
+                var fallbackValues: [MLXArray] = []
+                var lengths: [Int] = []
+                var capacities: [Int] = []
+                kernelKeys.reserveCapacity(B)
+                kernelValues.reserveCapacity(B)
+                fallbackKeys.reserveCapacity(B)
+                fallbackValues.reserveCapacity(B)
+                lengths.reserveCapacity(B)
+                capacities.reserveCapacity(B)
+                for (index, row) in rows.enumerated() {
+                    let (cachedKeys, cachedValues) = row.update(
+                        keys: keys[index ..< (index + 1)],
+                        values: values[index ..< (index + 1)])
+                    fallbackKeys.append(cachedKeys)
+                    fallbackValues.append(cachedValues)
+                    if let full = row as? CBv2FullSequenceKV,
+                        let physical = full.decodePhysicalKV()
+                    {
+                        kernelKeys.append(physical.keys)
+                        kernelValues.append(physical.values)
+                        lengths.append(physical.length)
+                        capacities.append(physical.capacity)
+                    } else {
+                        kernelKeys.append(cachedKeys)
+                        kernelValues.append(cachedValues)
+                        lengths.append(cachedKeys.dim(2))
+                        capacities.append(cachedKeys.dim(2))
+                    }
+                }
+                if let output = CBv2RaggedTwoPassFullDecodeAttentionV1.attend(
+                    queries: queries, keys: kernelKeys, values: kernelValues,
+                    lengths: lengths, capacities: capacities, scale: scale)
+                {
+                    return output
+                }
+
+                var outputs: [MLXArray] = []
+                outputs.reserveCapacity(B)
+                for index in 0 ..< B {
+                    outputs.append(
+                        attend(
+                            queries: queries[index ..< (index + 1)],
+                            keys: fallbackKeys[index],
+                            values: fallbackValues[index],
+                            scale: scale, L: 1, kL: fallbackKeys[index].dim(2),
+                            window: nil, sinks: effectiveSinks, softcap: softcap))
+                }
+                return concatenated(outputs, axis: 0)
+            }
+
             var outputs: [MLXArray] = []
             outputs.reserveCapacity(B)
             for (index, row) in rows.enumerated() {
@@ -579,6 +636,26 @@ enum CBv2AttentionV1 {
             return false
         }
         return window == 1024
+    }
+
+    @inline(__always)
+    private static func canUseRaggedTwoPassFullDecode(
+        batch: Int, cacheKind: CBv2LayerKind, queryKind: CBv2LayerKind,
+        scale: Float, sinks: MLXArray?, softcap: Float?
+    ) -> Bool {
+        guard batch == 8,
+            scale == 1.0,
+            sinks == nil,
+            softcap == nil,
+            !cacheKind.isBidirectional,
+            !queryKind.isBidirectional,
+            cacheKind.kvHeads == 2,
+            cacheKind.headDim == 512,
+            queryKind.queryHeads == 16,
+            queryKind.headDim == 512
+        else { return false }
+        guard case .full = cacheKind.attention else { return false }
+        return true
     }
 
     private static func window(of kind: CBv2LayerKind) -> Int? {

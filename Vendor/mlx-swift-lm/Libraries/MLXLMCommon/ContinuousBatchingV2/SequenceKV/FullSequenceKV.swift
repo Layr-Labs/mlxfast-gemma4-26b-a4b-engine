@@ -148,6 +148,16 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
         )
     }
 
+    /// Row-contiguous physical K/V plus the valid prefix length. Decode
+    /// kernels that walk the prefix in place use this instead of the sliced
+    /// snapshot, whose head stride is `capacity` rather than `length`.
+    func decodePhysicalKV() -> (
+        keys: MLXArray, values: MLXArray, length: Int, capacity: Int
+    )? {
+        guard let keys, let values, absoluteOffset > 0 else { return nil }
+        return (keys, values, absoluteOffset, capacity)
+    }
+
     /// Plain rollback is already value-exact (see `rollback`: the offset
     /// decrement makes the un-confirmed tail structurally unreachable and
     /// the confirmed prefix is untouched), so speculative begin/commit are

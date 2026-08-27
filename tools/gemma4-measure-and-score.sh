@@ -139,6 +139,16 @@
 #                                     flag (die 8, pre-GPU). Box-only, and
 #                                     tools/ranked-box-preflight.sh pin-verifies
 #                                     it against the fixture before this runs.
+#   MLXFAST_WRITE_GATE_BASE           The submission's FORK POINT from main
+#                                     (`git merge-base HEAD origin/main`),
+#                                     passed as `measure-job
+#                                     --write-gate-base`. REQUIRED for a real
+#                                     run: it is what benchd judges writes
+#                                     outside editablePaths against, and there
+#                                     is no legacy fallback here (see the
+#                                     WRITE GATE section below).
+#                                     .github/workflows/benchmark.yml resolves
+#                                     it on the ranked box and exports it.
 #   MLXFAST_GEMMA4_MEASURE_OUT_DIR    measure-job --out directory.
 #                                     Default: ./benchmark-results-local
 #   BENCHCTL                         Path to the benchctl binary. Default: the
@@ -333,6 +343,32 @@ esac
 # into that directory). No new variable is coined.
 WEIGHTS_PATH="${MLXFAST_WEIGHTS_PATH:-${SCRIPT_DIR}/weights}"
 
+# ---------------------------------------------------------------------------
+# THE WRITE GATE'S REFERENCE (David ruling 2026-08-27).
+#
+# benchd refuses any file added, changed or deleted outside editablePaths. It
+# used to find those writes by comparing the candidate workspace against the
+# organizer's staged BASELINE WORKSPACE, which made the gate depend on how
+# recently that snapshot was staged. On 2026-08-27 an organizer commit to main
+# moved every later submission tree away from the staged snapshot, and each one
+# died pre-GPU as "write-divergence ... deleted outside the modifiable surface"
+# (run 33084830394) -- for edits no submission had made.
+#
+# --write-gate-base names the submission's FORK POINT from main instead, so the
+# gate reads the submission's own committed diff and a moving main cannot
+# strand it. The baseline workspace keeps its other job -- it is the
+# serial-control leg that gets TIMED -- and loses this one.
+#
+# REQUIRED ON A REAL RUN, never inferred: this script does not run git itself.
+# The fork point is dispatch context (the workflow knows which commit was
+# dispatched and can fetch main); a workspace on a box may be a copy with no
+# usable remote, and guessing a reference for a gate is worse than refusing.
+WRITE_GATE_ARGS=()
+if [[ -n "${MLXFAST_WRITE_GATE_BASE:-}" ]]; then
+  WRITE_GATE_ARGS=(--write-gate-base "${MLXFAST_WRITE_GATE_BASE}")
+fi
+# ---------------------------------------------------------------------------
+
 if [[ "${PREFLIGHT_ONLY}" == "1" ]]; then
   # measure-job's own pre-GPU prereq/quiesce checks, no engine spawned. Still
   # requires --candidate/--baseline to resolve (they are validated as real
@@ -344,10 +380,18 @@ if [[ "${PREFLIGHT_ONLY}" == "1" ]]; then
   # `mtp`/absent branch `spec_args` is empty and this argv is unchanged.
   # `${spec_args[@]+...}` is the bash-3.2-safe empty-array expansion (`set -u`
   # treats a bare `${a[@]}` on an empty array as unbound there).
+  #
+  # THE WRITE-GATE BASE IS PASSED HERE ONLY WHEN IT IS KNOWN, and preflight is
+  # the one place that is right. This is benchmark.json's preSubmitCommand: it
+  # runs wherever a submission is prepared, measures nothing and seals nothing,
+  # and the ranked dispatch's fork point does not exist in that context. A
+  # participant who exports MLXFAST_WRITE_GATE_BASE gets the same gate the box
+  # will apply, one step earlier. The ranked run below REQUIRES it.
   exec "${BENCHCTL}" measure-job \
     --contract "${CONTRACT}" \
     --candidate "${SCRIPT_DIR}" \
     --baseline "${MLXFAST_GEMMA4_BASELINE_WORKSPACE:-${SCRIPT_DIR}}" \
+    ${WRITE_GATE_ARGS[@]+"${WRITE_GATE_ARGS[@]}"} \
     --weights "${WEIGHTS_PATH}" \
     ${spec_args[@]+"${spec_args[@]}"} \
     --min-pairs 4 --target-pairs 4 \
@@ -359,6 +403,16 @@ fi
 if [[ -z "${MLXFAST_GEMMA4_BASELINE_WORKSPACE:-}" ]]; then
   echo "gemma4-measure-and-score.sh: MLXFAST_GEMMA4_BASELINE_WORKSPACE is required for a real run." >&2
   echo "  (there is no default: no verified convention yet for a pinned on-box baseline clone)" >&2
+  exit 1
+fi
+
+if [[ -z "${MLXFAST_WRITE_GATE_BASE:-}" ]]; then
+  echo "gemma4-measure-and-score.sh: MLXFAST_WRITE_GATE_BASE is required for a real run." >&2
+  echo "  It is the submission's fork point from main (git merge-base HEAD origin/main), and it is" >&2
+  echo "  the reference benchd judges writes outside editablePaths against (David ruling 2026-08-27)." >&2
+  echo "  .github/workflows/benchmark.yml resolves it and exports it on the ranked box." >&2
+  echo "  There is no fallback: running without the flag would judge this submission against the" >&2
+  echo "  staged baseline workspace again, which is the failure this replaces." >&2
   exit 1
 fi
 
@@ -415,6 +469,7 @@ RESULTS_JSON="${OUT_DIR}/results.json"
   --contract "${CONTRACT}" \
   --candidate "${SCRIPT_DIR}" \
   --baseline "${MLXFAST_GEMMA4_BASELINE_WORKSPACE}" \
+  --write-gate-base "${MLXFAST_WRITE_GATE_BASE}" \
   --weights "${WEIGHTS_PATH}" \
   --correctness-golden "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" \
   ${spec_args[@]+"${spec_args[@]}"} \

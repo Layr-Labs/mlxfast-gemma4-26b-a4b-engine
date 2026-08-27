@@ -77,6 +77,19 @@
 # participant Swift inside the sandboxed runtime worker -- the accepted design
 # for this track family, matching the qwen precedent.
 #
+# THE WRITE GATE'S REFERENCE IS THE SUBMISSION'S FORK POINT (David ruling
+# 2026-08-27). benchd judges writes outside editablePaths against the commit
+# this submission forked from main -- `git merge-base HEAD origin/main`, passed
+# as `measure-job --write-gate-base` -- so a submission is measured against its
+# OWN committed diff. It is no longer judged against the staged baseline
+# workspace: on 2026-08-27 an organizer commit to main moved every later
+# submission tree away from that staged snapshot, and each one died pre-GPU with
+# "write-divergence ... deleted outside the modifiable surface" (run
+# 33084830394). FROM THIS COMMIT ON THE STAGED BASELINE WORKSPACE IS A TIMING
+# REFERENCE ONLY -- it is the serial-control leg, and nothing else. The step
+# that resolves the fork point below refuses (non-zero, no score) when it cannot
+# resolve one; it never falls through to the old comparison.
+#
 # WHAT MUST EXIST BEFORE A DISPATCH CAN GO GREEN (each is external to this
 # file, and each is David-gated):
 #   - organization Actions enabled for this repository (dispatch is refused at
@@ -254,6 +267,46 @@ jobs:
           # This job must hold no credential, and a persisted checkout token
           # would be one.
           persist-credentials: false
+          # FULL HISTORY, because the write gate's reference is an ANCESTOR.
+          # actions/checkout defaults to a depth-1 clone, which has no ancestry
+          # at all, so `git merge-base` cannot resolve a fork point in it. This
+          # is the minimal fix: one input, and actions/checkout owns the
+          # shallow-to-complete transition. Deepening by hand in the step below
+          # would need a `git rev-parse --is-shallow-repository` branch (the box
+          # keeps its clone between runs, and `--unshallow` fails on a clone
+          # that is already complete) and would still leave the dispatched
+          # commit's own parents unfetched when its branch carries more than one
+          # commit. The cost is a one-off full fetch on a persistent clone.
+          fetch-depth: 0
+
+      - name: Resolve the submission's fork point from main (write-gate reference)
+        # David ruling 2026-08-27, and the header block above states the rule.
+        # benchd judges writes outside editablePaths against THIS commit, so it
+        # sees the submission's own committed diff instead of the difference
+        # between the submission tree and the organizer's staged baseline
+        # snapshot.
+        #
+        # NO CREDENTIAL, STILL. The checkout above sets persist-credentials:
+        # false, and this repository is public, so an unauthenticated fetch of
+        # origin is all this needs -- and all it gets.
+        #
+        # FAIL-CLOSED. A failed fetch or an unresolvable merge base is a named
+        # refusal and a non-zero exit. There is deliberately no fall-through to
+        # a run without the flag: that run would be judged against the staged
+        # baseline workspace again, which is the failure this replaces.
+        run: |
+          set -euo pipefail
+          if ! git fetch --no-tags origin main; then
+            echo "::error::gemma4-ranked: could not fetch origin/main; refusing to measure without a write-gate reference" >&2
+            exit 1
+          fi
+          base="$(git merge-base HEAD FETCH_HEAD)" || base=""
+          if [[ -z "${base}" ]]; then
+            echo "::error::gemma4-ranked: the dispatched commit ${GITHUB_SHA} has no merge base with origin/main; refusing rather than judging the write gate against the staged baseline workspace" >&2
+            exit 1
+          fi
+          printf 'MLXFAST_WRITE_GATE_BASE=%s\n' "${base}" >> "${GITHUB_ENV}"
+          echo "gemma4-ranked: write-gate reference ${base} (fork point of ${GITHUB_SHA} from main)"
 
       - name: Ranked box preflight (staged assets, contract pins, no credential)
         # Items 2-5 of the fail-closed inventory in this file's header. Runs

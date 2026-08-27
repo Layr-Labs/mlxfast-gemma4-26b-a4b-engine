@@ -50,6 +50,67 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         }
     }
 
+    /// Hashable identity for one round's drafter preparation. The four fields
+    /// together pin the structural and contextual inputs to the prep:
+    ///  - `lastAcceptedPrefixLength`: how many draft tokens the previous
+    ///    round accepted across the cohort (per-batch-row aggregate). The
+    ///    driver fills this in from the previous round's finalize walk.
+    ///  - `preparedTokenTensorIdentity`: a content identity of the per-row
+    ///    captures the drafter would read for this prep. The drafter fills
+    ///    this in from the row captures (`fullKeys`/`fullValues`/
+    ///    `slidingKeys`/`slidingValues` data pointers + `slidingStart` +
+    ///    `anchor`), so two structurally identical inputs hash equal.
+    ///  - `previousRoundDepth`: the k the previous round used (the driver
+    ///    fills in `0` on the first round).
+    ///  - `previousRoundFullAccept`: `true` only when every verify row in
+    ///    the previous round fully accepted (no rollback). A partial accept
+    ///    invalidates the cache even if all other fields match.
+    public struct DrafterInputsKey: Hashable, Sendable {
+        public let lastAcceptedPrefixLength: Int
+        public let preparedTokenTensorIdentity: UInt
+        public let previousRoundDepth: Int
+        public let previousRoundFullAccept: Bool
+
+        public init(
+            lastAcceptedPrefixLength: Int,
+            preparedTokenTensorIdentity: UInt,
+            previousRoundDepth: Int,
+            previousRoundFullAccept: Bool
+        ) {
+            self.lastAcceptedPrefixLength = lastAcceptedPrefixLength
+            self.preparedTokenTensorIdentity = preparedTokenTensorIdentity
+            self.previousRoundDepth = previousRoundDepth
+            self.previousRoundFullAccept = previousRoundFullAccept
+        }
+    }
+
+    /// Context the round driver passes to `prepareInputs` to build the
+    /// `DrafterInputsKey`. `lastAcceptedPrefixLength`,
+    /// `previousRoundDepth`, and `previousRoundFullAccept` are driver-side
+    /// state populated at finalize; the drafter fills
+    /// `preparedTokenTensorIdentity` from the row captures.
+    public struct DrafterInputsContext: Sendable {
+        public let lastAcceptedPrefixLength: Int
+        public let previousRoundDepth: Int
+        public let previousRoundFullAccept: Bool
+
+        public init(
+            lastAcceptedPrefixLength: Int,
+            previousRoundDepth: Int,
+            previousRoundFullAccept: Bool
+        ) {
+            self.lastAcceptedPrefixLength = lastAcceptedPrefixLength
+            self.previousRoundDepth = previousRoundDepth
+            self.previousRoundFullAccept = previousRoundFullAccept
+        }
+
+        /// A zero context for the first round (no prior round exists).
+        public static let initial = DrafterInputsContext(
+            lastAcceptedPrefixLength: 0,
+            previousRoundDepth: 0,
+            previousRoundFullAccept: false)
+    }
+
     private let drafter: Gemma4AssistantDraftModel
     private let target: any Gemma4MTPTarget
 
@@ -66,7 +127,36 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
     public var mtpTargetIdentity: ObjectIdentifier? { ObjectIdentifier(target) }
 
     public func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture {
-        precondition(!rows.isEmpty, "Gemma4CBv2MTPDrafter.prepare: rows must be non-empty")
+        let result = prepareInputs(rows: rows, context: .initial)
+        return result.prepared
+    }
+
+    /// Thin entry point the round driver can call and cache. The driver
+    /// passes the previous round's finalize-time state via `context`; the
+    /// drafter fills in `preparedTokenTensorIdentity` from the row captures
+    /// (data-pointer hash over the per-row full/sliding K/V views and
+    /// `slidingStart`/`anchor` scalars). On a key match the driver skips
+    /// the underlying `prepare(rows:)` call entirely and reuses the
+    /// previously built `CBv2MTPPreparedCapture`.
+    public func prepareInputs(
+        rows: [CBv2MTPRowCapture], context: DrafterInputsContext
+    ) -> (key: DrafterInputsKey, prepared: CBv2MTPPreparedCapture) {
+        precondition(!rows.isEmpty, "Gemma4CBv2MTPDrafter.prepareInputs: rows must be non-empty")
+        let prepared = prepareImpl(rows: rows)
+        let identity = Self.captureIdentity(rows: rows)
+        let key = DrafterInputsKey(
+            lastAcceptedPrefixLength: context.lastAcceptedPrefixLength,
+            preparedTokenTensorIdentity: identity,
+            previousRoundDepth: context.previousRoundDepth,
+            previousRoundFullAccept: context.previousRoundFullAccept)
+        return (key, prepared)
+    }
+
+    /// Pure implementation of the per-round prep, factored so the thin
+    /// `prepare(rows:)` and `prepareInputs(rows:context:)` entry points can
+    /// share one code path. The driver only sees the returned prepared
+    /// state; this method never inspects the cache.
+    private func prepareImpl(rows: [CBv2MTPRowCapture]) -> Prepared {
         let positionOffset = Gemma4.PositionOffset.batch(
             MLXArray(rows.map { Int32($0.anchor) }))
 
@@ -99,6 +189,37 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
                 full: .array(fullMask),
                 sliding: .array(absoluteSlidingMask ?? slidingMask)),
             positionOffset: positionOffset)
+    }
+
+    /// Content identity for the per-row captures. Two rounds with identical
+    /// row shapes, lengths, and underlying storage buffers hash equal. The
+    /// data-pointer mix is order-sensitive so a re-ordering of rows also
+    /// misses the cache (the drafter's prep is row-order sensitive).
+    static func captureIdentity(rows: [CBv2MTPRowCapture]) -> UInt {
+        var hash: UInt = 1469598103934665603 &+ UInt(rows.count)
+        for row in rows {
+            hash = hash &+ Self.arrayIdentity(row.fullKeys)
+            hash = hash &* 1099511628211
+            hash = hash &+ Self.arrayIdentity(row.fullValues)
+            hash = hash &* 1099511628211
+            hash = hash &+ Self.arrayIdentity(row.slidingKeys)
+            hash = hash &* 1099511628211
+            hash = hash &+ Self.arrayIdentity(row.slidingValues)
+            hash = hash &* 1099511628211
+            hash = hash &+ UInt(bitPattern: Int32(row.slidingStart))
+            hash = hash &* 1099511628211
+            hash = hash &+ UInt(bitPattern: Int32(row.anchor))
+            hash = hash &* 1099511628211
+        }
+        return hash
+    }
+
+    /// Stable per-MLXArray identity: the underlying `mlx::core::array`
+    /// pointer, which uniquely identifies the storage buffer. Two views
+    /// over the same buffer (e.g. a slice and its parent) hash equal.
+    @inline(__always)
+    static func arrayIdentity(_ array: MLXArray) -> UInt {
+        UInt(bitPattern: array.ctx.ctx)
     }
 
     public func draftStep(

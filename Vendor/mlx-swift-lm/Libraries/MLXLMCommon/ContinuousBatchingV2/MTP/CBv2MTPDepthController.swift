@@ -1,10 +1,3 @@
-// CBv2MTPDepthController.swift
-//
-// Step-global adaptive depth selection for rectangular MTP verification.
-// One controller belongs to one EngineV2, so model build, assistant revision,
-// chip class, and target/assistant quantization are naturally isolated by the
-// loaded engine. Within that engine, learned state is keyed by the planned
-// decode-row bucket and persists across requests.
 
 import Foundation
 
@@ -22,14 +15,10 @@ struct CBv2MTPControllerSnapshot {
     let costInputs: [CBv2MTPCostInput]
 }
 
-/// Cost attribution attached to one launched engine step. The timestamp is
-/// host-only; observing it at finalize adds no MLX synchronization.
 struct CBv2MTPStepMeasurement {
     let decision: CBv2MTPDepthDecision
     let actualDepth: Int
     let costEligible: Bool
-    /// True when this interval overlaps either predecessor finalization or
-    /// successor construction because the step participated in a chain.
     var chained: Bool
     let seedOnly: Bool
 }
@@ -43,19 +32,6 @@ final class CBv2MTPDepthController {
     private static let baseProbeInterval = 8
     private static let maxProbeInterval = 256
 
-    /// PARTICIPANT POLICY LEVER (editable; the participant contract names
-    /// this controller as the adaptive policy a submission may change).
-    ///
-    /// This submission runs TARGET-ONLY: the controller never selects a
-    /// positive draft depth, so no seed step, no verify step, and no cost
-    /// probe is ever planned. The sealed verification mode for this track is
-    /// `.serialTarget`, where a depth-k round costs 1+k FULL target forwards;
-    /// the adaptive policy therefore converges to depth 0 on its own, but it
-    /// keeps re-proving that at every probe cadence (a seed step plus a
-    /// 1+k verify step) — pure loss on this arm. Pinning the policy at 0
-    /// removes those rounds. Every committed token is still produced by an
-    /// ordinary target decode step, so the emitted stream stays bit-identical
-    /// to serial decode.
     static let speculationEnabled = false
 
     private struct CostState {
@@ -83,7 +59,6 @@ final class CBv2MTPDepthController {
     }
 
     private struct AcceptanceState {
-        /// Index zero is unused so the draft-position math is 1-based.
         var rates: [Double] = [0]
         var seen: [Int] = [0]
 
@@ -210,23 +185,12 @@ final class CBv2MTPDepthController {
         buckets[decodeRowBucket] = state
     }
 
-    /// A depth-zero baseline is only comparable with verify steps when it is
-    /// finalized before another graph is constructed. One such probe is
-    /// required per bucket; ordinary target-only steps may keep chaining
-    /// after the baseline exists.
     func requiresNonChainedDepthZeroProbe(_ decision: CBv2MTPDepthDecision) -> Bool {
-        // Target-only policy: the baseline this probe would establish is only
-        // ever compared against a verify step that can never be selected.
         guard Self.speculationEnabled else { return false }
         guard decision.depth == 0, decision.decodeRowBucket > 0 else { return false }
         return buckets[decision.decodeRowBucket]?.costs[0] == nil
     }
 
-    /// Commit one completed controller sample. Positive depths require a
-    /// finalized verification at exactly the requested depth. Chained
-    /// depth-zero work advances normal-round cadence but never contributes a
-    /// wall-cost sample because its elapsed interval overlaps neighboring
-    /// graph construction/finalization.
     @discardableResult
     func recordFinalizedStep(
         decision: CBv2MTPDepthDecision,
@@ -249,9 +213,6 @@ final class CBv2MTPDepthController {
             guard finalizedPlainWork else { return false }
             if chained {
                 var state = buckets[decision.decodeRowBucket] ?? BucketState()
-                // A warmup baseline must be measured non-chained. Once it
-                // exists, completed chained target work may drive the bounded
-                // exploration cadence without polluting the cost curve.
                 guard state.costs[0] != nil, !decision.isExploration else { return false }
                 complete(decision, state: &state)
                 buckets[decision.decodeRowBucket] = state

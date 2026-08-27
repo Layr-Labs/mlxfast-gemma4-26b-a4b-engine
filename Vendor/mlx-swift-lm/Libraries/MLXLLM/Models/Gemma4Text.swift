@@ -1169,20 +1169,77 @@ private class Gemma4Attention: Module {
 
 // MARK: - MoE (26B-A4B)
 
-/// Width-probe observability sink (exactness round three, 2026-08-25).
-///
-/// Armed ONLY by the operator-driven `width-probe` diagnostic verb so it can
-/// record every MoE router's expert scores and top-K selection per forward;
-/// nil in production (one optional check per MoE layer per forward — no
-/// tensor work, no graph change when disarmed). The recorder receives the
-/// PRE-selection expert scores `[.., E]` and the selected `topKIndices`
-/// `[.., K]`, in layer execution order — the width-divergence localization
-/// needs exactly this seam to decide whether a forward-width numeric flip
-/// first enters the network at a router selection (unfixable-by-kernel
-/// design) or only at the final logits (width-stable head candidate).
+/// Diagnostic-only router score/selection recorder; nil in production.
 public enum Gemma4RouterProbe {
     nonisolated(unsafe) public static var recorder:
         ((_ expertScores: MLXArray, _ topKIndices: MLXArray) -> Void)?
+}
+
+private let gemma4RouterTop8Kernel = MLXFast.metalKernel(
+    name: "gemma4_router_top8_e128_v1",
+    inputNames: ["scores"],
+    outputNames: ["indices"],
+    source: """
+        constexpr uint E = 128, K = 8;
+        const uint row = threadgroup_position_in_grid.y;
+        const uint lane = thread_index_in_simdgroup;
+        const device T* values = scores + row * E;
+        device uint* output = indices + row * K;
+
+        uint ord[4], ids[4];
+        for (uint slot = 0; slot < 4; ++slot) {
+            const uint index = lane + slot * 32;
+            ord[slot] = gemma4_router_ordinal(float(values[index]));
+            ids[slot] = index;
+        }
+
+        uint taken = 0;
+        for (uint rank = 0; rank < K; ++rank) {
+            uint best_ord = 0, best_id = 0, best_slot = 0xFFFFFFFFu;
+            for (uint slot = 0; slot < 4; ++slot) {
+                if ((taken & (1u << slot)) != 0) { continue; }
+                if (ord[slot] > best_ord
+                    || (ord[slot] == best_ord && ids[slot] > best_id)) {
+                    best_ord = ord[slot];
+                    best_id = ids[slot];
+                    best_slot = slot;
+                }
+            }
+            const uint winner_ord = simd_max(best_ord);
+            const uint winner_id = simd_max(best_ord == winner_ord ? best_id : 0u);
+            if (best_slot != 0xFFFFFFFFu
+                && best_ord == winner_ord && best_id == winner_id) {
+                taken |= 1u << best_slot;
+            }
+            if (lane == 0) { output[K - 1u - rank] = winner_id; }
+        }
+    """,
+    header: """
+        inline uint gemma4_router_ordinal(float value) {
+            if (isnan(value)) { return 0xFFFFFFFFu; }
+            if (value == 0.0f) { return 0x80000000u; }
+            const uint bits = as_type<uint>(value);
+            return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+@_spi(Testing) public func gemma4RouterTop8Indices(_ scores: MLXArray) -> MLXArray? {
+    guard scores.dtype == .bfloat16, scores.ndim > 0, scores.dim(-1) == 128 else {
+        return nil
+    }
+    let rows = scores.size / 128
+    var outputShape = scores.shape
+    outputShape[outputShape.count - 1] = 8
+    return gemma4RouterTop8Kernel(
+        [scores],
+        template: [("T", scores.dtype)],
+        grid: (32, rows, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [[rows, 8]],
+        outputDTypes: [.uint32]
+    )[0].reshaped(outputShape)
 }
 
 /// Expert router. Norms `x` with a learnable scale, projects to expert
@@ -1217,17 +1274,19 @@ private class Gemma4Router: Module {
         let normed = MLXFast.rmsNorm(x, weight: scale * rootSize, eps: eps)
         let expertScores = proj(normed)
 
-        let kth = expertScores.dim(-1) - topK
-        var topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
-        topKIndices = topKIndices[.ellipsis, kth...]
+        let topKIndices: MLXArray
+        if topK == 8, let selected = gemma4RouterTop8Indices(expertScores) {
+            topKIndices = selected
+        } else {
+            let kth = expertScores.dim(-1) - topK
+            topKIndices = MLX.argPartition(
+                expertScores, kth: kth, axis: -1)[.ellipsis, kth...]
+        }
 
         var topKWeights = MLX.takeAlong(expertScores, topKIndices, axis: -1)
         topKWeights = MLX.softmax(topKWeights, axis: -1, precise: true)
         topKWeights = topKWeights * perExpertScale[topKIndices]
 
-        // Diagnostic-only observability (nil in production; see
-        // `Gemma4RouterProbe`). Recording the PRE-selection scores and the
-        // selection itself, never altering either.
         Gemma4RouterProbe.recorder?(expertScores, topKIndices)
 
         return (topKIndices, topKWeights)
@@ -1264,9 +1323,6 @@ private class Gemma4Experts: Module {
         topKWeights: MLXArray,
         isExpertPrefill: Bool
     ) -> MLXArray {
-        // Flatten [B, S, H] and always enter SwitchGLU's combined API. It
-        // selects direct sorted reduction only for the exact production
-        // contract; every other case performs the established unsort + sum.
         let (B, S, H) = (x.dim(0), x.dim(1), x.dim(2))
         let K = topKIndices.dim(-1)
         let y = switchGLU.callAndWeightedReduce(
@@ -1274,8 +1330,6 @@ private class Gemma4Experts: Module {
             topKIndices.reshaped(B * S, K),
             weights: topKWeights.reshaped(B * S, K),
             fuseSortedReduction: fuseWeightedUnsort,
-            // Ordinary/direct VLM and CBv2 prompt entry points may engage.
-            // Rectangular MTP verification explicitly passes false.
             isProductionPrefill: isExpertPrefill)
         return y.reshaped(B, S, H)
     }
@@ -1952,24 +2006,12 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     let model: Gemma4TextModelInner
     let fuseWeightedUnsort: Bool
 
-    /// Read-only accessor for the underlying text configuration. Needed by
-    /// `Gemma4AssistantDraftModel` for its bind-time compatibility checks.
     public var configuration: Gemma4TextConfiguration { config }
 
-    /// Process request and resolved immutable eligibility for production
-    /// benchmark provenance. A truthy request stays ineffective unless the
-    /// checkpoint is the exact supported Gemma 4 geometry *and* carries the
-    /// safe expert-QMM quantization contract, because weighted unsort is only
-    /// a win as half of the coupled weighted + safe-R1 pair.
+    /// Requested and resolved weighted-unsort state.
     public var weightedExpertUnsortRequested: Bool { gemma4FusedWeightedUnsortRequested }
     public var weightedExpertUnsortEffective: Bool { fuseWeightedUnsort }
 
-    /// Whether this checkpoint satisfies everything the safe Gemma 4
-    /// expert-QMM selector can decide from configuration: the exact expert
-    /// topology and the 4-bit / group-size-64 quantization contract. The
-    /// runtime feature request, AOT capability, and NAX precedence are
-    /// reported separately by MLX. Identical to the predicate gating weighted
-    /// unsort, so the pair can never report or run half-applied.
     public var expertQMMGeometryEligible: Bool {
         gemma4SupportsCoupledExpertOptimizations(config)
     }
@@ -1984,9 +2026,6 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         let fuseWeightedUnsort = gemma4ShouldFuseWeightedUnsort(config)
         self.config = config
         self.vocabularySize = config.vocabSize
-        // Per-layer KV head counts must agree with `Gemma4Attention.init`:
-        // full layers use `num_global_key_value_heads` when present (whether
-        // or not k_eq_v is enabled), sliding layers the sliding count.
         self.kvHeads = (0 ..< config.numHiddenLayers).map { idx in
             let layerType = idx < config.layerTypes.count ? config.layerTypes[idx] : "sliding_attention"
             return layerType == "full_attention"

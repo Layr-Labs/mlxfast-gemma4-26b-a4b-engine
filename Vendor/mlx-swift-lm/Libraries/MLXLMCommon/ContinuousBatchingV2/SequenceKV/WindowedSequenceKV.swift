@@ -99,6 +99,18 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
             && retainedCount == window
     }
 
+    func fullDecodeRingBeforeWrite() -> (keys: MLXArray, values: MLXArray, start: Int)? {
+        guard canUseFullDecodeRing else { return nil }
+        return (keys!, values!, (oldestValidPosition + 1) % window)
+    }
+
+    func advanceFullDecodeRingWithoutWrite() {
+        precondition(canUseFullDecodeRing)
+        borrowableChunkViews = nil
+        absoluteOffset += 1
+        oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
+    }
+
     func writeFullDecodeRing(
         keys newKeys: MLXArray, values newValues: MLXArray
     ) -> (keys: MLXArray, values: MLXArray, start: Int) {

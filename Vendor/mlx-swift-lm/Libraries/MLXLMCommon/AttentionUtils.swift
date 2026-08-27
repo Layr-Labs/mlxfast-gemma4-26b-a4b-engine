@@ -191,3 +191,79 @@ func cbv2LegacyAttentionBatchViolation(batch: Int, layerIndex: Int) -> String? {
         remains supported.
         """
 }
+
+// MARK: - Drafter per-row Q-only SDPA (B > 1, view-backed KV)
+//
+// The MTP drafter borrows the target's per-row contiguous KV (CBv2 v1
+// backend: `CBv2FullSequenceKV` / `CBv2WindowedSequenceKV`). The legacy
+// drafter path materializes those per-row strided views into one
+// padded/stacked `[B, kvHeads, Tmax, headDim]` tensor before each drafter
+// Q-only SDPA — an extra HBM round-trip the model didn't have to make,
+// because each per-row tensor is already a strided view of the contiguous
+// KV leg. The helpers below attend per row and concatenate the outputs,
+// so the drafter's Q-only SDPA reads the target's K/V directly from the
+// pinned contiguous storage without an intermediate materialization.
+
+/// Q-only SDPA for a B > 1 drafter that already owns per-row K/V strided
+/// views of the target's contiguous KV leg. Each row's `(keys, values)` is
+/// `[1, kvHeads, T_row, headDim]` in temporal order; `queries` is the
+/// drafter's per-row Q `[B, nHeads, qL, headDim]`. Rows are attended one
+/// at a time and the outputs concatenated on the batch axis. No K/V
+/// materialization, no host sync.
+public func drafterPerRowQOnlySDPA(
+    queries: MLXArray,
+    perRowKV: [(keys: MLXArray, values: MLXArray)],
+    scale: Float,
+    mask: MLXFast.ScaledDotProductAttentionMaskMode = .none
+) -> MLXArray {
+    precondition(
+        queries.dim(0) == perRowKV.count,
+        "drafterPerRowQOnlySDPA: query batch \(queries.dim(0)) != KV row count \(perRowKV.count)")
+    precondition(!perRowKV.isEmpty, "drafterPerRowQOnlySDPA: empty per-row KV")
+    var parts: [MLXArray] = []
+    parts.reserveCapacity(perRowKV.count)
+    for (rowIndex, kv) in perRowKV.enumerated() {
+        let rowQ = queries[rowIndex ..< rowIndex + 1, 0..., 0..., 0...]
+        let attended = MLXFast.scaledDotProductAttention(
+            queries: rowQ,
+            keys: kv.keys,
+            values: kv.values,
+            scale: scale,
+            mask: mask)
+        parts.append(attended)
+    }
+    return parts.count == 1 ? parts[0] : concatenated(parts, axis: 0)
+}
+
+/// Variant of `drafterPerRowQOnlySDPA` that accepts one pre-sliced
+/// `MLXArray` view per row (the encoder-side fusion contract: the drafter
+/// build can construct each view with a stride-friendly slice, never a
+/// materializing copy). The KV pair is the single contiguous tensor pair
+/// that backs the B > 1 drafter's frozen capture; per-row strides are
+/// already encoded in each `MLXArray` so SDPA reads them in place.
+public func drafterViewPerRowQOnlySDPA(
+    queries: MLXArray,
+    perRowKeyViews: [MLXArray],
+    perRowValueViews: [MLXArray],
+    scale: Float,
+    mask: MLXFast.ScaledDotProductAttentionMaskMode = .none
+) -> MLXArray {
+    precondition(
+        queries.dim(0) == perRowKeyViews.count
+            && perRowKeyViews.count == perRowValueViews.count,
+        "drafterViewPerRowQOnlySDPA: query batch must match per-row KV count")
+    precondition(!perRowKeyViews.isEmpty, "drafterViewPerRowQOnlySDPA: empty per-row KV")
+    var parts: [MLXArray] = []
+    parts.reserveCapacity(perRowKeyViews.count)
+    for (rowIndex, _) in perRowKeyViews.enumerated() {
+        let rowQ = queries[rowIndex ..< rowIndex + 1, 0..., 0..., 0...]
+        let attended = MLXFast.scaledDotProductAttention(
+            queries: rowQ,
+            keys: perRowKeyViews[rowIndex],
+            values: perRowValueViews[rowIndex],
+            scale: scale,
+            mask: mask)
+        parts.append(attended)
+    }
+    return parts.count == 1 ? parts[0] : concatenated(parts, axis: 0)
+}

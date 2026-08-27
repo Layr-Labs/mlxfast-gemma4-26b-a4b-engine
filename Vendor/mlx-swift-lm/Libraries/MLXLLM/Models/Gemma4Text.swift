@@ -235,6 +235,42 @@ private let gemma4CompiledLogitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArr
     return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
 
+/// Drafter-step encoder fusion: Q-projection (matmul + reshape + transpose)
+/// followed by RoPE(Q) collapsed into a single Metal command-encoder entry.
+/// The chained work was two encoder trips per drafter decode step on the
+/// legacy path; this fuses them without changing the math, the dtype, the
+/// RoPE tables, or the `[B, nHeads, qL, headDim]` layout SDPA expects. The
+/// wrap is gated on `gemma4CompiledDecodeSupported` so the same
+/// `MLX_COMPILED_DECODE` kill switch that governs `gemma4SafeGeluApproximate`
+/// and `gemma4CompiledLogitSoftcap` governs this fusion too.
+///
+/// Implementation note: the call site captures the concrete `RoPELayer`
+/// (`RoPE` / `ProportionalRoPE` / ...) instance and the concrete nHeads/
+/// headDim, then `compile(shapeless: true, body)` traces the body and
+/// inlines the matmul + reshape + transpose + RoPE chain into a single
+/// Metal command-encoder entry. The offset flows through the
+/// `Gemma4.PositionOffset` enum (already `@unchecked Sendable`) so the
+/// `.scalar` / `.batch` / `.graphArray` branch lands inside the same
+/// fused trace.
+internal func gemma4CompiledQProjRoPE<R: RoPELayer>(
+    _ input: MLXArray,
+    qWeight: MLXArray,
+    nHeads: Int,
+    headDim: Int,
+    rope: R,
+    offset: Gemma4.PositionOffset
+) -> MLXArray {
+    let capturedRope = rope
+    let body: @Sendable (MLXArray) -> MLXArray = { x in
+        let B = x.dim(0)
+        let qL = x.dim(1)
+        let projected = matmul(x, qWeight.T).reshaped(B, qL, nHeads, headDim)
+        let transposed = transposed(projected, 0, 2, 1, 3)
+        return gemma4ApplyRotaryPosition(capturedRope, to: transposed, offset: offset)
+    }
+    return gemma4CompiledDecodeSupported ? compile(shapeless: true, body)(input) : body(input)
+}
+
 // MARK: - Configuration
 
 struct Gemma4WeightQuantizationMetadata: Codable, Sendable {

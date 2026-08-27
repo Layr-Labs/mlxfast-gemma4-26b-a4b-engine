@@ -1848,6 +1848,12 @@ download_reference_shards() {
   else
     echo "${SETUP_LOG_LABEL}: downloading ${total} safetensors shard(s) with ${jobs} parallel job(s)"
   fi
+  # The embedded xargs worker below runs `set -u` in its own Bash process and
+  # references ${SETUP_LOG_LABEL} in its log lines. It is a plain shell variable,
+  # not exported, so without this the worker aborts on an unbound variable and
+  # the EXIT trap tears down the parallel build. Export it beside the other
+  # variables the worker expands.
+  export SETUP_LOG_LABEL
   export REFERENCE_BASE_URL
   export REFERENCE_FALLBACK_BASE_URL
   export REFERENCE_AUTH_HEADER

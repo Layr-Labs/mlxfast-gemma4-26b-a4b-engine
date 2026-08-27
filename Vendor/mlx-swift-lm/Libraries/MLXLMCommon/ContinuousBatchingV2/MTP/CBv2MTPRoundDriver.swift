@@ -158,6 +158,22 @@ struct CBv2MTPSeedCostLedger {
 /// Engine-side MTP state: drafter binding, carries, plan marks, metrics.
 final class CBv2MTPRoundDriver {
 
+    /// The draft depth (k) this engine drives, independent of the depth the
+    /// caller's `spec` block happened to request. The requested depth reaches
+    /// the driver as `config.maxDraftTokens`, which is an UPPER bound and
+    /// leaves the adaptive controller free to spend a window at depth zero;
+    /// the arm is only measurable at one depth if the driver states it. Used
+    /// twice below: as the controller's fixed step-global depth (only when the
+    /// caller set no explicit `fixedDraftTokens`), and as the floor of the
+    /// driver's own depth ceiling, so `verificationLimitedDecision` cannot
+    /// clamp the driven depth back to a smaller requested bound.
+    ///
+    /// The rectangular envelope is not a constraint at this value: the sealed
+    /// verification mode on this track is `.serialTarget`, whose verify
+    /// columns are `[B, 1]` eager forwards, and even the automatic envelope
+    /// admits `B * (1 + k)` = 8 * 2 = 16 within its pinned 32-row cap.
+    static let submissionDraftDepth = 2
+
     let config: CBv2MTPConfig
     let drafter: any CBv2MTPDrafter
     /// The engine's model, downcast once at build (verify forwards go
@@ -195,7 +211,8 @@ final class CBv2MTPRoundDriver {
         self.model = model
         self.captureLayers = captureLayers
         self.depthController = CBv2MTPDepthController(
-            maxDepth: config.maxDraftTokens, fixedDepth: config.fixedDraftTokens)
+            maxDepth: Swift.max(config.maxDraftTokens, Self.submissionDraftDepth),
+            fixedDepth: config.fixedDraftTokens ?? Self.submissionDraftDepth)
         self.metrics.verificationMode = config.verificationMode
         self.metrics.maxAutomaticRectangularTokens = config.maxAutomaticRectangularTokens
     }
@@ -250,12 +267,19 @@ final class CBv2MTPRoundDriver {
             plannedDecodeRows: plannedDecodeRows)
     }
 
+    /// The driver's own depth ceiling: the caller's bound, raised to the depth
+    /// this engine drives (`submissionDraftDepth`) when the caller asked for
+    /// less.
+    private var maxDraftTokens: Int {
+        Swift.max(config.maxDraftTokens, Self.submissionDraftDepth)
+    }
+
     func maximumAutomaticDepth(plannedDecodeRows: Int) -> Int {
         guard config.verificationMode == .automatic, plannedDecodeRows > 0 else {
-            return config.maxDraftTokens
+            return maxDraftTokens
         }
         let maxWidth = config.maxAutomaticRectangularTokens / plannedDecodeRows
-        return min(config.maxDraftTokens, max(0, maxWidth - 1))
+        return min(maxDraftTokens, max(0, maxWidth - 1))
     }
 
     private func verificationLimitedDecision(

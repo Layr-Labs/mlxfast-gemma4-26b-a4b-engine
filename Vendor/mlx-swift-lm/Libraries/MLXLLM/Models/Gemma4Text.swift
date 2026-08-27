@@ -26,6 +26,116 @@ private let gemma4CompiledDecodeSupported: Bool = {
     return true
 }()
 
+/// One threadgroup per B=8 decode row, matching MLX's `rms_single_row`
+/// reduction exactly while absorbing the MoE branch sum, residual add, and
+/// layer scalar. The scored Gemma shape is deliberately the only default-on
+/// specialization: `[8, 1, 2816]`, BF16, four values per thread, 704 threads
+/// per row.
+private let gemma4FusedMoEResidualTailEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_FUSED_MOE_RESIDUAL_TAIL"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+private let gemma4FusedMoEResidualTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "gemma4_b8_bf16_fused_moe_residual_tail_h2816_v1",
+    inputNames: ["lhs", "rhs", "residual", "weight", "layer_scalar"],
+    outputNames: ["out"],
+    source: """
+        constexpr uint N_READS = 4;
+        constexpr uint SIMD_SIZE = 32;
+
+        const uint row = threadgroup_position_in_grid.y;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint simd_group = simdgroup_index_in_threadgroup;
+        const uint column = lid * N_READS;
+        const size_t row_base = size_t(row) * HIDDEN_SIZE;
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[SIMD_SIZE];
+
+        float acc = 0.0f;
+        for (uint i = 0; i < N_READS; ++i) {
+            const uint c = column + i;
+            if (c < HIDDEN_SIZE) {
+                // Reproduce the separate BF16 MoE branch add before RMSNorm.
+                const T xi = T(lhs[row_base + c] + rhs[row_base + c]);
+                const float xf = float(xi);
+                acc += xf * xf;
+            }
+        }
+        acc = simd_sum(acc);
+
+        if (simd_group == 0) {
+            local_sums[lane] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) {
+            local_sums[simd_group] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[lane]);
+            if (lane == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(
+                    acc / float(HIDDEN_SIZE) + 1.0e-6f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = 0; i < N_READS; ++i) {
+            const uint c = column + i;
+            if (c < HIDDEN_SIZE) {
+                const T xi = T(lhs[row_base + c] + rhs[row_base + c]);
+                // Preserve all three BF16 rounding points from the established
+                // graph: branch add, RMSNorm, residual add, then layer scalar.
+                const T normalized = weight[c]
+                    * static_cast<T>(float(xi) * local_inv_mean[0]);
+                const T summed = T(residual[row_base + c] + normalized);
+                out[row_base + c] = T(summed * layer_scalar[0]);
+            }
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+/// `(residual + rmsNorm(lhs + rhs)) * layerScalar`, preserving the three
+/// intermediate BF16 roundings while replacing four dispatches with one.
+@inline(__always)
+internal func gemma4FusedMoEResidualTail(
+    _ lhs: MLXArray,
+    _ rhs: MLXArray,
+    residual: MLXArray,
+    weight: MLXArray,
+    eps: Float,
+    layerScalar: MLXArray
+) -> MLXArray? {
+    guard gemma4FusedMoEResidualTailEnabled,
+        eps == 1.0e-6,
+        weight.dtype == .bfloat16,
+        weight.shape == [2816],
+        lhs.dtype == .bfloat16,
+        lhs.shape == [8, 1, 2816],
+        rhs.dtype == .bfloat16,
+        rhs.shape == lhs.shape,
+        residual.dtype == .bfloat16,
+        residual.shape == lhs.shape,
+        layerScalar.dtype == .bfloat16,
+        layerScalar.shape == [1]
+    else { return nil }
+    return gemma4FusedMoEResidualTailKernel(
+        [lhs, rhs, residual, weight, layerScalar],
+        template: [("T", lhs.dtype), ("HIDDEN_SIZE", 2816)],
+        grid: (704, 8, 1),
+        threadGroup: (704, 1, 1),
+        outputShapes: [lhs.shape],
+        outputDTypes: [lhs.dtype]
+    )[0]
+}
+
 // MARK: - CBv2 prompt-path knobs (prefill only; decode never reads these)
 
 @inline(__always)
@@ -1440,6 +1550,7 @@ public class Gemma4DecoderLayer: Module {
         var out = residual + postAttn
 
         let residual2 = out
+        var fusedMoEResidualTail = false
 
         if isMoE,
             let router,
@@ -1462,14 +1573,29 @@ public class Gemma4DecoderLayer: Module {
                 isExpertPrefill: isExpertPrefill)
             h2 = postFeedforwardLayernorm2(h2)
 
-            out = h1 + h2
+            if hiddenSizePerLayerInput == 0,
+                let fused = gemma4FusedMoEResidualTail(
+                    h1,
+                    h2,
+                    residual: residual2,
+                    weight: postFeedforwardLayernorm.weight,
+                    eps: postFeedforwardLayernorm.eps,
+                    layerScalar: layerScalar)
+            {
+                out = fused
+                fusedMoEResidualTail = true
+            } else {
+                out = h1 + h2
+            }
         } else {
             out = preFeedforwardLayernorm(out)
             out = mlp(out)
         }
 
-        out = postFeedforwardLayernorm(out)
-        out = residual2 + out
+        if !fusedMoEResidualTail {
+            out = postFeedforwardLayernorm(out)
+            out = residual2 + out
+        }
 
         // PLE gating
         if let gate = perLayerInputGate,
@@ -1486,7 +1612,9 @@ public class Gemma4DecoderLayer: Module {
             out = residual3 + g
         }
 
-        out = out * layerScalar
+        if !fusedMoEResidualTail {
+            out = out * layerScalar
+        }
 
         return (out, kvPair, attnPositionOffset)
     }

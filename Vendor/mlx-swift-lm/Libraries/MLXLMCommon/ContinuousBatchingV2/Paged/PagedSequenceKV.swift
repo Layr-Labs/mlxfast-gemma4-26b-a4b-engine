@@ -1,35 +1,4 @@
-// PagedSequenceKV.swift
-//
-// Per-sequence, per-layer KV state for the paged backend (WS-C).
-//
-// A `PagedSequenceKV` owns a page TABLE (`[Int32]` physical page ids into
-// its group's slabs) plus its absolute position counter. There is no shared
-// frontier: joining a batch adds an object, leaving drops it, and nothing a
-// batchmate does can move this sequence's positions or evict its pages.
-//
-// Windowed layers use a RING of pages: token at absolute position `p` lives
-// in table slot `(p / pageSize) % ringPages`, slot `p % pageSize`. That is a
-// bijection onto `p % (ringPages * pageSize)`, i.e. the ring is a flat
-// circular buffer of `ringPages * pageSize` TOKEN slots that happens to be
-// paged. Eviction is therefore implicit overwrite keyed to absolute
-// positions — the recent end always survives and no window masks over
-// shared buffers exist. How far back that end reaches is
-// `oldestValidPosition`, measured from the highest position ever WRITTEN
-// rather than from the cursor: a rollback retreats the cursor, it does not
-// un-write a slot.
-//
-// The ring is sized (`PagedKVPool.ringPageCount`) to cover the trailing
-// window plus one speculative span (`CBv2PagedSpeculation
-// .maxSpeculativeSpan`), so an MTP round overwrites only already-evicted
-// slots. It does NOT carry a prefill-chunk term, and that is a PROPERTY OF
-// THIS FILE, not a free choice made in the pool: both routes into the ring
-// gather a chunk's window history BEFORE writing the chunk and concatenate
-// the chunk tensor the caller already holds, so the widest range this row is
-// ever asked for is `window - 1`. The serving route is
-// `PagedLayerCache.prefillKV` calling `write` / `gatherRange` directly; the
-// protocol route is this file's `update` (see there for who calls it). `maxWindowExposure` is where that promise is
-// written down, and `PagedKVPool.ringPageCount` reads it — widen the
-// exposure and the ring grows with it or the pool refuses to build.
+// PagedSequenceKV.swift — per-sequence paged KV (not on the ranked contiguous path).
 
 import Foundation
 import MLX

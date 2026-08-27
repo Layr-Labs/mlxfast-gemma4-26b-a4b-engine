@@ -1,43 +1,6 @@
-// PagedLayerCache.swift
+// PagedLayerCache.swift — paged CBv2AttendingLayerCache (not on ranked contiguous KV).
 //
-// Batch-facing per-layer cache for the paged backend (WS-C): the
-// `CBv2AttendingLayerCache` that owns BOTH the KV update and the attention
-// dispatch, so models and the scheduler never see the storage layout.
-//
-// Attention paths (numerically pinned — one path per phase, never switching
-// mask representation across steps):
-//   - decode (`L == 1`, any B, including B == 1): the paged Metal kernel.
-//     Per-row window clamping is start-offset arithmetic on absolute
-//     positions computed host-side from Swift Ints; masks do not exist.
-//   - prefill chunk (`B == 1`, `L > 1`): per-request SDPA over gathered
-//     pages with an explicit BOOL mask built from absolute positions
-//     (always `.array`, never `.none`/`.causal`, so the path cannot drift
-//     — see MLX #3384). Models with an attention-logit softcap use the
-//     composed reference path instead (SDPA cannot express softcap).
-//     The chunk is attended in QUERY BLOCKS (`CBv2AttentionV1.queryBlockSize`,
-//     shared kill switch `DARKBLOOM_CBV2_ATTN_QUERY_BLOCK`), which bounds the
-//     materialized score tensor at `[1, queryHeads, block, visible]` instead
-//     of `[1, queryHeads, chunk, retained]`. The mask representation is
-//     unchanged by blocking: every block still gets an absolute-position
-//     BOOL `.array`.
-//   - PACKED prefill (`B > 1`, `L > 1`, WS-2.1): the SAME per-request chunk
-//     path, run once per row and concatenated on the batch axis — the
-//     storage-agnostic rectangular loop `CBv2AttentionV1.updateAndAttend`
-//     already uses, ported to paged storage. Each row gathers its OWN pages
-//     and masks in its OWN absolute coordinates, so a packed row is
-//     BIT-IDENTICAL to that row run alone and cross-row contamination is
-//     impossible by construction rather than by mask arithmetic. Requires
-//     WS-0.2p's query blocking to already bound the per-row score tensor,
-//     which it does.
-//   - VISION span chunk (`B == 1`, `L > 1`, spans bound through
-//     `CBv2SpanMaskBinding`, WS-2.2): the same mask, OR-ed with a
-//     bidirectional-within-block overlay. Because this file's mask is
-//     ALREADY materialized in absolute coordinates, the overlay is two
-//     comparisons against the block bounds — no chunk-end coordinate
-//     reconstruction, and no escape from a symbolic mode. Span chunks stay
-//     UNBLOCKED: a block's visible span is causal, and a bidirectional query
-//     may attend keys AFTER its own position.
-//   - MTP rectangular verification (`CBv2MTPRectangularSerializing`, `L > 1`
+// Attention paths stay numerically pinned per phase. MTP rectangular verification (`CBv2MTPRectangularSerializing`, `L > 1`
 //     with `B` rows): the decode kernel again, one query COLUMN at a time,
 //     so each column is bit-identical to that column run as a standalone
 //     `L == 1` decode. No new kernel and no multi-query attention.

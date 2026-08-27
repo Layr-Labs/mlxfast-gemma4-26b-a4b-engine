@@ -282,6 +282,41 @@ enum CBv2AttentionV1 {
                 return concatenated(outputs, axis: 0)
             }
 
+            if canUseRaggedTwoPassFullDecode(
+                batch: B, cacheKind: kind, queryKind: kind,
+                scale: scale, sinks: effectiveSinks, softcap: softcap)
+            {
+                var cachedKeyRows: [MLXArray] = []
+                var cachedValueRows: [MLXArray] = []
+                cachedKeyRows.reserveCapacity(B)
+                cachedValueRows.reserveCapacity(B)
+                for (index, row) in rows.enumerated() {
+                    let (cachedKeys, cachedValues) = row.update(
+                        keys: keys[index ..< (index + 1)],
+                        values: values[index ..< (index + 1)])
+                    cachedKeyRows.append(cachedKeys)
+                    cachedValueRows.append(cachedValues)
+                }
+                if let output = CBv2RaggedTwoPassFullDecodeAttentionV1.attend(
+                    queries: queries, keys: cachedKeyRows, values: cachedValueRows,
+                    scale: scale)
+                {
+                    return output
+                }
+
+                var outputs: [MLXArray] = []
+                outputs.reserveCapacity(B)
+                for index in 0 ..< B {
+                    outputs.append(
+                        attend(
+                            queries: queries[index ..< (index + 1)],
+                            keys: cachedKeyRows[index], values: cachedValueRows[index],
+                            scale: scale, L: 1, kL: cachedKeyRows[index].dim(2),
+                            window: nil, sinks: effectiveSinks, softcap: softcap))
+                }
+                return concatenated(outputs, axis: 0)
+            }
+
             // Batched decode: split queries per row, per-row update + SDPA
             // against that row's own KV, then concatenate. No masks — each row
             // sees exactly its own KV, so batch-composition invariance holds by
@@ -708,6 +743,39 @@ enum CBv2AttentionV1 {
             return concatenated(outputs, axis: 0)
         }
 
+        if canUseRaggedTwoPassFullDecode(
+            batch: B, cacheKind: sourceKind, queryKind: kind,
+            scale: scale, sinks: effectiveSinks, softcap: softcap)
+        {
+            var cachedKeyRows: [MLXArray] = []
+            var cachedValueRows: [MLXArray] = []
+            cachedKeyRows.reserveCapacity(B)
+            cachedValueRows.reserveCapacity(B)
+            for row in sourceRows {
+                let (cachedKeys, cachedValues, _) = row.snapshot()
+                cachedKeyRows.append(cachedKeys)
+                cachedValueRows.append(cachedValues)
+            }
+            if let output = CBv2RaggedTwoPassFullDecodeAttentionV1.attend(
+                queries: queries, keys: cachedKeyRows, values: cachedValueRows,
+                scale: scale)
+            {
+                return output
+            }
+
+            var outputs: [MLXArray] = []
+            outputs.reserveCapacity(B)
+            for index in 0 ..< B {
+                outputs.append(
+                    attend(
+                        queries: queries[index ..< (index + 1)],
+                        keys: cachedKeyRows[index], values: cachedValueRows[index],
+                        scale: scale, L: 1, kL: cachedKeyRows[index].dim(2), window: nil,
+                        sinks: effectiveSinks, softcap: softcap))
+            }
+            return concatenated(outputs, axis: 0)
+        }
+
         var outputs: [MLXArray] = []
         outputs.reserveCapacity(B)
         for (index, row) in sourceRows.enumerated() {
@@ -801,6 +869,29 @@ enum CBv2AttentionV1 {
             return false
         }
         return window == 1024
+    }
+
+    @inline(__always)
+    private static func canUseRaggedTwoPassFullDecode(
+        batch: Int, cacheKind: CBv2LayerKind, queryKind: CBv2LayerKind,
+        scale: Float, sinks: MLXArray?, softcap: Float?
+    ) -> Bool {
+        guard batch == 8,
+            scale == 1.0,
+            sinks == nil,
+            softcap == nil,
+            !cacheKind.isBidirectional,
+            !queryKind.isBidirectional,
+            cacheKind.kvHeads == 2,
+            cacheKind.headDim == 512,
+            queryKind.queryHeads == 16,
+            queryKind.headDim == 512
+        else { return false }
+
+        guard case .full = cacheKind.attention, case .full = queryKind.attention else {
+            return false
+        }
+        return true
     }
 
     private static func window(of kind: CBv2LayerKind) -> Int? {

@@ -32,11 +32,16 @@
 # file and the runner side, and a mismatch strands a dispatch with no runner
 # rather than failing it.
 #
-# ONE RUN ON THE BOX AT A TIME. The ranked job takes a dedicated concurrency
-# group with cancel-in-progress: false, so a second dispatch QUEUES behind the
-# in-flight measurement instead of cancelling it mid-flight. Cancelling a timed
-# run mid-window destroys the measurement and leaves the GPU hot for the next
-# one.
+# ONE RUN PER BOX, ANY NUMBER OF BOXES. The ranked job declares NO concurrency
+# group. Each ranked box runs exactly one actions-runner process, and a runner
+# executes one job at a time, so a box never hosts two measurements at once.
+# With several boxes registered under the track label, queued dispatches go to
+# whichever box is free instead of waiting for the whole track. Nothing here
+# can cancel an in-flight measurement: cancellation is a property of a
+# concurrency group, and there is none. (Until 2026-08-27 the job took the
+# group `gemma4-26b-a4b-mlx-v1-ranked-box`. With one box that was the same
+# invariant; with a second box it capped the fleet at one measurement at a
+# time, which is why it was removed.)
 #
 # FAIL-CLOSED INVENTORY -- each of these aborts before a score.json can exist,
 # and none of them has a degraded path:
@@ -208,12 +213,7 @@ jobs:
     # by the fetch, the build and the measurement, not by gating. 240 min is the
     # pathological ceiling this cap must not be BELOW, not the expected cost.
     timeout-minutes: 360
-    concurrency:
-      # Dedicated to this box. Distinct from ci.yml's `ci-<ref>` group, and
-      # .github/workflows/qwen38-mtp-ranked-benchmark.yml declares no group at
-      # all, so nothing else can serialize against or evict this one.
-      group: gemma4-26b-a4b-mlx-v1-ranked-box
-      cancel-in-progress: false
+    # No concurrency group on purpose: see ONE RUN PER BOX in the header.
     env:
       # --- Host contract: the GPU temperature reader ----------------------
       # The challenger's job-env pin, same NAME, ported from

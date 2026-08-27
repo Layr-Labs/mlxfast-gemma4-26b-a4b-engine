@@ -6,6 +6,7 @@
 
 import Foundation
 import MLX
+import MLXFast
 import MLXLMCommon
 import MLXNN
 
@@ -234,6 +235,71 @@ private let gemma4CompiledLogitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArr
     }
     return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
+
+private let gemma4FusedSoftcapArgmaxEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "MLX_GEMMA4_FUSED_SOFTCAP_ARGMAX"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+private let gemma4FusedSoftcapArgmaxKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "gemma4_b8_bf16_softcap30_argmax_v1",
+    inputNames: ["raw_logits"], outputNames: ["tokens"],
+    source: """
+        constexpr uint simd_width = 32;
+        constexpr uint reads_per_thread = 4;
+        const uint tid = uint(thread_position_in_threadgroup.x);
+        const uint lane = uint(thread_index_in_simdgroup);
+        const uint sg = uint(simdgroup_index_in_threadgroup);
+        const uint row = uint(threadgroup_position_in_grid.y);
+        float best_value = -3.402823466e+38F;
+        uint best_index = 0;
+        for (uint base = tid * reads_per_thread; base < uint(V);
+             base += uint(threads_per_threadgroup.x) * reads_per_thread) {
+            for (uint r = 0; r < reads_per_thread; ++r) {
+                const uint index = base + r;
+                if (index >= uint(V)) break;
+                const float raw = float(raw_logits[row * uint(V) + index]);
+                const float capped = metal::precise::tanh(raw / 30.0f) * 30.0f;
+                if (capped > best_value) { best_value = capped; best_index = index; }
+            }
+        }
+        for (uint offset = 16; offset > 0; offset /= 2) {
+            const float nv = simd_shuffle_down(best_value, offset);
+            const uint ni = simd_shuffle_down(best_index, offset);
+            if (best_value < nv || (best_value == nv && best_index > ni)) {
+                best_value = nv; best_index = ni;
+            }
+        }
+        threadgroup float values[32];
+        threadgroup uint indices[32];
+        if (lane == 0) { values[sg] = best_value; indices[sg] = best_index; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg != 0) return;
+        best_value = values[lane]; best_index = indices[lane];
+        for (uint offset = 16; offset > 0; offset /= 2) {
+            const float nv = simd_shuffle_down(best_value, offset);
+            const uint ni = simd_shuffle_down(best_index, offset);
+            if (best_value < nv || (best_value == nv && best_index > ni)) {
+                best_value = nv; best_index = ni;
+            }
+        }
+        if (tid == 0) tokens[row] = int(best_index);
+    """,
+    ensureRowContiguous: true)
+
+func gemma4FusedSoftcapArgmax(_ rawLogits: MLXArray) -> MLXArray? {
+    let batch = 8, vocabulary = 262_144
+    guard gemma4FusedSoftcapArgmaxEnabled,
+        rawLogits.dtype == .bfloat16,
+        rawLogits.shape == [batch, vocabulary]
+    else { return nil }
+    return gemma4FusedSoftcapArgmaxKernel(
+        [rawLogits], template: [("T", rawLogits.dtype), ("V", vocabulary)],
+        grid: (1024, batch, 1), threadGroup: (1024, 1, 1),
+        outputShapes: [[batch]], outputDTypes: [.int32])[0]
+}
 
 // MARK: - Configuration
 
@@ -2586,6 +2652,24 @@ extension Gemma4TextModel {
 }
 
 // MARK: - ContinuousBatchingV2 prompt-only output narrowing
+
+extension Gemma4TextModel: CBv2LanguageModelDirectGreedyForwardable {
+    public var cbv2SupportsDirectGreedyTokens: Bool {
+        gemma4FusedSoftcapArgmaxEnabled
+            && config.hiddenSize == 2816 && config.vocabSize == 262_144
+            && config.tieWordEmbeddings && config.finalLogitSoftcapping == 30
+    }
+
+    public func cbv2DirectGreedyTokens(
+        _ inputs: MLXArray, cache: [KVCache]?
+    ) -> MLXArray {
+        let hidden = model(inputs, cache: cache)
+        let raw = applyRawLMHead(hidden[0..., -1, 0...])
+        if let tokens = gemma4FusedSoftcapArgmax(raw) { return tokens }
+        let cap = MLXArray(config.finalLogitSoftcapping)
+        return argMax(gemma4CompiledLogitSoftcap(raw, cap), axis: -1).asType(.int32)
+    }
+}
 
 /// CBv2 consumes only the final prompt position, so the public
 /// `LanguageModel` forward contract stays unchanged while the engine's

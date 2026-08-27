@@ -14,6 +14,16 @@
 import Foundation
 import MLX
 
+public protocol CBv2LanguageModelDirectGreedyForwardable: AnyObject {
+    var cbv2SupportsDirectGreedyTokens: Bool { get }
+    func cbv2DirectGreedyTokens(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray
+}
+
+public protocol CBv2DirectGreedySteppableModel: CBv2SteppableModel {
+    var supportsDirectGreedyTokens: Bool { get }
+    func directGreedyTokens(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray
+}
+
 /// `CBv2SteppableModel` over any `LanguageModel` whose forward path
 /// understands `CBv2AttendingLayerCache` (Gemma 4, GPT-OSS, test fixtures).
 public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
@@ -37,6 +47,22 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
             }
             return kv
         }
+    }
+}
+
+extension CBv2SteppableLanguageModelAdapter: CBv2DirectGreedySteppableModel {
+    public var supportsDirectGreedyTokens: Bool {
+        (model as? CBv2LanguageModelDirectGreedyForwardable)?
+            .cbv2SupportsDirectGreedyTokens ?? false
+    }
+
+    public func directGreedyTokens(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> MLXArray {
+        guard let direct = model as? CBv2LanguageModelDirectGreedyForwardable,
+            direct.cbv2SupportsDirectGreedyTokens
+        else { preconditionFailure("direct greedy model gating failed") }
+        return direct.cbv2DirectGreedyTokens(tokens, cache: asKVCaches(caches))
     }
 }
 

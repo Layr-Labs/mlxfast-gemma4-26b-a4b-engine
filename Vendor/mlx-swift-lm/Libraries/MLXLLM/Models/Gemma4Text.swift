@@ -1111,11 +1111,12 @@ private class Gemma4Attention: Module {
             preconditionFailure("Gemma4 non-shared layers require K/V projection modules")
         }
 
-        // Snapshot the per-row absolute offsets BEFORE updateAndAttend
-        // advances the rows (`+ 0` = graph-safe copy, same convention as
-        // gemma4CapturePositionOffset). KV-shared consumers of this layer
-        // reuse this exact snapshot via the returned PositionOffset.
-        let capturedOffsets = layerCache.positionOffsets + 0
+        // Capture the current per-row absolute offsets BEFORE updateAndAttend
+        // advances the rows. The CBv2 cache contract advances by rebinding
+        // its stored MLXArray, so this handle remains the pre-update value
+        // without an otherwise redundant device-side `+ 0`. KV-shared
+        // consumers reuse this exact capture via the returned PositionOffset.
+        let capturedOffsets = layerCache.positionOffsets
         let captured = Gemma4.PositionOffset.batch(capturedOffsets)
 
         // The frontier query sits `outputStart` positions past the chunk's

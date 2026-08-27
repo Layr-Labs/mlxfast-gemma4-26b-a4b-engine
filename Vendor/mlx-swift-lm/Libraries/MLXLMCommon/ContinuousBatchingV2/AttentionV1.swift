@@ -223,6 +223,44 @@ enum CBv2AttentionV1 {
         }
 
         if L == 1 {
+            if canUseRaggedTwoPassDecode(
+                batch: B, cacheKind: kind, queryKind: kind,
+                scale: scale, sinks: effectiveSinks, softcap: softcap)
+            {
+                var cachedKeyRows: [MLXArray] = []
+                var cachedValueRows: [MLXArray] = []
+                cachedKeyRows.reserveCapacity(B)
+                cachedValueRows.reserveCapacity(B)
+                for (index, row) in rows.enumerated() {
+                    let (cachedKeys, cachedValues) = row.update(
+                        keys: keys[index ..< (index + 1)],
+                        values: values[index ..< (index + 1)])
+                    cachedKeyRows.append(cachedKeys)
+                    cachedValueRows.append(cachedValues)
+                }
+                if let output = CBv2RaggedTwoPassDecodeAttentionV1.attend(
+                    queries: queries, keys: cachedKeyRows, values: cachedValueRows,
+                    scale: scale)
+                {
+                    return output
+                }
+
+                // Before every row's sliding ring reaches 1024 entries, retain
+                // the established row-local SDPA path over the views just
+                // returned by the updates above.
+                var outputs: [MLXArray] = []
+                outputs.reserveCapacity(B)
+                for index in 0 ..< B {
+                    outputs.append(
+                        attend(
+                            queries: queries[index ..< (index + 1)],
+                            keys: cachedKeyRows[index], values: cachedValueRows[index],
+                            scale: scale, L: 1, kL: cachedKeyRows[index].dim(2),
+                            window: nil, sinks: effectiveSinks, softcap: softcap))
+                }
+                return concatenated(outputs, axis: 0)
+            }
+
             // Batched decode: split queries per row, per-row update + SDPA
             // against that row's own KV, then concatenate. No masks — each row
             // sees exactly its own KV, so batch-composition invariance holds by
@@ -478,6 +516,45 @@ enum CBv2AttentionV1 {
             return concatenated(outputs, axis: 0)
         }
 
+        if canUseRaggedTwoPassDecode(
+            batch: B, cacheKind: sourceKind, queryKind: kind,
+            scale: scale, sinks: effectiveSinks, softcap: softcap)
+        {
+            var cachedKeyRows: [MLXArray] = []
+            var cachedValueRows: [MLXArray] = []
+            cachedKeyRows.reserveCapacity(B)
+            cachedValueRows.reserveCapacity(B)
+            for row in sourceRows {
+                let cachedKeys: MLXArray
+                let cachedValues: MLXArray
+                if let windowed = row as? CBv2WindowedSequenceKV {
+                    (cachedKeys, cachedValues) = windowed.decodeBorrowableViews()
+                } else {
+                    (cachedKeys, cachedValues, _) = row.snapshot()
+                }
+                cachedKeyRows.append(cachedKeys)
+                cachedValueRows.append(cachedValues)
+            }
+            if let output = CBv2RaggedTwoPassDecodeAttentionV1.attend(
+                queries: queries, keys: cachedKeyRows, values: cachedValueRows,
+                scale: scale)
+            {
+                return output
+            }
+
+            var outputs: [MLXArray] = []
+            outputs.reserveCapacity(B)
+            for index in 0 ..< B {
+                outputs.append(
+                    attend(
+                        queries: queries[index ..< (index + 1)],
+                        keys: cachedKeyRows[index], values: cachedValueRows[index],
+                        scale: scale, L: 1, kL: cachedKeyRows[index].dim(2), window: nil,
+                        sinks: effectiveSinks, softcap: softcap))
+            }
+            return concatenated(outputs, axis: 0)
+        }
+
         var outputs: [MLXArray] = []
         outputs.reserveCapacity(B)
         for (index, row) in sourceRows.enumerated() {
@@ -545,6 +622,33 @@ enum CBv2AttentionV1 {
     }
 
     // MARK: - Private
+
+    /// The only shape for which the custom batch-wide dispatch is a literal
+    /// transcription of the row-local MLX two-pass kernels. All other models,
+    /// phases, masks, sequence lengths, and dtypes fail closed in the custom
+    /// helper and retain the established dispatch below.
+    @inline(__always)
+    private static func canUseRaggedTwoPassDecode(
+        batch: Int, cacheKind: CBv2LayerKind, queryKind: CBv2LayerKind,
+        scale: Float, sinks: MLXArray?, softcap: Float?
+    ) -> Bool {
+        guard batch == 8,
+            scale == 1.0,
+            sinks == nil,
+            softcap == nil,
+            !cacheKind.isBidirectional,
+            !queryKind.isBidirectional,
+            cacheKind.kvHeads == 8,
+            cacheKind.headDim == 256,
+            queryKind.queryHeads == 16,
+            queryKind.headDim == 256
+        else { return false }
+
+        guard case .slidingWindow(let window) = cacheKind.attention else {
+            return false
+        }
+        return window == 1024
+    }
 
     private static func window(of kind: CBv2LayerKind) -> Int? {
         switch kind.attention {

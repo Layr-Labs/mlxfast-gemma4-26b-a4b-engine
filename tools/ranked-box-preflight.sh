@@ -80,7 +80,7 @@ ok "no R2 credential, signer, or dist token in the job environment"
 #
 #   BENCHCTL                          tools/gemma4-measure-and-score.sh honours a
 #                                     caller-supplied benchctl WITHOUT the
-#                                     benchd.pin hash check (deliberate, for
+#                                     channel-manifest hash check (deliberate, for
 #                                     benchd development) -- so on a ranked run
 #                                     it is a way to measure against unpinned
 #                                     scoring code.

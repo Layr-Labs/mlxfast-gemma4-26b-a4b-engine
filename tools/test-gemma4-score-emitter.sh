@@ -9,7 +9,7 @@
 # That invented fixture is why the emitter's object/number bug survived a green
 # test suite and only surfaced by killing a finished ranked round. The composite
 # blocks below are copied from sealed results.json files produced by the pinned
-# benchd (./benchd.pin sha256 e044e1f4...) on the ranked box, values and all.
+# benchd (the then-served build, sha256 e044e1f4...) on the ranked box, values and all.
 #
 # Usage: tools/test-gemma4-score-emitter.sh
 # Exit:  0 all cases pass, 1 a case failed (printed with a FAIL prefix)

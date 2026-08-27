@@ -483,7 +483,7 @@ done
 
 # Pinned measurement harness: an editable entry that reaches what decides which
 # scorer runs is refused by construction. benchd used to be a SOURCE submodule
-# (`benchd` + `.gitmodules`); it is now a pinned PREBUILT (`benchd.pin` ->
+# (`benchd` + `.gitmodules`); it is now a channel PREBUILT (the retired `benchd.pin` spelling ->
 # `benchd-bin/`). BOTH generations are exercised: the live pin paths because they
 # carry the property today, and the retired submodule spellings because all three
 # guard layers deliberately still carry them so a reintroduced gitlink is covered
@@ -503,7 +503,7 @@ PY
   printf 'attacker daemon\n' > "${fx}/sub/benchd/crates/PIN"
   printf '[submodule "benchd"]\n\tpath = elsewhere\n' > "${fx}/sub/.gitmodules"
   assert_exit "overlay/gitlink entry '${gitlink}' refused" 1 \
-    "pinned measurement harness" "${fx}/trusted" \
+    "measurement-harness surface" "${fx}/trusted" \
     env SUBMISSION_WORKTREE="${fx}/sub" "${SCRIPTS}/overlay-editable-paths.sh"
 done
 
@@ -567,7 +567,7 @@ PY
   printf 'attacker daemon\n' > "${fx}/sub/BENCHD/crates/PIN"
   printf '[submodule "benchd"]\n\tpath = elsewhere\n' > "${fx}/sub/.GITMODULES"
   assert_exit "overlay/case-folded gitlink entry '${gitlink_variant}' refused" 1 \
-    "pinned measurement harness" "${fx}/trusted" \
+    "measurement-harness surface" "${fx}/trusted" \
     env SUBMISSION_WORKTREE="${fx}/sub" "${SCRIPTS}/overlay-editable-paths.sh"
   assert_equal "overlay/case-folded gitlink '${gitlink_variant}' left benchd intact" \
     "$(cat "${fx}/trusted/benchd/PIN")" "pinned measurement daemon"
@@ -1034,7 +1034,7 @@ git -C "${gdir}" add -A
 git -C "${gdir}" -c user.name=t -c user.email=t@e commit -q -m repoint-scorer
 head_sha="$(git -C "${gdir}" rev-parse HEAD)"
 assert_exit "surface-gate/gitlink write refused even when the base contract lists it" 1 \
-  "reaches the pinned measurement harness" "${gdir}" \
+  "reaches the measurement-harness surface" "${gdir}" \
   env BASE_SHA="${base}" HEAD_SHA="${head_sha}" CONTRACT_PATH=benchmark.json \
   "${SCRIPTS}/enforce-modifiable-surface.sh"
 
@@ -1052,7 +1052,7 @@ for live_pin in benchd.pin benchd-bin/benchctl; do
   git -C "${gdir}" -c user.name=t -c user.email=t@e commit -q -m repoint-pinned-harness
   head_sha="$(git -C "${gdir}" rev-parse HEAD)"
   assert_exit "surface-gate/${live_pin} write refused even when the base contract lists it" 1 \
-    "reaches the pinned measurement harness" "${gdir}" \
+    "reaches the measurement-harness surface" "${gdir}" \
     env BASE_SHA="${base}" HEAD_SHA="${head_sha}" CONTRACT_PATH=benchmark.json \
     "${SCRIPTS}/enforce-modifiable-surface.sh"
 done
@@ -1067,7 +1067,7 @@ git -C "${gdir}" update-index --add --cacheinfo "100644,${case_blob},BENCHD/PIN"
 git -C "${gdir}" -c user.name=t -c user.email=t@e commit -q -m repoint-scorer-case-variant
 head_sha="$(git -C "${gdir}" rev-parse HEAD)"
 assert_exit "surface-gate/case-folded gitlink write refused" 1 \
-  "reaches the pinned measurement harness" "${gdir}" \
+  "reaches the measurement-harness surface" "${gdir}" \
   env BASE_SHA="${base}" HEAD_SHA="${head_sha}" CONTRACT_PATH=benchmark.json \
   "${SCRIPTS}/enforce-modifiable-surface.sh"
 
@@ -1078,7 +1078,7 @@ git -C "${gdir}" add -A
 git -C "${gdir}" -c user.name=t -c user.email=t@e commit -q -m repoint-pointer
 head_sha="$(git -C "${gdir}" rev-parse HEAD)"
 assert_exit "surface-gate/.gitmodules write refused even when the base contract lists it" 1 \
-  "reaches the pinned measurement harness" "${gdir}" \
+  "reaches the measurement-harness surface" "${gdir}" \
   env BASE_SHA="${base}" HEAD_SHA="${head_sha}" CONTRACT_PATH=benchmark.json \
   "${SCRIPTS}/enforce-modifiable-surface.sh"
 
@@ -1122,7 +1122,7 @@ if fs_folds_longs; then
   git -C "${gdir}" -c user.name=t -c user.email=t@e commit -q -m repoint-pointer-longs
   head_sha="$(git -C "${gdir}" rev-parse HEAD)"
   assert_exit "surface-gate/non-ASCII long-s .gitmoduleſ write refused (device:inode, raw bytes)" 1 \
-    "reaches the pinned measurement harness" "${gdir}" \
+    "reaches the measurement-harness surface" "${gdir}" \
     env BASE_SHA="${base}" HEAD_SHA="${head_sha}" CONTRACT_PATH=benchmark.json \
     "${SCRIPTS}/enforce-modifiable-surface.sh"
 else

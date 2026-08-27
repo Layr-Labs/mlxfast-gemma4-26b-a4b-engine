@@ -194,7 +194,7 @@ authority.
 | Editable paths, commands, scoring values | `benchmark.json` |
 | Pins, the timed pool, scoring semantics | `fixtures/gemma4_26b_a4b_track.json` |
 | Why the manifest says what it says | `docs/participant-contract.md` |
-| What a measured run executes | the pinned benchmarker (`benchd.pin`) |
+| What a measured run executes | the channel benchmarker (`tools/fetch-benchd.sh`, verified against the dist `benchctl.manifest.json`) |
 
 Where this document and the contract fixture disagree, the fixture wins. Where
 either disagrees with the benchmarker about measurement, the benchmarker wins.

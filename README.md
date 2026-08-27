@@ -54,7 +54,8 @@ tested against.
 - Git.
 
 You do not need Rust. The benchmarker arrives as a prebuilt binary.
-`./tools/fetch-benchd.sh` verifies that binary against `benchd.pin`.
+`./tools/fetch-benchd.sh` resolves it from the bench branch's release channel and
+verifies it against the channel's `benchctl.manifest.json`.
 
 ## Quickstart
 
@@ -76,8 +77,9 @@ This command makes the repository your working directory.
 ./tools/fetch-benchd.sh
 ```
 
-This command resolves the pinned benchmarker binary into `benchd-bin/` and
-verifies its sha256 and its byte count against `benchd.pin`.
+This command resolves the benchmarker binary from the release channel into
+`benchd-bin/` and verifies its sha256 and its byte count against the channel's
+`benchctl.manifest.json` (installed beside the binary).
 
 ```bash
 ./setup.sh
@@ -149,7 +151,6 @@ This command runs the local test against the checked-in public golden.
 | `Vendor/mlx-swift-lm/` | The pinned model fork. The `Gemma4*` model files, the batching engine, and the listed `MLXLMCommon` files are editable. | Mixed |
 | `fixtures/` | The track contract and the pinned checkpoint manifests. | Trusted |
 | `tools/` | Setup, build, lint, and measurement scripts. | Trusted |
-| `benchd.pin` | The pin for the benchmarker binary. It names a branch, a commit, a sha256, and a byte count. | Trusted |
 | `benchd-bin/` | Where `./tools/fetch-benchd.sh` installs the verified binary. Git ignores it. | Fetched |
 | `mtp-head/` | The slot for your own MTP head. | Editable, optional |
 | `dflash-head/` | The slot for your own DFlash drafter. | Editable, optional |
@@ -333,7 +334,7 @@ token.
 - Everything in `Sources/` that `editablePaths` does not list.
 - `Package.swift` and `Package.resolved`. The dependency graph is frozen.
 - Everything in `Vendor/` that `editablePaths` does not list.
-- `fixtures/`, `benchd.pin`, `benchmark.json`, the scripts, the tests, and the
+- `fixtures/`, `benchmark.json`, the scripts, the tests, and the
   documents.
 - `weights/`, the reference checkpoints, the scores, and the goldens.
 
@@ -564,7 +565,7 @@ No local run blocks the upload. Run the local test yourself before you submit.
 | MTP head manifest | `fixtures/gemma4_assistant.sha256` (8 records) |
 | DFlash drafter | `z-lab/gemma-4-26B-A4B-it-DFlash` |
 | DFlash drafter manifest | `fixtures/gemma4_dflash_drafter.sha256` (2 records) |
-| Benchmarker | branch `gemma4-26b-a4b-mlx-v1`, commit `6dc978b7fd2e246859e965a9e9a470265698c693`, sha256 `e044e1f43f21a2efd6ae5ee7799c912c2723da600d6e0a3adca95e5629fde4f4`, 2528464 bytes (`benchd.pin` is the authority; `tools/fetch-benchd.sh` enforces the sha256) |
+| Benchmarker | branch `gemma4-26b-a4b-mlx-v1`, resolved at run time from the branch's dist channel (`benchctl.manifest.json` is the authority for the bytes; `tools/fetch-benchd.sh` enforces it and logs the resolved `source_commit`/sha256) |
 | Model fork revision | `ed55bee83beb0623152f4c2e70f0cf99ad379e35` |
 
 Both model repositories are public. They download without a token. There is no

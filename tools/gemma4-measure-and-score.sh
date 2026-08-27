@@ -25,7 +25,8 @@
 #
 # WHAT IS AND IS NOT REAL HERE.
 #   REAL: every measure-job flag below is copied from
-#     `benchctl measure-job --help` at the pinned benchd commit (./benchd.pin),
+#     `benchctl measure-job --help` at the channel's source_commit (see
+#     benchd-bin/benchctl.manifest.json after a fetch),
 #     not invented. The score-conversion step is a real, testable jq/shell
 #     transform (see tools/test-gemma4-score-emitter.sh).
 #   NOT YET RUNNABLE END TO END, and this script says so rather than hiding
@@ -72,15 +73,15 @@
 #
 #   THE PIN DOES NOT YET AGREE, AND THIS SCRIPT SAYS SO RATHER THAN HIDING IT.
 #   The benchd side of this ruling (PAIRS_PER_COHORT_TARGET 2 -> 4) must MERGE
-#   AND PUBLISH before benchd.pin can name a commit that compiles 4. Until that
-#   pin advance lands, the pinned benchd compiles
+#   AND PUBLISH on the dist channel before the served build compiles 4. Until
+#   that publish lands, the served benchd compiles
 #   `PAIRS_PER_COHORT_TARGET: usize = 2` and an official-shaped invocation
 #   declaring --target-pairs 4 IS REFUSED at the pin, by name, before any GPU
 #   work happens. That is the ruled-ahead-of-pin state the 8/24 ruling also
 #   passed through: the refusal is the conformance gate working, not a defect,
 #   and it fails LOUD and pre-measurement rather than silently scoring over the
-#   wrong sample count. The follow-up commit that advances benchd.pin to the
-#   published 4-pair benchmarker closes it.
+#   wrong sample count. The bench-side dist publish of the 4-pair benchmarker
+#   closes it (no engine-repo commit involved; the sha pin is retired).
 #
 #   --min-pairs moves with it (4, not 2), and the FLOOR IS ENFORCED AT THE PIN
 #   exactly like the target: benchd refuses an official batched cohort run whose
@@ -141,8 +142,9 @@
 #   MLXFAST_GEMMA4_MEASURE_OUT_DIR    measure-job --out directory.
 #                                     Default: ./benchmark-results-local
 #   BENCHCTL                         Path to the benchctl binary. Default: the
-#                                     binary ./tools/fetch-benchd.sh resolves and
-#                                     hash-verifies against ./benchd.pin
+#                                     binary ./tools/fetch-benchd.sh resolves from
+#                                     the dist channel and verifies against the
+#                                     channel's benchctl.manifest.json
 #                                     (benchd-bin/benchctl). No cargo build: the
 #                                     ranked box has no Rust toolchain, so benchd
 #                                     ships prebuilt and pinned by sha256.
@@ -163,10 +165,12 @@ for arg in "$@"; do
 done
 
 # Resolve the PINNED benchctl. This used to be a gitlink check plus a
-# cargo-built binary under benchd/target/release; benchd is now a pinned
-# PREBUILT (./benchd.pin + ./tools/fetch-benchd.sh) and there is no submodule and
-# no cargo step. fetch-benchd.sh accepts an already-present benchd-bin/benchctl
-# whose sha256 and bytes match the pin -- the offline path on the ranked box,
+# cargo-built binary under benchd/target/release; benchd is now a channel
+# PREBUILT (./tools/fetch-benchd.sh, verified against the channel's
+# benchctl.manifest.json; the sha pin is retired -- David ruling 2026-08-27,
+# so measurement fixes ship bench-side with no engine commit). fetch-benchd.sh
+# accepts an already-present benchd-bin/benchctl whose sha256 and bytes match
+# the manifest beside it -- the offline path on the ranked box,
 # which has no Rust toolchain -- and otherwise downloads and verifies it. It
 # never yields an unverified binary, so this refuses rather than measuring
 # against unpinned scoring code.
@@ -182,7 +186,7 @@ if [[ -z "${BENCHCTL:-}" ]]; then
 fi
 if [[ ! -x "${BENCHCTL}" ]]; then
   echo "gemma4-measure-and-score.sh: benchctl not found at ${BENCHCTL}." >&2
-  echo "  fetch it: ./tools/fetch-benchd.sh   (resolves ./benchd.pin, verifies sha256)" >&2
+  echo "  fetch it: ./tools/fetch-benchd.sh   (resolves the dist channel, verifies the manifest)" >&2
   echo "  or set BENCHCTL to an existing binary." >&2
   exit 1
 fi
@@ -224,8 +228,8 @@ mkdir -p "${OUT_DIR}"
 #
 # WHAT THIS DOES NOT DO. It selects; it does not ADMIT. Admission is the pinned
 # benchmarker's, against the fixture's `allowed_modes`, and it is checked
-# pre-GPU (die 8) whatever this script passes. Verified live against the pinned
-# binary (./benchd.pin -> 6dc978b7): a `dspark` spec refuses by name and cites
+# pre-GPU (die 8) whatever this script passes. Verified live against the then-
+# served binary (source_commit 6dc978b7): a `dspark` spec refuses by name and cites
 # the list `["serial", "mtp", "dflash"]` as having come from the --contract
 # fixture, while the dflash spec below clears that gate and proceeds exactly as
 # the mtp spec does. So a declaration this script does not recognize never

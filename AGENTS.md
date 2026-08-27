@@ -23,7 +23,7 @@ allows.
 | Pins, the timed pool, scoring semantics | `fixtures/gemma4_26b_a4b_track.json` |
 | Why the manifest says what it says | `docs/participant-contract.md` |
 | The engineering log for this port | `docs/gemma4-port-notes.md` |
-| What a measured run executes | the pinned benchmarker (`benchd.pin`) |
+| What a measured run executes | the channel benchmarker (`tools/fetch-benchd.sh`, verified against the dist `benchctl.manifest.json`) |
 
 `benchmark.json` and `fixtures/gemma4_26b_a4b_track.json` carry pure
 configuration. They hold values, paths, commands, and pins. They carry no prose.

@@ -223,7 +223,7 @@ worker processes, each starting only once the GPU is below the fixed 40C gate
 
 The telemetry cadence is **point samples, not a stream**. This paragraph read
 "under 100 ms macmon telemetry" until 2026-08-26; no benchmarker this track has
-ever pinned sampled at 100 ms. The pinned benchd (`benchd.pin`, sha256
+ever pinned sampled at 100 ms. The served benchd (resolved from the dist channel; at writing, sha256
 `e044e1f4...`) invokes `macmon pipe -s1` -- `-s` is macmon's *sample count*, not
 a rate, so that is exactly ONE sample per call at macmon's default 1000 ms
 interval -- and it calls it at gate and poll boundaries (its cool-gate poll is

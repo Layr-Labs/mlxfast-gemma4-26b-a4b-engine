@@ -3,10 +3,10 @@
 #
 # RELOCATED COPY. This file used to live at benchd/scripts/benchmark.sh inside the
 # benchd SOURCE submodule. The submodule is gone: benchd now ships as a pinned
-# PREBUILT benchctl (./benchd.pin + ./tools/fetch-benchd.sh), so there is no
+# PREBUILT benchctl (./tools/fetch-benchd.sh, channel-resolved), so there is no
 # benchd/ checkout for the facade to live in and it is vendored here instead.
 # Its UPSTREAM is mlxfast-bench scripts/benchmark.sh at the pinned commit
-# (benchd.pin `commit`); the body below is that file verbatim apart from the
+# (the dist manifest's `source_commit`); the body below is that file verbatim apart from the
 # BENCHCTL resolution near "Dispatch to benchctl", which now resolves the pinned
 # binary instead of trusting whatever `benchctl` is on PATH. Port changes from
 # upstream rather than diverging here — the reference-parity comments below cite
@@ -342,7 +342,7 @@ fi
 
 # DIVERGENCE FROM UPSTREAM (the one edit this relocated copy carries). Upstream
 # defaults to whatever `benchctl` is first on PATH; here the default is the
-# binary fetch-benchd.sh has verified against ./benchd.pin, so a bare run cannot
+# binary fetch-benchd.sh has verified against the channel manifest, so a bare run cannot
 # score itself with an unpinned harness. fetch-benchd.sh is a no-op when
 # benchd-bin/benchctl is already present and matching, so this costs one hash on
 # the warm path and works fully offline. An explicit BENCHCTL= override is still

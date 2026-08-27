@@ -13,7 +13,7 @@
 #     tools/ci-workflow-egress-scan.sh for exactly what it does and does not
 #     detect;
 #   - no submodule checkout: this repository has none since benchd became a
-#     pinned prebuilt (./benchd.pin). The setting is retained so a reintroduced
+#     channel prebuilt (tools/fetch-benchd.sh). The setting is retained so a reintroduced
 #     private submodule cannot pull a credential into this pipeline, which is
 #     required to hold none;
 #   - no model weights, no R2, no network fetch beyond the SwiftPM dependency

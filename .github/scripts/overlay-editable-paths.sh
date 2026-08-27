@@ -14,7 +14,7 @@ CONTRACT_PATH="${CONTRACT_PATH:-benchmark.json}"
 
 # ADDITION (pinned measurement harness). benchd is what MEASURES a submission.
 # It used to be a SHA-pinned source submodule at `benchd`, pointed at by
-# `.gitmodules`; it is now a pinned PREBUILT binary -- `benchd.pin` names
+# `.gitmodules`; it is now a channel-resolved PREBUILT binary -- the retired `benchd.pin` spelling named
 # {branch, commit, sha256, bytes} and tools/fetch-benchd.sh resolves it into
 # `benchd-bin/`. An editable entry reaching the pin or the resolved binary would
 # let a submission repoint or replace its own scorer, so the overlay refuses to
@@ -102,7 +102,7 @@ validate_contract_path() {
       ;;
   esac
   if reaches_forbidden_path "${path}"; then
-    echo "::error::editable path '${path}' in ${CONTRACT_PATH} covers the pinned measurement harness (benchd.pin / benchd-bin) or a retired submodule spelling; refusing to overlay it" >&2
+    echo "::error::editable path '${path}' in ${CONTRACT_PATH} covers the measurement-harness surface (benchd-bin, or the retired benchd.pin spelling) or a retired submodule spelling; refusing to overlay it" >&2
     exit 1
   fi
 }

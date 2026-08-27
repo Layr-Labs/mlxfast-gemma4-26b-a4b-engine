@@ -556,10 +556,47 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// Bounded by `CBv2EngineLoopConfig.shutdownTimeout` (default 10 s): if
     /// the engine queue is wedged, live streams are force-finished with
     /// `.error` and this returns instead of hanging forever.
+    ///
+    /// FAST-ACK MODE (default on, kill with
+    /// `DARKBLOOM_CBV2_SHUTDOWN_FAST_ACK=0`): every consumer of this engine
+    /// calls `shutdown()` only after it has already collected every token it
+    /// wants — the caller's streams are complete and no further output can
+    /// exist. The remaining drain (letting the already-submitted in-flight
+    /// step finish on the GPU, force-finish bookkeeping, releasing KV
+    /// buffers back into the allocator cache) produces nothing the caller
+    /// reads, so it is moved to a detached task and this returns at once.
+    /// The work itself is unchanged — only its scheduling moves off the
+    /// caller's response path. `CBv2DetachedDrainRegistry.joinAll` gives a
+    /// later phase a bounded fence before it builds a new engine.
     public func shutdown() async {
+        beginRejectingSubmissions()
+        if Self.fastAckShutdown {
+            let loop = self.loop
+            // .userInitiated: a starved lower-priority drain would leave the
+            // engine loop thread alive (and any joiner waiting) through the
+            // caller's next work — measured locally as a real regression.
+            CBv2DetachedDrainRegistry.register(
+                Task.detached(priority: .userInitiated) {
+                    await loop.drain()
+                })
+            return
+        }
+        await loop.drain()
+    }
+
+    /// Always-synchronous variant for unscored callers (e.g. the constructor
+    /// warm) that want the engine fully retired before continuing regardless
+    /// of the fast-ack default.
+    public func shutdownSynchronously() async {
         beginRejectingSubmissions()
         await loop.drain()
     }
+
+    /// Resolved once: fast-ack drains are the default; set the variable to
+    /// `0`/`false` to restore the fully synchronous shutdown.
+    private static let fastAckShutdown: Bool =
+        ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_SHUTDOWN_FAST_ACK"]
+            .map { !["0", "false", "no", "off"].contains($0.lowercased()) } ?? true
 
     /// Synchronous helper: `NSLock` is not async-safe to hold across
     /// suspension points, so the flag flip lives outside the async context.
@@ -578,6 +615,67 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             continuation.yield(.finished(reason: reason, usage: usage))
             continuation.finish()
         }
+    }
+}
+
+/// One-shot engagement markers for local diagnostics (armed by
+/// `MLXFAST_ENGAGE_MARKS=1`; stderr only — the worker's stdout is protocol).
+public enum CBv2EngageMark {
+    nonisolated(unsafe) private static var seen = Set<String>()
+    private static let lock = NSLock()
+    private static let armed =
+        ProcessInfo.processInfo.environment["MLXFAST_ENGAGE_MARKS"] != nil
+
+    public static func once(_ tag: String) {
+        guard armed else { return }
+        lock.lock()
+        let fresh = seen.insert(tag).inserted
+        lock.unlock()
+        if fresh {
+            FileHandle.standardError.write(Data("[engage] \(tag)\n".utf8))
+        }
+    }
+}
+
+/// Fence for fast-ack engine shutdowns: every detached drain registers here,
+/// and a later phase can block (bounded) until all previously started drains
+/// have finished before it constructs a new engine or measures anything.
+/// The registry keeps only live tasks; `joinAll` is safe to call from
+/// synchronous, non-async code.
+public enum CBv2DetachedDrainRegistry {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var drains: [Task<Void, Never>] = []
+
+    static func register(_ task: Task<Void, Never>) {
+        lock.lock()
+        drains.append(task)
+        lock.unlock()
+    }
+
+    /// Wait (at most `timeout` seconds) for every registered drain to
+    /// complete, then drop the completed entries. Returns `true` when all
+    /// drains finished inside the deadline. A timeout leaves stragglers
+    /// registered so a later join can fence them again.
+    @discardableResult
+    public static func joinAll(timeout: TimeInterval = 5) -> Bool {
+        lock.lock()
+        let pending = drains
+        lock.unlock()
+        guard !pending.isEmpty else { return true }
+        let done = DispatchSemaphore(value: 0)
+        Task.detached(priority: .userInitiated) {
+            for task in pending { _ = await task.value }
+            done.signal()
+        }
+        let completed = done.wait(timeout: .now() + timeout) == .success
+        if completed {
+            // Registration only ever appends, so the joined tasks are
+            // exactly the current prefix of the array.
+            lock.lock()
+            drains.removeFirst(Swift.min(pending.count, drains.count))
+            lock.unlock()
+        }
+        return completed
     }
 }
 

@@ -18,13 +18,6 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    private static let ringEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_RING_ATTENTION"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
     private static let batch = 8
     private static let queryHeads = 16
     private static let kvHeads = 8
@@ -131,12 +124,11 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     )
 
     private static let ringPassAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_ring_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v1",
+        name: "cbv2_ragged8_sdpa_ring_2pass_a_bf16_d256_g2_b\(blocks)_v1",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
-            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
-            "starts",
+            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "starts",
         ],
         outputNames: ["partials", "sums", "maxs"],
         source: """
@@ -163,11 +155,13 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 case 7: keys = k7; values = v7; break;
                 default: break;
             }
+            const uint start = starts[batch_index];
 
             const device T* query =
                 queries + batch_head * D + lane * values_per_lane;
             keys += kv_head * N * D + lane * values_per_lane;
             values += kv_head * N * D + lane * values_per_lane;
+            int slot = int((start + block) % N);
             device T* partial = partials
                 + batch_head * BLOCKS * D + block * D + lane * values_per_lane;
             device float* sum_out = sums + batch_head * BLOCKS + block;
@@ -180,15 +174,14 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 accumulator[element] = 0.0f;
             }
 
-            uint slot = (starts[batch_index] + uint(block)) % uint(N);
             float max_score = -3.402823466e+38F;
             float sum_exp_score = 0.0f;
             for (int token = block; token < N; token += BLOCKS) {
-                const device T* key = keys + slot * D;
-                const device T* value = values + slot * D;
+                const device T* k = keys + slot * D;
+                const device T* v = values + slot * D;
                 float score = 0.0f;
                 for (int element = 0; element < values_per_lane; ++element) {
-                    score += q[element] * float(key[element]);
+                    score += q[element] * float(k[element]);
                 }
                 score = simd_sum(score);
 
@@ -199,13 +192,11 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 sum_exp_score = sum_exp_score * old_factor + score_factor;
                 for (int element = 0; element < values_per_lane; ++element) {
                     accumulator[element] = accumulator[element] * old_factor
-                        + score_factor * float(value[element]);
+                        + score_factor * float(v[element]);
                 }
 
                 slot += BLOCKS;
-                if (slot >= uint(N)) {
-                    slot -= uint(N);
-                }
+                if (slot >= N) slot -= N;
             }
 
             if (lane == 0) {
@@ -287,73 +278,41 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         ensureRowContiguous: true
     )
 
+    static func attend(
+        queries: MLXArray,
+        keys: [MLXArray],
+        values: [MLXArray],
+        scale: Float
+    ) -> MLXArray? {
+        attend(
+            passAKernel: passAKernel, queries: queries, keys: keys, values: values,
+            extraInputs: [], scale: scale)
+    }
+
     static func attendRing(
         queries: MLXArray,
         keys: [MLXArray],
         values: [MLXArray],
         starts: [Int],
-        scale: Float
+        scale: Float,
+        slidingWindowLength: Int
     ) -> MLXArray? {
-        guard enabled,
-            ringEnabled,
-            blocks > 0,
-            blocks.isMultiple(of: 32),
-            scale == 1.0,
-            queries.dtype == .bfloat16,
-            queries.shape == [batch, queryHeads, 1, headDim],
-            keys.count == batch,
-            values.count == batch,
+        guard slidingWindowLength == sequenceLength,
             starts.count == batch,
-            starts.allSatisfy({ (0 ..< sequenceLength).contains($0) })
+            starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength })
         else { return nil }
-
-        for index in 0 ..< batch {
-            let key = keys[index]
-            let value = values[index]
-            guard key.dtype == .bfloat16,
-                value.dtype == .bfloat16,
-                key.shape == [1, kvHeads, sequenceLength, headDim],
-                value.shape == key.shape
-            else { return nil }
-        }
-
-        let startArray = MLXArray(starts.map(UInt32.init))
-        let inputs = [queries] + keys + values + [startArray]
-        let partialShape = [batch, queryHeads, 1, blocks, headDim]
-        let summaryShape = [batch, queryHeads, 1, blocks]
-        let passA = ringPassAKernel(
-            inputs,
-            template: [
-                ("T", queries.dtype),
-                ("D", headDim),
-                ("N", sequenceLength),
-                ("GQA", gqa),
-                ("BLOCKS", blocks),
-            ],
-            grid: (kvHeads * 32, batch * gqa, blocks),
-            threadGroup: (32, gqa, 1),
-            outputShapes: [partialShape, summaryShape, summaryShape],
-            outputDTypes: [.bfloat16, .float32, .float32]
-        )
-
-        return passBKernel(
-            passA,
-            template: [
-                ("T", queries.dtype),
-                ("D", headDim),
-                ("BLOCKS", blocks),
-            ],
-            grid: (batch * queryHeads * 1024, 1, 1),
-            threadGroup: (1024, 1, 1),
-            outputShapes: [[batch, queryHeads, 1, headDim]],
-            outputDTypes: [.bfloat16]
-        )[0]
+        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        return attend(
+            passAKernel: ringPassAKernel, queries: queries, keys: keys, values: values,
+            extraInputs: [startArray], scale: scale)
     }
 
-    static func attend(
+    private static func attend(
+        passAKernel: MLXFast.MLXFastKernel,
         queries: MLXArray,
         keys: [MLXArray],
         values: [MLXArray],
+        extraInputs: [MLXArray],
         scale: Float
     ) -> MLXArray? {
         guard enabled,
@@ -376,7 +335,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             else { return nil }
         }
 
-        let inputs = [queries] + keys + values
+        let inputs = [queries] + keys + values + extraInputs
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let passA = passAKernel(

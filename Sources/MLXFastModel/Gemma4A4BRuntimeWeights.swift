@@ -109,7 +109,22 @@ public final class Gemma4A4BRuntimeWeightCache {
                    startupEnvironment["DARKBLOOM_QWEN_MTP_POST_WIRE_COMMAND_BUFFER"]
            )
         {
-            setenv("MLX_MAX_MB_PER_BUFFER", "512", 1)
+            // The referenced-byte cap, not the operation cap, ends a command
+            // buffer on this model. `CommandEncoder::needs_commit()` is
+            // `(buffer_ops_ > max_ops) || ((buffer_sizes_ >> 20) > max_mb)` and
+            // `buffer_sizes_` accumulates `a.data_size()` per referenced array.
+            // One Gemma MoE gather-GEMM references its layer's whole packed
+            // expert tensor -- 128 experts x 3 x 704 x 2816 at 4 bits is 362.8
+            // MiB in one operation -- so a 512 MiB cap admits about one such
+            // operation per buffer and the 50-operation cap, which this profile
+            // calls its outer safety wall, is never reached on a sparse layer.
+            setenv("MLX_MAX_MB_PER_BUFFER", "4096", 1)
+            // The operation cap must be set here too. The only other writer,
+            // `RuntimeStartupMemoryPolicy.installGemma4MTPFullProfileCommandBufferDefaults`,
+            // is reached solely from `RuntimeStartupMemoryPolicy.resolve`, which
+            // nothing in the shipped tree calls, so the encoder otherwise keeps
+            // whichever cap `device.cpp`'s architecture switch chose for it.
+            setenv("MLX_MAX_OPS_PER_BUFFER", "512", 1)
             Memory.cacheLimit = 32 << 30
         }
 

@@ -303,24 +303,28 @@ inline void qdot_affine4_pair(
     U sum1,
     thread U& out0,
     thread U& out1) {
-  U accum0 = 0;
-  U accum1 = 0;
-  const device uint16_t* ws = (const device uint16_t*)w;
-  for (int i = 0; i < (values_per_thread / 4); i++) {
-    const uint16_t packed = ws[i];
-    accum0 +=
-        (x0[4 * i] * (packed & 0x000f) +
-         x0[4 * i + 1] * (packed & 0x00f0) +
-         x0[4 * i + 2] * (packed & 0x0f00) +
-         x0[4 * i + 3] * (packed & 0xf000));
-    accum1 +=
-        (x1[4 * i] * (packed & 0x000f) +
-         x1[4 * i + 1] * (packed & 0x00f0) +
-         x1[4 * i + 2] * (packed & 0x0f00) +
-         x1[4 * i + 3] * (packed & 0xf000));
-  }
-  out0 = scale * accum0 + sum0 * bias;
-  out1 = scale * accum1 + sum1 * bias;
+  static_assert(values_per_thread == 8, "paired affine4 qdot consumes 8 values");
+  typedef vec<U, 2> U2;
+
+  // The production pair kernel keeps w four-byte aligned. Load both packed
+  // words together, then share each nibble extraction across the two inputs.
+  const uint packed_words =
+      *reinterpret_cast<const device uint*>(w);
+  const ushort packed0 = static_cast<ushort>(packed_words);
+  const ushort packed1 = static_cast<ushort>(packed_words >> 16);
+  U2 accum = U2(0);
+  accum +=
+      (U2(x0[0], x1[0]) * (packed0 & 0x000f) +
+       U2(x0[1], x1[1]) * (packed0 & 0x00f0) +
+       U2(x0[2], x1[2]) * (packed0 & 0x0f00) +
+       U2(x0[3], x1[3]) * (packed0 & 0xf000));
+  accum +=
+      (U2(x0[4], x1[4]) * (packed1 & 0x000f) +
+       U2(x0[5], x1[5]) * (packed1 & 0x00f0) +
+       U2(x0[6], x1[6]) * (packed1 & 0x0f00) +
+       U2(x0[7], x1[7]) * (packed1 & 0xf000));
+  out0 = scale * accum.x + sum0 * bias;
+  out1 = scale * accum.y + sum1 * bias;
 }
 
 template <typename U, int values_per_thread, int bits>

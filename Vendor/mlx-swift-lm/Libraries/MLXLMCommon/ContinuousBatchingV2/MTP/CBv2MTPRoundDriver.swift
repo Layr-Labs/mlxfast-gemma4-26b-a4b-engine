@@ -304,14 +304,6 @@ final class CBv2MTPRoundDriver {
         depthController.requiresNonChainedDepthZeroProbe(decision)
     }
 
-    /// True when no plan can ever carry MTP work, because the depth
-    /// controller's policy is target-only or its ceiling is zero. Fixed for
-    /// the driver's lifetime, so the engine loop can skip its per-step MTP
-    /// bookkeeping outright instead of re-deriving a zero depth every round.
-    var isTargetOnlyPolicy: Bool {
-        !CBv2MTPDepthController.speculationEnabled || depthController.maxDepth == 0
-    }
-
     var planDepth: Int { planDecision.depth }
     var planDecodeRowBucket: Int { planDecision.decodeRowBucket }
 

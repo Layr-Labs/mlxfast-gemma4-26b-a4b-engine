@@ -1665,30 +1665,73 @@ composite cohort scoring"). The relevant shape, current as of gitlink
   durations. The gate function does not attempt that reconciliation; it has
   nothing to reconcile yet.
 
-**`pairs_per_cohort` pin history.** The batch-8 brief's original default was
-4 (D2). David ruled 2 on 2026-08-24, verbatim "do 2" — "chose ~20-minute
-scored windows over 4-sample medians from the presented trade table". The
-ruling landed in benchd itself as commit
-`bb1a6216655912b8a57967bb9cd45cff973a82df` ("pairs_per_cohort: 4 -> 2 (David
-ruling 2026-08-24)"), merged as bench PR #184 at
-`047e21833a66264310307e1cb86ae3a290b0fc27` on the `gemma4-26b-a4b-mlx-v1`
-release branch. Between the ruling and the gitlink advance that landed
-`047e2183` in this repository, there was a real pinned-vs-ruled discrepancy:
-this repository's `benchd` gitlink sat at `dfd801f9`, which predated the
-ruling and still compiled `PAIRS_PER_COHORT_TARGET = 4` — an official run
-declaring `target_pairs=2` against that pin would have been refused. That
-discrepancy is resolved as of the gitlink advance to `047e2183` (verified by
-reading the checked-out submodule source directly:
-`grep 'PAIRS_PER_COHORT_TARGET.*usize.*=' benchd/crates/benchctl/src/measure_job.rs`
-now returns `= 2`, and by containment,
-`git -C benchd branch -r --contains 047e2183` returns exactly
-`origin/gemma4-26b-a4b-mlx-v1`). `tools/gemma4-measure-and-score.sh`'s two
-`--target-pairs` occurrences were flipped from 4 to 2 in that same PR.
-`minPairsPerCohort=2` is not independently benchd-enforced the way
-`pairsPerCohort` is — `--min-pairs` carries no compiled default (it is a
-required CLI flag; benchd only checks `target_pairs >= min_pairs` at parse)
-— it is this repository's own convention, matching the wrapper script's own
-`--min-pairs` value.
+**`pairs_per_cohort` pin history.** Three rulings, each superseding the one
+before it. The value is currently **4**.
+
+1. **Batch-8 brief D2** — the original default, 4.
+2. **David, 2026-08-24: 2.** Verbatim "do 2" — "chose ~20-minute scored
+   windows over 4-sample medians from the presented trade table". Landed in
+   benchd as commit `bb1a6216655912b8a57967bb9cd45cff973a82df`
+   ("pairs_per_cohort: 4 -> 2 (David ruling 2026-08-24)"), merged as bench PR
+   #184 at `047e21833a66264310307e1cb86ae3a290b0fc27` on the
+   `gemma4-26b-a4b-mlx-v1` release branch.
+3. **David, 2026-08-26: 4.** Verbatim: "you run it using 4 pairs instead of 2
+   of 8 batches". 8 prompts × 4 pairs is challenger-grade sample mass; the
+   8/24 ruling is superseded, not reinterpreted, and the trade it made
+   (shorter scored windows) is reversed. This is the current value in
+   `benchmark.json`, `tools/lint-benchmark-manifest.py`'s
+   `EXPECTED_SCORING_BY_TRACK` and both `--target-pairs` occurrences in
+   `tools/gemma4-measure-and-score.sh`.
+
+**The ruled-ahead-of-pin state recurs at each ruling, and it is load-bearing
+that it fails LOUD.** Between a ruling and the pin advance that carries it,
+the pinned benchd compiles the PREVIOUS target, and an official run declaring
+the NEW one is refused before any GPU work — `run_cohort_measure_job` checks
+`cfg.target_pairs != PAIRS_PER_COHORT_TARGET` and returns a named error. This
+happened once already under the 8/24 ruling: the gitlink sat at `dfd801f9`,
+which predated it and still compiled `PAIRS_PER_COHORT_TARGET = 4`, so a run
+declaring `target_pairs=2` was refused until the advance to `047e2183`
+resolved it (verified then by reading the checked-out submodule source
+directly — `grep 'PAIRS_PER_COHORT_TARGET.*usize.*=' benchd/crates/benchctl/src/measure_job.rs`
+returned `= 2` — and by containment,
+`git -C benchd branch -r --contains 047e2183` returning exactly
+`origin/gemma4-26b-a4b-mlx-v1`).
+
+The 8/26 ruling is in that same state **as of this commit**: the benchd side
+(`PAIRS_PER_COHORT_TARGET` 2 → 4) must merge and publish before this
+repository's `benchd.pin` can name a commit that compiles 4, so the pin
+advance is a SEPARATE follow-up commit rather than part of this change. Until
+it lands, an official-shaped invocation declaring `--target-pairs 4` is
+refused at the pin, by name and pre-measurement. Verify the same way the 8/24
+advance was verified — read the pinned source, do not assume — and record the
+resolution here.
+
+`minPairsPerCohort` moves with the target (now 4), and — since the
+trusted-layer floor gate landed — it is **independently benchd-enforced, the
+same way `pairsPerCohort` is**. benchd refuses an OFFICIAL batched cohort run
+whose `min_pairs != PAIRS_PER_COHORT_TARGET`, by name, at the same pre-GPU
+seam as the target refusal (`--local-dev` still explores other floors).
+
+This corrects an earlier claim in this section. Until that gate landed, benchd's
+only floor rule was the parse-time `target_pairs >= min_pairs`, and the ruled
+floor rode entirely on the wrapper script's `--min-pairs` argv. A run declaring
+min 2 / target 4 satisfied every trusted-side check, passed the target refusal
+untouched, and then published a median over half the support the ruling
+bought — with nothing downstream saying so. That is the gap the gate closes,
+and it is why floor == target is now a property of the published median rather
+than of the wrapper's command line.
+
+The wrapper's own `--min-pairs 4` is kept as a belt-and-suspenders
+**declaration** of the ruled floor: it states the value where an operator reads
+it, and `tools/` is organizer-controlled and outside `editablePaths`, so a
+submission cannot rewrite it. But it is no longer the thing doing the enforcing.
+
+Note the division of labour, since the two are easy to conflate:
+`tools/lint-benchmark-manifest.py` pins the VALUE of
+`scoring.minPairsPerCohort` in `benchmark.json` against its registry; it does
+not read the wrapper, so it would not catch a wrapper edited to `--min-pairs 2`
+against a manifest still saying 4. **That** drift is caught at the pin, by
+benchd's refusal.
 
 Cross-checking `pairsPerCohort`/`PAIRS_PER_COHORT_TARGET` agreement against
 the live `benchd` source is not implemented in

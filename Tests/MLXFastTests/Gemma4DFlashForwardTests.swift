@@ -22,7 +22,9 @@ import Testing
 // (the drafter applies its own), and the bind/draftBlock pair that is the
 // whole point of the real-loader lane.
 //
-// GPU-free at fixture scale, forced onto `.cpu`.
+// Forced onto `.cpu` and fixture-scale, but constructing the models still
+// needs the built MLX runtime, which hosted CI does not have: box-only, every
+// test gated behind MLXFAST_RUN_MLX_RUNTIME_TESTS=1.
 @Suite("Gemma4 DFlash target conformance")
 struct Gemma4DFlashForwardTests {
 
@@ -98,6 +100,9 @@ struct Gemma4DFlashForwardTests {
     // MARK: - Target conformance
 
     @Test func logitsMatchPlainForward() throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try Device.withDefaultDevice(.cpu) {
             let model = Gemma4TextModel(try tinyGemma4Config())
             eval(model)
@@ -116,6 +121,9 @@ struct Gemma4DFlashForwardTests {
     /// Tap ORDER is the config's order, not sorted order — the drafter's `fc`
     /// projection was trained against that concatenation.
     @Test func capturesRequestedHiddenStatesInRequestedOrder() throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try Device.withDefaultDevice(.cpu) {
             let model = Gemma4TextModel(try tinyGemma4Config())
             eval(model)
@@ -149,6 +157,9 @@ struct Gemma4DFlashForwardTests {
     }
 
     @Test func greedyTokensMatchSoftcappedLogitsArgmax() throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try Device.withDefaultDevice(.cpu) {
             let model = Gemma4TextModel(try tinyGemma4Config())
             eval(model)
@@ -173,6 +184,9 @@ struct Gemma4DFlashForwardTests {
     /// logits keep the cap — hence the two must NOT be equal on a config
     /// whose cap actually binds.
     @Test func drafterBorrowedLMHeadIsNotSoftcapped() throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try Device.withDefaultDevice(.cpu) {
             let config = try tinyGemma4Config()
             #expect(config.finalLogitSoftcapping > 0)
@@ -205,6 +219,9 @@ struct Gemma4DFlashForwardTests {
     }
 
     @Test func capturesSharedKVLayerHiddenStates() throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try Device.withDefaultDevice(.cpu) {
             let model = Gemma4TextModel(
                 try tinyGemma4Config(hiddenLayers: 4, sharedLayers: 2))
@@ -222,6 +239,9 @@ struct Gemma4DFlashForwardTests {
     }
 
     @Test func rejectsOutOfRangeTargetLayerIdsAtForward() throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try Device.withDefaultDevice(.cpu) {
             let model = Gemma4TextModel(try tinyGemma4Config(hiddenLayers: 4))
             #expect(throws: DFlashTargetError.self) {
@@ -236,6 +256,9 @@ struct Gemma4DFlashForwardTests {
     // MARK: - Drafter bind (the real-loader lane's whole point)
 
     @Test func bindsToMatchingGemma4Target() throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try Device.withDefaultDevice(.cpu) {
             let model = Gemma4TextModel(try tinyGemma4Config(hiddenLayers: 4))
             eval(model)
@@ -264,6 +287,9 @@ struct Gemma4DFlashForwardTests {
     /// check that makes the real A4B pairing (drafter 30 / target 30) a fact
     /// rather than a hope.
     @Test func refusesDrafterWithWrongTargetLayerCount() throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try Device.withDefaultDevice(.cpu) {
             let model = Gemma4TextModel(try tinyGemma4Config(hiddenLayers: 4))
             let drafter = DFlashDraftModel(
@@ -278,6 +304,9 @@ struct Gemma4DFlashForwardTests {
     }
 
     @Test func refusesForwardBeforeBind() throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try Device.withDefaultDevice(.cpu) {
             let drafter = DFlashDraftModel(config: try tinyDFlashConfig())
             eval(drafter)
@@ -297,6 +326,9 @@ struct Gemma4DFlashForwardTests {
     /// resolver, so an unclamped default cannot be echoed. A drafter with a
     /// trained block of 4 caps depth at 3 regardless of what a caller asks.
     @Test func depthCeilingComesFromTheBoundDrafterBlock() throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         let drafter = DFlashDraftModel(config: try tinyDFlashConfig(blockSize: 4))
         let ceiling = gemma4DFlashMaxDepth(for: drafter)
         #expect(ceiling == 3)
@@ -314,6 +346,9 @@ struct Gemma4DFlashForwardTests {
     /// the real z-lab head's trained block is 16, and
     /// `experimentalDFlashMaxBlockSize` is 16, so the ceiling is 15.
     @Test func depthCeilingIsAlsoBoundedByTheEngineBlockCeiling() throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         let drafter = DFlashDraftModel(config: try tinyDFlashConfig(blockSize: 64))
         #expect(
             gemma4DFlashMaxDepth(for: drafter)

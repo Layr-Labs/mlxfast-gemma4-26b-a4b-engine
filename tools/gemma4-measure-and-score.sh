@@ -41,15 +41,63 @@
 #   exit) rather than fabricate a number while either is missing -- refuse,
 #   not degrade, matching the kv_backend and byte-budget precedent elsewhere
 #   in this repository.
-#   --target-pairs below is 2, the RULED contest parameter (David, "do 2",
-#   2026-08-24; benchmark.json scoring.pairsPerCohort and
+#   THE THERMAL CONTRACT IS BENCHD'S, NOT THIS SCRIPT'S. Every timed phase this
+#   invocation produces runs behind benchd's own cool-down gate: a fixed 40C
+#   threshold (sealed as cool_gate_c with source "wrapper-constant-40" -- a
+#   calibration fixture offering a different value is ignored), a 900s ceiling
+#   per phase, prefill and decode gated separately on fresh workers. Telemetry
+#   is point-sampled with `macmon pipe -s1` at gate boundaries, NOT streamed;
+#   see docs/benchmark-window-freeze.md. A phase is rejected -- with one gated
+#   retry -- on throttling under load, missing telemetry, or token mismatch.
+#   Nothing here can relax any of that, and nothing here should try to: the one
+#   thing the caller owes benchd is a usable temperature reader, which on the
+#   ranked box is hard-verified by tools/ranked-box-preflight.sh before setup.
+#
+#   HOW MANY GATED PHASES THAT IS, at the ruled pair count below: 4 pairs x 2
+#   legs (serial control + candidate) = 8 timed legs, and prefill and decode
+#   gate SEPARATELY, so 16 gated phases per ranked run. That count is what
+#   .github/workflows/benchmark.yml's timeout-minutes budget is derived from;
+#   the two must move together, and they are cross-referenced in both
+#   directions so neither can drift silently.
+#
+#   --target-pairs below is 4, the RULED contest parameter. David, 2026-08-26,
+#   verbatim: "you run it using 4 pairs instead of 2 of 8 batches" -- 8 prompts
+#   x 4 pairs is challenger-grade sample mass. SUPERSESSION CHAIN, each link
+#   superseding the one above it: (1) batch-8 brief D2, default 4; (2) David
+#   2026-08-24 "do 2", RULED 2, which landed in benchd as PR #184 at
+#   047e21833a66264310307e1cb86ae3a290b0fc27; (3) David 2026-08-26, RULED 4,
+#   this value. benchmark.json scoring.pairsPerCohort and
 #   docs/gemma4-port-notes.md section 9.1 are the authority on the ruling and
-#   its citation chain). The PIN NOW AGREES: the benchd pin was advanced
-#   to include 047e21833a66264310307e1cb86ae3a290b0fc27 (PR #184,
-#   'pairs_per_cohort: 4 -> 2') in the same PR that flipped both
-#   occurrences of `--target-pairs` below from 4 to 2, resolving the
-#   pinned-vs-ruled discrepancy documented there (an official-shaped
-#   invocation declaring --target-pairs 2 is no longer refused at the pin).
+#   its citation chain.
+#
+#   THE PIN DOES NOT YET AGREE, AND THIS SCRIPT SAYS SO RATHER THAN HIDING IT.
+#   The benchd side of this ruling (PAIRS_PER_COHORT_TARGET 2 -> 4) must MERGE
+#   AND PUBLISH before benchd.pin can name a commit that compiles 4. Until that
+#   pin advance lands, the pinned benchd compiles
+#   `PAIRS_PER_COHORT_TARGET: usize = 2` and an official-shaped invocation
+#   declaring --target-pairs 4 IS REFUSED at the pin, by name, before any GPU
+#   work happens. That is the ruled-ahead-of-pin state the 8/24 ruling also
+#   passed through: the refusal is the conformance gate working, not a defect,
+#   and it fails LOUD and pre-measurement rather than silently scoring over the
+#   wrong sample count. The follow-up commit that advances benchd.pin to the
+#   published 4-pair benchmarker closes it.
+#
+#   --min-pairs moves with it (4, not 2), and the FLOOR IS ENFORCED AT THE PIN
+#   exactly like the target: benchd refuses an official batched cohort run whose
+#   min_pairs != PAIRS_PER_COHORT_TARGET, by name, at the same pre-GPU seam
+#   (--local-dev still explores other floors). Until that gate landed, benchd's
+#   only floor rule was the parse-time `target_pairs >= min_pairs`, so a floor
+#   left at 2 would have let a run accept only 2 of the 4 ruled pairs and still
+#   publish -- a median over half the support the ruling bought, and exactly the
+#   silent degradation the ruling was made to avoid.
+#
+#   The --min-pairs 4 written below is therefore a BELT-AND-SUSPENDERS
+#   DECLARATION of the ruled floor, not the thing that enforces it. It is worth
+#   keeping in that role: it states the ruled value at the call site where an
+#   operator reads it, and this script lives under tools/ -- organizer-
+#   controlled, outside editablePaths -- so a submission cannot rewrite it. But
+#   the guarantee that a published median covers 4 pairs comes from benchd's
+#   refusal, which no argv can talk its way past.
 #
 # Usage:
 #   ./tools/gemma4-measure-and-score.sh                 # full measure + score
@@ -162,7 +210,7 @@ if [[ "${PREFLIGHT_ONLY}" == "1" ]]; then
     --candidate "${SCRIPT_DIR}" \
     --baseline "${MLXFAST_GEMMA4_BASELINE_WORKSPACE:-${SCRIPT_DIR}}" \
     --weights "${WEIGHTS_PATH}" \
-    --min-pairs 2 --target-pairs 2 \
+    --min-pairs 4 --target-pairs 4 \
     --tag "gemma4-preflight" \
     --out "${OUT_DIR}" \
     --preflight-only
@@ -230,7 +278,7 @@ RESULTS_JSON="${OUT_DIR}/results.json"
   --weights "${WEIGHTS_PATH}" \
   --correctness-golden "${MLXFAST_CORRECTNESS_GOLDEN_PATH}" \
   "${golden_args[@]}" \
-  --min-pairs 2 --target-pairs 2 \
+  --min-pairs 4 --target-pairs 4 \
   --tag "gemma4-local-$(date -u +%Y%m%dT%H%M%SZ)" \
   --out "${OUT_DIR}"
 

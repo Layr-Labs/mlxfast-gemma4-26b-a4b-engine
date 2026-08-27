@@ -219,9 +219,24 @@ ranked run, after all correctness/gates work, a hidden-material scrub, and a
 quiescence wait, measure-job runs the pinned **baseline tree first, then the
 candidate workspace**, each as a full `./benchmark.sh --official` in fresh
 worker processes, each starting only once the GPU is below the fixed 40C gate
-(up to a 900s cooldown), each under 100 ms macmon telemetry.
-A measurement is rejected -- with one gated retry -- on GPU throttling under
-load, missing telemetry, or token mismatches. Because both sides run back to
+(up to a 900s cooldown), each under macmon telemetry.
+
+The telemetry cadence is **point samples, not a stream**. This paragraph read
+"under 100 ms macmon telemetry" until 2026-08-26; no benchmarker this track has
+ever pinned sampled at 100 ms. The pinned benchd (`benchd.pin`, sha256
+`e044e1f4...`) invokes `macmon pipe -s1` -- `-s` is macmon's *sample count*, not
+a rate, so that is exactly ONE sample per call at macmon's default 1000 ms
+interval -- and it calls it at gate and poll boundaries (its cool-gate poll is
+10s; the ranked workflow's own quiescence probe polls at 15s). The challenger's
+"2 Hz telemetry" is likewise its own box wrapper's number, not this
+benchmarker's, and is not adopted here.
+
+The 40C gate and the telemetry acceptance are enforced INSIDE benchd, and they
+are not overridable from this repository: `cool_gate_c` is a fixed wrapper
+constant of `40.0` sealed with source `wrapper-constant-40`, and a calibration
+fixture that supplies a different value is ignored. A measurement is rejected --
+with one gated retry -- on GPU throttling under load, missing telemetry, or
+token mismatches. Because both sides run back to
 back on the same silicon behind the same gate, the paired ratio cancels
 common-mode host drift. The four Poolside v2 activation runs above scored
 `0.9901`-`1.0042` for baseline-equivalent candidate trees.

@@ -75,6 +75,33 @@ The benchmarker waits for the GPU to cool before it starts a timed run. The
 local modes pass `--cool-gate` to the benchmarker automatically. The gate reads
 the GPU temperature through `macmon`.
 
+**The gate lives in the benchmarker, and only `./benchmark.sh` arms it.**
+`./benchmark.sh` passes `--cool-gate` to `benchctl`, and `benchctl` runs the gate
+itself before each timed phase. Prefill and decode are gated separately.
+
+> **WARNING — driving the Swift CLI directly runs UNGATED.**
+> `mlxfast-swift --local-iterate` and `--local-submit` do not go through
+> `./benchmark.sh`. The Swift harness dispatches its per-phase gate to an
+> external helper named by `MLXFAST_LOCAL_COOL_GATE_HELPER`
+> (`Sources/MLXFastHarness/Gemma4RuntimeLocalIterate.swift:520`, and the trusted
+> copy at `:530`). Nothing sets that variable. Unset, the gate returns
+> immediately and times a hot GPU without saying so.
+
+Set the variable to the pinned benchmarker to arm that path.
+
+```bash
+MLXFAST_LOCAL_COOL_GATE_HELPER="$PWD/benchd-bin/benchctl" mlxfast-swift --local-iterate
+```
+
+Prefer `./benchmark.sh`. It is the measured path and it needs no such variable.
+
+`./benchmark.sh --local-cool-gate-only` exits 0 without probing anything. The
+bare probe is the benchmarker's own entry point.
+
+```bash
+benchd-bin/benchctl --local-cool-gate-only
+```
+
 > **WARNING — a run that pauses on a cool-down message is working, not hung.**
 > Do not kill it. Do not treat the wait as a failure.
 
@@ -86,13 +113,24 @@ retry. The abort does not mean your change is wrong.
 gate warns and skips when `macmon` is absent. Skip the install with
 `MLXFAST_SKIP_MACMON_INSTALL=1`.
 
+> **WARNING — a skipped gate still produces a number.**
+> Locally, no reader means no gate, and the run times whatever temperature the
+> GPU happens to be at. Treat a timing taken without `macmon` as unmeasured.
+
+The ranked box does the opposite. A missing or frozen reader is a hard refusal
+there, before any measurement (`tools/ranked-box-preflight.sh`, sections 2b and
+2c). A ranked run never proceeds without thermal control.
+
 The gate mirrors the ranked runner's fixed 40 C thermal contract. That contract
 is operator-owned. The benchmarker owns the exact thresholds; this repository
-does not set them.
+does not set them. The threshold is a fixed constant inside the benchmarker and
+no fixture can move it.
 
 ### Fan control for a stalled cool-down
 
-Use the fan helper when the local gate sits hot with no cooling progress.
+Use the fan helper when the local gate sits hot with no cooling progress. The
+helper is manual only. No gate, script, or workflow invokes it. Nothing boosts
+the fans on your behalf, and a stalled cool-down will not fix itself.
 
 ```bash
 tools/fan-control.sh boost

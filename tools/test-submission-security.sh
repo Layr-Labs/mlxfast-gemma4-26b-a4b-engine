@@ -33,6 +33,17 @@ SCRIPTS="${REPO_ROOT}/.github/scripts"
 VERBOSE=0
 [[ "${1:-}" == "-v" ]] && VERBOSE=1
 
+# Under Actions the caller's environment carries the job's real step-to-step
+# channel files, and cases below run repo tools (tools/stage-ranked-heads.sh)
+# that append to whatever GITHUB_ENV names. A test suite must never write to
+# the job's real step-to-step state: on 2026-08-26 the ranked-heads cases
+# leaked four QMTP_* fixture paths into every later CI step this way. All four
+# writable channels are dropped -- the other three had no writer in-tree at
+# the time, and this keeps one gaining a writer from reopening the class. The
+# one case that tests the GITHUB_ENV path sets its own synthetic file
+# explicitly.
+unset GITHUB_ENV GITHUB_OUTPUT GITHUB_PATH GITHUB_STEP_SUMMARY
+
 # A section that stops running -- deleted, renamed out of the flow, or skipped by
 # an early `continue` -- leaves every REMAINING assertion green, so exit status
 # alone cannot notice it and the gate silently shrinks. This floor is the single

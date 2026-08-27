@@ -347,6 +347,10 @@ failure together with real timing numbers.
 | `--local-iterate` | 128 | 129 | On, because `./benchmark.sh` always passes `--cool-gate` |
 | `--local-submit` | 1023 | 1024 | On |
 
+The gate is on because `./benchmark.sh` arms it. Driving the Swift CLI directly
+skips it and times a hot GPU. Use `./benchmark.sh`. See AGENTS.md, "The
+cool-down gate".
+
 The two public goldens differ in length for this reason. Use the 256-token
 golden for `--local-iterate`. Use the 1024-token golden for `--local-submit`.
 
@@ -408,8 +412,8 @@ on the baseline leg and on the candidate leg, over the same cohort.
 | `scoredBatchSize` | 8 |
 | `prefillGainExponent` | 0.25 |
 | `decodeGainExponent` | 0.75 |
-| `pairsPerCohort` | 2 |
-| `minPairsPerCohort` | 2 |
+| `pairsPerCohort` | 4 |
+| `minPairsPerCohort` | 4 |
 | `decodeSpeedupFloor` | 0.90 |
 | `decodeSpeedupCeiling` | 5.0 |
 | `kvBackend` | `contiguous` |
@@ -417,7 +421,8 @@ on the baseline leg and on the candidate leg, over the same cohort.
 The cohort width is fixed. A width other than 8 has no certified series tag.
 The benchmarker refuses that width rather than run it.
 
-The median over 2 samples is the mean of the two cohort ratios.
+The median over the 4 cohort ratios is the mean of the two central
+values, so the fastest and slowest windows do not enter the score.
 
 `kvBackend` is pinned `contiguous` on both legs. The benchmarker refuses when
 it cannot honour the pinned backend. It does not degrade to another backend.

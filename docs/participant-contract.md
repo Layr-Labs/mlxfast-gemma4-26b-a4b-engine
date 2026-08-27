@@ -414,6 +414,12 @@ and DFlash alike. There is no DFlash-specific timing path.
 `MLXFastConstants.correctnessPromptTokens`, `benchmarkPrefillPromptTokens`, and
 `benchmarkDecodeSeedTokens` all equal 1024. `benchmarkDecodeSteps` is 128.
 
+Every timed leg runs on a cool, quiescent box. The ranked job waits for the
+machine to go idle before the clock starts, and the benchmarker holds each timed
+phase behind the fixed 40 C cool-down gate. The job refuses to measure at all
+when the box has no GPU temperature reader, or when that reader returns a frozen
+or implausible value. Only pairs accepted under that gate feed the composite.
+
 ### 5.3 The parameters
 
 | Parameter | Value |
@@ -421,8 +427,8 @@ and DFlash alike. There is no DFlash-specific timing path.
 | `scoredBatchSize` | 8 |
 | `prefillGainExponent` | 0.25 |
 | `decodeGainExponent` | 0.75 |
-| `pairsPerCohort` | 2 |
-| `minPairsPerCohort` | 2 |
+| `pairsPerCohort` | 4 |
+| `minPairsPerCohort` | 4 |
 | `decodeSpeedupFloor` | 0.90 |
 | `decodeSpeedupCeiling` | 5.0 |
 | `kvBackend` | `contiguous` |
@@ -431,7 +437,9 @@ The whole pinned 8-prompt pool runs concurrently as one cohort. There is no
 sweep and no per-run choice of width. A width other than 8 has no certified
 series tag. The benchmarker refuses that width rather than run it.
 
-The even-n median over 2 samples is the mean of the two cohort ratios.
+The even-n median over the 4 cohort ratios is the mean of the two central
+order statistics -- the fastest and the slowest of the four scored windows do
+not enter the published number.
 
 ### 5.4 Token fidelity
 
@@ -507,7 +515,7 @@ The wrapped invocation is:
 benchctl measure-job --contract fixtures/gemma4_26b_a4b_track.json \
   --candidate . --baseline $MLXFAST_GEMMA4_BASELINE_WORKSPACE \
   --golden <each *.json in $MLXFAST_GEMMA4_GOLDEN_DIR> \
-  --min-pairs 2 --target-pairs 2 \
+  --min-pairs 4 --target-pairs 4 \
   --tag <run tag> --out <results dir>
 ```
 

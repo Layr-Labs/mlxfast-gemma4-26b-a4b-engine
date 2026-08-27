@@ -391,7 +391,21 @@ jobs:
           git diff --exit-code -- Package.swift Package.resolved
 
       - name: Unit tests (no Metal runtime, no checkpoint)
-        run: swift test --force-resolved-versions
+        # --no-parallel is load-bearing, not a preference: parallel `swift
+        # test` on the macos-26 image wedges before completing a single test
+        # (every task "started" within ~100ms, none ever finishes -- the
+        # actions/runner-images#13143 signature), while the identical tree and
+        # toolchain run the parallel suite green in under a second on real
+        # hardware. Remove the flag only with a green parallel run on this
+        # image as evidence.
+        #
+        # timeout-minutes bounds a recurrence of that wedge (or of the
+        # 2026-08-26 incident class: the test process dies and `swift test`
+        # never notices) to minutes, not the job timeout sized for the
+        # vendored-MLX cold build. The serial gated suite itself finishes in
+        # low single-digit minutes.
+        timeout-minutes: 20
+        run: swift test --force-resolved-versions --no-parallel
 
       - name: Declare what this run did NOT cover
         if: always()

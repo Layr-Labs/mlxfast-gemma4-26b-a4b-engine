@@ -48,10 +48,12 @@ What it asserts, in order:
                         pins apply to the other), and agree with the contract
                         fixture's scoring_semantics where both state a value. A
                         manifest value ruled AHEAD of the pinned benchd source
-                        (historical example: scoring.pairsPerCohort=2 was ruled
-                        ahead of the then-pinned gitlink's compiled
+                        (this recurs at EVERY pairs ruling: pairsPerCohort=2 was
+                        ruled ahead of the then-pinned compiled
                         PAIRS_PER_COHORT_TARGET=4 until the 2026-08-24
-                        gitlink-advance PR brought the pin into agreement) is
+                        gitlink-advance brought the pin into agreement, and
+                        pairsPerCohort=4 is ruled ahead of it again under the
+                        2026-08-26 ruling until the benchd.pin advance lands) is
                         NOT machine-cross-checked against benchd here -- benchd is a
                         prebuilt binary now, not a source tree this linter could
                         grep, so a check of that shape has nowhere to read from. The honest, load-bearing
@@ -159,33 +161,52 @@ _QWEN_MTP_V1_SCORING = {
 #       (benchmark.json and its contract fixture carry values only, no prose
 #       fields, per David's 2026-08-24 ruling -- see
 #       docs/gemma4-port-notes.md section 9 for the full split).
-#   pairsPerCohort = 2
-#       RULED 2 by David 2026-08-24 ("do 2"), superseding the batch-8 brief
-#       D2 default of 4 -- landed in benchd itself as commit
-#       bb1a6216655912b8a57967bb9cd45cff973a82df, merged PR #184 at
-#       047e21833a66264310307e1cb86ae3a290b0fc27 on the gemma4-26b-a4b-mlx-v1
-#       release branch (verified via `git fetch` + `git show`, not assumed).
-#       This repository's benchd gitlink was ADVANCED to 047e2183 in the same
-#       PR that resolved the prior pinned-vs-ruled discrepancy, so the pin now
-#       compiles `PAIRS_PER_COHORT_TARGET: usize = 2` and an OFFICIAL run
-#       declaring target_pairs=2 is accepted. See
-#       docs/gemma4-port-notes.md section 9.1 (which this dict's value must
-#       always match) for the full citation chain and provenance of how the
-#       two sides came into agreement (tools/gemma4-measure-and-score.sh's
-#       --target-pairs was flipped from 4 to 2 in that same PR). NOT machine-
-#       cross-checked against the pinned benchd source here -- CI runs this
-#       linter without a benchd checkout, so that check could only ever run
-#       locally; docs/gemma4-port-notes.md section 9.1 remains the
-#       load-bearing, always-visible instrument for any future drift of this
-#       kind.
-#   minPairsPerCohort = 2
-#       NOT independently benchd-enforced the way pairsPerCohort is -- benchd
-#       only requires target_pairs >= min_pairs, min_pairs itself carries no
-#       compiled default and is a REQUIRED CLI flag. 2 is this repository's
-#       OWN convention (tools/gemma4-measure-and-score.sh's own --min-pairs
-#       value). Pinned here so a future drift between the manifest and the
-#       wrapper script is caught, not because benchd itself would refuse a
-#       different floor.
+#   pairsPerCohort = 4
+#       RULED 4 by David 2026-08-26, verbatim: "you run it using 4 pairs
+#       instead of 2 of 8 batches" -- 8 prompts x 4 pairs is the
+#       challenger-grade sample mass the ruling buys. SUPERSESSION CHAIN, each
+#       link superseding the one above it:
+#         1. batch-8 brief D2 -- default 4;
+#         2. David 2026-08-24 ("do 2") -- RULED 2, landed in benchd as commit
+#            bb1a6216655912b8a57967bb9cd45cff973a82df, merged PR #184 at
+#            047e21833a66264310307e1cb86ae3a290b0fc27 on the
+#            gemma4-26b-a4b-mlx-v1 release branch;
+#         3. David 2026-08-26 -- RULED 4 (this value), returning to the
+#            brief's sample count on sample-mass grounds.
+#       PIN AGREEMENT IS A TWO-PHASE LANDING HERE, and that is deliberate:
+#       the benchd side (PAIRS_PER_COHORT_TARGET 2 -> 4) must MERGE AND
+#       PUBLISH before this repository's benchd.pin can name a commit that
+#       compiles 4. Until that pin advances, the pinned benchd still compiles
+#       `PAIRS_PER_COHORT_TARGET: usize = 2` and an OFFICIAL run declaring
+#       target_pairs=4 IS REFUSED at the pin -- the same ruled-ahead-of-pin
+#       state the 8/24 ruling passed through, and the reason this field has a
+#       caveat-based warn path at all. See docs/gemma4-port-notes.md section
+#       9.1 (which this dict's value must always match) for the full citation
+#       chain. NOT machine-cross-checked against the pinned benchd source here
+#       -- CI runs this linter without a benchd checkout, so that check could
+#       only ever run locally; docs/gemma4-port-notes.md section 9.1 remains
+#       the load-bearing, always-visible instrument for any future drift of
+#       this kind.
+#   minPairsPerCohort = 4
+#       ENFORCED AT THE PIN, same as pairsPerCohort. benchd refuses an OFFICIAL
+#       batched cohort run whose min_pairs != PAIRS_PER_COHORT_TARGET, by name,
+#       at the same pre-GPU seam as the target refusal (--local-dev still
+#       explores other floors). Before that gate landed, benchd's only floor
+#       rule was the parse-time `min_pairs <= target_pairs`, so a run declaring
+#       min 2 / target 4 passed every trusted-side check and then published a
+#       median over half the ruled support; the ruled floor rode entirely on
+#       the wrapper's argv. It no longer does.
+#
+#       WHAT THIS LINTER ITSELF CHECKS, stated exactly, because the two are
+#       easy to conflate: it pins the value of scoring.minPairsPerCohort in
+#       benchmark.json against the registry below. It does NOT read
+#       tools/gemma4-measure-and-score.sh, so it does not compare the manifest
+#       against the wrapper's actual --min-pairs literal -- a wrapper edited to
+#       --min-pairs 2 while this manifest still said 4 would not be caught HERE.
+#       That drift is caught at the pin instead: benchd refuses the run. The
+#       wrapper's --min-pairs 4 is a belt-and-suspenders DECLARATION of the
+#       ruled floor, and the wrapper lives under tools/ -- organizer-controlled,
+#       outside editablePaths -- so a submission cannot rewrite it either way.
 _GEMMA4_A4B_MLX_V1_SCORING = {
     "mode": "batched-cohort-paired-decode-only",
     "scoredBatchSize": 8,
@@ -193,8 +214,8 @@ _GEMMA4_A4B_MLX_V1_SCORING = {
     "decodeSpeedupFloor": 0.90,
     "decodeSpeedupCeiling": 5.0,
     "scoredExponents": {"prefillGainExponent": 0.25, "decodeGainExponent": 0.75},
-    "pairsPerCohort": 2,
-    "minPairsPerCohort": 2,
+    "pairsPerCohort": 4,
+    "minPairsPerCohort": 4,
 }
 
 EXPECTED_SCORING_BY_TRACK = {

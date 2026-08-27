@@ -50,6 +50,7 @@ import Testing
 // same day -- `Vendor/mlx-swift-lm/Libraries/MLXSpeculative/DFlashDraftModel.swift`
 // is an `editablePaths` entry as of this branch, and the DFlash suite mirrors
 // every test here against `DFlashDraftModel.load(from:bindTo:)`.
+// Box-only: needs the built Metal runtime, gated behind MLXFAST_RUN_MLX_RUNTIME_TESTS=1.
 @Suite("Head requant on load")
 struct HeadRequantOnLoadTests {
 
@@ -172,6 +173,9 @@ struct HeadRequantOnLoadTests {
     /// forward from a tiny target and does — see
     /// `DFlashRequantOnLoadTests.theDrafterIsQuantizedOnLoadAndTheStagedBytesNeverChange`.
     @Test func aHeadIsQuantizedOnLoadAndTheStagedBytesNeverChange() async throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try await Device.withDefaultDevice(.cpu) {
             try await withTemporaryWorkspace { workspace in
                 let head = try stageHead(in: workspace)
@@ -223,6 +227,9 @@ struct HeadRequantOnLoadTests {
     /// the requant test above: the head loads, it carries NO quantized module,
     /// and the staged tree digest is unmoved.
     @Test func withNoRequantTheOrganizerHeadLoadsUnchanged() async throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try await Device.withDefaultDevice(.cpu) {
             try await withTemporaryWorkspace { workspace in
                 let head = try stageHead(in: workspace)
@@ -258,6 +265,9 @@ struct HeadRequantOnLoadTests {
     /// to FAIL: if it could not, "the bytes did not change" would be vacuous.
     /// A deliberate one-byte edit to the staged tree must move the digest.
     @Test func theUnchangedBytesAssertionIsNotVacuous() async throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try await Device.withDefaultDevice(.cpu) {
             try await withTemporaryWorkspace { workspace in
                 let head = try stageHead(in: workspace)
@@ -273,6 +283,9 @@ struct HeadRequantOnLoadTests {
     /// the read-only stand-in could be silently ineffective — a chmod that did
     /// not take would make the sandbox proxy prove nothing.
     @Test func theReadOnlyStandInActuallyBlocksAWrite() async throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try await withTemporaryWorkspace { workspace in
             let head = try stageHead(in: workspace)
             let blocked = withReadOnlyStagedHead(head) {

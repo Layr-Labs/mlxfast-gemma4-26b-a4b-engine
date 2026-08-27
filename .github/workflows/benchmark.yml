@@ -86,7 +86,10 @@
 #   - box staging: the 8 pinned tapes in MLXFAST_GEMMA4_GOLDEN_DIR, the pinned
 #     baseline workspace, benchd-bin/benchctl matching ./benchd.pin (the box has
 #     no Rust toolchain and this job holds no dist token, so the binary is
-#     placed there out of band), and the reference checkpoint;
+#     placed there out of band), the reference checkpoint, and a macmon GPU
+#     temperature reader at the path this file pins into MLXFAST_MACMON and
+#     MLXFAST_MACMON_BIN (/opt/homebrew/bin/macmon) -- no reader, no ranked run:
+#     tools/ranked-box-preflight.sh hard-fails on it, item 8 below;
 #   - the track ARMED: fixtures/gemma4_26b_a4b_track.json still sets
 #     official_scoring_enabled to false, and the pinned measure-job refuses to
 #     seal an official scoring artifact while it is false (or absent). The
@@ -155,14 +158,85 @@ jobs:
     # The third label IS the track id (= the branch name = the R2 key prefix).
     # tools/box-runner/box-runner.env RUNNER_LABELS must advertise it.
     runs-on: [self-hosted, macOS, gemma4-26b-a4b-mlx-v1]
-    # A cold run fetches the ~15.6 GB checkpoint before it measures anything.
-    timeout-minutes: 180
+    # A cold run fetches the ~15.6 GB checkpoint before it measures anything,
+    # and then every timed phase waits behind a cool-down that can legitimately
+    # spend 900 s. RECOMPUTED twice (2026-08-26), which is why this is no longer
+    # 180. THE COUNT IS DERIVED FROM THE RULED PAIR COUNT, so it moves whenever
+    # that ruling moves -- it is restated here rather than left implicit:
+    #
+    #   pairsPerCohort 4 (David 2026-08-26, superseding the 2026-08-24 ruling
+    #   of 2 -- see docs/gemma4-port-notes.md section 9.1), one cohort, so
+    #   4 pairs x 2 legs (serial control + candidate) = 8 timed legs, and benchd
+    #   gates PER PHASE -- prefill and decode are separate cool_gate() calls on
+    #   a fresh worker (mlxfast-bench crates/bench-runner/src/timing.rs:445 and
+    #   :491) -- so up to 16 gated phases x 900 s = 240 min of cool-down ALONE,
+    #   worst case, before a single token is timed. (At the superseded
+    #   pairsPerCohort 2 this was 8 phases = 120 min.)
+    #
+    # 240 min of gating plus a cold ~15.6 GB fetch, a Metal build, head staging
+    # and the measurement itself does not fit in 180. At the cap GitHub kills the
+    # job mid-measurement, which burns the box's slot and produces nothing. 360 is
+    # the challenger's own budget for the same reason (qwen-mtp-ranked-benchmark.yml
+    # :205-208: "cooldowns (up to 900s per timed phase)").
+    #
+    # WHY 360 STILL SUFFICES AT 16 PHASES, honestly stated: the 900 s ceiling is
+    # NOT an operating point. A phase that actually burns 900 s means the box
+    # never reached the 40 C gate, which is itself the refusal condition -- that
+    # run is rejected and retried on a clean box rather than proceeding. Sixteen
+    # consecutive 900 s waits is not a slow run, it is a broken box, and it fails
+    # rather than finishing at minute 359. Observed waits are 0-10 s, i.e. under
+    # ~3 min of cool-down across all 16 phases, so the real budget is dominated
+    # by the fetch, the build and the measurement, not by gating. 240 min is the
+    # pathological ceiling this cap must not be BELOW, not the expected cost.
+    timeout-minutes: 360
     concurrency:
       # Dedicated to this box. Distinct from ci.yml's `ci-<ref>` group, and
       # .github/workflows/qwen38-mtp-ranked-benchmark.yml declares no group at
       # all, so nothing else can serialize against or evict this one.
       group: gemma4-26b-a4b-mlx-v1-ranked-box
       cancel-in-progress: false
+    env:
+      # --- Host contract: the GPU temperature reader ----------------------
+      # The challenger's job-env pin, same NAME, ported from
+      # Layr-Labs/qwen-3.8-mtp-challenge
+      # .github/workflows/qwen-mtp-ranked-benchmark.yml:218
+      # (`MLXFAST_MACMON: /opt/bench-runner/bin/macmon`).
+      #
+      # THE VALUE IS THIS BOX'S PATH, NOT THE CHALLENGER'S, and that is settled
+      # box config (David, 2026-08-26), not an interim. /opt/bench-runner is the
+      # challenger box's operator-owned, sudo-gated tree and is deliberately NOT
+      # required here; this box's macmon is the homebrew one, which is also the
+      # first built-in candidate the pinned benchd searches. Challenger-exactness
+      # binds the env NAME, the hard-fail form and the cooldown thresholds. The
+      # path is ours.
+      #
+      # EXPLICIT PATH, NO DISCOVERY, and the same file for both consumers. The
+      # two names are pinned to one literal here rather than resolved at runtime:
+      #   MLXFAST_MACMON      the challenger's name, read by this workflow's own
+      #                       steps and by tools/ranked-box-preflight.sh;
+      #   MLXFAST_MACMON_BIN  the ONLY reader name the pinned benchd honours
+      #                       (mlxfast-bench crates/benchctl/src/coolgate.rs
+      #                       resolve_temp_reader: MLXFAST_GPU_TEMP_CMD, then
+      #                       MLXFAST_MACMON_BIN, then PATH, then the built-ins).
+      # Pinning benchd's first discovery branch means the file the preflight
+      # proves executable IS the file benchd opens -- no PATH, no built-in
+      # fallback, nothing for a dispatcher to shift underneath the gate.
+      #
+      # The challenger hands its box wrapper `MACMON=` (:2967). That name is the
+      # WRAPPER's, not benchd's: `MACMON` does not appear as an env read in the
+      # pinned binary (benchd.pin sha256 e044e1f4..., whose strings carry exactly
+      # MLXFAST_GPU_TEMP_CMD, MLXFAST_MACMON_BIN, /opt/homebrew/bin/macmon,
+      # /usr/local/bin/macmon), so passing it would be cargo cult. Two env vars
+      # are all benchd needs, and the second one is below.
+      #
+      # GPU_LOADED_UTIL IS DELIBERATELY NOT SET. The challenger sets 0.70, but it
+      # DERIVED that from its own ~0.79-util serial leg (:2957-2963) -- a number
+      # to derive, never to copy. benchd's built-in default is already 0.70
+      # ("GPU_LOADED_UTIL Telemetry loaded/steady util threshold (default 0.70;
+      # env-driven)"), so leaving it unset takes the same value without asserting
+      # a gemma-specific derivation nobody has done yet.
+      MLXFAST_MACMON: /opt/homebrew/bin/macmon
+      MLXFAST_MACMON_BIN: /opt/homebrew/bin/macmon
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -238,6 +312,69 @@ jobs:
             printf 'MLXFAST_CANDIDATE_SHA_FILE=%s\n' "${RUNNER_TEMP}/candidate.sha"
             printf 'MLXFAST_COMMIT_SHA=%s\n' "${GITHUB_SHA}"
           } >> "${GITHUB_ENV}"
+
+      - name: Wait for quiescence before timing
+        # The challenger's pre-timing cool-down, ported line for line from
+        # qwen-mtp-ranked-benchmark.yml:2877 ("Wait for quiescence before
+        # timing"): same load < 2.0 and gpu_util < 0.10 thresholds, same 15 s
+        # poll, same 900 s ceiling, same named refusal. The build, the checkpoint
+        # verification and the head staging above all leave the machine warm, and
+        # this is the last point before the clock starts.
+        #
+        # ONE OMISSION, RULED PERMANENT (David, 2026-08-26). The challenger reaps
+        # lingering bench processes first via `sudo -n /opt/bench/bench-exec.sh`.
+        # That step is unportable here BY DESIGN, not by accident: this box has
+        # no passwordless sudo, deliberately and permanently -- "it shouldn't
+        # have one". No sudoers line will be added to make the reap portable, so
+        # do not reopen this as a gap.
+        #
+        # THE REFUSAL IS THE DESIGN. Without a reap, a box left loaded by a
+        # lingering process does not get measured hot -- it fails this step at
+        # the 900 s ceiling and the run is retried on a clean box. Refuse and
+        # retry, never a hot measurement. That is a different mechanism from the
+        # challenger's and the same guarantee, which is the whole reason the
+        # omission is safe to make permanent.
+        #
+        # THE 40 C CONTRACT ITSELF IS NOT RE-IMPLEMENTED HERE. The challenger's
+        # fixed 40 C per-phase gate lives in its box-owned measure wrapper
+        # (:162, :2906); ours lives in the pinned benchd measure-job (GATE_TEMP=40,
+        # COOL_TIMEOUT=900 -- mlxfast-bench crates/benchctl/src/coolgate.rs and
+        # measure_job.rs), which gates EVERY timed leg, baseline and candidate
+        # alike. This step gets the machine to the starting line; benchd holds the
+        # contract between the legs.
+        run: |
+          set -euo pipefail
+          waited=0
+          while :; do
+            load="$(sysctl -n vm.loadavg | awk '{print $2}')"
+            util="$("${MLXFAST_MACMON}" pipe -s1 2>/dev/null | jq -r '.gpu_usage[1] // 1' || true)"
+            [[ -n "${util}" ]] || util=1
+            if [[ "$(echo "${load} < 2.0" | bc -l)" == "1" && "$(echo "${util} < 0.10" | bc -l)" == "1" ]]; then
+              break
+            fi
+            sleep 15
+            waited=$((waited + 15))
+            if [[ "${waited}" -ge 900 ]]; then
+              echo "::error::machine did not reach quiescence within 900s (load=${load} gpu_util=${util})" >&2
+              exit 1
+            fi
+          done
+          # Same field the gates read (.temp.gpu_temp_avg), so this probe and
+          # benchd's gate cannot disagree about what the sensor says. The
+          # frozen-sensor and implausibility checks ran in full at preflight
+          # (tools/ranked-box-preflight.sh section 2c); this is the last look
+          # before the clock starts, and a reader that has died in the meantime
+          # must not be handed to the gates.
+          temp="$("${MLXFAST_MACMON}" pipe -s1 2>/dev/null | jq -r '.temp.gpu_temp_avg // empty')"
+          if [[ -z "${temp}" ]]; then
+            echo "::error::the GPU temperature reader stopped returning samples between preflight and timing; refusing to hand the cool gate a dead sensor" >&2
+            exit 1
+          fi
+          if [[ "$(jq -n --argjson t "${temp}" '$t > 5')" != "true" ]]; then
+            echo "::error::GPU temperature reads ${temp}C, at or below the 5C implausibility floor; the sensor is broken or frozen and every 40C cool gate would pass regardless of real temperature" >&2
+            exit 1
+          fi
+          echo "gemma4-ranked: quiescent after ${waited}s (load=${load} gpu_util=${util} gpu_temp=${temp}C); the fixed 40C per-phase gate is enforced inside the pinned measure-job"
 
       - name: Benchmark (benchd measure-job, then score conversion)
         # benchmark.json's benchmarkCommand, character for character. The

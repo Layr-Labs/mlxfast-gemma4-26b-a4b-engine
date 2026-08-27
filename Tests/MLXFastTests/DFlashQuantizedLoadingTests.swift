@@ -31,8 +31,9 @@ import Testing
 // getting the declaration wrong refuses by name instead of quietly running a
 // drafter nobody asked for.
 //
-// GPU-free at fixture scale, forced onto `.cpu`, same as
-// `Gemma4DFlashForwardTests`.
+// Forced onto `.cpu` and fixture-scale like `Gemma4DFlashForwardTests`, but
+// constructing the models still needs the built MLX runtime, which hosted CI
+// does not have: box-only, every test gated behind MLXFAST_RUN_MLX_RUNTIME_TESTS=1.
 @Suite("DFlash quantized weight binding")
 struct DFlashQuantizedLoadingTests {
 
@@ -160,6 +161,9 @@ struct DFlashQuantizedLoadingTests {
     /// shape. Before this change the load threw `UpdateError.mismatchedSize`
     /// on `fc.weight`.
     @Test func quantizedDrafterBindsAndProducesFiniteLogits() async throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try await Device.withDefaultDevice(.cpu) {
             try await withTemporaryDirectory { directory in
                 try stageCheckpoint(
@@ -203,6 +207,9 @@ struct DFlashQuantizedLoadingTests {
     /// the MTP head loader drives, so a `false` entry must skip that module and
     /// leave it at full precision rather than refusing the head.
     @Test func perLayerSkipLeavesThatModuleUnquantized() async throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try await Device.withDefaultDevice(.cpu) {
             try await withTemporaryDirectory { directory in
                 let skipped = "layers.0.mlp.down_proj"
@@ -235,6 +242,9 @@ struct DFlashQuantizedLoadingTests {
     /// every parameter bound bit-for-bit as written, and the same logits a
     /// drafter updated straight from those tensors produces.
     @Test func unquantizedDrafterLoadIsUnchanged() async throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try await Device.withDefaultDevice(.cpu) {
             try await withTemporaryDirectory { directory in
                 let configJSON = drafterConfigJSON()
@@ -292,6 +302,9 @@ struct DFlashQuantizedLoadingTests {
     // MARK: - (c) Unsupported geometry refuses, it does not fall back
 
     @Test func refusesUnsupportedQuantizationBits() async throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try await Device.withDefaultDevice(.cpu) {
             try await withTemporaryDirectory { directory in
                 let quantization =
@@ -312,6 +325,9 @@ struct DFlashQuantizedLoadingTests {
     }
 
     @Test func refusesUnsupportedQuantizationGroupSize() async throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try await Device.withDefaultDevice(.cpu) {
             try await withTemporaryDirectory { directory in
                 let quantization =
@@ -334,6 +350,9 @@ struct DFlashQuantizedLoadingTests {
     /// A per-layer override is bounded the same way the default is, and the
     /// refusal names the layer.
     @Test func refusesUnsupportedPerLayerQuantization() async throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try await Device.withDefaultDevice(.cpu) {
             try await withTemporaryDirectory { directory in
                 let quantization = """
@@ -362,6 +381,9 @@ struct DFlashQuantizedLoadingTests {
     /// A malformed declaration is not "no declaration". Loading such a
     /// checkpoint at full precision would report a drafter that never ran.
     @Test func refusesUndecodableQuantizationDeclaration() async throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try await Device.withDefaultDevice(.cpu) {
             try await withTemporaryDirectory { directory in
                 let quantization =
@@ -391,6 +413,9 @@ struct DFlashQuantizedLoadingTests {
     /// `update(verify:)` and die on a shape; now it is named at the seam that
     /// knows what went wrong.
     @Test func refusesQuantizedWeightsWithoutDeclaration() async throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try await Device.withDefaultDevice(.cpu) {
             try await withTemporaryDirectory { directory in
                 try stageCheckpoint(
@@ -411,6 +436,9 @@ struct DFlashQuantizedLoadingTests {
     /// to. Binding this at full precision would run a drafter the config says
     /// is 4-bit.
     @Test func refusesDeclarationWithoutQuantizedWeights() async throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try await Device.withDefaultDevice(.cpu) {
             try await withTemporaryDirectory { directory in
                 try stageCheckpoint(
@@ -443,6 +471,9 @@ struct DFlashQuantizedLoadingTests {
     /// throws `UpdateError.mismatchedSize` on `fc.weight`, which is exactly the
     /// pre-fix behavior.
     @Test func declaredQuantizationIsNeverSilentlyDropped() async throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try await Device.withDefaultDevice(.cpu) {
             try await withTemporaryDirectory { directory in
                 let configJSON = drafterConfigJSON(quantization: Self.declaredQuantization)
@@ -476,6 +507,9 @@ struct DFlashQuantizedLoadingTests {
     /// because that is easy to break by "improving" the check into a
     /// tensor-shape comparison.
     @Test func compatibilityValidationIgnoresQuantizedStorageShapes() async throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try await Device.withDefaultDevice(.cpu) {
             try await withTemporaryDirectory { directory in
                 try stageCheckpoint(

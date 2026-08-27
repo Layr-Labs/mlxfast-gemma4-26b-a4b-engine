@@ -83,14 +83,23 @@ EOF
 }
 
 generate() {
-  local gate file count
+  # Count GATE EXPRESSIONS -- `environment["<gate>"]`, the form every guard and
+  # hoisted gate constant in Tests/ uses -- not bare mentions of the variable
+  # name. A comment naming the variable is not a gate: before 2026-08-27 the
+  # count was `grep -c` on the bare name, and TargetQuantizationBindTests sat
+  # in this inventory on the strength of one comment while all eight of its
+  # tests ran ungated (the 2026-08-26 CI incident). Bare-name mentions still
+  # matter for gate DISCOVERY, so check_gates_are_complete keeps the loose
+  # match; only the per-file accounting is strict.
+  local gate file count needle
   for gate in "${GATES[@]}"; do
+    needle="environment[\"${gate}\"]"
     while IFS= read -r file; do
-      count="$(grep -c "${gate}" "${repo_root}/${file}")"
+      count="$(grep -cF "${needle}" "${repo_root}/${file}")"
       printf '%s %s %s\n' "${gate}" "${file}" "${count}"
     done < <(
       cd "${repo_root}" &&
-        grep -rl "${gate}" Tests 2>/dev/null | LC_ALL=C sort
+        grep -rlF "${needle}" Tests 2>/dev/null | LC_ALL=C sort
     )
   done
 }

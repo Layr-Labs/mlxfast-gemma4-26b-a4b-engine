@@ -67,6 +67,7 @@ import Testing
 // cannot guarantee — but it stops these eight model constructions from piling
 // into the shared stream concurrently, which is this suite's own contribution
 // to it. Reported upward rather than patched here.
+// Box-only: needs the built Metal runtime, gated behind MLXFAST_RUN_MLX_RUNTIME_TESTS=1.
 @Suite("Target quantization bind", .serialized)
 struct TargetQuantizationBindTests {
 
@@ -214,6 +215,9 @@ struct TargetQuantizationBindTests {
     // MARK: - 1. The pinned geometry passes
 
     @Test func aTargetAtThePinnedGeometryPasses() throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try Device.withDefaultDevice(.cpu) {
             let overrides = pins.runtimeOverridePaths(layerCount: layerCount)
             let model = try makeTarget(pinnedGeometry(overridePaths: overrides))
@@ -243,6 +247,9 @@ struct TargetQuantizationBindTests {
     /// the same disk, one different number handed to `quantize(model:)`. It
     /// must refuse, and the refusal must be readable enough to act on.
     @Test func anInMemoryRequantOfTheTargetIsRefused() throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try Device.withDefaultDevice(.cpu) {
             let pins = self.pins
             // `quantize(model: target, groupSize: 32, bits: 2)`, expressed
@@ -279,6 +286,9 @@ struct TargetQuantizationBindTests {
     /// entry is left at the 4-bit fallback -- the silent demotion the override
     /// table exists to prevent -- and everything else is pinned.
     @Test func theRefusalNamesTheExactDemotedOverridePath() throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try Device.withDefaultDevice(.cpu) {
             let demoted = "model.layers.1.mlp.gate_proj"
             let overrides = pins.runtimeOverridePaths(layerCount: layerCount)
@@ -316,6 +326,9 @@ struct TargetQuantizationBindTests {
     /// The last two lines are the control: same declaration, same runnability,
     /// and the bind is what separates them.
     @Test func nothingButTheBindObjectsToARequantizedTarget() throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try Device.withDefaultDevice(.cpu) {
             let pins = self.pins
             let overrides = pins.runtimeOverridePaths(layerCount: layerCount)
@@ -365,6 +378,9 @@ struct TargetQuantizationBindTests {
     /// head at some other geometry sitting next to a pinned target is fine.
     /// Refusing one would revoke a granted exception.
     @Test func aLawfullyRequantizedHeadDoesNotTripTheBind() throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try Device.withDefaultDevice(.cpu) {
             let pins = self.pins
             let overrides = pins.runtimeOverridePaths(layerCount: layerCount)
@@ -460,6 +476,9 @@ struct TargetQuantizationBindTests {
     /// Remove the re-check and every one of those three stays true. That is the
     /// red half.
     @Test func anInPlaceMutationAfterStartupIsCaughtOnlyByTheReCheck() throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try Device.withDefaultDevice(.cpu) {
             let pins = self.pins
             let demoted = "model.layers.1.mlp.gate_proj"
@@ -513,6 +532,9 @@ struct TargetQuantizationBindTests {
     /// identity comparison and the geometry walk are separate failures with
     /// separate diagnostics, so a rejection says which one happened.
     @Test func aSubstitutedTargetInstanceIsRefusedByIdentity() throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try Device.withDefaultDevice(.cpu) {
             let pins = self.pins
             let overrides = pins.runtimeOverridePaths(layerCount: layerCount)
@@ -542,6 +564,9 @@ struct TargetQuantizationBindTests {
     /// re-check either — a gate that tightened only at the second one would
     /// revoke the granted exception halfway through a run.
     @Test func aLawfullyRequantizedHeadIsSilentThroughBothChecks() throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try Device.withDefaultDevice(.cpu) {
             let pins = self.pins
             let overrides = pins.runtimeOverridePaths(layerCount: layerCount)

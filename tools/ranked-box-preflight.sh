@@ -89,11 +89,84 @@ ok "no R2 credential, signer, or dist token in the job environment"
 #   MLXFAST_LOCAL_COOL_GATE           disables the thermal gate.
 #   MLXFAST_LOCAL_ALLOW_GOLDEN_DRIFT  publishes a timing estimate past a failed
 #                                     public correctness gate.
-for var in BENCHCTL MLXFAST_SKIP_WEIGHTS_DOWNLOAD SKIP_MODEL_DOWNLOAD MLXFAST_LOCAL_COOL_GATE MLXFAST_LOCAL_ALLOW_GOLDEN_DRIFT; do
+#   MLXFAST_GPU_TEMP_CMD              displaces macmon as benchd's temperature
+#                                     reader with an arbitrary shell command --
+#                                     it is the FIRST branch of benchd's reader
+#                                     discovery, ahead of MLXFAST_MACMON_BIN, so
+#                                     `echo 20` set here would make every cool
+#                                     gate pass instantly on a hot GPU.
+for var in BENCHCTL MLXFAST_SKIP_WEIGHTS_DOWNLOAD SKIP_MODEL_DOWNLOAD MLXFAST_LOCAL_COOL_GATE MLXFAST_LOCAL_ALLOW_GOLDEN_DRIFT MLXFAST_GPU_TEMP_CMD; do
   eval "value=\${${var}:-}"
   [[ -z "${value}" ]] || fail "${var} is set in the ranked job's environment; it weakens or bypasses what the ranked run measures"
 done
 ok "no measurement-weakening override in the job environment"
+
+# --- 2b. the GPU temperature reader exists ----------------------------------
+# DAVID'S RULING 2026-08-26: no calibration without thermal control, and a
+# missing reader REFUSES rather than silently self-disabling.
+#
+# This is the challenger's host-preflight line, same form, same variable:
+#   test -x "${MLXFAST_MACMON}" || { echo "::error::macmon missing"; exit 1; }
+# (Layr-Labs/qwen-3.8-mtp-challenge .github/workflows/qwen-mtp-ranked-benchmark.yml
+# :1049, with the job-env pin at :218). The PATH differs on purpose: the
+# challenger pins /opt/bench-runner/bin/macmon, its box's sudo-gated operator
+# tree. This box has no /opt/bench-runner and needs none.
+#
+# WHY IT MUST BE LOUD HERE. The pinned benchd's own cool gate SKIPS with a
+# warning when no reader resolves -- it returns GateState::SkippedNoReader
+# (mlxfast-bench crates/benchctl/src/coolgate.rs:253) rather than failing. That
+# is correct for a participant's laptop and catastrophic for a ranked run: every
+# timed leg would proceed ungated and the seal would look normal. Refusing here
+# makes that path unreachable on this box.
+#
+# The default below is the same literal .github/workflows/benchmark.yml pins into
+# MLXFAST_MACMON and MLXFAST_MACMON_BIN; it exists so a manual run of this script
+# on the box checks the same file the ranked job will use.
+MLXFAST_MACMON="${MLXFAST_MACMON:-${MLXFAST_MACMON_BIN:-/opt/homebrew/bin/macmon}}"
+test -x "${MLXFAST_MACMON}" \
+  || fail "macmon missing at ${MLXFAST_MACMON}: no GPU temperature reader, so the 40C cool-down gate would silently skip on every timed leg (benchd coolgate.rs:253). Install macmon or point MLXFAST_MACMON_BIN at it; this run measures nothing without thermal control"
+ok "GPU temperature reader present and executable: ${MLXFAST_MACMON}"
+
+# --- 2c. the reader is not frozen -------------------------------------------
+# A reader that ALWAYS returns the same number passes every cool gate instantly,
+# including on a hot GPU, and leaves a seal that looks perfect ("waited 0s" on
+# every phase). Presence is therefore not enough: the sample has to be plausible
+# and it has to be capable of moving. Mirrors the challenger's own implausible-
+# reading guard (benchmark.sh:445-454, :871-886) with its <=5C floor.
+#
+# ORDER, AND WHY IT IS NOT A FLAKE: three quick samples first; a constant reading
+# there is common on a genuinely idle box, so it is not by itself a refusal. Only
+# if all three agree does it take three more, spread wider. Six identical
+# readings across ~20s is a stuck sensor, not an idle one.
+read_gpu_temp() {
+  "${MLXFAST_MACMON}" pipe -s1 2>/dev/null | jq -r '.temp.gpu_temp_avg // empty' | head -1
+}
+
+first_temp="$(read_gpu_temp || true)"
+[[ -n "${first_temp}" ]] \
+  || fail "the temperature reader at ${MLXFAST_MACMON} produced no .temp.gpu_temp_avg sample; a reader that cannot be read is a missing reader"
+[[ "$(jq -n --argjson t "${first_temp}" '$t > 5')" == "true" ]] \
+  || fail "GPU temperature reads ${first_temp}C, at or below the 5C implausibility floor; the sensor is broken or frozen, and a broken sensor passes every cool gate"
+
+distinct_temp_count() {
+  printf '%s\n' "$@" | sort -u | wc -l | tr -d ' '
+}
+
+temps=("${first_temp}")
+for _ in 1 2; do
+  sleep 2
+  temps+=("$(read_gpu_temp || true)")
+done
+if [[ "$(distinct_temp_count "${temps[@]}")" == "1" ]]; then
+  for _ in 1 2 3; do
+    sleep 5
+    temps+=("$(read_gpu_temp || true)")
+  done
+  if [[ "$(distinct_temp_count "${temps[@]}")" == "1" ]]; then
+    fail "the temperature reader at ${MLXFAST_MACMON} returned the identical value ${first_temp}C on ${#temps[@]} samples across ~20s; treating it as a frozen sensor, because a stuck reading passes every 40C cool gate on an arbitrarily hot GPU"
+  fi
+fi
+ok "temperature reader is plausible and moving (samples: ${temps[*]})"
 
 # --- 3. the timed pool is armed ---------------------------------------------
 # "Armed" is a property of the CONTRACT, checked before anything on disk is

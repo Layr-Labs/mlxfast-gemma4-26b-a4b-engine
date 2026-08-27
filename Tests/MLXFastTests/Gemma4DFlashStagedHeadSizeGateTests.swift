@@ -112,6 +112,9 @@ struct Gemma4DFlashStagedHeadSizeGateTests {
     /// One byte over the per-head cap is capability-absence, named, NOT a
     /// throw and NOT a load.
     @Test func overCapStagedDFlashHeadIsIncompatibleAndNamesTheCap() throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try Device.withDefaultDevice(.cpu) {
             let directory = try makeStagedDirectory(
                 totalBytes: gemma4DFlashStagedHeadMaxBytes + 1)
@@ -139,6 +142,9 @@ struct Gemma4DFlashStagedHeadSizeGateTests {
     /// assertion is that the reason is a DECODE complaint and says nothing
     /// about a cap.
     @Test func atCapStagedDFlashHeadProceedsToTheLoadAttempt() throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
         try Device.withDefaultDevice(.cpu) {
             let directory = try makeStagedDirectory(
                 totalBytes: gemma4DFlashStagedHeadMaxBytes)

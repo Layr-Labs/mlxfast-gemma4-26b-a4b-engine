@@ -2,10 +2,14 @@
 # Unit test for .github/scripts/emit-gemma4-score.sh. Offline, no GPU, no
 # benchd invocation -- exercises the emitter against synthetic sealed-results
 # samples shaped like measure-job's PerCohort record (mlxfast-bench crates/benchctl/
-# src/measure_job.rs), both a real-composite-present case (the shape PR #182
-# defined, not yet reachable end to end) and the current gated-absent-
-# composite case (the pinned gitlink's actual shape, verified by direct grep
-# -- see docs/participant-contract.md section 5.2).
+# src/measure_job.rs).
+#
+# THE FIXTURES ARE THE REAL SCHEMA NOW. Case 1 carried `"composite": 1.1875`, a
+# bare number, until 2026-08-26 -- a shape the pinned benchd has never emitted.
+# That invented fixture is why the emitter's object/number bug survived a green
+# test suite and only surfaced by killing a finished ranked round. The composite
+# blocks below are copied from sealed results.json files produced by the pinned
+# benchd (./benchd.pin sha256 e044e1f4...) on the ranked box, values and all.
 #
 # Usage: tools/test-gemma4-score-emitter.sh
 # Exit:  0 all cases pass, 1 a case failed (printed with a FAIL prefix)
@@ -35,19 +39,25 @@ cat > "${WORK}/results-with-composite.json" <<'EOF'
       "serial_seconds_per_token_mean": 0.012,
       "candidate_seconds_per_token_mean": 0.010,
       "raw_ratio_of_means": 1.2,
-      "composite": 1.1875
+      "composite": {
+        "composite_score": 0.945956243476148,
+        "composite_speedup_floor": 0.9,
+        "composite_speedup_floor_met": true,
+        "decode_gain": 0.9193183158707673,
+        "prefill_gain": 1.0305912562853754
+      }
     }
   ]
 }
 EOF
 if "${EMITTER}" "${WORK}/results-with-composite.json" "${WORK}/score-1.json" >"${WORK}/case1.out" 2>&1; then
   score="$(jq -r '.score' "${WORK}/score-1.json" 2>/dev/null || echo "MISSING")"
-  metrics_composite="$(jq -r '.metrics.composite' "${WORK}/score-1.json" 2>/dev/null || echo "MISSING")"
-  if [[ "${score}" != "1.1875" ]]; then
-    fail "case 1: expected score 1.1875, got '${score}'"
+  metrics_composite="$(jq -r '.metrics.composite.composite_score' "${WORK}/score-1.json" 2>/dev/null || echo "MISSING")"
+  if [[ "${score}" != "0.945956243476148" ]]; then
+    fail "case 1: expected score 0.945956243476148, got '${score}'"
   fi
-  if [[ "${metrics_composite}" != "1.1875" ]]; then
-    fail "case 1: expected metrics.composite 1.1875, got '${metrics_composite}'"
+  if [[ "${metrics_composite}" != "0.945956243476148" ]]; then
+    fail "case 1: expected metrics.composite.composite_score 0.945956243476148, got '${metrics_composite}'"
   fi
   # score.ts's ScoreFileSchema requires `score` to parse as a finite number;
   # confirm the emitted file is valid JSON with a numeric (not string) score.
@@ -104,6 +114,122 @@ if "${EMITTER}" "${WORK}/results-absent-reason.json" "${WORK}/score-3.json" >"${
 fi
 if ! grep -q "per_stream_aggregate_source not yet implemented" "${WORK}/case3.out"; then
   fail "case 3: expected composite_absent_reason to be echoed; got: $(cat "${WORK}/case3.out")"
+fi
+
+# Case 3b: THE REGRESSION THAT KILLED A FINISHED ROUND. A bare-number composite
+# is the shape this script wrongly assumed; benchd does not emit it. It must now
+# be refused as a SCHEMA MISMATCH -- and must never again be read as a score.
+cat > "${WORK}/results-bare-number.json" <<'EOF'
+{
+  "per_cohort": [
+    {
+      "cohort_index": 0,
+      "batch_size": 8,
+      "parity_ok": true,
+      "accepted_pair_count": 2,
+      "composite": 1.1875
+    }
+  ]
+}
+EOF
+if "${EMITTER}" "${WORK}/results-bare-number.json" "${WORK}/score-3b.json" >"${WORK}/case3b.out" 2>&1; then
+  fail "case 3b: emitter exited 0 on a bare-number composite (should refuse as a schema mismatch)"
+fi
+if ! grep -q "SCHEMA MISMATCH" "${WORK}/case3b.out"; then
+  fail "case 3b: expected a SCHEMA MISMATCH refusal; got: $(cat "${WORK}/case3b.out")"
+fi
+if [[ -e "${WORK}/score-3b.json" ]]; then
+  fail "case 3b: emitter wrote a score file despite refusing"
+fi
+
+# Case 3c: BELOW FLOOR. An honest, well-formed measurement that did not clear the
+# floor must refuse -- benchd wires composite_speedup_floor_met to nothing, so
+# this seam is the enforcement -- and must say so in its OWN words, not the
+# schema-mismatch words.
+cat > "${WORK}/results-below-floor.json" <<'EOF'
+{
+  "per_cohort": [
+    {
+      "cohort_index": 0,
+      "batch_size": 8,
+      "parity_ok": true,
+      "accepted_pair_count": 2,
+      "composite": {
+        "composite_score": 0.8421,
+        "composite_speedup_floor": 0.9,
+        "composite_speedup_floor_met": false,
+        "decode_gain": 0.81,
+        "prefill_gain": 0.95
+      }
+    }
+  ]
+}
+EOF
+if "${EMITTER}" "${WORK}/results-below-floor.json" "${WORK}/score-3c.json" >"${WORK}/case3c.out" 2>&1; then
+  fail "case 3c: emitter exited 0 on a below-floor composite (should refuse)"
+fi
+if ! grep -q "BELOW FLOOR" "${WORK}/case3c.out"; then
+  fail "case 3c: expected a BELOW FLOOR refusal; got: $(cat "${WORK}/case3c.out")"
+fi
+if grep -q "SCHEMA MISMATCH" "${WORK}/case3c.out"; then
+  fail "case 3c: below-floor must not read as a schema mismatch; got: $(cat "${WORK}/case3c.out")"
+fi
+if [[ -e "${WORK}/score-3c.json" ]]; then
+  fail "case 3c: emitter wrote a score file despite refusing"
+fi
+
+# Case 3d: FLOOR DRIFT. benchd applied a floor other than the one benchmark.json
+# publishes -- the run was scored against a different bar, so refuse.
+cat > "${WORK}/results-floor-drift.json" <<'EOF'
+{
+  "per_cohort": [
+    {
+      "cohort_index": 0,
+      "batch_size": 8,
+      "parity_ok": true,
+      "accepted_pair_count": 2,
+      "composite": {
+        "composite_score": 0.7,
+        "composite_speedup_floor": 0.5,
+        "composite_speedup_floor_met": true,
+        "decode_gain": 0.7,
+        "prefill_gain": 0.7
+      }
+    }
+  ]
+}
+EOF
+if "${EMITTER}" "${WORK}/results-floor-drift.json" "${WORK}/score-3d.json" >"${WORK}/case3d.out" 2>&1; then
+  fail "case 3d: emitter exited 0 on a drifted floor (should refuse)"
+fi
+if ! grep -q "FLOOR DRIFT" "${WORK}/case3d.out"; then
+  fail "case 3d: expected a FLOOR DRIFT refusal; got: $(cat "${WORK}/case3d.out")"
+fi
+
+# Case 3e: composite object missing the floor flag entirely -> schema mismatch,
+# because a floor cannot be enforced against a flag that is not there.
+cat > "${WORK}/results-no-floor-flag.json" <<'EOF'
+{
+  "per_cohort": [
+    {
+      "cohort_index": 0,
+      "batch_size": 8,
+      "parity_ok": true,
+      "accepted_pair_count": 2,
+      "composite": {
+        "composite_score": 1.4,
+        "decode_gain": 1.5,
+        "prefill_gain": 1.1
+      }
+    }
+  ]
+}
+EOF
+if "${EMITTER}" "${WORK}/results-no-floor-flag.json" "${WORK}/score-3e.json" >"${WORK}/case3e.out" 2>&1; then
+  fail "case 3e: emitter exited 0 on a composite with no floor flag (should refuse)"
+fi
+if ! grep -q "SCHEMA MISMATCH" "${WORK}/case3e.out"; then
+  fail "case 3e: expected a SCHEMA MISMATCH refusal; got: $(cat "${WORK}/case3e.out")"
 fi
 
 # Case 4: missing results.json -> refuses with a clear message, exit nonzero.

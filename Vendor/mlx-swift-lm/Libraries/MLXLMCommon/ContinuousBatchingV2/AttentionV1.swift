@@ -20,6 +20,13 @@ enum CBv2AttentionV1 {
         return value << 20
     }()
 
+    private static let physicalRingDecodeEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PHYSICAL_RING_ATTENTION"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     @inline(__always)
     static func shouldBlockQueries(_ L: Int) -> Bool {
         queryBlockSize > 0 && L > queryBlockSize
@@ -64,7 +71,8 @@ enum CBv2AttentionV1 {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?, softcap: Float? = nil,
         spanContexts: [CBv2SpanChunkContext?]? = nil,
-        serializeQueries: Bool = false
+        serializeQueries: Bool = false,
+        decodeRingOffsets: MLXArray? = nil
     ) -> MLXArray {
         let B = queries.dim(0)
         let L = queries.dim(2)
@@ -107,45 +115,36 @@ enum CBv2AttentionV1 {
             {
                 var cachedKeyRows: [MLXArray] = []
                 var cachedValueRows: [MLXArray] = []
+                var physicalKeyRows: [MLXArray] = []
+                var physicalValueRows: [MLXArray] = []
+                var hasPhysicalRings = physicalRingDecodeEnabled
                 cachedKeyRows.reserveCapacity(B)
                 cachedValueRows.reserveCapacity(B)
-
-                let windowedRows = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
-                if windowedRows.count == B
-                    && windowedRows.allSatisfy(\.canUseFullDecodeRing)
-                {
-                    var starts: [Int] = []
-                    starts.reserveCapacity(B)
-                    for (index, row) in windowedRows.enumerated() {
-                        let ring = row.writeFullDecodeRing(
-                            keys: keys[index ..< (index + 1)],
-                            values: values[index ..< (index + 1)])
-                        cachedKeyRows.append(ring.keys)
-                        cachedValueRows.append(ring.values)
-                        starts.append(ring.start)
-                    }
-                    if let output = CBv2RaggedTwoPassDecodeAttentionV1.attendRing(
-                        queries: queries, keys: cachedKeyRows, values: cachedValueRows,
-                        starts: starts, scale: scale)
+                physicalKeyRows.reserveCapacity(B)
+                physicalValueRows.reserveCapacity(B)
+                for (index, row) in rows.enumerated() {
+                    let (cachedKeys, cachedValues) = row.update(
+                        keys: keys[index ..< (index + 1)],
+                        values: values[index ..< (index + 1)])
+                    cachedKeyRows.append(cachedKeys)
+                    cachedValueRows.append(cachedValues)
+                    if hasPhysicalRings,
+                        let ring = (row as? CBv2WindowedSequenceKV)?
+                            .decodePhysicalRingViews()
                     {
-                        return output
+                        physicalKeyRows.append(ring.keys)
+                        physicalValueRows.append(ring.values)
+                    } else {
+                        hasPhysicalRings = false
                     }
-
-                    cachedKeyRows.removeAll(keepingCapacity: true)
-                    cachedValueRows.removeAll(keepingCapacity: true)
-                    for row in windowedRows {
-                        let snapshot = row.snapshot()
-                        cachedKeyRows.append(snapshot.keys)
-                        cachedValueRows.append(snapshot.values)
-                    }
-                } else {
-                    for (index, row) in rows.enumerated() {
-                        let (cachedKeys, cachedValues) = row.update(
-                            keys: keys[index ..< (index + 1)],
-                            values: values[index ..< (index + 1)])
-                        cachedKeyRows.append(cachedKeys)
-                        cachedValueRows.append(cachedValues)
-                    }
+                }
+                if hasPhysicalRings, let decodeRingOffsets,
+                    let output = CBv2RaggedTwoPassDecodeAttentionV1.attendPhysicalRings(
+                        queries: queries, keys: physicalKeyRows,
+                        values: physicalValueRows, ringOffsets: decodeRingOffsets,
+                        offsetAdvance: 1, scale: scale)
+                {
+                    return output
                 }
                 if let output = CBv2RaggedTwoPassDecodeAttentionV1.attend(
                     queries: queries, keys: cachedKeyRows, values: cachedValueRows,
@@ -385,7 +384,8 @@ enum CBv2AttentionV1 {
         sourceRows: [CBv2SequenceKV], sourceKind: CBv2LayerKind, kind: CBv2LayerKind,
         queries: MLXArray, scale: Float, sinks: MLXArray?, softcap: Float? = nil,
         spanContexts: [CBv2SpanChunkContext?]? = nil,
-        serializeQueries: Bool = false
+        serializeQueries: Bool = false,
+        decodeRingOffsets: MLXArray? = nil
     ) -> MLXArray {
         let B = queries.dim(0)
         let L = queries.dim(2)
@@ -470,8 +470,13 @@ enum CBv2AttentionV1 {
         {
             var cachedKeyRows: [MLXArray] = []
             var cachedValueRows: [MLXArray] = []
+            var physicalKeyRows: [MLXArray] = []
+            var physicalValueRows: [MLXArray] = []
+            var hasPhysicalRings = physicalRingDecodeEnabled
             cachedKeyRows.reserveCapacity(B)
             cachedValueRows.reserveCapacity(B)
+            physicalKeyRows.reserveCapacity(B)
+            physicalValueRows.reserveCapacity(B)
             for row in sourceRows {
                 let cachedKeys: MLXArray
                 let cachedValues: MLXArray
@@ -482,6 +487,23 @@ enum CBv2AttentionV1 {
                 }
                 cachedKeyRows.append(cachedKeys)
                 cachedValueRows.append(cachedValues)
+                if hasPhysicalRings,
+                    let ring = (row as? CBv2WindowedSequenceKV)?
+                        .decodePhysicalRingViews()
+                {
+                    physicalKeyRows.append(ring.keys)
+                    physicalValueRows.append(ring.values)
+                } else {
+                    hasPhysicalRings = false
+                }
+            }
+            if hasPhysicalRings, let decodeRingOffsets,
+                let output = CBv2RaggedTwoPassDecodeAttentionV1.attendPhysicalRings(
+                    queries: queries, keys: physicalKeyRows,
+                    values: physicalValueRows, ringOffsets: decodeRingOffsets,
+                    offsetAdvance: 0, scale: scale)
+            {
+                return output
             }
             if let output = CBv2RaggedTwoPassDecodeAttentionV1.attend(
                 queries: queries, keys: cachedKeyRows, values: cachedValueRows,

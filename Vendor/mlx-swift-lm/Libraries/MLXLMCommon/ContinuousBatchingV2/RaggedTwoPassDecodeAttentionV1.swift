@@ -18,13 +18,6 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    private static let ringEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_RING_ATTENTION"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
     private static let batch = 8
     private static let queryHeads = 16
     private static let kvHeads = 8
@@ -47,15 +40,49 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         }
     }()
 
-    private static let passAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v1",
-        inputNames: [
-            "queries",
+    private static func makePassAKernel(physicalRing: Bool) -> MLXFast.MLXFastKernel {
+        var inputNames = ["queries"]
+        if physicalRing { inputNames.append("ring_offsets") }
+        inputNames += [
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
-        ],
-        outputNames: ["partials", "sums", "maxs"],
-        source: """
+        ]
+        let locateRows = physicalRing
+            ? """
+                const int ring_start =
+                    (int(ring_offsets[batch_index]) + OFFSET_ADVANCE) & (N - 1);
+                const device T* key_row = keys
+                    + kv_head * N * D + lane * values_per_lane;
+                const device T* value_row = values
+                    + kv_head * N * D + lane * values_per_lane;
+              """
+            : """
+                keys += kv_head * N * D + block * D + lane * values_per_lane;
+                values += kv_head * N * D + block * D + lane * values_per_lane;
+              """
+        let locateToken = physicalRing
+            ? """
+                    const int physical_token = (ring_start + token) & (N - 1);
+                    const device T* token_keys = key_row + physical_token * D;
+                    const device T* token_values = value_row + physical_token * D;
+              """
+            : ""
+        let keyName = physicalRing ? "token_keys" : "keys"
+        let valueName = physicalRing ? "token_values" : "values"
+        let advance = physicalRing
+            ? ""
+            : """
+                    keys += BLOCKS * D;
+                    values += BLOCKS * D;
+              """
+
+        return MLXFast.metalKernel(
+            name: physicalRing
+                ? "cbv2_ring8_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v1"
+                : "cbv2_ragged8_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v1",
+            inputNames: inputNames,
+            outputNames: ["partials", "sums", "maxs"],
+            source: """
             constexpr int simd_width = 32;
             constexpr int values_per_lane = D / simd_width;
 
@@ -82,8 +109,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
 
             const device T* query =
                 queries + batch_head * D + lane * values_per_lane;
-            keys += kv_head * N * D + block * D + lane * values_per_lane;
-            values += kv_head * N * D + block * D + lane * values_per_lane;
+            \(locateRows)
             device T* partial = partials
                 + batch_head * BLOCKS * D + block * D + lane * values_per_lane;
             device float* sum_out = sums + batch_head * BLOCKS + block;
@@ -99,9 +125,10 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             float max_score = -3.402823466e+38F;
             float sum_exp_score = 0.0f;
             for (int token = block; token < N; token += BLOCKS) {
+                \(locateToken)
                 float score = 0.0f;
                 for (int element = 0; element < values_per_lane; ++element) {
-                    score += q[element] * float(keys[element]);
+                    score += q[element] * float(\(keyName)[element]);
                 }
                 score = simd_sum(score);
 
@@ -112,11 +139,9 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 sum_exp_score = sum_exp_score * old_factor + score_factor;
                 for (int element = 0; element < values_per_lane; ++element) {
                     accumulator[element] = accumulator[element] * old_factor
-                        + score_factor * float(values[element]);
+                        + score_factor * float(\(valueName)[element]);
                 }
-
-                keys += BLOCKS * D;
-                values += BLOCKS * D;
+                \(advance)
             }
 
             if (lane == 0) {
@@ -126,98 +151,13 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             for (int element = 0; element < values_per_lane; ++element) {
                 partial[element] = T(accumulator[element]);
             }
-        """,
-        ensureRowContiguous: true
-    )
+            """,
+            ensureRowContiguous: true
+        )
+    }
 
-    private static let ringPassAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_ring_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v1",
-        inputNames: [
-            "queries",
-            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
-            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
-            "starts",
-        ],
-        outputNames: ["partials", "sums", "maxs"],
-        source: """
-            constexpr int simd_width = 32;
-            constexpr int values_per_lane = D / simd_width;
-
-            const int kv_head = int(threadgroup_position_in_grid.x);
-            const int batch_index = int(threadgroup_position_in_grid.y);
-            const int block = int(threadgroup_position_in_grid.z);
-            const int query_head_in_group = int(thread_position_in_threadgroup.y);
-            const int query_head = GQA * kv_head + query_head_in_group;
-            const int batch_head = batch_index * 16 + query_head;
-            const int lane = int(thread_index_in_simdgroup);
-
-            const device T* keys = k0;
-            const device T* values = v0;
-            switch (batch_index) {
-                case 1: keys = k1; values = v1; break;
-                case 2: keys = k2; values = v2; break;
-                case 3: keys = k3; values = v3; break;
-                case 4: keys = k4; values = v4; break;
-                case 5: keys = k5; values = v5; break;
-                case 6: keys = k6; values = v6; break;
-                case 7: keys = k7; values = v7; break;
-                default: break;
-            }
-
-            const device T* query =
-                queries + batch_head * D + lane * values_per_lane;
-            keys += kv_head * N * D + lane * values_per_lane;
-            values += kv_head * N * D + lane * values_per_lane;
-            device T* partial = partials
-                + batch_head * BLOCKS * D + block * D + lane * values_per_lane;
-            device float* sum_out = sums + batch_head * BLOCKS + block;
-            device float* max_out = maxs + batch_head * BLOCKS + block;
-
-            thread float q[values_per_lane];
-            thread float accumulator[values_per_lane];
-            for (int element = 0; element < values_per_lane; ++element) {
-                q[element] = 1.0f * float(query[element]);
-                accumulator[element] = 0.0f;
-            }
-
-            uint slot = (starts[batch_index] + uint(block)) % uint(N);
-            float max_score = -3.402823466e+38F;
-            float sum_exp_score = 0.0f;
-            for (int token = block; token < N; token += BLOCKS) {
-                const device T* key = keys + slot * D;
-                const device T* value = values + slot * D;
-                float score = 0.0f;
-                for (int element = 0; element < values_per_lane; ++element) {
-                    score += q[element] * float(key[element]);
-                }
-                score = simd_sum(score);
-
-                const float new_max = max(max_score, score);
-                const float old_factor = fast::exp(max_score - new_max);
-                const float score_factor = fast::exp(score - new_max);
-                max_score = new_max;
-                sum_exp_score = sum_exp_score * old_factor + score_factor;
-                for (int element = 0; element < values_per_lane; ++element) {
-                    accumulator[element] = accumulator[element] * old_factor
-                        + score_factor * float(value[element]);
-                }
-
-                slot += BLOCKS;
-                if (slot >= uint(N)) {
-                    slot -= uint(N);
-                }
-            }
-
-            if (lane == 0) {
-                sum_out[0] = sum_exp_score;
-                max_out[0] = max_score;
-            }
-            for (int element = 0; element < values_per_lane; ++element) {
-                partial[element] = T(accumulator[element]);
-            }
-        """,
-        ensureRowContiguous: true
-    )
+    private static let passAKernel = makePassAKernel(physicalRing: false)
+    private static let physicalPassAKernel = makePassAKernel(physicalRing: true)
 
     private static let passBKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "cbv2_ragged8_sdpa_2pass_b_bf16_d256_b\(blocks)_v1",
@@ -287,67 +227,55 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         ensureRowContiguous: true
     )
 
-    static func attendRing(
+    static func attendPhysicalRings(
         queries: MLXArray,
         keys: [MLXArray],
         values: [MLXArray],
-        starts: [Int],
+        ringOffsets: MLXArray,
+        offsetAdvance: Int,
         scale: Float
     ) -> MLXArray? {
         guard enabled,
-            ringEnabled,
             blocks > 0,
             blocks.isMultiple(of: 32),
             scale == 1.0,
             queries.dtype == .bfloat16,
             queries.shape == [batch, queryHeads, 1, headDim],
+            ringOffsets.dtype == .int32,
+            ringOffsets.shape == [batch],
+            offsetAdvance == 0 || offsetAdvance == 1,
             keys.count == batch,
-            values.count == batch,
-            starts.count == batch,
-            starts.allSatisfy({ (0 ..< sequenceLength).contains($0) })
+            values.count == batch
         else { return nil }
 
         for index in 0 ..< batch {
-            let key = keys[index]
-            let value = values[index]
-            guard key.dtype == .bfloat16,
-                value.dtype == .bfloat16,
-                key.shape == [1, kvHeads, sequenceLength, headDim],
-                value.shape == key.shape
+            guard keys[index].dtype == .bfloat16,
+                values[index].dtype == .bfloat16,
+                keys[index].shape == [1, kvHeads, sequenceLength, headDim],
+                values[index].shape == keys[index].shape
             else { return nil }
         }
 
-        let startArray = MLXArray(starts.map(UInt32.init))
-        let inputs = [queries] + keys + values + [startArray]
-        let partialShape = [batch, queryHeads, 1, blocks, headDim]
-        let summaryShape = [batch, queryHeads, 1, blocks]
-        let passA = ringPassAKernel(
-            inputs,
+        let passA = physicalPassAKernel(
+            [queries, ringOffsets] + keys + values,
             template: [
                 ("T", queries.dtype),
                 ("D", headDim),
                 ("N", sequenceLength),
                 ("GQA", gqa),
                 ("BLOCKS", blocks),
+                ("OFFSET_ADVANCE", offsetAdvance),
             ],
             grid: (kvHeads * 32, batch * gqa, blocks),
             threadGroup: (32, gqa, 1),
-            outputShapes: [partialShape, summaryShape, summaryShape],
+            outputShapes: [
+                [batch, queryHeads, 1, blocks, headDim],
+                [batch, queryHeads, 1, blocks],
+                [batch, queryHeads, 1, blocks],
+            ],
             outputDTypes: [.bfloat16, .float32, .float32]
         )
-
-        return passBKernel(
-            passA,
-            template: [
-                ("T", queries.dtype),
-                ("D", headDim),
-                ("BLOCKS", blocks),
-            ],
-            grid: (batch * queryHeads * 1024, 1, 1),
-            threadGroup: (1024, 1, 1),
-            outputShapes: [[batch, queryHeads, 1, headDim]],
-            outputDTypes: [.bfloat16]
-        )[0]
+        return merge(passA, dtype: queries.dtype)
     }
 
     static func attend(
@@ -394,10 +322,14 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             outputDTypes: [.bfloat16, .float32, .float32]
         )
 
-        return passBKernel(
+        return merge(passA, dtype: queries.dtype)
+    }
+
+    private static func merge(_ passA: [MLXArray], dtype: DType) -> MLXArray {
+        passBKernel(
             passA,
             template: [
-                ("T", queries.dtype),
+                ("T", dtype),
                 ("D", headDim),
                 ("BLOCKS", blocks),
             ],

@@ -117,7 +117,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             queries: queries, keys: keys, values: values,
             scale: scale, sinks: sinks, softcap: attentionSoftcap,
             spanContexts: boundSpanContexts,
-            serializeQueries: mtpSerializesRectangularAttention)
+            serializeQueries: mtpSerializesRectangularAttention,
+            decodeRingOffsets: cachedPositionOffsets)
         // Advance offsets ON-DEVICE. Decode and packed prefill are
         // rectangular, so L is uniform across every bound row.
         cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))
@@ -161,7 +162,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             sourceRows: source.rows, sourceKind: source.kind, kind: kind,
             queries: queries, scale: scale, sinks: sinks, softcap: attentionSoftcap,
             spanContexts: boundSpanContexts,
-            serializeQueries: mtpSerializesRectangularAttention)
+            serializeQueries: mtpSerializesRectangularAttention,
+            decodeRingOffsets: source.positionOffsets)
     }
 
     // MARK: - Private

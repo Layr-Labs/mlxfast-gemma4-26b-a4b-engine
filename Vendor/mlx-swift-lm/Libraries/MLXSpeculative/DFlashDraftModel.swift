@@ -347,6 +347,14 @@ public final class DFlashDraftModel: Module, @unchecked Sendable {
     /// same on both arms.
     public static let submissionDraftDepth = 1
 
+    /// The pure DFlash depth clamp. A requested draft depth, bounded by the
+    /// drafter ceiling and the engine ceiling, floored at 1. A value above a
+    /// ceiling clamps to the ceiling. The engine does not refuse it.
+    /// `gemma4DFlashMaxDepth` calls this with `submissionDraftDepth`.
+    public static func clampDepth(requested: Int, drafterCeiling: Int, engineCeiling: Int) -> Int {
+        Swift.max(1, Swift.min(requested, drafterCeiling, engineCeiling))
+    }
+
     public let config: DFlashConfiguration
 
     @ModuleInfo(key: "fc") public var contextProjection: Linear

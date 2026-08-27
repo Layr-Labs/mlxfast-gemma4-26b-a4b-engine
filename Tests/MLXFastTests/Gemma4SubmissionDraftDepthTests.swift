@@ -1,12 +1,11 @@
 import Testing
-@testable import MLXFastHarness
 @testable import MLXLMCommon
 import MLXSpeculative
 
 // The unified participant draft-depth lever. Both speculative arms read ONE
 // editable constant, `submissionDraftDepth` (default 1), written identically:
-//   MTP    — CBv2MTPRoundDriver.submissionDraftDepth (an adaptive CEILING)
-//   DFlash — DFlashDraftModel.submissionDraftDepth   (a FIXED block depth)
+//   MTP:    CBv2MTPRoundDriver.submissionDraftDepth (an adaptive CEILING).
+//   DFlash: DFlashDraftModel.submissionDraftDepth (a FIXED block depth).
 // These tests pin the defaults and the pure clamp/ceiling logic that turns the
 // constant into the operating depth. The per-arm run behaviour (adaptive vs
 // fixed block) is integration-level and covered by the ranked path; here we lock
@@ -29,17 +28,17 @@ import MLXSpeculative
 }
 
 @Test func dflashClampHonorsRequestBoundedByBothCeilings() {
-    // At or below the ceilings, the requested depth runs as set — 6 and 8 both.
-    #expect(gemma4DFlashClampDepth(requested: 1, drafterCeiling: 15, engineCeiling: 15) == 1)
-    #expect(gemma4DFlashClampDepth(requested: 6, drafterCeiling: 15, engineCeiling: 15) == 6)
-    #expect(gemma4DFlashClampDepth(requested: 8, drafterCeiling: 15, engineCeiling: 15) == 8)
-    #expect(gemma4DFlashClampDepth(requested: 15, drafterCeiling: 15, engineCeiling: 15) == 15)
-    // Above a ceiling clamps to it — not refused.
-    #expect(gemma4DFlashClampDepth(requested: 20, drafterCeiling: 15, engineCeiling: 15) == 15)
+    // At or below the ceilings, the requested depth runs as set. Both 6 and 8.
+    #expect(DFlashDraftModel.clampDepth(requested: 1, drafterCeiling: 15, engineCeiling: 15) == 1)
+    #expect(DFlashDraftModel.clampDepth(requested: 6, drafterCeiling: 15, engineCeiling: 15) == 6)
+    #expect(DFlashDraftModel.clampDepth(requested: 8, drafterCeiling: 15, engineCeiling: 15) == 8)
+    #expect(DFlashDraftModel.clampDepth(requested: 15, drafterCeiling: 15, engineCeiling: 15) == 15)
+    // Above a ceiling clamps to it. It is not refused.
+    #expect(DFlashDraftModel.clampDepth(requested: 20, drafterCeiling: 15, engineCeiling: 15) == 15)
     // The tighter of the drafter and engine ceilings wins.
-    #expect(gemma4DFlashClampDepth(requested: 20, drafterCeiling: 7, engineCeiling: 15) == 7)
-    #expect(gemma4DFlashClampDepth(requested: 20, drafterCeiling: 15, engineCeiling: 10) == 10)
-    // Floored at 1 — a non-positive request never disables the arm to depth 0.
-    #expect(gemma4DFlashClampDepth(requested: 0, drafterCeiling: 15, engineCeiling: 15) == 1)
-    #expect(gemma4DFlashClampDepth(requested: -3, drafterCeiling: 15, engineCeiling: 15) == 1)
+    #expect(DFlashDraftModel.clampDepth(requested: 20, drafterCeiling: 7, engineCeiling: 15) == 7)
+    #expect(DFlashDraftModel.clampDepth(requested: 20, drafterCeiling: 15, engineCeiling: 10) == 10)
+    // Floored at 1. A non-positive request never disables the arm to depth 0.
+    #expect(DFlashDraftModel.clampDepth(requested: 0, drafterCeiling: 15, engineCeiling: 15) == 1)
+    #expect(DFlashDraftModel.clampDepth(requested: -3, drafterCeiling: 15, engineCeiling: 15) == 1)
 }

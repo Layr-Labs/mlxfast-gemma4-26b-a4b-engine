@@ -11,7 +11,7 @@ import Testing
 //
 // Gemma4DFlashHeadDeclarationSizeGateTests covers the MANIFEST half: the cap
 // as `Gemma4MTPHeadDeclaration` with `kind: .dflash` enforces it on
-// `dflash-head.manifest.json`, upstream of the sandbox, on the size a stager
+// `spec-decoder-head.manifest.json`, upstream of the sandbox, on the size a stager
 // is allowed to DECLARE. That gate was written when the DFlash arm was an
 // ALIAS over the MTP assistant-head loader, so the declaration layer was the
 // only layer there was.

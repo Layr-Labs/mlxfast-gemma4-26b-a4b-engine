@@ -65,7 +65,7 @@
 # COMMITTABILITY. dflash-head/ IS a benchmark.json `editablePaths` /
 # `optionalEditablePaths` entry (the track's SECOND replaceable head, twin of
 # mtp-head/), so a participant MAY ship an in-branch drafter by declaring
-# `"source": "in_branch"` in dflash-head.manifest.json. What .gitignore
+# `"source": "in_branch"` in spec-decoder-head.manifest.json. What .gitignore
 # excludes is only the ORGANIZER-PINNED bytes this script stages -- 859 MB
 # that are downloaded and hash-verified, never authored, and that carry no
 # authority the pin does not already carry. The committed README.md is

@@ -92,7 +92,7 @@ struct Gemma4BenchmarkManifestTests {
         // WEIGHTS DIRECTORIES leave the editable surface. `mtp-head/` and
         // `dflash-head/` are organizer-staged, so a submission has no reason to
         // carry bytes there and no way to. The two declaration files
-        // (`mtp-head.manifest.json`, `dflash-head.manifest.json`) STAY editable:
+        // (`mtp-head.manifest.json`, `spec-decoder-head.manifest.json`) STAY editable:
         // they are how a participant declares a re-quantization of the pinned
         // head. 94 was the 2026-08-25 count, when the DFlash drafter joined as a
         // second REPLACEABLE head; replacement is retired, re-quantization is
@@ -278,7 +278,7 @@ struct Gemma4BenchmarkManifestTests {
 
         // POSITIVE DISCRIMINATOR. The rule is "no head WEIGHTS", not "no head
         // declaration": a requant submission has to have something to edit.
-        for declaration in ["mtp-head.manifest.json", "dflash-head.manifest.json"] {
+        for declaration in ["mtp-head.manifest.json", "spec-decoder-head.manifest.json"] {
             #expect(editablePaths.contains(declaration), "\(declaration) must stay editable: it is how a re-quantization is declared")
             #expect(optionalPaths.contains(declaration), "\(declaration) must stay optional: an absent declaration selects the organizer-pinned head")
         }

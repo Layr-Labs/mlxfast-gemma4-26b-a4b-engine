@@ -56,7 +56,7 @@ weights/*
 #
 # NOT a blanket ban on content here. dflash-head/ is an `optionalEditablePaths`
 # entry -- the twin of mtp-head/ -- so a participant MAY declare an in-branch
-# drafter (`"source": "in_branch"` in dflash-head.manifest.json) and add it
+# drafter (`"source": "in_branch"` in spec-decoder-head.manifest.json) and add it
 # with `git add -f`. And dflash-head/README.md is CHECKED IN on purpose: the
 # submission archiver fails on an editablePaths entry that is absent on disk,
 # so the README keeps the directory present while shipping no weights. Ignore

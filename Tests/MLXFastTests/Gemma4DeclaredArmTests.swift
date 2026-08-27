@@ -5,7 +5,7 @@ import Testing
 
 // THE SELECTION CHANNEL, parse side.
 //
-// `dflash-head.manifest.json` gained an `arm` key on 2026-08-26: the channel a
+// `spec-decoder-head.manifest.json` gained an `arm` key on 2026-08-26: the channel a
 // submission uses to say which speculative arm it wants measured. Until it
 // existed, `benchmark.json`, `docs/participant-contract.md` section 5.1.1,
 // `README.md` and `TASK.md` all promised "a submission runs whichever mode its
@@ -57,7 +57,7 @@ func declaredArmVocabularyIsTheTwoScoredArms() {
     #expect(DeclaredArm.declaringHeadKind == .dflash)
     #expect(
         DeclaredArm.declaringHeadKind.manifestRelativePath
-            == "dflash-head.manifest.json")
+            == "spec-decoder-head.manifest.json")
     #expect(Gemma4MTPHeadDeclaration.armKey == "arm")
 }
 
@@ -185,7 +185,7 @@ func armOnTheMTPManifestIsRefused() {
         _ = try parseMTP(#"{"source":"pinned","arm":"dflash"}"#)
         Issue.record("an arm on the MTP manifest must refuse")
     } catch {
-        #expect("\(error)".contains("dflash-head.manifest.json"))
+        #expect("\(error)".contains("spec-decoder-head.manifest.json"))
     }
     // ...and the MTP manifest WITHOUT an arm is untouched by the rule.
     #expect(throws: Never.self) {

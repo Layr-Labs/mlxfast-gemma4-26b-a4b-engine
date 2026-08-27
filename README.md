@@ -202,7 +202,7 @@ stays trusted.
 The editable surface has five groups.
 
 1. The two head declarations. `mtp-head.manifest.json` and
-   `dflash-head.manifest.json`. The declaration files only. The weights
+   `spec-decoder-head.manifest.json`. The declaration files only. The weights
    directories `mtp-head/` and `dflash-head/` are not editable.
 2. The participant runtime. `Sources/MLXFastModel/` and
    `Sources/MLXFastTransform/`.
@@ -229,12 +229,12 @@ carries no head weight file. A submission that carries one is refused before any
 measurement.
 
 The declaration files stay editable: `mtp-head.manifest.json` and
-`dflash-head.manifest.json`. Each accepts `"source": "pinned"` only.
+`spec-decoder-head.manifest.json`. Each accepts `"source": "pinned"` only.
 `"source": "remote"` and `"source": "in_branch"` are refused by name. Each head
 has a 2 GiB declaration cap (`max_bytes` = 2147483648); a declaration may lower
 it and may not raise it.
 
-`dflash-head.manifest.json` also carries the `arm` key, which selects the
+`spec-decoder-head.manifest.json` also carries the `arm` key, which selects the
 speculative arm the ranked run measures. `mtp-head.manifest.json` does not: an
 `arm` there is refused, because nothing reads it. See "Scoring" below and
 `docs/participant-contract.md` section 5.1.1.
@@ -267,18 +267,20 @@ head.
 > The batch size stays 8. You may not tune it.
 >
 > The draft depth is a free lever on BOTH speculative arms, and neither is
-> pinned at 1. Your drafter code sets it, and that code is editable. A request
-> above an arm's ceiling is clamped, not refused.
+> pinned at 1. You set it in code. Each arm reads one editable constant,
+> `submissionDraftDepth`. Both constants default to 1. A value above the ceiling
+> of an arm clamps to the ceiling. The engine does not refuse it.
 >
-> **MTP** — select 1, 2 or 3. The non-editable MTP envelope clamps at 3
-> (`maxDraftTokens` 3; `maxAutomaticRectangularTokens` 32 at batch 8). benchd
-> measures at depth 2 when the invocation names no depth; an `mtp` block with no
-> `depth` key resolves to the ceiling of 3.
+> MTP: `CBv2MTPRoundDriver.submissionDraftDepth`. It is a ceiling on the adaptive
+> controller. The controller selects a depth from 0 to this ceiling each round.
+> The envelope limits the ceiling to 3 (`maxDraftTokens` 3;
+> `maxAutomaticRectangularTokens` 32 at batch 8). The controller
+> (`CBv2MTPDepthController.swift`) is also editable.
 >
-> **DFlash** — select `depth` in the spec's `dflash` block, up to the drafter's
-> own ceiling (its recommended block size minus one, capped by the engine at 15).
-> An ABSENT `dflash` depth means "use everything the drafter supports" — the
-> ceiling, not 1.
+> DFlash: `DFlashDraftModel.submissionDraftDepth`. It is a fixed block depth.
+> Block diffusion drafts one whole block each round. The ceiling is the
+> recommended block size of the drafter minus one. The engine limits it to 15. On
+> DFlash the acceptance varies, not the drafted depth.
 >
 > The `fixed_depth = 1` constant in the track fixture is a darkbloom reference
 > constant for stateless Gemma. It is not a limit on your draft depth.
@@ -496,7 +498,7 @@ measured `noop_decode_speedup`. `hidden_correctness_golden` also holds a real
 The DFlash arm is a first-class scored mode. `allowed_modes` declares `serial`,
 `mtp` and `dflash`, and a submission runs whichever its own code drives.
 
-Declare the arm in `dflash-head.manifest.json`:
+Declare the arm in `spec-decoder-head.manifest.json`:
 
 ```json
 { "version": 1, "source": "pinned", "arm": "dflash", "max_bytes": 2147483648 }

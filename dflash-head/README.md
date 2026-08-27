@@ -25,7 +25,7 @@ Three things enforce that:
    says it is outside the modifiable surface. The overlay never copies it, and
    the benchmarker's write-divergence gate refuses it as content that diverges
    from the trusted baseline outside the editable surface.
-2. `../dflash-head.manifest.json` accepts `"source": "pinned"` only.
+2. `../spec-decoder-head.manifest.json` accepts `"source": "pinned"` only.
    `"source": "in_branch"` and `"source": "remote"` are refused by name.
 3. A re-quantization happens on load, in memory, on the benchmark machine.
    No re-quantized file is made, so there is no artifact to travel in a
@@ -33,7 +33,7 @@ Three things enforce that:
 
 ## How to declare a re-quantization
 
-`../dflash-head.manifest.json` stays editable. It is the declaration surface.
+`../spec-decoder-head.manifest.json` stays editable. It is the declaration surface.
 Keep `"source": "pinned"`. State the `bytes` you expect the staged artifact to
 have, if you want the record. A declaration may lower `max_bytes` and may not
 raise it above the 2 GiB track cap, which is the SAME cap the MTP head gets, per

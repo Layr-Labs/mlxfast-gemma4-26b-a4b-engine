@@ -209,7 +209,7 @@ mkdir -p "${OUT_DIR}"
 # `allowed_modes` and the engine's advertised `spec_modes` remain FENCES on top
 # of this -- they decide which modes are admitted, never which one runs.
 #
-# THE CHANNEL. `dflash-head.manifest.json`, key `arm`, values `dflash` | `mtp`.
+# THE CHANNEL. `spec-decoder-head.manifest.json`, key `arm`, values `dflash` | `mtp`.
 # It is an editable AND optional editable path, so a submission can write it.
 # ABSENT FILE, absent key, or `mtp` => this script passes NO spec flag and the
 # argv below is byte-for-byte what it was before the seam existed; benchd builds
@@ -243,7 +243,7 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-DFLASH_MANIFEST="${SCRIPT_DIR}/dflash-head.manifest.json"
+DFLASH_MANIFEST="${SCRIPT_DIR}/spec-decoder-head.manifest.json"
 MTP_MANIFEST="${SCRIPT_DIR}/mtp-head.manifest.json"
 
 # The literal candidate spec for the DFlash arm. benchd's SpecConfig envelope is
@@ -270,7 +270,7 @@ read_declared_arm() {
     fi
     if jq -e 'has("arm")' >/dev/null 2>&1 < "${MTP_MANIFEST}"; then
       echo "gemma4-measure-and-score.sh: mtp-head.manifest.json sets 'arm', but the arm is declared in" >&2
-      echo "  dflash-head.manifest.json only. Move the key there rather than leaving it where nothing reads it." >&2
+      echo "  spec-decoder-head.manifest.json only. Move the key there rather than leaving it where nothing reads it." >&2
       exit 1
     fi
   fi
@@ -292,7 +292,7 @@ read_declared_arm() {
   # A present key must be a STRING: `jq -r` would otherwise stringify a number
   # or a boolean into something that looks like a value.
   if ! jq -e '.arm | type == "string"' >/dev/null 2>&1 < "${DFLASH_MANIFEST}"; then
-    echo "gemma4-measure-and-score.sh: dflash-head.manifest.json sets 'arm' to a non-string value;" >&2
+    echo "gemma4-measure-and-score.sh: spec-decoder-head.manifest.json sets 'arm' to a non-string value;" >&2
     echo "  it must be one of: dflash, mtp." >&2
     exit 1
   fi
@@ -316,7 +316,7 @@ case "${DECLARED_ARM}" in
     spec_args=(--candidate-spec "${DFLASH_CANDIDATE_SPEC}")
     ;;
   *)
-    echo "gemma4-measure-and-score.sh: dflash-head.manifest.json declares arm '${DECLARED_ARM}', which is not a mode this track admits." >&2
+    echo "gemma4-measure-and-score.sh: spec-decoder-head.manifest.json declares arm '${DECLARED_ARM}', which is not a mode this track admits." >&2
     echo "  Declare one of: dflash, mtp -- or omit the key to run mtp." >&2
     exit 1
     ;;

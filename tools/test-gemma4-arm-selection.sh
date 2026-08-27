@@ -29,6 +29,15 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
 
+# The write-gate reference every FULL case passes as MLXFAST_WRITE_GATE_BASE
+# (`--write-gate-base`, David ruling 2026-08-27). The wrapper only forwards the
+# value, so any 40-hex string exercises the wiring. A case blanks
+# CASE_WRITE_GATE_BASE to reach the refusal branch; the wrapper tests
+# `-z "${MLXFAST_WRITE_GATE_BASE:-}"`, so an empty value and an unset one take
+# the same path.
+WRITE_GATE_BASE_STUB="0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c"
+CASE_WRITE_GATE_BASE="${WRITE_GATE_BASE_STUB}"
+
 failures=0
 fail() {
   echo "FAIL: $1" >&2
@@ -136,6 +145,7 @@ run_case() {
     MLXFAST_GEMMA4_BASELINE_WORKSPACE="${root}" \
     MLXFAST_GEMMA4_GOLDEN_DIR="${root}/goldens" \
     MLXFAST_CORRECTNESS_GOLDEN_PATH="${root}/correctness.json" \
+    MLXFAST_WRITE_GATE_BASE="${CASE_WRITE_GATE_BASE}" \
     MLXFAST_SCORE_PATH="${root}/score.json" \
       "${root}/tools/gemma4-measure-and-score.sh" \
         >"${WORK}/case.out" 2>&1 || rc=$?
@@ -168,6 +178,13 @@ reset_argv() { rm -f "${WORK}/argv.raw" "${WORK}/argv.txt"; }
 # the stub above rather than hand-edited, per this block's own rule -- and the
 # fact that the ruled pair count is the only difference is itself the evidence
 # that the arm-selection seam perturbs nothing else in the invocation.
+#
+# REGENERATED AGAIN for David's 2026-08-27 write-gate ruling. GOLDEN_FULL's only
+# delta is the `--write-gate-base <base>` pair after --baseline; GOLDEN_PREFLIGHT
+# is byte-unchanged, because the preflight invocation passes the flag only when
+# MLXFAST_WRITE_GATE_BASE is set and the preflight cases do not set it. Taken
+# through the stub, not transcribed: the diff being exactly those two entries is
+# the evidence that the new flag perturbs nothing else.
 
 read -r -d '' GOLDEN_PREFLIGHT <<'ARGV' || true
 measure-job
@@ -198,6 +215,8 @@ measure-job
 <ROOT>
 --baseline
 <ROOT>
+--write-gate-base
+0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c
 --weights
 <ROOT>/weights
 --correctness-golden
@@ -347,6 +366,18 @@ expect_refusal "malformed manifest JSON" "not a JSON object"
 reset_argv
 run_case manifest-not-object full 'spec-decoder-head.manifest.json=["dflash"]'
 expect_refusal "manifest that is not a JSON object" "not a JSON object"
+
+# THE WRITE-GATE REFERENCE IS REQUIRED ON A REAL RUN (David ruling
+# 2026-08-27). Without it benchd would fall back to comparing the submission
+# tree against the staged baseline workspace -- the comparison that stranded
+# every submission after an organizer commit to main -- so an absent reference
+# must REFUSE, never run the legacy shape. The positive control is the golden
+# above: every passing full case carries the flag.
+reset_argv
+CASE_WRITE_GATE_BASE=""
+run_case write-gate-base-absent full
+expect_refusal "absent write-gate base" "MLXFAST_WRITE_GATE_BASE is required"
+CASE_WRITE_GATE_BASE="${WRITE_GATE_BASE_STUB}"
 
 # The arm declared in the WRONG head manifest is a refusal, not a no-op: this
 # is the tolerance that would otherwise score a participant on an arm they did

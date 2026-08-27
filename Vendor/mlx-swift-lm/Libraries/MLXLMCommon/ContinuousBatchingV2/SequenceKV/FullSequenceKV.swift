@@ -109,6 +109,25 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
     }
 
     public func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
+        append(keys: newKeys, values: newValues)
+        return (
+            keys![.ellipsis, ..<absoluteOffset, 0...],
+            values![.ellipsis, ..<absoluteOffset, 0...]
+        )
+    }
+
+    var decodeFullView: (keys: MLXArray, values: MLXArray, length: Int, capacity: Int)? {
+        guard absoluteOffset >= 1024, let keys, let values else { return nil }
+        return (keys, values, absoluteOffset, capacity)
+    }
+
+    func decodeFullWrite(keys: MLXArray, values: MLXArray) {
+        precondition(keys.dim(2) == 1 && values.dim(2) == 1,
+            "CBv2FullSequenceKV: full decode write requires one token")
+        append(keys: keys, values: values)
+    }
+
+    private func append(keys newKeys: MLXArray, values newValues: MLXArray) {
         let n = newKeys.dim(2)
         precondition(newKeys.dim(0) == 1 && newValues.dim(0) == 1,
             "CBv2FullSequenceKV holds ONE sequence; got batch \(newKeys.dim(0))")
@@ -126,11 +145,6 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
         keys![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newKeys
         values![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newValues
         absoluteOffset += n
-
-        return (
-            keys![.ellipsis, ..<absoluteOffset, 0...],
-            values![.ellipsis, ..<absoluteOffset, 0...]
-        )
     }
 
     public func snapshot() -> (keys: MLXArray, values: MLXArray, offset: Int) {

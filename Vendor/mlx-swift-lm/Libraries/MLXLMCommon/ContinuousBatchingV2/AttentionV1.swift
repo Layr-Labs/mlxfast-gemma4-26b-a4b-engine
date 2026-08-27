@@ -101,6 +101,36 @@ enum CBv2AttentionV1 {
         }
 
         if L == 1 {
+            var fullFallbackViews: [(keys: MLXArray, values: MLXArray)]?
+            if B == 8, case .full = kind.attention,
+                !kind.isBidirectional, kind.queryHeads == 16,
+                kind.kvHeads == 2, kind.headDim == 512,
+                effectiveSinks == nil, softcap == nil
+            {
+                let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
+                if fullRows.count == B
+                    && fullRows.allSatisfy({ $0.decodeFullView != nil })
+                {
+                    for (index, row) in fullRows.enumerated() {
+                        row.decodeFullWrite(
+                            keys: keys[index ..< (index + 1)],
+                            values: values[index ..< (index + 1)])
+                    }
+                    let views = fullRows.map { $0.decodeFullView! }
+                    if let output = CBv2RaggedTwoPassDecodeAttentionV1.attendFullBatch(
+                        queries: queries, keys: views.map(\.keys),
+                        values: views.map(\.values), lens: views.map(\.length),
+                        capacity: views[0].capacity, scale: scale)
+                    {
+                        return output
+                    }
+                    fullFallbackViews = fullRows.map {
+                        let snapshot = $0.snapshot()
+                        return (snapshot.keys, snapshot.values)
+                    }
+                }
+            }
+
             if canUseRaggedTwoPassDecode(
                 batch: B, cacheKind: kind, queryKind: kind,
                 scale: scale, sinks: effectiveSinks, softcap: softcap)
@@ -170,9 +200,10 @@ enum CBv2AttentionV1 {
             var outputs: [MLXArray] = []
             outputs.reserveCapacity(B)
             for (index, row) in rows.enumerated() {
-                let (cachedKeys, cachedValues) = row.update(
-                    keys: keys[index ..< (index + 1)],
-                    values: values[index ..< (index + 1)])
+                let (cachedKeys, cachedValues) = fullFallbackViews?[index]
+                    ?? row.update(
+                        keys: keys[index ..< (index + 1)],
+                        values: values[index ..< (index + 1)])
                 outputs.append(
                     attend(
                         queries: queries[index ..< (index + 1)],

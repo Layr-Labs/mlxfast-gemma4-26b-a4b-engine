@@ -31,6 +31,9 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     private static let gqa = 2
     private static let headDim = 256
     private static let sequenceLength = 1024
+    private static let fullKVHeads = 2
+    private static let fullGQA = 8
+    private static let fullHeadDim = 512
 
     /// Mirrors `sdpa_vector_2pass` at N=1024 and qL=1/GQA=2. Honor the same
     /// diagnostic override so a process can never run mismatched partitions.
@@ -48,11 +51,12 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     }()
 
     private static let passAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v1",
+        name: "cbv2_ragged8_linear_sdpa_2pass_a_bf16_b\(blocks)_v1",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+            "lens",
         ],
         outputNames: ["partials", "sums", "maxs"],
         source: """
@@ -82,8 +86,8 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
 
             const device T* query =
                 queries + batch_head * D + lane * values_per_lane;
-            keys += kv_head * N * D + block * D + lane * values_per_lane;
-            values += kv_head * N * D + block * D + lane * values_per_lane;
+            keys += kv_head * C * D + lane * values_per_lane;
+            values += kv_head * C * D + lane * values_per_lane;
             device T* partial = partials
                 + batch_head * BLOCKS * D + block * D + lane * values_per_lane;
             device float* sum_out = sums + batch_head * BLOCKS + block;
@@ -98,10 +102,12 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
 
             float max_score = -3.402823466e+38F;
             float sum_exp_score = 0.0f;
-            for (int token = block; token < N; token += BLOCKS) {
+            for (int token = block; token < int(lens[batch_index]); token += BLOCKS) {
+                const device T* key = keys + token * D;
+                const device T* value = values + token * D;
                 float score = 0.0f;
                 for (int element = 0; element < values_per_lane; ++element) {
-                    score += q[element] * float(keys[element]);
+                    score += q[element] * float(key[element]);
                 }
                 score = simd_sum(score);
 
@@ -112,11 +118,8 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 sum_exp_score = sum_exp_score * old_factor + score_factor;
                 for (int element = 0; element < values_per_lane; ++element) {
                     accumulator[element] = accumulator[element] * old_factor
-                        + score_factor * float(values[element]);
+                        + score_factor * float(value[element]);
                 }
-
-                keys += BLOCKS * D;
-                values += BLOCKS * D;
             }
 
             if (lane == 0) {
@@ -350,6 +353,59 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         )[0]
     }
 
+    static func attendFullBatch(
+        queries: MLXArray, keys: [MLXArray], values: [MLXArray],
+        lens: [Int], capacity: Int, scale: Float
+    ) -> MLXArray? {
+        guard fullBatchEnabled,
+            blocks > 0, blocks.isMultiple(of: 32), scale == 1.0,
+            queries.dtype == .bfloat16,
+            queries.shape == [batch, queryHeads, 1, fullHeadDim],
+            keys.count == batch, values.count == batch, lens.count == batch,
+            lens.allSatisfy({ (sequenceLength ... capacity).contains($0) })
+        else { return nil }
+
+        for index in 0 ..< batch {
+            let key = keys[index]
+            let value = values[index]
+            guard key.dtype == .bfloat16, value.dtype == .bfloat16,
+                key.shape == [1, fullKVHeads, capacity, fullHeadDim],
+                value.shape == key.shape
+            else { return nil }
+        }
+
+        let lengths = MLXArray(lens.map(UInt32.init))
+        let partialShape = [batch, queryHeads, 1, blocks, fullHeadDim]
+        let summaryShape = [batch, queryHeads, 1, blocks]
+        // The partition is pinned here so pass A and pass B always share it.
+        let passA = passAKernel(
+            [queries] + keys + values + [lengths],
+            template: [
+                ("T", queries.dtype), ("D", fullHeadDim), ("C", capacity),
+                ("GQA", fullGQA), ("BLOCKS", blocks),
+            ],
+            grid: (fullKVHeads * 32, batch * fullGQA, blocks),
+            threadGroup: (32, fullGQA, 1),
+            outputShapes: [partialShape, summaryShape, summaryShape],
+            outputDTypes: [.bfloat16, .float32, .float32]
+        )
+        return passBKernel(
+            passA,
+            template: [("T", queries.dtype), ("D", fullHeadDim), ("BLOCKS", blocks)],
+            grid: (batch * queryHeads * 1024, 1, 1),
+            threadGroup: (1024, 1, 1),
+            outputShapes: [[batch, queryHeads, 1, fullHeadDim]],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
+
+    private static var fullBatchEnabled: Bool {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_FULL_BATCH_ATTENTION"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }
+
     static func attend(
         queries: MLXArray,
         keys: [MLXArray],
@@ -377,6 +433,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         }
 
         let inputs = [queries] + keys + values
+            + [MLXArray(Array(repeating: UInt32(sequenceLength), count: batch))]
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let passA = passAKernel(
@@ -384,7 +441,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             template: [
                 ("T", queries.dtype),
                 ("D", headDim),
-                ("N", sequenceLength),
+                ("C", sequenceLength),
                 ("GQA", gqa),
                 ("BLOCKS", blocks),
             ],

@@ -323,6 +323,30 @@ inline void qdot_affine4_pair(
   out1 = scale * accum1 + sum1 * bias;
 }
 
+// Two independent affine-8 dot products over one byte weight vector. Keep the
+// per-row scalar accumulation order of qdot while sharing each weight load.
+template <typename U, int values_per_thread>
+inline void qdot_affine8_pair(
+    const device uint8_t* w,
+    const thread U* x0,
+    const thread U* x1,
+    U scale,
+    U bias,
+    U sum0,
+    U sum1,
+    thread U& out0,
+    thread U& out1) {
+  U accum0 = 0;
+  U accum1 = 0;
+  for (int i = 0; i < values_per_thread; i++) {
+    const uint8_t packed = w[i];
+    accum0 += x0[i] * packed;
+    accum1 += x1[i] * packed;
+  }
+  out0 = scale * accum0 + sum0 * bias;
+  out1 = scale * accum1 + sum1 * bias;
+}
+
 template <typename U, int values_per_thread, int bits>
 inline U qdot_safe(
     const device uint8_t* w,
@@ -1476,6 +1500,101 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
 }
 
 template <typename T, const int group_size, const int bits>
+METAL_FUNC void qmv_affine8_g64_pair_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x0,
+    const device T* x1,
+    device T* y0,
+    device T* y1,
+    const constant int& in_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 4;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 16;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread float x0_thread[values_per_thread];
+  thread float x1_thread[values_per_thread];
+  thread float result0[results_per_simdgroup] = {0};
+  thread float result1[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x0 += simd_lid * values_per_thread;
+  x1 += simd_lid * values_per_thread;
+  y0 += out_row;
+  y1 += out_row;
+
+  int k = 0;
+  for (; k < in_vec_size - block_size; k += block_size) {
+    float sum0 = load_vector<T, float, values_per_thread, 8>(x0, x0_thread);
+    float sum1 = load_vector<T, float, values_per_thread, 8>(x1, x1_thread);
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      const device T* sl = scales + row * in_vec_size_g;
+      const device T* bl = biases + row * in_vec_size_g;
+      float dot0;
+      float dot1;
+      qdot_affine8_pair<float, values_per_thread>(
+          wl, x0_thread, x1_thread, sl[0], bl[0], sum0, sum1, dot0, dot1);
+      result0[row] += dot0;
+      result1[row] += dot1;
+    }
+
+    ws += block_size;
+    scales += block_size / 64;
+    biases += block_size / 64;
+    x0 += block_size;
+    x1 += block_size;
+  }
+
+  const int remaining = clamp(
+      static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
+      0,
+      values_per_thread);
+  if (remaining > 0) {
+    float sum0 = load_vector_safe<T, float, values_per_thread, 8>(
+        x0, x0_thread, remaining);
+    float sum1 = load_vector_safe<T, float, values_per_thread, 8>(
+        x1, x1_thread, remaining);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      const device T* sl = scales + row * in_vec_size_g;
+      const device T* bl = biases + row * in_vec_size_g;
+      float dot0;
+      float dot1;
+      qdot_affine8_pair<float, values_per_thread>(
+          wl, x0_thread, x1_thread, sl[0], bl[0], sum0, sum1, dot0, dot1);
+      result0[row] += dot0;
+      result1[row] += dot1;
+    }
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result0[row] = simd_sum(result0[row]);
+    result1[row] = simd_sum(result1[row]);
+    if (simd_lid == 0) {
+      y0[row] = static_cast<T>(result0[row]);
+      y1[row] = static_cast<T>(result1[row]);
+    }
+  }
+}
+
+template <typename T, const int group_size, const int bits>
 METAL_FUNC void qvm_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -2217,6 +2336,29 @@ template <typename T, const int group_size, const int bits, bool batched>
       return;
     }
     qmv_affine4_g64_pair_impl<T, 64, 4>(
+        w,
+        scales,
+        biases,
+        x + first_m * in_vec_size,
+        x + (first_m + 1) * in_vec_size,
+        y + first_m * out_vec_size,
+        y + (first_m + 1) * out_vec_size,
+        in_vec_size,
+        tid,
+        simd_gid,
+        simd_lid);
+    return;
+  }
+  if (!batched && group_size == 64 && bits == 8 && ntg.x == 8 &&
+      ntg.z == 1 && in_vec_size % 64 == 0 && out_vec_size >= 8 &&
+      out_vec_size % 8 == 0) {
+    // Dense decode projections use byte weights. Pair adjacent cohort rows so
+    // each weight byte feeds both exact per-row dot-product streams.
+    const int first_m = int(tid.x) * 2;
+    if (first_m >= 8) {
+      return;
+    }
+    qmv_affine8_g64_pair_impl<T, 64, 8>(
         w,
         scales,
         biases,

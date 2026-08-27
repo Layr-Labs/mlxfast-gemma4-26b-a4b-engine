@@ -314,8 +314,8 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
     /// Per-layer estimated initial allocation bytes, aligned to `layerKinds`
     /// (nil for KV-shared layers, which own no storage). Full layers allocate
     /// `promptLength + 256` slots capped at maxLength; windowed layers
-    /// allocate their full ring up front. The sum is the reservation charged
-    /// against capacity at admission.
+    /// allocate their window plus bounded linear decode slack up front. The
+    /// sum is the reservation charged against capacity at admission.
     private func rowEstimates(
         layerKinds: [CBv2LayerKind], promptLength: Int, maxLength: Int
     ) -> [Int?] {
@@ -324,7 +324,8 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
             guard kind.sharesKVWithLayer == nil else { return nil }
             switch kind.attention {
             case .slidingWindow(let window):
-                return window * kind.kvHeads * kind.headDim * itemSize * 2
+                return CBv2WindowedSequenceKV.storageSlotCount(for: window)
+                    * kind.kvHeads * kind.headDim * itemSize * 2
             case .full:
                 let slots = min(maxLength, max(1, promptLength + CBv2FullSequenceKV.initialSlack))
                 return slots * kind.kvHeads * kind.headDim * itemSize * 2
@@ -334,8 +335,8 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
 
     /// Adoption transfers native-dtype full rows from staging. Reserve their
     /// full request span before publication so later capacity growth cannot
-    /// outrun the backend hard ceiling. Sliding rows retain their fixed ring
-    /// estimate.
+    /// outrun the backend hard ceiling. Sliding rows retain their fixed
+    /// window-plus-slack estimate.
     private func adoptionRowEstimates(
         prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?],
         layerKinds: [CBv2LayerKind],
@@ -345,7 +346,8 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
             guard kind.sharesKVWithLayer == nil else { return nil }
             switch kind.attention {
             case .slidingWindow(let window):
-                return window * kind.kvHeads * kind.headDim * config.kvDType.size * 2
+                return CBv2WindowedSequenceKV.storageSlotCount(for: window)
+                    * kind.kvHeads * kind.headDim * config.kvDType.size * 2
             case .full:
                 guard let entry = prefix[index] else { return 0 }
                 return maxLength * kind.kvHeads * kind.headDim

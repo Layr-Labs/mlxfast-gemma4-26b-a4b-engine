@@ -153,6 +153,22 @@ enum CBv2AttentionV1 {
                 {
                     return output
                 }
+                let firstKL = cachedKeyRows[0].dim(2)
+                if B > 1
+                    && cachedKeyRows.allSatisfy({ $0.dim(2) == firstKL })
+                    && cachedValueRows.allSatisfy({ $0.dim(2) == firstKL })
+                {
+                    return attend(
+                        queries: queries,
+                        keys: concatenated(cachedKeyRows, axis: 0),
+                        values: concatenated(cachedValueRows, axis: 0),
+                        scale: scale,
+                        L: 1,
+                        kL: firstKL,
+                        window: nil,
+                        sinks: effectiveSinks,
+                        softcap: softcap)
+                }
 
                 var outputs: [MLXArray] = []
                 outputs.reserveCapacity(B)
@@ -167,18 +183,44 @@ enum CBv2AttentionV1 {
                 return concatenated(outputs, axis: 0)
             }
 
-            var outputs: [MLXArray] = []
-            outputs.reserveCapacity(B)
+            var cachedKeyRows: [MLXArray] = []
+            var cachedValueRows: [MLXArray] = []
+            cachedKeyRows.reserveCapacity(B)
+            cachedValueRows.reserveCapacity(B)
             for (index, row) in rows.enumerated() {
                 let (cachedKeys, cachedValues) = row.update(
                     keys: keys[index ..< (index + 1)],
                     values: values[index ..< (index + 1)])
+                cachedKeyRows.append(cachedKeys)
+                cachedValueRows.append(cachedValues)
+            }
+
+            let firstDecodeKL = cachedKeyRows[0].dim(2)
+            if B > 1
+                && cachedKeyRows.allSatisfy({ $0.dim(2) == firstDecodeKL })
+                && cachedValueRows.allSatisfy({ $0.dim(2) == firstDecodeKL })
+            {
+                return attend(
+                    queries: queries,
+                    keys: concatenated(cachedKeyRows, axis: 0),
+                    values: concatenated(cachedValueRows, axis: 0),
+                    scale: scale,
+                    L: 1,
+                    kL: firstDecodeKL,
+                    window: window(of: kind),
+                    sinks: effectiveSinks,
+                    softcap: softcap)
+            }
+
+            var outputs: [MLXArray] = []
+            outputs.reserveCapacity(B)
+            for index in 0 ..< B {
                 outputs.append(
                     attend(
                         queries: queries[index ..< (index + 1)],
-                        keys: cachedKeys, values: cachedValues, scale: scale,
-                        L: 1, kL: cachedKeys.dim(2), window: nil,
-                        sinks: effectiveSinks, softcap: softcap))
+                        keys: cachedKeyRows[index], values: cachedValueRows[index],
+                        scale: scale, L: 1, kL: cachedKeyRows[index].dim(2),
+                        window: window(of: kind), sinks: effectiveSinks, softcap: softcap))
             }
             return concatenated(outputs, axis: 0)
         }

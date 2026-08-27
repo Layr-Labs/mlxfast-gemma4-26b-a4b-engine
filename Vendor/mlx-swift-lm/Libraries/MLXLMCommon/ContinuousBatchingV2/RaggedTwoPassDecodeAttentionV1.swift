@@ -40,15 +40,49 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         }
     }()
 
-    private static let passAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v1",
-        inputNames: [
-            "queries",
+    private static func makePassAKernel(physicalRing: Bool) -> MLXFast.MLXFastKernel {
+        var inputNames = ["queries"]
+        if physicalRing { inputNames.append("ring_offsets") }
+        inputNames += [
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
-        ],
-        outputNames: ["partials", "sums", "maxs"],
-        source: """
+        ]
+        let locateRows = physicalRing
+            ? """
+                const int ring_start =
+                    (int(ring_offsets[batch_index]) + OFFSET_ADVANCE) & (N - 1);
+                const device T* key_row = keys
+                    + kv_head * N * D + lane * values_per_lane;
+                const device T* value_row = values
+                    + kv_head * N * D + lane * values_per_lane;
+              """
+            : """
+                keys += kv_head * N * D + block * D + lane * values_per_lane;
+                values += kv_head * N * D + block * D + lane * values_per_lane;
+              """
+        let locateToken = physicalRing
+            ? """
+                    const int physical_token = (ring_start + token) & (N - 1);
+                    const device T* token_keys = key_row + physical_token * D;
+                    const device T* token_values = value_row + physical_token * D;
+              """
+            : ""
+        let keyName = physicalRing ? "token_keys" : "keys"
+        let valueName = physicalRing ? "token_values" : "values"
+        let advance = physicalRing
+            ? ""
+            : """
+                    keys += BLOCKS * D;
+                    values += BLOCKS * D;
+              """
+
+        return MLXFast.metalKernel(
+            name: physicalRing
+                ? "cbv2_ring8_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v1"
+                : "cbv2_ragged8_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v1",
+            inputNames: inputNames,
+            outputNames: ["partials", "sums", "maxs"],
+            source: """
             constexpr int simd_width = 32;
             constexpr int values_per_lane = D / simd_width;
 
@@ -75,8 +109,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
 
             const device T* query =
                 queries + batch_head * D + lane * values_per_lane;
-            keys += kv_head * N * D + block * D + lane * values_per_lane;
-            values += kv_head * N * D + block * D + lane * values_per_lane;
+            \(locateRows)
             device T* partial = partials
                 + batch_head * BLOCKS * D + block * D + lane * values_per_lane;
             device float* sum_out = sums + batch_head * BLOCKS + block;
@@ -92,9 +125,10 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             float max_score = -3.402823466e+38F;
             float sum_exp_score = 0.0f;
             for (int token = block; token < N; token += BLOCKS) {
+                \(locateToken)
                 float score = 0.0f;
                 for (int element = 0; element < values_per_lane; ++element) {
-                    score += q[element] * float(keys[element]);
+                    score += q[element] * float(\(keyName)[element]);
                 }
                 score = simd_sum(score);
 
@@ -105,11 +139,9 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 sum_exp_score = sum_exp_score * old_factor + score_factor;
                 for (int element = 0; element < values_per_lane; ++element) {
                     accumulator[element] = accumulator[element] * old_factor
-                        + score_factor * float(values[element]);
+                        + score_factor * float(\(valueName)[element]);
                 }
-
-                keys += BLOCKS * D;
-                values += BLOCKS * D;
+                \(advance)
             }
 
             if (lane == 0) {
@@ -119,9 +151,13 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             for (int element = 0; element < values_per_lane; ++element) {
                 partial[element] = T(accumulator[element]);
             }
-        """,
-        ensureRowContiguous: true
-    )
+            """,
+            ensureRowContiguous: true
+        )
+    }
+
+    private static let passAKernel = makePassAKernel(physicalRing: false)
+    private static let physicalPassAKernel = makePassAKernel(physicalRing: true)
 
     private static let passBKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "cbv2_ragged8_sdpa_2pass_b_bf16_d256_b\(blocks)_v1",
@@ -191,6 +227,57 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         ensureRowContiguous: true
     )
 
+    static func attendPhysicalRings(
+        queries: MLXArray,
+        keys: [MLXArray],
+        values: [MLXArray],
+        ringOffsets: MLXArray,
+        offsetAdvance: Int,
+        scale: Float
+    ) -> MLXArray? {
+        guard enabled,
+            blocks > 0,
+            blocks.isMultiple(of: 32),
+            scale == 1.0,
+            queries.dtype == .bfloat16,
+            queries.shape == [batch, queryHeads, 1, headDim],
+            ringOffsets.dtype == .int32,
+            ringOffsets.shape == [batch],
+            offsetAdvance == 0 || offsetAdvance == 1,
+            keys.count == batch,
+            values.count == batch
+        else { return nil }
+
+        for index in 0 ..< batch {
+            guard keys[index].dtype == .bfloat16,
+                values[index].dtype == .bfloat16,
+                keys[index].shape == [1, kvHeads, sequenceLength, headDim],
+                values[index].shape == keys[index].shape
+            else { return nil }
+        }
+
+        let passA = physicalPassAKernel(
+            [queries, ringOffsets] + keys + values,
+            template: [
+                ("T", queries.dtype),
+                ("D", headDim),
+                ("N", sequenceLength),
+                ("GQA", gqa),
+                ("BLOCKS", blocks),
+                ("OFFSET_ADVANCE", offsetAdvance),
+            ],
+            grid: (kvHeads * 32, batch * gqa, blocks),
+            threadGroup: (32, gqa, 1),
+            outputShapes: [
+                [batch, queryHeads, 1, blocks, headDim],
+                [batch, queryHeads, 1, blocks],
+                [batch, queryHeads, 1, blocks],
+            ],
+            outputDTypes: [.bfloat16, .float32, .float32]
+        )
+        return merge(passA, dtype: queries.dtype)
+    }
+
     static func attend(
         queries: MLXArray,
         keys: [MLXArray],
@@ -235,10 +322,14 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             outputDTypes: [.bfloat16, .float32, .float32]
         )
 
-        return passBKernel(
+        return merge(passA, dtype: queries.dtype)
+    }
+
+    private static func merge(_ passA: [MLXArray], dtype: DType) -> MLXArray {
+        passBKernel(
             passA,
             template: [
-                ("T", queries.dtype),
+                ("T", dtype),
                 ("D", headDim),
                 ("BLOCKS", blocks),
             ],

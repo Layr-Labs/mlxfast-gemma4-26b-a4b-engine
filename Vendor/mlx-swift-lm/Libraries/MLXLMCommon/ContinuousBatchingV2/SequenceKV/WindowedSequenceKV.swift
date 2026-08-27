@@ -304,6 +304,16 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
         return (snap.keys, snap.values)
     }
 
+    /// The post-update physical ring for the exact full-window decode path.
+    /// Consumers must restore logical order while reading; ordinary callers
+    /// continue to use `decodeBorrowableViews()` / `snapshot()`.
+    func decodePhysicalRingViews() -> (keys: MLXArray, values: MLXArray)? {
+        guard staged == nil, retainedCount == window, let keys, let values else {
+            return nil
+        }
+        return (keys, values)
+    }
+
     public func snapshot() -> (keys: MLXArray, values: MLXArray, offset: Int) {
         if let staged {
             return stagedSnapshot(staged)

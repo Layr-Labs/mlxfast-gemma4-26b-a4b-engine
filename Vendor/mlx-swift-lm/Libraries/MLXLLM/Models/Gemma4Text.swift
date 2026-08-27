@@ -775,6 +775,131 @@ private func gemma4FusedQKVNorm(
     return (outputs[0], outputs[1], outputs[2])
 }
 
+/// The 26B-A4B ranked decode shape reaches this sequence in every decoder
+/// layer:
+///
+///     RMSNorm(attention) -> residual add -> two RMSNorms of the same result
+///
+/// The dense and sparse MoE branches use different learned weights for their
+/// final normalization, but their row reduction and inverse RMS are identical.
+/// Keeping the sequence in one kernel removes three dispatches per layer while
+/// preserving the stock BF16 rounding point after each normalization and add.
+private let gemma4PostAttentionMoENormKernel = MLXFast.metalKernel(
+    name: "gemma4_b8_post_attention_moe_norm_v1",
+    inputNames: [
+        "residual", "attention", "post_weight", "dense_weight", "sparse_weight",
+    ],
+    outputNames: ["merged", "dense_norm", "sparse_norm"],
+    source: """
+        constexpr uint reads = 4;
+        const uint row = threadgroup_position_in_grid.x;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint simd_group = simdgroup_index_in_threadgroup;
+        const uint row_offset = row * D;
+        const uint element_offset = row_offset + lid * reads;
+        const uint weight_offset = lid * reads;
+
+        threadgroup float partials[32];
+        threadgroup float inverse_rms;
+
+        float sum = 0.0f;
+        for (uint i = 0; i < reads; ++i) {
+            const float value = float(attention[element_offset + i]);
+            sum += value * value;
+        }
+        sum = simd_sum(sum);
+
+        if (simd_group == 0) partials[lane] = 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) partials[simd_group] = sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            sum = simd_sum(partials[lane]);
+            if (lane == 0) {
+                inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        T merged_values[reads];
+        float merged_sum = 0.0f;
+        for (uint i = 0; i < reads; ++i) {
+            const T normalized = T(float(attention[element_offset + i]) * inverse_rms);
+            const T post_attention = post_weight[weight_offset + i] * normalized;
+            const T value = residual[element_offset + i] + post_attention;
+            merged[element_offset + i] = value;
+            merged_values[i] = value;
+            const float float_value = float(value);
+            merged_sum += float_value * float_value;
+        }
+        merged_sum = simd_sum(merged_sum);
+
+        if (simd_group == 0) partials[lane] = 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) partials[simd_group] = merged_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            merged_sum = simd_sum(partials[lane]);
+            if (lane == 0) {
+                inverse_rms = metal::precise::rsqrt(
+                    merged_sum / float(D) + 1.0e-6f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = 0; i < reads; ++i) {
+            const T normalized = T(float(merged_values[i]) * inverse_rms);
+            dense_norm[element_offset + i] =
+                dense_weight[weight_offset + i] * normalized;
+            sparse_norm[element_offset + i] =
+                sparse_weight[weight_offset + i] * normalized;
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+private let gemma4FusedPostAttentionMoENormEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "MLXFAST_GEMMA4_FUSED_POST_ATTN_MOE_NORM"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+func gemma4FusedPostAttentionMoENorm(
+    residual: MLXArray,
+    attention: MLXArray,
+    postWeight: MLXArray,
+    denseWeight: MLXArray,
+    sparseWeight: MLXArray,
+    eps: Float
+) -> (MLXArray, MLXArray, MLXArray)? {
+    let hiddenSize = 2_816
+    let decodeShape = [8, 1, hiddenSize]
+    guard gemma4FusedPostAttentionMoENormEnabled,
+        eps == 1.0e-6,
+        residual.dtype == .bfloat16, attention.dtype == .bfloat16,
+        postWeight.dtype == .bfloat16, denseWeight.dtype == .bfloat16,
+        sparseWeight.dtype == .bfloat16,
+        residual.shape == decodeShape, attention.shape == decodeShape,
+        postWeight.shape == [hiddenSize], denseWeight.shape == [hiddenSize],
+        sparseWeight.shape == [hiddenSize]
+    else { return nil }
+
+    let reads = 4
+    let rows = 8
+    let threads = hiddenSize / reads
+    let outputs = gemma4PostAttentionMoENormKernel(
+        [residual, attention, postWeight, denseWeight, sparseWeight],
+        template: [("T", residual.dtype), ("D", hiddenSize)],
+        grid: (rows * threads, 1, 1),
+        threadGroup: (threads, 1, 1),
+        outputShapes: [decodeShape, decodeShape, decodeShape],
+        outputDTypes: [residual.dtype, residual.dtype, residual.dtype]
+    )
+    return (outputs[0], outputs[1], outputs[2])
+}
+
 private class ScaledLinear: Module {
     let weight: MLXArray
     let scalar: Float
@@ -1757,8 +1882,26 @@ public class Gemma4DecoderLayer: Module {
             h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset,
             v2SharedSource: v2SharedSource, outputStart: outputStart,
             useLastQueryPrefill: useLastQueryPrefill)
-        let postAttn = postAttentionLayernorm(attnOut)
-        var out = residual + postAttn
+        let fusedPostAttention: (MLXArray, MLXArray, MLXArray)?
+        if isMoE, let preFeedforwardLayernorm2 {
+            fusedPostAttention = gemma4FusedPostAttentionMoENorm(
+                residual: residual,
+                attention: attnOut,
+                postWeight: postAttentionLayernorm.weight,
+                denseWeight: preFeedforwardLayernorm.weight,
+                sparseWeight: preFeedforwardLayernorm2.weight,
+                eps: config.rmsNormEps)
+        } else {
+            fusedPostAttention = nil
+        }
+
+        var out: MLXArray
+        if let fusedPostAttention {
+            out = fusedPostAttention.0
+        } else {
+            let postAttn = postAttentionLayernorm(attnOut)
+            out = residual + postAttn
+        }
 
         let residual2 = out
 
@@ -1770,12 +1913,12 @@ public class Gemma4DecoderLayer: Module {
             let postFeedforwardLayernorm2
         {
             // Dense + sparse branches in parallel, summed into one residual.
-            var h1 = preFeedforwardLayernorm(out)
+            var h1 = fusedPostAttention?.1 ?? preFeedforwardLayernorm(out)
             h1 = mlp(h1)
             h1 = postFeedforwardLayernorm1(h1)
 
             let (topKIndices, topKWeights) = router(out)
-            var h2 = preFeedforwardLayernorm2(out)
+            var h2 = fusedPostAttention?.2 ?? preFeedforwardLayernorm2(out)
             h2 = experts(
                 h2,
                 topKIndices: topKIndices,

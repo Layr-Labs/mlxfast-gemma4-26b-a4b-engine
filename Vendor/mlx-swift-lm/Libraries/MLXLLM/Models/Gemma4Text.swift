@@ -1205,11 +1205,12 @@ private class Gemma4Attention: Module {
             preconditionFailure("Gemma4 non-shared layers require K/V projection modules")
         }
 
-        // Snapshot the per-row absolute offsets BEFORE updateAndAttend
-        // advances the rows (`+ 0` = graph-safe copy, same convention as
-        // gemma4CapturePositionOffset). KV-shared consumers of this layer
-        // reuse this exact snapshot via the returned PositionOffset.
-        let capturedOffsets = layerCache.positionOffsets + 0
+        // Capture the current per-row absolute offsets BEFORE updateAndAttend
+        // advances the rows. The CBv2 cache contract advances by rebinding
+        // its stored MLXArray, so this handle remains the pre-update value
+        // without an otherwise redundant device-side `+ 0`. KV-shared
+        // consumers reuse this exact capture via the returned PositionOffset.
+        let capturedOffsets = layerCache.positionOffsets
         let captured = Gemma4.PositionOffset.batch(capturedOffsets)
 
         // The frontier query sits `outputStart` positions past the chunk's
@@ -1282,6 +1283,12 @@ public enum Gemma4RouterProbe {
         ((_ expertScores: MLXArray, _ topKIndices: MLXArray) -> Void)?
 }
 
+/// Keeps the derived router norm weight out of `Module` parameter reflection.
+/// `Gemma4Router.update` clears it before any parameter wrapper is mutated.
+private final class Gemma4RouterNormWeightCache {
+    var value: MLXArray?
+}
+
 /// Expert router. Norms `x` with a learnable scale, projects to expert
 /// scores, and returns top-K (indices, weights) where weights are
 /// softmax-normalized and scaled by a per-expert scalar.
@@ -1293,6 +1300,7 @@ private class Gemma4Router: Module {
     let topK: Int
     let eps: Float
     let rootSize: Float
+    private let normWeightCache = Gemma4RouterNormWeightCache()
 
     init(_ config: Gemma4TextConfiguration) {
         precondition(
@@ -1310,8 +1318,26 @@ private class Gemma4Router: Module {
         super.init()
     }
 
+    @discardableResult
+    override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
+        modulePath: [String] = []
+    ) throws -> Self {
+        normWeightCache.value = nil
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
     func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
-        let normed = MLXFast.rmsNorm(x, weight: scale * rootSize, eps: eps)
+        let normWeight: MLXArray
+        if let cached = normWeightCache.value {
+            normWeight = cached
+        } else {
+            let derived = scale * rootSize
+            normWeightCache.value = derived
+            normWeight = derived
+        }
+        let normed = MLXFast.rmsNorm(x, weight: normWeight, eps: eps)
         let expertScores = proj(normed)
 
         let kth = expertScores.dim(-1) - topK

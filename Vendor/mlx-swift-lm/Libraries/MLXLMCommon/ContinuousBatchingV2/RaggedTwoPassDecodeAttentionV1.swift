@@ -291,7 +291,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         queries: MLXArray,
         keys: [MLXArray],
         values: [MLXArray],
-        starts: [Int],
+        starts: [UInt32],
         scale: Float
     ) -> MLXArray? {
         guard enabled,
@@ -304,7 +304,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             keys.count == batch,
             values.count == batch,
             starts.count == batch,
-            starts.allSatisfy({ (0 ..< sequenceLength).contains($0) })
+            starts.allSatisfy({ $0 < UInt32(sequenceLength) })
         else { return nil }
 
         for index in 0 ..< batch {
@@ -317,8 +317,13 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             else { return nil }
         }
 
-        let startArray = MLXArray(starts.map(UInt32.init))
-        let inputs = [queries] + keys + values + [startArray]
+        let startArray = MLXArray(starts)
+        var inputs: [MLXArray] = []
+        inputs.reserveCapacity(2 + keys.count + values.count)
+        inputs.append(queries)
+        inputs.append(contentsOf: keys)
+        inputs.append(contentsOf: values)
+        inputs.append(startArray)
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let passA = ringPassAKernel(

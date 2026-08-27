@@ -114,7 +114,7 @@ enum CBv2AttentionV1 {
                 if windowedRows.count == B
                     && windowedRows.allSatisfy(\.canUseFullDecodeRing)
                 {
-                    var starts: [Int] = []
+                    var starts: [UInt32] = []
                     starts.reserveCapacity(B)
                     for (index, row) in windowedRows.enumerated() {
                         let ring = row.writeFullDecodeRing(
@@ -122,7 +122,7 @@ enum CBv2AttentionV1 {
                             values: values[index ..< (index + 1)])
                         cachedKeyRows.append(ring.keys)
                         cachedValueRows.append(ring.values)
-                        starts.append(ring.start)
+                        starts.append(UInt32(ring.start))
                     }
                     if let output = CBv2RaggedTwoPassDecodeAttentionV1.attendRing(
                         queries: queries, keys: cachedKeyRows, values: cachedValueRows,

@@ -501,10 +501,12 @@ public protocol CBv2AttendingLayerCache: AnyObject {
     /// apply RoPE with array offsets (MLXFast.RoPE dynamic-offset overload).
     ///
     /// Snapshot semantics: the value read BEFORE `updateAndAttend` reflects
-    /// the PRE-update absolute offsets of the tokens about to be processed;
-    /// models must capture it before dispatching (graph-safe `+ 0` copy) and
-    /// KV-shared layers must reuse the SOURCE layer's pre-update capture —
-    /// a KV-shared cache owns no rows, so its own `positionOffsets` is empty.
+    /// the PRE-update absolute offsets of the tokens about to be processed.
+    /// Implementations must advance by rebinding this property, never by
+    /// mutating a previously returned `MLXArray`, so models can retain the
+    /// pre-update handle without inserting a device-side copy. KV-shared
+    /// layers must reuse the SOURCE layer's pre-update capture — their own
+    /// `positionOffsets` is empty because they own no rows.
     var positionOffsets: MLXArray { get }
     /// Update per-row KV with this step's K/V and compute attention.
     ///  - queries/keys/values: [B, heads, L, headDim]; L == 1 for decode,

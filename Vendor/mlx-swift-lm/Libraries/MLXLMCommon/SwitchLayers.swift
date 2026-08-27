@@ -236,11 +236,27 @@ private let compiledGeGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
     return body
 }()
 
-public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+public func gatherSort(
+    x: MLXArray,
+    indices: MLXArray,
+    directInversePermutation: Bool = false
+) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
     let indices = indices.flattened()
     let order = argSort(indices)
-    let inverseOrder = argSort(order)
+    let inverseOrder: MLXArray
+    if directInversePermutation {
+        // `order` is already a permutation of 0..<N. Building its inverse by
+        // indexed scatter is linear work; sorting that permutation again is
+        // unnecessary. The ranked decode caller enables this only for the
+        // exact 64-assignment cohort path, keeping prefill on the established
+        // implementation.
+        let inverse = MLXArray.zeros([order.size], dtype: order.dtype)
+        inverse[order] = MLXArray.arange(order.size, dtype: order.dtype)
+        inverseOrder = inverse
+    } else {
+        inverseOrder = argSort(order)
+    }
 
     return (
         x.flattened(start: 0, end: -3)[order.floorDivide(m)],
@@ -379,7 +395,9 @@ public class SwitchGLU: Module {
     }
 
     private func projectExperts(
-        _ x: MLXArray, _ indices: MLXArray
+        _ x: MLXArray,
+        _ indices: MLXArray,
+        directInversePermutation: Bool = false
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
         let doSort = indices.size >= 64
@@ -387,7 +405,10 @@ public class SwitchGLU: Module {
         var idx = indices
         var inverseOrder = MLXArray()
         if doSort {
-            (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
+            (x, idx, inverseOrder) = gatherSort(
+                x: x,
+                indices: indices,
+                directInversePermutation: directInversePermutation)
         }
 
         let xGate: MLXArray
@@ -483,7 +504,11 @@ public class SwitchGLU: Module {
         guard fuseSortedReduction && isProductionPrefill,
             supportsWeightedExpertUnsort(x, indices, weights: weights)
         else {
-            return weightedExpertSum(callAsFunction(x, indices), weights)
+            let projected = projectExperts(
+                x,
+                indices,
+                directInversePermutation: !isProductionPrefill && indices.size == 64)
+            return legacyWeightedReduction(projected, indices: indices, weights: weights)
         }
 
         let projected = projectExperts(x, indices)

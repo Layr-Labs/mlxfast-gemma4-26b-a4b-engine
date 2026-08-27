@@ -1233,6 +1233,32 @@ public final class EngineLoopV2: @unchecked Sendable {
         return (logits[0..., -1, 0...], eagerCacheInnerState(caches))
     }
 
+    private func directGreedyDecode(
+        rowStates: [[CBv2SequenceKV?]], tokens: MLXArray,
+        params: [CBv2SamplingParams], requestIDs: [CBv2RequestID]
+    ) -> (sampledTokens: MLXArray, cacheInnerState: [MLXArray])? {
+        let scoredBatch = 8
+        guard tokens.shape == [scoredBatch, 1], rowStates.count == scoredBatch,
+            params.count == scoredBatch, requestIDs.count == scoredBatch,
+            sampler is CBv2DefaultSampler,
+            let directModel = model as? CBv2DirectGreedySteppableModel,
+            directModel.supportsDirectGreedyTokens
+        else { return nil }
+        for (index, param) in params.enumerated() {
+            guard param.temperature < LogitsPipelineV2.greedyEpsilon,
+                param.topP == 1, param.topK == 0, param.minP == 0,
+                param.repetitionPenalty == 1,
+                param.frequencyPenalty == 0, param.presencePenalty == 0,
+                param.logitBias.isEmpty, param.topLogprobs == 0,
+                scheduler.record(for: requestIDs[index])?.request.tokenConstraint == nil
+            else { return nil }
+        }
+        let caches = eagerCaches(rowStates: rowStates)
+        let sampled = directModel.directGreedyTokens(tokens: tokens, caches: caches)
+        precondition(sampled.dtype == .int32 && sampled.shape == [scoredBatch])
+        return (sampled, eagerCacheInnerState(caches))
+    }
+
     /// Prompt-only output seam (see PrefillOutputV2.swift). Capable models
     /// skip the vocabulary projection for discarded prompt positions;
     /// everything else keeps the established full-logits forward and is
@@ -1414,24 +1440,29 @@ public final class EngineLoopV2: @unchecked Sendable {
 
         let inputs = lazyTokens.reshaped([ids.count, 1])
         let forwardStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-        let (last, cacheInnerState) = decodeLogits(rowStates: rowStates, tokens: inputs)  // [B, vocab]
+        let sampled: MLXArray
+        let cacheInnerState: [MLXArray]
+        let stepLogprobs: CBv2StepLogprobs?
+        if let direct = directGreedyDecode(
+            rowStates: rowStates, tokens: inputs, params: params, requestIDs: ids)
+        {
+            sampled = direct.sampledTokens
+            cacheInnerState = direct.cacheInnerState
+            stepLogprobs = nil
+        } else {
+            let decoded = decodeLogits(rowStates: rowStates, tokens: inputs)
+            cacheInnerState = decoded.cacheInnerState
+            sampled = sampler.sample(
+                logits: decoded.logits, params: params, requestIDs: ids,
+                stepIndex: stepCount, pendingSampledTokens: lazyTokens,
+                rowContext: { [scheduler] in
+                    ids.map { Self.samplerRow(scheduler.record(for: $0)!) }
+                })
+            stepLogprobs = sampler.takeStepLogprobs()
+        }
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.forward.build", seconds: CFAbsoluteTimeGetCurrent() - forwardStart)
-        }
-        // `pendingSampledTokens` = the fed lazy tokens: each row has exactly
-        // one launched-but-unconfirmed sample here (the chain invariant).
-        let samplerStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-        let sampled = sampler.sample(
-            logits: last, params: params, requestIDs: ids, stepIndex: stepCount,
-            pendingSampledTokens: lazyTokens,
-            rowContext: { [scheduler] in
-                ids.map { Self.samplerRow(scheduler.record(for: $0)!) }
-            })
-        let stepLogprobs = sampler.takeStepLogprobs()
-        if CBv2StepProfiler.enabled {
-            CBv2StepProfiler.record(
-                "v2.sampler.build", seconds: CFAbsoluteTimeGetCurrent() - samplerStart)
         }
         scheduler.markPendingSamples(ids: ids)
         var toEval = [sampled]
@@ -1507,18 +1538,26 @@ public final class EngineLoopV2: @unchecked Sendable {
         if !decodeRows.isEmpty {
             let inputs = MLXArray(decodeRows.map { Int32($0.rec.tokens[$0.start]) })
                 .reshaped([decodeRows.count, 1])
-            let (last, decodeInnerState) = decodeLogits(
-                rowStates: decodeRows.map { kvStates[$0.rec.id]! }, tokens: inputs)
-            cacheInnerState.append(contentsOf: decodeInnerState)
-            decodeSampled = sampler.sample(
-                logits: last,
-                params: decodeRows.map(\.rec.request.sampling),
-                requestIDs: decodeRows.map(\.rec.id),
-                stepIndex: stepCount,
-                pendingSampledTokens: nil,  // finalize preceded: all confirmed
-                rowContext: { decodeRows.map { Self.samplerRow($0.rec) } })
-            if let stepLogprobs = sampler.takeStepLogprobs() {
-                logprobSegments.append(stepLogprobs)
+            let decodeStates = decodeRows.map { kvStates[$0.rec.id]! }
+            let decodeParams = decodeRows.map(\.rec.request.sampling)
+            let decodeIDs = decodeRows.map(\.rec.id)
+            if let direct = directGreedyDecode(
+                rowStates: decodeStates, tokens: inputs,
+                params: decodeParams, requestIDs: decodeIDs)
+            {
+                decodeSampled = direct.sampledTokens
+                cacheInnerState.append(contentsOf: direct.cacheInnerState)
+            } else {
+                let decoded = decodeLogits(rowStates: decodeStates, tokens: inputs)
+                cacheInnerState.append(contentsOf: decoded.cacheInnerState)
+                decodeSampled = sampler.sample(
+                    logits: decoded.logits, params: decodeParams,
+                    requestIDs: decodeIDs, stepIndex: stepCount,
+                    pendingSampledTokens: nil,
+                    rowContext: { decodeRows.map { Self.samplerRow($0.rec) } })
+                if let stepLogprobs = sampler.takeStepLogprobs() {
+                    logprobSegments.append(stepLogprobs)
+                }
             }
         }
 

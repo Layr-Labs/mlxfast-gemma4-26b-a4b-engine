@@ -6,6 +6,7 @@
 
 import Foundation
 import MLX
+import MLXFast
 import MLXLMCommon
 import MLXNN
 
@@ -234,6 +235,93 @@ private let gemma4CompiledLogitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArr
     }
     return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
+
+private let gemma4FusedSoftcapArgmaxEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "MLX_GEMMA4_FUSED_SOFTCAP_ARGMAX"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+private let gemma4FusedSoftcapArgmaxKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "gemma4_b8_bf16_softcap30_argmax_v1",
+    inputNames: ["raw_logits"],
+    outputNames: ["tokens"],
+    source: """
+        constexpr uint simd_width = 32;
+        constexpr uint reads_per_thread = 4;
+        const uint thread_index = uint(thread_position_in_threadgroup.x);
+        const uint lane = uint(thread_index_in_simdgroup);
+        const uint simd_group = uint(simdgroup_index_in_threadgroup);
+        const uint row = uint(threadgroup_position_in_grid.y);
+
+        float best_value = -3.402823466e+38F;
+        uint best_index = 0;
+        for (uint base = thread_index * reads_per_thread;
+             base < uint(V);
+             base += uint(threads_per_threadgroup.x) * reads_per_thread) {
+            for (uint read = 0; read < reads_per_thread; ++read) {
+                const uint index = base + read;
+                if (index >= uint(V)) break;
+                const float raw = float(raw_logits[row * uint(V) + index]);
+                const float capped = metal::precise::tanh(raw / 30.0f) * 30.0f;
+                if (capped > best_value) {
+                    best_value = capped;
+                    best_index = index;
+                }
+            }
+        }
+
+        for (uint offset = simd_width / 2; offset > 0; offset /= 2) {
+            const float neighbor_value = simd_shuffle_down(best_value, offset);
+            const uint neighbor_index = simd_shuffle_down(best_index, offset);
+            if (best_value < neighbor_value
+                || (best_value == neighbor_value && best_index > neighbor_index)) {
+                best_value = neighbor_value;
+                best_index = neighbor_index;
+            }
+        }
+
+        threadgroup float group_values[32];
+        threadgroup uint group_indices[32];
+        if (lane == 0) {
+            group_values[simd_group] = best_value;
+            group_indices[simd_group] = best_index;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group != 0) return;
+        best_value = group_values[lane];
+        best_index = group_indices[lane];
+        for (uint offset = simd_width / 2; offset > 0; offset /= 2) {
+            const float neighbor_value = simd_shuffle_down(best_value, offset);
+            const uint neighbor_index = simd_shuffle_down(best_index, offset);
+            if (best_value < neighbor_value
+                || (best_value == neighbor_value && best_index > neighbor_index)) {
+                best_value = neighbor_value;
+                best_index = neighbor_index;
+            }
+        }
+        if (thread_index == 0) tokens[row] = int(best_index);
+    """,
+    ensureRowContiguous: true
+)
+
+func gemma4FusedSoftcapArgmax(_ rawLogits: MLXArray) -> MLXArray? {
+    let batch = 8
+    let vocabulary = 262_144
+    guard gemma4FusedSoftcapArgmaxEnabled,
+        rawLogits.dtype == .bfloat16,
+        rawLogits.shape == [batch, vocabulary]
+    else { return nil }
+    return gemma4FusedSoftcapArgmaxKernel(
+        [rawLogits],
+        template: [("T", rawLogits.dtype), ("V", vocabulary)],
+        grid: (1024, batch, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [[batch]],
+        outputDTypes: [.int32]
+    )[0]
+}
 
 // MARK: - Configuration
 
@@ -680,6 +768,101 @@ private class RMSNormNoScale: Module {
     }
 }
 
+private let gemma4QKVNormKernel = MLXFast.metalKernel(
+    name: "gemma4_b8_qkv_rms_norm_v1",
+    inputNames: ["q", "k", "v", "q_weight", "k_weight"],
+    outputNames: ["q_out", "k_out", "v_out"],
+    source: """
+        constexpr uint reads = 4;
+        const uint row = threadgroup_position_in_grid.x;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint simd_group = simdgroup_index_in_threadgroup;
+
+        const device T* input = q;
+        const device T* weight = q_weight;
+        device T* output = q_out;
+        uint local_row = row;
+        bool weighted = true;
+        if (row >= Q_ROWS + K_ROWS) {
+            input = v;
+            output = v_out;
+            local_row = row - Q_ROWS - K_ROWS;
+            weighted = false;
+        } else if (row >= Q_ROWS) {
+            input = k;
+            weight = k_weight;
+            output = k_out;
+            local_row = row - Q_ROWS;
+        }
+
+        input += local_row * D + lid * reads;
+        output += local_row * D + lid * reads;
+        weight += lid * reads;
+
+        float sum = 0.0f;
+        for (uint i = 0; i < reads; ++i) {
+            const float value = float(input[i]);
+            sum += value * value;
+        }
+        sum = simd_sum(sum);
+
+        threadgroup float partials[32];
+        threadgroup float inverse_rms;
+        if (simd_group == 0) partials[lane] = 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) partials[simd_group] = sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            sum = simd_sum(partials[lane]);
+            if (lane == 0) {
+                inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = 0; i < reads; ++i) {
+            const T normalized = T(float(input[i]) * inverse_rms);
+            output[i] = weighted ? weight[i] * normalized : T(1) * normalized;
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+private func gemma4FusedQKVNorm(
+    q: MLXArray,
+    k: MLXArray,
+    v: MLXArray,
+    qWeight: MLXArray,
+    kWeight: MLXArray,
+    eps: Float
+) -> (MLXArray, MLXArray, MLXArray)? {
+    guard eps == 1.0e-6,
+        q.dtype == .bfloat16, k.dtype == .bfloat16, v.dtype == .bfloat16,
+        qWeight.dtype == .bfloat16, kWeight.dtype == .bfloat16,
+        q.ndim == 4, k.ndim == 4, v.ndim == 4,
+        q.dim(0) == 8, q.dim(1) == 1, q.dim(2) == 16,
+        k.dim(0) == 8, k.dim(1) == 1, v.shape == k.shape,
+        q.dim(3) == k.dim(3),
+        (q.dim(3) == 256 && k.dim(2) == 8) || (q.dim(3) == 512 && k.dim(2) == 2),
+        qWeight.shape == [q.dim(3)], kWeight.shape == [q.dim(3)]
+    else { return nil }
+
+    let dimension = q.dim(3)
+    let qRows = 8 * 16
+    let kRows = 8 * k.dim(2)
+    let threads = dimension / 4
+    let outputs = gemma4QKVNormKernel(
+        [q, k, v, qWeight, kWeight],
+        template: [("T", q.dtype), ("D", dimension), ("Q_ROWS", qRows), ("K_ROWS", kRows)],
+        grid: ((qRows + 2 * kRows) * threads, 1, 1),
+        threadGroup: (threads, 1, 1),
+        outputShapes: [q.shape, k.shape, v.shape],
+        outputDTypes: [q.dtype, k.dtype, v.dtype]
+    )
+    return (outputs[0], outputs[1], outputs[2])
+}
+
 private class ScaledLinear: Module {
     let weight: MLXArray
     let scalar: Float
@@ -1073,9 +1256,7 @@ private class Gemma4Attention: Module {
         let queryInput = lastQueryCache == nil ? x : x[0..., outputStart..., 0...]
         let queryLength = queryInput.dim(1)
 
-        var queries = qProj(queryInput).reshaped(B, queryLength, nHeads, effectiveHeadDim)
-        queries = qNorm(queries)
-        queries = queries.transposed(0, 2, 1, 3)
+        let queryRaw = qProj(queryInput).reshaped(B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
             // KV-shared layer: projects queries only and borrows (K, V) from
@@ -1091,6 +1272,7 @@ private class Gemma4Attention: Module {
                     K/V (threaded by Gemma4TextModelInner)
                     """)
             }
+            var queries = qNorm(queryRaw).transposed(0, 2, 1, 3)
             queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: positionOffset)
             let outputDType = queries.dtype
             let attentionQueries =
@@ -1134,23 +1316,25 @@ private class Gemma4Attention: Module {
             lastQueryCache == nil
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
-        queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: queryPositionOffset)
-
         let kRaw = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
-        var k = kNorm(kRaw)
+        let vRaw: MLXArray
+        if let vProj {
+            vRaw = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+        } else {
+            vRaw = kRaw
+        }
+
+        let normalized = gemma4FusedQKVNorm(
+            q: queryRaw, k: kRaw, v: vRaw,
+            qWeight: qNorm.weight, kWeight: kNorm.weight, eps: config.rmsNormEps)
+        var queries = normalized?.0 ?? qNorm(queryRaw)
+        var k = normalized?.1 ?? kNorm(kRaw)
+        var v = normalized?.2 ?? vNorm(vRaw)
+
+        queries = queries.transposed(0, 2, 1, 3)
+        queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: queryPositionOffset)
         k = k.transposed(0, 2, 1, 3)
         k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
-
-        // K-eq-V (`attention_k_eq_v: true` on Gemma 4 26B/31B): values reuse
-        // the raw key projection (pre-norm) through their own vNorm — same as
-        // the legacy path.
-        var v: MLXArray
-        if let vProj {
-            v = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
-        } else {
-            v = kRaw
-        }
-        v = vNorm(v)
         v = v.transposed(0, 2, 1, 3)
 
         let outputDType = queries.dtype
@@ -2287,6 +2471,30 @@ extension Gemma4TextModel {
 }
 
 // MARK: - ContinuousBatchingV2 prompt-only output narrowing
+
+extension Gemma4TextModel: CBv2LanguageModelDirectGreedyForwardable {
+    public var cbv2SupportsDirectGreedyTokens: Bool {
+        gemma4FusedSoftcapArgmaxEnabled
+            && config.hiddenSize == 2816
+            && config.vocabSize == 262_144
+            && config.tieWordEmbeddings
+            && config.finalLogitSoftcapping == 30
+    }
+
+    public func cbv2DirectGreedyTokens(
+        _ inputs: MLXArray, cache: [KVCache]?
+    ) -> MLXArray {
+        let hidden = model(inputs, cache: cache)
+        let rawLogits = applyRawLMHead(hidden[0..., -1, 0...])
+        if let tokens = gemma4FusedSoftcapArgmax(rawLogits) { return tokens }
+        var logits = rawLogits
+        if config.finalLogitSoftcapping > 0 {
+            logits = gemma4CompiledLogitSoftcap(
+                logits, MLXArray(config.finalLogitSoftcapping))
+        }
+        return argMax(logits, axis: -1).asType(.int32)
+    }
+}
 
 /// CBv2 consumes only the final prompt position, so the public
 /// `LanguageModel` forward contract stays unchanged while the engine's

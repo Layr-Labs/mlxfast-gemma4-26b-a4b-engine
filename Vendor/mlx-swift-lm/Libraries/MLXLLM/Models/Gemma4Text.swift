@@ -6,6 +6,7 @@
 
 import Foundation
 import MLX
+import MLXFast
 import MLXLMCommon
 import MLXNN
 
@@ -234,6 +235,113 @@ private let gemma4CompiledLogitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArr
     }
     return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
+
+/// Exact terminal path for the scored Gemma-4 cohort: fold the configured
+/// float32 softcap into MLX's own one-threadgroup-per-row argmax geometry.
+/// This removes the `[8, 262144]` float32 softcap materialization while
+/// preserving precise tanh, reduction order, NaN handling, and first-index
+/// tie breaking. Every other shape keeps the established logits path.
+private let gemma4FusedSoftcapArgmaxEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "MLX_GEMMA4_FUSED_SOFTCAP_ARGMAX"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+private let gemma4FusedSoftcapArgmaxKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "gemma4_b8_bf16_softcap30_argmax_v1",
+    inputNames: ["raw_logits"],
+    outputNames: ["tokens"],
+    source: """
+        constexpr uint simd_width = 32;
+        constexpr uint reads_per_thread = 4;
+
+        const uint thread_index = uint(thread_position_in_threadgroup.x);
+        const uint lane = uint(thread_index_in_simdgroup);
+        const uint simd_group = uint(simdgroup_index_in_threadgroup);
+        const uint row = uint(threadgroup_position_in_grid.y);
+
+        float best_value = -3.402823466e+38F;
+        uint best_index = 0;
+        for (uint base = thread_index * reads_per_thread;
+             base < uint(V);
+             base += uint(threads_per_threadgroup.x) * reads_per_thread) {
+            for (uint read = 0; read < reads_per_thread; ++read) {
+                const uint index = base + read;
+                if (index >= uint(V)) {
+                    break;
+                }
+                const float raw = float(raw_logits[row * uint(V) + index]);
+                const float capped = metal::precise::tanh(raw / 30.0f) * 30.0f;
+                if (capped > best_value) {
+                    best_value = capped;
+                    best_index = index;
+                }
+            }
+        }
+
+        for (uint offset = simd_width / 2; offset > 0; offset /= 2) {
+            const float neighbor_value = simd_shuffle_down(best_value, offset);
+            const uint neighbor_index = simd_shuffle_down(best_index, offset);
+            if (best_value < neighbor_value
+                || (best_value == neighbor_value && best_index > neighbor_index)) {
+                best_value = neighbor_value;
+                best_index = neighbor_index;
+            }
+        }
+
+        threadgroup float group_values[32];
+        threadgroup uint group_indices[32];
+        if (lane == 0) {
+            group_values[simd_group] = best_value;
+            group_indices[simd_group] = best_index;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group != 0) {
+            return;
+        }
+        best_value = group_values[lane];
+        best_index = group_indices[lane];
+        for (uint offset = simd_width / 2; offset > 0; offset /= 2) {
+            const float neighbor_value = simd_shuffle_down(best_value, offset);
+            const uint neighbor_index = simd_shuffle_down(best_index, offset);
+            if (best_value < neighbor_value
+                || (best_value == neighbor_value && best_index > neighbor_index)) {
+                best_value = neighbor_value;
+                best_index = neighbor_index;
+            }
+        }
+        if (thread_index == 0) {
+            tokens[row] = int(best_index);
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+/// Returns nil unless the exact scored raw-logit tensor is eligible.
+/// Internal visibility exists for focused parity tests; production reaches
+/// this only through `CBv2LanguageModelDirectGreedyForwardable` below.
+func gemma4FusedSoftcapArgmax(_ rawLogits: MLXArray) -> MLXArray? {
+    let batch = 8
+    let vocabulary = 262_144
+    guard gemma4FusedSoftcapArgmaxEnabled,
+        rawLogits.dtype == .bfloat16,
+        rawLogits.shape == [batch, vocabulary]
+    else { return nil }
+
+    return gemma4FusedSoftcapArgmaxKernel(
+        [rawLogits],
+        template: [
+            ("T", rawLogits.dtype),
+            ("V", vocabulary),
+        ],
+        grid: (1024, batch, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [[batch]],
+        outputDTypes: [.int32]
+    )[0]
+}
 
 // MARK: - Configuration
 
@@ -2265,6 +2373,38 @@ extension Gemma4TextModel {
 }
 
 // MARK: - ContinuousBatchingV2 prompt-only output narrowing
+
+/// Direct greedy-token refinement for the exact scored decode geometry.
+/// The target trunk and tied vocabulary projection are unchanged; only the
+/// terminal softcap + argmax pair is fused. Unsupported configurations and
+/// shapes reproduce the established softcapped-logits reduction.
+extension Gemma4TextModel: CBv2LanguageModelDirectGreedyForwardable {
+
+    public var cbv2SupportsDirectGreedyTokens: Bool {
+        gemma4FusedSoftcapArgmaxEnabled
+            && config.hiddenSize == 2816
+            && config.vocabSize == 262_144
+            && config.tieWordEmbeddings
+            && config.finalLogitSoftcapping == 30
+    }
+
+    public func cbv2DirectGreedyTokens(
+        _ inputs: MLXArray, cache: [KVCache]?
+    ) -> MLXArray {
+        let hidden = model(inputs, cache: cache)
+        let rawLogits = applyRawLMHead(hidden[0..., -1, 0...])
+        if let tokens = gemma4FusedSoftcapArgmax(rawLogits) {
+            return tokens
+        }
+
+        var logits = rawLogits
+        if config.finalLogitSoftcapping > 0 {
+            logits = gemma4CompiledLogitSoftcap(
+                logits, MLXArray(config.finalLogitSoftcapping))
+        }
+        return argMax(logits, axis: -1).asType(.int32)
+    }
+}
 
 /// CBv2 consumes only the final prompt position, so the public
 /// `LanguageModel` forward contract stays unchanged while the engine's

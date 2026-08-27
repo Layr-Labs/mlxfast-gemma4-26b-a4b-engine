@@ -72,7 +72,9 @@ changed="$("${HARDENED_GIT}" -c core.quotePath=false diff --name-only "${BASE_SH
 #
 # WHAT THE PROTECTED THING IS NOW. benchd used to be a SHA-pinned source
 # submodule at `benchd`, pointed at by `.gitmodules`. It is now a pinned
-# PREBUILT binary: `benchd.pin` names {branch, commit, sha256, bytes} and
+# PREBUILT binary resolved from the dist channel (the `benchd.pin` sha pin is
+# RETIRED -- David ruling 2026-08-27 -- but the spelling stays FORBIDDEN below so
+# a submission can never plant a pin file and confuse tooling): historically it named {branch, commit, sha256, bytes} and
 # tools/fetch-benchd.sh resolves it into `benchd-bin/`. So the pin file and the
 # resolved-binary directory are the live entries -- writing the pin repoints the
 # scorer, writing benchd-bin swaps the bytes after verification. The two
@@ -137,7 +139,7 @@ bad=0
 while IFS= read -r f; do
   [[ -z "${f}" ]] && continue
   if reaches_forbidden_path "${f}"; then
-    echo "::error file=${f}::${f} reaches the pinned measurement harness (benchd.pin / benchd-bin) or a retired submodule spelling; a submission must never be able to change what scores it"
+    echo "::error file=${f}::${f} reaches the measurement-harness surface (benchd-bin, or the retired benchd.pin spelling) or a retired submodule spelling; a submission must never be able to change what scores it"
     bad=1
     continue
   fi

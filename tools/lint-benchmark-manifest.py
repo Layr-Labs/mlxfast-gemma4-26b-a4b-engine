@@ -710,19 +710,24 @@ class Linter:
 
         # NON-VACUITY. The exclusion is only worth anything if the thing it
         # refuses to make editable actually exists in the tree. That used to be
-        # `.gitmodules` (proving benchd was a submodule); benchd is now a pinned
-        # PREBUILT and the artifact carrying the same authority is `benchd.pin`,
-        # so that is what must be present. A tree where the pin has been deleted
-        # or renamed is a tree where this check guards nothing, and it must go
-        # red rather than quietly pass.
-        pin = self.abspath("benchd.pin")
-        if os.path.exists(pin):
-            self.ok("benchd.pin exists (benchd is a pinned prebuilt, as the exclusion assumes)")
+        # `.gitmodules` (submodule era), then `benchd.pin` (sha-pin era). The
+        # pin is RETIRED (David ruling 2026-08-27: benchd resolves from the
+        # bench branch's dist channel, verified against the channel's
+        # benchctl.manifest.json, so measurement fixes ship bench-side with no
+        # engine commit); the artifact carrying the same authority is now
+        # tools/fetch-benchd.sh -- the channel constants and the manifest
+        # verification live there, trusted-side. A tree where that script is
+        # gone is a tree where this check guards nothing, and it must go red
+        # rather than quietly pass. (The `benchd.pin` SPELLING stays excluded
+        # above so a submission can never plant a pin file.)
+        fetcher = self.abspath("tools/fetch-benchd.sh")
+        if os.path.exists(fetcher):
+            self.ok("tools/fetch-benchd.sh exists (benchd is a channel prebuilt, as the exclusion assumes)")
         else:
             self.fail(
-                "benchd.pin missing -- the exclusion assumes benchd is pinned by "
-                "{branch, commit, sha256, bytes}; without the pin there is nothing "
-                "binding which measurement binary runs"
+                "tools/fetch-benchd.sh missing -- benchd resolves from the dist "
+                "channel through that script; without it there is nothing binding "
+                "which measurement binary runs"
             )
 
     # -- 3c ----------------------------------------------------------------

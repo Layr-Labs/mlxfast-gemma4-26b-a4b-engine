@@ -21,9 +21,13 @@ If either configuration file disagrees with this document on a plain value, the
 configuration file wins. If either disagrees with the benchmarker about
 measurement, the benchmarker wins.
 
-The benchmarker is a sha256-pinned prebuilt `benchctl` binary. `benchd.pin`
-names one `{branch, commit, sha256, bytes}`. `./tools/fetch-benchd.sh` resolves
-and hash-verifies it into `benchd-bin/`. This repository carries no submodule.
+The benchmarker is a prebuilt `benchctl` binary resolved from the bench
+repository's release channel (the track branch's `dist/`). The channel publishes
+`benchctl.manifest.json` (`{branch, source_commit, sha256, bytes}`) beside the
+binary; `./tools/fetch-benchd.sh` verifies the binary against that manifest,
+installs both into `benchd-bin/`, and logs the resolved identity. The harness is
+trusted-side: a submission cannot change what measures it. This repository
+carries no submodule and no sha pin.
 
 ## 2. What the track measures
 

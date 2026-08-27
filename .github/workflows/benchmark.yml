@@ -40,8 +40,8 @@
 #
 # FAIL-CLOSED INVENTORY -- each of these aborts before a score.json can exist,
 # and none of them has a degraded path:
-#   1. benchd pin mismatch. ./tools/fetch-benchd.sh accepts only bytes matching
-#      ./benchd.pin {sha256, bytes}; it never returns an unverified binary and
+#   1. benchd manifest mismatch. ./tools/fetch-benchd.sh accepts only bytes
+#      matching the channel's benchctl.manifest.json; it never returns an unverified binary and
 #      never falls back to a PATH benchctl or a source build.
 #   2. Unarmed pool. A PENDING-ORGANIZER sentinel, a pool that is not 8 entries,
 #      or any entry whose sha256 is not 64 hex / bytes is not positive: refused,
@@ -54,7 +54,7 @@
 #      *.json in the staging directory is also refused: every *.json there is
 #      passed as a --golden, so one more file is one more cohort member.
 #   5. Credential or override in the job environment. R2 keys, an R2 signer, a
-#      dist token, BENCHCTL (which bypasses the benchd pin check),
+#      dist token, BENCHCTL (which bypasses the benchd manifest check),
 #      MLXFAST_SKIP_WEIGHTS_DOWNLOAD / SKIP_MODEL_DOWNLOAD,
 #      MLXFAST_LOCAL_COOL_GATE, MLXFAST_LOCAL_ALLOW_GOLDEN_DRIFT.
 #   6. Model absent and unfetchable. ./setup.sh verifies the reference
@@ -84,7 +84,7 @@
 #   - a registered self-hosted runner on the box advertising the three labels
 #     below (tools/box-runner/ owns that side);
 #   - box staging: the 8 pinned tapes in MLXFAST_GEMMA4_GOLDEN_DIR, the pinned
-#     baseline workspace, benchd-bin/benchctl matching ./benchd.pin (the box has
+#     baseline workspace, benchd-bin/benchctl + benchctl.manifest.json agreeing (the box has
 #     no Rust toolchain and this job holds no dist token, so the binary is
 #     placed there out of band), the reference checkpoint, and a macmon GPU
 #     temperature reader at the path this file pins into MLXFAST_MACMON and
@@ -230,7 +230,7 @@ jobs:
       #
       # The challenger hands its box wrapper `MACMON=` (:2967). That name is the
       # WRAPPER's, not benchd's: `MACMON` does not appear as an env read in the
-      # pinned binary (benchd.pin sha256 e044e1f4..., whose strings carry exactly
+      # served binary (at writing sha256 e044e1f4..., whose strings carry exactly
       # MLXFAST_GPU_TEMP_CMD, MLXFAST_MACMON_BIN, /opt/homebrew/bin/macmon,
       # /usr/local/bin/macmon), so passing it would be cargo cult. Two env vars
       # are all benchd needs, and the second one is below.
@@ -265,8 +265,9 @@ jobs:
         # First half of benchmark.json's setupCommand. mlxfast-bench's dist is
         # not anonymously readable and this job holds no token, so the resolve
         # is expected to take fetch-benchd.sh's OFFLINE path: an operator-placed
-        # benchd-bin/benchctl, accepted only when it matches ./benchd.pin. A
-        # binary that fails the pin is a hard refusal, never a replacement.
+        # benchd-bin/benchctl + benchctl.manifest.json pair, accepted only when the
+        # two agree. A binary that fails its manifest, or arrives without one, is a
+        # hard refusal, never a replacement.
         run: ./tools/fetch-benchd.sh
 
       - name: Setup (toolchain, Metal kernels, pinned checkpoint)

@@ -11,7 +11,8 @@
 # WHAT CHANGED (benchd submodule -> pinned prebuilt). benchd used to be a
 # SHA-pinned SOURCE submodule at benchd/, and this proxy's steps 1-2 installed
 # that gitlink and compared the checkout against it. The submodule is gone.
-# benchd now ships as a prebuilt `benchctl` binary pinned by ./benchd.pin
+# benchd now ships as a prebuilt `benchctl` binary resolved from the bench
+# branch's dist channel (verified against benchctl.manifest.json)
 # ({branch, commit, sha256, bytes}) and resolved by ./tools/fetch-benchd.sh,
 # because (a) the ranked M5 box has no Rust toolchain and could never build a
 # source submodule, and (b) a participant who compiles the scorer can weaken it
@@ -50,7 +51,7 @@ fi
 
 # 1. Resolve the PINNED measurement binary before anything else. fetch-benchd.sh
 #    accepts an already-present benchd-bin/benchctl whose sha256 and byte count
-#    match ./benchd.pin (the offline path the ranked box uses, where the binary
+#    match the channel manifest beside it (the offline path the ranked box uses, where the binary
 #    is scp'd in), otherwise downloads and verifies it. It NEVER yields an
 #    unverified binary: a mismatch or a failed download is a hard refusal here,
 #    exactly as an off-pin submodule checkout used to be.

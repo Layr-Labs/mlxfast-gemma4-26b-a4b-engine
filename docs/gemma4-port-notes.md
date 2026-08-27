@@ -1698,8 +1698,8 @@ returned `= 2` — and by containment,
 `origin/gemma4-26b-a4b-mlx-v1`).
 
 The 8/26 ruling is in that same state **as of this commit**: the benchd side
-(`PAIRS_PER_COHORT_TARGET` 2 → 4) must merge and publish before this
-repository's `benchd.pin` can name a commit that compiles 4, so the pin
+(`PAIRS_PER_COHORT_TARGET` 2 → 4) must merge and publish before the served
+channel build compiles 4, so the served build
 advance is a SEPARATE follow-up commit rather than part of this change. Until
 it lands, an official-shaped invocation declaring `--target-pairs 4` is
 refused at the pin, by name and pre-measurement. Verify the same way the 8/24

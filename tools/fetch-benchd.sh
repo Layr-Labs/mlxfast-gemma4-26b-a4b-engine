@@ -1,72 +1,76 @@
 #!/usr/bin/env bash
 #
-# fetch-benchd.sh -- resolve the pinned `benchctl` measurement harness.
+# fetch-benchd.sh -- resolve the `benchctl` measurement harness from its release
+# channel.
 #
-# This replaces the benchd SOURCE submodule. benchd is no longer checked out or
-# built here: the organizer publishes a prebuilt per-branch `benchctl` (see the
-# bench repo's scripts/build-dist.sh and .github/workflows/dist.yml) and this
-# repository pins ONE of those binaries by {branch, commit, sha256, bytes} in
-# ./benchd.pin. Two reasons the pin is a binary and not source:
+# THE PIN IS REMOVED (David ruling 2026-08-27). benchd used to be frozen here by
+# ./benchd.pin ({branch, commit, sha256, bytes}), which made every benchd bug
+# fix require an engine-repo pin-advance commit before it could reach a box --
+# the depth/echo fix sat merged in the bench repo while the served pin still
+# carried the bug. That coupling is gone: this repository names only the CHANNEL
+# (the bench repo + branch), and the channel's tip is what runs. Fixing a
+# measurement bug is now: merge it bench-side, republish dist, done -- zero
+# engine commits.
 #
-#   1. NO CARGO ON THE RANKED BOX. The M5 box has no Rust toolchain, so a source
-#      submodule could never be built where it actually matters -- the binary had
-#      to be produced elsewhere and copied in, undocumented and unverified.
-#   2. SOURCE-THE-USER-BUILDS IS WEAK TAMPER-EVIDENCE. The measurement harness is
-#      immutable to the participant by contract; only the ENGINE is editable. A
-#      participant who compiles the scorer can weaken it first. A pinned sha256
-#      makes that concrete and, locally, evident.
+# WHAT REPLACES THE PIN'S GUARANTEES, stated honestly:
 #
-# Honest limit, stated so nobody over-claims: a participant owns their machine
-# and can patch this check out. What it buys LOCALLY is that the default path
-# runs the organizer's exact binary and that drift is evident. The actual
-# enforcement is the official run on organizer infrastructure.
+#   * INTEGRITY (the bytes are what the organizer published): the dist channel
+#     publishes `benchctl.manifest.json` next to the binary ({branch,
+#     source_commit, sha256, bytes}, written by the bench repo's
+#     scripts/build-dist.sh). The binary is verified against THAT manifest --
+#     fetched from the same organizer-controlled channel -- and nothing
+#     unverified is ever installed or returned. What this no longer defends
+#     against is the channel itself moving, which is the point: the channel is
+#     the organizer's bench repo, participants cannot write to it, and its tip
+#     is now the intended source of truth.
+#   * PROVENANCE (knowing which benchd measured a run): recorded, not pinned.
+#     The resolved {branch, source_commit, sha256} is logged loudly on every
+#     resolve and the manifest is installed beside the binary
+#     (benchd-bin/benchctl.manifest.json), so any run's harness identity can be
+#     read off the box afterwards.
+#   * SUBMISSION-PROOFNESS: unchanged. This script and the channel constants
+#     live under tools/, outside editablePaths, and the modifiable-surface
+#     guard still forbids `benchd.pin`/`benchd-bin` spellings in submissions,
+#     so a submission can neither redirect the fetch nor resurrect a pin.
 #
 # WHAT IT DOES, in order:
-#   1. If benchd-bin/benchctl exists and its sha256 AND byte count match the
-#      pin, use it and never touch the network. This is the OFFLINE path: on the
-#      box the binary is scp'd into place and accepted here without any
-#      download.
-#   2. Otherwise try each download candidate in turn, verifying EACH against the
-#      pin, and install the first one that matches -- a candidate that responds
-#      with the wrong bytes is skipped, not fatal, so one stale publish cannot
-#      hide a good binary at the next location.
-#
-# It NEVER runs, installs, or returns an unverified binary. An unparseable pin,
-# a pre-placed binary that fails the pin, a named BENCHD_DIST_LOCAL that fails
-# the pin, and an exhausted candidate list (whether nothing responded or nothing
-# that responded matched) are all hard refusals -- there is no fallback to
-# "whatever benchctl is on PATH" and no fallback to building from source,
-# because both would silently score a submission against unpinned measurement
-# code.
-#
-# Note the one asymmetry, which is deliberate: a mismatch is skipped only where
-# there is a NEXT candidate to try. Where the caller named a single source --
-# benchd-bin/benchctl already in place, or BENCHD_DIST_LOCAL -- a mismatch is
-# fatal, because silently moving past the exact file the operator pointed at
-# would hide the problem rather than route around it.
+#   1. If benchd-bin/benchctl AND benchd-bin/benchctl.manifest.json exist and
+#      agree (sha256 + bytes), use them, never touching the network -- the
+#      OFFLINE path: the ranked box gets both files placed together. A binary
+#      with no manifest, or a pair that disagrees, refuses loudly (a bare
+#      unattributable binary is exactly what this script must never run).
+#      Set BENCHD_REFRESH=1 to discard the local pair and re-resolve the
+#      channel tip.
+#   2. Otherwise obtain the PAIR -- from BENCHD_DIST_LOCAL (file/dir, for
+#      air-gapped boxes) or by downloading manifest-then-binary from the
+#      channel -- verify the binary against its manifest, and install both.
 #
 # Prints the absolute path of the verified binary on STDOUT (diagnostics go to
 # stderr), so callers can do:  BENCHCTL="$(./tools/fetch-benchd.sh)"
 #
 # Env:
-#   BENCHD_BIN_DIR      install directory. Default: <repo>/benchd-bin (gitignored;
-#                       it is a fetched artifact, not repository content).
-#   BENCHD_DIST_LOCAL   path to an already-obtained benchctl (file) or to a
-#                       directory containing one. Copied in instead of
-#                       downloading -- still hash-verified. For air-gapped boxes.
-#   BENCHD_DIST_URL     exact URL to fetch, overriding the derived candidates.
+#   BENCHD_BRANCH       channel branch. Default: gemma4-26b-a4b-mlx-v1 (this
+#                       track's bench branch).
+#   BENCHD_BIN_DIR      install directory. Default: <repo>/benchd-bin
+#                       (gitignored; a fetched artifact, not repository content).
+#   BENCHD_REFRESH      set to 1 to discard an already-installed pair and
+#                       re-resolve the channel tip.
+#   BENCHD_DIST_LOCAL   path to an already-obtained dist (a directory holding
+#                       benchctl + benchctl.manifest.json, or the benchctl file
+#                       with the manifest beside it). Verified, never trusted
+#                       bare.
 #   BENCHD_DIST_BASE_URL
 #                       raw host + repo prefix. Default:
 #                       https://raw.githubusercontent.com/Layr-Labs/mlxfast-bench
 #   BENCHD_DIST_TOKEN / GITHUB_TOKEN
-#                       bearer token; mlxfast-bench is private, so raw fetches
-#                       need one.
+#                       bearer token for a private channel repo.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PIN_FILE="${REPO_ROOT}/benchd.pin"
+BRANCH="${BENCHD_BRANCH:-gemma4-26b-a4b-mlx-v1}"
 DEST_DIR="${BENCHD_BIN_DIR:-${REPO_ROOT}/benchd-bin}"
 DEST="${DEST_DIR}/benchctl"
+DEST_MANIFEST="${DEST_DIR}/benchctl.manifest.json"
 BASE_URL="${BENCHD_DIST_BASE_URL:-https://raw.githubusercontent.com/Layr-Labs/mlxfast-bench}"
 
 die() {
@@ -74,220 +78,149 @@ die() {
   exit 1
 }
 
-# -- pin ----------------------------------------------------------------------
-# benchd.pin is values-only JSON, one key per line, authored by this repository
-# from the dist manifest. Parsed with sed rather than jq/python3 so the OFFLINE
-# path on the ranked box needs nothing but a shell and shasum.
-pin_field() {
-  sed -n "s/^[[:space:]]*\"$1\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",]*\)\"\{0,1\}[[:space:]]*,\{0,1\}[[:space:]]*\$/\1/p" "${PIN_FILE}"
+command -v shasum >/dev/null 2>&1 || die "shasum is required to verify benchctl."
+
+# -- manifest -----------------------------------------------------------------
+# benchctl.manifest.json is values-only JSON, one key per line (build-dist.sh).
+# Parsed with sed rather than jq/python3 so the OFFLINE path on the ranked box
+# needs nothing but a shell and shasum.
+manifest_field() {
+  sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",]*\)\"\{0,1\}[[:space:]]*,\{0,1\}[[:space:]]*\$/\1/p" "$1"
 }
 
-[[ -f "${PIN_FILE}" ]] || die "${PIN_FILE} is missing; there is no pin to resolve."
-
-PIN_BRANCH="$(pin_field branch)"
-PIN_COMMIT="$(pin_field commit)"
-PIN_SHA256="$(pin_field sha256)"
-PIN_BYTES="$(pin_field bytes)"
-
-# An unparseable pin must refuse, not degrade: empty fields would make every
-# comparison below trivially "match".
-if [[ "${#PIN_SHA256}" -ne 64 || -n "${PIN_SHA256//[0-9a-f]/}" ]]; then
-  die "benchd.pin sha256 is not 64 lowercase hex characters: '${PIN_SHA256}'"
-fi
-if [[ -z "${PIN_BYTES}" || -n "${PIN_BYTES//[0-9]/}" ]]; then
-  die "benchd.pin bytes is not a positive integer: '${PIN_BYTES}'"
-fi
-[[ -n "${PIN_BRANCH}" ]] || die "benchd.pin branch is empty."
-[[ -n "${PIN_COMMIT}" ]] || die "benchd.pin commit is empty."
-
-command -v shasum >/dev/null 2>&1 || die "shasum is required to verify the pinned benchctl."
-
-# -- verify -------------------------------------------------------------------
-# Bytes first (cheap, and a length mismatch is already disqualifying), then the
-# digest. Reports on stderr so callers see WHICH half failed.
-matches_pin() {
-  local path="$1" actual_bytes actual_sha
+# Load + validate a manifest file; sets MF_BRANCH/MF_COMMIT/MF_SHA256/MF_BYTES.
+# An unparseable manifest must refuse, not degrade: empty fields would make
+# every comparison below trivially "match".
+load_manifest() {
+  local path="$1"
   [[ -f "${path}" ]] || return 1
-  actual_bytes="$(wc -c < "${path}" | tr -d '[:space:]')"
-  if [[ "${actual_bytes}" != "${PIN_BYTES}" ]]; then
-    echo "fetch-benchd.sh:   byte count mismatch: pin=${PIN_BYTES} actual=${actual_bytes} (${path})" >&2
+  MF_BRANCH="$(manifest_field "${path}" branch)"
+  MF_COMMIT="$(manifest_field "${path}" source_commit)"
+  MF_SHA256="$(manifest_field "${path}" sha256)"
+  MF_BYTES="$(manifest_field "${path}" bytes)"
+  if [[ "${#MF_SHA256}" -ne 64 || -n "${MF_SHA256//[0-9a-f]/}" ]]; then
+    echo "fetch-benchd.sh:   manifest sha256 is not 64 lowercase hex characters: '${MF_SHA256}' (${path})" >&2
     return 1
   fi
-  actual_sha="$(shasum -a 256 "${path}" | awk '{print $1}')"
-  if [[ "${actual_sha}" != "${PIN_SHA256}" ]]; then
-    echo "fetch-benchd.sh:   sha256 mismatch: pin=${PIN_SHA256} actual=${actual_sha} (${path})" >&2
+  if [[ -z "${MF_BYTES}" || -n "${MF_BYTES//[0-9]/}" ]]; then
+    echo "fetch-benchd.sh:   manifest bytes is not a positive integer: '${MF_BYTES}' (${path})" >&2
+    return 1
+  fi
+  if [[ "${MF_BRANCH}" != "${BRANCH}" ]]; then
+    echo "fetch-benchd.sh:   manifest names branch '${MF_BRANCH}', expected '${BRANCH}' -- wrong channel (${path})" >&2
     return 1
   fi
   return 0
 }
 
-# -- 1. already in place (the offline path) -----------------------------------
-if [[ -f "${DEST}" ]]; then
-  if matches_pin "${DEST}"; then
-    chmod 755 "${DEST}"
-    printf '%s\n' "${DEST}"
-    exit 0
+# Verify a binary against the LOADED manifest. Bytes first (cheap, and a length
+# mismatch is already disqualifying), then the digest. Reports on stderr so
+# callers see WHICH half failed.
+matches_manifest() {
+  local path="$1" actual_bytes actual_sha
+  [[ -f "${path}" ]] || return 1
+  actual_bytes="$(wc -c < "${path}" | tr -d '[:space:]')"
+  if [[ "${actual_bytes}" != "${MF_BYTES}" ]]; then
+    echo "fetch-benchd.sh:   byte count mismatch: manifest=${MF_BYTES} actual=${actual_bytes} (${path})" >&2
+    return 1
   fi
-  # Present but WRONG. Do not silently overwrite an operator-placed binary that
-  # fails the pin: that is exactly the condition worth surfacing loudly. Set
-  # BENCHD_BIN_DIR elsewhere, or delete it deliberately, then re-run.
-  die "${DEST} exists but does NOT match benchd.pin (see the mismatch above); refusing to run or replace it."
+  actual_sha="$(shasum -a 256 "${path}" | awk '{print $1}')"
+  if [[ "${actual_sha}" != "${MF_SHA256}" ]]; then
+    echo "fetch-benchd.sh:   sha256 mismatch: manifest=${MF_SHA256} actual=${actual_sha} (${path})" >&2
+    return 1
+  fi
+  return 0
+}
+
+announce() {
+  echo "fetch-benchd.sh: benchctl identity: branch=${MF_BRANCH} source_commit=${MF_COMMIT} sha256=${MF_SHA256} bytes=${MF_BYTES}" >&2
+}
+
+# -- 1. already in place (the offline path) -----------------------------------
+if [[ "${BENCHD_REFRESH:-0}" == "1" && -f "${DEST}" ]]; then
+  echo "fetch-benchd.sh: BENCHD_REFRESH=1 -- discarding the installed pair to re-resolve the channel tip" >&2
+  rm -f "${DEST}" "${DEST_MANIFEST}"
 fi
 
-# -- 2. obtain ----------------------------------------------------------------
+if [[ -f "${DEST}" ]]; then
+  load_manifest "${DEST_MANIFEST}" \
+    || die "${DEST} exists but ${DEST_MANIFEST} is missing or malformed; a binary with no manifest is unattributable and will not be run. Place the channel's benchctl.manifest.json beside it, or delete the binary and re-run."
+  matches_manifest "${DEST}" \
+    || die "${DEST} does NOT match its manifest (see the mismatch above); refusing to run or replace it. Delete the pair deliberately, then re-run."
+  chmod 755 "${DEST}"
+  announce
+  printf '%s\n' "${DEST}"
+  exit 0
+fi
+
+# -- 2. obtain the pair -------------------------------------------------------
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "${TMP_DIR}"' EXIT
 STAGED="${TMP_DIR}/benchctl"
-
-verified=0
+STAGED_MANIFEST="${TMP_DIR}/benchctl.manifest.json"
 
 if [[ -n "${BENCHD_DIST_LOCAL:-}" ]]; then
   src="${BENCHD_DIST_LOCAL}"
   [[ -d "${src}" ]] && src="${src}/benchctl"
-  [[ -f "${src}" ]] || die "BENCHD_DIST_LOCAL does not resolve to a file: ${src}"
-  echo "fetch-benchd.sh: taking the pinned benchctl from ${src}" >&2
+  [[ -f "${src}" ]] || die "BENCHD_DIST_LOCAL does not resolve to a benchctl file: ${src}"
+  src_manifest="$(dirname "${src}")/benchctl.manifest.json"
+  [[ -f "${src_manifest}" ]] || die "BENCHD_DIST_LOCAL has no benchctl.manifest.json beside the binary (${src_manifest}); an unattributable binary will not be installed."
+  echo "fetch-benchd.sh: taking benchctl from ${src}" >&2
   cp "${src}" "${STAGED}"
-  # One named source, so a mismatch here is a hard refusal rather than a skip:
-  # there is no next candidate to fall through to, and silently continuing past
+  cp "${src_manifest}" "${STAGED_MANIFEST}"
+  load_manifest "${STAGED_MANIFEST}" \
+    || die "BENCHD_DIST_LOCAL manifest is malformed or names the wrong channel; refusing."
+  # One named source, so a mismatch is a hard refusal: silently continuing past
   # the file the operator explicitly pointed at would hide the real problem.
-  matches_pin "${STAGED}" \
-    || die "BENCHD_DIST_LOCAL (${src}) does NOT match benchd.pin (see the mismatch above); refusing to install or run it."
-  verified=1
+  matches_manifest "${STAGED}" \
+    || die "BENCHD_DIST_LOCAL (${src}) does NOT match its manifest (see the mismatch above); refusing to install or run it."
 else
-  command -v curl >/dev/null 2>&1 || die "curl is required to download the pinned benchctl (or set BENCHD_DIST_LOCAL)."
+  command -v curl >/dev/null 2>&1 || die "curl is required to download benchctl (or set BENCHD_DIST_LOCAL)."
 
-  # Candidate URLs, tried in order. Trying more than one is NOT a weakening:
-  # every candidate is hash-verified against the same pin before it is installed,
-  # so a wrong or hostile response cannot be accepted from any of them.
-  #
-  #   (a) BENCHD_DIST_URL, when the caller names one exactly.
-  #   (b) The CI layout published by the bench repo's .github/workflows/dist.yml:
-  #       an orphan `dist/<branch>` branch with one directory per source commit.
-  #       This is the steady state.
-  #   (c) The HAND-PUBLISHED layout: dist/ committed on the source branch itself.
-  #       Org Actions are currently disabled, so (b) does not exist yet for this
-  #       pin and (c) is what actually resolves today. Drop (c) once CI publishes.
-  #
-  # The `refs/heads/` prefix is required, not cosmetic: these branch names
-  # contain slashes, and without the explicit ref namespace raw.githubusercontent
-  # cannot tell where the ref ends and the path begins.
-  candidates=""
-  if [[ -n "${BENCHD_DIST_URL:-}" ]]; then
-    candidates="${BENCHD_DIST_URL}"
-  else
-    candidates="${BASE_URL}/refs/heads/dist/${PIN_BRANCH}/${PIN_COMMIT}/benchctl
-${BASE_URL}/refs/heads/${PIN_BRANCH}/dist/benchctl"
-  fi
-
+  # The channel: dist/ on the bench branch tip. The manifest is fetched FIRST,
+  # then the binary from the same directory, and the binary must match the
+  # manifest -- so a half-updated publish (one file at the old build) refuses
+  # rather than installing a pair that disagrees. The `refs/heads/` prefix is
+  # required, not cosmetic: branch names contain slashes, and without the
+  # explicit ref namespace raw.githubusercontent cannot tell where the ref ends
+  # and the path begins.
+  DIST_DIR_URL="${BASE_URL}/refs/heads/${BRANCH}/dist"
   auth_token="${BENCHD_DIST_TOKEN:-${GITHUB_TOKEN:-}}"
-  # A candidate is accepted only by PASSING THE PIN, not by returning 200. The
-  # hash check lives inside this loop for availability: candidate (b) can exist
-  # and serve the wrong bytes -- a dist branch left behind at an older commit is
-  # the ordinary way that happens -- and verifying only after the loop would let
-  # that one stale hit mask a later candidate holding the correct binary. A
-  # mismatch therefore continues to the next URL instead of aborting.
-  #
-  # This does not loosen anything. Every candidate is measured against the SAME
-  # pin, the loop can only end in "one candidate matched exactly" or "none did",
-  # and the latter still refuses below. Trying more places to find the ONE
-  # accepted byte sequence is not the same as accepting more byte sequences.
-  # A MISSING candidate is the ORDINARY case, not a failure: candidate (b) does
-  # not exist at all until CI publishes, so on every current run the first URL
-  # 404s and the second one serves the binary. That normal resolve used to read
-  # as a broken one -- an unqualified "fetching <url>", then curl's own
-  # "curl: (22) The requested URL returned error: 404" on its own line, then
-  # "not available here", none of which said that a next candidate was about to
-  # be tried and that this was expected.
-  #
-  # So: fold the miss into ONE line that ends in what happens next, and keep
-  # curl's exit code AND its message inside it. Nothing is lost -- the exit code
-  # is what separates "published nothing here" (22) from a DNS (6) or TLS (35)
-  # problem worth acting on, and curl's own text rides along after it. curl
-  # keeps --show-error; its stderr is captured rather than silenced so it can be
-  # folded in instead of landing mid-transcript.
-  candidate_total="$(printf '%s\n' "${candidates}" | grep -c '[^[:space:]]' || true)"
-  candidate_index=0
-  curl_err="${TMP_DIR}/curl.err"
-  downloaded_any=0
-  while IFS= read -r url; do
-    [[ -n "${url}" ]] || continue
-    candidate_index=$((candidate_index + 1))
-    if [[ "${candidate_index}" -lt "${candidate_total}" ]]; then
-      next_step="trying the next candidate"
-    else
-      next_step="no candidates left"
-    fi
-    echo "fetch-benchd.sh: candidate ${candidate_index}/${candidate_total}: ${url}" >&2
-    rm -f "${STAGED}"
-    : > "${curl_err}"
+  fetch() {
+    local url="$1" out="$2"
     if [[ -n "${auth_token}" ]]; then
-      curl_ok=0
-      curl -fsSL --retry 3 --retry-delay 2 \
-        -H "Authorization: Bearer ${auth_token}" \
-        -o "${STAGED}" "${url}" 2>"${curl_err}" || curl_ok=$?
+      curl -fsSL --retry 3 --retry-delay 2 -H "Authorization: Bearer ${auth_token}" -o "${out}" "${url}"
     else
-      curl_ok=0
-      curl -fsSL --retry 3 --retry-delay 2 -o "${STAGED}" "${url}" 2>"${curl_err}" || curl_ok=$?
+      curl -fsSL --retry 3 --retry-delay 2 -o "${out}" "${url}"
     fi
-    if [[ "${curl_ok}" != "0" || ! -f "${STAGED}" ]]; then
-      # curl's own leading "curl: (<code>) " is dropped because the code is
-      # already in the line; the rest of its text is kept verbatim, flattened to
-      # one line.
-      curl_detail="$(tr '\n' ' ' < "${curl_err}" | sed -e 's/^curl: ([0-9]*) //' -e 's/[[:space:]]*$//')"
-      if [[ -n "${curl_detail}" ]]; then
-        echo "fetch-benchd.sh:   nothing published here (curl exit ${curl_ok}: ${curl_detail}); ${next_step}" >&2
-      else
-        echo "fetch-benchd.sh:   nothing published here (curl exit ${curl_ok}); ${next_step}" >&2
-      fi
-      continue
-    fi
-    downloaded_any=1
-    if matches_pin "${STAGED}"; then
-      verified=1
-      break
-    fi
-    echo "fetch-benchd.sh:   these bytes do not match the pin; ${next_step}" >&2
-  done <<EOF
-${candidates}
-EOF
+  }
 
-  if [[ "${verified}" != "1" ]]; then
+  echo "fetch-benchd.sh: resolving the ${BRANCH} channel tip (${DIST_DIR_URL})" >&2
+  fetch "${DIST_DIR_URL}/benchctl.manifest.json" "${STAGED_MANIFEST}" || {
     {
-      if [[ "${downloaded_any}" == "1" ]]; then
-        # Reached a candidate but the bytes were wrong. Nearly always a stale
-        # publish rather than an attack, and worth naming that way so the reader
-        # checks the dist before assuming the worst.
-        echo "fetch-benchd.sh: every candidate that responded FAILED the pin (see the mismatches above)."
-        echo "  pin: branch=${PIN_BRANCH} commit=${PIN_COMMIT}"
-        echo "  usually this means the dist for this pin has not been published yet, or the"
-        echo "  branch is serving an older build. It is NOT resolved by re-running."
-      else
-        echo "fetch-benchd.sh: could not download the pinned benchctl."
-        echo "  pin: branch=${PIN_BRANCH} commit=${PIN_COMMIT}"
-        if [[ -z "${auth_token}" ]]; then
-          echo "  no BENCHD_DIST_TOKEN/GITHUB_TOKEN was set, and mlxfast-bench is a PRIVATE repository."
-        fi
+      echo "fetch-benchd.sh: could not fetch the channel manifest (${DIST_DIR_URL}/benchctl.manifest.json)."
+      if [[ -z "${auth_token}" ]]; then
+        echo "  if the channel repo is private, set BENCHD_DIST_TOKEN/GITHUB_TOKEN."
       fi
-      echo "  offline alternative: place the binary at ${DEST}, or point BENCHD_DIST_LOCAL at it."
-      echo "  it is accepted without any network access as long as it matches the pin."
+      echo "  offline alternative: place benchctl + benchctl.manifest.json at ${DEST_DIR}/,"
+      echo "  or point BENCHD_DIST_LOCAL at a directory holding both."
     } >&2
     exit 1
-  fi
+  }
+  load_manifest "${STAGED_MANIFEST}" \
+    || die "the channel manifest is malformed or names the wrong branch; refusing (this is a publish problem, not resolved by re-running)."
+  fetch "${DIST_DIR_URL}/benchctl" "${STAGED}" \
+    || die "the channel manifest exists but the binary download failed (${DIST_DIR_URL}/benchctl)."
+  matches_manifest "${STAGED}" \
+    || die "the downloaded benchctl does NOT match the channel manifest (see the mismatch above) -- a half-updated publish; refusing. Republish dist bench-side, then re-run."
 fi
 
 # -- 3. install ONLY what was verified ----------------------------------------
-# Belt-and-braces: every path above sets verified=1 only immediately after a
-# matches_pin() success on these exact staged bytes, and nothing has been made
-# runnable yet. This re-asserts it so that a future edit adding a fourth way to
-# obtain the binary cannot reach the install below without passing the pin.
-if [[ "${verified}" != "1" ]]; then
-  die "internal: reached install with unverified bytes; refusing."
-fi
-
 mkdir -p "${DEST_DIR}"
 chmod 755 "${STAGED}"
 mv "${STAGED}" "${DEST}"
-echo "fetch-benchd.sh: installed the pinned benchctl at ${DEST}" >&2
-echo "fetch-benchd.sh:   branch=${PIN_BRANCH} commit=${PIN_COMMIT} sha256=${PIN_SHA256} bytes=${PIN_BYTES}" >&2
+mv "${STAGED_MANIFEST}" "${DEST_MANIFEST}"
+echo "fetch-benchd.sh: installed benchctl at ${DEST} (manifest beside it)" >&2
+announce
 
 printf '%s\n' "${DEST}"

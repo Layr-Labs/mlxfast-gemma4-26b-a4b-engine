@@ -43,6 +43,8 @@ final class CBv2MTPDepthController {
     private static let baseProbeInterval = 8
     private static let maxProbeInterval = 256
 
+    static let specOn = false
+
     private struct CostState {
         var samples = 0
         var ewmaNanos = 0.0
@@ -200,6 +202,7 @@ final class CBv2MTPDepthController {
     /// required per bucket; ordinary target-only steps may keep chaining
     /// after the baseline exists.
     func requiresNonChainedDepthZeroProbe(_ decision: CBv2MTPDepthDecision) -> Bool {
+        guard Self.specOn else { return false }
         guard decision.depth == 0, decision.decodeRowBucket > 0 else { return false }
         return buckets[decision.decodeRowBucket]?.costs[0] == nil
     }
@@ -293,7 +296,7 @@ final class CBv2MTPDepthController {
                     isExploration: false),
                 mutate: mutate)
         }
-        guard canSpeculate, maxDepth > 0 else {
+        guard canSpeculate && Self.specOn, maxDepth > 0 else {
             return finish(
                 CBv2MTPDepthDecision(
                     depth: 0, decodeRowBucket: bucket,

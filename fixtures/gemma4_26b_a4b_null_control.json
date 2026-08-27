@@ -1,0 +1,8 @@
+{
+  "schema": "gemma4-null-control-v1",
+  "track_id": "gemma4-26b-a4b-mlx-v1",
+  "timed_mode": "batched_free_run_v1_2_b8",
+  "status": "pending-measurement",
+  "expected_composite": 0,
+  "band_pct": 2.0
+}

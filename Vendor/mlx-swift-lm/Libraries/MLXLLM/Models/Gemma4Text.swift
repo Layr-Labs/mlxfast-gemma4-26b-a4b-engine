@@ -1,24 +1,9 @@
-//
-//  Gemma4Text.swift
-//  mlx-swift-lm
-//
-//  Port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/gemma4_text.py
 
 import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
 
-// MARK: - vMLX decode hot-path helpers (ported from osaurus/main Gemma4Text)
-//
-// File-private, self-contained compiled fusions. They do NOT depend on the
-// SwitchLayers / HardwareInfo lane so this file builds stand-alone; when that
-// lane lands public `safeGeluApproximate` / `MLXHardwareInfo` these can collapse
-// to the shared symbols (identical math + same env knob) with no behavior change.
-// `compile(shapeless: true)` is gated by `MLX_COMPILED_DECODE` (default on),
-// mirroring `MLXHardwareInfo.isCompiledDecodeSupported`, so M1/M2 + macOS Tahoe
-// (MLX #3329) can opt out without a code change. Matches the ungated
-// `compiledSiluProduct` / `weightedExpertSum` convention already in this tree.
 private let gemma4CompiledDecodeSupported: Bool = {
     if let raw = ProcessInfo.processInfo.environment["MLX_COMPILED_DECODE"] {
         return ["1", "true", "yes", "on"].contains(raw.lowercased())
@@ -26,7 +11,6 @@ private let gemma4CompiledDecodeSupported: Bool = {
     return true
 }()
 
-// MARK: - CBv2 prompt-path knobs (prefill only; decode never reads these)
 
 @inline(__always)
 private func gemma4TruthyFlag(_ raw: String?) -> Bool {
@@ -34,13 +18,6 @@ private func gemma4TruthyFlag(_ raw: String?) -> Bool {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }
 
-/// Submit intermediate Gemma 4 prefill graphs while Swift continues to build
-/// later layers. This changes only when already-built work is queued; the
-/// operations and results are unchanged. Single-token decode is excluded.
-///
-/// The 18-layer default leaves twelve layers of the 30-layer 26B model for
-/// useful CPU/GPU overlap. `DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL=0` restores
-/// one final submission; another positive value tunes the layer interval.
 @inline(__always)
 internal func resolveGemma4PrefillChunkEvalLayers(_ raw: String?) -> Int {
     guard let raw, let value = Int(raw) else { return 18 }
@@ -62,14 +39,6 @@ internal func gemma4ShouldSubmitPrefillChunkEval(
         && layerNumber.isMultiple(of: interval)
 }
 
-/// CBv2 consumes only the final prompt position, so the LAST decoder layer
-/// can keep full attention and every K/V write while retaining just this
-/// many trailing rows for `o_proj`, the residual, the feed-forward/MoE
-/// branches, PLE, and the final norm. One row is what the frontier needs,
-/// and it puts that work on the same small-M expert path as B=1 decode.
-///
-/// `DARKBLOOM_GEMMA4_PREFILL_TAIL_ROWS=0` restores the full final layer
-/// (the kill switch); a larger value is for comparing kernel geometries.
 private let gemma4PrefillTailRows: Int = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_GEMMA4_PREFILL_TAIL_ROWS"],
@@ -78,31 +47,15 @@ private let gemma4PrefillTailRows: Int = {
     return max(0, value)
 }()
 
-/// Parse the independent direct expert-reduction control, which is ON by
-/// default: the coupled weighted-unsort + safe-R1 pair is what was measured
-/// faster, and the ranked box sets no environment.
-///
-/// R1 is selected by MLX itself for the sorted expert QMM whenever the
-/// checkpoint satisfies the selector's contract, so on the production
-/// checkpoint the weighted half was the only part still left on the table.
-/// `MLX_GEMMA4_FUSED_WEIGHTED_UNSORT=0` (or `false`/`no`/`off`) is the kill
-/// switch back to scatter-unsort + `weightedExpertSum`.
-/// `gemma4SupportsCoupledExpertOptimizations` still has the final say, so a
-/// checkpoint that categorically cannot run safe R1 never reaches the
-/// weighted-only state the comment below warns about.
 func gemma4FusedWeightedUnsortFlag(_ raw: String?) -> Bool {
     guard let raw else { return true }
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }
 
-/// The retained weighted/R1 pair is measured only on scheduled CBv2 prefill.
-/// Direct model forwards keep the established reduction path.
 func gemma4AllowsWeightedExpertUnsort(schedulePrefill: Bool) -> Bool {
     schedulePrefill
 }
 
-/// The exact production expert topology. Near matches retain the established
-/// unsort + weighted sum and the generic gather-QMM route.
 func gemma4SupportsProductionExpertTopology(_ config: Gemma4TextConfiguration) -> Bool {
     config.enableMoeBlock
         && config.hiddenSize == 2816
@@ -113,11 +66,6 @@ func gemma4SupportsProductionExpertTopology(_ config: Gemma4TextConfiguration) -
         && config.useBidirectionalAttention == "vision"
 }
 
-/// The safe Gemma 4 expert-QMM selector (`classify_gemma4_expert_qmm`) rejects
-/// anything that is not affine 4-bit at group size 64 with
-/// `fallback_quantization`, before it ever looks at topology. The remaining
-/// selector conditions (dtypes, contiguity, assignment count, AOT metallib,
-/// NAX precedence) are dispatch-time facts MLX reports separately.
 func gemma4HasExpertQuantizationOverrides(
     _ quantization: BaseConfiguration.PerLayerQuantization?
 ) -> Bool {
@@ -132,13 +80,6 @@ func gemma4SupportsSafeExpertQMMQuantization(_ config: Gemma4TextConfiguration) 
         && !config.hasExpertQuantizationOverrides
 }
 
-/// Direct weighted unsort and the safe expert-QMM (R1) kernel are one measured
-/// unit. Weighted unsort on its own is materially slower than the retained
-/// baseline, so it must never engage on a checkpoint where safe R1
-/// categorically cannot — which is any checkpoint outside the exact production
-/// topology *and* the selector's 4-bit / group-size-64 quantization contract.
-/// Both features gate on this single predicate, so reported eligibility
-/// matches real dispatch and no weighted-only state is reachable.
 func gemma4SupportsCoupledExpertOptimizations(_ config: Gemma4TextConfiguration) -> Bool {
     gemma4SupportsProductionExpertTopology(config)
         && gemma4SupportsSafeExpertQMMQuantization(config)
@@ -147,9 +88,6 @@ func gemma4SupportsCoupledExpertOptimizations(_ config: Gemma4TextConfiguration)
 internal let gemma4FusedWeightedUnsortRequested = gemma4FusedWeightedUnsortFlag(
     ProcessInfo.processInfo.environment["MLX_GEMMA4_FUSED_WEIGHTED_UNSORT"])
 
-/// Pure policy seam for the weighted-unsort resolution, so the coupling with
-/// safe R1 is unit-testable without building a production-sized model. The
-/// request is the only thing separating this from `expertQMMGeometryEligible`.
 func gemma4ShouldFuseWeightedUnsort(
     _ config: Gemma4TextConfiguration,
     requested: Bool = gemma4FusedWeightedUnsortRequested
@@ -158,10 +96,6 @@ func gemma4ShouldFuseWeightedUnsort(
 }
 
 
-/// Chunks shorter than this keep the unnarrowed final layer: the saving
-/// scales with the discarded row count, and tiny chunks are dominated by
-/// fixed overhead. Overridable so tests can exercise the narrow path on
-/// small fixtures.
 private let gemma4PrefillTailMinChunk: Int = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_GEMMA4_PREFILL_TAIL_MIN_CHUNK"],
@@ -170,11 +104,6 @@ private let gemma4PrefillTailMinChunk: Int = {
     return max(2, value)
 }()
 
-/// Final-layer last-query prefill: project and cache the whole chunk's K/V
-/// but compute Q and attention for the frontier row alone. Requires the tail
-/// narrowing above (exactly one retained row) and a cache that can commit
-/// full K/V for a single query. Default ON with
-/// `DARKBLOOM_GEMMA4_PREFILL_LAST_QUERY=0` as the kill switch.
 private let gemma4PrefillLastQueryEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_GEMMA4_PREFILL_LAST_QUERY"]
@@ -182,19 +111,12 @@ private let gemma4PrefillLastQueryEnabled: Bool = {
     return gemma4TruthyFlag(raw)
 }()
 
-/// The final layer must own a full-attention, non-shared cache for
-/// last-query prefill to be equivalent. Sliding windows give each query a
-/// different visible span, and a KV-shared final layer writes nothing.
 func gemma4SupportsLastQueryPrefill(_ config: Gemma4TextConfiguration) -> Bool {
     config.layerTypes.count == config.numHiddenLayers
         && config.layerTypes.last == "full_attention"
         && !config.layerUsesSharedKV(layerIdx: config.numHiddenLayers - 1)
 }
 
-/// Pure policy seam for the final layer's prompt specialization, so the
-/// decision is unit-testable without building a model. Cache capability is
-/// supplied by the caller: only the contiguous CBv2 cache exposes the
-/// atomic full-K/V + last-query operation.
 func gemma4UseLastQueryPrefill(
     _ config: Gemma4TextConfiguration,
     layerIdx: Int,
@@ -213,10 +135,6 @@ func gemma4UseLastQueryPrefill(
         && gemma4SupportsLastQueryPrefill(config)
 }
 
-/// Approximate (tanh) GELU written with `x * x * x` instead of the Power
-/// primitive (`x ** 3`) so it is safe under `compile(shapeless: true)` — the
-/// Power primitive returns zero results on the Tahoe Metal JIT (MLX #3329).
-/// Numerically identical to `MLXNN.geluApproximate` (vMLX `safeGeluApproximate`).
 private let gemma4SafeGeluApproximate: @Sendable (MLXArray) -> MLXArray = {
     let body: @Sendable (MLXArray) -> MLXArray = { (x: MLXArray) -> MLXArray in
         0.5 * x * (1 + tanh(sqrt(2 / Float.pi) * (x + 0.044715 * x * x * x)))
@@ -224,9 +142,6 @@ private let gemma4SafeGeluApproximate: @Sendable (MLXArray) -> MLXArray = {
     return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
 
-/// Final-logit softcap (`tanh(x / cap) * cap`) fused into one Metal dispatch
-/// (vMLX `compiledLogitSoftcap`). The untyped (float32) cap keeps the softcap
-/// math — and the logits handed to the sampler — full precision.
 private let gemma4CompiledLogitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArray = {
     let body: @Sendable (MLXArray, MLXArray) -> MLXArray = {
         (x: MLXArray, cap: MLXArray) -> MLXArray in
@@ -235,7 +150,6 @@ private let gemma4CompiledLogitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArr
     return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
 
-// MARK: - Configuration
 
 struct Gemma4WeightQuantizationMetadata: Codable, Sendable {
     var bits: Int?
@@ -274,10 +188,6 @@ private struct Gemma4WeightQuantizationConfiguration: Encodable {
     }
 }
 
-/// Default profile used while decoding Gemma4 text configuration. Direct
-/// language-model checkpoints and nested VLM checkpoints historically shipped
-/// different omission semantics; selecting the profile at the decoder boundary
-/// keeps one implementation without silently changing VLM topology.
 public enum Gemma4TextConfigurationDefaults: Sendable, Equatable {
     case languageModel
     case visionLanguageModel
@@ -311,29 +221,19 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
     public internal(set) var quantizationGroupSize: Int?
     public internal(set) var quantizationMode: QuantizationMode = .affine
     public internal(set) var perLayerQuantization: BaseConfiguration.PerLayerQuantization?
-    /// Any explicit expert-path quantization entry makes the coupled
-    /// weighted-unsort/R1 optimization fail closed. The runtime quantizer
-    /// resolves these entries per module, so global bits/group size alone is
-    /// not proof that every expert projection reaches safe R1.
     public var hasExpertQuantizationOverrides: Bool {
         gemma4HasExpertQuantizationOverrides(perLayerQuantization)
     }
 
-    // MoE (only set on the 26B-A4B variant; 2B/4B/31B are dense)
     public internal(set) var enableMoeBlock: Bool = false
     public internal(set) var numExperts: Int?
     public internal(set) var topKExperts: Int?
     public internal(set) var moeIntermediateSize: Int?
 
-    // RoPE parameters (nested dict with full_attention/sliding_attention sub-configs)
     public internal(set) var ropeParameters: [String: [String: StringOrNumber]]?
 
-    // "vision" enables blockwise bidirectional attention within image/video
-    // soft-token spans. "all" makes the full prefill bidirectional (bounded by
-    // the configured window on sliding layers). nil/other remains causal.
     public internal(set) var useBidirectionalAttention: String?
 
-    // Derived properties
     public internal(set) var slidingRopeTheta: Float = 10000.0
     public internal(set) var fullRopeTheta: Float = 1_000_000.0
     public internal(set) var fullPartialRotaryFactor: Float = 1.0
@@ -380,14 +280,6 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
         case quantizationConfig = "quantization_config"
     }
 
-    /// The synthesized encoder silently dropped the effective quantization
-    /// metadata (it has no `CodingKeys` case), so a
-    /// decode→encode→decode round trip lost the nested quantization contract
-    /// and a later strict load of a quantized checkpoint skipped quantization
-    /// outright. Encode explicitly: every keyed property plus the nested
-    /// `quantization` block in exactly the shape the decoder first looks for.
-    /// The derived rope thetas/partial factor re-derive from `ropeParameters`
-    /// on decode, so they are intentionally not keyed.
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(modelType, forKey: .modelType)
@@ -507,9 +399,6 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
             try container.decodeIfPresent(Int.self, forKey: .vocabSizePerLayerInput)
             ?? (isVLM ? 0 : 262144)
         if isVLM {
-            // Preserve the former nested VLM DTO's PLE contract: zero hidden
-            // width disables both tensors, while positive hidden width requires
-            // an explicitly positive vocabulary width.
             if decodedHiddenSizePerLayerInput == 0 {
                 decodedVocabSizePerLayerInput = 0
             } else if decodedVocabSizePerLayerInput == 0 {
@@ -542,15 +431,9 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
             ?? !isVLM
         if let decoded = try container.decodeIfPresent([String].self, forKey: .layerTypes) {
             if decoded.isEmpty {
-                // The deleted VLM tower interpreted an explicit empty list as
-                // all sliding-attention layers (non-VLM checkpoints inherit
-                // the same robust fallback rather than trapping later).
                 self.layerTypes = Array(
                     repeating: "sliding_attention", count: numHiddenLayers)
             } else if decoded.count < numHiddenLayers {
-                // The deleted towers fell back to sliding attention for
-                // out-of-range layer indices; normalize short explicit lists
-                // by padding instead of trapping at model construction.
                 self.layerTypes =
                     decoded
                     + Array(
@@ -560,7 +443,6 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
                 self.layerTypes = Array(decoded.prefix(numHiddenLayers))
             }
         } else if isVLM {
-            // The same VLM fallback applies when the key is absent.
             self.layerTypes = Array(
                 repeating: "sliding_attention", count: numHiddenLayers)
         } else {
@@ -615,9 +497,6 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
 }
 
 extension Gemma4TextConfiguration {
-    /// Overlay checkpoint-level quantization metadata on a decoded text
-    /// configuration. VLM checkpoints commonly keep this metadata beside
-    /// `text_config`; an absent overlay preserves any nested metadata.
     public mutating func mergeQuantization(
         _ quantization: BaseConfiguration.Quantization?
     ) {
@@ -631,9 +510,6 @@ extension Gemma4TextConfiguration {
         }
     }
 
-    /// Overlay the effective root mixed-precision map used by the model
-    /// loader. Expert-path entries make the coupled optimization fail closed,
-    /// even when the root default remains nominally 4-bit/group-64.
     public mutating func mergeQuantization(
         _ quantization: BaseConfiguration.PerLayerQuantization?
     ) {
@@ -649,14 +525,6 @@ extension Gemma4TextConfiguration {
 
 extension Gemma4TextConfiguration {
 
-    /// Predicate for whether a layer uses shared K/V (consuming it from an
-    /// earlier layer rather than projecting its own).
-    ///
-    /// A layer is shared when either:
-    /// - `forceSharedKV` is true (drafter / assistant models where every layer
-    ///   borrows K/V from the target), or
-    /// - the config declares `numKvSharedLayers > 0` AND this layer's index
-    ///   falls within the trailing shared block.
     public func layerUsesSharedKV(layerIdx: Int, forceSharedKV: Bool = false) -> Bool {
         if forceSharedKV { return true }
         guard numKvSharedLayers > 0 else { return false }
@@ -665,7 +533,6 @@ extension Gemma4TextConfiguration {
     }
 }
 
-// MARK: - Helper Modules
 
 private class RMSNormNoScale: Module {
     let eps: Float
@@ -698,15 +565,10 @@ private class ScaledLinear: Module {
 @inline(__always)
 internal func gemma4CapturePositionOffset(from cache: KVCache?) -> Gemma4.PositionOffset {
     if let compilableRot = cache as? CompilableRotatingKVCache {
-        // Snapshot: `+ 0` creates a graph-safe copy so cache.update()
-        // advancing offsetArray doesn't shift the query RoPE position.
         .graphArray(compilableRot.offsetArray + 0)
     } else if let compilable = cache as? CompilableKVCache {
-        // Snapshot: `+ 0` creates a graph-safe copy so cache.update()
-        // advancing offsetArray doesn't shift the query RoPE position.
         .graphArray(compilable.offsetArray + 0)
     } else if let batchCache = cache as? BatchPositionedKVCache {
-        // Snapshot the per-sequence offsets before cache.update(...) advances them.
         .batch(batchCache.batchOffset + 0)
     } else {
         .scalar(cache?.offset ?? 0)
@@ -787,14 +649,6 @@ private func gemma4AttentionFallback(
     }
 
     var probs = softmax(scores.asType(.float32), axis: -1, precise: true)
-    // A fully-masked query row (every key masked -> all -inf) softmaxes to NaN.
-    // For left-padded batches these are the padding query positions, whose
-    // outputs are discarded — but `0 * NaN = NaN` in the value matmul below
-    // would propagate NaN into the hidden state, and a later layer's real
-    // queries (which mask padding keys to weight 0) then hit `0 * NaN` again
-    // and corrupt EVERY row of the batch. Map NaN -> 0 so a fully-masked query
-    // contributes nothing. This matches `MLXFast.scaledDotProductAttention`,
-    // which this manual fallback replaces for the batched (ragged) path.
     probs = MLX.where(probs .!= probs, MLXArray(Float(0)), probs)
     scores = probs.asType(scores.dtype)
     var output = matmul(scores, v)
@@ -804,7 +658,6 @@ private func gemma4AttentionFallback(
     return output
 }
 
-// MARK: - Attention
 
 private class Gemma4Attention: Module {
     let config: Gemma4TextConfiguration
@@ -837,21 +690,13 @@ private class Gemma4Attention: Module {
         self.usesSharedKV = config.layerUsesSharedKV(
             layerIdx: layerIdx, forceSharedKV: forceSharedKV)
 
-        // Full attention uses globalHeadDim, sliding uses headDim
         self.effectiveHeadDim =
             isSliding ? config.headDim : config.globalHeadDim
 
         let dim = config.hiddenSize
         self.nHeads = config.numAttentionHeads
 
-        // K-eq-V for full attention layers
         self.useKeqV = config.attentionKeqV && !isSliding
-        // Full layers honor `num_global_key_value_heads` whenever it is
-        // present, independent of `attention_k_eq_v`; k_eq_v only elides the
-        // v_proj. This restores the deleted inline VLM tower's rule — a full
-        // layer with global heads different from the sliding count and
-        // k_eq_v=false still allocates its K/V projections for the global
-        // count, matching such checkpoints' weights.
         if !isSliding, let globalKvHeads = config.numGlobalKeyValueHeads {
             self.nKvHeads = globalKvHeads
         } else {
@@ -873,7 +718,6 @@ private class Gemma4Attention: Module {
 
         self._qNorm.wrappedValue = RMSNorm(dimensions: effectiveHeadDim, eps: config.rmsNormEps)
 
-        // RoPE: sliding uses default, full uses proportional with partial rotation
         if isSliding {
             self.rope = initializeRope(
                 dims: effectiveHeadDim, base: config.slidingRopeTheta, traditional: false,
@@ -901,10 +745,6 @@ private class Gemma4Attention: Module {
         outputStart: Int = 0,
         useLastQueryPrefill: Bool = false
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
-        // ContinuousBatchingV2: the layer cache owns both the KV update and
-        // the attention computation (no masks, no padding — see
-        // CBv2Contracts.swift). Entirely separate branch; the legacy paths
-        // below are untouched.
         if let layerCacheV2 = cache as? (any CBv2AttendingLayerCache) {
             return forwardV2(
                 x, layerCache: layerCacheV2, source: v2SharedSource,
@@ -925,7 +765,6 @@ private class Gemma4Attention: Module {
         let activePositionOffset = positionOffset ?? gemma4CapturePositionOffset(from: cache)
 
         if let (sharedK, sharedV) = sharedKV {
-            // KV-shared layers use pre-computed KV from an earlier layer
             keys = sharedK
             values = sharedV
         } else {
@@ -938,10 +777,6 @@ private class Gemma4Attention: Module {
             k = k.transposed(0, 2, 1, 3)
             k = gemma4ApplyRotaryPosition(rope, to: k, offset: activePositionOffset)
 
-            // K-eq-V (`attention_k_eq_v: true` on Gemma 4 26B/31B):
-            // values reuses the raw key projection (pre-norm), then goes
-            // through its own `vNorm` and transpose to land in the same
-            // `[B, n_kv_heads, L, D]` layout as keys.
             var v: MLXArray
             if let vProj {
                 v = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
@@ -964,7 +799,6 @@ private class Gemma4Attention: Module {
         queries = queries.transposed(0, 2, 1, 3)
         queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: activePositionOffset)
 
-        // Adjust mask if cache size differs from mask size
         var adjustedMask = mask
         if case .array(let maskArray) = mask {
             let keysSeqLen = keys.dim(2)
@@ -980,20 +814,9 @@ private class Gemma4Attention: Module {
         case .batch:
             hasCachedPrefix = true
         case .graphArray:
-            // CompilableKVCache: can't read Int offset without readback.
-            // During compiled decode L==1, so L>1 && hasCachedPrefix is
-            // false anyway. Setting true is safe for the prefill path.
             hasCachedPrefix = true
         }
 
-        // vmlx #52 text-path: Gemma 4 attention scores can exceed the fp16
-        // range (±65504) on long contexts, and the fused/composed SDPA shapes
-        // would materialize non-finite intermediates. Promote Q/K/V to
-        // float32 for the attention math when the activation dtype is fp16,
-        // then cast back so `oProj` sees its own dtype. Mirrors the deleted
-        // inline VLM twin; bf16 activations (production) skip the cast.
-        // The CBv2 path applies the same promotion to queries below; its cache
-        // keeps K/V in their storage dtype and widens the attention views.
         let attentionInputDType = queries.dtype
         var attentionQueries = queries
         var attentionKeys = keys
@@ -1032,15 +855,6 @@ private class Gemma4Attention: Module {
         return (oProj(output), (keys, values), activePositionOffset)
     }
 
-    /// ContinuousBatchingV2 attention path. The `CBv2AttendingLayerCache`
-    /// owns the KV update AND the attention computation, so this method only
-    /// projects/normalizes/ropes Q (and K/V for non-shared layers) and
-    /// dispatches. The model never builds masks and never pads — decode is
-    /// rectangular `[B, 1]`, prefill is per-request `[1, chunk]`.
-    ///
-    /// Invariant 1 (report 10 §4): RoPE offsets are per-row absolutes,
-    /// snapshotted BEFORE `updateAndAttend` advances the rows, and KV-shared
-    /// layers reuse the SOURCE layer's captured snapshot byte-identically.
     private func forwardV2(
         _ x: MLXArray,
         layerCache: any CBv2AttendingLayerCache,
@@ -1055,9 +869,6 @@ private class Gemma4Attention: Module {
             outputStart >= 0 && outputStart < L,
             "Gemma4: output narrowing start \(outputStart) outside chunk length \(L)")
 
-        // Last-query prefill projects Q for the frontier row only. Every
-        // other path keeps the full query rectangle and narrows (if at all)
-        // AFTER attention.
         let lastQueryCache: (any CBv2LastQueryPrefillLayerCache)? =
             useLastQueryPrefill
             ? layerCache as? (any CBv2LastQueryPrefillLayerCache) : nil
@@ -1078,11 +889,6 @@ private class Gemma4Attention: Module {
         queries = queries.transposed(0, 2, 1, 3)
 
         if usesSharedKV {
-            // KV-shared layer: projects queries only and borrows (K, V) from
-            // the source layer's cache at attention time. The RoPE offsets
-            // MUST be the source layer's pre-update snapshot (threaded by the
-            // trunk) — reading `source.positionOffsets` here would observe
-            // positions already advanced by the source's update this step.
             guard let source, let positionOffset, let sharedKV else {
                 preconditionFailure(
                     """
@@ -1111,16 +917,9 @@ private class Gemma4Attention: Module {
             preconditionFailure("Gemma4 non-shared layers require K/V projection modules")
         }
 
-        // Snapshot the per-row absolute offsets BEFORE updateAndAttend
-        // advances the rows (`+ 0` = graph-safe copy, same convention as
-        // gemma4CapturePositionOffset). KV-shared consumers of this layer
-        // reuse this exact snapshot via the returned PositionOffset.
         let capturedOffsets = layerCache.positionOffsets + 0
         let captured = Gemma4.PositionOffset.batch(capturedOffsets)
 
-        // The frontier query sits `outputStart` positions past the chunk's
-        // first token, so last-query prefill must shift its RoPE position.
-        // K/V keep the unshifted capture: they cover the whole chunk.
         let queryPositionOffset: Gemma4.PositionOffset =
             lastQueryCache == nil
             ? captured
@@ -1132,9 +931,6 @@ private class Gemma4Attention: Module {
         k = k.transposed(0, 2, 1, 3)
         k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
 
-        // K-eq-V (`attention_k_eq_v: true` on Gemma 4 26B/31B): values reuse
-        // the raw key projection (pre-norm) through their own vNorm — same as
-        // the legacy path.
         var v: MLXArray
         if let vProj {
             v = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
@@ -1167,27 +963,12 @@ private class Gemma4Attention: Module {
     }
 }
 
-// MARK: - MoE (26B-A4B)
 
-/// Width-probe observability sink (exactness round three, 2026-08-25).
-///
-/// Armed ONLY by the operator-driven `width-probe` diagnostic verb so it can
-/// record every MoE router's expert scores and top-K selection per forward;
-/// nil in production (one optional check per MoE layer per forward — no
-/// tensor work, no graph change when disarmed). The recorder receives the
-/// PRE-selection expert scores `[.., E]` and the selected `topKIndices`
-/// `[.., K]`, in layer execution order — the width-divergence localization
-/// needs exactly this seam to decide whether a forward-width numeric flip
-/// first enters the network at a router selection (unfixable-by-kernel
-/// design) or only at the final logits (width-stable head candidate).
 public enum Gemma4RouterProbe {
     nonisolated(unsafe) public static var recorder:
         ((_ expertScores: MLXArray, _ topKIndices: MLXArray) -> Void)?
 }
 
-/// Expert router. Norms `x` with a learnable scale, projects to expert
-/// scores, and returns top-K (indices, weights) where weights are
-/// softmax-normalized and scaled by a per-expert scalar.
 private class Gemma4Router: Module {
     @ModuleInfo(key: "proj") var proj: Linear
     @ModuleInfo(key: "scale") var scale: MLXArray
@@ -1196,6 +977,9 @@ private class Gemma4Router: Module {
     let topK: Int
     let eps: Float
     let rootSize: Float
+
+    // input-independent product avoids rebuilding it on every decode step.
+    private lazy var scaledRMSWeight = scale * rootSize
 
     init(_ config: Gemma4TextConfiguration) {
         precondition(
@@ -1214,7 +998,7 @@ private class Gemma4Router: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
-        let normed = MLXFast.rmsNorm(x, weight: scale * rootSize, eps: eps)
+        let normed = MLXFast.rmsNorm(x, weight: scaledRMSWeight, eps: eps)
         let expertScores = proj(normed)
 
         let kth = expertScores.dim(-1) - topK

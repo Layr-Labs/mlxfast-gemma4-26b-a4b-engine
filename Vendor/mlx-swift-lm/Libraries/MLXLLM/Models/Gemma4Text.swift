@@ -120,13 +120,7 @@ func gemma4SupportsSafeExpertQMMQuantization(_ config: Gemma4TextConfiguration) 
         && !config.hasExpertQuantizationOverrides
 }
 
-/// Direct weighted unsort and the safe expert-QMM (R1) kernel are one measured
-/// unit. Weighted unsort on its own is materially slower than the retained
-/// baseline, so it must never engage on a checkpoint where safe R1
-/// categorically cannot — which is any checkpoint outside the exact production
-/// topology *and* the selector's 4-bit / group-size-64 quantization contract.
-/// Both features gate on this single predicate, so reported eligibility
-/// matches real dispatch and no weighted-only state is reachable.
+/// Shared exact-production eligibility for the prefill reduction/QMM pair.
 func gemma4SupportsCoupledExpertOptimizations(_ config: Gemma4TextConfiguration) -> Bool {
     gemma4SupportsProductionExpertTopology(config)
         && gemma4SupportsSafeExpertQMMQuantization(config)
@@ -134,6 +128,13 @@ func gemma4SupportsCoupledExpertOptimizations(_ config: Gemma4TextConfiguration)
 
 internal let gemma4FusedWeightedUnsortRequested = gemma4FusedWeightedUnsortFlag(
     ProcessInfo.processInfo.environment["MLX_GEMMA4_FUSED_WEIGHTED_UNSORT"])
+
+private let gemma4DecodeWeightedUnsortEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DECODE_WEIGHTED_UNSORT"]
+    else { return true }
+    return gemma4TruthyFlag(raw)
+}()
 
 /// Pure policy seam for the weighted-unsort resolution, so the coupling with
 /// safe R1 is unit-testable without building a production-sized model. The
@@ -1262,8 +1263,9 @@ private class Gemma4Experts: Module {
             topKIndices.reshaped(B * S, K),
             weights: topKWeights.reshaped(B * S, K),
             fuseSortedReduction: fuseWeightedUnsort,
-            // Ordinary/direct VLM and CBv2 prompt entry points may engage.
-            // Rectangular MTP verification explicitly passes false.
+            fuseDecodeSortedReduction: gemma4DecodeWeightedUnsortEnabled,
+            // Scheduled prefill and exact B=8 decode engage independently;
+            // every rectangular MTP shape remains on the established path.
             isProductionPrefill: isExpertPrefill)
         return y.reshaped(B, S, H)
     }

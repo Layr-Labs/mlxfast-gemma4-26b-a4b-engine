@@ -834,6 +834,15 @@ METAL_FUNC void qmv_fast_impl(
   y += tid.x * out_vec_size + out_row;
 
   for (int k = 0; k < in_vec_size; k += block_size) {
+    // Exact K tail. A lane whose values_per_thread slice runs past in_vec_size
+    // sits this block out: it reads no weight, no scale, no bias and no
+    // activation, and adds literal nothing to its accumulator. Every in-range
+    // lane keeps the stock value and the stock K order, so relaxing the host's
+    // K % 512 == 0 gate to K % 64 == 0 changes no in-range arithmetic. Only the
+    // final partial block can trip this, so the full blocks are unchanged.
+    if (k + int(simd_lid + 1) * values_per_thread > in_vec_size) {
+      continue;
+    }
     U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
 
     for (int row = 0; row < results_per_simdgroup; row++) {
@@ -940,6 +949,15 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
   }
 
   for (int k = 0; k < in_vec_size; k += block_size) {
+    // Exact K tail. A lane whose values_per_thread slice runs past in_vec_size
+    // sits this block out: it reads no weight, no scale, no bias and no
+    // activation, and adds literal nothing to its accumulator. Every in-range
+    // lane keeps the stock value and the stock K order, so relaxing the host's
+    // K % 512 == 0 gate to K % 64 == 0 changes no in-range arithmetic. Only the
+    // final partial block can trip this, so the full blocks are unchanged.
+    if (k + int(simd_lid + 1) * values_per_thread > in_vec_size) {
+      continue;
+    }
     thread uint16_t packed[rows_per_simd][4];
     thread float scale_local[rows_per_simd];
     thread float bias_local[rows_per_simd];
@@ -1039,6 +1057,15 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
   }
 
   for (int k = 0; k < in_vec_size; k += block_size) {
+    // Exact K tail. A lane whose values_per_thread slice runs past in_vec_size
+    // sits this block out: it reads no weight, no scale, no bias and no
+    // activation, and adds literal nothing to its accumulator. Every in-range
+    // lane keeps the stock value and the stock K order, so relaxing the host's
+    // K % 512 == 0 gate to K % 64 == 0 changes no in-range arithmetic. Only the
+    // final partial block can trip this, so the full blocks are unchanged.
+    if (k + int(simd_lid + 1) * values_per_thread > in_vec_size) {
+      continue;
+    }
     thread uint16_t packed[rows_per_simd][4];
     thread float scale_local[rows_per_simd];
     thread float bias_local[rows_per_simd];
@@ -1232,6 +1259,130 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_m(
   }
 }
 
+// K-tail port of the affine4/g64 cross-row crown to the shapes the frozen
+// host refuses to name "fast". The host sets the *_qmv_fast_* kernel name only
+// when K % 512 == 0 (metal/quantized.cpp, `bool fast = N % bn == 0 && K % 512
+// == 0`), which is not an editable file; a K = 2816 / 2112 / 704 tower
+// therefore never reaches a single kernel above. The two host paths share a
+// byte-identical launch -- bn = 8, bk = 32, group (32, 2, 1), grid (M,
+// ceil(N / 8), B) -- so the generic entry can select the same work itself.
+// Returns true when it handled the tile.
+template <typename T>
+METAL_FUNC bool qmv_crossrow_affine4_g64_try(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint3 ntg,
+    uint simd_gid,
+    uint simd_lid) {
+  if (out_vec_size >= 4096) {
+    switch (ntg.x) {
+      case 2:
+        qmv_fast_crossrow_affine4_g64<T, 2>(
+            w, scales, biases, x, y, in_vec_size, out_vec_size,
+            tid, simd_gid, simd_lid);
+        return true;
+      case 3:
+        qmv_fast_crossrow_affine4_g64_m<T, 3, 3, true>(
+            w, scales, biases, x, y, in_vec_size, out_vec_size,
+            tid, simd_gid, simd_lid);
+        return true;
+      case 4:
+        qmv_fast_crossrow_affine4_g64_m<T, 4, 4, true>(
+            w, scales, biases, x, y, in_vec_size, out_vec_size,
+            tid, simd_gid, simd_lid);
+        return true;
+      case 5:
+        qmv_fast_crossrow_affine4_g64_m<T, 5, 3, true>(
+            w, scales, biases, x, y, in_vec_size, out_vec_size,
+            tid, simd_gid, simd_lid);
+        return true;
+      case 6:
+        qmv_fast_crossrow_affine4_g64_m<T, 6, 3, true>(
+            w, scales, biases, x, y, in_vec_size, out_vec_size,
+            tid, simd_gid, simd_lid);
+        return true;
+      case 7:
+        qmv_fast_crossrow_affine4_g64_m<T, 7, 4, true>(
+            w, scales, biases, x, y, in_vec_size, out_vec_size,
+            tid, simd_gid, simd_lid);
+        return true;
+      case 8:
+        qmv_fast_crossrow_affine4_g64_m<T, 8, 4, true>(
+            w, scales, biases, x, y, in_vec_size, out_vec_size,
+            tid, simd_gid, simd_lid);
+        return true;
+      case 9:
+        qmv_fast_crossrow_affine4_g64_m<T, 9, 3, true>(
+            w, scales, biases, x, y, in_vec_size, out_vec_size,
+            tid, simd_gid, simd_lid);
+        return true;
+      default:
+        return false;
+    }
+  }
+  switch (ntg.x) {
+    case 2:
+      qmv_fast_crossrow_affine4_g64<T, 2>(
+          w, scales, biases, x, y, in_vec_size, out_vec_size,
+          tid, simd_gid, simd_lid);
+      return true;
+    case 3:
+      qmv_fast_crossrow_affine4_g64<T, 3>(
+          w, scales, biases, x, y, in_vec_size, out_vec_size,
+          tid, simd_gid, simd_lid);
+      return true;
+    case 4:
+      qmv_fast_crossrow_affine4_g64<T, 4>(
+          w, scales, biases, x, y, in_vec_size, out_vec_size,
+          tid, simd_gid, simd_lid);
+      return true;
+    case 5:
+      qmv_fast_crossrow_affine4_g64<T, 5>(
+          w, scales, biases, x, y, in_vec_size, out_vec_size,
+          tid, simd_gid, simd_lid);
+      return true;
+    case 6:
+      qmv_fast_crossrow_affine4_g64<T, 6>(
+          w, scales, biases, x, y, in_vec_size, out_vec_size,
+          tid, simd_gid, simd_lid);
+      return true;
+    case 7:
+      qmv_fast_crossrow_affine4_g64<T, 7>(
+          w, scales, biases, x, y, in_vec_size, out_vec_size,
+          tid, simd_gid, simd_lid);
+      return true;
+    case 8:
+      qmv_fast_crossrow_affine4_g64<T, 8>(
+          w, scales, biases, x, y, in_vec_size, out_vec_size,
+          tid, simd_gid, simd_lid);
+      return true;
+    case 9:
+      qmv_fast_crossrow_affine4_g64<T, 9>(
+          w, scales, biases, x, y, in_vec_size, out_vec_size,
+          tid, simd_gid, simd_lid);
+      return true;
+    default:
+      return false;
+  }
+}
+
+// The alignment the fast affine kernels actually need, as opposed to the
+// K % 512 == 0 the host asks for: whole values_per_thread lanes and whole
+// scale groups along K (K % 64 == 0, with the per-lane tail guard above), and
+// whole 8-row output tiles along N (N % 8 == 0), which is what the host's
+// N % bn == 0 half of the gate already meant.
+template <int group_size, int bits>
+METAL_FUNC bool qmv_ktail_fast_ok(int in_vec_size, int out_vec_size) {
+  return group_size == 64 && (bits == 4 || bits == 8) &&
+      (in_vec_size % 64) == 0 && (out_vec_size % 8) == 0;
+}
+
 template <typename T, int group_size, int bits>
 METAL_FUNC void qmv_impl(
     const device uint32_t* w,
@@ -1389,6 +1540,95 @@ METAL_FUNC void qmv_impl(
       if (simd_lid == 0) {
         y[row] = static_cast<T>(result[row]);
       }
+    }
+  }
+}
+
+// Same-expert assignment pairing at the FAST lane width. qmv_affine4_g64_pair_impl
+// shares one packed-weight stream between two adjacent assignments routed to the
+// same expert, but it does so on the generic 8-values-per-lane geometry, because
+// the frozen host only names a *_gather_qmv_fast_* kernel when K % 512 == 0 and
+// this tower's expert shapes are K = 2816 (gate/up) and K = 704 (down). With the
+// per-lane K tail guard the fast geometry is reachable at K % 64 == 0, so the two
+// wins compose: 16 values per lane AND one weight load for two assignments, which
+// is half the weight traffic of the pair kernel and a quarter of the stock path's.
+//
+// Exactness: each accumulator keeps its own scalar order and qdot_affine4_pair is
+// qdot<float, 16, 4> evaluated twice over one loaded uint16, so every output is
+// bit-identical to running qmv_fast_impl on that assignment alone. A lane whose
+// 16-value slice runs past in_vec_size sits the block out and adds nothing.
+template <typename T, const int group_size, const int bits>
+METAL_FUNC void qmv_fast_affine4_g64_pair_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x0,
+    const device T* x1,
+    device T* y0,
+    device T* y1,
+    const constant int& in_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 16;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 8;
+  constexpr int scale_step_per_thread = 4;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread float x0_thread[values_per_thread];
+  thread float x1_thread[values_per_thread];
+  thread float result0[results_per_simdgroup] = {0};
+  thread float result1[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x0 += simd_lid * values_per_thread;
+  x1 += simd_lid * values_per_thread;
+  y0 += out_row;
+  y1 += out_row;
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    // Exact K tail, identical in form to the one in qmv_fast_impl.
+    if (k + int(simd_lid + 1) * values_per_thread > in_vec_size) {
+      continue;
+    }
+    float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
+    float sum1 = load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      const device T* sl = scales + row * in_vec_size_g;
+      const device T* bl = biases + row * in_vec_size_g;
+      float dot0;
+      float dot1;
+      qdot_affine4_pair<float, values_per_thread>(
+          wl, x0_thread, x1_thread, sl[0], bl[0], sum0, sum1, dot0, dot1);
+      result0[row] += dot0;
+      result1[row] += dot1;
+    }
+
+    ws += block_size / 2;
+    scales += block_size / 64;
+    biases += block_size / 64;
+    x0 += block_size;
+    x1 += block_size;
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result0[row] = simd_sum(result0[row]);
+    result1[row] = simd_sum(result1[row]);
+    if (simd_lid == 0) {
+      y0[row] = static_cast<T>(result0[row]);
+      y1[row] = static_cast<T>(result1[row]);
     }
   }
 }
@@ -2186,6 +2426,7 @@ template <typename T, const int group_size, const int bits, bool batched>
     const constant int64_t* s_strides [[buffer(13)]],
     const constant int64_t* b_strides [[buffer(14)]],
     uint3 tid [[threadgroup_position_in_grid]],
+    uint3 ntg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   if (batched) {
@@ -2206,6 +2447,26 @@ template <typename T, const int group_size, const int bits, bool batched>
         s_strides,
         b_strides,
         tid);
+  }
+  if (qmv_ktail_fast_ok<group_size, bits>(in_vec_size, out_vec_size)) {
+    if (!batched && bits == 4 && out_vec_size >= 1024 &&
+        qmv_crossrow_affine4_g64_try<T>(
+            w, scales, biases, x, y, in_vec_size, out_vec_size,
+            tid, ntg, simd_gid, simd_lid)) {
+      return;
+    }
+    qmv_fast_impl<T, group_size, bits>(
+        w,
+        scales,
+        biases,
+        x,
+        y,
+        in_vec_size,
+        out_vec_size,
+        tid,
+        simd_gid,
+        simd_lid);
+    return;
   }
   qmv_impl<T, group_size, bits>(
       w,
@@ -2650,6 +2911,31 @@ template <typename T, int group_size, int bits>
       const device T* pair_x1 = x + x1_idx * x_strides[0];
       device T* pair_y0 = y + assignment * out_vec_size;
       device T* pair_y1 = y + (assignment + 1) * out_vec_size;
+      // Lane width is chosen by OUTPUT TILE COUNT, measured on the only two
+      // expert shapes this tower has. N = 2816 (down_proj) has 352 output
+      // tiles: the 16-value lane's fewer, fatter K blocks pay, and the fast
+      // pair kernel is 1.07-1.11x the stock pair kernel at 0.5-0.6 duplicate
+      // fraction. N = 704 (gate/up) has only 88 tiles, so the extra live
+      // registers of two 16-float activation vectors cost more occupancy than
+      // the wider lane returns -- there the 8-value pair kernel wins by
+      // 1.03-1.10x and is kept. Same 1024 threshold the cross-row crown uses,
+      // and for the same reason.
+      if ((in_vec_size % 64) == 0 && (out_vec_size % 8) == 0 &&
+          out_vec_size >= 1024) {
+        qmv_fast_affine4_g64_pair_impl<T, group_size, bits>(
+            pair_w,
+            pair_scales,
+            pair_biases,
+            pair_x0,
+            pair_x1,
+            pair_y0,
+            pair_y1,
+            in_vec_size,
+            tid,
+            simd_gid,
+            simd_lid);
+        return;
+      }
       qmv_affine4_g64_pair_impl<T, group_size, bits>(
           pair_w,
           pair_scales,
@@ -2687,6 +2973,24 @@ template <typename T, int group_size, int bits>
       s_strides,
       b_strides,
       tid);
+  // Unpaired assignments: the same tile-count split, the other way round. At
+  // N = 704 the fast width is 1.02x the stock generic kernel; at N = 2816 it
+  // is 0.93x, so the wide shape keeps the stock path when it cannot pair.
+  if (qmv_ktail_fast_ok<group_size, bits>(in_vec_size, out_vec_size) &&
+      out_vec_size < 1024) {
+    qmv_fast_impl<T, group_size, bits>(
+        w,
+        scales,
+        biases,
+        x,
+        y,
+        in_vec_size,
+        out_vec_size,
+        tid,
+        simd_gid,
+        simd_lid);
+    return;
+  }
   qmv_impl<T, group_size, bits>(
       w,
       scales,

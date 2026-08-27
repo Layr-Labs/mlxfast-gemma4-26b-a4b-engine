@@ -40,6 +40,27 @@ enum CBv2AttentionV1 {
         return value
     }()
 
+    /// Ceiling, in MiB, on the K+V a PACKED prefill may restack on the batch
+    /// axis for one batched SDPA (`batchedPackedAttention`).
+    ///
+    /// Batching the rows is a strict dispatch win — 8 rows x 8 query blocks
+    /// becomes 8 dispatches — but `concatenated` materializes a second copy
+    /// of the rows' committed K/V. That copy is bounded by this budget so a
+    /// long-context packed continuation falls back to the per-row
+    /// decomposition instead of doubling a multi-GiB KV footprint the
+    /// provider's `UnifiedMemoryCap` never reserved for it. A fresh 8 x 1024
+    /// prompt pass is ~32 MiB and always batches.
+    ///
+    /// `0` disables batching entirely — the kill switch back to the pinned
+    /// per-row path if this is ever implicated in a regression.
+    static let packedBatchKVBudgetBytes: Int = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_ATTN_BATCH_KV_BUDGET_MB"],
+            let value = Int(raw), value >= 0
+        else { return 512 << 20 }
+        return value << 20
+    }()
+
     /// Whether a chunk of `L` queries should be split into blocks. Single
     /// queries (decode) and chunks already at or below the block width take
     /// the unchanged single-call path, so decode is provably untouched.
@@ -247,19 +268,138 @@ enum CBv2AttentionV1 {
         // takes the same per-row path as a singleton chunk and attends
         // exactly its own KV. Serialized queries remain MTP-only; ordinary
         // packed prefill keeps q-blocking and optional row-local span masks.
-        return packedPerRow(batch: B) { index, slice in
-            if serializeQueries {
-                return updateAndAttendRowSerialQueries(
+        if serializeQueries {
+            return packedPerRow(batch: B) { index, slice in
+                updateAndAttendRowSerialQueries(
                     row: rows[index], kind: kind,
                     queries: slice(queries), keys: slice(keys), values: slice(values),
                     scale: scale, sinks: effectiveSinks, softcap: softcap)
             }
-            return updateAndAttendRow(
-                row: rows[index], kind: kind,
-                queries: slice(queries), keys: slice(keys), values: slice(values),
-                scale: scale, sinks: effectiveSinks, softcap: softcap,
+        }
+
+        // Commit every row's K/V FIRST, in row order. `update` appends to that
+        // row's own ring and hands back that row's own view; it reads nothing
+        // from any other row and nothing from the attention that used to sit
+        // between two commits. Hoisting the commits above the attention loop
+        // therefore leaves each row seeing exactly the view it saw before, and
+        // it is what lets the uniform case below see all B views at once.
+        var cachedKeys: [MLXArray] = []
+        var cachedValues: [MLXArray] = []
+        cachedKeys.reserveCapacity(B)
+        cachedValues.reserveCapacity(B)
+        for (index, row) in rows.enumerated() {
+            let (rowKeys, rowValues) = row.update(
+                keys: keys[index ..< (index + 1)],
+                values: values[index ..< (index + 1)])
+            cachedKeys.append(rowKeys)
+            cachedValues.append(rowValues)
+        }
+
+        if let batched = batchedPackedAttention(
+            kind: kind, queries: queries,
+            cachedKeys: cachedKeys, cachedValues: cachedValues,
+            window: window(of: kind), scale: scale,
+            sinks: effectiveSinks, softcap: softcap, spanContexts: spanContexts)
+        {
+            return batched
+        }
+
+        return packedPerRow(batch: B) { index, slice in
+            attendCommittedRow(
+                kind: kind, queries: slice(queries),
+                cachedKeys: cachedKeys[index], cachedValues: cachedValues[index],
+                window: window(of: kind), scale: scale,
+                sinks: effectiveSinks, softcap: softcap,
                 spanContext: spanContexts?[index])
         }
+    }
+
+    /// One batched SDPA for a packed `[B > 1, L > 1]` pass whose rows all hold
+    /// the SAME committed K/V length and carry no span overlay.
+    ///
+    /// Why this is the same computation, not an approximation of it:
+    /// `maskMode` is a pure function of `(L, kL, window)` and
+    /// `attendQueryBlocks` derives each block's key span from
+    /// `(historyCount, offset, count, window)` alone — `historyCount` being
+    /// `kL - L`. Equal `kL` across rows therefore means every row would be
+    /// handed the IDENTICAL mask and slice the IDENTICAL key columns, so the
+    /// only thing separating B one-row calls from one B-row call is the batch
+    /// extent. SDPA reduces independently per `(batch, head, query)`, so no
+    /// row's sum acquires a term from a batchmate and none of them is
+    /// re-ordered. What it buys is dispatches: an 8-row, 8-block prompt layer
+    /// goes from 64 SDPA launches to 8.
+    ///
+    /// Returns nil — and the caller keeps the per-row decomposition — when the
+    /// rows are NOT interchangeable this way: unequal committed lengths (mixed
+    /// prefix reuse or continuation offsets), a mismatched head count/head dim
+    /// /dtype, any bound span context, or a restack that would exceed
+    /// ``packedBatchKVBudgetBytes``.
+    private static func batchedPackedAttention(
+        kind: CBv2LayerKind, queries: MLXArray,
+        cachedKeys: [MLXArray], cachedValues: [MLXArray],
+        window: Int?, scale: Float, sinks: MLXArray?, softcap: Float?,
+        spanContexts: [CBv2SpanChunkContext?]?
+    ) -> MLXArray? {
+        guard packedBatchKVBudgetBytes > 0 else { return nil }
+        guard spanContexts?.allSatisfy({ $0 == nil }) ?? true else { return nil }
+        guard let headKeys = cachedKeys.first, let headValues = cachedValues.first,
+            cachedKeys.count == cachedValues.count, cachedKeys.count > 1
+        else { return nil }
+        guard headKeys.ndim == 4, headValues.ndim == 4 else { return nil }
+        let kL = headKeys.dim(2)
+        guard headValues.dim(2) == kL else { return nil }
+        for index in cachedKeys.indices {
+            let rowKeys = cachedKeys[index]
+            let rowValues = cachedValues[index]
+            guard rowKeys.ndim == 4, rowValues.ndim == 4,
+                rowKeys.dim(0) == 1, rowValues.dim(0) == 1,
+                rowKeys.dim(2) == kL, rowValues.dim(2) == kL,
+                rowKeys.dim(1) == headKeys.dim(1), rowKeys.dim(3) == headKeys.dim(3),
+                rowValues.dim(1) == headValues.dim(1),
+                rowValues.dim(3) == headValues.dim(3),
+                rowKeys.dtype == headKeys.dtype, rowValues.dtype == headValues.dtype
+            else { return nil }
+        }
+        let restackedBytes =
+            (headKeys.nbytes + headValues.nbytes) * cachedKeys.count
+        guard restackedBytes <= packedBatchKVBudgetBytes else { return nil }
+
+        return attendCommittedRow(
+            kind: kind, queries: queries,
+            cachedKeys: concatenated(cachedKeys, axis: 0),
+            cachedValues: concatenated(cachedValues, axis: 0),
+            window: window, scale: scale, sinks: sinks, softcap: softcap,
+            spanContext: nil)
+    }
+
+    /// Attention for K/V that is ALREADY committed — verbatim the tail of
+    /// `updateAndAttendRow`, so a batched call and a per-row call select the
+    /// same path from the same `(L, kL, window)` and differ only in how many
+    /// rows ride the batch axis.
+    private static func attendCommittedRow(
+        kind: CBv2LayerKind, queries: MLXArray,
+        cachedKeys: MLXArray, cachedValues: MLXArray,
+        window: Int?, scale: Float, sinks: MLXArray?, softcap: Float?,
+        spanContext: CBv2SpanChunkContext?
+    ) -> MLXArray {
+        let L = queries.dim(2)
+        if shouldBlockQueries(L) && !kind.isBidirectional {
+            return attendQueryBlocks(
+                queries: queries, keys: cachedKeys, values: cachedValues,
+                newTokenCount: L, window: window, scale: scale,
+                sinks: sinks, softcap: softcap, blockSize: queryBlockSize,
+                spanContext: spanContext)
+        }
+        if let spanContext {
+            return attendSpanChunk(
+                queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
+                L: L, kL: cachedKeys.dim(2), window: window,
+                context: spanContext, sinks: sinks, softcap: softcap)
+        }
+        return attend(
+            queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
+            L: L, kL: cachedKeys.dim(2), window: window,
+            sinks: sinks, softcap: softcap, bidirectional: kind.isBidirectional)
     }
 
     /// The batch-axis decomposition of a PACKED `[B, ...]` prompt pass —
@@ -362,25 +502,12 @@ enum CBv2AttentionV1 {
         scale: Float, sinks: MLXArray?, softcap: Float?,
         spanContext: CBv2SpanChunkContext?
     ) -> MLXArray {
-        let L = queries.dim(2)
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
-        if shouldBlockQueries(L) && !kind.isBidirectional {
-            return attendQueryBlocks(
-                queries: queries, keys: cachedKeys, values: cachedValues,
-                newTokenCount: L, window: window(of: kind), scale: scale,
-                sinks: sinks, softcap: softcap, blockSize: queryBlockSize,
-                spanContext: spanContext)
-        }
-        if let spanContext {
-            return attendSpanChunk(
-                queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
-                L: L, kL: cachedKeys.dim(2), window: window(of: kind),
-                context: spanContext, sinks: sinks, softcap: softcap)
-        }
-        return attend(
-            queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
-            L: L, kL: cachedKeys.dim(2), window: window(of: kind),
-            sinks: sinks, softcap: softcap, bidirectional: kind.isBidirectional)
+        return attendCommittedRow(
+            kind: kind, queries: queries,
+            cachedKeys: cachedKeys, cachedValues: cachedValues,
+            window: window(of: kind), scale: scale,
+            sinks: sinks, softcap: softcap, spanContext: spanContext)
     }
 
     private static func updateAndAttendRowSerialQueries(
@@ -455,6 +582,32 @@ enum CBv2AttentionV1 {
             }
             // Rectangular [B > 1, L > 1] packed prefill / MTP verify:
             // independently borrow each source row's current chunk views.
+            // Borrowing mutates nothing, so when those views are uniform the
+            // same batch-axis stacking the storage-owning path uses applies
+            // here unchanged (`batchedPackedAttention` explains why that is
+            // the same computation). Gemma 4's KV-sharing layers are the
+            // majority of the tower, so this is where most of the dispatch
+            // collapse lands.
+            if !serializeQueries {
+                var borrowedKeys: [MLXArray] = []
+                var borrowedValues: [MLXArray] = []
+                borrowedKeys.reserveCapacity(B)
+                borrowedValues.reserveCapacity(B)
+                for row in sourceRows {
+                    let (rowKeys, rowValues) = chunkBorrowViews(of: row)
+                    borrowedKeys.append(rowKeys)
+                    borrowedValues.append(rowValues)
+                }
+                if let batched = batchedPackedAttention(
+                    kind: sourceKind, queries: queries,
+                    cachedKeys: borrowedKeys, cachedValues: borrowedValues,
+                    window: window(of: sourceKind), scale: scale,
+                    sinks: effectiveSinks, softcap: softcap,
+                    spanContexts: spanContexts)
+                {
+                    return batched
+                }
+            }
             var outputs: [MLXArray] = []
             outputs.reserveCapacity(B)
             for (index, row) in sourceRows.enumerated() {

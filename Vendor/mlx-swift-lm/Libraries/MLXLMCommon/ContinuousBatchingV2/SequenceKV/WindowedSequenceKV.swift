@@ -139,11 +139,7 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
         if n == 1 {
             // Decode fast path: one modular slot write, then the retained
             // window in temporal order (1 slice pre-wrap, 2-slice concat after).
-            borrowableChunkViews = nil  // ring == window: snapshot is exact
-            writeRing(keys!, tokens: newKeys, firstPosition: absoluteOffset)
-            writeRing(values!, tokens: newValues, firstPosition: absoluteOffset)
-            absoluteOffset += 1
-            oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
+            writeDecodeToken(keys: newKeys, values: newValues)
             return (
                 temporalOrder(keys!, from: oldestValidPosition, to: absoluteOffset),
                 temporalOrder(values!, from: oldestValidPosition, to: absoluteOffset)
@@ -176,6 +172,21 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
 
         borrowableChunkViews = (returnedKeys, returnedValues)
         return (returnedKeys, returnedValues)
+    }
+
+    func decodeRingWrite(keys newKeys: MLXArray, values newValues: MLXArray) {
+        precondition(
+            staged == nil && !speculativeWriteArmed
+                && newKeys.dim(2) == 1 && newValues.dim(2) == 1)
+        allocateIfNeeded(keyTemplate: newKeys, valueTemplate: newValues)
+        writeDecodeToken(keys: newKeys, values: newValues)
+    }
+
+    var decodeRingView: (keys: MLXArray, values: MLXArray, start: Int)? {
+        guard staged == nil, !speculativeWriteArmed, let keys, let values,
+            retainedCount == window
+        else { return nil }
+        return (keys, values, oldestValidPosition % window)
     }
 
     // MARK: - Speculative (MTP) staging
@@ -304,16 +315,6 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
         return (snap.keys, snap.values)
     }
 
-    /// The post-update physical ring for the exact full-window decode path.
-    /// Consumers must restore logical order while reading; ordinary callers
-    /// continue to use `decodeBorrowableViews()` / `snapshot()`.
-    func decodePhysicalRingViews() -> (keys: MLXArray, values: MLXArray)? {
-        guard staged == nil, retainedCount == window, let keys, let values else {
-            return nil
-        }
-        return (keys, values)
-    }
-
     public func snapshot() -> (keys: MLXArray, values: MLXArray, offset: Int) {
         if let staged {
             return stagedSnapshot(staged)
@@ -420,6 +421,14 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
     }
 
     // MARK: - Ring geometry
+
+    private func writeDecodeToken(keys newKeys: MLXArray, values newValues: MLXArray) {
+        borrowableChunkViews = nil
+        writeRing(keys!, tokens: newKeys, firstPosition: absoluteOffset)
+        writeRing(values!, tokens: newValues, firstPosition: absoluteOffset)
+        absoluteOffset += 1
+        oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
+    }
 
     /// Views covering absolute positions `[from, to)` in temporal order:
     /// one slice when the modular range does not cross the wrap point,

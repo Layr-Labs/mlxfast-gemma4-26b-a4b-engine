@@ -23,6 +23,12 @@ import Foundation
 ///      (`bfab0de:72-73`), i.e. a typo widened nothing but silently replaced
 ///      the operator's intent.
 public enum EditableSurfaceByteBudget {
+    /// RAISED AGAIN 2026-08-27 (David ruling): +5 MiB (5,242,880 bytes) over
+    /// the 2026-08-24 value of 4,404,587. Promoted submissions grew the
+    /// ENFORCED at-rest surface on main to 3,367,645 bytes, so the margin fell
+    /// to 1,036,942 bytes -- under the 1 MiB minimum stated below. The margin
+    /// at this raise is 6,279,822 bytes. The history below is kept as written.
+    ///
     /// RAISED 2026-08-24 (David ruling: the vendored ContinuousBatchingV2
     /// batching/round-driving engine joins the gemma4-26b-a4b-mlx-v1
     /// editablePaths surface -- docs/participant-contract.md section 2). The
@@ -47,7 +53,7 @@ public enum EditableSurfaceByteBudget {
     /// submission growth cap before this budget needs raising again, while
     /// keeping the cap tight enough to bind fail-closed rather than leave
     /// exploitable slack for smuggled content.
-    public static let defaultMaxTotalBytes = 4_404_587
+    public static let defaultMaxTotalBytes = 9_647_467
     public static let defaultMaxFileBytes = 524_288
     /// Bound on the bytes a submission may ADD to the editable surface versus
     /// its review base. Not consumed by the launch-time walk (there is no base
@@ -65,7 +71,7 @@ public enum EditableSurfaceByteBudget {
     /// expanded-archive cap is 512 MiB (536,870,912) and `maxSubmissionBytes`
     /// can only lower it, so an exempt surface above this could never pass
     /// submission validation. 512,000,000 plus `defaultMaxTotalBytes`
-    /// (4,404,587) leaves ~32.4 MB of headroom under the platform cap.
+    /// (9,647,467) leaves ~15.2 MB of headroom under the platform cap.
     ///
     /// NOT the staged-head cap. An organizer-pinned head fetched ON BOX by
     /// `setup-gemma4-assistant.sh` / `setup-gemma4-dflash.sh` is gitignored,

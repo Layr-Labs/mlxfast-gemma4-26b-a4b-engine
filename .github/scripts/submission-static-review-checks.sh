@@ -217,7 +217,11 @@ resolve_cap() { # resolve_cap VAR_NAME CONTRACT_KEY FALLBACK
 # now -- do not edit a number below without editing benchmark.json, or that
 # check (and drift/shell fallback constants equal the manifest in
 # tools/test-submission-security.sh) reds.
-resolve_cap MAX_BYTES maxTotalBytes 4404587
+#
+# maxTotalBytes was raised again on 2026-08-27, from 4404587 to 9647467 (+5
+# MiB, David ruling), because promoted submissions grew the enforced at-rest
+# surface on main and the margin fell under the stated 1 MiB minimum.
+resolve_cap MAX_BYTES maxTotalBytes 9647467
 resolve_cap MAX_FILE_BYTES maxFileBytes 524288
 resolve_cap MAX_GROWTH_BYTES maxGrowthBytes 262144
 

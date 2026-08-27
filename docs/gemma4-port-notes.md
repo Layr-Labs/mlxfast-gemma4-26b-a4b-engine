@@ -1763,12 +1763,21 @@ minimum-plus-margin pass double-counted the exempt `mtp-head/` bytes into the
 "at-rest" figure (3,358,640 instead of the correct enforced-only 3,356,011),
 landing on 4,407,216. Both are superseded by 4,404,587.
 
+The cap was raised again on 2026-08-27, from 4,404,587 to 9,647,467 (David
+ruling: add 5 MiB, 5,242,880 bytes). Promoted submissions had grown the
+enforced at-rest surface on main to 3,367,645 bytes. That left 1,036,942
+bytes of margin, under the stated 1 MiB minimum, so
+`enforcedSurfaceStaysUnderTotalCap` failed on main and on every submission
+PR. The margin at the raise is 6,279,822 bytes. The manifest declaration, the
+trusted enforcer default, and the static-review shell fallback all moved in
+the same commit. The 1 MiB minimum-margin assertion is unchanged.
+
 `maxFileBytes` (524,288) is unchanged: the largest single file in the new
 surface (`EngineLoopV2.swift`, 126,460 bytes) is well under the existing
 512 KiB per-file cap, so only the total needed to move. The manifest's
 numbers are verified equal to the trusted enforcer's own compiled-in
 defaults (`Sources/MLXFastTrustedHarness/EditableSurfaceByteBudget.swift`:
-`defaultMaxTotalBytes=4_404_587`, `defaultMaxFileBytes=524_288`,
+`defaultMaxTotalBytes=9_647_467`, `defaultMaxFileBytes=524_288`,
 `defaultMaxGrowthBytes=262_144`, `defaultExemptPathMaxBytes=512_000_000`,
 `defaultExemptPathMaxFileBytes=100_000_000`) —
 `tools/lint-benchmark-manifest.py` check 3b fails on manifest/enforcer drift,

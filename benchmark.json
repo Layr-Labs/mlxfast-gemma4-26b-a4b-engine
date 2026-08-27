@@ -107,7 +107,7 @@
   "editableSurfaceByteBudget": {
     "exemptPathMaxBytes": 512000000,
     "exemptPathMaxFileBytes": 100000000,
-    "maxTotalBytes": 4404587,
+    "maxTotalBytes": 9647467,
     "maxFileBytes": 524288,
     "maxGrowthBytes": 262144
   },

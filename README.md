@@ -297,7 +297,7 @@ surface.
 
 | Key | Value |
 |---|---|
-| `maxTotalBytes` | 4404587 |
+| `maxTotalBytes` | 9647467 |
 | `maxFileBytes` | 524288 |
 | `maxGrowthBytes` | 262144 |
 | `exemptPathMaxBytes` | 512000000 |

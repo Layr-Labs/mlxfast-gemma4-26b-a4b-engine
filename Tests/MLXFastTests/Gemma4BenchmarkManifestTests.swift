@@ -211,7 +211,12 @@ struct Gemma4BenchmarkManifestTests {
         // cap. Dropping them from editablePaths therefore moves the enforced
         // at-rest total by zero bytes. `enforcedSurfaceStaysUnderTotalCap`
         // below re-derives that from the tree rather than restating it.
-        #expect(budget["maxTotalBytes"] as? Int == 4_404_587)
+        //
+        // Raised again 2026-08-27 (4,404,587 -> 9,647,467, +5 MiB, David
+        // ruling) after promoted submissions pushed the margin under the 1 MiB
+        // minimum. This literal MIRRORS the enforcer default, so it moves with
+        // it; the 1 MiB minimum-margin assertion below is unchanged.
+        #expect(budget["maxTotalBytes"] as? Int == 9_647_467)
         #expect(budget["maxFileBytes"] as? Int == 524_288)
         #expect(budget["maxGrowthBytes"] as? Int == 262_144)
 
@@ -233,7 +238,7 @@ struct Gemma4BenchmarkManifestTests {
 
         // NOTHING IS EXEMPT (David requant-only ruling, 2026-08-26). An exempt
         // path only ever existed to let head WEIGHTS ride in a submission
-        // outside the 4.4 MB source budget. A submission no longer carries head
+        // outside the source byte budget. A submission no longer carries head
         // weights at all, so an exemption would be an exemption from nothing --
         // and a stale `exemptPaths` naming a path that is no longer editable is
         // a hard failure in tools/lint-benchmark-manifest.py (exemptPaths must

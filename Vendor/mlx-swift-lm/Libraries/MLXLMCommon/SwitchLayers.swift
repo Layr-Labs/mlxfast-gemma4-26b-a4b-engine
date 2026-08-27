@@ -236,9 +236,55 @@ private let compiledGeGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
     return body
 }()
 
-public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+/// Exact ranked-cohort expert sort. One lane owns one assignment and computes
+/// its stable rank among 64 expert IDs. This produces the order, sorted expert
+/// IDs, and inverse permutation in one dispatch instead of two generic sorts
+/// plus an index gather.
+private let exact64ExpertSortKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "exact64_expert_sort",
+    inputNames: ["indices"],
+    outputNames: ["order", "sorted_indices", "inverse_order"],
+    source: """
+        uint assignment = thread_position_in_grid.x;
+        uint expert = (uint)indices[assignment];
+        uint rank = 0;
+        for (uint other = 0; other < 64; ++other) {
+            uint other_expert = (uint)indices[other];
+            rank += (other_expert < expert
+                || (other_expert == expert && other < assignment));
+        }
+        order[rank] = assignment;
+        sorted_indices[rank] = expert;
+        inverse_order[assignment] = rank;
+    """,
+    ensureRowContiguous: true
+)
+
+public func gatherSort(
+    x: MLXArray,
+    indices: MLXArray,
+    useExact64FusedSort: Bool = false
+) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
     let indices = indices.flattened()
+    if useExact64FusedSort {
+        precondition(
+            indices.size == 64 && indices.dtype == .uint32,
+            "exact64 expert sort requires 64 uint32 assignments")
+        let outputs = exact64ExpertSortKernel(
+            [indices],
+            grid: (64, 1, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [[64], [64], [64]],
+            outputDTypes: [.uint32, .uint32, .uint32]
+        )
+        let order = outputs[0]
+        return (
+            x.flattened(start: 0, end: -3)[order.floorDivide(m)],
+            outputs[1],
+            outputs[2]
+        )
+    }
     let order = argSort(indices)
     let inverseOrder = argSort(order)
 
@@ -379,7 +425,9 @@ public class SwitchGLU: Module {
     }
 
     private func projectExperts(
-        _ x: MLXArray, _ indices: MLXArray
+        _ x: MLXArray,
+        _ indices: MLXArray,
+        useExact64FusedSort: Bool = false
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
         let doSort = indices.size >= 64
@@ -387,7 +435,10 @@ public class SwitchGLU: Module {
         var idx = indices
         var inverseOrder = MLXArray()
         if doSort {
-            (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
+            (x, idx, inverseOrder) = gatherSort(
+                x: x,
+                indices: indices,
+                useExact64FusedSort: useExact64FusedSort)
         }
 
         let xGate: MLXArray
@@ -489,7 +540,11 @@ public class SwitchGLU: Module {
         guard fuseSortedReduction && (isProductionPrefill || isEightRowDecode),
             supportsWeightedExpertUnsort(x, indices, weights: weights)
         else {
-            return weightedExpertSum(callAsFunction(x, indices), weights)
+            let projected = projectExperts(
+                x,
+                indices,
+                useExact64FusedSort: !isProductionPrefill && indices.size == 64)
+            return legacyWeightedReduction(projected, indices: indices, weights: weights)
         }
 
         let projected = projectExperts(x, indices)

@@ -252,12 +252,35 @@ enum CBv2AttentionV1 {
                 var cachedValueRows: [MLXArray] = []
                 cachedKeyRows.reserveCapacity(B)
                 cachedValueRows.reserveCapacity(B)
-                for (index, row) in rows.enumerated() {
-                    let (cachedKeys, cachedValues) = row.update(
-                        keys: keys[index ..< (index + 1)],
-                        values: values[index ..< (index + 1)])
-                    cachedKeyRows.append(cachedKeys)
-                    cachedValueRows.append(cachedValues)
+                let ringRows = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
+                if ringRows.count == B && ringRows.allSatisfy({ $0.decodeRingView != nil }) {
+                    for (index, row) in ringRows.enumerated() {
+                        row.decodeRingWrite(
+                            keys: keys[index ..< (index + 1)],
+                            values: values[index ..< (index + 1)])
+                    }
+                    let views = ringRows.compactMap { $0.decodeRingView }
+                    if views.count == B,
+                        let output = CBv2RaggedTwoPassDecodeAttentionV1.attendRing(
+                            queries: queries, keys: views.map(\.keys),
+                            values: views.map(\.values), starts: views.map(\.start),
+                            scale: scale, slidingWindowLength: ringRows[0].window)
+                    {
+                        return output
+                    }
+                    for row in ringRows {
+                        let view = row.snapshot()
+                        cachedKeyRows.append(view.keys)
+                        cachedValueRows.append(view.values)
+                    }
+                } else {
+                    for (index, row) in rows.enumerated() {
+                        let (cachedKeys, cachedValues) = row.update(
+                            keys: keys[index ..< (index + 1)],
+                            values: values[index ..< (index + 1)])
+                        cachedKeyRows.append(cachedKeys)
+                        cachedValueRows.append(cachedValues)
+                    }
                 }
                 if let output = CBv2RaggedTwoPassDecodeAttentionV1.attend(
                     queries: queries, keys: cachedKeyRows, values: cachedValueRows,
@@ -282,22 +305,43 @@ enum CBv2AttentionV1 {
                 return concatenated(outputs, axis: 0)
             }
 
-            // Batched decode: split queries per row, per-row update + SDPA
-            // against that row's own KV, then concatenate. No masks — each row
-            // sees exactly its own KV, so batch-composition invariance holds by
-            // construction and fully-masked rows cannot exist.
-            var outputs: [MLXArray] = []
-            outputs.reserveCapacity(B)
+            // Full-attention (and any other non-ragged) decode: commit each
+            // row's K/V first. When every row shares one kL — the ranked B=8
+            // cohort — one SDPA over the stacked batch replaces eight
+            // row-local launches plus a concat of outputs. Axis-0 of SDPA is
+            // independent, maskMode(L:1) is `.none`, and mismatched lengths
+            // keep the established per-row loop.
+            var cachedKeyRows: [MLXArray] = []
+            var cachedValueRows: [MLXArray] = []
+            cachedKeyRows.reserveCapacity(B)
+            cachedValueRows.reserveCapacity(B)
             for (index, row) in rows.enumerated() {
                 let (cachedKeys, cachedValues) = row.update(
                     keys: keys[index ..< (index + 1)],
                     values: values[index ..< (index + 1)])
+                cachedKeyRows.append(cachedKeys)
+                cachedValueRows.append(cachedValues)
+            }
+            let decodeKL = cachedKeyRows[0].dim(2)
+            if cachedKeyRows.allSatisfy({ $0.dim(2) == decodeKL })
+                && cachedValueRows.allSatisfy({ $0.dim(2) == decodeKL })
+            {
+                return attend(
+                    queries: queries,
+                    keys: concatenated(cachedKeyRows, axis: 0),
+                    values: concatenated(cachedValueRows, axis: 0),
+                    scale: scale, L: 1, kL: decodeKL, window: nil,
+                    sinks: effectiveSinks, softcap: softcap)
+            }
+            var outputs: [MLXArray] = []
+            outputs.reserveCapacity(B)
+            for index in 0 ..< B {
                 outputs.append(
                     attend(
                         queries: queries[index ..< (index + 1)],
-                        keys: cachedKeys, values: cachedValues, scale: scale,
-                        L: 1, kL: cachedKeys.dim(2), window: nil,
-                        sinks: effectiveSinks, softcap: softcap))
+                        keys: cachedKeyRows[index], values: cachedValueRows[index],
+                        scale: scale, L: 1, kL: cachedKeyRows[index].dim(2),
+                        window: nil, sinks: effectiveSinks, softcap: softcap))
             }
             return concatenated(outputs, axis: 0)
         }

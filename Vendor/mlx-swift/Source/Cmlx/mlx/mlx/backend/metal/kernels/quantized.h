@@ -2183,6 +2183,7 @@ template <typename T, const int group_size, const int bits, bool batched>
     const constant int64_t* s_strides [[buffer(13)]],
     const constant int64_t* b_strides [[buffer(14)]],
     uint3 tid [[threadgroup_position_in_grid]],
+    uint3 ntg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   if (batched) {
@@ -2203,6 +2204,31 @@ template <typename T, const int group_size, const int bits, bool batched>
         s_strides,
         b_strides,
         tid);
+  }
+  if (!batched && group_size == 64 && bits == 4 && ntg.x == 8 &&
+      ntg.z == 1 && in_vec_size % 64 == 0 && out_vec_size >= 8 &&
+      out_vec_size % 8 == 0) {
+    // The ruled decode cohort presents eight input rows to ordinary QMV.
+    // Claim adjacent rows in four active x-groups and let the remaining host
+    // groups return. The established pair helper shares each packed-weight
+    // load while preserving each row's qdot, K-loop, and simd_sum order.
+    const int first_m = int(tid.x) * 2;
+    if (first_m >= 8) {
+      return;
+    }
+    qmv_affine4_g64_pair_impl<T, 64, 4>(
+        w,
+        scales,
+        biases,
+        x + first_m * in_vec_size,
+        x + (first_m + 1) * in_vec_size,
+        y + first_m * out_vec_size,
+        y + (first_m + 1) * out_vec_size,
+        in_vec_size,
+        tid,
+        simd_gid,
+        simd_lid);
+    return;
   }
   qmv_impl<T, group_size, bits>(
       w,

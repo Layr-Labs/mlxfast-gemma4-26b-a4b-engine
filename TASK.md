@@ -70,9 +70,19 @@ denies file writes, and the benchmarker refuses a changed head tree.
 > re-quantization only. You may re-quantize either one, within its 2 GiB
 > declaration cap. You may not replace either one.
 
-> **NOTE — two levers are locked.**
-> The batch size stays 8. The draft depth stays 1. Make the forward passes
-> faster instead of tuning either one.
+> **NOTE — batch size is locked. Draft depth is not.**
+> The batch size stays 8. You may not tune it.
+>
+> The draft depth is a free lever on BOTH speculative arms, set from your own
+> drafter code, which is editable. Neither arm is pinned at 1.
+>
+> MTP: select 1, 2 or 3; the non-editable envelope clamps at 3, and benchd
+> measures at depth 2 when the invocation names no depth.
+> DFlash: select `spec.dflash.depth` up to the drafter's ceiling (engine cap 15);
+> an absent dflash depth means the full ceiling, not 1.
+>
+> Each run seals `effective_spec` and `effective_mean_draft_len`, so the depth
+> that ran and the draft length it realized are both visible afterwards.
 
 You may not change anything that verifies, measures, or ledgers. This covers the
 trusted harness, the target weights, the transform contract, the tokenizer, the
@@ -157,12 +167,16 @@ The benchmarker applies a per-stream token-tolerance gate with a 10% budget.
 
 The DFlash arm is a first-class scored mode. `allowed_modes` declares
 `serial`, `mtp` and `dflash`, and a submission runs whichever its own code
-drives.
+drives. Declare the arm in `dflash-head.manifest.json`, key `arm`, value
+`"dflash"` or `"mtp"`. An absent key and an absent file both mean `"mtp"`.
+Any other value is refused by name before any measurement.
 
 It runs single-stream only — the engine refuses the batched DFlash path by
 name — so a DFlash submission is measured in the single-stream series and is
-not scored by the B=8 cohort composite. The two arms are separate values and
-are never pooled. See `docs/participant-contract.md` section 5.1.1.
+not scored by the B=8 cohort composite. Its score is the even-n median of the
+per-prompt raw ratio-of-means, serial-anchored, floor 0.90, ceiling 5.0. The
+two arms are separate values and are never pooled. See
+`docs/participant-contract.md` section 5.1.1.
 
 The repositories stay private until launch.
 

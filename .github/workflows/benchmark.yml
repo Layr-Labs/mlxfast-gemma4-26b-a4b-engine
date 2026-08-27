@@ -150,6 +150,12 @@ jobs:
       - name: Score emitter unit test
         run: tools/test-gemma4-score-emitter.sh
 
+      - name: Arm selection seam unit test
+        # The submission's declared arm decides which spec the ranked leg
+        # measures, so it is checked on the ranked pipeline's own surface
+        # gate, before the box is reached -- not only in engine CI.
+        run: tools/test-gemma4-arm-selection.sh
+
   # The ranked measurement. `needs: surface-check` so a submission that fails
   # the static review never reaches the box at all.
   ranked:

@@ -1668,7 +1668,7 @@ echo "=== F. requant-only heads (David ruling 2026-08-26) ======================
 # may NOT upload head weights of their own, and may not alter the organizer's.
 #
 # THE MECHANISM. `mtp-head/` and `dflash-head/` are no longer `editablePaths`
-# entries; `mtp-head.manifest.json` and `dflash-head.manifest.json` still are.
+# entries; `mtp-head.manifest.json` and `spec-decoder-head.manifest.json` still are.
 # So the rule is not a promise in prose, it is the allowlist -- and the layer
 # that reads the allowlist against a submission's DIFF is
 # .github/scripts/enforce-modifiable-surface.sh.
@@ -1686,7 +1686,7 @@ real_contract_fixture() { # -> echoes a git repo carrying the REAL benchmark.jso
   mkdir -p "${dir}/mtp-head" "${dir}/dflash-head" "${dir}/Sources/MLXFastModel"
   cp "${REPO_ROOT}/benchmark.json" "${dir}/benchmark.json"
   cp "${REPO_ROOT}/mtp-head.manifest.json" "${dir}/mtp-head.manifest.json"
-  cp "${REPO_ROOT}/dflash-head.manifest.json" "${dir}/dflash-head.manifest.json"
+  cp "${REPO_ROOT}/spec-decoder-head.manifest.json" "${dir}/spec-decoder-head.manifest.json"
   # Stand-ins for the organizer-staged head bytes. The real ones are gitignored
   # and fetched on box; what matters to this gate is only that a path under the
   # head directory shows up in the diff.
@@ -1805,7 +1805,7 @@ assert_exit "requant-only/declaration-only requant submission accepted" 0 "" "${
 
 rq="$(real_contract_fixture)"
 rq_base="$(git -C "${rq}" rev-parse HEAD)"
-python3 - "${rq}/dflash-head.manifest.json" <<'PY'
+python3 - "${rq}/spec-decoder-head.manifest.json" <<'PY'
 import json, sys
 p = sys.argv[1]
 c = json.load(open(p))
@@ -1896,7 +1896,7 @@ import json, sys
 c = json.load(open(sys.argv[1]))
 editable = set(c.get("editablePaths", []))
 optional = set(c.get("optionalEditablePaths", []))
-want = {"mtp-head.manifest.json", "dflash-head.manifest.json"}
+want = {"mtp-head.manifest.json", "spec-decoder-head.manifest.json"}
 print(len(want & editable & optional))
 PY
 )"

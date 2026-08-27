@@ -62,7 +62,7 @@ the forward pass is editable. Anything that **verifies**, **measures**, or
 The editable surface has five groups.
 
 1. **The two head declarations.** `mtp-head.manifest.json` and
-   `dflash-head.manifest.json`. The declaration files only. The weights
+   `spec-decoder-head.manifest.json`. The declaration files only. The weights
    directories `mtp-head/` and `dflash-head/` are **not** editable. See
    section 4.
 2. **The participant runtime.** `Sources/MLXFastModel/` and
@@ -88,9 +88,9 @@ The editable surface has five groups.
 ### 3.1 Optional paths
 
 `optionalEditablePaths` lists `mtp-head.manifest.json` and
-`dflash-head.manifest.json`.
+`spec-decoder-head.manifest.json`.
 
-`dflash-head.manifest.json` carries one more key than the MTP declaration
+`spec-decoder-head.manifest.json` carries one more key than the MTP declaration
 does: `arm`, which selects the speculative arm the ranked run measures. See
 section 5.1.1.
 
@@ -215,7 +215,7 @@ use the same declaration mechanism.
 | Head | Declaration | Staged at | Organizer pin |
 |---|---|---|---|
 | The MTP head | `mtp-head.manifest.json` | `mtp-head/` | `mlx-community/gemma-4-26B-A4B-it-qat-assistant-4bit@bb94eae1` |
-| The DFlash drafter | `dflash-head.manifest.json` | `dflash-head/` | `z-lab/gemma-4-26B-A4B-it-DFlash@77d42027` |
+| The DFlash drafter | `spec-decoder-head.manifest.json` | `dflash-head/` | `z-lab/gemma-4-26B-A4B-it-DFlash@77d42027` |
 
 The declaration file is editable. The staged directory is not.
 
@@ -393,7 +393,7 @@ DFlash became a first-class scored mode on this track on 2026-08-26. The track
 fixture declares it: `allowed_modes` is `["serial", "mtp", "dflash"]`, and a
 submission runs whichever of those modes its own code drives.
 
-**Declare the arm in `dflash-head.manifest.json`, key `arm`.**
+**Declare the arm in `spec-decoder-head.manifest.json`, key `arm`.**
 
 | `arm` | What runs |
 |---|---|
@@ -615,43 +615,44 @@ target is a failure.
 The rectangular cap is `B * (1 + k) <= 8` on M3 and later. Batch size is locked
 at 8.
 
-You can select the draft depth. Both speculative arms permit this. Neither arm
-is pinned at 1.
+You set the draft depth in code. Each arm reads one editable constant,
+`submissionDraftDepth`. The two constants are written the same way.
 
-Your drafter code sets the depth. That code is an editable path, so the depth is
-a free lever on both arms. Each arm has its own ceiling. A request above a
-ceiling is clamped to that ceiling. It is not refused.
+- MTP: `CBv2MTPRoundDriver.submissionDraftDepth`
+  (`Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/MTP/CBv2MTPRoundDriver.swift`).
+- DFlash: `DFlashDraftModel.submissionDraftDepth`
+  (`Vendor/mlx-swift-lm/Libraries/MLXSpeculative/DFlashDraftModel.swift`).
 
-**The MTP arm.** The permitted values are 1, 2 and 3. The MTP envelope limits
-the depth to 3. The envelope is trusted code and is not an editable path:
-`maxDraftTokens` is 3, and `maxAutomaticRectangularTokens` is 32 at batch
-size 8.
+Both constants default to 1. Edit the constant for the arm that your submission
+runs. A value at or below the ceiling of the arm runs as set. A larger value
+clamps to the ceiling. The engine does not refuse it. benchd adds no depth of
+its own. The engine resolves the depth and reports the depth that ran.
 
-**The DFlash arm.** Select the depth with `depth` in the spec `dflash` block.
-The ceiling is the drafter's own: its recommended block size minus one. The
-engine caps that ceiling at 15 (`experimentalDFlashMaxBlockSize` is 16). The
-DFlash ceiling is therefore much larger than the MTP ceiling of 3.
+The two arms use the constant differently.
 
-Absent depths do not mean 1. Three layers supply a depth when a request does not
-name one. Do not confuse them.
+MTP adapts. The constant is a ceiling. The depth controller selects a depth from
+0 to this ceiling each round. A higher constant makes the adaptive range wider.
+It does not force speculation. The controller is editable
+(`CBv2MTPDepthController.swift`). You can change the adaptive policy. The MTP
+envelope limits the ceiling to 3. `maxDraftTokens` is 3.
+`maxAutomaticRectangularTokens` is 32 at batch 8. The effective ceiling is
+`min(3, submissionDraftDepth)`.
 
-| Request | Result |
-|---|---|
-| benchd invocation gives no `--mtp-depth` | benchd measures at depth 2 |
-| the `mtp` block has no `depth` key | the envelope uses its ceiling of 3 |
-| the `dflash` block has no `depth` key | the drafter uses its full ceiling |
+DFlash is fixed. Block diffusion drafts one whole block each round. The constant
+sets a fixed block depth for the run. The drafter proposes this many speculative
+tokens each round. The block that it emits is `depth + 1`. The extra column is a
+bonus token. The ceiling is the recommended block size of the drafter minus one.
+The engine limits this ceiling to 15. `experimentalDFlashMaxBlockSize` is 16. On
+DFlash the acceptance varies, not the drafted depth. Each round the target
+verifies the block. The target commits the longest correct prefix.
 
-An absent `dflash` depth means "use everything the drafter supports". It does
-not mean 1.
+You select the arm in `spec-decoder-head.manifest.json`, key `arm`. The values
+are `mtp` and `dflash`. An absent key means `mtp`. See section 5.1.1. The depth
+is code. The arm is the manifest.
 
-The `fixed_depth = 1` constant in the track fixture is a darkbloom reference
-constant. It records the stateless-Gemma protocol value that this track
-inherited. It is not a limit on your draft depth.
-
-Every run seals the depth that operated. Read `effective_spec` for the arm and
-the depth the run declared. Read `effective_mean_draft_len` for the draft length
-that the run realized. The two can differ: a run can declare depth 2 and realize
-a mean draft length near 1.
+Each run seals the depth that ran. Read `effective_spec` for the arm. Read
+`effective_mean_draft_len` for the draft length that the run realized. On MTP the
+two values can differ because the depth adapts.
 
 ## 8. Prohibited techniques
 

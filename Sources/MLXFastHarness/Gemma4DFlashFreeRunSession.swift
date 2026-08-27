@@ -63,9 +63,14 @@ import MLXSpeculative
 /// sliding-attention layers — clamped by the engine's configured block
 /// ceiling. The single source for the dflash depth ceiling.
 func gemma4DFlashMaxDepth(for drafter: DFlashDraftModel) -> Int {
-    let drafterCeiling = drafter.config.recommendedBlockSize - 1
-    let engineCeiling = MLXFastConstants.experimentalDFlashMaxBlockSize - 1
-    return Swift.max(1, Swift.min(drafterCeiling, engineCeiling))
+    // The participant's editable draft-depth lever (DFlashDraftModel.swift), the
+    // DFlash counterpart of MTP's CBv2MTPRoundDriver.submissionDraftDepth,
+    // clamped to the drafter's trained ceiling and the engine ceiling. The pure
+    // clamp lives on DFlashDraftModel so it is unit-testable without this model.
+    DFlashDraftModel.clampDepth(
+        requested: DFlashDraftModel.submissionDraftDepth,
+        drafterCeiling: drafter.config.recommendedBlockSize - 1,
+        engineCeiling: MLXFastConstants.experimentalDFlashMaxBlockSize - 1)
 }
 
 /// Single-stream DFlash free-run session: real `draftBlock` → target verify →

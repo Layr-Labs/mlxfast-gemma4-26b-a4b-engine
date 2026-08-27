@@ -246,7 +246,7 @@ expect_argv "absent manifest (full run)" "${GOLDEN_FULL}"
 # NEGATIVE CONTROL 2 -- a manifest with NO `arm` key seals MTP, same argv.
 # ===========================================================================
 reset_argv
-run_case no-arm-key full "dflash-head.manifest.json=${MANIFEST_PINNED}"
+run_case no-arm-key full "spec-decoder-head.manifest.json=${MANIFEST_PINNED}"
 if [[ "${CASE_RC}" -ne 0 ]]; then
   fail "manifest without an arm key: wrapper exited ${CASE_RC}; output: $(cat "${WORK}/case.out")"
 fi
@@ -258,7 +258,7 @@ expect_argv "manifest without an arm key" "${GOLDEN_FULL}"
 # ===========================================================================
 reset_argv
 run_case arm-mtp full \
-  'dflash-head.manifest.json={"version":1,"source":"pinned","arm":"mtp","max_bytes":2147483648}'
+  'spec-decoder-head.manifest.json={"version":1,"source":"pinned","arm":"mtp","max_bytes":2147483648}'
 if [[ "${CASE_RC}" -ne 0 ]]; then
   fail "arm mtp: wrapper exited ${CASE_RC}; output: $(cat "${WORK}/case.out")"
 fi
@@ -273,7 +273,7 @@ fi
 # ===========================================================================
 reset_argv
 run_case arm-dflash full \
-  'dflash-head.manifest.json={"version":1,"source":"pinned","arm":"dflash","max_bytes":2147483648}'
+  'spec-decoder-head.manifest.json={"version":1,"source":"pinned","arm":"dflash","max_bytes":2147483648}'
 if [[ "${CASE_RC}" -ne 0 ]]; then
   fail "arm dflash: wrapper exited ${CASE_RC}; output: $(cat "${WORK}/case.out")"
 fi
@@ -297,7 +297,7 @@ fi
 # pre-GPU, at preSubmitCommand time, not on the ranked box.
 reset_argv
 run_case arm-dflash-preflight preflight \
-  'dflash-head.manifest.json={"version":1,"source":"pinned","arm":"dflash","max_bytes":2147483648}'
+  'spec-decoder-head.manifest.json={"version":1,"source":"pinned","arm":"dflash","max_bytes":2147483648}'
 if ! grep -q -- "--candidate-spec" "${WORK}/argv.txt"; then
   fail "arm dflash (preflight): no --candidate-spec was passed to the preflight invocation"
 fi
@@ -321,31 +321,31 @@ expect_refusal() {
 
 reset_argv
 run_case arm-unknown full \
-  'dflash-head.manifest.json={"version":1,"source":"pinned","arm":"dspark"}'
+  'spec-decoder-head.manifest.json={"version":1,"source":"pinned","arm":"dspark"}'
 expect_refusal "unknown arm 'dspark'" "dspark"
 
 reset_argv
 run_case arm-empty full \
-  'dflash-head.manifest.json={"version":1,"source":"pinned","arm":""}'
+  'spec-decoder-head.manifest.json={"version":1,"source":"pinned","arm":""}'
 expect_refusal "empty arm" "not a mode this track admits"
 
 reset_argv
 run_case arm-wrong-case full \
-  'dflash-head.manifest.json={"version":1,"source":"pinned","arm":"MTP"}'
+  'spec-decoder-head.manifest.json={"version":1,"source":"pinned","arm":"MTP"}'
 expect_refusal "wrong-case arm 'MTP'" "MTP"
 
 reset_argv
 run_case arm-non-string full \
-  'dflash-head.manifest.json={"version":1,"source":"pinned","arm":1}'
+  'spec-decoder-head.manifest.json={"version":1,"source":"pinned","arm":1}'
 expect_refusal "non-string arm" "non-string"
 
 reset_argv
 run_case manifest-malformed full \
-  'dflash-head.manifest.json={"version":1,"source":'
+  'spec-decoder-head.manifest.json={"version":1,"source":'
 expect_refusal "malformed manifest JSON" "not a JSON object"
 
 reset_argv
-run_case manifest-not-object full 'dflash-head.manifest.json=["dflash"]'
+run_case manifest-not-object full 'spec-decoder-head.manifest.json=["dflash"]'
 expect_refusal "manifest that is not a JSON object" "not a JSON object"
 
 # The arm declared in the WRONG head manifest is a refusal, not a no-op: this
@@ -354,7 +354,7 @@ expect_refusal "manifest that is not a JSON object" "not a JSON object"
 reset_argv
 run_case arm-in-mtp-manifest full \
   'mtp-head.manifest.json={"version":1,"source":"pinned","arm":"dflash"}'
-expect_refusal "arm declared in mtp-head.manifest.json" "dflash-head.manifest.json only"
+expect_refusal "arm declared in mtp-head.manifest.json" "spec-decoder-head.manifest.json only"
 
 # ===========================================================================
 # ANTI-DRIFT -- the wrapper's vocabulary is the Swift declaration parser's.

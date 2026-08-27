@@ -27,7 +27,7 @@ groups.
 
 | Group | Paths |
 |---|---|
-| The head declarations | `mtp-head.manifest.json`, `dflash-head.manifest.json` (the declaration files only) |
+| The head declarations | `mtp-head.manifest.json`, `spec-decoder-head.manifest.json` (the declaration files only) |
 | The participant runtime | `Sources/MLXFastModel/`, `Sources/MLXFastTransform/` |
 | The vendored model | The six `Gemma4*.swift` files, `DFlashDraftModel.swift`, and 12 `MLXLMCommon` support files |
 | The batching engine | `MLXLMCommon/ContinuousBatchingV2/` and `MLXLMServer/Runtime/ToolStreamHandler.swift` |
@@ -43,7 +43,7 @@ of your own.
 
 `mtp-head/` and `dflash-head/` are not editable paths, so a submission carries
 no head weight file. The declaration files `mtp-head.manifest.json` and
-`dflash-head.manifest.json` stay editable, and each accepts `"source": "pinned"`
+`spec-decoder-head.manifest.json` stay editable, and each accepts `"source": "pinned"`
 only. `"source": "remote"` and `"source": "in_branch"` are refused by name.
 
 Each head has a 2 GiB declaration cap. The size cap is the only gate on a
@@ -73,13 +73,15 @@ denies file writes, and the benchmarker refuses a changed head tree.
 > **NOTE — batch size is locked. Draft depth is not.**
 > The batch size stays 8. You may not tune it.
 >
-> The draft depth is a free lever on BOTH speculative arms, set from your own
-> drafter code, which is editable. Neither arm is pinned at 1.
+> You set the draft depth in code. Each speculative arm reads one editable
+> constant `submissionDraftDepth`. Both constants default to 1. benchd adds no
+> default of its own.
 >
-> MTP: select 1, 2 or 3; the non-editable envelope clamps at 3, and benchd
-> measures at depth 2 when the invocation names no depth.
-> DFlash: select `spec.dflash.depth` up to the drafter's ceiling (engine cap 15);
-> an absent dflash depth means the full ceiling, not 1.
+> MTP: `CBv2MTPRoundDriver.submissionDraftDepth`. It is a ceiling on the adaptive
+> controller, bounded by the envelope value 3.
+> DFlash: `DFlashDraftModel.submissionDraftDepth`. It is a fixed block depth, up
+> to the drafter ceiling (engine limit 15). A value above a ceiling clamps to the
+> ceiling. The engine does not refuse it.
 >
 > Each run seals `effective_spec` and `effective_mean_draft_len`, so the depth
 > that ran and the draft length it realized are both visible afterwards.
@@ -167,7 +169,7 @@ The benchmarker applies a per-stream token-tolerance gate with a 10% budget.
 
 The DFlash arm is a first-class scored mode. `allowed_modes` declares
 `serial`, `mtp` and `dflash`, and a submission runs whichever its own code
-drives. Declare the arm in `dflash-head.manifest.json`, key `arm`, value
+drives. Declare the arm in `spec-decoder-head.manifest.json`, key `arm`, value
 `"dflash"` or `"mtp"`. An absent key and an absent file both mean `"mtp"`.
 Any other value is refused by name before any measurement.
 

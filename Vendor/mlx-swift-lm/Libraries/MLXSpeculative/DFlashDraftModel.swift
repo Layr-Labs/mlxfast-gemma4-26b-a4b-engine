@@ -330,6 +330,31 @@ private final class DFlashDecoderLayer: Module {
 }
 
 public final class DFlashDraftModel: Module, @unchecked Sendable {
+    /// PARTICIPANT DRAFT-DEPTH LEVER (editable). The DFlash draft depth this
+    /// submission runs. It is the number of speculative tokens the drafter
+    /// proposes per round. The block that it emits is `depth + 1`. The extra
+    /// column is a bonus token. This depth is FIXED for the run. Block diffusion
+    /// drafts a whole block at once, so unlike MTP this depth does not adapt each
+    /// round. `gemma4DFlashMaxDepth` clamps it to the drafter ceiling
+    /// (`recommendedBlockSize - 1`) and the engine ceiling
+    /// (`experimentalDFlashMaxBlockSize - 1`, which is 15). A value above a
+    /// ceiling clamps to the ceiling. The engine does not refuse it. Default 1.
+    ///
+    /// UNIFORM WITH MTP. `CBv2MTPRoundDriver.submissionDraftDepth` is the MTP
+    /// counterpart. It has the same name, the same meaning, and the same default
+    /// 1. The per-arm behaviour differs. MTP adapts up to its ceiling each round.
+    /// DFlash proposes a fixed block of this size. The constant you edit is the
+    /// same on both arms.
+    public static let submissionDraftDepth = 1
+
+    /// The pure DFlash depth clamp. A requested draft depth, bounded by the
+    /// drafter ceiling and the engine ceiling, floored at 1. A value above a
+    /// ceiling clamps to the ceiling. The engine does not refuse it.
+    /// `gemma4DFlashMaxDepth` calls this with `submissionDraftDepth`.
+    public static func clampDepth(requested: Int, drafterCeiling: Int, engineCeiling: Int) -> Int {
+        Swift.max(1, Swift.min(requested, drafterCeiling, engineCeiling))
+    }
+
     public let config: DFlashConfiguration
 
     @ModuleInfo(key: "fc") public var contextProjection: Linear

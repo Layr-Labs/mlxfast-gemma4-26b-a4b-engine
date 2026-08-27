@@ -34,7 +34,7 @@ import MLXFastCore
 // BOTH REPLACEABLE HEADS, ONE MECHANISM (David ruling, 2026-08-25). The
 // gemma4-26b-a4b-mlx-v1 track carries a SECOND replaceable head -- the z-lab
 // DFlash drafter staged at `dflash-head/` -- and it is declared exactly the
-// way the MTP head is: `dflash-head.manifest.json`, same
+// way the MTP head is: `spec-decoder-head.manifest.json`, same
 // `source`/`sha256`/`bytes` shape, the SAME 2 GiB size-only cap, the same
 // absent-means-organizer-default and present-but-broken-means-refusal
 // posture. Rather than a second copy of this parser, the head KIND is a
@@ -65,7 +65,7 @@ public enum ReplaceableHeadKind: String, Equatable, CaseIterable, Sendable {
     public var manifestRelativePath: String {
         switch self {
         case .mtp: return "mtp-head.manifest.json"
-        case .dflash: return "dflash-head.manifest.json"
+        case .dflash: return "spec-decoder-head.manifest.json"
         }
     }
 
@@ -105,7 +105,7 @@ public typealias ReplaceableHeadDeclaration = Gemma4MTPHeadDeclaration
 /// ranked run therefore measured the MTP default no matter what the submission
 /// contained. This enum is the vocabulary of the channel that closes that gap.
 ///
-/// WHERE IT IS DECLARED: the `arm` key of `dflash-head.manifest.json`, which is
+/// WHERE IT IS DECLARED: the `arm` key of `spec-decoder-head.manifest.json`, which is
 /// an `editablePaths` AND `optionalEditablePaths` entry -- a file a submission
 /// can actually write. (`benchmark.json` itself is trusted-side, so the ruled
 /// design's literal "a field on the workspace manifest" is unimplementable as
@@ -143,7 +143,7 @@ public enum DeclaredArm: String, Equatable, CaseIterable, Sendable {
 }
 
 /// One parsed head declaration (`mtp-head.manifest.json` or, for the same
-/// mechanism aimed at the DFlash drafter, `dflash-head.manifest.json`).
+/// mechanism aimed at the DFlash drafter, `spec-decoder-head.manifest.json`).
 public struct Gemma4MTPHeadDeclaration: Equatable, Sendable {
     public enum Source: String, Equatable, CaseIterable, Sendable {
         /// The operator's section-9d pinned head. The default, and what an
@@ -191,7 +191,7 @@ public struct Gemma4MTPHeadDeclaration: Equatable, Sendable {
     }
 
     /// 2 GiB. Mirrored in `mtp-head.manifest.json` and
-    /// `dflash-head.manifest.json` (`max_bytes`) and in the contract
+    /// `spec-decoder-head.manifest.json` (`max_bytes`) and in the contract
     /// manifest's `editableSurfaceByteBudget.exemptPathMaxBytes`; a
     /// declaration may lower it and may not raise it. ONE cap for BOTH
     /// replaceable heads -- there is no per-kind ceiling.

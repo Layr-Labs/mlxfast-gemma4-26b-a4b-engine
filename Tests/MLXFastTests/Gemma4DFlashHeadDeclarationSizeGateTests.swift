@@ -6,7 +6,7 @@ import Testing
 // The DFlash drafter is the gemma4-26b-a4b-mlx-v1 track's SECOND speculative
 // head, and per David's 2026-08-25 ruling it gets the SAME 2 GiB size-only cap
 // the MTP head gets, through the SAME declaration mechanism:
-// `dflash-head.manifest.json` (`source` / optional `sha256` / `bytes` /
+// `spec-decoder-head.manifest.json` (`source` / optional `sha256` / `bytes` /
 // `max_bytes`), parsed and size-gated by `Gemma4MTPHeadDeclaration` with
 // `kind: .dflash`, absent-means-organizer-default, present-but-broken-means-
 // refusal.
@@ -50,7 +50,7 @@ private func makeDFlashTempDirectory() throws -> URL {
 
 @Test
 func dflashKindNamesItsOwnManifestAndDirectory() {
-    #expect(ReplaceableHeadKind.dflash.manifestRelativePath == "dflash-head.manifest.json")
+    #expect(ReplaceableHeadKind.dflash.manifestRelativePath == "spec-decoder-head.manifest.json")
     #expect(ReplaceableHeadKind.dflash.stagedDirectoryName == "dflash-head")
     // The mirror must not have renamed the MTP side.
     #expect(ReplaceableHeadKind.mtp.manifestRelativePath == "mtp-head.manifest.json")
@@ -85,7 +85,7 @@ func dflashHeadOneByteOverTheCapIsRefused() throws {
     let json = #"{"source":"pinned","bytes":\#(overCap)}"#
     #expect(throws: MLXFastError.self) {
         _ = try Gemma4MTPHeadDeclaration.parse(
-            data: Data(json.utf8), origin: "dflash-head.manifest.json", kind: .dflash)
+            data: Data(json.utf8), origin: "spec-decoder-head.manifest.json", kind: .dflash)
     }
 }
 
@@ -98,7 +98,7 @@ func dflashOverCapRefusalNamesTheCapAndTheActualSize() throws {
     let json = #"{"source":"pinned","bytes":\#(overCap)}"#
     do {
         _ = try Gemma4MTPHeadDeclaration.parse(
-            data: Data(json.utf8), origin: "dflash-head.manifest.json", kind: .dflash)
+            data: Data(json.utf8), origin: "spec-decoder-head.manifest.json", kind: .dflash)
         Issue.record("an over-cap DFlash declaration must refuse")
     } catch let error as MLXFastError {
         let message = error.description
@@ -107,7 +107,7 @@ func dflashOverCapRefusalNamesTheCapAndTheActualSize() throws {
             message.contains("\(Gemma4MTPHeadDeclaration.defaultMaxBytes)"),
             "refusal must name the cap")
         #expect(message.contains("DFlash"), "refusal must name which head it is about")
-        #expect(message.contains("dflash-head.manifest.json"))
+        #expect(message.contains("spec-decoder-head.manifest.json"))
     }
 }
 
@@ -161,7 +161,7 @@ func dflashRetiredSourcesAreRefused() throws {
     ] {
         #expect(throws: MLXFastError.self, "retired source must refuse: \(json)") {
             _ = try Gemma4MTPHeadDeclaration.parse(
-                data: Data(json.utf8), origin: "dflash-head.manifest.json", kind: .dflash)
+                data: Data(json.utf8), origin: "spec-decoder-head.manifest.json", kind: .dflash)
         }
     }
 }
@@ -194,7 +194,7 @@ func dflashHeadDeclaredDigestIsCarriedLowercasedNotGated() throws {
 
 @Test
 func absentDFlashManifestIsTheOrganizerDefaultNotAnError() throws {
-    // An empty contract root carries no dflash-head.manifest.json: that is the
+    // An empty contract root carries no spec-decoder-head.manifest.json: that is the
     // NORMAL case (no DFlash capability declared), never a refusal.
     let root = try makeDFlashTempDirectory()
     defer { try? FileManager.default.removeItem(at: root) }

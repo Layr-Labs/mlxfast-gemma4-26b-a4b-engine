@@ -90,7 +90,7 @@ let gemma4AssistantHeadDirectoryName = "mtp-head"
 /// SIZE. The DFlash drafter is the track's SECOND replaceable head and it is
 /// held to the SAME 2 GiB per-head cap as the MTP head (David's 2026-08-25
 /// both-replaceable-heads-one-cap ruling). That cap binds at TWO layers, and
-/// this arm needs both: `dflash-head.manifest.json`, parsed and size-gated by
+/// this arm needs both: `spec-decoder-head.manifest.json`, parsed and size-gated by
 /// `Gemma4MTPHeadDeclaration` with `kind: .dflash`
 /// (Sources/MLXFastTrustedHarness), gates what the trusted, pre-sandbox
 /// stager is allowed to DECLARE and fetch; `gemma4DFlashStagedHeadMaxBytes`
@@ -103,7 +103,7 @@ let gemma4DFlashHeadDirectoryName = "dflash-head"
 /// WHY THIS EXISTS SEPARATELY FROM THE DECLARATION GATE. The declaration
 /// mechanism (`Gemma4MTPHeadDeclaration` + `ReplaceableHeadKind.dflash`,
 /// Sources/MLXFastTrustedHarness) enforces the same 2 GiB on
-/// `dflash-head.manifest.json`'s `bytes` — but that gate sits on the MANIFEST
+/// `spec-decoder-head.manifest.json`'s `bytes` — but that gate sits on the MANIFEST
 /// layer, upstream of the sandbox, and it binds the DECLARED size of a head
 /// the stager fetches. The MTP arm can lean on it alone because its loader
 /// runs behind that same stager. This arm cannot: `loadGemma4DFlashHeadIfStaged`
@@ -374,7 +374,7 @@ func loadGemma4DFlashHeadIfStaged(
             directory: directory,
             reason: "the staged DFlash head is \(stagedBytes) bytes, above the "
                 + "\(gemma4DFlashStagedHeadMaxBytes)-byte per-head cap that "
-                + "the DFlash head declaration (dflash-head.manifest.json) "
+                + "the DFlash head declaration (spec-decoder-head.manifest.json) "
                 + "enforces on the manifest layer")
     }
 

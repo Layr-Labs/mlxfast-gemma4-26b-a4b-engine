@@ -85,6 +85,8 @@ extension EngineLoopV2 {
     /// Break the chained fast path when the next step must seed or verify.
     func mtpWantsStep(ids: [CBv2RequestID]) -> Bool {
         guard let mtp else { return false }
+        // Target-only policy: never break the chained fast path for MTP.
+        if mtp.isTargetOnlyPolicy { return false }
         let rows = ids.compactMap { scheduler.record(for: $0) }
         let withinBatchGate = ids.count <= mtp.config.maxSpeculativeBatch
         let canSpeculate = withinBatchGate && rows.count == ids.count
@@ -117,6 +119,10 @@ extension EngineLoopV2 {
     /// Chunked-prefill neighbors do not change the controller batch bucket.
     func beginMTPPlan() {
         guard let mtp else { return }
+        // Target-only policy: skip the per-step bookkeeping below. The
+        // inactive default plan (depth 0, empty mark sets) is exactly what
+        // the full path would produce, and no carry exists without a round.
+        if mtp.isTargetOnlyPolicy { return }
         let rows = scheduler.running.filter {
             !$0.isPaused && !$0.cancelRequested && $0.isDecodeReady
         }

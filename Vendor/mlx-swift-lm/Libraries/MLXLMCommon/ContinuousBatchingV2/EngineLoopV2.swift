@@ -652,7 +652,9 @@ public final class EngineLoopV2: @unchecked Sendable {
         // MTP: the scheduler consults the loop for 1+k decode assignments.
         // `unowned` is safe (and cycle-free): the loop owns the scheduler
         // and both live exactly as long as the engine.
-        if mtp != nil {
+        // Left nil under the target-only policy: the hook would return 0
+        // for every row.
+        if self.mtp?.isTargetOnlyPolicy == false {
             scheduler.speculationPlanner = { [unowned self] rec in
                 self.mtpPlanSpeculation(for: rec)
             }

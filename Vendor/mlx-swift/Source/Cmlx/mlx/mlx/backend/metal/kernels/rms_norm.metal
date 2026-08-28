@@ -1,6 +1,7 @@
 // Copyright © 2024 Apple Inc.
 
 #include <metal_common>
+#include <metal_math>
 #include <metal_simdgroup>
 
 #include "mlx/backend/metal/kernels/utils.h"
@@ -379,6 +380,80 @@ template <typename T, int N_READS = RMS_N_READS>
   }
 }
 
+template <typename T>
+[[kernel]] void fused_qk_rms_rope_inplace(
+    device T* qk [[buffer(0)]],
+    const device T* w_q [[buffer(1)]],
+    const device T* w_k [[buffer(2)]],
+    const device int* offset [[buffer(3)]],
+    constant const float& scale [[buffer(4)]],
+    constant const int64_t& q_stride0 [[buffer(5)]],
+    constant const int64_t& q_stride1 [[buffer(6)]],
+    constant const int64_t& q_stride2 [[buffer(7)]],
+    constant const int64_t& k_stride0 [[buffer(8)]],
+    constant const int64_t& k_stride1 [[buffer(9)]],
+    constant const int64_t& k_stride2 [[buffer(10)]],
+    constant const int64_t& offset_stride [[buffer(11)]],
+    constant const int& n_q_heads [[buffer(12)]],
+    constant const int& n_kv_heads [[buffer(13)]],
+    constant const float& base [[buffer(14)]],
+    constant const float& eps [[buffer(15)]],
+    constant const uint& head_dim [[buffer(16)]],
+    constant const int& q_offset [[buffer(17)]],
+    uint3 pos [[thread_position_in_grid]],
+    uint3 grid [[threads_per_grid]]) {
+  constexpr int SIMD_SIZE = 32;
+  constexpr int N_READS = 4;
+  const int D = int(head_dim);
+  const int half = D / 2;
+  const bool is_q = int(pos.z) < n_q_heads;
+  const int head = is_q ? int(pos.z) : int(pos.z) - n_q_heads;
+  const int b = int(pos.y / 1024);
+  const int t = int(pos.y % 1024);
+  const int d_half = int(pos.x);
+  if (d_half >= half) return;
+  const device T* w = is_q ? w_q : w_k;
+  const int64_t s0 = is_q ? q_stride0 : k_stride0;
+  const int64_t s1 = is_q ? q_stride1 : k_stride1;
+  const int64_t s2 = is_q ? q_stride2 : k_stride2;
+  const int qk_batch_stride = 1024 * (is_q ? n_q_heads : n_kv_heads) * D;
+  device T* base_ptr = qk + (is_q ? 0 : q_offset) + int64_t(b) * int64_t(qk_batch_stride);
+  const int64_t row_base = int64_t(t) * s1 + int64_t(head) * s0;
+  threadgroup float local_inv[1];
+  threadgroup float partials[SIMD_SIZE];
+  float acc = 0;
+  for (int d = int(pos.x); d < D; d += int(grid.x)) {
+    float v = float(base_ptr[row_base + int64_t(d) * s2]);
+    acc += v * v;
+  }
+  acc = simd_sum(acc);
+  if (simdgroup_index_in_threadgroup == 0) partials[thread_index_in_simdgroup] = 0;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (thread_index_in_simdgroup == 0) partials[simdgroup_index_in_threadgroup] = acc;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simdgroup_index_in_threadgroup == 0) {
+    float s = simd_sum(partials[thread_index_in_simdgroup]);
+    if (thread_index_in_simdgroup == 0) local_inv[0] = metal::precise::rsqrt(s / float(D) + eps);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float inv = local_inv[0];
+  float d_norm = float(d_half) / float(half);
+  float inv_freq = metal::exp2(-d_norm * base);
+  int off = offset[b * int(offset_stride)];
+  float L = scale * float(t + off);
+  float th = L * inv_freq;
+  float c = metal::fast::cos(th);
+  float s_ = metal::fast::sin(th);
+  int64_t i1 = row_base + int64_t(d_half) * s2;
+  int64_t i2 = row_base + int64_t(d_half + half) * s2;
+  float x1 = float(base_ptr[i1]) * inv * float(w[d_half]);
+  float x2 = float(base_ptr[i2]) * inv * float(w[d_half + half]);
+  float rx1 = x1 * c - x2 * s_;
+  float rx2 = x1 * s_ + x2 * c;
+  base_ptr[i1] = T(rx1);
+  base_ptr[i2] = T(rx2);
+}
+
 // clang-format off
 #define instantiate_rms(name, itype)                                \
   instantiate_kernel("rms" #name, rms_single_row, itype)            \
@@ -388,4 +463,7 @@ template <typename T, int N_READS = RMS_N_READS>
 
 instantiate_rms(float32, float)
 instantiate_rms(float16, half)
-instantiate_rms(bfloat16, bfloat16_t) // clang-format on
+instantiate_rms(bfloat16, bfloat16_t)
+instantiate_kernel("fused_qk_rms_rope_inplace_bfloat16", fused_qk_rms_rope_inplace, bfloat16_t)
+instantiate_kernel("fused_qk_rms_rope_inplace_float16", fused_qk_rms_rope_inplace, half)
+instantiate_kernel("fused_qk_rms_rope_inplace_float32", fused_qk_rms_rope_inplace, float) // clang-format on

@@ -12,6 +12,8 @@ public struct DenseTensorRecord: Equatable {
 }
 
 public final class DenseTensorStore {
+    public static let fusedQKRMSRoPEInplaceVersion = "fused-qk-rms-rope-inplace-v1"
+    public static let fusedQKRMSRoPEEliminatesIntermediateBHTD = true
     public let weightsPath: String
     private let recordsByName: [String: DenseTensorRecord]
 

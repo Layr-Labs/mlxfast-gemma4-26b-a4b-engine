@@ -1459,7 +1459,15 @@ METAL_FUNC void qmv_impl(
   }
 }
 
-template <typename T, const int group_size, const int bits>
+// `results_per_simdgroup` stays four for ordinary QMV. The exact routed
+// Gemma decode pair uses eight and lets alternate host y-groups return, so one
+// pair leader covers 16 output rows instead of 8 without changing any row's
+// qdot or reduction chain.
+template <
+    typename T,
+    const int group_size,
+    const int bits,
+    const int results_per_simdgroup = 4>
 METAL_FUNC void qmv_affine4_g64_pair_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1469,11 +1477,10 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
     device T* y0,
     device T* y1,
     const constant int& in_vec_size,
-    uint3 tid [[threadgroup_position_in_grid]],
+    uint output_tile,
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   constexpr int num_simdgroups = 2;
-  constexpr int results_per_simdgroup = 4;
   constexpr int values_per_thread = 8;
   constexpr int block_size = values_per_thread * SIMD_SIZE;
   constexpr int bytes_per_thread = 4;
@@ -1487,7 +1494,7 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
 
   const int in_vec_size_w = in_vec_size / 2;
   const int in_vec_size_g = in_vec_size / 64;
-  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+  const int out_row = output_tile * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
 
   ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
@@ -2767,7 +2774,7 @@ template <typename T, const int group_size, const int bits, bool batched>
         y + first_m * out_vec_size,
         y + (first_m + 1) * out_vec_size,
         in_vec_size,
-        tid,
+        tid.y,
         simd_gid,
         simd_lid);
     return;
@@ -3262,6 +3269,14 @@ template <typename T, int group_size, int bits>
         assignment + 1 < 64 &&
         rhs_indices[(assignment + 1) * (uint)rhs_strides[0]] == expert;
     if (has_pair) {
+      // The frozen host launches one y-group per eight output rows. Pair
+      // leaders use a 16-row tile, so only even groups execute and compact
+      // their coordinate by two. Every output row still runs the incumbent
+      // qdot/K-loop/simd_sum sequence; this only halves pair-group scheduling,
+      // lhs/rhs-index replay, and activation-vector loads.
+      if ((tid.y & 1) != 0) {
+        return;
+      }
       const uint32_t x0_idx =
           lhs_indices[assignment * (uint)lhs_strides[0]];
       const uint32_t x1_idx =
@@ -3273,7 +3288,7 @@ template <typename T, int group_size, int bits>
       const device T* pair_x1 = x + x1_idx * x_strides[0];
       device T* pair_y0 = y + assignment * out_vec_size;
       device T* pair_y1 = y + (assignment + 1) * out_vec_size;
-      qmv_affine4_g64_pair_impl<T, group_size, bits>(
+      qmv_affine4_g64_pair_impl<T, group_size, bits, 8>(
           pair_w,
           pair_scales,
           pair_biases,
@@ -3282,7 +3297,7 @@ template <typename T, int group_size, int bits>
           pair_y0,
           pair_y1,
           in_vec_size,
-          tid,
+          tid.y >> 1,
           simd_gid,
           simd_lid);
       return;

@@ -2394,6 +2394,254 @@ public enum Gemma4MMAQuantizedGEMV {
         ensureRowContiguous: true
     )
 
+    // MARK: - Attention projection train
+
+    /// Reuse version 9's one-weight-pass arithmetic across Gemma 4's complete
+    /// attention input projection train. The production geometries are:
+    ///
+    ///   * sliding: Q=4096, K=2048, V=2048 (8192 columns total);
+    ///   * full: Q=8192, K=1024, V=K (9216 columns total).
+    ///
+    /// The individual planes are deliberately not concatenated. A global
+    /// threadgroup coordinate selects one of the independent packed banks,
+    /// while all banks share one dispatch, one exact activation-sum prepass,
+    /// and version 9's eight-row matrix-unit body. Outputs remain independent
+    /// row-contiguous tensors, so Q/K/V normalization does not pay a slicing
+    /// materialization after the projection.
+    private static let attentionProjectionTrainSourceV1: String = {
+        var result = sourceV9
+
+        func replaceOnce(_ old: String, with new: String) {
+            precondition(
+                result.components(separatedBy: old).count == 2,
+                "Gemma 4 attention MMA projection-train marker drifted")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+
+        replaceOnce(
+            """
+            const uint n0 = tg * (N_SG * N_PSG);
+            const uint sgN0 = n0 + sg * N_PSG;
+            """,
+            with: """
+            const uint unionN0 = tg * (N_SG * N_PSG);
+            const uint projection = unionN0 < QN ? 0u :
+                (unionN0 < QN + KN ? 1u : 2u);
+            const uint n0 = projection == 0u ? unionN0 :
+                (projection == 1u ? unionN0 - QN : unionN0 - QN - KN);
+            const uint sgN0 = n0 + sg * N_PSG;
+            """
+        )
+        replaceOnce(
+            """
+            const device T* sRow = scales + (sgN0 + min(lane, N_PSG - 1)) * G_ROW;
+            const device T* bRow = biases + (sgN0 + min(lane, N_PSG - 1)) * G_ROW;
+            """,
+            with: """
+            const uint metadataRow = sgN0 + min(lane, N_PSG - 1);
+            const device T* sRow = projection == 0u
+                ? qScales + metadataRow * G_ROW
+                : (projection == 1u
+                    ? kScales + metadataRow * G_ROW
+                    : vScales + metadataRow * G_ROW);
+            const device T* bRow = projection == 0u
+                ? qBiases + metadataRow * G_ROW
+                : (projection == 1u
+                    ? kBiases + metadataRow * G_ROW
+                    : vBiases + metadataRow * G_ROW);
+            """
+        )
+        replaceOnce(
+            """
+            const device uint32_t* fragmentWRow =
+                w + (sgN0 + fragmentRow) * W_ROW_U32;
+            """,
+            with: """
+            const device uint32_t* selectedW = projection == 0u
+                ? qW : (projection == 1u ? kW : vW);
+            const device uint32_t* fragmentWRow =
+                selectedW + (sgN0 + fragmentRow) * W_ROW_U32;
+            """
+        )
+        replaceOnce(
+            """
+            const uint outputN = sgN0 + fragmentRow;
+            out[fragmentCol * N + outputN] = T(acc.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN] = T(acc.thread_elements()[1]);
+            """,
+            with: """
+            const uint outputN = sgN0 + fragmentRow;
+            if (projection == 0u) {
+                qOut[fragmentCol * QN + outputN] = T(acc.thread_elements()[0]);
+                qOut[(fragmentCol + 1) * QN + outputN] = T(acc.thread_elements()[1]);
+            } else if (projection == 1u) {
+                kOut[fragmentCol * KN + outputN] = T(acc.thread_elements()[0]);
+                kOut[(fragmentCol + 1) * KN + outputN] = T(acc.thread_elements()[1]);
+            } else {
+                vOut[fragmentCol * VN + outputN] = T(acc.thread_elements()[0]);
+                vOut[(fragmentCol + 1) * VN + outputN] = T(acc.thread_elements()[1]);
+            }
+            """
+        )
+
+        return result
+    }()
+
+    private static let attentionProjectionTrainKernelV1: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_mma_attention_projection_train_m8_v1",
+            inputNames: [
+                "x",
+                "qW", "qScales", "qBiases",
+                "kW", "kScales", "kBiases",
+                "vW", "vScales", "vBiases",
+                "xSums",
+            ],
+            outputNames: ["qOut", "kOut", "vOut"],
+            source: attentionProjectionTrainSourceV1,
+            header: "#include <metal_simdgroup_matrix>\n",
+            ensureRowContiguous: true
+        )
+
+    /// Independent Q/K/V tensors emitted by the single projection dispatch.
+    public struct AttentionProjectionTrain {
+        public let q: MLXArray
+        public let k: MLXArray
+        public let v: MLXArray?
+    }
+
+    /// Exact-production attention input projection train, or `nil` on any
+    /// representation/geometry drift. This is intentionally much narrower
+    /// than the tied-head entry point: it admits only the two target Gemma 4
+    /// B8/L1 shapes and requires bias-free affine4/group64 QuantizedLinear
+    /// components (the affine quantizer's per-group `biases` are required).
+    public static func applyAttentionProjectionTrain(
+        x: MLXArray,
+        qW: MLXArray,
+        qScales: MLXArray,
+        qBiases: MLXArray?,
+        kW: MLXArray,
+        kScales: MLXArray,
+        kBiases: MLXArray?,
+        vW: MLXArray?,
+        vScales: MLXArray?,
+        vBiases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode
+    ) -> AttentionProjectionTrain? {
+        guard attentionProjectionTrainEnabled,
+            groupSize == 64,
+            bits == 4,
+            mode == .affine,
+            let qBiases,
+            let kBiases,
+            x.dtype == .bfloat16,
+            x.shape == [mRows, 1, 2816],
+            x.size == mRows * 2816
+        else { return nil }
+
+        let k = 2816
+        let qn = qW.dim(0)
+        let kn = kW.dim(0)
+        let hasV = vW != nil || vScales != nil || vBiases != nil
+        let vn: Int
+        let selectedVW: MLXArray
+        let selectedVScales: MLXArray
+        let selectedVBiases: MLXArray
+
+        if hasV {
+            guard let vW, let vScales, let vBiases else { return nil }
+            vn = vW.dim(0)
+            selectedVW = vW
+            selectedVScales = vScales
+            selectedVBiases = vBiases
+        } else {
+            // The full-attention checkpoint has attention_k_eq_v=true and no
+            // V plane. Reusing K arguments keeps one fixed Metal signature;
+            // VN=0 ensures no threadgroup ever dereferences them as V.
+            vn = 0
+            selectedVW = kW
+            selectedVScales = kScales
+            selectedVBiases = kBiases
+        }
+
+        let sliding = qn == 4096 && kn == 2048 && vn == 2048
+        let full = qn == 8192 && kn == 1024 && vn == 0
+        guard sliding || full else { return nil }
+
+        @inline(__always)
+        func validPlane(
+            _ weight: MLXArray,
+            _ scales: MLXArray,
+            _ biases: MLXArray,
+            width: Int
+        ) -> Bool {
+            weight.dtype == .uint32
+                && scales.dtype == .bfloat16
+                && biases.dtype == .bfloat16
+                && weight.shape == [width, k * bits / 32]
+                && scales.shape == [width, k / groupSize]
+                && biases.shape == scales.shape
+        }
+
+        guard validPlane(qW, qScales, qBiases, width: qn),
+            validPlane(kW, kScales, kBiases, width: kn),
+            !hasV || validPlane(selectedVW, selectedVScales, selectedVBiases, width: vn)
+        else { return nil }
+
+        let flatX = x.reshaped([mRows, k])
+        let sumCells = mRows * (k / groupSize)
+        let sumThreads = 128
+        let sumThreadgroups = (sumCells + sumThreads - 1) / sumThreads
+        let xSums = xSumKernel(
+            [flatX],
+            template: [("T", x.dtype), ("K", k)],
+            grid: (sumThreadgroups * sumThreads, 1, 1),
+            threadGroup: (sumThreads, 1, 1),
+            outputShapes: [[sumCells]],
+            outputDTypes: [.float32]
+        )[0]
+
+        let totalWidth = qn + kn + vn
+        let outputs = attentionProjectionTrainKernelV1(
+            [
+                flatX,
+                qW, qScales, qBiases,
+                kW, kScales, kBiases,
+                selectedVW, selectedVScales, selectedVBiases,
+                xSums,
+            ],
+            template: [
+                ("T", x.dtype), ("K", k),
+                ("QN", qn), ("KN", kn), ("VN", vn),
+            ],
+            grid: ((totalWidth / colsPerThreadgroup) * threadsPerThreadgroup, 1, 1),
+            threadGroup: (threadsPerThreadgroup, 1, 1),
+            outputShapes: [
+                [mRows, qn],
+                [mRows, kn],
+                [mRows, max(vn, 1)],
+            ],
+            outputDTypes: [x.dtype, x.dtype, x.dtype]
+        )
+        return AttentionProjectionTrain(
+            q: outputs[0], k: outputs[1], v: hasV ? outputs[2] : nil)
+    }
+
+    /// Process-level kill switch for the attention projection train. It is
+    /// separate from the tied-head switch so either mechanism can be ablated
+    /// without perturbing the other.
+    private static let attentionProjectionTrainEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MMA_ATTN_QKV"]
+        else { return true }
+        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "0", "false", "no", "off": return false
+        default: return true
+        }
+    }()
+
     /// Tied-head GEMV, or `nil` when any gate above fails.
     ///
     /// - Parameters:

@@ -1521,6 +1521,356 @@ private enum Gemma4FusedRouterTop8 {
     }
 }
 
+private let gemma4MoEPostMergeKernel = MLXFast.metalKernel(
+    name: "gemma4_moe_post_merge_h2816_v1",
+    inputNames: ["h1", "h2", "weight", "residual"],
+    outputNames: ["out"],
+    source: """
+        constexpr uint AXIS = 2816, N_READS = 4, SIMD_SIZE = 32;
+        constexpr float EPS = 1.0e-6f;
+        const uint row = threadgroup_position_in_grid.y;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint simd_group = simdgroup_index_in_threadgroup;
+        const uint base = row * AXIS + lid * N_READS;
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[SIMD_SIZE];
+
+        T merged[N_READS];
+        float acc = 0.0f;
+        for (uint offset = 0; offset < N_READS; ++offset) {
+            merged[offset] = h1[base + offset] + h2[base + offset];
+            const float value = float(merged[offset]);
+            acc += value * value;
+        }
+        acc = simd_sum(acc);
+        if (simd_group == 0) { local_sums[lane] = 0.0f; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) { local_sums[simd_group] = acc; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            acc = simd_sum(local_sums[lane]);
+            if (lane == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(acc / AXIS + EPS);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint offset = 0; offset < N_READS; ++offset) {
+            const uint column = lid * N_READS + offset;
+            const T normalized = T(float(merged[offset]) * local_inv_mean[0]);
+            const T weighted = weight[column] * normalized;
+            out[base + offset] = residual[base + offset] + weighted;
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+@_spi(Testing) public func gemma4MoEPostMerge(
+    _ h1: MLXArray,
+    _ h2: MLXArray,
+    weight: MLXArray,
+    residual: MLXArray,
+    eps: Float = 1e-6
+) -> MLXArray? {
+    guard h1.dtype == .bfloat16, h1.ndim > 0, h1.dim(-1) == 2816,
+        h2.dtype == .bfloat16, h2.shape == h1.shape,
+        residual.dtype == .bfloat16, residual.shape == h1.shape,
+        weight.dtype == .bfloat16, weight.shape == [2816], eps == 1e-6
+    else { return nil }
+    let rows = h1.size / 2816
+    return gemma4MoEPostMergeKernel(
+        [h1, h2, weight, residual],
+        template: [("T", h1.dtype)],
+        grid: (704, rows, 1),
+        threadGroup: (704, 1, 1),
+        outputShapes: [[rows, 2816]],
+        outputDTypes: [.bfloat16]
+    )[0].reshaped(h1.shape)
+}
+
+@_spi(Testing) public func gemma4ShouldFuseMoEPostMerge(rowCount: Int) -> Bool {
+    rowCount >= 128
+}
+
+private let gemma4RouterTop8Header = """
+    inline uint gemma4_router_ordinal(float value) {
+        if (isnan(value)) { return 0xFFFFFFFFu; }
+        if (value == 0.0f) { return 0x80000000u; }
+        const uint bits = as_type<uint>(value);
+        return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+    }
+"""
+
+private let gemma4RouterTop8IndicesKernel = MLXFast.metalKernel(
+    name: "gemma4_router_top8_indices_e128_v1",
+    inputNames: ["scores"],
+    outputNames: ["indices"],
+    source: """
+        constexpr uint E = 128, K = 8;
+        const uint row = threadgroup_position_in_grid.y;
+        const uint lane = thread_index_in_simdgroup;
+        const device T* values = scores + row * E;
+        device uint* output = indices + row * K;
+
+        uint ord[4], ids[4];
+        for (uint slot = 0; slot < 4; ++slot) {
+            const uint index = lane + slot * 32;
+            ord[slot] = gemma4_router_ordinal(float(values[index]));
+            ids[slot] = index;
+        }
+
+        uint taken = 0;
+        for (uint rank = 0; rank < K; ++rank) {
+            uint best_ord = 0, best_id = 0, best_slot = 0xFFFFFFFFu;
+            for (uint slot = 0; slot < 4; ++slot) {
+                if ((taken & (1u << slot)) != 0) { continue; }
+                if (ord[slot] > best_ord
+                    || (ord[slot] == best_ord && ids[slot] > best_id)) {
+                    best_ord = ord[slot];
+                    best_id = ids[slot];
+                    best_slot = slot;
+                }
+            }
+            const uint winner_ord = simd_max(best_ord);
+            const uint winner_id = simd_max(best_ord == winner_ord ? best_id : 0u);
+            if (best_slot != 0xFFFFFFFFu
+                && best_ord == winner_ord && best_id == winner_id) {
+                taken |= 1u << best_slot;
+            }
+            if (lane == 0) { output[K - 1u - rank] = winner_id; }
+        }
+    """,
+    header: gemma4RouterTop8Header,
+    ensureRowContiguous: true
+)
+
+private let gemma4RouterTop8ValuesKernel = MLXFast.metalKernel(
+    name: "gemma4_router_top8_values_e128_v2",
+    inputNames: ["scores", "expert_scales"],
+    outputNames: ["indices", "selected_scores", "selected_scales"],
+    source: """
+        constexpr uint E = 128, K = 8;
+        const uint row = threadgroup_position_in_grid.y;
+        const uint lane = thread_index_in_simdgroup;
+        const device T* values = scores + row * E;
+        device uint* output = indices + row * K;
+        device T* score_output = selected_scores + row * K;
+        device T* scale_output = selected_scales + row * K;
+
+        uint ord[4], ids[4];
+        for (uint slot = 0; slot < 4; ++slot) {
+            const uint index = lane + slot * 32;
+            ord[slot] = gemma4_router_ordinal(float(values[index]));
+            ids[slot] = index;
+        }
+
+        uint taken = 0;
+        for (uint rank = 0; rank < K; ++rank) {
+            uint best_ord = 0, best_id = 0, best_slot = 0xFFFFFFFFu;
+            for (uint slot = 0; slot < 4; ++slot) {
+                if ((taken & (1u << slot)) != 0) { continue; }
+                if (ord[slot] > best_ord
+                    || (ord[slot] == best_ord && ids[slot] > best_id)) {
+                    best_ord = ord[slot];
+                    best_id = ids[slot];
+                    best_slot = slot;
+                }
+            }
+            const uint winner_ord = simd_max(best_ord);
+            const uint winner_id = simd_max(best_ord == winner_ord ? best_id : 0u);
+            if (best_slot != 0xFFFFFFFFu
+                && best_ord == winner_ord && best_id == winner_id) {
+                taken |= 1u << best_slot;
+            }
+            if (lane == 0) {
+                const uint destination = K - 1u - rank;
+                output[destination] = winner_id;
+                score_output[destination] = values[winner_id];
+                scale_output[destination] = expert_scales[winner_id];
+            }
+        }
+    """,
+    header: gemma4RouterTop8Header,
+    ensureRowContiguous: true
+)
+
+private let gemma4RouterTop8WeightsKernel = MLXFast.metalKernel(
+    name: "gemma4_router_top8_weights_e128_v1",
+    inputNames: ["scores", "expert_scales"],
+    outputNames: ["indices", "weights"],
+    source: """
+        constexpr uint E = 128, K = 8, N_READS = 4;
+        constexpr float FINITE_MIN = -3.402823466e+38F;
+        const uint row = threadgroup_position_in_grid.y;
+        const uint lane = thread_index_in_simdgroup;
+        const device T* values = scores + row * E;
+        device uint* index_output = indices + row * K;
+        device T* weight_output = weights + row * K;
+        threadgroup uint selected_ids[K];
+
+        uint ord[4], ids[4];
+        for (uint slot = 0; slot < 4; ++slot) {
+            const uint index = lane + slot * 32;
+            ord[slot] = gemma4_router_ordinal(float(values[index]));
+            ids[slot] = index;
+        }
+        uint taken = 0;
+        for (uint rank = 0; rank < K; ++rank) {
+            uint best_ord = 0, best_id = 0, best_slot = 0xFFFFFFFFu;
+            for (uint slot = 0; slot < 4; ++slot) {
+                if ((taken & (1u << slot)) != 0) { continue; }
+                if (ord[slot] > best_ord
+                    || (ord[slot] == best_ord && ids[slot] > best_id)) {
+                    best_ord = ord[slot];
+                    best_id = ids[slot];
+                    best_slot = slot;
+                }
+            }
+            const uint winner_ord = simd_max(best_ord);
+            const uint winner_id = simd_max(best_ord == winner_ord ? best_id : 0u);
+            if (best_slot != 0xFFFFFFFFu
+                && best_ord == winner_ord && best_id == winner_id) {
+                taken |= 1u << best_slot;
+            }
+            if (lane == 0) {
+                const uint destination = K - 1u - rank;
+                selected_ids[destination] = winner_id;
+                index_output[destination] = winner_id;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup float local_max[32];
+        threadgroup float local_normalizer[32];
+        float selected[N_READS];
+        for (uint offset = 0; offset < N_READS; ++offset) {
+            const uint position = lane * N_READS + offset;
+            selected[offset] = position < K
+                ? float(values[selected_ids[position]]) : FINITE_MIN;
+        }
+        local_max[lane] = FINITE_MIN;
+        local_normalizer[lane] = 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float max_value = FINITE_MIN;
+        for (uint offset = 0; offset < N_READS; ++offset) {
+            max_value = max_value < selected[offset] ? selected[offset] : max_value;
+        }
+        max_value = simd_max(max_value);
+        if (lane == 0) { local_max[0] = max_value; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        max_value = local_max[0];
+
+        float normalizer = 0.0f;
+        for (uint offset = 0; offset < N_READS; ++offset) {
+            const float exponential = fast::exp(selected[offset] - max_value);
+            selected[offset] = exponential;
+            normalizer += exponential;
+        }
+        normalizer = simd_sum(normalizer);
+        if (lane == 0) { local_normalizer[0] = normalizer; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        normalizer = 1.0f / local_normalizer[0];
+
+        if (lane < 2) {
+            for (uint offset = 0; offset < N_READS; ++offset) {
+                const uint position = lane * N_READS + offset;
+                const T rounded = T(selected[offset] * normalizer);
+                weight_output[position] = rounded * expert_scales[selected_ids[position]];
+            }
+        }
+    """,
+    header: gemma4RouterTop8Header,
+    ensureRowContiguous: true
+)
+
+private func gemma4RouterTop8Outputs(
+    _ scores: MLXArray, expertScales: MLXArray
+) -> [MLXArray]? {
+    guard scores.dtype == .bfloat16, scores.ndim > 0, scores.dim(-1) == 128,
+        expertScales.dtype == .bfloat16, expertScales.shape == [128]
+    else {
+        return nil
+    }
+    let rows = scores.size / 128
+    return gemma4RouterTop8ValuesKernel(
+        [scores, expertScales],
+        template: [("T", scores.dtype)],
+        grid: (32, rows, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [[rows, 8], [rows, 8], [rows, 8]],
+        outputDTypes: [.uint32, .bfloat16, .bfloat16]
+    )
+}
+
+@_spi(Testing) public func gemma4RouterTop8Indices(_ scores: MLXArray) -> MLXArray? {
+    guard scores.dtype == .bfloat16, scores.ndim > 0, scores.dim(-1) == 128 else {
+        return nil
+    }
+    let rows = scores.size / 128
+    var outputShape = scores.shape
+    outputShape[outputShape.count - 1] = 8
+    return gemma4RouterTop8IndicesKernel(
+        [scores],
+        template: [("T", scores.dtype)],
+        grid: (32, rows, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [[rows, 8]],
+        outputDTypes: [.uint32]
+    )[0].reshaped(outputShape)
+}
+
+@_spi(Testing) public func gemma4RouterTop8Values(
+    _ scores: MLXArray, expertScales: MLXArray
+) -> (indices: MLXArray, scores: MLXArray, scales: MLXArray)? {
+    guard let outputs = gemma4RouterTop8Outputs(scores, expertScales: expertScales) else {
+        return nil
+    }
+    var outputShape = scores.shape
+    outputShape[outputShape.count - 1] = 8
+    return (
+        outputs[0].reshaped(outputShape),
+        outputs[1].reshaped(outputShape),
+        outputs[2].reshaped(outputShape))
+}
+
+@_spi(Testing) public func gemma4RouterTop8HybridValues(
+    _ scores: MLXArray, expertScales: MLXArray
+) -> (indices: MLXArray, scores: MLXArray, scales: MLXArray)? {
+    guard scores.ndim > 0 else { return nil }
+    let rows = scores.size / 128
+    if rows >= 64 {
+        return gemma4RouterTop8Values(scores, expertScales: expertScales)
+    }
+    guard expertScales.dtype == .bfloat16, expertScales.shape == [128],
+        let indices = gemma4RouterTop8Indices(scores)
+    else { return nil }
+    return (
+        indices,
+        MLX.takeAlong(scores, indices, axis: -1),
+        expertScales[indices])
+}
+
+@_spi(Testing) public func gemma4RouterTop8FusedWeights(
+    _ scores: MLXArray, expertScales: MLXArray
+) -> (indices: MLXArray, weights: MLXArray)? {
+    guard scores.dtype == .bfloat16, scores.ndim > 0, scores.dim(-1) == 128,
+        expertScales.dtype == .bfloat16, expertScales.shape == [128]
+    else { return nil }
+    let rows = scores.size / 128
+    var outputShape = scores.shape
+    outputShape[outputShape.count - 1] = 8
+    let output = gemma4RouterTop8WeightsKernel(
+        [scores, expertScales],
+        template: [("T", scores.dtype)],
+        grid: (32, rows, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [[rows, 8], [rows, 8]],
+        outputDTypes: [.uint32, .bfloat16])
+    return (output[0].reshaped(outputShape), output[1].reshaped(outputShape))
+}
+
 /// Expert router. Norms `x` with a learnable scale, projects to expert
 /// scores, and returns top-K (indices, weights) where weights are
 /// softmax-normalized and scaled by a per-expert scalar.
@@ -1563,6 +1913,20 @@ private class Gemma4Router: Module {
         }
         let normed = MLXFast.rmsNorm(x, weight: effScale, eps: eps)
         let expertScores = proj(normed)
+
+        // PORT ROUTE-002: gemma4_router_top8 fused kernels — exact fixed-128
+        // top-8 selector with fused softmax/scale weights, engaged for ANY row
+        // count at topK == 8 (ranked B=8 decode and cohort prefill alike).
+        // Bit-exact parity with the stock argPartition/takeAlong/softmax/
+        // scale chain is verified adversarially (Gemma4RouterTop8Tests). Falls
+        // through to ROUTE-001 / stock chain on any shape or dtype mismatch.
+        if topK == 8,
+            let selected = gemma4RouterTop8FusedWeights(
+                expertScores, expertScales: perExpertScale)
+        {
+            Gemma4RouterProbe.recorder?(expertScores, selected.indices)
+            return (selected.indices, selected.weights)
+        }
 
         // ROUTE-001: single-dispatch byte-identical replacement of the chain
         // below for the B=8 decode geometry. Every other geometry, dtype, or
@@ -1797,6 +2161,7 @@ public class Gemma4DecoderLayer: Module {
 
         let residual2 = out
 
+        var completedPostMerge = false
         if isMoE,
             let router,
             let experts,
@@ -1818,14 +2183,32 @@ public class Gemma4DecoderLayer: Module {
                 isExpertPrefill: isExpertPrefill)
             h2 = postFeedforwardLayernorm2(h2)
 
-            out = h1 + h2
+            // PORT: fold the final post-feedforward RMSNorm + residual add on
+            // the dense/sparse sum into one kernel at large row counts
+            // (cohort prefill B=8: 8192 rows). Bit-identical math: merged =
+            // h1 + h2, then residual + weight * rms-normalized(merged) with
+            // the same eps; verified by Gemma4MoEPostMergeTests. Decode
+            // (8 rows) and other geometries keep the stock two-dispatcher
+            // path.
+            if gemma4ShouldFuseMoEPostMerge(rowCount: h1.size / h1.dim(-1)),
+                let fused = gemma4MoEPostMerge(
+                h1, h2, weight: postFeedforwardLayernorm.weight,
+                residual: residual2, eps: postFeedforwardLayernorm.eps)
+            {
+                out = fused
+                completedPostMerge = true
+            } else {
+                out = h1 + h2
+            }
         } else {
             out = preFeedforwardLayernorm(out)
             out = mlp(out)
         }
 
-        out = postFeedforwardLayernorm(out)
-        out = residual2 + out
+        if !completedPostMerge {
+            out = postFeedforwardLayernorm(out)
+            out = residual2 + out
+        }
 
         // PLE gating
         if let gate = perLayerInputGate,

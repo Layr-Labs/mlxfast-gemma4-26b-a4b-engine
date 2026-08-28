@@ -59,6 +59,19 @@ public protocol CBv2MTPForwardable: AnyObject {
     /// plain forward on the logits side.
     func cbv2ForwardWithHidden(_ tokens: MLXArray, caches: [KVCache])
         -> (logits: MLXArray, lastHidden: MLXArray)
+    /// Target-token specialization. Implementations may avoid materializing
+    /// full logits when they preserve the same argmax result.
+    func cbv2ArgmaxWithHidden(_ tokens: MLXArray, caches: [KVCache])
+        -> (argmax: MLXArray, lastHidden: MLXArray)
+}
+
+extension CBv2MTPForwardable {
+    public func cbv2ArgmaxWithHidden(_ tokens: MLXArray, caches: [KVCache])
+        -> (argmax: MLXArray, lastHidden: MLXArray)
+    {
+        let output = cbv2ForwardWithHidden(tokens, caches: caches)
+        return (argMax(output.logits, axis: -1).asType(.int32), output.lastHidden)
+    }
 }
 
 /// Steppable models that can drive MTP rounds. Additive refinement of
@@ -76,10 +89,20 @@ public protocol CBv2MTPSteppableModel: CBv2SteppableModel {
     /// [B, L, hidden]. Same cache/attention semantics as `forward`.
     func forwardWithHidden(tokens: MLXArray, caches: [CBv2AttendingLayerCache])
         -> (logits: MLXArray, lastHidden: MLXArray)
+    /// Forward returning target argmax IDs [B, L] and pre-norm last hidden.
+    func argmaxWithHidden(tokens: MLXArray, caches: [CBv2AttendingLayerCache])
+        -> (argmax: MLXArray, lastHidden: MLXArray)
 }
 
 extension CBv2MTPSteppableModel {
     public var mtpTargetIdentity: ObjectIdentifier? { nil }
+
+    public func argmaxWithHidden(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> (argmax: MLXArray, lastHidden: MLXArray) {
+        let output = forwardWithHidden(tokens: tokens, caches: caches)
+        return (argMax(output.logits, axis: -1).asType(.int32), output.lastHidden)
+    }
 }
 
 // MARK: - Drafter seam
@@ -282,6 +305,8 @@ public struct CBv2MTPMetrics: Sendable {
     /// both across batch/depth regimes.
     public var rectangularVerificationRounds: Int = 0
     public var serialVerificationRounds: Int = 0
+    /// Target model forwards launched by verification rounds.
+    public var targetVerificationForwardPasses: Int = 0
     /// Most recently selected step-global depth (zero means target-only).
     public var selectedDepth: Int = 0
     /// Planned decode-row bucket used for the most recent selection.

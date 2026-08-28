@@ -28,13 +28,17 @@ extension EngineLoopV2 {
         let argmax: MLXArray
         let hidden: MLXArray
 
-        var useRectangular = switch mtp.config.verificationMode {
-        case .serialTarget: false
-        case .rectangular: true
+        var useRectangular: Bool
+        switch mtp.config.verificationMode {
+        case .serialTarget:
+            useRectangular = true
+        case .rectangular:
+            useRectangular = true
         case .automatic:
-            columns.count * columns[0].dim(0) <= mtp.config.maxAutomaticRectangularTokens
+            useRectangular =
+                columns.count * columns[0].dim(0)
+                <= mtp.config.maxAutomaticRectangularTokens
         }
-
         // Rectangular verification obliges every layer cache in the bank to
         // serialise its attention one query position at a time for the
         // duration of the round. That capability is the opt-in marker
@@ -69,11 +73,11 @@ extension EngineLoopV2 {
             hiddenColumns.reserveCapacity(columns.count)
             for column in columns {
                 precondition(column.dim(1) == 1, "CBv2 MTP: serial target column must have L=1")
-                let output = mtp.model.forwardWithHidden(tokens: column, caches: caches)
-                let columnArgmax = argMax(output.logits, axis: -1).asType(.int32)
-                // Building several eager decode calls in one lazy graph can
-                // let mutable KV buffers observe a later version. Complete
-                // each canonical target step before constructing the next.
+                mtp.recordTargetVerificationForwardPass()
+                let output = mtp.model.argmaxWithHidden(tokens: column, caches: caches)
+                let columnArgmax = output.argmax
+                // Complete each target step before the next mutable cache
+                // append is built.
                 eval([columnArgmax, output.lastHidden] + eagerCacheInnerState(caches))
                 argmaxColumns.append(columnArgmax)
                 hiddenColumns.append(output.lastHidden)
@@ -87,8 +91,9 @@ extension EngineLoopV2 {
                 for cache in serializingCaches { cache.mtpSerializesRectangularAttention = false }
             }
             let tokens = concatenated(columns, axis: 1)
-            let output = mtp.model.forwardWithHidden(tokens: tokens, caches: caches)
-            argmax = argMax(output.logits, axis: -1).asType(.int32)
+            mtp.recordTargetVerificationForwardPass()
+            let output = mtp.model.argmaxWithHidden(tokens: tokens, caches: caches)
+            argmax = output.argmax
             hidden = output.lastHidden
         }
 

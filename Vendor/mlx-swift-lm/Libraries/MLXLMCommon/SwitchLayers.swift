@@ -249,8 +249,47 @@ public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, M
     )
 }
 
+/// Single-dispatch stable rank-sort for the exact B=8 decode assignment plane
+/// (64 keys over the 128-expert alphabet). Each thread computes its
+/// assignment's stable rank directly — strictly-smaller keys plus earlier
+/// equal keys — which is the definition the two-argSort pipeline below
+/// realizes, so all three outputs are bit-identical to it (stability
+/// included). One 64-thread dispatch replaces two bitonic argSort pipelines,
+/// a floor-divide, and a gather on every MoE layer of every decode step.
+private let gemma4GatherSort64Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "gemma4_gather_sort_64",
+    inputNames: ["indices"],
+    outputNames: ["lhs_indices", "sorted_indices", "inverse_order"],
+    source: """
+        const uint assignment = thread_position_in_grid.x;
+        const uint key = (uint)indices[assignment];
+        uint rank = 0;
+        for (uint other = 0; other < 64; ++other) {
+            const uint other_key = (uint)indices[other];
+            rank += (uint)((other_key < key)
+                || (other_key == key && other < assignment));
+        }
+        lhs_indices[rank] = assignment / 8;
+        sorted_indices[rank] = key;
+        inverse_order[assignment] = rank;
+    """,
+    ensureRowContiguous: true
+)
+
 public func gatherSortIndices(indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
+    // Exact ranked decode plane only: [8, 8] uint32. Every other shape,
+    // dtype, or width keeps the established sort pipeline.
+    if indices.ndim == 2, indices.shape == [8, 8], indices.dtype == .uint32 {
+        let outs = gemma4GatherSort64Kernel(
+            [indices],
+            grid: (64, 1, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [[64], [64], [64]],
+            outputDTypes: [.uint32, .uint32, .uint32]
+        )
+        return (outs[0], outs[1], outs[2])
+    }
     let indices = indices.flattened()
     let order = argSort(indices)
     return (order.floorDivide(m), indices[order], argSort(order))
@@ -385,6 +424,44 @@ public class SwitchGLU: Module {
         super.init()
     }
 
+    /// Gate/up projection plus the configured GLU activation.  Keeping this
+    /// as one helper lets the exact routed-down fusion consume the same sorted
+    /// BF16 activation that the established `downProj` consumes, without
+    /// changing the generic projection graph.
+    private func activateExperts(
+        _ x: MLXArray,
+        _ indices: MLXArray,
+        lhsIndices: MLXArray?,
+        sortedIndices: Bool
+    ) -> MLXArray {
+        let xGate: MLXArray
+        let xUp: MLXArray
+        if let gateUpProj {
+            let xGateUp = gateUpProj(
+                x, indices, lhsIndices: lhsIndices, sortedIndices: sortedIndices)
+            xGate = xGateUp[.ellipsis, ..<hiddenDims]
+            xUp = xGateUp[.ellipsis, hiddenDims...]
+        } else {
+            guard let gateProj, let upProj else {
+                preconditionFailure("SwitchGLU requires gate_up_proj or gate_proj/up_proj")
+            }
+            xUp = upProj(
+                x, indices, lhsIndices: lhsIndices, sortedIndices: sortedIndices)
+            xGate = gateProj(
+                x, indices, lhsIndices: lhsIndices, sortedIndices: sortedIndices)
+        }
+
+        if let activationProduct {
+            return activationProduct(xGate, xUp)
+        } else if isSiluActivation {
+            return compiledSwiGLU(xGate, xUp)
+        } else if isGeluActivation {
+            return compiledGeGLU(xGate, xUp)
+        } else {
+            return activation(xGate) * xUp
+        }
+    }
+
     private func projectExperts(
         _ x: MLXArray, _ indices: MLXArray
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
@@ -406,31 +483,8 @@ public class SwitchGLU: Module {
             }
         }
 
-        let xGate: MLXArray
-        let xUp: MLXArray
-        if let gateUpProj {
-            let xGateUp = gateUpProj(
-                x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
-            xGate = xGateUp[.ellipsis, ..<hiddenDims]
-            xUp = xGateUp[.ellipsis, hiddenDims...]
-        } else {
-            guard let gateProj, let upProj else {
-                preconditionFailure("SwitchGLU requires gate_up_proj or gate_proj/up_proj")
-            }
-            xUp = upProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
-            xGate = gateProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
-        }
-
-        let activated: MLXArray
-        if let activationProduct {
-            activated = activationProduct(xGate, xUp)
-        } else if isSiluActivation {
-            activated = compiledSwiGLU(xGate, xUp)
-        } else if isGeluActivation {
-            activated = compiledGeGLU(xGate, xUp)
-        } else {
-            activated = activation(xGate) * xUp
-        }
+        let activated = activateExperts(
+            x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
 
         x = downProj(activated, idx, sortedIndices: doSort)
         return (x, doSort ? inverseOrder : nil, doSort)
@@ -474,6 +528,100 @@ public class SwitchGLU: Module {
             && indices.size >= 64
     }
 
+    /// Exact module/array gate for GEMMA-DOWN-001.  The value-only portion is
+    /// delegated to `gemma4RoutedDownReduceEligible`; concrete parameter
+    /// dtypes, shapes, and dynamic subclass identity fail closed here.
+    private func routedDownReductionModule(
+        _ x: MLXArray,
+        _ indices: MLXArray,
+        weights: MLXArray,
+        isProductionDecodeBatch8: Bool
+    ) -> QuantizedSwitchLinear? {
+        guard gemma4RoutedDownReduceRequested,
+            isProductionDecodeBatch8,
+            weightedReductionProfile == .gemma4ProductionGeGLU,
+            gateUpProj == nil,
+            activationProduct == nil,
+            isGeluActivation,
+            x.ndim == 2,
+            x.shape == [8, 2816],
+            x.dtype == .bfloat16,
+            indices.ndim == 2,
+            indices.shape == [8, 8],
+            indices.dtype == .uint32,
+            weights.ndim == 2,
+            weights.shape == [8, 8],
+            weights.dtype == .bfloat16,
+            let down = downProj as? QuantizedSwitchLinear,
+            type(of: down) == QuantizedSwitchLinear.self,
+            let affineBiases = down.biases,
+            gemma4RoutedDownReduceEligible(
+                Gemma4RoutedDownReduceContract(
+                    productionGeGLUProfile: true,
+                    hasSeparateGateAndUp: gateProj != nil && upProj != nil,
+                    inputDims: inputDims,
+                    hiddenDims: hiddenDims,
+                    numExperts: numExperts,
+                    batchSize: x.dim(0),
+                    sequenceLength: 1,
+                    topK: indices.dim(1),
+                    quantizationBits: down.bits,
+                    quantizationGroupSize: down.groupSize,
+                    affineQuantization: down.mode == .affine,
+                    hasProjectionBias: down.bias != nil,
+                    hasAffineBiases: true)),
+            down.weight.shape == [128, 2816, 88],
+            down.weight.dtype == .uint32,
+            down.weight.strides == [2816 * 88, 88, 1],
+            down.scales.shape == [128, 2816, 11],
+            down.scales.dtype == .bfloat16,
+            down.scales.strides == [2816 * 11, 11, 1],
+            affineBiases.shape == down.scales.shape,
+            affineBiases.dtype == .bfloat16,
+            affineBiases.strides == down.scales.strides
+        else { return nil }
+        return down
+    }
+
+    /// Sort and activate the 64 assignments exactly as `projectExperts`, then
+    /// consume the quantized down bank and established ordered reduction in a
+    /// single tiled kernel.  `nil` means the caller must keep the stock graph.
+    private func fusedRoutedDownReduction(
+        _ x: MLXArray,
+        _ indices: MLXArray,
+        weights: MLXArray,
+        isProductionDecodeBatch8: Bool
+    ) -> MLXArray? {
+        guard let down = routedDownReductionModule(
+            x, indices, weights: weights,
+            isProductionDecodeBatch8: isProductionDecodeBatch8),
+            let downBiases = down.biases
+        else { return nil }
+
+        var projectedInput = MLX.expandedDimensions(x, axes: [-2, -3])
+        projectedInput = projectedInput.flattened(start: 0, end: -3)
+        let (lhsIndices, sortedIndices, inverseOrder) = gatherSortIndices(indices: indices)
+        let activated = activateExperts(
+            projectedInput,
+            sortedIndices,
+            lhsIndices: lhsIndices,
+            sortedIndices: true)
+        guard activated.dtype == .bfloat16,
+            activated.size == 64 * 704,
+            activated.dim(-1) == 704
+        else { return nil }
+
+        weightedExpertUnsortProbe.recordEffective()
+        return gemma4RoutedDownReduce(
+            activated: activated,
+            downWeight: down.weight,
+            downScales: down.scales,
+            downBiases: downBiases,
+            sortedIndices: sortedIndices,
+            inverseOrder: inverseOrder,
+            routerWeights: weights)
+    }
+
     public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
         var projected = projectExperts(x, indices)
         if let inverseOrder = projected.inverseOrder {
@@ -495,7 +643,8 @@ public class SwitchGLU: Module {
         _ indices: MLXArray,
         weights: MLXArray,
         fuseSortedReduction: Bool,
-        isProductionPrefill: Bool = true
+        isProductionPrefill: Bool = true,
+        isProductionDecodeBatch8: Bool = false
     ) -> MLXArray {
         // At B=8 decode there are exactly 64 assignments (8 rows x top-k 8),
         // which is the sorting threshold and the minimum geometry accepted by
@@ -507,6 +656,14 @@ public class SwitchGLU: Module {
             supportsWeightedExpertUnsort(x, indices, weights: weights)
         else {
             return weightedExpertSum(callAsFunction(x, indices), weights)
+        }
+
+        if isEightRowDecode,
+            let fused = fusedRoutedDownReduction(
+                x, indices, weights: weights,
+                isProductionDecodeBatch8: isProductionDecodeBatch8)
+        {
+            return fused
         }
 
         let projected = projectExperts(x, indices)

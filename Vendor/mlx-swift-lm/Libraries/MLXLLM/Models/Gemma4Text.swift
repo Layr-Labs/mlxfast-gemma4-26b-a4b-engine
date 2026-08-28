@@ -915,6 +915,25 @@ private func gemma4AttentionFallback(
 
 // MARK: - Attention
 
+@inline(__always)
+private func gemma4AttentionQMV(
+    _ layer: Linear,
+    _ x: MLXArray
+) -> MLXArray? {
+    guard let quantized = layer as? QuantizedLinear,
+        quantized.bias == nil,
+        quantized.groupSize == 64,
+        quantized.bits == 4,
+        quantized.mode == .affine
+    else { return nil }
+    return CBv2AttentionQMV4QuadStreamV1.matmul(
+        x: x,
+        weight: quantized.weight,
+        scales: quantized.scales,
+        biases: quantized.biases,
+        outputDimension: quantized.shape.0)
+}
+
 private class Gemma4Attention: Module {
     let config: Gemma4TextConfiguration
     let layerIdx: Int
@@ -1026,7 +1045,8 @@ private class Gemma4Attention: Module {
 
         let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
 
-        var queries = qProj(x).reshaped(B, L, nHeads, effectiveHeadDim)
+        var queries = (gemma4AttentionQMV(qProj, x) ?? qProj(x))
+            .reshaped(B, L, nHeads, effectiveHeadDim)
         queries = qNorm(queries)
 
         let keys: MLXArray
@@ -1042,7 +1062,8 @@ private class Gemma4Attention: Module {
                 preconditionFailure("Gemma4 shared-KV layers require sharedKV input")
             }
 
-            let kRaw = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            let kRaw = (gemma4AttentionQMV(kProj, x) ?? kProj(x))
+                .reshaped(B, L, nKvHeads, effectiveHeadDim)
             var k = kNorm(kRaw)
             k = k.transposed(0, 2, 1, 3)
             k = gemma4ApplyRotaryPosition(rope, to: k, offset: activePositionOffset)
@@ -1053,7 +1074,8 @@ private class Gemma4Attention: Module {
             // `[B, n_kv_heads, L, D]` layout as keys.
             var v: MLXArray
             if let vProj {
-                v = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+                v = (gemma4AttentionQMV(vProj, x) ?? vProj(x))
+                    .reshaped(B, L, nKvHeads, effectiveHeadDim)
             } else {
                 v = kRaw
             }
@@ -1182,7 +1204,8 @@ private class Gemma4Attention: Module {
         let queryInput = lastQueryCache == nil ? x : x[0..., outputStart..., 0...]
         let queryLength = queryInput.dim(1)
 
-        let queryRaw = qProj(queryInput).reshaped(B, queryLength, nHeads, effectiveHeadDim)
+        let queryRaw = (gemma4AttentionQMV(qProj, queryInput) ?? qProj(queryInput))
+            .reshaped(B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
             // KV-shared layer: projects queries only and borrows (K, V) from
@@ -1244,10 +1267,12 @@ private class Gemma4Attention: Module {
             lastQueryCache == nil
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
-        let kRaw = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+        let kRaw = (gemma4AttentionQMV(kProj, x) ?? kProj(x))
+            .reshaped(B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
         if let vProj {
-            vRaw = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            vRaw = (gemma4AttentionQMV(vProj, x) ?? vProj(x))
+                .reshaped(B, L, nKvHeads, effectiveHeadDim)
         } else {
             vRaw = kRaw
         }

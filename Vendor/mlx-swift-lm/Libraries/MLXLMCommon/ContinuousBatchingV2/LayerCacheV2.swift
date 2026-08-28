@@ -173,6 +173,26 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?
     ) -> MLXArray {
+        updateAndAttendImpl(
+            queries: queries, keys: keys, values: values,
+            scale: scale, sinks: sinks, positionOffsets: nil)
+    }
+
+    /// Gemma contiguous-bank path: reuse its graph-safe pre-step RoPE snapshot
+    /// as fused ring metadata instead of uploading identical host starts per layer.
+    public func updateAndAttend(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?, positionOffsets: MLXArray
+    ) -> MLXArray {
+        updateAndAttendImpl(
+            queries: queries, keys: keys, values: values,
+            scale: scale, sinks: sinks, positionOffsets: positionOffsets)
+    }
+
+    private func updateAndAttendImpl(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?, positionOffsets: MLXArray?
+    ) -> MLXArray {
         precondition(
             kind.sharesKVWithLayer == nil,
             "CBv2LayerCache: KV-shared layer \(layerIndex) must use attendBorrowing")
@@ -183,6 +203,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             spanContexts: boundSpanContexts,
             serializeQueries: mtpSerializesRectangularAttention,
             decodeRingWriteFence: decodeRingWriteFence,
+            positionOffsets: positionOffsets,
             allowFusedRingWrite: !retainsChunkForBorrowers)
         // Advance offsets ON-DEVICE. A unified bank elects exactly one owning
         // cache; Gemma snapshots the shared pre-step value before this call.

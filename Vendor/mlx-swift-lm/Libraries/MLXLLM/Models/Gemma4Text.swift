@@ -1273,6 +1273,10 @@ private class Gemma4Attention: Module {
         if let lastQueryCache {
             attention = lastQueryCache.updateAndAttendLastQuery(
                 queries: attentionQueries, keys: k, values: v, scale: scale, sinks: nil)
+        } else if let contiguousCache = layerCache as? CBv2LayerCache {
+            attention = contiguousCache.updateAndAttend(
+                queries: attentionQueries, keys: k, values: v,
+                scale: scale, sinks: nil, positionOffsets: capturedOffsets)
         } else {
             attention = layerCache.updateAndAttend(
                 queries: attentionQueries, keys: k, values: v, scale: scale, sinks: nil)

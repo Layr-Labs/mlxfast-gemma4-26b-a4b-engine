@@ -25,7 +25,103 @@
 
 import Foundation
 import MLX
+import MLXFast
 import MLXRandom
+
+/// The scored Gemma-4 decode cohort emits `[8, 262144]` float32 logits and
+/// immediately asks MLX for a uint32 argmax before casting that tiny result to
+/// int32.  Write the contract's int32 token ids directly so the cast dispatch
+/// and its uint32 intermediate are absent.  Every other shape/dtype keeps the
+/// stock reduction.
+private enum CBv2ArgMaxInt32V1 {
+    private static let batch = 8
+    private static let vocab = 262_144
+    private static let threads = 1_024
+
+    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_argmax_int32_b8_v262144_f32_v1",
+        inputNames: ["logits"],
+        outputNames: ["tokens"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint simd_group = simdgroup_index_in_threadgroup;
+
+            const device float* row_logits = logits + row * VOCAB;
+            float best_value = -3.402823466e+38F;
+            uint best_index = 0;
+
+            // Match MLX arg_reduce's four adjacent reads per thread and its
+            // strict comparison: equal maxima retain the lowest index and
+            // NaNs never replace a finite/current winner.
+            for (uint base = lid * 4; base < VOCAB; base += THREADS * 4) {
+                for (uint read = 0; read < 4; ++read) {
+                    const uint index = base + read;
+                    const float value = row_logits[index];
+                    if (value > best_value) {
+                        best_value = value;
+                        best_index = index;
+                    }
+                }
+            }
+
+            for (uint offset = 16; offset > 0; offset /= 2) {
+                const float neighbor_value = simd_shuffle_down(best_value, offset);
+                const uint neighbor_index = simd_shuffle_down(best_index, offset);
+                if (best_value < neighbor_value
+                    || (best_value == neighbor_value && best_index > neighbor_index))
+                {
+                    best_value = neighbor_value;
+                    best_index = neighbor_index;
+                }
+            }
+
+            threadgroup float group_values[32];
+            threadgroup uint group_indices[32];
+            if (lane == 0) {
+                group_values[simd_group] = best_value;
+                group_indices[simd_group] = best_index;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (simd_group == 0) {
+                best_value = group_values[lane];
+                best_index = group_indices[lane];
+                for (uint offset = 16; offset > 0; offset /= 2) {
+                    const float neighbor_value = simd_shuffle_down(best_value, offset);
+                    const uint neighbor_index = simd_shuffle_down(best_index, offset);
+                    if (best_value < neighbor_value
+                        || (best_value == neighbor_value && best_index > neighbor_index))
+                    {
+                        best_value = neighbor_value;
+                        best_index = neighbor_index;
+                    }
+                }
+                if (lane == 0) {
+                    tokens[row] = int(best_index);
+                }
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    static func apply(_ logits: MLXArray) -> MLXArray? {
+        guard logits.dtype == .float32,
+            logits.ndim == 2,
+            logits.shape == [batch, vocab]
+        else { return nil }
+
+        return kernel(
+            [logits],
+            template: [("VOCAB", vocab), ("THREADS", threads)],
+            grid: (batch * threads, 1, 1),
+            threadGroup: (threads, 1, 1),
+            outputShapes: [[batch]],
+            outputDTypes: [.int32]
+        )[0]
+    }
+}
 
 public final class SamplerV2 {
 
@@ -89,7 +185,9 @@ public final class SamplerV2 {
 
         // Fast path: every row greedy ⇒ one argMax, bit-identical to the
         // legacy vectorized greedy decode.
-        let greedyTokens = argMax(logits, axis: -1).asType(.int32)
+        let greedyTokens =
+            CBv2ArgMaxInt32V1.apply(logits)
+            ?? argMax(logits, axis: -1).asType(.int32)
         if allGreedy {
             return greedyTokens
         }
@@ -100,7 +198,10 @@ public final class SamplerV2 {
         let vocab = logits.dim(-1)
         let probs = softmax(logits, axis: -1)
         let noise = exponentialNoise(vocab: vocab)
-        let sampledTokens = argMax(probs / noise, axis: -1).asType(.int32)
+        let sampledLogits = probs / noise
+        let sampledTokens =
+            CBv2ArgMaxInt32V1.apply(sampledLogits)
+            ?? argMax(sampledLogits, axis: -1).asType(.int32)
 
         guard let greedyMask else { return sampledTokens }
         return which(greedyMask, greedyTokens, sampledTokens)

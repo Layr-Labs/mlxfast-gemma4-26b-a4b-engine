@@ -757,7 +757,7 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
 
         for (uint i = 0; i < reads; ++i) {
             const T normalized = T(float(input[i]) * inverse_rms);
-            output[i] = weighted ? weight[i] * normalized : T(1) * normalized;
+            output[i] = weighted ? weight[i] * normalized : normalized;
         }
     """,
     ensureRowContiguous: true
@@ -1540,6 +1540,8 @@ private class Gemma4Router: Module {
     let topK: Int
     let eps: Float
     let rootSize: Float
+    let kth: Int
+    private var cachedEffectiveScale: MLXArray?
 
     init(_ config: Gemma4TextConfiguration) {
         precondition(
@@ -1550,6 +1552,7 @@ private class Gemma4Router: Module {
         self.topK = config.topKExperts ?? 0
         self.eps = config.rmsNormEps
         self.rootSize = pow(Float(config.hiddenSize), -0.5)
+        self.kth = numExperts - self.topK
 
         self._proj.wrappedValue = Linear(config.hiddenSize, numExperts, bias: false)
         self._scale.wrappedValue = MLXArray.ones([config.hiddenSize])
@@ -1557,8 +1560,17 @@ private class Gemma4Router: Module {
         super.init()
     }
 
+    private var effectiveScale: MLXArray {
+        if let cachedEffectiveScale {
+            return cachedEffectiveScale
+        }
+        let eff = scale * rootSize
+        cachedEffectiveScale = eff
+        return eff
+    }
+
     func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
-        let normed = MLXFast.rmsNorm(x, weight: scale * rootSize, eps: eps)
+        let normed = MLXFast.rmsNorm(x, weight: effectiveScale, eps: eps)
         let expertScores = proj(normed)
 
         // ROUTE-001: single-dispatch byte-identical replacement of the chain
@@ -1571,7 +1583,6 @@ private class Gemma4Router: Module {
             return (fused.indices, fused.weights)
         }
 
-        let kth = expertScores.dim(-1) - topK
         var topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
         topKIndices = topKIndices[.ellipsis, kth...]
 

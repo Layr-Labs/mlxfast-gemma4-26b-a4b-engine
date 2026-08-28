@@ -604,10 +604,12 @@ public class SwitchGLU: Module {
         // profile keeps generic SwitchGLU/custom activations on the established
         // implementation.
         guard weightedReductionProfile == .gemma4ProductionGeGLU else { return false }
+        let hasSplitGateUp = gateProj != nil && upProj != nil && gateUpProj == nil
+        let hasFusedGateUp = gateProj == nil && upProj == nil && gateUpProj != nil
         return inputDims == 2816
             && hiddenDims == 704
             && numExperts == 128
-            && gateUpProj == nil
+            && (hasSplitGateUp || hasFusedGateUp)
             && activationProduct == nil
             && isGeluActivation
             && x.ndim == 2

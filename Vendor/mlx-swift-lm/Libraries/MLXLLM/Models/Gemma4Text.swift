@@ -157,6 +157,28 @@ func gemma4ShouldFuseWeightedUnsort(
     requested && gemma4SupportsCoupledExpertOptimizations(config)
 }
 
+/// Load-time concat of the MoE expert gate/up banks along the output axis.
+/// Affine quantization packs each output row independently along K, so
+/// concatenating the frozen gate/up weight, scale, and bias rows is a pure
+/// relayout. This removes one routed projection dispatch without requantizing
+/// or changing any individual output row.
+internal let gemma4FuseExpertGateUpRequested: Bool = {
+    guard
+        let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_FUSE_GATEUP"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// Construction and checkpoint normalization use this same resolved policy so
+/// the module topology and the emitted parameter keys cannot disagree.
+func gemma4ShouldFuseExpertGateUp(
+    _ config: Gemma4TextConfiguration,
+    requested: Bool = gemma4FuseExpertGateUpRequested
+) -> Bool {
+    requested && gemma4SupportsCoupledExpertOptimizations(config)
+}
+
 
 /// Chunks shorter than this keep the unnarrowed final layer: the saving
 /// scales with the discarded row count, and tiny chunks are dominated by
@@ -1815,7 +1837,8 @@ private class Gemma4Experts: Module {
 
     init(
         _ config: Gemma4TextConfiguration,
-        fuseWeightedUnsort: Bool = false
+        fuseWeightedUnsort: Bool = false,
+        fuseExpertGateUp: Bool = false
     ) {
         let numExperts = config.numExperts ?? 1
         let moeIntermediate = config.moeIntermediateSize ?? config.intermediateSize
@@ -1827,6 +1850,7 @@ private class Gemma4Experts: Module {
             numExperts: numExperts,
             activation: { gemma4SafeGeluApproximate($0) },
             bias: false,
+            fuseGateUp: fuseExpertGateUp,
             weightedReductionProfile: .gemma4ProductionGeGLU
         )
         super.init()
@@ -1918,7 +1942,8 @@ public class Gemma4DecoderLayer: Module {
 
     public init(
         _ config: Gemma4TextConfiguration, layerIdx: Int, forceSharedKV: Bool = false,
-        fuseWeightedUnsort: Bool = false
+        fuseWeightedUnsort: Bool = false,
+        fuseExpertGateUp: Bool = false
     ) {
         self.config = config
         self.layerIdx = layerIdx
@@ -1943,7 +1968,8 @@ public class Gemma4DecoderLayer: Module {
             self._router.wrappedValue = Gemma4Router(config)
             self._experts.wrappedValue = Gemma4Experts(
                 config,
-                fuseWeightedUnsort: fuseWeightedUnsort)
+                fuseWeightedUnsort: fuseWeightedUnsort,
+                fuseExpertGateUp: fuseExpertGateUp)
             self._postFeedforwardLayernorm1.wrappedValue = RMSNorm(
                 dimensions: config.hiddenSize, eps: config.rmsNormEps)
             self._preFeedforwardLayernorm2.wrappedValue = RMSNorm(
@@ -2137,7 +2163,8 @@ public class Gemma4TextModelInner: Module {
 
     public init(
         _ config: Gemma4TextConfiguration, forceSharedKV: Bool = false,
-        fuseWeightedUnsort: Bool = false
+        fuseWeightedUnsort: Bool = false,
+        fuseExpertGateUp: Bool = false
     ) {
         self.config = config
         self.embedScale = Float(config.hiddenSize).squareRoot()
@@ -2148,7 +2175,8 @@ public class Gemma4TextModelInner: Module {
         self._layers.wrappedValue = (0 ..< config.numHiddenLayers).map {
             Gemma4DecoderLayer(
                 config, layerIdx: $0, forceSharedKV: forceSharedKV,
-                fuseWeightedUnsort: fuseWeightedUnsort)
+                fuseWeightedUnsort: fuseWeightedUnsort,
+                fuseExpertGateUp: fuseExpertGateUp)
         }
         self._norm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
 
@@ -2576,6 +2604,9 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     fileprivate let config: Gemma4TextConfiguration
     let model: Gemma4TextModelInner
     let fuseWeightedUnsort: Bool
+    /// Resolved once at model construction and reused by `sanitize(weights:)`
+    /// so the checkpoint mapping matches the selected SwitchGLU topology.
+    let fuseExpertGateUp: Bool
 
     /// Read-only accessor for the underlying text configuration. Needed by
     /// `Gemma4AssistantDraftModel` for its bind-time compatibility checks.
@@ -2607,6 +2638,7 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
     public init(_ config: Gemma4TextConfiguration) {
         let fuseWeightedUnsort = gemma4ShouldFuseWeightedUnsort(config)
+        let fuseExpertGateUp = gemma4ShouldFuseExpertGateUp(config)
         self.config = config
         self.vocabularySize = config.vocabSize
         // Per-layer KV head counts must agree with `Gemma4Attention.init`:
@@ -2619,9 +2651,11 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 : config.numKeyValueHeads
         }
         self.fuseWeightedUnsort = fuseWeightedUnsort
+        self.fuseExpertGateUp = fuseExpertGateUp
         self.model = Gemma4TextModelInner(
             config,
-            fuseWeightedUnsort: fuseWeightedUnsort)
+            fuseWeightedUnsort: fuseWeightedUnsort,
+            fuseExpertGateUp: fuseExpertGateUp)
 
         if !config.tieWordEmbeddings {
             self._lmHead.wrappedValue = Linear(config.hiddenSize, config.vocabSize, bias: false)
@@ -2799,6 +2833,7 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var sanitized = [String: MLXArray]()
+        var pendingExpertSplits = [String: MLXArray]()
         for (k, v) in weights {
             // Skip vision/audio/rotary/quantization-range weights.
             if k.contains("self_attn.rotary_emb")
@@ -2826,10 +2861,15 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             }
 
             // Some 26B-A4B checkpoints ship one raw expert `gate_up_proj`
-            // tensor plus `down_proj`. The ordinary SwitchGLU topology owns
-            // split projections, so normalize the packed tensor here.
+            // tensor plus `down_proj`. A fused topology consumes that packed
+            // layout directly; the ordinary topology normalizes it to two
+            // projection banks.
             if k.hasSuffix(".experts.gate_up_proj") {
                 let base = String(k.dropLast(".gate_up_proj".count))
+                if fuseExpertGateUp {
+                    sanitized["\(base).switch_glu.gate_up_proj.weight"] = v
+                    continue
+                }
                 let parts = MLX.split(v, parts: 2, axis: -2)
                 sanitized["\(base).switch_glu.gate_proj.weight"] = parts[0]
                 sanitized["\(base).switch_glu.up_proj.weight"] = parts[1]
@@ -2842,7 +2882,53 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 continue
             }
 
+            // The pinned checkpoint stores split, pre-quantized expert
+            // components. Hold both banks until their matching weight/scales/
+            // biases can be concatenated on the output axis.
+            if fuseExpertGateUp,
+                k.contains(".experts.switch_glu.gate_proj.")
+                    || k.contains(".experts.switch_glu.up_proj.")
+            {
+                pendingExpertSplits[k] = v
+                continue
+            }
+
             sanitized[k] = v
+        }
+
+        if fuseExpertGateUp {
+            for (gateKey, gateValue) in pendingExpertSplits {
+                guard let stem = gateKey.range(
+                    of: ".experts.switch_glu.gate_proj.")
+                else { continue }
+
+                let base = String(gateKey[..<stem.lowerBound])
+                let component = String(gateKey[stem.upperBound...])
+                let upKey = "\(base).experts.switch_glu.up_proj.\(component)"
+                guard let upValue = pendingExpertSplits[upKey] else {
+                    // Preserve an orphan under its original name so strict
+                    // parameter verification reports the real mismatch.
+                    sanitized[gateKey] = gateValue
+                    continue
+                }
+
+                sanitized[
+                    "\(base).experts.switch_glu.gate_up_proj.\(component)"
+                ] = MLX.concatenated([gateValue, upValue], axis: -2)
+            }
+
+            for (upKey, upValue) in pendingExpertSplits {
+                guard let stem = upKey.range(
+                    of: ".experts.switch_glu.up_proj.")
+                else { continue }
+
+                let base = String(upKey[..<stem.lowerBound])
+                let component = String(upKey[stem.upperBound...])
+                let gateKey = "\(base).experts.switch_glu.gate_proj.\(component)"
+                if pendingExpertSplits[gateKey] == nil {
+                    sanitized[upKey] = upValue
+                }
+            }
         }
         return sanitized
     }

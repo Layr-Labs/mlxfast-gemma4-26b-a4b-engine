@@ -89,7 +89,7 @@ public final class SamplerV2 {
 
         // Fast path: every row greedy ⇒ one argMax, bit-identical to the
         // legacy vectorized greedy decode.
-        let greedyTokens = argMax(logits, axis: -1).asType(.int32)
+        let greedyTokens = argMax(logits, axis: -1).view(dtype: .int32)
         if allGreedy {
             return greedyTokens
         }

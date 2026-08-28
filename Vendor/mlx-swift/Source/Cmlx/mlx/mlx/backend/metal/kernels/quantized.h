@@ -1336,7 +1336,19 @@ METAL_FUNC void qmv_impl(
     y += tid.x * out_vec_size + out_row;
 
     int k = 0;
-    for (; k < in_vec_size - block_size; k += block_size) {
+    // Exact-K fast bound. A plane whose K is a whole number of blocks has no
+    // partial trailing block, so the guarded tail below would re-run a FULL block
+    // through the bounds-checked path for nothing. Consume it here instead;
+    // `remaining` then computes to zero and the tail is skipped. This is
+    // bit-exact -- load_vector_safe with remaining == values_per_thread returns
+    // what load_vector returns, and the qdot expression, the K accumulation order
+    // and simd_sum are unchanged. K = 2816 (q/k/v_proj, tied lm_head, mlp
+    // gate/up_proj, router) qualifies for both quantizations; K = 2112
+    // (mlp down_proj) does not and keeps the original bound.
+    const int k_end = (in_vec_size % block_size == 0)
+        ? in_vec_size
+        : (in_vec_size - block_size);
+    for (; k < k_end; k += block_size) {
       U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
 
       for (int row = 0;
@@ -1399,7 +1411,10 @@ METAL_FUNC void qmv_impl(
     y += tid.x * out_vec_size + used_out_row;
 
     int k = 0;
-    for (; k < in_vec_size - block_size; k += block_size) {
+    const int k_end = (in_vec_size % block_size == 0)
+        ? in_vec_size
+        : (in_vec_size - block_size);
+    for (; k < k_end; k += block_size) {
       U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
 
       for (int row = 0; row < results_per_simdgroup; row++) {
@@ -1486,7 +1501,10 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   y1 += out_row;
 
   int k = 0;
-  for (; k < in_vec_size - block_size; k += block_size) {
+  const int k_end = (in_vec_size % block_size == 0)
+      ? in_vec_size
+      : (in_vec_size - block_size);
+  for (; k < k_end; k += block_size) {
     float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
     float sum1 = load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
 
@@ -1617,7 +1635,10 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
   y3 += out_row;
 
   int k = 0;
-  for (; k < in_vec_size - block_size; k += block_size) {
+  const int k_end = (in_vec_size % block_size == 0)
+      ? in_vec_size
+      : (in_vec_size - block_size);
+  for (; k < k_end; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint16_t* wl =
           (const device uint16_t*)(ws + row * in_vec_size_w);
@@ -1753,7 +1774,10 @@ METAL_FUNC void qmv_affine8_g64_pair_impl(
   y1 += out_row;
 
   int k = 0;
-  for (; k < in_vec_size - block_size; k += block_size) {
+  const int k_end = (in_vec_size % block_size == 0)
+      ? in_vec_size
+      : (in_vec_size - block_size);
+  for (; k < k_end; k += block_size) {
     float sum0 = load_vector<T, float, values_per_thread, 8>(x0, x0_thread);
     float sum1 = load_vector<T, float, values_per_thread, 8>(x1, x1_thread);
 
@@ -1876,7 +1900,10 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
   y3 += out_row;
 
   int k = 0;
-  for (; k < in_vec_size - block_size; k += block_size) {
+  const int k_end = (in_vec_size % block_size == 0)
+      ? in_vec_size
+      : (in_vec_size - block_size);
+  for (; k < k_end; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* wl = ws + row * in_vec_size_w;
       for (int i = 0; i < bytes_per_thread; i++) {
@@ -2539,10 +2566,27 @@ template <typename T, int group_size, int bits, bool batched>
     return;
   }
   if (!batched && group_size == 64 && bits == 4 && out_vec_size >= 1024) {
-    if (out_vec_size >= 4096) {
+    if (out_vec_size >= 2816) {
+      // FLOOR LOWERED 4096 -> 2816 so o_proj reaches this family. o_proj
+      // (N = 2816, K = 4096 sliding / 8192 global) is the only decode plane
+      // that satisfies affine_qmv_fast's N % 8 == 0 && K % 512 == 0 at all,
+      // and it was landing in the else arm's pair rung. Two measurements on
+      // an M4 Pro, arms interleaved inside each repetition, 40 reps, weights
+      // rotated through a 3 GiB pool, against STOCK qmv_fast_impl as the
+      // bit-exactness reference:
+      //   K = 4096   stock 124.31 us | pair 94.41 (+28.6%, exact NO)
+      //              | wide quad 80.17 (+47.3%, exact yes)
+      //   K = 8192   stock 229.90 us | pair 190.71 (+21.4%, exact NO)
+      //              | wide quad 154.36 (+49.2%, exact yes)
+      // So the wide quad is 13-24% faster than the rung o_proj takes today AND
+      // it reproduces the stock output exactly, which the pair rung does not.
+      // The old rationale below is kept because it still holds for widths this
+      // floor no longer admits.
+      //
       // Wide row sharing needs enough output tiles to keep the machine fed;
-      // below 4096 outputs the reduced x-group count thins the grid, so the
-      // promoted pair kernel is kept there byte-for-byte.
+      // far below this the reduced x-group count thins the grid. At N = 2816
+      // the quad still leaves 2 * 2816/8 = 704 active threadgroups, which is
+      // not thin.
       switch (ntg.x) {
         case 2:
           qmv_fast_crossrow_affine4_g64<T, 2>(

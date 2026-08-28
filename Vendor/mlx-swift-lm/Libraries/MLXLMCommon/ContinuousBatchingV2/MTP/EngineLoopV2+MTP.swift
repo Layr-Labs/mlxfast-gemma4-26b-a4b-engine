@@ -14,6 +14,22 @@ extension EngineLoopV2 {
     /// decode neighbors, and per-request prefill chunks.
     func executeMTPRound(_ plan: CBv2StepPlan) -> CBv2InFlightStep? {
         guard let mtp else { return executeMixed(plan) }
+        // FAST-CANCEL entry gate: when every planned row already has a
+        // pending caller cancel, nothing this round could draft, verify, or
+        // commit is deliverable — every row is finished at the next
+        // boundary. Drop the round HERE, before any carry is consumed or
+        // any graph is built, mirroring the empty-work rollback path below.
+        // (Deliberately not re-checked after the graph build: unlike the
+        // plain chained round, the MTP build consumes per-row carries and
+        // publishes KV-capture fence edges, so the only safe drop point is
+        // before it starts.)
+        if EngineLoopV2.fastCancelEnabled,
+            pendingCancelsCover(plan.assignments.map(\.id))
+        {
+            CBv2EngageMark.once("fastcancel.mtp")
+            scheduler.rollback(plan)
+            return nil
+        }
         let wallStartedNanos = DispatchTime.now().uptimeNanoseconds
 
         // A per-row reserve retry can demote a round after the step-global

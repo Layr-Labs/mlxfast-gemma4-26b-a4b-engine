@@ -981,6 +981,59 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     // MARK: Cancellation & backpressure (any thread)
 
+    /// FAST-CANCEL (never run a round no waiter needs) — resolved once.
+    /// Default ON; set `DARKBLOOM_CBV2_FAST_CANCEL=0` to restore the
+    /// pre-trim behavior (cancels observed only at the next step top, and
+    /// chained decode running one discarded round past budget exhaustion).
+    /// Three gates share the switch, all pure scheduling (no numeric path,
+    /// no asyncEval restructuring — every round that still runs is built
+    /// and dispatched exactly as before):
+    ///   1. the chained fast path refuses to build a successor round when
+    ///      every candidate row's in-flight sample already exhausts its
+    ///      `maxTokens` budget (`chainHasRemainingBudget`);
+    ///   2. a fully-built chained round is dropped BEFORE its `asyncEval`
+    ///      when every row it decodes is already cancel-pending
+    ///      (`launchChainedDecode`), and an MTP round is dropped at its
+    ///      entry under the same all-rows condition (`executeMTPRound`);
+    ///   3. the boundary path re-processes cancels right after `finalize`'s
+    ///      blocking readback, so a cancel that landed during that GPU wait
+    ///      is resolved before the next plan instead of one full round
+    ///      later (`engineStep`).
+    static let fastCancelEnabled: Bool =
+        ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_FAST_CANCEL"]
+            .map { !["0", "false", "no", "off"].contains($0.lowercased()) } ?? true
+
+    /// True when EVERY id in `ids` has a pending caller cancel. Lock-guarded
+    /// set read (ns-scale beside the ms-scale step build); the count guard
+    /// makes the common empty-set case a single comparison.
+    func pendingCancelsCover(_ ids: [CBv2RequestID]) -> Bool {
+        guard !ids.isEmpty else { return false }
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard pendingCancels.count >= ids.count else { return false }
+        return ids.allSatisfy(pendingCancels.contains)
+    }
+
+    /// FAST-CANCEL budget gate: false when every chain-candidate row's
+    /// in-flight (pending) sample already exhausts its request budget — the
+    /// successor round could only compute tokens `finalize` is certain to
+    /// discard (`.length` finishes every row at the previous step's
+    /// finalize, before any successor sample could be recorded), so the
+    /// chain breaks and the boundary path retires the rows without paying
+    /// one extra full round. Partial exhaustion keeps the old chain: with
+    /// any surviving row the batch composition of every executed round is
+    /// byte-identical to the ungated engine, and the doomed row's extra
+    /// sample is discarded exactly as before.
+    private func chainHasRemainingBudget(ids: [CBv2RequestID]) -> Bool {
+        guard Self.fastCancelEnabled else { return true }
+        let allExhausted = ids.allSatisfy { id in
+            guard let rec = scheduler.record(for: id) else { return true }
+            return rec.generatedTokenCount + rec.pendingSamples >= rec.request.maxTokens
+        }
+        if allExhausted { CBv2EngageMark.once("fastcancel.budget") }
+        return !allExhausted
+    }
+
     /// O(1): marks the request; the row is dropped at the next step boundary.
     /// Lock-based (not a queue hop) so cancellation works even while the
     /// engine thread is blocked inside a long step.
@@ -1051,7 +1104,10 @@ public final class EngineLoopV2: @unchecked Sendable {
             // not launch N+1 from N's lazy token before that transition.
             ids.allSatisfy({ scheduler.record(for: $0)?.request.tokenConstraint == nil }),
             !mtpWantsStep(ids: ids),
-            capacity?.hasHeadroom(additionalTokens: ids.count) ?? true
+            capacity?.hasHeadroom(additionalTokens: ids.count) ?? true,
+            // FAST-CANCEL budget gate: never chain a round every waiter's
+            // budget already made unobservable (see chainHasRemainingBudget).
+            chainHasRemainingBudget(ids: ids)
         {
             beginMTPPlan()
             let plan = scheduler.plan()
@@ -1061,56 +1117,66 @@ public final class EngineLoopV2: @unchecked Sendable {
                         "v2.boundary", seconds: CFAbsoluteTimeGetCurrent() - stepStart)
                 }
                 let measurement = mtpMeasurement(for: plan)
-                let next = launchChainedDecode(plan, feeding: previous.sampledTokens!)
-                attachMTPMeasurement(measurement, to: next, chained: true)
-                if var previousMeasurement = previous.mtpMeasurement {
-                    // The previous step's finalize-to-launch interval now
-                    // includes construction of this successor. It is no
-                    // longer an isolated depth-zero cost sample either.
-                    previousMeasurement.chained = true
-                    previous.mtpMeasurement = previousMeasurement
+                if let next = launchChainedDecode(plan, feeding: previous.sampledTokens!) {
+                    attachMTPMeasurement(measurement, to: next, chained: true)
+                    if var previousMeasurement = previous.mtpMeasurement {
+                        // The previous step's finalize-to-launch interval now
+                        // includes construction of this successor. It is no
+                        // longer an isolated depth-zero cost sample either.
+                        previousMeasurement.chained = true
+                        previous.mtpMeasurement = previousMeasurement
+                    }
+                    inFlight = next
+                    chainedStepCount += 1
+                    stepCount += 1
+                    finalize(previous, now: stepNow)
+                    publishGauges()
+                    scheduleNextStep()
+                    return
                 }
-                inFlight = next
-                chainedStepCount += 1
-                stepCount += 1
-                finalize(previous, now: stepNow)
-                publishGauges()
-                scheduleNextStep()
-                return
-            }
-            // Defensive: chainCandidateIDs and plan() disagree (only
-            // possible when the capacity oracle's `hasHeadroom` was
-            // optimistic and `reserve` preempted mid-plan). Roll the
-            // optimistic advance back and fall through to the general path.
-            // Preemptions are NOT rolled back (the scheduler already
-            // requeued the victims), so their KV must be released here —
-            // fenced behind the still-in-flight step that references it.
-            // The victims are NOT added to `discard`: their in-flight
-            // sample must be recorded at finalization (preemption keeps
-            // generated tokens, and an unconfirmed `pendingSamples` would
-            // block their re-admission forever).
-            scheduler.rollback(plan)
-            // Lease rewind is DEFERRED past the finalize below: the victims'
-            // in-flight sample is confirmed there (refreshProgressLeases would
-            // see generated > watermark and flip the lease back to .decode,
-            // undoing an earlier markPreempted — PR#82 review). The general
-            // path already has the correct order because it finalizes before
-            // planning; this defers the rollback path to match.
-            leasePreemptionsPendingFinalize.append(contentsOf: plan.preemptions)
-            for id in plan.preemptions {
-                preemptionCount += 1
-                // A preempted request recomputes from scratch — any adopted
-                // prefix credit no longer describes work that was skipped.
-                invalidateAdoptedPrefix(id)
-                mtp?.invalidateCarry(id)
-                guard let state = kvStates.removeValue(forKey: id) else { continue }
-                if previous.participants.contains(id) {
-                    previous.deferredReleases.append(
-                        (
-                            id: id, state: state, rollbackOne: false, donation: nil
-                        ))
-                } else {
-                    backend.release(state)
+                // FAST-CANCEL abort: the successor round was dropped before
+                // its dispatch (every row cancel-pending). Unwind the plan's
+                // optimistic advance and fall through to the boundary path,
+                // which finalizes the in-flight step and then resolves the
+                // cancels at that boundary. A pure-decode plan carries no
+                // preemptions (`isPureDecodePlan`), so the defensive path's
+                // victim handling below has nothing to do here.
+                scheduler.rollback(plan)
+            } else {
+                // Defensive: chainCandidateIDs and plan() disagree (only
+                // possible when the capacity oracle's `hasHeadroom` was
+                // optimistic and `reserve` preempted mid-plan). Roll the
+                // optimistic advance back and fall through to the general path.
+                // Preemptions are NOT rolled back (the scheduler already
+                // requeued the victims), so their KV must be released here —
+                // fenced behind the still-in-flight step that references it.
+                // The victims are NOT added to `discard`: their in-flight
+                // sample must be recorded at finalization (preemption keeps
+                // generated tokens, and an unconfirmed `pendingSamples` would
+                // block their re-admission forever).
+                scheduler.rollback(plan)
+                // Lease rewind is DEFERRED past the finalize below: the victims'
+                // in-flight sample is confirmed there (refreshProgressLeases would
+                // see generated > watermark and flip the lease back to .decode,
+                // undoing an earlier markPreempted — PR#82 review). The general
+                // path already has the correct order because it finalizes before
+                // planning; this defers the rollback path to match.
+                leasePreemptionsPendingFinalize.append(contentsOf: plan.preemptions)
+                for id in plan.preemptions {
+                    preemptionCount += 1
+                    // A preempted request recomputes from scratch — any adopted
+                    // prefix credit no longer describes work that was skipped.
+                    invalidateAdoptedPrefix(id)
+                    mtp?.invalidateCarry(id)
+                    guard let state = kvStates.removeValue(forKey: id) else { continue }
+                    if previous.participants.contains(id) {
+                        previous.deferredReleases.append(
+                            (
+                                id: id, state: state, rollbackOne: false, donation: nil
+                            ))
+                    } else {
+                        backend.release(state)
+                    }
                 }
             }
         }
@@ -1133,6 +1199,18 @@ public final class EngineLoopV2: @unchecked Sendable {
                 }
             }
             leasePreemptionsPendingFinalize.removeAll(keepingCapacity: true)
+        }
+
+        // FAST-CANCEL boundary: cancels that landed while the finalize above
+        // blocked on its GPU readback (or whose arrival aborted a chained
+        // launch pre-dispatch) are resolved NOW, before the next plan —
+        // otherwise the loop plans and dispatches one more full round for
+        // rows whose consumers already walked away, and only the NEXT step
+        // top would clean up. Idempotent with the step-top call; the
+        // in-flight step is already finalized here, so a finish retires KV
+        // directly (no fence needed).
+        if Self.fastCancelEnabled {
+            processCancellations()
         }
 
         guard scheduler.hasWork else {
@@ -1231,6 +1309,28 @@ public final class EngineLoopV2: @unchecked Sendable {
         let caches = eagerCaches(rowStates: rowStates)
         let logits = model.forward(tokens: tokens, caches: caches)
         return (logits[0..., -1, 0...], eagerCacheInnerState(caches))
+    }
+
+    /// Exact terminal decode specialization. It is deliberately restricted to
+    /// the production sampler: custom samplers may attach behavior even when
+    /// their parameters look greedy. The default sampler's skipped state is
+    /// inert in this state (no penalties, RNG, constraints, or logprobs), and
+    /// any later membership change reconstructs it from confirmed history.
+    private func directGreedyDecode(
+        rowStates: [[CBv2SequenceKV?]], tokens: MLXArray,
+        params: [CBv2SamplingParams], ids: [CBv2RequestID]
+    ) -> (tokens: MLXArray, cacheInnerState: [MLXArray])? {
+        guard sampler is CBv2DefaultSampler,
+            params.count == ids.count,
+            params.allSatisfy(cbv2IsUntransformedGreedy),
+            ids.allSatisfy({ scheduler.record(for: $0)?.request.tokenConstraint == nil }),
+            let directModel = model as? CBv2DirectGreedySteppableModel,
+            directModel.supportsDirectGreedy(batchSize: ids.count)
+        else { return nil }
+
+        let caches = eagerCaches(rowStates: rowStates)
+        let sampled = directModel.directGreedyTokens(tokens: tokens, caches: caches)
+        return (sampled, eagerCacheInnerState(caches))
     }
 
     /// Prompt-only output seam (see PrefillOutputV2.swift). Capable models
@@ -1401,9 +1501,17 @@ public final class EngineLoopV2: @unchecked Sendable {
     }
 
     /// Pure-decode step fed by the previous step's still-lazy tokens.
+    /// Returns nil ONLY on the fast-cancel abort: every row of this chained
+    /// round is already cancel-pending, and the round is dropped BEFORE its
+    /// `asyncEval` (the caller rolls the plan back and falls through to the
+    /// boundary path). The all-rows condition is what makes the drop safe:
+    /// the graph build below lazily advances every participating row's
+    /// eager-cache state, so with ANY surviving row the round must run —
+    /// but when every row is finishing, all of that state is released
+    /// unread and the never-evaluated graph is simply deallocated.
     private func launchChainedDecode(
         _ plan: CBv2StepPlan, feeding lazyTokens: MLXArray
-    ) -> CBv2InFlightStep {
+    ) -> CBv2InFlightStep? {
         let wallStartedNanos = DispatchTime.now().uptimeNanoseconds
         let buildStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         let ids = plan.assignments.map(\.id)
@@ -1414,24 +1522,51 @@ public final class EngineLoopV2: @unchecked Sendable {
 
         let inputs = lazyTokens.reshaped([ids.count, 1])
         let forwardStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-        let (last, cacheInnerState) = decodeLogits(rowStates: rowStates, tokens: inputs)  // [B, vocab]
+        let sampled: MLXArray
+        let cacheInnerState: [MLXArray]
+        let stepLogprobs: CBv2StepLogprobs?
+        var samplerBuildSeconds = 0.0
+        if let direct = directGreedyDecode(
+            rowStates: rowStates, tokens: inputs, params: params, ids: ids)
+        {
+            sampled = direct.tokens
+            cacheInnerState = direct.cacheInnerState
+            stepLogprobs = nil
+        } else {
+            let decoded = decodeLogits(rowStates: rowStates, tokens: inputs)
+            cacheInnerState = decoded.cacheInnerState
+            let samplerStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+            sampled = sampler.sample(
+                logits: decoded.logits, params: params, requestIDs: ids, stepIndex: stepCount,
+                pendingSampledTokens: lazyTokens,
+                rowContext: { [scheduler] in
+                    ids.map { Self.samplerRow(scheduler.record(for: $0)!) }
+                })
+            stepLogprobs = sampler.takeStepLogprobs()
+            if CBv2StepProfiler.enabled {
+                samplerBuildSeconds = CFAbsoluteTimeGetCurrent() - samplerStart
+            }
+        }
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.forward.build", seconds: CFAbsoluteTimeGetCurrent() - forwardStart)
         }
-        // `pendingSampledTokens` = the fed lazy tokens: each row has exactly
-        // one launched-but-unconfirmed sample here (the chain invariant).
-        let samplerStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-        let sampled = sampler.sample(
-            logits: last, params: params, requestIDs: ids, stepIndex: stepCount,
-            pendingSampledTokens: lazyTokens,
-            rowContext: { [scheduler] in
-                ids.map { Self.samplerRow(scheduler.record(for: $0)!) }
-            })
-        let stepLogprobs = sampler.takeStepLogprobs()
         if CBv2StepProfiler.enabled {
-            CBv2StepProfiler.record(
-                "v2.sampler.build", seconds: CFAbsoluteTimeGetCurrent() - samplerStart)
+            CBv2StepProfiler.record("v2.sampler.build", seconds: samplerBuildSeconds)
+        }
+        // FAST-CANCEL pre-dispatch gate: a caller cancel typically races
+        // exactly the ms-scale graph build above (the consumer saw its last
+        // token at the PREVIOUS finalize, and the loop was already planning
+        // this successor when the cancel call arrived). When every row of
+        // the round is cancel-pending, nothing it computes can ever be
+        // delivered — each row is finished at the next boundary and its
+        // sample would be discarded there — so drop the round instead of
+        // dispatching a full raced forward and then draining it. Checked
+        // BEFORE `markPendingSamples`, so no scheduler state needs undoing
+        // beyond the caller's plan rollback.
+        if Self.fastCancelEnabled, pendingCancelsCover(ids) {
+            CBv2EngageMark.once("fastcancel")
+            return nil
         }
         scheduler.markPendingSamples(ids: ids)
         var toEval = [sampled]
@@ -1507,18 +1642,28 @@ public final class EngineLoopV2: @unchecked Sendable {
         if !decodeRows.isEmpty {
             let inputs = MLXArray(decodeRows.map { Int32($0.rec.tokens[$0.start]) })
                 .reshaped([decodeRows.count, 1])
-            let (last, decodeInnerState) = decodeLogits(
-                rowStates: decodeRows.map { kvStates[$0.rec.id]! }, tokens: inputs)
-            cacheInnerState.append(contentsOf: decodeInnerState)
-            decodeSampled = sampler.sample(
-                logits: last,
-                params: decodeRows.map(\.rec.request.sampling),
-                requestIDs: decodeRows.map(\.rec.id),
-                stepIndex: stepCount,
-                pendingSampledTokens: nil,  // finalize preceded: all confirmed
-                rowContext: { decodeRows.map { Self.samplerRow($0.rec) } })
-            if let stepLogprobs = sampler.takeStepLogprobs() {
-                logprobSegments.append(stepLogprobs)
+            let decodeStates = decodeRows.map { kvStates[$0.rec.id]! }
+            let decodeParams = decodeRows.map(\.rec.request.sampling)
+            let decodeIDs = decodeRows.map(\.rec.id)
+            if let direct = directGreedyDecode(
+                rowStates: decodeStates, tokens: inputs,
+                params: decodeParams, ids: decodeIDs)
+            {
+                decodeSampled = direct.tokens
+                cacheInnerState.append(contentsOf: direct.cacheInnerState)
+            } else {
+                let decoded = decodeLogits(rowStates: decodeStates, tokens: inputs)
+                cacheInnerState.append(contentsOf: decoded.cacheInnerState)
+                decodeSampled = sampler.sample(
+                    logits: decoded.logits,
+                    params: decodeParams,
+                    requestIDs: decodeIDs,
+                    stepIndex: stepCount,
+                    pendingSampledTokens: nil,  // finalize preceded: all confirmed
+                    rowContext: { decodeRows.map { Self.samplerRow($0.rec) } })
+                if let stepLogprobs = sampler.takeStepLogprobs() {
+                    logprobSegments.append(stepLogprobs)
+                }
             }
         }
 

@@ -1431,23 +1431,51 @@ METAL_FUNC void qmv_impl(
       biases += block_size / group_size;
       x += block_size;
     }
-    const int remaining = clamp(
-        static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
-        0,
-        values_per_thread);
-    if (remaining > 0) {
-      U sum = load_vector_safe<T, U, values_per_thread, bits>(
-          x, x_thread, remaining);
+    const int tail_values = static_cast<int>(in_vec_size - k);
+    if (tail_values > 0) {
+      // Affine callers keep K a whole number of quantization groups and k
+      // advances by whole blocks, so the tail is a whole number of
+      // values_per_thread lane packets: routed-expert down_proj K=704 leaves
+      // 192 values = 24 complete packets, dense down_proj K=2112 (8-bit)
+      // leaves 64 = 16.  Active lanes run the fixed unrolled loader and qdot;
+      // the dynamic safe-tail remains only for a genuinely partial packet,
+      // which no affine caller presents.
+      if (tail_values % values_per_thread == 0) {
+        const uint active_tail_lanes = uint(tail_values / values_per_thread);
+        if (simd_lid < active_tail_lanes) {
+          U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
 
-      for (int row = 0; row < results_per_simdgroup; row++) {
-        auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-        const device T* sl = scales + row * in_vec_size_g;
-        const device T* bl = biases + row * in_vec_size_g;
+          for (int row = 0; row < results_per_simdgroup; row++) {
+            auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+            const device T* sl = scales + row * in_vec_size_g;
+            const device T* bl = biases + row * in_vec_size_g;
 
-        U s = sl[0];
-        U b = bl[0];
-        result[row] += qdot_safe<U, values_per_thread, bits>(
-            wl, x_thread, s, b, sum, remaining);
+            U s = sl[0];
+            U b = bl[0];
+            result[row] +=
+                qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+          }
+        }
+      } else {
+        const int remaining = clamp(
+            static_cast<int>(tail_values - simd_lid * values_per_thread),
+            0,
+            values_per_thread);
+        if (remaining > 0) {
+          U sum = load_vector_safe<T, U, values_per_thread, bits>(
+              x, x_thread, remaining);
+
+          for (int row = 0; row < results_per_simdgroup; row++) {
+            auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+            const device T* sl = scales + row * in_vec_size_g;
+            const device T* bl = biases + row * in_vec_size_g;
+
+            U s = sl[0];
+            U b = bl[0];
+            result[row] += qdot_safe<U, values_per_thread, bits>(
+                wl, x_thread, s, b, sum, remaining);
+          }
+        }
       }
     }
     for (int row = 0; row < results_per_simdgroup; row++) {
@@ -3421,6 +3449,35 @@ template <typename T, int group_size, int bits>
           simd_lid);
       return;
     }
+
+    // Unpaired singleton / odd-run tail. The exact Gemma geometry has one
+    // gathered batch dimension, M == 1 and batch_ndims == x_batch_ndims ==
+    // w_batch_ndims == 1, so adjust_matrix_offsets would recompute exactly
+    // the token and expert indices this arm already holds. Apply the same
+    // reduced offsets directly and call qmv_impl on them. Address-identical
+    // to the fall-through below, so the arithmetic is untouched.
+    // K = 704 never reaches here: the down plane returns from the
+    // KERN-DOWN-TILE walker above, so this arm serves the K = 2816 gate/up
+    // singles only.
+    const uint32_t x_idx =
+        lhs_indices[assignment * (uint)lhs_strides[0]];
+    x += x_idx * x_strides[0];
+    w += expert * w_strides[0];
+    scales += expert * s_strides[0];
+    biases += expert * b_strides[0];
+    y += assignment * out_vec_size;
+    qmv_impl<T, group_size, bits>(
+        w,
+        scales,
+        biases,
+        x,
+        y,
+        in_vec_size,
+        out_vec_size,
+        tid,
+        simd_gid,
+        simd_lid);
+    return;
   }
   adjust_matrix_offsets<T>(
       x,

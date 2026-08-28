@@ -25,6 +25,35 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     private static let headDim = 256
     private static let sequenceLength = 1024
 
+    // Consecutive sliding layers in one decode step carry the same eight ring
+    // starts. Reuse the tiny device input instead of constructing/uploading it
+    // once per layer. A one-entry cache is bounded for general serving and the
+    // lock makes interleaved engines a safe miss rather than a stale hit.
+    private static let startArrayLock = NSLock()
+    private static let startArrayCacheEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_START_ARRAY_CACHE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+    nonisolated(unsafe) private static var cachedStarts: [Int]?
+    nonisolated(unsafe) private static var cachedStartArray: MLXArray?
+
+    private static func startArray(for starts: [Int]) -> MLXArray {
+        guard startArrayCacheEnabled else {
+            return MLXArray(starts.map(UInt32.init), [batch])
+        }
+        startArrayLock.lock()
+        defer { startArrayLock.unlock() }
+        if cachedStarts == starts, let cachedStartArray {
+            return cachedStartArray
+        }
+        let array = MLXArray(starts.map(UInt32.init), [batch])
+        cachedStarts = starts
+        cachedStartArray = array
+        return array
+    }
+
     /// Mirrors `sdpa_vector_2pass` at N=1024 and qL=1/GQA=2. Honor the same
     /// diagnostic override so a process can never run mismatched partitions.
     private static let blocks: Int = {
@@ -35,7 +64,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         }
         switch MLX.GPU.deviceInfo().architecture.last {
         case "s": return 64
-        case "d": return 128
+        case "d": return 32
         default: return 32
         }
     }()
@@ -228,8 +257,13 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// evaluated dependency chain: the next step's writing pass A consumes
     /// this step's fence, so the mutation can never be reordered against a
     /// later read of the same allocation.
+    ///
+    /// The two GQA query heads sharing a KV head are evaluated by one SIMDgroup.
+    /// Their scores, online-softmax state, and output accumulators remain
+    /// independent and keep the established token order; only each K/V load is
+    /// shared before the two head-local updates.
     private static let fusedRingPassAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_ringwrite_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v1",
+        name: "cbv2_ragged8_ringwrite_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v2",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -244,9 +278,8 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             const int kv_head = int(threadgroup_position_in_grid.x);
             const int batch_index = int(threadgroup_position_in_grid.y);
             const int block = int(threadgroup_position_in_grid.z);
-            const int query_head_in_group = int(thread_position_in_threadgroup.y);
-            const int query_head = GQA * kv_head + query_head_in_group;
-            const int batch_head = batch_index * 16 + query_head;
+            const int batch_head0 = batch_index * 16 + GQA * kv_head;
+            const int batch_head1 = batch_head0 + 1;
             const int lane = int(thread_index_in_simdgroup);
 
             const device T* keys = k0;
@@ -262,8 +295,9 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 default: break;
             }
 
-            const device T* query =
-                queries + batch_head * D + lane * values_per_lane;
+            const device T* query0 =
+                queries + batch_head0 * D + lane * values_per_lane;
+            const device T* query1 = query0 + D;
             keys += kv_head * N * D + lane * values_per_lane;
             values += kv_head * N * D + lane * values_per_lane;
             const device T* new_key = new_keys
@@ -272,7 +306,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
             const uint ring_start = starts[batch_index];
             const uint write_slot = (ring_start + uint(N - 1)) % uint(N);
-            if (block == 0 && query_head_in_group == 0) {
+            if (block == 0) {
                 device T* write_key = const_cast<device T*>(keys) + write_slot * D;
                 device T* write_value = const_cast<device T*>(values) + write_slot * D;
                 for (int element = 0; element < values_per_lane; ++element) {
@@ -280,44 +314,66 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     write_value[element] = new_value[element];
                 }
             }
-            if (batch_index == 0 && kv_head == 0 && block == 0
-                && query_head_in_group == 0 && lane == 0) {
+            if (batch_index == 0 && kv_head == 0 && block == 0 && lane == 0) {
                 fence[0] = write_fence[0] + 1;
             }
 
-            device T* partial = partials
-                + batch_head * BLOCKS * D + block * D + lane * values_per_lane;
-            device float* sum_out = sums + batch_head * BLOCKS + block;
-            device float* max_out = maxs + batch_head * BLOCKS + block;
+            device T* partial0 = partials
+                + batch_head0 * BLOCKS * D + block * D + lane * values_per_lane;
+            device T* partial1 = partial0 + BLOCKS * D;
+            device float* sum_out0 = sums + batch_head0 * BLOCKS + block;
+            device float* sum_out1 = sum_out0 + BLOCKS;
+            device float* max_out0 = maxs + batch_head0 * BLOCKS + block;
+            device float* max_out1 = max_out0 + BLOCKS;
 
-            thread float q[values_per_lane];
-            thread float accumulator[values_per_lane];
+            thread float q0[values_per_lane];
+            thread float q1[values_per_lane];
+            thread float accumulator0[values_per_lane];
+            thread float accumulator1[values_per_lane];
             for (int element = 0; element < values_per_lane; ++element) {
-                q[element] = 1.0f * float(query[element]);
-                accumulator[element] = 0.0f;
+                q0[element] = 1.0f * float(query0[element]);
+                q1[element] = 1.0f * float(query1[element]);
+                accumulator0[element] = 0.0f;
+                accumulator1[element] = 0.0f;
             }
 
             uint slot = (ring_start + uint(block)) % uint(N);
-            float max_score = -3.402823466e+38F;
-            float sum_exp_score = 0.0f;
+            float max_score0 = -3.402823466e+38F;
+            float max_score1 = -3.402823466e+38F;
+            float sum_exp_score0 = 0.0f;
+            float sum_exp_score1 = 0.0f;
             for (int token = block; token < N; token += BLOCKS) {
                 const bool current = token == N - 1;
                 const device T* k = current ? new_key : keys + slot * D;
                 const device T* v = current ? new_value : values + slot * D;
-                float score = 0.0f;
+                float score0 = 0.0f;
+                float score1 = 0.0f;
                 for (int element = 0; element < values_per_lane; ++element) {
-                    score += q[element] * float(k[element]);
+                    const float key = float(k[element]);
+                    score0 += q0[element] * key;
+                    score1 += q1[element] * key;
                 }
-                score = simd_sum(score);
+                score0 = simd_sum(score0);
+                score1 = simd_sum(score1);
 
-                const float new_max = max(max_score, score);
-                const float old_factor = fast::exp(max_score - new_max);
-                const float score_factor = fast::exp(score - new_max);
-                max_score = new_max;
-                sum_exp_score = sum_exp_score * old_factor + score_factor;
+                const float new_max0 = max(max_score0, score0);
+                const float old_factor0 = fast::exp(max_score0 - new_max0);
+                const float score_factor0 = fast::exp(score0 - new_max0);
+                const float new_max1 = max(max_score1, score1);
+                const float old_factor1 = fast::exp(max_score1 - new_max1);
+                const float score_factor1 = fast::exp(score1 - new_max1);
+                max_score0 = new_max0;
+                max_score1 = new_max1;
+                sum_exp_score0 =
+                    sum_exp_score0 * old_factor0 + score_factor0;
+                sum_exp_score1 =
+                    sum_exp_score1 * old_factor1 + score_factor1;
                 for (int element = 0; element < values_per_lane; ++element) {
-                    accumulator[element] = accumulator[element] * old_factor
-                        + score_factor * float(v[element]);
+                    const float value = float(v[element]);
+                    accumulator0[element] = accumulator0[element] * old_factor0
+                        + score_factor0 * value;
+                    accumulator1[element] = accumulator1[element] * old_factor1
+                        + score_factor1 * value;
                 }
 
                 slot += BLOCKS;
@@ -327,11 +383,14 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             }
 
             if (lane == 0) {
-                sum_out[0] = sum_exp_score;
-                max_out[0] = max_score;
+                sum_out0[0] = sum_exp_score0;
+                max_out0[0] = max_score0;
+                sum_out1[0] = sum_exp_score1;
+                max_out1[0] = max_score1;
             }
             for (int element = 0; element < values_per_lane; ++element) {
-                partial[element] = T(accumulator[element]);
+                partial0[element] = T(accumulator0[element]);
+                partial1[element] = T(accumulator1[element]);
             }
         """,
         ensureRowContiguous: true
@@ -428,7 +487,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             starts.count == batch,
             starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength })
         else { return nil }
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = startArray(for: starts)
         return attend(
             passAKernel: ringPassAKernel, queries: queries, keys: keys, values: values,
             extraInputs: [startArray], scale: scale)
@@ -481,7 +540,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             else { return nil }
         }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = startArray(for: starts)
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let passA = fusedRingPassAKernel(
@@ -495,8 +554,8 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 ("KV_HEADS", kvHeads),
                 ("BLOCKS", blocks),
             ],
-            grid: (kvHeads * 32, batch * gqa, blocks),
-            threadGroup: (32, gqa, 1),
+            grid: (kvHeads * 32, batch, blocks),
+            threadGroup: (32, 1, 1),
             outputShapes: [partialShape, summaryShape, summaryShape, [1]],
             outputDTypes: [.bfloat16, .float32, .float32, .int32]
         )

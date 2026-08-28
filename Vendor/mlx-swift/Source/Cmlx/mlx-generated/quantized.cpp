@@ -1431,23 +1431,35 @@ METAL_FUNC void qmv_impl(
       biases += block_size / group_size;
       x += block_size;
     }
-    const int remaining = clamp(
-        static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
-        0,
-        values_per_thread);
-    if (remaining > 0) {
-      U sum = load_vector_safe<T, U, values_per_thread, bits>(
-          x, x_thread, remaining);
-
-      for (int row = 0; row < results_per_simdgroup; row++) {
-        auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-        const device T* sl = scales + row * in_vec_size_g;
-        const device T* bl = biases + row * in_vec_size_g;
-
-        U s = sl[0];
-        U b = bl[0];
-        result[row] += qdot_safe<U, values_per_thread, bits>(
-            wl, x_thread, s, b, sum, remaining);
+    if (group_size == 64 && bits == 4 &&
+        (in_vec_size == 704 || in_vec_size == 2816)) {
+      const uint active_tail_lanes =
+          uint((in_vec_size - k) / values_per_thread);
+      if (simd_lid < active_tail_lanes) {
+        U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+        for (int row = 0; row < results_per_simdgroup; row++) {
+          auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+          const device T* sl = scales + row * in_vec_size_g;
+          const device T* bl = biases + row * in_vec_size_g;
+          result[row] += qdot<U, values_per_thread, bits>(
+              wl, x_thread, sl[0], bl[0], sum);
+        }
+      }
+    } else {
+      const int remaining = clamp(
+          static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
+          0,
+          values_per_thread);
+      if (remaining > 0) {
+        U sum = load_vector_safe<T, U, values_per_thread, bits>(
+            x, x_thread, remaining);
+        for (int row = 0; row < results_per_simdgroup; row++) {
+          auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+          const device T* sl = scales + row * in_vec_size_g;
+          const device T* bl = biases + row * in_vec_size_g;
+          result[row] += qdot_safe<U, values_per_thread, bits>(
+              wl, x_thread, sl[0], bl[0], sum, remaining);
+        }
       }
     }
     for (int row = 0; row < results_per_simdgroup; row++) {

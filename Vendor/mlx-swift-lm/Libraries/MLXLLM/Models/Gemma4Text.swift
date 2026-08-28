@@ -2413,6 +2413,26 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 imageTokenMask: imageTokenMask))
     }
 
+    /// MMA-003: serve all eight cohort rows from one matrix-unit pass over the
+    /// tied affine-4 vocabulary plane. The implementation fails closed for
+    /// every non-production geometry, allowing the promoted tight-grid QMV
+    /// below to remain the exact fallback.
+    @inline(__always)
+    private func tiedLMHeadMMA(_ hidden: MLXArray) -> MLXArray? {
+        guard lmHead == nil,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.mode == .affine,
+            let mma = Gemma4MMAQuantizedGEMV.apply(
+                x: hidden,
+                w: quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                groupSize: quantized.groupSize,
+                bits: quantized.bits)
+        else { return nil }
+        return mma.reshaped(Array(hidden.shape.dropLast()) + [mma.dim(-1)])
+    }
+
     /// Apply the LM head (tied embedding or explicit `lm_head`) plus the
     /// configured final-logit softcap. Pure function of the post-norm hidden.
     /// LMH-001: tight-grid dispatch for the tied lm_head ordinary QMV.
@@ -2444,6 +2464,8 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         var out: MLXArray
         if let lmHead {
             out = lmHead(hidden)
+        } else if let mma = tiedLMHeadMMA(hidden) {
+            out = mma
         } else if let tight = tiedLMHeadTightGrid(hidden) {
             out = tight
         } else {

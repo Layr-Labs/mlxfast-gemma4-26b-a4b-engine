@@ -2366,12 +2366,39 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 imageTokenMask: imageTokenMask))
     }
 
+    /// LMH-001: tight-grid dispatch for the tied lm_head ordinary QMV.
+    ///
+    /// The vendored host launches ordinary QMV with an x grid extent of M = 8
+    /// (`backend/metal/quantized.cpp`), while the promoted large-N tier claims
+    /// four cohort rows per threadgroup and returns from the rest. On the tied
+    /// head that is 262144 threadgroups of which 196608 exist only to hit that
+    /// early return. `CBv2TiedLMHeadQMVV1` runs the same computation from a
+    /// kernel whose own x extent is two, so only the groups that were already
+    /// doing the work are launched. Returns `nil` unless every pin holds, and
+    /// the caller then keeps the stock path.
+    private func tiedLMHeadTightGrid(_ hidden: MLXArray) -> MLXArray? {
+        guard lmHead == nil,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.groupSize == 64,
+            quantized.bits == 4
+        else { return nil }
+        return CBv2TiedLMHeadQMVV1.matmul(
+            x: hidden,
+            weight: quantized.weight,
+            scales: quantized.scales,
+            biases: quantized.biases,
+            inDim: config.hiddenSize,
+            outDim: config.vocabSize)
+    }
+
     /// Apply the LM head (tied embedding or explicit `lm_head`) plus the
     /// configured final-logit softcap. Pure function of the post-norm hidden.
     func applyLMHead(_ hidden: MLXArray) -> MLXArray {
         var out: MLXArray
         if let lmHead {
             out = lmHead(hidden)
+        } else if let tight = tiedLMHeadTightGrid(hidden) {
+            out = tight
         } else {
             out = model.embedTokens.asLinear(hidden)
         }
@@ -2395,6 +2422,9 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     func applyRawLMHead(_ hidden: MLXArray) -> MLXArray {
         if let lmHead {
             return lmHead(hidden)
+        }
+        if let tight = tiedLMHeadTightGrid(hidden) {
+            return tight
         }
         return model.embedTokens.asLinear(hidden)
     }

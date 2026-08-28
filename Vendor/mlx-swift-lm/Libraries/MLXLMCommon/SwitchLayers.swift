@@ -282,7 +282,7 @@ let routeCountingSortKeyBound = 256
 private let routeFusedScatterKernelT64: MLXFast.MLXFastKernel = {
     let m = routeFusedScatterTopK
     return MLXFast.metalKernel(
-        name: "mlx_lm_route_csort_scatter_fused_m\(m)_u32_t64_v1",
+        name: "mlx_lm_route_csort_scatter_fused_m\(m)_u32_t64_shared_v2",
         inputNames: ["keys"],
         outputNames: ["row_order", "sorted_keys", "inverse_order"],
         source: """
@@ -301,8 +301,10 @@ private let routeFusedScatterKernelT64: MLXFast.MLXFastKernel = {
             // any accumulation order produces the byte-identical tables.
             threadgroup atomic_uint tg_total[256];
             threadgroup atomic_uint tg_before[256];
+            threadgroup uint tg_keys[TILE];
             atomic_store_explicit(&tg_total[k], 0u, memory_order_relaxed);
             atomic_store_explicit(&tg_before[k], 0u, memory_order_relaxed);
+            if (k < TILE) tg_keys[k] = keys[t * TILE + k];
             threadgroup_barrier(mem_flags::mem_threadgroup);
             // Split at the before-limit boundary so the tail segment
             // carries no branch; identical counters, identical adds.
@@ -338,7 +340,7 @@ private let routeFusedScatterKernelT64: MLXFast.MLXFastKernel = {
             // construction, exactly the stock scatter's write order.
             for (uint i = 0; i < TILE; ++i) {
                 uint idx = t * TILE + i;
-                if (keys[idx] == k) {
+                if (tg_keys[i] == k) {
                     row_order[off] = idx / M;
                     sorted_keys[off] = k;
                     inverse_order[idx] = off;

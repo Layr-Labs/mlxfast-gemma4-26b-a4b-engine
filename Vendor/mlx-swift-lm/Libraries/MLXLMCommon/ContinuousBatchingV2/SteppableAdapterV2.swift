@@ -14,6 +14,14 @@
 import Foundation
 import MLX
 
+/// Model-level opt-in for the reduced target-only decode fence.
+///
+/// A conformer promises that every CBv2 layer's attention result is on the
+/// returned logits path. Since `CBv2LayerCache` attention consumes views of
+/// each just-updated K/V buffer, evaluating sampled tokens then commits every
+/// K/V write transitively. Models without this marker keep the full fence.
+public protocol CBv2DecodeOutputKVCommitForwardable: AnyObject {}
+
 /// `CBv2SteppableModel` over any `LanguageModel` whose forward path
 /// understands `CBv2AttendingLayerCache` (Gemma 4, GPT-OSS, test fixtures).
 public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
@@ -26,6 +34,10 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
 
     public func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
         return model(tokens, cache: asKVCaches(caches))
+    }
+
+    public var decodeOutputCommitsKVWrites: Bool {
+        model is any CBv2DecodeOutputKVCommitForwardable
     }
 
     private func asKVCaches(_ caches: [CBv2AttendingLayerCache]) -> [KVCache] {

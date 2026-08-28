@@ -312,6 +312,13 @@ final class CBv2MTPRoundDriver {
         !CBv2MTPDepthController.speculationEnabled || depthController.maxDepth == 0
     }
 
+    /// Stronger name used by the decode-evaluation fence: this is true only
+    /// when the controller can never select a positive draft depth, so every
+    /// chained decode is exact target-only work rather than seed/verify work.
+    var isExactTargetOnlyPolicy: Bool {
+        isTargetOnlyPolicy || depthController.fixedDepth == 0
+    }
+
     var planDepth: Int { planDecision.depth }
     var planDecodeRowBucket: Int { planDecision.decodeRowBucket }
 

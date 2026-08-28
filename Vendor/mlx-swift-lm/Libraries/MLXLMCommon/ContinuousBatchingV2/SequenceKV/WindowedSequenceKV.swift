@@ -180,21 +180,46 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
         writeDecodeToken(keys: newKeys, values: newValues)
     }
 
+    var canUseFullDecodeRing: Bool {
+        !speculativeWriteArmed && staged == nil && keys != nil && values != nil
+            && retainedCount == window
+    }
+
     var decodeRingView: (keys: MLXArray, values: MLXArray, start: Int)? {
         guard staged == nil, let keys, let values, retainedCount == window else { return nil }
         return (keys, values, oldestValidPosition % window)
     }
 
     func fullDecodeRingBeforeWrite() -> (keys: MLXArray, values: MLXArray, start: Int)? {
-        guard staged == nil, let keys, let values, retainedCount == window else { return nil }
-        return (keys, values, (oldestValidPosition + 1) % window)
+        guard canUseFullDecodeRing else { return nil }
+        return (keys!, values!, (oldestValidPosition + 1) % window)
     }
 
     func advanceFullDecodeRingWithoutWrite() {
-        precondition(staged == nil && retainedCount == window)
+        precondition(canUseFullDecodeRing)
         borrowableChunkViews = nil
         absoluteOffset += 1
         oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
+    }
+
+    func writeFullDecodeRing(
+        keys newKeys: MLXArray, values newValues: MLXArray
+    ) -> (keys: MLXArray, values: MLXArray, start: Int) {
+        precondition(canUseFullDecodeRing,
+            "CBv2WindowedSequenceKV: ring decode requires a full unstaged ring")
+        precondition(newKeys.dim(0) == 1 && newValues.dim(0) == 1,
+            "CBv2WindowedSequenceKV holds one sequence")
+        precondition(newKeys.dim(1) == kvHeads && newKeys.dim(2) == 1,
+            "CBv2WindowedSequenceKV: ring decode key shape mismatch")
+        precondition(newValues.dim(2) == 1,
+            "CBv2WindowedSequenceKV: ring decode value shape mismatch")
+
+        borrowableChunkViews = nil
+        writeRing(keys!, tokens: newKeys, firstPosition: absoluteOffset)
+        writeRing(values!, tokens: newValues, firstPosition: absoluteOffset)
+        absoluteOffset += 1
+        oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
+        return (keys!, values!, oldestValidPosition % window)
     }
 
     // MARK: - Speculative (MTP) staging

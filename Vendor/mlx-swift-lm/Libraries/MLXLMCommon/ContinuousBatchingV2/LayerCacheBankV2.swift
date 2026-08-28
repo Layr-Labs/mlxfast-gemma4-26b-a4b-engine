@@ -100,27 +100,12 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
     private let caches: [any CBv2AttendingLayerCache]
     private var boundRowIdentity: [ObjectIdentifier] = []
     private var hasBound = false
-    /// Canonical owning layer for an all-contiguous bank's shared position
-    /// chain. nil keeps mixed and paged banks on their established behavior.
-    private var unifiedPositionLayerIndex: Int?
 
     /// Wrap pre-built caches — e.g. `model.newCacheV2 { ... }` output (the
     /// GPT-OSS path, which also primes sink activation at build time) or
     /// `PagedKVBackend.makeLayerCaches(attentionSoftcap:)`.
     public init(caches: [any CBv2AttendingLayerCache]) {
         self.caches = caches
-        let contiguous = caches.compactMap { $0 as? CBv2LayerCache }
-        if contiguous.count == caches.count,
-            // Advance at the last owning layer so every earlier layer still
-            // observes the pre-step value even outside Gemma's one-snapshot path.
-            let canonical = contiguous.last(where: { $0.kind.sharesKVWithLayer == nil })
-        {
-            let state = CBv2PositionOffsetsState(rows: canonical.rows)
-            unifiedPositionLayerIndex = canonical.layerIndex
-            for cache in contiguous {
-                cache.unifyPositionOffsets(with: state, advances: cache === canonical)
-            }
-        }
         var borrowedSources = Set<Int>()
         for cache in caches {
             guard let source = cache.kind.sharesKVWithLayer else { continue }
@@ -162,7 +147,7 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
     public func releaseBoundRows() {
         guard hasBound else { return }
         for cache in caches where cache.kind.sharesKVWithLayer == nil {
-            bindRows([], to: cache)
+            cache.setRows([])
         }
         hasBound = false
         boundRowIdentity = []
@@ -203,59 +188,20 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
             return ObjectIdentifier(anchor)
         }
         if !hasBound || identity != boundRowIdentity {
-            validateUnifiedPositionInvariant(rowStates)
             for (layer, cache) in caches.enumerated() {
                 guard cache.kind.sharesKVWithLayer == nil else { continue }
-                bindRows(
+                cache.setRows(
                     rowStates.map { states in
                         guard let state = states[layer] else {
                             preconditionFailure(
                                 "CBv2LayerCacheBank: missing sequence state for layer \(layer)")
                         }
                         return state
-                    },
-                    to: cache)
+                    })
             }
             boundRowIdentity = identity
             hasBound = true
         }
         return caches
-    }
-
-    /// Sharing is valid only while every owning layer for a row has consumed
-    /// the same absolute token count. Check at rare membership boundaries so
-    /// a future backend cannot silently opt into an invalid shared chain.
-    private func validateUnifiedPositionInvariant(
-        _ rowStates: [[CBv2SequenceKV?]]
-    ) {
-        guard let canonicalLayer = unifiedPositionLayerIndex else { return }
-        for states in rowStates {
-            guard let canonical = states[canonicalLayer] else {
-                preconditionFailure("CBv2LayerCacheBank: missing canonical position state")
-            }
-            for cache in caches where cache.kind.sharesKVWithLayer == nil {
-                guard let state = states[cache.layerIndex],
-                    state.absoluteOffset == canonical.absoluteOffset
-                else {
-                    preconditionFailure(
-                        "CBv2LayerCacheBank: layer positions diverged inside a unified bank")
-                }
-            }
-        }
-    }
-
-    /// Unified contiguous banks rebuild the shared host-derived tensor only
-    /// from their canonical layer. Other banks retain per-cache rebuilding.
-    private func bindRows(
-        _ rows: [CBv2SequenceKV], to cache: any CBv2AttendingLayerCache
-    ) {
-        guard let unifiedPositionLayerIndex,
-            let contiguous = cache as? CBv2LayerCache
-        else {
-            cache.setRows(rows)
-            return
-        }
-        contiguous.setRows(
-            rows, rebuildPositionOffsets: cache.layerIndex == unifiedPositionLayerIndex)
     }
 }

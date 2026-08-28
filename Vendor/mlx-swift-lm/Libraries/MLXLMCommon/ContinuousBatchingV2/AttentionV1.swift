@@ -22,13 +22,6 @@ import MLX
 /// Namespace for the v1 (per-row SDPA) attention dispatch.
 enum CBv2AttentionV1 {
 
-    private static let fusedRingWriteEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_FUSED_RING_WRITE"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
     /// Query-block width for multi-token prompt attention (see
     /// `attendQueryBlocks`). Smaller blocks execute strictly less attention
     /// work and hold a smaller score tensor, but cost one dispatch set each;
@@ -39,6 +32,13 @@ enum CBv2AttentionV1 {
     /// launch overhead of 32. `0` disables blocking entirely (one call for the
     /// whole chunk — the pre-2026-07 behavior), which is the kill switch if
     /// this is ever implicated in a numerics or latency regression.
+    private static let fusedRingWriteEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_FUSED_RING_WRITE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     static let queryBlockSize: Int = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_ATTN_QUERY_BLOCK"],
@@ -275,12 +275,14 @@ enum CBv2AttentionV1 {
                 var cachedValueRows: [MLXArray] = []
                 cachedKeyRows.reserveCapacity(B)
                 cachedValueRows.reserveCapacity(B)
-                let ringRows = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
-                if ringRows.count == B && ringRows.allSatisfy({ $0.decodeRingView != nil }) {
+                let windowedRows = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
+                if windowedRows.count == B
+                    && windowedRows.allSatisfy(\.canUseFullDecodeRing)
+                {
                     if fusedRingWriteEnabled, allowFusedRingWrite,
                         let decodeRingWriteFence
                     {
-                        let rings = ringRows.compactMap {
+                        let rings = windowedRows.compactMap {
                             $0.fullDecodeRingBeforeWrite()
                         }
                         if rings.count == B,
@@ -294,7 +296,7 @@ enum CBv2AttentionV1 {
                                     previousWriteFence: decodeRingWriteFence.value,
                                     scale: scale)
                         {
-                            for row in ringRows {
+                            for row in windowedRows {
                                 row.advanceFullDecodeRingWithoutWrite()
                             }
                             decodeRingWriteFence.value = result.nextWriteFence
@@ -302,21 +304,26 @@ enum CBv2AttentionV1 {
                         }
                     }
 
-                    for (index, row) in ringRows.enumerated() {
-                        row.decodeRingWrite(
+                    var starts: [Int] = []
+                    starts.reserveCapacity(B)
+                    for (index, row) in windowedRows.enumerated() {
+                        let ring = row.writeFullDecodeRing(
                             keys: keys[index ..< (index + 1)],
                             values: values[index ..< (index + 1)])
+                        cachedKeyRows.append(ring.keys)
+                        cachedValueRows.append(ring.values)
+                        starts.append(ring.start)
                     }
-                    let views = ringRows.compactMap { $0.decodeRingView }
-                    if views.count == B,
-                        let output = CBv2RaggedTwoPassDecodeAttentionV1.attendRing(
-                            queries: queries, keys: views.map(\.keys),
-                            values: views.map(\.values), starts: views.map(\.start),
-                            scale: scale)
+                    if let output = CBv2RaggedTwoPassDecodeAttentionV1.attendRing(
+                        queries: queries, keys: cachedKeyRows,
+                        values: cachedValueRows, starts: starts,
+                        scale: scale, slidingWindowLength: windowedRows[0].window)
                     {
                         return output
                     }
-                    for row in ringRows {
+                    cachedKeyRows.removeAll(keepingCapacity: true)
+                    cachedValueRows.removeAll(keepingCapacity: true)
+                    for row in windowedRows {
                         let view = row.snapshot()
                         cachedKeyRows.append(view.keys)
                         cachedValueRows.append(view.values)

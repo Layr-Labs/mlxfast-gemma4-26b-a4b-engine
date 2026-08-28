@@ -2704,7 +2704,7 @@ template <typename T, const int group_size, const int bits, bool batched>
       ntg.z == 1 && in_vec_size % 64 == 0 && out_vec_size >= 8 &&
       out_vec_size % 8 == 0) {
     // The ruled decode cohort presents eight input rows to ordinary QMV.
-    if (out_vec_size >= 1024) {
+    if (out_vec_size >= 8192) {
       // WIDE-N tier -- every non-`fast` 4-bit decode plane on this model:
       // full-attention k_proj N = 1024 (k_eq_v), k/v_proj N = 2048, sliding
       // q_proj N = 4096, full q_proj N = 8192, tied lm_head N = 262144. K is

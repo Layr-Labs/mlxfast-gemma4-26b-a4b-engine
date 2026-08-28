@@ -2552,10 +2552,27 @@ template <typename T, int group_size, int bits, bool batched>
     return;
   }
   if (!batched && group_size == 64 && bits == 4 && out_vec_size >= 1024) {
-    if (out_vec_size >= 4096) {
+    if (out_vec_size >= 2816) {
+      // FLOOR LOWERED 4096 -> 2816 so o_proj reaches this family. o_proj
+      // (N = 2816, K = 4096 sliding / 8192 global) is the only decode plane
+      // that satisfies affine_qmv_fast's N % 8 == 0 && K % 512 == 0 at all,
+      // and it was landing in the else arm's pair rung. Two measurements on
+      // an M4 Pro, arms interleaved inside each repetition, 40 reps, weights
+      // rotated through a 3 GiB pool, against STOCK qmv_fast_impl as the
+      // bit-exactness reference:
+      //   K = 4096   stock 124.31 us | pair 94.41 (+28.6%, exact NO)
+      //              | wide quad 80.17 (+47.3%, exact yes)
+      //   K = 8192   stock 229.90 us | pair 190.71 (+21.4%, exact NO)
+      //              | wide quad 154.36 (+49.2%, exact yes)
+      // So the wide quad is 13-24% faster than the rung o_proj takes today AND
+      // it reproduces the stock output exactly, which the pair rung does not.
+      // The old rationale below is kept because it still holds for widths this
+      // floor no longer admits.
+      //
       // Wide row sharing needs enough output tiles to keep the machine fed;
-      // below 4096 outputs the reduced x-group count thins the grid, so the
-      // promoted pair kernel is kept there byte-for-byte.
+      // far below this the reduced x-group count thins the grid. At N = 2816
+      // the quad still leaves 2 * 2816/8 = 704 active threadgroups, which is
+      // not thin.
       switch (ntg.x) {
         case 2:
           qmv_fast_crossrow_affine4_g64<T, 2>(

@@ -1150,6 +1150,27 @@ private class Gemma4Attention: Module {
     /// Invariant 1 (report 10 §4): RoPE offsets are per-row absolutes,
     /// snapshotted BEFORE `updateAndAttend` advances the rows, and KV-shared
     /// layers reuse the SOURCE layer's captured snapshot byte-identically.
+    @inline(__always)
+    private func packedMPPProjection(
+        _ projection: Linear,
+        input: MLXArray,
+        prepared: Gemma4PackedInlineQ4MPP.PreparedInput?
+    ) -> MLXArray {
+        guard let prepared,
+            let quantized = projection as? QuantizedLinear,
+            quantized.mode == .affine,
+            quantized.bias == nil,
+            let output = Gemma4PackedInlineQ4MPP.apply(
+                prepared: prepared,
+                weight: quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                groupSize: quantized.groupSize,
+                bits: quantized.bits)
+        else { return projection(input) }
+        return output.reshaped(Array(input.shape.dropLast()) + [quantized.shape.0])
+    }
+
     private func forwardV2(
         _ x: MLXArray,
         layerCache: any CBv2AttendingLayerCache,
@@ -1181,8 +1202,16 @@ private class Gemma4Attention: Module {
 
         let queryInput = lastQueryCache == nil ? x : x[0..., outputStart..., 0...]
         let queryLength = queryInput.dim(1)
+        // At exact B8 decode geometry this produces one layer-local affine
+        // x-sum surface. Q/K/V below share it; every prompt, speculative-width,
+        // unsupported-hardware, or non-Q4 path receives nil and stays stock.
+        let packedMPPInput =
+            lastQueryCache == nil
+            ? Gemma4PackedInlineQ4MPP.prepare(x: x) : nil
 
-        let queryRaw = qProj(queryInput).reshaped(B, queryLength, nHeads, effectiveHeadDim)
+        let queryRaw = packedMPPProjection(
+            qProj, input: queryInput, prepared: packedMPPInput
+        ).reshaped(B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
             // KV-shared layer: projects queries only and borrows (K, V) from
@@ -1244,10 +1273,14 @@ private class Gemma4Attention: Module {
             lastQueryCache == nil
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
-        let kRaw = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+        let kRaw = packedMPPProjection(
+            kProj, input: x, prepared: packedMPPInput
+        ).reshaped(B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
         if let vProj {
-            vRaw = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            vRaw = packedMPPProjection(
+                vProj, input: x, prepared: packedMPPInput
+            ).reshaped(B, L, nKvHeads, effectiveHeadDim)
         } else {
             vRaw = kRaw
         }

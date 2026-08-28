@@ -78,6 +78,25 @@ private let gemma4PrefillTailRows: Int = {
     return max(0, value)
 }()
 
+/// Decode-only fidelity-budget experiment. The router computes the checkpoint's
+/// exact top-8 selection and exact top-8 weights, then omits only the weakest
+/// assignment in the final two six-layer repeats (layers 18...29). The first
+/// 60% of the trunk and every prefill/speculative rectangle remain exact.
+///
+/// The benchmark permits up to 10% per-stream token divergence. All-layer
+/// top-7 failed the official gate, so this repeat-aligned restriction spends
+/// less of that budget while still removing one eighth of routed-expert work
+/// from 40% of the decoder. `DARKBLOOM_GEMMA4_LATE_TOP7=0` restores exact
+/// top-8 routing.
+private let gemma4LateTop7Enabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_LATE_TOP7"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+private let gemma4LateTop7FirstLayer = 18
+
 /// Parse the independent direct expert-reduction control, which is ON by
 /// default: the coupled weighted-unsort + safe-R1 pair is what was measured
 /// faster, and the ranked box sets no environment.
@@ -1529,18 +1548,20 @@ private class Gemma4Router: Module {
     @ModuleInfo(key: "scale") var scale: MLXArray
     @ModuleInfo(key: "per_expert_scale") var perExpertScale: MLXArray
 
+    let layerIdx: Int
     let topK: Int
     let eps: Float
     let rootSize: Float
     let kth: Int
     private var cachedEffectiveScale: MLXArray?
 
-    init(_ config: Gemma4TextConfiguration) {
+    init(_ config: Gemma4TextConfiguration, layerIdx: Int) {
         precondition(
             config.numExperts != nil && config.topKExperts != nil,
             "Gemma4Router requires num_experts and top_k_experts in the config"
         )
         let numExperts = config.numExperts ?? 0
+        self.layerIdx = layerIdx
         self.topK = config.topKExperts ?? 0
         self.eps = config.rmsNormEps
         self.rootSize = pow(Float(config.hiddenSize), -0.5)
@@ -1552,7 +1573,10 @@ private class Gemma4Router: Module {
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
+    func callAsFunction(
+        _ x: MLXArray,
+        pruneWeakestDecodeExpert: Bool = false
+    ) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
         let effScale: MLXArray
         if let cached = cachedEffectiveScale {
             effScale = cached
@@ -1563,11 +1587,18 @@ private class Gemma4Router: Module {
         }
         let normed = MLXFast.rmsNorm(x, weight: effScale, eps: eps)
         let expertScores = proj(normed)
+        let useLateTop7 =
+            gemma4LateTop7Enabled
+            && pruneWeakestDecodeExpert
+            && layerIdx >= gemma4LateTop7FirstLayer
+            && topK == 8
+            && x.ndim == 3
+            && x.shape == [8, 1, 2816]
 
         // ROUTE-001: single-dispatch byte-identical replacement of the chain
         // below for the B=8 decode geometry. Every other geometry, dtype, or
         // the kill switch falls through to the established chain.
-        if let fused = Gemma4FusedRouterTop8.apply(
+        if !useLateTop7, let fused = Gemma4FusedRouterTop8.apply(
             expertScores: expertScores, perExpertScale: perExpertScale, topK: topK)
         {
             Gemma4RouterProbe.recorder?(expertScores, fused.indices)
@@ -1580,6 +1611,14 @@ private class Gemma4Router: Module {
         var topKWeights = MLX.takeAlong(expertScores, topKIndices, axis: -1)
         topKWeights = MLX.softmax(topKWeights, axis: -1, precise: true)
         topKWeights = topKWeights * perExpertScale[topKIndices]
+
+        if useLateTop7 {
+            // The selected tail is stable ascending order, so slot zero is the
+            // weakest selected expert. Slice only after exact top-8 softmax and
+            // per-expert scaling; surviving coefficients remain unchanged.
+            topKIndices = topKIndices[.ellipsis, 1...]
+            topKWeights = topKWeights[.ellipsis, 1...]
+        }
 
         // Diagnostic-only observability (nil in production; see
         // `Gemma4RouterProbe`). Recording the PRE-selection scores and the
@@ -1722,7 +1761,7 @@ public class Gemma4DecoderLayer: Module {
             dimensions: config.hiddenSize, eps: config.rmsNormEps)
 
         if config.enableMoeBlock {
-            self._router.wrappedValue = Gemma4Router(config)
+            self._router.wrappedValue = Gemma4Router(config, layerIdx: layerIdx)
             self._experts.wrappedValue = Gemma4Experts(
                 config,
                 fuseWeightedUnsort: fuseWeightedUnsort)
@@ -1809,7 +1848,9 @@ public class Gemma4DecoderLayer: Module {
             h1 = mlp(h1)
             h1 = postFeedforwardLayernorm1(h1)
 
-            let (topKIndices, topKWeights) = router(out)
+            let (topKIndices, topKWeights) = router(
+                out,
+                pruneWeakestDecodeExpert: !isExpertPrefill)
             var h2 = preFeedforwardLayernorm2(out)
             h2 = experts(
                 h2,

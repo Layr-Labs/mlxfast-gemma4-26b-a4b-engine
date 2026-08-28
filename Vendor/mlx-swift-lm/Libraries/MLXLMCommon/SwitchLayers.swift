@@ -139,9 +139,10 @@ private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
 /// permutation and reduce original top-K slots into `[tokens, hidden]`.
 ///
 /// This primitive deliberately accepts only the production logical layout:
-/// bfloat16 `[tokens * 8, 2816]`, uint32 inverse order, and bfloat16
-/// `[tokens, 8]`. Callers must use the legacy scatter + weighted sum for every
-/// other dtype, shape, or layout.
+/// bfloat16 `[tokens * K, 2816]`, uint32 inverse order, and bfloat16
+/// `[tokens, K]`, where K is production top-8 or the late-layer decode-only
+/// top-7 experiment. Callers must use the legacy scatter + weighted sum for
+/// every other dtype, shape, or layout.
 public func weightedExpertUnsort(
     sortedOutputs: MLXArray,
     inverseOrder: MLXArray,
@@ -155,20 +156,22 @@ public func weightedExpertUnsort(
         inverseOrder.ndim == 1 && inverseOrder.dtype == .uint32,
         "weightedExpertUnsort inverse order must be flat uint32")
     precondition(
-        weights.ndim == 2 && weights.dim(1) == 8 && weights.size >= 64
+        weights.ndim == 2 && (weights.dim(1) == 7 || weights.dim(1) == 8)
+            && weights.size >= 56
             && weights.dtype == .bfloat16,
-        "weightedExpertUnsort weights must be sorted-prefill bfloat16 [tokens, 8]")
+        "weightedExpertUnsort weights must be bfloat16 [tokens, 7 or 8]")
     precondition(
         sortedOutputs.dim(0) == weights.size && inverseOrder.size == weights.size,
         "weightedExpertUnsort assignment counts must match")
 
     let tokens = weights.dim(0)
+    let topK = weights.dim(1)
     weightedExpertUnsortProbe.recordEffective()
     return weightedExpertUnsortKernel(
         [sortedOutputs, inverseOrder, weights],
         template: [
             ("T", sortedOutputs.dtype),
-            ("K", 8),
+            ("K", topK),
         ],
         grid: (2816, tokens, 1),
         threadGroup: (64, 4, 1),
@@ -249,7 +252,55 @@ public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, M
     )
 }
 
+/// Stable expert-assignment metadata for the exact late-layer batch-8/top-7
+/// decode experiment. The generic path below builds the same three arrays with
+/// two `argSort`s, a gather, and integer division. At exactly 56 assignments,
+/// one thread per assignment can instead compute its unique stable rank.
+///
+/// Equal expert IDs retain original flat-assignment order, matching the stable
+/// expert sort used by the established path. The `(expert, assignment)` key is
+/// unique, so writes indexed by `rank` cannot collide.
+private let gatherSortIndicesB8K7Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "gather_sort_indices_b8_k7_u32_v1",
+    inputNames: ["indices"],
+    outputNames: ["lhs_indices", "sorted_indices", "inverse_order"],
+    source: """
+        const uint assignment = thread_position_in_grid.x;
+        threadgroup uint experts[56];
+        experts[assignment] = uint(indices[assignment]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint expert = experts[assignment];
+        uint rank = 0;
+        for (uint other_assignment = 0; other_assignment < 56; ++other_assignment) {
+            const uint other_expert = experts[other_assignment];
+            if (other_expert < expert
+                || (other_expert == expert && other_assignment < assignment)) {
+                ++rank;
+            }
+        }
+
+        lhs_indices[rank] = assignment / 7;
+        sorted_indices[rank] = expert;
+        inverse_order[assignment] = rank;
+    """,
+    ensureRowContiguous: true
+)
+
 public func gatherSortIndices(indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+    if indices.ndim == 2 && indices.shape == [8, 7]
+        && indices.dtype == .uint32
+    {
+        let outputs = gatherSortIndicesB8K7Kernel(
+            [indices],
+            grid: (56, 1, 1),
+            threadGroup: (56, 1, 1),
+            outputShapes: [[56], [56], [56]],
+            outputDTypes: [.uint32, .uint32, .uint32]
+        )
+        return (outputs[0], outputs[1], outputs[2])
+    }
+
     let m = indices.dim(-1)
     let indices = indices.flattened()
     let order = argSort(indices)
@@ -389,10 +440,11 @@ public class SwitchGLU: Module {
         _ x: MLXArray, _ indices: MLXArray
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
         let useLhsIndices =
-            indices.size == 64 && indices.ndim == 2 && indices.shape == [8, 8]
+            indices.ndim == 2 && indices.dim(0) == 8
+            && (indices.dim(1) == 7 || indices.dim(1) == 8)
             && x.ndim == 2 && x.shape == [8, inputDims]
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
-        let doSort = indices.size >= 64
+        let doSort = indices.size >= 64 || useLhsIndices
 
         var idx = indices
         var inverseOrder = MLXArray()
@@ -455,6 +507,9 @@ public class SwitchGLU: Module {
         // profile keeps generic SwitchGLU/custom activations on the established
         // implementation.
         guard weightedReductionProfile == .gemma4ProductionGeGLU else { return false }
+        let supportedAssignmentGeometry =
+            (indices.dim(1) == 8 && indices.size >= 64)
+            || (x.shape == [8, 2816] && indices.shape == [8, 7])
         return inputDims == 2816
             && hiddenDims == 704
             && numExperts == 128
@@ -466,12 +521,11 @@ public class SwitchGLU: Module {
             && x.dtype == .bfloat16
             && indices.ndim == 2
             && indices.dim(0) == x.dim(0)
-            && indices.dim(1) == 8
+            && supportedAssignmentGeometry
             && indices.dtype == .uint32
             && weights.ndim == 2
             && weights.shape == indices.shape
             && weights.dtype == .bfloat16
-            && indices.size >= 64
     }
 
     public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
@@ -497,12 +551,13 @@ public class SwitchGLU: Module {
         fuseSortedReduction: Bool,
         isProductionPrefill: Bool = true
     ) -> MLXArray {
-        // At B=8 decode there are exactly 64 assignments (8 rows x top-k 8),
-        // which is the sorting threshold and the minimum geometry accepted by
-        // weightedExpertUnsort.  Keep the decode gate exact so MTP rectangles
-        // and smaller serving cohorts remain on their established reduction.
+        // At B=8 decode there are exactly 56 or 64 assignments for the
+        // late-layer top-7 experiment or production top-8. Keep the decode
+        // gate exact so MTP rectangles and smaller serving cohorts remain on
+        // their established reduction.
         let isEightRowDecode =
-            !isProductionPrefill && x.dim(0) == 8 && indices.size == 64
+            !isProductionPrefill && x.dim(0) == 8
+            && (indices.shape == [8, 7] || indices.shape == [8, 8])
         guard fuseSortedReduction && (isProductionPrefill || isEightRowDecode),
             supportsWeightedExpertUnsort(x, indices, weights: weights)
         else {

@@ -330,6 +330,15 @@ extension CBv2SequenceKV {
     public func commitSpeculativeWrite() {}
 }
 
+/// Affirmative storage proof for decode evaluation-root compaction.
+///
+/// Conformance means every mutation an ordinary one-token decode performs is
+/// ordered by either the K/V views consumed by the attention output or the
+/// owning `CBv2LayerCache`'s explicit fused-ring-write fence. Unknown/custom
+/// row implementations make no such claim, so the engine must keep their full
+/// cache inner state as evaluation roots.
+public protocol CBv2DecodeRootCompactionCapableSequenceKV: CBv2SequenceKV {}
+
 /// Factory for per-sequence KV state; implemented by the v1 contiguous
 /// backend and the v2 paged backend.
 public protocol CBv2KVBackend: AnyObject {

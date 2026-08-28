@@ -180,6 +180,23 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
         writeDecodeToken(keys: newKeys, values: newValues)
     }
 
+    /// Full-ring storage and the temporal start it will have AFTER the next
+    /// decode token replaces the oldest slot.  The fused attention kernel
+    /// reads the new token directly while writing that same slot in place.
+    func fullDecodeRingBeforeWrite() -> (keys: MLXArray, values: MLXArray, start: Int)? {
+        guard staged == nil, let keys, let values, retainedCount == window else { return nil }
+        return (keys, values, (oldestValidPosition + 1) % window)
+    }
+
+    /// Advance the host-side ring coordinates after a fused kernel has taken
+    /// ownership of the physical K/V write.
+    func advanceFullDecodeRingWithoutWrite() {
+        precondition(staged == nil && retainedCount == window)
+        borrowableChunkViews = nil
+        absoluteOffset += 1
+        oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
+    }
+
     var decodeRingView: (keys: MLXArray, values: MLXArray, start: Int)? {
         guard staged == nil, let keys, let values, retainedCount == window else { return nil }
         return (keys, values, oldestValidPosition % window)

@@ -16,6 +16,10 @@
 import Foundation
 import MLX
 
+final class CBv2DecodeRingWriteFence {
+    var value = MLXArray.zeros([1], dtype: .int32)
+}
+
 /// Per-layer, batch-facing cache + attention dispatcher for the v2 engine.
 public final class CBv2LayerCache: CBv2AttendingLayerCache {
 
@@ -42,6 +46,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     public var positionOffsets: MLXArray { cachedPositionOffsets }
 
     private var cachedPositionOffsets: MLXArray
+    private let decodeRingWriteFence = CBv2DecodeRingWriteFence()
+    private var retainsChunkForBorrowers = true
 
     /// MTP-only verification policy. When true, an L>1 update still projects
     /// and stores the whole rectangle once, but attention evaluates each
@@ -117,7 +123,9 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             queries: queries, keys: keys, values: values,
             scale: scale, sinks: sinks, softcap: attentionSoftcap,
             spanContexts: boundSpanContexts,
-            serializeQueries: mtpSerializesRectangularAttention)
+            serializeQueries: mtpSerializesRectangularAttention,
+            decodeRingWriteFence: decodeRingWriteFence,
+            allowFusedRingWrite: !retainsChunkForBorrowers)
         // Advance offsets ON-DEVICE. Decode and packed prefill are
         // rectangular, so L is uniform across every bound row.
         cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))
@@ -177,6 +185,12 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     }
 }
 
+extension CBv2LayerCache: CBv2KVSourceChunkRetaining {
+    public func setRetainsChunkForBorrowers(_ retains: Bool) {
+        retainsChunkForBorrowers = retains
+    }
+}
+
 // MARK: - Final-layer last-query prefill
 
 extension CBv2LayerCache: CBv2LastQueryPrefillLayerCache {}
@@ -211,7 +225,7 @@ extension CBv2LayerCache: KVCache {
     /// The engine loop evaluates cache inner state each step (asyncEval) to
     /// collapse lazy chains: per-row storage plus the positionOffsets chain.
     public func innerState() -> [MLXArray] {
-        var arrays = [cachedPositionOffsets]
+        var arrays = [cachedPositionOffsets, decodeRingWriteFence.value]
         for row in rows {
             if let provider = row as? CBv2InnerStateProviding {
                 arrays.append(contentsOf: provider.cbv2InnerState())

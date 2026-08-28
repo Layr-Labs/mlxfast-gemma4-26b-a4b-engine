@@ -902,6 +902,13 @@ private func gemma4AttentionFallback(
 // MARK: - Attention
 
 private class Gemma4Attention: Module {
+    private static let projectionCotileEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_QKV_COTILE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     let config: Gemma4TextConfiguration
     let layerIdx: Int
     let layerType: String
@@ -915,6 +922,8 @@ private class Gemma4Attention: Module {
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
     @ModuleInfo(key: "k_proj") var kProj: Linear?
+    @ModuleInfo(key: "qk_proj") var qkProj: Linear?
+    @ModuleInfo(key: "qkv_proj") var qkvProj: Linear?
     @ModuleInfo(key: "v_proj") var vProj: Linear?
     @ModuleInfo(key: "o_proj") var oProj: Linear
 
@@ -960,6 +969,17 @@ private class Gemma4Attention: Module {
             self._kProj.wrappedValue = Linear(dim, nKvHeads * effectiveHeadDim, bias: false)
             if !useKeqV {
                 self._vProj.wrappedValue = Linear(dim, nKvHeads * effectiveHeadDim, bias: false)
+                // Preserve the three declared projections for last-query
+                // prefill, then co-tile their exact packed rows for ordinary
+                // decode/prefill.  This removes two QMV dispatches without
+                // changing any output row's arithmetic.
+                self._qkvProj.wrappedValue = Linear(
+                    dim, (nHeads + 2 * nKvHeads) * effectiveHeadDim, bias: false)
+            } else {
+                // Full-attention K-eq-V layers have no V projection, so their
+                // corresponding exact co-tile contains Q and K only.
+                self._qkProj.wrappedValue = Linear(
+                    dim, (nHeads + nKvHeads) * effectiveHeadDim, bias: false)
             }
             self._kNorm.wrappedValue = RMSNorm(dimensions: effectiveHeadDim, eps: config.rmsNormEps)
             self._vNorm.wrappedValue = RMSNormNoScale(eps: config.rmsNormEps)
@@ -984,6 +1004,32 @@ private class Gemma4Attention: Module {
         }
 
         super.init()
+    }
+
+    @inline(__always)
+    private func projectCombinedQK(_ x: MLXArray) -> (queries: MLXArray, keys: MLXArray)? {
+        guard Self.projectionCotileEnabled, let qkProj else { return nil }
+        let queryWidth = nHeads * effectiveHeadDim
+        let projected = qkProj(x)
+        return (
+            projected[.ellipsis, ..<queryWidth],
+            projected[.ellipsis, queryWidth...]
+        )
+    }
+
+    @inline(__always)
+    private func projectCombinedQKV(
+        _ x: MLXArray
+    ) -> (queries: MLXArray, keys: MLXArray, values: MLXArray)? {
+        guard Self.projectionCotileEnabled, let qkvProj else { return nil }
+        let queryWidth = nHeads * effectiveHeadDim
+        let keyWidth = nKvHeads * effectiveHeadDim
+        let projected = qkvProj(x)
+        return (
+            projected[.ellipsis, ..<queryWidth],
+            projected[.ellipsis, queryWidth ..< (queryWidth + keyWidth)],
+            projected[.ellipsis, (queryWidth + keyWidth)...]
+        )
     }
 
     func callAsFunction(
@@ -1012,7 +1058,10 @@ private class Gemma4Attention: Module {
 
         let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
 
-        var queries = qProj(x).reshaped(B, L, nHeads, effectiveHeadDim)
+        let combinedQKV = usesSharedKV ? nil : projectCombinedQKV(x)
+        let combinedQK = usesSharedKV || combinedQKV != nil ? nil : projectCombinedQK(x)
+        var queries = (combinedQKV?.queries ?? combinedQK?.queries ?? qProj(x)).reshaped(
+            B, L, nHeads, effectiveHeadDim)
         queries = qNorm(queries)
 
         let keys: MLXArray
@@ -1028,7 +1077,8 @@ private class Gemma4Attention: Module {
                 preconditionFailure("Gemma4 shared-KV layers require sharedKV input")
             }
 
-            let kRaw = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            let kRaw = (combinedQKV?.keys ?? combinedQK?.keys ?? kProj(x)).reshaped(
+                B, L, nKvHeads, effectiveHeadDim)
             var k = kNorm(kRaw)
             k = k.transposed(0, 2, 1, 3)
             k = gemma4ApplyRotaryPosition(rope, to: k, offset: activePositionOffset)
@@ -1039,7 +1089,8 @@ private class Gemma4Attention: Module {
             // `[B, n_kv_heads, L, D]` layout as keys.
             var v: MLXArray
             if let vProj {
-                v = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+                v = (combinedQKV?.values ?? vProj(x)).reshaped(
+                    B, L, nKvHeads, effectiveHeadDim)
             } else {
                 v = kRaw
             }
@@ -1168,7 +1219,17 @@ private class Gemma4Attention: Module {
         let queryInput = lastQueryCache == nil ? x : x[0..., outputStart..., 0...]
         let queryLength = queryInput.dim(1)
 
-        let queryRaw = qProj(queryInput).reshaped(B, queryLength, nHeads, effectiveHeadDim)
+        // Last-query prefill deliberately keeps separate Q/K projections:
+        // Q sees one row while K must cover the full chunk.  Every other
+        // non-shared path can consume one value-identical co-tiled QKV/QK tensor.
+        let combinedQKV = !usesSharedKV && lastQueryCache == nil
+            ? projectCombinedQKV(x) : nil
+        let combinedQK = !usesSharedKV && lastQueryCache == nil && combinedQKV == nil
+            ? projectCombinedQK(x) : nil
+        let queryRaw = (
+            combinedQKV?.queries ?? combinedQK?.queries ?? qProj(queryInput)
+        ).reshaped(
+            B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
             // KV-shared layer: projects queries only and borrows (K, V) from
@@ -1219,10 +1280,12 @@ private class Gemma4Attention: Module {
             lastQueryCache == nil
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
-        let kRaw = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+        let kRaw = (combinedQKV?.keys ?? combinedQK?.keys ?? kProj(x)).reshaped(
+            B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
         if let vProj {
-            vRaw = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            vRaw = (combinedQKV?.values ?? vProj(x)).reshaped(
+                B, L, nKvHeads, effectiveHeadDim)
         } else {
             vRaw = kRaw
         }
@@ -2487,6 +2550,41 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             }
 
             sanitized[k] = v
+        }
+
+        // The target's Q/K/V projections use the same affine-4/group-64
+        // format.  Keep their declared tensors for last-query prefill, and
+        // add one input-independent co-tiled copy for ordinary decode/prefill
+        // (QK for K-eq-V layers, QKV otherwise).
+        // Concatenating the output-row axis changes no packed code, scale, or
+        // bias value; each output retains the incumbent QMV reduction order.
+        let qMarker = ".self_attn.q_proj."
+        for qKey in Array(sanitized.keys) where qKey.contains(qMarker) {
+            guard qKey.hasSuffix(".weight") || qKey.hasSuffix(".scales")
+                    || qKey.hasSuffix(".biases"),
+                let layerIdx = extractLayerIdx(from: qKey),
+                !config.layerUsesSharedKV(layerIdx: layerIdx)
+            else { continue }
+
+            let kKey = qKey.replacingOccurrences(
+                of: qMarker, with: ".self_attn.k_proj.")
+            guard let qValue = sanitized[qKey], let kValue = sanitized[kKey] else {
+                continue
+            }
+            let isSliding = config.layerTypes[layerIdx] == "sliding_attention"
+            let usesKeqV = config.attentionKeqV && !isSliding
+            if usesKeqV {
+                let qkKey = qKey.replacingOccurrences(
+                    of: qMarker, with: ".self_attn.qk_proj.")
+                sanitized[qkKey] = concatenated([qValue, kValue], axis: -2)
+            } else {
+                let vKey = qKey.replacingOccurrences(
+                    of: qMarker, with: ".self_attn.v_proj.")
+                let qkvKey = qKey.replacingOccurrences(
+                    of: qMarker, with: ".self_attn.qkv_proj.")
+                guard let vValue = sanitized[vKey] else { continue }
+                sanitized[qkvKey] = concatenated([qValue, kValue, vValue], axis: -2)
+            }
         }
         return sanitized
     }

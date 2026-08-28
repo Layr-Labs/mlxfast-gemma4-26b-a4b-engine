@@ -2026,6 +2026,7 @@ public class Gemma4DecoderLayer: Module {
         // sum + postFFLN + residual) into one dispatch; when it engages, the
         // common tail below must not run again.
         var tailApplied = false
+        var layerScalarApplied = false
 
         if isMoE,
             let router,
@@ -2060,7 +2061,25 @@ public class Gemma4DecoderLayer: Module {
                     isExpertPrefill: isExpertPrefill)
             }
 
-            if let fusedTail = Gemma4FusedLayerGlue.tail(
+            // The scored text tower has no PLE, so its layer scalar is the
+            // immediate consumer of this exact fused-tail result. Keep the
+            // established GLUE-001 object as the fallback for every geometry,
+            // dtype, or model structure the separate scaled-tail kernel refuses.
+            if perLayerInputGate == nil,
+                perLayerProjection == nil,
+                postPerLayerInputNorm == nil,
+                let fusedTail = CBv2Gemma4ScaledTailV1.tail(
+                    mlpOut: h1Raw, expertOut: h2Raw, residual: residual2,
+                    w1: postFeedforwardLayernorm1.weight,
+                    w2: postFeedforwardLayernorm2.weight,
+                    w3: postFeedforwardLayernorm.weight,
+                    layerScalar: layerScalar,
+                    eps: config.rmsNormEps)
+            {
+                out = fusedTail
+                tailApplied = true
+                layerScalarApplied = true
+            } else if let fusedTail = Gemma4FusedLayerGlue.tail(
                 mlpOut: h1Raw, expertOut: h2Raw, residual: residual2,
                 w1: postFeedforwardLayernorm1.weight,
                 w2: postFeedforwardLayernorm2.weight,
@@ -2099,7 +2118,9 @@ public class Gemma4DecoderLayer: Module {
             out = residual3 + g
         }
 
-        out = out * layerScalar
+        if !layerScalarApplied {
+            out = out * layerScalar
+        }
 
         return (out, kvPair, attnPositionOffset)
     }

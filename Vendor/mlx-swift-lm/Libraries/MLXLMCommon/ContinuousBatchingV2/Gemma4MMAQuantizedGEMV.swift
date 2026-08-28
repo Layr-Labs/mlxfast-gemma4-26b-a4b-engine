@@ -2372,14 +2372,16 @@ public enum Gemma4MMAQuantizedGEMV {
             const uint outputN1 = outputN0 + N_PSG;
             const uint outputN2 = outputN0 + N_PSG * 2;
             const uint outputN3 = outputN0 + N_PSG * 3;
-            out[fragmentCol * N + outputN0] = T(acc0.thread_elements()[0]);
-            out[(fragmentCol + 1) * N + outputN0] = T(acc0.thread_elements()[1]);
-            out[fragmentCol * N + outputN1] = T(acc1.thread_elements()[0]);
-            out[(fragmentCol + 1) * N + outputN1] = T(acc1.thread_elements()[1]);
-            out[fragmentCol * N + outputN2] = T(acc2.thread_elements()[0]);
-            out[(fragmentCol + 1) * N + outputN2] = T(acc2.thread_elements()[1]);
-            out[fragmentCol * N + outputN3] = T(acc3.thread_elements()[0]);
-            out[(fragmentCol + 1) * N + outputN3] = T(acc3.thread_elements()[1]);
+            constexpr float softcap = 30.0f;
+            constexpr float invSoftcap = 1.0f / 30.0f;
+            out[fragmentCol * N + outputN0] = T(precise::tanh(acc0.thread_elements()[0] * invSoftcap) * softcap);
+            out[(fragmentCol + 1) * N + outputN0] = T(precise::tanh(acc0.thread_elements()[1] * invSoftcap) * softcap);
+            out[fragmentCol * N + outputN1] = T(precise::tanh(acc1.thread_elements()[0] * invSoftcap) * softcap);
+            out[(fragmentCol + 1) * N + outputN1] = T(precise::tanh(acc1.thread_elements()[1] * invSoftcap) * softcap);
+            out[fragmentCol * N + outputN2] = T(precise::tanh(acc2.thread_elements()[0] * invSoftcap) * softcap);
+            out[(fragmentCol + 1) * N + outputN2] = T(precise::tanh(acc2.thread_elements()[1] * invSoftcap) * softcap);
+            out[fragmentCol * N + outputN3] = T(precise::tanh(acc3.thread_elements()[0] * invSoftcap) * softcap);
+            out[(fragmentCol + 1) * N + outputN3] = T(precise::tanh(acc3.thread_elements()[1] * invSoftcap) * softcap);
             """
         )
         return result

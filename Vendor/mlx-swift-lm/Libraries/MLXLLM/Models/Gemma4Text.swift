@@ -913,6 +913,28 @@ private func gemma4AttentionFallback(
     return output
 }
 
+@inline(__always)
+private func gemma4TightGridQMV(
+    _ layer: Linear?,
+    _ x: MLXArray
+) -> MLXArray? {
+    guard let layer,
+        let quantized = layer as? QuantizedLinear,
+        type(of: quantized) == QuantizedLinear.self,
+        quantized.bias == nil,
+        quantized.groupSize == 64,
+        quantized.mode == .affine
+    else { return nil }
+    return CBv2QMVQuadStreamTightGridV1.matmul(
+        x: x,
+        weight: quantized.weight,
+        scales: quantized.scales,
+        biases: quantized.biases,
+        bits: quantized.bits,
+        inputDimension: quantized.shape.1,
+        outputDimension: quantized.shape.0)
+}
+
 // MARK: - Attention
 
 private class Gemma4Attention: Module {
@@ -1182,7 +1204,14 @@ private class Gemma4Attention: Module {
         let queryInput = lastQueryCache == nil ? x : x[0..., outputStart..., 0...]
         let queryLength = queryInput.dim(1)
 
-        let queryRaw = qProj(queryInput).reshaped(B, queryLength, nHeads, effectiveHeadDim)
+        let tightQuery: MLXArray?
+        if lastQueryCache == nil {
+            tightQuery = gemma4TightGridQMV(qProj, queryInput)
+        } else {
+            tightQuery = nil
+        }
+        let queryRaw = (tightQuery ?? qProj(queryInput))
+            .reshaped(B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
             // KV-shared layer: projects queries only and borrows (K, V) from
@@ -1244,10 +1273,12 @@ private class Gemma4Attention: Module {
             lastQueryCache == nil
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
-        let kRaw = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+        let kRaw = (gemma4TightGridQMV(kProj, x) ?? kProj(x))
+            .reshaped(B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
         if let vProj {
-            vRaw = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            vRaw = (gemma4TightGridQMV(vProj, x) ?? vProj(x))
+                .reshaped(B, L, nKvHeads, effectiveHeadDim)
         } else {
             vRaw = kRaw
         }
@@ -1532,6 +1563,8 @@ private class Gemma4Router: Module {
     let topK: Int
     let eps: Float
     let rootSize: Float
+    let kth: Int
+    private var cachedEffectiveScale: MLXArray?
 
     init(_ config: Gemma4TextConfiguration) {
         precondition(
@@ -1542,6 +1575,7 @@ private class Gemma4Router: Module {
         self.topK = config.topKExperts ?? 0
         self.eps = config.rmsNormEps
         self.rootSize = pow(Float(config.hiddenSize), -0.5)
+        self.kth = numExperts - self.topK
 
         self._proj.wrappedValue = Linear(config.hiddenSize, numExperts, bias: false)
         self._scale.wrappedValue = MLXArray.ones([config.hiddenSize])
@@ -1550,7 +1584,15 @@ private class Gemma4Router: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
-        let normed = MLXFast.rmsNorm(x, weight: scale * rootSize, eps: eps)
+        let effScale: MLXArray
+        if let cached = cachedEffectiveScale {
+            effScale = cached
+        } else {
+            let eff = scale * rootSize
+            cachedEffectiveScale = eff
+            effScale = eff
+        }
+        let normed = MLXFast.rmsNorm(x, weight: effScale, eps: eps)
         let expertScores = proj(normed)
 
         // ROUTE-001: single-dispatch byte-identical replacement of the chain
@@ -1563,7 +1605,6 @@ private class Gemma4Router: Module {
             return (fused.indices, fused.weights)
         }
 
-        let kth = expertScores.dim(-1) - topK
         var topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
         topKIndices = topKIndices[.ellipsis, kth...]
 
@@ -1646,8 +1687,23 @@ private class Gemma4MLP: Module {
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(gemma4SafeGeluProduct(gateProj(x), upProj(x)))
+    func callAsFunction(_ x: MLXArray, useTightGridQMV: Bool = false) -> MLXArray {
+        let gate: MLXArray
+        let up: MLXArray
+        if useTightGridQMV {
+            gate = gemma4TightGridQMV(gateProj, x) ?? gateProj(x)
+            up = gemma4TightGridQMV(upProj, x) ?? upProj(x)
+        } else {
+            gate = gateProj(x)
+            up = upProj(x)
+        }
+        let product = gemma4SafeGeluProduct(gate, up)
+        if useTightGridQMV,
+            let tightOutput = gemma4TightGridQMV(downProj, product)
+        {
+            return tightOutput
+        }
+        return downProj(product)
     }
 }
 
@@ -1796,7 +1852,7 @@ public class Gemma4DecoderLayer: Module {
         {
             // Dense + sparse branches in parallel, summed into one residual.
             var h1 = preFeedforwardLayernorm(out)
-            h1 = mlp(h1)
+            h1 = mlp(h1, useTightGridQMV: !isExpertPrefill)
             h1 = postFeedforwardLayernorm1(h1)
 
             let (topKIndices, topKWeights) = router(out)
@@ -1811,7 +1867,7 @@ public class Gemma4DecoderLayer: Module {
             out = h1 + h2
         } else {
             out = preFeedforwardLayernorm(out)
-            out = mlp(out)
+            out = mlp(out, useTightGridQMV: !isExpertPrefill)
         }
 
         out = postFeedforwardLayernorm(out)
@@ -2405,10 +2461,37 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
     /// Apply the LM head (tied embedding or explicit `lm_head`) plus the
     /// configured final-logit softcap. Pure function of the post-norm hidden.
+    /// LMH-001: tight-grid dispatch for the tied lm_head ordinary QMV.
+    ///
+    /// The vendored host launches ordinary QMV with an x grid extent of M = 8
+    /// (`backend/metal/quantized.cpp`), while the promoted large-N tier claims
+    /// four cohort rows per threadgroup and returns from the rest. On the tied
+    /// head that is 262144 threadgroups of which 196608 exist only to hit that
+    /// early return. `CBv2TiedLMHeadQMVV1` runs the same computation from a
+    /// kernel whose own x extent is two, so only the groups that were already
+    /// doing the work are launched. Returns `nil` unless every pin holds, and
+    /// the caller then keeps the stock path.
+    private func tiedLMHeadTightGrid(_ hidden: MLXArray) -> MLXArray? {
+        guard lmHead == nil,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.groupSize == 64,
+            quantized.bits == 4
+        else { return nil }
+        return CBv2TiedLMHeadQMVV1.matmul(
+            x: hidden,
+            weight: quantized.weight,
+            scales: quantized.scales,
+            biases: quantized.biases,
+            inDim: config.hiddenSize,
+            outDim: config.vocabSize)
+    }
+
     func applyLMHead(_ hidden: MLXArray) -> MLXArray {
         var out: MLXArray
         if let lmHead {
             out = lmHead(hidden)
+        } else if let tight = tiedLMHeadTightGrid(hidden) {
+            out = tight
         } else {
             out = model.embedTokens.asLinear(hidden)
         }
@@ -2432,6 +2515,9 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     func applyRawLMHead(_ hidden: MLXArray) -> MLXArray {
         if let lmHead {
             return lmHead(hidden)
+        }
+        if let tight = tiedLMHeadTightGrid(hidden) {
+            return tight
         }
         return model.embedTokens.asLinear(hidden)
     }

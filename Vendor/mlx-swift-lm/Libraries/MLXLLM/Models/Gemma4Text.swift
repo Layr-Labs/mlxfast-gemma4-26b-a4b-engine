@@ -224,6 +224,28 @@ private let gemma4SafeGeluApproximate: @Sendable (MLXArray) -> MLXArray = {
     return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
 
+/// Extend the existing safe approximate-GELU compilation through the dense
+/// MLP's following elementwise product. The expression and operand order are
+/// identical; only the intermediate dispatch is removed.
+private let gemma4SafeGeluProductEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_SAFE_GELU_PRODUCT"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+private let gemma4SafeGeluProduct: @Sendable (
+    MLXArray, MLXArray
+) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+        (gate: MLXArray, up: MLXArray) -> MLXArray in
+        let activated = 0.5 * gate
+            * (1 + tanh(sqrt(2 / Float.pi) * (gate + 0.044715 * gate * gate * gate)))
+        return activated * up
+    }
+    return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
+}()
+
 /// Final-logit softcap (`tanh(x / cap) * cap`) fused into one Metal dispatch
 /// (vMLX `compiledLogitSoftcap`). The untyped (float32) cap keeps the softcap
 /// math — and the logits handed to the sampler — full precision.
@@ -1641,7 +1663,12 @@ private class Gemma4MLP: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(gemma4SafeGeluApproximate(gateProj(x)) * upProj(x))
+        let gate = gateProj(x)
+        let up = upProj(x)
+        let product = gemma4SafeGeluProductEnabled
+            ? gemma4SafeGeluProduct(gate, up)
+            : gemma4SafeGeluApproximate(gate) * up
+        return downProj(product)
     }
 }
 

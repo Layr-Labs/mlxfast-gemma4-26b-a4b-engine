@@ -1336,7 +1336,7 @@ METAL_FUNC void qmv_impl(
     y += tid.x * out_vec_size + out_row;
 
     int k = 0;
-    for (; k <= in_vec_size - block_size; k += block_size) {
+    for (; k < in_vec_size - block_size; k += block_size) {
       U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
 
       for (int row = 0;
@@ -1399,7 +1399,7 @@ METAL_FUNC void qmv_impl(
     y += tid.x * out_vec_size + used_out_row;
 
     int k = 0;
-    for (; k <= in_vec_size - block_size; k += block_size) {
+    for (; k < in_vec_size - block_size; k += block_size) {
       U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
 
       for (int row = 0; row < results_per_simdgroup; row++) {
@@ -1486,7 +1486,7 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   y1 += out_row;
 
   int k = 0;
-  for (; k <= in_vec_size - block_size; k += block_size) {
+  for (; k < in_vec_size - block_size; k += block_size) {
     float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
     float sum1 = load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
 
@@ -1619,7 +1619,7 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
   y3 += out_row;
 
   int k = 0;
-  for (; k <= in_vec_size - block_size; k += block_size) {
+  for (; k < in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint16_t* wl =
           (const device uint16_t*)(ws + row * in_vec_size_w);
@@ -1755,7 +1755,7 @@ METAL_FUNC void qmv_affine8_g64_pair_impl(
   y1 += out_row;
 
   int k = 0;
-  for (; k <= in_vec_size - block_size; k += block_size) {
+  for (; k < in_vec_size - block_size; k += block_size) {
     float sum0 = load_vector<T, float, values_per_thread, 8>(x0, x0_thread);
     float sum1 = load_vector<T, float, values_per_thread, 8>(x1, x1_thread);
 
@@ -1878,7 +1878,7 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
   y3 += out_row;
 
   int k = 0;
-  for (; k <= in_vec_size - block_size; k += block_size) {
+  for (; k < in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* wl = ws + row * in_vec_size_w;
       for (int i = 0; i < bytes_per_thread; i++) {
@@ -3284,6 +3284,31 @@ template <typename T, int group_size, int bits>
           simd_lid);
       return;
     }
+
+    // Singleton or unpaired tail of an odd run.  Under the geometry proven
+    // above (M == 1, one collapsed batch dimension, 64 assignments), these
+    // are byte-for-byte the offsets adjust_matrix_offsets would compute, so
+    // apply them directly and run the unchanged single-vector QMV body
+    // without reloading both gather indices through the generic helper.
+    const uint32_t single_lhs =
+        lhs_indices[assignment * (uint)lhs_strides[0]];
+    const device T* single_x = x + single_lhs * x_strides[0];
+    const device uint32_t* single_w = w + expert * w_strides[0];
+    const device T* single_scales = scales + expert * s_strides[0];
+    const device T* single_biases = biases + expert * b_strides[0];
+    device T* single_y = y + assignment * (uint)out_vec_size;
+    qmv_impl<T, group_size, bits>(
+        single_w,
+        single_scales,
+        single_biases,
+        single_x,
+        single_y,
+        in_vec_size,
+        out_vec_size,
+        tid,
+        simd_gid,
+        simd_lid);
+    return;
   }
   adjust_matrix_offsets<T>(
       x,

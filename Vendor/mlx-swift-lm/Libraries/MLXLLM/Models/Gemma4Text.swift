@@ -34,6 +34,13 @@ private func gemma4TruthyFlag(_ raw: String?) -> Bool {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }
 
+/// Default-on; set `MLX_GEMMA4_B8_OEA_ROUTING=0|false|no|off` before startup to opt out.
+private let gemma4OutputErrorAwareB8RoutingEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["MLX_GEMMA4_B8_OEA_ROUTING"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// Submit intermediate Gemma 4 prefill graphs while Swift continues to build
 /// later layers. This changes only when already-built work is queued; the
 /// operations and results are unchanged. Single-token decode is excluded.
@@ -1518,6 +1525,7 @@ private class Gemma4Router: Module {
     let topK: Int
     let eps: Float
     let rootSize: Float
+    let productionTopology: Bool
 
     init(_ config: Gemma4TextConfiguration) {
         precondition(
@@ -1528,6 +1536,7 @@ private class Gemma4Router: Module {
         self.topK = config.topKExperts ?? 0
         self.eps = config.rmsNormEps
         self.rootSize = pow(Float(config.hiddenSize), -0.5)
+        self.productionTopology = gemma4SupportsProductionExpertTopology(config)
 
         self._proj.wrappedValue = Linear(config.hiddenSize, numExperts, bias: false)
         self._scale.wrappedValue = MLXArray.ones([config.hiddenSize])
@@ -1535,7 +1544,10 @@ private class Gemma4Router: Module {
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
+    func callAsFunction(
+        _ x: MLXArray,
+        isExpertPrefill: Bool
+    ) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
         let normed = MLXFast.rmsNorm(x, weight: scale * rootSize, eps: eps)
         let expertScores = proj(normed)
 
@@ -1553,13 +1565,50 @@ private class Gemma4Router: Module {
         var topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
         topKIndices = topKIndices[.ellipsis, kth...]
 
+        // The prompt flag excludes narrowed `[8, 1, 128]` final-layer prefill.
+        if gemma4OutputErrorAwareB8RoutingEnabled && productionTopology
+            && !isExpertPrefill && topK == 8 && expertScores.shape == [8, 1, 128]
+        {
+            // Keep the baseline top-8 ordering; only its lowest-logit slot may change.
+            let flatScores = expertScores.reshaped(8, 128)
+            var flatIndices = topKIndices.reshaped(8, 8)
+            let selectedScores = MLX.takeAlong(flatScores, flatIndices, axis: -1)
+            let eighthSlot = MLX.argMin(selectedScores, axis: -1, keepDims: true)
+            let slotIDs = MLXArray.arange(8, dtype: eighthSlot.dtype).reshaped(1, 8)
+            let keepTopSeven = slotIDs .!= eighthSlot
+
+            // Eligible eighths are in the batch top-7 union, excluding this row's top 7.
+            let expertIDs = MLXArray.arange(128, dtype: flatIndices.dtype)
+                .reshaped(1, 1, 128)
+            let selectedExpertIDs = flatIndices.expandedDimensions(axis: -1)
+            let retainedAssignments = MLX.logicalAnd(
+                selectedExpertIDs .== expertIDs,
+                keepTopSeven.expandedDimensions(axis: -1))
+            let ownTopSeven = MLX.any(retainedAssignments, axis: 1)
+            let batchTopSevenUnion = MLX.any(ownTopSeven, axis: 0, keepDims: true)
+            let eligible = MLX.logicalAnd(batchTopSevenUnion, MLX.logicalNot(ownTopSeven))
+
+            // Fall back to the exact eighth when identical top-7 sets leave no candidate.
+            let maskedScores = MLX.where(
+                eligible,
+                flatScores,
+                MLXArray(-Float.infinity, dtype: flatScores.dtype))
+            let preferredEighth = MLX.argMax(maskedScores, axis: -1, keepDims: true)
+            let originalEighth = MLX.takeAlong(flatIndices, eighthSlot, axis: -1)
+            let hasEligibleEighth = MLX.any(eligible, axis: -1, keepDims: true)
+            let replacement = MLX.where(
+                hasEligibleEighth, preferredEighth, originalEighth)
+
+            flatIndices = MLX.where(keepTopSeven, flatIndices, replacement)
+            topKIndices = flatIndices.reshaped(8, 1, 8)
+        }
+
+        // Renormalize the actual selection exactly as the baseline policy does.
         var topKWeights = MLX.takeAlong(expertScores, topKIndices, axis: -1)
         topKWeights = MLX.softmax(topKWeights, axis: -1, precise: true)
         topKWeights = topKWeights * perExpertScale[topKIndices]
 
-        // Diagnostic-only observability (nil in production; see
-        // `Gemma4RouterProbe`). Recording the PRE-selection scores and the
-        // selection itself, never altering either.
+        // Diagnostic-only observability; nil in production.
         Gemma4RouterProbe.recorder?(expertScores, topKIndices)
 
         return (topKIndices, topKWeights)
@@ -1785,7 +1834,8 @@ public class Gemma4DecoderLayer: Module {
             h1 = mlp(h1)
             h1 = postFeedforwardLayernorm1(h1)
 
-            let (topKIndices, topKWeights) = router(out)
+            let (topKIndices, topKWeights) = router(
+                out, isExpertPrefill: isExpertPrefill)
             var h2 = preFeedforwardLayernorm2(out)
             h2 = experts(
                 h2,

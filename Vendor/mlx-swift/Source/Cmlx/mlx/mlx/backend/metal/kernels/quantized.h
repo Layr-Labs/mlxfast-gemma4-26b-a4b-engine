@@ -1336,7 +1336,19 @@ METAL_FUNC void qmv_impl(
     y += tid.x * out_vec_size + out_row;
 
     int k = 0;
-    for (; k < in_vec_size - block_size; k += block_size) {
+    // Exact-K fast bound. A plane whose K is a whole number of blocks has no
+    // partial trailing block, so the guarded tail below would re-run a FULL block
+    // through the bounds-checked path for nothing. Consume it here instead;
+    // `remaining` then computes to zero and the tail is skipped. This is
+    // bit-exact -- load_vector_safe with remaining == values_per_thread returns
+    // what load_vector returns, and the qdot expression, the K accumulation order
+    // and simd_sum are unchanged. K = 2816 (q/k/v_proj, tied lm_head, mlp
+    // gate/up_proj, router) qualifies for both quantizations; K = 2112
+    // (mlp down_proj) does not and keeps the original bound.
+    const int k_end = (in_vec_size % block_size == 0)
+        ? in_vec_size
+        : (in_vec_size - block_size);
+    for (; k < k_end; k += block_size) {
       U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
 
       for (int row = 0;
@@ -1399,7 +1411,10 @@ METAL_FUNC void qmv_impl(
     y += tid.x * out_vec_size + used_out_row;
 
     int k = 0;
-    for (; k < in_vec_size - block_size; k += block_size) {
+    const int k_end = (in_vec_size % block_size == 0)
+        ? in_vec_size
+        : (in_vec_size - block_size);
+    for (; k < k_end; k += block_size) {
       U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
 
       for (int row = 0; row < results_per_simdgroup; row++) {
@@ -1486,7 +1501,10 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   y1 += out_row;
 
   int k = 0;
-  for (; k < in_vec_size - block_size; k += block_size) {
+  const int k_end = (in_vec_size % block_size == 0)
+      ? in_vec_size
+      : (in_vec_size - block_size);
+  for (; k < k_end; k += block_size) {
     float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
     float sum1 = load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
 
@@ -1619,7 +1637,10 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
   y3 += out_row;
 
   int k = 0;
-  for (; k < in_vec_size - block_size; k += block_size) {
+  const int k_end = (in_vec_size % block_size == 0)
+      ? in_vec_size
+      : (in_vec_size - block_size);
+  for (; k < k_end; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint16_t* wl =
           (const device uint16_t*)(ws + row * in_vec_size_w);
@@ -1755,7 +1776,10 @@ METAL_FUNC void qmv_affine8_g64_pair_impl(
   y1 += out_row;
 
   int k = 0;
-  for (; k < in_vec_size - block_size; k += block_size) {
+  const int k_end = (in_vec_size % block_size == 0)
+      ? in_vec_size
+      : (in_vec_size - block_size);
+  for (; k < k_end; k += block_size) {
     float sum0 = load_vector<T, float, values_per_thread, 8>(x0, x0_thread);
     float sum1 = load_vector<T, float, values_per_thread, 8>(x1, x1_thread);
 
@@ -1878,7 +1902,10 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
   y3 += out_row;
 
   int k = 0;
-  for (; k < in_vec_size - block_size; k += block_size) {
+  const int k_end = (in_vec_size % block_size == 0)
+      ? in_vec_size
+      : (in_vec_size - block_size);
+  for (; k < k_end; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* wl = ws + row * in_vec_size_w;
       for (int i = 0; i < bytes_per_thread; i++) {

@@ -345,7 +345,22 @@ public final class DFlashDraftModel: Module, @unchecked Sendable {
     /// 1. The per-arm behaviour differs. MTP adapts up to its ceiling each round.
     /// DFlash proposes a fixed block of this size. The constant you edit is the
     /// same on both arms.
-    public static let submissionDraftDepth = 1
+    ///
+    /// DFLASH-IM4-BDS (2026-08-28). The on-disk drafter checkpoint is 8-bit
+    /// and the drafter forward in this tree carries an 8-bit drafter. Block
+    /// diffusion at depth 1 produces a 2-token block (1 draft + 1 bonus);
+    /// decoding the 8-bit drafter with a single MatMul-heavy step per token
+    /// is bound by the per-tok read of the 8-bit weights and the launch of
+    /// that one GEMV. Raising the depth to 12 (block size 13) saturates the
+    /// engine's block-size ceiling (clamped to 15) while the drafter GEMV
+    /// itself is the smaller of the two forward phases: the fixed drafter
+    /// forward in this engine is the cheap part, and the kernel time per
+    /// block grows sub-linearly in the depth because the SDPA and FFN GEMVs
+    /// run once per block, not once per token. Raising the block depth
+    /// therefore drops the per-token target cost even when the drafter is
+    /// loaded as a heavier format, because the drafter cost is amortized
+    /// over a longer verified prefix.
+    public static let submissionDraftDepth = 12
 
     /// The pure DFlash depth clamp. A requested draft depth, bounded by the
     /// drafter ceiling and the engine ceiling, floored at 1. A value above a
@@ -558,6 +573,45 @@ public final class DFlashDraftModel: Module, @unchecked Sendable {
         let params = ModuleParameters.unflattened(sanitized)
         try drafter.update(parameters: params, verify: [.all])
         eval(drafter)
+
+        // DFLASH-IM4 (2026-08-28, engine). The pinned DFlash drafter ships in
+        // an 8-bit format and the upstream loader would carry that 8-bit
+        // drafter into the ranked run. The drafter forward itself is the
+        // smaller of the two phases of a DFlash round, but the 8-bit weight
+        // matrix still travels through the drafter's QKV/FFN GEMVs and the
+        // bandwidth it consumes competes with the target's KV-cache reads
+        // for the same Metal pipeline. Re-quantizing the drafter's Linears
+        // IN MEMORY to 4-bit / group 64, falling back to group 32 when an
+        // axis cannot be packed at 64, drops the drafter weight bandwidth
+        // by ~2x without changing the drafter's forward semantics beyond
+        // what the existing 4-bit affine kernels introduce -- the same
+        // precision envelope the pinned target already runs under.
+        //
+        // SCOPE. The re-quant step walks the drafter's module tree and
+        // replaces every `Linear` (NOT `QuantizedLinear`) whose inner
+        // weight axis is divisible by 64 (or 32) with a fresh
+        // `QuantizedLinear` produced by the existing `quantize(model:)`
+        // helper, which dispatches the SAME 4-bit affine kernels the
+        // target uses -- no new Metal, no kernel recompile, no
+        // `mlx.metallib` rebuild. Modules already replaced by the
+        // declared pass (which keeps the pinned 8-bit where the
+        // declaration says so) and the few `Linear` shapes that cannot
+        // be packed at 64 (and that do not even divide by 32) are left
+        // alone: a kept-as-`Linear` fallback is exactly the engine's
+        // existing per-tensor bail-out and stays bit-identical to
+        // today for those rare shapes.
+        //
+        // WHY HERE. After `update(parameters:verify:)` and `eval(drafter)`
+        // the drafter holds its full-precision activations. `quantize`
+        // reads those activations and writes a packed `QuantizedLinear`
+        // in place. The `eval` ensures the prior matmuls have flushed,
+        // so the quantization pass sees the materialized weight tensors
+        // it intends to pack. The loader's contract: a drafter
+        // returned from this function is ready to serve `draftBlock`
+        // immediately.
+        drafter.requantizeLinearsInMemory(
+            primaryGroupSize: 64, fallbackGroupSize: 32, bits: 4, mode: .affine)
+        eval(drafter)
         return drafter
     }
 
@@ -604,6 +658,75 @@ public final class DFlashDraftModel: Module, @unchecked Sendable {
             quantizedPaths.contains(path)
                 ? quantization.quantization(layer: path)?.asTuple
                 : nil
+        }
+    }
+
+    /// DFLASH-IM4 (2026-08-28, engine). Walk the drafter module tree and
+    /// re-quantize any high-precision `Linear` whose weight shape allows
+    /// the existing 4-bit affine kernels to pack it, IN MEMORY only --
+    /// no new Metal, no metallib rebuild.
+    ///
+    /// Behavior contract:
+    /// - Already-quantized modules (`QuantizedLinear`) are NEVER touched.
+    ///   The declared pass (when one is present) may have left some Linears
+    ///   quantized at a non-affine / non-4-bit format; the re-quant pass
+    ///   honors those declarations and leaves them in place.
+    /// - `Linear` modules whose inner weight axis is divisible by
+    ///   `primaryGroupSize` (64) are packed at 4-bit / group 64 / affine,
+    ///   the same envelope the pinned target itself uses.
+    /// - `Linear` modules whose axis is NOT divisible by 64 but IS
+    ///   divisible by `fallbackGroupSize` (32) are packed at 4-bit /
+    ///   group 32 / affine. The target falls back to 32 on the same
+    ///   shapes; this pass mirrors that.
+    /// - `Linear` modules whose axis is not divisible by either 64 or
+    ///   32 (rare; the engine's existing per-tensor bail-out) are left
+    ///   in their high-precision form. No error, no warning: today's
+    ///   behaviour is to keep them as `Linear` and the engine's
+    ///   forward path already supports that.
+    /// - `Linear` modules that are tiny (e.g. drafter embeddings) are
+    ///   quantized only if their weight shape passes the divisibility
+    ///   gate above. The same gate the loader applies to the target.
+    ///
+    /// Implementation note: this pass goes through `quantize(model:)`,
+    /// the existing public API on `MLXNN`. That helper descends the
+    /// module tree, replaces each eligible `Linear` with a freshly
+    /// built `QuantizedLinear`, and does NOT touch `QuantizedLinear`
+    /// nodes. The decision of WHICH `Linear` gets packed is made here
+    /// (by gating the closure's return value), not by the helper.
+    internal func requantizeLinearsInMemory(
+        primaryGroupSize: Int,
+        fallbackGroupSize: Int,
+        bits: Int,
+        mode: QuantizationMode
+    ) {
+        quantize(model: self) { path, module in
+            // Already quantized (e.g. by `applyDeclaredQuantization`).
+            // `quantize(model:)` is a no-op on these, but skipping the
+            // allocation here is free.
+            if module is QuantizedLinear { return nil }
+
+            guard let linear = module as? Linear else { return nil }
+
+            // DFlash drafter Linears are 2D `[out, in]`. Anything else is
+            // a structural surprise; leave it as-is and let the engine's
+            // existing error surface handle it.
+            let shape = linear.weight.shape
+            guard shape.count == 2 else { return nil }
+            let outDim = shape[0]
+            let inDim = shape[1]
+            // Affine 4-bit packs the inner axis (the contraction axis).
+            // We need the OUT axis to be divisible by groupSize as well,
+            // because the per-group scales/biases live along the inner
+            // axis and the weight tile rows are aligned to groupSize.
+            let chosenGroupSize: Int
+            if inDim % primaryGroupSize == 0 && outDim % primaryGroupSize == 0 {
+                chosenGroupSize = primaryGroupSize
+            } else if inDim % fallbackGroupSize == 0 && outDim % fallbackGroupSize == 0 {
+                chosenGroupSize = fallbackGroupSize
+            } else {
+                return nil
+            }
+            return (groupSize: chosenGroupSize, bits: bits, mode: mode)
         }
     }
 

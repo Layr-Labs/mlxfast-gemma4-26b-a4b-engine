@@ -35,7 +35,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         }
         switch MLX.GPU.deviceInfo().architecture.last {
         case "s": return 64
-        case "d": return 128
+        case "d": return 32
         default: return 32
         }
     }()

@@ -1521,6 +1521,312 @@ private enum Gemma4FusedRouterTop8 {
     }
 }
 
+/// M-003: the whole-router single dispatch. Extends ROUTE-001's one-dispatch
+/// replacement of the decode router's selection chain with the sorted-expert
+/// stage that FOLLOWS it, so the entire per-step router region — stable top-8
+/// selection, precise softmax over 8, per-expert-scale multiply, the global
+/// 64-cell sort of the selected expert ids, the per-token lhs floor-divide,
+/// and the inverse permutation — collapses into ONE kernel dispatch (one grid,
+/// one encoder) for the exact B=8 decode geometry (`expertScores`
+/// [8, 1, 128] bf16).
+///
+/// Dispatch accounting vs the stock chain (per MoE layer per step): the old
+/// `argPartition` → slice-copy → `takeAlong` → `softmax(precise)` →
+/// per-expert-scale gather+multiply sequence (5-6 dispatches, ROUTE-001's
+/// target) plus `gatherSortIndices`' two `argSort`s + `floorDivide` + gather
+/// (4 dispatches) become one 256-thread single-threadgroup kernel. The packet
+/// it emits as extra outputs (`Gemma4FusedRouterSort`) is consumed verbatim by
+/// `SwitchGLU.projectExperts`, so the sorted-expert gather-QMMs and
+/// `weightedExpertUnsort` receive the exact arrays the stock decomposition
+/// would have produced.
+///
+/// Exactness — two independent lemmas, both carried from validated code:
+/// (1) Top-8 + softmax reuse ROUTE-001's per-row transcription verbatim
+/// (predecessor counting under sort.h's stable `LessThan`, and
+/// `softmax_single_row<bfloat16_t, float, N_READS=4>` on one 32-thread
+/// simdgroup; bit-exact verified 113/113 adversarial fixtures). One row maps
+/// to exactly one simdgroup inside the single threadgroup, and
+/// softmax.h's two-level `local_max`/`local_normalizer` reduction collapses to
+/// the row-local `simd_max`/`simd_sum` BIT-IDENTICALLY: its second level
+/// reduces a vector whose only real slot is the row's own value and whose
+/// other 31 slots are `Limits<AccT>::min` / `+0.0` — exact identity elements
+/// for max and IEEE addition, so the values (and therefore every `T(...)`
+/// rounding) are unchanged. (2) The 64-cell sort is the same STABLE ascending
+/// rank-count sort MLX's argsort implements on the flattened [8, 8] ids: each
+/// cell gets rank `#{j : val[j]<val[i]} + #{j<i : val[j]==val[i]}`, ties by
+/// original row-major index — for values that are distinct within a row and
+/// only collide across rows, this is exactly the merge sort's left-first tie
+/// rule. `lhs[rank] = cell_row` is `order.floorDivide(8)`, `sorted` is
+/// `indices[order]`, and `inv[cell] = rank` is `argSort(order)` by
+/// construction (order is a permutation).
+///
+/// Fail-closed: any other row count, sequence length, expert count, top-K, or
+/// dtype takes the established chain (cohort prefill at [8, 1024, ·] never
+/// matches; the narrowed final-layer prompt tail at [8, 1, ·] is the same
+/// geometry and is bit-identical there too). Kill switch:
+/// `DARKBLOOM_GEMMA4_WHOLE_ROUTER_TOP8=0`. When disabled the router falls
+/// through to ROUTE-001 (its own opt-in flag) and then the stock chain.
+private enum Gemma4WholeRouterTop8 {
+    /// DEFAULT ON (`DARKBLOOM_GEMMA4_WHOLE_ROUTER_TOP8=0` disables): the
+    /// fused kernel replaces the whole router + sort + inverse-order stage at
+    /// the exact B=8 decode geometry. The kill switch is the surgical off for
+    /// measurement A/B; the stock chain is kept for every other path.
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_WHOLE_ROUTER_TOP8"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let rows = 8
+    private static let experts = 128
+    private static let selected = 8
+    /// cells = rows * selected = 64: the flattened assignment array the
+    /// sorted-expert path rank-sorts across all 8 rows.
+    private static let cells = rows * selected
+
+    static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_whole_router_top8_e128_k8_sort64_bf16_v1",
+        inputNames: ["scores", "pes"],
+        outputNames: ["inds", "wts", "lhs", "sorted", "inv"],
+        source: """
+            constexpr int SIMD_SIZE = 32;
+            constexpr int N_READS = 4;
+            constexpr int KTH = E - K;
+            constexpr int ROWS = 8;
+            constexpr int N_CELLS = ROWS * K;
+
+            // One threadgroup of ROWS*32 threads: simdgroup `row` owns row
+            // `row` of the score tensor, so the cross-row 64-cell sort can
+            // synchronize with a threadgroup barrier.
+            const int row = int(simdgroup_index_in_threadgroup);
+            const int lid = int(thread_index_in_simdgroup);
+            const int tid = int(thread_position_in_threadgroup.x);
+
+            threadgroup float vals[ROWS][E];
+            threadgroup float topv[ROWS][K];
+            threadgroup uint topi[ROWS][K];
+
+            // --- Phase 0: per-row score load --------------------------------
+            const device T* srow = scores + row * E;
+            for (int i = lid; i < E; i += SIMD_SIZE) {
+                vals[row][i] = float(srow[i]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // --- Phase 1: per-row stable top-8 (ROUTE-001 transcription) ----
+            // Stable-argsort position by predecessor counting under sort.h's
+            // LessThan comparator (NaN orders after every non-NaN; ties keep
+            // the original index order because the merge sort is stable).
+            // Position == #{i : less(v_i, v_e)} + #{i < e : neither less} —
+            // a permutation, so the writes below never collide.
+            for (int j = 0; j < E / SIMD_SIZE; ++j) {
+                const int e = lid + j * SIMD_SIZE;
+                const float v = vals[row][e];
+                const bool v_nan = isnan(v);
+                int rank = 0;
+                for (int i = 0; i < E; ++i) {
+                    const float u = vals[row][i];
+                    const bool u_nan = isnan(u);
+                    bool u_less_v;
+                    bool v_less_u;
+                    if (u_nan || v_nan) {
+                        u_less_v = !u_nan && v_nan;
+                        v_less_u = !v_nan && u_nan;
+                    } else {
+                        u_less_v = u < v;
+                        v_less_u = v < u;
+                    }
+                    if (u_less_v || (!v_less_u && i < e)) {
+                        ++rank;
+                    }
+                }
+                if (rank >= KTH) {
+                    const int p = rank - KTH;
+                    inds[row * K + p] = uint(e);
+                    topi[row][p] = uint(e);
+                    topv[row][p] = v;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // --- Phase 2: global stable sort of the 64 selected ids ---------
+            // gatherSortIndices sorts the FLATTENED [8, 8] top-K ids with a
+            // full stable argsort over all 64 cells (ties keep the original
+            // row-major cell index). ids are distinct within a row and only
+            // collide across rows, so rank(t) below — smaller value first,
+            // ties by original cell index — reproduces that stable order
+            // exactly. Each cell t writes its id and token row to position
+            // rank(t) (a permutation: writes never collide) and records
+            // rank(t) as its inverse-permutation slot, matching
+            // `order.floorDivide(8)`, `indices[order]`, `argSort(order)`.
+            if (tid < N_CELLS) {
+                const int c_row = tid >> 3;
+                const int c_slot = tid & 7;
+                const uint my = topi[c_row][c_slot];
+                uint rank = 0;
+                for (uint c = 0; c < (uint)N_CELLS; ++c) {
+                    const uint u = topi[c >> 3][c & 7];
+                    if (u < my || (u == my && c < (uint)tid)) {
+                        ++rank;
+                    }
+                }
+                sorted[rank] = my;
+                lhs[rank] = uint(c_row);
+                inv[tid] = rank;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // --- Phase 3: per-row precise softmax + per-expert scale --------
+            // softmax_single_row<bfloat16_t, float, N_READS=4> transcription
+            // (softmax.h): same lane layout, same Limits<float>::min padding,
+            // same fast::exp, same simd_max/simd_sum reduction order — but on
+            // one simdgroup per row the two-level local_max/local_normalizer
+            // reduction collapses to the row-local reduction bit-identically
+            // (see the enum doc). The stock bf16 per-expert-scale multiply is
+            // fused into the write exactly as ROUTE-001 does.
+            float ld[N_READS];
+            const int base = lid * N_READS;
+            if (base + N_READS <= K) {
+                for (int i = 0; i < N_READS; i++) {
+                    ld[i] = topv[row][base + i];
+                }
+            } else {
+                for (int i = 0; i < N_READS; i++) {
+                    ld[i] = ((base + i) < K) ? topv[row][base + i] : Limits<float>::min;
+                }
+            }
+
+            float maxval = Limits<float>::finite_min;
+            for (int i = 0; i < N_READS; i++) {
+                maxval = (maxval < ld[i]) ? ld[i] : maxval;
+            }
+            maxval = simd_max(maxval);
+
+            float normalizer = 0;
+            for (int i = 0; i < N_READS; i++) {
+                float exp_x = fast::exp(ld[i] - maxval);
+                ld[i] = exp_x;
+                normalizer += exp_x;
+            }
+            normalizer = simd_sum(normalizer);
+            normalizer = 1 / normalizer;
+
+            if (base + N_READS <= K) {
+                for (int i = 0; i < N_READS; i++) {
+                    const T w = T(ld[i] * normalizer);
+                    wts[row * K + base + i] = w * pes[topi[row][base + i]];
+                }
+            } else {
+                for (int i = 0; i < N_READS; i++) {
+                    if ((base + i) < K) {
+                        const T w = T(ld[i] * normalizer);
+                        wts[row * K + base + i] = w * pes[topi[row][base + i]];
+                    }
+                }
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    static func apply(
+        expertScores: MLXArray, perExpertScale: MLXArray, topK: Int
+    ) -> (indices: MLXArray, weights: MLXArray, sort: Gemma4FusedRouterSort)? {
+        guard enabled,
+            topK == selected,
+            expertScores.ndim == 3,
+            expertScores.dim(0) == rows,
+            expertScores.dim(1) == 1,
+            expertScores.dim(2) == experts,
+            expertScores.dtype == .bfloat16,
+            perExpertScale.ndim == 1,
+            perExpertScale.dim(0) == experts,
+            perExpertScale.dtype == .bfloat16
+        else { return nil }
+        CBv2EngageMark.once("whole-router-top8")
+
+        let outputs = kernel(
+            [expertScores, perExpertScale],
+            template: [
+                ("T", expertScores.dtype),
+                ("E", experts),
+                ("K", selected),
+            ],
+            // MLXFast launches `dispatch_threads(grid, threadGroup)` where
+            // grid counts TOTAL THREADS and the group size is clamped to the
+            // grid (CustomKernel::eval_gpu). The kernel's `row` is
+            // `simdgroup_index_in_threadgroup`, so the whole 8-row design
+            // must live in ONE 256-thread threadgroup: grid must equal
+            // threadGroup == (rows * 32, 1, 1). A grid of (1, 1, 1) would
+            // clamp the group down to a single thread and mis-execute every
+            // phase (verified: the parity suite's first runtime run showed
+            // exactly one garbage row and all-zero sort outputs).
+            grid: (rows * 32, 1, 1),
+            threadGroup: (rows * 32, 1, 1),
+            outputShapes: [
+                [rows, 1, selected],
+                [rows, 1, selected],
+                [cells],
+                [cells],
+                [cells],
+            ],
+            outputDTypes: [.uint32, .bfloat16, .uint32, .uint32, .uint32]
+        )
+        return (
+            outputs[0],
+            outputs[1],
+            Gemma4FusedRouterSort(
+                lhsIndices: outputs[2],
+                sortedIndices: outputs[3],
+                inverseOrder: outputs[4]))
+    }
+}
+
+/// SPI test entry point for the M-003 whole-router fused kernel. Runs the
+/// kernel directly regardless of the `DARKBLOOM_GEMMA4_WHOLE_ROUTER_TOP8`
+/// production gate so the parity suite can exercise it in isolation; shape
+/// guards mirror `Gemma4WholeRouterTop8.apply`. Returns nil for any geometry
+/// outside the exact targeted contract.
+@_spi(Testing) public func gemma4WholeRouterTop8Fused(
+    _ expertScores: MLXArray,
+    perExpertScale: MLXArray,
+    topK: Int = 8
+) -> (indices: MLXArray, weights: MLXArray, sort: Gemma4FusedRouterSort)? {
+    guard expertScores.dtype == .bfloat16, expertScores.ndim == 3,
+        expertScores.dim(0) == 8, expertScores.dim(1) == 1,
+        expertScores.dim(2) == 128, topK == 8,
+        perExpertScale.dtype == .bfloat16, perExpertScale.shape == [128]
+    else { return nil }
+    let outputs = Gemma4WholeRouterTop8.kernel(
+        [expertScores, perExpertScale],
+        template: [
+            ("T", expertScores.dtype),
+            ("E", 128),
+            ("K", 8),
+        ],
+        // Same single-threadgroup contract as the production `apply` above:
+        // grid counts total threads, so a one-threadgroup 256-thread launch
+        // needs grid == threadGroup == (256, 1, 1).
+        grid: (8 * 32, 1, 1),
+        threadGroup: (8 * 32, 1, 1),
+        outputShapes: [
+            [8, 1, 8],
+            [8, 1, 8],
+            [64],
+            [64],
+            [64],
+        ],
+        outputDTypes: [.uint32, .bfloat16, .uint32, .uint32, .uint32]
+    )
+    return (
+        outputs[0],
+        outputs[1],
+        Gemma4FusedRouterSort(
+            lhsIndices: outputs[2],
+            sortedIndices: outputs[3],
+            inverseOrder: outputs[4]))
+}
+
 /// GLUE-001: fused decode-plane layer glue. Three single-dispatch kernels
 /// replace the strictly SERIAL RMSNorm/add chains between the layer's matmuls
 /// at the exact ranked decode geometry ([8, 1, 2816] bfloat16):
@@ -1770,7 +2076,9 @@ private class Gemma4Router: Module {
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
+    func callAsFunction(
+        _ x: MLXArray
+    ) -> (topKIndices: MLXArray, topKWeights: MLXArray, fusedSort: Gemma4FusedRouterSort?) {
         let effScale: MLXArray
         if let cached = cachedEffectiveScale {
             effScale = cached
@@ -1782,6 +2090,18 @@ private class Gemma4Router: Module {
         let normed = MLXFast.rmsNorm(x, weight: effScale, eps: eps)
         let expertScores = proj(normed)
 
+        // M-003 whole-router single dispatch: ROUTE-001's chain PLUS the
+        // sorted-expert stage (sort, lhs floor-divide, inverse order) in one
+        // grid. The emitted packet replaces gatherSortIndices downstream,
+        // bit-identically. Any other geometry, dtype, or the kill switch
+        // falls through to ROUTE-001 and then the established chain.
+        if let whole = Gemma4WholeRouterTop8.apply(
+            expertScores: expertScores, perExpertScale: perExpertScale, topK: topK)
+        {
+            Gemma4RouterProbe.recorder?(expertScores, whole.indices)
+            return (whole.indices, whole.weights, whole.sort)
+        }
+
         // ROUTE-001: single-dispatch byte-identical replacement of the chain
         // below for the B=8 decode geometry. Every other geometry, dtype, or
         // the kill switch falls through to the established chain.
@@ -1789,7 +2109,7 @@ private class Gemma4Router: Module {
             expertScores: expertScores, perExpertScale: perExpertScale, topK: topK)
         {
             Gemma4RouterProbe.recorder?(expertScores, fused.indices)
-            return (fused.indices, fused.weights)
+            return (fused.indices, fused.weights, nil)
         }
 
         var topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
@@ -1804,7 +2124,7 @@ private class Gemma4Router: Module {
         // selection itself, never altering either.
         Gemma4RouterProbe.recorder?(expertScores, topKIndices)
 
-        return (topKIndices, topKWeights)
+        return (topKIndices, topKWeights, nil)
     }
 }
 
@@ -1836,6 +2156,7 @@ private class Gemma4Experts: Module {
         _ x: MLXArray,
         topKIndices: MLXArray,
         topKWeights: MLXArray,
+        fusedSort: Gemma4FusedRouterSort? = nil,
         isExpertPrefill: Bool
     ) -> MLXArray {
         // Flatten [B, S, H] and always enter SwitchGLU's combined API. It
@@ -1848,6 +2169,10 @@ private class Gemma4Experts: Module {
             topKIndices.reshaped(B * S, K),
             weights: topKWeights.reshaped(B * S, K),
             fuseSortedReduction: fuseWeightedUnsort,
+            // M-003: the whole-router kernel's sort packet, consumed by
+            // SwitchGLU.projectExperts in place of gatherSortIndices when it
+            // matches this assignment geometry; nil elsewhere.
+            fusedSort: fusedSort,
             // Ordinary/direct VLM and CBv2 prompt entry points may engage.
             // Rectangular MTP verification explicitly passes false.
             isProductionPrefill: isExpertPrefill)
@@ -2035,7 +2360,7 @@ public class Gemma4DecoderLayer: Module {
             let postFeedforwardLayernorm2
         {
             // Dense + sparse branches in parallel, summed into one residual.
-            let (topKIndices, topKWeights) = router(out)
+            let (topKIndices, topKWeights, fusedSort) = router(out)
 
             let h1Raw: MLXArray
             let h2Raw: MLXArray
@@ -2050,6 +2375,7 @@ public class Gemma4DecoderLayer: Module {
                     n2,
                     topKIndices: topKIndices,
                     topKWeights: topKWeights,
+                    fusedSort: fusedSort,
                     isExpertPrefill: isExpertPrefill)
             } else {
                 h1Raw = mlp(preFeedforwardLayernorm(out))
@@ -2057,6 +2383,7 @@ public class Gemma4DecoderLayer: Module {
                     preFeedforwardLayernorm2(out),
                     topKIndices: topKIndices,
                     topKWeights: topKWeights,
+                    fusedSort: fusedSort,
                     isExpertPrefill: isExpertPrefill)
             }
 

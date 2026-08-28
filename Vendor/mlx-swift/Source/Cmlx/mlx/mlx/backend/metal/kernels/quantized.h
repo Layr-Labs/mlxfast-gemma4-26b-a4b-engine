@@ -913,6 +913,110 @@ METAL_FUNC void qmv_fast_impl(
   }
 }
 
+// WIDE-G64. `qmv_fast_impl`'s two-pack lane block -- 16 values and EIGHT
+// weight bytes per lane per step, against the one-pack block's 8 values and
+// FOUR bytes -- made available to a K that is not a multiple of the 512-value
+// block size. The main loop walks the aligned 512-value prefix; whatever is
+// left runs as one more identical block in which only the lanes that own real
+// data participate.
+//
+// Every Gemma 4 g64 caller has K % 64 == 0, and 64 is a whole number of
+// 16-value lane packets, so the remainder is always lane-aligned and no lane
+// ever needs a partial load. `active_tail_lanes` is the same device-side
+// arithmetic `qmv_affine4_g64_pair_impl` already uses for its own tail.
+//
+// The body below is `qmv_fast_impl` unchanged: same `load_vector`, same
+// `qdot`, same `values_per_thread`, same lane-to-value map, same
+// `scale_step_per_thread`, same `simd_sum`. It is therefore bit-identical to
+// the kernel MLX itself selects for every shape with K % 512 == 0. It is NOT
+// bit-identical to `qmv_impl`, which partitions K across lanes in 8-value
+// rather than 16-value packets and so builds a different partial-sum tree.
+// That is precisely the reassociation upstream MLX already accepts at the
+// `qmv_fast` boundary; the only reason Gemma 4 never crosses it is that 2816
+// and 704 are not multiples of 512.
+template <typename T, int group_size, int bits>
+METAL_FUNC void qmv_fast_aligned_tail_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int packs_per_thread = 2;
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+
+  typedef float U;
+
+  thread U x_thread[values_per_thread];
+  thread U result[results_per_simdgroup] = {0};
+
+  // Adjust positions
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x += tid.x * in_vec_size + simd_lid * values_per_thread;
+  y += tid.x * out_vec_size + out_row;
+
+  int k = 0;
+  for (; k + block_size <= in_vec_size; k += block_size) {
+    U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+      const device T* sl = scales + row * in_vec_size_g;
+      const device T* bl = biases + row * in_vec_size_g;
+
+      U s = sl[0];
+      U b = bl[0];
+      result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+    }
+
+    ws += block_size * bytes_per_pack / pack_factor;
+    scales += block_size / group_size;
+    biases += block_size / group_size;
+    x += block_size;
+  }
+
+  const uint active_tail_lanes = uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
+    U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+      const device T* sl = scales + row * in_vec_size_g;
+      const device T* bl = biases + row * in_vec_size_g;
+
+      U s = sl[0];
+      U b = bl[0];
+      result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+    }
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result[row] = simd_sum(result[row]);
+    if (simd_lid == 0) {
+      y[row] = static_cast<T>(result[row]);
+    }
+  }
+}
+
 // Exact-order affine4/g64 multi-row QMV. The frozen host launches M x-groups
 // for each 8-output tile. Pair adjacent input rows in one group while keeping
 // the stock two-simdgroup by four-output-row layout. Each active group caches a
@@ -3284,6 +3388,23 @@ template <typename T, int group_size, int bits>
           simd_lid);
       return;
     }
+
+    // No run partner: one input row against this expert, on the two-pack lane
+    // block. The pointers are resolved here exactly as the pair arm resolves
+    // them, so tid.x is passed as zero rather than relied on being zero.
+    const uint32_t solo_x_idx = lhs_indices[assignment * (uint)lhs_strides[0]];
+    qmv_fast_aligned_tail_impl<T, group_size, bits>(
+        w + expert * w_strides[0],
+        scales + expert * s_strides[0],
+        biases + expert * b_strides[0],
+        x + solo_x_idx * x_strides[0],
+        y + assignment * out_vec_size,
+        in_vec_size,
+        out_vec_size,
+        uint3(0, tid.y, 0),
+        simd_gid,
+        simd_lid);
+    return;
   }
   adjust_matrix_offsets<T>(
       x,

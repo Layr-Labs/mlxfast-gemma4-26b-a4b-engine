@@ -915,6 +915,25 @@ private func gemma4AttentionFallback(
 
 // MARK: - Attention
 
+
+/// MMA-QPROJ: route the full-attention q_proj through the promoted matrix-unit
+/// GEMV instead of the vector-unit quad tier. No fusion: the layer keeps its
+/// own weight matrix and its own affine groups; only the kernel changes.
+private func gemma4MMAProjection(_ layer: Linear?, _ x: MLXArray) -> MLXArray? {
+    guard let quantized = layer as? QuantizedLinear,
+        quantized.bias == nil,
+        quantized.scales.ndim == 2,
+        quantized.scales.dim(0) >= 8192
+    else { return nil }
+    return Gemma4MMAQuantizedGEMV.apply(
+        x: x,
+        w: quantized.weight,
+        scales: quantized.scales,
+        biases: quantized.biases,
+        groupSize: quantized.groupSize,
+        bits: quantized.bits)
+}
+
 private class Gemma4Attention: Module {
     let config: Gemma4TextConfiguration
     let layerIdx: Int
@@ -1026,7 +1045,8 @@ private class Gemma4Attention: Module {
 
         let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
 
-        var queries = qProj(x).reshaped(B, L, nHeads, effectiveHeadDim)
+        var queries = (gemma4MMAProjection(qProj, x) ?? qProj(x))
+            .reshaped(B, L, nHeads, effectiveHeadDim)
         queries = qNorm(queries)
 
         let keys: MLXArray
@@ -1182,7 +1202,8 @@ private class Gemma4Attention: Module {
         let queryInput = lastQueryCache == nil ? x : x[0..., outputStart..., 0...]
         let queryLength = queryInput.dim(1)
 
-        let queryRaw = qProj(queryInput).reshaped(B, queryLength, nHeads, effectiveHeadDim)
+        let queryRaw = (gemma4MMAProjection(qProj, queryInput) ?? qProj(queryInput))
+            .reshaped(B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
             // KV-shared layer: projects queries only and borrows (K, V) from

@@ -229,12 +229,12 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// this step's fence, so the mutation can never be reordered against a
     /// later read of the same allocation.
     private static let fusedRingPassAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_ringwrite_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v1",
+        name: "cbv2_ragged8_ringwrite_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v2",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
-            "starts", "new_keys", "new_values", "write_fence",
+            "position_offsets", "new_keys", "new_values", "write_fence",
         ],
         outputNames: ["partials", "sums", "maxs", "fence"],
         source: """
@@ -270,7 +270,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
             const device T* new_value = new_values
                 + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
-            const uint ring_start = starts[batch_index];
+            const uint ring_start = uint(position_offsets[batch_index] + 1) % uint(N);
             const uint write_slot = (ring_start + uint(N - 1)) % uint(N);
             if (block == 0 && query_head_in_group == 0) {
                 device T* write_key = const_cast<device T*>(keys) + write_slot * D;
@@ -436,9 +436,8 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
 
     /// `attendRing` with this step's one-token ring write fused into pass A.
     ///
-    /// `keys`/`values` are the rows' RETAINED ring allocations and `starts`
-    /// the post-write ring starts — i.e. exactly what `attendRing` would be
-    /// handed after a separate `decodeRingWrite`, minus the write. Returns
+    /// `keys`/`values` are the rows' RETAINED ring allocations. The pre-step
+    /// absolute offsets derive the post-write ring starts in-kernel. Returns
     /// nil (write NOT performed) whenever any predicate fails, so the caller
     /// falls back to the established write-then-attend pair.
     static func attendRingWriting(
@@ -447,7 +446,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         newValues: MLXArray,
         keys: [MLXArray],
         values: [MLXArray],
-        starts: [Int],
+        positionOffsets: MLXArray,
         previousWriteFence: MLXArray,
         scale: Float,
         slidingWindowLength: Int
@@ -467,8 +466,8 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             previousWriteFence.shape == [1],
             keys.count == batch,
             values.count == batch,
-            starts.count == batch,
-            starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength })
+            positionOffsets.dtype == .int32,
+            positionOffsets.shape == [batch]
         else { return nil }
 
         for index in 0 ..< batch {
@@ -481,12 +480,11 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             else { return nil }
         }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let passA = fusedRingPassAKernel(
             [queries] + keys + values
-                + [startArray, newKeys, newValues, previousWriteFence],
+                + [positionOffsets, newKeys, newValues, previousWriteFence],
             template: [
                 ("T", queries.dtype),
                 ("D", headDim),

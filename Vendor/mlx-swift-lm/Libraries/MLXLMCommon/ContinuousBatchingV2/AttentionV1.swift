@@ -235,6 +235,7 @@ enum CBv2AttentionV1 {
         spanContexts: [CBv2SpanChunkContext?]? = nil,
         serializeQueries: Bool = false,
         decodeRingWriteFence: CBv2DecodeRingWriteFence? = nil,
+        positionOffsets: MLXArray? = nil,
         allowFusedRingWrite: Bool = false
     ) -> MLXArray {
         let B = queries.dim(0)
@@ -296,7 +297,7 @@ enum CBv2AttentionV1 {
                     // layer has no K/V borrower that must keep observing the
                     // pre-write allocation.
                     if fusedRingWriteEnabled, allowFusedRingWrite,
-                        let decodeRingWriteFence
+                        let decodeRingWriteFence, let positionOffsets
                     {
                         let preWrite = ringRows.compactMap { $0.decodeRingViewBeforeWrite }
                         if preWrite.count == B,
@@ -306,7 +307,7 @@ enum CBv2AttentionV1 {
                                     newKeys: keys, newValues: values,
                                     keys: preWrite.map(\.keys),
                                     values: preWrite.map(\.values),
-                                    starts: preWrite.map(\.start),
+                                    positionOffsets: positionOffsets,
                                     previousWriteFence: decodeRingWriteFence.value,
                                     scale: scale,
                                     slidingWindowLength: ringRows[0].window)

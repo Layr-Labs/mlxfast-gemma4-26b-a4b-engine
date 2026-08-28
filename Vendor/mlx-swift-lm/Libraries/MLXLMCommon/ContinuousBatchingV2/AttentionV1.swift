@@ -32,13 +32,6 @@ enum CBv2AttentionV1 {
     /// launch overhead of 32. `0` disables blocking entirely (one call for the
     /// whole chunk — the pre-2026-07 behavior), which is the kill switch if
     /// this is ever implicated in a numerics or latency regression.
-    private static let fusedRingWriteEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_FUSED_RING_WRITE"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
     static let queryBlockSize: Int = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_ATTN_QUERY_BLOCK"],
@@ -68,9 +61,9 @@ enum CBv2AttentionV1 {
         return value << 20
     }()
 
-    /// ATT-008 opt-in switch: batch-wide FULL-attention decode over pooled
-    /// KV (`DARKBLOOM_GEMMA4_BATCHED_FULL_ATTENTION=1` enables it).
-    /// DEFAULT OFF: three counterbalanced local B=8 probe pairs measured the
+    /// ATT-008 switch: batch-wide FULL-attention decode over pooled
+    /// KV (`DARKBLOOM_GEMMA4_BATCHED_FULL_ATTENTION=0` disables it).
+    /// DEFAULT ON: three counterbalanced local B=8 probe pairs measured the
     /// consolidation at +0.27 ms/round (+1.2%) — the concurrent Metal
     /// encoder already overlaps the per-row dispatches it removes. Kept
     /// selectable because the mechanism is parity-proven bit-exact and the
@@ -78,7 +71,7 @@ enum CBv2AttentionV1 {
     static let batchedFullDecodeEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_BATCHED_FULL_ATTENTION"]
-        else { return false }
+        else { return true }
         return ["1", "true", "yes", "on"].contains(raw.lowercased())
     }()
 
@@ -228,9 +221,7 @@ enum CBv2AttentionV1 {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?, softcap: Float? = nil,
         spanContexts: [CBv2SpanChunkContext?]? = nil,
-        serializeQueries: Bool = false,
-        decodeRingWriteFence: CBv2DecodeRingWriteFence? = nil,
-        allowFusedRingWrite: Bool = false
+        serializeQueries: Bool = false
     ) -> MLXArray {
         let B = queries.dim(0)
         let L = queries.dim(2)
@@ -275,55 +266,23 @@ enum CBv2AttentionV1 {
                 var cachedValueRows: [MLXArray] = []
                 cachedKeyRows.reserveCapacity(B)
                 cachedValueRows.reserveCapacity(B)
-                let windowedRows = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
-                if windowedRows.count == B
-                    && windowedRows.allSatisfy(\.canUseFullDecodeRing)
-                {
-                    if fusedRingWriteEnabled, allowFusedRingWrite,
-                        let decodeRingWriteFence
-                    {
-                        let rings = windowedRows.compactMap {
-                            $0.fullDecodeRingBeforeWrite()
-                        }
-                        if rings.count == B,
-                            let result = CBv2RaggedTwoPassDecodeAttentionV1
-                                .attendRingWriting(
-                                    queries: queries,
-                                    newKeys: keys, newValues: values,
-                                    keys: rings.map(\.keys),
-                                    values: rings.map(\.values),
-                                    starts: rings.map(\.start),
-                                    previousWriteFence: decodeRingWriteFence.value,
-                                    scale: scale)
-                        {
-                            for row in windowedRows {
-                                row.advanceFullDecodeRingWithoutWrite()
-                            }
-                            decodeRingWriteFence.value = result.nextWriteFence
-                            return result.output
-                        }
-                    }
-
-                    var starts: [Int] = []
-                    starts.reserveCapacity(B)
-                    for (index, row) in windowedRows.enumerated() {
-                        let ring = row.writeFullDecodeRing(
+                let ringRows = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
+                if ringRows.count == B && ringRows.allSatisfy({ $0.decodeRingView != nil }) {
+                    for (index, row) in ringRows.enumerated() {
+                        row.decodeRingWrite(
                             keys: keys[index ..< (index + 1)],
                             values: values[index ..< (index + 1)])
-                        cachedKeyRows.append(ring.keys)
-                        cachedValueRows.append(ring.values)
-                        starts.append(ring.start)
                     }
-                    if let output = CBv2RaggedTwoPassDecodeAttentionV1.attendRing(
-                        queries: queries, keys: cachedKeyRows,
-                        values: cachedValueRows, starts: starts,
-                        scale: scale, slidingWindowLength: windowedRows[0].window)
+                    let views = ringRows.compactMap { $0.decodeRingView }
+                    if views.count == B,
+                        let output = CBv2RaggedTwoPassDecodeAttentionV1.attendRing(
+                            queries: queries, keys: views.map(\.keys),
+                            values: views.map(\.values), starts: views.map(\.start),
+                            scale: scale, slidingWindowLength: ringRows[0].window)
                     {
                         return output
                     }
-                    cachedKeyRows.removeAll(keepingCapacity: true)
-                    cachedValueRows.removeAll(keepingCapacity: true)
-                    for row in windowedRows {
+                    for row in ringRows {
                         let view = row.snapshot()
                         cachedKeyRows.append(view.keys)
                         cachedValueRows.append(view.values)

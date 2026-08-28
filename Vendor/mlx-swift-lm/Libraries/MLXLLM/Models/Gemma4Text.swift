@@ -249,6 +249,238 @@ private let gemma4CompiledLogitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArr
     return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
 
+/// Decode-only fusion for the serial RMSNorm/add glue around each Gemma 4
+/// decoder layer. The fused kernels deliberately reproduce every bfloat16
+/// materialization in the stock graph: normalized branch values, the MoE
+/// branch sum, the final normalized value, and residual results are rounded
+/// to `T` at the same boundaries as the separate MLX operations.
+private enum Gemma4FusedLayerGlue {
+    private static let rows = 8
+    private static let width = 2816
+    private static let readsPerThread = 4
+    private static let threads = width / readsPerThread
+
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_FUSED_LAYER_GLUE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static func isDecodePlane(_ x: MLXArray) -> Bool {
+        x.ndim == 3 && x.dim(0) == rows && x.dim(1) == 1 && x.dim(2) == width
+            && x.dtype == .bfloat16
+    }
+
+    private static func isWeight(_ w: MLXArray) -> Bool {
+        w.ndim == 1 && w.dim(0) == width && w.dtype == .bfloat16
+    }
+
+    private static let normResidualKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_glue_norm_residual_2816_bf16_v1",
+        inputNames: ["residual", "x", "w"],
+        outputNames: ["out"],
+        source: """
+            constexpr int SIMD_SIZE = 32;
+            constexpr int N_READS = 4;
+            constexpr int WIDTH = 2816;
+            const int row = int(threadgroup_position_in_grid.y);
+            const int lid = int(thread_position_in_threadgroup.x);
+            const int lane = int(thread_index_in_simdgroup);
+            const int simd = int(simdgroup_index_in_threadgroup);
+            const int base = row * WIDTH + lid * N_READS;
+            threadgroup float local_inv[1];
+            threadgroup float local_sums[SIMD_SIZE];
+            float acc = 0.0f;
+            for (int i = 0; i < N_READS; ++i) {
+                const float value = float(x[base + i]);
+                acc += value * value;
+            }
+            acc = simd_sum(acc);
+            if (simd == 0) local_sums[lane] = 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) local_sums[simd] = acc;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd == 0) {
+                acc = simd_sum(local_sums[lane]);
+                if (lane == 0) {
+                    local_inv[0] = metal::precise::rsqrt(acc / float(WIDTH) + 1e-6f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int i = 0; i < N_READS; ++i) {
+                const int feature = lid * N_READS + i;
+                const T scaled = static_cast<T>(float(x[base + i]) * local_inv[0]);
+                const T normed = static_cast<T>(float(w[feature]) * float(scaled));
+                out[base + i] = static_cast<T>(float(residual[base + i]) + float(normed));
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    private static let dualPreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_glue_dual_prenorm_2816_bf16_v1",
+        inputNames: ["x", "w1", "w2"],
+        outputNames: ["out1", "out2"],
+        source: """
+            constexpr int SIMD_SIZE = 32;
+            constexpr int N_READS = 4;
+            constexpr int WIDTH = 2816;
+            const int row = int(threadgroup_position_in_grid.y);
+            const int lid = int(thread_position_in_threadgroup.x);
+            const int lane = int(thread_index_in_simdgroup);
+            const int simd = int(simdgroup_index_in_threadgroup);
+            const int base = row * WIDTH + lid * N_READS;
+            threadgroup float local_inv[1];
+            threadgroup float local_sums[SIMD_SIZE];
+            float acc = 0.0f;
+            for (int i = 0; i < N_READS; ++i) {
+                const float value = float(x[base + i]);
+                acc += value * value;
+            }
+            acc = simd_sum(acc);
+            if (simd == 0) local_sums[lane] = 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) local_sums[simd] = acc;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd == 0) {
+                acc = simd_sum(local_sums[lane]);
+                if (lane == 0) {
+                    local_inv[0] = metal::precise::rsqrt(acc / float(WIDTH) + 1e-6f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int i = 0; i < N_READS; ++i) {
+                const int feature = lid * N_READS + i;
+                const T scaled = static_cast<T>(float(x[base + i]) * local_inv[0]);
+                out1[base + i] = static_cast<T>(float(w1[feature]) * float(scaled));
+                out2[base + i] = static_cast<T>(float(w2[feature]) * float(scaled));
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    private static let tailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_glue_tail_2816_bf16_v1",
+        inputNames: ["residual", "h1", "h2", "w1", "w2", "wout"],
+        outputNames: ["out"],
+        source: """
+            constexpr int SIMD_SIZE = 32;
+            constexpr int N_READS = 4;
+            constexpr int WIDTH = 2816;
+            const int row = int(threadgroup_position_in_grid.y);
+            const int lid = int(thread_position_in_threadgroup.x);
+            const int lane = int(thread_index_in_simdgroup);
+            const int simd = int(simdgroup_index_in_threadgroup);
+            const int base = row * WIDTH + lid * N_READS;
+            threadgroup float local_inv[3];
+            threadgroup float sums1[SIMD_SIZE];
+            threadgroup float sums2[SIMD_SIZE];
+            threadgroup float sums3[SIMD_SIZE];
+            float acc1 = 0.0f;
+            float acc2 = 0.0f;
+            for (int i = 0; i < N_READS; ++i) {
+                const float a = float(h1[base + i]);
+                const float b = float(h2[base + i]);
+                acc1 += a * a;
+                acc2 += b * b;
+            }
+            acc1 = simd_sum(acc1);
+            acc2 = simd_sum(acc2);
+            if (simd == 0) {
+                sums1[lane] = 0.0f;
+                sums2[lane] = 0.0f;
+                sums3[lane] = 0.0f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) {
+                sums1[simd] = acc1;
+                sums2[simd] = acc2;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd == 0) {
+                acc1 = simd_sum(sums1[lane]);
+                acc2 = simd_sum(sums2[lane]);
+                if (lane == 0) {
+                    local_inv[0] = metal::precise::rsqrt(acc1 / float(WIDTH) + 1e-6f);
+                    local_inv[1] = metal::precise::rsqrt(acc2 / float(WIDTH) + 1e-6f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            T joined[N_READS];
+            float acc3 = 0.0f;
+            for (int i = 0; i < N_READS; ++i) {
+                const int feature = lid * N_READS + i;
+                const T scaled1 = static_cast<T>(float(h1[base + i]) * local_inv[0]);
+                const T scaled2 = static_cast<T>(float(h2[base + i]) * local_inv[1]);
+                const T normed1 = static_cast<T>(float(w1[feature]) * float(scaled1));
+                const T normed2 = static_cast<T>(float(w2[feature]) * float(scaled2));
+                joined[i] = static_cast<T>(float(normed1) + float(normed2));
+                const float value = float(joined[i]);
+                acc3 += value * value;
+            }
+            acc3 = simd_sum(acc3);
+            if (lane == 0) sums3[simd] = acc3;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd == 0) {
+                acc3 = simd_sum(sums3[lane]);
+                if (lane == 0) {
+                    local_inv[2] = metal::precise::rsqrt(acc3 / float(WIDTH) + 1e-6f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int i = 0; i < N_READS; ++i) {
+                const int feature = lid * N_READS + i;
+                const T scaled = static_cast<T>(float(joined[i]) * local_inv[2]);
+                const T normed = static_cast<T>(float(wout[feature]) * float(scaled));
+                out[base + i] = static_cast<T>(float(residual[base + i]) + float(normed));
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    static func normResidual(
+        residual: MLXArray, x: MLXArray, weight: MLXArray, eps: Float
+    ) -> MLXArray? {
+        guard enabled, eps == 1e-6, isDecodePlane(residual), isDecodePlane(x),
+            isWeight(weight)
+        else { return nil }
+        return normResidualKernel(
+            [residual, x, weight], template: [("T", x.dtype)],
+            grid: (threads, rows, 1), threadGroup: (threads, 1, 1),
+            outputShapes: [x.shape], outputDTypes: [x.dtype]
+        )[0]
+    }
+
+    static func dualPreNorm(
+        _ x: MLXArray, weight1: MLXArray, weight2: MLXArray, eps: Float
+    ) -> (MLXArray, MLXArray)? {
+        guard enabled, eps == 1e-6, isDecodePlane(x), isWeight(weight1), isWeight(weight2)
+        else { return nil }
+        let outputs = dualPreNormKernel(
+            [x, weight1, weight2], template: [("T", x.dtype)],
+            grid: (threads, rows, 1), threadGroup: (threads, 1, 1),
+            outputShapes: [x.shape, x.shape], outputDTypes: [x.dtype, x.dtype]
+        )
+        return (outputs[0], outputs[1])
+    }
+
+    static func tail(
+        residual: MLXArray, h1: MLXArray, h2: MLXArray,
+        weight1: MLXArray, weight2: MLXArray, outputWeight: MLXArray, eps: Float
+    ) -> MLXArray? {
+        guard enabled, eps == 1e-6, isDecodePlane(residual), isDecodePlane(h1),
+            isDecodePlane(h2), isWeight(weight1), isWeight(weight2), isWeight(outputWeight)
+        else { return nil }
+        return tailKernel(
+            [residual, h1, h2, weight1, weight2, outputWeight],
+            template: [("T", h1.dtype)], grid: (threads, rows, 1),
+            threadGroup: (threads, 1, 1), outputShapes: [h1.shape],
+            outputDTypes: [h1.dtype]
+        )[0]
+    }
+}
+
 // MARK: - Configuration
 
 struct Gemma4WeightQuantizationMetadata: Codable, Sendable {
@@ -1792,8 +2024,16 @@ public class Gemma4DecoderLayer: Module {
             h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset,
             v2SharedSource: v2SharedSource, outputStart: outputStart,
             useLastQueryPrefill: useLastQueryPrefill)
-        let postAttn = postAttentionLayernorm(attnOut)
-        var out = residual + postAttn
+        var out: MLXArray
+        if let fused = Gemma4FusedLayerGlue.normResidual(
+            residual: residual, x: attnOut, weight: postAttentionLayernorm.weight,
+            eps: config.rmsNormEps
+        ) {
+            out = fused
+        } else {
+            let postAttn = postAttentionLayernorm(attnOut)
+            out = residual + postAttn
+        }
 
         let residual2 = out
 
@@ -1805,27 +2045,42 @@ public class Gemma4DecoderLayer: Module {
             let postFeedforwardLayernorm2
         {
             // Dense + sparse branches in parallel, summed into one residual.
-            var h1 = preFeedforwardLayernorm(out)
+            let fusedPreNorms = Gemma4FusedLayerGlue.dualPreNorm(
+                out, weight1: preFeedforwardLayernorm.weight,
+                weight2: preFeedforwardLayernorm2.weight, eps: config.rmsNormEps)
+
+            var h1 = fusedPreNorms?.0 ?? preFeedforwardLayernorm(out)
             h1 = mlp(h1)
-            h1 = postFeedforwardLayernorm1(h1)
 
             let (topKIndices, topKWeights) = router(out)
-            var h2 = preFeedforwardLayernorm2(out)
+            var h2 = fusedPreNorms?.1 ?? preFeedforwardLayernorm2(out)
             h2 = experts(
                 h2,
                 topKIndices: topKIndices,
                 topKWeights: topKWeights,
                 isExpertPrefill: isExpertPrefill)
-            h2 = postFeedforwardLayernorm2(h2)
 
-            out = h1 + h2
+            if let fused = Gemma4FusedLayerGlue.tail(
+                residual: residual2, h1: h1, h2: h2,
+                weight1: postFeedforwardLayernorm1.weight,
+                weight2: postFeedforwardLayernorm2.weight,
+                outputWeight: postFeedforwardLayernorm.weight,
+                eps: config.rmsNormEps
+            ) {
+                out = fused
+            } else {
+                h1 = postFeedforwardLayernorm1(h1)
+                h2 = postFeedforwardLayernorm2(h2)
+                out = h1 + h2
+                out = postFeedforwardLayernorm(out)
+                out = residual2 + out
+            }
         } else {
             out = preFeedforwardLayernorm(out)
             out = mlp(out)
+            out = postFeedforwardLayernorm(out)
+            out = residual2 + out
         }
-
-        out = postFeedforwardLayernorm(out)
-        out = residual2 + out
 
         // PLE gating
         if let gate = perLayerInputGate,
@@ -2413,6 +2668,26 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 imageTokenMask: imageTokenMask))
     }
 
+    /// MMA-003: serve all eight cohort rows from one matrix-unit pass over the
+    /// tied affine-4 vocabulary plane. The implementation fails closed for
+    /// every non-production geometry, allowing the promoted tight-grid QMV
+    /// below to remain the exact fallback.
+    @inline(__always)
+    private func tiedLMHeadMMA(_ hidden: MLXArray) -> MLXArray? {
+        guard lmHead == nil,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.mode == .affine,
+            let mma = Gemma4MMAQuantizedGEMV.apply(
+                x: hidden,
+                w: quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                groupSize: quantized.groupSize,
+                bits: quantized.bits)
+        else { return nil }
+        return mma.reshaped(Array(hidden.shape.dropLast()) + [mma.dim(-1)])
+    }
+
     /// Apply the LM head (tied embedding or explicit `lm_head`) plus the
     /// configured final-logit softcap. Pure function of the post-norm hidden.
     /// LMH-001: tight-grid dispatch for the tied lm_head ordinary QMV.
@@ -2444,6 +2719,8 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         var out: MLXArray
         if let lmHead {
             out = lmHead(hidden)
+        } else if let mma = tiedLMHeadMMA(hidden) {
+            out = mma
         } else if let tight = tiedLMHeadTightGrid(hidden) {
             out = tight
         } else {

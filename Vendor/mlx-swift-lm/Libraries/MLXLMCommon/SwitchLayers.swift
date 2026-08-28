@@ -249,7 +249,48 @@ public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, M
     )
 }
 
+/// Stable rank-sort for the scored Gemma 4 decode router plane. Each of the
+/// 64 keys computes its stable sorted position directly, replacing the two
+/// generic argsort dispatches while preserving tie order exactly.
+private let gemma4RankSort64Enabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_RANK_SORT_64"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+private let gemma4RankSort64Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "gemma4_rank_sort_64_u32_v1",
+    inputNames: ["indices"],
+    outputNames: ["lhs_indices", "sorted_indices", "inverse_order"],
+    source: """
+        const uint element = thread_position_in_grid.x;
+        const uint value = uint(indices[element]);
+        uint rank = 0;
+        for (uint i = 0; i < 64; ++i) {
+            const uint other = uint(indices[i]);
+            rank += uint(other < value || (other == value && i < element));
+        }
+        lhs_indices[rank] = element / 8;
+        sorted_indices[rank] = value;
+        inverse_order[element] = rank;
+    """,
+    ensureRowContiguous: true
+)
+
 public func gatherSortIndices(indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+    if gemma4RankSort64Enabled,
+        indices.ndim == 2,
+        indices.dim(0) == 8,
+        indices.dim(1) == 8,
+        indices.dtype == .uint32
+    {
+        let outputs = gemma4RankSort64Kernel(
+            [indices], grid: (64, 1, 1), threadGroup: (64, 1, 1),
+            outputShapes: [[64], [64], [64]],
+            outputDTypes: [.uint32, .uint32, .uint32])
+        return (outputs[0], outputs[1], outputs[2])
+    }
     let m = indices.dim(-1)
     let indices = indices.flattened()
     let order = argSort(indices)

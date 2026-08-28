@@ -710,7 +710,7 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
         device T* output = q_out;
         uint local_row = row;
         bool weighted = true;
-        if (row >= Q_ROWS + K_ROWS) {
+        if (!KEY_VALUE_SHARED && row >= Q_ROWS + K_ROWS) {
             input = v;
             output = v_out;
             local_row = row - Q_ROWS - K_ROWS;
@@ -725,6 +725,13 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
         input += local_row * D + lid * reads;
         output += local_row * D + lid * reads;
         weight += lid * reads;
+        // Keep the pointer inside the V allocation for Q rows even though
+        // those rows never dereference it.  K rows advance to their matching
+        // V row only in the compile-time shared-input variant.
+        device T* shared_value_output = v_out;
+        if (KEY_VALUE_SHARED && row >= Q_ROWS) {
+            shared_value_output += local_row * D + lid * reads;
+        }
 
         float sum = 0.0f;
         for (uint i = 0; i < reads; ++i) {
@@ -750,6 +757,14 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
         for (uint i = 0; i < reads; ++i) {
             const T normalized = T(float(input[i]) * inverse_rms);
             output[i] = weighted ? weight[i] * normalized : T(1) * normalized;
+            // Gemma's full-attention K-eq-V layers feed the same raw key
+            // projection to K RMSNorm and V RMSNormNoScale.  The reduction
+            // above is therefore identical for both outputs; keep each
+            // output's established final expression, but write V while the
+            // exact normalizer and input value are live.
+            if (KEY_VALUE_SHARED && row >= Q_ROWS) {
+                shared_value_output[i] = T(1) * normalized;
+            }
         }
     """,
     ensureRowContiguous: true
@@ -761,7 +776,8 @@ private func gemma4FusedQKVNorm(
     v: MLXArray,
     qWeight: MLXArray,
     kWeight: MLXArray,
-    eps: Float
+    eps: Float,
+    keyValueShared: Bool
 ) -> (MLXArray, MLXArray, MLXArray)? {
     guard eps == 1.0e-6,
         q.dtype == .bfloat16, k.dtype == .bfloat16, v.dtype == .bfloat16,
@@ -771,17 +787,25 @@ private func gemma4FusedQKVNorm(
         k.dim(0) == 8, k.dim(1) == 1, v.shape == k.shape,
         q.dim(3) == k.dim(3),
         (q.dim(3) == 256 && k.dim(2) == 8) || (q.dim(3) == 512 && k.dim(2) == 2),
-        qWeight.shape == [q.dim(3)], kWeight.shape == [q.dim(3)]
+        qWeight.shape == [q.dim(3)], kWeight.shape == [q.dim(3)],
+        !keyValueShared || v.shape == k.shape
     else { return nil }
 
     let dimension = q.dim(3)
     let qRows = 8 * 16
     let kRows = 8 * k.dim(2)
     let threads = dimension / 4
+    // In the exact K-eq-V case V reads kRaw, so one row reduction produces
+    // both the weighted K and no-scale V outputs.  Keep the ordinary three
+    // banks for every non-shared projection and for all guard failures.
+    let normRows = qRows + kRows + (keyValueShared ? 0 : kRows)
     let outputs = gemma4QKVNormKernel(
         [q, k, v, qWeight, kWeight],
-        template: [("T", q.dtype), ("D", dimension), ("Q_ROWS", qRows), ("K_ROWS", kRows)],
-        grid: ((qRows + 2 * kRows) * threads, 1, 1),
+        template: [
+            ("T", q.dtype), ("D", dimension), ("Q_ROWS", qRows), ("K_ROWS", kRows),
+            ("KEY_VALUE_SHARED", keyValueShared),
+        ],
+        grid: (normRows * threads, 1, 1),
         threadGroup: (threads, 1, 1),
         outputShapes: [q.shape, k.shape, v.shape],
         outputDTypes: [q.dtype, k.dtype, v.dtype]
@@ -1254,7 +1278,8 @@ private class Gemma4Attention: Module {
 
         let normalized = gemma4FusedQKVNorm(
             q: queryRaw, k: kRaw, v: vRaw,
-            qWeight: qNorm.weight, kWeight: kNorm.weight, eps: config.rmsNormEps)
+            qWeight: qNorm.weight, kWeight: kNorm.weight, eps: config.rmsNormEps,
+            keyValueShared: vProj == nil)
         var queries = normalized?.0 ?? qNorm(queryRaw)
         var k = normalized?.1 ?? kNorm(kRaw)
         var v = normalized?.2 ?? vNorm(vRaw)
@@ -2413,26 +2438,6 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 imageTokenMask: imageTokenMask))
     }
 
-    /// MMA-003: serve all eight cohort rows from one matrix-unit pass over the
-    /// tied affine-4 vocabulary plane. The implementation fails closed for
-    /// every non-production geometry, allowing the promoted tight-grid QMV
-    /// below to remain the exact fallback.
-    @inline(__always)
-    private func tiedLMHeadMMA(_ hidden: MLXArray) -> MLXArray? {
-        guard lmHead == nil,
-            let quantized = model.embedTokens as? QuantizedEmbedding,
-            quantized.mode == .affine,
-            let mma = Gemma4MMAQuantizedGEMV.apply(
-                x: hidden,
-                w: quantized.weight,
-                scales: quantized.scales,
-                biases: quantized.biases,
-                groupSize: quantized.groupSize,
-                bits: quantized.bits)
-        else { return nil }
-        return mma.reshaped(Array(hidden.shape.dropLast()) + [mma.dim(-1)])
-    }
-
     /// Apply the LM head (tied embedding or explicit `lm_head`) plus the
     /// configured final-logit softcap. Pure function of the post-norm hidden.
     /// LMH-001: tight-grid dispatch for the tied lm_head ordinary QMV.
@@ -2464,8 +2469,6 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         var out: MLXArray
         if let lmHead {
             out = lmHead(hidden)
-        } else if let mma = tiedLMHeadMMA(hidden) {
-            out = mma
         } else if let tight = tiedLMHeadTightGrid(hidden) {
             out = tight
         } else {

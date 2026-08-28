@@ -2111,7 +2111,7 @@ public class Gemma4TextModelInner: Module {
             guard isCBv2 else { return nil }
             for case let entry? in fullCache {
                 if let offsets = (entry as? CBv2LayerCache)?.unifiedPositionOffsets {
-                    return .batch(offsets + 0)
+                    return .batch(offsets)
                 }
             }
             return nil
@@ -2319,6 +2319,7 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     fileprivate let config: Gemma4TextConfiguration
     let model: Gemma4TextModelInner
     let fuseWeightedUnsort: Bool
+    private let finalLogitSoftcapScalar: MLXArray?
 
     /// Read-only accessor for the underlying text configuration. Needed by
     /// `Gemma4AssistantDraftModel` for its bind-time compatibility checks.
@@ -2351,6 +2352,10 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public init(_ config: Gemma4TextConfiguration) {
         let fuseWeightedUnsort = gemma4ShouldFuseWeightedUnsort(config)
         self.config = config
+        self.finalLogitSoftcapScalar =
+            config.finalLogitSoftcapping > 0
+            ? MLXArray(config.finalLogitSoftcapping)
+            : nil
         self.vocabularySize = config.vocabSize
         // Per-layer KV head counts must agree with `Gemma4Attention.init`:
         // full layers use `num_global_key_value_heads` when present (whether
@@ -2451,9 +2456,8 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
         // The VLM omission profile uses zero to represent the former optional
         // softcap's nil/disabled state.
-        if config.finalLogitSoftcapping > 0 {
-            out = gemma4CompiledLogitSoftcap(
-                out, MLXArray(config.finalLogitSoftcapping))
+        if let finalLogitSoftcapScalar {
+            out = gemma4CompiledLogitSoftcap(out, finalLogitSoftcapScalar)
         }
         return out
     }

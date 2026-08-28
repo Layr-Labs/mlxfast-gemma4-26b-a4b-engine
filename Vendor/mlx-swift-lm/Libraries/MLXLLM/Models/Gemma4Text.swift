@@ -2676,7 +2676,8 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     /// below to remain the exact fallback.
     @inline(__always)
     private func tiedLMHeadMMA(_ hidden: MLXArray) -> MLXArray? {
-        guard lmHead == nil,
+        guard config.finalLogitSoftcapping > 0,
+            lmHead == nil,
             let quantized = model.embedTokens as? QuantizedEmbedding,
             quantized.mode == .affine,
             let mma = Gemma4MMAQuantizedGEMV.apply(
@@ -2718,12 +2719,19 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     func applyLMHead(_ hidden: MLXArray) -> MLXArray {
-        var out: MLXArray
         if let lmHead {
-            out = lmHead(hidden)
-        } else if let mma = tiedLMHeadMMA(hidden) {
-            out = mma
-        } else if let tight = tiedLMHeadTightGrid(hidden) {
+            var out = lmHead(hidden)
+            if config.finalLogitSoftcapping > 0 {
+                out = gemma4CompiledLogitSoftcap(
+                    out, MLXArray(config.finalLogitSoftcapping))
+            }
+            return out
+        }
+        if let mma = tiedLMHeadMMA(hidden) {
+            return mma
+        }
+        var out: MLXArray
+        if let tight = tiedLMHeadTightGrid(hidden) {
             out = tight
         } else {
             out = model.embedTokens.asLinear(hidden)

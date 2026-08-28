@@ -3243,50 +3243,58 @@ template <typename T, int group_size, int bits>
       ((in_vec_size == 2816 && out_vec_size == 704) ||
        (in_vec_size == 704 && out_vec_size == 2816));
   if (gemma4_pair_geometry) {
-    const uint assignment = tid.z;
-    const uint32_t expert =
-        rhs_indices[assignment * (uint)rhs_strides[0]];
-    uint run_offset = 0;
-    for (uint prior = assignment; prior > 0; --prior) {
-      if (rhs_indices[(prior - 1) * (uint)rhs_strides[0]] != expert) {
-        break;
-      }
-      run_offset++;
-    }
-
-    // Odd positions are produced by the immediately preceding pair leader.
-    if ((run_offset & 1) != 0) {
-      return;
-    }
-    const bool has_pair =
-        assignment + 1 < 64 &&
-        rhs_indices[(assignment + 1) * (uint)rhs_strides[0]] == expert;
-    if (has_pair) {
-      const uint32_t x0_idx =
-          lhs_indices[assignment * (uint)lhs_strides[0]];
-      const uint32_t x1_idx =
-          lhs_indices[(assignment + 1) * (uint)lhs_strides[0]];
-      const device uint32_t* pair_w = w + expert * w_strides[0];
-      const device T* pair_scales = scales + expert * s_strides[0];
-      const device T* pair_biases = biases + expert * b_strides[0];
-      const device T* pair_x0 = x + x0_idx * x_strides[0];
-      const device T* pair_x1 = x + x1_idx * x_strides[0];
-      device T* pair_y0 = y + assignment * out_vec_size;
-      device T* pair_y1 = y + (assignment + 1) * out_vec_size;
+    // The host halves the z grid for this exact contract. Each group owns a
+    // global pair. Same-expert pairs share one weight stream; a pair crossing
+    // an expert boundary runs the two incumbent single-row computations in
+    // sequence. This preserves each output's arithmetic while eliminating the
+    // run scan and all return-only follower groups.
+    const uint assignment0 = tid.z * 2u;
+    const uint assignment1 = assignment0 + 1u;
+    const uint32_t expert0 =
+        rhs_indices[assignment0 * (uint)rhs_strides[0]];
+    const uint32_t expert1 =
+        rhs_indices[assignment1 * (uint)rhs_strides[0]];
+    const uint32_t x0_idx =
+        lhs_indices[assignment0 * (uint)lhs_strides[0]];
+    const uint32_t x1_idx =
+        lhs_indices[assignment1 * (uint)lhs_strides[0]];
+    const device T* x0 = x + x0_idx * x_strides[0];
+    const device T* x1 = x + x1_idx * x_strides[0];
+    device T* y0 = y + assignment0 * out_vec_size;
+    device T* y1 = y + assignment1 * out_vec_size;
+    const device uint32_t* w0 = w + expert0 * w_strides[0];
+    const device T* scales0 = scales + expert0 * s_strides[0];
+    const device T* biases0 = biases + expert0 * b_strides[0];
+    if (expert0 == expert1) {
       qmv_affine4_g64_pair_impl<T, group_size, bits>(
-          pair_w,
-          pair_scales,
-          pair_biases,
-          pair_x0,
-          pair_x1,
-          pair_y0,
-          pair_y1,
+          w0,
+          scales0,
+          biases0,
+          x0,
+          x1,
+          y0,
+          y1,
           in_vec_size,
           tid,
           simd_gid,
           simd_lid);
-      return;
+    } else {
+      qmv_impl<T, group_size, bits>(
+          w0, scales0, biases0, x0, y0, in_vec_size, out_vec_size,
+          tid, simd_gid, simd_lid);
+      qmv_impl<T, group_size, bits>(
+          w + expert1 * w_strides[0],
+          scales + expert1 * s_strides[0],
+          biases + expert1 * b_strides[0],
+          x1,
+          y1,
+          in_vec_size,
+          out_vec_size,
+          tid,
+          simd_gid,
+          simd_lid);
     }
+    return;
   }
   adjust_matrix_offsets<T>(
       x,

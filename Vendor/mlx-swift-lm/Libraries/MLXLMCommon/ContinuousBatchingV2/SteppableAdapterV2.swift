@@ -40,6 +40,25 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
     }
 }
 
+// MARK: - Direct untransformed greedy decode
+
+extension CBv2SteppableLanguageModelAdapter: CBv2DirectGreedySteppableModel {
+
+    public func supportsDirectGreedy(batchSize: Int) -> Bool {
+        (model as? CBv2LanguageModelDirectGreedyForwardable)?
+            .cbv2SupportsDirectGreedy(batchSize: batchSize) ?? false
+    }
+
+    public func directGreedyTokens(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> MLXArray {
+        guard let direct = model as? CBv2LanguageModelDirectGreedyForwardable else {
+            preconditionFailure("direct greedy decode reached a model without the opt-in seam")
+        }
+        return direct.cbv2DirectGreedyTokens(tokens, cache: asKVCaches(caches))
+    }
+}
+
 // MARK: - Prompt-output narrowing (prefill only)
 
 /// Answered at RUNTIME like the multimodal/MTP capabilities: only models

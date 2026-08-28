@@ -563,6 +563,34 @@ dequantize(const device uint8_t* w, U scale, U bias, threadgroup U* w_local) {
   }
 }
 
+// Wide device loads for the 4-bit QuantizedBlockLoader (Laguna P4 loader
+// lever), kept DISABLED after measurement. Four formulations were run
+// through the pf04 parity harness against the stock scalar loader, at the
+// production geometries of both consumers (affine_gather_qmm_rhs_nax at
+// 65,536 expert-sorted rows, ragged/skew/single/adversarial; affine_qmm_t
+// _nax at M=8192 across the production N/K set). All four were uint16-view
+// BIT-EXACT (dequant expressions kept verbatim; loads/stores only, no
+// accumulation touched) and all four REGRESSED heavily on M5
+// (applegpu_g17s), chained timing with null-chain control, 2 runs each:
+//   1. 1x16B uint4 load + thread-array staging + 4x16B threadgroup
+//      stores, runtime 16B-alignment branch:          -58% .. -136%
+//   2. same, register-only as_type packing:           -21% .. -142%
+//   3. 1x16B uint4 load + stock scalar stores, branch: -41% .. -140%
+//   4. 4x4B uint loads + stock scalar stores, NO branch (alignment
+//      provable at compile time: uint32 buffer => element-granular base;
+//      gs=64 => K%64==0 => every folded offset = 0 mod 4; bj = 0 mod 16
+//      by the n_reads gate):                          -32% .. -118%
+// Conclusion: the Metal compiler already turns the stock unrolled byte
+// dequant into an optimally scheduled wide-load pipeline; every manual
+// re-expression of the load width defeats that scheduling (the on-box
+// -1.60% for manual u32 widening of qdot in the plain twin is the same
+// law). Do not re-buy without an on-box receipt. Flipping this constant
+// re-enables formulation 4 below, the least-bad bit-exact variant, whose
+// alignment contract needs no runtime check. Compile-time source constant
+// by design: an enable must never ride a function constant (pipeline-key
+// law).
+MLX_MTL_CONST bool kQuantLoaderWideStage = false;
+
 template <
     typename T,
     short BROWS,
@@ -635,6 +663,29 @@ struct QuantizedBlockLoader {
 
     T scale = *scales;
     T bias = *biases;
+    if constexpr (
+        kQuantLoaderWideStage && bits == 4 && reduction_dim == 1 &&
+        n_reads * bytes_per_pack == 16 && sizeof(T) == 2 &&
+        ((BCOLS_PACKED * bytes_per_pack) & 3) == 0) {
+      // Branch-free four 4-byte device loads of this thread's 16 packed
+      // bytes (alignment proven at compile time -- contract above). The
+      // per-byte dequant and the threadgroup stores below are
+      // dequantize<T, pack_factor, 4>'s expressions verbatim.
+      const device uint* src32 = (const device uint*)src;
+      const T s0 = scale;
+      const T s1 = scale / static_cast<T>(16.0f);
+      STEEL_PRAGMA_UNROLL
+      for (short q = 0; q < 4; ++q) {
+        const uint w32 = src32[q];
+        STEEL_PRAGMA_UNROLL
+        for (short e = 0; e < 4; ++e) {
+          const ushort wb = (w32 >> (e * 8)) & 0xff;
+          dst[8 * q + 2 * e] = s0 * (wb & 0x0f) + bias;
+          dst[8 * q + 2 * e + 1] = s1 * (wb & 0xf0) + bias;
+        }
+      }
+      return;
+    }
     for (int i = 0; i < n_reads; i++) {
       dequantize<T, pack_factor, bits>(
           src + i * bytes_per_pack, scale, bias, dst + i * pack_factor);
@@ -1448,6 +1499,69 @@ template <
       w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
+// Expert-segment elision for affine_gather_qmm_rhs_nax: the per-tile
+// segment loop re-runs the full K-loop once per distinct expert in the
+// row tile and discards out-of-segment rows at store_slice. The helpers
+// below let a simdgroup skip A loads and MMA for 16-row NAX fragment
+// rows that fall wholly outside the current segment's stored row band.
+// Fragment rows are independent accumulators, so eliding rows that are
+// never stored cannot change any stored element's accumulation sequence.
+// Compile-time source constant by design: an enable must never ride a
+// function constant magnitude (pipeline-key law).
+MLX_MTL_CONST bool kGatherRhsSegmentElide = true;
+
+// Loads one 16-row fragment row of an A tile from device memory. The
+// address arithmetic matches NAXTile::load exactly for that fragment row
+// (row offset mm * kFragRows), so the loaded values are identical to the
+// full-tile load for the surviving rows.
+template <typename U, typename ATile>
+METAL_FUNC void gather_rhs_load_frag_row(
+    const short mm,
+    thread ATile& Atile,
+    const device U* src,
+    const int ld) {
+  STEEL_PRAGMA_UNROLL
+  for (short kk = 0; kk < ATile::kTileCols; ++kk) {
+    ATile::NAXFrag_t::load(
+        Atile.frag_at(mm, kk),
+        src,
+        ld,
+        Int<1>{},
+        short(mm * ATile::kFragRows),
+        short(kk * ATile::kFragCols));
+  }
+}
+
+// Issues the mm-th fragment row's MMA op sequence of tile_matmad_nax's
+// TN-even branch, unchanged: same operands, same per-fragment
+// accumulation chain, only the dead fragment rows' ops are absent.
+template <typename CTile, typename ATile, typename BTile, bool transpose_b>
+METAL_FUNC void gather_rhs_mma_frag_row(
+    const short mm,
+    thread CTile& C,
+    thread ATile& A,
+    thread BTile& B,
+    metal::bool_constant<transpose_b> tb) {
+  constexpr short TN = CTile::kTileCols;
+  constexpr short TK = transpose_b ? BTile::kTileCols : BTile::kTileRows;
+  constexpr auto ta = metal::bool_constant<false>{};
+  static_assert(TN % 2 == 0, "Segment elision expects even TN");
+  STEEL_PRAGMA_UNROLL
+  for (short nn = 0; nn < TN; nn += 2) {
+    STEEL_PRAGMA_UNROLL
+    for (short kk = 0; kk < TK; ++kk) {
+      CTile::NAXFrag_t::mma(
+          C.frag_at(mm, nn),
+          C.frag_at(mm, nn + 1),
+          A.frag_at(mm, kk, ta),
+          ta,
+          B.frag_at(kk, nn, tb),
+          B.frag_at(kk, nn + 1, tb),
+          tb);
+    }
+  }
+}
+
 template <
     typename T,
     int group_size,
@@ -1567,6 +1681,22 @@ template <
 
     const device T* xn = x + tm * K;
 
+    // This simdgroup's stored row band for the current expert segment,
+    // hoisted ahead of the K-loop (it depends only on offset, offset_next,
+    // tm and sgp_sm, all known here). The stock path computes the full
+    // tile and discards rows outside [seg_lo, seg_hi) at store_slice; with
+    // the elision enabled those rows' A loads and MMA ops are skipped
+    // instead. Cooperative weight loads and every threadgroup_barrier stay
+    // unconditional, so barrier convergence is preserved, and seg_* are
+    // uniform within a simdgroup (offset/offset_next are threadgroup
+    // uniform). With the enable off both flags fold to false and only the
+    // stock path below runs.
+    const short seg_lo = min(int(sgp_sm), max(0, offset - tm));
+    const short seg_hi = min(int(sgp_sm), max(0, offset_next - tm));
+    const bool seg_empty = kGatherRhsSegmentElide && (seg_hi <= seg_lo);
+    const bool seg_partial = kGatherRhsSegmentElide && !seg_empty &&
+        !(seg_lo == 0 && seg_hi == sgp_sm);
+
     // Prepare threadgroup loading operations
     thread loader_w_t loader_w(
         wl + index * stride_w,
@@ -1590,33 +1720,72 @@ template <
 
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
-          STEEL_PRAGMA_NO_UNROLL
-          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-            NAXTile<T, TM, TK> Atile;
-            NAXTile<T, BR, BC> Btile;
+          if (seg_partial && kAlignedM.value) {
+            // 16-row fragment-row granularity: only fragment rows that
+            // intersect [seg_lo, seg_hi) load A and issue MMA. Each live
+            // fragment row runs the exact op sequence of the stock path.
+            STEEL_PRAGMA_NO_UNROLL
+            for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+              NAXTile<T, TM, TK> Atile;
+              NAXTile<T, BR, BC> Btile;
 
-            volatile int compiler_barrier;
+              volatile int compiler_barrier;
 
-            if constexpr (kAlignedM.value) {
-              Atile.load(xn + kk1, K);
-            } else {
-              Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+              if constexpr (transpose) {
+                Btile.template load<T, BK_padded, 1>(
+                    Ws + tn * BK_padded + kk1);
+              } else {
+                Btile.template load<T, BN_padded, 1>(
+                    Ws + tn + kk1 * BN_padded);
+              }
+
+              STEEL_PRAGMA_UNROLL
+              for (short mm = 0; mm < TM; mm++) {
+                const short fr = short(mm * Dtile.kFragRows);
+                if (fr < seg_hi && short(fr + Dtile.kFragRows) > seg_lo) {
+                  gather_rhs_load_frag_row(mm, Atile, xn + kk1, K);
+                  gather_rhs_mma_frag_row(
+                      mm,
+                      Dtile,
+                      Atile,
+                      Btile,
+                      metal::bool_constant<transpose>{});
+                }
+              }
+
+              (void)compiler_barrier;
             }
+          } else if (!seg_empty) {
+            STEEL_PRAGMA_NO_UNROLL
+            for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+              NAXTile<T, TM, TK> Atile;
+              NAXTile<T, BR, BC> Btile;
 
-            if constexpr (transpose) {
-              Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
-            } else {
-              Btile.template load<T, BN_padded, 1>(Ws + tn + kk1 * BN_padded);
+              volatile int compiler_barrier;
+
+              if constexpr (kAlignedM.value) {
+                Atile.load(xn + kk1, K);
+              } else {
+                Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+              }
+
+              if constexpr (transpose) {
+                Btile.template load<T, BK_padded, 1>(
+                    Ws + tn * BK_padded + kk1);
+              } else {
+                Btile.template load<T, BN_padded, 1>(
+                    Ws + tn + kk1 * BN_padded);
+              }
+
+              tile_matmad_nax(
+                  Dtile,
+                  Atile,
+                  metal::bool_constant<false>{},
+                  Btile,
+                  metal::bool_constant<transpose>{});
+
+              (void)compiler_barrier;
             }
-
-            tile_matmad_nax(
-                Dtile,
-                Atile,
-                metal::bool_constant<false>{},
-                Btile,
-                metal::bool_constant<transpose>{});
-
-            (void)compiler_barrier;
           }
 
           xn += BK;
@@ -1628,52 +1797,59 @@ template <
           loader_w.load_safe(tile_w);
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
-          STEEL_PRAGMA_NO_UNROLL
-          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-            NAXTile<T, TM, TK> Atile;
-            NAXTile<T, BR, BC> Btile;
+          // Elision here is band-granular only (seg_empty): a partial band
+          // runs the stock tail, whose extra MMA lands in fragment rows
+          // that are never stored.
+          if (!seg_empty) {
+            STEEL_PRAGMA_NO_UNROLL
+            for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+              NAXTile<T, TM, TK> Atile;
+              NAXTile<T, BR, BC> Btile;
 
-            volatile int compiler_barrier;
+              volatile int compiler_barrier;
 
-            const short psk = min(int(SK), max(0, (BK - kk1)));
-            Atile.load_safe(xn + kk1, K, short2(psk, sgp_sm));
+              const short psk = min(int(SK), max(0, (BK - kk1)));
+              Atile.load_safe(xn + kk1, K, short2(psk, sgp_sm));
 
-            if constexpr (transpose) {
-              Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
-            } else {
-              Btile.template load<T, BN_padded, 1>(Ws + tn + kk1 * BN_padded);
+              if constexpr (transpose) {
+                Btile.template load<T, BK_padded, 1>(
+                    Ws + tn * BK_padded + kk1);
+              } else {
+                Btile.template load<T, BN_padded, 1>(
+                    Ws + tn + kk1 * BN_padded);
+              }
+
+              tile_matmad_nax(
+                  Dtile,
+                  Atile,
+                  metal::bool_constant<false>{},
+                  Btile,
+                  metal::bool_constant<transpose>{});
+
+              (void)compiler_barrier;
             }
-
-            tile_matmad_nax(
-                Dtile,
-                Atile,
-                metal::bool_constant<false>{},
-                Btile,
-                metal::bool_constant<transpose>{});
-
-            (void)compiler_barrier;
           }
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        const short m_lo_lim = min(int(sgp_sm), max(0, offset - tm));
-        const short m_hi_lim = min(int(sgp_sm), max(0, offset_next - tm));
-
-        // Store results to device memory
-        if constexpr (kAlignedN.value) {
-          if (m_lo_lim == 0 && m_hi_lim == SM) {
-            Dtile.store(y + tm * N + tn, N);
+        // Store results to device memory. seg_lo/seg_hi are the stock
+        // m_lo_lim/m_hi_lim, hoisted ahead of the K-loop.
+        if (!seg_empty) {
+          if constexpr (kAlignedN.value) {
+            if (seg_lo == 0 && seg_hi == SM) {
+              Dtile.store(y + tm * N + tn, N);
+            } else {
+              Dtile.store_slice(
+                  y + tm * N + tn, N, short2(0, seg_lo), short2(SN, seg_hi));
+            }
           } else {
             Dtile.store_slice(
-                y + tm * N + tn, N, short2(0, m_lo_lim), short2(SN, m_hi_lim));
+                y + tm * N + tn,
+                N,
+                short2(0, seg_lo),
+                short2(sgp_sn, seg_hi));
           }
-        } else {
-          Dtile.store_slice(
-              y + tm * N + tn,
-              N,
-              short2(0, m_lo_lim),
-              short2(sgp_sn, m_hi_lim));
         }
       });
     });

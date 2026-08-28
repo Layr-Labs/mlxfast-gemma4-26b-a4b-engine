@@ -455,10 +455,15 @@ public class SwitchGLU: Module {
         // profile keeps generic SwitchGLU/custom activations on the established
         // implementation.
         guard weightedReductionProfile == .gemma4ProductionGeGLU else { return false }
+        // Exactly one GLU topology must be wired: the split gate/up pair, or
+        // the FUSE-001 output-axis-fused gate_up bank. Both produce
+        // bit-identical projections (each fused output row keeps its packed
+        // bytes and per-row dequant+dot order), so both are production.
+        let splitTopology = gateProj != nil && upProj != nil
         return inputDims == 2816
             && hiddenDims == 704
             && numExperts == 128
-            && gateUpProj == nil
+            && (gateUpProj == nil) == splitTopology
             && activationProduct == nil
             && isGeluActivation
             && x.ndim == 2

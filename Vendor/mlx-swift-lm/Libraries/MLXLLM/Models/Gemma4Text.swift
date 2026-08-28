@@ -147,6 +147,23 @@ func gemma4SupportsCoupledExpertOptimizations(_ config: Gemma4TextConfiguration)
 internal let gemma4FusedWeightedUnsortRequested = gemma4FusedWeightedUnsortFlag(
     ProcessInfo.processInfo.environment["MLX_GEMMA4_FUSED_WEIGHTED_UNSORT"])
 
+/// Two-stream MoE decode gate. The dense `h1` chain and the sparse `h2`
+/// chain (plus the router, which feeds only the sparse branch) are
+/// independent — both depend only on `out` after the residual is materialized.
+/// Running the sparse branch on a second GPU stream lets MLX overlap the
+/// memory-bound norm/attention work and the compute-bound expert GEMMs.
+///
+/// DEFAULT ON: the split is parity-proven bit-exact (no op is duplicated,
+/// reordered within a stream, or reassociated; the join is the existing
+/// `h1 + h2`), verified by `Gemma4StreamFFNParityTests`. `=0`/`false`/`no`/`off`
+/// restores the single-stream sequence.
+internal let gemma4StreamFFNEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_STREAM_FFN"] else {
+        return true
+    }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// Pure policy seam for the weighted-unsort resolution, so the coupling with
 /// safe R1 is unit-testable without building a production-sized model. The
 /// request is the only thing separating this from `expertQMMGeometryEligible`.
@@ -1748,6 +1765,73 @@ public class Gemma4DecoderLayer: Module {
         super.init()
     }
 
+    /// Execute the MoE layer's two feed-forward branches and sum them into
+    /// `h1 + h2`. Both branches depend only on `out` (the post-attention
+    /// residual), so they are independent.
+    ///
+    /// With `useStream` true, the sparse `h2` chain — including the router,
+    /// which feeds only the sparse branch — is built under a second GPU
+    /// stream (`MLX.Stream.withNewDefaultStream(device: .gpu)`), letting MLX overlap the
+    /// memory-bound norm work on the caller's stream with the compute-bound
+    /// expert GEMMs. With false, the established single-stream sequence runs.
+    ///
+    /// BIT-EXACTNESS: no op is duplicated, reordered within a stream, or
+    /// reassociated in either mode. Each individual op reads identical bytes
+    /// and runs the same Metal kernel; the two branches never share a
+    /// consumer before the join, and the join is exactly one `h1 + h2` add on
+    /// the caller's stream, whose eval order is guaranteed by MLX's stream
+    /// scheduler (a cross-stream dependency on `h2`). The output MLXArray is
+    /// the same bit pattern as single-stream execution. `@inline(__always)`
+    /// is omitted so a parity test can call this seam directly with both
+    /// `useStream:` values on one model.
+    internal func gemma4MoeBranches(
+        out: MLXArray,
+        useStream: Bool,
+        isExpertPrefill: Bool
+    ) -> MLXArray {
+        guard let router,
+            let experts,
+            let postFeedforwardLayernorm1,
+            let preFeedforwardLayernorm2,
+            let postFeedforwardLayernorm2
+        else {
+            preconditionFailure("Gemma4MoE: MoE modules not configured")
+        }
+
+        // Dense branch: stays on the caller's stream (default GPU stream).
+        var h1 = preFeedforwardLayernorm(out)
+        h1 = mlp(h1)
+        h1 = postFeedforwardLayernorm1(h1)
+
+        if useStream {
+            // Sparse branch + router on a second GPU stream. The closure is
+            // synchronous and non-escaping; the resulting `h2` array owns the
+            // second stream's `mlx::core::Stream` copy, so it outlives the
+            // throwaway Swift `Stream` handle and flows into the join below.
+            let h2 = MLX.Stream.withNewDefaultStream(device: MLX.Device.gpu) {
+                let (topKIndices, topKWeights) = router(out)
+                var sparse = preFeedforwardLayernorm2(out)
+                sparse = experts(
+                    sparse,
+                    topKIndices: topKIndices,
+                    topKWeights: topKWeights,
+                    isExpertPrefill: isExpertPrefill)
+                return postFeedforwardLayernorm2(sparse)
+            }
+            return h1 + h2
+        } else {
+            let (topKIndices, topKWeights) = router(out)
+            var h2 = preFeedforwardLayernorm2(out)
+            h2 = experts(
+                h2,
+                topKIndices: topKIndices,
+                topKWeights: topKWeights,
+                isExpertPrefill: isExpertPrefill)
+            h2 = postFeedforwardLayernorm2(h2)
+            return h1 + h2
+        }
+    }
+
     public func callAsFunction(
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
@@ -1798,27 +1882,17 @@ public class Gemma4DecoderLayer: Module {
         let residual2 = out
 
         if isMoE,
-            let router,
-            let experts,
-            let postFeedforwardLayernorm1,
-            let preFeedforwardLayernorm2,
-            let postFeedforwardLayernorm2
+            router != nil,
+            experts != nil,
+            postFeedforwardLayernorm1 != nil,
+            preFeedforwardLayernorm2 != nil,
+            postFeedforwardLayernorm2 != nil
         {
-            // Dense + sparse branches in parallel, summed into one residual.
-            var h1 = preFeedforwardLayernorm(out)
-            h1 = mlp(h1)
-            h1 = postFeedforwardLayernorm1(h1)
-
-            let (topKIndices, topKWeights) = router(out)
-            var h2 = preFeedforwardLayernorm2(out)
-            h2 = experts(
-                h2,
-                topKIndices: topKIndices,
-                topKWeights: topKWeights,
+            // Dense + sparse branches, optionally overlapped on two GPU
+            // streams; always summed into one residual `h1 + h2`.
+            out = gemma4MoeBranches(
+                out: out, useStream: gemma4StreamFFNEnabled,
                 isExpertPrefill: isExpertPrefill)
-            h2 = postFeedforwardLayernorm2(h2)
-
-            out = h1 + h2
         } else {
             out = preFeedforwardLayernorm(out)
             out = mlp(out)

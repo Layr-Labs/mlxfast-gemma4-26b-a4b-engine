@@ -2529,9 +2529,9 @@ template <typename T, const int group_size, const int bits, bool batched>
       ntg.z == 1 && in_vec_size % 64 == 0 && out_vec_size >= 8 &&
       out_vec_size % 8 == 0) {
     // The ruled decode cohort presents eight input rows to ordinary QMV.
-    if (out_vec_size >= 8192) {
-      // LARGE-N tier (full q_proj N = 8192, tied lm_head N = 262144): these
-      // planes are weight-bandwidth bound, so one packed-weight stream feeds
+    if (out_vec_size >= 32768) {
+      // VERY-LARGE-N tier (tied lm_head N = 262144): this plane is strongly
+      // weight-bandwidth bound, so one packed-weight stream feeds
       // FOUR cohort rows in two active x-groups (4+4); the remaining host
       // groups return. Per-row qdot, K-loop, and simd_sum keep the stock
       // qmv_impl sequence for every output element -- only loads are shared.

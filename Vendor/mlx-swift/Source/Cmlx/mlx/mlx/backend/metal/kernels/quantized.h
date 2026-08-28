@@ -1336,7 +1336,7 @@ METAL_FUNC void qmv_impl(
     y += tid.x * out_vec_size + out_row;
 
     int k = 0;
-    for (; k < in_vec_size - block_size; k += block_size) {
+    for (; k <= in_vec_size - block_size; k += block_size) {
       U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
 
       for (int row = 0;
@@ -1399,7 +1399,7 @@ METAL_FUNC void qmv_impl(
     y += tid.x * out_vec_size + used_out_row;
 
     int k = 0;
-    for (; k < in_vec_size - block_size; k += block_size) {
+    for (; k <= in_vec_size - block_size; k += block_size) {
       U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
 
       for (int row = 0; row < results_per_simdgroup; row++) {
@@ -1486,7 +1486,7 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   y1 += out_row;
 
   int k = 0;
-  for (; k < in_vec_size - block_size; k += block_size) {
+  for (; k <= in_vec_size - block_size; k += block_size) {
     float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
     float sum1 = load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
 
@@ -1619,7 +1619,7 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
   y3 += out_row;
 
   int k = 0;
-  for (; k < in_vec_size - block_size; k += block_size) {
+  for (; k <= in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint16_t* wl =
           (const device uint16_t*)(ws + row * in_vec_size_w);
@@ -1660,11 +1660,9 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     x3 += block_size;
   }
 
-  const int remaining = clamp(
-      static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
-      0,
-      values_per_thread);
-  if (remaining > 0) {
+  const uint active_tail_lanes =
+      uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint16_t* wl =
           (const device uint16_t*)(ws + row * in_vec_size_w);
@@ -1676,25 +1674,25 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     }
 
     float sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x0, x_thread, remaining);
+        load_vector<T, float, values_per_thread, 4>(x0, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x1, x_thread, remaining);
+        load_vector<T, float, values_per_thread, 4>(x1, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x2, x_thread, remaining);
+        load_vector<T, float, values_per_thread, 4>(x2, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x3, x_thread, remaining);
+        load_vector<T, float, values_per_thread, 4>(x3, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result3[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
@@ -1755,7 +1753,7 @@ METAL_FUNC void qmv_affine8_g64_pair_impl(
   y1 += out_row;
 
   int k = 0;
-  for (; k < in_vec_size - block_size; k += block_size) {
+  for (; k <= in_vec_size - block_size; k += block_size) {
     float sum0 = load_vector<T, float, values_per_thread, 8>(x0, x0_thread);
     float sum1 = load_vector<T, float, values_per_thread, 8>(x1, x1_thread);
 
@@ -1778,15 +1776,13 @@ METAL_FUNC void qmv_affine8_g64_pair_impl(
     x1 += block_size;
   }
 
-  const int remaining = clamp(
-      static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
-      0,
-      values_per_thread);
-  if (remaining > 0) {
-    float sum0 = load_vector_safe<T, float, values_per_thread, 8>(
-        x0, x0_thread, remaining);
-    float sum1 = load_vector_safe<T, float, values_per_thread, 8>(
-        x1, x1_thread, remaining);
+  const uint active_tail_lanes =
+      uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
+    float sum0 = load_vector<T, float, values_per_thread, 8>(
+        x0, x0_thread);
+    float sum1 = load_vector<T, float, values_per_thread, 8>(
+        x1, x1_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* wl = ws + row * in_vec_size_w;
       const device T* sl = scales + row * in_vec_size_g;
@@ -1878,7 +1874,7 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
   y3 += out_row;
 
   int k = 0;
-  for (; k < in_vec_size - block_size; k += block_size) {
+  for (; k <= in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* wl = ws + row * in_vec_size_w;
       for (int i = 0; i < bytes_per_thread; i++) {

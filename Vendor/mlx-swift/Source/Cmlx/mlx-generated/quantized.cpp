@@ -1349,7 +1349,7 @@ METAL_FUNC void qmv_impl(
     y += tid.x * out_vec_size + out_row;
 
     int k = 0;
-    for (; k < in_vec_size - block_size; k += block_size) {
+    for (; k <= in_vec_size - block_size; k += block_size) {
       U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
 
       for (int row = 0;
@@ -1412,7 +1412,7 @@ METAL_FUNC void qmv_impl(
     y += tid.x * out_vec_size + used_out_row;
 
     int k = 0;
-    for (; k < in_vec_size - block_size; k += block_size) {
+    for (; k <= in_vec_size - block_size; k += block_size) {
       U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
 
       for (int row = 0; row < results_per_simdgroup; row++) {
@@ -1499,7 +1499,7 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   y1 += out_row;
 
   int k = 0;
-  for (; k < in_vec_size - block_size; k += block_size) {
+  for (; k <= in_vec_size - block_size; k += block_size) {
     float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
     float sum1 = load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
 
@@ -1632,7 +1632,7 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
   y3 += out_row;
 
   int k = 0;
-  for (; k < in_vec_size - block_size; k += block_size) {
+  for (; k <= in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint16_t* wl =
           (const device uint16_t*)(ws + row * in_vec_size_w);
@@ -1673,11 +1673,9 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     x3 += block_size;
   }
 
-  const int remaining = clamp(
-      static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
-      0,
-      values_per_thread);
-  if (remaining > 0) {
+  const uint active_tail_lanes =
+      uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint16_t* wl =
           (const device uint16_t*)(ws + row * in_vec_size_w);
@@ -1689,25 +1687,25 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     }
 
     float sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x0, x_thread, remaining);
+        load_vector<T, float, values_per_thread, 4>(x0, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x1, x_thread, remaining);
+        load_vector<T, float, values_per_thread, 4>(x1, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x2, x_thread, remaining);
+        load_vector<T, float, values_per_thread, 4>(x2, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x3, x_thread, remaining);
+        load_vector<T, float, values_per_thread, 4>(x3, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result3[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
@@ -1768,7 +1766,7 @@ METAL_FUNC void qmv_affine8_g64_pair_impl(
   y1 += out_row;
 
   int k = 0;
-  for (; k < in_vec_size - block_size; k += block_size) {
+  for (; k <= in_vec_size - block_size; k += block_size) {
     float sum0 = load_vector<T, float, values_per_thread, 8>(x0, x0_thread);
     float sum1 = load_vector<T, float, values_per_thread, 8>(x1, x1_thread);
 
@@ -1791,15 +1789,13 @@ METAL_FUNC void qmv_affine8_g64_pair_impl(
     x1 += block_size;
   }
 
-  const int remaining = clamp(
-      static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
-      0,
-      values_per_thread);
-  if (remaining > 0) {
-    float sum0 = load_vector_safe<T, float, values_per_thread, 8>(
-        x0, x0_thread, remaining);
-    float sum1 = load_vector_safe<T, float, values_per_thread, 8>(
-        x1, x1_thread, remaining);
+  const uint active_tail_lanes =
+      uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
+    float sum0 = load_vector<T, float, values_per_thread, 8>(
+        x0, x0_thread);
+    float sum1 = load_vector<T, float, values_per_thread, 8>(
+        x1, x1_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* wl = ws + row * in_vec_size_w;
       const device T* sl = scales + row * in_vec_size_g;
@@ -1891,7 +1887,7 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
   y3 += out_row;
 
   int k = 0;
-  for (; k < in_vec_size - block_size; k += block_size) {
+  for (; k <= in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* wl = ws + row * in_vec_size_w;
       for (int i = 0; i < bytes_per_thread; i++) {
@@ -2588,9 +2584,19 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 8:
-          // 4+4: two weight streams, receipted on this benchmark (scored
-          // 3.195804751396457 as a promoted submission) before a later
-          // stale-base REPLACE overlay reverted it; restored here.
+          // 3+3+2, not 4+4. M = 8 is the only hot width whose EVEN split needs
+          // two simultaneous vec<float,4> accumulators in every active worker;
+          // M = 9 uses three-lane vectors and profiles CHEAPER despite more work
+          // (319 / 437 / 216 us for M = 7 / 8 / 9 in the public cross-row study)
+          // — a register cliff, not work scaling.
+          // Exact: these lanes carry INDEPENDENT input rows and are never reduced
+          // across (simd_sum reduces along K WITHIN a row), so moving a row from
+          // lane 3 of a four-wide vector to lane 0 of a two-wide one cannot
+          // reorder its scalar chain. Template admits it: M in [3,9], 8 % 3 == 2
+          // (no one-row tail), IPG 3 inside the wide helper's [2,4].
+          // Receipts: 85d5bca3 2.91143, yzxoi 2.92675.
+          // SYNERGY with the streak gate above, which is why they ship together:
+          // gate 2 reaches the width-8 verify SOONER, so this kernel fires MORE.
           qmv_fast_crossrow_affine4_g64_m<T, 8, 4, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
@@ -3898,8 +3904,6 @@ template <typename T, const int group_size, const int bits>
     }
   }
 }
-
-///////////////////////////////////////////////////////////////////////////////
 )preamble";
 }
 

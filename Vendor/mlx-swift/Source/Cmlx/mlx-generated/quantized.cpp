@@ -1577,6 +1577,37 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
 // `qdot_affine4_registered` is the bits == 4 arm of `qdot` verbatim. Only the
 // LOADS are shared, so every output element's add sequence is identical to
 // stock qmv_impl.
+// Dispatch floor for the quad-stream collapse.
+//
+// This was 1024 -- the smallest plane our own DRAM-cold microbenchmark showed
+// converting. Independent same-binary probes contradict that reading. A floor
+// sweep of THIS kernel against the promoted pair it replaces measured the
+// quad-stream LOSING below 8192: N = 1024 -2.9% / -4.7%, N = 2048 -4.0% /
+// -3.7%, N = 4096 -5.6% / -3.6% (two runs each), and winning only at
+// N = 8192 (+1.3% / +3.8%) and N = 262144 (+2.7% / +3.9%). That is the same
+// direction 0xkydo's PAIR-027 reported for the ORIGINAL four-row quad, which
+// also only ever paid at the widest planes.
+//
+// Our microbenchmark is the outlier, and the honest reading is that it
+// overstated the small-N wins: it timed each plane in isolation against a
+// streamed weight pool, which flatters a kernel whose whole advantage is
+// halving weight traffic, while the probes above ran the shapes inside the
+// same binary. Two independent parties measuring the same sign beats one
+// in-house harness measuring the other, so the floor moves to where all three
+// sources agree the collapse pays.
+//
+// At 8192 the nibble tier keeps exactly the two planes that converted on every
+// measurement: full-attention q_proj (N = 8192) and the tied lm_head
+// (N = 262144). Every narrower nibble plane -- k_proj 1024, k/v_proj 2048,
+// sliding q_proj 4096 -- returns to the promoted pair kernel byte-for-byte.
+//
+// The byte-weight tier shares this floor, which puts the dense MLP
+// (gate/up N = 2112, down N = 2816) back on the pair kernel too. No byte-weight
+// plane on this model reaches 8192, so the affine-8 collapse is unreachable
+// here; it is left in place rather than deleted because it is correct and would
+// engage on a model that does carry such a plane.
+constant int kQuadStreamMinOutVecSize = 8192;
+
 template <typename T, const int group_size, const int bits>
 METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     const device uint32_t* w,
@@ -2707,28 +2738,20 @@ template <typename T, const int group_size, const int bits, bool batched>
       ntg.z == 1 && in_vec_size % 64 == 0 && out_vec_size >= 8 &&
       out_vec_size % 8 == 0) {
     // The ruled decode cohort presents eight input rows to ordinary QMV.
-    if (out_vec_size >= 1024) {
-      // WIDE-N tier -- every non-`fast` 4-bit decode plane on this model:
-      // full-attention k_proj N = 1024 (k_eq_v), k/v_proj N = 2048, sliding
-      // q_proj N = 4096, full q_proj N = 8192, tied lm_head N = 262144. K is
-      // 2816, not a multiple of 512, so none of these reach affine_qmv_fast
-      // and its cross-row family; before this they ran two-row pair (and, at
-      // N >= 8192, a four-row quad that held 32 floats of x live and lost to
-      // the pair it replaced).
+    if (out_vec_size >= kQuadStreamMinOutVecSize) {
+      // WIDE-N tier -- the non-`fast` 4-bit decode planes wide enough for the
+      // collapse to pay: full-attention q_proj N = 8192 and the tied lm_head
+      // N = 262144. K is 2816, not a multiple of 512, so neither reaches
+      // affine_qmv_fast and its cross-row family.
       //
       // One packed-weight stream feeds FOUR cohort rows in two active x-groups
       // (4+4); the remaining host groups return. Per-row qdot, K-loop and
       // simd_sum keep the stock qmv_impl sequence for every output element --
       // only loads are shared.
       //
-      // Measured on the ranked box (M4 Pro, B = 8, streamed weight pool so
-      // every dispatch pulls from DRAM), us/dispatch, incumbent -> this:
-      //   N = 1024   27.3 -> 26.1     N = 2048   54.1 -> 51.3
-      //   N = 4096  106.7 -> 101.6    N = 8192  233.6 -> 201.5
-      // The floor sits at 1024 because that is the smallest plane measured to
-      // convert; below it (router.proj N = 128) two active x-groups leave only
-      // (N / 8) * 2 threadgroups and the promoted pair kernel is kept
-      // byte-for-byte.
+      // Narrower nibble planes (k_proj 1024, k/v_proj 2048, sliding q_proj
+      // 4096, router.proj 128) stay on the promoted pair kernel byte-for-byte.
+      // See kQuadStreamMinOutVecSize for why that floor moved up from 1024.
       const int first_m = int(tid.x) * 4;
       if (first_m >= 8) {
         return;
@@ -2776,18 +2799,16 @@ template <typename T, const int group_size, const int bits, bool batched>
       ntg.z == 1 && in_vec_size % 64 == 0 && out_vec_size >= 8 &&
       out_vec_size % 8 == 0) {
     // Dense decode projections use byte weights.
-    if (out_vec_size >= 1024) {
-      // WIDE-N tier -- the dense MLP of all 30 layers: gate_proj and up_proj
-      // N = 2112 over K = 2816, down_proj N = 2816 over K = 2112. One
-      // byte-weight stream feeds FOUR cohort rows in two active x-groups
-      // (4+4); the remaining host groups return, and per-row qdot, K-loop and
-      // simd_sum stay the stock qmv_impl sequence.
+    if (out_vec_size >= kQuadStreamMinOutVecSize) {
+      // WIDE-N tier for byte weights. One byte-weight stream feeds FOUR cohort
+      // rows in two active x-groups (4+4); the remaining host groups return,
+      // and per-row qdot, K-loop and simd_sum stay the stock qmv_impl sequence.
       //
-      // Measured on the ranked box (M4 Pro, B = 8, streamed weight pool),
-      // us/dispatch, incumbent pair -> this:
-      //   N = 2112 (gate/up)  64.4 -> 56.2     N = 2816 (down)  67.4 -> 59.0
-      // Same 1024 floor as the nibble tier, which keeps router.proj (N = 128)
-      // on the promoted pair kernel byte-for-byte.
+      // This tier shares the nibble floor, and no byte-weight plane on this
+      // model reaches it: the dense MLP is gate/up N = 2112 and down N = 2816,
+      // so all three return to the promoted pair kernel byte-for-byte. The
+      // branch is retained because it is correct for a model that does carry a
+      // byte-weight plane at or above the floor.
       const int first_m = int(tid.x) * 4;
       if (first_m >= 8) {
         return;

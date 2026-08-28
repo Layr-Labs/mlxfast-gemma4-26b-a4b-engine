@@ -229,12 +229,12 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// this step's fence, so the mutation can never be reordered against a
     /// later read of the same allocation.
     private static let fusedRingPassAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_ringwrite_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v1",
+        name: "cbv2_ragged8_ringwrite_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_offsets_v2",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
-            "starts", "new_keys", "new_values", "write_fence",
+            "position_offsets", "new_keys", "new_values", "write_fence",
         ],
         outputNames: ["partials", "sums", "maxs", "fence"],
         source: """
@@ -270,7 +270,12 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
             const device T* new_value = new_values
                 + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
-            const uint ring_start = starts[batch_index];
+            // The cache bank already owns one shared PRE-step absolute
+            // position tensor. On a full ring, the post-write physical start
+            // is `(absolute_offset + 1) % N`; derive it in-register instead
+            // of uploading the same [B] uint32 start tensor in every layer.
+            const uint ring_start =
+                (uint(position_offsets[batch_index]) + 1u) % uint(N);
             const uint write_slot = (ring_start + uint(N - 1)) % uint(N);
             if (block == 0 && query_head_in_group == 0) {
                 device T* write_key = const_cast<device T*>(keys) + write_slot * D;
@@ -448,11 +453,16 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         keys: [MLXArray],
         values: [MLXArray],
         starts: [Int],
+        geometries: [CBv2RingGeometry?],
+        preStepPositionOffsets: MLXArray?,
         previousWriteFence: MLXArray,
         scale: Float,
         slidingWindowLength: Int
     ) -> (output: MLXArray, nextWriteFence: MLXArray)? {
         guard enabled,
+            let preStepPositionOffsets,
+            preStepPositionOffsets.dtype == .int32,
+            preStepPositionOffsets.shape == [batch],
             blocks > 0,
             blocks.isMultiple(of: 32),
             scale == 1.0,
@@ -471,22 +481,49 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength })
         else { return nil }
 
-        for index in 0 ..< batch {
-            let key = keys[index]
-            let value = values[index]
-            guard key.dtype == .bfloat16,
-                value.dtype == .bfloat16,
-                key.shape == [1, kvHeads, sequenceLength, headDim],
-                value.shape == key.shape
-            else { return nil }
+        // HOST-SHAPE-001. The rows' K/V here are their PERSISTENT ring
+        // allocations, whose dtype and shape were settled once at allocation
+        // and cannot have moved since (see `CBv2RingGeometry`). Re-deriving
+        // them per step meant, for each of the eight rows, two `.shape` calls
+        // plus the two `[Int]` literals they were compared against -- and this
+        // predicate runs on every sliding layer of every decode step, so the
+        // ruled cohort paid tens of thousands of throwaway array allocations
+        // per generation to reconfirm a constant. When every row carries the
+        // attestation and it agrees with this kernel's compiled geometry, the
+        // integer comparisons below settle it. Any unattested row (non-bf16
+        // storage, an unallocated ring, a count mismatch) falls through to the
+        // original per-row revalidation, and a failure there still returns nil
+        // with the write NOT performed.
+        var attested = geometries.count == batch
+        if attested {
+            for geometry in geometries {
+                guard let geometry,
+                    geometry.kvHeads == kvHeads,
+                    geometry.length == sequenceLength,
+                    geometry.headDim == headDim
+                else {
+                    attested = false
+                    break
+                }
+            }
+        }
+        if !attested {
+            for index in 0 ..< batch {
+                let key = keys[index]
+                let value = values[index]
+                guard key.dtype == .bfloat16,
+                    value.dtype == .bfloat16,
+                    key.shape == [1, kvHeads, sequenceLength, headDim],
+                    value.shape == key.shape
+                else { return nil }
+            }
         }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let passA = fusedRingPassAKernel(
             [queries] + keys + values
-                + [startArray, newKeys, newValues, previousWriteFence],
+                + [preStepPositionOffsets, newKeys, newValues, previousWriteFence],
             template: [
                 ("T", queries.dtype),
                 ("D", headDim),

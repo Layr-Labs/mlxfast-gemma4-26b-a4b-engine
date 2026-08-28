@@ -28,8 +28,34 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
         return model(tokens, cache: asKVCaches(caches))
     }
 
+    // HOST-BRIDGE-001. The bridged `[KVCache]`, memoized on the exact cache
+    // list that produced it.
+    //
+    // A B = 8 target chain hands `forward` the SAME layer-cache objects, in the
+    // same order, on every step of a generation -- only their CONTENTS move.
+    // Rebuilding the bridge per call therefore re-ran one existential
+    // `as? KVCache` conformance lookup per layer (30 at this model's ruled
+    // topology, and `swift_dynamicCast` on an `any P` is the expensive cast
+    // form) plus one array allocation, purely to rediscover an answer that
+    // cannot have changed. `bridgedIdentities` is the proof that it has not.
+    private var bridgedIdentities: [ObjectIdentifier] = []
+    private var bridgedCaches: [KVCache] = []
+
     private func asKVCaches(_ caches: [CBv2AttendingLayerCache]) -> [KVCache] {
-        caches.map { cache -> KVCache in
+        if bridgedIdentities.count == caches.count {
+            var reusable = true
+            for index in caches.indices
+            where bridgedIdentities[index] != ObjectIdentifier(caches[index]) {
+                reusable = false
+                break
+            }
+            if reusable { return bridgedCaches }
+        }
+
+        // Count, identity, or ORDER changed: rebuild and fail exactly as
+        // before. A cast that would have trapped still traps, and it traps
+        // before the memo is published, so a rejected list is never cached.
+        let bridged = caches.map { cache -> KVCache in
             guard let kv = cache as? KVCache else {
                 fatalError(
                     "CBv2 layer cache \(type(of: cache)) must conform to KVCache to drive "
@@ -37,6 +63,9 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
             }
             return kv
         }
+        bridgedIdentities = caches.map(ObjectIdentifier.init)
+        bridgedCaches = bridged
+        return bridged
     }
 }
 

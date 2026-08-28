@@ -1,0 +1,594 @@
+// Copyright © 2026 Apple Inc.
+
+import Foundation
+import MLX
+import MLXFast
+
+/// MMA-001 --- simdgroup-matrix affine-4/8 quantized GEMV for the tied LM head.
+///
+/// WHY. Gemma 4 26B A4B ties its embedding to the LM head, so `applyLMHead` is
+/// one `quantizedMM` against a `[262144, 2816]` affine group-64 plane. At the
+/// ranked cohort geometry the activation is `[8, 1, 2816]`, i.e. M = 8. Stock
+/// `quantizedMM` routes that to ordinary `affine_qmv` (K = 2816 is not a
+/// multiple of 512, so `qmv_fast` never launches), and the promoted tree
+/// further routes N >= 8192 to `qmv_affine4_g64_quad_stream_impl`. That quad
+/// serves FOUR activation rows per weight fetch, so an M = 8 head streams the
+/// whole 369 MB vocab plane TWICE. The plane is the single largest contiguous
+/// read in a decode step; halving its traffic is the entire mechanism here.
+///
+/// WHAT. One `MLXFast.metalKernel` that serves all EIGHT rows from a single
+/// weight fetch by handing the unpacked codes to the simdgroup matrix units:
+///
+///   * a threadgroup is 4 simdgroups x 32 lanes = 128 threads and owns 32
+///     output columns; each simdgroup owns 8 columns, i.e. one 8x8 `float`
+///     accumulator tile whose rows are the eight activation rows;
+///   * per affine group of 64 the simdgroup unpacks its 8 weight rows into
+///     threadgroup memory ALREADY MULTIPLIED BY THE GROUP SCALE, and the
+///     8-row activation tile is staged alongside it;
+///   * nine `simdgroup_multiply_accumulate` calls consume the group: eight for
+///     the 64 weight columns, and a ninth that carries the affine bias term as
+///     a single extra K slot (see the algebra below), so the bias needs no
+///     second accumulator and no separate reduction.
+///
+/// THE ALGEBRA. Affine quantization dequantizes as `w_k = s_g * q_k + b_g`, so
+///
+///     sum_k x_k * w_k == s_g * (sum_k x_k * q_k) + b_g * (sum_k x_k)
+///
+/// which is exactly how stock `qdot` closes (`scale * accum + sum * bias`).
+/// This kernel folds `s_g` into the staged code (`s_g * q_k`, see EXACTNESS)
+/// and appends `(sum_k x_k, b_g)` as K slot 64 of the same tile, so one MMA
+/// chain produces both terms.
+///
+/// EXACTNESS. This is NOT bit-identical to stock and is not claimed to be.
+/// Two properties are nevertheless held deliberately:
+///
+///   1. `s_g * q_k` is computed in `float` and is EXACT. `s_g` is bf16 (8-bit
+///      significand) and `q_k` is an integer in 0...15 (4 bits), so the product
+///      needs at most 12 significand bits and is exactly representable in
+///      `float`. Folding the scale into the staged weight therefore introduces
+///      no rounding that stock does not also have.
+///   2. The `sum_k x_k` term reproduces stock `load_vector`'s BF16 QUAD-SUM
+///      QUIRK verbatim. Stock sums each aligned group of four activations at
+///      the ACTIVATION dtype before widening to `float`
+///      (`sum += x[i] + x[i+1] + x[i+2] + x[i+3]`, `sum` a `float`), which is
+///      measurably off exact math. The bias term is a first-class part of the
+///      logit, so matching stock's answer -- not exact math -- is what keeps
+///      greedy argmax aligned with the golden tape. The staging code below
+///      writes that expression in stock's exact form and types.
+///
+/// What genuinely differs is FLOAT ACCUMULATION ORDER: the matrix units reduce
+/// a tile as a tree, stock accumulates sequentially per lane and closes with a
+/// `simd_sum` over 64 lanes. Both are float sums of the same terms.
+///
+/// FAIL-CLOSED. `apply` returns `nil` -- and every caller falls back to stock
+/// `asLinear`/`quantizedMM` -- unless every one of these holds:
+///
+///   * `DARKBLOOM_GEMMA4_MMA_HEAD` is not one of `0`/`false`/`no`/`off`;
+///   * the activation is bf16 and shaped `[8, K]` or `[8, 1, K]` -- eight
+///     BATCH rows at one position, never an eight-token prefill chunk;
+///   * affine group size 64, bits 4 (the tied head's quantization);
+///   * K % 64 == 0 (whole affine groups) and K % 8 == 0 (whole uint32 words);
+///   * N % 32 == 0 (whole threadgroups) and N >= 8192.
+///
+/// The N >= 8192 floor is load-bearing and must NOT be widened. A threadgroup
+/// here claims only 32 output columns, so narrow planes (q/k/v/o, the dense
+/// MLP) cannot fill the machine and measured SLOWER than ordinary pair/quad
+/// QMV in isolation. Only the tied vocab plane is meant to enter.
+public enum Gemma4MMAQuantizedGEMV {
+
+    /// Rows the accumulator tile carries --- the ranked cohort's batch.
+    private static let mRows = 8
+    /// Output columns one simdgroup owns (one 8x8 tile).
+    private static let colsPerSimdgroup = 8
+    /// Simdgroups per threadgroup.
+    private static let simdgroupsPerThreadgroup = 4
+    /// Output columns one threadgroup owns.
+    private static let colsPerThreadgroup = colsPerSimdgroup * simdgroupsPerThreadgroup
+    /// Threads per threadgroup (one Apple simdgroup is 32 lanes).
+    private static let threadsPerThreadgroup = simdgroupsPerThreadgroup * 32
+    /// Narrowest plane allowed to enter. See FAIL-CLOSED above.
+    private static let minOutputWidth = 8192
+
+    /// `false` only when `DARKBLOOM_GEMMA4_MMA_HEAD` is an explicit off value.
+    /// Resolved once; the kill switch is a process-level decision.
+    private static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_MMA_HEAD"]
+        else { return true }
+        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "0", "false", "no", "off": return false
+        default: return true
+        }
+    }()
+
+    /// Which staging/MMA formulation runs. `DARKBLOOM_GEMMA4_MMA_HEAD_VERSION`
+    /// is `1` for the fp32 scale-folded kernel and `2` for the bf16-operand
+    /// kernel with the per-group diagonal rescale. Both are shippable and both
+    /// are numerically validated; see the version-2 source for what differs.
+    /// Anything unrecognised takes the default.
+    private static let version: Int = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MMA_HEAD_VERSION"]
+        else { return defaultVersion }
+        switch raw.trimmingCharacters(in: .whitespaces) {
+        case "1": return 1
+        case "2": return 2
+        default: return defaultVersion
+        }
+    }()
+
+    private static let defaultVersion = 2
+
+    /// Kernel source. `T` is the activation/scale dtype, `K` the contraction
+    /// length, `N` the output width; all three arrive as template constants so
+    /// the loop trip counts and the threadgroup allocation are compile-time.
+    ///
+    /// Layout notes for the two staging buffers:
+    ///
+    ///   * `Xs[m * A_STRIDE + j]` --- activation tile. `j` in 0..<64 is the
+    ///     group's activations, `j == 64` is the bf16-quad `sum_k x_k` that
+    ///     multiplies the affine bias, `j` in 65..<72 is zero padding so the
+    ///     ninth 8-wide MMA slice contributes only the bias term.
+    ///   * `Ws[sg][j * 8 + n]` --- staged weight tile for simdgroup `sg`, same
+    ///     `j` convention: scaled codes, then the bias, then zeros.
+    ///
+    /// The pad slots are written once before the group loop and never touched
+    /// again, so the loop stages exactly 64 + 1 slots per group.
+    private static let source = """
+        constexpr uint M_ROWS = 8;
+        constexpr uint GROUP = 64;
+        constexpr uint N_SG = 4;
+        constexpr uint N_PSG = 8;
+        constexpr uint A_STRIDE = 72;
+        // W_STRIDE is 73 -- ODD ON PURPOSE. Threadgroup memory banks are the
+        // word index mod 32, and a lane stages eight CONSECUTIVE j for one
+        // output column n. With lane -> (n = lane/4, u = lane%4) the store
+        // address is 73n + 8u + b, whose bank is (9n + 8u + b) mod 32: 9n is
+        // distinct mod 8 across n in 0..7 and 8u picks one of four offsets, so
+        // the 32 lanes hit 32 DISTINCT banks. A natural even stride (72, or a
+        // j-major [j][n] layout) puts eight lanes on one bank and costs an
+        // 8-way conflict on the kernel's dominant store.
+        constexpr uint W_STRIDE = 73;
+        constexpr uint N_GROUPS = K / GROUP;
+        constexpr uint W_ROW_U32 = K / 8;
+        constexpr uint G_ROW = K / GROUP;
+
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint lane = thread_index_in_simdgroup;
+        const uint tg = threadgroup_position_in_grid.x;
+
+        threadgroup float Xs[M_ROWS * A_STRIDE];
+        threadgroup float Ws[N_SG][N_PSG * W_STRIDE];
+        threadgroup float Os[N_SG][M_ROWS * N_PSG];
+        threadgroup float XSum[M_ROWS * N_GROUPS];
+
+        // Zero the seven pad slots that follow the bias slot. Written once:
+        // the group loop only ever rewrites j in 0...64.
+        if (lid < M_ROWS * 7) {
+            Xs[(lid / 7) * A_STRIDE + 65 + (lid % 7)] = 0.0f;
+        }
+        for (uint t = lane; t < 7 * N_PSG; t += 32) {
+            Ws[sg][(t / 7) * W_STRIDE + 65 + (t % 7)] = 0.0f;
+        }
+
+        // --- sum_k x_k for every (row, group), ONCE ---------------------
+        // Hoisted out of the group loop: it depends only on the activation, so
+        // recomputing it per group merely serialised 64 loads onto 8 threads
+        // while the other 120 waited at the barrier.
+        //
+        // The addend is written in stock `load_vector<T, float, 8, 4>`'s exact
+        // form -- a float accumulator, and the four-term sum evaluated at the
+        // ACTIVATION dtype (`sum += x[i] + x[i+1] + x[i+2] + x[i+3];`),
+        // including its two-addends-per-eight-values grouping. That bf16
+        // quad-sum is what stock multiplies by the affine bias, so matching it
+        // (not exact math) is what keeps greedy argmax on stock's answer.
+        for (uint cell = lid; cell < M_ROWS * N_GROUPS; cell += N_SG * 32) {
+            const device T* xp = x + (cell / N_GROUPS) * K + (cell % N_GROUPS) * GROUP;
+            float s = 0.0f;
+            for (uint c = 0; c < GROUP / 8; ++c) {
+                const uint i = c * 8;
+                s += xp[i + 0] + xp[i + 1] + xp[i + 2] + xp[i + 3];
+                s += xp[i + 4] + xp[i + 5] + xp[i + 6] + xp[i + 7];
+            }
+            XSum[cell] = s;
+        }
+
+        const uint n0 = tg * (N_SG * N_PSG);
+        const uint sgN0 = n0 + sg * N_PSG;
+
+        // Weight staging assignment. See W_STRIDE: n = lane/4 keeps the eight
+        // output columns one per bank class, u = lane%4 (and u+4) covers the
+        // group's eight uint32 words.
+        const uint wn = lane / 4;
+        const uint wu = lane % 4;
+        const uint wRow = sgN0 + wn;
+        const device uint32_t* wRowPtr = w + wRow * W_ROW_U32;
+        threadgroup float* wDst = Ws[sg] + wn * W_STRIDE;
+
+        // A zero-valued simdgroup_matrix is all-zero under either reading of
+        // the scalar constructor (diagonal fill or broadcast fill).
+        simdgroup_matrix<float, 8, 8> acc = simdgroup_matrix<float, 8, 8>(0.0f);
+
+        threadgroup float* d0 = wDst + wu * 8;
+        threadgroup float* d1 = wDst + (wu + 4) * 8;
+
+        // SOFTWARE PIPELINE. Each lane consumes only two uint32 of weight per
+        // group, so a naive loop issues 8 bytes of DRAM demand and then blocks
+        // on a barrier -- far too few loads in flight to cover DRAM latency,
+        // and the kernel measured ~66 GB/s against a ~273 GB/s part. The next
+        // group's words and scale are therefore requested BEFORE the staging
+        // barrier and consumed only after this group's MMAs, so the fetch has
+        // the whole MMA phase to land.
+        uint32_t p0 = wRowPtr[wu];
+        uint32_t p1 = wRowPtr[wu + 4];
+        float sc = float(scales[wRow * G_ROW]);
+        float bs = lane < N_PSG ? float(biases[(sgN0 + lane) * G_ROW]) : 0.0f;
+
+        for (uint g = 0; g < N_GROUPS; ++g) {
+            // Protect the previous iteration's MMA reads before restaging.
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // --- activations: 512 values, 4 per thread ------------------
+            // Staged rather than read straight from device as an f32 view: an
+            // 8x8 activation tile taken from device memory is eight rows at a
+            // K-float stride, i.e. eight cache lines per tile, and measured
+            // SLOWER (5.95 ms vs 5.83 ms) than staging the group once into
+            // threadgroup memory where the tile rows are adjacent.
+            {
+                const uint m = lid / 16;
+                const uint j0 = (lid % 16) * 4;
+                const device T* xp = x + m * K + g * GROUP + j0;
+                threadgroup float* dst = Xs + m * A_STRIDE + j0;
+                dst[0] = float(xp[0]);
+                dst[1] = float(xp[1]);
+                dst[2] = float(xp[2]);
+                dst[3] = float(xp[3]);
+            }
+            if (lid < M_ROWS) {
+                Xs[lid * A_STRIDE + 64] = XSum[lid * N_GROUPS + g];
+            }
+
+            // --- weights: 8 rows x 8 uint32 words, 2 words per lane -----
+            // `sc * float(code)` is EXACT: a bf16 significand (8 bits) times a
+            // 4-bit integer needs at most 12 significand bits, so folding the
+            // group scale into the staged code adds no rounding stock lacks.
+            for (uint b = 0; b < 8; ++b) {
+                d0[b] = sc * float((p0 >> (4 * b)) & 0xF);
+                d1[b] = sc * float((p1 >> (4 * b)) & 0xF);
+            }
+            // One lane per output column -- `wn` covers only two columns per
+            // quad of lanes, so the bias slot is assigned separately.
+            if (lane < N_PSG) {
+                Ws[sg][lane * W_STRIDE + 64] = bs;
+            }
+
+            // Request group g+1 now; it is consumed after the MMAs below.
+            uint32_t n0w = 0;
+            uint32_t n1w = 0;
+            float nsc = 0.0f;
+            float nbs = 0.0f;
+            if (g + 1 < N_GROUPS) {
+                const uint wBase = ((g + 1) * GROUP) / 8;
+                n0w = wRowPtr[wBase + wu];
+                n1w = wRowPtr[wBase + wu + 4];
+                nsc = float(scales[wRow * G_ROW + g + 1]);
+                if (lane < N_PSG) {
+                    nbs = float(biases[(sgN0 + lane) * G_ROW + g + 1]);
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // --- eight code slices plus the bias slice ------------------
+            // Ws is [n][j], so B is read transposed to present [j][n].
+            for (uint t = 0; t < 9; ++t) {
+                simdgroup_matrix<float, 8, 8> A;
+                simdgroup_matrix<float, 8, 8> B;
+                simdgroup_load(A, Xs + t * 8, A_STRIDE);
+                simdgroup_load(B, Ws[sg] + t * 8, W_STRIDE, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(acc, A, B, acc);
+            }
+
+            p0 = n0w;
+            p1 = n1w;
+            sc = nsc;
+            bs = nbs;
+        }
+
+        simdgroup_store(acc, Os[sg], N_PSG);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint idx = lid; idx < M_ROWS * N_SG * N_PSG; idx += N_SG * 32) {
+            const uint m = idx / (N_SG * N_PSG);
+            const uint c = idx % (N_SG * N_PSG);
+            out[m * N + n0 + c] = T(Os[c / N_PSG][m * N_PSG + (c % N_PSG)]);
+        }
+        """
+
+    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_affine4_qmv_m8_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["out"],
+        source: source,
+        header: "#include <metal_simdgroup_matrix>\n",
+        ensureRowContiguous: true
+    )
+
+    // MARK: - Version 2 --- bf16 operands on the matrix units
+
+    /// Version 2. Same geometry, same gates, same answer to one ULP --- what
+    /// changes is WHICH ARITHMETIC UNITS DO THE WORK.
+    ///
+    /// Version 1 hands `simdgroup_multiply_accumulate` three fp32 matrices.
+    /// Apple's matrix units accelerate 16-bit operands; an fp32 MMA falls back
+    /// to ordinary FMA rate, so v1's 396 fp32 MMAs per simdgroup bought tile
+    /// syntax and no matrix throughput. Metal's MMA is fully mixed-precision
+    /// (`d:R, a:T, b:U, c:V`, independently typed, the only constraint being
+    /// that each is floating point), so the accumulator can stay fp32 while
+    /// BOTH OPERANDS drop to bf16.
+    ///
+    /// Both operands are bf16 WITHOUT LOSING ANYTHING:
+    ///
+    ///   * A is the activation, which is ALREADY bf16 --- staging it as bf16
+    ///     is the identity, where v1 widened every value to float;
+    ///   * B is the RAW 4-bit code, an integer in 0...15, which needs four
+    ///     significand bits and is therefore EXACT in bf16's eight.
+    ///
+    /// The products are exact in fp32 (8 + 8 significand bits) and the
+    /// accumulator is fp32, so the group dot product is exact. v1 instead
+    /// folded the group scale into the staged weight (`s_g * q_k`, also exact,
+    /// but fp32-wide). The scale has to be reapplied somewhere; v2 does it
+    /// AFTER the group's dot product, which is also closer to stock's own
+    /// `scale * accum + sum * bias` close than v1's per-element fold.
+    ///
+    /// Reapplying a PER-COLUMN scale to an accumulator tile has no cheap
+    /// elementwise form --- `thread_elements()` lane mapping is not contracted
+    /// --- so v2 uses the identity `accg * diag(s) == accg scaled by column`:
+    /// one fp32 MMA against a diagonal matrix. The affine bias rides a second
+    /// fp32 MMA of a rank-1 pair (a column of `sum_k x_k`, a row of `b_g`).
+    /// That is 2 fp32 MMAs per group against 8 bf16 ones, i.e. 88 fp32 + 352
+    /// bf16 per simdgroup where v1 ran 396 fp32.
+    ///
+    /// Three consequences beyond the matrix units, all of which favour v2:
+    ///
+    ///   * the weight staging buffer halves (bf16, not fp32), which is the
+    ///     kernel's dominant threadgroup store;
+    ///   * threadgroup memory drops ~14 KB -> ~10.6 KB per threadgroup, so
+    ///     more threadgroups stay resident --- v1 measured only ~71 GB/s on a
+    ///     ~273 GB/s part, i.e. it was occupancy/latency bound, not bandwidth
+    ///     bound, and this is the direct lever on that;
+    ///   * staging loses a multiply per weight element (no scale fold).
+    ///
+    /// `W_STRIDE` is 74, which is `2 (mod 4)` ON PURPOSE. Banks are 4-byte
+    /// words, so a bf16 element's bank is `(byte/4) % 32`. A stride of 74
+    /// makes the per-n word stride 37 --- ODD --- and the store bank
+    /// `(5n + 4u + b/2) % 32`. Because `5n mod 4 == n mod 4`, two lanes
+    /// collide only if `5(n - n') == 4(u' - u)`, which needs `n == n' (mod 4)`
+    /// and then `u - u' == 5`: impossible for `u` in 0...3. So all 32 lanes of
+    /// a simdgroup hit 32 distinct bank words, elementwise, with no packing.
+    private static let sourceV2 = """
+        constexpr uint M_ROWS = 8;
+        constexpr uint GROUP = 64;
+        constexpr uint N_SG = 4;
+        constexpr uint N_PSG = 8;
+        constexpr uint A_STRIDE = 72;
+        constexpr uint W_STRIDE = 74;
+        constexpr uint N_GROUPS = K / GROUP;
+        constexpr uint W_ROW_U32 = K / 8;
+        constexpr uint G_ROW = K / GROUP;
+
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint lane = thread_index_in_simdgroup;
+        const uint tg = threadgroup_position_in_grid.x;
+
+        threadgroup T Xs[M_ROWS * A_STRIDE];
+        threadgroup T Ws[N_SG][N_PSG * W_STRIDE];
+        threadgroup float Sd[N_SG][64];
+        threadgroup float Bb[N_SG][64];
+        threadgroup float Xb[64];
+        threadgroup float Os[N_SG][M_ROWS * N_PSG];
+        threadgroup float XSum[M_ROWS * N_GROUPS];
+
+        // The three rescale tiles are mostly structural zeros that never
+        // change: Sd is diagonal, Bb carries the bias in row 0 only, Xb the
+        // activation sum in column 0 only. Written once here; the group loop
+        // rewrites exactly 8 live slots in each.
+        for (uint i = lid; i < 64; i += N_SG * 32) {
+            Xb[i] = 0.0f;
+        }
+        for (uint i = lane; i < 64; i += 32) {
+            Sd[sg][i] = 0.0f;
+            Bb[sg][i] = 0.0f;
+        }
+
+        // --- sum_k x_k for every (row, group), ONCE ---------------------
+        // Identical to version 1, and for the same reason: it depends only on
+        // the activation, and it is written in stock
+        // `load_vector<T, float, 8, 4>`'s exact form -- a float accumulator
+        // with the four-term addend evaluated at the ACTIVATION dtype -- so
+        // the affine bias is multiplied by stock's bf16 quad-sum, not by exact
+        // math. That is what keeps greedy argmax on stock's answer.
+        for (uint cell = lid; cell < M_ROWS * N_GROUPS; cell += N_SG * 32) {
+            const device T* xp = x + (cell / N_GROUPS) * K + (cell % N_GROUPS) * GROUP;
+            float s = 0.0f;
+            for (uint c = 0; c < GROUP / 8; ++c) {
+                const uint i = c * 8;
+                s += xp[i + 0] + xp[i + 1] + xp[i + 2] + xp[i + 3];
+                s += xp[i + 4] + xp[i + 5] + xp[i + 6] + xp[i + 7];
+            }
+            XSum[cell] = s;
+        }
+
+        const uint n0 = tg * (N_SG * N_PSG);
+        const uint sgN0 = n0 + sg * N_PSG;
+
+        const uint wn = lane / 4;
+        const uint wu = lane % 4;
+        const uint wRow = sgN0 + wn;
+        const device uint32_t* wRowPtr = w + wRow * W_ROW_U32;
+        threadgroup T* d0 = Ws[sg] + wn * W_STRIDE + wu * 8;
+        threadgroup T* d1 = Ws[sg] + wn * W_STRIDE + (wu + 4) * 8;
+
+        // Software pipeline, as in version 1: each lane demands only two
+        // uint32 of weight per group, far too few in flight to cover DRAM
+        // latency, so group g+1 is requested before the staging barrier and
+        // consumed after this group's MMAs.
+        // Version 1 needed the scale of the weight row THIS LANE stages, to
+        // fold into the code. Version 2 stages raw codes, so the only scale it
+        // wants is the one that rescales output COLUMN `lane` -- read by the
+        // same eight lanes that fill the diagonal and the bias row.
+        uint32_t p0 = wRowPtr[wu];
+        uint32_t p1 = wRowPtr[wu + 4];
+        float sd = lane < N_PSG ? float(scales[(sgN0 + lane) * G_ROW]) : 0.0f;
+        float bs = lane < N_PSG ? float(biases[(sgN0 + lane) * G_ROW]) : 0.0f;
+
+        simdgroup_matrix<float, 8, 8> acc = simdgroup_matrix<float, 8, 8>(0.0f);
+
+        for (uint g = 0; g < N_GROUPS; ++g) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // --- activations: staged AT THEIR OWN DTYPE ------------------
+            {
+                const uint m = lid / 16;
+                const uint j0 = (lid % 16) * 4;
+                const device T* xp = x + m * K + g * GROUP + j0;
+                threadgroup T* dst = Xs + m * A_STRIDE + j0;
+                dst[0] = xp[0];
+                dst[1] = xp[1];
+                dst[2] = xp[2];
+                dst[3] = xp[3];
+            }
+
+            // --- weights: RAW codes, exact in bf16 -----------------------
+            for (uint b = 0; b < 8; ++b) {
+                d0[b] = T(float((p0 >> (4 * b)) & 0xF));
+                d1[b] = T(float((p1 >> (4 * b)) & 0xF));
+            }
+
+            // --- the three rescale tiles' live slots ---------------------
+            if (lane < N_PSG) {
+                Sd[sg][lane * 8 + lane] = sd;
+                Bb[sg][lane] = bs;
+            }
+            if (lid < M_ROWS) {
+                Xb[lid * 8] = XSum[lid * N_GROUPS + g];
+            }
+
+            uint32_t n0w = 0;
+            uint32_t n1w = 0;
+            float nsd = 0.0f;
+            float nbs = 0.0f;
+            if (g + 1 < N_GROUPS) {
+                const uint wBase = ((g + 1) * GROUP) / 8;
+                n0w = wRowPtr[wBase + wu];
+                n1w = wRowPtr[wBase + wu + 4];
+                if (lane < N_PSG) {
+                    nsd = float(scales[(sgN0 + lane) * G_ROW + g + 1]);
+                    nbs = float(biases[(sgN0 + lane) * G_ROW + g + 1]);
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // --- the group's exact dot product, on the matrix units ------
+            simdgroup_matrix<float, 8, 8> accg = simdgroup_matrix<float, 8, 8>(0.0f);
+            for (uint t = 0; t < 8; ++t) {
+                simdgroup_matrix<T, 8, 8> A;
+                simdgroup_matrix<T, 8, 8> B;
+                simdgroup_load(A, Xs + t * 8, A_STRIDE);
+                simdgroup_load(B, Ws[sg] + t * 8, W_STRIDE, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(accg, A, B, accg);
+            }
+
+            // --- reapply the group scale, then the affine bias -----------
+            // acc += accg * diag(s_g)   -- scales column n by s_g[n]
+            // acc += xsum_col * bias_row -- the rank-1 affine bias term
+            {
+                simdgroup_matrix<float, 8, 8> S;
+                simdgroup_matrix<float, 8, 8> XBm;
+                simdgroup_matrix<float, 8, 8> BBm;
+                simdgroup_load(S, Sd[sg], 8);
+                simdgroup_multiply_accumulate(acc, accg, S, acc);
+                simdgroup_load(XBm, Xb, 8);
+                simdgroup_load(BBm, Bb[sg], 8);
+                simdgroup_multiply_accumulate(acc, XBm, BBm, acc);
+            }
+
+            p0 = n0w;
+            p1 = n1w;
+            sd = nsd;
+            bs = nbs;
+        }
+
+        simdgroup_store(acc, Os[sg], N_PSG);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint idx = lid; idx < M_ROWS * N_SG * N_PSG; idx += N_SG * 32) {
+            const uint m = idx / (N_SG * N_PSG);
+            const uint c = idx % (N_SG * N_PSG);
+            out[m * N + n0 + c] = T(Os[c / N_PSG][m * N_PSG + (c % N_PSG)]);
+        }
+        """
+
+    private static let kernelV2: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_affine4_qmv_m8_v2",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["out"],
+        source: sourceV2,
+        header: "#include <metal_simdgroup_matrix>\n",
+        ensureRowContiguous: true
+    )
+
+    /// Tied-head GEMV, or `nil` when any gate above fails.
+    ///
+    /// - Parameters:
+    ///   - x: activation, `[8, K]` or anything that flattens to it, bf16.
+    ///   - w: packed affine codes, `[N, K * bits / 32]` uint32.
+    ///   - scales: `[N, K / groupSize]`, same dtype as `x`.
+    ///   - biases: `[N, K / groupSize]`, same dtype as `x`.
+    /// - Returns: `[8, N]` in `x`'s dtype, or `nil`.
+    public static func apply(
+        x: MLXArray,
+        w: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int
+    ) -> MLXArray? {
+        guard enabled else { return nil }
+        guard let biases else { return nil }
+        guard groupSize == 64, bits == 4 else { return nil }
+        guard x.dtype == .bfloat16, scales.dtype == .bfloat16, biases.dtype == .bfloat16
+        else { return nil }
+        guard w.dtype == .uint32 else { return nil }
+        guard w.ndim == 2, scales.ndim == 2, biases.ndim == 2 else { return nil }
+
+        // [8, K] or [8, 1, K] ONLY -- the decode cohort's own shape, eight
+        // BATCH rows at one position. A [1, 8, K] eight-token prefill chunk
+        // has the same element count and must NOT enter: the gate is meant to
+        // claim the cohort's decode head, and prefill stays on stock.
+        guard x.ndim == 2 || (x.ndim == 3 && x.dim(1) == 1) else { return nil }
+        guard x.dim(0) == mRows else { return nil }
+        let k = x.dim(-1)
+        guard k > 0, x.size == mRows * k else { return nil }
+
+        let n = w.dim(0)
+        guard n >= minOutputWidth, n % colsPerThreadgroup == 0 else { return nil }
+        guard k % groupSize == 0, k % 8 == 0 else { return nil }
+        guard w.dim(1) == k * bits / 32 else { return nil }
+        guard scales.dim(0) == n, biases.dim(0) == n else { return nil }
+        guard scales.dim(1) == k / groupSize, biases.dim(1) == k / groupSize else { return nil }
+
+        let threadgroups = n / colsPerThreadgroup
+        let outputs = (version == 2 ? kernelV2 : kernel)(
+            [x.reshaped([mRows, k]), w, scales, biases],
+            template: [("T", x.dtype), ("K", k), ("N", n)],
+            grid: (threadgroups * threadsPerThreadgroup, 1, 1),
+            threadGroup: (threadsPerThreadgroup, 1, 1),
+            outputShapes: [[mRows, n]],
+            outputDTypes: [x.dtype]
+        )
+        return outputs[0]
+    }
+}

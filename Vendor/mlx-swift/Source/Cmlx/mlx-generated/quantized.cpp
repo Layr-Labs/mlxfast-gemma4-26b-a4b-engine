@@ -3287,6 +3287,20 @@ template <typename T, int group_size, int bits>
           simd_lid);
       return;
     }
+
+    // Singleton experts and odd-run tails still need one ordinary QMV, but
+    // their one-dimensional offsets are already resolved by this guard.
+    const uint32_t single_lhs =
+        lhs_indices[assignment * (uint)lhs_strides[0]];
+    const device T* single_x = x + single_lhs * x_strides[0];
+    const device uint32_t* single_w = w + expert * w_strides[0];
+    const device T* single_scales = scales + expert * s_strides[0];
+    const device T* single_biases = biases + expert * b_strides[0];
+    device T* single_y = y + assignment * (uint)out_vec_size;
+    qmv_impl<T, group_size, bits>(
+        single_w, single_scales, single_biases, single_x, single_y,
+        in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+    return;
   }
   adjust_matrix_offsets<T>(
       x,

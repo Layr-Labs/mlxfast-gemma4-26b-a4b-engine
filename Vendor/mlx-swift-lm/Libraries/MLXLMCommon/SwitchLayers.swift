@@ -256,6 +256,83 @@ public func gatherSortIndices(indices: MLXArray) -> (MLXArray, MLXArray, MLXArra
     return (order.floorDivide(m), indices[order], argSort(order))
 }
 
+/// Decode-only replacement for the generic gather-sort metadata chain.
+///
+/// Gemma 4's ranked B=8 path always presents 64 assignments (`8 tokens x
+/// top-8 experts`).  The generic implementation above materializes this
+/// metadata with two full `argSort` operations plus gather/floor-divide
+/// kernels.  One 64-thread bitonic network can instead emit the three arrays
+/// consumed by the expert gather and weighted unsort in a single dispatch.
+///
+/// `(expert, original assignment)` is the comparison key.  The secondary key
+/// preserves stable ascending-argsort semantics for repeated expert ids, while
+/// `inverse_order[original] = sorted row` preserves the established top-K
+/// weighted-reduction order exactly.
+private let gemma4B8GatherSortKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "gemma4_b8_gather_sort_metadata_v1",
+    inputNames: ["indices"],
+    outputNames: ["lhs_indices", "sorted_indices", "inverse_order"],
+    source: """
+        const uint lane = thread_position_in_threadgroup.x;
+
+        threadgroup uint keys[64];
+        threadgroup uint originals[64];
+        keys[lane] = (uint)indices[lane];
+        originals[lane] = lane;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Stable ascending bitonic sort of (expert id, original assignment).
+        for (uint width = 2; width <= 64; width <<= 1) {
+            for (uint stride = width >> 1; stride > 0; stride >>= 1) {
+                const uint peer = lane ^ stride;
+                const uint own_key = keys[lane];
+                const uint own_original = originals[lane];
+                const uint peer_key = keys[peer];
+                const uint peer_original = originals[peer];
+                const bool ascending = (lane & width) == 0;
+                if (peer > lane) {
+                    const bool own_after_peer =
+                        own_key > peer_key
+                        || (own_key == peer_key && own_original > peer_original);
+                    const bool own_before_peer =
+                        own_key < peer_key
+                        || (own_key == peer_key && own_original < peer_original);
+                    if ((ascending && own_after_peer) || (!ascending && own_before_peer)) {
+                        keys[lane] = peer_key;
+                        originals[lane] = peer_original;
+                        keys[peer] = own_key;
+                        originals[peer] = own_original;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+
+        const uint original = originals[lane];
+        lhs_indices[lane] = original >> 3;
+        sorted_indices[lane] = keys[lane];
+        inverse_order[original] = lane;
+    """,
+    ensureRowContiguous: true
+)
+
+private func gemma4B8GatherSortIndices(
+    indices: MLXArray
+) -> (lhsIndices: MLXArray, sortedIndices: MLXArray, inverseOrder: MLXArray) {
+    precondition(
+        indices.ndim == 2 && indices.shape == [8, 8] && indices.dtype == .uint32,
+        "Gemma 4 B=8 gather sort requires uint32 [8, 8] indices")
+
+    let outputs = gemma4B8GatherSortKernel(
+        [indices],
+        grid: (64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[64], [64], [64]],
+        outputDTypes: [.uint32, .uint32, .uint32]
+    )
+    return (outputs[0], outputs[1], outputs[2])
+}
+
 public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) -> MLXArray {
     var x = x[invOrder]
     if let shape {
@@ -400,7 +477,7 @@ public class SwitchGLU: Module {
         if doSort {
             if useLhsIndices {
                 x = x.flattened(start: 0, end: -3)
-                (lhsIndices, idx, inverseOrder) = gatherSortIndices(indices: indices)
+                (lhsIndices, idx, inverseOrder) = gemma4B8GatherSortIndices(indices: indices)
             } else {
                 (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
             }

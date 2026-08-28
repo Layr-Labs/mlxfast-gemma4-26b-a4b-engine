@@ -73,18 +73,27 @@ enum CBv2AttentionV1 {
         return value << 20
     }()
 
-    /// ATT-008 opt-in switch: batch-wide FULL-attention decode over pooled
-    /// KV (`DARKBLOOM_GEMMA4_BATCHED_FULL_ATTENTION=1` enables it).
-    /// DEFAULT OFF: three counterbalanced local B=8 probe pairs measured the
-    /// consolidation at +0.27 ms/round (+1.2%) — the concurrent Metal
-    /// encoder already overlaps the per-row dispatches it removes. Kept
-    /// selectable because the mechanism is parity-proven bit-exact and the
-    /// balance could differ on other hardware.
+    /// ATT-008: batch-wide FULL-attention decode over pooled KV. The pooled
+    /// append + single batched call (via `batchedFullDecodeUpdateAndAttend`)
+    /// is parity-proven bit-exact against the per-row chain at kL ∈ {1024,
+    /// 1025, 1100, 1152} and replaces ~49 per-layer per-step dispatches with
+    /// ~6, with zero per-step copies (the pool is written in place).
+    ///
+    /// DEFAULT ON. Kill switch: `DARKBLOOM_GEMMA4_BATCHED_FULL_DECODE=0`
+    /// (or `false`/`no`/`off`) restores the pinned per-row loop. The legacy
+    /// opt-in `DARKBLOOM_GEMMA4_BATCHED_FULL_ATTENTION=1` is honored as an
+    /// explicit re-enable override; an explicit falsy value there also
+    /// disables.
     static let batchedFullDecodeEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_BATCHED_FULL_ATTENTION"]
-        else { return false }
-        return ["1", "true", "yes", "on"].contains(raw.lowercased())
+        if let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_BATCHED_FULL_DECODE"] {
+            return !["0", "false", "no", "off"].contains(raw.lowercased())
+        }
+        if let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_BATCHED_FULL_ATTENTION"] {
+            return ["1", "true", "yes", "on"].contains(raw.lowercased())
+        }
+        return true
     }()
 
     /// Whether a chunk of `L` queries should be split into blocks. Single

@@ -274,6 +274,32 @@ public enum SwitchGLUWeightedReductionProfile: Sendable {
     case gemma4ProductionGeGLU
 }
 
+/// Construction-bound projection route for the certified Gemma 4 expert
+/// geometry. Only the logical row count and top-k vary at execution; model
+/// topology is resolved once while the SwitchGLU is installed.
+struct SwitchGLUExpertProjectionBinding: Sendable {
+    private let admitsGemma4ProductionRows: Bool
+
+    init(
+        inputDims: Int,
+        hiddenDims: Int,
+        numExperts: Int,
+        profile: SwitchGLUWeightedReductionProfile
+    ) {
+        admitsGemma4ProductionRows =
+            profile == .gemma4ProductionGeGLU
+            && inputDims == 2816
+            && hiddenDims == 704
+            && numExperts == 128
+    }
+
+    @inline(__always)
+    func usesDirectSortedLHSIndices(rowCount: Int, topK: Int) -> Bool {
+        admitsGemma4ProductionRows && topK == 8
+            && (rowCount == 8 || rowCount == 16)
+    }
+}
+
 public class SwitchGLU: Module {
     @ModuleInfo(key: "gate_proj") var gateProj: SwitchLinear?
     @ModuleInfo(key: "up_proj") var upProj: SwitchLinear?
@@ -289,6 +315,7 @@ public class SwitchGLU: Module {
     /// supplied (we then fall back to `activation(gate) * up`). Upstream ef85ed0.
     let activationProduct: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
     let weightedReductionProfile: SwitchGLUWeightedReductionProfile
+    let expertProjectionBinding: SwitchGLUExpertProjectionBinding
 
     /// Activation-type flags detected once at init from a tiny test input (vMLX
     /// approach — no per-token check). Only consulted when `activationProduct` is
@@ -315,6 +342,11 @@ public class SwitchGLU: Module {
         self.activation = MLXNN.silu
         self.activationProduct = compiledSiluProduct
         self.weightedReductionProfile = weightedReductionProfile
+        self.expertProjectionBinding = SwitchGLUExpertProjectionBinding(
+            inputDims: inputDims,
+            hiddenDims: hiddenDims,
+            numExperts: numExperts,
+            profile: weightedReductionProfile)
         // Default path is SiLU and `activationProduct` is non-nil, so these are
         // not consulted on the hot path; set them accurately for completeness
         // (and to avoid a needless probe eval at load for every MoE layer).
@@ -355,6 +387,11 @@ public class SwitchGLU: Module {
         self.activation = activation
         self.activationProduct = nil
         self.weightedReductionProfile = weightedReductionProfile
+        self.expertProjectionBinding = SwitchGLUExpertProjectionBinding(
+            inputDims: inputDims,
+            hiddenDims: hiddenDims,
+            numExperts: numExperts,
+            profile: weightedReductionProfile)
         // Detect SiLU/GELU once via a tiny test input (vMLX approach) so the hot
         // path can select the compiled fusion without a per-token check. Exact
         // equality is intentional: a match means the supplied closure computes
@@ -389,8 +426,10 @@ public class SwitchGLU: Module {
         _ x: MLXArray, _ indices: MLXArray
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
         let useLhsIndices =
-            indices.size == 64 && indices.ndim == 2 && indices.shape == [8, 8]
-            && x.ndim == 2 && x.shape == [8, inputDims]
+            x.ndim == 2 && x.dim(1) == inputDims
+            && indices.ndim == 2 && indices.dim(0) == x.dim(0)
+            && expertProjectionBinding.usesDirectSortedLHSIndices(
+                rowCount: x.dim(0), topK: indices.dim(1))
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
         let doSort = indices.size >= 64
 

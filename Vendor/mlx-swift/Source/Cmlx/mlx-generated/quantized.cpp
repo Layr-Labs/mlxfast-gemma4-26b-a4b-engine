@@ -1983,6 +1983,97 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
   }
 }
 
+// Sixteen-row ordinary affine QMV for fixed [B=8,T=2] verification.
+// One simdgroup owns one output row and holds sixteen independent scalar
+// accumulators. The packed packet, scale, and affine bias are loaded once per
+// K block, then each logical input row walks the same load_vector / qdot
+// sequence as qmv_impl. Only weight ownership changes.
+template <typename T, const int bits>
+METAL_FUNC void qmv_affine_g64_sixteen_stream_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int in_vec_size,
+    const int out_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(bits == 4 || bits == 8, "M16 stream supports affine4/8 only");
+  constexpr int values_per_thread = bits == 4 ? 8 : 4;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 64 / values_per_thread;
+
+  const int out_row = int(tid.y) * 2 + int(simd_gid);
+  const int in_vec_size_w = in_vec_size * bits / 8;
+  const int in_vec_size_g = in_vec_size / 64;
+  const device uint8_t* ws =
+      (const device uint8_t*)w + out_row * in_vec_size_w
+      + simd_lid * bytes_per_thread;
+  const device T* scale_ptr =
+      scales + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  const device T* bias_ptr =
+      biases + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  const device T* x_ptr = x + simd_lid * values_per_thread;
+
+  thread uint32_t packed;
+  thread float x_thread[values_per_thread];
+  thread float result[16] = {0};
+
+  int k = 0;
+  for (; k < in_vec_size - block_size; k += block_size) {
+    packed = *((const device uint32_t*)ws);
+    const float scale = scale_ptr[0];
+    const float bias = bias_ptr[0];
+
+    for (int m = 0; m < 16; ++m) {
+      const device T* xm = x_ptr + m * in_vec_size;
+      const float sum =
+          load_vector<T, float, values_per_thread, bits>(xm, x_thread);
+      if (bits == 4) {
+        result[m] += qdot_affine4_registered<float, values_per_thread>(
+            (const thread uint16_t*)&packed, x_thread, scale, bias, sum);
+      } else {
+        result[m] += qdot_affine8_registered<float, values_per_thread>(
+            (const thread uint8_t*)&packed, x_thread, scale, bias, sum);
+      }
+    }
+
+    ws += block_size * bits / 8;
+    scale_ptr += block_size / 64;
+    bias_ptr += block_size / 64;
+    x_ptr += block_size;
+  }
+
+  const uint active_tail_lanes = uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
+    packed = *((const device uint32_t*)ws);
+    const float scale = scale_ptr[0];
+    const float bias = bias_ptr[0];
+    for (int m = 0; m < 16; ++m) {
+      const device T* xm = x_ptr + m * in_vec_size;
+      const float sum =
+          load_vector<T, float, values_per_thread, bits>(xm, x_thread);
+      if (bits == 4) {
+        result[m] += qdot_affine4_registered<float, values_per_thread>(
+            (const thread uint16_t*)&packed, x_thread, scale, bias, sum);
+      } else {
+        result[m] += qdot_affine8_registered<float, values_per_thread>(
+            (const thread uint8_t*)&packed, x_thread, scale, bias, sum);
+      }
+    }
+  }
+
+  for (int m = 0; m < 16; ++m) {
+    result[m] = simd_sum(result[m]);
+    if (simd_lid == 0) {
+      y[m * out_vec_size + out_row] = static_cast<T>(result[m]);
+    }
+  }
+}
+
 template <typename T, const int group_size, const int bits>
 METAL_FUNC void qvm_impl(
     const device uint32_t* w,
@@ -3237,9 +3328,11 @@ template <typename T, int group_size, int bits>
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   int M = x_shape[x_batch_ndims];
+  const uint assignment_count = batch_ndims == 1 ? uint(batch_shape[0]) : 0;
   const bool gemma4_pair_geometry =
       group_size == 64 && bits == 4 && M == 1 && batch_ndims == 1 &&
-      batch_shape[0] == 64 && x_batch_ndims == 1 && w_batch_ndims == 1 &&
+      (assignment_count == 64 || assignment_count == 128) &&
+      x_batch_ndims == 1 && w_batch_ndims == 1 &&
       ((in_vec_size == 2816 && out_vec_size == 704) ||
        (in_vec_size == 704 && out_vec_size == 2816));
   if (gemma4_pair_geometry) {
@@ -3254,12 +3347,63 @@ template <typename T, int group_size, int bits>
       run_offset++;
     }
 
+    // The fixed M16 verifier has 128 sorted assignments. Four consecutive
+    // assignments for one expert share a single packed-weight stream while
+    // retaining four independent qdot/K-loop/simd_sum sequences. A partial
+    // run keeps the established pair leader and ordinary singleton tail.
+    if (assignment_count == 128) {
+      const uint quad_offset = run_offset & 3;
+      if (quad_offset != 0) {
+        const uint quad_leader = assignment - quad_offset;
+        const bool claimed_by_quad =
+            quad_leader + 3 < assignment_count &&
+            rhs_indices[(quad_leader + 3) * (uint)rhs_strides[0]] == expert;
+        if (claimed_by_quad) {
+          return;
+        }
+      } else {
+        const bool has_quad =
+            assignment + 3 < assignment_count &&
+            rhs_indices[(assignment + 3) * (uint)rhs_strides[0]] == expert;
+        if (has_quad) {
+          const uint32_t x0_idx =
+              lhs_indices[assignment * (uint)lhs_strides[0]];
+          const uint32_t x1_idx =
+              lhs_indices[(assignment + 1) * (uint)lhs_strides[0]];
+          const uint32_t x2_idx =
+              lhs_indices[(assignment + 2) * (uint)lhs_strides[0]];
+          const uint32_t x3_idx =
+              lhs_indices[(assignment + 3) * (uint)lhs_strides[0]];
+          const device uint32_t* quad_w = w + expert * w_strides[0];
+          const device T* quad_scales = scales + expert * s_strides[0];
+          const device T* quad_biases = biases + expert * b_strides[0];
+          qmv_affine4_g64_quad_stream_impl<T, group_size, bits>(
+              quad_w,
+              quad_scales,
+              quad_biases,
+              x + x0_idx * x_strides[0],
+              x + x1_idx * x_strides[0],
+              x + x2_idx * x_strides[0],
+              x + x3_idx * x_strides[0],
+              y + assignment * out_vec_size,
+              y + (assignment + 1) * out_vec_size,
+              y + (assignment + 2) * out_vec_size,
+              y + (assignment + 3) * out_vec_size,
+              in_vec_size,
+              tid,
+              simd_gid,
+              simd_lid);
+          return;
+        }
+      }
+    }
+
     // Odd positions are produced by the immediately preceding pair leader.
     if ((run_offset & 1) != 0) {
       return;
     }
     const bool has_pair =
-        assignment + 1 < 64 &&
+        assignment + 1 < assignment_count &&
         rhs_indices[(assignment + 1) * (uint)rhs_strides[0]] == expert;
     if (has_pair) {
       const uint32_t x0_idx =

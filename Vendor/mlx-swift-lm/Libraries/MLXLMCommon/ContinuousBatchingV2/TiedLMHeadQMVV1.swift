@@ -257,6 +257,20 @@ inline U qdot_affine4_registered(
   return scale * accum + sum * bias;
 }
 
+template <typename U, int values_per_thread>
+inline U qdot_affine8_registered(
+    const thread uint8_t* w,
+    const thread U* x_thread,
+    U scale,
+    U bias,
+    U sum) {
+  U accum = 0;
+  for (int i = 0; i < values_per_thread; i++) {
+    accum += x_thread[i] * w[i];
+  }
+  return scale * accum + sum * bias;
+}
+
 template <typename T, const int group_size, const int bits>
 METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     const device uint32_t* w,
@@ -405,6 +419,155 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     }
   }
 }
+
+// Fixed M=16 verification QMV.  Each simdgroup owns one output row, so the
+// sixteen independent accumulators replace the ordinary kernel's one while a
+// packed weight packet is loaded only once.  Every accumulator retains the
+// ordinary QMV K-loop, qdot, simd_sum, and cast order.
+template <typename T>
+METAL_FUNC void qmv_affine4_g64_sixteen_stream_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int in_vec_size,
+    const int out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int values_per_thread = 8;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int uint16_per_thread = 2;
+  constexpr int scale_step_per_thread = 8;
+
+  const int out_row = int(tid.y) * 2 + int(simd_gid);
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+  const device uint8_t* ws =
+      (const device uint8_t*)w + out_row * in_vec_size_w
+      + simd_lid * bytes_per_thread;
+  const device T* scale_ptr =
+      scales + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  const device T* bias_ptr =
+      biases + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  const device T* x_ptr = x + simd_lid * values_per_thread;
+
+  thread uint16_t packed[uint16_per_thread];
+  thread float x_thread[values_per_thread];
+  thread float result[16] = {0};
+
+  int k = 0;
+  for (; k < in_vec_size - block_size; k += block_size) {
+    const device uint16_t* wl = (const device uint16_t*)ws;
+    for (int i = 0; i < uint16_per_thread; ++i) packed[i] = wl[i];
+    const float scale = scale_ptr[0];
+    const float bias = bias_ptr[0];
+
+    for (int m = 0; m < 16; ++m) {
+      const device T* xm = x_ptr + m * in_vec_size;
+      const float sum = load_vector<T, float, values_per_thread, 4>(xm, x_thread);
+      result[m] += qdot_affine4_registered<float, values_per_thread>(
+          packed, x_thread, scale, bias, sum);
+    }
+
+    ws += block_size / 2;
+    scale_ptr += block_size / 64;
+    bias_ptr += block_size / 64;
+    x_ptr += block_size;
+  }
+
+  const uint active_tail_lanes = uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
+    const device uint16_t* wl = (const device uint16_t*)ws;
+    for (int i = 0; i < uint16_per_thread; ++i) packed[i] = wl[i];
+    const float scale = scale_ptr[0];
+    const float bias = bias_ptr[0];
+    for (int m = 0; m < 16; ++m) {
+      const device T* xm = x_ptr + m * in_vec_size;
+      const float sum = load_vector<T, float, values_per_thread, 4>(xm, x_thread);
+      result[m] += qdot_affine4_registered<float, values_per_thread>(
+          packed, x_thread, scale, bias, sum);
+    }
+  }
+
+  for (int m = 0; m < 16; ++m) {
+    result[m] = simd_sum(result[m]);
+    if (simd_lid == 0) y[m * out_vec_size + out_row] = static_cast<T>(result[m]);
+  }
+}
+
+template <typename T>
+METAL_FUNC void qmv_affine8_g64_sixteen_stream_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int in_vec_size,
+    const int out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int values_per_thread = 4;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 16;
+
+  const int out_row = int(tid.y) * 2 + int(simd_gid);
+  const int in_vec_size_w = in_vec_size;
+  const int in_vec_size_g = in_vec_size / 64;
+  const device uint8_t* ws =
+      (const device uint8_t*)w + out_row * in_vec_size_w
+      + simd_lid * bytes_per_thread;
+  const device T* scale_ptr =
+      scales + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  const device T* bias_ptr =
+      biases + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  const device T* x_ptr = x + simd_lid * values_per_thread;
+
+  thread uint8_t packed[bytes_per_thread];
+  thread float x_thread[values_per_thread];
+  thread float result[16] = {0};
+
+  int k = 0;
+  for (; k < in_vec_size - block_size; k += block_size) {
+    for (int i = 0; i < bytes_per_thread; ++i) packed[i] = ws[i];
+    const float scale = scale_ptr[0];
+    const float bias = bias_ptr[0];
+
+    for (int m = 0; m < 16; ++m) {
+      const device T* xm = x_ptr + m * in_vec_size;
+      const float sum = load_vector<T, float, values_per_thread, 8>(xm, x_thread);
+      result[m] += qdot_affine8_registered<float, values_per_thread>(
+          packed, x_thread, scale, bias, sum);
+    }
+
+    ws += block_size;
+    scale_ptr += block_size / 64;
+    bias_ptr += block_size / 64;
+    x_ptr += block_size;
+  }
+
+  const uint active_tail_lanes = uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
+    for (int i = 0; i < bytes_per_thread; ++i) packed[i] = ws[i];
+    const float scale = scale_ptr[0];
+    const float bias = bias_ptr[0];
+    for (int m = 0; m < 16; ++m) {
+      const device T* xm = x_ptr + m * in_vec_size;
+      const float sum = load_vector<T, float, values_per_thread, 8>(xm, x_thread);
+      result[m] += qdot_affine8_registered<float, values_per_thread>(
+          packed, x_thread, scale, bias, sum);
+    }
+  }
+
+  for (int m = 0; m < 16; ++m) {
+    result[m] = simd_sum(result[m]);
+    if (simd_lid == 0) y[m * out_vec_size + out_row] = static_cast<T>(result[m]);
+  }
+}
 """
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
@@ -444,6 +607,55 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
         header: kernelHeader,
         ensureRowContiguous: true
     )
+
+    private static let m16Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_b8t2_qmv_affine_g64_sixteen_stream_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+            if (BITS == 4) {
+                qmv_affine4_g64_sixteen_stream_impl<T>(
+                    w, scales, biases, x, y, K, OUTN, tid, simd_gid, simd_lid);
+            } else {
+                qmv_affine8_g64_sixteen_stream_impl<T>(
+                    w, scales, biases, x, y, K, OUTN, tid, simd_gid, simd_lid);
+            }
+            """,
+        header: kernelHeader,
+        ensureRowContiguous: true
+    )
+
+    /// Exact fixed-shape primitive shared by installed Gemma dense linears and
+    /// the tied embedding head. Eligibility is certified before installation;
+    /// this entry point binds only the logical M and immutable tensor geometry.
+    public static func matmulM16(
+        x: MLXArray,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray,
+        inDim: Int,
+        outDim: Int,
+        bits: Int
+    ) -> MLXArray {
+        let prefix = Array(x.shape.dropLast())
+        let output = m16Kernel(
+            [x, weight, scales, biases],
+            template: [
+                ("T", x.dtype),
+                ("K", inDim),
+                ("OUTN", outDim),
+                ("BITS", bits),
+            ],
+            grid: (simdWidth, (outDim / 2) * simdGroups, 1),
+            threadGroup: (simdWidth, simdGroups, 1),
+            outputShapes: [[16, outDim]],
+            outputDTypes: [x.dtype]
+        )[0]
+        return output.reshaped(prefix + [outDim])
+    }
 
     /// Returns `nil` unless every pin holds; the caller then keeps the stock path.
     public static func matmul(

@@ -25,6 +25,27 @@ extension EngineLoopV2 {
     ) -> (argmax: MLXArray, hidden: MLXArray, cacheInnerState: [MLXArray]) {
         precondition(!columns.isEmpty, "CBv2 MTP: target verification requires a seed column")
         let caches = eagerCaches(rowStates: rows.map { kvStates[$0.rec.id]! })
+
+        let usesInstalledVerifier =
+            columns.count == 2 && columns[0].dim(0) == 8
+            && mtp.supportsInstalledVerification(batchSize: 8, draftDepth: 1)
+        if usesInstalledVerifier {
+            // Both production cache backends certify this phase route. The
+            // flag keeps each attention column identical to standalone L=1
+            // decode while the weight-bound trunk runs once at M16.
+            cacheProvider.setMTPRectangularVerification(true)
+            defer {
+                cacheProvider.setMTPRectangularVerification(false)
+            }
+            let tokens = concatenated(columns, axis: 1)
+            let output = mtp.forwardInstalledMTPVerification(
+                tokens: tokens, caches: caches)
+            return (
+                argMax(output.logits, axis: -1).asType(.int32),
+                output.lastHidden,
+                eagerCacheInnerState(caches))
+        }
+
         let argmax: MLXArray
         let hidden: MLXArray
 

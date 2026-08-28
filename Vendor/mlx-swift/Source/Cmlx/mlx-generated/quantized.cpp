@@ -3536,6 +3536,10 @@ template <
       w, scales, biases, x, y, Xs, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
+// PF-04 kill switch. `false` restores the stock per-segment tile pass
+// byte for byte.
+MLX_MTL_CONST bool kGatherRhsFragmentElide = true;
+
 template <
     typename T,
     int group_size,
@@ -3578,6 +3582,23 @@ template <
       transpose ? BK_padded : BN_padded>;
   using loader_x_t =
       mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+  // PF-04. Half-height twin of `mma_t`, addressed at ONE 8-row MMA fragment
+  // row of the same block. Same fragment size, same operand types, same fp32
+  // accumulator, same `WM`/`WN` lane mapping; only `BM` changes, so `TM` is 1
+  // rather than `BM / (8 * WM)`. Used for expert segments that live inside a
+  // single fragment row -- see the elision below.
+  using mma_frag_t = mlx::steel::BlockMMA<
+      T,
+      T,
+      8 * WM,
+      BN,
+      BK,
+      WM,
+      WN,
+      false,
+      transpose,
+      BK_padded,
+      transpose ? BK_padded : BN_padded>;
   using loader_w_t = QuantizedBlockLoader<
       T,
       transpose ? BN : BK,
@@ -3641,6 +3662,98 @@ template <
       }
     }
     threadgroup_barrier(mem_flags::mem_none);
+
+    // PF-04: out-of-segment issue elision.
+    //
+    // A BM-row tile straddled by an expert boundary is run once per segment,
+    // and each run stages ALL BM activation rows and issues the FULL BM x BN
+    // matrix product, discarding the rows outside its own segment only at the
+    // store. At the Gemma 4 MoE prefill geometry (8192 expert-sorted rows,
+    // 128 experts, BM = 16) about a quarter of the 512 row tiles are straddled,
+    // so that discard is a real fraction of the kernel's device reads and of
+    // its `simdgroup_multiply_accumulate` issue.
+    //
+    // Two elisions, both issue-only:
+    //
+    //   * Activation rows. This tiling gives every thread exactly one
+    //     activation row (`loader_x_t::n_rows == 1`), so a thread whose row is
+    //     outside [offset, offset_next) simply does not read it. Its Xs slot
+    //     goes stale; the only accumulator that reads that slot is the one for
+    //     that same row, and the store below writes exactly
+    //     [offset, offset_next), so a stale slot can never reach memory.
+    //
+    //   * MMA fragment rows. When a segment lives inside a single 8-row
+    //     fragment row, running it on `mma_frag_t` addressed at that fragment
+    //     row issues exactly the surviving half of the fragments instead of
+    //     both. `BlockMMA` reads its A operand through the pointer it is
+    //     handed, so the addressing is the stock addressing at a stock
+    //     fragment-row offset.
+    //
+    // No stored element's accumulation changes: the same staged bf16 operands
+    // enter the same fp32 accumulator in the same k order, eight at a time.
+    // This elides issue, never reassociates. `kGatherRhsFragmentElide` is the
+    // kill switch; there are no new kernel names and no new function
+    // constants.
+    if (kGatherRhsFragmentElide && align_M && align_N && align_K &&
+        loader_x_t::n_rows == 1 && BM > 8 * WM) {
+      constexpr short frag_rows = 8 * WM;
+      thread loader_x_t lx(x, K, Xs, simd_group_id, simd_lane_id);
+      thread loader_w_t lw(
+          wl + index * stride_w,
+          scales + index * stride_s,
+          biases + index * stride_s,
+          transpose ? K : N,
+          Ws,
+          simd_group_id,
+          simd_lane_id);
+      const bool x_live = (lx.bi >= offset) && (lx.bi < offset_next);
+      const short f_lo = offset / frag_rows;
+      const short f_hi = short((offset_next - 1) / frag_rows);
+
+      if (f_lo == f_hi) {
+        thread mma_frag_t mma_frag(simd_group_id, simd_lane_id);
+        const threadgroup T* As_frag = Xs + f_lo * frag_rows * BK_padded;
+        for (int k = 0; k < K_it; k++) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (x_live) {
+            lx.load_unsafe();
+          }
+          lw.load_unsafe();
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          mma_frag.mma(As_frag, Ws);
+          lx.next();
+          lw.next();
+        }
+        device T* y_frag = y + size_t(f_lo) * frag_rows * size_t(N);
+        const short lo = offset - f_lo * frag_rows;
+        const short hi = offset_next - f_lo * frag_rows;
+        if (lo == 0 && hi == frag_rows) {
+          mma_frag.store_result(y_frag, N);
+        } else {
+          mma_frag.store_result_slice(y_frag, N, short2(0, lo), short2(BN, hi));
+        }
+      } else {
+        thread mma_t mma_full(simd_group_id, simd_lane_id);
+        for (int k = 0; k < K_it; k++) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (x_live) {
+            lx.load_unsafe();
+          }
+          lw.load_unsafe();
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          mma_full.mma(Xs, Ws);
+          lx.next();
+          lw.next();
+        }
+        if (offset_next - offset == BM) {
+          mma_full.store_result(y, N);
+        } else {
+          mma_full.store_result_slice(
+              y, N, short2(0, offset), short2(BN, offset_next));
+        }
+      }
+      continue;
+    }
 
     // Prepare threadgroup mma operation
     thread mma_t mma_op(simd_group_id, simd_lane_id);

@@ -340,11 +340,13 @@ inline void qdot_affine4_pair(
     U sum1,
     thread U& out0,
     thread U& out1) {
+  static_assert(values_per_thread == 8, "paired affine4 dot consumes one u32");
   U accum0 = 0;
   U accum1 = 0;
-  const device uint16_t* ws = (const device uint16_t*)w;
+  const uint32_t packed_pair = *((const device uint32_t*)w);
+#pragma unroll
   for (int i = 0; i < (values_per_thread / 4); i++) {
-    const uint16_t packed = ws[i];
+    const uint16_t packed = uint16_t(packed_pair >> (16 * i));
     accum0 +=
         (x0[4 * i] * (packed & 0x000f) +
          x0[4 * i + 1] * (packed & 0x00f0) +
@@ -3287,6 +3289,23 @@ template <typename T, int group_size, int bits>
           simd_lid);
       return;
     }
+    // Exact singleton/tail assignments need only the two gather offsets. Avoid
+    // reloading both indices and the generic batch/broadcast branches in
+    // adjust_matrix_offsets after the expert and run were already resolved.
+    const uint32_t x_idx =
+        lhs_indices[assignment * (uint)lhs_strides[0]];
+    qmv_impl<T, group_size, bits>(
+        w + expert * w_strides[0],
+        scales + expert * s_strides[0],
+        biases + expert * b_strides[0],
+        x + x_idx * x_strides[0],
+        y + assignment * out_vec_size,
+        in_vec_size,
+        out_vec_size,
+        tid,
+        simd_gid,
+        simd_lid);
+    return;
   }
   adjust_matrix_offsets<T>(
       x,

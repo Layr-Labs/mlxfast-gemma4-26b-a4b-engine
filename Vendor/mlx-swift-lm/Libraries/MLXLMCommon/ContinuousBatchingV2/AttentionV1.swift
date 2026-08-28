@@ -235,7 +235,8 @@ enum CBv2AttentionV1 {
         spanContexts: [CBv2SpanChunkContext?]? = nil,
         serializeQueries: Bool = false,
         decodeRingWriteFence: CBv2DecodeRingWriteFence? = nil,
-        allowFusedRingWrite: Bool = false
+        allowFusedRingWrite: Bool = false,
+        ringPositionOffsets: MLXArray? = nil
     ) -> MLXArray {
         let B = queries.dim(0)
         let L = queries.dim(2)
@@ -307,6 +308,7 @@ enum CBv2AttentionV1 {
                                     keys: preWrite.map(\.keys),
                                     values: preWrite.map(\.values),
                                     starts: preWrite.map(\.start),
+                                    preStepPositionOffsets: ringPositionOffsets,
                                     previousWriteFence: decodeRingWriteFence.value,
                                     scale: scale,
                                     slidingWindowLength: ringRows[0].window)

@@ -183,7 +183,12 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             spanContexts: boundSpanContexts,
             serializeQueries: mtpSerializesRectangularAttention,
             decodeRingWriteFence: decodeRingWriteFence,
-            allowFusedRingWrite: !retainsChunkForBorrowers)
+            allowFusedRingWrite: !retainsChunkForBorrowers,
+            // Every cache in a contiguous bank observes the same pre-step
+            // device tensor. The fused ring kernel can derive its post-write
+            // physical start from this directly, avoiding one fresh [B]
+            // host array per sliding layer and decode step.
+            ringPositionOffsets: positionOffsetsState.value)
         // Advance offsets ON-DEVICE. A unified bank elects exactly one owning
         // cache; Gemma snapshots the shared pre-step value before this call.
         if advancesPositionOffsets {

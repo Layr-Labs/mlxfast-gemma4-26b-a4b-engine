@@ -224,6 +224,24 @@ private let gemma4SafeGeluApproximate: @Sendable (MLXArray) -> MLXArray = {
     return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
 
+/// Safe approximate GELU and its following dense-MLP product in ONE compiled
+/// graph. The activation expression is character-for-character the body of
+/// `gemma4SafeGeluApproximate` above, so the operation order — and therefore
+/// every output bit — matches `gemma4SafeGeluApproximate(gate) * up`. Only the
+/// graph boundary moves: the product joins the same compiled region instead of
+/// forcing a separate elementwise dispatch over the activation's result.
+private let gemma4SafeGeluProduct: @Sendable (
+    MLXArray, MLXArray
+) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+        (gate: MLXArray, up: MLXArray) -> MLXArray in
+        let activated = 0.5 * gate
+            * (1 + tanh(sqrt(2 / Float.pi) * (gate + 0.044715 * gate * gate * gate)))
+        return activated * up
+    }
+    return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
+}()
+
 /// Final-logit softcap (`tanh(x / cap) * cap`) fused into one Metal dispatch
 /// (vMLX `compiledLogitSoftcap`). The untyped (float32) cap keeps the softcap
 /// math — and the logits handed to the sampler — full precision.
@@ -1633,7 +1651,7 @@ private class Gemma4MLP: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(gemma4SafeGeluApproximate(gateProj(x)) * upProj(x))
+        downProj(gemma4SafeGeluProduct(gateProj(x), upProj(x)))
     }
 }
 

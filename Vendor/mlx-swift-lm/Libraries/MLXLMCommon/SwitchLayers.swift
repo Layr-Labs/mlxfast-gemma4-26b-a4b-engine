@@ -284,7 +284,7 @@ private let routeFusedScatterKernelT64: MLXFast.MLXFastKernel = {
     return MLXFast.metalKernel(
         name: "mlx_lm_route_csort_scatter_fused_m\(m)_u32_t64_v1",
         inputNames: ["keys"],
-        outputNames: ["row_order", "sorted_keys", "inverse_order"],
+        outputNames: ["row_order", "sorted_keys", "inverse_order", "run_keys"],
         source: """
             constexpr uint TILE = \(routeSortTile64);
             constexpr uint M = \(m);
@@ -332,17 +332,26 @@ private let routeFusedScatterKernelT64: MLXFast.MLXFastKernel = {
                 simd_base += simd_totals[s];
             }
             // Rank base for key k in tile t: global base + earlier tiles.
-            uint off = simd_base + lane_excl +
+            uint run_offset =
                 atomic_load_explicit(&tg_before[k], memory_order_relaxed);
+            uint off = simd_base + lane_excl + run_offset;
+            const uint paired_count = total & ~1u;
             // Walk this tile's slice in input order: stability by
-            // construction, exactly the stock scatter's write order.
+            // construction, exactly the stock scatter's write order. The
+            // additional internal key carries the already-known run offset
+            // for positions covered by a pair; an odd singleton tail stays
+            // plain so generic gather fallback remains safe.
             for (uint i = 0; i < TILE; ++i) {
                 uint idx = t * TILE + i;
                 if (keys[idx] == k) {
                     row_order[off] = idx / M;
                     sorted_keys[off] = k;
+                    run_keys[off] = run_offset < paired_count
+                        ? (0x80000000u | (run_offset << 8) | k)
+                        : k;
                     inverse_order[idx] = off;
                     ++off;
+                    ++run_offset;
                 }
             }
             """,
@@ -352,7 +361,7 @@ private let routeFusedScatterKernelT64: MLXFast.MLXFastKernel = {
 
 private func routeCountingSortFusedT64(
     _ indices: MLXArray, m: Int
-) -> (rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray)? {
+) -> (rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray, runKeys: MLXArray)? {
     let n = indices.size
     guard routeCountingSort64Enabled,
         indices.dtype == .uint32,
@@ -365,10 +374,10 @@ private func routeCountingSortFusedT64(
         [indices],
         grid: (tiles * 256, 1, 1),
         threadGroup: (256, 1, 1),
-        outputShapes: [[n], [n], [n]],
-        outputDTypes: [.uint32, .uint32, .uint32]
+        outputShapes: [[n], [n], [n], [n]],
+        outputDTypes: [.uint32, .uint32, .uint32, .uint32]
     )
-    return (outputs[0], outputs[1], outputs[2])
+    return (outputs[0], outputs[1], outputs[2], outputs[3])
 }
 
 public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
@@ -389,7 +398,8 @@ public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, M
 /// its 256-entry counter table covers every key. The default (`Int.max`)
 /// fails closed onto the established `argSort` chain.
 public func gatherSortIndices(
-    indices: MLXArray, numExperts: Int = Int.max
+    indices: MLXArray, numExperts: Int = Int.max,
+    encodeRunOffsets: Bool = false
 ) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
     let indices = indices.flattened()
@@ -398,7 +408,10 @@ public func gatherSortIndices(
     if numExperts <= routeCountingSortKeyBound,
         let fused = routeCountingSortFusedT64(indices, m: m)
     {
-        return (fused.rowOrder, fused.sortedKeys, fused.inverseOrder)
+        return (
+            fused.rowOrder,
+            encodeRunOffsets ? fused.runKeys : fused.sortedKeys,
+            fused.inverseOrder)
     }
     let order = argSort(indices)
     return (order.floorDivide(m), indices[order], argSort(order))
@@ -549,7 +562,8 @@ public class SwitchGLU: Module {
             if useLhsIndices {
                 x = x.flattened(start: 0, end: -3)
                 (lhsIndices, idx, inverseOrder) = gatherSortIndices(
-                    indices: indices, numExperts: numExperts)
+                    indices: indices, numExperts: numExperts,
+                    encodeRunOffsets: true)
             } else {
                 (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
             }

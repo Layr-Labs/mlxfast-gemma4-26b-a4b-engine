@@ -1728,6 +1728,105 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
   }
 }
 
+// Three-row weight-stream sharing for the scored Gemma 4 expert gate/up
+// gather. The helper keeps a separate accumulator and reduction for each
+// input row while loading each immutable packed weight/scale/bias tile once.
+// It is called only at K = 2816, which is exactly eleven 256-value blocks.
+template <typename T, const int group_size, const int bits>
+METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x0,
+    const device T* x1,
+    const device T* x2,
+    device T* y0,
+    device T* y1,
+    device T* y2,
+    const int in_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 8;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int uint16_per_thread = bytes_per_thread / 2;
+  constexpr int scale_step_per_thread = 8;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread float x_thread[values_per_thread];
+  thread uint16_t packed[results_per_simdgroup][uint16_per_thread];
+  thread float scale_local[results_per_simdgroup];
+  thread float bias_local[results_per_simdgroup];
+  thread float result0[results_per_simdgroup] = {0};
+  thread float result1[results_per_simdgroup] = {0};
+  thread float result2[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x0 += simd_lid * values_per_thread;
+  x1 += simd_lid * values_per_thread;
+  x2 += simd_lid * values_per_thread;
+  y0 += out_row;
+  y1 += out_row;
+  y2 += out_row;
+
+  for (int k = 0; k <= in_vec_size - block_size; k += block_size) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint16_t* wl =
+          (const device uint16_t*)(ws + row * in_vec_size_w);
+      for (int i = 0; i < uint16_per_thread; i++) {
+        packed[row][i] = wl[i];
+      }
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine4_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result1[row] += qdot_affine4_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result2[row] += qdot_affine4_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+
+    ws += block_size / 2;
+    scales += block_size / 64;
+    biases += block_size / 64;
+    x0 += block_size;
+    x1 += block_size;
+    x2 += block_size;
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result0[row] = simd_sum(result0[row]);
+    result1[row] = simd_sum(result1[row]);
+    result2[row] = simd_sum(result2[row]);
+    if (simd_lid == 0) {
+      y0[row] = static_cast<T>(result0[row]);
+      y1[row] = static_cast<T>(result1[row]);
+      y2[row] = static_cast<T>(result2[row]);
+    }
+  }
+}
+
+
 template <typename T, const int group_size, const int bits>
 METAL_FUNC void qmv_affine8_g64_pair_impl(
     const device uint32_t* w,
@@ -3388,8 +3487,49 @@ template <typename T, int group_size, int bits>
       run_offset++;
     }
 
-    // Odd positions are produced by the immediately preceding pair leader.
-    if ((run_offset & 1) != 0) {
+    // The wide gate/up projection is weight-bandwidth dominated. Partition
+    // each stable equal-expert run into complete triples, then preserve the
+    // incumbent pair/single fallback for the remainder. The common run of
+    // eight becomes 3 + 3 + 2; the promoted K = 704 down-tile arm above is
+    // untouched.
+    const uint triple_base = assignment - (run_offset % 3u);
+    const bool belongs_to_triple =
+        in_vec_size == 2816 && out_vec_size == 704 &&
+        triple_base + 2 < 64 &&
+        rhs_indices[(triple_base + 1) * (uint)rhs_strides[0]] == expert &&
+        rhs_indices[(triple_base + 2) * (uint)rhs_strides[0]] == expert;
+    if (belongs_to_triple) {
+      if (assignment != triple_base) {
+        return;
+      }
+      const device uint32_t* tri_w = w + expert * w_strides[0];
+      const device T* tri_scales = scales + expert * s_strides[0];
+      const device T* tri_biases = biases + expert * b_strides[0];
+      const uint32_t x0_idx =
+          lhs_indices[triple_base * (uint)lhs_strides[0]];
+      const uint32_t x1_idx =
+          lhs_indices[(triple_base + 1) * (uint)lhs_strides[0]];
+      const uint32_t x2_idx =
+          lhs_indices[(triple_base + 2) * (uint)lhs_strides[0]];
+      qmv_affine4_g64_triple_stream_impl<T, group_size, bits>(
+          tri_w,
+          tri_scales,
+          tri_biases,
+          x + x0_idx * x_strides[0],
+          x + x1_idx * x_strides[0],
+          x + x2_idx * x_strides[0],
+          y + triple_base * out_vec_size,
+          y + (triple_base + 1) * out_vec_size,
+          y + (triple_base + 2) * out_vec_size,
+          in_vec_size,
+          tid,
+          simd_gid,
+          simd_lid);
+      return;
+    }
+
+    // Position one of an incomplete triple is produced by its pair leader.
+    if ((run_offset % 3u) == 1u) {
       return;
     }
     const bool has_pair =

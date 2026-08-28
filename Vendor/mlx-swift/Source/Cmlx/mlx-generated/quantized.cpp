@@ -1983,6 +1983,234 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
   }
 }
 
+// Eight-row byte-weight-stream sharing for the affine8/g64 QMV, held to a
+// PAIR-SIZED x residency (one four-value x buffer live at a time), extending
+// qmv_affine8_g64_quad_stream_impl from four cohort rows to the full
+// eight-row decode cohort. Same geometry: two simdgroups by four output rows
+// per 64-thread group, values_per_thread = 4, block_size = 128,
+// scale_step_per_thread = 16, same load_vector / tail structure.
+//
+// The block's byte weights and scale/bias are fetched into registers ONCE and
+// the eight cohort input rows then walk through a SINGLE four-value x buffer,
+// so only one row of x is live at a time (the residency rule the quad_stream
+// comment above establishes). Each (output row, input row) pair keeps its own
+// accumulator, its own K-loop order and its own simd_sum, and
+// qdot_affine8_registered is the bits == 8 arm of qdot verbatim, so every
+// output element's add sequence is identical to stock qmv_impl -- only the
+// LOADS are shared. One weight pass now serves the whole cohort where the
+// promoted quad_stream tier serves it twice (two x-groups of four rows).
+template <typename T, const int group_size, const int bits>
+METAL_FUNC void qmv_affine8_g64_octo_stream_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x0,
+    const device T* x1,
+    const device T* x2,
+    const device T* x3,
+    const device T* x4,
+    const device T* x5,
+    const device T* x6,
+    const device T* x7,
+    device T* y0,
+    device T* y1,
+    device T* y2,
+    device T* y3,
+    device T* y4,
+    device T* y5,
+    device T* y6,
+    device T* y7,
+    const constant int& in_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 4;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 16;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread float x_thread[values_per_thread];
+  thread uint8_t packed[results_per_simdgroup][bytes_per_thread];
+  thread float scale_local[results_per_simdgroup];
+  thread float bias_local[results_per_simdgroup];
+  thread float result0[results_per_simdgroup] = {0};
+  thread float result1[results_per_simdgroup] = {0};
+  thread float result2[results_per_simdgroup] = {0};
+  thread float result3[results_per_simdgroup] = {0};
+  thread float result4[results_per_simdgroup] = {0};
+  thread float result5[results_per_simdgroup] = {0};
+  thread float result6[results_per_simdgroup] = {0};
+  thread float result7[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x0 += simd_lid * values_per_thread;
+  x1 += simd_lid * values_per_thread;
+  x2 += simd_lid * values_per_thread;
+  x3 += simd_lid * values_per_thread;
+  x4 += simd_lid * values_per_thread;
+  x5 += simd_lid * values_per_thread;
+  x6 += simd_lid * values_per_thread;
+  x7 += simd_lid * values_per_thread;
+  y0 += out_row;
+  y1 += out_row;
+  y2 += out_row;
+  y3 += out_row;
+  y4 += out_row;
+  y5 += out_row;
+  y6 += out_row;
+  y7 += out_row;
+
+  int k = 0;
+  for (; k < in_vec_size - block_size; k += block_size) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      for (int i = 0; i < bytes_per_thread; i++) {
+        packed[row][i] = wl[i];
+      }
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    float sum = load_vector<T, float, values_per_thread, 8>(x0, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x1, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result1[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x2, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result2[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x3, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result3[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x4, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result4[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x5, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result5[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x6, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result6[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x7, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result7[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+
+    ws += block_size;
+    scales += block_size / 64;
+    biases += block_size / 64;
+    x0 += block_size;
+    x1 += block_size;
+    x2 += block_size;
+    x3 += block_size;
+    x4 += block_size;
+    x5 += block_size;
+    x6 += block_size;
+    x7 += block_size;
+  }
+
+  const uint active_tail_lanes =
+      uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      for (int i = 0; i < bytes_per_thread; i++) {
+        packed[row][i] = wl[i];
+      }
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    float sum = load_vector<T, float, values_per_thread, 8>(x0, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x1, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result1[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x2, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result2[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x3, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result3[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x4, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result4[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x5, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result5[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x6, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result6[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x7, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result7[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result0[row] = simd_sum(result0[row]);
+    result1[row] = simd_sum(result1[row]);
+    result2[row] = simd_sum(result2[row]);
+    result3[row] = simd_sum(result3[row]);
+    result4[row] = simd_sum(result4[row]);
+    result5[row] = simd_sum(result5[row]);
+    result6[row] = simd_sum(result6[row]);
+    result7[row] = simd_sum(result7[row]);
+    if (simd_lid == 0) {
+      y0[row] = static_cast<T>(result0[row]);
+      y1[row] = static_cast<T>(result1[row]);
+      y2[row] = static_cast<T>(result2[row]);
+      y3[row] = static_cast<T>(result3[row]);
+      y4[row] = static_cast<T>(result4[row]);
+      y5[row] = static_cast<T>(result5[row]);
+      y6[row] = static_cast<T>(result6[row]);
+      y7[row] = static_cast<T>(result7[row]);
+    }
+  }
+}
+
 template <typename T, const int group_size, const int bits>
 METAL_FUNC void qvm_impl(
     const device uint32_t* w,
@@ -2778,32 +3006,42 @@ template <typename T, const int group_size, const int bits, bool batched>
     // Dense decode projections use byte weights.
     if (out_vec_size >= 1024) {
       // WIDE-N tier -- the dense MLP of all 30 layers: gate_proj and up_proj
-      // N = 2112 over K = 2816, down_proj N = 2816 over K = 2112. One
-      // byte-weight stream feeds FOUR cohort rows in two active x-groups
-      // (4+4); the remaining host groups return, and per-row qdot, K-loop and
-      // simd_sum stay the stock qmv_impl sequence.
+      // N = 2112 over K = 2816, down_proj N = 2816 over K = 2112. ONE
+      // byte-weight stream now feeds the WHOLE eight-row cohort from
+      // x-column 0 of the host grid; the remaining host groups return, and
+      // per-row qdot, K-loop and simd_sum stay the stock qmv_impl sequence.
       //
-      // Measured on the ranked box (M4 Pro, B = 8, streamed weight pool),
-      // us/dispatch, incumbent pair -> this:
+      // This extends the promoted quad_stream tier (two x-groups of four
+      // rows, i.e. each weight byte fetched twice per matrix) to a single
+      // weight pass. The box receipt that promoted quad_stream measured
+      // (M4 Pro, B = 8, streamed weight pool) pair -> quad_stream at
       //   N = 2112 (gate/up)  64.4 -> 56.2     N = 2816 (down)  67.4 -> 59.0
+      // us/dispatch; halving the weight fetches again targets the same axis.
       // Same 1024 floor as the nibble tier, which keeps router.proj (N = 128)
       // on the promoted pair kernel byte-for-byte.
-      const int first_m = int(tid.x) * 4;
-      if (first_m >= 8) {
+      if (int(tid.x) != 0) {
         return;
       }
-      qmv_affine8_g64_quad_stream_impl<T, 64, 8>(
+      qmv_affine8_g64_octo_stream_impl<T, 64, 8>(
           w,
           scales,
           biases,
-          x + first_m * in_vec_size,
-          x + (first_m + 1) * in_vec_size,
-          x + (first_m + 2) * in_vec_size,
-          x + (first_m + 3) * in_vec_size,
-          y + first_m * out_vec_size,
-          y + (first_m + 1) * out_vec_size,
-          y + (first_m + 2) * out_vec_size,
-          y + (first_m + 3) * out_vec_size,
+          x,
+          x + in_vec_size,
+          x + 2 * in_vec_size,
+          x + 3 * in_vec_size,
+          x + 4 * in_vec_size,
+          x + 5 * in_vec_size,
+          x + 6 * in_vec_size,
+          x + 7 * in_vec_size,
+          y,
+          y + out_vec_size,
+          y + 2 * out_vec_size,
+          y + 3 * out_vec_size,
+          y + 4 * out_vec_size,
+          y + 5 * out_vec_size,
+          y + 6 * out_vec_size,
+          y + 7 * out_vec_size,
           in_vec_size,
           tid,
           simd_gid,

@@ -282,13 +282,6 @@ public final class LogitsPipelineV2 {
             logits.dim(0) == rowCount,
             "logits rows (\(logits.dim(0))) != configured rows (\(rowCount)) — call setRows")
 
-        if allGreedy && !wantsLogprobs && !anyBias && !anyRepetition
-            && !anyFrequencyPresence && !anyTemperature && !anyTopKPMinP
-            && hardMask == nil
-        {
-            return Output(sampling: logits, rawLogprobs: nil)
-        }
-
         // Work in float32 for numerically stable softmax/cumsum (vLLM does
         // the same). f16→f32 is exact, so greedy argmax is unaffected.
         var x = logits.asType(.float32)

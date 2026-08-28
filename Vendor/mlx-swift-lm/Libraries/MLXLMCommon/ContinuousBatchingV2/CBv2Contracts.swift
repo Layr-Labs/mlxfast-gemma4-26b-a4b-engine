@@ -517,12 +517,36 @@ public protocol CBv2AttendingLayerCache: AnyObject {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?
     ) -> MLXArray
+    /// updateAndAttend with an optional PRE-BUILT ring-start tensor for the
+    /// decode ring path. `ringStarts` must be a device uint32 array of shape
+    /// `[B]` whose row values equal each row's `oldestValidPosition % window`
+    /// at view time. Backends that do not consume ring starts keep the
+    /// established behavior (the extension default forwards unchanged), so
+    /// only ring-capable caches need to implement this.
+    func updateAndAttend(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?, ringStarts: MLXArray?
+    ) -> MLXArray
     /// Borrow the source layer's K/V for Gemma-style KV-shared layers.
     /// Only valid when `kind.sharesKVWithLayer != nil`.
     func attendBorrowing(
         source: CBv2AttendingLayerCache,
         queries: MLXArray, scale: Float, sinks: MLXArray?
     ) -> MLXArray
+}
+
+// Default ringStarts-bearing updateAndAttend: forwards to the established
+// 5-parameter path, so non-ring backends (and every existing conformer)
+// keep byte-identical behavior without any source change.
+public extension CBv2AttendingLayerCache {
+    func updateAndAttend(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?, ringStarts: MLXArray?
+    ) -> MLXArray {
+        updateAndAttend(
+            queries: queries, keys: keys, values: values,
+            scale: scale, sinks: sinks)
+    }
 }
 
 // MARK: - Scheduler plan (vLLM-V1 style: no phases)

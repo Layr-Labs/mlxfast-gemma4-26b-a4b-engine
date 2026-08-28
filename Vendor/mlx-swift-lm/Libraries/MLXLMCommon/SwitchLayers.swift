@@ -249,13 +249,6 @@ public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, M
     )
 }
 
-public func gatherSortIndices(indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
-    let m = indices.dim(-1)
-    let indices = indices.flattened()
-    let order = argSort(indices)
-    return (order.floorDivide(m), indices[order], argSort(order))
-}
-
 public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) -> MLXArray {
     var x = x[invOrder]
     if let shape {
@@ -388,37 +381,27 @@ public class SwitchGLU: Module {
     private func projectExperts(
         _ x: MLXArray, _ indices: MLXArray
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
-        let useLhsIndices =
-            indices.size == 64 && indices.ndim == 2 && indices.shape == [8, 8]
-            && x.ndim == 2 && x.shape == [8, inputDims]
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
         let doSort = indices.size >= 64
 
         var idx = indices
         var inverseOrder = MLXArray()
-        var lhsIndices: MLXArray?
         if doSort {
-            if useLhsIndices {
-                x = x.flattened(start: 0, end: -3)
-                (lhsIndices, idx, inverseOrder) = gatherSortIndices(indices: indices)
-            } else {
-                (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
-            }
+            (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
         }
 
         let xGate: MLXArray
         let xUp: MLXArray
         if let gateUpProj {
-            let xGateUp = gateUpProj(
-                x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
+            let xGateUp = gateUpProj(x, idx, sortedIndices: doSort)
             xGate = xGateUp[.ellipsis, ..<hiddenDims]
             xUp = xGateUp[.ellipsis, hiddenDims...]
         } else {
             guard let gateProj, let upProj else {
                 preconditionFailure("SwitchGLU requires gate_up_proj or gate_proj/up_proj")
             }
-            xUp = upProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
-            xGate = gateProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
+            xUp = upProj(x, idx, sortedIndices: doSort)
+            xGate = gateProj(x, idx, sortedIndices: doSort)
         }
 
         let activated: MLXArray
@@ -571,13 +554,10 @@ public class SwitchLinear: Module, Quantizable {
     }
 
     public func callAsFunction(
-        _ x: MLXArray, _ indices: MLXArray, lhsIndices: MLXArray? = nil,
-        sortedIndices: Bool = false
+        _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false
     ) -> MLXArray {
         let weightT = self.weight.swappedAxes(-1, -2)
-        var result = MLX.gatherMM(
-            x, weightT, lhsIndices: lhsIndices, rhsIndices: indices,
-            sortedIndices: sortedIndices)
+        var result = MLX.gatherMM(x, weightT, rhsIndices: indices, sortedIndices: sortedIndices)
 
         if let bias = self.bias {
             result = result + MLX.expandedDimensions(bias[indices], axis: -2)
@@ -620,15 +600,13 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
     }
 
     override public func callAsFunction(
-        _ x: MLXArray, _ indices: MLXArray, lhsIndices: MLXArray? = nil,
-        sortedIndices: Bool = false
+        _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false
     ) -> MLXArray {
         var result = MLX.gatherQuantizedMM(
             x,
             self.weight,
             scales: self.scales,
             biases: self.biases,
-            lhsIndices: lhsIndices,
             rhsIndices: indices,
             transpose: true,
             groupSize: self.groupSize,

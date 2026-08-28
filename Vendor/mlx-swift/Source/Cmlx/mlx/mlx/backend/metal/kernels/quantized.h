@@ -289,30 +289,6 @@ inline U qdot(
   return scale * accum + sum * bias;
 }
 
-// One affine-4 dot product against a packed weight vector ALREADY held in
-// registers. Byte-for-byte the bits == 4 arm of qdot: same nibble masks, same
-// four-term expression, same accumulation order over i, same
-// `scale * accum + sum * bias` close. Only the residence of `w` differs
-// (thread instead of device), which is what lets one weight fetch serve four
-// cohort input rows without holding four rows of x live at once.
-template <typename U, int values_per_thread>
-inline U qdot_affine4_registered(
-    const thread uint16_t* w,
-    const thread U* x_thread,
-    U scale,
-    U bias,
-    U sum) {
-  U accum = 0;
-  for (int i = 0; i < (values_per_thread / 4); i++) {
-    accum +=
-        (x_thread[4 * i] * (w[i] & 0x000f) +
-         x_thread[4 * i + 1] * (w[i] & 0x00f0) +
-         x_thread[4 * i + 2] * (w[i] & 0x0f00) +
-         x_thread[4 * i + 3] * (w[i] & 0xf000));
-  }
-  return scale * accum + sum * bias;
-}
-
 // Two independent affine-4 dot products over one packed weight vector. Each
 // accumulator retains the scalar qdot operation order; only the packed weight
 // load is shared between adjacent assignments routed to the same expert.
@@ -347,23 +323,61 @@ inline void qdot_affine4_pair(
   out1 = scale * accum1 + sum1 * bias;
 }
 
-// One affine-8 dot product against a byte weight vector ALREADY held in
-// registers. Byte-for-byte the bits == 8 arm of qdot: same per-element
-// multiply, same accumulation order over i, same `scale * accum + sum * bias`
-// close. Only the residence of `w` differs (thread instead of device).
+// Four independent affine-4 dot products over one packed weight vector. Same
+// discipline as qdot_affine4_pair: each accumulator retains the scalar qdot
+// operation order; only the packed weight load is shared across the four
+// adjacent cohort input rows.
 template <typename U, int values_per_thread>
-inline U qdot_affine8_registered(
-    const thread uint8_t* w,
-    const thread U* x_thread,
+inline void qdot_affine4_quad(
+    const device uint8_t* w,
+    const thread U* x0,
+    const thread U* x1,
+    const thread U* x2,
+    const thread U* x3,
     U scale,
     U bias,
-    U sum) {
-  U accum = 0;
-  for (int i = 0; i < values_per_thread; i++) {
-    accum += x_thread[i] * w[i];
+    U sum0,
+    U sum1,
+    U sum2,
+    U sum3,
+    thread U& out0,
+    thread U& out1,
+    thread U& out2,
+    thread U& out3) {
+  U accum0 = 0;
+  U accum1 = 0;
+  U accum2 = 0;
+  U accum3 = 0;
+  const device uint16_t* ws = (const device uint16_t*)w;
+  for (int i = 0; i < (values_per_thread / 4); i++) {
+    const uint16_t packed = ws[i];
+    accum0 +=
+        (x0[4 * i] * (packed & 0x000f) +
+         x0[4 * i + 1] * (packed & 0x00f0) +
+         x0[4 * i + 2] * (packed & 0x0f00) +
+         x0[4 * i + 3] * (packed & 0xf000));
+    accum1 +=
+        (x1[4 * i] * (packed & 0x000f) +
+         x1[4 * i + 1] * (packed & 0x00f0) +
+         x1[4 * i + 2] * (packed & 0x0f00) +
+         x1[4 * i + 3] * (packed & 0xf000));
+    accum2 +=
+        (x2[4 * i] * (packed & 0x000f) +
+         x2[4 * i + 1] * (packed & 0x00f0) +
+         x2[4 * i + 2] * (packed & 0x0f00) +
+         x2[4 * i + 3] * (packed & 0xf000));
+    accum3 +=
+        (x3[4 * i] * (packed & 0x000f) +
+         x3[4 * i + 1] * (packed & 0x00f0) +
+         x3[4 * i + 2] * (packed & 0x0f00) +
+         x3[4 * i + 3] * (packed & 0xf000));
   }
-  return scale * accum + sum * bias;
+  out0 = scale * accum0 + sum0 * bias;
+  out1 = scale * accum1 + sum1 * bias;
+  out2 = scale * accum2 + sum2 * bias;
+  out3 = scale * accum3 + sum3 * bias;
 }
+
 
 // Two independent affine-8 dot products over one byte weight vector. Keep the
 // per-row scalar accumulation order of qdot while sharing each weight load.
@@ -1542,30 +1556,21 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
 }
 
 // Four-row weight-stream sharing for the ordinary (plain-order) affine4/g64
-// QMV, held to a PAIR-SIZED register footprint. Same geometry as
-// qmv_affine4_g64_pair_impl: two simdgroups by four output rows per
-// 64-thread group, values_per_thread = 8, block_size = 256,
-// scale_step_per_thread = 8, same load_vector / load_vector_safe tail.
-//
-// RESIDENCY is the whole point. The retired four-row quad this replaces held
-// all four cohort rows of x live across a block (4 x 8 = 32 floats) on top of
-// its 16 accumulators, and measured SLOWER than the two-row pair it was meant
-// to beat -- 226.3 us against 208.7 us at N = 8192 on the ranked box, with the
-// halved weight stream never converting. This kernel fetches the block's
-// packed weights and scale/bias into registers ONCE and then walks the four
-// input rows in sequence through a SINGLE eight-value x buffer, so only one
-// row of x is live at a time -- the discipline of
-// qmv_fast_crossrow_affine4_g64_wide, which keeps four x values per input row
-// live and states the same reason. With it the collapse converts: 197.5 us at
-// N = 8192, under BOTH the pair kernel and the retired quad.
-//
-// Exactness is unchanged and argued the same way: each (output row, input row)
-// pair keeps its own accumulator, its own K-loop order, and its own simd_sum;
-// `qdot_affine4_registered` is the bits == 4 arm of `qdot` verbatim. Only the
-// LOADS are shared, so every output element's add sequence is identical to
-// stock qmv_impl.
+// QMV, LARGE-N tier only. Same geometry as qmv_affine4_g64_pair_impl: two
+// simdgroups by four output rows per 64-thread group, values_per_thread = 8,
+// block_size = 256, scale_step_per_thread = 8, and the same load_vector /
+// load_vector_safe tail structure. One packed-weight/scale/bias tile feeds
+// FOUR cohort input rows; each row keeps the stock qdot expression, the K
+// accumulation order, and its own simd_sum, so every output element's add
+// sequence is identical to stock qmv_impl -- only loads are shared.
+// Register note: full x residency is 4 rows x 8 floats = 32 floats plus 16
+// accumulators, 4 block sums, 4 dot temporaries, and ~11 pointers (~100-110
+// 32-bit registers estimated) -- held to the 64-thread threadgroup where
+// occupancy pressure is mild; if a future variant spills, restructure like
+// qmv_fast_crossrow_affine4_g64_wide, which keeps only 4 x-values per input
+// row live at a time.
 template <typename T, const int group_size, const int bits>
-METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
+METAL_FUNC void qmv_affine4_g64_quad_impl(
     const device uint32_t* w,
     const device T* scales,
     const device T* biases,
@@ -1586,14 +1591,13 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
   constexpr int values_per_thread = 8;
   constexpr int block_size = values_per_thread * SIMD_SIZE;
   constexpr int bytes_per_thread = 4;
-  constexpr int uint16_per_thread = bytes_per_thread / 2;
   constexpr int scale_step_per_thread = 8;
 
   const device uint8_t* ws = (const device uint8_t*)w;
-  thread float x_thread[values_per_thread];
-  thread uint16_t packed[results_per_simdgroup][uint16_per_thread];
-  thread float scale_local[results_per_simdgroup];
-  thread float bias_local[results_per_simdgroup];
+  thread float x0_thread[values_per_thread];
+  thread float x1_thread[values_per_thread];
+  thread float x2_thread[values_per_thread];
+  thread float x3_thread[values_per_thread];
   thread float result0[results_per_simdgroup] = {0};
   thread float result1[results_per_simdgroup] = {0};
   thread float result2[results_per_simdgroup] = {0};
@@ -1618,35 +1622,26 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
 
   int k = 0;
   for (; k < in_vec_size - block_size; k += block_size) {
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      const device uint16_t* wl =
-          (const device uint16_t*)(ws + row * in_vec_size_w);
-      for (int i = 0; i < uint16_per_thread; i++) {
-        packed[row][i] = wl[i];
-      }
-      scale_local[row] = scales[row * in_vec_size_g];
-      bias_local[row] = biases[row * in_vec_size_g];
-    }
+    float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
+    float sum1 = load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
+    float sum2 = load_vector<T, float, values_per_thread, 4>(x2, x2_thread);
+    float sum3 = load_vector<T, float, values_per_thread, 4>(x3, x3_thread);
 
-    float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result0[row] += qdot_affine4_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
-    }
-    sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result1[row] += qdot_affine4_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
-    }
-    sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result2[row] += qdot_affine4_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
-    }
-    sum = load_vector<T, float, values_per_thread, 4>(x3, x_thread);
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result3[row] += qdot_affine4_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      const device T* sl = scales + row * in_vec_size_g;
+      const device T* bl = biases + row * in_vec_size_g;
+      float dot0;
+      float dot1;
+      float dot2;
+      float dot3;
+      qdot_affine4_quad<float, values_per_thread>(
+          wl, x0_thread, x1_thread, x2_thread, x3_thread, sl[0], bl[0],
+          sum0, sum1, sum2, sum3, dot0, dot1, dot2, dot3);
+      result0[row] += dot0;
+      result1[row] += dot1;
+      result2[row] += dot2;
+      result3[row] += dot3;
     }
 
     ws += block_size / 2;
@@ -1663,39 +1658,29 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
       0,
       values_per_thread);
   if (remaining > 0) {
+    float sum0 = load_vector_safe<T, float, values_per_thread, 4>(
+        x0, x0_thread, remaining);
+    float sum1 = load_vector_safe<T, float, values_per_thread, 4>(
+        x1, x1_thread, remaining);
+    float sum2 = load_vector_safe<T, float, values_per_thread, 4>(
+        x2, x2_thread, remaining);
+    float sum3 = load_vector_safe<T, float, values_per_thread, 4>(
+        x3, x3_thread, remaining);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      const device uint16_t* wl =
-          (const device uint16_t*)(ws + row * in_vec_size_w);
-      for (int i = 0; i < uint16_per_thread; i++) {
-        packed[row][i] = wl[i];
-      }
-      scale_local[row] = scales[row * in_vec_size_g];
-      bias_local[row] = biases[row * in_vec_size_g];
-    }
-
-    float sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x0, x_thread, remaining);
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result0[row] += qdot_affine4_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
-    }
-    sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x1, x_thread, remaining);
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result1[row] += qdot_affine4_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
-    }
-    sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x2, x_thread, remaining);
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result2[row] += qdot_affine4_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
-    }
-    sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x3, x_thread, remaining);
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result3[row] += qdot_affine4_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      const device T* sl = scales + row * in_vec_size_g;
+      const device T* bl = biases + row * in_vec_size_g;
+      float dot0;
+      float dot1;
+      float dot2;
+      float dot3;
+      qdot_affine4_quad<float, values_per_thread>(
+          wl, x0_thread, x1_thread, x2_thread, x3_thread, sl[0], bl[0],
+          sum0, sum1, sum2, sum3, dot0, dot1, dot2, dot3);
+      result0[row] += dot0;
+      result1[row] += dot1;
+      result2[row] += dot2;
+      result3[row] += dot3;
     }
   }
 
@@ -1712,7 +1697,6 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     }
   }
 }
-
 template <typename T, const int group_size, const int bits>
 METAL_FUNC void qmv_affine8_g64_pair_impl(
     const device uint32_t* w,
@@ -1804,168 +1788,6 @@ METAL_FUNC void qmv_affine8_g64_pair_impl(
     if (simd_lid == 0) {
       y0[row] = static_cast<T>(result0[row]);
       y1[row] = static_cast<T>(result1[row]);
-    }
-  }
-}
-
-// Four-row byte-weight-stream sharing for the affine8/g64 QMV, held to a
-// PAIR-SIZED register footprint, exactly as
-// qmv_affine4_g64_quad_stream_impl does for the nibble path. Same geometry as
-// qmv_affine8_g64_pair_impl: two simdgroups by four output rows per 64-thread
-// group, values_per_thread = 4, block_size = 128, scale_step_per_thread = 16,
-// same load_vector / load_vector_safe tail.
-//
-// The block's byte weights and scale/bias are fetched into registers ONCE and
-// the four cohort input rows then walk through a SINGLE four-value x buffer,
-// so only one row of x is live at a time. This is the reason an earlier
-// affine-8 quad that held all four rows of x live measured as a regression:
-// the residency, not the arithmetic. Each (output row, input row) pair keeps
-// its own accumulator, its own K-loop order and its own simd_sum, and
-// qdot_affine8_registered is the bits == 8 arm of qdot verbatim, so every
-// output element's add sequence is identical to stock qmv_impl -- only the
-// LOADS are shared.
-template <typename T, const int group_size, const int bits>
-METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
-    const device uint32_t* w,
-    const device T* scales,
-    const device T* biases,
-    const device T* x0,
-    const device T* x1,
-    const device T* x2,
-    const device T* x3,
-    device T* y0,
-    device T* y1,
-    device T* y2,
-    device T* y3,
-    const constant int& in_vec_size,
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
-  constexpr int num_simdgroups = 2;
-  constexpr int results_per_simdgroup = 4;
-  constexpr int values_per_thread = 4;
-  constexpr int block_size = values_per_thread * SIMD_SIZE;
-  constexpr int bytes_per_thread = 4;
-  constexpr int scale_step_per_thread = 16;
-
-  const device uint8_t* ws = (const device uint8_t*)w;
-  thread float x_thread[values_per_thread];
-  thread uint8_t packed[results_per_simdgroup][bytes_per_thread];
-  thread float scale_local[results_per_simdgroup];
-  thread float bias_local[results_per_simdgroup];
-  thread float result0[results_per_simdgroup] = {0};
-  thread float result1[results_per_simdgroup] = {0};
-  thread float result2[results_per_simdgroup] = {0};
-  thread float result3[results_per_simdgroup] = {0};
-
-  const int in_vec_size_w = in_vec_size;
-  const int in_vec_size_g = in_vec_size / 64;
-  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
-      simd_gid * results_per_simdgroup;
-
-  ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
-  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-  x0 += simd_lid * values_per_thread;
-  x1 += simd_lid * values_per_thread;
-  x2 += simd_lid * values_per_thread;
-  x3 += simd_lid * values_per_thread;
-  y0 += out_row;
-  y1 += out_row;
-  y2 += out_row;
-  y3 += out_row;
-
-  int k = 0;
-  for (; k < in_vec_size - block_size; k += block_size) {
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      const device uint8_t* wl = ws + row * in_vec_size_w;
-      for (int i = 0; i < bytes_per_thread; i++) {
-        packed[row][i] = wl[i];
-      }
-      scale_local[row] = scales[row * in_vec_size_g];
-      bias_local[row] = biases[row * in_vec_size_g];
-    }
-
-    float sum = load_vector<T, float, values_per_thread, 8>(x0, x_thread);
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result0[row] += qdot_affine8_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
-    }
-    sum = load_vector<T, float, values_per_thread, 8>(x1, x_thread);
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result1[row] += qdot_affine8_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
-    }
-    sum = load_vector<T, float, values_per_thread, 8>(x2, x_thread);
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result2[row] += qdot_affine8_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
-    }
-    sum = load_vector<T, float, values_per_thread, 8>(x3, x_thread);
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result3[row] += qdot_affine8_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
-    }
-
-    ws += block_size;
-    scales += block_size / 64;
-    biases += block_size / 64;
-    x0 += block_size;
-    x1 += block_size;
-    x2 += block_size;
-    x3 += block_size;
-  }
-
-  const int remaining = clamp(
-      static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
-      0,
-      values_per_thread);
-  if (remaining > 0) {
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      const device uint8_t* wl = ws + row * in_vec_size_w;
-      for (int i = 0; i < bytes_per_thread; i++) {
-        packed[row][i] = wl[i];
-      }
-      scale_local[row] = scales[row * in_vec_size_g];
-      bias_local[row] = biases[row * in_vec_size_g];
-    }
-
-    float sum =
-        load_vector_safe<T, float, values_per_thread, 8>(x0, x_thread, remaining);
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result0[row] += qdot_affine8_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
-    }
-    sum =
-        load_vector_safe<T, float, values_per_thread, 8>(x1, x_thread, remaining);
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result1[row] += qdot_affine8_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
-    }
-    sum =
-        load_vector_safe<T, float, values_per_thread, 8>(x2, x_thread, remaining);
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result2[row] += qdot_affine8_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
-    }
-    sum =
-        load_vector_safe<T, float, values_per_thread, 8>(x3, x_thread, remaining);
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result3[row] += qdot_affine8_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
-    }
-  }
-
-  for (int row = 0; row < results_per_simdgroup; row++) {
-    result0[row] = simd_sum(result0[row]);
-    result1[row] = simd_sum(result1[row]);
-    result2[row] = simd_sum(result2[row]);
-    result3[row] = simd_sum(result3[row]);
-    if (simd_lid == 0) {
-      y0[row] = static_cast<T>(result0[row]);
-      y1[row] = static_cast<T>(result1[row]);
-      y2[row] = static_cast<T>(result2[row]);
-      y3[row] = static_cast<T>(result3[row]);
     }
   }
 }
@@ -2704,33 +2526,17 @@ template <typename T, const int group_size, const int bits, bool batched>
       ntg.z == 1 && in_vec_size % 64 == 0 && out_vec_size >= 8 &&
       out_vec_size % 8 == 0) {
     // The ruled decode cohort presents eight input rows to ordinary QMV.
-    if (out_vec_size >= 1024) {
-      // WIDE-N tier -- every non-`fast` 4-bit decode plane on this model:
-      // full-attention k_proj N = 1024 (k_eq_v), k/v_proj N = 2048, sliding
-      // q_proj N = 4096, full q_proj N = 8192, tied lm_head N = 262144. K is
-      // 2816, not a multiple of 512, so none of these reach affine_qmv_fast
-      // and its cross-row family; before this they ran two-row pair (and, at
-      // N >= 8192, a four-row quad that held 32 floats of x live and lost to
-      // the pair it replaced).
-      //
-      // One packed-weight stream feeds FOUR cohort rows in two active x-groups
-      // (4+4); the remaining host groups return. Per-row qdot, K-loop and
-      // simd_sum keep the stock qmv_impl sequence for every output element --
-      // only loads are shared.
-      //
-      // Measured on the ranked box (M4 Pro, B = 8, streamed weight pool so
-      // every dispatch pulls from DRAM), us/dispatch, incumbent -> this:
-      //   N = 1024   27.3 -> 26.1     N = 2048   54.1 -> 51.3
-      //   N = 4096  106.7 -> 101.6    N = 8192  233.6 -> 201.5
-      // The floor sits at 1024 because that is the smallest plane measured to
-      // convert; below it (router.proj N = 128) two active x-groups leave only
-      // (N / 8) * 2 threadgroups and the promoted pair kernel is kept
-      // byte-for-byte.
+    if (out_vec_size >= 8192) {
+      // LARGE-N tier (full q_proj N = 8192, tied lm_head N = 262144): these
+      // planes are weight-bandwidth bound, so one packed-weight stream feeds
+      // FOUR cohort rows in two active x-groups (4+4); the remaining host
+      // groups return. Per-row qdot, K-loop, and simd_sum keep the stock
+      // qmv_impl sequence for every output element -- only loads are shared.
       const int first_m = int(tid.x) * 4;
       if (first_m >= 8) {
         return;
       }
-      qmv_affine4_g64_quad_stream_impl<T, 64, 4>(
+      qmv_affine4_g64_quad_impl<T, 64, 4>(
           w,
           scales,
           biases,
@@ -2772,43 +2578,8 @@ template <typename T, const int group_size, const int bits, bool batched>
   if (!batched && group_size == 64 && bits == 8 && ntg.x == 8 &&
       ntg.z == 1 && in_vec_size % 64 == 0 && out_vec_size >= 8 &&
       out_vec_size % 8 == 0) {
-    // Dense decode projections use byte weights.
-    if (out_vec_size >= 1024) {
-      // WIDE-N tier -- the dense MLP of all 30 layers: gate_proj and up_proj
-      // N = 2112 over K = 2816, down_proj N = 2816 over K = 2112. One
-      // byte-weight stream feeds FOUR cohort rows in two active x-groups
-      // (4+4); the remaining host groups return, and per-row qdot, K-loop and
-      // simd_sum stay the stock qmv_impl sequence.
-      //
-      // Measured on the ranked box (M4 Pro, B = 8, streamed weight pool),
-      // us/dispatch, incumbent pair -> this:
-      //   N = 2112 (gate/up)  64.4 -> 56.2     N = 2816 (down)  67.4 -> 59.0
-      // Same 1024 floor as the nibble tier, which keeps router.proj (N = 128)
-      // on the promoted pair kernel byte-for-byte.
-      const int first_m = int(tid.x) * 4;
-      if (first_m >= 8) {
-        return;
-      }
-      qmv_affine8_g64_quad_stream_impl<T, 64, 8>(
-          w,
-          scales,
-          biases,
-          x + first_m * in_vec_size,
-          x + (first_m + 1) * in_vec_size,
-          x + (first_m + 2) * in_vec_size,
-          x + (first_m + 3) * in_vec_size,
-          y + first_m * out_vec_size,
-          y + (first_m + 1) * out_vec_size,
-          y + (first_m + 2) * out_vec_size,
-          y + (first_m + 3) * out_vec_size,
-          in_vec_size,
-          tid,
-          simd_gid,
-          simd_lid);
-      return;
-    }
-    // Pair adjacent cohort rows so each weight byte feeds both exact per-row
-    // dot-product streams.
+    // Dense decode projections use byte weights. Pair adjacent cohort rows so
+    // each weight byte feeds both exact per-row dot-product streams.
     const int first_m = int(tid.x) * 2;
     if (first_m >= 8) {
       return;

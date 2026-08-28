@@ -22,18 +22,6 @@ import MLX
 /// Namespace for the v1 (per-row SDPA) attention dispatch.
 enum CBv2AttentionV1 {
 
-    /// Kill switch for the fused full-ring decode write (see
-    /// `CBv2RaggedTwoPassDecodeAttentionV1.attendRingWriting`).
-    /// `0`/`false`/`no`/`off` restores the established `decodeRingWrite` +
-    /// `attendRing` pair, which also stays the fallback for every input the
-    /// fused path refuses.
-    private static let fusedRingWriteEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_FUSED_RING_WRITE"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
     /// Query-block width for multi-token prompt attention (see
     /// `attendQueryBlocks`). Smaller blocks execute strictly less attention
     /// work and hold a smaller score tensor, but cost one dispatch set each;
@@ -234,8 +222,7 @@ enum CBv2AttentionV1 {
         scale: Float, sinks: MLXArray?, softcap: Float? = nil,
         spanContexts: [CBv2SpanChunkContext?]? = nil,
         serializeQueries: Bool = false,
-        decodeRingWriteFence: CBv2DecodeRingWriteFence? = nil,
-        allowFusedRingWrite: Bool = false
+        ringStarts: MLXArray? = nil
     ) -> MLXArray {
         let B = queries.dim(0)
         let L = queries.dim(2)
@@ -282,44 +269,6 @@ enum CBv2AttentionV1 {
                 cachedValueRows.reserveCapacity(B)
                 let ringRows = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
                 if ringRows.count == B && ringRows.allSatisfy({ $0.decodeRingView != nil }) {
-                    // WRITE-016: fold this step's one-token ring write into
-                    // ring pass A. The separate `decodeRingWrite` below is a
-                    // `SliceUpdate` over a 4 MiB allocation the direct-ring
-                    // attention graph still retains, so it cannot generally
-                    // donate: 4 KiB of new K/V costs a full-ring copy, 25
-                    // sliding layers x 8 rows x K/V per forward. The fused
-                    // pass A stores the same bytes into the same evicted slot
-                    // in place and serves logical token 1023 from the new K/V
-                    // arrays, so no block reads the slot it writes and the
-                    // accumulation order is unchanged. Refused (and skipped
-                    // entirely, write included) unless the storage-owning
-                    // layer has no K/V borrower that must keep observing the
-                    // pre-write allocation.
-                    if fusedRingWriteEnabled, allowFusedRingWrite,
-                        let decodeRingWriteFence
-                    {
-                        let preWrite = ringRows.compactMap { $0.decodeRingViewBeforeWrite }
-                        if preWrite.count == B,
-                            let fused = CBv2RaggedTwoPassDecodeAttentionV1
-                                .attendRingWriting(
-                                    queries: queries,
-                                    newKeys: keys, newValues: values,
-                                    keys: preWrite.map(\.keys),
-                                    values: preWrite.map(\.values),
-                                    starts: preWrite.map(\.start),
-                                    previousWriteFence: decodeRingWriteFence.value,
-                                    scale: scale,
-                                    slidingWindowLength: ringRows[0].window)
-                        {
-                            for row in ringRows {
-                                row.advanceDecodeRingAfterFusedWrite()
-                            }
-                            decodeRingWriteFence.value = fused.nextWriteFence
-                            CBv2EngageMark.once("write016")
-                            return fused.output
-                        }
-                    }
-
                     for (index, row) in ringRows.enumerated() {
                         row.decodeRingWrite(
                             keys: keys[index ..< (index + 1)],
@@ -330,7 +279,8 @@ enum CBv2AttentionV1 {
                         let output = CBv2RaggedTwoPassDecodeAttentionV1.attendRing(
                             queries: queries, keys: views.map(\.keys),
                             values: views.map(\.values), starts: views.map(\.start),
-                            scale: scale, slidingWindowLength: ringRows[0].window)
+                            scale: scale, slidingWindowLength: ringRows[0].window,
+                            prebuiltStarts: ringStarts)
                     {
                         return output
                     }

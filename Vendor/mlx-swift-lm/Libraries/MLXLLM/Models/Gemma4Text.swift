@@ -246,6 +246,20 @@ private let gemma4SafeGeluProduct: @Sendable (
     return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
 
+/// Post-feedforward residual addition and the layer-scalar multiply in one
+/// compiled graph. Operation order remains `(residual + branch) * scale`.
+/// The production checkpoint has no PLE branch, so this is its terminal
+/// elementwise seam on every decoder layer.
+private let gemma4PostFFResidualScale: @Sendable (
+    MLXArray, MLXArray, MLXArray
+) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = {
+        (residual: MLXArray, branch: MLXArray, scale: MLXArray) -> MLXArray in
+        (residual + branch) * scale
+    }
+    return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
+}()
+
 /// Final-logit softcap (`tanh(x / cap) * cap`) fused into one Metal dispatch
 /// (vMLX `compiledLogitSoftcap`). The untyped (float32) cap keeps the softcap
 /// math — and the logits handed to the sampler — full precision.
@@ -1827,8 +1841,7 @@ public class Gemma4DecoderLayer: Module {
             out = mlp(out)
         }
 
-        out = postFeedforwardLayernorm(out)
-        out = residual2 + out
+        let postFeedforward = postFeedforwardLayernorm(out)
 
         // PLE gating
         if let gate = perLayerInputGate,
@@ -1836,6 +1849,7 @@ public class Gemma4DecoderLayer: Module {
             let norm = postPerLayerInputNorm,
             let perLayerInput = activePerLayerInput
         {
+            out = residual2 + postFeedforward
             let residual3 = out
             var g = gate(out)
             g = gemma4SafeGeluApproximate(g)
@@ -1843,9 +1857,11 @@ public class Gemma4DecoderLayer: Module {
             g = proj(g)
             g = norm(g)
             out = residual3 + g
+            out = out * layerScalar
+        } else {
+            out = gemma4PostFFResidualScale(
+                residual2, postFeedforward, layerScalar)
         }
-
-        out = out * layerScalar
 
         return (out, kvPair, attnPositionOffset)
     }

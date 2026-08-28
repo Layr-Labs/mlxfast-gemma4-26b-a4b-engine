@@ -2772,6 +2772,54 @@ template <typename T, const int group_size, const int bits, bool batched>
         simd_lid);
     return;
   }
+  if (!batched && group_size == 64 && bits == 4 && ntg.x == 16 &&
+      ntg.z == 1 && in_vec_size % 64 == 0 && out_vec_size >= 8 &&
+      out_vec_size % 8 == 0) {
+    // MTP verify cohort at draft depth=1 presents 16 input rows
+    // (B=8 decode batch x (1+1) verify columns). One packed-weight stream
+    // feeds FOUR cohort rows per active x-group; the remaining host groups
+    // (first_m >= 16) return immediately.
+    if (out_vec_size >= 1024) {
+      const int first_m = int(tid.x) * 4;
+      if (first_m >= 16) {
+        return;
+      }
+      qmv_affine4_g64_quad_stream_impl<T, 64, 4>(
+          w,
+          scales,
+          biases,
+          x + first_m * in_vec_size,
+          x + (first_m + 1) * in_vec_size,
+          x + (first_m + 2) * in_vec_size,
+          x + (first_m + 3) * in_vec_size,
+          y + first_m * out_vec_size,
+          y + (first_m + 1) * out_vec_size,
+          y + (first_m + 2) * out_vec_size,
+          y + (first_m + 3) * out_vec_size,
+          in_vec_size,
+          tid,
+          simd_gid,
+          simd_lid);
+      return;
+    }
+    const int first_m = int(tid.x) * 2;
+    if (first_m >= 16) {
+      return;
+    }
+    qmv_affine4_g64_pair_impl<T, 64, 4>(
+        w,
+        scales,
+        biases,
+        x + first_m * in_vec_size,
+        x + (first_m + 1) * in_vec_size,
+        y + first_m * out_vec_size,
+        y + (first_m + 1) * out_vec_size,
+        in_vec_size,
+        tid,
+        simd_gid,
+        simd_lid);
+    return;
+  }
   if (!batched && group_size == 64 && bits == 8 && ntg.x == 8 &&
       ntg.z == 1 && in_vec_size % 64 == 0 && out_vec_size >= 8 &&
       out_vec_size % 8 == 0) {
@@ -2814,6 +2862,51 @@ template <typename T, const int group_size, const int bits, bool batched>
     // dot-product streams.
     const int first_m = int(tid.x) * 2;
     if (first_m >= 8) {
+      return;
+    }
+    qmv_affine8_g64_pair_impl<T, 64, 8>(
+        w,
+        scales,
+        biases,
+        x + first_m * in_vec_size,
+        x + (first_m + 1) * in_vec_size,
+        y + first_m * out_vec_size,
+        y + (first_m + 1) * out_vec_size,
+        in_vec_size,
+        tid,
+        simd_gid,
+        simd_lid);
+    return;
+  }
+  if (!batched && group_size == 64 && bits == 8 && ntg.x == 16 &&
+      ntg.z == 1 && in_vec_size % 64 == 0 && out_vec_size >= 8 &&
+      out_vec_size % 8 == 0) {
+    // Dense decode projections: MTP verify at depth=1 presents 16 rows.
+    if (out_vec_size >= 1024) {
+      const int first_m = int(tid.x) * 4;
+      if (first_m >= 16) {
+        return;
+      }
+      qmv_affine8_g64_quad_stream_impl<T, 64, 8>(
+          w,
+          scales,
+          biases,
+          x + first_m * in_vec_size,
+          x + (first_m + 1) * in_vec_size,
+          x + (first_m + 2) * in_vec_size,
+          x + (first_m + 3) * in_vec_size,
+          y + first_m * out_vec_size,
+          y + (first_m + 1) * out_vec_size,
+          y + (first_m + 2) * out_vec_size,
+          y + (first_m + 3) * out_vec_size,
+          in_vec_size,
+          tid,
+          simd_gid,
+          simd_lid);
+      return;
+    }
+    const int first_m = int(tid.x) * 2;
+    if (first_m >= 16) {
       return;
     }
     qmv_affine8_g64_pair_impl<T, 64, 8>(

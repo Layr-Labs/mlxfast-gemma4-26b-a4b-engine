@@ -1301,13 +1301,15 @@ public enum Gemma4RouterProbe {
 /// (plus the contiguous copy the strided index slice forces downstream)
 /// collapse into one 8-threadgroup kernel.
 ///
-/// Exactness (counting-predecessors lemma): `ArgPartition::eval_gpu` on Metal
+/// Exactness (stable-tail lemma): `ArgPartition::eval_gpu` on Metal
 /// is `gpu_merge_sort(argsort=true)` — a FULL stable merge sort (sort.cpp) —
-/// so the sliced `[kth...]` output is the stable ascending argsort tail. Under
-/// sort.h's `LessThan` comparator (NaN ordered after every non-NaN, ties kept
-/// in original index order by stability) each element's stable-sort position
-/// equals its predecessor count, which the kernel evaluates directly; the
-/// selected values then run a verbatim transcription of
+/// so the sliced `[kth...]` output is the stable ascending argsort tail. The
+/// kernel selects that tail from greatest to least, breaking equal values by
+/// greater original index, then writes the eight winners in reverse. Under
+/// sort.h's `LessThan` comparator (NaN ordered after every non-NaN), this is
+/// exactly the stable ascending tail, including NaNs and signed-zero ties.
+/// Selection is O(E*K), replacing the v1 predecessor-counting O(E*E) work.
+/// The selected values then run a verbatim transcription of
 /// `softmax_single_row<bfloat16_t, float, N_READS=4>` (softmax.h — same lane
 /// layout, same `Limits<float>::min` padding, same `fast::exp`, same
 /// `simd_max`/`simd_sum` reduction order on one 32-thread simdgroup) and the
@@ -1322,16 +1324,13 @@ public enum Gemma4RouterProbe {
 /// bit-identical there too). Kill switch:
 /// `DARKBLOOM_GEMMA4_FUSED_ROUTER_TOP8=0`.
 private enum Gemma4FusedRouterTop8 {
-    /// DEFAULT OFF (`DARKBLOOM_GEMMA4_FUSED_ROUTER_TOP8=1` enables): the
-    /// fused chain is bit-exact (113/113 adversarial parity) but measured
-    /// +~0.1 ms/round inside the +0.27 ms consolidation cost of three
-    /// counterbalanced local B=8 probe pairs — dispatch deletion does not
-    /// pay while the concurrent encoder overlaps these small kernels.
+    /// Default on for the exact production decode geometry. Set
+    /// `DARKBLOOM_GEMMA4_FUSED_ROUTER_TOP8=0` for the established MLX chain.
     static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_FUSED_ROUTER_TOP8"]
-        else { return false }
-        return ["1", "true", "yes", "on"].contains(raw.lowercased())
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
     private static let rows = 8
@@ -1339,60 +1338,107 @@ private enum Gemma4FusedRouterTop8 {
     private static let selected = 8
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_fused_router_top8_e128_k8_bf16_v1",
+        name: "gemma4_fused_router_top8_e128_k8_bf16_v2",
         inputNames: ["scores", "pes"],
         outputNames: ["inds", "wts"],
         source: """
             constexpr int SIMD_SIZE = 32;
             constexpr int N_READS = 4;
-            constexpr int KTH = E - K;
 
             const int row = int(threadgroup_position_in_grid.x);
             const int lid = int(thread_position_in_threadgroup.x);
 
-            threadgroup float vals[E];
             threadgroup float topv[K];
             threadgroup uint topi[K];
+            threadgroup float candidate_values[SIMD_SIZE];
+            threadgroup uint candidate_indices[SIMD_SIZE];
+            threadgroup uint winner_index;
             threadgroup float local_max[SIMD_SIZE];
             threadgroup float local_normalizer[SIMD_SIZE];
 
             const device T* srow = scores + row * E;
-            for (int i = lid; i < E; i += SIMD_SIZE) {
-                vals[i] = float(srow[i]);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            // Stable-argsort position by predecessor counting under sort.h's
-            // LessThan comparator (NaN orders after every non-NaN; ties keep
-            // the original index order because the merge sort is stable).
-            // Position == #{i : less(v_i, v_e)} + #{i < e : neither less} —
-            // a permutation, so the writes below never collide.
+            thread float lane_values[E / SIMD_SIZE];
+            thread bool lane_selected[E / SIMD_SIZE];
             for (int j = 0; j < E / SIMD_SIZE; ++j) {
-                const int e = lid + j * SIMD_SIZE;
-                const float v = vals[e];
-                const bool v_nan = isnan(v);
-                int rank = 0;
-                for (int i = 0; i < E; ++i) {
-                    const float u = vals[i];
-                    const bool u_nan = isnan(u);
-                    bool u_less_v;
-                    bool v_less_u;
-                    if (u_nan || v_nan) {
-                        u_less_v = !u_nan && v_nan;
-                        v_less_u = !v_nan && u_nan;
-                    } else {
-                        u_less_v = u < v;
-                        v_less_u = v < u;
+                lane_values[j] = float(srow[lid + j * SIMD_SIZE]);
+                lane_selected[j] = false;
+            }
+
+            // Repeatedly select the stable tail's greatest remaining item.
+            // Equal values select the greater original index first because
+            // winners are written from K-1 down to 0. NaN is greater than
+            // every non-NaN, exactly matching sort.h's LessThan comparator.
+            for (int pick = 0; pick < K; ++pick) {
+                uint best_index = 0xffffffffu;
+                float best_value = 0.0f;
+                for (int j = 0; j < E / SIMD_SIZE; ++j) {
+                    if (lane_selected[j]) continue;
+                    const uint candidate_index = uint(lid + j * SIMD_SIZE);
+                    const float candidate_value = lane_values[j];
+                    bool candidate_after = best_index == 0xffffffffu;
+                    if (!candidate_after) {
+                        const bool candidate_nan = isnan(candidate_value);
+                        const bool best_nan = isnan(best_value);
+                        if (candidate_nan || best_nan) {
+                            candidate_after = candidate_nan && !best_nan;
+                        } else {
+                            candidate_after = best_value < candidate_value;
+                        }
+                        if (!candidate_after) {
+                            const bool best_before = candidate_nan || best_nan
+                                ? best_nan && !candidate_nan
+                                : candidate_value < best_value;
+                            candidate_after = !best_before
+                                && candidate_index > best_index;
+                        }
                     }
-                    if (u_less_v || (!v_less_u && i < e)) {
-                        ++rank;
+                    if (candidate_after) {
+                        best_index = candidate_index;
+                        best_value = candidate_value;
                     }
                 }
-                if (rank >= KTH) {
-                    const int p = rank - KTH;
-                    inds[row * K + p] = uint(e);
-                    topi[p] = uint(e);
-                    topv[p] = v;
+
+                candidate_indices[lid] = best_index;
+                candidate_values[lid] = best_value;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (lid == 0) {
+                    for (int lane = 1; lane < SIMD_SIZE; ++lane) {
+                        const uint candidate_index = candidate_indices[lane];
+                        const float candidate_value = candidate_values[lane];
+                        bool candidate_after = best_index == 0xffffffffu;
+                        if (candidate_index != 0xffffffffu && !candidate_after) {
+                            const bool candidate_nan = isnan(candidate_value);
+                            const bool best_nan = isnan(best_value);
+                            if (candidate_nan || best_nan) {
+                                candidate_after = candidate_nan && !best_nan;
+                            } else {
+                                candidate_after = best_value < candidate_value;
+                            }
+                            if (!candidate_after) {
+                                const bool best_before = candidate_nan || best_nan
+                                    ? best_nan && !candidate_nan
+                                    : candidate_value < best_value;
+                                candidate_after = !best_before
+                                    && candidate_index > best_index;
+                            }
+                        }
+                        if (candidate_index != 0xffffffffu && candidate_after) {
+                            best_index = candidate_index;
+                            best_value = candidate_value;
+                        }
+                    }
+
+                    const int position = K - 1 - pick;
+                    winner_index = best_index;
+                    inds[row * K + position] = best_index;
+                    topi[position] = best_index;
+                    topv[position] = best_value;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (int j = 0; j < E / SIMD_SIZE; ++j) {
+                    if (uint(lid + j * SIMD_SIZE) == winner_index) {
+                        lane_selected[j] = true;
+                    }
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);

@@ -345,7 +345,13 @@ public final class DFlashDraftModel: Module, @unchecked Sendable {
     /// 1. The per-arm behaviour differs. MTP adapts up to its ceiling each round.
     /// DFlash proposes a fixed block of this size. The constant you edit is the
     /// same on both arms.
-    public static let submissionDraftDepth = 1
+    // Block diffusion draws one whole block per round, so the depth is the
+    // block width the drafter was trained for, not an adaptive ceiling. The
+    // staged drafter's `config.json` declares `block_size: 16`, and
+    // `gemma4DFlashMaxDepth` clamps to `recommendedBlockSize - 1` = 15, which
+    // the engine ceiling also allows. 1 drafts a single token per round and
+    // leaves the block-diffusion head almost entirely unused.
+    public static let submissionDraftDepth = 15
 
     /// The pure DFlash depth clamp. A requested draft depth, bounded by the
     /// drafter ceiling and the engine ceiling, floored at 1. A value above a

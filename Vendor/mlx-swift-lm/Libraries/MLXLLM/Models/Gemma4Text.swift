@@ -224,6 +224,20 @@ private let gemma4SafeGeluApproximate: @Sendable (MLXArray) -> MLXArray = {
     return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
 
+/// Layer-tail residual add and layer-scalar application in one compiled
+/// graph. Keep the explicit `(residual + branch) * scale` order: the compiled
+/// path fuses graph/dispatch work without reassociating either elementwise
+/// operation.
+private let gemma4CompiledResidualScale: @Sendable (
+    MLXArray, MLXArray, MLXArray
+) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = {
+        (residual: MLXArray, branch: MLXArray, scale: MLXArray) -> MLXArray in
+        (residual + branch) * scale
+    }
+    return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
+}()
+
 /// Safe approximate GELU and its following dense-MLP product in one compiled
 /// graph. Operation order matches `gemma4SafeGeluApproximate(gate) * up`.
 private let gemma4SafeGeluProduct: @Sendable (
@@ -1814,8 +1828,7 @@ public class Gemma4DecoderLayer: Module {
             out = mlp(out)
         }
 
-        out = postFeedforwardLayernorm(out)
-        out = residual2 + out
+        let postFF = postFeedforwardLayernorm(out)
 
         // PLE gating
         if let gate = perLayerInputGate,
@@ -1823,6 +1836,7 @@ public class Gemma4DecoderLayer: Module {
             let norm = postPerLayerInputNorm,
             let perLayerInput = activePerLayerInput
         {
+            out = residual2 + postFF
             let residual3 = out
             var g = gate(out)
             g = gemma4SafeGeluApproximate(g)
@@ -1830,9 +1844,13 @@ public class Gemma4DecoderLayer: Module {
             g = proj(g)
             g = norm(g)
             out = residual3 + g
+            out = out * layerScalar
+        } else {
+            // No PLE on this configuration: fuse the residual add and the
+            // layer scalar into one compiled dispatch, preserving
+            // `(residual2 + postFF) * layerScalar` order exactly.
+            out = gemma4CompiledResidualScale(residual2, postFF, layerScalar)
         }
-
-        out = out * layerScalar
 
         return (out, kvPair, attnPositionOffset)
     }

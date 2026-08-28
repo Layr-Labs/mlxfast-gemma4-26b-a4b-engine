@@ -1147,6 +1147,86 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
         return (lastHidden, logits)
     }
 
+    /// Run preProjection → drafter layers → `model.norm` → `postProjection`
+    /// and return the pre-LM-head hidden. The drafter's `forwardProjected`
+    /// always applies the LM head; this variant stops before it so the CBv2
+    /// drafter can batch the LM head across the k<=3 speculative envelope
+    /// (DLMB). Shape: `[B, 1, hidden]`.
+    ///
+    /// The drafter layers consume the shared KV (no cache writes) and the
+    /// per-step Q-only SDPA runs once per call — same path as
+    /// `forwardProjected`, just no LM head at the tail.
+    internal func forwardProjectedNoHead(
+        _ projected: MLXArray,
+        sharedKV: Gemma4SharedKV,
+        positionOffset: Gemma4.PositionOffset,
+        masks: Gemma4DrafterMasks
+    ) -> (preHeadHidden: MLXArray, lastHidden: MLXArray) {
+        let textCfg = config.textConfig
+        var h = projected
+        for (i, layer) in model.layers.enumerated() {
+            let layerType = textCfg.layerTypes[i]
+            let kv: (MLXArray, MLXArray)
+            let mask: MLXFast.ScaledDotProductAttentionMaskMode
+            switch layerType {
+            case "full_attention":
+                kv = sharedKV.fullAttention
+                mask = masks.full
+            case "sliding_attention":
+                kv = sharedKV.slidingAttention
+                mask = masks.sliding
+            default:
+                preconditionFailure(
+                    "Gemma4AssistantDraftModel: unexpected layerType '\(layerType)' at "
+                    + "layer \(i). Compat validation should have rejected this."
+                )
+            }
+            let (out, _, _) = layer(
+                h,
+                mask: mask,
+                cache: nil,
+                perLayerInput: nil,
+                sharedKV: kv,
+                positionOffset: positionOffset
+            )
+            h = out
+        }
+        h = model.norm(h)
+        let lastHidden = postProjection(h)
+        // `h` here is the pre-LM-head hidden; the caller batched-projects it.
+        return (preHeadHidden: h, lastHidden: lastHidden)
+    }
+
+    /// Apply the LM head to a batched `[N, hidden]` hidden-states tensor in
+    /// one dispatch. The LM head dispatch mirrors `applyLMHead`: masked
+    /// centroid, explicit `lm_head`, or tied to `embed_tokens`. No softcap.
+    ///
+    /// `applyLMHead` is private; this is the public seam the CBv2 drafter
+    /// uses to batch the projection across k positions. For the
+    /// masked-centroid path the embedder is naturally `[B, L, hidden] → [B,
+    /// L, vocab]`, so calling it with `[N, hidden]` (reshaped to `[N, 1,
+    /// hidden]`) and reshaping the output back to `[N, vocab]` is
+    /// semantically identical to k separate calls — just one matmul
+    /// dispatch instead of k.
+    internal func batchedApplyLMHead(_ hidden: MLXArray) -> MLXArray {
+        let shape = hidden.shape
+        precondition(shape.count == 2,
+            "Gemma4AssistantDraftModel.batchedApplyLMHead: expected [N, hidden], got \(shape)")
+        let hidden3D = hidden.reshaped([shape[0], 1, shape[1]])
+        let logits3D: MLXArray
+        if let maskedEmbedder {
+            logits3D = maskedEmbedder(
+                hiddenStates: hidden3D,
+                lmHeadWeight: model.embedTokens.weight)
+        } else if let lmHead {
+            logits3D = lmHead(hidden3D)
+        } else {
+            logits3D = model.embedTokens.asLinear(hidden3D)
+        }
+        let vocab = logits3D.dim(-1)
+        return logits3D.reshaped([shape[0], vocab])
+    }
+
     /// Dispatch the LM head: masked-centroid if `useOrderedEmbeddings`,
     /// tied otherwise (unless an explicit `lm_head` is present).
     /// No softcap.

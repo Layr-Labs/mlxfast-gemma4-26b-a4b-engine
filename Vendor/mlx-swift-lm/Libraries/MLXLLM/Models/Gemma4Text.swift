@@ -78,6 +78,19 @@ private let gemma4PrefillTailRows: Int = {
     return max(0, value)
 }()
 
+/// Decode-only approximation for the ranked B=8 cohort. The router still
+/// computes the checkpoint's exact top-8 selection and exact top-8 weights,
+/// then omits only the weakest selected assignment before expert projection.
+/// Keeping the surviving seven weights unchanged minimizes the perturbation:
+/// there is no top-7 re-normalization and prefill remains on the exact top-8
+/// path. Set `DARKBLOOM_GEMMA4_DECODE_TOP7=0` to disable.
+private let gemma4DecodeTop7Enabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DECODE_TOP7"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// Parse the independent direct expert-reduction control, which is ON by
 /// default: the coupled weighted-unsort + safe-R1 pair is what was measured
 /// faster, and the ranked box sets no environment.
@@ -1535,14 +1548,20 @@ private class Gemma4Router: Module {
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
+    func callAsFunction(
+        _ x: MLXArray,
+        pruneWeakestDecodeExpert: Bool = false
+    ) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
         let normed = MLXFast.rmsNorm(x, weight: scale * rootSize, eps: eps)
         let expertScores = proj(normed)
+        let useDecodeTop7 =
+            gemma4DecodeTop7Enabled && pruneWeakestDecodeExpert && topK == 8
+            && x.ndim == 3 && x.shape == [8, 1, 2816]
 
         // ROUTE-001: single-dispatch byte-identical replacement of the chain
         // below for the B=8 decode geometry. Every other geometry, dtype, or
         // the kill switch falls through to the established chain.
-        if let fused = Gemma4FusedRouterTop8.apply(
+        if !useDecodeTop7, let fused = Gemma4FusedRouterTop8.apply(
             expertScores: expertScores, perExpertScale: perExpertScale, topK: topK)
         {
             Gemma4RouterProbe.recorder?(expertScores, fused.indices)
@@ -1556,6 +1575,15 @@ private class Gemma4Router: Module {
         var topKWeights = MLX.takeAlong(expertScores, topKIndices, axis: -1)
         topKWeights = MLX.softmax(topKWeights, axis: -1, precise: true)
         topKWeights = topKWeights * perExpertScale[topKIndices]
+
+        if useDecodeTop7 {
+            // ArgPartition's Metal implementation is a stable full sort, so
+            // the first entry in the selected ascending tail is the weakest.
+            // Slice only after the exact top-8 softmax and scale multiply so
+            // the seven retained assignments keep their baseline weights.
+            topKIndices = topKIndices[.ellipsis, 1...]
+            topKWeights = topKWeights[.ellipsis, 1...]
+        }
 
         // Diagnostic-only observability (nil in production; see
         // `Gemma4RouterProbe`). Recording the PRE-selection scores and the
@@ -1785,7 +1813,12 @@ public class Gemma4DecoderLayer: Module {
             h1 = mlp(h1)
             h1 = postFeedforwardLayernorm1(h1)
 
-            let (topKIndices, topKWeights) = router(out)
+            let (topKIndices, topKWeights) = router(
+                out,
+                // Prompt work, including the narrowed final prompt layer,
+                // remains exact top-8. Only the true B=8 single-token decode
+                // cohort is eligible for weakest-assignment pruning.
+                pruneWeakestDecodeExpert: !isExpertPrefill)
             var h2 = preFeedforwardLayernorm2(out)
             h2 = experts(
                 h2,

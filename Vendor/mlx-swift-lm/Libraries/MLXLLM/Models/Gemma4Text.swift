@@ -236,6 +236,176 @@ private let gemma4CompiledLogitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArr
     return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
 
+private let gemma4SoftcapArgmaxEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "MLX_GEMMA4_FUSED_SOFTCAP_ARGMAX"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// Exact terminal operation for the scored B=8 greedy decode shape. BF16 is
+/// discrete and softcap is monotone, so a raw maximum whose immediate BF16
+/// predecessor maps lower is already the exact softcapped argmax. Saturated
+/// or otherwise-colliding winners fall back to the full precise-tanh scan.
+/// This preserves first-index ties while avoiding the complete `[8, 262144]`
+/// softcapped intermediate and, on ordinary logits, every per-item tanh.
+private let gemma4SoftcapArgmaxKernel = MLXFast.metalKernel(
+    name: "gemma4_adaptive_softcap_argmax_b8_v262144",
+    inputNames: ["logits"],
+    outputNames: ["tokens"],
+    source: """
+        const uint lane = thread_index_in_simdgroup;
+        const uint simd_group = simdgroup_index_in_threadgroup;
+        const uint local = thread_position_in_threadgroup.x;
+        const uint row = threadgroup_position_in_grid.x;
+
+        constexpr uint width = 262144;
+        constexpr uint reads = 16;
+        constexpr uint group_width = 1024;
+        constexpr float cap = 30.0f;
+
+        float best_value = -metal::numeric_limits<float>::infinity();
+        uint best_index = 0;
+        for (uint block = 0; block < width / (reads * group_width); ++block) {
+            const uint first = block * reads * group_width + local * reads;
+            for (uint read = 0; read < reads; ++read) {
+                const uint index = first + read;
+                const float value = (float)logits[row * width + index];
+                if (value > best_value) {
+                    best_value = value;
+                    best_index = index;
+                }
+            }
+        }
+
+        for (uint offset = 16; offset > 0; offset /= 2) {
+            const float neighbor_value = simd_shuffle_down(best_value, offset);
+            const uint neighbor_index = simd_shuffle_down(best_index, offset);
+            if (best_value < neighbor_value
+                || (best_value == neighbor_value && best_index > neighbor_index)) {
+                best_value = neighbor_value;
+                best_index = neighbor_index;
+            }
+        }
+
+        threadgroup float group_values[32];
+        threadgroup uint group_indices[32];
+        threadgroup uint fallback;
+        if (lane == 0) {
+            group_values[simd_group] = best_value;
+            group_indices[simd_group] = best_index;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group == 0) {
+            best_value = group_values[lane];
+            best_index = group_indices[lane];
+            for (uint offset = 16; offset > 0; offset /= 2) {
+                const float neighbor_value = simd_shuffle_down(best_value, offset);
+                const uint neighbor_index = simd_shuffle_down(best_index, offset);
+                if (best_value < neighbor_value
+                    || (best_value == neighbor_value && best_index > neighbor_index)) {
+                    best_value = neighbor_value;
+                    best_index = neighbor_index;
+                }
+            }
+            if (lane == 0) {
+                group_indices[0] = best_index;
+                const ushort bits = as_type<ushort>(
+                    logits[row * width + best_index]);
+                if (bits == 0xff80) {
+                    fallback = 0;
+                } else {
+                    ushort predecessor_bits;
+                    if ((bits & 0x7fff) == 0) {
+                        predecessor_bits = 0x8001;
+                    } else if ((bits & 0x8000) == 0) {
+                        predecessor_bits = bits - 1;
+                    } else {
+                        predecessor_bits = bits + 1;
+                    }
+                    const float predecessor = (float)as_type<T>(predecessor_bits);
+                    const float transformed =
+                        metal::precise::tanh(best_value / cap) * cap;
+                    const float predecessor_transformed =
+                        metal::precise::tanh(predecessor / cap) * cap;
+                    fallback = transformed == predecessor_transformed;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (fallback == 0) {
+            if (local == 0) {
+                tokens[row] = (int)group_indices[0];
+            }
+            return;
+        }
+
+        best_value = -metal::numeric_limits<float>::infinity();
+        best_index = 0;
+        for (uint block = 0; block < width / (reads * group_width); ++block) {
+            const uint first = block * reads * group_width + local * reads;
+            for (uint read = 0; read < reads; ++read) {
+                const uint index = first + read;
+                const float raw = (float)logits[row * width + index];
+                const float value = metal::precise::tanh(raw / cap) * cap;
+                if (value > best_value) {
+                    best_value = value;
+                    best_index = index;
+                }
+            }
+        }
+        for (uint offset = 16; offset > 0; offset /= 2) {
+            const float neighbor_value = simd_shuffle_down(best_value, offset);
+            const uint neighbor_index = simd_shuffle_down(best_index, offset);
+            if (best_value < neighbor_value
+                || (best_value == neighbor_value && best_index > neighbor_index)) {
+                best_value = neighbor_value;
+                best_index = neighbor_index;
+            }
+        }
+        if (lane == 0) {
+            group_values[simd_group] = best_value;
+            group_indices[simd_group] = best_index;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group != 0) {
+            return;
+        }
+        best_value = group_values[lane];
+        best_index = group_indices[lane];
+        for (uint offset = 16; offset > 0; offset /= 2) {
+            const float neighbor_value = simd_shuffle_down(best_value, offset);
+            const uint neighbor_index = simd_shuffle_down(best_index, offset);
+            if (best_value < neighbor_value
+                || (best_value == neighbor_value && best_index > neighbor_index)) {
+                best_value = neighbor_value;
+                best_index = neighbor_index;
+            }
+        }
+        if (lane == 0) {
+            tokens[row] = (int)best_index;
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+private func gemma4SoftcapArgmax(_ logits: MLXArray) -> MLXArray {
+    precondition(
+        logits.ndim == 2 && logits.shape == [8, 262_144]
+            && logits.dtype == .bfloat16,
+        "Gemma4 direct greedy logits must be bfloat16 [8, 262144]")
+    return gemma4SoftcapArgmaxKernel(
+        [logits],
+        template: [("T", logits.dtype)],
+        grid: (8 * 1024, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [[8]],
+        outputDTypes: [.int32]
+    )[0]
+}
+
 // MARK: - Configuration
 
 struct Gemma4WeightQuantizationMetadata: Codable, Sendable {
@@ -2906,6 +3076,32 @@ extension Gemma4TextModel {
         return try cbv2LayerKinds.enumerated().map { index, kind in
             try makeLayerCache(index, kind)
         }
+    }
+}
+
+// MARK: - ContinuousBatchingV2 direct untransformed greedy decode
+
+extension Gemma4TextModel: CBv2LanguageModelDirectGreedyForwardable {
+
+    public func cbv2SupportsDirectGreedy(batchSize: Int) -> Bool {
+        gemma4SoftcapArgmaxEnabled
+            && batchSize == 8
+            && config.hiddenSize == 2816
+            && config.vocabSize == 262_144
+            && config.tieWordEmbeddings
+            && config.finalLogitSoftcapping == 30
+    }
+
+    public func cbv2DirectGreedyTokens(
+        _ inputs: MLXArray, cache: [KVCache]?
+    ) -> MLXArray {
+        precondition(
+            cbv2SupportsDirectGreedy(batchSize: inputs.dim(0))
+                && inputs.ndim == 2 && inputs.dim(1) == 1,
+            "Gemma4 direct greedy decode requires the production [8, 1] target")
+        let hidden = model(inputs, cache: cache)
+        let rawLogits = applyRawLMHead(hidden)[0..., -1, 0...]
+        return gemma4SoftcapArgmax(rawLogits)
     }
 }
 

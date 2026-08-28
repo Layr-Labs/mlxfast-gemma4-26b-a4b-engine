@@ -344,6 +344,8 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         source: """
             constexpr int simd_width = 32;
             constexpr int values_per_lane = D / simd_width;
+            constexpr int reduction_chunk = 4;
+            constexpr int scratch_stride = simd_width + 1;
 
             const int batch_head = int(threadgroup_position_in_grid.x);
             const int simdgroup = int(simdgroup_index_in_threadgroup);
@@ -359,7 +361,8 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             for (int element = 0; element < values_per_lane; ++element) {
                 accumulator[element] = 0.0f;
             }
-            threadgroup float partial_outputs[simd_width * simd_width];
+            threadgroup float partial_outputs[
+                reduction_chunk * simd_width * scratch_stride];
 
             float sum_exp_score = 0.0f;
             float max_score = -3.402823466e+38F;
@@ -385,15 +388,27 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 partials += simd_width * D;
             }
 
-            for (int element = 0; element < values_per_lane; ++element) {
-                partial_outputs[lane * simd_width + simdgroup] = accumulator[element];
+            for (int base = 0; base < values_per_lane; base += reduction_chunk) {
+                for (int offset = 0; offset < reduction_chunk; ++offset) {
+                    partial_outputs[
+                        offset * simd_width * scratch_stride
+                        + lane * scratch_stride + simdgroup] = accumulator[base + offset];
+                }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                accumulator[element] = simd_sum(
-                    partial_outputs[simdgroup * simd_width + lane]);
-                accumulator[element] = sum_exp_score == 0.0f
-                    ? accumulator[element]
-                    : accumulator[element] / sum_exp_score;
-                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (int offset = 0; offset < reduction_chunk; ++offset) {
+                    const float reduced = simd_sum(
+                        partial_outputs[
+                            offset * simd_width * scratch_stride
+                            + simdgroup * scratch_stride + lane]);
+                    if (lane == 0) {
+                        accumulator[base + offset] = sum_exp_score == 0.0f
+                            ? reduced
+                            : reduced / sum_exp_score;
+                    }
+                }
+                if (base + reduction_chunk < values_per_lane) {
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
             }
 
             if (lane == 0) {

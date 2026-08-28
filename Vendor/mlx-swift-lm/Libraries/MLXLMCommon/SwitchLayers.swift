@@ -236,6 +236,84 @@ private let compiledGeGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
     return body
 }()
 
+/// Exact cohort-decode specialization: stable-sort 64 top-8 assignments in
+/// one threadgroup and one dispatch.
+private enum StableExpertSort64Decode {
+    private static let assignments = 64
+
+    private static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "MLX_GEMMA4_STABLE_EXPERT_SORT"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "stable_expert_sort_decode_k8_a64_v2",
+        inputNames: ["indices"],
+        outputNames: ["lhs_indices", "sorted_indices", "inverse_order"],
+        source: """
+            constexpr uint ASSIGNMENTS = 64;
+            constexpr uint TOP_K = 8;
+
+            const uint lid = uint(thread_position_in_threadgroup.x);
+            threadgroup uint assignment_experts[ASSIGNMENTS];
+            assignment_experts[lid] = indices[lid];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const uint expert = assignment_experts[lid];
+            uint position = 0;
+            for (uint assignment = 0; assignment < ASSIGNMENTS; ++assignment) {
+                const uint candidate = assignment_experts[assignment];
+                position += uint(
+                    candidate < expert ||
+                    (candidate == expert && assignment < lid));
+            }
+
+            lhs_indices[position] = lid / TOP_K;
+            sorted_indices[position] = expert;
+            inverse_order[lid] = position;
+        """,
+        ensureRowContiguous: true)
+
+    static func apply(
+        indices: MLXArray
+    ) -> (lhsIndices: MLXArray, sortedIndices: MLXArray, inverseOrder: MLXArray)? {
+#if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
+        let stream = StreamOrDevice.default
+        guard enabled,
+            stream == .gpu,
+            indices.dtype == .uint32,
+            indices.ndim == 2,
+            indices.shape == [8, 8]
+        else { return nil }
+
+        let outputs = kernel(
+            [indices],
+            grid: (assignments, 1, 1),
+            threadGroup: (assignments, 1, 1),
+            outputShapes: [[assignments], [assignments], [assignments]],
+            outputDTypes: [.uint32, .uint32, .uint32],
+            stream: stream
+        )
+        return (outputs[0], outputs[1], outputs[2])
+#else
+        return nil
+#endif
+    }
+}
+
+/// Internal test seam for proving that the specialization engaged. Production
+/// reaches this only after `SwitchGLU` validates the explicit Gemma semantic
+/// profile. That router obtains IDs either by arg-partitioning 128 logits or by
+/// emitting its fused rank loop's `0..<128` expert counter; both prove every
+/// value lies in `0..<128` without a hot host sync.
+func gemma4StableExpertSortDecode(
+    indices: MLXArray
+) -> (lhsIndices: MLXArray, sortedIndices: MLXArray, inverseOrder: MLXArray)? {
+    StableExpertSort64Decode.apply(indices: indices)
+}
+
 public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
     let indices = indices.flattened()
@@ -391,6 +469,8 @@ public class SwitchGLU: Module {
         let useLhsIndices =
             indices.size == 64 && indices.ndim == 2 && indices.shape == [8, 8]
             && x.ndim == 2 && x.shape == [8, inputDims]
+        let useStableDecodeSort =
+            useLhsIndices && supportsGemma4ProductionExperts(x, indices)
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
         let doSort = indices.size >= 64
 
@@ -400,7 +480,15 @@ public class SwitchGLU: Module {
         if doSort {
             if useLhsIndices {
                 x = x.flattened(start: 0, end: -3)
-                (lhsIndices, idx, inverseOrder) = gatherSortIndices(indices: indices)
+                if useStableDecodeSort,
+                    let sorted = gemma4StableExpertSortDecode(indices: indices)
+                {
+                    lhsIndices = sorted.lhsIndices
+                    idx = sorted.sortedIndices
+                    inverseOrder = sorted.inverseOrder
+                } else {
+                    (lhsIndices, idx, inverseOrder) = gatherSortIndices(indices: indices)
+                }
             } else {
                 (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
             }
@@ -451,6 +539,16 @@ public class SwitchGLU: Module {
     private func supportsWeightedExpertUnsort(
         _ x: MLXArray, _ indices: MLXArray, weights: MLXArray
     ) -> Bool {
+        supportsGemma4ProductionExperts(x, indices)
+            && weights.ndim == 2
+            && weights.shape == indices.shape
+            && weights.dtype == .bfloat16
+            && indices.size >= 64
+    }
+
+    private func supportsGemma4ProductionExperts(
+        _ x: MLXArray, _ indices: MLXArray
+    ) -> Bool {
         // Exact Gemma 4 26B-A4B production contract. The explicit semantic
         // profile keeps generic SwitchGLU/custom activations on the established
         // implementation.
@@ -468,10 +566,6 @@ public class SwitchGLU: Module {
             && indices.dim(0) == x.dim(0)
             && indices.dim(1) == 8
             && indices.dtype == .uint32
-            && weights.ndim == 2
-            && weights.shape == indices.shape
-            && weights.dtype == .bfloat16
-            && indices.size >= 64
     }
 
     public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {

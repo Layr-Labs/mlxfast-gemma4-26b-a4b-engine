@@ -235,6 +235,7 @@ enum CBv2AttentionV1 {
         spanContexts: [CBv2SpanChunkContext?]? = nil,
         serializeQueries: Bool = false,
         decodeRingWriteFence: CBv2DecodeRingWriteFence? = nil,
+        decodePositionOffsets: MLXArray? = nil,
         allowFusedRingWrite: Bool = false
     ) -> MLXArray {
         let B = queries.dim(0)
@@ -278,8 +279,12 @@ enum CBv2AttentionV1 {
             {
                 var cachedKeyRows: [MLXArray] = []
                 var cachedValueRows: [MLXArray] = []
-                cachedKeyRows.reserveCapacity(B)
-                cachedValueRows.reserveCapacity(B)
+                if !CBv2RaggedTwoPassDecodeAttentionV1.ringHostAllocationElisionEnabled {
+                    // Kill-switch control: reproduce the former eager fallback
+                    // buffers even though the full-ring fused branch returns.
+                    cachedKeyRows.reserveCapacity(B)
+                    cachedValueRows.reserveCapacity(B)
+                }
                 let ringRows = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
                 if ringRows.count == B && ringRows.allSatisfy({ $0.decodeRingView != nil }) {
                     // WRITE-016: fold this step's one-token ring write into
@@ -306,7 +311,12 @@ enum CBv2AttentionV1 {
                                     newKeys: keys, newValues: values,
                                     keys: preWrite.map(\.keys),
                                     values: preWrite.map(\.values),
-                                    starts: preWrite.map(\.start),
+                                    starts: CBv2RaggedTwoPassDecodeAttentionV1
+                                        .ringHostAllocationElisionEnabled
+                                        && decodePositionOffsets?.dtype == .int32
+                                        && decodePositionOffsets?.shape == [B]
+                                        ? nil : preWrite.map(\.start),
+                                    positionOffsets: decodePositionOffsets,
                                     previousWriteFence: decodeRingWriteFence.value,
                                     scale: scale,
                                     slidingWindowLength: ringRows[0].window)
@@ -334,12 +344,22 @@ enum CBv2AttentionV1 {
                     {
                         return output
                     }
+                    if CBv2RaggedTwoPassDecodeAttentionV1.ringHostAllocationElisionEnabled {
+                        // Neither full-ring kernel needs these fallback
+                        // vectors. Allocate only if both kernels refuse.
+                        cachedKeyRows.reserveCapacity(B)
+                        cachedValueRows.reserveCapacity(B)
+                    }
                     for row in ringRows {
                         let view = row.snapshot()
                         cachedKeyRows.append(view.keys)
                         cachedValueRows.append(view.values)
                     }
                 } else {
+                    if CBv2RaggedTwoPassDecodeAttentionV1.ringHostAllocationElisionEnabled {
+                        cachedKeyRows.reserveCapacity(B)
+                        cachedValueRows.reserveCapacity(B)
+                    }
                     for (index, row) in rows.enumerated() {
                         let (cachedKeys, cachedValues) = row.update(
                             keys: keys[index ..< (index + 1)],

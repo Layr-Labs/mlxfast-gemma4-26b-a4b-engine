@@ -14,6 +14,12 @@
 import Foundation
 import MLX
 
+/// Model-level proof that an ordinary CBv2 decode output transitively
+/// consumes every K/V mutation performed by that forward. This is deliberately
+/// narrower than `LanguageModel`: an adapter cannot infer the dependency from
+/// a cache type alone.
+public protocol CBv2LanguageModelDecodeOutputCoversCacheMutations: AnyObject {}
+
 /// `CBv2SteppableModel` over any `LanguageModel` whose forward path
 /// understands `CBv2AttendingLayerCache` (Gemma 4, GPT-OSS, test fixtures).
 public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
@@ -26,6 +32,44 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
 
     public func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
         return model(tokens, cache: asKVCaches(caches))
+    }
+
+    /// Initial fail-closed decode compaction: only an affirming model over an
+    /// all-owning, all-contiguous bank with one shared position state. The
+    /// output root forces every K/V mutation; the post-forward position root
+    /// collapses the next-step offset chain; per-layer fences conservatively
+    /// retain explicit ordering for fused in-place sliding-ring writes.
+    public func compactDecodeEvaluationRoots(
+        forwardOutput: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> [MLXArray]? {
+        guard model is any CBv2LanguageModelDecodeOutputCoversCacheMutations else {
+            return nil
+        }
+        guard let first = caches.first as? CBv2LayerCache,
+            first.kind.sharesKVWithLayer == nil,
+            first.decodeRootCompactionRowsAreCapable,
+            let stateIdentity = first.unifiedPositionStateIdentity,
+            let offsets = first.unifiedPositionOffsets
+        else { return nil }
+
+        let rowCount = first.rows.count
+        guard rowCount > 0 else { return nil }
+
+        var roots: [MLXArray] = []
+        roots.reserveCapacity(2 + caches.count)
+        roots.append(forwardOutput)
+        roots.append(offsets)
+        roots.append(first.decodeRingWriteFenceEvaluationRoot)
+        for candidate in caches.dropFirst() {
+            guard let cache = candidate as? CBv2LayerCache,
+                cache.kind.sharesKVWithLayer == nil,
+                cache.rows.count == rowCount,
+                cache.decodeRootCompactionRowsAreCapable,
+                cache.unifiedPositionStateIdentity == stateIdentity
+            else { return nil }
+            roots.append(cache.decodeRingWriteFenceEvaluationRoot)
+        }
+        return roots
     }
 
     private func asKVCaches(_ caches: [CBv2AttendingLayerCache]) -> [KVCache] {

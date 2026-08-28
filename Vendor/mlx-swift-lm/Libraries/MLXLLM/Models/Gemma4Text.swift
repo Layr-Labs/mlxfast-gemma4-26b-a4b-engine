@@ -26,6 +26,48 @@ private let gemma4CompiledDecodeSupported: Bool = {
     return true
 }()
 
+// MARK: - CBv2 B=8 decode graph-submission ladder
+
+/// Earlier graph submission is ON by default for the one scored decode
+/// geometry below. `DARKBLOOM_GEMMA4_DECODE_ASYNC_EVAL_LADDER=0` (also
+/// `false`/`no`/`off`) is the attribution and emergency kill switch.
+@inline(__always)
+internal func resolveGemma4DecodeAsyncEvalLadderEnabled(_ raw: String?) -> Bool {
+    guard let raw else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}
+
+private let gemma4DecodeAsyncEvalLadderEnabled =
+    resolveGemma4DecodeAsyncEvalLadderEnabled(
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_DECODE_ASYNC_EVAL_LADDER"])
+
+/// Pure, fail-closed policy for the Gemma 4 decode submission ladder.
+///
+/// Layer indices name boundaries AFTER a complete decoder layer. In
+/// particular, the MoE layer has already recombined its dense and sparse
+/// branches before a selected boundary is submitted, so both branches retain
+/// their natural concurrency inside the same graph frontier.
+@inline(__always)
+internal func gemma4ShouldSubmitDecodeAsyncEvalLadder(
+    enabled: Bool,
+    schedulePrefill: Bool,
+    isCBv2: Bool,
+    batchSize: Int,
+    inputLength: Int,
+    layerIndex: Int
+) -> Bool {
+    guard enabled, isCBv2, !schedulePrefill, batchSize == 8, inputLength == 1
+    else { return false }
+
+    switch layerIndex {
+    case 0, 1, 5, 11, 17, 23, 27:
+        return true
+    default:
+        return false
+    }
+}
+
 // MARK: - CBv2 prompt-path knobs (prefill only; decode never reads these)
 
 @inline(__always)
@@ -234,6 +276,20 @@ private let gemma4SafeGeluProduct: @Sendable (
         let activated = 0.5 * gate
             * (1 + tanh(sqrt(2 / Float.pi) * (gate + 0.044715 * gate * gate * gate)))
         return activated * up
+    }
+    return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
+}()
+
+/// Fuse the final residual add and layer-scalar multiply without changing
+/// their graph order.  The result of `residual + branch` retains its regular
+/// array dtype before the scalar multiply, matching the two-op path while
+/// removing its intermediate dispatch/materialization.
+private let gemma4ResidualScale: @Sendable (
+    MLXArray, MLXArray, MLXArray
+) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = {
+        (residual: MLXArray, branch: MLXArray, scale: MLXArray) -> MLXArray in
+        (residual + branch) * scale
     }
     return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
@@ -1850,7 +1906,10 @@ private class Gemma4Experts: Module {
             fuseSortedReduction: fuseWeightedUnsort,
             // Ordinary/direct VLM and CBv2 prompt entry points may engage.
             // Rectangular MTP verification explicitly passes false.
-            isProductionPrefill: isExpertPrefill)
+            isProductionPrefill: isExpertPrefill,
+            // GEMMA-DOWN-001 is pinned to the serving decode cohort, not an
+            // arbitrary flattened eight-row prompt/verification rectangle.
+            isProductionDecodeBatch8: !isExpertPrefill && B == 8 && S == 1)
         return y.reshaped(B, S, H)
     }
 }
@@ -1874,8 +1933,41 @@ private class Gemma4MLP: Module {
         super.init()
     }
 
+    /// DMLP-001: route only the pinned batch-eight/decode-one affine-8 dense
+    /// MLP geometries through the exact quad-stream kernel's tight grid.
+    /// Everything else, including prefill and any strided input, keeps the
+    /// original layer call.
+    @inline(__always)
+    private func denseProjection(
+        _ layer: Linear,
+        _ x: MLXArray,
+        activationSums: CBv2DenseMLPQMVV1.ActivationSums? = nil
+    ) -> MLXArray {
+        guard let quantized = layer as? QuantizedLinear,
+            quantized.bias == nil,
+            let tight = CBv2DenseMLPQMVV1.matmul(
+                x: x,
+                weight: quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                groupSize: quantized.groupSize,
+                bits: quantized.bits,
+                mode: quantized.mode,
+                activationSums: activationSums)
+        else { return layer(x) }
+        return tight
+    }
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(gemma4SafeGeluProduct(gateProj(x), upProj(x)))
+        // DMLP-002: one exact activation-sum prepass feeds both projections.
+        // If either projection is not the pinned affine8 cell, the candidate
+        // arrays remain unevaluated and the DMLP-001 calls below take over.
+        let activationSums = CBv2DenseMLPQMVV1.activationSums(for: x)
+        return denseProjection(
+            downProj,
+            gemma4SafeGeluProduct(
+                denseProjection(gateProj, x, activationSums: activationSums),
+                denseProjection(upProj, x, activationSums: activationSums)))
     }
 }
 
@@ -2096,10 +2188,10 @@ public class Gemma4DecoderLayer: Module {
             g = g * perLayerInput
             g = proj(g)
             g = norm(g)
-            out = residual3 + g
+            out = gemma4ResidualScale(residual3, g, layerScalar)
+        } else {
+            out = out * layerScalar
         }
-
-        out = out * layerScalar
 
         return (out, kvPair, attnPositionOffset)
     }
@@ -2299,6 +2391,12 @@ public class Gemma4TextModelInner: Module {
         dFlashHiddenCapture: Gemma4DFlashHiddenCapture? = nil,
         forceArrayMask requestedArrayMask: Bool = false
     ) -> (postNorm: MLXArray, preNorm: MLXArray?) {
+        // Shape queries cross the Swift/C boundary. Cache the two immutable
+        // input dimensions once rather than paying for them at every ladder
+        // policy check while the host is building the decode graph.
+        let inputBatchSize = inputs.dim(0)
+        let inputLength = inputs.dim(1)
+
         // Vision prefill (mirrors the inline VLM twin `TextModel.callAsFunction`):
         // `inputEmbedding` — the scaled text embeddings with image soft-token
         // embeddings spliced at placeholder positions — replaces the trunk's
@@ -2468,11 +2566,28 @@ public class Gemma4TextModelInner: Module {
             captureHook?(idx, kvPair)
             dFlashHiddenCapture?.capture(h, layer: idx)
 
+            // `layer` returns the recombined dense+sparse result. Submitting
+            // only here starts the completed prefix early without serializing
+            // those independent per-layer branches or changing any math.
+            if gemma4ShouldSubmitDecodeAsyncEvalLadder(
+                enabled: gemma4DecodeAsyncEvalLadderEnabled,
+                schedulePrefill: schedulePrefill,
+                isCBv2: isCBv2,
+                batchSize: inputBatchSize,
+                inputLength: inputLength,
+                layerIndex: idx)
+            {
+                asyncEval(h)
+                CBv2EngageMark.once("gemma4-b8-decode-async-ladder")
+                CBv2StepProfiler.recordEvent(
+                    "v2.gemma4.decode.async_eval_ladder")
+            }
+
             let layerNumber = idx + 1
             if gemma4ShouldSubmitPrefillChunkEval(
                 schedulePrefill: schedulePrefill,
                 isCBv2: isCBv2,
-                inputLength: inputs.dim(1),
+                inputLength: inputLength,
                 layerNumber: layerNumber,
                 interval: gemma4PrefillChunkEvalLayers)
             {

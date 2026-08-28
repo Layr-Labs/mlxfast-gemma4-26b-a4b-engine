@@ -1056,6 +1056,98 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
   }
 }
 
+// Exact B8 MTP output projection. The serial fast kernel shares each weight
+// tile across a pair of cohort rows. This variant keeps that arithmetic for
+// every row and also applies the loaded tile to each draft position before it
+// advances K. The per-position accumulators never interact.
+template <typename T, int P>
+METAL_FUNC void qmv_fast_crossposition_affine4_g64_b8(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int x_position_stride,
+    const int in_vec_size,
+    const int out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  static_assert(P >= 2 && P <= 4, "MTP position count must be in [2, 4]");
+  constexpr int inputs_per_group = 2;
+  constexpr int rows_per_simd = 4;
+  constexpr int values_per_thread = 16;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_lane = 8;
+
+  const int first_m = int(tid.x) * inputs_per_group;
+  if (first_m >= 8) {
+    return;
+  }
+  const int out_row = int(tid.y) * 8 + int(simd_gid) * rows_per_simd;
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+
+  thread float2 results[P][rows_per_simd];
+  for (int position = 0; position < P; position++) {
+    for (int row = 0; row < rows_per_simd; row++) {
+      results[position][row] = 0.0f;
+    }
+  }
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    thread uint16_t packed[rows_per_simd][4];
+    thread float scale_local[rows_per_simd];
+    thread float bias_local[rows_per_simd];
+    for (int r = 0; r < rows_per_simd; r++) {
+      const int row = out_row + r;
+      const device uint8_t* wb =
+          reinterpret_cast<const device uint8_t*>(w) +
+          row * in_vec_size_w + k / 2 + simd_lid * bytes_per_lane;
+      const device uint16_t* ws =
+          reinterpret_cast<const device uint16_t*>(wb);
+      for (int i = 0; i < 4; i++) {
+        packed[r][i] = ws[i];
+      }
+      const int group_index =
+          row * in_vec_size_g + k / 64 + simd_lid / 4;
+      scale_local[r] = scales[group_index];
+      bias_local[r] = biases[group_index];
+    }
+
+    for (int position = 0; position < P; position++) {
+      thread float x0[values_per_thread];
+      thread float x1[values_per_thread];
+      const device T* xm0 =
+          x + position * x_position_stride + first_m * in_vec_size + k
+          + simd_lid * values_per_thread;
+      const float sum0 =
+          load_vector<T, float, values_per_thread, 4>(xm0, x0);
+      const float sum1 =
+          load_vector<T, float, values_per_thread, 4>(xm0 + in_vec_size, x1);
+      for (int r = 0; r < rows_per_simd; r++) {
+        results[position][r] += qdot_affine4_loaded_pair(
+            packed[r], x0, x1, scale_local[r], bias_local[r],
+            float2(sum0, sum1));
+      }
+    }
+  }
+
+  for (int position = 0; position < P; position++) {
+    device T* position_y = y + position * 8 * out_vec_size;
+    for (int r = 0; r < rows_per_simd; r++) {
+      const float reduced0 = simd_sum(results[position][r].x);
+      const float reduced1 = simd_sum(results[position][r].y);
+      if (simd_lid == 0) {
+        position_y[first_m * out_vec_size + out_row + r] =
+            static_cast<T>(reduced0);
+        position_y[(first_m + 1) * out_vec_size + out_row + r] =
+            static_cast<T>(reduced1);
+      }
+    }
+  }
+}
+
 // Wider row sharing for the affine4/g64 multi-row QMV. Same contract as
 // qmv_fast_crossrow_affine4_g64: the frozen host launches M x-groups for each
 // 8-output tile, so a group that claims NA adjacent input rows lets the
@@ -1715,6 +1807,167 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
   }
 }
 
+// Eight-row stream sharing for the position-major B8 MTP rectangle. One
+// threadgroup keeps the stock accumulation order for each row while it loads
+// each packed weight block only once.
+template <typename T, const int group_size, const int bits>
+METAL_FUNC void qmv_affine4_g64_octet_stream_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int x_position_stride,
+    const int y_position_stride,
+    const int in_vec_size,
+    const int out_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 8;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int uint16_per_thread = bytes_per_thread / 2;
+  constexpr int scale_step_per_thread = 8;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread float x_thread[values_per_thread];
+  thread uint16_t packed[results_per_simdgroup][uint16_per_thread];
+  thread float scale_local[results_per_simdgroup];
+  thread float bias_local[results_per_simdgroup];
+  thread float result0[results_per_simdgroup] = {0};
+  thread float result1[results_per_simdgroup] = {0};
+  thread float result2[results_per_simdgroup] = {0};
+  thread float result3[results_per_simdgroup] = {0};
+  thread float result4[results_per_simdgroup] = {0};
+  thread float result5[results_per_simdgroup] = {0};
+  thread float result6[results_per_simdgroup] = {0};
+  thread float result7[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row = tid.y * 8 + simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x += simd_lid * values_per_thread;
+
+#define MLXFAST_AFFINE4_OCTET_ACCUMULATE(STREAM, RESULT)                  \
+  do {                                                                    \
+    const int stream_offset = (STREAM) < 4                                \
+        ? (STREAM) * in_vec_size                                          \
+        : x_position_stride + ((STREAM) - 4) * in_vec_size;               \
+    float stream_sum = load_vector<T, float, values_per_thread, 4>(       \
+        x + stream_offset, x_thread);                                     \
+    for (int row = 0; row < results_per_simdgroup; row++) {               \
+      RESULT[row] += qdot_affine4_registered<float, values_per_thread>(   \
+          packed[row],                                                    \
+          x_thread,                                                       \
+          scale_local[row],                                               \
+          bias_local[row],                                                \
+          stream_sum);                                                    \
+    }                                                                     \
+  } while (0)
+#define MLXFAST_AFFINE4_OCTET_ACCUMULATE_SAFE(STREAM, RESULT)             \
+  do {                                                                    \
+    const int stream_offset = (STREAM) < 4                                \
+        ? (STREAM) * in_vec_size                                          \
+        : x_position_stride + ((STREAM) - 4) * in_vec_size;               \
+    float stream_sum = load_vector_safe<T, float, values_per_thread, 4>(  \
+        x + stream_offset, x_thread, remaining);                          \
+    for (int row = 0; row < results_per_simdgroup; row++) {               \
+      RESULT[row] += qdot_affine4_registered<float, values_per_thread>(   \
+          packed[row],                                                    \
+          x_thread,                                                       \
+          scale_local[row],                                               \
+          bias_local[row],                                                \
+          stream_sum);                                                    \
+    }                                                                     \
+  } while (0)
+
+  int k = 0;
+  for (; k < in_vec_size - block_size; k += block_size) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint16_t* wl =
+          (const device uint16_t*)(ws + row * in_vec_size_w);
+      for (int i = 0; i < uint16_per_thread; i++) {
+        packed[row][i] = wl[i];
+      }
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    MLXFAST_AFFINE4_OCTET_ACCUMULATE(0, result0);
+    MLXFAST_AFFINE4_OCTET_ACCUMULATE(1, result1);
+    MLXFAST_AFFINE4_OCTET_ACCUMULATE(2, result2);
+    MLXFAST_AFFINE4_OCTET_ACCUMULATE(3, result3);
+    MLXFAST_AFFINE4_OCTET_ACCUMULATE(4, result4);
+    MLXFAST_AFFINE4_OCTET_ACCUMULATE(5, result5);
+    MLXFAST_AFFINE4_OCTET_ACCUMULATE(6, result6);
+    MLXFAST_AFFINE4_OCTET_ACCUMULATE(7, result7);
+
+    ws += block_size / 2;
+    scales += block_size / 64;
+    biases += block_size / 64;
+    x += block_size;
+  }
+
+  const int remaining = clamp(
+      static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
+      0,
+      values_per_thread);
+  if (remaining > 0) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint16_t* wl =
+          (const device uint16_t*)(ws + row * in_vec_size_w);
+      for (int i = 0; i < uint16_per_thread; i++) {
+        packed[row][i] = wl[i];
+      }
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    MLXFAST_AFFINE4_OCTET_ACCUMULATE_SAFE(0, result0);
+    MLXFAST_AFFINE4_OCTET_ACCUMULATE_SAFE(1, result1);
+    MLXFAST_AFFINE4_OCTET_ACCUMULATE_SAFE(2, result2);
+    MLXFAST_AFFINE4_OCTET_ACCUMULATE_SAFE(3, result3);
+    MLXFAST_AFFINE4_OCTET_ACCUMULATE_SAFE(4, result4);
+    MLXFAST_AFFINE4_OCTET_ACCUMULATE_SAFE(5, result5);
+    MLXFAST_AFFINE4_OCTET_ACCUMULATE_SAFE(6, result6);
+    MLXFAST_AFFINE4_OCTET_ACCUMULATE_SAFE(7, result7);
+  }
+
+#undef MLXFAST_AFFINE4_OCTET_ACCUMULATE
+#undef MLXFAST_AFFINE4_OCTET_ACCUMULATE_SAFE
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    float sum0 = simd_sum(result0[row]);
+    float sum1 = simd_sum(result1[row]);
+    float sum2 = simd_sum(result2[row]);
+    float sum3 = simd_sum(result3[row]);
+    float sum4 = simd_sum(result4[row]);
+    float sum5 = simd_sum(result5[row]);
+    float sum6 = simd_sum(result6[row]);
+    float sum7 = simd_sum(result7[row]);
+    if (simd_lid == 0) {
+      y[0 * out_vec_size + out_row + row] = static_cast<T>(sum0);
+      y[1 * out_vec_size + out_row + row] = static_cast<T>(sum1);
+      y[2 * out_vec_size + out_row + row] = static_cast<T>(sum2);
+      y[3 * out_vec_size + out_row + row] = static_cast<T>(sum3);
+      y[y_position_stride + 0 * out_vec_size + out_row + row] =
+          static_cast<T>(sum4);
+      y[y_position_stride + 1 * out_vec_size + out_row + row] =
+          static_cast<T>(sum5);
+      y[y_position_stride + 2 * out_vec_size + out_row + row] =
+          static_cast<T>(sum6);
+      y[y_position_stride + 3 * out_vec_size + out_row + row] =
+          static_cast<T>(sum7);
+    }
+  }
+}
+
 template <typename T, const int group_size, const int bits>
 METAL_FUNC void qmv_affine8_g64_pair_impl(
     const device uint32_t* w,
@@ -1969,6 +2222,281 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
     }
   }
 }
+
+template <typename T, const int group_size, const int bits>
+METAL_FUNC void qmv_affine8_g64_octet_stream_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int x_position_stride,
+    const int y_position_stride,
+    const int in_vec_size,
+    const int out_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 4;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 16;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread float x_thread[values_per_thread];
+  thread uint8_t packed[results_per_simdgroup][bytes_per_thread];
+  thread float scale_local[results_per_simdgroup];
+  thread float bias_local[results_per_simdgroup];
+  thread float result0[results_per_simdgroup] = {0};
+  thread float result1[results_per_simdgroup] = {0};
+  thread float result2[results_per_simdgroup] = {0};
+  thread float result3[results_per_simdgroup] = {0};
+  thread float result4[results_per_simdgroup] = {0};
+  thread float result5[results_per_simdgroup] = {0};
+  thread float result6[results_per_simdgroup] = {0};
+  thread float result7[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row = tid.y * 8 + simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x += simd_lid * values_per_thread;
+
+#define MLXFAST_AFFINE8_OCTET_ACCUMULATE(STREAM, RESULT)                  \
+  do {                                                                    \
+    const int stream_offset = (STREAM) < 4                                \
+        ? (STREAM) * in_vec_size                                          \
+        : x_position_stride + ((STREAM) - 4) * in_vec_size;               \
+    float stream_sum = load_vector<T, float, values_per_thread, 8>(       \
+        x + stream_offset, x_thread);                                     \
+    for (int row = 0; row < results_per_simdgroup; row++) {               \
+      RESULT[row] += qdot_affine8_registered<float, values_per_thread>(   \
+          packed[row],                                                    \
+          x_thread,                                                       \
+          scale_local[row],                                               \
+          bias_local[row],                                                \
+          stream_sum);                                                    \
+    }                                                                     \
+  } while (0)
+#define MLXFAST_AFFINE8_OCTET_ACCUMULATE_SAFE(STREAM, RESULT)             \
+  do {                                                                    \
+    const int stream_offset = (STREAM) < 4                                \
+        ? (STREAM) * in_vec_size                                          \
+        : x_position_stride + ((STREAM) - 4) * in_vec_size;               \
+    float stream_sum = load_vector_safe<T, float, values_per_thread, 8>(  \
+        x + stream_offset, x_thread, remaining);                          \
+    for (int row = 0; row < results_per_simdgroup; row++) {               \
+      RESULT[row] += qdot_affine8_registered<float, values_per_thread>(   \
+          packed[row],                                                    \
+          x_thread,                                                       \
+          scale_local[row],                                               \
+          bias_local[row],                                                \
+          stream_sum);                                                    \
+    }                                                                     \
+  } while (0)
+
+  int k = 0;
+  for (; k < in_vec_size - block_size; k += block_size) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      for (int i = 0; i < bytes_per_thread; i++) {
+        packed[row][i] = wl[i];
+      }
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    MLXFAST_AFFINE8_OCTET_ACCUMULATE(0, result0);
+    MLXFAST_AFFINE8_OCTET_ACCUMULATE(1, result1);
+    MLXFAST_AFFINE8_OCTET_ACCUMULATE(2, result2);
+    MLXFAST_AFFINE8_OCTET_ACCUMULATE(3, result3);
+    MLXFAST_AFFINE8_OCTET_ACCUMULATE(4, result4);
+    MLXFAST_AFFINE8_OCTET_ACCUMULATE(5, result5);
+    MLXFAST_AFFINE8_OCTET_ACCUMULATE(6, result6);
+    MLXFAST_AFFINE8_OCTET_ACCUMULATE(7, result7);
+
+    ws += block_size;
+    scales += block_size / 64;
+    biases += block_size / 64;
+    x += block_size;
+  }
+
+  const int remaining = clamp(
+      static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
+      0,
+      values_per_thread);
+  if (remaining > 0) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      for (int i = 0; i < bytes_per_thread; i++) {
+        packed[row][i] = wl[i];
+      }
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    MLXFAST_AFFINE8_OCTET_ACCUMULATE_SAFE(0, result0);
+    MLXFAST_AFFINE8_OCTET_ACCUMULATE_SAFE(1, result1);
+    MLXFAST_AFFINE8_OCTET_ACCUMULATE_SAFE(2, result2);
+    MLXFAST_AFFINE8_OCTET_ACCUMULATE_SAFE(3, result3);
+    MLXFAST_AFFINE8_OCTET_ACCUMULATE_SAFE(4, result4);
+    MLXFAST_AFFINE8_OCTET_ACCUMULATE_SAFE(5, result5);
+    MLXFAST_AFFINE8_OCTET_ACCUMULATE_SAFE(6, result6);
+    MLXFAST_AFFINE8_OCTET_ACCUMULATE_SAFE(7, result7);
+  }
+
+#undef MLXFAST_AFFINE8_OCTET_ACCUMULATE
+#undef MLXFAST_AFFINE8_OCTET_ACCUMULATE_SAFE
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    float sum0 = simd_sum(result0[row]);
+    float sum1 = simd_sum(result1[row]);
+    float sum2 = simd_sum(result2[row]);
+    float sum3 = simd_sum(result3[row]);
+    float sum4 = simd_sum(result4[row]);
+    float sum5 = simd_sum(result5[row]);
+    float sum6 = simd_sum(result6[row]);
+    float sum7 = simd_sum(result7[row]);
+    if (simd_lid == 0) {
+      y[0 * out_vec_size + out_row + row] = static_cast<T>(sum0);
+      y[1 * out_vec_size + out_row + row] = static_cast<T>(sum1);
+      y[2 * out_vec_size + out_row + row] = static_cast<T>(sum2);
+      y[3 * out_vec_size + out_row + row] = static_cast<T>(sum3);
+      y[y_position_stride + 0 * out_vec_size + out_row + row] =
+          static_cast<T>(sum4);
+      y[y_position_stride + 1 * out_vec_size + out_row + row] =
+          static_cast<T>(sum5);
+      y[y_position_stride + 2 * out_vec_size + out_row + row] =
+          static_cast<T>(sum6);
+      y[y_position_stride + 3 * out_vec_size + out_row + row] =
+          static_cast<T>(sum7);
+    }
+  }
+}
+
+
+// Low-register B8 rectangle kernel. Each threadgroup owns one output row.
+// Its two SIMD groups process one draft position each, and each SIMD group
+// applies one packed weight stream to all eight cohort rows. This keeps eight
+// accumulators per SIMD lane instead of the 32 used by the wide octet kernel.
+template <typename T, const int bits>
+METAL_FUNC void qmv_g64_position_pair_octet_output_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int x_position_stride,
+    const int position_count,
+    const int in_vec_size,
+    const int out_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(bits == 4 || bits == 8, "only affine 4/8-bit supported");
+  constexpr int values_per_thread = bits == 4 ? 8 : 4;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 64 / values_per_thread;
+
+  const int position = 2 * int(tid.z) + int(simd_gid);
+  if (position >= position_count) {
+    return;
+  }
+  const int out_row = int(tid.y) * 8 + int(tid.x);
+  const int in_vec_size_w = in_vec_size * bits / 8;
+  const int in_vec_size_g = in_vec_size / 64;
+
+  const device uint8_t* ws =
+      reinterpret_cast<const device uint8_t*>(w) +
+      out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  const device T* scale_row =
+      scales + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  const device T* bias_row =
+      biases + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  const device T* position_x =
+      x + position * x_position_stride + simd_lid * values_per_thread;
+
+  thread float x_thread[values_per_thread];
+  thread uint16_t packed4[2];
+  thread uint8_t packed8[4];
+  thread float result[8] = {0};
+
+  int k = 0;
+  for (; k < in_vec_size - block_size; k += block_size) {
+    if (bits == 4) {
+      const device uint16_t* source =
+          reinterpret_cast<const device uint16_t*>(ws);
+      packed4[0] = source[0];
+      packed4[1] = source[1];
+    } else {
+      for (int i = 0; i < 4; i++) {
+        packed8[i] = ws[i];
+      }
+    }
+    const float scale = scale_row[0];
+    const float bias = bias_row[0];
+    for (int stream = 0; stream < 8; stream++) {
+      const float sum = load_vector<T, float, values_per_thread, bits>(
+          position_x + stream * in_vec_size, x_thread);
+      if (bits == 4) {
+        result[stream] += qdot_affine4_registered<float, values_per_thread>(
+            packed4, x_thread, scale, bias, sum);
+      } else {
+        result[stream] += qdot_affine8_registered<float, values_per_thread>(
+            packed8, x_thread, scale, bias, sum);
+      }
+    }
+    ws += block_size * bits / 8;
+    scale_row += block_size / 64;
+    bias_row += block_size / 64;
+    position_x += block_size;
+  }
+
+  const int remaining = clamp(
+      static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
+      0,
+      values_per_thread);
+  if (remaining > 0) {
+    if (bits == 4) {
+      const device uint16_t* source =
+          reinterpret_cast<const device uint16_t*>(ws);
+      packed4[0] = source[0];
+      packed4[1] = source[1];
+    } else {
+      for (int i = 0; i < 4; i++) {
+        packed8[i] = ws[i];
+      }
+    }
+    const float scale = scale_row[0];
+    const float bias = bias_row[0];
+    for (int stream = 0; stream < 8; stream++) {
+      const float sum = load_vector_safe<T, float, values_per_thread, bits>(
+          position_x + stream * in_vec_size, x_thread, remaining);
+      if (bits == 4) {
+        result[stream] += qdot_affine4_registered<float, values_per_thread>(
+            packed4, x_thread, scale, bias, sum);
+      } else {
+        result[stream] += qdot_affine8_registered<float, values_per_thread>(
+            packed8, x_thread, scale, bias, sum);
+      }
+    }
+  }
+
+  device T* position_y = y + position * 8 * out_vec_size;
+  for (int stream = 0; stream < 8; stream++) {
+    const float reduced = simd_sum(result[stream]);
+    if (simd_lid == 0) {
+      position_y[stream * out_vec_size + out_row] =
+          static_cast<T>(reduced);
+    }
+  }
+}
+
 
 template <typename T, const int group_size, const int bits>
 METAL_FUNC void qvm_impl(
@@ -2510,6 +3038,30 @@ template <typename T, int group_size, int bits, bool batched>
     uint3 ntg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
+  if (batched && x_batch_ndims == 1 && w_batch_ndims == 0 &&
+      group_size == 64 && (bits == 4 || bits == 8) && ntg.x == 8 &&
+      ntg.z >= 2 && ntg.z <= 4 && x_shape[0] == int(ntg.z) &&
+      x_shape[1] == 8 && x_strides[0] == 9 * int64_t(in_vec_size) &&
+      x_strides[1] == in_vec_size && x_strides[2] == 1 &&
+      in_vec_size % 64 == 0 && out_vec_size >= 1024 &&
+      out_vec_size % 8 == 0) {
+    const int position = int(tid.z);
+    if (position >= int(ntg.z)) {
+      return;
+    }
+    const device T* position_x = x + position * x_strides[0];
+    device T* position_y = y + position * 8 * out_vec_size;
+    if (bits == 4) {
+      qmv_fast_crossrow_affine4_g64<T, 8>(
+          w, scales, biases, position_x, position_y,
+          in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+    } else {
+      qmv_fast_impl<T, 64, 8>(
+          w, scales, biases, position_x, position_y,
+          in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+    }
+    return;
+  }
   if (batched) {
     int M = x_shape[x_batch_ndims];
     adjust_matrix_offsets<T>(
@@ -2681,6 +3233,96 @@ template <typename T, const int group_size, const int bits, bool batched>
     uint3 ntg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
+  if (batched && x_batch_ndims == 1 && w_batch_ndims == 0 &&
+      group_size == 64 && (bits == 4 || bits == 8) && ntg.x == 8 &&
+      ntg.z >= 2 && ntg.z <= 4 && x_shape[0] == int(ntg.z) &&
+      x_shape[1] == 8 && x_strides[0] == 9 * int64_t(in_vec_size) &&
+      x_strides[1] == in_vec_size && x_strides[2] == 1 &&
+      in_vec_size % 64 == 0 && out_vec_size >= 1024 &&
+      out_vec_size % 8 == 0) {
+    if (bits == 4) {
+      qmv_g64_position_pair_octet_output_impl<T, 4>(
+          w, scales, biases, x, y, int(x_strides[0]), int(ntg.z),
+          in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+    } else {
+      qmv_g64_position_pair_octet_output_impl<T, 8>(
+          w, scales, biases, x, y, int(x_strides[0]), int(ntg.z),
+          in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+    }
+    return;
+    const int position = 2 * int(tid.z);
+    const int first_m = int(tid.x) * 2;
+    if (position >= int(ntg.z) || first_m >= 8) {
+      return;
+    }
+    const device T* position_x =
+        x + position * x_strides[0] + first_m * in_vec_size;
+    device T* position_y =
+        y + position * 8 * out_vec_size + first_m * out_vec_size;
+    if (position + 1 < int(ntg.z) && bits == 4) {
+      qmv_affine4_g64_quad_stream_impl<T, 64, 4>(
+          w,
+          scales,
+          biases,
+          position_x,
+          position_x + in_vec_size,
+          position_x + x_strides[0],
+          position_x + x_strides[0] + in_vec_size,
+          position_y,
+          position_y + out_vec_size,
+          position_y + 8 * out_vec_size,
+          position_y + 9 * out_vec_size,
+          in_vec_size,
+          tid,
+          simd_gid,
+          simd_lid);
+    } else if (position + 1 < int(ntg.z)) {
+      qmv_affine8_g64_quad_stream_impl<T, 64, 8>(
+          w,
+          scales,
+          biases,
+          position_x,
+          position_x + in_vec_size,
+          position_x + x_strides[0],
+          position_x + x_strides[0] + in_vec_size,
+          position_y,
+          position_y + out_vec_size,
+          position_y + 8 * out_vec_size,
+          position_y + 9 * out_vec_size,
+          in_vec_size,
+          tid,
+          simd_gid,
+          simd_lid);
+    } else if (bits == 4) {
+      qmv_affine4_g64_pair_impl<T, 64, 4>(
+          w,
+          scales,
+          biases,
+          position_x,
+          position_x + in_vec_size,
+          position_y,
+          position_y + out_vec_size,
+          in_vec_size,
+          tid,
+          simd_gid,
+          simd_lid);
+    } else {
+      qmv_affine8_g64_pair_impl<T, 64, 8>(
+          w,
+          scales,
+          biases,
+          position_x,
+          position_x + in_vec_size,
+          position_y,
+          position_y + out_vec_size,
+          in_vec_size,
+          tid,
+          simd_gid,
+          simd_lid);
+    }
+    return;
+  }
+
   if (batched) {
     int M = x_shape[x_batch_ndims];
     adjust_matrix_offsets<T>(
@@ -3234,9 +3876,12 @@ template <typename T, int group_size, int bits>
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   int M = x_shape[x_batch_ndims];
+  const uint assignment_count = uint(batch_shape[0]);
   const bool gemma4_pair_geometry =
       group_size == 64 && bits == 4 && M == 1 && batch_ndims == 1 &&
-      batch_shape[0] == 64 && x_batch_ndims == 1 && w_batch_ndims == 1 &&
+      assignment_count >= 64 && assignment_count <= 256 &&
+      assignment_count % 64 == 0 &&
+      x_batch_ndims == 1 && w_batch_ndims == 1 &&
       ((in_vec_size == 2816 && out_vec_size == 704) ||
        (in_vec_size == 704 && out_vec_size == 2816));
   if (gemma4_pair_geometry) {
@@ -3256,7 +3901,7 @@ template <typename T, int group_size, int bits>
       return;
     }
     const bool has_pair =
-        assignment + 1 < 64 &&
+        assignment + 1 < assignment_count &&
         rhs_indices[(assignment + 1) * (uint)rhs_strides[0]] == expert;
     if (has_pair) {
       const uint32_t x0_idx =

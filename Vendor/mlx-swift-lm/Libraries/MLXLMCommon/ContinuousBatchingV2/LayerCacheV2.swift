@@ -94,6 +94,10 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     /// query with the canonical L=1 SDPA path and its exact visible KV prefix.
     var mtpSerializesRectangularAttention = false
 
+    /// A seed step is followed by an MTP snapshot/transaction instead of the
+    /// next fused decode call that normally consumes the ring-write fence.
+    var mtpSuppressesFusedRingWrite = false
+
     /// Times `positionOffsets` was rebuilt from host integers. Tests assert
     /// this only moves on membership changes — never inside the step loop.
     public private(set) var positionOffsetsHostRebuilds = 0
@@ -183,7 +187,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             spanContexts: boundSpanContexts,
             serializeQueries: mtpSerializesRectangularAttention,
             decodeRingWriteFence: decodeRingWriteFence,
-            allowFusedRingWrite: !retainsChunkForBorrowers)
+            allowFusedRingWrite:
+                !retainsChunkForBorrowers && !mtpSuppressesFusedRingWrite)
         // Advance offsets ON-DEVICE. A unified bank elects exactly one owning
         // cache; Gemma snapshots the shared pre-step value before this call.
         if advancesPositionOffsets {

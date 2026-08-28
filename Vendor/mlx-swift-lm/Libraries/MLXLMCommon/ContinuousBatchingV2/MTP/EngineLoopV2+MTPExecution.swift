@@ -100,7 +100,11 @@ extension EngineLoopV2 {
             let inputs = MLXArray(decodeRows.map { Int32($0.rec.tokens[$0.start]) })
                 .reshaped([decodeRows.count, 1])
             let caches = eagerCaches(rowStates: decodeRows.map { kvStates[$0.rec.id]! })
+            let seedCaches = decodeRows.contains(where: \.isSeed)
+                ? caches.compactMap { $0 as? CBv2LayerCache } : []
+            for cache in seedCaches { cache.mtpSuppressesFusedRingWrite = true }
             let (logits, hidden) = mtp.model.forwardWithHidden(tokens: inputs, caches: caches)
+            for cache in seedCaches { cache.mtpSuppressesFusedRingWrite = false }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             decodeSampled = sampler.sample(
                 logits: logits[0..., -1, 0...],

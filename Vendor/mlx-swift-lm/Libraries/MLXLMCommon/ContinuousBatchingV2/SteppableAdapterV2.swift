@@ -156,4 +156,14 @@ extension CBv2SteppableLanguageModelAdapter: CBv2MTPSteppableModel {
         }
         return forwardable.cbv2ForwardWithHidden(tokens, caches: asKVCaches(caches))
     }
+
+    public func argmaxWithHidden(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> (argmax: MLXArray, lastHidden: MLXArray) {
+        guard let forwardable = model as? CBv2MTPForwardable else {
+            preconditionFailure(
+                "CBv2 MTP: \(type(of: model)) is not CBv2MTPForwardable — engine gating failed")
+        }
+        return forwardable.cbv2ArgmaxWithHidden(tokens, caches: asKVCaches(caches))
+    }
 }

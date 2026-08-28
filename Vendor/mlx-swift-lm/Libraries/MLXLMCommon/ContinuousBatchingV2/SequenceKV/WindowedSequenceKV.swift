@@ -175,13 +175,17 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
     }
 
     func decodeRingWrite(keys newKeys: MLXArray, values newValues: MLXArray) {
-        precondition(staged == nil && newKeys.dim(2) == 1 && newValues.dim(2) == 1)
+        precondition(
+            !speculativeWriteArmed && staged == nil
+                && newKeys.dim(2) == 1 && newValues.dim(2) == 1)
         allocateIfNeeded(keyTemplate: newKeys, valueTemplate: newValues)
         writeDecodeToken(keys: newKeys, values: newValues)
     }
 
     var decodeRingView: (keys: MLXArray, values: MLXArray, start: Int)? {
-        guard staged == nil, let keys, let values, retainedCount == window else { return nil }
+        guard !speculativeWriteArmed, staged == nil,
+            let keys, let values, retainedCount == window
+        else { return nil }
         return (keys, values, oldestValidPosition % window)
     }
 
@@ -196,7 +200,9 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
     /// lands in is `absoluteOffset % window`, i.e. `(start + window - 1) %
     /// window` — the slot the returned start has just stepped past.
     var decodeRingViewBeforeWrite: (keys: MLXArray, values: MLXArray, start: Int)? {
-        guard staged == nil, let keys, let values, retainedCount == window else { return nil }
+        guard !speculativeWriteArmed, staged == nil,
+            let keys, let values, retainedCount == window
+        else { return nil }
         return (keys, values, (oldestValidPosition + 1) % window)
     }
 

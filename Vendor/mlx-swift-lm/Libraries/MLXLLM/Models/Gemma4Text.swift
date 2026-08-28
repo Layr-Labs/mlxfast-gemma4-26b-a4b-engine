@@ -2014,6 +2014,11 @@ public class Gemma4DecoderLayer: Module {
         if let fusedOut = Gemma4FusedLayerGlue.normResidual(
             x: attnOut, residual: residual,
             weight: postAttentionLayernorm.weight, eps: config.rmsNormEps)
+            // GLUE-001 admits only [8, 1, 2816]; the prefill rectangle
+            // [B, chunk >= 2, 2816] falls through to the same fusion here.
+            ?? Gemma4PrefillGlueV1.normResidual(
+                x: attnOut, weight: postAttentionLayernorm.weight,
+                residual: residual, eps: config.rmsNormEps)
         {
             out = fusedOut
         } else {
@@ -2044,6 +2049,11 @@ public class Gemma4DecoderLayer: Module {
                 w1: preFeedforwardLayernorm.weight,
                 w2: preFeedforwardLayernorm2.weight,
                 eps: config.rmsNormEps)
+                ?? Gemma4PrefillGlueV1.dualPreNorm(
+                    x: out,
+                    w1: preFeedforwardLayernorm.weight,
+                    w2: preFeedforwardLayernorm2.weight,
+                    eps: config.rmsNormEps)
             {
                 h1Raw = mlp(n1)
                 h2Raw = experts(
@@ -2066,6 +2076,12 @@ public class Gemma4DecoderLayer: Module {
                 w2: postFeedforwardLayernorm2.weight,
                 w3: postFeedforwardLayernorm.weight,
                 eps: config.rmsNormEps)
+                ?? Gemma4PrefillGlueV1.branchTail(
+                    h1: h1Raw, h2: h2Raw,
+                    w1: postFeedforwardLayernorm1.weight,
+                    w2: postFeedforwardLayernorm2.weight,
+                    w3: postFeedforwardLayernorm.weight,
+                    residual2: residual2, eps: config.rmsNormEps)
             {
                 out = fusedTail
                 tailApplied = true

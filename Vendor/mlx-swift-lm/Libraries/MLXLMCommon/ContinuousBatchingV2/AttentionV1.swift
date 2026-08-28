@@ -44,6 +44,7 @@ enum CBv2AttentionV1 {
     /// launch overhead of 32. `0` disables blocking entirely (one call for the
     /// whole chunk — the pre-2026-07 behavior), which is the kill switch if
     /// this is ever implicated in a numerics or latency regression.
+
     static let queryBlockSize: Int = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_ATTN_QUERY_BLOCK"],
@@ -86,6 +87,160 @@ enum CBv2AttentionV1 {
         else { return false }
         return ["1", "true", "yes", "on"].contains(raw.lowercased())
     }()
+
+    /// PREF-ATT kill switch (`DARKBLOOM_GEMMA4_PREFILL_ATT_FASTPATH=0`
+    /// restores the pinned `MLXFast.scaledDotProductAttention` call for every
+    /// prefill shape). Default ON.
+    ///
+    /// What the fast path replaces: at the packed-prefill attention shapes
+    /// (qL > 8, head dim 256 or 512) the FROZEN host lowers every
+    /// `MLXFast.scaledDotProductAttention` call to the composed fallback
+    /// graph built inline by `mlx/fast.cpp` (`use_fallback` in
+    /// `scaled_dot_product_attention.cpp:591-640` — the fused steel path
+    /// supports head dim 64/80/128 only, the vector path qL <= 8). That
+    /// fallback is, per call: `multiply(q, scale)` → GQA unflatten/expand
+    /// views → `matmul` QKᵀ → `arange`+`arange`+`greater_equal` (the causal
+    /// mask, rebuilt EVERY call) → `where` → `softmax(precise: true)` →
+    /// `matmul` scores·V → flatten view.
+    ///
+    /// `prefillCausalUnfusedAttention` transcribes that graph op-for-op with
+    /// two bit-exact deltas:
+    ///  1. the `multiply` by `scale == 1.0` is elided — x·1.0 is the IEEE-754
+    ///     identity on every bf16 value, and the QKᵀ matmul then reads the
+    ///     strided query-block view directly: `check_transpose`
+    ///     (`matmul.cpp:25-41`) takes the no-copy branch because the last two
+    ///     dims keep strides (headDim, 1), and kernel selection + per-output
+    ///     accumulation depend only on (M, N, K, transposes, dtype) — batch
+    ///     strides merely relocate each matrix. This deletes one full
+    ///     read+write pass over Q per call (~4.7 GB per 8×1024 packed
+    ///     prefill) plus 240 dispatches.
+    ///  2. the causal bool mask and the `finfo(bf16).min` fill scalar are
+    ///     built ONCE per (qL, kL) and reused across layers/blocks/steps —
+    ///     they are input-independent, and `where` is elementwise, so
+    ///     identical mask VALUES give identical output bits. An 8-block 30
+    ///     layer prefill builds 8 masks instead of 240 (× 3 dispatches each).
+    ///
+    /// Parity: uint16-bit-identical to the current chain at every engine cut
+    /// (q-blocks 128 at kL = 128…1024, tails 9…127, both geometries
+    /// D=256/gqa2 and D=512/gqa8, B ∈ {1, 8}) — scratchpad/parity-prefatt.log.
+    static let prefillCausalFastPathEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_ATT_FASTPATH"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Input-independent cache of causal bool masks keyed by (qL, kL), plus
+    /// the bf16 lowest-finite fill scalar. Bounded: the production prefill
+    /// uses exactly 8 keys (qL=128 × kL=128…1024, shared by BOTH head
+    /// geometries — the mask does not depend on heads or head dim); an
+    /// overflowing key set past `prefillMaskCacheLimit` simply builds
+    /// uncached, which stays correct.
+    private static let prefillMaskLock = NSLock()
+    nonisolated(unsafe) private static var prefillCausalMasks: [Int: MLXArray] = [:]
+    nonisolated(unsafe) private static var prefillLowestBF16Scalar: MLXArray?
+    private static let prefillMaskCacheLimit = 64
+
+    /// The causal bool mask the mlx fallback would build for (qL, kL):
+    /// `arange(kL-qL, kL)[:, None] >= arange(0, kL)[None, :]` — verbatim its
+    /// construction (int32 aranges, `greater_equal`), so cached and fresh
+    /// masks are the same VALUES and `where` output is bit-identical.
+    private static func prefillCausalMask(qL: Int, kL: Int) -> MLXArray {
+        let key = (qL << 24) | kL
+        prefillMaskLock.lock()
+        if let mask = prefillCausalMasks[key] {
+            prefillMaskLock.unlock()
+            return mask
+        }
+        prefillMaskLock.unlock()
+        let offset = kL - qL
+        let qIdx = MLXArray(Int32(offset) ..< Int32(qL + offset))
+            .expandedDimensions(axis: 1)
+        let kIdx = MLXArray(Int32(0) ..< Int32(kL)).expandedDimensions(axis: 0)
+        let mask = qIdx .>= kIdx
+        prefillMaskLock.lock()
+        if prefillCausalMasks.count < prefillMaskCacheLimit {
+            prefillCausalMasks[key] = mask
+        }
+        prefillMaskLock.unlock()
+        return mask
+    }
+
+    /// `array(finfo(bfloat16).min, bfloat16)` — the masked-score fill the
+    /// fallback uses for bf16 scores: the LOWEST finite bf16
+    /// (-3.3895313892515355e38, bit pattern 0xFF7F). The value is exactly
+    /// representable, so the Float → bf16 cast reproduces it bit-exactly.
+    private static func prefillMaskFillBF16() -> MLXArray {
+        prefillMaskLock.lock()
+        if let scalar = prefillLowestBF16Scalar {
+            prefillMaskLock.unlock()
+            return scalar
+        }
+        prefillMaskLock.unlock()
+        let scalar = MLXArray(Float(-3.3895313892515355e38)).asType(.bfloat16)
+        prefillMaskLock.lock()
+        prefillLowestBF16Scalar = scalar
+        prefillMaskLock.unlock()
+        return scalar
+    }
+
+    /// PREF-ATT: exact transcription of the composed fallback graph the
+    /// FROZEN host runs for the packed-prefill causal attention shapes,
+    /// minus the scale-by-1.0 multiply and with the mask/fill hoisted into
+    /// the per-shape cache above (see `prefillCausalFastPathEnabled` for the
+    /// full argument). Returns nil — and the caller keeps the pinned
+    /// `MLXFast.scaledDotProductAttention` call — for every shape whose
+    /// host lowering is NOT provably this graph:
+    ///  - `L <= 8`: the fused `sdpa_vector` path can take those (decode and
+    ///    short tails stay untouched by construction);
+    ///  - head dim ∉ {256, 512}: 64/80/128 can take the fused steel path;
+    ///  - a binding window (`kL > window`), sinks, bidirectional kinds, a
+    ///    non-1.0 scale, non-bf16 dtypes, `kL < L`, or any shape mismatch.
+    private static func prefillCausalUnfusedAttention(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, L: Int, kL: Int, window: Int?
+    ) -> MLXArray? {
+        guard prefillCausalFastPathEnabled else { return nil }
+        guard L > 8, kL >= L, scale == 1.0 else { return nil }
+        if let window, kL > window { return nil }
+        guard queries.ndim == 4, keys.ndim == 4, values.ndim == 4 else { return nil }
+        let headDim = queries.dim(3)
+        guard headDim == 256 || headDim == 512 else { return nil }
+        guard queries.dtype == .bfloat16, keys.dtype == .bfloat16,
+            values.dtype == .bfloat16
+        else { return nil }
+        let batch = queries.dim(0)
+        let queryHeads = queries.dim(1)
+        let kvHeads = keys.dim(1)
+        guard queries.dim(2) == L,
+            keys.dim(0) == batch, values.dim(0) == batch,
+            keys.dim(2) == kL, values.dim(2) == kL,
+            keys.dim(3) == headDim, values.dim(3) == headDim,
+            values.dim(1) == kvHeads,
+            kvHeads >= 1, queryHeads % kvHeads == 0
+        else { return nil }
+
+        // Verbatim the fallback body (fast.cpp:717-789) for
+        // (causal, no sinks, scale 1.0), multiply elided.
+        let nRepeats = queryHeads / kvHeads
+        var q = queries
+        var k = keys
+        var v = values
+        if nRepeats > 1 {
+            q = unflatten(q, axis: 1, shape: [kvHeads, nRepeats])
+            k = k.expandedDimensions(axis: 2)
+            v = v.expandedDimensions(axis: 2)
+        }
+        var scores = matmul(q, k.swappedAxes(-1, -2))
+        scores = which(
+            prefillCausalMask(qL: L, kL: kL), scores, prefillMaskFillBF16())
+        scores = softmax(scores, axis: -1, precise: true)
+        var out = matmul(scores, v)
+        if nRepeats > 1 {
+            out = out.flattened(start: 1, end: 2)
+        }
+        return out
+    }
 
     /// Whether a chunk of `L` queries should be split into blocks. Single
     /// queries (decode) and chunks already at or below the block width take
@@ -369,6 +524,19 @@ enum CBv2AttentionV1 {
                             window: nil, sinks: effectiveSinks, softcap: softcap))
                 }
                 return concatenated(outputs, axis: 0)
+            }
+
+            // D512-SDPA: batched 3-dispatch full-attention decode with the
+            // unfused chain's exact numerics (default off:
+            // DARKBLOOM_GEMMA4_D512_DECODE_SDPA=1). Precedes ATT-008 so rows
+            // stay unpooled; pooled rows fail its gate closed.
+            if let output = CBv2RaggedComposedD512DecodeAttentionV1.updateAndAttend(
+                rows: rows, kind: kind,
+                queries: queries, keys: keys, values: values,
+                scale: scale, sinks: effectiveSinks, softcap: softcap)
+            {
+                CBv2EngageMark.once("d512sdpa")
+                return output
             }
 
             // ATT-008: batch-wide FULL-attention decode. One pooled append +
@@ -1131,6 +1299,23 @@ enum CBv2AttentionV1 {
             assert(
                 sinks == nil || sinks!.dtype == queries.dtype,
                 "CBv2AttentionV1: sinks must be normalized to the query dtype before SDPA")
+            // PREF-ATT: at the prefill causal shapes the host provably
+            // lowers the call below to the composed fallback graph; build
+            // that graph directly with the scale-by-1.0 multiply elided and
+            // the causal mask hoisted into a per-shape cache — bit-identical
+            // output (see `prefillCausalFastPathEnabled`). Every other shape
+            // — decode (L == 1), short tails (L <= 8, fusable), fused head
+            // dims, windows that bind, sinks, bidirectional — fails closed
+            // to the pinned call.
+            if sinks == nil, !bidirectional,
+                let fast = prefillCausalUnfusedAttention(
+                    queries: queries, keys: attentionKeys,
+                    values: attentionValues,
+                    scale: scale, L: L, kL: kL, window: window)
+            {
+                CBv2EngageMark.once("prefatt")
+                return fast
+            }
             return MLXFast.scaledDotProductAttention(
                 queries: queries, keys: attentionKeys, values: attentionValues, scale: scale,
                 mask: maskMode(

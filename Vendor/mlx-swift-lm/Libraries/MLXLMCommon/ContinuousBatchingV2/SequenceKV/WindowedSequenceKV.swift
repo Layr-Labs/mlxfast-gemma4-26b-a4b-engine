@@ -180,6 +180,11 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
         writeDecodeToken(keys: newKeys, values: newValues)
     }
 
+    var canUseFullDecodeRing: Bool {
+        !speculativeWriteArmed && staged == nil && keys != nil && values != nil
+            && retainedCount == window
+    }
+
     var decodeRingView: (keys: MLXArray, values: MLXArray, start: Int)? {
         guard staged == nil, let keys, let values, retainedCount == window else { return nil }
         return (keys, values, oldestValidPosition % window)

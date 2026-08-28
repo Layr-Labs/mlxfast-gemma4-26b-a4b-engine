@@ -1,5 +1,5 @@
-// LMH-001v2: tight-grid dispatch for the tied lm_head ordinary QMV at batch
-// eight, carrying the promoted quad-STREAM body verbatim.
+// LMH-001v3: tight-grid dispatch for the tied lm_head ordinary QMV at batch
+// eight, carrying the promoted quad-STREAM body with its exact full-block tail.
 //
 // The vendored MLX host launches ordinary QMV as
 //
@@ -351,45 +351,37 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     x3 += block_size;
   }
 
-  const int remaining = clamp(
-      static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
-      0,
-      values_per_thread);
-  if (remaining > 0) {
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      const device uint16_t* wl =
-          (const device uint16_t*)(ws + row * in_vec_size_w);
-      for (int i = 0; i < uint16_per_thread; i++) {
-        packed[row][i] = wl[i];
-      }
-      scale_local[row] = scales[row * in_vec_size_g];
-      bias_local[row] = biases[row * in_vec_size_g];
+  // The Swift gate pins K to a whole 256-value block. The loop deliberately
+  // leaves that final full block here, so every SIMD lane owns eight values.
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    const device uint16_t* wl =
+        (const device uint16_t*)(ws + row * in_vec_size_w);
+    for (int i = 0; i < uint16_per_thread; i++) {
+      packed[row][i] = wl[i];
     }
+    scale_local[row] = scales[row * in_vec_size_g];
+    bias_local[row] = biases[row * in_vec_size_g];
+  }
 
-    float sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x0, x_thread, remaining);
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result0[row] += qdot_affine4_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
-    }
-    sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x1, x_thread, remaining);
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result1[row] += qdot_affine4_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
-    }
-    sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x2, x_thread, remaining);
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result2[row] += qdot_affine4_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
-    }
-    sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x3, x_thread, remaining);
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result3[row] += qdot_affine4_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
-    }
+  float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result0[row] += qdot_affine4_registered<float, values_per_thread>(
+        packed[row], x_thread, scale_local[row], bias_local[row], sum);
+  }
+  sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result1[row] += qdot_affine4_registered<float, values_per_thread>(
+        packed[row], x_thread, scale_local[row], bias_local[row], sum);
+  }
+  sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result2[row] += qdot_affine4_registered<float, values_per_thread>(
+        packed[row], x_thread, scale_local[row], bias_local[row], sum);
+  }
+  sum = load_vector<T, float, values_per_thread, 4>(x3, x_thread);
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result3[row] += qdot_affine4_registered<float, values_per_thread>(
+        packed[row], x_thread, scale_local[row], bias_local[row], sum);
   }
 
   for (int row = 0; row < results_per_simdgroup; row++) {
@@ -408,7 +400,7 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
 """
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_tied_lmhead_qmv_affine4_g64_quad_stream_v2",
+        name: "cbv2_b8_tied_lmhead_qmv_affine4_g64_quad_stream_v3",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -469,7 +461,7 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
             x.dim(2) == inDim,
             outDim >= 8,
             outDim % outputsPerGroup == 0,
-            inDim % groupSize == 0,
+            inDim % values_per_thread_block == 0,
             inDim >= 2 * values_per_thread_block,
             weight.ndim == 2,
             weight.dim(0) == outDim,

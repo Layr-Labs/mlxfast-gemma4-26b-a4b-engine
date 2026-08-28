@@ -1525,9 +1525,9 @@ private enum Gemma4FusedRouterTop8 {
 /// replace the strictly SERIAL RMSNorm/add chains between the layer's matmuls
 /// at the exact ranked decode geometry ([8, 1, 2816] bfloat16):
 ///
-///   1. `dualPreNorm` — `preFeedforwardLayernorm(out)` and
-///      `preFeedforwardLayernorm2(out)` norm the SAME tensor; one reduction
-///      feeds both weight applications (2 kernels -> 1).
+///   1. `triplePreNorm` — the dense branch, router, and sparse branch norm the
+///      SAME tensor; one reduction feeds all three weight applications
+///      (3 kernels -> 1).
 ///   2. `tail` — `postFFLN1(h1) + postFFLN2(h2)` -> `postFFLN` -> `+ residual`
 ///      (5 kernels -> 1).
 ///   3. `normResidual` — `residual + postAttentionLayernorm(attnOut)`
@@ -1612,10 +1612,10 @@ private enum Gemma4FusedLayerGlue {
         ensureRowContiguous: true
     )
 
-    private static let dualPreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_dual_prenorm_2816_bf16_v1",
-        inputNames: ["x", "w1", "w2"],
-        outputNames: ["out1", "out2"],
+    private static let triplePreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_glue_triple_prenorm_2816_bf16_v1",
+        inputNames: ["x", "w1", "w2", "w3"],
+        outputNames: ["out1", "out2", "out3"],
         source: """
             const uint row = threadgroup_position_in_grid.x;
             const uint lid = thread_position_in_threadgroup.x;
@@ -1631,6 +1631,7 @@ private enum Gemma4FusedLayerGlue {
                 const T nx = static_cast<T>((float)x[base + i] * inv);
                 out1[base + i] = w1[wbase + i] * nx;
                 out2[base + i] = w2[wbase + i] * nx;
+                out3[base + i] = w3[wbase + i] * nx;
             }
         """,
         ensureRowContiguous: true
@@ -1699,22 +1700,23 @@ private enum Gemma4FusedLayerGlue {
         )[0]
     }
 
-    static func dualPreNorm(
-        x: MLXArray, w1: MLXArray, w2: MLXArray, eps: Float
-    ) -> (MLXArray, MLXArray)? {
+    static func triplePreNorm(
+        x: MLXArray, w1: MLXArray, w2: MLXArray, w3: MLXArray, eps: Float
+    ) -> (MLXArray, MLXArray, MLXArray)? {
         guard admits(x, weight: w1, eps: eps),
-            w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16
+            w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16,
+            w3.ndim == 1, w3.dim(0) == axis, w3.dtype == .bfloat16
         else { return nil }
-        CBv2EngageMark.once("glue-dual-prenorm")
-        let outs = dualPreNormKernel(
-            [x, w1, w2],
+        CBv2EngageMark.once("glue-triple-prenorm")
+        let outs = triplePreNormKernel(
+            [x, w1, w2, w3],
             template: [("T", x.dtype)],
             grid: (rows * tgThreads, 1, 1),
             threadGroup: (tgThreads, 1, 1),
-            outputShapes: [[rows, 1, axis], [rows, 1, axis]],
-            outputDTypes: [.bfloat16, .bfloat16]
+            outputShapes: [[rows, 1, axis], [rows, 1, axis], [rows, 1, axis]],
+            outputDTypes: [.bfloat16, .bfloat16, .bfloat16]
         )
-        return (outs[0], outs[1])
+        return (outs[0], outs[1], outs[2])
     }
 
     static func tail(
@@ -1770,16 +1772,18 @@ private class Gemma4Router: Module {
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
-        let effScale: MLXArray
+    func effectiveScale() -> MLXArray {
         if let cached = cachedEffectiveScale {
-            effScale = cached
-        } else {
-            let eff = scale * rootSize
-            cachedEffectiveScale = eff
-            effScale = eff
+            return cached
         }
-        let normed = MLXFast.rmsNorm(x, weight: effScale, eps: eps)
+        let result = scale * rootSize
+        cachedEffectiveScale = result
+        return result
+    }
+
+    func routeNormalized(
+        _ normed: MLXArray
+    ) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
         let expertScores = proj(normed)
 
         // ROUTE-001: single-dispatch byte-identical replacement of the chain
@@ -1805,6 +1809,11 @@ private class Gemma4Router: Module {
         Gemma4RouterProbe.recorder?(expertScores, topKIndices)
 
         return (topKIndices, topKWeights)
+    }
+
+    func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
+        let normed = MLXFast.rmsNorm(x, weight: effectiveScale(), eps: eps)
+        return routeNormalized(normed)
     }
 }
 
@@ -2035,16 +2044,21 @@ public class Gemma4DecoderLayer: Module {
             let postFeedforwardLayernorm2
         {
             // Dense + sparse branches in parallel, summed into one residual.
-            let (topKIndices, topKWeights) = router(out)
+            // The promoted glue already shares the dense/sparse RMS reduction;
+            // extend that exact reduction to the router's third weight.
+            let fusedPreNorm = Gemma4FusedLayerGlue.triplePreNorm(
+                x: out,
+                w1: preFeedforwardLayernorm.weight,
+                w2: router.effectiveScale(),
+                w3: preFeedforwardLayernorm2.weight,
+                eps: config.rmsNormEps)
+
+            let (topKIndices, topKWeights) =
+                fusedPreNorm.map { router.routeNormalized($0.1) } ?? router(out)
 
             let h1Raw: MLXArray
             let h2Raw: MLXArray
-            if let (n1, n2) = Gemma4FusedLayerGlue.dualPreNorm(
-                x: out,
-                w1: preFeedforwardLayernorm.weight,
-                w2: preFeedforwardLayernorm2.weight,
-                eps: config.rmsNormEps)
-            {
+            if let (n1, _, n2) = fusedPreNorm {
                 h1Raw = mlp(n1)
                 h2Raw = experts(
                     n2,

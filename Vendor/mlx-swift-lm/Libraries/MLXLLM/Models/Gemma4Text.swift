@@ -2452,11 +2452,25 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         // The VLM omission profile uses zero to represent the former optional
         // softcap's nil/disabled state.
         if config.finalLogitSoftcapping > 0 {
-            out = gemma4CompiledLogitSoftcap(
-                out, MLXArray(config.finalLogitSoftcapping))
+            // The cap is a config constant, but this call previously allocated
+            // and uploaded a fresh scalar MLXArray on EVERY forward (each
+            // decode step, both legs). Materialize it once and reuse — the
+            // same input-independent constant-folding class as the promoted
+            // router memoization and drafter RoPE table.
+            let cap: MLXArray
+            if let cached = cachedSoftcapScalar {
+                cap = cached
+            } else {
+                let scalar = MLXArray(config.finalLogitSoftcapping)
+                cachedSoftcapScalar = scalar
+                cap = scalar
+            }
+            out = gemma4CompiledLogitSoftcap(out, cap)
         }
         return out
     }
+
+    private var cachedSoftcapScalar: MLXArray?
 
     /// The LM head WITHOUT the configured final-logit softcap.
     ///

@@ -93,6 +93,10 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
     /// at `commitSpeculativeWrite()`. At most one transaction per row.
     private var staged: (keys: MLXArray, values: MLXArray, basePosition: Int)?
 
+    /// Full-ring working copy for serial B8 verification. It preserves the
+    /// ordinary ring-attention reduction without changing confirmed storage.
+    private var speculativeRing: (keys: MLXArray, values: MLXArray)?
+
     /// - Parameters:
     ///   - window: sliding window in tokens (> 0).
     ///   - initialOffset: absolute position this sequence starts at. Non-zero
@@ -114,6 +118,7 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
         // 1+k-token chunk per in-flight MTP round).
         (keys?.nbytes ?? 0) + (values?.nbytes ?? 0)
             + (staged.map { $0.keys.nbytes + $0.values.nbytes } ?? 0)
+            + (speculativeRing.map { $0.keys.nbytes + $0.values.nbytes } ?? 0)
     }
 
     public func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
@@ -175,12 +180,32 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
     }
 
     func decodeRingWrite(keys newKeys: MLXArray, values newValues: MLXArray) {
-        precondition(staged == nil && newKeys.dim(2) == 1 && newValues.dim(2) == 1)
+        precondition(newKeys.dim(2) == 1 && newValues.dim(2) == 1)
+        if speculativeWriteArmed {
+            guard let baseKeys = speculativeRing?.keys ?? keys,
+                let baseValues = speculativeRing?.values ?? values
+            else {
+                preconditionFailure(
+                    "CBv2WindowedSequenceKV: serial speculative ring write before allocation")
+            }
+            let position = absoluteOffset
+            _ = stageSpeculativeUpdate(
+                newKeys: newKeys, newValues: newValues, count: 1)
+            speculativeRing = (
+                replacingRingToken(baseKeys, with: newKeys, at: position),
+                replacingRingToken(baseValues, with: newValues, at: position))
+            return
+        }
+        precondition(staged == nil)
         allocateIfNeeded(keyTemplate: newKeys, valueTemplate: newValues)
         writeDecodeToken(keys: newKeys, values: newValues)
     }
 
     var decodeRingView: (keys: MLXArray, values: MLXArray, start: Int)? {
+        if let speculativeRing {
+            let oldest = max(oldestValidPosition, absoluteOffset - window)
+            return (speculativeRing.keys, speculativeRing.values, oldest % window)
+        }
         guard staged == nil, let keys, let values, retainedCount == window else { return nil }
         return (keys, values, oldestValidPosition % window)
     }
@@ -196,7 +221,9 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
     /// lands in is `absoluteOffset % window`, i.e. `(start + window - 1) %
     /// window` — the slot the returned start has just stepped past.
     var decodeRingViewBeforeWrite: (keys: MLXArray, values: MLXArray, start: Int)? {
-        guard staged == nil, let keys, let values, retainedCount == window else { return nil }
+        guard !speculativeWriteArmed, staged == nil,
+            let keys, let values, retainedCount == window
+        else { return nil }
         return (keys, values, (oldestValidPosition + 1) % window)
     }
 
@@ -228,6 +255,9 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
             staged == nil,
             "CBv2WindowedSequenceKV: beginSpeculativeWrite with a staged update pending — commit first"
         )
+        precondition(
+            speculativeRing == nil,
+            "CBv2WindowedSequenceKV: beginSpeculativeWrite with a ring copy pending")
         speculativeWriteArmed = true
     }
 
@@ -283,6 +313,7 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
 
     public func commitSpeculativeWrite() {
         speculativeWriteArmed = false
+        defer { speculativeRing = nil }
         guard let staged else { return }
         self.staged = nil
         // Confirmed range after finalize-time rollback: [basePosition,
@@ -425,6 +456,7 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
                     + "\(absoluteOffset - staged.basePosition)")
             absoluteOffset -= n
             borrowableChunkViews = nil
+            speculativeRing = nil
             return
         }
         precondition(
@@ -497,6 +529,22 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
             buffer[.ellipsis, start ..< window, 0...] = tokens[.ellipsis, ..<first, 0...]
             buffer[.ellipsis, 0 ..< (n - first), 0...] = tokens[.ellipsis, first..., 0...]
         }
+    }
+
+    /// Functional one-token ring replacement used by a serial speculative
+    /// transaction. The confirmed ring stays untouched until commit.
+    private func replacingRingToken(
+        _ buffer: MLXArray, with token: MLXArray, at position: Int
+    ) -> MLXArray {
+        precondition(token.dim(2) == 1)
+        let slot = position % window
+        var parts: [MLXArray] = []
+        if slot > 0 { parts.append(buffer[.ellipsis, ..<slot, 0...]) }
+        parts.append(token)
+        if slot + 1 < window {
+            parts.append(buffer[.ellipsis, (slot + 1)..., 0...])
+        }
+        return parts.count == 1 ? parts[0] : concatenated(parts, axis: 2)
     }
 
     private func allocateIfNeeded(keyTemplate: MLXArray, valueTemplate: MLXArray) {

@@ -100,7 +100,11 @@ extension EngineLoopV2 {
             let inputs = MLXArray(decodeRows.map { Int32($0.rec.tokens[$0.start]) })
                 .reshaped([decodeRows.count, 1])
             let caches = eagerCaches(rowStates: decodeRows.map { kvStates[$0.rec.id]! })
+            let seedCaches = decodeRows.contains(where: \.isSeed)
+                ? caches.compactMap { $0 as? CBv2LayerCache } : []
+            for cache in seedCaches { cache.mtpSuppressesFusedRingWrite = true }
             let (logits, hidden) = mtp.model.forwardWithHidden(tokens: inputs, caches: caches)
+            for cache in seedCaches { cache.mtpSuppressesFusedRingWrite = false }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             decodeSampled = sampler.sample(
                 logits: logits[0..., -1, 0...],
@@ -309,10 +313,8 @@ extension EngineLoopV2 {
     private func mtpFreezeCaptures(
         _ captured: [(row: CBv2SequenceKV, keys: MLXArray, values: MLXArray)]
     ) {
-        // Contiguous rows are ARC-owned by their views and need nothing.
-        // `requiresMaterializedSnapshots` is the bit that already documents
-        // exactly this recyclable-storage hazard: true for `PagedKVBackend`,
-        // false everywhere else, so contiguous stays byte-identical.
+        // Contiguous storage stages speculative writes, so its captures keep
+        // stable pre-round bytes. Paged storage needs the explicit edge.
         guard backend.requiresMaterializedSnapshots else { return }
         let unfenceable = CBv2MTPCaptureFence.publish(captured)
         if !unfenceable.isEmpty { eval(unfenceable) }

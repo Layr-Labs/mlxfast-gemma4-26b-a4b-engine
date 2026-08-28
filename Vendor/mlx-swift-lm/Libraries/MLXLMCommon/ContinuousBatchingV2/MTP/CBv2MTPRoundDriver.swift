@@ -159,24 +159,22 @@ struct CBv2MTPSeedCostLedger {
 final class CBv2MTPRoundDriver {
 
     /// PARTICIPANT DRAFT-DEPTH LEVER (editable). The maximum MTP draft depth this
-    /// submission's adaptive controller uses per decode round. This is a CEILING,
-    /// not a fixed depth. The controller selects a depth from 0 to this ceiling
-    /// each round. A higher value widens the adaptive range. It does not force
-    /// speculation. The trusted MTP envelope (`config.maxDraftTokens`, ceiling 3
-    /// at batch 8) also bounds it, so the effective cap is
-    /// `min(envelope, submissionDraftDepth)`. Default 1.
+    /// submission permits. Generic automatic configurations adapt from zero to
+    /// this ceiling. The production serial-target route pins this depth so its
+    /// first cost probe cannot disable MTP. The trusted MTP envelope
+    /// (`config.maxDraftTokens`, ceiling 3 at batch 8) also bounds it, so the
+    /// effective cap is `min(envelope, submissionDraftDepth)`. Default 1.
     ///
     /// UNIFORM WITH DFLASH. `DFlashDraftModel.submissionDraftDepth` is the DFlash
     /// counterpart. It has the same name, the same meaning, and the same default
     /// 1. The per-arm behaviour differs. MTP adapts up to this ceiling each round.
     /// DFlash proposes a fixed block of this size, because block diffusion drafts
     /// a whole block at once. The constant you edit is the same on both arms.
-    static let submissionDraftDepth = 0
+    static let submissionDraftDepth = 3
 
-    /// The effective adaptive-depth ceiling: the trusted envelope's max, bounded
-    /// by the participant's `submissionDraftDepth`. Pure and static so the cap is
-    /// unit-testable without a full driver. It is a CEILING the controller adapts
-    /// under, never a fixed pin.
+    /// The effective depth ceiling: the trusted envelope's max, bounded by the
+    /// participant's `submissionDraftDepth`. Pure and static so the cap is
+    /// unit-testable without a full driver.
     static func effectiveDraftCeiling(envelopeMax: Int) -> Int {
         min(envelopeMax, submissionDraftDepth)
     }
@@ -217,14 +215,17 @@ final class CBv2MTPRoundDriver {
         self.drafter = drafter
         self.model = model
         self.captureLayers = captureLayers
-        // The adaptive controller's CEILING: the trusted envelope cap
-        // (`config.maxDraftTokens`), further bounded by the participant's
-        // `submissionDraftDepth`. `fixedDepth` stays `config.fixedDraftTokens`
-        // (adaptive) — submissionDraftDepth is a ceiling, NEVER a fixed pin, so
-        // the controller keeps choosing 0…this per round.
+        let maximumDepth = Self.effectiveDraftCeiling(
+            envelopeMax: config.maxDraftTokens)
+        // The production Gemma route uses serialTarget as its sealed strategy.
+        // Pin that route at the participant ceiling so Yukon cannot adapt back
+        // to depth zero before the assistant has a chance to amortize target
+        // verification. Keep generic automatic configurations adaptive.
+        let fixedDepth = config.fixedDraftTokens
+            ?? (config.verificationMode == .serialTarget ? maximumDepth : nil)
         self.depthController = CBv2MTPDepthController(
-            maxDepth: Self.effectiveDraftCeiling(envelopeMax: config.maxDraftTokens),
-            fixedDepth: config.fixedDraftTokens)
+            maxDepth: maximumDepth,
+            fixedDepth: fixedDepth)
         self.metrics.verificationMode = config.verificationMode
         self.metrics.maxAutomaticRectangularTokens = config.maxAutomaticRectangularTokens
     }
@@ -558,6 +559,12 @@ final class CBv2MTPRoundDriver {
         } else {
             metrics.serialVerificationRounds += 1
         }
+        metricsLock.unlock()
+    }
+
+    func recordTargetVerificationForwardPass() {
+        metricsLock.lock()
+        metrics.targetVerificationForwardPasses += 1
         metricsLock.unlock()
     }
 

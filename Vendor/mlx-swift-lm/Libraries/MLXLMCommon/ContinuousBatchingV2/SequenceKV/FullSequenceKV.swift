@@ -210,6 +210,13 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
     private(set) var cohortPool: CBv2FullDecodeCohortPool?
     private(set) var cohortIndex: Int = -1
 
+    /// MTP target verification stages full-cache writes too. A pooled row
+    /// otherwise rewrites shared backing storage while sibling lazy graphs
+    /// still read the pre-round bytes.
+    private var speculativeWriteArmed = false
+    private var staged: (keys: MLXArray, values: MLXArray, basePosition: Int)?
+    var hasActiveSpeculativeWrite: Bool { speculativeWriteArmed }
+
     /// - Parameters:
     ///   - promptLength: expected prompt length, used to size the initial
     ///     allocation (`promptLength + 256`, capped at `maxLength`).
@@ -228,13 +235,14 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
     }
 
     public var byteCount: Int {
+        let stagedBytes = staged.map { $0.keys.nbytes + $0.values.nbytes } ?? 0
         if let pool = cohortPool {
             // This row's share of the pooled allocation; summing every bound
             // row reproduces the pool total, so the backend ledger stays
             // truthful after migration.
-            return pool.nbytes / pool.rowCount
+            return pool.nbytes / pool.rowCount + stagedBytes
         }
-        return (keys?.nbytes ?? 0) + (values?.nbytes ?? 0)
+        return (keys?.nbytes ?? 0) + (values?.nbytes ?? 0) + stagedBytes
     }
 
     public func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
@@ -249,6 +257,11 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
             absoluteOffset + n <= maxLength,
             "CBv2FullSequenceKV: append past maxLength (\(absoluteOffset) + \(n) > \(maxLength)) — admission bug"
         )
+
+        if speculativeWriteArmed {
+            return stageSpeculativeUpdate(keys: newKeys, values: newValues)
+        }
+        precondition(staged == nil, "CBv2FullSequenceKV: plain update with staged MTP data")
 
         if let pool = cohortPool {
             // Pooled twin of the private-buffer append below: same values
@@ -285,30 +298,75 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
     }
 
     public func snapshot() -> (keys: MLXArray, values: MLXArray, offset: Int) {
+        if let staged {
+            let base = confirmedViews(upTo: staged.basePosition)
+            let confirmed = absoluteOffset - staged.basePosition
+            var keyParts = [base.keys]
+            var valueParts = [base.values]
+            if confirmed > 0 {
+                keyParts.append(staged.keys[.ellipsis, ..<confirmed, 0...])
+                valueParts.append(staged.values[.ellipsis, ..<confirmed, 0...])
+            }
+            return (
+                keyParts.count == 1 ? keyParts[0] : concatenated(keyParts, axis: 2),
+                valueParts.count == 1 ? valueParts[0] : concatenated(valueParts, axis: 2),
+                absoluteOffset)
+        }
+        return confirmedViews(upTo: absoluteOffset)
+    }
+
+    private func confirmedViews(
+        upTo offset: Int
+    ) -> (keys: MLXArray, values: MLXArray, offset: Int) {
         if let pool = cohortPool {
             let (poolKeys, poolValues) = pool.rowViews(
-                index: cohortIndex, upTo: absoluteOffset)
-            return (poolKeys, poolValues, absoluteOffset)
+                index: cohortIndex, upTo: offset)
+            return (poolKeys, poolValues, offset)
         }
         guard let keys, let values else {
             return (
                 MLXArray.zeros([1, kvHeads, 0, headDim], dtype: .float16),
                 MLXArray.zeros([1, kvHeads, 0, headDim], dtype: .float16),
-                absoluteOffset
+                offset
             )
         }
         return (
-            keys[.ellipsis, ..<absoluteOffset, 0...],
-            values[.ellipsis, ..<absoluteOffset, 0...],
-            absoluteOffset
+            keys[.ellipsis, ..<offset, 0...],
+            values[.ellipsis, ..<offset, 0...],
+            offset
         )
     }
 
-    /// Plain rollback is already value-exact (see `rollback`: the offset
-    /// decrement makes the un-confirmed tail structurally unreachable and
-    /// the confirmed prefix is untouched), so speculative begin/commit are
-    /// the contract's default no-ops.
+    /// Full-cache MTP writes stay staged until the target accept walk commits
+    /// the confirmed prefix.
     public var supportsSpeculativeWrites: Bool { true }
+
+    public func beginSpeculativeWrite() {
+        precondition(!speculativeWriteArmed, "CBv2FullSequenceKV: nested MTP transaction")
+        precondition(staged == nil, "CBv2FullSequenceKV: stale staged MTP data")
+        speculativeWriteArmed = true
+    }
+
+    public func commitSpeculativeWrite() {
+        speculativeWriteArmed = false
+        guard let staged else { return }
+        self.staged = nil
+        let confirmed = absoluteOffset - staged.basePosition
+        guard confirmed > 0 else { return }
+        let confirmedKeys = staged.keys[.ellipsis, ..<confirmed, 0...]
+        let confirmedValues = staged.values[.ellipsis, ..<confirmed, 0...]
+        if let pool = cohortPool {
+            pool.rowAppend(
+                index: cohortIndex, keys: confirmedKeys, values: confirmedValues,
+                at: staged.basePosition, count: confirmed)
+        } else {
+            ensureCapacity(
+                staged.basePosition + confirmed,
+                keyTemplate: confirmedKeys, valueTemplate: confirmedValues)
+            keys![.ellipsis, staged.basePosition ..< absoluteOffset, 0...] = confirmedKeys
+            values![.ellipsis, staged.basePosition ..< absoluteOffset, 0...] = confirmedValues
+        }
+    }
 
     /// Rollback the last `n` tokens (speculative rejection). The un-confirmed
     /// tail is structurally unreachable afterwards: every view this class
@@ -317,6 +375,13 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
     /// so no zeroing pass is needed.
     public func rollback(_ n: Int) {
         precondition(n >= 0, "CBv2FullSequenceKV.rollback: negative n")
+        if let staged {
+            precondition(
+                n <= absoluteOffset - staged.basePosition,
+                "CBv2FullSequenceKV.rollback exceeds staged MTP range")
+            absoluteOffset -= n
+            return
+        }
         precondition(
             n <= absoluteOffset,
             "CBv2FullSequenceKV.rollback(\(n)) exceeds retained \(absoluteOffset)")
@@ -324,10 +389,17 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
     }
 
     func cbv2InnerState() -> [MLXArray] {
+        var state: [MLXArray]
         if let pool = cohortPool {
-            return [pool.keys, pool.values]
+            state = [pool.keys, pool.values]
+        } else {
+            state = [keys, values].compactMap { $0 }
         }
-        return [keys, values].compactMap { $0 }
+        if let staged {
+            state.append(staged.keys)
+            state.append(staged.values)
+        }
+        return state
     }
 
     // MARK: - ATT-008 cohort pooling
@@ -394,6 +466,27 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
     }
 
     // MARK: - Private
+
+    private func stageSpeculativeUpdate(
+        keys newKeys: MLXArray, values newValues: MLXArray
+    ) -> (MLXArray, MLXArray) {
+        let before = snapshot()
+        let returnedKeys = concatenated([before.keys, newKeys], axis: 2)
+        let returnedValues = concatenated([before.values, newValues], axis: 2)
+        if let existing = staged {
+            let retained = absoluteOffset - existing.basePosition
+            staged = (
+                concatenated(
+                    [existing.keys[.ellipsis, ..<retained, 0...], newKeys], axis: 2),
+                concatenated(
+                    [existing.values[.ellipsis, ..<retained, 0...], newValues], axis: 2),
+                existing.basePosition)
+        } else {
+            staged = (newKeys, newValues, absoluteOffset)
+        }
+        absoluteOffset += newKeys.dim(2)
+        return (returnedKeys, returnedValues)
+    }
 
     private func ensureCapacity(_ needed: Int, keyTemplate: MLXArray, valueTemplate: MLXArray) {
         if keys == nil {

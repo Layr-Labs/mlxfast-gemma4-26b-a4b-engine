@@ -182,16 +182,12 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
             cacheLimitBytes: 32 << 30,
             // The MLX M5 Max default commits a command buffer after
             // referencing 50 MiB. Many 4-bit projections individually exceed
-            // that, so 512 MiB groups adjacent kernels without long command
-            // buffers; decode's explicit async-eval groups remain the outer
-            // command-buffer boundary, and this referenced-buffer budget
-            // governs within them. 512 / 50 is the promoted Laguna M5-Max
-            // post-wire profile -- the same pair
+            // that, so the larger budget groups adjacent kernels. Decode's
+            // explicit async-eval groups remain the outer command-buffer
+            // boundary. This is the promoted Laguna M5-Max post-wire profile,
+            // and it is the same pair
             // `installGemma4MTPFullProfileCommandBufferDefaults` force-sets
-            // above, so these values now REPORT the ranked environment rather
-            // than contradict it. (They were 320 / 128 until the accepted
-            // submission 0cd0a6b4-b539-4705-a1c7-cb271c1f9d3b; the prose here
-            // still said 320 afterwards, which is what this line fixes.)
+            // above, so these values report the ranked environment.
             maxMegabytesPerCommandBuffer: 512,
             maxOperationsPerCommandBuffer: 50,
             clearAllocatorCacheAfterWarmup: false,

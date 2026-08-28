@@ -385,6 +385,13 @@ enum CBv2AttentionV1 {
                 CBv2EngageMark.once("att008")
                 return output
             }
+            if let output = pooledFullPerRowUpdateAndAttend(
+                rows: rows, kind: kind,
+                queries: queries, keys: keys, values: values,
+                scale: scale, sinks: effectiveSinks, softcap: softcap)
+            {
+                return output
+            }
 
             // Batched decode: split queries per row, per-row update + SDPA
             // against that row's own KV, then concatenate. No masks — each row
@@ -937,7 +944,9 @@ enum CBv2AttentionV1 {
         guard case .full = kind.attention else { return nil }
 
         let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
-        guard fullRows.count == 8 else { return nil }
+        guard fullRows.count == 8,
+            fullRows.allSatisfy({ !$0.hasActiveSpeculativeWrite })
+        else { return nil }
 
         // Lockstep gate: one pooled append writes ONE slot for all rows, so
         // every row must be at the same committed offset with headroom.
@@ -961,6 +970,40 @@ enum CBv2AttentionV1 {
             queries: queries, keys: cachedKeys, values: cachedValues,
             scale: scale, L: 1, kL: offset + 1, window: nil,
             sinks: nil, softcap: nil)
+    }
+
+    /// A subset or offset-diverged set of pooled rows cannot use ATT-008's
+    /// lockstep append. Finish every row update before any lazy attention
+    /// reads the shared pool, then read all rows from the final pool version.
+    private static func pooledFullPerRowUpdateAndAttend(
+        rows: [CBv2SequenceKV], kind: CBv2LayerKind,
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?, softcap: Float?
+    ) -> MLXArray? {
+        guard case .full = kind.attention else { return nil }
+        let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
+        guard fullRows.count == rows.count,
+            let pool = fullRows.first?.cohortPool,
+            fullRows.allSatisfy({ $0.cohortPool === pool })
+        else { return nil }
+
+        for (index, row) in fullRows.enumerated() {
+            _ = row.update(
+                keys: keys[index ..< (index + 1)],
+                values: values[index ..< (index + 1)])
+        }
+        var outputs: [MLXArray] = []
+        outputs.reserveCapacity(fullRows.count)
+        for (index, row) in fullRows.enumerated() {
+            let cached = row.snapshot()
+            outputs.append(
+                attend(
+                    queries: queries[index ..< (index + 1)],
+                    keys: cached.keys, values: cached.values,
+                    scale: scale, L: 1, kL: cached.keys.dim(2), window: nil,
+                    sinks: sinks, softcap: softcap))
+        }
+        return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 0)
     }
 
     /// The only shape for which the custom batch-wide dispatch is a literal

@@ -124,16 +124,7 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
             MLXArray(rows.map { Int32($0.anchor) }))
 
         let slidingWindow = drafter.config.textConfig.slidingWindow
-        // Materialize the round's cos/sin table once. Anchor the table at
-        // the minimum anchor across the batch so a per-row query position
-        // anywhere inside `[anchorMin, anchorMin + windowAhead)` indexes
-        // into the table with a non-negative step.
-        let anchorMin = rows.map(\.anchor).min() ?? 0
-        let ropeTable = Self.materializeDrafterRoPETable(
-            drafterConfig: drafter.config.textConfig,
-            startPosition: anchorMin,
-            windowAhead: Self.defaultRoPEWindowAhead)
-        cachedRoPETable = ropeTable
+        cachedRoPETable = nil
 
         if rows.count == 1 {
             let row = rows[0]
@@ -148,7 +139,7 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
                     full: .none,
                     sliding: slidingMask.map { .array($0) } ?? .none),
                 positionOffset: positionOffset,
-                ropeTable: ropeTable)
+                ropeTable: nil)
         }
 
         let (fullKV, fullMask) = Self.padAndMask(
@@ -164,7 +155,7 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
                 full: .array(fullMask),
                 sliding: .array(absoluteSlidingMask ?? slidingMask)),
             positionOffset: positionOffset,
-            ropeTable: ropeTable)
+            ropeTable: nil)
     }
 
     public func draftStep(
@@ -175,27 +166,10 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
                 "Gemma4CBv2MTPDrafter.draftStep: prepared capture "
                     + "\(type(of: prepared)) was not built by prepare(rows:)")
         }
-        // If the round has a cached RoPE table, pre-rotate the drafter's
-        // carried hidden along its rotary prefix using the cached
-        // (cos, sin) for the per-step query position. The drafter's
-        // `preProjection` is a Linear, so pre-rotation of the input is
-        // a real, distinct transformation from the drafter's downstream
-        // RoPE on Q/K. The pre-rotation is intentionally cheap (one
-        // per-round table lookup + an `a*cos-b*sin` slice) and amortizes
-        // the per-step `MLXFast.RoPE` frequency compute into the single
-        // `prepare(rows:)` materialization: the downstream rope module
-        // no longer pays the table-build cost on every draft step.
-        let rotatedHidden: MLXArray
-        if let table = prepared.ropeTable {
-            rotatedHidden = Self.applyCachedDrafterRoPE(
-                hidden: hidden, table: table, positionOffset: prepared.positionOffset)
-        } else {
-            rotatedHidden = hidden
-        }
         // Mirror runGemma4MTPGreedyRound: seed = concat(target embedding of
         // the token, carried hidden) along the feature axis.
         let inputsEmbeds = concatenated(
-            [target.embedTokensForDrafter(tokens), rotatedHidden], axis: -1)
+            [target.embedTokensForDrafter(tokens), hidden], axis: -1)
         let (newHidden, logits) = drafter(
             inputsEmbeds: inputsEmbeds,
             sharedKV: prepared.sharedKV,

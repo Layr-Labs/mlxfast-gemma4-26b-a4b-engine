@@ -388,9 +388,11 @@ public class SwitchGLU: Module {
     private func projectExperts(
         _ x: MLXArray, _ indices: MLXArray
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
+        let rowCount = indices.ndim == 2 ? indices.dim(0) : 0
         let useLhsIndices =
-            indices.size == 64 && indices.ndim == 2 && indices.shape == [8, 8]
-            && x.ndim == 2 && x.shape == [8, inputDims]
+            rowCount >= 8 && rowCount <= 32 && rowCount.isMultiple(of: 8)
+            && indices.dim(1) == 8
+            && x.ndim == 2 && x.shape == [rowCount, inputDims]
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
         let doSort = indices.size >= 64
 
@@ -486,10 +488,10 @@ public class SwitchGLU: Module {
     /// Always-called expert projection + weighted reduction entry point.
     ///
     /// When the experiment is enabled, the exact sorted production Gemma
-    /// prefill contract and the exact eight-row decode cohort reduce directly
-    /// to `[tokens, hidden]`. Smaller decode cohorts, rectangular speculative
-    /// verification, generic/custom-activation, dtype/layout, and near-geometry
-    /// calls retain scatter/unsort followed by ``weightedExpertSum``.
+    /// prefill contract and B=8 decode rectangles reduce directly to
+    /// `[tokens, hidden]`. Smaller decode cohorts, generic/custom-activation,
+    /// dtype/layout, and near-geometry calls retain scatter/unsort followed by
+    /// ``weightedExpertSum``.
     public func callAndWeightedReduce(
         _ x: MLXArray,
         _ indices: MLXArray,
@@ -497,13 +499,13 @@ public class SwitchGLU: Module {
         fuseSortedReduction: Bool,
         isProductionPrefill: Bool = true
     ) -> MLXArray {
-        // At B=8 decode there are exactly 64 assignments (8 rows x top-k 8),
-        // which is the sorting threshold and the minimum geometry accepted by
-        // weightedExpertUnsort.  Keep the decode gate exact so MTP rectangles
-        // and smaller serving cohorts remain on their established reduction.
-        let isEightRowDecode =
-            !isProductionPrefill && x.dim(0) == 8 && indices.size == 64
-        guard fuseSortedReduction && (isProductionPrefill || isEightRowDecode),
+        let decodeRows = x.dim(0)
+        let isB8DecodeRectangle =
+            !isProductionPrefill
+            && decodeRows >= 8 && decodeRows <= 32
+            && decodeRows.isMultiple(of: 8)
+            && indices.size == decodeRows * 8
+        guard fuseSortedReduction && (isProductionPrefill || isB8DecodeRectangle),
             supportsWeightedExpertUnsort(x, indices, weights: weights)
         else {
             return weightedExpertSum(callAsFunction(x, indices), weights)

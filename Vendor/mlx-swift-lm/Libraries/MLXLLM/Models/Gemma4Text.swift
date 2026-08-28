@@ -26,6 +26,32 @@ private let gemma4CompiledDecodeSupported: Bool = {
     return true
 }()
 
+/// Quantized Gemma projections can consume one shared, position-major B8
+/// rectangle. Q/K/V and gate/up use this to avoid duplicate padding copies.
+public protocol Gemma4B8PreparedQuantizedLinear: AnyObject {
+    func gemma4ProjectPreparedB8(_ positionBatches: MLXArray) -> MLXArray
+}
+
+/// Optional tied-head specialization used by MTP target verification.
+public protocol Gemma4B8QuantizedArgmaxHead: AnyObject {
+    func gemma4ArgmaxB8(_ hidden: MLXArray) -> MLXArray?
+}
+
+private func gemma4PrepareB8PositionBatches(_ x: MLXArray) -> MLXArray? {
+    guard x.ndim == 3, x.dim(0) == 8,
+        (2...4).contains(x.dim(1))
+    else { return nil }
+
+    let positions = x.dim(1)
+    let inputDimensions = x.dim(2)
+    let paddedPositionMajor = padded(
+        x.swappedAxes(0, 1), widths: [0, [0, 1], 0])
+    return asStrided(
+        paddedPositionMajor,
+        [positions, 8, inputDimensions],
+        strides: [9 * inputDimensions, inputDimensions, 1])
+}
+
 // MARK: - CBv2 prompt-path knobs (prefill only; decode never reads these)
 
 @inline(__always)
@@ -156,6 +182,20 @@ func gemma4ShouldFuseWeightedUnsort(
 ) -> Bool {
     requested && gemma4SupportsCoupledExpertOptimizations(config)
 }
+
+private let gemma4FuseQKVRequested: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_FUSE_QKV"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+private let gemma4FuseDenseGateUpRequested: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_FUSE_DENSE_GATEUP"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
 
 
 /// Chunks shorter than this keep the unnarrowed final layer: the saving
@@ -767,16 +807,16 @@ private func gemma4FusedQKVNorm(
         q.dtype == .bfloat16, k.dtype == .bfloat16, v.dtype == .bfloat16,
         qWeight.dtype == .bfloat16, kWeight.dtype == .bfloat16,
         q.ndim == 4, k.ndim == 4, v.ndim == 4,
-        q.dim(0) == 8, q.dim(1) == 1, q.dim(2) == 16,
-        k.dim(0) == 8, k.dim(1) == 1, v.shape == k.shape,
+        q.dim(0) == 8, (1...4).contains(q.dim(1)), q.dim(2) == 16,
+        k.dim(0) == 8, k.dim(1) == q.dim(1), v.shape == k.shape,
         q.dim(3) == k.dim(3),
         (q.dim(3) == 256 && k.dim(2) == 8) || (q.dim(3) == 512 && k.dim(2) == 2),
         qWeight.shape == [q.dim(3)], kWeight.shape == [q.dim(3)]
     else { return nil }
 
     let dimension = q.dim(3)
-    let qRows = 8 * 16
-    let kRows = 8 * k.dim(2)
+    let qRows = 8 * q.dim(1) * 16
+    let kRows = 8 * k.dim(1) * k.dim(2)
     let threads = dimension / 4
     let outputs = gemma4QKVNormKernel(
         [q, k, v, qWeight, kWeight],
@@ -915,6 +955,34 @@ private func gemma4AttentionFallback(
 
 // MARK: - Attention
 
+private final class Gemma4FusedQKVOperands {
+    let weight: MLXArray
+    let scales: MLXArray
+    let biases: MLXArray
+    let qRows: Int
+    let kRows: Int
+    let vRows: Int
+    let groupSize: Int
+    let bits: Int
+    let mode: QuantizationMode
+
+    init(
+        weight: MLXArray, scales: MLXArray, biases: MLXArray,
+        qRows: Int, kRows: Int, vRows: Int,
+        groupSize: Int, bits: Int, mode: QuantizationMode
+    ) {
+        self.weight = weight
+        self.scales = scales
+        self.biases = biases
+        self.qRows = qRows
+        self.kRows = kRows
+        self.vRows = vRows
+        self.groupSize = groupSize
+        self.bits = bits
+        self.mode = mode
+    }
+}
+
 private class Gemma4Attention: Module {
     let config: Gemma4TextConfiguration
     let layerIdx: Int
@@ -926,6 +994,9 @@ private class Gemma4Attention: Module {
     let useKeqV: Bool
     let usesSharedKV: Bool
     let scale: Float
+
+    private var fusedQKVOperands: Gemma4FusedQKVOperands?
+    private var fusedQKVResolved = false
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
     @ModuleInfo(key: "k_proj") var kProj: Linear?
@@ -1141,6 +1212,50 @@ private class Gemma4Attention: Module {
         return (oProj(output), (keys, values), activePositionOffset)
     }
 
+    private func resolveFusedQKVOperands() -> Gemma4FusedQKVOperands? {
+        if fusedQKVResolved { return fusedQKVOperands }
+        fusedQKVResolved = true
+        guard gemma4FuseQKVRequested,
+            isSliding, !usesSharedKV, !useKeqV,
+            effectiveHeadDim == 256, nHeads == 16, nKvHeads == 8,
+            let q = qProj as? QuantizedLinear,
+            let k = kProj as? QuantizedLinear,
+            let v = vProj as? QuantizedLinear
+        else { return nil }
+        guard q.bits == 4, k.bits == 4, v.bits == 4,
+            q.groupSize == 64, k.groupSize == 64, v.groupSize == 64,
+            q.mode == .affine, k.mode == .affine, v.mode == .affine,
+            q.bias == nil, k.bias == nil, v.bias == nil,
+            let qBiases = q.biases, let kBiases = k.biases, let vBiases = v.biases
+        else { return nil }
+        guard q.weight.dtype == .uint32, k.weight.dtype == .uint32,
+            v.weight.dtype == .uint32,
+            q.scales.dtype == .bfloat16, k.scales.dtype == .bfloat16,
+            v.scales.dtype == .bfloat16,
+            qBiases.dtype == .bfloat16, kBiases.dtype == .bfloat16,
+            vBiases.dtype == .bfloat16,
+            q.weight.shape == [4096, 352],
+            k.weight.shape == [2048, 352],
+            v.weight.shape == [2048, 352],
+            q.scales.shape == [4096, 44],
+            k.scales.shape == [2048, 44],
+            v.scales.shape == [2048, 44],
+            qBiases.shape == q.scales.shape,
+            kBiases.shape == k.scales.shape,
+            vBiases.shape == v.scales.shape
+        else { return nil }
+
+        let fused = Gemma4FusedQKVOperands(
+            weight: concatenated([q.weight, k.weight, v.weight], axis: 0),
+            scales: concatenated([q.scales, k.scales, v.scales], axis: 0),
+            biases: concatenated([qBiases, kBiases, vBiases], axis: 0),
+            qRows: 4096, kRows: 2048, vRows: 2048,
+            groupSize: 64, bits: 4, mode: .affine)
+        eval(fused.weight, fused.scales, fused.biases)
+        fusedQKVOperands = fused
+        return fused
+    }
+
     /// ContinuousBatchingV2 attention path. The `CBv2AttendingLayerCache`
     /// owns the KV update AND the attention computation, so this method only
     /// projects/normalizes/ropes Q (and K/V for non-shared layers) and
@@ -1182,7 +1297,55 @@ private class Gemma4Attention: Module {
         let queryInput = lastQueryCache == nil ? x : x[0..., outputStart..., 0...]
         let queryLength = queryInput.dim(1)
 
-        let queryRaw = qProj(queryInput).reshaped(B, queryLength, nHeads, effectiveHeadDim)
+        let fusedProjection: (q: MLXArray, k: MLXArray, v: MLXArray)? = {
+            guard B == 8, (1 ... 4).contains(L), queryLength == L,
+                outputStart == 0, x.dim(2) == 2816, x.dtype == .bfloat16,
+                let bank = resolveFusedQKVOperands()
+            else { return nil }
+            let positionInput: MLXArray
+            let needsSwap: Bool
+            if L == 1 {
+                positionInput = x
+                needsSwap = false
+            } else if let prepared = gemma4PrepareB8PositionBatches(x) {
+                positionInput = prepared
+                needsSwap = true
+            } else {
+                return nil
+            }
+            let positionOutput = quantizedMM(
+                positionInput, bank.weight,
+                scales: bank.scales, biases: bank.biases,
+                transpose: true, groupSize: bank.groupSize,
+                bits: bank.bits, mode: bank.mode)
+            let output = needsSwap ? positionOutput.swappedAxes(0, 1) : positionOutput
+            let kStart = bank.qRows
+            let vStart = bank.qRows + bank.kRows
+            return (
+                output[.ellipsis, ..<kStart],
+                output[.ellipsis, kStart ..< vStart],
+                output[.ellipsis, vStart ..< vStart + bank.vRows])
+        }()
+
+        let canSharePreparedProjection =
+            lastQueryCache == nil && !usesSharedKV
+            && qProj is any Gemma4B8PreparedQuantizedLinear
+            && (kProj as? any Gemma4B8PreparedQuantizedLinear) != nil
+            && (vProj == nil
+                || (vProj as? any Gemma4B8PreparedQuantizedLinear) != nil)
+        let preparedPositionBatches = canSharePreparedProjection
+            ? gemma4PrepareB8PositionBatches(x) : nil
+        let projectedQueries: MLXArray
+        if let fusedProjection {
+            projectedQueries = fusedProjection.q
+        } else if let preparedPositionBatches,
+            let projection = qProj as? any Gemma4B8PreparedQuantizedLinear
+        {
+            projectedQueries = projection.gemma4ProjectPreparedB8(preparedPositionBatches)
+        } else {
+            projectedQueries = qProj(queryInput)
+        }
+        let queryRaw = projectedQueries.reshaped(B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
             // KV-shared layer: projects queries only and borrows (K, V) from
@@ -1244,28 +1407,44 @@ private class Gemma4Attention: Module {
             lastQueryCache == nil
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
-        let kRaw = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+        let projectedKeys: MLXArray
+        if let fusedProjection {
+            projectedKeys = fusedProjection.k
+        } else if let preparedPositionBatches,
+            let projection = kProj as? any Gemma4B8PreparedQuantizedLinear
+        {
+            projectedKeys = projection.gemma4ProjectPreparedB8(preparedPositionBatches)
+        } else {
+            projectedKeys = kProj(x)
+        }
+        let kRaw = projectedKeys.reshaped(B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
-        if let vProj {
-            vRaw = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+        if let fusedProjection {
+            vRaw = fusedProjection.v.reshaped(B, L, nKvHeads, effectiveHeadDim)
+        } else if let vProj {
+            if let preparedPositionBatches,
+                let projection = vProj as? any Gemma4B8PreparedQuantizedLinear
+            {
+                vRaw = projection.gemma4ProjectPreparedB8(preparedPositionBatches)
+                    .reshaped(B, L, nKvHeads, effectiveHeadDim)
+            } else {
+                vRaw = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            }
         } else {
             vRaw = kRaw
         }
-
         let normalized = gemma4FusedQKVNorm(
             q: queryRaw, k: kRaw, v: vRaw,
             qWeight: qNorm.weight, kWeight: kNorm.weight, eps: config.rmsNormEps)
         var queries = normalized?.0 ?? qNorm(queryRaw)
         var k = normalized?.1 ?? kNorm(kRaw)
         var v = normalized?.2 ?? vNorm(vRaw)
-
         queries = queries.transposed(0, 2, 1, 3)
         queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: queryPositionOffset)
         k = k.transposed(0, 2, 1, 3)
         k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
 
         v = v.transposed(0, 2, 1, 3)
-
         let outputDType = queries.dtype
         let attentionQueries =
             outputDType == .float16 ? queries.asType(.float32) : queries
@@ -1277,7 +1456,6 @@ private class Gemma4Attention: Module {
             attention = layerCache.updateAndAttend(
                 queries: attentionQueries, keys: k, values: v, scale: scale, sinks: nil)
         }
-
         var output = attention.transposed(0, 2, 1, 3).reshaped(B, queryLength, -1)
         if lastQueryCache == nil && outputStart > 0 {
             output = output[0..., outputStart..., 0...]
@@ -1532,8 +1710,6 @@ private class Gemma4Router: Module {
     let topK: Int
     let eps: Float
     let rootSize: Float
-    let kth: Int
-    private var cachedEffectiveScale: MLXArray?
 
     init(_ config: Gemma4TextConfiguration) {
         precondition(
@@ -1544,7 +1720,6 @@ private class Gemma4Router: Module {
         self.topK = config.topKExperts ?? 0
         self.eps = config.rmsNormEps
         self.rootSize = pow(Float(config.hiddenSize), -0.5)
-        self.kth = numExperts - self.topK
 
         self._proj.wrappedValue = Linear(config.hiddenSize, numExperts, bias: false)
         self._scale.wrappedValue = MLXArray.ones([config.hiddenSize])
@@ -1552,16 +1727,10 @@ private class Gemma4Router: Module {
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
-        let effScale: MLXArray
-        if let cached = cachedEffectiveScale {
-            effScale = cached
-        } else {
-            let eff = scale * rootSize
-            cachedEffectiveScale = eff
-            effScale = eff
-        }
-        let normed = MLXFast.rmsNorm(x, weight: effScale, eps: eps)
+    func callAsFunction(
+        _ x: MLXArray
+    ) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
+        let normed = MLXFast.rmsNorm(x, weight: scale * rootSize, eps: eps)
         let expertScores = proj(normed)
 
         // ROUTE-001: single-dispatch byte-identical replacement of the chain
@@ -1574,6 +1743,7 @@ private class Gemma4Router: Module {
             return (fused.indices, fused.weights)
         }
 
+        let kth = expertScores.dim(-1) - topK
         var topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
         topKIndices = topKIndices[.ellipsis, kth...]
 
@@ -1639,10 +1809,36 @@ private class Gemma4Experts: Module {
 
 // MARK: - MLP
 
+private final class Gemma4FusedGateUpOperands {
+    let weight: MLXArray
+    let scales: MLXArray
+    let biases: MLXArray
+    let hidden: Int
+    let groupSize: Int
+    let bits: Int
+    let mode: QuantizationMode
+
+    init(
+        weight: MLXArray, scales: MLXArray, biases: MLXArray,
+        hidden: Int, groupSize: Int, bits: Int, mode: QuantizationMode
+    ) {
+        self.weight = weight
+        self.scales = scales
+        self.biases = biases
+        self.hidden = hidden
+        self.groupSize = groupSize
+        self.bits = bits
+        self.mode = mode
+    }
+}
+
 private class Gemma4MLP: Module {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
+
+    private var fusedGateUpOperands: Gemma4FusedGateUpOperands?
+    private var fusedGateUpResolved = false
 
     init(_ config: Gemma4TextConfiguration, layerIdx: Int) {
         let isKvSharedLayer = config.layerUsesSharedKV(layerIdx: layerIdx)
@@ -1656,8 +1852,93 @@ private class Gemma4MLP: Module {
         super.init()
     }
 
+    private func resolveFusedGateUpOperands() -> Gemma4FusedGateUpOperands? {
+        if fusedGateUpResolved { return fusedGateUpOperands }
+        fusedGateUpResolved = true
+        guard gemma4FuseDenseGateUpRequested,
+            let gate = gateProj as? QuantizedLinear,
+            let up = upProj as? QuantizedLinear,
+            gate.bits == 8, up.bits == 8,
+            gate.groupSize == 64, up.groupSize == 64,
+            gate.mode == .affine, up.mode == .affine,
+            gate.bias == nil, up.bias == nil,
+            let gateBiases = gate.biases, let upBiases = up.biases
+        else { return nil }
+        guard gate.weight.dtype == .uint32, up.weight.dtype == .uint32,
+            gate.scales.dtype == .bfloat16, up.scales.dtype == .bfloat16,
+            gateBiases.dtype == .bfloat16, upBiases.dtype == .bfloat16,
+            gate.weight.shape == [2112, 704], up.weight.shape == [2112, 704],
+            gate.scales.shape == [2112, 44], up.scales.shape == [2112, 44],
+            gateBiases.shape == gate.scales.shape,
+            upBiases.shape == up.scales.shape
+        else { return nil }
+
+        let hidden = 2112
+        let weight = concatenated([gate.weight, up.weight], axis: 0)
+        let scales = concatenated([gate.scales, up.scales], axis: 0)
+        let biases = concatenated([gateBiases, upBiases], axis: 0)
+        eval(weight, scales, biases)
+
+        var gateParameters = ModuleParameters()
+        gateParameters["weight"] = .value(weight[0 ..< hidden])
+        gateParameters["scales"] = .value(scales[0 ..< hidden])
+        gateParameters["biases"] = .value(biases[0 ..< hidden])
+        gate.update(parameters: gateParameters)
+
+        var upParameters = ModuleParameters()
+        upParameters["weight"] = .value(weight[hidden...])
+        upParameters["scales"] = .value(scales[hidden...])
+        upParameters["biases"] = .value(biases[hidden...])
+        up.update(parameters: upParameters)
+
+        let fused = Gemma4FusedGateUpOperands(
+            weight: weight, scales: scales, biases: biases,
+            hidden: hidden, groupSize: 64, bits: 8, mode: .affine)
+        fusedGateUpOperands = fused
+        return fused
+    }
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(gemma4SafeGeluProduct(gateProj(x), upProj(x)))
+        if x.ndim == 3, x.dim(0) == 8, (1 ... 4).contains(x.dim(1)),
+            x.dim(2) == 2816, x.dtype == .bfloat16,
+            let bank = resolveFusedGateUpOperands()
+        {
+            let positionInput: MLXArray
+            let needsSwap: Bool
+            if x.dim(1) == 1 {
+                positionInput = x
+                needsSwap = false
+            } else if let prepared = gemma4PrepareB8PositionBatches(x) {
+                positionInput = prepared
+                needsSwap = true
+            } else {
+                return downProj(gemma4SafeGeluProduct(gateProj(x), upProj(x)))
+            }
+            let positionOutput = quantizedMM(
+                positionInput, bank.weight,
+                scales: bank.scales, biases: bank.biases,
+                transpose: true, groupSize: bank.groupSize,
+                bits: bank.bits, mode: bank.mode)
+            let gateUp = needsSwap
+                ? positionOutput.swappedAxes(0, 1) : positionOutput
+            return downProj(gemma4SafeGeluProduct(
+                gateUp[.ellipsis, ..<bank.hidden],
+                gateUp[.ellipsis, bank.hidden...]))
+        }
+
+        let gate: MLXArray
+        let up: MLXArray
+        if let gateProjection = gateProj as? any Gemma4B8PreparedQuantizedLinear,
+            let upProjection = upProj as? any Gemma4B8PreparedQuantizedLinear,
+            let preparedPositionBatches = gemma4PrepareB8PositionBatches(x)
+        {
+            gate = gateProjection.gemma4ProjectPreparedB8(preparedPositionBatches)
+            up = upProjection.gemma4ProjectPreparedB8(preparedPositionBatches)
+        } else {
+            gate = gateProj(x)
+            up = upProj(x)
+        }
+        return downProj(gemma4SafeGeluProduct(gate, up))
     }
 }
 
@@ -1809,7 +2090,28 @@ public class Gemma4DecoderLayer: Module {
             h1 = mlp(h1)
             h1 = postFeedforwardLayernorm1(h1)
 
-            let (topKIndices, topKWeights) = router(out)
+            let routing: (topKIndices: MLXArray, topKWeights: MLXArray)
+            if !isExpertPrefill,
+                out.dim(0) == 8,
+                (2 ... 4).contains(out.dim(1))
+            {
+                var indexColumns: [MLXArray] = []
+                var weightColumns: [MLXArray] = []
+                indexColumns.reserveCapacity(out.dim(1))
+                weightColumns.reserveCapacity(out.dim(1))
+                for position in 0 ..< out.dim(1) {
+                    let column = router(out[0..., position ..< position + 1, 0...])
+                    indexColumns.append(column.topKIndices)
+                    weightColumns.append(column.topKWeights)
+                }
+                routing = (
+                    concatenated(indexColumns, axis: 1),
+                    concatenated(weightColumns, axis: 1))
+            } else {
+                routing = router(out)
+            }
+            let topKIndices = routing.topKIndices
+            let topKWeights = routing.topKWeights
             var h2 = preFeedforwardLayernorm2(out)
             h2 = experts(
                 h2,
@@ -2415,37 +2717,10 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
     /// Apply the LM head (tied embedding or explicit `lm_head`) plus the
     /// configured final-logit softcap. Pure function of the post-norm hidden.
-    /// LMH-001: tight-grid dispatch for the tied lm_head ordinary QMV.
-    ///
-    /// The vendored host launches ordinary QMV with an x grid extent of M = 8
-    /// (`backend/metal/quantized.cpp`), while the promoted large-N tier claims
-    /// four cohort rows per threadgroup and returns from the rest. On the tied
-    /// head that is 262144 threadgroups of which 196608 exist only to hit that
-    /// early return. `CBv2TiedLMHeadQMVV1` runs the same computation from a
-    /// kernel whose own x extent is two, so only the groups that were already
-    /// doing the work are launched. Returns `nil` unless every pin holds, and
-    /// the caller then keeps the stock path.
-    private func tiedLMHeadTightGrid(_ hidden: MLXArray) -> MLXArray? {
-        guard lmHead == nil,
-            let quantized = model.embedTokens as? QuantizedEmbedding,
-            quantized.groupSize == 64,
-            quantized.bits == 4
-        else { return nil }
-        return CBv2TiedLMHeadQMVV1.matmul(
-            x: hidden,
-            weight: quantized.weight,
-            scales: quantized.scales,
-            biases: quantized.biases,
-            inDim: config.hiddenSize,
-            outDim: config.vocabSize)
-    }
-
     func applyLMHead(_ hidden: MLXArray) -> MLXArray {
         var out: MLXArray
         if let lmHead {
             out = lmHead(hidden)
-        } else if let tight = tiedLMHeadTightGrid(hidden) {
-            out = tight
         } else {
             out = model.embedTokens.asLinear(hidden)
         }
@@ -2469,9 +2744,6 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     func applyRawLMHead(_ hidden: MLXArray) -> MLXArray {
         if let lmHead {
             return lmHead(hidden)
-        }
-        if let tight = tiedLMHeadTightGrid(hidden) {
-            return tight
         }
         return model.embedTokens.asLinear(hidden)
     }
@@ -2743,7 +3015,6 @@ extension Gemma4TextModel: CBv2EmbeddingForwardable {
 /// frozen KV. The logits side is numerically identical to
 /// `callAsFunction(_:cache:)` — same trunk, same LM head, same softcap.
 extension Gemma4TextModel: CBv2MTPForwardable {
-
     public var cbv2MTPCaptureLayers: CBv2MTPCaptureLayers? {
         let full = model.lastFullAttentionNonSharedIdx
         let sliding = model.lastSlidingAttentionNonSharedIdx
@@ -2755,6 +3026,20 @@ extension Gemma4TextModel: CBv2MTPForwardable {
         _ tokens: MLXArray, caches: [KVCache]
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         let (postNorm, preNorm) = model.callCapturingPreNorm(tokens, cache: caches)
-        return (applyLMHead(postNorm), preNorm)
+        return (applyRawLMHead(postNorm), preNorm)
+    }
+
+    public func cbv2ArgmaxWithHidden(
+        _ tokens: MLXArray, caches: [KVCache]
+    ) -> (argmax: MLXArray, lastHidden: MLXArray) {
+        let (postNorm, preNorm) = model.callCapturingPreNorm(tokens, cache: caches)
+        if lmHead == nil,
+            let head = model.embedTokens as? any Gemma4B8QuantizedArgmaxHead,
+            let direct = head.gemma4ArgmaxB8(postNorm)
+        {
+            return (direct, preNorm)
+        }
+        let logits = applyRawLMHead(postNorm)
+        return (argMax(logits, axis: -1).asType(.int32), preNorm)
     }
 }

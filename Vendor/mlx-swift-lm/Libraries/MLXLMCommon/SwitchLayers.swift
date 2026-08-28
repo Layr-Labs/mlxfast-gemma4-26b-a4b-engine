@@ -236,6 +236,175 @@ private let compiledGeGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
     return body
 }()
 
+/// ROUTE-002: precomputed replacement for the ``gatherSortIndices`` chain,
+/// produced upstream (inside the fused whole-router dispatch) from the same
+/// flattened row-major top-K assignment order that ``gatherSortIndices`` would
+/// have sorted. Field-for-field contract:
+/// - `lhsIndices`  == `argSort(indices.flattened()).floorDivide(topK)`
+/// - `sortedIndices` == `indices.flattened()[order]`
+/// - `inverseOrder`  == `argSort(order)` (the inverse permutation)
+/// All three are flat uint32 arrays of `indices.size` elements. The producer
+/// must guarantee bit-identical values (MLX `argSort` is a stable merge sort;
+/// integer keys tie-break by original flat position). Consumers fail closed:
+/// any shape/dtype near miss keeps the established `gatherSortIndices` chain.
+public struct SwitchGLUSortPlan {
+    public let lhsIndices: MLXArray
+    public let sortedIndices: MLXArray
+    public let inverseOrder: MLXArray
+
+    public init(lhsIndices: MLXArray, sortedIndices: MLXArray, inverseOrder: MLXArray) {
+        self.lhsIndices = lhsIndices
+        self.sortedIndices = sortedIndices
+        self.inverseOrder = inverseOrder
+    }
+
+    /// Exact-geometry acceptance test: three flat uint32 arrays, one entry
+    /// per expert assignment.
+    public func matches(assignments: Int) -> Bool {
+        lhsIndices.ndim == 1 && lhsIndices.dim(0) == assignments
+            && lhsIndices.dtype == .uint32
+            && sortedIndices.ndim == 1 && sortedIndices.dim(0) == assignments
+            && sortedIndices.dtype == .uint32
+            && inverseOrder.ndim == 1 && inverseOrder.dim(0) == assignments
+            && inverseOrder.dtype == .uint32
+    }
+}
+
+// MARK: - ROUTE-CSORT-64: fused counting-sort route table (donor port)
+
+/// Stable counting sort for the flattened B=8 decode route table (64 uint32
+/// expert keys), `argSort`-identical by construction — a port of the proven
+/// production fused-scatter v4 kernel from the sibling challenge tree
+/// (mlxfast-challenge SwitchLayers.swift `routeCountingSortFused`), retiled
+/// from 128 to 64 keys per tile so the exact decode geometry (n = 64
+/// assignments → one 256-thread threadgroup) is accepted, and RENAMED
+/// (`_t64_v1`) so the Metal pipeline cannot collide with the donor's `_v4`
+/// instance if both ever share a metallib cache.
+///
+/// Exactness (donor stability lemma, re-verified here by parity harness):
+/// the vendored merge sort is stable at every stage (thread sort swaps only
+/// on strictly-less, the merge prefers A on ties), so `argSort`'s tie order
+/// is input order; a stable counting sort reproduces the exact permutation
+/// for EVERY input, not just tested ones. At the write point where the
+/// scatter emits `order[off] = idx`, every downstream index product of the
+/// sorted-MoE chain is already known — `idx / m` is the gathered row
+/// (`order.floorDivide(m)`), the tested key IS `indices[order[off]]`, and
+/// `off` is the inverse permutation entry for `idx` — so ONE dispatch
+/// replaces the 4-kernel `argSort` → `floorDivide` → take → `argSort` chain
+/// with byte-identical integer outputs. Counters are commutative integer
+/// atomics (any accumulation order produces identical tables); the per-key
+/// walk of each tile slice is in input order, so no write order ever
+/// depends on scheduling.
+///
+/// The 256-entry counter table requires keys < 256; callers guarantee this
+/// via the `numExperts` guard on `gatherSortIndices`. DEFAULT OFF
+/// (`DARKBLOOM_ROUTE_COUNTING_SORT=1` enables; note the donor tree ships
+/// this default ON — our default stays OFF until a box receipt exists for
+/// this composition). Engage mark: `route-csort64`.
+private let routeCountingSort64Enabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_ROUTE_COUNTING_SORT"]
+    else { return false }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
+private let routeSortTile64 = 64
+private let routeFusedScatterTopK = 8
+/// Key-space bound of the fused scatter's 256-entry counter table.
+let routeCountingSortKeyBound = 256
+
+private let routeFusedScatterKernelT64: MLXFast.MLXFastKernel = {
+    let m = routeFusedScatterTopK
+    return MLXFast.metalKernel(
+        name: "mlx_lm_route_csort_scatter_fused_m\(m)_u32_t64_v1",
+        inputNames: ["keys"],
+        outputNames: ["row_order", "sorted_keys", "inverse_order"],
+        source: """
+            constexpr uint TILE = \(routeSortTile64);
+            constexpr uint M = \(m);
+            uint t = threadgroup_position_in_grid.x;
+            uint k = thread_position_in_threadgroup.x;
+            uint simd_id = k / 32;
+            uint lane = k % 32;
+            uint n = keys_shape[0];
+            // In-threadgroup histograms replace both the standalone hist
+            // dispatch and the scan dispatch: one cooperative pass counts
+            // every key (totals) and every key in earlier tiles (before),
+            // then a simd exclusive prefix over the 256 totals yields the
+            // base table. Counts and sums are commutative integer adds, so
+            // any accumulation order produces the byte-identical tables.
+            threadgroup atomic_uint tg_total[256];
+            threadgroup atomic_uint tg_before[256];
+            atomic_store_explicit(&tg_total[k], 0u, memory_order_relaxed);
+            atomic_store_explicit(&tg_before[k], 0u, memory_order_relaxed);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // Split at the before-limit boundary so the tail segment
+            // carries no branch; identical counters, identical adds.
+            uint before_limit = t * TILE;
+            uint idx = k;
+            for (; idx < before_limit; idx += 256) {
+                uint key = keys[idx];
+                atomic_fetch_add_explicit(
+                    &tg_total[key], 1u, memory_order_relaxed);
+                atomic_fetch_add_explicit(
+                    &tg_before[key], 1u, memory_order_relaxed);
+            }
+            for (; idx < n; idx += 256) {
+                atomic_fetch_add_explicit(
+                    &tg_total[keys[idx]], 1u, memory_order_relaxed);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint total = atomic_load_explicit(&tg_total[k], memory_order_relaxed);
+            uint lane_excl = simd_prefix_exclusive_sum(total);
+            threadgroup uint simd_totals[8];
+            if (lane == 31) {
+                simd_totals[simd_id] = lane_excl + total;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint simd_base = 0;
+            for (uint s = 0; s < simd_id; ++s) {
+                simd_base += simd_totals[s];
+            }
+            // Rank base for key k in tile t: global base + earlier tiles.
+            uint off = simd_base + lane_excl +
+                atomic_load_explicit(&tg_before[k], memory_order_relaxed);
+            // Walk this tile's slice in input order: stability by
+            // construction, exactly the stock scatter's write order.
+            for (uint i = 0; i < TILE; ++i) {
+                uint idx = t * TILE + i;
+                if (keys[idx] == k) {
+                    row_order[off] = idx / M;
+                    sorted_keys[off] = k;
+                    inverse_order[idx] = off;
+                    ++off;
+                }
+            }
+            """,
+        ensureRowContiguous: false
+    )
+}()
+
+private func routeCountingSortFusedT64(
+    _ indices: MLXArray, m: Int
+) -> (rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray)? {
+    let n = indices.size
+    guard routeCountingSort64Enabled,
+        indices.dtype == .uint32,
+        n > 0, n % routeSortTile64 == 0,
+        m == routeFusedScatterTopK
+    else { return nil }
+    CBv2EngageMark.once("route-csort64")
+    let tiles = n / routeSortTile64
+    let outputs = routeFusedScatterKernelT64(
+        [indices],
+        grid: (tiles * 256, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[n], [n], [n]],
+        outputDTypes: [.uint32, .uint32, .uint32]
+    )
+    return (outputs[0], outputs[1], outputs[2])
+}
+
 public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
     let indices = indices.flattened()
@@ -249,9 +418,22 @@ public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, M
     )
 }
 
-public func gatherSortIndices(indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+/// `numExperts` is the exclusive upper bound of the index key space; callers
+/// that know it (SwitchGLU) pass it so the counting-sort fast path can prove
+/// its 256-entry counter table covers every key. The default (`Int.max`)
+/// fails closed onto the established `argSort` chain.
+public func gatherSortIndices(
+    indices: MLXArray, numExperts: Int = Int.max
+) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
     let indices = indices.flattened()
+    // ROUTE-CSORT-64: one fused dispatch with byte-identical outputs
+    // (default OFF; see routeCountingSort64Enabled above).
+    if numExperts <= routeCountingSortKeyBound,
+        let fused = routeCountingSortFusedT64(indices, m: m)
+    {
+        return (fused.rowOrder, fused.sortedKeys, fused.inverseOrder)
+    }
     let order = argSort(indices)
     return (order.floorDivide(m), indices[order], argSort(order))
 }
@@ -386,7 +568,7 @@ public class SwitchGLU: Module {
     }
 
     private func projectExperts(
-        _ x: MLXArray, _ indices: MLXArray
+        _ x: MLXArray, _ indices: MLXArray, sortPlan: SwitchGLUSortPlan? = nil
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
         let useLhsIndices =
             indices.size == 64 && indices.ndim == 2 && indices.shape == [8, 8]
@@ -400,7 +582,18 @@ public class SwitchGLU: Module {
         if doSort {
             if useLhsIndices {
                 x = x.flattened(start: 0, end: -3)
-                (lhsIndices, idx, inverseOrder) = gatherSortIndices(indices: indices)
+                // ROUTE-002: the whole-router dispatch already produced the
+                // exact gatherSortIndices triple for these indices; consume it
+                // and skip the 4-kernel argsort chain. Fail closed on any
+                // shape/dtype near miss.
+                if let sortPlan, sortPlan.matches(assignments: indices.size) {
+                    lhsIndices = sortPlan.lhsIndices
+                    idx = sortPlan.sortedIndices
+                    inverseOrder = sortPlan.inverseOrder
+                } else {
+                    (lhsIndices, idx, inverseOrder) = gatherSortIndices(
+                        indices: indices, numExperts: numExperts)
+                }
             } else {
                 (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
             }
@@ -455,10 +648,15 @@ public class SwitchGLU: Module {
         // profile keeps generic SwitchGLU/custom activations on the established
         // implementation.
         guard weightedReductionProfile == .gemma4ProductionGeGLU else { return false }
+        // Exactly one GLU topology must be wired: the split gate/up pair, or
+        // the FUSE-001 output-axis-fused gate_up bank. Both produce
+        // bit-identical projections (each fused output row keeps its packed
+        // bytes and per-row dequant+dot order), so both are production.
+        let splitTopology = gateProj != nil && upProj != nil
         return inputDims == 2816
             && hiddenDims == 704
             && numExperts == 128
-            && gateUpProj == nil
+            && (gateUpProj == nil) == splitTopology
             && activationProduct == nil
             && isGeluActivation
             && x.ndim == 2
@@ -495,7 +693,8 @@ public class SwitchGLU: Module {
         _ indices: MLXArray,
         weights: MLXArray,
         fuseSortedReduction: Bool,
-        isProductionPrefill: Bool = true
+        isProductionPrefill: Bool = true,
+        sortPlan: SwitchGLUSortPlan? = nil
     ) -> MLXArray {
         // At B=8 decode there are exactly 64 assignments (8 rows x top-k 8),
         // which is the sorting threshold and the minimum geometry accepted by
@@ -509,7 +708,7 @@ public class SwitchGLU: Module {
             return weightedExpertSum(callAsFunction(x, indices), weights)
         }
 
-        let projected = projectExperts(x, indices)
+        let projected = projectExperts(x, indices, sortPlan: sortPlan)
         guard projected.sorted,
             let inverseOrder = projected.inverseOrder,
             projected.output.ndim == 3,

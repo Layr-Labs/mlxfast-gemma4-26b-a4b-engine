@@ -563,6 +563,34 @@ dequantize(const device uint8_t* w, U scale, U bias, threadgroup U* w_local) {
   }
 }
 
+// Wide device loads for the 4-bit QuantizedBlockLoader (Laguna P4 loader
+// lever), kept DISABLED after measurement. Four formulations were run
+// through the pf04 parity harness against the stock scalar loader, at the
+// production geometries of both consumers (affine_gather_qmm_rhs_nax at
+// 65,536 expert-sorted rows, ragged/skew/single/adversarial; affine_qmm_t
+// _nax at M=8192 across the production N/K set). All four were uint16-view
+// BIT-EXACT (dequant expressions kept verbatim; loads/stores only, no
+// accumulation touched) and all four REGRESSED heavily on M5
+// (applegpu_g17s), chained timing with null-chain control, 2 runs each:
+//   1. 1x16B uint4 load + thread-array staging + 4x16B threadgroup
+//      stores, runtime 16B-alignment branch:          -58% .. -136%
+//   2. same, register-only as_type packing:           -21% .. -142%
+//   3. 1x16B uint4 load + stock scalar stores, branch: -41% .. -140%
+//   4. 4x4B uint loads + stock scalar stores, NO branch (alignment
+//      provable at compile time: uint32 buffer => element-granular base;
+//      gs=64 => K%64==0 => every folded offset = 0 mod 4; bj = 0 mod 16
+//      by the n_reads gate):                          -32% .. -118%
+// Conclusion: the Metal compiler already turns the stock unrolled byte
+// dequant into an optimally scheduled wide-load pipeline; every manual
+// re-expression of the load width defeats that scheduling (the on-box
+// -1.60% for manual u32 widening of qdot in the plain twin is the same
+// law). Do not re-buy without an on-box receipt. Flipping this constant
+// re-enables formulation 4 below, the least-bad bit-exact variant, whose
+// alignment contract needs no runtime check. Compile-time source constant
+// by design: an enable must never ride a function constant (pipeline-key
+// law).
+MLX_MTL_CONST bool kQuantLoaderWideStage = false;
+
 template <
     typename T,
     short BROWS,
@@ -635,6 +663,29 @@ struct QuantizedBlockLoader {
 
     T scale = *scales;
     T bias = *biases;
+    if constexpr (
+        kQuantLoaderWideStage && bits == 4 && reduction_dim == 1 &&
+        n_reads * bytes_per_pack == 16 && sizeof(T) == 2 &&
+        ((BCOLS_PACKED * bytes_per_pack) & 3) == 0) {
+      // Branch-free four 4-byte device loads of this thread's 16 packed
+      // bytes (alignment proven at compile time -- contract above). The
+      // per-byte dequant and the threadgroup stores below are
+      // dequantize<T, pack_factor, 4>'s expressions verbatim.
+      const device uint* src32 = (const device uint*)src;
+      const T s0 = scale;
+      const T s1 = scale / static_cast<T>(16.0f);
+      STEEL_PRAGMA_UNROLL
+      for (short q = 0; q < 4; ++q) {
+        const uint w32 = src32[q];
+        STEEL_PRAGMA_UNROLL
+        for (short e = 0; e < 4; ++e) {
+          const ushort wb = (w32 >> (e * 8)) & 0xff;
+          dst[8 * q + 2 * e] = s0 * (wb & 0x0f) + bias;
+          dst[8 * q + 2 * e + 1] = s1 * (wb & 0xf0) + bias;
+        }
+      }
+      return;
+    }
     for (int i = 0; i < n_reads; i++) {
       dequantize<T, pack_factor, bits>(
           src + i * bytes_per_pack, scale, bias, dst + i * pack_factor);

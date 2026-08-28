@@ -1322,15 +1322,13 @@ public enum Gemma4RouterProbe {
 /// bit-identical there too). Kill switch:
 /// `DARKBLOOM_GEMMA4_FUSED_ROUTER_TOP8=0`.
 private enum Gemma4FusedRouterTop8 {
-    /// DEFAULT OFF (`DARKBLOOM_GEMMA4_FUSED_ROUTER_TOP8=1` enables): the
-    /// fused chain is bit-exact (113/113 adversarial parity) but measured
-    /// +~0.1 ms/round inside the +0.27 ms consolidation cost of three
-    /// counterbalanced local B=8 probe pairs — dispatch deletion does not
-    /// pay while the concurrent encoder overlaps these small kernels.
+    /// DEFAULT ON. Kill switch `DARKBLOOM_GEMMA4_FUSED_ROUTER_TOP8=0`.
+    /// The fused chain is fail-closed to the stock op chain on any other
+    /// geometry. Prefill at [8, 1024, ·] never matches this gate.
     static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_FUSED_ROUTER_TOP8"]
-        else { return false }
+        else { return true }
         return ["1", "true", "yes", "on"].contains(raw.lowercased())
     }()
 

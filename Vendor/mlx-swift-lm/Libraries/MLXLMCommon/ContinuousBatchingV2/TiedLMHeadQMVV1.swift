@@ -1,5 +1,6 @@
-// LMH-001v2: tight-grid dispatch for the tied lm_head ordinary QMV at batch
-// eight, carrying the promoted quad-STREAM body verbatim.
+// LMH-001v3: tight-grid dispatch for the tied lm_head ordinary QMV at batch
+// eight, carrying the promoted quad-STREAM body verbatim, launched at a
+// threadgroup height of sixteen simdgroups instead of two.
 //
 // The vendored MLX host launches ordinary QMV as
 //
@@ -45,6 +46,33 @@
 // the prior parity receipts on this track used, and the local runtime parity
 // test pins it bitwise.) Only the grid differs from the stock road.
 //
+// THREADGROUP HEIGHT. The stock road launches (32, 2, 1): one simdgroup pair
+// per threadgroup, four output rows each, so sixty-four threads carry eight
+// rows. That shape comes from the library kernel, which must also serve
+// N = 128 planes where a taller group would not divide the output. Nothing
+// about the tied head needs it. `num_simdgroups` is now a template parameter
+// rather than a hardcoded 2, and this file instantiates it at 16, launching
+// (32, 16, 1) and sixty-four output rows per threadgroup.
+//
+// The body is otherwise character-for-character what it was. `num_simdgroups`
+// appears in exactly one expression,
+//
+//     const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+//         simd_gid * results_per_simdgroup;
+//
+// which maps (tid.y, simd_gid) onto a base output row. Raising it renumbers
+// which threadgroup owns which rows and leaves the set of (row, k) products,
+// their order within a row, and the `simd_sum` reduction untouched. Every
+// output element keeps the exact add sequence it had, so the result is bitwise
+// identical, not merely close.
+//
+// The one shape consequence: `outDim` must now be a multiple of
+// `num_simdgroups * results_per_simdgroup` = 64 rather than 8, since the
+// kernel has no partial-group path. The gate below tightens accordingly. The
+// only caller is `Gemma4TextModel.tiedLMHeadTightGrid`, which passes
+// `config.vocabSize` = 262144 = 4096 * 64. Anything that does not divide gets
+// `nil` and the stock road, as before.
+//
 // `DARKBLOOM_CBV2_TIED_LMHEAD_QMV=0` restores the stock path inside the same
 // executable.
 
@@ -66,8 +94,9 @@ public enum CBv2TiedLMHeadQMVV1 {
     private static let bits = 4
     private static let rowsPerGroup = 4
     private static let simdWidth = 32
-    private static let simdGroups = 2
-    private static let outputsPerGroup = 8
+    /// LMH-SGW: eight times the stock height. See the file header.
+    private static let simdGroups = 16
+    private static let outputsPerGroup = 64
     /// `values_per_thread * SIMD` in the kernel; the tail block needs one more.
     private static let values_per_thread_block = 256
 
@@ -257,7 +286,11 @@ inline U qdot_affine4_registered(
   return scale * accum + sum * bias;
 }
 
-template <typename T, const int group_size, const int bits>
+template <
+    typename T,
+    const int group_size,
+    const int bits,
+    const int num_simdgroups>
 METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -274,7 +307,6 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int values_per_thread = 8;
   constexpr int block_size = values_per_thread * SIMD_SIZE;
@@ -408,7 +440,7 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
 """
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_tied_lmhead_qmv_affine4_g64_quad_stream_v2",
+        name: "cbv2_b8_tied_lmhead_qmv_affine4_g64_quad_stream_v3",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -423,7 +455,7 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
             if (first_m >= 8) {
                 return;
             }
-            qmv_affine4_g64_quad_stream_impl<T, 64, 4>(
+            qmv_affine4_g64_quad_stream_impl<T, 64, 4, 16>(
                 w,
                 scales,
                 biases,

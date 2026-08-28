@@ -913,6 +913,28 @@ private func gemma4AttentionFallback(
     return output
 }
 
+@inline(__always)
+private func gemma4TightGridQMV(
+    _ layer: Linear?,
+    _ x: MLXArray
+) -> MLXArray? {
+    guard let layer,
+        let quantized = layer as? QuantizedLinear,
+        type(of: quantized) == QuantizedLinear.self,
+        quantized.bias == nil,
+        quantized.groupSize == 64,
+        quantized.mode == .affine
+    else { return nil }
+    return CBv2QMVQuadStreamTightGridV1.matmul(
+        x: x,
+        weight: quantized.weight,
+        scales: quantized.scales,
+        biases: quantized.biases,
+        bits: quantized.bits,
+        inputDimension: quantized.shape.1,
+        outputDimension: quantized.shape.0)
+}
+
 // MARK: - Attention
 
 private class Gemma4Attention: Module {
@@ -1182,7 +1204,14 @@ private class Gemma4Attention: Module {
         let queryInput = lastQueryCache == nil ? x : x[0..., outputStart..., 0...]
         let queryLength = queryInput.dim(1)
 
-        let queryRaw = qProj(queryInput).reshaped(B, queryLength, nHeads, effectiveHeadDim)
+        let tightQuery: MLXArray?
+        if lastQueryCache == nil {
+            tightQuery = gemma4TightGridQMV(qProj, queryInput)
+        } else {
+            tightQuery = nil
+        }
+        let queryRaw = (tightQuery ?? qProj(queryInput))
+            .reshaped(B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
             // KV-shared layer: projects queries only and borrows (K, V) from
@@ -1244,10 +1273,12 @@ private class Gemma4Attention: Module {
             lastQueryCache == nil
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
-        let kRaw = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+        let kRaw = (gemma4TightGridQMV(kProj, x) ?? kProj(x))
+            .reshaped(B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
         if let vProj {
-            vRaw = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            vRaw = (gemma4TightGridQMV(vProj, x) ?? vProj(x))
+                .reshaped(B, L, nKvHeads, effectiveHeadDim)
         } else {
             vRaw = kRaw
         }
@@ -1656,8 +1687,23 @@ private class Gemma4MLP: Module {
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(gemma4SafeGeluProduct(gateProj(x), upProj(x)))
+    func callAsFunction(_ x: MLXArray, useTightGridQMV: Bool = false) -> MLXArray {
+        let gate: MLXArray
+        let up: MLXArray
+        if useTightGridQMV {
+            gate = gemma4TightGridQMV(gateProj, x) ?? gateProj(x)
+            up = gemma4TightGridQMV(upProj, x) ?? upProj(x)
+        } else {
+            gate = gateProj(x)
+            up = upProj(x)
+        }
+        let product = gemma4SafeGeluProduct(gate, up)
+        if useTightGridQMV,
+            let tightOutput = gemma4TightGridQMV(downProj, product)
+        {
+            return tightOutput
+        }
+        return downProj(product)
     }
 }
 
@@ -1806,7 +1852,7 @@ public class Gemma4DecoderLayer: Module {
         {
             // Dense + sparse branches in parallel, summed into one residual.
             var h1 = preFeedforwardLayernorm(out)
-            h1 = mlp(h1)
+            h1 = mlp(h1, useTightGridQMV: !isExpertPrefill)
             h1 = postFeedforwardLayernorm1(h1)
 
             let (topKIndices, topKWeights) = router(out)
@@ -1821,7 +1867,7 @@ public class Gemma4DecoderLayer: Module {
             out = h1 + h2
         } else {
             out = preFeedforwardLayernorm(out)
-            out = mlp(out)
+            out = mlp(out, useTightGridQMV: !isExpertPrefill)
         }
 
         out = postFeedforwardLayernorm(out)

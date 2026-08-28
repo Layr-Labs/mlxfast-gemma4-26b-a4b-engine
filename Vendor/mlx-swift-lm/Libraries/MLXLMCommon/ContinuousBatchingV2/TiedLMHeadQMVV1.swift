@@ -1,4 +1,4 @@
-// LMH-001v2: tight-grid dispatch for the tied lm_head ordinary QMV at batch
+// LMH-001v3: tight-grid dispatch for the tied lm_head ordinary QMV at batch
 // eight, carrying the promoted quad-STREAM body verbatim.
 //
 // The vendored MLX host launches ordinary QMV as
@@ -66,8 +66,9 @@ public enum CBv2TiedLMHeadQMVV1 {
     private static let bits = 4
     private static let rowsPerGroup = 4
     private static let simdWidth = 32
-    private static let simdGroups = 2
-    private static let outputsPerGroup = 8
+    private static let tiedSIMDGroups = 2
+    private static let attentionSIMDGroups = 4
+    private static let resultsPerSIMDGroup = 4
     /// `values_per_thread * SIMD` in the kernel; the tail block needs one more.
     private static let values_per_thread_block = 256
 
@@ -257,7 +258,11 @@ inline U qdot_affine4_registered(
   return scale * accum + sum * bias;
 }
 
-template <typename T, const int group_size, const int bits>
+template <
+    typename T,
+    const int group_size,
+    const int bits,
+    const int num_simdgroups>
 METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -274,7 +279,6 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int values_per_thread = 8;
   constexpr int block_size = values_per_thread * SIMD_SIZE;
@@ -351,45 +355,35 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     x3 += block_size;
   }
 
-  const int remaining = clamp(
-      static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
-      0,
-      values_per_thread);
-  if (remaining > 0) {
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      const device uint16_t* wl =
-          (const device uint16_t*)(ws + row * in_vec_size_w);
-      for (int i = 0; i < uint16_per_thread; i++) {
-        packed[row][i] = wl[i];
-      }
-      scale_local[row] = scales[row * in_vec_size_g];
-      bias_local[row] = biases[row * in_vec_size_g];
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    const device uint16_t* wl =
+        (const device uint16_t*)(ws + row * in_vec_size_w);
+    for (int i = 0; i < uint16_per_thread; i++) {
+      packed[row][i] = wl[i];
     }
+    scale_local[row] = scales[row * in_vec_size_g];
+    bias_local[row] = biases[row * in_vec_size_g];
+  }
 
-    float sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x0, x_thread, remaining);
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result0[row] += qdot_affine4_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
-    }
-    sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x1, x_thread, remaining);
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result1[row] += qdot_affine4_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
-    }
-    sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x2, x_thread, remaining);
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result2[row] += qdot_affine4_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
-    }
-    sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x3, x_thread, remaining);
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result3[row] += qdot_affine4_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
-    }
+  float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result0[row] += qdot_affine4_registered<float, values_per_thread>(
+        packed[row], x_thread, scale_local[row], bias_local[row], sum);
+  }
+  sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result1[row] += qdot_affine4_registered<float, values_per_thread>(
+        packed[row], x_thread, scale_local[row], bias_local[row], sum);
+  }
+  sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result2[row] += qdot_affine4_registered<float, values_per_thread>(
+        packed[row], x_thread, scale_local[row], bias_local[row], sum);
+  }
+  sum = load_vector<T, float, values_per_thread, 4>(x3, x_thread);
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result3[row] += qdot_affine4_registered<float, values_per_thread>(
+        packed[row], x_thread, scale_local[row], bias_local[row], sum);
   }
 
   for (int row = 0; row < results_per_simdgroup; row++) {
@@ -408,7 +402,7 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
 """
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_tied_lmhead_qmv_affine4_g64_quad_stream_v2",
+        name: "cbv2_b8_qmv_affine4_g64_quad_stream_v4",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -423,7 +417,7 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
             if (first_m >= 8) {
                 return;
             }
-            qmv_affine4_g64_quad_stream_impl<T, 64, 4>(
+            qmv_affine4_g64_quad_stream_impl<T, 64, 4, NSG>(
                 w,
                 scales,
                 biases,
@@ -445,8 +439,8 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
         ensureRowContiguous: true
     )
 
-    /// Returns `nil` unless every pin holds; the caller then keeps the stock path.
-    public static func matmul(
+    private static func matmul(
+        simdGroups: Int,
         x: MLXArray,
         weight: MLXArray,
         scales: MLXArray,
@@ -454,11 +448,8 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
         inDim: Int,
         outDim: Int
     ) -> MLXArray? {
-        // Every dimension is validated against every other, so the gate is a
-        // full shape pin at runtime even though the tower's hidden size is not
-        // written as a literal here.
-        guard enabled,
-            let biases,
+        let outputsPerGroup = simdGroups * resultsPerSIMDGroup
+        guard let biases,
             x.dtype == .bfloat16,
             scales.dtype == x.dtype,
             biases.dtype == x.dtype,
@@ -469,7 +460,7 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
             x.dim(2) == inDim,
             outDim >= 8,
             outDim % outputsPerGroup == 0,
-            inDim % groupSize == 0,
+            inDim % values_per_thread_block == 0,
             inDim >= 2 * values_per_thread_block,
             weight.ndim == 2,
             weight.dim(0) == outDim,
@@ -488,6 +479,7 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
                 ("T", x.dtype),
                 ("K", inDim),
                 ("OUTN", outDim),
+                ("NSG", simdGroups),
             ],
             grid: (xGroups * simdWidth, yGroups * simdGroups, 1),
             threadGroup: (simdWidth, simdGroups, 1),
@@ -495,4 +487,54 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
             outputDTypes: [x.dtype]
         )[0]
     }
+
+    /// Returns `nil` unless every tied-head pin holds; the caller then keeps
+    /// the stock path. Two SIMDgroups retain the promoted occupancy shape.
+    public static func matmul(
+        x: MLXArray,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        inDim: Int,
+        outDim: Int
+    ) -> MLXArray? {
+        guard enabled else { return nil }
+        return matmul(
+            simdGroups: tiedSIMDGroups,
+            x: x,
+            weight: weight,
+            scales: scales,
+            biases: biases,
+            inDim: inDim,
+            outDim: outDim)
+    }
+
+    /// Exact batch-eight Q/K projection path. Four SIMDgroups halve the
+    /// threadgroup count while retaining the same independent per-output
+    /// arithmetic. The model call site pins this to K=2816 attention Q/K.
+    public static func attentionMatmul(
+        x: MLXArray,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        inDim: Int,
+        outDim: Int
+    ) -> MLXArray? {
+        guard enabled, attentionEnabled, inDim == 2816 else { return nil }
+        return matmul(
+            simdGroups: attentionSIMDGroups,
+            x: x,
+            weight: weight,
+            scales: scales,
+            biases: biases,
+            inDim: inDim,
+            outDim: outDim)
+    }
+
+    private static let attentionEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ATTN_TIGHT_GRID"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
 }

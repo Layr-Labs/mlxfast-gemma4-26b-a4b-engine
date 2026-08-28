@@ -342,9 +342,12 @@ inline void qdot_affine4_pair(
     thread U& out1) {
   U accum0 = 0;
   U accum1 = 0;
-  const device uint16_t* ws = (const device uint16_t*)w;
+  static_assert(
+      values_per_thread == 8,
+      "qdot_affine4_pair coalesced load requires one 32-bit lane packet");
+  const uint32_t packed_pair = *((const device uint32_t*)w);
   for (int i = 0; i < (values_per_thread / 4); i++) {
-    const uint16_t packed = ws[i];
+    const uint16_t packed = uint16_t(packed_pair >> (16 * i));
     accum0 +=
         (x0[4 * i] * (packed & 0x000f) +
          x0[4 * i + 1] * (packed & 0x00f0) +
@@ -916,6 +919,83 @@ METAL_FUNC void qmv_fast_impl(
     scales += block_size / group_size;
     biases += block_size / group_size;
     x += block_size;
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result[row] = simd_sum(result[row]);
+    if (simd_lid == 0) {
+      y[row] = static_cast<T>(result[row]);
+    }
+  }
+}
+
+// Wide affine4/g64 QMV with a lane-aligned final block. This is the stock
+// qmv_fast_impl arithmetic at values_per_thread=16, extended to the Gemma 4
+// routed-expert K sizes whose final block is a whole number of 16-value lane
+// packets but not a whole 512-value SIMD block.
+template <typename T>
+METAL_FUNC void qmv_fast_aligned_tail_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int in_vec_size,
+    const int out_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 16;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_pack = 4;
+  constexpr int pack_factor = 8;
+  constexpr int packs_per_thread = 2;
+  constexpr int scale_step_per_thread = 4;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread float x_thread[values_per_thread];
+  thread float result[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x += simd_lid * values_per_thread;
+  y += out_row;
+
+  int k = 0;
+  for (; k + block_size <= in_vec_size; k += block_size) {
+    float sum = load_vector<T, float, values_per_thread, 4>(x, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      const device T* sl = scales + row * in_vec_size_g;
+      const device T* bl = biases + row * in_vec_size_g;
+      result[row] += qdot<float, values_per_thread, 4>(
+          wl, x_thread, sl[0], bl[0], sum);
+    }
+    ws += block_size / 2;
+    scales += block_size / 64;
+    biases += block_size / 64;
+    x += block_size;
+  }
+
+  const uint active_tail_lanes =
+      uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
+    float sum = load_vector<T, float, values_per_thread, 4>(x, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      const device T* sl = scales + row * in_vec_size_g;
+      const device T* bl = biases + row * in_vec_size_g;
+      result[row] += qdot<float, values_per_thread, 4>(
+          wl, x_thread, sl[0], bl[0], sum);
+    }
   }
 
   for (int row = 0; row < results_per_simdgroup; row++) {
@@ -3287,6 +3367,25 @@ template <typename T, int group_size, int bits>
           simd_lid);
       return;
     }
+    const uint32_t x_idx =
+        lhs_indices[assignment * (uint)lhs_strides[0]];
+    const device uint32_t* solo_w = w + expert * w_strides[0];
+    const device T* solo_scales = scales + expert * s_strides[0];
+    const device T* solo_biases = biases + expert * b_strides[0];
+    const device T* solo_x = x + x_idx * x_strides[0];
+    device T* solo_y = y + assignment * out_vec_size;
+    qmv_fast_aligned_tail_impl<T>(
+        solo_w,
+        solo_scales,
+        solo_biases,
+        solo_x,
+        solo_y,
+        in_vec_size,
+        out_vec_size,
+        tid,
+        simd_gid,
+        simd_lid);
+    return;
   }
   adjust_matrix_offsets<T>(
       x,

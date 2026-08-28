@@ -38,12 +38,12 @@ private func gemma4TruthyFlag(_ raw: String?) -> Bool {
 /// later layers. This changes only when already-built work is queued; the
 /// operations and results are unchanged. Single-token decode is excluded.
 ///
-/// The 18-layer default leaves twelve layers of the 30-layer 26B model for
-/// useful CPU/GPU overlap. `DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL=0` restores
+/// The six-layer default adds submission points across the 30-layer 26B model
+/// for useful CPU/GPU overlap. `DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL=0` restores
 /// one final submission; another positive value tunes the layer interval.
 @inline(__always)
 internal func resolveGemma4PrefillChunkEvalLayers(_ raw: String?) -> Int {
-    guard let raw, let value = Int(raw) else { return 18 }
+    guard let raw, let value = Int(raw) else { return 6 }
     return max(0, value)
 }
 
@@ -789,6 +789,166 @@ private func gemma4FusedQKVNorm(
     return (outputs[0], outputs[1], outputs[2])
 }
 
+private let gemma4QKVNormRoPEKernel = MLXFast.metalKernel(
+    name: "gemma4_b8_qkv_rms_norm_rope_v1",
+    inputNames: ["q", "k", "v", "q_weight", "k_weight", "offsets", "rope_operand"],
+    outputNames: ["q_out", "k_out", "v_out"],
+    source: """
+        constexpr uint reads = 4;
+        const uint row = threadgroup_position_in_grid.x;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint simd_group = simdgroup_index_in_threadgroup;
+
+        const device T* row_input = q;
+        const device T* row_weight = q_weight;
+        device T* row_output = q_out;
+        uint local_row = row;
+        uint heads = Q_HEADS;
+        bool weighted = true;
+        bool rotate = true;
+        bool key_row = false;
+        if (KV_SHARED == 0 && row >= Q_ROWS + K_ROWS) {
+            row_input = v;
+            row_output = v_out;
+            local_row = row - Q_ROWS - K_ROWS;
+            heads = K_HEADS;
+            weighted = false;
+            rotate = false;
+        } else if (row >= Q_ROWS) {
+            row_input = k;
+            row_weight = k_weight;
+            row_output = k_out;
+            local_row = row - Q_ROWS;
+            heads = K_HEADS;
+            key_row = true;
+        }
+
+        row_input += local_row * D;
+        row_output += local_row * D;
+
+        float sum = 0.0f;
+        for (uint i = 0; i < reads; ++i) {
+            const float value = float(row_input[lid * reads + i]);
+            sum += value * value;
+        }
+        sum = simd_sum(sum);
+
+        threadgroup float partials[32];
+        threadgroup float inverse_rms;
+        if (simd_group == 0) partials[lane] = 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) partials[simd_group] = sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            sum = simd_sum(partials[lane]);
+            if (lane == 0) {
+                inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint half_dimension = D / 2;
+        const int position = offsets[local_row / heads];
+        for (uint i = 0; i < reads; ++i) {
+            const uint dimension = lid * reads + i;
+            const T normalized = T(float(row_input[dimension]) * inverse_rms);
+            const T current = weighted
+                ? T(row_weight[dimension] * normalized)
+                : normalized;
+            if (KV_SHARED != 0 && key_row) {
+                v_out[local_row * D + dimension] = T(T(1) * normalized);
+            }
+            if (!rotate) {
+                row_output[dimension] = current;
+                continue;
+            }
+
+            const uint pair_dimension =
+                dimension < half_dimension
+                ? dimension + half_dimension
+                : dimension - half_dimension;
+            const T pair_normalized =
+                T(float(row_input[pair_dimension]) * inverse_rms);
+            const T pair_value = T(row_weight[pair_dimension] * pair_normalized);
+            const uint frequency_index =
+                dimension - (dimension / half_dimension) * half_dimension;
+            float inverse_frequency;
+            if (USE_FREQS != 0) {
+                inverse_frequency = 1.0f / rope_operand[frequency_index];
+            } else {
+                const float exponent =
+                    float(frequency_index) / float(half_dimension);
+                inverse_frequency = metal::exp2(-exponent * rope_operand[0]);
+            }
+            const float theta = float(position) * inverse_frequency;
+            const float cosine = metal::fast::cos(theta);
+            const float sine = metal::fast::sin(theta);
+            row_output[dimension] = dimension < half_dimension
+                ? T(float(current) * cosine - float(pair_value) * sine)
+                : T(float(pair_value) * sine + float(current) * cosine);
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+private func gemma4FusedQKVNormRoPE(
+    q: MLXArray,
+    k: MLXArray,
+    v: MLXArray,
+    qWeight: MLXArray,
+    kWeight: MLXArray,
+    offsets: MLXArray,
+    ropeOperand: MLXArray,
+    usesFreqs: Bool,
+    keyValueShared: Bool,
+    eps: Float
+) -> (MLXArray, MLXArray, MLXArray)? {
+    guard eps == 1.0e-6,
+        q.dtype == .bfloat16, k.dtype == .bfloat16, v.dtype == .bfloat16,
+        qWeight.dtype == .bfloat16, kWeight.dtype == .bfloat16,
+        offsets.dtype == .int32, ropeOperand.dtype == .float32,
+        q.ndim == 4, k.ndim == 4, v.ndim == 4,
+        q.dim(0) == 8, q.dim(1) == 1, q.dim(2) == 16,
+        k.dim(0) == 8, k.dim(1) == 1, v.shape == k.shape,
+        q.dim(3) == k.dim(3),
+        (q.dim(3) == 256 && k.dim(2) == 8) || (q.dim(3) == 512 && k.dim(2) == 2),
+        qWeight.shape == [q.dim(3)], kWeight.shape == [q.dim(3)],
+        offsets.shape == [8],
+        ropeOperand.shape == [q.dim(3) / 2],
+        !keyValueShared || (q.dim(3) == 512 && k.dim(2) == 2)
+    else { return nil }
+
+    let dimension = q.dim(3)
+    let qHeads = 16
+    let kHeads = k.dim(2)
+    let qRows = 8 * qHeads
+    let kRows = 8 * kHeads
+    let threads = dimension / 4
+    let outputs = gemma4QKVNormRoPEKernel(
+        [q, k, v, qWeight, kWeight, offsets, ropeOperand],
+        template: [
+            ("T", q.dtype), ("D", dimension),
+            ("Q_ROWS", qRows), ("K_ROWS", kRows),
+            ("Q_HEADS", qHeads), ("K_HEADS", kHeads),
+            ("USE_FREQS", usesFreqs ? 1 : 0),
+            ("KV_SHARED", keyValueShared ? 1 : 0),
+        ],
+        grid: ((qRows + (keyValueShared ? kRows : 2 * kRows)) * threads, 1, 1),
+        threadGroup: (threads, 1, 1),
+        outputShapes: [q.shape, k.shape, v.shape],
+        outputDTypes: [q.dtype, k.dtype, v.dtype]
+    )
+    return (outputs[0], outputs[1], outputs[2])
+}
+
+private let gemma4StreamFFNEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_STREAM_FFN"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 private class ScaledLinear: Module {
     let weight: MLXArray
     let scalar: Float
@@ -926,6 +1086,8 @@ private class Gemma4Attention: Module {
     let useKeqV: Bool
     let usesSharedKV: Bool
     let scale: Float
+    let fusedRoPEOperand: MLXArray
+    let fusedRoPEUsesFreqs: Bool
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
     @ModuleInfo(key: "k_proj") var kProj: Linear?
@@ -969,6 +1131,28 @@ private class Gemma4Attention: Module {
 
         self.scale = 1.0
 
+        if isSliding {
+            self.fusedRoPEOperand = MLXArray(
+                Array(
+                    repeating: log2(config.slidingRopeTheta),
+                    count: effectiveHeadDim / 2))
+            self.fusedRoPEUsesFreqs = false
+        } else {
+            let rotatedDims = Int(config.fullPartialRotaryFactor * Float(effectiveHeadDim) / 2) * 2
+            let exponents =
+                MLXArray(stride(from: 0, to: rotatedDims, by: 2)).asType(.float32)
+                / Float(effectiveHeadDim)
+            let realFreqs = MLX.pow(config.fullRopeTheta, exponents)
+            let padCount = (effectiveHeadDim - rotatedDims) / 2
+            if padCount > 0 {
+                let padding = MLXArray(Array(repeating: Float.infinity, count: padCount))
+                self.fusedRoPEOperand = concatenated([realFreqs, padding], axis: -1)
+            } else {
+                self.fusedRoPEOperand = realFreqs
+            }
+            self.fusedRoPEUsesFreqs = true
+        }
+
         self._qProj.wrappedValue = Linear(dim, nHeads * effectiveHeadDim, bias: false)
         if !usesSharedKV {
             self._kProj.wrappedValue = Linear(dim, nKvHeads * effectiveHeadDim, bias: false)
@@ -998,6 +1182,28 @@ private class Gemma4Attention: Module {
         }
 
         super.init()
+    }
+
+    /// Tight-grid affine-4 Q/K projection for the exact ranked CBv2 decode
+    /// shape. Any metadata or runtime-shape mismatch keeps the stock module.
+    private func projectAttentionQK(_ projection: Linear, input: MLXArray) -> MLXArray {
+        guard config.hiddenSize == 2816,
+            let quantized = projection as? QuantizedLinear,
+            quantized.mode == .affine,
+            quantized.groupSize == 64,
+            quantized.bits == 4,
+            quantized.bias == nil
+        else { return projection(input) }
+
+        let (outDim, inDim) = quantized.shape
+        return CBv2TiedLMHeadQMVV1.attentionMatmul(
+            x: input,
+            weight: quantized.weight,
+            scales: quantized.scales,
+            biases: quantized.biases,
+            inDim: inDim,
+            outDim: outDim)
+            ?? projection(input)
     }
 
     func callAsFunction(
@@ -1182,7 +1388,8 @@ private class Gemma4Attention: Module {
         let queryInput = lastQueryCache == nil ? x : x[0..., outputStart..., 0...]
         let queryLength = queryInput.dim(1)
 
-        let queryRaw = qProj(queryInput).reshaped(B, queryLength, nHeads, effectiveHeadDim)
+        let queryRaw = projectAttentionQK(qProj, input: queryInput)
+            .reshaped(B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
             // KV-shared layer: projects queries only and borrows (K, V) from
@@ -1244,7 +1451,8 @@ private class Gemma4Attention: Module {
             lastQueryCache == nil
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
-        let kRaw = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+        let kRaw = projectAttentionQK(kProj, input: x)
+            .reshaped(B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
         if let vProj {
             vRaw = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
@@ -1252,19 +1460,45 @@ private class Gemma4Attention: Module {
             vRaw = kRaw
         }
 
-        let normalized = gemma4FusedQKVNorm(
-            q: queryRaw, k: kRaw, v: vRaw,
-            qWeight: qNorm.weight, kWeight: kNorm.weight, eps: config.rmsNormEps)
-        var queries = normalized?.0 ?? qNorm(queryRaw)
-        var k = normalized?.1 ?? kNorm(kRaw)
-        var v = normalized?.2 ?? vNorm(vRaw)
+        let fusedNormRoPE: (MLXArray, MLXArray, MLXArray)? = {
+            guard lastQueryCache == nil,
+                case .batch(let offsets) = captured
+            else { return nil }
+            return gemma4FusedQKVNormRoPE(
+                q: queryRaw, k: kRaw, v: vRaw,
+                qWeight: qNorm.weight, kWeight: kNorm.weight,
+                offsets: offsets,
+                ropeOperand: fusedRoPEOperand,
+                usesFreqs: fusedRoPEUsesFreqs,
+                keyValueShared: vProj == nil,
+                eps: config.rmsNormEps)
+        }()
 
-        queries = queries.transposed(0, 2, 1, 3)
-        queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: queryPositionOffset)
-        k = k.transposed(0, 2, 1, 3)
-        k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
+        let queries: MLXArray
+        let k: MLXArray
+        let v: MLXArray
+        if let fusedNormRoPE {
+            queries = fusedNormRoPE.0.transposed(0, 2, 1, 3)
+            k = fusedNormRoPE.1.transposed(0, 2, 1, 3)
+            v = fusedNormRoPE.2.transposed(0, 2, 1, 3)
+        } else {
+            let normalized = gemma4FusedQKVNorm(
+                q: queryRaw, k: kRaw, v: vRaw,
+                qWeight: qNorm.weight, kWeight: kNorm.weight, eps: config.rmsNormEps)
+            var stockQueries = normalized?.0 ?? qNorm(queryRaw)
+            var stockK = normalized?.1 ?? kNorm(kRaw)
+            let stockV = normalized?.2 ?? vNorm(vRaw)
 
-        v = v.transposed(0, 2, 1, 3)
+            stockQueries = stockQueries.transposed(0, 2, 1, 3)
+            stockQueries = gemma4ApplyRotaryPosition(
+                rope, to: stockQueries, offset: queryPositionOffset)
+            stockK = stockK.transposed(0, 2, 1, 3)
+            stockK = gemma4ApplyRotaryPosition(rope, to: stockK, offset: captured)
+
+            queries = stockQueries
+            k = stockK
+            v = stockV.transposed(0, 2, 1, 3)
+        }
 
         let outputDType = queries.dtype
         let attentionQueries =
@@ -1748,6 +1982,41 @@ public class Gemma4DecoderLayer: Module {
         super.init()
     }
 
+    /// Build the independent dense and routed MoE branches on one or two GPU
+    /// streams without changing either branch's operation graph or join.
+    private func gemma4MoEBranches(
+        _ out: MLXArray,
+        useStream: Bool,
+        isExpertPrefill: Bool
+    ) -> (MLXArray, MLXArray)? {
+        guard isMoE,
+            let router,
+            let experts,
+            let postFeedforwardLayernorm1,
+            let preFeedforwardLayernorm2,
+            let postFeedforwardLayernorm2
+        else { return nil }
+
+        let buildSparse = {
+            let (topKIndices, topKWeights) = router(out)
+            var sparse = preFeedforwardLayernorm2(out)
+            sparse = experts(
+                sparse,
+                topKIndices: topKIndices,
+                topKWeights: topKWeights,
+                isExpertPrefill: isExpertPrefill)
+            return postFeedforwardLayernorm2(sparse)
+        }
+        let h2 = useStream
+            ? Stream.withNewDefaultStream(device: .gpu, buildSparse)
+            : buildSparse()
+
+        var h1 = preFeedforwardLayernorm(out)
+        h1 = mlp(h1)
+        h1 = postFeedforwardLayernorm1(h1)
+        return (h1, h2)
+    }
+
     public func callAsFunction(
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
@@ -1797,26 +2066,13 @@ public class Gemma4DecoderLayer: Module {
 
         let residual2 = out
 
-        if isMoE,
-            let router,
-            let experts,
-            let postFeedforwardLayernorm1,
-            let preFeedforwardLayernorm2,
-            let postFeedforwardLayernorm2
+        if let (h1, h2) = gemma4MoEBranches(
+            out,
+            useStream: gemma4StreamFFNEnabled
+                && out.shape == [8, 1, 2816]
+                && !isExpertPrefill,
+            isExpertPrefill: isExpertPrefill)
         {
-            // Dense + sparse branches in parallel, summed into one residual.
-            var h1 = preFeedforwardLayernorm(out)
-            h1 = mlp(h1)
-            h1 = postFeedforwardLayernorm1(h1)
-
-            let (topKIndices, topKWeights) = router(out)
-            var h2 = preFeedforwardLayernorm2(out)
-            h2 = experts(
-                h2,
-                topKIndices: topKIndices,
-                topKWeights: topKWeights,
-                isExpertPrefill: isExpertPrefill)
-            h2 = postFeedforwardLayernorm2(h2)
 
             out = h1 + h2
         } else {
@@ -2111,7 +2367,7 @@ public class Gemma4TextModelInner: Module {
             guard isCBv2 else { return nil }
             for case let entry? in fullCache {
                 if let offsets = (entry as? CBv2LayerCache)?.unifiedPositionOffsets {
-                    return .batch(offsets + 0)
+                    return .batch(offsets)
                 }
             }
             return nil
@@ -2319,6 +2575,7 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     fileprivate let config: Gemma4TextConfiguration
     let model: Gemma4TextModelInner
     let fuseWeightedUnsort: Bool
+    private var cachedSoftcapScalar: MLXArray?
 
     /// Read-only accessor for the underlying text configuration. Needed by
     /// `Gemma4AssistantDraftModel` for its bind-time compatibility checks.
@@ -2452,8 +2709,15 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         // The VLM omission profile uses zero to represent the former optional
         // softcap's nil/disabled state.
         if config.finalLogitSoftcapping > 0 {
-            out = gemma4CompiledLogitSoftcap(
-                out, MLXArray(config.finalLogitSoftcapping))
+            let cap: MLXArray
+            if let cachedSoftcapScalar {
+                cap = cachedSoftcapScalar
+            } else {
+                let scalar = MLXArray(config.finalLogitSoftcapping)
+                cachedSoftcapScalar = scalar
+                cap = scalar
+            }
+            out = gemma4CompiledLogitSoftcap(out, cap)
         }
         return out
     }

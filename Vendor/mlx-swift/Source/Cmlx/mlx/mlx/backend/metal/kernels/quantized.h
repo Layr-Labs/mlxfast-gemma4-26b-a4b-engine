@@ -3284,6 +3284,28 @@ template <typename T, int group_size, int bits>
           simd_lid);
       return;
     }
+
+    // The exact Gemma guard proves the simple one-dimensional offsets for an
+    // unmatched singleton or odd-run tail, avoiding generic gather handling.
+    const uint32_t x_idx =
+        lhs_indices[assignment * (uint)lhs_strides[0]];
+    x += x_idx * x_strides[0];
+    w += expert * w_strides[0];
+    scales += expert * s_strides[0];
+    biases += expert * b_strides[0];
+    y += assignment * out_vec_size;
+    qmv_impl<T, group_size, bits>(
+        w,
+        scales,
+        biases,
+        x,
+        y,
+        in_vec_size,
+        out_vec_size,
+        tid,
+        simd_gid,
+        simd_lid);
+    return;
   }
   adjust_matrix_offsets<T>(
       x,

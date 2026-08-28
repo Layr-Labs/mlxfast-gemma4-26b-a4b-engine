@@ -22,6 +22,13 @@ import MLX
 /// Namespace for the v1 (per-row SDPA) attention dispatch.
 enum CBv2AttentionV1 {
 
+    private static let fusedRingWriteEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_FUSED_RING_WRITE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// Query-block width for multi-token prompt attention (see
     /// `attendQueryBlocks`). Smaller blocks execute strictly less attention
     /// work and hold a smaller score tensor, but cost one dispatch set each;
@@ -221,7 +228,9 @@ enum CBv2AttentionV1 {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?, softcap: Float? = nil,
         spanContexts: [CBv2SpanChunkContext?]? = nil,
-        serializeQueries: Bool = false
+        serializeQueries: Bool = false,
+        decodeRingWriteFence: CBv2DecodeRingWriteFence? = nil,
+        allowFusedRingWrite: Bool = false
     ) -> MLXArray {
         let B = queries.dim(0)
         let L = queries.dim(2)
@@ -268,6 +277,31 @@ enum CBv2AttentionV1 {
                 cachedValueRows.reserveCapacity(B)
                 let ringRows = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
                 if ringRows.count == B && ringRows.allSatisfy({ $0.decodeRingView != nil }) {
+                    if fusedRingWriteEnabled, allowFusedRingWrite,
+                        let decodeRingWriteFence
+                    {
+                        let rings = ringRows.compactMap {
+                            $0.fullDecodeRingBeforeWrite()
+                        }
+                        if rings.count == B,
+                            let result = CBv2RaggedTwoPassDecodeAttentionV1
+                                .attendRingWriting(
+                                    queries: queries,
+                                    newKeys: keys, newValues: values,
+                                    keys: rings.map(\.keys),
+                                    values: rings.map(\.values),
+                                    starts: rings.map(\.start),
+                                    previousWriteFence: decodeRingWriteFence.value,
+                                    scale: scale)
+                        {
+                            for row in ringRows {
+                                row.advanceFullDecodeRingWithoutWrite()
+                            }
+                            decodeRingWriteFence.value = result.nextWriteFence
+                            return result.output
+                        }
+                    }
+
                     for (index, row) in ringRows.enumerated() {
                         row.decodeRingWrite(
                             keys: keys[index ..< (index + 1)],
@@ -278,7 +312,7 @@ enum CBv2AttentionV1 {
                         let output = CBv2RaggedTwoPassDecodeAttentionV1.attendRing(
                             queries: queries, keys: views.map(\.keys),
                             values: views.map(\.values), starts: views.map(\.start),
-                            scale: scale, slidingWindowLength: ringRows[0].window)
+                            scale: scale)
                     {
                         return output
                     }

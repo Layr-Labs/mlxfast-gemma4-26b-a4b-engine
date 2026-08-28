@@ -81,16 +81,19 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         /// `[anchorMin, anchorMin + windowAhead)`. May be nil if the
         /// drafter's geometry made the table empty.
         let ropeTable: DrafterRoPETable?
+        let outputGroupIndices: [Int]?
 
         init(
             sharedKV: Gemma4SharedKV, masks: Gemma4DrafterMasks,
             positionOffset: Gemma4.PositionOffset,
-            ropeTable: DrafterRoPETable?
+            ropeTable: DrafterRoPETable?,
+            outputGroupIndices: [Int]? = nil
         ) {
             self.sharedKV = sharedKV
             self.masks = masks
             self.positionOffset = positionOffset
             self.ropeTable = ropeTable
+            self.outputGroupIndices = outputGroupIndices
         }
     }
 
@@ -120,25 +123,35 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
 
     public func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture {
         precondition(!rows.isEmpty, "Gemma4CBv2MTPDrafter.prepare: rows must be non-empty")
+        let suppliedGroups = rows.compactMap(\.draftGroupIndex)
+        let groupsAreComplete = suppliedGroups.count == rows.count
+        let groupCount = groupsAreComplete ? (suppliedGroups.max() ?? -1) + 1 : rows.count
+        let representativeIndices = groupsAreComplete
+            ? (0..<groupCount).map { group in
+                suppliedGroups.firstIndex(of: group)!
+            }
+            : Array(rows.indices)
+        let preparedRows = representativeIndices.map { rows[$0] }
+        let outputGroupIndices = groupCount < rows.count ? suppliedGroups : nil
         let positionOffset = Gemma4.PositionOffset.batch(
-            MLXArray(rows.map { Int32($0.anchor) }))
+            MLXArray(preparedRows.map { Int32($0.anchor) }))
 
         let slidingWindow = drafter.config.textConfig.slidingWindow
         // Materialize the round's cos/sin table once. Anchor the table at
         // the minimum anchor across the batch so a per-row query position
         // anywhere inside `[anchorMin, anchorMin + windowAhead)` indexes
         // into the table with a non-negative step.
-        let anchorMin = rows.map(\.anchor).min() ?? 0
+        let anchorMin = preparedRows.map(\.anchor).min() ?? 0
         let ropeTable = Self.materializeDrafterRoPETable(
             drafterConfig: drafter.config.textConfig,
             startPosition: anchorMin,
             windowAhead: Self.defaultRoPEWindowAhead)
         cachedRoPETable = ropeTable
 
-        if rows.count == 1 {
-            let row = rows[0]
+        if preparedRows.count == 1 {
+            let row = preparedRows[0]
             let slidingMask = Self.slidingMask(
-                rows: rows, tMax: row.slidingKeys.dim(2), window: slidingWindow,
+                rows: preparedRows, tMax: row.slidingKeys.dim(2), window: slidingWindow,
                 dtype: row.slidingKeys.dtype)
             return Prepared(
                 sharedKV: Gemma4SharedKV(
@@ -148,15 +161,16 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
                     full: .none,
                     sliding: slidingMask.map { .array($0) } ?? .none),
                 positionOffset: positionOffset,
-                ropeTable: ropeTable)
+                ropeTable: ropeTable,
+                outputGroupIndices: outputGroupIndices)
         }
 
         let (fullKV, fullMask) = Self.padAndMask(
-            keys: rows.map(\.fullKeys), values: rows.map(\.fullValues))
+            keys: preparedRows.map(\.fullKeys), values: preparedRows.map(\.fullValues))
         let (slidingKV, slidingMask) = Self.padAndMask(
-            keys: rows.map(\.slidingKeys), values: rows.map(\.slidingValues))
+            keys: preparedRows.map(\.slidingKeys), values: preparedRows.map(\.slidingValues))
         let absoluteSlidingMask = Self.slidingMask(
-            rows: rows, tMax: slidingKV.0.dim(2), window: slidingWindow,
+            rows: preparedRows, tMax: slidingKV.0.dim(2), window: slidingWindow,
             dtype: slidingKV.0.dtype)
         return Prepared(
             sharedKV: Gemma4SharedKV(fullAttention: fullKV, slidingAttention: slidingKV),
@@ -164,7 +178,8 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
                 full: .array(fullMask),
                 sliding: .array(absoluteSlidingMask ?? slidingMask)),
             positionOffset: positionOffset,
-            ropeTable: ropeTable)
+            ropeTable: ropeTable,
+            outputGroupIndices: outputGroupIndices)
     }
 
     public func draftStep(
@@ -175,33 +190,42 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
                 "Gemma4CBv2MTPDrafter.draftStep: prepared capture "
                     + "\(type(of: prepared)) was not built by prepare(rows:)")
         }
-        // If the round has a cached RoPE table, pre-rotate the drafter's
-        // carried hidden along its rotary prefix using the cached
-        // (cos, sin) for the per-step query position. The drafter's
-        // `preProjection` is a Linear, so pre-rotation of the input is
-        // a real, distinct transformation from the drafter's downstream
-        // RoPE on Q/K. The pre-rotation is intentionally cheap (one
-        // per-round table lookup + an `a*cos-b*sin` slice) and amortizes
-        // the per-step `MLXFast.RoPE` frequency compute into the single
-        // `prepare(rows:)` materialization: the downstream rope module
-        // no longer pays the table-build cost on every draft step.
-        let rotatedHidden: MLXArray
-        if let table = prepared.ropeTable {
-            rotatedHidden = Self.applyCachedDrafterRoPE(
-                hidden: hidden, table: table, positionOffset: prepared.positionOffset)
+        // The carried target hidden is an input to the drafter projection,
+        // not an attention query. Keep it unchanged here; the drafter applies
+        // RoPE once, downstream, to the Q/K projections it actually rotates.
+        let draftTokens: MLXArray
+        let draftHidden: MLXArray
+        if let groupIndices = prepared.outputGroupIndices {
+            var representativeRows: [MLXArray] = []
+            var representativeHidden: [MLXArray] = []
+            let groupCount = (groupIndices.max() ?? -1) + 1
+            representativeRows.reserveCapacity(groupCount)
+            representativeHidden.reserveCapacity(groupCount)
+            for group in 0..<groupCount {
+                let index = groupIndices.firstIndex(of: group)!
+                representativeRows.append(tokens[index ..< (index + 1)])
+                representativeHidden.append(hidden[index ..< (index + 1)])
+            }
+            draftTokens = concatenated(representativeRows, axis: 0)
+            draftHidden = concatenated(representativeHidden, axis: 0)
         } else {
-            rotatedHidden = hidden
+            draftTokens = tokens
+            draftHidden = hidden
         }
         // Mirror runGemma4MTPGreedyRound: seed = concat(target embedding of
         // the token, carried hidden) along the feature axis.
         let inputsEmbeds = concatenated(
-            [target.embedTokensForDrafter(tokens), rotatedHidden], axis: -1)
+            [target.embedTokensForDrafter(draftTokens), draftHidden], axis: -1)
         let (newHidden, logits) = drafter(
             inputsEmbeds: inputsEmbeds,
             sharedKV: prepared.sharedKV,
             positionOffset: prepared.positionOffset,
             masks: prepared.masks)
         let next = logits.squeezed(axis: 1).argMax(axis: -1).asType(.int32)
+        if let groupIndices = prepared.outputGroupIndices {
+            let gather = MLXArray(groupIndices.map(Int32.init))
+            return (next[gather], newHidden[gather])
+        }
         return (next, newHidden)
     }
 
@@ -383,7 +407,7 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         let bRot = a * sinB + b * cosB
         let rotatedPrefix = MLX.stacked([aRot, bRot], axis: -1)
             .reshaped(Array(prefixShape))
-            .reshaped(Array(prefixLead) + [rotaryPrefix])
+            .reshaped(leadShape + [rotaryPrefix])
         let tail = flat[.ellipsis, rotaryPrefix ..< featureDim]
         return MLX.concatenated([rotatedPrefix, tail], axis: -1)
     }

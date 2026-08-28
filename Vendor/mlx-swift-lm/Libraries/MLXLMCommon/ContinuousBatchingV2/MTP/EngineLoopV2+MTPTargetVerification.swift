@@ -6,6 +6,16 @@ import MLX
 
 extension EngineLoopV2 {
 
+    /// Pack one row per equal-history group into the single causal target
+    /// rectangle used by representative verification.
+    static func mtpGroupedRepresentativeTokens(
+        columns: [MLXArray], representativeIndices: [Int]
+    ) -> MLXArray {
+        precondition(!columns.isEmpty)
+        let representatives = MLXArray(representativeIndices.map(Int32.init))
+        return concatenated(columns.map { $0[representatives] }, axis: 1)
+    }
+
     /// Serial mode is the chip-independent authority path: every column
     /// executes the same `[B, 1]` eager forward used by ordinary decode,
     /// while one surrounding speculative KV transaction defers commit until
@@ -24,7 +34,35 @@ extension EngineLoopV2 {
         columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver
     ) -> (argmax: MLXArray, hidden: MLXArray, cacheInnerState: [MLXArray]) {
         precondition(!columns.isEmpty, "CBv2 MTP: target verification requires a seed column")
+        if let grouped = mtpBuildGroupedHistoryVerification(
+            columns: columns, rows: rows, driver: mtp)
+        {
+            return grouped
+        }
         let caches = eagerCaches(rowStates: rows.map { kvStates[$0.rec.id]! })
+
+        let installedDepth = columns.count - 1
+        let usesInstalledVerifier =
+            columns[0].dim(0) == 8
+            && mtp.supportsInstalledVerification(
+                batchSize: 8, draftDepth: installedDepth)
+        if usesInstalledVerifier {
+            // Both production cache backends certify this phase route. The
+            // flag keeps each attention column identical to standalone L=1
+            // decode while the weight-bound trunk runs once at M16.
+            cacheProvider.setMTPRectangularVerification(true)
+            defer {
+                cacheProvider.setMTPRectangularVerification(false)
+            }
+            let tokens = concatenated(columns, axis: 1)
+            let output = mtp.forwardInstalledMTPVerification(
+                tokens: tokens, caches: caches)
+            return (
+                argMax(output.logits, axis: -1).asType(.int32),
+                output.lastHidden,
+                eagerCacheInnerState(caches))
+        }
+
         let argmax: MLXArray
         let hidden: MLXArray
 
@@ -93,5 +131,63 @@ extension EngineLoopV2 {
         }
 
         return (argmax, hidden, eagerCacheInnerState(caches))
+    }
+
+    /// Equal confirmed histories produce equal target activations and K/V
+    /// tails. Score one representative per distinct history together, then
+    /// append each representative's projected tail to only its equal-history
+    /// peers. Every request keeps independent storage and finalize-time
+    /// longest-prefix rollback.
+    private func mtpBuildGroupedHistoryVerification(
+        columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver
+    ) -> (argmax: MLXArray, hidden: MLXArray, cacheInnerState: [MLXArray])? {
+        guard rows.count == 8 else { return nil }
+
+        let groupIndices = mtp.draftGroupIndices(rows.map(\.rec))
+        let groupCount = (groupIndices.max() ?? -1) + 1
+        guard groupCount > 0, groupCount < rows.count else { return nil }
+        let representativeIndices = (0..<groupCount).map { group in
+            groupIndices.firstIndex(of: group)!
+        }
+
+        let states = rows.map { kvStates[$0.rec.id]! }
+        let representativeStates = representativeIndices.map { states[$0] }
+        let representativeCaches = eagerCaches(rowStates: representativeStates)
+        let tokens = Self.mtpGroupedRepresentativeTokens(
+            columns: columns, representativeIndices: representativeIndices)
+        cacheProvider.setMTPRectangularVerification(true)
+        defer { cacheProvider.setMTPRectangularVerification(false) }
+        let output = mtp.model.forwardWithHidden(
+            tokens: tokens, caches: representativeCaches)
+        let representativeArgmax = argMax(output.logits, axis: -1).asType(.int32)
+        let representativeHidden = output.lastHidden
+        eval([representativeArgmax, representativeHidden]
+            + eagerCacheInnerState(representativeCaches))
+
+        let width = columns.count
+        for layer in states[0].indices {
+            for group in 0..<groupCount {
+                let representativeIndex = representativeIndices[group]
+                guard let source = states[representativeIndex][layer] else { continue }
+                let snapshot = source.snapshot()
+                let retained = snapshot.keys.dim(2)
+                precondition(retained >= width)
+                let newKeys =
+                    snapshot.keys[0..., 0..., (retained - width)..<retained, 0...]
+                let newValues =
+                    snapshot.values[0..., 0..., (retained - width)..<retained, 0...]
+                for peer in rows.indices
+                where groupIndices[peer] == group && peer != representativeIndex {
+                    guard let destination = states[peer][layer] else { continue }
+                    _ = destination.update(keys: newKeys, values: newValues)
+                }
+            }
+        }
+
+        let gather = MLXArray(groupIndices.map(Int32.init))
+        let argmax = representativeArgmax[gather]
+        let hidden = representativeHidden[gather]
+        let allCaches = eagerCaches(rowStates: states)
+        return (argmax, hidden, eagerCacheInnerState(allCaches))
     }
 }

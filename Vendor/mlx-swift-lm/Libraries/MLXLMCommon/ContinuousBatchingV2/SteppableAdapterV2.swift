@@ -19,9 +19,38 @@ import MLX
 public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
 
     private let model: any LanguageModel
+    private let installedMTPVerifier: (any CBv2MTPInstalledVerifier)?
 
     public init(_ model: any LanguageModel) {
         self.model = model
+        self.installedMTPVerifier =
+            (model as? any CBv2MTPVerifierInstallable)?.installCBv2MTPVerifier()
+    }
+
+    /// Immutable geometry installed with the adapter, or nil when the target
+    /// did not certify an optimized verifier.
+    public var mtpVerificationGeometry: CBv2MTPVerificationGeometry? {
+        installedMTPVerifier?.geometry
+    }
+
+    public func supportsMTPVerification(batchSize: Int, draftDepth: Int) -> Bool {
+        installedMTPVerifier?.geometry
+            == CBv2MTPVerificationGeometry(batchSize: batchSize, draftDepth: draftDepth)
+    }
+
+    func forwardInstalledMTPVerification(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        guard let installedMTPVerifier else {
+            preconditionFailure("CBv2 MTP: no verifier was installed at model construction")
+        }
+        let geometry = installedMTPVerifier.geometry
+        precondition(
+            tokens.dim(0) == geometry.batchSize
+                && tokens.dim(1) == geometry.draftDepth + 1,
+            "CBv2 MTP: installed verifier called with a different logical shape")
+        return installedMTPVerifier.forwardWithHidden(
+            tokens: tokens, caches: asKVCaches(caches))
     }
 
     public func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {

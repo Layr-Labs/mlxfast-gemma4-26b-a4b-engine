@@ -144,6 +144,42 @@ func gemma4SupportsCoupledExpertOptimizations(_ config: Gemma4TextConfiguration)
         && gemma4SupportsSafeExpertQMMQuantization(config)
 }
 
+/// The only Gemma 4 target geometry certified for the fixed-shape MTP
+/// verifier.  This predicate intentionally spells every arithmetic and cache
+/// ownership invariant that affects a two-token, eight-row target forward;
+/// nearby Gemma variants must construct without the verifier route.
+func gemma4SupportsBatch8Depth1MTPVerifier(_ config: Gemma4TextConfiguration) -> Bool {
+    let expectedLayerTypes = (0..<30).map { layer in
+        layer % 6 == 5 ? "full_attention" : "sliding_attention"
+    }
+    return config.modelType == "gemma4_text"
+        && config.hiddenSize == 2816
+        && config.numHiddenLayers == 30
+        && config.intermediateSize == 2112
+        && config.numAttentionHeads == 16
+        && config.headDim == 256
+        && config.globalHeadDim == 512
+        && config.numKeyValueHeads == 8
+        && config.numGlobalKeyValueHeads == 2
+        && config.numKvSharedLayers == 0
+        && config.hiddenSizePerLayerInput == 0
+        && config.slidingWindow == 1024
+        && config.maxPositionEmbeddings == 262_144
+        && config.attentionKeqV
+        && config.rmsNormEps == 1.0e-6
+        && config.finalLogitSoftcapping == 30
+        && !config.useDoubleWideMlp
+        && config.vocabSizePerLayerInput == 262_144
+        && config.globalPartialRotaryFactor == 0.25
+        && config.slidingRopeTheta == 10_000
+        && config.fullRopeTheta == 1_000_000
+        && config.layerTypes == expectedLayerTypes
+        && config.tieWordEmbeddings
+        && config.vocabSize == 262_144
+        && gemma4SupportsProductionExpertTopology(config)
+        && gemma4SupportsSafeExpertQMMQuantization(config)
+}
+
 internal let gemma4FusedWeightedUnsortRequested = gemma4FusedWeightedUnsortFlag(
     ProcessInfo.processInfo.environment["MLX_GEMMA4_FUSED_WEIGHTED_UNSORT"])
 
@@ -787,6 +823,85 @@ private func gemma4FusedQKVNorm(
         outputDTypes: [q.dtype, k.dtype, v.dtype]
     )
     return (outputs[0], outputs[1], outputs[2])
+}
+
+/// Quantized dense projection installed only on the certified production
+/// target. Ordinary decode and prefill retain `QuantizedLinear` verbatim; the
+/// sole runtime route is the logical row count that genuinely changes between
+/// those phases and fixed `[8,2]` verification.
+final class Gemma4MTPVerifyQuantizedLinear: QuantizedLinear {
+    static func install(_ source: QuantizedLinear) -> Gemma4MTPVerifyQuantizedLinear? {
+        guard source.groupSize == 64,
+            source.bits == 4 || source.bits == 8,
+            source.mode == .affine,
+            let affineBiases = source.biases,
+            source.weight.dtype == .uint32,
+            source.scales.dtype == .bfloat16,
+            affineBiases.dtype == .bfloat16,
+            source.weight.ndim == 2,
+            source.scales.ndim == 2,
+            affineBiases.shape == source.scales.shape
+        else { return nil }
+
+        let (outDim, inDim) = source.shape
+        guard inDim % 64 == 0,
+            outDim % 2 == 0,
+            source.weight.shape == [outDim, inDim * source.bits / 32],
+            source.scales.shape == [outDim, inDim / 64],
+            source.bias?.dtype == nil || source.bias?.dtype == .bfloat16
+        else { return nil }
+
+        return Gemma4MTPVerifyQuantizedLinear(
+            weight: source.weight,
+            bias: source.bias,
+            scales: source.scales,
+            biases: affineBiases,
+            groupSize: source.groupSize,
+            bits: source.bits,
+            mode: source.mode)
+    }
+
+    override func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let logicalRows = x.size / x.dim(-1)
+        guard logicalRows == 16 || logicalRows == 32 else {
+            return super.callAsFunction(x)
+        }
+        let prefix = Array(x.shape.dropLast())
+        let flat = x.reshaped([logicalRows, shape.1])
+        let output = concatenated(
+            stride(from: 0, to: logicalRows, by: 8).map { start in
+                super.callAsFunction(flat[start..<(start + 8)])
+            }, axis: 0)
+        return output.reshaped(prefix + [shape.0])
+    }
+}
+
+/// Tied embedding head captured at verifier installation. The affine tensor
+/// contract is checked once by `install`; the measured call is a direct M16
+/// kernel followed by the target's fixed softcap.
+final class Gemma4MTPVerifyTiedHead {
+    let weight: MLXArray
+    let scales: MLXArray
+    let biases: MLXArray
+    let inDim: Int
+    let outDim: Int
+
+    init(
+        weight: MLXArray, scales: MLXArray, biases: MLXArray,
+        inDim: Int, outDim: Int
+    ) {
+        self.weight = weight
+        self.scales = scales
+        self.biases = biases
+        self.inDim = inDim
+        self.outDim = outDim
+    }
+
+    func callAsFunction(_ hidden: MLXArray) -> MLXArray {
+        return CBv2TiedLMHeadQMVV1.matmulVerifierColumnsM8(
+            x: hidden, weight: weight, scales: scales, biases: biases,
+            inDim: inDim, outDim: outDim)
+    }
 }
 
 private class ScaledLinear: Module {
@@ -3035,5 +3150,39 @@ extension Gemma4TextModel: CBv2MTPForwardable {
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         let (postNorm, preNorm) = model.callCapturingPreNorm(tokens, cache: caches)
         return (applyLMHead(postNorm), preNorm)
+    }
+}
+
+extension Gemma4TextModel {
+    func makeMTPVerifyTiedHead() -> Gemma4MTPVerifyTiedHead? {
+        guard lmHead == nil,
+            let embedding = model.embedTokens as? QuantizedEmbedding,
+            embedding.groupSize == 64,
+            embedding.bits == 4,
+            embedding.mode == .affine,
+            let biases = embedding.biases,
+            embedding.weight.dtype == .uint32,
+            embedding.scales.dtype == .bfloat16,
+            biases.dtype == .bfloat16,
+            embedding.weight.shape == [config.vocabSize, config.hiddenSize / 8],
+            embedding.scales.shape == [config.vocabSize, config.hiddenSize / 64],
+            biases.shape == embedding.scales.shape
+        else { return nil }
+        return Gemma4MTPVerifyTiedHead(
+            weight: embedding.weight,
+            scales: embedding.scales,
+            biases: biases,
+            inDim: config.hiddenSize,
+            outDim: config.vocabSize)
+    }
+
+    func cbv2MTPVerifyHiddenStates(
+        _ tokens: MLXArray, caches: [KVCache]
+    ) -> (postNorm: MLXArray, preNorm: MLXArray) {
+        model.callCapturingPreNorm(tokens, cache: caches)
+    }
+
+    func cbv2MTPVerifySoftcap(_ logits: MLXArray) -> MLXArray {
+        gemma4CompiledLogitSoftcap(logits, MLXArray(config.finalLogitSoftcapping))
     }
 }

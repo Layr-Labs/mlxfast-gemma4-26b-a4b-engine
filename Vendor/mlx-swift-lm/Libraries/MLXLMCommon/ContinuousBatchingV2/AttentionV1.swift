@@ -411,6 +411,13 @@ enum CBv2AttentionV1 {
         // exactly its own KV. Serialized queries remain MTP-only; ordinary
         // packed prefill keeps q-blocking and optional row-local span masks.
         if serializeQueries {
+            if let staged = updateAndAttendStagedRingMTP(
+                rows: rows, kind: kind,
+                queries: queries, keys: keys, values: values,
+                scale: scale, sinks: effectiveSinks, softcap: softcap)
+            {
+                return staged
+            }
             return packedPerRow(batch: B) { index, slice in
                 updateAndAttendRowSerialQueries(
                     row: rows[index], kind: kind,
@@ -663,6 +670,42 @@ enum CBv2AttentionV1 {
             queries: queries, keys: cachedKeys, values: cachedValues,
             newTokenCount: L, window: window(of: kind), scale: scale,
             sinks: sinks, softcap: softcap)
+    }
+
+    /// Fixed full-ring phase for the installed Gemma B8/K1 verifier. All
+    /// eight pre-write rings are admitted before any row is staged; after
+    /// that boundary the custom lane executes directly and cache mutation
+    /// remains deferred to speculative finalize.
+    private static func updateAndAttendStagedRingMTP(
+        rows: [CBv2SequenceKV], kind: CBv2LayerKind,
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?, softcap: Float?
+    ) -> MLXArray? {
+        let B = queries.dim(0)
+        let L = queries.dim(2)
+        guard (2...4).contains(L),
+            canUseRaggedTwoPassDecode(
+                batch: B, cacheKind: kind, queryKind: kind,
+                scale: scale, sinks: sinks, softcap: softcap)
+        else { return nil }
+
+        let ringRows = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
+        guard ringRows.count == B else { return nil }
+        let prewrite = ringRows.compactMap(\.mtpPrewriteRingView)
+        guard prewrite.count == B else { return nil }
+
+        for index in 0 ..< B {
+            ringRows[index].stageMTPColumns(
+                keys: keys[index ..< (index + 1)],
+                values: values[index ..< (index + 1)])
+        }
+        return CBv2RaggedTwoPassDecodeAttentionV1.attendInstalledStagedMTP(
+            queries: queries,
+            newKeys: keys,
+            newValues: values,
+            keys: prewrite.map(\.keys),
+            values: prewrite.map(\.values),
+            starts: prewrite.map(\.start))
     }
 
     /// Attend against `sourceRows`' KV WITHOUT updating (Gemma-4 cross-layer

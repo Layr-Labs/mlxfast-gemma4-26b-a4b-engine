@@ -226,8 +226,10 @@ extension EngineLoopV2 {
         var captured: [(row: CBv2SequenceKV, keys: MLXArray, values: MLXArray)] = []
         captures.reserveCapacity(batch)
         captured.reserveCapacity(2 * batch)
+        let draftGroupIndices = mtp.draftGroupIndices(
+            verifyRows.map(\.rec))
 
-        for row in verifyRows {
+        for (rowIndex, row) in verifyRows.enumerated() {
             let state = kvStates[row.rec.id]!
             let carry = row.carry!
             // Captured BEFORE the target forward writes the round's
@@ -249,7 +251,8 @@ extension EngineLoopV2 {
                     slidingKeys: slidingSnapshot.keys,
                     slidingValues: slidingSnapshot.values,
                     slidingStart: slidingRow.absoluteOffset - slidingRow.retainedCount,
-                    anchor: fullRow.absoluteOffset))
+                    anchor: fullRow.absoluteOffset,
+                    draftGroupIndex: draftGroupIndices[rowIndex]))
             captured.append((fullRow, fullSnapshot.keys, fullSnapshot.values))
             captured.append((slidingRow, slidingSnapshot.keys, slidingSnapshot.values))
             rowMetadata.append(

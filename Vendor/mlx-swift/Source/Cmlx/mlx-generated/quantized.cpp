@@ -3254,6 +3254,50 @@ template <typename T, int group_size, int bits>
       run_offset++;
     }
 
+    // The ruled cohort commonly presents identical rows, so each selected
+    // expert forms an eight-assignment run after SwitchGLU's stable sort.
+    // Reuse one packed-weight stream across each complete block of four.
+    // qmv_affine4_g64_quad_stream_impl retains an independent accumulator,
+    // K-loop, and simd_sum for every input row; only the loads are shared.
+    const uint quad_base = assignment - (run_offset & 3u);
+    const bool belongs_to_quad =
+        quad_base + 3 < 64 &&
+        rhs_indices[(quad_base + 1) * (uint)rhs_strides[0]] == expert &&
+        rhs_indices[(quad_base + 2) * (uint)rhs_strides[0]] == expert &&
+        rhs_indices[(quad_base + 3) * (uint)rhs_strides[0]] == expert;
+    if (belongs_to_quad) {
+      if (assignment != quad_base) {
+        return;
+      }
+      const device uint32_t* quad_w = w + expert * w_strides[0];
+      const device T* quad_scales = scales + expert * s_strides[0];
+      const device T* quad_biases = biases + expert * b_strides[0];
+      const uint32_t x0_idx = lhs_indices[quad_base * (uint)lhs_strides[0]];
+      const uint32_t x1_idx =
+          lhs_indices[(quad_base + 1) * (uint)lhs_strides[0]];
+      const uint32_t x2_idx =
+          lhs_indices[(quad_base + 2) * (uint)lhs_strides[0]];
+      const uint32_t x3_idx =
+          lhs_indices[(quad_base + 3) * (uint)lhs_strides[0]];
+      qmv_affine4_g64_quad_stream_impl<T, group_size, bits>(
+          quad_w,
+          quad_scales,
+          quad_biases,
+          x + x0_idx * x_strides[0],
+          x + x1_idx * x_strides[0],
+          x + x2_idx * x_strides[0],
+          x + x3_idx * x_strides[0],
+          y + quad_base * out_vec_size,
+          y + (quad_base + 1) * out_vec_size,
+          y + (quad_base + 2) * out_vec_size,
+          y + (quad_base + 3) * out_vec_size,
+          in_vec_size,
+          tid,
+          simd_gid,
+          simd_lid);
+      return;
+    }
+
     // Odd positions are produced by the immediately preceding pair leader.
     if ((run_offset & 1) != 0) {
       return;

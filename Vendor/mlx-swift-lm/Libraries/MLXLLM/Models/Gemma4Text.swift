@@ -224,16 +224,8 @@ private let gemma4SafeGeluApproximate: @Sendable (MLXArray) -> MLXArray = {
     return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
 
-/// Extend the existing safe approximate-GELU compilation through the dense
-/// MLP's following elementwise product. The expression and operand order are
-/// identical; only the intermediate dispatch is removed.
-private let gemma4SafeGeluProductEnabled: Bool = {
-    guard let raw = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_GEMMA4_SAFE_GELU_PRODUCT"]
-    else { return true }
-    return !["0", "false", "no", "off"].contains(raw.lowercased())
-}()
-
+/// Safe approximate GELU and its following dense-MLP product in one compiled
+/// graph. Operation order matches `gemma4SafeGeluApproximate(gate) * up`.
 private let gemma4SafeGeluProduct: @Sendable (
     MLXArray, MLXArray
 ) -> MLXArray = {
@@ -1655,12 +1647,7 @@ private class Gemma4MLP: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let gate = gateProj(x)
-        let up = upProj(x)
-        let product = gemma4SafeGeluProductEnabled
-            ? gemma4SafeGeluProduct(gate, up)
-            : gemma4SafeGeluApproximate(gate) * up
-        return downProj(product)
+        downProj(gemma4SafeGeluProduct(gateProj(x), upProj(x)))
     }
 }
 

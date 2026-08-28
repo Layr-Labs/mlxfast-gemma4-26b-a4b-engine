@@ -43,7 +43,7 @@ private func gemma4TruthyFlag(_ raw: String?) -> Bool {
 /// one final submission; another positive value tunes the layer interval.
 @inline(__always)
 internal func resolveGemma4PrefillChunkEvalLayers(_ raw: String?) -> Int {
-    guard let raw, let value = Int(raw) else { return 18 }
+    guard let raw, let value = Int(raw) else { return 6 }
     return max(0, value)
 }
 

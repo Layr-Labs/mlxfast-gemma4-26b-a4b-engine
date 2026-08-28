@@ -824,6 +824,161 @@ internal func gemma4ApplyRotaryPosition<R: RoPELayer>(
     }
 }
 
+// MARK: - Exact batch-8 decode Q/K RoPE
+
+/// One two-output dispatch for the production `[8, heads, 1, D]` Q/K shapes.
+/// The arithmetic below is deliberately the forward, non-traditional body of
+/// MLX's AOT `rope` / `rope_freqs` kernel, in the same statement order. Each
+/// thread handles the same four adjacent heads as that kernel; the only change
+/// is that Q and K head groups share one launch.
+private let gemma4DecodeQKRoPEKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "gemma4_decode_qk_rope_b8_v1",
+    inputNames: ["queries", "keys", "offsets", "freqs", "log2_base"],
+    outputNames: ["rotated_queries", "rotated_keys"],
+    source: """
+        const uint pair = thread_position_in_grid.x;
+        const uint group = thread_position_in_grid.z;
+        constexpr uint heads_per_thread = 4;
+        constexpr uint q_groups = (Q_HEADS + heads_per_thread - 1) / heads_per_thread;
+        constexpr uint k_groups = (K_HEADS + heads_per_thread - 1) / heads_per_thread;
+        constexpr uint groups_per_batch = q_groups + k_groups;
+
+        const uint batch = group / groups_per_batch;
+        const uint local_group = group - batch * groups_per_batch;
+        const bool is_query = local_group < q_groups;
+        uint head = heads_per_thread * (is_query ? local_group : local_group - q_groups);
+        const uint head_count = is_query ? Q_HEADS : K_HEADS;
+        if (head >= head_count) {
+            return;
+        }
+
+        const float L = 1.0f * static_cast<float>(offsets[batch]);
+        float inv_freq;
+        if (USE_FREQS) {
+            inv_freq = 1.0f / freqs[pair];
+        } else {
+            const float d = static_cast<float>(pair) / static_cast<float>(DIM / 2);
+            inv_freq = metal::exp2(-d * log2_base);
+        }
+        const float theta = L * inv_freq;
+        const float costheta = metal::fast::cos(theta);
+        const float sintheta = metal::fast::sin(theta);
+
+        for (uint i = 0; i < heads_per_thread && head + i < head_count; ++i) {
+            const uint matrix = batch * head_count + head + i;
+            const uint index_1 = matrix * DIM + pair;
+            const uint index_2 = index_1 + DIM / 2;
+            if (is_query) {
+                const float x1 = static_cast<float>(queries[index_1]);
+                const float x2 = static_cast<float>(queries[index_2]);
+                const float rx1 = x1 * costheta - x2 * sintheta;
+                const float rx2 = x1 * sintheta + x2 * costheta;
+                rotated_queries[index_1] = static_cast<T>(rx1);
+                rotated_queries[index_2] = static_cast<T>(rx2);
+            } else {
+                const float x1 = static_cast<float>(keys[index_1]);
+                const float x2 = static_cast<float>(keys[index_2]);
+                const float rx1 = x1 * costheta - x2 * sintheta;
+                const float rx2 = x1 * sintheta + x2 * costheta;
+                rotated_keys[index_1] = static_cast<T>(rx1);
+                rotated_keys[index_2] = static_cast<T>(rx2);
+            }
+        }
+    """,
+    // Decode's transposed `[B, H, 1, D]` views are physically linear even
+    // though the singleton sequence axis retains its old stride. Avoiding the
+    // generic row-contiguous coercion is what keeps this at one dispatch.
+    ensureRowContiguous: false
+)
+
+/// Shape/layout gate for the only geometries used by the ruled Gemma 4 batch-8
+/// decode. Every near match keeps the two established MLX RoPE primitives.
+internal func gemma4CanFuseDecodeQKRoPE(
+    queries: MLXArray,
+    keys: MLXArray,
+    offsets: MLXArray,
+    dimensions: Int,
+    frequencies: MLXArray,
+    log2Base: MLXArray,
+    useFrequencies: Bool
+) -> Bool {
+    guard queries.ndim == 4, keys.ndim == 4,
+        queries.dtype == .bfloat16, keys.dtype == .bfloat16,
+        queries.dim(0) == 8, keys.dim(0) == 8,
+        queries.dim(2) == 1, keys.dim(2) == 1,
+        queries.dim(3) == dimensions, keys.dim(3) == dimensions,
+        offsets.dtype == .int32, offsets.shape == [8], offsets.strides == [1],
+        frequencies.dtype == .float32, frequencies.size > 0,
+        log2Base.dtype == .float32, log2Base.ndim == 0, log2Base.size == 1
+    else { return false }
+
+    let productionGeometry =
+        (dimensions == 256 && queries.dim(1) == 16 && keys.dim(1) == 8)
+        || (dimensions == 512 && queries.dim(1) == 16 && keys.dim(1) == 2)
+    guard productionGeometry else { return false }
+
+    if useFrequencies {
+        guard frequencies.dtype == .float32,
+            frequencies.shape == [dimensions / 2], frequencies.strides == [1]
+        else { return false }
+    }
+
+    // `forwardV2` reaches this helper immediately after transposing contiguous
+    // `[B, 1, H, D]` norm outputs. The sequence-axis stride is immaterial at
+    // length one; these three strides prove linear `(batch, head, feature)`
+    // addressing without asking the custom-op wrapper to copy either input.
+    func isLinearDecodeView(_ x: MLXArray) -> Bool {
+        let strides = x.strides
+        return strides.count == 4
+            && strides[0] == x.dim(1) * dimensions
+            && strides[1] == dimensions
+            && strides[3] == 1
+    }
+    return isLinearDecodeView(queries) && isLinearDecodeView(keys)
+}
+
+/// Returns nil unless the exact batch-8 decode specialization is legal.
+internal func gemma4FusedDecodeQKRoPE(
+    queries: MLXArray,
+    keys: MLXArray,
+    offsets: MLXArray,
+    dimensions: Int,
+    frequencies: MLXArray,
+    log2Base: MLXArray,
+    useFrequencies: Bool
+) -> (queries: MLXArray, keys: MLXArray)? {
+    guard gemma4CanFuseDecodeQKRoPE(
+        queries: queries,
+        keys: keys,
+        offsets: offsets,
+        dimensions: dimensions,
+        frequencies: frequencies,
+        log2Base: log2Base,
+        useFrequencies: useFrequencies)
+    else { return nil }
+
+    let qHeads = queries.dim(1)
+    let kHeads = keys.dim(1)
+    let groupsPerBatch = (qHeads + 3) / 4 + (kHeads + 3) / 4
+    let outputs = gemma4DecodeQKRoPEKernel(
+        [queries, keys, offsets, frequencies, log2Base],
+        template: [
+            ("T", queries.dtype),
+            ("DIM", dimensions),
+            ("Q_HEADS", qHeads),
+            ("K_HEADS", kHeads),
+            ("USE_FREQS", useFrequencies),
+        ],
+        grid: (dimensions / 2, 1, 8 * groupsPerBatch),
+        // MLX `get_block_dims(D / 2, 1, 8 * groupsPerBatch)` resolves to
+        // `(32, 1, 32)` for both ruled geometries (1,024 threads total).
+        threadGroup: (32, 1, 32),
+        outputShapes: [queries.shape, keys.shape],
+        outputDTypes: [queries.dtype, keys.dtype]
+    )
+    return (outputs[0], outputs[1])
+}
+
 private func gemma4AttentionFallback(
     queries: MLXArray,
     keys: MLXArray,
@@ -912,6 +1067,9 @@ private class Gemma4Attention: Module {
     let useKeqV: Bool
     let usesSharedKV: Bool
     let scale: Float
+    let decodeRoPEUsesFrequencies: Bool
+    let decodeRoPEFrequencies: MLXArray
+    let decodeRoPELog2Base: MLXArray
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
     @ModuleInfo(key: "k_proj") var kProj: Linear?
@@ -968,19 +1126,34 @@ private class Gemma4Attention: Module {
 
         self._qNorm.wrappedValue = RMSNorm(dimensions: effectiveHeadDim, eps: config.rmsNormEps)
 
-        // RoPE: sliding uses default, full uses proportional with partial rotation
+        // RoPE: sliding uses default, full uses proportional with partial rotation.
+        // Keep the exact parameter input used by MLX's primitive so the paired
+        // decode kernel can reproduce its arithmetic rather than rebuilding it.
         if isSliding {
             self.rope = initializeRope(
                 dims: effectiveHeadDim, base: config.slidingRopeTheta, traditional: false,
                 scalingConfig: nil, maxPositionEmbeddings: nil)
+            self.decodeRoPEUsesFrequencies = false
+            self.decodeRoPEFrequencies = MLXArray([Float(1)])
+            // `mlx/backend/metal/rope.cpp` supplies this same float
+            // `std::log2(base_)` value to the AOT base-frequency kernel.
+            self.decodeRoPELog2Base = MLXArray(log2(config.slidingRopeTheta))
         } else {
-            self.rope = initializeRope(
+            let fullRoPE = initializeRope(
                 dims: effectiveHeadDim, base: config.fullRopeTheta, traditional: false,
                 scalingConfig: [
                     "type": .string("proportional"),
                     "partial_rotary_factor": .float(config.fullPartialRotaryFactor),
                 ],
                 maxPositionEmbeddings: nil)
+            self.rope = fullRoPE
+            let frequencies = (fullRoPE as? ProportionalRoPE)?.fusedDecodeFrequencies
+            // Full attention is frequency-backed by definition. A degenerate
+            // proportional rope with no frequencies must fail the helper's
+            // `[D / 2]` frequency-shape gate and retain the generic no-op path.
+            self.decodeRoPEUsesFrequencies = true
+            self.decodeRoPEFrequencies = frequencies ?? MLXArray([Float(1)])
+            self.decodeRoPELog2Base = MLXArray(Float(0))
         }
 
         super.init()
@@ -1235,9 +1408,30 @@ private class Gemma4Attention: Module {
         var v = normalized?.2 ?? vNorm(vRaw)
 
         queries = queries.transposed(0, 2, 1, 3)
-        queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: queryPositionOffset)
         k = k.transposed(0, 2, 1, 3)
-        k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
+
+        // Ordinary ruled decode gives Q and K the same per-row position. Fuse
+        // exactly that `[8, *, 1, D]` case into one two-output dispatch. Last-
+        // query prefill shifts Q relative to K and therefore always retains the
+        // generic pair of established RoPE calls.
+        if lastQueryCache == nil, outputStart == 0,
+            case .batch(let offsets) = captured,
+            let rotated = gemma4FusedDecodeQKRoPE(
+                queries: queries,
+                keys: k,
+                offsets: offsets,
+                dimensions: effectiveHeadDim,
+                frequencies: decodeRoPEFrequencies,
+                log2Base: decodeRoPELog2Base,
+                useFrequencies: decodeRoPEUsesFrequencies)
+        {
+            queries = rotated.queries
+            k = rotated.keys
+        } else {
+            queries = gemma4ApplyRotaryPosition(
+                rope, to: queries, offset: queryPositionOffset)
+            k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
+        }
 
         v = v.transposed(0, 2, 1, 3)
 

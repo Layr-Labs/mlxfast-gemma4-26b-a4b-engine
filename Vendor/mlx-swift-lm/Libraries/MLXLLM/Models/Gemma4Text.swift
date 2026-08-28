@@ -1792,10 +1792,17 @@ public class Gemma4DecoderLayer: Module {
             h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset,
             v2SharedSource: v2SharedSource, outputStart: outputStart,
             useLastQueryPrefill: useLastQueryPrefill)
-        let postAttn = postAttentionLayernorm(attnOut)
-        var out = residual + postAttn
+        var out =
+            Gemma4PrefillGlueV1.normResidual(
+                x: attnOut,
+                weight: postAttentionLayernorm.weight,
+                residual: residual,
+                eps: postAttentionLayernorm.eps)
+            ?? (residual + postAttentionLayernorm(attnOut))
 
         let residual2 = out
+        // Set when the fused tail has already folded `residual2` back in.
+        var fusedMoETail = false
 
         if isMoE,
             let router,
@@ -1805,27 +1812,47 @@ public class Gemma4DecoderLayer: Module {
             let postFeedforwardLayernorm2
         {
             // Dense + sparse branches in parallel, summed into one residual.
-            var h1 = preFeedforwardLayernorm(out)
+            // Both pre-norms reduce the identical input, so one fused kernel
+            // does the reduction once and applies both weight vectors.
+            let preNorms = Gemma4PrefillGlueV1.dualPreNorm(
+                x: out,
+                w1: preFeedforwardLayernorm.weight,
+                w2: preFeedforwardLayernorm2.weight,
+                eps: preFeedforwardLayernorm.eps)
+
+            var h1 = preNorms?.0 ?? preFeedforwardLayernorm(out)
             h1 = mlp(h1)
-            h1 = postFeedforwardLayernorm1(h1)
 
             let (topKIndices, topKWeights) = router(out)
-            var h2 = preFeedforwardLayernorm2(out)
-            h2 = experts(
-                h2,
+            let h2 = experts(
+                preNorms?.1 ?? preFeedforwardLayernorm2(out),
                 topKIndices: topKIndices,
                 topKWeights: topKWeights,
                 isExpertPrefill: isExpertPrefill)
-            h2 = postFeedforwardLayernorm2(h2)
 
-            out = h1 + h2
+            if let fusedTail = Gemma4PrefillGlueV1.branchTail(
+                h1: h1,
+                h2: h2,
+                w1: postFeedforwardLayernorm1.weight,
+                w2: postFeedforwardLayernorm2.weight,
+                w3: postFeedforwardLayernorm.weight,
+                residual2: residual2,
+                eps: postFeedforwardLayernorm.eps)
+            {
+                out = fusedTail
+                fusedMoETail = true
+            } else {
+                out = postFeedforwardLayernorm1(h1) + postFeedforwardLayernorm2(h2)
+            }
         } else {
             out = preFeedforwardLayernorm(out)
             out = mlp(out)
         }
 
-        out = postFeedforwardLayernorm(out)
-        out = residual2 + out
+        if !fusedMoETail {
+            out = postFeedforwardLayernorm(out)
+            out = residual2 + out
+        }
 
         // PLE gating
         if let gate = perLayerInputGate,

@@ -775,6 +775,116 @@ private func gemma4FusedQKVNorm(
     return (outputs[0], outputs[1], outputs[2])
 }
 
+func gemma4FusedRMSSeamsFlag(_ raw: String?) -> Bool {
+    guard let raw else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}
+
+let gemma4FusedRMSSeamsEnabled = gemma4FusedRMSSeamsFlag(
+    ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_FUSED_RMS_SEAMS"])
+
+private let gemma4RMSSeamsKernel = MLXFast.metalKernel(
+    name: "gemma4_b8_rms_seams_v1",
+    inputNames: ["x", "x_weight", "y", "y_weight", "residual"],
+    outputNames: ["out"],
+    source: """
+        constexpr uint reads = 4;
+        const uint row = threadgroup_position_in_grid.x;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint simd_group = simdgroup_index_in_threadgroup;
+        x += row * D + lid * reads;
+        y += row * D + lid * reads;
+        x_weight += lid * reads;
+        y_weight += lid * reads;
+        residual += row * D + lid * reads;
+        out += row * D + lid * reads;
+
+        float x_sum = 0.0f;
+        float y_sum = 0.0f;
+        for (uint i = 0; i < reads; ++i) {
+            const float xv = float(x[i]);
+            x_sum += xv * xv;
+            if (DUAL) {
+                const float yv = float(y[i]);
+                y_sum += yv * yv;
+            }
+        }
+        x_sum = simd_sum(x_sum);
+        if (DUAL) y_sum = simd_sum(y_sum);
+
+        threadgroup float x_partials[32];
+        threadgroup float y_partials[32];
+        threadgroup float x_inverse_rms;
+        threadgroup float y_inverse_rms;
+        if (simd_group == 0) {
+            x_partials[lane] = 0.0f;
+            if (DUAL) y_partials[lane] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) {
+            x_partials[simd_group] = x_sum;
+            if (DUAL) y_partials[simd_group] = y_sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            x_sum = simd_sum(x_partials[lane]);
+            if (DUAL) y_sum = simd_sum(y_partials[lane]);
+            if (lane == 0) {
+                x_inverse_rms = metal::precise::rsqrt(x_sum / float(D) + 1.0e-6f);
+                if (DUAL) {
+                    y_inverse_rms = metal::precise::rsqrt(y_sum / float(D) + 1.0e-6f);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = 0; i < reads; ++i) {
+            const T x_normalized = T(float(x[i]) * x_inverse_rms);
+            const T x_normed = x_weight[i] * x_normalized;
+            if (DUAL) {
+                const T y_normalized = T(float(y[i]) * y_inverse_rms);
+                const T y_normed = y_weight[i] * y_normalized;
+                out[i] = x_normed + y_normed;
+            } else {
+                out[i] = residual[i] + x_normed;
+            }
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+func gemma4FusedRMSResidual(
+    _ x: MLXArray, weight: MLXArray, residual: MLXArray, eps: Float,
+    enabled: Bool = gemma4FusedRMSSeamsEnabled
+) -> MLXArray? {
+    guard enabled, eps == 1.0e-6, x.dtype == .bfloat16,
+        weight.dtype == .bfloat16, residual.dtype == .bfloat16,
+        x.shape == [8, 1, 2816], residual.shape == x.shape, weight.shape == [2816]
+    else { return nil }
+    return gemma4RMSSeamsKernel(
+        [x, weight, x, weight, residual],
+        template: [("T", x.dtype), ("D", 2816), ("DUAL", false)],
+        grid: (8 * 704, 1, 1), threadGroup: (704, 1, 1),
+        outputShapes: [x.shape], outputDTypes: [x.dtype])[0]
+}
+
+func gemma4FusedDualRMS(
+    _ x: MLXArray, xWeight: MLXArray, _ y: MLXArray, yWeight: MLXArray, eps: Float,
+    enabled: Bool = gemma4FusedRMSSeamsEnabled
+) -> MLXArray? {
+    guard enabled, eps == 1.0e-6, x.dtype == .bfloat16, y.dtype == .bfloat16,
+        xWeight.dtype == .bfloat16, yWeight.dtype == .bfloat16,
+        x.shape == [8, 1, 2816], y.shape == x.shape,
+        xWeight.shape == [2816], yWeight.shape == [2816]
+    else { return nil }
+    return gemma4RMSSeamsKernel(
+        [x, xWeight, y, yWeight, x],
+        template: [("T", x.dtype), ("D", 2816), ("DUAL", true)],
+        grid: (8 * 704, 1, 1), threadGroup: (704, 1, 1),
+        outputShapes: [x.shape], outputDTypes: [x.dtype])[0]
+}
+
 private class ScaledLinear: Module {
     let weight: MLXArray
     let scalar: Float
@@ -1757,8 +1867,10 @@ public class Gemma4DecoderLayer: Module {
             h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset,
             v2SharedSource: v2SharedSource, outputStart: outputStart,
             useLastQueryPrefill: useLastQueryPrefill)
-        let postAttn = postAttentionLayernorm(attnOut)
-        var out = residual + postAttn
+        var out = gemma4FusedRMSResidual(
+            attnOut, weight: postAttentionLayernorm.weight, residual: residual,
+            eps: postAttentionLayernorm.eps)
+            ?? residual + postAttentionLayernorm(attnOut)
 
         let residual2 = out
 
@@ -1772,7 +1884,6 @@ public class Gemma4DecoderLayer: Module {
             // Dense + sparse branches in parallel, summed into one residual.
             var h1 = preFeedforwardLayernorm(out)
             h1 = mlp(h1)
-            h1 = postFeedforwardLayernorm1(h1)
 
             let (topKIndices, topKWeights) = router(out)
             var h2 = preFeedforwardLayernorm2(out)
@@ -1781,16 +1892,20 @@ public class Gemma4DecoderLayer: Module {
                 topKIndices: topKIndices,
                 topKWeights: topKWeights,
                 isExpertPrefill: isExpertPrefill)
-            h2 = postFeedforwardLayernorm2(h2)
-
-            out = h1 + h2
+            out = gemma4FusedDualRMS(
+                h1, xWeight: postFeedforwardLayernorm1.weight,
+                h2, yWeight: postFeedforwardLayernorm2.weight,
+                eps: postFeedforwardLayernorm1.eps)
+                ?? postFeedforwardLayernorm1(h1) + postFeedforwardLayernorm2(h2)
         } else {
             out = preFeedforwardLayernorm(out)
             out = mlp(out)
         }
 
-        out = postFeedforwardLayernorm(out)
-        out = residual2 + out
+        out = gemma4FusedRMSResidual(
+            out, weight: postFeedforwardLayernorm.weight, residual: residual2,
+            eps: postFeedforwardLayernorm.eps)
+            ?? residual2 + postFeedforwardLayernorm(out)
 
         // PLE gating
         if let gate = perLayerInputGate,

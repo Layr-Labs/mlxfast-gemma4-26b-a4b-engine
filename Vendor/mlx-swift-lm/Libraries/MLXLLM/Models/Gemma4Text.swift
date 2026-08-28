@@ -2403,6 +2403,33 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 imageTokenMask: imageTokenMask))
     }
 
+    /// MMA-001 --- the tied LM head's vocab-plane GEMV.
+    ///
+    /// `Gemma4MMAQuantizedGEMV` serves all eight cohort rows from ONE pass over
+    /// the 369 MB `[262144, 2816]` affine-4 plane; the promoted quad-stream QMV
+    /// underneath `asLinear` serves four, so an M = 8 head streams the plane
+    /// twice. Every gate is inside `apply`, which returns `nil` for anything
+    /// that is not the bf16 M = 8 affine-4 group-64 N >= 8192 tied head --- and
+    /// `nil` means the stock `asLinear` below runs unchanged. Prefill, B = 1,
+    /// and the drafter therefore never leave stock.
+    @inline(__always)
+    private func gemma4TiedHead(_ embed: Embedding, _ hidden: MLXArray) -> MLXArray {
+        if let quantized = embed as? QuantizedEmbedding,
+            quantized.mode == .affine,
+            let mma = Gemma4MMAQuantizedGEMV.apply(
+                x: hidden,
+                w: quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                groupSize: quantized.groupSize,
+                bits: quantized.bits)
+        {
+            // `apply` returns [8, N]; restore the caller's leading dims.
+            return mma.reshaped(Array(hidden.shape.dropLast()) + [mma.dim(-1)])
+        }
+        return embed.asLinear(hidden)
+    }
+
     /// Apply the LM head (tied embedding or explicit `lm_head`) plus the
     /// configured final-logit softcap. Pure function of the post-norm hidden.
     func applyLMHead(_ hidden: MLXArray) -> MLXArray {
@@ -2410,7 +2437,7 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         if let lmHead {
             out = lmHead(hidden)
         } else {
-            out = model.embedTokens.asLinear(hidden)
+            out = gemma4TiedHead(model.embedTokens, hidden)
         }
         // The VLM omission profile uses zero to represent the former optional
         // softcap's nil/disabled state.

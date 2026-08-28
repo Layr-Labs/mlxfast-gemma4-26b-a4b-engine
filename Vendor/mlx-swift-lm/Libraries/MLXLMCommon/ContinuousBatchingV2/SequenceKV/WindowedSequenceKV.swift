@@ -51,6 +51,30 @@ import MLX
 /// `commitSpeculativeWrite()`. A final `rollback(m)` is a pure counter move —
 /// nothing was destroyed — so after commit the state is value-exactly what
 /// plain updates of only the confirmed tokens would have produced.
+/// HOST-SHAPE-001 — the geometry of a persistent windowed K/V ring allocation,
+/// recorded once when that allocation is created.
+///
+/// A row's ring storage is allocated exactly once and then only written
+/// through in place, so the four facts a consumer wants (bf16, kv-head count,
+/// ring length, head dim) are fixed for the row's whole life. Carrying them as
+/// a value lets the fused-ring decode path settle its storage predicate with
+/// integer comparisons instead of rebuilding `[Int]` shape arrays out of eight
+/// rows' K and V on every step of every sliding layer.
+///
+/// Existence of a value is itself the bf16 claim — `nil` means unproven, and
+/// an unproven row is revalidated exactly as before.
+public struct CBv2RingGeometry: Equatable {
+    public let kvHeads: Int
+    public let length: Int
+    public let headDim: Int
+
+    public init(kvHeads: Int, length: Int, headDim: Int) {
+        self.kvHeads = kvHeads
+        self.length = length
+        self.headDim = headDim
+    }
+}
+
 public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
 
     /// Window size in tokens == number of physical ring slots.
@@ -70,6 +94,11 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
 
     private var keys: MLXArray?
     private var values: MLXArray?
+
+    /// HOST-SHAPE-001 — proof, recorded at the single allocation site, that
+    /// this row's persistent ring storage is bf16 with the stated geometry.
+    /// nil until the ring is allocated, and nil for any non-bf16 storage.
+    private(set) var ringGeometry: CBv2RingGeometry?
 
     /// Step-scoped PRE-EVICTION views captured by the most recent MULTI-token
     /// `update()` (`retainedHistory ++ chunk`, up to `window - 1 + n` entries).
@@ -195,9 +224,11 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
     /// `(oldestValidPosition + 1) % window`. The physical slot that write
     /// lands in is `absoluteOffset % window`, i.e. `(start + window - 1) %
     /// window` — the slot the returned start has just stepped past.
-    var decodeRingViewBeforeWrite: (keys: MLXArray, values: MLXArray, start: Int)? {
+    var decodeRingViewBeforeWrite:
+        (keys: MLXArray, values: MLXArray, start: Int, geometry: CBv2RingGeometry?)?
+    {
         guard staged == nil, let keys, let values, retainedCount == window else { return nil }
-        return (keys, values, (oldestValidPosition + 1) % window)
+        return (keys, values, (oldestValidPosition + 1) % window, ringGeometry)
     }
 
     /// Bookkeeping half of a fused decode step. The attention kernel already
@@ -501,9 +532,26 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
 
     private func allocateIfNeeded(keyTemplate: MLXArray, valueTemplate: MLXArray) {
         guard keys == nil else { return }
-        keys = MLXArray.zeros(
+        let allocatedKeys = MLXArray.zeros(
             [1, kvHeads, window, keyTemplate.dim(3)], dtype: keyTemplate.dtype)
-        values = MLXArray.zeros(
+        let allocatedValues = MLXArray.zeros(
             [1, kvHeads, window, valueTemplate.dim(3)], dtype: valueTemplate.dtype)
+        keys = allocatedKeys
+        values = allocatedValues
+
+        // HOST-SHAPE-001. Attest the persistent ring geometry HERE, at the one
+        // site that can create it: `keys` and `values` are assigned nowhere
+        // else in this type, and the guard above makes this allocation once per
+        // row for the life of the row. Every later write is an in-place slice
+        // update or the fused ring kernel's in-place store, neither of which
+        // can change a shape or a dtype. A consumer holding this attestation
+        // therefore need not re-derive the same facts from the arrays on every
+        // decode step. Non-bf16 storage stays unattested and gets revalidated.
+        ringGeometry =
+            allocatedKeys.dtype == .bfloat16 && allocatedValues.dtype == .bfloat16
+            && allocatedValues.dim(3) == allocatedKeys.dim(3)
+            ? CBv2RingGeometry(
+                kvHeads: kvHeads, length: window, headDim: allocatedKeys.dim(3))
+            : nil
     }
 }

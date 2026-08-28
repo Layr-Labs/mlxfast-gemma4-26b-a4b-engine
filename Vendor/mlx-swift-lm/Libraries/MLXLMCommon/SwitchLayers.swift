@@ -249,7 +249,59 @@ public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, M
     )
 }
 
+/// Stable assignment sort for the exact Gemma 4 batch-8 decode cohort.
+///
+/// The generic path below constructs the gathered-QMM metadata with two
+/// `argSort`s plus gather and integer-division graph nodes. At B=8/top-k=8
+/// there are always exactly 64 uint32 assignments, so one small kernel can
+/// produce the same three arrays directly:
+///
+/// - `lhs_indices[rank]` selects the source token row,
+/// - `sorted_indices[rank]` selects the expert,
+/// - `inverse_order[assignment]` restores the original top-k slot order.
+///
+/// Ties retain original flat-assignment order, matching the stable ordering
+/// of MLX's GPU merge sort. Every assignment has a unique rank under that
+/// tie-break, so the parallel output writes never collide.
+private let gatherSortIndicesB8K8Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "gather_sort_indices_b8_k8_u32_v1",
+    inputNames: ["indices"],
+    outputNames: ["lhs_indices", "sorted_indices", "inverse_order"],
+    source: """
+        const uint assignment = thread_position_in_grid.x;
+        threadgroup uint experts[64];
+        experts[assignment] = uint(indices[assignment]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint expert = experts[assignment];
+        uint rank = 0;
+        for (uint other_assignment = 0; other_assignment < 64; ++other_assignment) {
+            const uint other_expert = experts[other_assignment];
+            if (other_expert < expert
+                || (other_expert == expert && other_assignment < assignment)) {
+                ++rank;
+            }
+        }
+
+        lhs_indices[rank] = assignment / 8;
+        sorted_indices[rank] = expert;
+        inverse_order[assignment] = rank;
+    """,
+    ensureRowContiguous: true
+)
+
 public func gatherSortIndices(indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+    if indices.ndim == 2 && indices.shape == [8, 8] && indices.dtype == .uint32 {
+        let outputs = gatherSortIndicesB8K8Kernel(
+            [indices],
+            grid: (64, 1, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [[64], [64], [64]],
+            outputDTypes: [.uint32, .uint32, .uint32]
+        )
+        return (outputs[0], outputs[1], outputs[2])
+    }
+
     let m = indices.dim(-1)
     let indices = indices.flattened()
     let order = argSort(indices)

@@ -789,6 +789,49 @@ private func gemma4FusedQKVNorm(
     return (outputs[0], outputs[1], outputs[2])
 }
 
+/// Dispatch the promoted four-row affine-4 QMV body on the two x-groups that
+/// actually own the ruled B=8 decode rows. The stock host grid has x extent
+/// eight, so six groups per output tile only reach the specialization's early
+/// return. Every near-match keeps `QuantizedLinear.callAsFunction`.
+private let gemma4AttentionTightGridEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_ATTN_TIGHT_GRID"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+@inline(__always)
+private func gemma4TightGridAffine4(
+    _ linear: Linear, _ x: MLXArray
+) -> MLXArray? {
+    guard gemma4AttentionTightGridEnabled,
+        let quantized = linear as? QuantizedLinear,
+        quantized.groupSize == 64,
+        quantized.bits == 4,
+        quantized.bias == nil
+    else { return nil }
+    guard case .affine = quantized.mode else { return nil }
+
+    let outDim = quantized.weight.dim(0)
+    let inDim = x.dim(-1)
+    guard inDim == 2816 else { return nil }
+    guard let result = CBv2TiedLMHeadQMVV1.matmul(
+        x: x,
+        weight: quantized.weight,
+        scales: quantized.scales,
+        biases: quantized.biases,
+        inDim: inDim,
+        outDim: outDim)
+    else { return nil }
+    CBv2EngageMark.once("attn-tight-grid")
+    return result
+}
+
+@inline(__always)
+private func gemma4DecodeLinear(_ linear: Linear, _ x: MLXArray) -> MLXArray {
+    gemma4TightGridAffine4(linear, x) ?? linear(x)
+}
+
 private class ScaledLinear: Module {
     let weight: MLXArray
     let scalar: Float
@@ -1182,7 +1225,8 @@ private class Gemma4Attention: Module {
         let queryInput = lastQueryCache == nil ? x : x[0..., outputStart..., 0...]
         let queryLength = queryInput.dim(1)
 
-        let queryRaw = qProj(queryInput).reshaped(B, queryLength, nHeads, effectiveHeadDim)
+        let queryRaw = gemma4DecodeLinear(qProj, queryInput)
+            .reshaped(B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
             // KV-shared layer: projects queries only and borrows (K, V) from
@@ -1244,7 +1288,8 @@ private class Gemma4Attention: Module {
             lastQueryCache == nil
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
-        let kRaw = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+        let kRaw = gemma4DecodeLinear(kProj, x)
+            .reshaped(B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
         if let vProj {
             vRaw = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)

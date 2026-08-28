@@ -1131,6 +1131,18 @@ enum CBv2AttentionV1 {
             assert(
                 sinks == nil || sinks!.dtype == queries.dtype,
                 "CBv2AttentionV1: sinks must be normalized to the query dtype before SDPA")
+            // Gemma 4 full-attention decode uses D=512, which the pinned MLX
+            // SDPA implementation routes to its composed fallback. At scale
+            // 1.0 that fallback's first operation is a value-identical BF16
+            // query materialization. The exact helper retains the rest of the
+            // fallback graph and removes only that memory boundary.
+            if let output = CBv2ScaleOneFullDecodeAttentionV1.attend(
+                queries: queries, keys: attentionKeys, values: attentionValues,
+                scale: scale, queryLength: L, keyLength: kL,
+                window: window, sinks: sinks, bidirectional: bidirectional)
+            {
+                return output
+            }
             return MLXFast.scaledDotProductAttention(
                 queries: queries, keys: attentionKeys, values: attentionValues, scale: scale,
                 mask: maskMode(

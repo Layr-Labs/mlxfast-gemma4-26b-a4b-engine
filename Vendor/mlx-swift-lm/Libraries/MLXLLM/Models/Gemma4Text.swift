@@ -225,6 +225,20 @@ private let gemma4SafeGeluApproximate: @Sendable (MLXArray) -> MLXArray = {
     return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
 
+/// Safe approximate GELU and its following dense-MLP product in one compiled
+/// graph. Operation order matches `gemma4SafeGeluApproximate(gate) * up`.
+private let gemma4SafeGeluProduct: @Sendable (
+    MLXArray, MLXArray
+) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+        (gate: MLXArray, up: MLXArray) -> MLXArray in
+        let activated = 0.5 * gate
+            * (1 + tanh(sqrt(2 / Float.pi) * (gate + 0.044715 * gate * gate * gate)))
+        return activated * up
+    }
+    return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
+}()
+
 /// Final-logit softcap (`tanh(x / cap) * cap`) fused into one Metal dispatch
 /// (vMLX `compiledLogitSoftcap`). The untyped (float32) cap keeps the softcap
 /// math — and the logits handed to the sampler — full precision.
@@ -1942,7 +1956,7 @@ private class Gemma4MLP: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(gemma4SafeGeluApproximate(gateProj(x)) * upProj(x))
+        downProj(gemma4SafeGeluProduct(gateProj(x), upProj(x)))
     }
 }
 
@@ -2690,12 +2704,39 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 imageTokenMask: imageTokenMask))
     }
 
+    /// LMH-001: tight-grid dispatch for the tied lm_head ordinary QMV.
+    ///
+    /// The vendored host launches ordinary QMV with an x grid extent of M = 8
+    /// (`backend/metal/quantized.cpp`), while the promoted large-N tier claims
+    /// four cohort rows per threadgroup and returns from the rest. On the tied
+    /// head that is 262144 threadgroups of which 196608 exist only to hit that
+    /// early return. `CBv2TiedLMHeadQMVV1` runs the same computation from a
+    /// kernel whose own x extent is two, so only the groups that were already
+    /// doing the work are launched. Returns `nil` unless every pin holds, and
+    /// the caller then keeps the stock path.
+    private func tiedLMHeadTightGrid(_ hidden: MLXArray) -> MLXArray? {
+        guard lmHead == nil,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.groupSize == 64,
+            quantized.bits == 4
+        else { return nil }
+        return CBv2TiedLMHeadQMVV1.matmul(
+            x: hidden,
+            weight: quantized.weight,
+            scales: quantized.scales,
+            biases: quantized.biases,
+            inDim: config.hiddenSize,
+            outDim: config.vocabSize)
+    }
+
     /// Apply the LM head (tied embedding or explicit `lm_head`) plus the
     /// configured final-logit softcap. Pure function of the post-norm hidden.
     func applyLMHead(_ hidden: MLXArray) -> MLXArray {
         var out: MLXArray
         if let lmHead {
             out = lmHead(hidden)
+        } else if let tight = tiedLMHeadTightGrid(hidden) {
+            out = tight
         } else {
             out = model.embedTokens.asLinear(hidden)
         }
@@ -2719,6 +2760,9 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     func applyRawLMHead(_ hidden: MLXArray) -> MLXArray {
         if let lmHead {
             return lmHead(hidden)
+        }
+        if let tight = tiedLMHeadTightGrid(hidden) {
+            return tight
         }
         return model.embedTokens.asLinear(hidden)
     }

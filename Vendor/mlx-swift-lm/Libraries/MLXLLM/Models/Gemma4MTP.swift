@@ -1271,10 +1271,10 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
         // Quantize matching modules before applying weights when the checkpoint
         // is quantized (4-bit QAT drafter). A module is quantized iff its
         // `.scales` tensor is present. Mirrors `loadWeights` in MLXLMCommon.
-        if let plq = document.baseConfiguration.perLayerQuantization {
+        if document.baseConfiguration.perLayerQuantization != nil {
             quantize(model: drafter) { path, _ in
                 sanitized["\(path).scales"] != nil
-                    ? plq.quantization(layer: path)?.asTuple : nil
+                    ? (groupSize: 128, bits: 4) : nil
             }
         }
 

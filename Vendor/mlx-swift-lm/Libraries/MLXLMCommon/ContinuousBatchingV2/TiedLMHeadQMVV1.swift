@@ -351,11 +351,17 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     x3 += block_size;
   }
 
-  const int remaining = clamp(
-      static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
-      0,
-      values_per_thread);
-  if (remaining > 0) {
+  // Same aligned tail the g64 pair and the affine-8 quad stream already carry.
+  // The `affine_qmv` wide-N tier only reaches here under `in_vec_size % 64 ==
+  // 0`, so the final block holds a whole number of complete eight-value lane
+  // packets (32 active lanes at K = 2816, the K of every 4-bit decode plane on
+  // this model: k_proj N = 1024, k/v_proj N = 2048, sliding q_proj N = 4096,
+  // full q_proj N = 8192, tied lm_head N = 262144). No active lane needs the
+  // dynamic safe-tail loop, whose trip count is a runtime value the compiler
+  // cannot unroll.
+  const uint active_tail_lanes =
+      uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint16_t* wl =
           (const device uint16_t*)(ws + row * in_vec_size_w);
@@ -366,26 +372,22 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
       bias_local[row] = biases[row * in_vec_size_g];
     }
 
-    float sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x0, x_thread, remaining);
+    float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
-    sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x1, x_thread, remaining);
+    sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
-    sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x2, x_thread, remaining);
+    sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
-    sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x3, x_thread, remaining);
+    sum = load_vector<T, float, values_per_thread, 4>(x3, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result3[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);

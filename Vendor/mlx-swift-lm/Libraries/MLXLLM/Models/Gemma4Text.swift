@@ -1042,7 +1042,8 @@ private class Gemma4Attention: Module {
                 preconditionFailure("Gemma4 shared-KV layers require sharedKV input")
             }
 
-            let kRaw = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            let kRaw = (gemma4TightGridPairQMV(kProj, x) ?? kProj(x))
+                .reshaped(B, L, nKvHeads, effectiveHeadDim)
             var k = kNorm(kRaw)
             k = k.transposed(0, 2, 1, 3)
             k = gemma4ApplyRotaryPosition(rope, to: k, offset: activePositionOffset)
@@ -1053,7 +1054,8 @@ private class Gemma4Attention: Module {
             // `[B, n_kv_heads, L, D]` layout as keys.
             var v: MLXArray
             if let vProj {
-                v = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+                v = (gemma4TightGridPairQMV(vProj, x) ?? vProj(x))
+                    .reshaped(B, L, nKvHeads, effectiveHeadDim)
             } else {
                 v = kRaw
             }
@@ -1244,10 +1246,12 @@ private class Gemma4Attention: Module {
             lastQueryCache == nil
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
-        let kRaw = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+        let kRaw = (gemma4TightGridPairQMV(kProj, x) ?? kProj(x))
+            .reshaped(B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
         if let vProj {
-            vRaw = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            vRaw = (gemma4TightGridPairQMV(vProj, x) ?? vProj(x))
+                .reshaped(B, L, nKvHeads, effectiveHeadDim)
         } else {
             vRaw = kRaw
         }
@@ -1521,6 +1525,38 @@ private enum Gemma4FusedRouterTop8 {
     }
 }
 
+
+/// QMV-PAIR: route a quantized projection through the tight-grid pair kernels.
+///
+/// `backend/metal/quantized.cpp` launches ordinary QMV with an x grid extent of
+/// `M` = 8, the cohort row count, while `affine_qmv`'s pair tiers claim two
+/// cohort rows per threadgroup and `return` from the rest, so four of every
+/// eight x-groups exist only to reach that early return. The host grid is not
+/// an editable path; these kernels dispatch the same computation with the x
+/// extent the tier actually uses. Returns `nil` unless every pin holds.
+@inline(__always)
+private func gemma4TightGridPairQMV(_ layer: Linear, _ x: MLXArray) -> MLXArray? {
+    guard let quantized = layer as? QuantizedLinear,
+        quantized.bias == nil,
+        quantized.groupSize == 64,
+        x.ndim == 3
+    else { return nil }
+    let inDim = x.dim(2)
+    let outDim = quantized.shape.0
+    switch quantized.bits {
+    case 8:
+        return CBv2OrdinaryQMV8PairV1.matmul(
+            x: x, weight: quantized.weight, scales: quantized.scales,
+            biases: quantized.biases, inDim: inDim, outDim: outDim)
+    case 4:
+        return CBv2OrdinaryQMVPairV1.matmul(
+            x: x, weight: quantized.weight, scales: quantized.scales,
+            biases: quantized.biases, inDim: inDim, outDim: outDim)
+    default:
+        return nil
+    }
+}
+
 /// Expert router. Norms `x` with a learnable scale, projects to expert
 /// scores, and returns top-K (indices, weights) where weights are
 /// softmax-normalized and scaled by a per-expert scalar.
@@ -1562,7 +1598,7 @@ private class Gemma4Router: Module {
             effScale = eff
         }
         let normed = MLXFast.rmsNorm(x, weight: effScale, eps: eps)
-        let expertScores = proj(normed)
+        let expertScores = gemma4TightGridPairQMV(proj, normed) ?? proj(normed)
 
         // ROUTE-001: single-dispatch byte-identical replacement of the chain
         // below for the B=8 decode geometry. Every other geometry, dtype, or
@@ -1792,8 +1828,30 @@ public class Gemma4DecoderLayer: Module {
             h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset,
             v2SharedSource: v2SharedSource, outputStart: outputStart,
             useLastQueryPrefill: useLastQueryPrefill)
-        let postAttn = postAttentionLayernorm(attnOut)
-        var out = residual + postAttn
+        // HEAD-001: one dispatch for post-attention norm -> residual -> the two
+        // pre-feed-forward norms, which share one reduction because they are
+        // applied to the same row with the same epsilon.
+        var out: MLXArray
+        var fusedH1: MLXArray?
+        var fusedH2: MLXArray?
+        if isMoE, let preFF2 = preFeedforwardLayernorm2,
+            let fused = CBv2LayerHeadFusionV1.apply(
+                attn: attnOut,
+                postWeight: postAttentionLayernorm.weight,
+                residual: residual,
+                preWeight1: preFeedforwardLayernorm.weight,
+                preWeight2: preFF2.weight,
+                postEps: postAttentionLayernorm.eps,
+                preEps1: preFeedforwardLayernorm.eps,
+                preEps2: preFF2.eps)
+        {
+            out = fused.out
+            fusedH1 = fused.h1
+            fusedH2 = fused.h2
+        } else {
+            let postAttn = postAttentionLayernorm(attnOut)
+            out = residual + postAttn
+        }
 
         let residual2 = out
 
@@ -1805,12 +1863,12 @@ public class Gemma4DecoderLayer: Module {
             let postFeedforwardLayernorm2
         {
             // Dense + sparse branches in parallel, summed into one residual.
-            var h1 = preFeedforwardLayernorm(out)
+            var h1 = fusedH1 ?? preFeedforwardLayernorm(out)
             h1 = mlp(h1)
             h1 = postFeedforwardLayernorm1(h1)
 
             let (topKIndices, topKWeights) = router(out)
-            var h2 = preFeedforwardLayernorm2(out)
+            var h2 = fusedH2 ?? preFeedforwardLayernorm2(out)
             h2 = experts(
                 h2,
                 topKIndices: topKIndices,

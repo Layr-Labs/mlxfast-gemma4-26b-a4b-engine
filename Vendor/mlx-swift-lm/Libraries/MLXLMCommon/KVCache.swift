@@ -236,6 +236,28 @@ public func createCausalMask(
         return hit
     }
 
+    if offset > 0, windowSize == nil, lengths == nil, leftPadding == nil {
+        // Every position before `offset` is unconditionally visible in a plain
+        // (non-windowed) causal mask: for column j < offset, `linds[i] =
+        // offset + i >= j` holds for every row i >= 0. So the only
+        // offset-dependent work needed is the trailing `[n, n]` triangular
+        // block (columns `offset..<offset+n`), which is exactly
+        // `createCausalMask(n: n, offset: 0)` -- itself memoized above under
+        // the stable key `(n, 0, -1)`, so it costs nothing after the first
+        // call for a given `n`. The `[n, offset]` prefix is filled with a
+        // constant `true` instead of re-deriving it from a growing arange +
+        // comparison on every call, which is what made this path grow with
+        // `offset`: a `StandardKVCache`'s offset advances every round, so the
+        // `(n, offset, -1)` key above never repeats for it.
+        let tail = createCausalMask(n: n, offset: 0)
+        let prefix = MLXArray.full([n, offset], values: MLXArray(true))
+        let mask = concatenated([prefix, tail], axis: 1)
+        if let key {
+            causalMaskCache.store(key, mask)
+        }
+        return mask
+    }
+
     var rinds = MLXArray(Int32(0) ..< Int32(offset + n))
     var linds = offset != 0 ? MLXArray(Int32(offset) ..< Int32(offset + n)) : rinds
     linds = linds[0..., .newAxis]

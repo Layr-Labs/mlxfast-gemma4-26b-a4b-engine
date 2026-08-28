@@ -1461,69 +1461,6 @@ template <
       w, scales, biases, x, y, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
-// Expert-segment elision for affine_gather_qmm_rhs_nax: the per-tile
-// segment loop re-runs the full K-loop once per distinct expert in the
-// row tile and discards out-of-segment rows at store_slice. The helpers
-// below let a simdgroup skip A loads and MMA for 16-row NAX fragment
-// rows that fall wholly outside the current segment's stored row band.
-// Fragment rows are independent accumulators, so eliding rows that are
-// never stored cannot change any stored element's accumulation sequence.
-// Compile-time source constant by design: an enable must never ride a
-// function constant magnitude (pipeline-key law).
-MLX_MTL_CONST bool kGatherRhsSegmentElide = true;
-
-// Loads one 16-row fragment row of an A tile from device memory. The
-// address arithmetic matches NAXTile::load exactly for that fragment row
-// (row offset mm * kFragRows), so the loaded values are identical to the
-// full-tile load for the surviving rows.
-template <typename U, typename ATile>
-METAL_FUNC void gather_rhs_load_frag_row(
-    const short mm,
-    thread ATile& Atile,
-    const device U* src,
-    const int ld) {
-  STEEL_PRAGMA_UNROLL
-  for (short kk = 0; kk < ATile::kTileCols; ++kk) {
-    ATile::NAXFrag_t::load(
-        Atile.frag_at(mm, kk),
-        src,
-        ld,
-        Int<1>{},
-        short(mm * ATile::kFragRows),
-        short(kk * ATile::kFragCols));
-  }
-}
-
-// Issues the mm-th fragment row's MMA op sequence of tile_matmad_nax's
-// TN-even branch, unchanged: same operands, same per-fragment
-// accumulation chain, only the dead fragment rows' ops are absent.
-template <typename CTile, typename ATile, typename BTile, bool transpose_b>
-METAL_FUNC void gather_rhs_mma_frag_row(
-    const short mm,
-    thread CTile& C,
-    thread ATile& A,
-    thread BTile& B,
-    metal::bool_constant<transpose_b> tb) {
-  constexpr short TN = CTile::kTileCols;
-  constexpr short TK = transpose_b ? BTile::kTileCols : BTile::kTileRows;
-  constexpr auto ta = metal::bool_constant<false>{};
-  static_assert(TN % 2 == 0, "Segment elision expects even TN");
-  STEEL_PRAGMA_UNROLL
-  for (short nn = 0; nn < TN; nn += 2) {
-    STEEL_PRAGMA_UNROLL
-    for (short kk = 0; kk < TK; ++kk) {
-      CTile::NAXFrag_t::mma(
-          C.frag_at(mm, nn),
-          C.frag_at(mm, nn + 1),
-          A.frag_at(mm, kk, ta),
-          ta,
-          B.frag_at(kk, nn, tb),
-          B.frag_at(kk, nn + 1, tb),
-          tb);
-    }
-  }
-}
-
 template <
     typename T,
     int group_size,
@@ -1643,22 +1580,6 @@ template <
 
     const device T* xn = x + tm * K;
 
-    // This simdgroup's stored row band for the current expert segment,
-    // hoisted ahead of the K-loop (it depends only on offset, offset_next,
-    // tm and sgp_sm, all known here). The stock path computes the full
-    // tile and discards rows outside [seg_lo, seg_hi) at store_slice; with
-    // the elision enabled those rows' A loads and MMA ops are skipped
-    // instead. Cooperative weight loads and every threadgroup_barrier stay
-    // unconditional, so barrier convergence is preserved, and seg_* are
-    // uniform within a simdgroup (offset/offset_next are threadgroup
-    // uniform). With the enable off both flags fold to false and only the
-    // stock path below runs.
-    const short seg_lo = min(int(sgp_sm), max(0, offset - tm));
-    const short seg_hi = min(int(sgp_sm), max(0, offset_next - tm));
-    const bool seg_empty = kGatherRhsSegmentElide && (seg_hi <= seg_lo);
-    const bool seg_partial = kGatherRhsSegmentElide && !seg_empty &&
-        !(seg_lo == 0 && seg_hi == sgp_sm);
-
     // Prepare threadgroup loading operations
     thread loader_w_t loader_w(
         wl + index * stride_w,
@@ -1682,72 +1603,33 @@ template <
 
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
-          if (seg_partial && kAlignedM.value) {
-            // 16-row fragment-row granularity: only fragment rows that
-            // intersect [seg_lo, seg_hi) load A and issue MMA. Each live
-            // fragment row runs the exact op sequence of the stock path.
-            STEEL_PRAGMA_NO_UNROLL
-            for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-              NAXTile<T, TM, TK> Atile;
-              NAXTile<T, BR, BC> Btile;
+          STEEL_PRAGMA_NO_UNROLL
+          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<T, BR, BC> Btile;
 
-              volatile int compiler_barrier;
+            volatile int compiler_barrier;
 
-              if constexpr (transpose) {
-                Btile.template load<T, BK_padded, 1>(
-                    Ws + tn * BK_padded + kk1);
-              } else {
-                Btile.template load<T, BN_padded, 1>(
-                    Ws + tn + kk1 * BN_padded);
-              }
-
-              STEEL_PRAGMA_UNROLL
-              for (short mm = 0; mm < TM; mm++) {
-                const short fr = short(mm * Dtile.kFragRows);
-                if (fr < seg_hi && short(fr + Dtile.kFragRows) > seg_lo) {
-                  gather_rhs_load_frag_row(mm, Atile, xn + kk1, K);
-                  gather_rhs_mma_frag_row(
-                      mm,
-                      Dtile,
-                      Atile,
-                      Btile,
-                      metal::bool_constant<transpose>{});
-                }
-              }
-
-              (void)compiler_barrier;
+            if constexpr (kAlignedM.value) {
+              Atile.load(xn + kk1, K);
+            } else {
+              Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
             }
-          } else if (!seg_empty) {
-            STEEL_PRAGMA_NO_UNROLL
-            for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-              NAXTile<T, TM, TK> Atile;
-              NAXTile<T, BR, BC> Btile;
 
-              volatile int compiler_barrier;
-
-              if constexpr (kAlignedM.value) {
-                Atile.load(xn + kk1, K);
-              } else {
-                Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
-              }
-
-              if constexpr (transpose) {
-                Btile.template load<T, BK_padded, 1>(
-                    Ws + tn * BK_padded + kk1);
-              } else {
-                Btile.template load<T, BN_padded, 1>(
-                    Ws + tn + kk1 * BN_padded);
-              }
-
-              tile_matmad_nax(
-                  Dtile,
-                  Atile,
-                  metal::bool_constant<false>{},
-                  Btile,
-                  metal::bool_constant<transpose>{});
-
-              (void)compiler_barrier;
+            if constexpr (transpose) {
+              Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+            } else {
+              Btile.template load<T, BN_padded, 1>(Ws + tn + kk1 * BN_padded);
             }
+
+            tile_matmad_nax(
+                Dtile,
+                Atile,
+                metal::bool_constant<false>{},
+                Btile,
+                metal::bool_constant<transpose>{});
+
+            (void)compiler_barrier;
           }
 
           xn += BK;
@@ -1759,59 +1641,52 @@ template <
           loader_w.load_safe(tile_w);
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
-          // Elision here is band-granular only (seg_empty): a partial band
-          // runs the stock tail, whose extra MMA lands in fragment rows
-          // that are never stored.
-          if (!seg_empty) {
-            STEEL_PRAGMA_NO_UNROLL
-            for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-              NAXTile<T, TM, TK> Atile;
-              NAXTile<T, BR, BC> Btile;
+          STEEL_PRAGMA_NO_UNROLL
+          for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<T, BR, BC> Btile;
 
-              volatile int compiler_barrier;
+            volatile int compiler_barrier;
 
-              const short psk = min(int(SK), max(0, (BK - kk1)));
-              Atile.load_safe(xn + kk1, K, short2(psk, sgp_sm));
+            const short psk = min(int(SK), max(0, (BK - kk1)));
+            Atile.load_safe(xn + kk1, K, short2(psk, sgp_sm));
 
-              if constexpr (transpose) {
-                Btile.template load<T, BK_padded, 1>(
-                    Ws + tn * BK_padded + kk1);
-              } else {
-                Btile.template load<T, BN_padded, 1>(
-                    Ws + tn + kk1 * BN_padded);
-              }
-
-              tile_matmad_nax(
-                  Dtile,
-                  Atile,
-                  metal::bool_constant<false>{},
-                  Btile,
-                  metal::bool_constant<transpose>{});
-
-              (void)compiler_barrier;
+            if constexpr (transpose) {
+              Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+            } else {
+              Btile.template load<T, BN_padded, 1>(Ws + tn + kk1 * BN_padded);
             }
+
+            tile_matmad_nax(
+                Dtile,
+                Atile,
+                metal::bool_constant<false>{},
+                Btile,
+                metal::bool_constant<transpose>{});
+
+            (void)compiler_barrier;
           }
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Store results to device memory. seg_lo/seg_hi are the stock
-        // m_lo_lim/m_hi_lim, hoisted ahead of the K-loop.
-        if (!seg_empty) {
-          if constexpr (kAlignedN.value) {
-            if (seg_lo == 0 && seg_hi == SM) {
-              Dtile.store(y + tm * N + tn, N);
-            } else {
-              Dtile.store_slice(
-                  y + tm * N + tn, N, short2(0, seg_lo), short2(SN, seg_hi));
-            }
+        const short m_lo_lim = min(int(sgp_sm), max(0, offset - tm));
+        const short m_hi_lim = min(int(sgp_sm), max(0, offset_next - tm));
+
+        // Store results to device memory
+        if constexpr (kAlignedN.value) {
+          if (m_lo_lim == 0 && m_hi_lim == SM) {
+            Dtile.store(y + tm * N + tn, N);
           } else {
             Dtile.store_slice(
-                y + tm * N + tn,
-                N,
-                short2(0, seg_lo),
-                short2(sgp_sn, seg_hi));
+                y + tm * N + tn, N, short2(0, m_lo_lim), short2(SN, m_hi_lim));
           }
+        } else {
+          Dtile.store_slice(
+              y + tm * N + tn,
+              N,
+              short2(0, m_lo_lim),
+              short2(sgp_sn, m_hi_lim));
         }
       });
     });

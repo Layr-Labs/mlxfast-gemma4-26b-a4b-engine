@@ -1079,6 +1079,52 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
             masks: masks)
     }
 
+    /// Greedy fast path: identical to `callAsFunction` but the LM head is
+    /// replaced by a chunked matmul-argmax fusion that NEVER materializes
+    /// the full `[B, 1, vocab]` logits tensor. The tied LM head splits the
+    /// `[vocab, hidden]` weight along axis 0 into N chunks of `chunkSize`;
+    /// each chunk's matmul output is immediately argmaxed to one
+    /// `[B, 1]` (value, local_index) pair. The final reduction is a
+    /// `[N, B, 1]` argmax over the per-chunk max values.
+    ///
+    /// Numeric equivalence: bit-exact argmax of `h @ embed.weight.T`. The
+    /// split is along the output axis only; each chunk's local argmax is the
+    /// position of the chunk's true max, and the global reduction picks the
+    /// chunk whose max value is largest. No reduction over zero/garbage
+    /// elements — every vocab index is visited exactly once.
+    ///
+    /// Unsupported cases (`useOrderedEmbeddings`, untied explicit `lmHead`)
+    /// fall back to `callAsFunction(...).logits.argMax(axis: -1)` so
+    /// behavior is preserved on every model variant.
+    internal func callAsFunctionArgMax(
+        inputsEmbeds: MLXArray,
+        sharedKV: Gemma4SharedKV,
+        positionOffset: Gemma4.PositionOffset,
+        masks: Gemma4DrafterMasks
+    ) -> (lastHidden: MLXArray, argmaxIndex: MLXArray) {
+        let h = preProjection(inputsEmbeds)
+        let (lastHidden, projected) = forwardProjectedHidden(
+            h,
+            sharedKV: sharedKV,
+            positionOffset: positionOffset,
+            masks: masks)
+        // Greedy fused-argmax is only safe on the TIED path
+        // (`model.embedTokens.asLinear`). When the drafter uses
+        // `maskedEmbedder` (ordered embeddings) or a separate
+        // `lm_head.weight`, the chunked reduction would miss a
+        // post-matmul step the simple tied path doesn't have; route
+        // through the full forward to preserve behavior on those
+        // model variants.
+        if maskedEmbedder == nil && lmHead == nil {
+            let argmaxIndex = Self.tiedArgMaxLMHead(
+                hidden: projected, weight: model.embedTokens.weight)
+            return (lastHidden, argmaxIndex)
+        }
+        let logits = applyLMHead(projected)
+        let argmaxIndex = logits.argMax(axis: -1).asType(.int32)
+        return (lastHidden, argmaxIndex)
+    }
+
     internal func makeMasks(
         queryLen: Int,
         sharedKV: Gemma4SharedKV,
@@ -1110,6 +1156,26 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
         positionOffset: Gemma4.PositionOffset,
         masks: Gemma4DrafterMasks
     ) -> (lastHidden: MLXArray, logits: MLXArray) {
+        let (lastHidden, h) = forwardProjectedHidden(
+            projected,
+            sharedKV: sharedKV,
+            positionOffset: positionOffset,
+            masks: masks)
+        let logits = applyLMHead(h)
+        return (lastHidden, logits)
+    }
+
+    /// Run the drafter trunk (pre-projection already applied) and return
+    /// both the `postProjection(h)` last-hidden and the pre-LM-head `h`
+    /// itself. `forwardProjected` chains this with the full LM head;
+    /// `callAsFunctionArgMax` chains it with the chunked fused argmax
+    /// LM head.
+    private func forwardProjectedHidden(
+        _ projected: MLXArray,
+        sharedKV: Gemma4SharedKV,
+        positionOffset: Gemma4.PositionOffset,
+        masks: Gemma4DrafterMasks
+    ) -> (lastHidden: MLXArray, headInput: MLXArray) {
         let textCfg = config.textConfig
         var h = projected
         // Run each drafter layer with the appropriate shared-KV + mask.
@@ -1143,8 +1209,80 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
 
         h = model.norm(h)
         let lastHidden = postProjection(h)
-        let logits = applyLMHead(h)
-        return (lastHidden, logits)
+        return (lastHidden, h)
+    }
+
+    /// Greedy fused-argmax tied LM head. Splits the `[vocab, hidden]`
+    /// weight along axis 0 into `ceil(vocab / chunkSize)` contiguous
+    /// chunks. Each chunk produces a `[B, L, chunkSize]` partial logits
+    /// tensor that is immediately reduced to one (value, local_index)
+    /// pair per row, never surviving in full. The final reduction is a
+    /// tiny `[numChunks, B, L]` argmax over the per-chunk max values.
+    ///
+    /// Returns an `[B, L]` int32 array of GLOBAL vocab indices. Numeric
+    /// equivalence: `argmax(h @ weight.T, axis: -1)` is bit-exact — every
+    /// vocab index is visited exactly once, and the global reduction picks
+    /// the chunk whose argmax value is largest.
+    static func tiedArgMaxLMHead(hidden: MLXArray, weight: MLXArray) -> MLXArray {
+        let chunkSize = 8192
+        let vocab = weight.dim(0)
+        precondition(vocab > 0, "tiedArgMaxLMHead: empty vocab")
+        let hiddenDim = weight.dim(1)
+        precondition(
+            hidden.dim(-1) == hiddenDim,
+            "tiedArgMaxLMHead: hidden feature dim \(hidden.dim(-1)) "
+                + "!= weight dim \(hiddenDim)")
+
+        // Reshape hidden to `[B*L, hiddenDim]` so per-row reductions and
+        // the matmul are 2-D for the chunk loop. The output index space
+        // is rebuilt at the end.
+        let leadShape = Array(hidden.shape.dropLast())
+        let rows = leadShape.reduce(1, *)
+        let h2 = hidden.reshaped([rows, hiddenDim])
+
+        var globalIndices: MLXArray? = nil
+        var globalValues: MLXArray? = nil
+        var chunkStart = 0
+        while chunkStart < vocab {
+            let thisChunk = Swift.min(chunkSize, vocab - chunkStart)
+            let wChunk = weight[chunkStart ..< chunkStart + thisChunk, 0...]
+            // h2 @ wChunk.T -> [rows, thisChunk]; transpose-and-matmul
+            // matches `asLinear` (h @ W.T) for the chunk's rows.
+            let partial = matmul(h2, wChunk.transposed())
+            // local argmax per row: (value, index) within this chunk.
+            let localIdx = argMax(partial, axis: -1)  // [rows]
+            // Gather the value at the local argmax position for the
+            // global reduction. Using `takeAlong` keeps everything on
+            // device.
+            let localIdxExp = localIdx.reshaped([rows, 1])
+            let partialVal = takeAlong(partial, localIdxExp, axis: -1)
+                .reshaped([rows])  // [rows]
+            // GLOBAL index into the full vocab.
+            let localIdxI = localIdx.asType(.int32)
+            let offset = Int32(chunkStart)
+            let gIdx: MLXArray
+            if offset == 0 {
+                gIdx = localIdxI
+            } else {
+                gIdx = localIdxI + MLXArray(offset)
+            }
+            if let existingValues = globalValues, let existingIndices = globalIndices {
+                // Per-row "replace if larger value" across chunks. Use
+                // `where` to keep the index aligned with the value.
+                let replace = partialVal .> existingValues
+                globalValues = MLX.where(replace, partialVal, existingValues)
+                globalIndices = MLX.where(replace, gIdx, existingIndices)
+            } else {
+                globalValues = partialVal
+                globalIndices = gIdx
+            }
+            chunkStart += thisChunk
+        }
+        // globalValues/globalIndices are non-nil iff at least one chunk ran
+        // (vocab > 0 is the only precondition; the loop always runs once).
+        precondition(globalValues != nil && globalIndices != nil,
+            "tiedArgMaxLMHead: no chunk executed")
+        return globalIndices!.reshaped(leadShape)
     }
 
     /// Dispatch the LM head: masked-centroid if `useOrderedEmbeddings`,

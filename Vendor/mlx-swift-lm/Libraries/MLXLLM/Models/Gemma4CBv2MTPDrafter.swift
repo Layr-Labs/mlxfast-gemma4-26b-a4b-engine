@@ -196,13 +196,19 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         // the token, carried hidden) along the feature axis.
         let inputsEmbeds = concatenated(
             [target.embedTokensForDrafter(tokens), rotatedHidden], axis: -1)
-        let (newHidden, logits) = drafter(
+        // Greedy fast path: skip materializing the full `[B, 1, vocab]`
+        // logits tensor. The drafter's tied LM head is fused into a
+        // chunked matmul-argmax that returns only the argmax index
+        // (numeric equivalence: bit-exact argmax of `h @ embed.weight.T`).
+        // This is the drafter's dominant per-step memory write and the
+        // fused path keeps the working set to a per-chunk `[B, 1, 8192]`
+        // slice instead of the full `[B, 1, 262144]` logits.
+        let (newHidden, argmaxIndex) = drafter.callAsFunctionArgMax(
             inputsEmbeds: inputsEmbeds,
             sharedKV: prepared.sharedKV,
             positionOffset: prepared.positionOffset,
             masks: prepared.masks)
-        let next = logits.squeezed(axis: 1).argMax(axis: -1).asType(.int32)
-        return (next, newHidden)
+        return (argmaxIndex, newHidden)
     }
 
     // MARK: - Padding + masks (B > 1)

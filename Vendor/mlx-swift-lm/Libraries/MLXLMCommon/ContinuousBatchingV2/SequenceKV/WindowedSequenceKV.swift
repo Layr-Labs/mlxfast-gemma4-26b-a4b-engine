@@ -185,35 +185,6 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
         return (keys, values, oldestValidPosition % window)
     }
 
-    /// The ring view a fused decode step should attend: the SAME allocations
-    /// and the SAME start `decodeRingView` would report AFTER this step's
-    /// one-token `decodeRingWrite`, offered before that write happens.
-    ///
-    /// Only defined on an already-full ring — the identical predicate the
-    /// separate-write path uses — where the append evicts exactly one entry,
-    /// so `oldestValidPosition` advances by one and the post-write start is
-    /// `(oldestValidPosition + 1) % window`. The physical slot that write
-    /// lands in is `absoluteOffset % window`, i.e. `(start + window - 1) %
-    /// window` — the slot the returned start has just stepped past.
-    var decodeRingViewBeforeWrite: (keys: MLXArray, values: MLXArray, start: Int)? {
-        guard staged == nil, let keys, let values, retainedCount == window else { return nil }
-        return (keys, values, (oldestValidPosition + 1) % window)
-    }
-
-    /// Bookkeeping half of a fused decode step. The attention kernel already
-    /// stored this step's token into the ring allocation in place, so advance
-    /// exactly the counters `writeDecodeToken` would and construct no
-    /// `SliceUpdate`. Precondition mirrors `decodeRingViewBeforeWrite`, which
-    /// the caller must have consulted for the very same step.
-    func advanceDecodeRingAfterFusedWrite() {
-        precondition(
-            staged == nil && keys != nil && retainedCount == window,
-            "CBv2WindowedSequenceKV: fused ring advance outside a full-ring decode step")
-        borrowableChunkViews = nil
-        absoluteOffset += 1
-        oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
-    }
-
     // MARK: - Speculative (MTP) staging
 
     /// Staging always supported: the ring defers its destructive writes to

@@ -224,20 +224,6 @@ private let gemma4SafeGeluApproximate: @Sendable (MLXArray) -> MLXArray = {
     return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
 
-/// Safe approximate GELU and its following dense-MLP product in one compiled
-/// graph. Operation order matches `gemma4SafeGeluApproximate(gate) * up`.
-private let gemma4SafeGeluProduct: @Sendable (
-    MLXArray, MLXArray
-) -> MLXArray = {
-    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = {
-        (gate: MLXArray, up: MLXArray) -> MLXArray in
-        let activated = 0.5 * gate
-            * (1 + tanh(sqrt(2 / Float.pi) * (gate + 0.044715 * gate * gate * gate)))
-        return activated * up
-    }
-    return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
-}()
-
 /// Final-logit softcap (`tanh(x / cap) * cap`) fused into one Metal dispatch
 /// (vMLX `compiledLogitSoftcap`). The untyped (float32) cap keeps the softcap
 /// math — and the logits handed to the sampler — full precision.
@@ -1006,6 +992,7 @@ private class Gemma4Attention: Module {
         cache: KVCache? = nil,
         sharedKV: (MLXArray, MLXArray)? = nil,
         positionOffset: Gemma4.PositionOffset? = nil,
+        ringStarts: MLXArray? = nil,
         v2SharedSource: (any CBv2AttendingLayerCache)? = nil,
         outputStart: Int = 0,
         useLastQueryPrefill: Bool = false
@@ -1018,6 +1005,7 @@ private class Gemma4Attention: Module {
             return forwardV2(
                 x, layerCache: layerCacheV2, source: v2SharedSource,
                 sharedKV: sharedKV, positionOffset: positionOffset,
+                ringStarts: ringStarts,
                 outputStart: outputStart, useLastQueryPrefill: useLastQueryPrefill)
         }
         precondition(
@@ -1156,6 +1144,7 @@ private class Gemma4Attention: Module {
         source: (any CBv2AttendingLayerCache)?,
         sharedKV: (MLXArray, MLXArray)?,
         positionOffset: Gemma4.PositionOffset?,
+        ringStarts: MLXArray?,
         outputStart: Int = 0,
         useLastQueryPrefill: Bool = false
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
@@ -1219,23 +1208,12 @@ private class Gemma4Attention: Module {
             preconditionFailure("Gemma4 non-shared layers require K/V projection modules")
         }
 
-        // A unified contiguous bank supplies one graph-safe pre-step snapshot
-        // for every layer. Standalone and paged caches retain the established
-        // per-layer capture (`+ 0` = graph-safe copy, same convention as
+        // Snapshot the per-row absolute offsets BEFORE updateAndAttend
+        // advances the rows (`+ 0` = graph-safe copy, same convention as
         // gemma4CapturePositionOffset). KV-shared consumers of this layer
         // reuse this exact snapshot via the returned PositionOffset.
-        let capturedOffsets: MLXArray
-        let captured: Gemma4.PositionOffset
-        if let positionOffset {
-            guard case .batch(let offsets) = positionOffset else {
-                preconditionFailure("Gemma4 CBv2 position offsets must be a per-row batch")
-            }
-            capturedOffsets = offsets
-            captured = positionOffset
-        } else {
-            capturedOffsets = layerCache.positionOffsets + 0
-            captured = .batch(capturedOffsets)
-        }
+        let capturedOffsets = layerCache.positionOffsets + 0
+        let captured = Gemma4.PositionOffset.batch(capturedOffsets)
 
         // The frontier query sits `outputStart` positions past the chunk's
         // first token, so last-query prefill must shift its RoPE position.
@@ -1275,7 +1253,8 @@ private class Gemma4Attention: Module {
                 queries: attentionQueries, keys: k, values: v, scale: scale, sinks: nil)
         } else {
             attention = layerCache.updateAndAttend(
-                queries: attentionQueries, keys: k, values: v, scale: scale, sinks: nil)
+                queries: attentionQueries, keys: k, values: v, scale: scale, sinks: nil,
+                ringStarts: ringStarts)
         }
 
         var output = attention.transposed(0, 2, 1, 3).reshaped(B, queryLength, -1)
@@ -1647,7 +1626,7 @@ private class Gemma4MLP: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(gemma4SafeGeluProduct(gateProj(x), upProj(x)))
+        downProj(gemma4SafeGeluApproximate(gateProj(x)) * upProj(x))
     }
 }
 
@@ -1745,6 +1724,7 @@ public class Gemma4DecoderLayer: Module {
         perLayerInput: MLXArray? = nil,
         sharedKV: (MLXArray, MLXArray)? = nil,
         positionOffset: Gemma4.PositionOffset? = nil,
+        ringStarts: MLXArray? = nil,
         v2SharedSource: (any CBv2AttendingLayerCache)? = nil,
         outputTailRows: Int? = nil,
         useLastQueryPrefill: Bool = false,
@@ -1780,6 +1760,7 @@ public class Gemma4DecoderLayer: Module {
         let h = inputLayernorm(x)
         let (attnOut, kvPair, attnPositionOffset) = selfAttn(
             h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset,
+            ringStarts: ringStarts,
             v2SharedSource: v2SharedSource, outputStart: outputStart,
             useLastQueryPrefill: useLastQueryPrefill)
         let postAttn = postAttentionLayernorm(attnOut)
@@ -2094,18 +2075,6 @@ public class Gemma4TextModelInner: Module {
         // no padding and no shared frontier to mask). In v2 mode every layer
         // (including KV-shared ones) has a cache object.
         let isCBv2 = fullCache.contains { ($0 as? (any CBv2AttendingLayerCache)) != nil }
-        // All-contiguous banks expose one position chain. Snapshot it before
-        // the first layer advances the chain, then reuse that same lazy array
-        // for every Q/K RoPE call in this forward.
-        let unifiedCBv2PositionOffset: Gemma4.PositionOffset? = {
-            guard isCBv2 else { return nil }
-            for case let entry? in fullCache {
-                if let offsets = (entry as? CBv2LayerCache)?.unifiedPositionOffsets {
-                    return .batch(offsets + 0)
-                }
-            }
-            return nil
-        }()
 
         // Build masks: one per attention type (legacy path only). "vision"
         // overlays bidirectional access within visual spans. "all" preserves
@@ -2149,6 +2118,29 @@ public class Gemma4TextModelInner: Module {
         var intermediates = [(kv: (MLXArray, MLXArray)?, positionOffset: Gemma4.PositionOffset?)](
             repeating: (nil, nil), count: config.numHiddenLayers)
 
+        // RING-START-002 (one derivation per round, trunk-level): every
+        // owning sliding layer's decode ring attention consumes the same
+        // [B] uint32 ring-start values, a pure integer function of the
+        // PRE-step shared position chain: `(offsets + L - window) % window`.
+        // The ring branch engages only when each row's retainedCount ==
+        // window (oldestValidPosition == absoluteOffset - window), and the
+        // chain is bank-shared and PRE-step at this point in the step.
+        // Derive it ONCE here and thread it to every layer; attendRing
+        // validates shape/dtype and falls back to the established host
+        // construction for any non-owning or malformed case.
+        var trunkRingStarts: MLXArray? = nil
+        if isCBv2 {
+            for case let ringCache as any CBv2AttendingLayerCache in fullCache {
+                if case .slidingWindow(let ringWindow) = ringCache.kind.attention,
+                    !ringCache.rows.isEmpty
+                {
+                    trunkRingStarts = ((ringCache.positionOffsets
+                        + Int32(1 - ringWindow)) % Int32(ringWindow)).asType(.uint32)
+                    break
+                }
+            }
+        }
+
         for (idx, layer) in layers.enumerated() {
             let prevIdx = previousKvs[idx]
             let sharedKV = intermediates[prevIdx].kv
@@ -2185,7 +2177,8 @@ public class Gemma4TextModelInner: Module {
                 cache: fullCache[idx],
                 perLayerInput: perLayerInputs[idx],
                 sharedKV: sharedKV,
-                positionOffset: unifiedCBv2PositionOffset ?? sharedPositionOffset,
+                positionOffset: sharedPositionOffset,
+                ringStarts: trunkRingStarts,
                 v2SharedSource: v2SharedSource,
                 outputTailRows: outputTailRows,
                 useLastQueryPrefill: useLastQueryPrefill,

@@ -690,6 +690,13 @@ struct QuantizedBlockLoader {
       biases += group_stride;
     }
   }
+
+  // Retarget the threadgroup destination by delta elements. Used by the
+  // software-pipelined (double-buffered) kernels to alternate the staging
+  // buffer between loads; the device-side source walk is unaffected.
+  void shift_dst(const int delta) {
+    dst += delta;
+  }
 };
 
 template <
@@ -829,6 +836,13 @@ struct QuantizedBlockLoader<
       scales += n_groups * group_stride;
       biases += n_groups * group_stride;
     }
+  }
+
+  // Retarget the threadgroup destination by delta elements. Used by the
+  // software-pipelined (double-buffered) kernels to alternate the staging
+  // buffer between loads; the device-side source walk is unaffected.
+  void shift_dst(const int delta) {
+    dst += delta;
   }
 };
 
@@ -1017,16 +1031,26 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
   dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
-      for (int k = 0; k < K; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+      // Software-pipelined k-loop over a double-buffered Ws: while the MMA
+      // consumes one staged weight tile, the loader stages the next tile in
+      // the other half. Loads and dequantization retain their existing order,
+      // as does every MMA operation.
+      constexpr int Ws_tile = BN * BK_padded;
+
+      if (K > 0) {
         if constexpr (kAlignedN.value) {
           loader_w.load_unsafe();
         } else {
           loader_w.load_safe(short2(BK, tgp_bn));
         }
+        loader_w.next();
+        loader_w.shift_dst(Ws_tile);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
+      short cur = 0;
+      for (int k = 0; k < K; k += BK) {
+        const threadgroup T* Wk = Ws + cur * Ws_tile;
         STEEL_PRAGMA_NO_UNROLL
         for (int kk1 = 0; kk1 < BK; kk1 += SK) {
           NAXTile<T, TM, TK> Atile;
@@ -1040,7 +1064,7 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
             Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
           }
 
-          Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+          Btile.template load<T, BK_padded, 1>(Wk + tn * BK_padded + kk1);
 
           tile_matmad_nax(
               Dtile,
@@ -1053,7 +1077,18 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
         }
 
         x += BK;
-        loader_w.next();
+        if (k + BK < K) {
+          if constexpr (kAlignedN.value) {
+            loader_w.load_unsafe();
+          } else {
+            loader_w.load_safe(short2(BK, tgp_bn));
+          }
+          loader_w.next();
+          loader_w.shift_dst(cur ? Ws_tile : -Ws_tile);
+        }
+
+        cur ^= 1;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
       }
 
       // Store results to device memory
@@ -1227,7 +1262,7 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  threadgroup T Ws[BN * BK_padded];
+  threadgroup T Ws[2 * BN * BK_padded];
 
   if (batched) {
     adjust_matrix_offsets<T>(
@@ -1352,7 +1387,7 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  threadgroup T Ws[BN * BK_padded];
+  threadgroup T Ws[2 * BN * BK_padded];
 
   adjust_matrix_offsets<T>(
       x,

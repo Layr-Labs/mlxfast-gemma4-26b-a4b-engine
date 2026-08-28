@@ -1459,6 +1459,11 @@ template <
 // function constant magnitude (pipeline-key law).
 MLX_MTL_CONST bool kGatherRhsSegmentElide = true;
 
+// RESHAPE-001: re-decompose the host grid onto 128x32 tiles instead of 64x64.
+// Compile-time source constant by design: an enable must never ride a function
+// constant magnitude (pipeline-key law), same rule as the elide above.
+MLX_MTL_CONST bool kGatherRhsReshape = true;
+
 // Loads one 16-row fragment row of an A tile from device memory. The
 // address arithmetic matches NAXTile::load exactly for that fragment row
 // (row offset mm * kFragRows), so the loaded values are identical to the
@@ -1559,6 +1564,196 @@ template <
   const int K_it = K / BK;
   const size_t stride_w = transpose ? N * K_w : K * N_w;
   const size_t stride_s = transpose ? N * K_g : K * N_g;
+
+  // -------------------------------------------------------------------
+  // RESHAPE-001. Two different budgets govern this kernel, and they scale
+  // differently with the tile shape:
+  //
+  //     dequantization per (threadgroup, k-step)  =  BN x BK
+  //     accumulator floats per thread             =  (BM x BN) / threads
+  //
+  // So a TALLER, NARROWER tile of the SAME AREA halves the dequantization and
+  // costs nothing in registers. 128x32 keeps 4,096 outputs per threadgroup and
+  // 32 accumulator floats per thread, and stages half the weight block.
+  //
+  // The host grid (ceil(N/BN), ceil(M/BM)) cannot be changed, but it is only a
+  // set of ids: ceil(N/64)*ceil(M/64) == ceil(N/32)*ceil(M/128) whenever
+  // N % 64 == 0 and M % 128 == 0, so the same threadgroups re-decompose onto
+  // the new tiling with none spare and none doubled.
+  //
+  // The simdgroup layout goes 2x2 -> 4x1, which holds SM = SN = 32 and so
+  // TM = TN = 2. The fragment types, the per-thread A and B element counts and
+  // the accumulator size are all IDENTICAL to stock. It also removes the 2x2
+  // layout's redundant A traffic, where simdgroups 0 and 1 share `tm` and load
+  // the same rows.
+  //
+  // THE PRICE, MEASURED RATHER THAN WAVED AT. A 128-row tile spans an expert
+  // boundary ~24.8% of the time instead of ~12.4%, and every straddle repeats
+  // the dequantization. But the A+MMA straddle penalty is UNCHANGED at 1.031x:
+  // PF-03's residue is a fixed 16-row fragment, and a tile twice as tall
+  // straddles twice as often while there are half as many of it. So the
+  // doubling lands only on the term that was just halved:
+  //     stock    160 x 1.124 + 576 x 1.031 = 773.7
+  //     reshaped  80 x 1.248 + 576 x 1.031 = 693.7   ->  1.115x
+  //
+  // ALIGNMENT IS DERIVED HERE, NOT INHERITED. The host computed align_M and
+  // align_N for the 64x64 shape; they are wrong for this tiling and are never
+  // read. The gate below requires exact divisibility instead, which makes both
+  // unconditionally true for this path. align_K is still the host's and still
+  // correct, because BK is unchanged.
+  // group_size < BK selects a DIFFERENT QuantizedBlockLoader specialization
+  // whose extra constraint is tgp_size/BROWS == BCOLS/group_size; at BROWS=32
+  // that is 4 != 2 and it static_asserts. The primary template, which the
+  // scored gs=64 path uses, carries no such constraint. Compile this path only
+  // where the primary template applies; gs=32 falls through to stock.
+  if constexpr (transpose && group_size >= BK && (group_size % BK) == 0) {
+    if (kGatherRhsReshape && align_K) {
+      constexpr int RBM = 128, RBN = 32, RWM = 4, RWN = 1;
+      constexpr short RSM = RBM / RWM;
+      constexpr short RSN = RBN / RWN;
+      constexpr short RTM = RSM / 16;
+      constexpr short RTN = RSN / 16;
+      constexpr short RSK = 32;
+      constexpr short RTK = RSK / 16;
+      constexpr short RBR = RTN;
+      constexpr short RBC = RTK;
+
+      const int gx = (N + BN - 1) / BN;
+      const int gy = (M + BM - 1) / BM;
+      const int nt = N / RBN;
+      const int mt = M / RBM;
+
+      if ((N % RBN) == 0 && (M % RBM) == 0 && (gx * gy) == (nt * mt)) {
+        using loader_r_t = QuantizedBlockLoader<
+            T,
+            RBN,
+            BK,
+            BK_padded,
+            transpose,
+            WM * WN * SIMD_SIZE,
+            group_size,
+            bits>;
+
+        using AccumType = float;
+
+        const int linear = int(tid.y) * gx + int(tid.x);
+        const int r_row = (linear / nt) * RBM;
+        const int r_col = (linear % nt) * RBN;
+
+        const short r_tm = RSM * short(simd_group_id / RWN);
+        const short r_tn = RSN * short(simd_group_id % RWN);
+
+        auto rwl = (const device uint8_t*)w;
+        rwl += size_t(r_col) * K_w;
+        const device T* rscales = scales + size_t(r_col) * K_g;
+        const device T* rbiases = biases + size_t(r_col) * K_g;
+        const device T* rx = x + size_t(r_row) * K;
+        device T* ry = y + size_t(r_row) * N + size_t(r_col);
+
+        uint32_t r_index;
+        short r_offset;
+        uint32_t r_index_next = indices[r_row];
+        short r_offset_next = 0;
+        int rn = 0;
+        while (rn < RBM) {
+          rn++;
+          r_offset = r_offset_next;
+          r_index = r_index_next;
+          r_offset_next = RBM;
+          for (; rn < RBM; rn++) {
+            if (indices[r_row + rn] != r_index) {
+              r_offset_next = short(rn);
+              r_index_next = indices[r_row + rn];
+              break;
+            }
+          }
+          threadgroup_barrier(mem_flags::mem_none);
+
+          NAXTile<AccumType, RTM, RTN> Dtile;
+          Dtile.clear();
+
+          const device T* xn = rx + r_tm * K;
+
+          // This simdgroup's stored row band, same derivation store_slice uses.
+          const short seg_lo = min(int(RSM), max(0, r_offset - r_tm));
+          const short seg_hi = min(int(RSM), max(0, r_offset_next - r_tm));
+          const bool seg_empty = (seg_hi <= seg_lo);
+          const bool seg_full = (seg_lo == 0 && seg_hi == RSM);
+          const bool seg_partial =
+              kGatherRhsSegmentElide && !seg_empty && !seg_full;
+
+          thread loader_r_t loader_w(
+              rwl + r_index * stride_w,
+              rscales + r_index * stride_s,
+              rbiases + r_index * stride_s,
+              K,
+              Ws,
+              simd_group_id,
+              simd_lane_id);
+
+          for (int k = 0; k < K_it; k++) {
+            // Cooperative and unconditional, so barrier convergence holds even
+            // for a simdgroup whose band is empty.
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            loader_w.load_unsafe();
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (!seg_empty) {
+              STEEL_PRAGMA_NO_UNROLL
+              for (int kk1 = 0; kk1 < BK; kk1 += RSK) {
+                NAXTile<T, RTM, RTK> Atile;
+                NAXTile<T, RBR, RBC> Btile;
+
+                volatile int compiler_barrier;
+
+                Btile.template load<T, BK_padded, 1>(
+                    Ws + r_tn * BK_padded + kk1);
+
+                if (seg_partial) {
+                  STEEL_PRAGMA_UNROLL
+                  for (short mm = 0; mm < RTM; mm++) {
+                    const short fr = short(mm * Dtile.kFragRows);
+                    if (fr < seg_hi && short(fr + Dtile.kFragRows) > seg_lo) {
+                      gather_rhs_load_frag_row(mm, Atile, xn + kk1, K);
+                      gather_rhs_mma_frag_row(
+                          mm,
+                          Dtile,
+                          Atile,
+                          Btile,
+                          metal::bool_constant<transpose>{});
+                    }
+                  }
+                } else {
+                  Atile.load(xn + kk1, K);
+                  tile_matmad_nax(
+                      Dtile,
+                      Atile,
+                      metal::bool_constant<false>{},
+                      Btile,
+                      metal::bool_constant<transpose>{});
+                }
+
+                (void)compiler_barrier;
+              }
+            }
+
+            xn += BK;
+            loader_w.next();
+          }
+
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+
+          if (seg_full) {
+            Dtile.store(ry + r_tm * N + r_tn, N);
+          } else if (!seg_empty) {
+            Dtile.store_slice(
+                ry + r_tm * N + r_tn, N, short2(0, seg_lo), short2(RSN, seg_hi));
+          }
+        }
+        return;
+      }
+    }
+  }
   const int y_row = tid.y * BM;
   const int y_col = tid.x * BN;
   const size_t y_row_long = size_t(y_row);

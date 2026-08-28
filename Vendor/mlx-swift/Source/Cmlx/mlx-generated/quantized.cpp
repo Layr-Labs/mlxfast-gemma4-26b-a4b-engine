@@ -3536,6 +3536,8 @@ template <
       w, scales, biases, x, y, Xs, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
+MLX_MTL_CONST bool kGatherRhsTwinReshape = true;
+
 template <
     typename T,
     int group_size,
@@ -3613,6 +3615,91 @@ template <
   const short2 tile_x = short2(k_remain, tgp_bm);
   const short2 tile_w =
       transpose ? short2(k_remain, tgp_bn) : short2(tgp_bn, k_remain);
+
+
+  // TWIN-RESHAPE: equal-area 32x16 tile against the stock 16x32. Local
+  // instrument for the RESHAPE-001 premise; the ranked box takes the NAX path
+  // so this is inert there. Allocates no threadgroup memory: the reshape's X
+  // and W staging are exactly the stock Ws and Xs buffers, swapped.
+  if constexpr (transpose) {
+    if (kGatherRhsTwinReshape && align_K) {
+      constexpr int RBM = 32, RBN = 16, RWM = 2, RWN = 1;
+      static_assert(RWM * RWN == WM * WN, "thread count must match the host");
+      static_assert(RBM * BK_padded == BN * BK_padded, "X staging must fit Ws");
+      static_assert(RBN * BK_padded == BM * BK_padded, "W staging must fit Xs");
+
+      const int gx = (N + BN - 1) / BN;
+      const int gy = (M + BM - 1) / BM;
+      const int nt = N / RBN;
+      const int mt = M / RBM;
+
+      if ((N % RBN) == 0 && (M % RBM) == 0 && (gx * gy) == (nt * mt)) {
+        using r_mma_t = mlx::steel::BlockMMA<
+            T, T, RBM, RBN, BK, RWM, RWN, false, transpose,
+            BK_padded, BK_padded>;
+        using r_loader_x_t = mlx::steel::BlockLoader<
+            T, RBM, BK, BK_padded, 1, RWM * RWN * SIMD_SIZE>;
+        using r_loader_w_t = QuantizedBlockLoader<
+            T, RBN, BK, BK_padded, transpose,
+            RWM * RWN * SIMD_SIZE, group_size, bits>;
+
+        threadgroup T* rXs = Ws;   // 1280 T == RBM * BK_padded
+        threadgroup T* rWs = Xs;   //  640 T == RBN * BK_padded
+
+        const int linear = int(tid.y) * gx + int(tid.x);
+        const int r_row = (linear / nt) * RBM;
+        const int r_col = (linear % nt) * RBN;
+
+        auto rwl = (const device uint8_t*)w;
+        rwl += size_t(r_col) * K_w;
+        const device T* rsc = scales + size_t(r_col) * K_g;
+        const device T* rbi = biases + size_t(r_col) * K_g;
+        const device T* rx = x + size_t(r_row) * K;
+        device T* ry = y + size_t(r_row) * N + size_t(r_col);
+
+        uint32_t r_index;
+        short r_offset;
+        uint32_t r_index_next = indices[r_row];
+        short r_offset_next = 0;
+        int rn = 0;
+        while (rn < RBM) {
+          rn++;
+          r_offset = r_offset_next;
+          r_index = r_index_next;
+          r_offset_next = RBM;
+          for (; rn < RBM; rn++) {
+            if (indices[r_row + rn] != r_index) {
+              r_offset_next = short(rn);
+              r_index_next = indices[r_row + rn];
+              break;
+            }
+          }
+          threadgroup_barrier(mem_flags::mem_none);
+
+          thread r_mma_t mma_op(simd_group_id, simd_lane_id);
+          thread r_loader_x_t loader_x(rx, K, rXs, simd_group_id, simd_lane_id);
+          thread r_loader_w_t loader_w(
+              rwl + r_index * stride_w,
+              rsc + r_index * stride_s,
+              rbi + r_index * stride_s,
+              K,
+              rWs,
+              simd_group_id,
+              simd_lane_id);
+
+          gemm_loop_aligned(rXs, rWs, mma_op, loader_x, loader_w, K_it);
+
+          if (r_offset_next - r_offset == RBM) {
+            mma_op.store_result(ry, N);
+          } else {
+            mma_op.store_result_slice(
+                ry, N, short2(0, r_offset), short2(RBN, r_offset_next));
+          }
+        }
+        return;
+      }
+    }
+  }
 
   // Move x and output to the correct block
   auto wl = (const device uint8_t*)w;

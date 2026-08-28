@@ -56,6 +56,13 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     /// own no storage and borrow via `attendBorrowing`.
     public private(set) var rows: [CBv2SequenceKV]
 
+    /// Host-only membership proof for compact decode evaluation roots.
+    ///
+    /// A row's protocol conformance cannot change during its lifetime, so
+    /// repeating these casts every decode round proves nothing new. Refresh
+    /// this cached conjunction only where `rows` membership changes.
+    private(set) var decodeRootCompactionRowsAreCapable: Bool
+
     /// Per-row absolute RoPE offsets `[B]` (int32, device array).
     ///
     /// REBUILT from host integers only on membership changes; ADVANCED
@@ -76,6 +83,18 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     public var unifiedPositionOffsets: MLXArray? {
         usesUnifiedPositionOffsets ? positionOffsetsState.value : nil
     }
+
+    /// Stable identity of the bank-owned shared position state. Comparing
+    /// the MLXArray values themselves would evaluate them; the adapter uses
+    /// this host-only identity to prove every layer shares one chain.
+    var unifiedPositionStateIdentity: ObjectIdentifier? {
+        usesUnifiedPositionOffsets ? ObjectIdentifier(positionOffsetsState) : nil
+    }
+
+    /// Explicit ordering root for the fused in-place sliding-ring write.
+    /// Kept in the initial conservative compaction even though the logits
+    /// graph also reaches the multi-output primitive that produces it.
+    var decodeRingWriteFenceEvaluationRoot: MLXArray { decodeRingWriteFence.value }
 
     private var positionOffsetsState: CBv2PositionOffsetsState
     private var usesUnifiedPositionOffsets = false
@@ -120,6 +139,11 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         self.layerIndex = layerIndex
         self.kind = kind
         self.rows = rows
+        self.decodeRootCompactionRowsAreCapable =
+            !rows.isEmpty
+            && rows.allSatisfy {
+                $0 is any CBv2DecodeRootCompactionCapableSequenceKV
+            }
         self.attentionSoftcap = attentionSoftcap
         self.positionOffsetsState = CBv2PositionOffsetsState(rows: rows)
     }
@@ -140,11 +164,13 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         precondition(
             kind.sharesKVWithLayer == nil, "CBv2LayerCache: cannot add rows to a KV-shared layer")
         rows.append(row)
+        refreshDecodeRootCompactionRowsCapability()
         rebuildPositionOffsets()
     }
 
     public func removeRow(at index: Int) {
         rows.remove(at: index)
+        refreshDecodeRootCompactionRowsCapability()
         rebuildPositionOffsets()
     }
 
@@ -164,6 +190,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             kind.sharesKVWithLayer == nil || newRows.isEmpty,
             "CBv2LayerCache: KV-shared layers own no rows")
         rows = newRows
+        refreshDecodeRootCompactionRowsCapability()
         if shouldRebuild { rebuildPositionOffsets() }
     }
 
@@ -183,6 +210,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             spanContexts: boundSpanContexts,
             serializeQueries: mtpSerializesRectangularAttention,
             decodeRingWriteFence: decodeRingWriteFence,
+            decodePositionOffsets: CBv2RaggedTwoPassDecodeAttentionV1
+                .ringHostAllocationElisionEnabled ? unifiedPositionOffsets : nil,
             allowFusedRingWrite: !retainsChunkForBorrowers)
         // Advance offsets ON-DEVICE. A unified bank elects exactly one owning
         // cache; Gemma snapshots the shared pre-step value before this call.
@@ -235,6 +264,14 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     }
 
     // MARK: - Private
+
+    private func refreshDecodeRootCompactionRowsCapability() {
+        decodeRootCompactionRowsAreCapable =
+            !rows.isEmpty
+            && rows.allSatisfy {
+                $0 is any CBv2DecodeRootCompactionCapableSequenceKV
+            }
+    }
 
     private func rebuildPositionOffsets() {
         positionOffsetsHostRebuilds += 1

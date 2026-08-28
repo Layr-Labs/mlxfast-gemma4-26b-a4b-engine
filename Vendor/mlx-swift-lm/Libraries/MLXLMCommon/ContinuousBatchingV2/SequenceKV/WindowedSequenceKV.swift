@@ -51,7 +51,9 @@ import MLX
 /// `commitSpeculativeWrite()`. A final `rollback(m)` is a pure counter move —
 /// nothing was destroyed — so after commit the state is value-exactly what
 /// plain updates of only the confirmed tokens would have produced.
-public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
+public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV,
+    CBv2InnerStateProviding
+{
 
     /// Window size in tokens == number of physical ring slots.
     public let window: Int

@@ -789,6 +789,188 @@ private func gemma4FusedQKVNorm(
     return (outputs[0], outputs[1], outputs[2])
 }
 
+/// Exact B=8 MoE post-branch chain:
+///
+///     rmsNorm(dense, w0) + rmsNorm(expert, w1) -> rmsNorm(_, w2)
+///
+/// The stock chain materializes both branch norms and their BF16 sum before
+/// the final norm. This kernel preserves those three BF16 rounding boundaries,
+/// the stock four-values-per-thread reduction tree, and precise rsqrt while
+/// retaining the merged BF16 values in registers for the final reduction.
+/// `DARKBLOOM_GEMMA4_POST_BRANCH_RMS_MERGE=0` restores the four-dispatch chain.
+private let gemma4PostBranchRMSMergeEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_POST_BRANCH_RMS_MERGE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+private let gemma4PostBranchRMSMergeKernel = MLXFast.metalKernel(
+    name: "gemma4_b8_post_branch_rms_merge_v1",
+    inputNames: ["x0", "x1", "weight0", "weight1", "weight2"],
+    outputNames: ["output"],
+    source: """
+        constexpr uint reads = 4;
+        constexpr uint dimension = 2816;
+        const uint row = threadgroup_position_in_grid.x;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint simd_group = simdgroup_index_in_threadgroup;
+
+        const device T* input0 = x0 + row * dimension + lid * reads;
+        const device T* input1 = x1 + row * dimension + lid * reads;
+        device T* out = output + row * dimension + lid * reads;
+        weight0 += lid * reads;
+        weight1 += lid * reads;
+        weight2 += lid * reads;
+
+        float sum0 = 0.0f;
+        float sum1 = 0.0f;
+        for (uint i = 0; i < reads; ++i) {
+            const float value0 = input0[i];
+            const float value1 = input1[i];
+            sum0 += value0 * value0;
+            sum1 += value1 * value1;
+        }
+        sum0 = simd_sum(sum0);
+        sum1 = simd_sum(sum1);
+
+        threadgroup float partials0[32];
+        threadgroup float partials1[32];
+        threadgroup float inverse0[1];
+        threadgroup float inverse1[1];
+        if (simd_group == 0) {
+            partials0[lane] = 0.0f;
+            partials1[lane] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) {
+            partials0[simd_group] = sum0;
+            partials1[simd_group] = sum1;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            sum0 = simd_sum(partials0[lane]);
+            sum1 = simd_sum(partials1[lane]);
+            if (lane == 0) {
+                inverse0[0] = metal::precise::rsqrt(
+                    sum0 / float(dimension) + 1.0e-6f);
+                inverse1[0] = metal::precise::rsqrt(
+                    sum1 / float(dimension) + 1.0e-6f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        thread T merged[reads];
+        float sum2 = 0.0f;
+        for (uint i = 0; i < reads; ++i) {
+            const T normalized0 = static_cast<T>(input0[i] * inverse0[0]);
+            const T normalized1 = static_cast<T>(input1[i] * inverse1[0]);
+            const T branch0 = weight0[i] * normalized0;
+            const T branch1 = weight1[i] * normalized1;
+            merged[i] = static_cast<T>(branch0 + branch1);
+            const float value = merged[i];
+            sum2 += value * value;
+        }
+        sum2 = simd_sum(sum2);
+
+        threadgroup float partials2[32];
+        threadgroup float inverse2[1];
+        if (simd_group == 0) partials2[lane] = 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) partials2[simd_group] = sum2;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            sum2 = simd_sum(partials2[lane]);
+            if (lane == 0) {
+                inverse2[0] = metal::precise::rsqrt(
+                    sum2 / float(dimension) + 1.0e-6f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = 0; i < reads; ++i) {
+            out[i] = weight2[i] * static_cast<T>(merged[i] * inverse2[0]);
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+internal func gemma4FusedPostBranchRMSMerge(
+    dense: MLXArray,
+    expert: MLXArray,
+    denseWeight: MLXArray,
+    expertWeight: MLXArray,
+    outputWeight: MLXArray,
+    denseEps: Float,
+    expertEps: Float,
+    outputEps: Float,
+    enabled: Bool,
+    stream: StreamOrDevice = .default
+) -> MLXArray? {
+    guard enabled,
+        stream == .gpu,
+        dense.shape == [8, 1, 2816], expert.shape == dense.shape,
+        dense.dtype == .bfloat16, expert.dtype == .bfloat16,
+        denseWeight.shape == [2816], expertWeight.shape == [2816],
+        outputWeight.shape == [2816],
+        denseWeight.dtype == .bfloat16, expertWeight.dtype == .bfloat16,
+        outputWeight.dtype == .bfloat16,
+        denseEps == 1.0e-6, expertEps == 1.0e-6, outputEps == 1.0e-6
+    else { return nil }
+
+    return gemma4PostBranchRMSMergeKernel(
+        [dense, expert, denseWeight, expertWeight, outputWeight],
+        template: [("T", dense.dtype)],
+        grid: (8 * 704, 1, 1),
+        threadGroup: (704, 1, 1),
+        outputShapes: [dense.shape],
+        outputDTypes: [dense.dtype],
+        stream: stream
+    )[0]
+}
+
+/// Complete fused-or-stock seam used by the decoder layer. Keeping the final
+/// norm in this helper makes it impossible for the caller to apply it twice or
+/// omit it when the exact custom-kernel selector changes state.
+internal func gemma4PostBranchRMSMergeOrFallback(
+    dense: MLXArray,
+    expert: MLXArray,
+    denseWeight: MLXArray,
+    expertWeight: MLXArray,
+    outputWeight: MLXArray,
+    denseEps: Float,
+    expertEps: Float,
+    outputEps: Float,
+    enabled: Bool,
+    stream: StreamOrDevice = .default
+) -> MLXArray {
+    if let fused = gemma4FusedPostBranchRMSMerge(
+        dense: dense,
+        expert: expert,
+        denseWeight: denseWeight,
+        expertWeight: expertWeight,
+        outputWeight: outputWeight,
+        denseEps: denseEps,
+        expertEps: expertEps,
+        outputEps: outputEps,
+        enabled: enabled,
+        stream: stream)
+    {
+        return fused
+    }
+
+    let denseNorm = MLXFast.rmsNorm(
+        dense, weight: denseWeight, eps: denseEps, stream: stream)
+    let expertNorm = MLXFast.rmsNorm(
+        expert, weight: expertWeight, eps: expertEps, stream: stream)
+    return MLXFast.rmsNorm(
+        add(denseNorm, expertNorm, stream: stream),
+        weight: outputWeight,
+        eps: outputEps,
+        stream: stream)
+}
+
 private class ScaledLinear: Module {
     let weight: MLXArray
     let scalar: Float
@@ -1796,6 +1978,7 @@ public class Gemma4DecoderLayer: Module {
         var out = residual + postAttn
 
         let residual2 = out
+        var postFeedforwardNormApplied = false
 
         if isMoE,
             let router,
@@ -1807,7 +1990,6 @@ public class Gemma4DecoderLayer: Module {
             // Dense + sparse branches in parallel, summed into one residual.
             var h1 = preFeedforwardLayernorm(out)
             h1 = mlp(h1)
-            h1 = postFeedforwardLayernorm1(h1)
 
             let (topKIndices, topKWeights) = router(out)
             var h2 = preFeedforwardLayernorm2(out)
@@ -1816,15 +1998,26 @@ public class Gemma4DecoderLayer: Module {
                 topKIndices: topKIndices,
                 topKWeights: topKWeights,
                 isExpertPrefill: isExpertPrefill)
-            h2 = postFeedforwardLayernorm2(h2)
 
-            out = h1 + h2
+            out = gemma4PostBranchRMSMergeOrFallback(
+                dense: h1,
+                expert: h2,
+                denseWeight: postFeedforwardLayernorm1.weight,
+                expertWeight: postFeedforwardLayernorm2.weight,
+                outputWeight: postFeedforwardLayernorm.weight,
+                denseEps: postFeedforwardLayernorm1.eps,
+                expertEps: postFeedforwardLayernorm2.eps,
+                outputEps: postFeedforwardLayernorm.eps,
+                enabled: gemma4PostBranchRMSMergeEnabled)
+            postFeedforwardNormApplied = true
         } else {
             out = preFeedforwardLayernorm(out)
             out = mlp(out)
         }
 
-        out = postFeedforwardLayernorm(out)
+        if !postFeedforwardNormApplied {
+            out = postFeedforwardLayernorm(out)
+        }
         out = residual2 + out
 
         // PLE gating
@@ -2699,6 +2892,11 @@ extension Gemma4TextModel: CBv2LanguageModelPrefillForwardable {
         }
     }
 }
+
+/// Every storage-owning CBv2 attention result is consumed by the sequential
+/// Gemma trunk and final LM head, so ordinary decode logits transitively root
+/// that forward's K/V mutations. Cache-layout gates remain in the adapter.
+extension Gemma4TextModel: CBv2LanguageModelDecodeOutputCoversCacheMutations {}
 
 // MARK: - ContinuousBatchingV2 multimodal (vision prefill)
 

@@ -18,6 +18,17 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Elide host allocations from the successful full-ring decode path:
+    /// reuse the cache bank's pre-step `[B]` position tensor for ring starts
+    /// and defer fallback vectors until both ring kernels refuse. `0` restores
+    /// the former UInt32 start tensor, eager reserves, and original kernel.
+    static let ringHostAllocationElisionEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_RING_HOST_ALLOCATION_ELISION"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let batch = 8
     private static let queryHeads = 16
     private static let kvHeads = 8
@@ -228,16 +239,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// evaluated dependency chain: the next step's writing pass A consumes
     /// this step's fence, so the mutation can never be reordered against a
     /// later read of the same allocation.
-    private static let fusedRingPassAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_ringwrite_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v1",
-        inputNames: [
-            "queries",
-            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
-            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
-            "starts", "new_keys", "new_values", "write_fence",
-        ],
-        outputNames: ["partials", "sums", "maxs", "fence"],
-        source: """
+    private static let fusedRingPassASource = """
             constexpr int simd_width = 32;
             constexpr int values_per_lane = D / simd_width;
 
@@ -333,7 +335,49 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             for (int element = 0; element < values_per_lane; ++element) {
                 partial[element] = T(accumulator[element]);
             }
-        """,
+        """
+
+    /// A separate candidate source preserves the original kernel byte-for-byte
+    /// for kill-switch attribution and exactness tests.
+    private static let fusedRingPositionPassASource: String = {
+        let needle = "const uint ring_start = starts[batch_index];"
+        precondition(
+            fusedRingPassASource.components(separatedBy: needle).count == 2,
+            "fused ring position source must replace exactly one start load")
+        return fusedRingPassASource.replacingOccurrences(
+            of: needle,
+            with: """
+                // A full ring's post-write oldest position is
+                // `pre_step_offset + 1 - N`; modulo N this is exactly
+                // `pre_step_offset + 1`.
+                const uint ring_start =
+                    (uint(starts[batch_index]) + 1u) & uint(N - 1);
+                """)
+    }()
+
+    private static let fusedRingPassAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_ringwrite_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v1",
+        inputNames: [
+            "queries",
+            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+            "starts", "new_keys", "new_values", "write_fence",
+        ],
+        outputNames: ["partials", "sums", "maxs", "fence"],
+        source: fusedRingPassASource,
+        ensureRowContiguous: true
+    )
+
+    private static let fusedRingPositionPassAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_ringwrite_position_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v1",
+        inputNames: [
+            "queries",
+            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+            "starts", "new_keys", "new_values", "write_fence",
+        ],
+        outputNames: ["partials", "sums", "maxs", "fence"],
+        source: fusedRingPositionPassASource,
         ensureRowContiguous: true
     )
 
@@ -436,18 +480,19 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
 
     /// `attendRing` with this step's one-token ring write fused into pass A.
     ///
-    /// `keys`/`values` are the rows' RETAINED ring allocations and `starts`
-    /// the post-write ring starts — i.e. exactly what `attendRing` would be
-    /// handed after a separate `decodeRingWrite`, minus the write. Returns
-    /// nil (write NOT performed) whenever any predicate fails, so the caller
-    /// falls back to the established write-then-attend pair.
+    /// `keys`/`values` are the rows' RETAINED ring allocations. The original
+    /// path consumes post-write ring `starts`; the optimized path consumes
+    /// the cache bank's pre-step `positionOffsets` and derives the same starts
+    /// in the kernel. Returns nil (write NOT performed) whenever any predicate
+    /// fails, so the caller falls back to the established write-then-attend pair.
     static func attendRingWriting(
         queries: MLXArray,
         newKeys: MLXArray,
         newValues: MLXArray,
         keys: [MLXArray],
         values: [MLXArray],
-        starts: [Int],
+        starts: [Int]? = nil,
+        positionOffsets: MLXArray? = nil,
         previousWriteFence: MLXArray,
         scale: Float,
         slidingWindowLength: Int
@@ -466,9 +511,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             previousWriteFence.dtype == .int32,
             previousWriteFence.shape == [1],
             keys.count == batch,
-            values.count == batch,
-            starts.count == batch,
-            starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength })
+            values.count == batch
         else { return nil }
 
         for index in 0 ..< batch {
@@ -481,10 +524,28 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             else { return nil }
         }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray: MLXArray
+        let usesPositionOffsets: Bool
+        if ringHostAllocationElisionEnabled,
+            let positionOffsets,
+            positionOffsets.dtype == .int32,
+            positionOffsets.shape == [batch]
+        {
+            startArray = positionOffsets
+            usesPositionOffsets = true
+        } else {
+            guard let starts,
+                starts.count == batch,
+                starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength })
+            else { return nil }
+            startArray = MLXArray(starts.map(UInt32.init), [batch])
+            usesPositionOffsets = false
+        }
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
-        let passA = fusedRingPassAKernel(
+        let selectedPassAKernel = usesPositionOffsets
+            ? fusedRingPositionPassAKernel : fusedRingPassAKernel
+        let passA = selectedPassAKernel(
             [queries] + keys + values
                 + [startArray, newKeys, newValues, previousWriteFence],
             template: [

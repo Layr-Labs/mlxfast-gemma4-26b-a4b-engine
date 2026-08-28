@@ -93,6 +93,11 @@ public class ProportionalRoPE: Module, OffsetLayer, ArrayOffsetLayer {
     let rotatedDims: Int
     let _freqs: MLXArray?
 
+    /// Exact frequency tensor consumed by the underlying MLX RoPE primitive.
+    /// Decode-only fused normalization/RoPE kernels reuse these operands rather
+    /// than reconstructing the proportional/partial-rotation angle table.
+    public var fusedDecodeFrequencies: MLXArray? { _freqs }
+
     init(
         dims: Int,
         traditional: Bool = false,

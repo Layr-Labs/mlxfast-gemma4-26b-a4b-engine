@@ -694,6 +694,170 @@ private class RMSNormNoScale: Module {
     }
 }
 
+/// Fuses the already-promoted batch-8 Q/K/V RMS-normalization dispatch with
+/// both decode RoPE transforms. This is not the earlier paired-RoPE launch:
+/// normalization owns the input rows already, so rotating Q/K while storing
+/// their normalized outputs removes both standalone RoPE dispatches without
+/// introducing another kernel or intermediate allocation.
+private let gemma4QKVNormRoPEKernel = MLXFast.metalKernel(
+    name: "gemma4_b8_qkv_rms_norm_rope_v1",
+    inputNames: [
+        "q", "k", "v", "q_weight", "k_weight", "offsets", "freqs", "log2_base",
+    ],
+    outputNames: ["q_out", "k_out", "v_out"],
+    source: """
+        constexpr uint reads = 4;
+        const uint row = threadgroup_position_in_grid.x;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint simd_group = simdgroup_index_in_threadgroup;
+
+        const device T* input = q;
+        const device T* weight = q_weight;
+        device T* output = q_out;
+        uint local_row = row;
+        uint head_count = Q_HEADS;
+        bool rotate = true;
+        if (row >= Q_ROWS + K_ROWS) {
+            input = v;
+            output = v_out;
+            local_row = row - Q_ROWS - K_ROWS;
+            head_count = K_HEADS;
+            rotate = false;
+        } else if (row >= Q_ROWS) {
+            input = k;
+            weight = k_weight;
+            output = k_out;
+            local_row = row - Q_ROWS;
+            head_count = K_HEADS;
+        }
+
+        input += local_row * D + lid * reads;
+        output += local_row * D + lid * reads;
+        weight += lid * reads;
+
+        float sum = 0.0f;
+        for (uint i = 0; i < reads; ++i) {
+            const float value = float(input[i]);
+            sum += value * value;
+        }
+        sum = simd_sum(sum);
+
+        threadgroup float partials[32];
+        threadgroup float inverse_rms;
+        if (simd_group == 0) partials[lane] = 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) partials[simd_group] = sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            sum = simd_sum(partials[lane]);
+            if (lane == 0) {
+                inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (!rotate) {
+            // Preserve the promoted V RMSNorm statement order exactly.
+            for (uint i = 0; i < reads; ++i) {
+                const T normalized = T(float(input[i]) * inverse_rms);
+                output[i] = T(1) * normalized;
+            }
+        } else if (lid < (D / (2 * reads))) {
+            // The promoted norm kernel assigns four contiguous values to each
+            // lane. Keep that reduction unchanged, then let the first-half
+            // lanes load their partners D/2 away and store both halves. The
+            // norm result is rounded to T before the gain multiply, and that
+            // gained T is widened again for RoPE, exactly matching the former
+            // RMSNorm-output -> AOT-RoPE boundary.
+            const uint batch = local_row / head_count;
+            const float L = static_cast<float>(offsets[batch]);
+            for (uint i = 0; i < reads; ++i) {
+                const uint pair = lid * reads + i;
+                const T normalized_1 = T(float(input[i]) * inverse_rms);
+                const T normalized_2 = T(float(input[D / 2 + i]) * inverse_rms);
+                const T normed_1 = weight[i] * normalized_1;
+                const T normed_2 = weight[D / 2 + i] * normalized_2;
+
+                float inv_freq;
+                if (USE_FREQS) {
+                    inv_freq = 1.0f / freqs[pair];
+                } else {
+                    const float d = static_cast<float>(pair)
+                        / static_cast<float>(D / 2);
+                    inv_freq = metal::exp2(-d * log2_base);
+                }
+                const float theta = L * inv_freq;
+                const float costheta = metal::fast::cos(theta);
+                const float sintheta = metal::fast::sin(theta);
+                const float x1 = static_cast<float>(normed_1);
+                const float x2 = static_cast<float>(normed_2);
+                output[i] = T(x1 * costheta - x2 * sintheta);
+                output[D / 2 + i] = T(x1 * sintheta + x2 * costheta);
+            }
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+/// Returns rotated Q/K plus normalized V only for the exact ranked decode
+/// geometries. Prefill, shifted last-query prefill, non-bf16 checkpoints, and
+/// every other topology retain the promoted QKV-norm and generic RoPE paths.
+internal func gemma4FusedDecodeQKVNormRoPE(
+    q: MLXArray,
+    k: MLXArray,
+    v: MLXArray,
+    qWeight: MLXArray,
+    kWeight: MLXArray,
+    eps: Float,
+    offsets: MLXArray,
+    frequencies: MLXArray,
+    log2Base: MLXArray,
+    useFrequencies: Bool
+) -> (MLXArray, MLXArray, MLXArray)? {
+    guard eps == 1.0e-6,
+        q.dtype == .bfloat16, k.dtype == .bfloat16, v.dtype == .bfloat16,
+        qWeight.dtype == .bfloat16, kWeight.dtype == .bfloat16,
+        q.ndim == 4, k.ndim == 4, v.ndim == 4,
+        q.dim(0) == 8, q.dim(1) == 1, q.dim(2) == 16,
+        k.dim(0) == 8, k.dim(1) == 1, v.shape == k.shape,
+        q.dim(3) == k.dim(3),
+        (q.dim(3) == 256 && k.dim(2) == 8) || (q.dim(3) == 512 && k.dim(2) == 2),
+        qWeight.shape == [q.dim(3)], kWeight.shape == [q.dim(3)],
+        offsets.dtype == .int32, offsets.shape == [8], offsets.strides == [1],
+        frequencies.dtype == .float32, frequencies.size > 0,
+        log2Base.dtype == .float32, log2Base.ndim == 0, log2Base.size == 1
+    else { return nil }
+
+    let dimension = q.dim(3)
+    if useFrequencies {
+        guard frequencies.shape == [dimension / 2], frequencies.strides == [1]
+        else { return nil }
+    }
+
+    let qRows = 8 * 16
+    let kRows = 8 * k.dim(2)
+    let threads = dimension / 4
+    let outputs = gemma4QKVNormRoPEKernel(
+        [q, k, v, qWeight, kWeight, offsets, frequencies, log2Base],
+        template: [
+            ("T", q.dtype), ("D", dimension),
+            ("Q_ROWS", qRows), ("K_ROWS", kRows),
+            ("Q_HEADS", 16), ("K_HEADS", k.dim(2)),
+            ("USE_FREQS", useFrequencies),
+        ],
+        grid: ((qRows + 2 * kRows) * threads, 1, 1),
+        threadGroup: (threads, 1, 1),
+        outputShapes: [q.shape, k.shape, v.shape],
+        outputDTypes: [q.dtype, k.dtype, v.dtype]
+    )
+    return (outputs[0], outputs[1], outputs[2])
+}
+
+/// The promoted QKV RMSNorm kernel retained verbatim as the fallback whenever
+/// decode RoPE cannot be folded safely. Keeping the prior kernel (rather than
+/// widening the new kernel's contract with a runtime mode) preserves every
+/// leader path and its exact input/dependency surface.
 private let gemma4QKVNormKernel = MLXFast.metalKernel(
     name: "gemma4_b8_qkv_rms_norm_v1",
     inputNames: ["q", "k", "v", "q_weight", "k_weight"],
@@ -755,7 +919,7 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-private func gemma4FusedQKVNorm(
+internal func gemma4FusedQKVNorm(
     q: MLXArray,
     k: MLXArray,
     v: MLXArray,
@@ -787,6 +951,111 @@ private func gemma4FusedQKVNorm(
         outputDTypes: [q.dtype, k.dtype, v.dtype]
     )
     return (outputs[0], outputs[1], outputs[2])
+}
+
+/// Byte-identical B=8 single-row specialization for the MoE layer tail:
+/// branch add -> RMSNorm -> residual add -> layer-scalar multiply. The
+/// explicit BF16 temporaries preserve each stock dispatch's rounding point.
+/// `DARKBLOOM_GEMMA4_FUSED_MOE_EPILOGUE=0` restores the established chain.
+private enum Gemma4FusedMoEEpilogue {
+    private static let batchSize = 8
+    private static let width = 2816
+    private static let reads = 4
+
+    private static let enabled: Bool = {
+        guard
+            let raw = ProcessInfo.processInfo.environment[
+                "DARKBLOOM_GEMMA4_FUSED_MOE_EPILOGUE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "gemma4_b8_moe_epilogue_bf16_v1",
+        inputNames: ["h1", "h2", "residual", "weight", "scalar"],
+        outputNames: ["y"],
+        source: """
+                constexpr uint reads = 4;
+                constexpr uint axis_size = 2816;
+                const uint row = threadgroup_position_in_grid.x;
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint lane = thread_index_in_simdgroup;
+                const uint simd_group = simdgroup_index_in_threadgroup;
+
+                threadgroup float inverse_rms;
+                threadgroup float partials[32];
+
+                const device T* row_h1 = h1 + row * axis_size + lid * reads;
+                const device T* row_h2 = h2 + row * axis_size + lid * reads;
+                const device T* row_residual = residual + row * axis_size + lid * reads;
+                const device T* row_weight = weight + lid * reads;
+                device T* row_y = y + row * axis_size + lid * reads;
+
+                T combined[reads];
+                float sum = 0.0f;
+                for (uint i = 0; i < reads; ++i) {
+                    combined[i] = T(float(row_h1[i]) + float(row_h2[i]));
+                    const float value = float(combined[i]);
+                    sum += value * value;
+                }
+                sum = simd_sum(sum);
+
+                if (simd_group == 0) partials[lane] = 0.0f;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (lane == 0) partials[simd_group] = sum;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simd_group == 0) {
+                    sum = simd_sum(partials[lane]);
+                    if (lane == 0) {
+                        inverse_rms = metal::precise::rsqrt(
+                            sum / float(axis_size) + 1.0e-6f);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                for (uint i = 0; i < reads; ++i) {
+                    const T normalized = T(float(combined[i]) * inverse_rms);
+                    const T normed = row_weight[i] * normalized;
+                    const T added = T(float(row_residual[i]) + float(normed));
+                    row_y[i] = added * scalar[0];
+                }
+            """,
+        ensureRowContiguous: true
+    )
+
+    static func apply(
+        h1: MLXArray,
+        h2: MLXArray,
+        residual: MLXArray,
+        weight: MLXArray,
+        scalar: MLXArray,
+        eps: Float
+    ) -> MLXArray? {
+        guard enabled,
+            eps == 1.0e-6,
+            h1.dtype == .bfloat16,
+            h2.dtype == .bfloat16,
+            residual.dtype == .bfloat16,
+            weight.dtype == .bfloat16,
+            scalar.dtype == .bfloat16,
+            h1.shape == [batchSize, 1, width],
+            h2.shape == h1.shape,
+            residual.shape == h1.shape,
+            weight.shape == [width],
+            scalar.shape == [1]
+        else { return nil }
+
+        let threads = width / reads
+        CBv2EngageMark.once("moe-epilogue")
+        return kernel(
+            [h1, h2, residual, weight, scalar],
+            template: [("T", h1.dtype)],
+            grid: (batchSize * threads, 1, 1),
+            threadGroup: (threads, 1, 1),
+            outputShapes: [h1.shape],
+            outputDTypes: [h1.dtype]
+        )[0]
+    }
 }
 
 private class ScaledLinear: Module {
@@ -915,6 +1184,22 @@ private func gemma4AttentionFallback(
 
 // MARK: - Attention
 
+/// Non-module holder for decode-only RoPE operands. Ordinary stored properties
+/// on a `Module` participate in reflection; keeping these immutable arrays in
+/// a plain reference object prevents them from being mistaken for checkpoint
+/// parameters while still constructing them once per layer.
+private final class Gemma4DecodeRoPEOperands {
+    let usesFrequencies: Bool
+    let frequencies: MLXArray
+    let log2Base: MLXArray
+
+    init(usesFrequencies: Bool, frequencies: MLXArray, log2Base: MLXArray) {
+        self.usesFrequencies = usesFrequencies
+        self.frequencies = frequencies
+        self.log2Base = log2Base
+    }
+}
+
 private class Gemma4Attention: Module {
     let config: Gemma4TextConfiguration
     let layerIdx: Int
@@ -926,6 +1211,7 @@ private class Gemma4Attention: Module {
     let useKeqV: Bool
     let usesSharedKV: Bool
     let scale: Float
+    let decodeRoPEOperands: Gemma4DecodeRoPEOperands
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
     @ModuleInfo(key: "k_proj") var kProj: Linear?
@@ -982,19 +1268,34 @@ private class Gemma4Attention: Module {
 
         self._qNorm.wrappedValue = RMSNorm(dimensions: effectiveHeadDim, eps: config.rmsNormEps)
 
-        // RoPE: sliding uses default, full uses proportional with partial rotation
+        // RoPE: sliding uses default, full uses proportional with partial
+        // rotation. Retain the exact operands MLX hands to its AOT kernel so
+        // the decode norm+RoPE store reproduces the same angle calculation.
         if isSliding {
             self.rope = initializeRope(
                 dims: effectiveHeadDim, base: config.slidingRopeTheta, traditional: false,
                 scalingConfig: nil, maxPositionEmbeddings: nil)
+            self.decodeRoPEOperands = Gemma4DecodeRoPEOperands(
+                usesFrequencies: false,
+                frequencies: MLXArray([Float(1)]),
+                log2Base: MLXArray(log2(config.slidingRopeTheta)))
         } else {
-            self.rope = initializeRope(
+            let fullRoPE = initializeRope(
                 dims: effectiveHeadDim, base: config.fullRopeTheta, traditional: false,
                 scalingConfig: [
                     "type": .string("proportional"),
                     "partial_rotary_factor": .float(config.fullPartialRotaryFactor),
                 ],
                 maxPositionEmbeddings: nil)
+            self.rope = fullRoPE
+            // Full attention is frequency-backed by definition. A malformed
+            // proportional rope with no table receives a one-element sentinel
+            // that fails the fused helper's exact `[D/2]` shape guard.
+            self.decodeRoPEOperands = Gemma4DecodeRoPEOperands(
+                usesFrequencies: true,
+                frequencies: (fullRoPE as? ProportionalRoPE)?.fusedDecodeFrequencies
+                    ?? MLXArray([Float(1)]),
+                log2Base: MLXArray(Float(0)))
         }
 
         super.init()
@@ -1252,7 +1553,24 @@ private class Gemma4Attention: Module {
             vRaw = kRaw
         }
 
-        let normalized = gemma4FusedQKVNorm(
+        // Exact ranked decode: the promoted one-dispatch QKV norm now rotates
+        // Q/K while writing them, deleting both standalone AOT RoPE dispatches.
+        // Shifted last-query prefill and every near-match retain the established
+        // norm + separate RoPE sequence below.
+        let fusedDecode: (MLXArray, MLXArray, MLXArray)? = {
+            guard lastQueryCache == nil, outputStart == 0,
+                case .batch(let offsets) = captured
+            else { return nil }
+            return gemma4FusedDecodeQKVNormRoPE(
+                q: queryRaw, k: kRaw, v: vRaw,
+                qWeight: qNorm.weight, kWeight: kNorm.weight,
+                eps: config.rmsNormEps,
+                offsets: offsets,
+                frequencies: decodeRoPEOperands.frequencies,
+                log2Base: decodeRoPEOperands.log2Base,
+                useFrequencies: decodeRoPEOperands.usesFrequencies)
+        }()
+        let normalized = fusedDecode ?? gemma4FusedQKVNorm(
             q: queryRaw, k: kRaw, v: vRaw,
             qWeight: qNorm.weight, kWeight: kNorm.weight, eps: config.rmsNormEps)
         var queries = normalized?.0 ?? qNorm(queryRaw)
@@ -1260,9 +1578,14 @@ private class Gemma4Attention: Module {
         var v = normalized?.2 ?? vNorm(vRaw)
 
         queries = queries.transposed(0, 2, 1, 3)
-        queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: queryPositionOffset)
         k = k.transposed(0, 2, 1, 3)
-        k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
+        if fusedDecode == nil {
+            queries = gemma4ApplyRotaryPosition(
+                rope, to: queries, offset: queryPositionOffset)
+            k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
+        } else {
+            CBv2EngageMark.once("qkvnorm-rope")
+        }
 
         v = v.transposed(0, 2, 1, 3)
 
@@ -1817,6 +2140,18 @@ public class Gemma4DecoderLayer: Module {
                 topKWeights: topKWeights,
                 isExpertPrefill: isExpertPrefill)
             h2 = postFeedforwardLayernorm2(h2)
+
+            if hiddenSizePerLayerInput == 0,
+                let fused = Gemma4FusedMoEEpilogue.apply(
+                    h1: h1,
+                    h2: h2,
+                    residual: residual2,
+                    weight: postFeedforwardLayernorm.weight,
+                    scalar: layerScalar,
+                    eps: postFeedforwardLayernorm.eps)
+            {
+                return (fused, kvPair, attnPositionOffset)
+            }
 
             out = h1 + h2
         } else {

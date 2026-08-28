@@ -329,7 +329,8 @@ inline void qdot_affine4_pair(
     thread U& out1) {
   U accum0 = 0;
   U accum1 = 0;
-  const device uint16_t* ws = (const device uint16_t*)w;
+  const uint32_t packed32 = *(const device uint32_t*)w;
+  const uint16_t ws[2] = {uint16_t(packed32), uint16_t(packed32 >> 16)};
   for (int i = 0; i < (values_per_thread / 4); i++) {
     const uint16_t packed = ws[i];
     accum0 +=
@@ -380,8 +381,9 @@ inline void qdot_affine8_pair(
     thread U& out1) {
   U accum0 = 0;
   U accum1 = 0;
+  const uint32_t packed32 = *(const device uint32_t*)w;
   for (int i = 0; i < values_per_thread; i++) {
-    const uint8_t packed = w[i];
+    const uint8_t packed = uint8_t(packed32 >> (i * 8));
     accum0 += x0[i] * packed;
     accum1 += x1[i] * packed;
   }
@@ -1621,11 +1623,10 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
   int k = 0;
   for (; k < in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
-      const device uint16_t* wl =
-          (const device uint16_t*)(ws + row * in_vec_size_w);
-      for (int i = 0; i < uint16_per_thread; i++) {
-        packed[row][i] = wl[i];
-      }
+      const uint32_t packed32 =
+          *(const device uint32_t*)(ws + row * in_vec_size_w);
+      packed[row][0] = uint16_t(packed32);
+      packed[row][1] = uint16_t(packed32 >> 16);
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }
@@ -1660,41 +1661,34 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     x3 += block_size;
   }
 
-  const int remaining = clamp(
-      static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
-      0,
-      values_per_thread);
-  if (remaining > 0) {
+  const uint active_tail_lanes =
+      uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
     for (int row = 0; row < results_per_simdgroup; row++) {
-      const device uint16_t* wl =
-          (const device uint16_t*)(ws + row * in_vec_size_w);
-      for (int i = 0; i < uint16_per_thread; i++) {
-        packed[row][i] = wl[i];
-      }
+      const uint32_t packed32 =
+          *(const device uint32_t*)(ws + row * in_vec_size_w);
+      packed[row][0] = uint16_t(packed32);
+      packed[row][1] = uint16_t(packed32 >> 16);
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }
 
-    float sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x0, x_thread, remaining);
+    float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
-    sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x1, x_thread, remaining);
+    sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
-    sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x2, x_thread, remaining);
+    sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
-    sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x3, x_thread, remaining);
+    sum = load_vector<T, float, values_per_thread, 4>(x3, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result3[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
@@ -1778,15 +1772,13 @@ METAL_FUNC void qmv_affine8_g64_pair_impl(
     x1 += block_size;
   }
 
-  const int remaining = clamp(
-      static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
-      0,
-      values_per_thread);
-  if (remaining > 0) {
-    float sum0 = load_vector_safe<T, float, values_per_thread, 8>(
-        x0, x0_thread, remaining);
-    float sum1 = load_vector_safe<T, float, values_per_thread, 8>(
-        x1, x1_thread, remaining);
+  const uint active_tail_lanes =
+      uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
+    float sum0 =
+        load_vector<T, float, values_per_thread, 8>(x0, x0_thread);
+    float sum1 =
+        load_vector<T, float, values_per_thread, 8>(x1, x1_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* wl = ws + row * in_vec_size_w;
       const device T* sl = scales + row * in_vec_size_g;
@@ -1880,10 +1872,12 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
   int k = 0;
   for (; k < in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
-      const device uint8_t* wl = ws + row * in_vec_size_w;
-      for (int i = 0; i < bytes_per_thread; i++) {
-        packed[row][i] = wl[i];
-      }
+      const uint32_t packed32 =
+          *(const device uint32_t*)(ws + row * in_vec_size_w);
+      packed[row][0] = uint8_t(packed32);
+      packed[row][1] = uint8_t(packed32 >> 8);
+      packed[row][2] = uint8_t(packed32 >> 16);
+      packed[row][3] = uint8_t(packed32 >> 24);
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }
@@ -1926,10 +1920,12 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
       uint((in_vec_size - k) / values_per_thread);
   if (simd_lid < active_tail_lanes) {
     for (int row = 0; row < results_per_simdgroup; row++) {
-      const device uint8_t* wl = ws + row * in_vec_size_w;
-      for (int i = 0; i < bytes_per_thread; i++) {
-        packed[row][i] = wl[i];
-      }
+      const uint32_t packed32 =
+          *(const device uint32_t*)(ws + row * in_vec_size_w);
+      packed[row][0] = uint8_t(packed32);
+      packed[row][1] = uint8_t(packed32 >> 8);
+      packed[row][2] = uint8_t(packed32 >> 16);
+      packed[row][3] = uint8_t(packed32 >> 24);
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }

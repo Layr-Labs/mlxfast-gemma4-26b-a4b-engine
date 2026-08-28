@@ -1509,15 +1509,17 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
     x1 += block_size;
   }
 
-  const int remaining = clamp(
-      static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
-      0,
-      values_per_thread);
-  if (remaining > 0) {
-    float sum0 = load_vector_safe<T, float, values_per_thread, 4>(
-        x0, x0_thread, remaining);
-    float sum1 = load_vector_safe<T, float, values_per_thread, 4>(
-        x1, x1_thread, remaining);
+  // Every Gemma 4 caller entering this specialized g64 path has K aligned to
+  // 64.  The final block therefore contains an integral number of complete
+  // eight-value lane packets (32 lanes for K=2816, 24 for expert down_proj
+  // K=704); no active lane needs the generic dynamic safe-tail loops.
+  const uint active_tail_lanes =
+      uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
+    float sum0 =
+        load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
+    float sum1 =
+        load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* wl = ws + row * in_vec_size_w;
       const device T* sl = scales + row * in_vec_size_g;
@@ -1916,11 +1918,13 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
     x3 += block_size;
   }
 
-  const int remaining = clamp(
-      static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
-      0,
-      values_per_thread);
-  if (remaining > 0) {
+  // Dense Gemma 4 K is g64-aligned, so the tail is always a whole number of
+  // four-value lane packets.  In particular down_proj K=2112 leaves exactly
+  // 16 active lanes; use the fixed unrolled load instead of four dynamic
+  // safe-tail loops while preserving each lane's qdot and simd_sum order.
+  const uint active_tail_lanes =
+      uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* wl = ws + row * in_vec_size_w;
       for (int i = 0; i < bytes_per_thread; i++) {
@@ -1930,26 +1934,22 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
       bias_local[row] = biases[row * in_vec_size_g];
     }
 
-    float sum =
-        load_vector_safe<T, float, values_per_thread, 8>(x0, x_thread, remaining);
+    float sum = load_vector<T, float, values_per_thread, 8>(x0, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine8_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
-    sum =
-        load_vector_safe<T, float, values_per_thread, 8>(x1, x_thread, remaining);
+    sum = load_vector<T, float, values_per_thread, 8>(x1, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine8_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
-    sum =
-        load_vector_safe<T, float, values_per_thread, 8>(x2, x_thread, remaining);
+    sum = load_vector<T, float, values_per_thread, 8>(x2, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine8_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
-    sum =
-        load_vector_safe<T, float, values_per_thread, 8>(x3, x_thread, remaining);
+    sum = load_vector<T, float, values_per_thread, 8>(x3, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result3[row] += qdot_affine8_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);

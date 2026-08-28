@@ -2396,7 +2396,7 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         if let lmHead {
             out = lmHead(hidden)
         } else {
-            out = model.embedTokens.asLinear(hidden)
+            out = gemma4TiedHead(model.embedTokens, hidden)
         }
         // The VLM omission profile uses zero to represent the former optional
         // softcap's nil/disabled state.
@@ -2703,4 +2703,20 @@ extension Gemma4TextModel: CBv2MTPForwardable {
         let (postNorm, preNorm) = model.callCapturingPreNorm(tokens, cache: caches)
         return (applyLMHead(postNorm), preNorm)
     }
+}
+
+/// Tied LM head at the B=8 decode width through `Gemma4MMAQuantizedGEMV`
+/// when the embedding is an affine-4/8 group-64 `QuantizedEmbedding` and
+/// N >= 8192 (the vocab plane). Every other call takes `asLinear`.
+@inline(__always)
+func gemma4TiedHead(_ embedding: Embedding, _ hidden: MLXArray) -> MLXArray {
+    if hidden.ndim == 3, hidden.dim(0) == Gemma4MMAQuantizedGEMV.rows, hidden.dim(1) == 1,
+        let quantized = embedding as? QuantizedEmbedding,
+        let y = Gemma4MMAQuantizedGEMV.apply(
+            x: hidden, weight: quantized.weight, scales: quantized.scales,
+            biases: quantized.biases, bits: quantized.bits, groupSize: quantized.groupSize)
+    {
+        return y.reshaped(hidden.dim(0), 1, y.dim(-1))
+    }
+    return embedding.asLinear(hidden)
 }

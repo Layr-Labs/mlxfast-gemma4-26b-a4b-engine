@@ -257,7 +257,11 @@ inline U qdot_affine4_registered(
   return scale * accum + sum * bias;
 }
 
-template <typename T, const int group_size, const int bits>
+template <
+    typename T,
+    const int group_size,
+    const int bits,
+    const int num_simdgroups>
 METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -274,7 +278,6 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int values_per_thread = 8;
   constexpr int block_size = values_per_thread * SIMD_SIZE;
@@ -423,7 +426,7 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
             if (first_m >= 8) {
                 return;
             }
-            qmv_affine4_g64_quad_stream_impl<T, 64, 4>(
+            qmv_affine4_g64_quad_stream_impl<T, 64, 4, SG>(
                 w,
                 scales,
                 biases,
@@ -452,7 +455,8 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
         scales: MLXArray,
         biases: MLXArray?,
         inDim: Int,
-        outDim: Int
+        outDim: Int,
+        simdGroupsOverride: Int? = nil
     ) -> MLXArray? {
         // Every dimension is validated against every other, so the gate is a
         // full shape pin at runtime even though the tower's hidden size is not
@@ -480,17 +484,31 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
             biases.shape == scales.shape
         else { return nil }
 
+        // The tied head retains the promoted two-group default. Narrow callers
+        // may pack the same independent simdgroups into a taller threadgroup;
+        // each specialization keeps identical per-output arithmetic.
+        let selectedSimdGroups = simdGroupsOverride ?? simdGroups
+        switch selectedSimdGroups {
+        case 1, 2, 4, 8, 16:
+            break
+        default:
+            return nil
+        }
+        let selectedOutputsPerGroup = selectedSimdGroups * 4
+        guard outDim % selectedOutputsPerGroup == 0 else { return nil }
+
         let xGroups = batch / rowsPerGroup
-        let yGroups = outDim / outputsPerGroup
+        let yGroups = outDim / selectedOutputsPerGroup
         return kernel(
             [x, weight, scales, biases],
             template: [
                 ("T", x.dtype),
                 ("K", inDim),
                 ("OUTN", outDim),
+                ("SG", selectedSimdGroups),
             ],
-            grid: (xGroups * simdWidth, yGroups * simdGroups, 1),
-            threadGroup: (simdWidth, simdGroups, 1),
+            grid: (xGroups * simdWidth, yGroups * selectedSimdGroups, 1),
+            threadGroup: (simdWidth, selectedSimdGroups, 1),
             outputShapes: [[batch, 1, outDim]],
             outputDTypes: [x.dtype]
         )[0]

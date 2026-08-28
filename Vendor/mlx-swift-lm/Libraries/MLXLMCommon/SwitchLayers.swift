@@ -177,7 +177,6 @@ public func weightedExpertUnsort(
     )[0]
 }
 
-
 // MARK: - Compiled activation fusions (vMLX / osaurus-main port)
 
 /// Approximate (tanh) GELU written with `x * x * x` instead of the Power
@@ -254,6 +253,30 @@ public func gatherSortIndices(indices: MLXArray) -> (MLXArray, MLXArray, MLXArra
     let indices = indices.flattened()
     let order = argSort(indices)
     return (order.floorDivide(m), indices[order], argSort(order))
+}
+
+private let inversePermutation64Kernel = MLXFast.metalKernel(
+    name: "inverse_permutation_u32_n64",
+    inputNames: ["order"],
+    outputNames: ["inverse"],
+    source: """
+        const uint rank = thread_position_in_grid.x;
+        inverse[(uint)order[rank]] = rank;
+    """,
+    ensureRowContiguous: true)
+
+/// Exact one-group inverse for the production B=8 expert assignment order.
+public func inversePermutation64(_ order: MLXArray) -> MLXArray {
+    precondition(
+        order.ndim == 1 && order.size == 64 && order.dtype == .uint32,
+        "expert assignment order must be flat uint32[64]")
+    return inversePermutation64Kernel(
+        [order],
+        grid: (64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[64]],
+        outputDTypes: [.uint32]
+    )[0]
 }
 
 public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) -> MLXArray {
@@ -400,7 +423,11 @@ public class SwitchGLU: Module {
         if doSort {
             if useLhsIndices {
                 x = x.flattened(start: 0, end: -3)
-                (lhsIndices, idx, inverseOrder) = gatherSortIndices(indices: indices)
+                let flatIndices = indices.flattened()
+                let order = argSort(flatIndices)
+                inverseOrder = inversePermutation64(order)
+                lhsIndices = order.floorDivide(indices.dim(-1))
+                idx = flatIndices[order]
             } else {
                 (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
             }

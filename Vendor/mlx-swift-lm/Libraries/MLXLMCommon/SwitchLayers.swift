@@ -236,12 +236,95 @@ private let compiledGeGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
     return body
 }()
 
+func fusedExpertSortPostprocessFlag(_ raw: String?) -> Bool {
+    guard let raw else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}
+
+/// Request bit for the exact production-prefill sort postprocess. Setting
+/// `MLX_FUSED_EXPERT_SORT_POSTPROCESS=0` restores the established floor-divide,
+/// gather, and second argsort chain for counterbalanced measurement.
+let fusedExpertSortPostprocessRequested = fusedExpertSortPostprocessFlag(
+    ProcessInfo.processInfo.environment["MLX_FUSED_EXPERT_SORT_POSTPROCESS"])
+
+/// One assignment owns one unique `order` value, so the inverse write cannot
+/// collide. The other two writes transcribe `order.floorDivide(8)` and
+/// `indices[order]` without changing the first argsort or its stable tie order.
+private let fusedExpertSortPostprocessKernel = MLXFast.metalKernel(
+    name: "expert_sort_postprocess_u32_k8_v1",
+    inputNames: ["order", "indices"],
+    outputNames: ["lhs", "sorted_indices", "inverse"],
+    source: """
+        const uint sorted_position = thread_position_in_grid.x;
+        const uint original_assignment = order[sorted_position];
+        lhs[sorted_position] = original_assignment >> 3;
+        sorted_indices[sorted_position] = indices[original_assignment];
+        inverse[original_assignment] = sorted_position;
+    """,
+    // `order` is contiguous by construction. The production router indices are
+    // contiguous too; retain the wrapper check so an unusual view stays safe.
+    ensureRowContiguous: true
+)
+
+@inline(__always)
+func supportsFusedExpertSortPostprocess(
+    order: MLXArray,
+    indices: MLXArray,
+    topK: Int,
+    requested: Bool = fusedExpertSortPostprocessRequested
+) -> Bool {
+    guard requested, topK == 8,
+        order.ndim == 1, indices.ndim == 1,
+        order.shape == indices.shape,
+        order.dtype == .uint32, indices.dtype == .uint32
+    else { return false }
+
+    // The three assignment counts admitted by the measured safe-R1 prefill
+    // contract: 512, 1,024, or 2,048 token rows times Gemma top-K 8. Every
+    // near geometry retains the generic stable-sort postprocess below.
+    switch indices.size {
+    case 4_096, 8_192, 16_384:
+        return true
+    default:
+        return false
+    }
+}
+
+private func fusedExpertSortPostprocess(
+    order: MLXArray,
+    indices: MLXArray,
+    topK: Int
+) -> (lhs: MLXArray, sortedIndices: MLXArray, inverseOrder: MLXArray)? {
+    guard supportsFusedExpertSortPostprocess(
+        order: order, indices: indices, topK: topK)
+    else { return nil }
+
+    let outputs = fusedExpertSortPostprocessKernel(
+        [order, indices],
+        grid: (indices.size, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [indices.shape, indices.shape, indices.shape],
+        outputDTypes: [.uint32, .uint32, .uint32]
+    )
+    return (outputs[0], outputs[1], outputs[2])
+}
+
 public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
     let indices = indices.flattened()
     let order = argSort(indices)
-    let inverseOrder = argSort(order)
 
+    if let postprocessed = fusedExpertSortPostprocess(
+        order: order, indices: indices, topK: m)
+    {
+        return (
+            x.flattened(start: 0, end: -3)[postprocessed.lhs],
+            postprocessed.sortedIndices,
+            postprocessed.inverseOrder
+        )
+    }
+
+    let inverseOrder = argSort(order)
     return (
         x.flattened(start: 0, end: -3)[order.floorDivide(m)],
         indices[order],
@@ -253,6 +336,15 @@ public func gatherSortIndices(indices: MLXArray) -> (MLXArray, MLXArray, MLXArra
     let m = indices.dim(-1)
     let indices = indices.flattened()
     let order = argSort(indices)
+    if let postprocessed = fusedExpertSortPostprocess(
+        order: order, indices: indices, topK: m)
+    {
+        return (
+            postprocessed.lhs,
+            postprocessed.sortedIndices,
+            postprocessed.inverseOrder
+        )
+    }
     return (order.floorDivide(m), indices[order], argSort(order))
 }
 

@@ -34,6 +34,13 @@ private func gemma4TruthyFlag(_ raw: String?) -> Bool {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }
 
+/// Default-on; set `MLX_GEMMA4_B8_OEA_ROUTING=0|false|no|off` before startup to opt out.
+private let gemma4OutputErrorAwareB8RoutingEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["MLX_GEMMA4_B8_OEA_ROUTING"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// Submit intermediate Gemma 4 prefill graphs while Swift continues to build
 /// later layers. This changes only when already-built work is queued; the
 /// operations and results are unchanged. Single-token decode is excluded.
@@ -1521,6 +1528,322 @@ private enum Gemma4FusedRouterTop8 {
     }
 }
 
+/// True only for the ranked decode router geometry. Kept as a value-level
+/// predicate so the guard can be exercised without compiling or dispatching
+/// the Metal kernel; production passes the OEA environment policy as
+/// `enabled`, while parity tests deliberately bypass only that policy bit.
+@inline(__always)
+internal func gemma4FusedOutputErrorAwareB8RouterEligible(
+    enabled: Bool,
+    productionTopology: Bool,
+    isExpertPrefill: Bool,
+    topK: Int,
+    expertScores: MLXArray,
+    perExpertScale: MLXArray
+) -> Bool {
+    enabled && productionTopology && !isExpertPrefill && topK == 8
+        && expertScores.ndim == 3
+        && expertScores.dim(0) == 8
+        && expertScores.dim(1) == 1
+        && expertScores.dim(2) == 128
+        && expertScores.dtype == .bfloat16
+        && perExpertScale.ndim == 1
+        && perExpertScale.dim(0) == 128
+        && perExpertScale.dtype == .bfloat16
+}
+
+/// The candidate OEA policy expressed only with established MLX operations.
+/// The production hot path never calls this function; it is the independent
+/// implementation used by the deterministic bit-parity harness.
+internal func gemma4OutputErrorAwareB8RouterOracle(
+    expertScores: MLXArray,
+    perExpertScale: MLXArray
+) -> (indices: MLXArray, weights: MLXArray) {
+    let kth = expertScores.dim(-1) - 8
+    var topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
+    topKIndices = topKIndices[.ellipsis, kth...]
+
+    let flatScores = expertScores.reshaped(8, 128)
+    var flatIndices = topKIndices.reshaped(8, 8)
+    let selectedScores = MLX.takeAlong(flatScores, flatIndices, axis: -1)
+    let eighthSlot = MLX.argMin(selectedScores, axis: -1, keepDims: true)
+    let slotIDs = MLXArray.arange(8, dtype: eighthSlot.dtype).reshaped(1, 8)
+    let keepTopSeven = slotIDs .!= eighthSlot
+
+    let expertIDs = MLXArray.arange(128, dtype: flatIndices.dtype)
+        .reshaped(1, 1, 128)
+    let selectedExpertIDs = flatIndices.expandedDimensions(axis: -1)
+    let retainedAssignments = MLX.logicalAnd(
+        selectedExpertIDs .== expertIDs,
+        keepTopSeven.expandedDimensions(axis: -1))
+    let ownTopSeven = MLX.any(retainedAssignments, axis: 1)
+    let batchTopSevenUnion = MLX.any(ownTopSeven, axis: 0, keepDims: true)
+    let eligible = MLX.logicalAnd(batchTopSevenUnion, MLX.logicalNot(ownTopSeven))
+
+    let maskedScores = MLX.where(
+        eligible,
+        flatScores,
+        MLXArray(-Float.infinity, dtype: flatScores.dtype))
+    let preferredEighth = MLX.argMax(maskedScores, axis: -1, keepDims: true)
+    let originalEighth = MLX.takeAlong(flatIndices, eighthSlot, axis: -1)
+    let hasEligibleEighth = MLX.any(eligible, axis: -1, keepDims: true)
+    let replacement = MLX.where(hasEligibleEighth, preferredEighth, originalEighth)
+
+    flatIndices = MLX.where(keepTopSeven, flatIndices, replacement)
+    topKIndices = flatIndices.reshaped(8, 1, 8)
+
+    var topKWeights = MLX.takeAlong(expertScores, topKIndices, axis: -1)
+    topKWeights = MLX.softmax(topKWeights, axis: -1, precise: true)
+    topKWeights = topKWeights * perExpertScale[topKIndices]
+    return (topKIndices, topKWeights)
+}
+
+/// OEA-ROUTE-001: the exact batch-8 OEA selection and normalization graph in
+/// one custom Metal dispatch. One 256-thread threadgroup is intentional: its
+/// eight simdgroups rank one row each, synchronize the retained top-seven
+/// union in threadgroup memory, choose each row's replacement, then reproduce
+/// the stock precise-softmax lane layout independently per simdgroup.
+///
+/// The baseline tail is the same stable ascending `argPartition` tail as
+/// ROUTE-001 (predecessor counting under sort.h's NaN-aware comparator). The
+/// weakest slot and preferred replacement reproduce arg_reduce.metal's strict
+/// compare, first-index tie, and all-NaN/all-minus-infinity default-index-zero
+/// behavior. The final BF16 softmax and per-expert-scale multiply are the same
+/// operations and reduction order as softmax_single_row<T,float,4> followed by
+/// stock BF16 Multiply.
+private enum Gemma4FusedOutputErrorAwareB8RouterTop8 {
+    private static let rows = 8
+    private static let experts = 128
+    private static let selected = 8
+    private static let simdSize = 32
+
+    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_fused_oea_router_top8_e128_b8_bf16_v1",
+        inputNames: ["scores", "pes"],
+        outputNames: ["inds", "wts"],
+        source: """
+            constexpr int SIMD_SIZE = 32;
+            constexpr int N_READS = 4;
+            constexpr int KTH = E - K;
+
+            const int row = int(simdgroup_index_in_threadgroup);
+            const int lane = int(thread_index_in_simdgroup);
+
+            threadgroup float vals[ROWS * E];
+            threadgroup uint topi[ROWS * K];
+            threadgroup uint weakest[ROWS];
+            threadgroup float local_max[ROWS * SIMD_SIZE];
+            threadgroup float local_normalizer[ROWS * SIMD_SIZE];
+
+            const device T* srow = scores + row * E;
+            for (int j = 0; j < E / SIMD_SIZE; ++j) {
+                const int e = lane + j * SIMD_SIZE;
+                vals[row * E + e] = float(srow[e]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Stable full-sort position by predecessor counting. The top-K
+            // writes form a permutation of the stable ascending tail.
+            for (int j = 0; j < E / SIMD_SIZE; ++j) {
+                const int e = lane + j * SIMD_SIZE;
+                const float v = vals[row * E + e];
+                const bool v_nan = isnan(v);
+                int rank = 0;
+                for (int i = 0; i < E; ++i) {
+                    const float u = vals[row * E + i];
+                    const bool u_nan = isnan(u);
+                    bool u_less_v;
+                    bool v_less_u;
+                    if (u_nan || v_nan) {
+                        u_less_v = !u_nan && v_nan;
+                        v_less_u = !v_nan && u_nan;
+                    } else {
+                        u_less_v = u < v;
+                        v_less_u = v < u;
+                    }
+                    if (u_less_v || (!v_less_u && i < e)) {
+                        ++rank;
+                    }
+                }
+                if (rank >= KTH) {
+                    topi[row * K + rank - KTH] = uint(e);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // argMin over the selected BF16 values: strict improvement from
+            // +inf and first-slot ties. This also pins stock's slot-zero result
+            // when every candidate is NaN or +inf.
+            if (lane == 0) {
+                float best = Limits<float>::max;
+                uint slot = 0;
+                for (uint i = 0; i < K; ++i) {
+                    const float v = vals[row * E + topi[row * K + i]];
+                    if (v < best) {
+                        best = v;
+                        slot = i;
+                    }
+                }
+                weakest[row] = slot;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // argMax over batch-retained-union minus own-retained. The lane
+            // layout matches arg_reduce_general<T,ArgMax<T>,N_READS=4> for an
+            // axis of 128, including the default index zero for all NaN/-inf.
+            float best_value = Limits<float>::min;
+            uint best_index = 0;
+            uint local_has_eligible = 0;
+            const int base_expert = lane * N_READS;
+            for (int j = 0; j < N_READS; ++j) {
+                const uint e = uint(base_expert + j);
+                bool in_own = false;
+                bool in_union = false;
+                for (int r = 0; r < ROWS; ++r) {
+                    for (int slot = 0; slot < K; ++slot) {
+                        if (uint(slot) != weakest[r] && topi[r * K + slot] == e) {
+                            in_union = true;
+                            in_own = in_own || (r == row);
+                        }
+                    }
+                }
+                const bool eligible = in_union && !in_own;
+                local_has_eligible |= uint(eligible);
+                const float v = eligible ? vals[row * E + e] : Limits<float>::min;
+                if (v > best_value) {
+                    best_value = v;
+                    best_index = e;
+                }
+            }
+            const uint has_eligible = simd_sum(local_has_eligible);
+            for (uint offset = SIMD_SIZE / 2; offset > 0; offset /= 2) {
+                const float neighbor_value = simd_shuffle_down(best_value, offset);
+                const uint neighbor_index = simd_shuffle_down(best_index, offset);
+                if (best_value < neighbor_value ||
+                    (best_value == neighbor_value && best_index > neighbor_index)) {
+                    best_value = neighbor_value;
+                    best_index = neighbor_index;
+                }
+            }
+            if (lane == 0) {
+                const uint slot = weakest[row];
+                const uint original = topi[row * K + slot];
+                topi[row * K + slot] = has_eligible ? best_index : original;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (lane < K) {
+                inds[row * K + lane] = topi[row * K + lane];
+            }
+
+            // Verbatim softmax_single_row<T,float,N_READS=4> arithmetic, with
+            // each simdgroup emulating one 32-thread stock threadgroup.
+            float ld[N_READS];
+            const int base = lane * N_READS;
+            for (int i = 0; i < N_READS; ++i) {
+                ld[i] = (base + i < K)
+                    ? vals[row * E + topi[row * K + base + i]]
+                    : Limits<float>::min;
+            }
+            local_max[row * SIMD_SIZE + lane] = Limits<float>::min;
+            local_normalizer[row * SIMD_SIZE + lane] = 0;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float maxval = Limits<float>::finite_min;
+            for (int i = 0; i < N_READS; ++i) {
+                maxval = (maxval < ld[i]) ? ld[i] : maxval;
+            }
+            maxval = simd_max(maxval);
+            if (lane == 0) {
+                local_max[row * SIMD_SIZE] = maxval;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            maxval = simd_max(local_max[row * SIMD_SIZE + lane]);
+            if (lane == 0) {
+                local_max[row * SIMD_SIZE] = maxval;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            maxval = local_max[row * SIMD_SIZE];
+
+            float normalizer = 0;
+            for (int i = 0; i < N_READS; ++i) {
+                const float exp_x = fast::exp(ld[i] - maxval);
+                ld[i] = exp_x;
+                normalizer += exp_x;
+            }
+            normalizer = simd_sum(normalizer);
+            if (lane == 0) {
+                local_normalizer[row * SIMD_SIZE] = normalizer;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            normalizer = simd_sum(local_normalizer[row * SIMD_SIZE + lane]);
+            if (lane == 0) {
+                local_normalizer[row * SIMD_SIZE] = normalizer;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            normalizer = 1 / local_normalizer[row * SIMD_SIZE];
+
+            for (int i = 0; i < N_READS; ++i) {
+                if (base + i < K) {
+                    const uint index = topi[row * K + base + i];
+                    const T weight = T(ld[i] * normalizer);
+                    wts[row * K + base + i] = weight * pes[index];
+                }
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    static func applyUnchecked(
+        expertScores: MLXArray,
+        perExpertScale: MLXArray
+    ) -> (indices: MLXArray, weights: MLXArray) {
+        let outputs = kernel(
+            [expertScores, perExpertScale],
+            template: [
+                ("T", expertScores.dtype),
+                ("ROWS", rows),
+                ("E", experts),
+                ("K", selected),
+            ],
+            grid: (rows * simdSize, 1, 1),
+            threadGroup: (rows * simdSize, 1, 1),
+            outputShapes: [[rows, 1, selected], [rows, 1, selected]],
+            outputDTypes: [.uint32, .bfloat16]
+        )
+        return (outputs[0], outputs[1])
+    }
+
+    static func apply(
+        expertScores: MLXArray,
+        perExpertScale: MLXArray,
+        productionTopology: Bool,
+        isExpertPrefill: Bool,
+        topK: Int
+    ) -> (indices: MLXArray, weights: MLXArray)? {
+        guard gemma4FusedOutputErrorAwareB8RouterEligible(
+            enabled: gemma4OutputErrorAwareB8RoutingEnabled,
+            productionTopology: productionTopology,
+            isExpertPrefill: isExpertPrefill,
+            topK: topK,
+            expertScores: expertScores,
+            perExpertScale: perExpertScale)
+        else { return nil }
+        CBv2EngageMark.once("router-oea-top8")
+        return applyUnchecked(expertScores: expertScores, perExpertScale: perExpertScale)
+    }
+}
+
+/// Test seam for the raw specialized dispatch. The production path always
+/// enters through the complete fail-closed predicate above.
+internal func gemma4FusedOutputErrorAwareB8RouterUnchecked(
+    expertScores: MLXArray,
+    perExpertScale: MLXArray
+) -> (indices: MLXArray, weights: MLXArray) {
+    Gemma4FusedOutputErrorAwareB8RouterTop8.applyUnchecked(
+        expertScores: expertScores, perExpertScale: perExpertScale)
+}
+
 /// Expert router. Norms `x` with a learnable scale, projects to expert
 /// scores, and returns top-K (indices, weights) where weights are
 /// softmax-normalized and scaled by a per-expert scalar.
@@ -1533,6 +1856,7 @@ private class Gemma4Router: Module {
     let eps: Float
     let rootSize: Float
     let kth: Int
+    let productionTopology: Bool
     private var cachedEffectiveScale: MLXArray?
 
     init(_ config: Gemma4TextConfiguration) {
@@ -1545,6 +1869,7 @@ private class Gemma4Router: Module {
         self.eps = config.rmsNormEps
         self.rootSize = pow(Float(config.hiddenSize), -0.5)
         self.kth = numExperts - self.topK
+        self.productionTopology = gemma4SupportsProductionExpertTopology(config)
 
         self._proj.wrappedValue = Linear(config.hiddenSize, numExperts, bias: false)
         self._scale.wrappedValue = MLXArray.ones([config.hiddenSize])
@@ -1552,7 +1877,10 @@ private class Gemma4Router: Module {
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
+    func callAsFunction(
+        _ x: MLXArray,
+        isExpertPrefill: Bool
+    ) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
         let effScale: MLXArray
         if let cached = cachedEffectiveScale {
             effScale = cached
@@ -1563,6 +1891,20 @@ private class Gemma4Router: Module {
         }
         let normed = MLXFast.rmsNorm(x, weight: effScale, eps: eps)
         let expertScores = proj(normed)
+
+        // OEA-ROUTE-001: the candidate policy takes precedence at its exact
+        // ranked decode geometry. Generic shapes and the OEA kill switch fall
+        // through; the leader's default-off ROUTE-001 path remains untouched.
+        if let fusedOEA = Gemma4FusedOutputErrorAwareB8RouterTop8.apply(
+            expertScores: expertScores,
+            perExpertScale: perExpertScale,
+            productionTopology: productionTopology,
+            isExpertPrefill: isExpertPrefill,
+            topK: topK)
+        {
+            Gemma4RouterProbe.recorder?(expertScores, fusedOEA.indices)
+            return (fusedOEA.indices, fusedOEA.weights)
+        }
 
         // ROUTE-001: single-dispatch byte-identical replacement of the chain
         // below for the B=8 decode geometry. Every other geometry, dtype, or
@@ -1577,13 +1919,12 @@ private class Gemma4Router: Module {
         var topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
         topKIndices = topKIndices[.ellipsis, kth...]
 
+        // Stock routing for every non-OEA geometry and explicit OEA opt-out.
         var topKWeights = MLX.takeAlong(expertScores, topKIndices, axis: -1)
         topKWeights = MLX.softmax(topKWeights, axis: -1, precise: true)
         topKWeights = topKWeights * perExpertScale[topKIndices]
 
-        // Diagnostic-only observability (nil in production; see
-        // `Gemma4RouterProbe`). Recording the PRE-selection scores and the
-        // selection itself, never altering either.
+        // Diagnostic-only observability; nil in production.
         Gemma4RouterProbe.recorder?(expertScores, topKIndices)
 
         return (topKIndices, topKWeights)
@@ -1809,7 +2150,8 @@ public class Gemma4DecoderLayer: Module {
             h1 = mlp(h1)
             h1 = postFeedforwardLayernorm1(h1)
 
-            let (topKIndices, topKWeights) = router(out)
+            let (topKIndices, topKWeights) = router(
+                out, isExpertPrefill: isExpertPrefill)
             var h2 = preFeedforwardLayernorm2(out)
             h2 = experts(
                 h2,

@@ -1808,6 +1808,24 @@ public class Gemma4DecoderLayer: Module {
                 isExpertPrefill: isExpertPrefill)
             h2 = postFeedforwardLayernorm2(h2)
 
+            // TAIL-001: one dispatch for `h1 + h2` -> post-FF RMSNorm ->
+            // residual -> layer scalar. Returns nil unless every pin holds,
+            // including the caller's statement that the PLE block below is
+            // unreachable on this checkpoint.
+            let pleActive =
+                perLayerInputGate != nil && perLayerProjection != nil
+                && postPerLayerInputNorm != nil && activePerLayerInput != nil
+            if let fusedTail = CBv2BranchTailFusionV1.apply(
+                h1: h1,
+                h2: h2,
+                weight: postFeedforwardLayernorm.weight,
+                eps: postFeedforwardLayernorm.eps,
+                residual: residual2,
+                layerScalar: layerScalar,
+                pleSkipped: !pleActive)
+            {
+                return (fusedTail, kvPair, attnPositionOffset)
+            }
             out = h1 + h2
         } else {
             out = preFeedforwardLayernorm(out)

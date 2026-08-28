@@ -249,6 +249,20 @@ private let gemma4CompiledLogitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArr
     return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
 
+/// Layer-tail residual join and per-layer scalar (`(residual + normed) * s`)
+/// in one compiled elementwise graph. Operation order matches the split form
+/// `out = residual + normed; out = out * layerScalar` exactly, so the fused
+/// and unfused paths compute the same expression.
+private let gemma4CompiledResidualScaleTail: @Sendable (
+    MLXArray, MLXArray, MLXArray
+) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = {
+        (residual: MLXArray, normed: MLXArray, scalar: MLXArray) -> MLXArray in
+        (residual + normed) * scalar
+    }
+    return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
+}()
+
 // MARK: - Configuration
 
 struct Gemma4WeightQuantizationMetadata: Codable, Sendable {
@@ -1825,7 +1839,6 @@ public class Gemma4DecoderLayer: Module {
         }
 
         out = postFeedforwardLayernorm(out)
-        out = residual2 + out
 
         // PLE gating
         if let gate = perLayerInputGate,
@@ -1833,6 +1846,7 @@ public class Gemma4DecoderLayer: Module {
             let norm = postPerLayerInputNorm,
             let perLayerInput = activePerLayerInput
         {
+            out = residual2 + out
             let residual3 = out
             var g = gate(out)
             g = gemma4SafeGeluApproximate(g)
@@ -1840,9 +1854,10 @@ public class Gemma4DecoderLayer: Module {
             g = proj(g)
             g = norm(g)
             out = residual3 + g
+            out = out * layerScalar
+        } else {
+            out = gemma4CompiledResidualScaleTail(residual2, out, layerScalar)
         }
-
-        out = out * layerScalar
 
         return (out, kvPair, attnPositionOffset)
     }
@@ -2413,26 +2428,6 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 imageTokenMask: imageTokenMask))
     }
 
-    /// MMA-003: serve all eight cohort rows from one matrix-unit pass over the
-    /// tied affine-4 vocabulary plane. The implementation fails closed for
-    /// every non-production geometry, allowing the promoted tight-grid QMV
-    /// below to remain the exact fallback.
-    @inline(__always)
-    private func tiedLMHeadMMA(_ hidden: MLXArray) -> MLXArray? {
-        guard lmHead == nil,
-            let quantized = model.embedTokens as? QuantizedEmbedding,
-            quantized.mode == .affine,
-            let mma = Gemma4MMAQuantizedGEMV.apply(
-                x: hidden,
-                w: quantized.weight,
-                scales: quantized.scales,
-                biases: quantized.biases,
-                groupSize: quantized.groupSize,
-                bits: quantized.bits)
-        else { return nil }
-        return mma.reshaped(Array(hidden.shape.dropLast()) + [mma.dim(-1)])
-    }
-
     /// Apply the LM head (tied embedding or explicit `lm_head`) plus the
     /// configured final-logit softcap. Pure function of the post-norm hidden.
     /// LMH-001: tight-grid dispatch for the tied lm_head ordinary QMV.
@@ -2464,8 +2459,6 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         var out: MLXArray
         if let lmHead {
             out = lmHead(hidden)
-        } else if let mma = tiedLMHeadMMA(hidden) {
-            out = mma
         } else if let tight = tiedLMHeadTightGrid(hidden) {
             out = tight
         } else {

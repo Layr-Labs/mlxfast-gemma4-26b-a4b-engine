@@ -235,6 +235,17 @@ private let gemma4CompiledLogitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArr
     return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
 
+/// Decoder residual-and-layer-scalar `(x + y) * s` as one compiled dispatch.
+/// Same elementwise arithmetic as the previous two ops; shapeless compile
+/// matches `gemma4SafeGeluApproximate` / `gemma4CompiledLogitSoftcap`.
+private let gemma4CompiledResidualScale: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = {
+        (residual: MLXArray, branch: MLXArray, scale: MLXArray) -> MLXArray in
+        (residual + branch) * scale
+    }
+    return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
+}()
+
 // MARK: - Configuration
 
 struct Gemma4WeightQuantizationMetadata: Codable, Sendable {
@@ -1790,24 +1801,23 @@ public class Gemma4DecoderLayer: Module {
         }
 
         out = postFeedforwardLayernorm(out)
-        out = residual2 + out
 
-        // PLE gating
         if let gate = perLayerInputGate,
             let proj = perLayerProjection,
             let norm = postPerLayerInputNorm,
             let perLayerInput = activePerLayerInput
         {
+            out = residual2 + out
             let residual3 = out
             var g = gate(out)
             g = gemma4SafeGeluApproximate(g)
             g = g * perLayerInput
             g = proj(g)
             g = norm(g)
-            out = residual3 + g
+            out = gemma4CompiledResidualScale(residual3, g, layerScalar)
+        } else {
+            out = gemma4CompiledResidualScale(residual2, out, layerScalar)
         }
-
-        out = out * layerScalar
 
         return (out, kvPair, attnPositionOffset)
     }

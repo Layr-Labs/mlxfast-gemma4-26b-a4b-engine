@@ -1712,10 +1712,10 @@ METAL_FUNC void qmv_affine8_g64_pair_impl(
     uint simd_lid [[thread_index_in_simdgroup]]) {
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
-  constexpr int values_per_thread = 4;
+  constexpr int values_per_thread = 8;
   constexpr int block_size = values_per_thread * SIMD_SIZE;
-  constexpr int bytes_per_thread = 4;
-  constexpr int scale_step_per_thread = 16;
+  constexpr int bytes_per_thread = 8;
+  constexpr int scale_step_per_thread = 8;
 
   const device uint8_t* ws = (const device uint8_t*)w;
   thread float x0_thread[values_per_thread];

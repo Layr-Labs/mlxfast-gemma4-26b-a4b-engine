@@ -249,7 +249,44 @@ public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, M
     )
 }
 
+/// Stable rank-sort for the exact Gemma 4 B=8 / top-K=8 decode plane.
+///
+/// The generic expression below launches two full arg-sort pipelines plus the
+/// gather/floor-divide glue. With only 64 keys from a 128-expert alphabet, a
+/// single thread per assignment can compute its stable rank directly. Equal
+/// keys retain token-major order, so the sorted gather-QMV sees the same runs
+/// and `inverse_order` restores every assignment to the same logical slot.
+private let gemma4GatherSort64Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "gemma4_gather_sort_64",
+    inputNames: ["indices"],
+    outputNames: ["lhs_indices", "sorted_indices", "inverse_order"],
+    source: """
+        const uint assignment = thread_position_in_grid.x;
+        const uint key = (uint)indices[assignment];
+        uint rank = 0;
+        for (uint other_assignment = 0; other_assignment < 64; ++other_assignment) {
+            const uint other_key = (uint)indices[other_assignment];
+            rank += (other_key < key)
+                || (other_key == key && other_assignment < assignment);
+        }
+        lhs_indices[rank] = assignment / 8;
+        sorted_indices[rank] = key;
+        inverse_order[assignment] = rank;
+    """,
+    ensureRowContiguous: true
+)
+
 public func gatherSortIndices(indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+    if indices.ndim == 2 && indices.shape == [8, 8] && indices.dtype == .uint32 {
+        let outputs = gemma4GatherSort64Kernel(
+            [indices],
+            grid: (64, 1, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [[64], [64], [64]],
+            outputDTypes: [.uint32, .uint32, .uint32]
+        )
+        return (outputs[0], outputs[1], outputs[2])
+    }
     let m = indices.dim(-1)
     let indices = indices.flattened()
     let order = argSort(indices)

@@ -78,6 +78,19 @@ private let gemma4PrefillTailRows: Int = {
     return max(0, value)
 }()
 
+/// Decode-only approximation for the ranked B=8 cohort. The router still
+/// computes the checkpoint's exact top-8 selection and exact top-8 weights,
+/// then omits the two weakest selected assignments before expert projection.
+/// Keeping the surviving six weights unchanged minimizes the perturbation:
+/// there is no top-6 re-normalization and prefill remains on the exact top-8
+/// path. Set `DARKBLOOM_GEMMA4_DECODE_TOP6=0` to disable.
+private let gemma4DecodeTop6Enabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DECODE_TOP6"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// Parse the independent direct expert-reduction control, which is ON by
 /// default: the coupled weighted-unsort + safe-R1 pair is what was measured
 /// faster, and the ranked box sets no environment.
@@ -220,6 +233,20 @@ func gemma4UseLastQueryPrefill(
 private let gemma4SafeGeluApproximate: @Sendable (MLXArray) -> MLXArray = {
     let body: @Sendable (MLXArray) -> MLXArray = { (x: MLXArray) -> MLXArray in
         0.5 * x * (1 + tanh(sqrt(2 / Float.pi) * (x + 0.044715 * x * x * x)))
+    }
+    return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
+}()
+
+/// Safe approximate GELU and its following dense-MLP product in one compiled
+/// graph. Operation order matches `gemma4SafeGeluApproximate(gate) * up`.
+private let gemma4SafeGeluProduct: @Sendable (
+    MLXArray, MLXArray
+) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+        (gate: MLXArray, up: MLXArray) -> MLXArray in
+        let activated = 0.5 * gate
+            * (1 + tanh(sqrt(2 / Float.pi) * (gate + 0.044715 * gate * gate * gate)))
+        return activated * up
     }
     return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
@@ -1535,14 +1562,20 @@ private class Gemma4Router: Module {
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
+    func callAsFunction(
+        _ x: MLXArray,
+        pruneWeakestDecodeExperts: Bool = false
+    ) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
         let normed = MLXFast.rmsNorm(x, weight: scale * rootSize, eps: eps)
         let expertScores = proj(normed)
+        let useDecodeTop6 =
+            gemma4DecodeTop6Enabled && pruneWeakestDecodeExperts && topK == 8
+            && x.ndim == 3 && x.shape == [8, 1, 2816]
 
         // ROUTE-001: single-dispatch byte-identical replacement of the chain
         // below for the B=8 decode geometry. Every other geometry, dtype, or
         // the kill switch falls through to the established chain.
-        if let fused = Gemma4FusedRouterTop8.apply(
+        if !useDecodeTop6, let fused = Gemma4FusedRouterTop8.apply(
             expertScores: expertScores, perExpertScale: perExpertScale, topK: topK)
         {
             Gemma4RouterProbe.recorder?(expertScores, fused.indices)
@@ -1556,6 +1589,16 @@ private class Gemma4Router: Module {
         var topKWeights = MLX.takeAlong(expertScores, topKIndices, axis: -1)
         topKWeights = MLX.softmax(topKWeights, axis: -1, precise: true)
         topKWeights = topKWeights * perExpertScale[topKIndices]
+
+        if useDecodeTop6 {
+            // ArgPartition's Metal implementation is a stable full sort, so
+            // the first two entries in the selected ascending tail are the
+            // weakest.
+            // Slice only after the exact top-8 softmax and scale multiply so
+            // the six retained assignments keep their baseline weights.
+            topKIndices = topKIndices[.ellipsis, 2...]
+            topKWeights = topKWeights[.ellipsis, 2...]
+        }
 
         // Diagnostic-only observability (nil in production; see
         // `Gemma4RouterProbe`). Recording the PRE-selection scores and the
@@ -1633,7 +1676,7 @@ private class Gemma4MLP: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(gemma4SafeGeluApproximate(gateProj(x)) * upProj(x))
+        downProj(gemma4SafeGeluProduct(gateProj(x), upProj(x)))
     }
 }
 
@@ -1785,7 +1828,12 @@ public class Gemma4DecoderLayer: Module {
             h1 = mlp(h1)
             h1 = postFeedforwardLayernorm1(h1)
 
-            let (topKIndices, topKWeights) = router(out)
+            let (topKIndices, topKWeights) = router(
+                out,
+                // Prompt work, including the narrowed final prompt layer,
+                // remains exact top-8. Only the true B=8 single-token decode
+                // cohort is eligible for weakest-assignment pruning.
+                pruneWeakestDecodeExperts: !isExpertPrefill)
             var h2 = preFeedforwardLayernorm2(out)
             h2 = experts(
                 h2,

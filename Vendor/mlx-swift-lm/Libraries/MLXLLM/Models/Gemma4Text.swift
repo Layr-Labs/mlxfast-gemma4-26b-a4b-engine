@@ -2111,7 +2111,7 @@ public class Gemma4TextModelInner: Module {
             guard isCBv2 else { return nil }
             for case let entry? in fullCache {
                 if let offsets = (entry as? CBv2LayerCache)?.unifiedPositionOffsets {
-                    return .batch(offsets + 0)
+                    return .batch(offsets)
                 }
             }
             return nil

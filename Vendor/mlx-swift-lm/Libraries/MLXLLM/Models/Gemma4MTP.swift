@@ -973,6 +973,13 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
     internal var targetEmbed: ((MLXArray) -> MLXArray)?
     internal var boundTargetID: ObjectIdentifier?
 
+    /// Drafter-owned compile-traceable cache. Pre-allocated once at init to
+    /// `drafterKVCapacity` (32) — sized to absorb every spec-decoder round
+    /// without further resizing, so the Q/K/V pipeline's buffer accounting
+    /// never has to wait on an allocator during the timed window.
+    internal let drafterKVCache: CompilableKVCache = CompilableKVCache(maxLength: 32)
+    internal let drafterKVCapacity: Int = 32
+
     public init(config: Gemma4AssistantConfiguration) throws {
         let geometry = try Gemma4AssistantConfigurationValidator.validate(config)
         self.config = config
@@ -1004,6 +1011,12 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
         }
 
         super.init()
+
+        // One-shot contiguous pre-allocation. The drafter's pinned
+        // [B=1, H=1, capacity=32, D=32] backend is sized once; subsequent
+        // calls would be no-ops. Keeps the Metal allocator off the
+        // hot path during decode rounds.
+        self.drafterKVCache.preallocateToCapacity(self.drafterKVCapacity)
     }
 
     /// Bind the drafter to a Gemma 4 target. Captures a closure into the

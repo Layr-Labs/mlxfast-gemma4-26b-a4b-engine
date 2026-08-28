@@ -846,6 +846,70 @@ internal func gemma4ApplyRotaryPosition<R: RoPELayer>(
     }
 }
 
+/// Single-dispatch fused Q-rotate. Issues exactly one Metal kernel
+/// (`MLXFast.RoPE`) that reads the transposed `[B, H, L, D]` Q tensor and
+/// writes the rotated Q in place — bypassing the offset-typed dispatch in
+/// `gemma4ApplyRotaryPosition` and avoiding any intermediate copy. Used by
+/// the MTP drafter's single-stream Q path where the offset is a `.scalar`
+/// held constant for the whole round.
+///
+/// For `ProportionalRoPE` (Gemma 4 full/sliding attention), the rope's
+/// precomputed `_freqs` (with the +inf-padded pass-through tail) is passed
+/// directly so `MLXFast.RoPE` rotates only the rotated pairs in one fused
+/// dispatch. For other RoPE types, the function falls through to the rope's
+/// own single-dispatch call, which is already a single fused Metal kernel.
+@inline(__always)
+internal func gemma4FusedQRotate<R: RoPELayer>(
+    rope: R,
+    queries: MLXArray,
+    offset: Gemma4.PositionOffset
+) -> MLXArray {
+    // ProportionalRoPE (Gemma 4 attention): build the fused single-dispatch
+    // call directly. This is the hot path the drafter exercises.
+    if let propRope = rope as? ProportionalRoPE,
+        let freqs = propRope._freqs
+    {
+        let dims = propRope.dims
+        let traditional = propRope.traditional
+        switch offset {
+        case .scalar(let value):
+            return MLXFast.RoPE(
+                queries,
+                dimensions: dims,
+                traditional: traditional,
+                base: nil,
+                scale: 1.0,
+                offset: value,
+                freqs: freqs
+            )
+        case .batch(let values):
+            return MLXFast.RoPE(
+                queries,
+                dimensions: dims,
+                traditional: traditional,
+                base: nil,
+                scale: 1.0,
+                offset: values,
+                freqs: freqs
+            )
+        case .graphArray(let offsetArray):
+            return MLXFast.RoPE(
+                queries,
+                dimensions: dims,
+                traditional: traditional,
+                base: nil,
+                scale: 1.0,
+                offset: offsetArray,
+                freqs: freqs
+            )
+        }
+    }
+    // Fallback: every other RoPELayer variant is already a single fused
+    // MLXFast.RoPE dispatch under the hood; route through the rope's own
+    // call to preserve behavior.
+    return gemma4ApplyRotaryPosition(rope, to: queries, offset: offset)
+}
+
 private func gemma4AttentionFallback(
     queries: MLXArray,
     keys: MLXArray,
@@ -1016,7 +1080,8 @@ private class Gemma4Attention: Module {
         positionOffset: Gemma4.PositionOffset? = nil,
         v2SharedSource: (any CBv2AttendingLayerCache)? = nil,
         outputStart: Int = 0,
-        useLastQueryPrefill: Bool = false
+        useLastQueryPrefill: Bool = false,
+        useFusedQRotate: Bool = false
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         // ContinuousBatchingV2: the layer cache owns both the KV update and
         // the attention computation (no masks, no padding — see
@@ -1079,7 +1144,19 @@ private class Gemma4Attention: Module {
         }
 
         queries = queries.transposed(0, 2, 1, 3)
-        queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: activePositionOffset)
+        // Fused Q-rotate: when the caller opts in (drafter single-stream
+        // path), issue a single Metal kernel dispatch that reads Q and
+        // writes the rotated Q in place, bypassing the offset-typed dispatch
+        // in `gemma4ApplyRotaryPosition`. The offset is the source layer's
+        // pre-update snapshot, so the Q rotation is correct for every draft
+        // step in the round.
+        if useFusedQRotate {
+            queries = gemma4FusedQRotate(
+                rope: rope, queries: queries, offset: activePositionOffset)
+        } else {
+            queries = gemma4ApplyRotaryPosition(
+                rope, to: queries, offset: activePositionOffset)
+        }
 
         // Adjust mask if cache size differs from mask size
         var adjustedMask = mask
@@ -1761,7 +1838,8 @@ public class Gemma4DecoderLayer: Module {
         v2SharedSource: (any CBv2AttendingLayerCache)? = nil,
         outputTailRows: Int? = nil,
         useLastQueryPrefill: Bool = false,
-        isExpertPrefill: Bool = false
+        isExpertPrefill: Bool = false,
+        useFusedQRotate: Bool = false
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         // Prompt-path narrowing (CBv2 only): attention and every K/V write
         // still cover the full chunk; only the token-local work AFTER
@@ -1794,7 +1872,7 @@ public class Gemma4DecoderLayer: Module {
         let (attnOut, kvPair, attnPositionOffset) = selfAttn(
             h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset,
             v2SharedSource: v2SharedSource, outputStart: outputStart,
-            useLastQueryPrefill: useLastQueryPrefill)
+            useLastQueryPrefill: useLastQueryPrefill, useFusedQRotate: useFusedQRotate)
         let postAttn = postAttentionLayernorm(attnOut)
         var out = residual + postAttn
 

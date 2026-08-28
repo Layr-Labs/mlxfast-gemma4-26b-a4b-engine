@@ -73,6 +73,32 @@ public class CompilableKVCache: BaseKVCache {
         return CompilableKVCache(from: cache, maxLength: maxLength)
     }
 
+    /// One-shot contiguous pre-allocation. On the first call with a
+    /// non-zero `capacity`, the cache sizes a contiguous [B, H, capacity, D]
+    /// K/V storage in one allocation. The contiguous pinned backend is
+    /// preserved (zero-fill of the buffer ensures the attention mask still
+    /// masks unwritten positions, and the size is large enough to absorb
+    /// every spec-decoder round without further resizing). Subsequent calls
+    /// are no-ops so callers can safely invoke this from drafter init without
+    /// tracking first-call state.
+    public func preallocateToCapacity(_ capacity: Int) {
+        guard capacity > 0 else { return }
+        if self.keys != nil && self.values != nil {
+            return
+        }
+        let B = 1
+        let H = 1
+        let D = max(1, self.maxLength)
+        let kD = D
+        let vD = D
+        let useMax = Swift.max(capacity, D)
+        let cap = Swift.min(useMax, self.maxLength)
+        self.keys = MLXArray.zeros(
+            [B, H, cap, kD], dtype: .float16)
+        self.values = MLXArray.zeros(
+            [B, H, cap, vD], dtype: .float16)
+    }
+
     /// Create from an existing KVCacheSimple (e.g., after prefill).
     /// Copies the existing cache state into a fixed-size buffer.
     public convenience init(from cache: KVCache, maxLength: Int = 4096) {

@@ -27,6 +27,15 @@ import MLX
 /// layer with rows matching batch rows. Returns logits [B, L, vocab].
 public protocol CBv2SteppableModel: AnyObject {
     func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray
+
+    /// True only when evaluating decode logits necessarily evaluates every
+    /// K/V write made by that forward. The default is deliberately false:
+    /// custom models keep the full cache-state eval fence.
+    var decodeOutputCommitsKVWrites: Bool { get }
+}
+
+extension CBv2SteppableModel {
+    public var decodeOutputCommitsKVWrites: Bool { false }
 }
 
 /// Builds per-layer batch-facing cache views for a set of rows
@@ -1221,16 +1230,47 @@ public final class EngineLoopV2: @unchecked Sendable {
         caches.flatMap { ($0 as? KVCache)?.innerState() ?? [] }
     }
 
+    /// Narrow eval fence for the exact target-only chained decode path.
+    ///
+    /// `CBv2LayerCache` decode writes replace each row buffer with a lazy
+    /// slice-update and immediately feed views of that updated buffer into
+    /// attention. A model opting into `decodeOutputCommitsKVWrites` therefore
+    /// makes every K/V write an ancestor of its sampled token. The only cache
+    /// state outside that chain is the post-forward `positionOffsets + 1`
+    /// plus any cache-owned ordering fence for fused in-kernel ring writes.
+    ///
+    /// Fail closed for an unproven model or cache type: the caller retains the
+    /// established full `eagerCacheInnerState` fence unchanged.
+    func targetOnlyDecodeFenceState(
+        _ caches: [CBv2AttendingLayerCache]
+    ) -> [MLXArray]? {
+        guard model.decodeOutputCommitsKVWrites else { return nil }
+        var state: [MLXArray] = []
+        state.reserveCapacity(caches.count * 2)
+        for cache in caches {
+            guard let contiguous = cache as? CBv2LayerCache else { return nil }
+            state.append(contentsOf: contiguous.targetOnlyDecodeFenceState)
+        }
+        return state
+    }
+
     /// Last-position logits [B, vocab] for a rectangular [B, 1] decode
-    /// batch. The second tuple element is the eager caches' inner state
-    /// (offset chain + KV buffers) that must ride the step's `asyncEval`
-    /// (DAR-325).
+    /// batch. The second tuple element is either the eager caches' full inner
+    /// state (offset chain + KV buffers), or — for the exact opt-in target-only
+    /// path — just the offset chains whose K/V writes are already logits
+    /// ancestors. `reducedFence` tells the caller whether it may group those
+    /// dependencies under the sampled-token root.
     private func decodeLogits(
-        rowStates: [[CBv2SequenceKV?]], tokens: MLXArray
-    ) -> (logits: MLXArray, cacheInnerState: [MLXArray]) {
+        rowStates: [[CBv2SequenceKV?]], tokens: MLXArray,
+        preferTargetOnlyFence: Bool = false
+    ) -> (logits: MLXArray, cacheInnerState: [MLXArray], reducedFence: Bool) {
         let caches = eagerCaches(rowStates: rowStates)
         let logits = model.forward(tokens: tokens, caches: caches)
-        return (logits[0..., -1, 0...], eagerCacheInnerState(caches))
+        let reducedState = preferTargetOnlyFence ? targetOnlyDecodeFenceState(caches) : nil
+        return (
+            logits[0..., -1, 0...],
+            reducedState ?? eagerCacheInnerState(caches),
+            reducedState != nil)
     }
 
     /// Prompt-only output seam (see PrefillOutputV2.swift). Capable models
@@ -1414,7 +1454,11 @@ public final class EngineLoopV2: @unchecked Sendable {
 
         let inputs = lazyTokens.reshaped([ids.count, 1])
         let forwardStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-        let (last, cacheInnerState) = decodeLogits(rowStates: rowStates, tokens: inputs)  // [B, vocab]
+        let (last, cacheInnerState, reducedFence) = decodeLogits(
+            rowStates: rowStates, tokens: inputs,
+            // No driver is the ordinary ranked target-only path. A bound
+            // driver is eligible only when it can never select positive depth.
+            preferTargetOnlyFence: mtp == nil || mtp?.isExactTargetOnlyPolicy == true)  // [B, vocab]
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.forward.build", seconds: CFAbsoluteTimeGetCurrent() - forwardStart)
@@ -1434,22 +1478,40 @@ public final class EngineLoopV2: @unchecked Sendable {
                 "v2.sampler.build", seconds: CFAbsoluteTimeGetCurrent() - samplerStart)
         }
         scheduler.markPendingSamples(ids: ids)
-        var toEval = [sampled]
-        if let stepLogprobs { toEval.append(contentsOf: stepLogprobs.evalTargets) }
-        // Collapse the eager caches' lazy offset/KV chains this step (DAR-325).
-        if !cacheInnerState.isEmpty {
-            toEval.append(contentsOf: cacheInnerState)
-            offsetChainEvalSteps += 1
-        }
         let evalStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-        asyncEval(toEval)
+        let sampledForStep: MLXArray
+        if reducedFence {
+            // One root instead of ~510 explicit cache arrays at B=8. `depends`
+            // preserves the offset fence while the sampled-token ancestry
+            // evaluates every contiguous K/V slice-update. Logprob gathers, if
+            // present, ride the same root. No cache/model capability => the
+            // established full-root path below.
+            var dependencies = cacheInnerState
+            if let stepLogprobs {
+                dependencies.append(contentsOf: stepLogprobs.evalTargets)
+            }
+            sampledForStep = dependencies.isEmpty
+                ? sampled : depends(input: sampled, dependencies: dependencies)
+            asyncEval(CollectionOfOne(sampledForStep))
+            if !cacheInnerState.isEmpty { offsetChainEvalSteps += 1 }
+        } else {
+            var toEval = [sampled]
+            if let stepLogprobs { toEval.append(contentsOf: stepLogprobs.evalTargets) }
+            // Collapse the eager caches' lazy offset/KV chains this step (DAR-325).
+            if !cacheInnerState.isEmpty {
+                toEval.append(contentsOf: cacheInnerState)
+                offsetChainEvalSteps += 1
+            }
+            asyncEval(toEval)
+            sampledForStep = sampled
+        }
         if CBv2StepProfiler.enabled {
             let now = CFAbsoluteTimeGetCurrent()
             CBv2StepProfiler.record("v2.asyncEval.submit", seconds: now - evalStart)
             CBv2StepProfiler.record("v2.launch.total", seconds: now - buildStart)
         }
         let step = CBv2InFlightStep(
-            participants: Set(ids), sampledRows: ids, sampledTokens: sampled, evalTargets: [],
+            participants: Set(ids), sampledRows: ids, sampledTokens: sampledForStep, evalTargets: [],
             wallStartedNanos: wallStartedNanos)
         if let stepLogprobs { step.logprobSegments = [stepLogprobs] }
         return step
@@ -1507,7 +1569,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         if !decodeRows.isEmpty {
             let inputs = MLXArray(decodeRows.map { Int32($0.rec.tokens[$0.start]) })
                 .reshaped([decodeRows.count, 1])
-            let (last, decodeInnerState) = decodeLogits(
+            let (last, decodeInnerState, _) = decodeLogits(
                 rowStates: decodeRows.map { kvStates[$0.rec.id]! }, tokens: inputs)
             cacheInnerState.append(contentsOf: decodeInnerState)
             decodeSampled = sampler.sample(

@@ -2844,6 +2844,13 @@ extension Gemma4TextModel: LoRAModel {
 
 // MARK: - ContinuousBatchingV2
 
+/// Every decoder layer assigns its attention-bearing result back to `h`
+/// (`h = out`), and `callAsFunction` projects the final normalized `h` to
+/// logits. With CBv2 caches, each attention result consumes views of that
+/// layer's freshly slice-updated K/V buffers. The logits graph therefore
+/// contains every target-decode K/V write.
+extension Gemma4TextModel: CBv2DecodeOutputKVCommitForwardable {}
+
 extension Gemma4TextConfiguration {
     /// Per-layer attention structure for the CBv2 engine, derived purely
     /// from this configuration (invariant 11: model structure is data).

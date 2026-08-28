@@ -234,6 +234,13 @@ extension CBv2LayerCache: KVCache {
         return arrays
     }
 
+    /// State that is not guaranteed to be an ancestor of target decode
+    /// logits. K/V storage is reached through attention; the post-forward
+    /// position advance and fused-ring write fence must remain explicit.
+    var targetOnlyDecodeFenceState: [MLXArray] {
+        [cachedPositionOffsets, decodeRingWriteFence.value]
+    }
+
     public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         fatalError(
             "CBv2LayerCache.update(keys:values:) is unsupported — v2-adapted models must call updateAndAttend (layer \(layerIndex))"

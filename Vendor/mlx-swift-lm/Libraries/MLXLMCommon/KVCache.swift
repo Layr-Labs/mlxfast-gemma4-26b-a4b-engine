@@ -539,6 +539,25 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     var step: Int
     var idx: Int = 0
 
+    /// Number of rows the last *concatenating* update left in the buffer, in
+    /// strict temporal order — or `nil` when the layout is not known to be
+    /// linear.
+    ///
+    /// `updateConcat` always rebuilds the buffer as
+    /// `[keep sink rows] ++ [retained recent rows] ++ [the rows just written]`,
+    /// i.e. exactly the layout `temporalOrder` produces, with `idx` equal to
+    /// its length. Recording that fact is what lets ``trim(_:)`` rewind a
+    /// speculative block exactly and for free — see ``exactRewindCapacity``.
+    ///
+    /// It is deliberately `private` and armed in exactly one place. Anything
+    /// that can make it stale clears it: the ring write (`updateInPlace`), a
+    /// `state` assignment, a `metaState` assignment. `copy()` builds a fresh
+    /// instance through those setters, so a copy is never armed. A subclass
+    /// that overrides `update(keys:values:)` without going through
+    /// `updateConcat` — `CompilableRotatingKVCache` does exactly that — never
+    /// arms it either, so it cannot inherit the fast rewind by accident.
+    private var linearRows: Int?
+
     public override var maxSize: Int? { maxCacheSize }
 
     public init(maxSize: Int, keep: Int = 0, step: Int = 256) {
@@ -585,6 +604,9 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     }
 
     private func updateConcat(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        // A write invalidates the previous rewind window before anything can
+        // read it against the new buffer. It is re-armed at the bottom.
+        linearRows = nil
         if self.keys == nil {
             self.keys = keys
             self.values = values
@@ -604,11 +626,16 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
 
         offset += keys.dim(2)
         idx = self.keys!.dim(2)
+        // The buffer is now in strict temporal order and `idx` is its length.
+        linearRows = idx
 
         return (self.keys!, self.values!)
     }
 
     private func updateInPlace(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        // The ring write clobbers slots in place, so no previously recorded
+        // linear layout survives it.
+        linearRows = nil
         let B = keys.dim(0)
         let nKVHeads = keys.dim(1)
         let S = keys.dim(2)
@@ -692,6 +719,8 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
             guard newValue.count == 2 else {
                 fatalError("RotatingKVCache state must have exactly 2 arrays")
             }
+            // Replacing the buffers invalidates any recorded rewind window.
+            self.linearRows = nil
             self.keys = newValue[0]
             self.values = newValue[1]
             // Note: RotatingKVCache doesn't set offset from keys like KVCache does
@@ -727,16 +756,96 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
             self.step = stepVal
             self.offset = offsetVal
             self.idx = idxVal
+            // Externally supplied counters say nothing about the buffer's
+            // layout, so no rewind window survives them.
+            self.linearRows = nil
         }
     }
 
+    /// How many rows ``trim(_:)`` can give back *exactly* — without needing a
+    /// row this cache no longer holds, and without moving or recomputing a
+    /// single byte.
+    ///
+    /// Only a linear (concat-built) buffer qualifies, and then only in two
+    /// cases:
+    ///
+    /// 1. **Nothing has been discarded yet** (`rows == offset`). The buffer
+    ///    still holds every position ever written, so a rewind is a pure
+    ///    truncation of any depth.
+    /// 2. **Rows have been discarded, but the buffer over-retains.**
+    ///    `updateConcat` trims to `maxCacheSize - 1` rows before appending
+    ///    `S`, deliberately leaving `maxCacheSize + S - 1` — "the largest size
+    ///    is maxCacheSize + S - 1 to ensure every token gets at least
+    ///    maxCacheSize context". Exactly the `rows - maxCacheSize` rows past
+    ///    the window can be dropped while still leaving a complete
+    ///    `maxCacheSize`-token window for the next token. In steady state that
+    ///    is `S - 1`, which is precisely the largest rejection a width-`S`
+    ///    speculative block can produce: a verify pass always accepts at least
+    ///    its own first token, so `rejected <= S - 1`.
+    ///
+    /// The same bound is what keeps the buffer and the mask in step. After a
+    /// capped rewind `rows >= maxCacheSize`, so the next `updateConcat` still
+    /// trims (`trimSize >= 1`) and produces `maxCacheSize - 1 + S` rows, which
+    /// is exactly the width `makeMask` builds from the capped offset.
+    ///
+    /// A wrapped ring returns 0. Its rewind really is unrecoverable: the ring
+    /// write overwrote the rows a rewind would need, and no bookkeeping brings
+    /// them back.
+    private var exactRewindCapacity: Int {
+        guard let rows = linearRows, let keys = self.keys, let values = self.values,
+            rows == keys.dim(2), rows == values.dim(2), rows <= offset
+        else { return 0 }
+        if rows == offset { return rows }
+        return Swift.max(0, rows - maxCacheSize)
+    }
+
     public override var isTrimmable: Bool {
-        return offset < maxCacheSize
+        // Unchanged legacy answer: before the window fills nothing has been
+        // discarded, so a rewind is pure bookkeeping.
+        if offset < maxCacheSize { return true }
+        // After it fills, only an over-retaining linear buffer can be rewound.
+        return exactRewindCapacity > 0
     }
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
-        let trimmed = min(offset, n)
+        guard n > 0 else { return 0 }
+
+        // Exact rewind of a linear buffer.
+        //
+        // This moves no data and recomputes nothing. The result is byte-for-byte
+        // the buffer `updateConcat` would have produced had it been handed
+        // `S - n` rows instead of `S`: the front trim it performs
+        // (`trimSize = idx - maxCacheSize + 1`) depends only on the PRE-write
+        // length, never on `S`, so the retained old rows are identical and the
+        // appended rows are a strict prefix of the ones just written.
+        //
+        // The slice is not an optimization, it is the correctness step: it
+        // restores the invariant `idx == keys.dim(2)`. Without it the next
+        // `temporalOrder` sees `idx < offset`, concludes the buffer is a
+        // wrapped ring, and rotates rows that were never rotated. These are
+        // views over the existing allocation, not copies.
+        if let rows = linearRows, let keys = self.keys, let values = self.values,
+            rows == keys.dim(2), rows == values.dim(2)
+        {
+            let trimmed = Swift.min(exactRewindCapacity, n)
+            guard trimmed > 0 else { return 0 }
+            let kept = rows - trimmed
+            self.keys = keys[.ellipsis, ..<kept, 0...]
+            self.values = values[.ellipsis, ..<kept, 0...]
+            linearRows = kept
+            idx = kept
+            offset -= trimmed
+            return trimmed
+        }
+
+        // Every other layout keeps the previous behaviour, with one
+        // strengthening: a wrapped ring now REFUSES (returns 0, mutates
+        // nothing) instead of silently rewinding a cursor over rows it has
+        // already overwritten. `isTrimmable` was already false there, so no
+        // caller that honours the protocol reaches this line.
+        guard offset < maxCacheSize else { return 0 }
+        let trimmed = Swift.min(offset, n)
         offset -= trimmed
         idx -= trimmed
         return trimmed

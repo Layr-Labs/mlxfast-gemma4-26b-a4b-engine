@@ -1310,17 +1310,16 @@ public enum Gemma4RouterProbe {
 /// matches; the narrowed final-layer prompt tail at [8, 1, ·] does, and is
 /// bit-identical there too). Kill switch:
 /// `DARKBLOOM_GEMMA4_FUSED_ROUTER_TOP8=0`.
-private enum Gemma4FusedRouterTop8 {
-    /// DEFAULT OFF (`DARKBLOOM_GEMMA4_FUSED_ROUTER_TOP8=1` enables): the
-    /// fused chain is bit-exact (113/113 adversarial parity) but measured
-    /// +~0.1 ms/round inside the +0.27 ms consolidation cost of three
-    /// counterbalanced local B=8 probe pairs — dispatch deletion does not
-    /// pay while the concurrent encoder overlaps these small kernels.
+public enum Gemma4FusedRouterTop8 {
+    /// Default ON. `DARKBLOOM_GEMMA4_FUSED_ROUTER_TOP8=0` restores the
+    /// argPartition + precise-softmax + per-expert scale chain. Local M5 Max
+    /// called this timing-neutral; the ranked box paid for QKV-NORM's similar
+    /// dispatch cut, so this ships on.
     static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_FUSED_ROUTER_TOP8"]
-        else { return false }
-        return ["1", "true", "yes", "on"].contains(raw.lowercased())
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
     private static let rows = 8
@@ -1464,7 +1463,7 @@ private enum Gemma4FusedRouterTop8 {
         ensureRowContiguous: true
     )
 
-    static func apply(
+    public static func apply(
         expertScores: MLXArray, perExpertScale: MLXArray, topK: Int
     ) -> (indices: MLXArray, weights: MLXArray)? {
         guard enabled,

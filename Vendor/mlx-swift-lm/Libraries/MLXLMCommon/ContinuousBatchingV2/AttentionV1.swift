@@ -61,18 +61,15 @@ enum CBv2AttentionV1 {
         return value << 20
     }()
 
-    /// ATT-008 opt-in switch: batch-wide FULL-attention decode over pooled
-    /// KV (`DARKBLOOM_GEMMA4_BATCHED_FULL_ATTENTION=1` enables it).
-    /// DEFAULT OFF: three counterbalanced local B=8 probe pairs measured the
-    /// consolidation at +0.27 ms/round (+1.2%) — the concurrent Metal
-    /// encoder already overlaps the per-row dispatches it removes. Kept
-    /// selectable because the mechanism is parity-proven bit-exact and the
-    /// balance could differ on other hardware.
+    /// ATT-008: batch-wide FULL-attention decode over pooled KV.
+    /// Default ON. `DARKBLOOM_GEMMA4_BATCHED_FULL_ATTENTION=0` restores the
+    /// eight row-local graphs. Local M5 Max called this timing-neutral; the
+    /// ranked box paid for QKV-NORM's similar dispatch cut, so this ships on.
     static let batchedFullDecodeEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_BATCHED_FULL_ATTENTION"]
-        else { return false }
-        return ["1", "true", "yes", "on"].contains(raw.lowercased())
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
     /// Whether a chunk of `L` queries should be split into blocks. Single

@@ -185,18 +185,6 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
         return (keys, values, oldestValidPosition % window)
     }
 
-    func fullDecodeRingBeforeWrite() -> (keys: MLXArray, values: MLXArray, start: Int)? {
-        guard staged == nil, let keys, let values, retainedCount == window else { return nil }
-        return (keys, values, (oldestValidPosition + 1) % window)
-    }
-
-    func advanceFullDecodeRingWithoutWrite() {
-        precondition(staged == nil && retainedCount == window)
-        borrowableChunkViews = nil
-        absoluteOffset += 1
-        oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
-    }
-
     // MARK: - Speculative (MTP) staging
 
     /// Staging always supported: the ring defers its destructive writes to

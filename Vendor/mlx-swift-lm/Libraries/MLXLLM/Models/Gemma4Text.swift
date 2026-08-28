@@ -1205,21 +1205,12 @@ private class Gemma4Attention: Module {
             preconditionFailure("Gemma4 non-shared layers require K/V projection modules")
         }
 
-        // A unified contiguous bank supplies one graph-safe pre-step snapshot
-        // for every layer. Standalone and paged caches retain the established
-        // per-layer capture. KV-shared consumers reuse the returned snapshot.
-        let capturedOffsets: MLXArray
-        let captured: Gemma4.PositionOffset
-        if let positionOffset {
-            guard case .batch(let offsets) = positionOffset else {
-                preconditionFailure("Gemma4 CBv2 position offsets must be a per-row batch")
-            }
-            capturedOffsets = offsets
-            captured = positionOffset
-        } else {
-            capturedOffsets = layerCache.positionOffsets + 0
-            captured = .batch(capturedOffsets)
-        }
+        // Snapshot the per-row absolute offsets BEFORE updateAndAttend
+        // advances the rows (`+ 0` = graph-safe copy, same convention as
+        // gemma4CapturePositionOffset). KV-shared consumers of this layer
+        // reuse this exact snapshot via the returned PositionOffset.
+        let capturedOffsets = layerCache.positionOffsets + 0
+        let captured = Gemma4.PositionOffset.batch(capturedOffsets)
 
         // The frontier query sits `outputStart` positions past the chunk's
         // first token, so last-query prefill must shift its RoPE position.
@@ -1516,8 +1507,6 @@ private class Gemma4Router: Module {
     let topK: Int
     let eps: Float
     let rootSize: Float
-    let kth: Int
-    private var cachedEffectiveScale: MLXArray?
 
     init(_ config: Gemma4TextConfiguration) {
         precondition(
@@ -1528,7 +1517,6 @@ private class Gemma4Router: Module {
         self.topK = config.topKExperts ?? 0
         self.eps = config.rmsNormEps
         self.rootSize = pow(Float(config.hiddenSize), -0.5)
-        self.kth = numExperts - topK
 
         self._proj.wrappedValue = Linear(config.hiddenSize, numExperts, bias: false)
         self._scale.wrappedValue = MLXArray.ones([config.hiddenSize])
@@ -1537,15 +1525,7 @@ private class Gemma4Router: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
-        let effScale: MLXArray
-        if let cached = cachedEffectiveScale {
-            effScale = cached
-        } else {
-            let eff = scale * rootSize
-            cachedEffectiveScale = eff
-            effScale = eff
-        }
-        let normed = MLXFast.rmsNorm(x, weight: effScale, eps: eps)
+        let normed = MLXFast.rmsNorm(x, weight: scale * rootSize, eps: eps)
         let expertScores = proj(normed)
 
         // ROUTE-001: single-dispatch byte-identical replacement of the chain
@@ -1558,6 +1538,7 @@ private class Gemma4Router: Module {
             return (fused.indices, fused.weights)
         }
 
+        let kth = expertScores.dim(-1) - topK
         var topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
         topKIndices = topKIndices[.ellipsis, kth...]
 
@@ -2088,19 +2069,6 @@ public class Gemma4TextModelInner: Module {
         // no padding and no shared frontier to mask). In v2 mode every layer
         // (including KV-shared ones) has a cache object.
         let isCBv2 = fullCache.contains { ($0 as? (any CBv2AttendingLayerCache)) != nil }
-        // All-contiguous banks expose one position chain. Snapshot it before
-        // the first layer advances the chain, then reuse that same lazy array
-        // for every Q/K RoPE call in this forward.
-        let unifiedCBv2PositionOffset: Gemma4.PositionOffset? = {
-            guard isCBv2 else { return nil }
-            for case let entry? in fullCache {
-                if let offsets = (entry as? CBv2LayerCache)?.unifiedPositionOffsets
-                {
-                    return .batch(offsets + 0)
-                }
-            }
-            return nil
-        }()
 
         // Build masks: one per attention type (legacy path only). "vision"
         // overlays bidirectional access within visual spans. "all" preserves
@@ -2180,7 +2148,7 @@ public class Gemma4TextModelInner: Module {
                 cache: fullCache[idx],
                 perLayerInput: perLayerInputs[idx],
                 sharedKV: sharedKV,
-                positionOffset: unifiedCBv2PositionOffset ?? sharedPositionOffset,
+                positionOffset: sharedPositionOffset,
                 v2SharedSource: v2SharedSource,
                 outputTailRows: outputTailRows,
                 useLastQueryPrefill: useLastQueryPrefill,

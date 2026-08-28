@@ -89,7 +89,13 @@ public enum Gemma4MMAQuantizedGEMV {
     /// Threads per threadgroup (one Apple simdgroup is 32 lanes).
     private static let threadsPerThreadgroup = simdgroupsPerThreadgroup * 32
     /// Narrowest plane allowed to enter. See FAIL-CLOSED above.
-    private static let minOutputWidth = 8192
+    /// Narrowest plane allowed to enter. 8192 was a fail-closed SCOPE limit
+    /// ("only the tied vocab plane is meant to enter"), not a measured floor.
+    /// Lowered to 2048 so the sliding attention planes (q 4096, k/v 2048 over
+    /// K=2816, 25 of 30 layers, ~324 MB of weight traffic -- comparable to the
+    /// 369 MB vocabulary plane) can be measured. The grid narrows to
+    /// n/128 threadgroups, so this is exactly the trade to measure, not assume.
+    private static let minOutputWidth = 2048
 
     /// `false` only when `DARKBLOOM_GEMMA4_MMA_HEAD` is an explicit off value.
     /// Resolved once; the kill switch is a process-level decision.

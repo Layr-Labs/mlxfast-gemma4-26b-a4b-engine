@@ -928,6 +928,22 @@ private class Gemma4Attention: Module {
     let scale: Float
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
+
+    /// MMA-QKV: serve all eight cohort rows of an attention projection from one
+    /// matrix-unit pass. Same mechanism MMA-003 applies to the tied vocabulary
+    /// plane; the promoted ordinary QMV streams each plane TWICE (four cohort
+    /// rows in two active x-groups), MMA streams it once.
+    /// Fails closed via `Gemma4MMAQuantizedGEMV.apply` (affine-4/g64, bf16,
+    /// `[8,1,K]` full cohort, n % 128 == 0, n >= minOutputWidth).
+    @inline(__always)
+    private func projMMA(_ proj: Linear, _ x: MLXArray) -> MLXArray? {
+        guard let q = proj as? QuantizedLinear, q.mode == .affine,
+            let mma = Gemma4MMAQuantizedGEMV.apply(
+                x: x, w: q.weight, scales: q.scales, biases: q.biases,
+                groupSize: q.groupSize, bits: q.bits)
+        else { return nil }
+        return mma.reshaped(Array(x.shape.dropLast()) + [mma.dim(-1)])
+    }
     @ModuleInfo(key: "k_proj") var kProj: Linear?
     @ModuleInfo(key: "v_proj") var vProj: Linear?
     @ModuleInfo(key: "o_proj") var oProj: Linear
@@ -1182,7 +1198,8 @@ private class Gemma4Attention: Module {
         let queryInput = lastQueryCache == nil ? x : x[0..., outputStart..., 0...]
         let queryLength = queryInput.dim(1)
 
-        let queryRaw = qProj(queryInput).reshaped(B, queryLength, nHeads, effectiveHeadDim)
+        let queryProjected = projMMA(qProj, queryInput) ?? qProj(queryInput)
+        let queryRaw = queryProjected.reshaped(B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
             // KV-shared layer: projects queries only and borrows (K, V) from

@@ -4,6 +4,17 @@ import Foundation
 import MLX
 import MLXNN
 
+/// Compiled-in RMSNorm→RoPE fuse + SWKV mask-trim knobs.
+/// `fusedRmsRopeTile` matches `rms_single_row` SIMD_SIZE; `fusedRmsRopeUnroll`
+/// matches `RMS_N_READS` / `rope_impl` N=4. Not env-gated.
+public enum Gemma4FusedRmsRope {
+    public static let fusedRmsRopeEnabled = true
+    public static let fusedRmsRopeTile = 32
+    public static let fusedRmsRopeUnroll = 4
+    public static let attentionTrimMask = true
+    public static let swkvTrimRadiusP = 1024
+}
+
 // MARK: - BatchPositionedKVCache
 
 /// Protocol for KV caches that expose per-sequence RoPE offsets.
@@ -66,7 +77,20 @@ public func applyRotaryPosition<R: RoPELayer>(_ rope: R, to x: MLXArray, cache: 
     -> MLXArray
 {
     if let offsetArray = graphOffsetArray(for: cache) {
-        return rope(x, offset: offsetArray)
+        return applyRotaryPosition(rope, to: x, offsetArray: offsetArray)
     }
-    return rope(x, offset: cache?.offset ?? 0)
+    return applyRotaryPosition(rope, to: x, offset: cache?.offset ?? 0)
+}
+
+/// Scalar-offset twin used by `gemma4ApplyRotaryPosition` (.scalar).
+public func applyRotaryPosition<R: RoPELayer>(_ rope: R, to x: MLXArray, offset: Int) -> MLXArray {
+    rope(x, offset: offset)
+}
+
+/// Array-offset twin used by `gemma4ApplyRotaryPosition` (.batch / .graphArray)
+/// so CompilableRotatingKVCache.offsetArray stays graph-visible.
+public func applyRotaryPosition<R: RoPELayer>(_ rope: R, to x: MLXArray, offsetArray: MLXArray)
+    -> MLXArray
+{
+    rope(x, offset: offsetArray)
 }

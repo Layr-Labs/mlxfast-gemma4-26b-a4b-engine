@@ -789,6 +789,175 @@ private func gemma4FusedQKVNorm(
     return (outputs[0], outputs[1], outputs[2])
 }
 
+/// Live Q/K RMSNorm→RoPE fuse. Stock `w * T(x * inv_rms)` writeback, then
+/// stock `rope_single_impl` pairs (non-traditional, forward, N=4). Freqs are
+/// `base^(2i/D)` so `inv_freq = 1/freqs[i]` matches `exp2(-d * log2(base))`
+/// and ProportionalRoPE's inf-padded table (identity on the tail).
+private let gemma4RmsRopeKernel = MLXFast.metalKernel(
+    name: "gemma4_fused_rms_rope_v1",
+    inputNames: ["x", "w", "offset", "freqs", "layout"],
+    outputNames: ["out"],
+    source: """
+        constexpr int SIMD_SIZE = 32;
+        constexpr int N_READS = 4;
+        const uint row = threadgroup_position_in_grid.x;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint simd_lane_id = thread_index_in_simdgroup;
+        const uint simd_group_id = simdgroup_index_in_threadgroup;
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[SIMD_SIZE];
+        threadgroup T normed[D];
+
+        const device T* xrow = x + row * D + lid * N_READS;
+        const device T* wrow = w + lid * N_READS;
+
+        float acc = 0;
+        for (int i = 0; i < N_READS; i++) {
+            float xi = float(xrow[i]);
+            acc += xi * xi;
+        }
+        acc = simd_sum(acc);
+        if (simd_group_id == 0) {
+            local_sums[simd_lane_id] = 0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_lane_id == 0) {
+            local_sums[simd_group_id] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group_id == 0) {
+            acc = simd_sum(local_sums[simd_lane_id]);
+            if (simd_lane_id == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(acc / float(D) + 1.0e-6f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const float inv = local_inv_mean[0];
+        for (int i = 0; i < N_READS; i++) {
+            normed[lid * N_READS + i] =
+                wrow[i] * T(float(xrow[i]) * inv);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint half = D / 2;
+        const uint nHeads = uint(layout[0]);
+        const uint seqLen = uint(layout[1]);
+        const uint seq = seqLen == 0 ? 0 : uint(row % seqLen);
+        const uint batch = (nHeads == 0 || seqLen == 0) ? 0 : uint(row / (nHeads * seqLen));
+        const int pos = int(seq) + (PER_BATCH ? offset[batch] : offset[0]);
+
+        device T* outrow = out + row * D;
+        if (lid * N_READS + N_READS <= half) {
+            for (int i = 0; i < N_READS; i++) {
+                const uint p = lid * N_READS + i;
+                float inv_freq;
+                if (USE_FREQS) {
+                    inv_freq = 1.0f / freqs[p];
+                } else {
+                    inv_freq = metal::exp2(-float(p) / float(half) * freqs[0]);
+                }
+                const float theta = float(pos) * inv_freq;
+                const float costheta = metal::fast::cos(theta);
+                const float sintheta = metal::fast::sin(theta);
+                const float x1 = float(normed[p]);
+                const float x2 = float(normed[p + half]);
+                outrow[p] = T(x1 * costheta - x2 * sintheta);
+                outrow[p + half] = T(x1 * sintheta + x2 * costheta);
+            }
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+private final class Gemma4RopeFreqCache: @unchecked Sendable {
+    static let shared = Gemma4RopeFreqCache()
+    private let lock = NSLock()
+    private var table: [String: MLXArray] = [:]
+
+    func freqs(dims: Int, base: Float, partialRotaryFactor: Float) -> MLXArray {
+        let key = "\(dims)|\(base)|\(partialRotaryFactor)"
+        lock.lock()
+        defer { lock.unlock() }
+        if let hit = table[key] { return hit }
+        let ropeAngles = Int(partialRotaryFactor * Float(dims) / 2.0)
+        let rotatedDims = 2 * ropeAngles
+        let exponents =
+            MLXArray(stride(from: 0, to: max(rotatedDims, 2), by: 2)).asType(.float32)
+            / Float(dims)
+        let realFreqs = MLX.pow(MLXArray(base), exponents)
+        let padCount = (dims - rotatedDims) / 2
+        let built: MLXArray
+        if padCount > 0 {
+            let pad = MLXArray(Array(repeating: Float.infinity, count: padCount))
+            built = concatenated([realFreqs, pad], axis: -1)
+        } else {
+            built = realFreqs
+        }
+        table[key] = built
+        return built
+    }
+}
+
+private func gemma4ApplyFusedRmsRope(
+    _ x: MLXArray,
+    weight: MLXArray,
+    eps: Float,
+    freqs: MLXArray,
+    useFreqs: Bool,
+    offset: Gemma4.PositionOffset
+) -> MLXArray? {
+    let unroll = Gemma4FusedRmsRope.fusedRmsRopeUnroll
+    guard Gemma4FusedRmsRope.fusedRmsRopeEnabled,
+        Gemma4FusedRmsRope.fusedRmsRopeTile == 32,
+        unroll == 4,
+        eps == 1.0e-6,
+        x.ndim == 4,
+        weight.ndim == 1,
+        freqs.ndim == 1
+    else { return nil }
+    let D = x.dim(3)
+    guard D == 256 || D == 512,
+        D % unroll == 0,
+        D / 2 % unroll == 0,
+        weight.dim(0) == D,
+        (useFreqs ? freqs.dim(0) == D / 2 : freqs.dim(0) >= 1)
+    else { return nil }
+
+    let offsetArray: MLXArray
+    let perBatch: Bool
+    switch offset {
+    case .scalar(let value):
+        offsetArray = MLXArray([Int32(value)])
+        perBatch = false
+    case .batch(let values), .graphArray(let values):
+        offsetArray = values
+        perBatch = values.size > 1
+    }
+
+    let B = x.dim(0)
+    let H = x.dim(1)
+    let L = x.dim(2)
+    let threads = D / unroll
+    let rows = B * H * L
+    let layout = MLXArray([Int32(H), Int32(L)])
+    let outputs = gemma4RmsRopeKernel(
+        [x, weight, offsetArray, freqs, layout],
+        template: [
+            ("T", x.dtype),
+            ("D", D),
+            ("PER_BATCH", perBatch),
+            ("USE_FREQS", useFreqs),
+        ],
+        grid: (rows * threads, 1, 1),
+        threadGroup: (threads, 1, 1),
+        outputShapes: [x.shape],
+        outputDTypes: [x.dtype]
+    )
+    return outputs[0]
+}
+
 private class ScaledLinear: Module {
     let weight: MLXArray
     let scalar: Float
@@ -806,20 +975,13 @@ private class ScaledLinear: Module {
 
 @inline(__always)
 internal func gemma4CapturePositionOffset(from cache: KVCache?) -> Gemma4.PositionOffset {
-    if let compilableRot = cache as? CompilableRotatingKVCache {
-        // Snapshot: `+ 0` creates a graph-safe copy so cache.update()
-        // advancing offsetArray doesn't shift the query RoPE position.
-        .graphArray(compilableRot.offsetArray + 0)
-    } else if let compilable = cache as? CompilableKVCache {
-        // Snapshot: `+ 0` creates a graph-safe copy so cache.update()
-        // advancing offsetArray doesn't shift the query RoPE position.
-        .graphArray(compilable.offsetArray + 0)
-    } else if let batchCache = cache as? BatchPositionedKVCache {
-        // Snapshot the per-sequence offsets before cache.update(...) advances them.
-        .batch(batchCache.batchOffset + 0)
-    } else {
-        .scalar(cache?.offset ?? 0)
+    if let offsetArray = graphOffsetArray(for: cache) {
+        if cache is CompilableRotatingKVCache || cache is CompilableKVCache {
+            return .graphArray(offsetArray)
+        }
+        return .batch(offsetArray)
     }
+    return .scalar(cache?.offset ?? 0)
 }
 
 @inline(__always)
@@ -830,11 +992,9 @@ internal func gemma4ApplyRotaryPosition<R: RoPELayer>(
 ) -> MLXArray {
     switch offset {
     case .scalar(let value):
-        rope(x, offset: value)
-    case .batch(let values):
-        rope(x, offset: values)
-    case .graphArray(let offsetArray):
-        rope(x, offset: offsetArray)
+        applyRotaryPosition(rope, to: x, offset: value)
+    case .batch(let values), .graphArray(let values):
+        applyRotaryPosition(rope, to: x, offsetArray: values)
     }
 }
 
@@ -1000,6 +1160,36 @@ private class Gemma4Attention: Module {
         super.init()
     }
 
+    /// RMS along D then RoPE, one dispatch when the fused kernel matches
+    /// production head dims. Transpose first so RoPE sees `[B, H, L, D]`.
+    private func fusedRmsThenRope(
+        _ raw: MLXArray, weight: MLXArray, offset: Gemma4.PositionOffset
+    ) -> MLXArray {
+        let x = raw.transposed(0, 2, 1, 3)
+        let useFreqs = !isSliding
+        let freqs = useFreqs
+            ? Gemma4RopeFreqCache.shared.freqs(
+                dims: effectiveHeadDim,
+                base: config.fullRopeTheta,
+                partialRotaryFactor: config.fullPartialRotaryFactor)
+            : MLXArray([log2(config.slidingRopeTheta)])
+        if Gemma4FusedRmsRope.fusedRmsRopeEnabled,
+            let fused = gemma4ApplyFusedRmsRope(
+                x,
+                weight: weight,
+                eps: config.rmsNormEps,
+                freqs: freqs,
+                useFreqs: useFreqs,
+                offset: offset)
+        {
+            return fused
+        }
+        return gemma4ApplyRotaryPosition(
+            rope,
+            to: MLXFast.rmsNorm(x, weight: weight, eps: config.rmsNormEps),
+            offset: offset)
+    }
+
     func callAsFunction(
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
@@ -1026,8 +1216,7 @@ private class Gemma4Attention: Module {
 
         let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
 
-        var queries = qProj(x).reshaped(B, L, nHeads, effectiveHeadDim)
-        queries = qNorm(queries)
+        let queryRaw = qProj(x).reshaped(B, L, nHeads, effectiveHeadDim)
 
         let keys: MLXArray
         let values: MLXArray
@@ -1043,9 +1232,7 @@ private class Gemma4Attention: Module {
             }
 
             let kRaw = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
-            var k = kNorm(kRaw)
-            k = k.transposed(0, 2, 1, 3)
-            k = gemma4ApplyRotaryPosition(rope, to: k, offset: activePositionOffset)
+            let k = fusedRmsThenRope(kRaw, weight: kNorm.weight, offset: activePositionOffset)
 
             // K-eq-V (`attention_k_eq_v: true` on Gemma 4 26B/31B):
             // values reuses the raw key projection (pre-norm), then goes
@@ -1070,8 +1257,8 @@ private class Gemma4Attention: Module {
             }
         }
 
-        queries = queries.transposed(0, 2, 1, 3)
-        queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: activePositionOffset)
+        let queries = fusedRmsThenRope(
+            queryRaw, weight: qNorm.weight, offset: activePositionOffset)
 
         // Adjust mask if cache size differs from mask size
         var adjustedMask = mask
@@ -1198,8 +1385,8 @@ private class Gemma4Attention: Module {
                     K/V (threaded by Gemma4TextModelInner)
                     """)
             }
-            var queries = qNorm(queryRaw).transposed(0, 2, 1, 3)
-            queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: positionOffset)
+            var queries = fusedRmsThenRope(
+                queryRaw, weight: qNorm.weight, offset: positionOffset)
             let outputDType = queries.dtype
             let attentionQueries =
                 outputDType == .float16 ? queries.asType(.float32) : queries
@@ -1252,19 +1439,10 @@ private class Gemma4Attention: Module {
             vRaw = kRaw
         }
 
-        let normalized = gemma4FusedQKVNorm(
-            q: queryRaw, k: kRaw, v: vRaw,
-            qWeight: qNorm.weight, kWeight: kNorm.weight, eps: config.rmsNormEps)
-        var queries = normalized?.0 ?? qNorm(queryRaw)
-        var k = normalized?.1 ?? kNorm(kRaw)
-        var v = normalized?.2 ?? vNorm(vRaw)
-
-        queries = queries.transposed(0, 2, 1, 3)
-        queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: queryPositionOffset)
-        k = k.transposed(0, 2, 1, 3)
-        k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
-
-        v = v.transposed(0, 2, 1, 3)
+        var queries = fusedRmsThenRope(
+            queryRaw, weight: qNorm.weight, offset: queryPositionOffset)
+        var k = fusedRmsThenRope(kRaw, weight: kNorm.weight, offset: captured)
+        var v = vNorm(vRaw).transposed(0, 2, 1, 3)
 
         let outputDType = queries.dtype
         let attentionQueries =
@@ -2393,8 +2571,11 @@ public class Gemma4TextModelInner: Module {
                 if maskByType[lt] == nil {
                     var mask: MLXFast.ScaledDotProductAttentionMaskMode
                     if lt == "sliding_attention" {
+                        let trimDecodeMask =
+                            Gemma4FusedRmsRope.attentionTrimMask && h.dim(1) == 1
                         mask = createAttentionMask(
-                            h: h, cache: fullCache[i], windowSize: config.slidingWindow,
+                            h: h, cache: fullCache[i],
+                            windowSize: trimDecodeMask ? nil : config.slidingWindow,
                             returnArray: forceArrayMask)
                     } else {
                         mask = createAttentionMask(

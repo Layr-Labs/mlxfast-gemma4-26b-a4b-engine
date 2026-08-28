@@ -81,6 +81,9 @@ template <typename T>
   rope_single_impl<T>(in, out, offset, inv_freq, scale, stride, pos, grid);
 }
 
+// fused-rmsrope-swkv-trim-attn: Gemma4 Q/K fuse applies these N=4 pairs
+// in-register after stock RMS writeback (rms_rope_single_row). Keep N=4
+// and rope_single_impl costheta/sintheta numerics; signatures unchanged.
 template <typename T, typename IdxT, int N = 4>
 void rope_impl(
     const device T* in,

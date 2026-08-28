@@ -198,6 +198,19 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
     public override func makeMask(
         n: Int, windowSize: Int?, returnArray: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        let slidingRing =
+            Gemma4FusedRmsRope.attentionTrimMask
+            && keep == 0
+            && maxCacheSize == Gemma4FusedRmsRope.swkvTrimRadiusP
+
+        // Parent RotatingKVCache.makeMask returns .none for n=1 when the ring
+        // IS the window (maxCacheSize == sliding_window). Skip rematerializing
+        // the full-buffer causal array on decode. CBv2 LayerCacheV2.makeMask
+        // is unsupported and is not this type.
+        if slidingRing && n == 1 {
+            return .none
+        }
+
         let linds: MLXArray
         if n == 1 {
             linds = offsetArray.reshaped(1, 1)
@@ -219,15 +232,21 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
         var mask = MLX.`where`(linds .>= maxSzArr, allTrueMask, causal)
 
         if let windowSize {
-            // After ring wrap, the recent window may be split across buffer
-            // end and beginning. Compare in modular token-index space rather
-            // than physical ring-column space so both halves are included.
-            // tokenInds maps each physical position to its distance from the
-            // write cursor: idxArray → 0 (oldest/next-write), idxArray-1 →
-            // maxCacheSize-1 (most recent). Keep the RECENT end of the ring.
-            let tokenInds = (rinds - idxArray + MLXArray(Int32(maxCacheSize))) % Int32(maxCacheSize)
-            let windowFilter = tokenInds .>= Int32(maxCacheSize - windowSize)
-            mask = mask & windowFilter
+            let redundantWindow =
+                Gemma4FusedRmsRope.attentionTrimMask
+                && keep == 0
+                && maxCacheSize == windowSize
+            if !redundantWindow {
+                // After ring wrap, the recent window may be split across buffer
+                // end and beginning. Compare in modular token-index space rather
+                // than physical ring-column space so both halves are included.
+                // tokenInds maps each physical position to its distance from the
+                // write cursor: idxArray → 0 (oldest/next-write), idxArray-1 →
+                // maxCacheSize-1 (most recent). Keep the RECENT end of the ring.
+                let tokenInds = (rinds - idxArray + MLXArray(Int32(maxCacheSize))) % Int32(maxCacheSize)
+                let windowFilter = tokenInds .>= Int32(maxCacheSize - windowSize)
+                mask = mask & windowFilter
+            }
         }
 
         return .array(mask)

@@ -79,6 +79,104 @@ template <typename T, int N_READS = RMS_N_READS>
   }
 }
 
+// Sibling of rms_single_row: stock RMS writeback (w * T(x * inv_rms)) then
+// in-register non-traditional RoPE pairs matching rope_single_impl / rope_impl
+// N=4. Dispatched from Gemma4Attention when fusedRmsRopeEnabled. Signature of
+// rms_single_row is unchanged. Tile=32 (SIMD_SIZE), unroll=RMS_N_READS=4.
+// axis_size is the head dim (256 sliding / 512 full); pairs at (i, i+D/2).
+template <typename T, int N_READS = RMS_N_READS>
+[[kernel]] void rms_rope_single_row(
+    const device T* x,
+    const device T* w,
+    const device int* offset,
+    const device float* freqs,
+    device T* out,
+    constant float& eps,
+    constant uint& axis_size,
+    constant uint& w_stride,
+    constant uint& seq_len,
+    constant uint& n_heads,
+    constant uint& per_batch,
+    uint gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]]) {
+  constexpr int SIMD_SIZE = 32;
+  threadgroup float local_inv_mean[1];
+  threadgroup float local_sums[SIMD_SIZE];
+  threadgroup T normed[512];
+
+  float acc = 0;
+  x += gid * size_t(axis_size) + lid * N_READS;
+  w += w_stride * lid * N_READS;
+  if (lid * N_READS + N_READS <= axis_size) {
+    for (int i = 0; i < N_READS; i++) {
+      float xi = x[i];
+      acc += xi * xi;
+    }
+  } else {
+    for (int i = 0; i < N_READS; i++) {
+      if ((lid * N_READS + i) < axis_size) {
+        float xi = x[i];
+        acc += xi * xi;
+      }
+    }
+  }
+  acc = simd_sum(acc);
+  if (simd_group_id == 0) {
+    local_sums[simd_lane_id] = 0;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_lane_id == 0) {
+    local_sums[simd_group_id] = acc;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_group_id == 0) {
+    acc = simd_sum(local_sums[simd_lane_id]);
+    if (simd_lane_id == 0) {
+      local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const float inv = local_inv_mean[0];
+  if (lid * N_READS + N_READS <= axis_size) {
+    for (int i = 0; i < N_READS; i++) {
+      normed[lid * N_READS + i] =
+          w[w_stride * i] * static_cast<T>(x[i] * inv);
+    }
+  } else {
+    for (int i = 0; i < N_READS; i++) {
+      if ((lid * N_READS + i) < axis_size) {
+        normed[lid * N_READS + i] =
+            w[w_stride * i] * static_cast<T>(x[i] * inv);
+      }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const uint half = axis_size / 2;
+  const uint seq = seq_len == 0 ? 0 : (gid % seq_len);
+  const uint heads_seq = n_heads * seq_len;
+  const uint batch = heads_seq == 0 ? 0 : (gid / heads_seq);
+  const int pos = int(seq) + (per_batch ? offset[batch] : offset[0]);
+
+  out += gid * size_t(axis_size);
+  if (lid * N_READS + N_READS <= half) {
+    for (int i = 0; i < N_READS; i++) {
+      const uint p = lid * N_READS + i;
+      const float inv_freq = 1.0f / freqs[p];
+      const float theta = static_cast<float>(pos) * inv_freq;
+      const float costheta = metal::fast::cos(theta);
+      const float sintheta = metal::fast::sin(theta);
+      const float x1 = static_cast<float>(normed[p]);
+      const float x2 = static_cast<float>(normed[p + half]);
+      out[p] = static_cast<T>(x1 * costheta - x2 * sintheta);
+      out[p + half] = static_cast<T>(x1 * sintheta + x2 * costheta);
+    }
+  }
+}
+
 template <typename T, int N_READS = RMS_N_READS>
 [[kernel]] void rms_looped(
     const device T* x,
@@ -384,7 +482,8 @@ template <typename T, int N_READS = RMS_N_READS>
   instantiate_kernel("rms" #name, rms_single_row, itype)            \
   instantiate_kernel("vjp_rms" #name, vjp_rms_single_row, itype)    \
   instantiate_kernel("rms_looped" #name, rms_looped, itype)         \
-  instantiate_kernel("vjp_rms_looped" #name, vjp_rms_looped, itype)
+  instantiate_kernel("vjp_rms_looped" #name, vjp_rms_looped, itype) \
+  instantiate_kernel("rms_rope" #name, rms_rope_single_row, itype)
 
 instantiate_rms(float32, float)
 instantiate_rms(float16, half)

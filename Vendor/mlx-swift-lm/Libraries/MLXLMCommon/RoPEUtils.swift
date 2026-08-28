@@ -93,11 +93,6 @@ public class ProportionalRoPE: Module, OffsetLayer, ArrayOffsetLayer {
     let rotatedDims: Int
     let _freqs: MLXArray?
 
-    /// Exact frequency tensor consumed by the underlying MLX RoPE primitive.
-    /// Gemma 4's decode-only paired Q/K kernel reuses this tensor so combining
-    /// the two launches does not regenerate or approximate the angles.
-    public var fusedDecodeFrequencies: MLXArray? { _freqs }
-
     init(
         dims: Int,
         traditional: Bool = false,

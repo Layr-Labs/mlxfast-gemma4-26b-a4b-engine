@@ -775,6 +775,40 @@ private func gemma4FusedQKVNorm(
     return (outputs[0], outputs[1], outputs[2])
 }
 
+private let gemma4ResidualScaleKernel = MLXFast.metalKernel(
+    name: "gemma4_b8_residual_scale_v1",
+    inputNames: ["x", "residual", "scale"],
+    outputNames: ["out"],
+    source: """
+        constexpr uint reads = 4;
+        const uint base = thread_position_in_grid.x * reads;
+        for (uint i = 0; i < reads; ++i) {
+            const T seam = residual[base + i] + x[base + i];
+            out[base + i] = seam * scale[0];
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+private func gemma4FusedResidualScale(
+    _ x: MLXArray,
+    residual: MLXArray,
+    scale: MLXArray
+) -> MLXArray? {
+    guard x.dtype == .bfloat16, residual.dtype == .bfloat16, scale.dtype == .bfloat16,
+        x.shape == [8, 1, 2816], residual.shape == x.shape, scale.shape == [1]
+    else { return nil }
+
+    return gemma4ResidualScaleKernel(
+        [x, residual, scale],
+        template: [("T", x.dtype)],
+        grid: (x.size / 4, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [x.shape],
+        outputDTypes: [x.dtype]
+    )[0]
+}
+
 private class ScaledLinear: Module {
     let weight: MLXArray
     let scalar: Float
@@ -1801,7 +1835,15 @@ public class Gemma4DecoderLayer: Module {
         }
 
         out = postFeedforwardLayernorm(out)
-        out = residual2 + out
+        var layerScaleApplied = false
+        if perLayerInputGate == nil,
+            let fused = gemma4FusedResidualScale(out, residual: residual2, scale: layerScalar)
+        {
+            out = fused
+            layerScaleApplied = true
+        } else {
+            out = residual2 + out
+        }
 
         // PLE gating
         if let gate = perLayerInputGate,
@@ -1818,7 +1860,9 @@ public class Gemma4DecoderLayer: Module {
             out = residual3 + g
         }
 
-        out = out * layerScalar
+        if !layerScaleApplied {
+            out = out * layerScalar
+        }
 
         return (out, kvPair, attnPositionOffset)
     }

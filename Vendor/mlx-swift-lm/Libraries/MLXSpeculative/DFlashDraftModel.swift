@@ -345,7 +345,7 @@ public final class DFlashDraftModel: Module, @unchecked Sendable {
     /// 1. The per-arm behaviour differs. MTP adapts up to its ceiling each round.
     /// DFlash proposes a fixed block of this size. The constant you edit is the
     /// same on both arms.
-    public static let submissionDraftDepth = 1
+    public static let submissionDraftDepth = 8
 
     /// The pure DFlash depth clamp. A requested draft depth, bounded by the
     /// drafter ceiling and the engine ceiling, floored at 1. A value above a
@@ -600,10 +600,15 @@ public final class DFlashDraftModel: Module, @unchecked Sendable {
             throw DFlashError.declaredQuantizationWithoutQuantizedWeights
         }
 
-        quantize(model: drafter) { path, _ in
-            quantizedPaths.contains(path)
-                ? quantization.quantization(layer: path)?.asTuple
-                : nil
+        // PARTICIPANT BIAS (editable). Force 4-bit, group-64 quantization on the
+        // DFlash drafter so its per-layer weights land in the affine-4 path the
+        // Metal GEMM stack is built around. The default `groupSize`/`bits` on
+        // this overload are themselves 64/4, but pinning them here is the lever
+        // the contract records. Layers not in the drafter's quantized set are
+        // skipped; the declared per-layer tuple is overridden with the pinned
+        // 4-bit / group-64 shape when the layer is in the drafter.
+        quantize(model: drafter, groupSize: 64, bits: 4) { path, _ in
+            quantizedPaths.contains(path) ? (64, 4) : nil
         }
     }
 

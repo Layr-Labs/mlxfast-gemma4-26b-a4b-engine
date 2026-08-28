@@ -249,11 +249,60 @@ public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, M
     )
 }
 
-public func gatherSortIndices(indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+private let gemma4FusedMoEReorderEnabled = gemma4FusedMoEReorderRequested(
+    ProcessInfo.processInfo.environment)
+
+func gemma4FusedMoEReorderRequested(_ environment: [String: String]) -> Bool {
+    environment["DARKBLOOM_GEMMA4_FUSED_MOE_REORDER"] != "0"
+}
+
+private let gemma4FusedMoEReorderKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "gemma4_fused_moe_reorder_lite",
+    inputNames: ["indices"],
+    outputNames: ["lhs_rows", "sorted_indices", "inverse_order"],
+    source: """
+        const uint a = thread_position_in_threadgroup.x;
+        const uint key = indices[a];
+        uint rank = 0;
+        for (uint b = 0; b < 64; ++b) {
+            const uint other = indices[b];
+            rank += (other < key) || (other == key && b < a);
+        }
+        lhs_rows[rank] = a / 8;
+        sorted_indices[rank] = key;
+        inverse_order[a] = rank;
+    """
+)
+
+func stockGatherSortIndices(indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
     let indices = indices.flattened()
     let order = argSort(indices)
     return (order.floorDivide(m), indices[order], argSort(order))
+}
+
+func fusedGemma4DecodeGatherSortIndices(
+    indices: MLXArray
+) -> (MLXArray, MLXArray, MLXArray)? {
+    guard indices.shape == [8, 8], indices.dtype == .uint32
+    else { return nil }
+    let outputs = gemma4FusedMoEReorderKernel(
+        [indices], grid: (64, 1, 1), threadGroup: (64, 1, 1),
+        outputShapes: [[64], [64], [64]], outputDTypes: [.uint32, .uint32, .uint32])
+    return (outputs[0], outputs[1], outputs[2])
+}
+
+func gatherSortIndices(
+    indices: MLXArray, fusedMoEReorderEnabled: Bool
+) -> (MLXArray, MLXArray, MLXArray) {
+    if fusedMoEReorderEnabled, let fused = fusedGemma4DecodeGatherSortIndices(indices: indices) {
+        return fused
+    }
+    return stockGatherSortIndices(indices: indices)
+}
+
+public func gatherSortIndices(indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+    gatherSortIndices(indices: indices, fusedMoEReorderEnabled: gemma4FusedMoEReorderEnabled)
 }
 
 public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) -> MLXArray {

@@ -2105,6 +2105,101 @@ public class Gemma4DecoderLayer: Module {
     }
 }
 
+/// EMB-001: fuse the ranked decode token embedding's three indexed gathers,
+/// affine dequantization, and embedding-scale multiply into one dispatch.
+///
+/// The production table is affine 4-bit/group-64 with packed uint32 weights:
+/// one uint32 contains eight adjacent 4-bit values, and eight uint32 words
+/// share one `(scale, bias)` pair.  The stock path materializes gathered
+/// weight/scales/biases, dequantizes to bfloat16, then reads that bfloat16
+/// result in a separate multiply by the bfloat16 scalar `sqrt(2816) == 53`.
+/// The local `T dequantized` below deliberately preserves that intermediate
+/// bfloat16 rounding boundary before the second multiplication.
+///
+/// Fail closed for every shape, dtype, quantization mode, or checkpoint
+/// geometry outside the exact ranked B=8 single-token path.  Kill switch:
+/// `DARKBLOOM_GEMMA4_SCALED_EMBEDDING=0`.
+private enum Gemma4ScaledDecodeEmbedding {
+    private static let rows = 8
+    private static let hidden = 2816
+    private static let vocab = 262_144
+    private static let wordsPerRow = hidden / 8
+    private static let groupsPerRow = hidden / 64
+    private static let threads = 256
+
+    private static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_SCALED_EMBEDDING"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_b8_scaled_affine4_embedding_2816_bf16_v1",
+        inputNames: ["tokens", "weight", "scales", "biases"],
+        outputNames: ["out"],
+        source: """
+            const uint packed_index = thread_position_in_grid.x;
+            const uint row = packed_index / WORDS_PER_ROW;
+            const uint word = packed_index - row * WORDS_PER_ROW;
+            const uint token = uint(tokens[row]);
+            const uint table_word = token * WORDS_PER_ROW + word;
+            const uint group = token * GROUPS_PER_ROW + (word >> 3);
+            const uint packed = weight[table_word];
+            const T scale = scales[group];
+            const T bias = biases[group];
+            const uint output_base = packed_index * 8;
+
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 8; ++i) {
+                const uchar code = uchar((packed >> (4 * i)) & 0x0f);
+                // Preserve both stock BF16 stores: affine dequantization,
+                // then the separate BF16 embedding-scale multiplication.
+                const T dequantized = scale * code + bias;
+                out[output_base + i] = dequantized * T(53.0f);
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    static func apply(
+        tokens: MLXArray, embedding: Embedding, embedScale: Float
+    ) -> MLXArray? {
+        guard enabled,
+            embedScale == Float(hidden).squareRoot(),
+            tokens.ndim == 2,
+            tokens.dim(0) == rows,
+            tokens.dim(1) == 1,
+            tokens.dtype == .int32,
+            let quantized = embedding as? QuantizedEmbedding,
+            quantized.mode == .affine,
+            quantized.groupSize == 64,
+            quantized.bits == 4,
+            quantized.weight.shape == [vocab, wordsPerRow],
+            quantized.weight.dtype == .uint32,
+            quantized.scales.shape == [vocab, groupsPerRow],
+            quantized.scales.dtype == .bfloat16,
+            let biases = quantized.biases,
+            biases.shape == [vocab, groupsPerRow],
+            biases.dtype == .bfloat16
+        else { return nil }
+
+        CBv2EngageMark.once("scaled-embedding")
+        return kernel(
+            [tokens, quantized.weight, quantized.scales, biases],
+            template: [
+                ("T", DType.bfloat16),
+                ("WORDS_PER_ROW", wordsPerRow),
+                ("GROUPS_PER_ROW", groupsPerRow),
+            ],
+            grid: (rows * wordsPerRow, 1, 1),
+            threadGroup: (threads, 1, 1),
+            outputShapes: [[rows, 1, hidden]],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
+}
+
 // MARK: - Text Model
 
 /// Inner Gemma 4 trunk: embeddings + per-layer-input (PLE) + 35 decoder
@@ -2307,6 +2402,10 @@ public class Gemma4TextModelInner: Module {
         var h: MLXArray
         if let inputEmbedding {
             h = inputEmbedding.ndim == 2 ? inputEmbedding.expandedDimensions(axis: 0) : inputEmbedding
+        } else if let scaled = Gemma4ScaledDecodeEmbedding.apply(
+            tokens: inputs, embedding: embedTokens, embedScale: embedScale)
+        {
+            h = scaled
         } else {
             h = embedTokens(inputs) * embedScale
         }
@@ -2760,7 +2859,10 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     /// Used by `Gemma4AssistantDraftModel` as the "target embedding" input
     /// when building its drafter-step input `[target_embed(last_token), last_hidden]`.
     public func embedTokensForDrafter(_ tokens: MLXArray) -> MLXArray {
-        model.embedTokens(tokens) * Float(config.hiddenSize).squareRoot()
+        Gemma4ScaledDecodeEmbedding.apply(
+            tokens: tokens, embedding: model.embedTokens,
+            embedScale: Float(config.hiddenSize).squareRoot())
+            ?? (model.embedTokens(tokens) * Float(config.hiddenSize).squareRoot())
     }
 
     /// Width-probe diagnostic forward (exactness round three): full logits

@@ -249,7 +249,58 @@ public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, M
     )
 }
 
+/// Stable rank sort for the exact B=8/top-K=8 decode plane.  Each SIMDgroup
+/// loads the 64 keys once (two keys per lane) and broadcasts them to its lanes,
+/// replacing 64 independent global loads per assignment and the generic pair
+/// of arg-sort pipelines.
+private let gemma4GatherSort64BroadcastKernel: MLXFast.MLXFastKernel =
+    MLXFast.metalKernel(
+        name: "gemma4_gather_sort_64_simd_broadcast",
+        inputNames: ["indices"],
+        outputNames: ["lhs_indices", "sorted_indices", "inverse_order"],
+        source: """
+            const uint assignment = thread_position_in_grid.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint key = (uint)indices[assignment];
+            const uint key_low = (uint)indices[lane];
+            const uint key_high = (uint)indices[32u + lane];
+            uint rank = 0;
+            for (uint source = 0; source < 32; ++source) {
+                const uint other_low = simd_broadcast(key_low, ushort(source));
+                rank += (other_low < key)
+                    || (other_low == key && source < assignment);
+                const uint other_high = simd_broadcast(key_high, ushort(source));
+                const uint high_assignment = 32u + source;
+                rank += (other_high < key)
+                    || (other_high == key && high_assignment < assignment);
+            }
+            lhs_indices[rank] = assignment / 8;
+            sorted_indices[rank] = key;
+            inverse_order[assignment] = rank;
+        """,
+        ensureRowContiguous: true
+    )
+
+private let gemma4GatherSort64BroadcastEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_CBV2_BROADCAST_SORT"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 public func gatherSortIndices(indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+    if gemma4GatherSort64BroadcastEnabled,
+        indices.ndim == 2, indices.shape == [8, 8], indices.dtype == .uint32
+    {
+        let outputs = gemma4GatherSort64BroadcastKernel(
+            [indices],
+            grid: (64, 1, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [[64], [64], [64]],
+            outputDTypes: [.uint32, .uint32, .uint32]
+        )
+        return (outputs[0], outputs[1], outputs[2])
+    }
     let m = indices.dim(-1)
     let indices = indices.flattened()
     let order = argSort(indices)

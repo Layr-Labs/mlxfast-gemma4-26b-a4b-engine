@@ -906,6 +906,9 @@ private class Gemma4Attention: Module {
     let layerIdx: Int
     let layerType: String
     let isSliding: Bool
+    /// Lazily concatenated as-stored q/k/v packed weights for the fused
+    /// eight-row decode projection (input-independent derived tensors).
+    let fusedQKVWeights = Gemma4MMAFusedWeights()
     let effectiveHeadDim: Int
     let nHeads: Int
     let nKvHeads: Int
@@ -1168,7 +1171,35 @@ private class Gemma4Attention: Module {
         let queryInput = lastQueryCache == nil ? x : x[0..., outputStart..., 0...]
         let queryLength = queryInput.dim(1)
 
-        let queryRaw = qProj(queryInput).reshaped(B, queryLength, nHeads, effectiveHeadDim)
+        // Fused q/k/v projection on the matrix units at the exact eight-row
+        // decode rectangle (concatenated as-stored packed weights, one
+        // dispatch, three outputs). Fails closed to the per-projection path.
+        var fusedQKV: (MLXArray, MLXArray, MLXArray)? = nil
+        if Gemma4MMAQuantizedGEMV.enabled,
+            lastQueryCache == nil, !usesSharedKV, L == 1,
+            B == Gemma4MMAQuantizedGEMV.rows,
+            let q = qProj as? QuantizedLinear, let kp = kProj, let k = kp as? QuantizedLinear
+        {
+            let members: [QuantizedLinear]
+            if let vp = vProj, let v = vp as? QuantizedLinear {
+                members = [q, k, v]
+            } else {
+                members = [q, k]
+            }
+            if let (w, sc, bi, bits, segs) = fusedQKVWeights.resolve(members) {
+                let nv = segs.count == 3 ? segs[2] : 0
+                if let out = Gemma4MMAQuantizedGEMV.applyFused(
+                    x: x, weight: w, scales: sc, biases: bi, bits: bits,
+                    nq: segs[0], nk: segs[1], nv: nv)
+                {
+                    fusedQKV = out
+                }
+            }
+        }
+
+        let queryRaw = (fusedQKV?.0.reshaped(B, queryLength, nHeads * effectiveHeadDim)
+            ?? qProj(queryInput))
+            .reshaped(B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
             // KV-shared layer: projects queries only and borrows (K, V) from
@@ -1230,10 +1261,12 @@ private class Gemma4Attention: Module {
             lastQueryCache == nil
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
-        let kRaw = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+        let kRaw = (fusedQKV?.1.reshaped(B, L, nKvHeads * effectiveHeadDim) ?? kProj(x))
+            .reshaped(B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
         if let vProj {
-            vRaw = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            vRaw = (fusedQKV?.2.reshaped(B, L, nKvHeads * effectiveHeadDim) ?? vProj(x))
+                .reshaped(B, L, nKvHeads, effectiveHeadDim)
         } else {
             vRaw = kRaw
         }
@@ -2396,7 +2429,7 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         if let lmHead {
             out = lmHead(hidden)
         } else {
-            out = model.embedTokens.asLinear(hidden)
+            out = gemma4TiedHead(model.embedTokens, hidden)
         }
         // The VLM omission profile uses zero to represent the former optional
         // softcap's nil/disabled state.
@@ -2703,4 +2736,35 @@ extension Gemma4TextModel: CBv2MTPForwardable {
         let (postNorm, preNorm) = model.callCapturingPreNorm(tokens, cache: caches)
         return (applyLMHead(postNorm), preNorm)
     }
+}
+
+// MARK: - Matrix-unit dense projections at the B=8 decode width
+
+/// One `QuantizedLinear` through `Gemma4MMAQuantizedGEMV.apply` at the exact
+/// eight-row decode rectangle; every other input takes the module's own path.
+@inline(__always)
+func gemma4DenseProjection(_ module: Linear, _ x: MLXArray) -> MLXArray {
+    if x.ndim == 3, x.dim(0) == Gemma4MMAQuantizedGEMV.rows, x.dim(1) == 1,
+        let quantized = module as? QuantizedLinear, quantized.bias == nil,
+        let y = Gemma4MMAQuantizedGEMV.apply(
+            x: x, weight: quantized.weight, scales: quantized.scales, biases: quantized.biases,
+            bits: quantized.bits, groupSize: quantized.groupSize)
+    {
+        return y.reshaped(x.dim(0), 1, y.dim(-1))
+    }
+    return module(x)
+}
+
+/// The tied LM head at the eight-row decode width through the same kernel.
+@inline(__always)
+func gemma4TiedHead(_ embedding: Embedding, _ hidden: MLXArray) -> MLXArray {
+    if hidden.ndim == 3, hidden.dim(0) == Gemma4MMAQuantizedGEMV.rows, hidden.dim(1) == 1,
+        let quantized = embedding as? QuantizedEmbedding,
+        let y = Gemma4MMAQuantizedGEMV.apply(
+            x: hidden, weight: quantized.weight, scales: quantized.scales, biases: quantized.biases,
+            bits: quantized.bits, groupSize: quantized.groupSize)
+    {
+        return y.reshaped(hidden.dim(0), 1, y.dim(-1))
+    }
+    return embedding.asLinear(hidden)
 }

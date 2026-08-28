@@ -403,6 +403,11 @@ enum CBv2AttentionV1 {
                         L: 1, kL: cachedKeys.dim(2), window: nil,
                         sinks: effectiveSinks, softcap: softcap))
             }
+            if kind.attention == .full,
+                let packed = CBv2FullAttentionDecodeOutputPack.pack(outputs)
+            {
+                return packed
+            }
             return concatenated(outputs, axis: 0)
         }
 

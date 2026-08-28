@@ -111,7 +111,71 @@ public func resetWeightedExpertUnsortStats() {
 /// ``weightedExpertSum``. This kernel reads those sorted rows through the inverse
 /// permutation and writes `[tokens, hidden]` directly, avoiding that full
 /// `[tokens, topK, hidden]` intermediate.
+/// Kill switch for COMBINE-META-001 (the SIMD-shared metadata reduction below).
+/// Default ON; `DARKBLOOM_CBV2_COMBINE_META=0` restores the byte-identical
+/// legacy kernel. Settable, not just seeded, so a probe can A/B the two
+/// reductions inside one process without a rebuild.
+public enum Gemma4CombineMetaControl {
+    nonisolated(unsafe) public static var enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_COMBINE_META"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+}
+
+/// COMBINE-META-001. Every lane of a simdgroup loaded the SAME K inverse
+/// indices and the SAME K weights. The threadgroup is `(64, 4, 1)`, so a
+/// thread's index within it is `x + 64 * y`; 64 is a multiple of the 32-lane
+/// simdgroup width, so a simdgroup never spans two `y` values. All 32 lanes
+/// therefore share one token, hence one set of metadata. Lanes `0 ..< K` each
+/// load one slot and `simd_broadcast` it to the 32 feature lanes consuming it,
+/// turning 32*2K scattered scalar loads per simdgroup into 2K.
+///
+/// `H` replaces `threads_per_grid.x` in the two address computations. The
+/// caller's own precondition already pins `sortedOutputs.dim(1) == 2816` and
+/// the dispatch grid to `(2816, tokens, 1)`, so the value is identical and the
+/// stride folds at compile time instead of reading a builtin in the loop.
+///
+/// Arithmetic is untouched: same values, same per-output multiply-then-add
+/// order over `slot`, same bfloat16 rounding. Only which lane issues the
+/// metadata load changes.
 private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "weighted_expert_unsort_simd_metadata",
+    inputNames: ["sorted_outputs", "inverse_order", "weights"],
+    outputNames: ["output"],
+    source: """
+        const uint feature = thread_position_in_grid.x;
+        const uint token = thread_position_in_grid.y;
+        const ushort lane = ushort(thread_index_in_simdgroup);
+        const uint assignment_base = token * (uint)K;
+
+        uint lane_sorted_row = 0;
+        float lane_weight = 0.0f;
+        if (lane < (ushort)K) {
+            const uint assignment = assignment_base + uint(lane);
+            lane_sorted_row = (uint)inverse_order[assignment];
+            lane_weight = (float)weights[assignment];
+        }
+
+        T accumulator = (T)0;
+        for (uint slot = 0; slot < (uint)K; ++slot) {
+            const uint sorted_row = simd_broadcast(lane_sorted_row, ushort(slot));
+            const float weight = simd_broadcast(lane_weight, ushort(slot));
+            // Preserve the legacy bfloat16 multiply-then-reduce rounding.
+            const uint row_base = sorted_row * (uint)H + feature;
+            const T weighted = (T)((float)sorted_outputs[row_base] * weight);
+            accumulator = accumulator + weighted;
+        }
+        const uint output_base = token * (uint)H + feature;
+        output[output_base] = accumulator;
+    """,
+    ensureRowContiguous: true
+)
+
+/// The pre-COMBINE-META-001 reduction, retained verbatim as the kill-switch
+/// arm. Every lane reloads the whole metadata set.
+private let weightedExpertUnsortLegacyKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
     name: "weighted_expert_unsort",
     inputNames: ["sorted_outputs", "inverse_order", "weights"],
     outputNames: ["output"],
@@ -164,7 +228,23 @@ public func weightedExpertUnsort(
 
     let tokens = weights.dim(0)
     weightedExpertUnsortProbe.recordEffective()
-    return weightedExpertUnsortKernel(
+    // Each arm carries only the template constants its own source names, so
+    // the legacy kernel is instantiated exactly as it was before this change.
+    if Gemma4CombineMetaControl.enabled {
+        return weightedExpertUnsortKernel(
+            [sortedOutputs, inverseOrder, weights],
+            template: [
+                ("T", sortedOutputs.dtype),
+                ("K", 8),
+                ("H", 2816),
+            ],
+            grid: (2816, tokens, 1),
+            threadGroup: (64, 4, 1),
+            outputShapes: [[tokens, 2816]],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
+    return weightedExpertUnsortLegacyKernel(
         [sortedOutputs, inverseOrder, weights],
         template: [
             ("T", sortedOutputs.dtype),

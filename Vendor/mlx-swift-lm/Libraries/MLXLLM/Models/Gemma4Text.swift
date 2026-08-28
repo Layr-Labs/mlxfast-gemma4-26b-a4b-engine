@@ -1532,6 +1532,8 @@ private class Gemma4Router: Module {
     let topK: Int
     let eps: Float
     let rootSize: Float
+    let kth: Int
+    private var cachedEffectiveScale: MLXArray?
 
     init(_ config: Gemma4TextConfiguration) {
         precondition(
@@ -1542,6 +1544,7 @@ private class Gemma4Router: Module {
         self.topK = config.topKExperts ?? 0
         self.eps = config.rmsNormEps
         self.rootSize = pow(Float(config.hiddenSize), -0.5)
+        self.kth = numExperts - self.topK
 
         self._proj.wrappedValue = Linear(config.hiddenSize, numExperts, bias: false)
         self._scale.wrappedValue = MLXArray.ones([config.hiddenSize])
@@ -1550,7 +1553,15 @@ private class Gemma4Router: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
-        let normed = MLXFast.rmsNorm(x, weight: scale * rootSize, eps: eps)
+        let effScale: MLXArray
+        if let cached = cachedEffectiveScale {
+            effScale = cached
+        } else {
+            let eff = scale * rootSize
+            cachedEffectiveScale = eff
+            effScale = eff
+        }
+        let normed = MLXFast.rmsNorm(x, weight: effScale, eps: eps)
         let expertScores = proj(normed)
 
         // ROUTE-001: single-dispatch byte-identical replacement of the chain
@@ -1563,7 +1574,6 @@ private class Gemma4Router: Module {
             return (fused.indices, fused.weights)
         }
 
-        let kth = expertScores.dim(-1) - topK
         var topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
         topKIndices = topKIndices[.ellipsis, kth...]
 
@@ -2405,10 +2415,37 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
     /// Apply the LM head (tied embedding or explicit `lm_head`) plus the
     /// configured final-logit softcap. Pure function of the post-norm hidden.
+    /// LMH-001: tight-grid dispatch for the tied lm_head ordinary QMV.
+    ///
+    /// The vendored host launches ordinary QMV with an x grid extent of M = 8
+    /// (`backend/metal/quantized.cpp`), while the promoted large-N tier claims
+    /// four cohort rows per threadgroup and returns from the rest. On the tied
+    /// head that is 262144 threadgroups of which 196608 exist only to hit that
+    /// early return. `CBv2TiedLMHeadQMVV1` runs the same computation from a
+    /// kernel whose own x extent is two, so only the groups that were already
+    /// doing the work are launched. Returns `nil` unless every pin holds, and
+    /// the caller then keeps the stock path.
+    private func tiedLMHeadTightGrid(_ hidden: MLXArray) -> MLXArray? {
+        guard lmHead == nil,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.groupSize == 64,
+            quantized.bits == 4
+        else { return nil }
+        return CBv2TiedLMHeadQMVV1.matmul(
+            x: hidden,
+            weight: quantized.weight,
+            scales: quantized.scales,
+            biases: quantized.biases,
+            inDim: config.hiddenSize,
+            outDim: config.vocabSize)
+    }
+
     func applyLMHead(_ hidden: MLXArray) -> MLXArray {
         var out: MLXArray
         if let lmHead {
             out = lmHead(hidden)
+        } else if let tight = tiedLMHeadTightGrid(hidden) {
+            out = tight
         } else {
             out = model.embedTokens.asLinear(hidden)
         }
@@ -2432,6 +2469,9 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     func applyRawLMHead(_ hidden: MLXArray) -> MLXArray {
         if let lmHead {
             return lmHead(hidden)
+        }
+        if let tight = tiedLMHeadTightGrid(hidden) {
+            return tight
         }
         return model.embedTokens.asLinear(hidden)
     }

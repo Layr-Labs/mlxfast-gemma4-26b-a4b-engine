@@ -249,47 +249,8 @@ public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, M
     )
 }
 
-/// Single-dispatch stable rank-sort for the exact B=8 decode assignment plane
-/// (64 keys over the 128-expert alphabet). Each thread computes its
-/// assignment's stable rank directly — strictly-smaller keys plus earlier
-/// equal keys — which is the definition the two-argSort pipeline below
-/// realizes, so all three outputs are bit-identical to it (stability
-/// included). One 64-thread dispatch replaces two bitonic argSort pipelines,
-/// a floor-divide, and a gather on every MoE layer of every decode step.
-private let gemma4GatherSort64Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "gemma4_gather_sort_64",
-    inputNames: ["indices"],
-    outputNames: ["lhs_indices", "sorted_indices", "inverse_order"],
-    source: """
-        const uint assignment = thread_position_in_grid.x;
-        const uint key = (uint)indices[assignment];
-        uint rank = 0;
-        for (uint other = 0; other < 64; ++other) {
-            const uint other_key = (uint)indices[other];
-            rank += (uint)((other_key < key)
-                || (other_key == key && other < assignment));
-        }
-        lhs_indices[rank] = assignment / 8;
-        sorted_indices[rank] = key;
-        inverse_order[assignment] = rank;
-    """,
-    ensureRowContiguous: true
-)
-
 public func gatherSortIndices(indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
-    // Exact ranked decode plane only: [8, 8] uint32. Every other shape,
-    // dtype, or width keeps the established sort pipeline.
-    if indices.ndim == 2, indices.shape == [8, 8], indices.dtype == .uint32 {
-        let outs = gemma4GatherSort64Kernel(
-            [indices],
-            grid: (64, 1, 1),
-            threadGroup: (64, 1, 1),
-            outputShapes: [[64], [64], [64]],
-            outputDTypes: [.uint32, .uint32, .uint32]
-        )
-        return (outs[0], outs[1], outs[2])
-    }
     let indices = indices.flattened()
     let order = argSort(indices)
     return (order.floorDivide(m), indices[order], argSort(order))

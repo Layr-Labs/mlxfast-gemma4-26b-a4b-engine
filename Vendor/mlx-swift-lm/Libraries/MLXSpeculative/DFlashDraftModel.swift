@@ -345,7 +345,16 @@ public final class DFlashDraftModel: Module, @unchecked Sendable {
     /// 1. The per-arm behaviour differs. MTP adapts up to its ceiling each round.
     /// DFlash proposes a fixed block of this size. The constant you edit is the
     /// same on both arms.
-    public static let submissionDraftDepth = 1
+    /// THIS SUBMISSION (2026-08-28): the z-lab A4B head publishes block_size 16,
+    /// and both ceilings resolve to 15, so the lever runs at its maximum: one
+    /// 16-column block (15 proposed + 1 bonus) per greedy round. At single-stream
+    /// decode the verify forward is weight-bandwidth bound, so a [1, 16] target
+    /// pass costs little more than the serial [1, 1] pass it replaces, while the
+    /// 0.4B drafter adds only a small per-round constant. Late-block acceptance
+    /// decay therefore trades almost no throughput for extra committed tokens.
+    /// The ranked run seals accepted_total / drafted_total, so a follow-up can
+    /// re-seat this constant from measured acceptance, not from a guess.
+    public static let submissionDraftDepth = 15
 
     /// The pure DFlash depth clamp. A requested draft depth, bounded by the
     /// drafter ceiling and the engine ceiling, floored at 1. A value above a

@@ -1294,44 +1294,29 @@ public enum Gemma4RouterProbe {
 }
 
 /// ROUTE-001: one-dispatch, byte-identical replacement of the decode router's
-/// selection chain — `argPartition(kth: E-8)` → slice → `takeAlong` →
-/// `softmax(precise)` over 8 → `perExpertScale` gather + multiply — for the
-/// exact B=8 decode geometry (`expertScores` [8, 1, 128] bf16). Five sort /
-/// gather / softmax / gather / multiply dispatches per MoE layer per step
-/// (plus the contiguous copy the strided index slice forces downstream)
-/// collapse into one 8-threadgroup kernel.
+/// `argPartition(kth: E-8)` → slice selection for the exact B=8 decode geometry
+/// (`expertScores` [8, 1, 128] bf16). The selected indices feed the established
+/// `takeAlong` → `softmax(precise)` → per-expert scale chain unchanged.
 ///
-/// Exactness (counting-predecessors lemma): `ArgPartition::eval_gpu` on Metal
-/// is `gpu_merge_sort(argsort=true)` — a FULL stable merge sort (sort.cpp) —
-/// so the sliced `[kth...]` output is the stable ascending argsort tail. Under
-/// sort.h's `LessThan` comparator (NaN ordered after every non-NaN, ties kept
-/// in original index order by stability) each element's stable-sort position
-/// equals its predecessor count, which the kernel evaluates directly; the
-/// selected values then run a verbatim transcription of
-/// `softmax_single_row<bfloat16_t, float, N_READS=4>` (softmax.h — same lane
-/// layout, same `Limits<float>::min` padding, same `fast::exp`, same
-/// `simd_max`/`simd_sum` reduction order on one 32-thread simdgroup) and the
-/// stock bf16 `Multiply` expression against the gathered per-expert scale.
-/// Bit-exact parity vs the stock op chain verified on uniform / tied /
-/// ulp-near-tie / ±inf / NaN / realistic rows (indices and uint16-viewed
-/// weights).
-///
+/// Exactness: `ArgPartition::eval_gpu` on Metal is
+/// `gpu_merge_sort(argsort=true)` — a FULL stable merge sort (sort.cpp) — so
+/// the sliced `[kth...]` output is the stable ascending argsort tail. The
+/// kernel bitonically sorts `(score, originalIndex)` tuples under that same
+/// order (NaN after every non-NaN, equal values by ascending original index),
+/// and returns the final eight indices.
 /// Fail-closed: any other row count, sequence length, expert count, top-K, or
 /// dtype takes the established chain (cohort prefill at [8, 1024, ·] never
 /// matches; the narrowed final-layer prompt tail at [8, 1, ·] does, and is
 /// bit-identical there too). Kill switch:
 /// `DARKBLOOM_GEMMA4_FUSED_ROUTER_TOP8=0`.
 private enum Gemma4FusedRouterTop8 {
-    /// DEFAULT OFF (`DARKBLOOM_GEMMA4_FUSED_ROUTER_TOP8=1` enables): the
-    /// fused chain is bit-exact (113/113 adversarial parity) but measured
-    /// +~0.1 ms/round inside the +0.27 ms consolidation cost of three
-    /// counterbalanced local B=8 probe pairs — dispatch deletion does not
-    /// pay while the concurrent encoder overlaps these small kernels.
+    /// Enabled by default. Set `DARKBLOOM_GEMMA4_FUSED_ROUTER_TOP8=0` to keep
+    /// the established five-dispatch chain for same-binary timing and triage.
     static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_FUSED_ROUTER_TOP8"]
-        else { return false }
-        return ["1", "true", "yes", "on"].contains(raw.lowercased())
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
     private static let rows = 8
@@ -1339,171 +1324,95 @@ private enum Gemma4FusedRouterTop8 {
     private static let selected = 8
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_fused_router_top8_e128_k8_bf16_v1",
-        inputNames: ["scores", "pes"],
-        outputNames: ["inds", "wts"],
+        name: "gemma4_router_top8_stable_sort_e128_bf16_v2",
+        inputNames: ["scores"],
+        outputNames: ["inds"],
         source: """
-            constexpr int SIMD_SIZE = 32;
-            constexpr int N_READS = 4;
-            constexpr int KTH = E - K;
-
             const int row = int(threadgroup_position_in_grid.x);
             const int lid = int(thread_position_in_threadgroup.x);
 
-            threadgroup float vals[E];
-            threadgroup float topv[K];
-            threadgroup uint topi[K];
-            threadgroup float local_max[SIMD_SIZE];
-            threadgroup float local_normalizer[SIMD_SIZE];
+            threadgroup float vals_a[E];
+            threadgroup float vals_b[E];
+            threadgroup uint order_a[E];
+            threadgroup uint order_b[E];
 
             const device T* srow = scores + row * E;
-            for (int i = lid; i < E; i += SIMD_SIZE) {
-                vals[i] = float(srow[i]);
-            }
+            vals_a[lid] = float(srow[lid]);
+            order_a[lid] = uint(lid);
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // Stable-argsort position by predecessor counting under sort.h's
-            // LessThan comparator (NaN orders after every non-NaN; ties keep
-            // the original index order because the merge sort is stable).
-            // Position == #{i : less(v_i, v_e)} + #{i < e : neither less} —
-            // a permutation, so the writes below never collide.
-            for (int j = 0; j < E / SIMD_SIZE; ++j) {
-                const int e = lid + j * SIMD_SIZE;
-                const float v = vals[e];
-                const bool v_nan = isnan(v);
-                int rank = 0;
-                for (int i = 0; i < E; ++i) {
-                    const float u = vals[i];
-                    const bool u_nan = isnan(u);
-                    bool u_less_v;
-                    bool v_less_u;
-                    if (u_nan || v_nan) {
-                        u_less_v = !u_nan && v_nan;
-                        v_less_u = !v_nan && u_nan;
+            // Full stable ascending bitonic sort of (score, original index).
+            // E is the exact 128-expert production geometry and therefore a
+            // power of two. The index tie-break reproduces stable merge-sort
+            // order without carrying an extra stability flag. Ping-pong
+            // storage gives every lane sole ownership of its destination;
+            // no lane writes through another lane's address.
+            bool source_a = true;
+            for (uint span = 2; span <= uint(E); span <<= 1) {
+                for (uint stride = span >> 1; stride > 0; stride >>= 1) {
+                    const uint peer = uint(lid) ^ stride;
+                    const float a = source_a ? vals_a[lid] : vals_b[lid];
+                    const float b = source_a ? vals_a[peer] : vals_b[peer];
+                    const uint ai = source_a ? order_a[lid] : order_b[lid];
+                    const uint bi = source_a ? order_a[peer] : order_b[peer];
+                    const bool a_nan = isnan(a);
+                    const bool b_nan = isnan(b);
+                    const bool a_less_b =
+                        (a_nan != b_nan) ? !a_nan
+                        : ((!a_nan && a != b) ? a < b : ai < bi);
+                    const bool b_less_a =
+                        (a_nan != b_nan) ? !b_nan
+                        : ((!a_nan && a != b) ? b < a : bi < ai);
+                    const bool ascending = (uint(lid) & span) == 0;
+                    const bool lower_lane = (uint(lid) & stride) == 0;
+                    const bool wants_min = ascending == lower_lane;
+                    const bool take_peer = wants_min ? b_less_a : a_less_b;
+                    const float out_v = take_peer ? b : a;
+                    const uint out_i = take_peer ? bi : ai;
+                    if (source_a) {
+                        vals_b[lid] = out_v;
+                        order_b[lid] = out_i;
                     } else {
-                        u_less_v = u < v;
-                        v_less_u = v < u;
+                        vals_a[lid] = out_v;
+                        order_a[lid] = out_i;
                     }
-                    if (u_less_v || (!v_less_u && i < e)) {
-                        ++rank;
-                    }
-                }
-                if (rank >= KTH) {
-                    const int p = rank - KTH;
-                    inds[row * K + p] = uint(e);
-                    topi[p] = uint(e);
-                    topv[p] = v;
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    source_a = !source_a;
                 }
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // softmax_single_row<T, float, N_READS=4> transcription
-            // (softmax.h) at axis_size = K on one 32-thread simdgroup, with
-            // the stock bf16 per-expert-scale multiply fused into the write.
-            const int simd_lane_id = int(thread_index_in_simdgroup);
-            const int simd_group_id = int(simdgroup_index_in_threadgroup);
-
-            float ld[N_READS];
-            const int base = lid * N_READS;
-            if (base + N_READS <= K) {
-                for (int i = 0; i < N_READS; i++) {
-                    ld[i] = topv[base + i];
-                }
-            } else {
-                for (int i = 0; i < N_READS; i++) {
-                    ld[i] = ((base + i) < K) ? topv[base + i] : Limits<float>::min;
-                }
-            }
-            if (simd_group_id == 0) {
-                local_max[simd_lane_id] = Limits<float>::min;
-                local_normalizer[simd_lane_id] = 0;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            float maxval = Limits<float>::finite_min;
-            for (int i = 0; i < N_READS; i++) {
-                maxval = (maxval < ld[i]) ? ld[i] : maxval;
-            }
-            maxval = simd_max(maxval);
-            if (simd_lane_id == 0) {
-                local_max[simd_group_id] = maxval;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_group_id == 0) {
-                maxval = simd_max(local_max[simd_lane_id]);
-                if (simd_lane_id == 0) {
-                    local_max[0] = maxval;
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            maxval = local_max[0];
-
-            float normalizer = 0;
-            for (int i = 0; i < N_READS; i++) {
-                float exp_x = fast::exp(ld[i] - maxval);
-                ld[i] = exp_x;
-                normalizer += exp_x;
-            }
-            normalizer = simd_sum(normalizer);
-            if (simd_lane_id == 0) {
-                local_normalizer[simd_group_id] = normalizer;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_group_id == 0) {
-                normalizer = simd_sum(local_normalizer[simd_lane_id]);
-                if (simd_lane_id == 0) {
-                    local_normalizer[0] = normalizer;
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            normalizer = 1 / local_normalizer[0];
-
-            if (base + N_READS <= K) {
-                for (int i = 0; i < N_READS; i++) {
-                    const T w = T(ld[i] * normalizer);
-                    wts[row * K + base + i] = w * pes[topi[base + i]];
-                }
-            } else {
-                for (int i = 0; i < N_READS; i++) {
-                    if ((base + i) < K) {
-                        const T w = T(ld[i] * normalizer);
-                        wts[row * K + base + i] = w * pes[topi[base + i]];
-                    }
-                }
+            if (lid < K) {
+                const int sorted = E - K + lid;
+                inds[row * K + lid] =
+                    source_a ? order_a[sorted] : order_b[sorted];
             }
         """,
         ensureRowContiguous: true
     )
 
-    static func apply(
-        expertScores: MLXArray, perExpertScale: MLXArray, topK: Int
-    ) -> (indices: MLXArray, weights: MLXArray)? {
+    static func apply(expertScores: MLXArray, topK: Int) -> MLXArray? {
         guard enabled,
             topK == selected,
             expertScores.ndim == 3,
             expertScores.dim(0) == rows,
             expertScores.dim(1) == 1,
             expertScores.dim(2) == experts,
-            expertScores.dtype == .bfloat16,
-            perExpertScale.ndim == 1,
-            perExpertScale.dim(0) == experts,
-            perExpertScale.dtype == .bfloat16
+            expertScores.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("router-top8")
 
-        let outputs = kernel(
-            [expertScores, perExpertScale],
+        return kernel(
+            [expertScores],
             template: [
                 ("T", expertScores.dtype),
                 ("E", experts),
                 ("K", selected),
             ],
-            grid: (rows * 32, 1, 1),
-            threadGroup: (32, 1, 1),
-            outputShapes: [[rows, 1, selected], [rows, 1, selected]],
-            outputDTypes: [.uint32, .bfloat16]
-        )
-        return (outputs[0], outputs[1])
+            grid: (rows * experts, 1, 1),
+            threadGroup: (experts, 1, 1),
+            outputShapes: [[rows, 1, selected]],
+            outputDTypes: [.uint32]
+        )[0]
     }
 }
 
@@ -1542,11 +1451,14 @@ private class Gemma4Router: Module {
         // ROUTE-001: single-dispatch byte-identical replacement of the chain
         // below for the B=8 decode geometry. Every other geometry, dtype, or
         // the kill switch falls through to the established chain.
-        if let fused = Gemma4FusedRouterTop8.apply(
-            expertScores: expertScores, perExpertScale: perExpertScale, topK: topK)
+        if let selected = Gemma4FusedRouterTop8.apply(
+            expertScores: expertScores, topK: topK)
         {
-            Gemma4RouterProbe.recorder?(expertScores, fused.indices)
-            return (fused.indices, fused.weights)
+            var weights = MLX.takeAlong(expertScores, selected, axis: -1)
+            weights = MLX.softmax(weights, axis: -1, precise: true)
+            weights = weights * perExpertScale[selected]
+            Gemma4RouterProbe.recorder?(expertScores, selected)
+            return (selected, weights)
         }
 
         let kth = expertScores.dim(-1) - topK

@@ -18,13 +18,6 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    private static let ringEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_RING_ATTENTION"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
     private static let batch = 8
     private static let queryHeads = 16
     private static let kvHeads = 8
@@ -217,6 +210,24 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         ensureRowContiguous: true
     )
 
+    /// `ringPassAKernel` with this step's one-token ring write folded in.
+    ///
+    /// The ring is FULL, so the token about to be appended evicts exactly the
+    /// entry the caller's `start` has already stepped past: physical slot
+    /// `(start + N - 1) % N`. No block ever READS that slot — logical token
+    /// `N - 1` is served straight from `new_keys`/`new_values` — so one
+    /// threadgroup per (row, kv head) can store the new token into it in
+    /// place while the rest of the grid streams the retained window. The
+    /// traversal, the block-strided partition, the BF16 partial store, and
+    /// the online-softmax accumulation order are byte-for-byte those of
+    /// `ringPassAKernel`; only the source of logical token `N - 1` changes,
+    /// and it carries the same values the elided `SliceUpdate` would have
+    /// left in that slot.
+    ///
+    /// `write_fence` in / `fence` out makes the in-place store part of the
+    /// evaluated dependency chain: the next step's writing pass A consumes
+    /// this step's fence, so the mutation can never be reordered against a
+    /// later read of the same allocation.
     private static let fusedRingPassAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "cbv2_ragged8_ringwrite_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v1",
         inputNames: [
@@ -256,9 +267,9 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             keys += kv_head * N * D + lane * values_per_lane;
             values += kv_head * N * D + lane * values_per_lane;
             const device T* new_key = new_keys
-                + (batch_index * 8 + kv_head) * D + lane * values_per_lane;
+                + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
             const device T* new_value = new_values
-                + (batch_index * 8 + kv_head) * D + lane * values_per_lane;
+                + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
             const uint ring_start = starts[batch_index];
             const uint write_slot = (ring_start + uint(N - 1)) % uint(N);
             if (block == 0 && query_head_in_group == 0) {
@@ -291,11 +302,11 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             float sum_exp_score = 0.0f;
             for (int token = block; token < N; token += BLOCKS) {
                 const bool current = token == N - 1;
-                const device T* key = current ? new_key : keys + slot * D;
-                const device T* value = current ? new_value : values + slot * D;
+                const device T* k = current ? new_key : keys + slot * D;
+                const device T* v = current ? new_value : values + slot * D;
                 float score = 0.0f;
                 for (int element = 0; element < values_per_lane; ++element) {
-                    score += q[element] * float(key[element]);
+                    score += q[element] * float(k[element]);
                 }
                 score = simd_sum(score);
 
@@ -306,7 +317,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 sum_exp_score = sum_exp_score * old_factor + score_factor;
                 for (int element = 0; element < values_per_lane; ++element) {
                     accumulator[element] = accumulator[element] * old_factor
-                        + score_factor * float(value[element]);
+                        + score_factor * float(v[element]);
                 }
 
                 slot += BLOCKS;
@@ -423,6 +434,13 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             extraInputs: [startArray], scale: scale)
     }
 
+    /// `attendRing` with this step's one-token ring write fused into pass A.
+    ///
+    /// `keys`/`values` are the rows' RETAINED ring allocations and `starts`
+    /// the post-write ring starts — i.e. exactly what `attendRing` would be
+    /// handed after a separate `decodeRingWrite`, minus the write. Returns
+    /// nil (write NOT performed) whenever any predicate fails, so the caller
+    /// falls back to the established write-then-attend pair.
     static func attendRingWriting(
         queries: MLXArray,
         newKeys: MLXArray,
@@ -431,13 +449,14 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         values: [MLXArray],
         starts: [Int],
         previousWriteFence: MLXArray,
-        scale: Float
+        scale: Float,
+        slidingWindowLength: Int
     ) -> (output: MLXArray, nextWriteFence: MLXArray)? {
         guard enabled,
-            ringEnabled,
             blocks > 0,
             blocks.isMultiple(of: 32),
             scale == 1.0,
+            slidingWindowLength == sequenceLength,
             queries.dtype == .bfloat16,
             queries.shape == [batch, queryHeads, 1, headDim],
             newKeys.dtype == .bfloat16,
@@ -449,7 +468,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             keys.count == batch,
             values.count == batch,
             starts.count == batch,
-            starts.allSatisfy({ (0 ..< sequenceLength).contains($0) })
+            starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength })
         else { return nil }
 
         for index in 0 ..< batch {
@@ -462,7 +481,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             else { return nil }
         }
 
-        let startArray = MLXArray(starts.map(UInt32.init))
+        let startArray = MLXArray(starts.map(UInt32.init), [batch])
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let passA = fusedRingPassAKernel(
@@ -473,6 +492,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 ("D", headDim),
                 ("N", sequenceLength),
                 ("GQA", gqa),
+                ("KV_HEADS", kvHeads),
                 ("BLOCKS", blocks),
             ],
             grid: (kvHeads * 32, batch * gqa, blocks),

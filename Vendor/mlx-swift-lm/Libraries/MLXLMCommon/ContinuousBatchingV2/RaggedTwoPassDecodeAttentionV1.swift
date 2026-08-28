@@ -338,7 +338,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     )
 
     private static let passBKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_2pass_b_bf16_d256_b\(blocks)_v1",
+        name: "cbv2_ragged8_sdpa_2pass_b_direct_bf16_d256_b\(blocks)_v2",
         inputNames: ["partials", "sums", "maxs"],
         outputNames: ["out"],
         source: """
@@ -346,39 +346,40 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             constexpr int values_per_lane = D / simd_width;
 
             const int batch_head = int(threadgroup_position_in_grid.x);
-            const int simdgroup = int(simdgroup_index_in_threadgroup);
-            const int lane = int(thread_index_in_simdgroup);
+            const int output_group = int(simdgroup_index_in_threadgroup);
+            const int block_lane = int(thread_index_in_simdgroup);
 
             partials += batch_head * BLOCKS * D
-                + simdgroup * D + lane * values_per_lane;
+                + block_lane * D + output_group * values_per_lane;
             sums += batch_head * BLOCKS;
             maxs += batch_head * BLOCKS;
-            out += batch_head * D + simdgroup * values_per_lane;
+            out += batch_head * D + output_group * values_per_lane;
 
             thread float accumulator[values_per_lane];
             for (int element = 0; element < values_per_lane; ++element) {
                 accumulator[element] = 0.0f;
             }
-            threadgroup float partial_outputs[simd_width * simd_width];
-
             float sum_exp_score = 0.0f;
             float max_score = -3.402823466e+38F;
             for (int block = 0; block < BLOCKS / simd_width; ++block) {
-                max_score = max(max_score, maxs[lane + simd_width * block]);
+                max_score = max(
+                    max_score, maxs[block_lane + simd_width * block]);
             }
             max_score = simd_max(max_score);
 
             for (int block = 0; block < BLOCKS / simd_width; ++block) {
                 const float factor = fast::exp(
-                    maxs[lane + simd_width * block] - max_score);
-                sum_exp_score += factor * sums[lane + simd_width * block];
+                    maxs[block_lane + simd_width * block] - max_score);
+                sum_exp_score +=
+                    factor * sums[block_lane + simd_width * block];
             }
             sum_exp_score = simd_sum(sum_exp_score);
 
             for (int block = 0; block < BLOCKS / simd_width; ++block) {
-                const float factor = fast::exp(maxs[simdgroup] - max_score);
+                const float factor = fast::exp(maxs[block_lane] - max_score);
                 for (int element = 0; element < values_per_lane; ++element) {
-                    accumulator[element] += factor * float(partials[element]);
+                    accumulator[element] +=
+                        factor * float(partials[element]);
                 }
                 maxs += simd_width;
                 sums += simd_width;
@@ -386,19 +387,12 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             }
 
             for (int element = 0; element < values_per_lane; ++element) {
-                partial_outputs[lane * simd_width + simdgroup] = accumulator[element];
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                accumulator[element] = simd_sum(
-                    partial_outputs[simdgroup * simd_width + lane]);
-                accumulator[element] = sum_exp_score == 0.0f
-                    ? accumulator[element]
-                    : accumulator[element] / sum_exp_score;
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-
-            if (lane == 0) {
-                for (int element = 0; element < values_per_lane; ++element) {
-                    out[element] = T(accumulator[element]);
+                const float reduced = simd_sum(accumulator[element]);
+                if (block_lane == 0) {
+                    out[element] = T(
+                        sum_exp_score == 0.0f
+                            ? reduced
+                            : reduced / sum_exp_score);
                 }
             }
         """,

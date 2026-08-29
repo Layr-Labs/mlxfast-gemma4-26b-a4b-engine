@@ -119,15 +119,31 @@ private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
         uint feature = thread_position_in_grid.x;
         uint token = thread_position_in_grid.y;
 
-        T accumulator = (T)0;
+        // A 64 x 4 threadgroup evaluates 64 features for four tokens.  The
+        // inverse row and routing weight depend only on (token, slot), yet the
+        // stock loop reloads both for every feature.  Stage the 4 x 8 metadata
+        // tile once; float is an exact expansion of the bfloat16 weight.
+        threadgroup uint staged_rows[4][8];
+        threadgroup float staged_weights[4][8];
+        const uint local_feature = thread_position_in_threadgroup.x;
+        const uint local_token = thread_position_in_threadgroup.y;
         const uint assignment_base = token * (uint)K;
+        if (local_feature < (uint)K) {
+            const uint assignment = assignment_base + local_feature;
+            staged_rows[local_token][local_feature] =
+                (uint)inverse_order[assignment];
+            staged_weights[local_token][local_feature] =
+                (float)weights[assignment];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        T accumulator = (T)0;
         for (uint slot = 0; slot < (uint)K; ++slot) {
-            const uint assignment = assignment_base + slot;
-            const uint sorted_row = (uint)inverse_order[assignment];
+            const uint sorted_row = staged_rows[local_token][slot];
             // Preserve the legacy bfloat16 multiply-then-reduce rounding.
             const T weighted = (T)(
                 (float)sorted_outputs[sorted_row * threads_per_grid.x + feature]
-                * (float)weights[assignment]);
+                * staged_weights[local_token][slot]);
             accumulator = accumulator + weighted;
         }
         output[token * threads_per_grid.x + feature] = accumulator;

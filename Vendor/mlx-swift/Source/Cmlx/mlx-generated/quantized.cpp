@@ -3614,10 +3614,12 @@ template <typename T, int group_size, int bits>
 // -- measured ~390 GB/s while the K = 2816 gate/up gathers move the same
 // unique bytes at 479-589 GB/s. Here only every span-th y-group survives
 // (the rest return before the scan); the survivor elects ONCE and then
-// walks its span consecutive 8-row y-tiles serially through the verbatim
-// pair impl -- or, for a pairless run position, the verbatim stock
-// qmv_impl -- with tid.y rewritten to the tile index (a strip-walk
-// pattern). Tile u is served by survivor (u / span) * span
+// walks its span consecutive 8-row y-tiles serially through whichever
+// verbatim impl its run length selects -- KERN-QUAD-TILE, below, measures
+// that run and picks the stock qmv_impl, the pair impl, the triple stream
+// impl or the quad stream impl, the SAME run_offset % 4 election the
+// K = 2816 gate/up arm already runs -- with tid.y rewritten to the tile
+// index (a strip-walk pattern). Tile u is served by survivor (u / span) * span
 // at loop step u % span and by no other group, so every output row keeps
 // the IDENTICAL qdot sequence, accumulator, simd_sum and store the
 // untiled arm produces for it: loads-only rescheduling, registers stay
@@ -3661,9 +3663,20 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     }
     run_offset++;
   }
-  // Odd positions are produced by the immediately preceding pair leader.
-  if ((run_offset & 1) != 0) {
+  // KERN-QUAD-TILE: elect on run_offset % 4, the SAME election the
+  // K = 2816 gate/up arm below already uses, instead of the pair-only
+  // run_offset % 2 this arm shipped with. Adding the y-tile coarsening
+  // narrowed this plane's run sharing back to pairs, so a run of three
+  // was costing a pair plus a singleton and a run of four two pairs --
+  // two weight streams where one suffices. Positions 1..3 of each aligned
+  // quartet are produced by their leader and return above.
+  if ((run_offset & 3) != 0) {
     return;
+  }
+  uint run_len = 1;
+  while (run_len < 4 && assignment + run_len < 64 &&
+         rhs_indices[(assignment + run_len) * rhs_stride] == expert) {
+    run_len++;
   }
   const device uint32_t* tile_w = w + expert * w_stride;
   const device T* tile_scales = scales + expert * s_stride;
@@ -3671,13 +3684,28 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   const device T* tile_x0 =
       x + lhs_indices[assignment * lhs_stride] * x_stride;
   device T* tile_y0 = y + assignment * out_vec_size;
-  const bool has_pair =
-      assignment + 1 < 64 &&
-      rhs_indices[(assignment + 1) * rhs_stride] == expert;
-  if (has_pair) {
-    const device T* tile_x1 =
-        x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
-    device T* tile_y1 = y + (assignment + 1) * out_vec_size;
+  if (run_len == 1) {
+    for (int t = 0; t < gemma4_down_tile_span; t++) {
+      uint3 tile_tid = tid;
+      tile_tid.y = tid.y + uint(t);
+      qmv_impl<T, group_size, bits>(
+          tile_w,
+          tile_scales,
+          tile_biases,
+          tile_x0,
+          tile_y0,
+          in_vec_size,
+          out_vec_size,
+          tile_tid,
+          simd_gid,
+          simd_lid);
+    }
+    return;
+  }
+  const device T* tile_x1 =
+      x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
+  device T* tile_y1 = y + (assignment + 1) * out_vec_size;
+  if (run_len == 2) {
     for (int t = 0; t < gemma4_down_tile_span; t++) {
       uint3 tile_tid = tid;
       tile_tid.y = tid.y + uint(t);
@@ -3696,17 +3724,49 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     }
     return;
   }
+  const device T* tile_x2 =
+      x + lhs_indices[(assignment + 2) * lhs_stride] * x_stride;
+  device T* tile_y2 = y + (assignment + 2) * out_vec_size;
+  if (run_len == 3) {
+    for (int t = 0; t < gemma4_down_tile_span; t++) {
+      uint3 tile_tid = tid;
+      tile_tid.y = tid.y + uint(t);
+      qmv_affine4_g64_triple_stream_impl<T, group_size, bits>(
+          tile_w,
+          tile_scales,
+          tile_biases,
+          tile_x0,
+          tile_x1,
+          tile_x2,
+          tile_y0,
+          tile_y1,
+          tile_y2,
+          in_vec_size,
+          tile_tid,
+          simd_gid,
+          simd_lid);
+    }
+    return;
+  }
+  const device T* tile_x3 =
+      x + lhs_indices[(assignment + 3) * lhs_stride] * x_stride;
+  device T* tile_y3 = y + (assignment + 3) * out_vec_size;
   for (int t = 0; t < gemma4_down_tile_span; t++) {
     uint3 tile_tid = tid;
     tile_tid.y = tid.y + uint(t);
-    qmv_impl<T, group_size, bits>(
+    qmv_affine4_g64_quad_stream_impl<T, group_size, bits>(
         tile_w,
         tile_scales,
         tile_biases,
         tile_x0,
+        tile_x1,
+        tile_x2,
+        tile_x3,
         tile_y0,
+        tile_y1,
+        tile_y2,
+        tile_y3,
         in_vec_size,
-        out_vec_size,
         tile_tid,
         simd_gid,
         simd_lid);

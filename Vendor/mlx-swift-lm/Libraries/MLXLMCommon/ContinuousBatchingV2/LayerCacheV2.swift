@@ -241,6 +241,39 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         CBv2CoreInstrumentation.recordPositionOffsetsHostRebuild()
         positionOffsetsState.rebuild(from: rows)
     }
+
+    /// Append only the cache roots that can acquire a new lazy value in an
+    /// all-contiguous bank. The shared position chain is emitted once. Every
+    /// row K/V root stays, and every layer-level in-place-write fence that can
+    /// advance stays: promoted WRITE-016 uses the fence on full-attention
+    /// layers, while the fused sliding writer uses it only on unborrowed
+    /// sliding owners.
+    func appendBankEvaluationRoots(
+        to roots: inout [MLXArray], includeSharedPositionRoot: Bool
+    ) {
+        if includeSharedPositionRoot {
+            roots.append(positionOffsetsState.value)
+        }
+
+        let canAdvanceWriteFence: Bool
+        switch kind.attention {
+        case .slidingWindow:
+            canAdvanceWriteFence =
+                kind.sharesKVWithLayer == nil && !retainsChunkForBorrowers
+        case .full:
+            // WRITE-016-D512 stores K/V in place and publishes this fence.
+            canAdvanceWriteFence = kind.sharesKVWithLayer == nil
+        }
+        if canAdvanceWriteFence {
+            roots.append(decodeRingWriteFence.value)
+        }
+
+        for row in rows {
+            if let provider = row as? CBv2InnerStateProviding {
+                roots.append(contentsOf: provider.cbv2InnerState())
+            }
+        }
+    }
 }
 
 // MARK: - Borrower retention (fused ring-write eligibility)

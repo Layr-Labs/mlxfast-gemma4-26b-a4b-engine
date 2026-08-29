@@ -121,6 +121,8 @@ public struct Gemma4A4BWeightLoader {
 
     /// Packed width of a quantized weight's last axis: `in * bits / 32`,
     /// because affine-quantized weights are stored as `UInt32` words.
+    /// Dense affine-8 QMV (M=8, group=64) dispatches IPG=3 (3+3+2); packing
+    /// stays bits-aware and is independent of the input-row grouping.
     static func packedColumns(inFeatures: Int, bits: Int) -> Int {
         inFeatures * bits / 32
     }
@@ -128,6 +130,14 @@ public struct Gemma4A4BWeightLoader {
     /// Width of a `scales`/`biases` last axis: one entry per group.
     static func groupColumns(inFeatures: Int, groupSize: Int) -> Int {
         inFeatures / groupSize
+    }
+
+    /// Input rows per affine-8 ordinary QMV stream group for the dense MLP
+    /// decode cohort (M=8, bits=8, group=64). IPG=3 yields 3+3+2, not 4+4.
+    static let affine8QMVInputsPerGroup = 3
+    static let affine8QMVDecodeM = 8
+    static func affine8QMVXGroups(batch: Int = affine8QMVDecodeM) -> Int {
+        (batch + affine8QMVInputsPerGroup - 1) / affine8QMVInputsPerGroup
     }
 
     // MARK: - Inventory

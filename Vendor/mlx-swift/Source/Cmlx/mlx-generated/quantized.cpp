@@ -1891,6 +1891,7 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
   }
 }
 
+// ntg.x==8 uses this only as the IPG3 TAIL=2 remainder (rows 6..7), not 2+2+2+2.
 template <typename T, const int group_size, const int bits>
 METAL_FUNC void qmv_affine8_g64_pair_impl(
     const device uint32_t* w,
@@ -1992,6 +1993,10 @@ METAL_FUNC void qmv_affine8_g64_pair_impl(
 // qmv_affine8_g64_pair_impl: two simdgroups by four output rows per 64-thread
 // group, values_per_thread = 4, block_size = 128, scale_step_per_thread = 16,
 // same load_vector / load_vector_safe tail.
+//
+// ntg.x==8 does NOT enter this body as 4+4. affine_qmv's IPG3 consider
+// (triple+triple+pair, TAIL=2) replaces both this quad schedule and the
+// 2+2+2+2 pair schedule for M=8.
 //
 // The block's byte weights and scale/bias are fetched into registers ONCE and
 // the four cohort input rows then walk through a SINGLE four-value x buffer,
@@ -2144,6 +2149,247 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
       y3[row] = static_cast<T>(result3[row]);
     }
   }
+}
+
+// Three-row weight-stream sharing for affine8/g64 QMV: qmv_affine8_g64_quad_stream_impl
+// with the fourth input row deleted. Same geometry as the pair/quad (two
+// simdgroups by four output rows, values_per_thread = 4, block_size = 128,
+// scale_step_per_thread = 16), same one-live-x register discipline, same
+// per-(output, input) accumulators and qdot_affine8_registered arithmetic.
+// IPG=3 on M=8 is two of these covering rows 0..2 and 3..5, then pair TAIL=2.
+template <typename T, const int group_size, const int bits>
+METAL_FUNC void qmv_affine8_g64_triple_stream_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x0,
+    const device T* x1,
+    const device T* x2,
+    device T* y0,
+    device T* y1,
+    device T* y2,
+    const constant int& in_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 4;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 16;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread float x_thread[values_per_thread];
+  thread uint8_t packed[results_per_simdgroup][bytes_per_thread];
+  thread float scale_local[results_per_simdgroup];
+  thread float bias_local[results_per_simdgroup];
+  thread float result0[results_per_simdgroup] = {0};
+  thread float result1[results_per_simdgroup] = {0};
+  thread float result2[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x0 += simd_lid * values_per_thread;
+  x1 += simd_lid * values_per_thread;
+  x2 += simd_lid * values_per_thread;
+  y0 += out_row;
+  y1 += out_row;
+  y2 += out_row;
+
+  int k = 0;
+  for (; k <= in_vec_size - block_size; k += block_size) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      for (int i = 0; i < bytes_per_thread; i++) {
+        packed[row][i] = wl[i];
+      }
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    float sum = load_vector<T, float, values_per_thread, 8>(x0, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x1, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result1[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x2, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result2[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+
+    ws += block_size;
+    scales += block_size / 64;
+    biases += block_size / 64;
+    x0 += block_size;
+    x1 += block_size;
+    x2 += block_size;
+  }
+
+  const uint active_tail_lanes =
+      uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      for (int i = 0; i < bytes_per_thread; i++) {
+        packed[row][i] = wl[i];
+      }
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    float sum = load_vector<T, float, values_per_thread, 8>(x0, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x1, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result1[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x2, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result2[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result0[row] = simd_sum(result0[row]);
+    result1[row] = simd_sum(result1[row]);
+    result2[row] = simd_sum(result2[row]);
+    if (simd_lid == 0) {
+      y0[row] = static_cast<T>(result0[row]);
+      y1[row] = static_cast<T>(result1[row]);
+      y2[row] = static_cast<T>(result2[row]);
+    }
+  }
+}
+
+// IPG3 consider for bits==8 M=8: two triples (rows 0..2, 3..5) then pair
+// TAIL=2 (rows 6..7). Not a clamp of _m<T,8,4,true>. x/y are the cohort base
+// (row 0), not a 4-row or 2-row slice. The pair leaf below is the TAIL only
+// -- it does not re-enter this consider.
+template <typename T>
+METAL_FUNC void qmv_affine8_g64_m8_ipg3(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int M = 8;
+  constexpr int IPG = 3;
+  constexpr int TAIL = M % IPG;
+  const int first_m = int(tid.x) * IPG;
+  if (first_m >= M) {
+    return;
+  }
+  if (TAIL == 0 || M - first_m >= IPG) {
+    qmv_affine8_g64_triple_stream_impl<T, 64, 8>(
+        w,
+        scales,
+        biases,
+        x + first_m * in_vec_size,
+        x + (first_m + 1) * in_vec_size,
+        x + (first_m + 2) * in_vec_size,
+        y + first_m * out_vec_size,
+        y + (first_m + 1) * out_vec_size,
+        y + (first_m + 2) * out_vec_size,
+        in_vec_size,
+        tid,
+        simd_gid,
+        simd_lid);
+  } else {
+    qmv_affine8_g64_pair_impl<T, 64, 8>(
+        w,
+        scales,
+        biases,
+        x + first_m * in_vec_size,
+        x + (first_m + 1) * in_vec_size,
+        y + first_m * out_vec_size,
+        y + (first_m + 1) * out_vec_size,
+        in_vec_size,
+        tid,
+        simd_gid,
+        simd_lid);
+  }
+}
+
+// ntg.x==8 consider on the quad entry: 3+3+2 instead of 4+4. x0/y0 are the
+// cohort base. Other ntg.x keeps the four-row body.
+template <typename T, const int group_size, const int bits>
+METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x0,
+    const device T* x1,
+    const device T* x2,
+    const device T* x3,
+    device T* y0,
+    device T* y1,
+    device T* y2,
+    device T* y3,
+    const constant int& in_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint3 ntg,
+    const constant int& out_vec_size) {
+  if (ntg.x == 8) {
+    qmv_affine8_g64_m8_ipg3<T>(
+        w, scales, biases, x0, y0, in_vec_size, out_vec_size, tid, simd_gid,
+        simd_lid);
+    return;
+  }
+  qmv_affine8_g64_quad_stream_impl<T, group_size, bits>(
+      w, scales, biases, x0, x1, x2, x3, y0, y1, y2, y3, in_vec_size, tid,
+      simd_gid, simd_lid);
+}
+
+// ntg.x==8 consider on the pair entry: 3+3+2 instead of 2+2+2+2. x0/y0 are
+// the cohort base. Other ntg.x keeps the two-row leaf.
+template <typename T, const int group_size, const int bits>
+METAL_FUNC void qmv_affine8_g64_pair_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x0,
+    const device T* x1,
+    device T* y0,
+    device T* y1,
+    const constant int& in_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint3 ntg,
+    const constant int& out_vec_size) {
+  if (ntg.x == 8) {
+    qmv_affine8_g64_m8_ipg3<T>(
+        w, scales, biases, x0, y0, in_vec_size, out_vec_size, tid, simd_gid,
+        simd_lid);
+    return;
+  }
+  qmv_affine8_g64_pair_impl<T, group_size, bits>(
+      w, scales, biases, x0, x1, y0, y1, in_vec_size, tid, simd_gid, simd_lid);
 }
 
 // GROUP-EXACT-MMA -- the fp32 `simdgroup_float8x8` body for the M = 8 decode
@@ -3171,59 +3417,45 @@ template <typename T, const int group_size, const int bits, bool batched>
   if (!batched && group_size == 64 && bits == 8 && ntg.x == 8 &&
       ntg.z == 1 && in_vec_size % 64 == 0 && out_vec_size >= 8 &&
       out_vec_size % 8 == 0) {
-    // Dense decode projections use byte weights.
+    // IPG3 via the quad/pair ntg.x==8 consider -- not a clamp of
+    // _m<T,8,4,true>. Wide-N enters through quad_stream_impl, otherwise
+    // through pair_impl; both redirect to triple+triple+pair (TAIL=2)
+    // instead of 4+4 or 2+2+2+2. x0/y0 are the cohort base.
     if (out_vec_size >= 1024) {
-      // WIDE-N tier -- the dense MLP of all 30 layers: gate_proj and up_proj
-      // N = 2112 over K = 2816, down_proj N = 2816 over K = 2112. One
-      // byte-weight stream feeds FOUR cohort rows in two active x-groups
-      // (4+4); the remaining host groups return, and per-row qdot, K-loop and
-      // simd_sum stay the stock qmv_impl sequence.
-      //
-      // Measured on the ranked box (M4 Pro, B = 8, streamed weight pool),
-      // us/dispatch, incumbent pair -> this:
-      //   N = 2112 (gate/up)  64.4 -> 56.2     N = 2816 (down)  67.4 -> 59.0
-      // Same 1024 floor as the nibble tier, which keeps router.proj (N = 128)
-      // on the promoted pair kernel byte-for-byte.
-      const int first_m = int(tid.x) * 4;
-      if (first_m >= 8) {
-        return;
-      }
       qmv_affine8_g64_quad_stream_impl<T, 64, 8>(
           w,
           scales,
           biases,
-          x + first_m * in_vec_size,
-          x + (first_m + 1) * in_vec_size,
-          x + (first_m + 2) * in_vec_size,
-          x + (first_m + 3) * in_vec_size,
-          y + first_m * out_vec_size,
-          y + (first_m + 1) * out_vec_size,
-          y + (first_m + 2) * out_vec_size,
-          y + (first_m + 3) * out_vec_size,
+          x,
+          x + in_vec_size,
+          x + 2 * in_vec_size,
+          x + 3 * in_vec_size,
+          y,
+          y + out_vec_size,
+          y + 2 * out_vec_size,
+          y + 3 * out_vec_size,
           in_vec_size,
           tid,
           simd_gid,
-          simd_lid);
-      return;
+          simd_lid,
+          ntg,
+          out_vec_size);
+    } else {
+      qmv_affine8_g64_pair_impl<T, 64, 8>(
+          w,
+          scales,
+          biases,
+          x,
+          x + in_vec_size,
+          y,
+          y + out_vec_size,
+          in_vec_size,
+          tid,
+          simd_gid,
+          simd_lid,
+          ntg,
+          out_vec_size);
     }
-    // Pair adjacent cohort rows so each weight byte feeds both exact per-row
-    // dot-product streams.
-    const int first_m = int(tid.x) * 2;
-    if (first_m >= 8) {
-      return;
-    }
-    qmv_affine8_g64_pair_impl<T, 64, 8>(
-        w,
-        scales,
-        biases,
-        x + first_m * in_vec_size,
-        x + (first_m + 1) * in_vec_size,
-        y + first_m * out_vec_size,
-        y + (first_m + 1) * out_vec_size,
-        in_vec_size,
-        tid,
-        simd_gid,
-        simd_lid);
     return;
   }
   qmv_impl<T, group_size, bits>(

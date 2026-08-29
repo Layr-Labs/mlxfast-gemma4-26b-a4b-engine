@@ -380,6 +380,80 @@ public struct Gemma4MTPAutomaticPolicy: Sendable, Equatable {
 
 extension Gemma4TextModel {
 
+    /// Build the B=8 sealed-serial verify semantics in one lazy graph.
+    ///
+    /// The traversal is layer-major, but each token column enters every
+    /// decoder layer with the ordinary `[8, 1, H]` shape.  Transformer layers
+    /// and their KV stores are independent across layer index, so commuting
+    /// `column -> layer` into `layer -> column` changes no dependency: within
+    /// each layer the columns still write and attend in serial order.  Keeping
+    /// one glue-chain box per column also preserves the ordinary cross-layer
+    /// fusion choices exactly.
+    fileprivate func cbv2BatchedExactMTPForward(
+        _ tokenColumns: [MLXArray], caches: [CBv2AttendingLayerCache]
+    ) -> (argmax: MLXArray, lastHidden: MLXArray)? {
+        guard tokenColumns.count > 1,
+            tokenColumns.allSatisfy({
+                $0.ndim == 2 && $0.dim(0) == 8 && $0.dim(1) == 1
+            }),
+            model.hiddenSizePerLayerInput == 0,
+            model.config.numKvSharedLayers == 0,
+            !caches.isEmpty,
+            caches.count == model.layers.count
+        else { return nil }
+
+        let contiguous = caches.compactMap { $0 as? CBv2LayerCache }
+        guard contiguous.count == caches.count,
+            contiguous.enumerated().allSatisfy({ index, cache in
+                cache.layerIndex == index
+                    && cache.kind.sharesKVWithLayer == nil
+                    && cache.rows.count == 8
+                    && cache.unifiedPositionOffsets != nil
+            }),
+            let positionOffsets = contiguous[0].unifiedPositionOffsets
+        else { return nil }
+        // Match the ordinary trunk's pre-layer snapshot before the one
+        // elected cache advances the shared offset chain.
+        let baseOffsets = positionOffsets + 0
+
+        let kvCaches = caches.compactMap { $0 as? KVCache }
+        guard kvCaches.count == caches.count else { return nil }
+
+        let length = tokenColumns.count
+        var columns = tokenColumns.map { ids in
+            model.embedTokens(ids) * model.embedScale
+        }
+        let glueChains = (0 ..< length).map { _ in Gemma4GlueChainBox() }
+
+        for (layerIndex, layer) in model.layers.enumerated() {
+            let nextWeight = layerIndex + 1 < model.layers.count
+                ? model.layers[layerIndex + 1].inputLayernorm.weight : nil
+            for column in 0 ..< length {
+                let (out, _, _) = layer(
+                    columns[column],
+                    mask: nil,
+                    cache: kvCaches[layerIndex],
+                    perLayerInput: nil,
+                    sharedKV: nil,
+                    positionOffset: .batch(
+                        column == 0 ? baseOffsets : baseOffsets + Int32(column)),
+                    v2SharedSource: nil,
+                    outputTailRows: nil,
+                    useLastQueryPrefill: false,
+                    isExpertPrefill: false,
+                    glueChain: glueChains[column],
+                    nextInputLayernormWeight: nextWeight)
+                columns[column] = out
+            }
+        }
+
+        let hidden = concatenated(columns, axis: 1)
+        let argmaxColumns = columns.map {
+            cbv2ArgmaxForMTPHidden(model.norm($0))
+        }
+        return (concatenated(argmaxColumns, axis: 1), hidden)
+    }
+
     /// Forward pass tailored for MTP speculative decoding.
     ///
     /// Returns both the LM head output (logits) and the pre-head trunk
@@ -1012,14 +1086,25 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
     /// with a different target.
     public func bind(target: any Gemma4MTPTarget) throws {
         let newID = ObjectIdentifier(target)
+        func registerBatchedExactTarget() {
+            guard let concreteTarget = target as? Gemma4TextModel else { return }
+            CBv2MTPBatchedExactTargetRegistry.register(targetID: newID) {
+                [weak concreteTarget] columns, caches in
+                concreteTarget?.cbv2BatchedExactMTPForward(columns, caches: caches)
+            }
+        }
         if let existing = boundTargetID {
-            if existing == newID { return }  // idempotent same-target
+            if existing == newID {
+                registerBatchedExactTarget()
+                return  // idempotent same-target
+            }
             throw Gemma4MTPError.rebindForbidden
         }
         try validateCompatibility(with: target)
         self.targetEmbed = { [target] tokens in
             target.embedTokensForDrafter(tokens)
         }
+        registerBatchedExactTarget()
         self.boundTargetID = newID
     }
 

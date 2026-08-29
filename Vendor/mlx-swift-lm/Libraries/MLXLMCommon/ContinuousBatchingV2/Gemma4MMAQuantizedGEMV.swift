@@ -2580,4 +2580,197 @@ public enum Gemma4MMAQuantizedGEMV {
         )
         return outputs[0]
     }
+
+    // MARK: - MTP logitsless top-1 on the promoted version-26 head
+
+    /// Version 26 with its final vocabulary store replaced by a reduction.
+    /// The compared value is `float(T(acc))`, exactly the bf16 value the
+    /// promoted head would have written before ordinary argmax. Ties retain
+    /// the lower vocabulary index, matching MLX argmax.
+    private static let sourceV26Argmax: String = {
+        var result = sourceV26
+
+        func replaceOnce(_ old: String, with new: String) {
+            let count = result.components(separatedBy: old).count
+            precondition(count == 2, "sourceV26Argmax replacement count \(count): \(old)")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+
+        replaceOnce(
+            """
+            const uint outputN0 = sgN0 + fragmentRow;
+            const uint outputN1 = outputN0 + N_PSG;
+            const uint outputN2 = outputN0 + N_PSG * 2;
+            const uint outputN3 = outputN0 + N_PSG * 3;
+            out[fragmentCol * N + outputN0] = T(acc0.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN0] = T(acc0.thread_elements()[1]);
+            out[fragmentCol * N + outputN1] = T(acc1.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN1] = T(acc1.thread_elements()[1]);
+            out[fragmentCol * N + outputN2] = T(acc2.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN2] = T(acc2.thread_elements()[1]);
+            out[fragmentCol * N + outputN3] = T(acc3.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN3] = T(acc3.thread_elements()[1]);
+            """,
+            with: """
+            constexpr uint TILES = uint(N) / (N_SG * N_PSG * 4);
+            threadgroup float bestVal[N_SG * M_ROWS];
+            threadgroup uint bestIdx[N_SG * M_ROWS];
+
+            const uint outputN0 = sgN0 + fragmentRow;
+            float va = float(T(acc0.thread_elements()[0]));
+            float vb = float(T(acc0.thread_elements()[1]));
+            uint ia = outputN0;
+            uint ib = outputN0;
+            const float va1 = float(T(acc1.thread_elements()[0]));
+            const float vb1 = float(T(acc1.thread_elements()[1]));
+            if (va1 > va) { va = va1; ia = outputN0 + N_PSG; }
+            if (vb1 > vb) { vb = vb1; ib = outputN0 + N_PSG; }
+            const float va2 = float(T(acc2.thread_elements()[0]));
+            const float vb2 = float(T(acc2.thread_elements()[1]));
+            if (va2 > va) { va = va2; ia = outputN0 + N_PSG * 2; }
+            if (vb2 > vb) { vb = vb2; ib = outputN0 + N_PSG * 2; }
+            const float va3 = float(T(acc3.thread_elements()[0]));
+            const float vb3 = float(T(acc3.thread_elements()[1]));
+            if (va3 > va) { va = va3; ia = outputN0 + N_PSG * 3; }
+            if (vb3 > vb) { vb = vb3; ib = outputN0 + N_PSG * 3; }
+
+            // `fragmentRow` is lane bits 1, 2 and 4. These three butterflies
+            // close the 32 vocabulary columns owned by one simdgroup for both
+            // activation rows held by this lane.
+            for (uint s = 0; s < 3; ++s) {
+                const ushort xm = s == 0 ? 2 : (s == 1 ? 4 : 16);
+                const float oa = simd_shuffle_xor(va, xm);
+                const uint oia = simd_shuffle_xor(ia, xm);
+                if (oa > va || (oa == va && oia < ia)) { va = oa; ia = oia; }
+                const float ob = simd_shuffle_xor(vb, xm);
+                const uint oib = simd_shuffle_xor(ib, xm);
+                if (ob > vb || (ob == vb && oib < ib)) { vb = ob; ib = oib; }
+            }
+
+            // Lanes 0, 1, 8 and 9 carry the eight activation rows exactly
+            // once. Fold the four simdgroups, then publish one partial record
+            // per threadgroup and row.
+            if ((lane & 22u) == 0u) {
+                bestVal[sg * M_ROWS + fragmentCol] = va;
+                bestIdx[sg * M_ROWS + fragmentCol] = ia;
+                bestVal[sg * M_ROWS + fragmentCol + 1] = vb;
+                bestIdx[sg * M_ROWS + fragmentCol + 1] = ib;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lid < M_ROWS) {
+                float rv = bestVal[lid];
+                uint ri = bestIdx[lid];
+                for (uint s = 1; s < N_SG; ++s) {
+                    const float ov = bestVal[s * M_ROWS + lid];
+                    const uint oi = bestIdx[s * M_ROWS + lid];
+                    if (ov > rv || (ov == rv && oi < ri)) { rv = ov; ri = oi; }
+                }
+                pv[lid * TILES + tg] = rv;
+                pi[lid * TILES + tg] = ri;
+            }
+            """
+        )
+        precondition(!result.contains("out["), "sourceV26Argmax still stores logits")
+        return result
+    }()
+
+    private static let kernelV26Argmax: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_affine4_qmv_m8_v26_argmax",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["pv", "pi"],
+        source: sourceV26Argmax,
+        header: "#include <metal_simdgroup_matrix>\n",
+        ensureRowContiguous: true
+    )
+
+    /// One simdgroup per activation row folds the vocabulary-tile partials.
+    private static let argmaxReduceKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_head_argmax_reduce_v26",
+        inputNames: ["pv", "pi"],
+        outputNames: ["tokens"],
+        source: """
+            const uint m = threadgroup_position_in_grid.x;
+            const uint lane = thread_index_in_simdgroup;
+            float rv = -INFINITY;
+            uint ri = 0xFFFFFFFFu;
+            for (uint i = lane; i < uint(NT); i += 32) {
+                const float ov = pv[m * uint(NT) + i];
+                const uint oi = pi[m * uint(NT) + i];
+                if (ov > rv || (ov == rv && oi < ri)) { rv = ov; ri = oi; }
+            }
+            for (ushort xm = 1; xm < 32; xm <<= 1) {
+                const float ov = simd_shuffle_xor(rv, xm);
+                const uint oi = simd_shuffle_xor(ri, xm);
+                if (ov > rv || (ov == rv && oi < ri)) { rv = ov; ri = oi; }
+            }
+            if (lane == 0) {
+                tokens[m] = int32_t(ri);
+            }
+            """,
+        ensureRowContiguous: true
+    )
+
+    /// The exact version-26 tied-head top-1 token per B=8 activation row.
+    /// Unsupported geometry returns nil so callers retain the stock head.
+    public static func applyArgmax(
+        x: MLXArray,
+        w: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int
+    ) -> MLXArray? {
+        guard enabled, version == 26, let biases else { return nil }
+        guard groupSize == 64, bits == 4 else { return nil }
+        guard x.dtype == .bfloat16, scales.dtype == .bfloat16, biases.dtype == .bfloat16
+        else { return nil }
+        guard w.dtype == .uint32 else { return nil }
+        guard w.ndim == 2, scales.ndim == 2, biases.ndim == 2 else { return nil }
+        guard x.ndim == 2 || (x.ndim == 3 && x.dim(1) == 1) else { return nil }
+        guard x.dim(0) == mRows else { return nil }
+        let k = x.dim(-1)
+        guard k > 0, x.size == mRows * k else { return nil }
+
+        let n = w.dim(0)
+        let cols = colsPerThreadgroup * 4
+        guard n >= minOutputWidth, n % cols == 0 else { return nil }
+        guard k % groupSize == 0, k % 8 == 0 else { return nil }
+        guard w.dim(1) == k * bits / 32 else { return nil }
+        guard scales.dim(0) == n, biases.dim(0) == n else { return nil }
+        guard scales.dim(1) == k / groupSize, biases.dim(1) == k / groupSize else {
+            return nil
+        }
+
+        let flatX = x.reshaped([mRows, k])
+        let threadgroups = n / cols
+        let sumCells = mRows * (k / groupSize)
+        let sumThreads = 128
+        let sumThreadgroups = (sumCells + sumThreads - 1) / sumThreads
+        let xSums = xSumKernel(
+            [flatX],
+            template: [("T", x.dtype), ("K", k)],
+            grid: (sumThreadgroups * sumThreads, 1, 1),
+            threadGroup: (sumThreads, 1, 1),
+            outputShapes: [[sumCells]],
+            outputDTypes: [.float32]
+        )[0]
+
+        let partials = kernelV26Argmax(
+            [flatX, w, scales, biases, xSums],
+            template: [("T", x.dtype), ("K", k), ("N", n)],
+            grid: (threadgroups * threadsPerThreadgroup, 1, 1),
+            threadGroup: (threadsPerThreadgroup, 1, 1),
+            outputShapes: [[mRows * threadgroups], [mRows * threadgroups]],
+            outputDTypes: [.float32, .uint32]
+        )
+
+        return argmaxReduceKernel(
+            [partials[0], partials[1]],
+            template: [("NT", threadgroups)],
+            grid: (mRows * 32, 1, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[mRows]],
+            outputDTypes: [.int32]
+        )[0]
+    }
 }

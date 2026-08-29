@@ -4179,4 +4179,47 @@ extension Gemma4TextModel: CBv2MTPForwardable {
         let (postNorm, preNorm) = model.callCapturingPreNorm(tokens, cache: caches)
         return (applyLMHead(postNorm), preNorm)
     }
+
+    /// Target-authoritative top-1 for one ordinary B=8 decode column.
+    ///
+    /// The fast arm compares the same bf16 values version 26 would store
+    /// before the ordinary argmax, including lower-index tie breaking. The
+    /// final softcap is strictly monotone and therefore cannot change top-1.
+    /// Every unsupported geometry retains the established full-head path.
+    func cbv2ArgmaxForMTPHidden(_ hidden: MLXArray) -> MLXArray {
+        guard lmHead == nil,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.mode == .affine,
+            let top1 = Gemma4MMAQuantizedGEMV.applyArgmax(
+                x: hidden,
+                w: quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                groupSize: quantized.groupSize,
+                bits: quantized.bits)
+        else {
+            return argMax(applyLMHead(hidden), axis: -1).asType(.int32)
+        }
+        return top1.reshaped([hidden.dim(0), 1])
+    }
+
+    /// MTP verification consumes only the target's top-1 ids and pre-norm
+    /// hidden. At the ranked B=8 geometry, project each verification column
+    /// through the exact version-26 tied-head reduction and never construct
+    /// the [8, L, 262144] logits tensor. Every unsupported shape falls back to
+    /// the established head plus argmax.
+    public func cbv2ForwardArgmaxWithHidden(
+        _ tokens: MLXArray, caches: [KVCache]
+    ) -> (argmax: MLXArray, lastHidden: MLXArray) {
+        let (postNorm, preNorm) = model.callCapturingPreNorm(tokens, cache: caches)
+        let length = postNorm.dim(1)
+        let columns = (0 ..< length).map { offset -> MLXArray in
+            let hidden = postNorm[0..., offset ..< (offset + 1), 0...]
+            return cbv2ArgmaxForMTPHidden(hidden)
+        }
+        return (
+            columns.count == 1 ? columns[0] : concatenated(columns, axis: 1),
+            preNorm
+        )
+    }
 }

@@ -59,6 +59,21 @@ public protocol CBv2MTPForwardable: AnyObject {
     /// plain forward on the logits side.
     func cbv2ForwardWithHidden(_ tokens: MLXArray, caches: [KVCache])
         -> (logits: MLXArray, lastHidden: MLXArray)
+    /// Target-authoritative top-1 ids [B, L] plus the same pre-norm hidden.
+    /// A model may fuse the tied head with argmax so verification never
+    /// materializes [B, L, vocab]. The default below is exact and preserves
+    /// the established full-logits path for every other conformer.
+    func cbv2ForwardArgmaxWithHidden(_ tokens: MLXArray, caches: [KVCache])
+        -> (argmax: MLXArray, lastHidden: MLXArray)
+}
+
+extension CBv2MTPForwardable {
+    public func cbv2ForwardArgmaxWithHidden(
+        _ tokens: MLXArray, caches: [KVCache]
+    ) -> (argmax: MLXArray, lastHidden: MLXArray) {
+        let output = cbv2ForwardWithHidden(tokens, caches: caches)
+        return (argMax(output.logits, axis: -1).asType(.int32), output.lastHidden)
+    }
 }
 
 /// Steppable models that can drive MTP rounds. Additive refinement of
@@ -76,10 +91,22 @@ public protocol CBv2MTPSteppableModel: CBv2SteppableModel {
     /// [B, L, hidden]. Same cache/attention semantics as `forward`.
     func forwardWithHidden(tokens: MLXArray, caches: [CBv2AttendingLayerCache])
         -> (logits: MLXArray, lastHidden: MLXArray)
+    /// Target-authoritative top-1 ids [B, L] and pre-norm hidden, with an
+    /// optional model-owned logitsless head.
+    func forwardArgmaxWithHidden(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> (argmax: MLXArray, lastHidden: MLXArray)
 }
 
 extension CBv2MTPSteppableModel {
     public var mtpTargetIdentity: ObjectIdentifier? { nil }
+
+    public func forwardArgmaxWithHidden(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> (argmax: MLXArray, lastHidden: MLXArray) {
+        let output = forwardWithHidden(tokens: tokens, caches: caches)
+        return (argMax(output.logits, axis: -1).asType(.int32), output.lastHidden)
+    }
 }
 
 // MARK: - Drafter seam

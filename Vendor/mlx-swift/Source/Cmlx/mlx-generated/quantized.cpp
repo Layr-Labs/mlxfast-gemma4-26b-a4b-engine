@@ -3648,7 +3648,16 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int gemma4_down_tile_span = 4; // sweep alternate: 2
+  // KERN-SPAN-2: the strip walk's span, swept 4 -> 2. Same ownership
+  // argument (352 divides by both, tile u served by (u / span) * span at
+  // step u % span), same registers, same impls, same per-output add
+  // sequence -- only the survivor count changes: 88 y-groups at span 4,
+  // 176 at span 2. Span 4 amortizes the serial run scan twice as hard;
+  // span 2 leaves twice as many threadgroups resident to hide the
+  // dependent gather loads. Which wins is a hardware property, not an
+  // algebraic one, and the ranked generation is not the one the span was
+  // first picked on.
+  constexpr int gemma4_down_tile_span = 2; // sweep alternate: 4
   if (tid.y % uint(gemma4_down_tile_span) != 0u) {
     return;
   }

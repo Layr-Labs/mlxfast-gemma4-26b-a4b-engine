@@ -74,6 +74,172 @@ public enum CBv2DenseMLPQMVV1 {
     /// the incumbent runtime K loop for both live shapes.
     private static let kernelHeader = CBv2TiedLMHeadQMVV1.kernelHeader + """
 
+// MMA8-029 -- affine-8 port of quantized.h's GROUP-EXACT-MMA decode body.
+// A byte code has eight significant bits and a bf16 operand has eight, so the
+// elementary product is still exact in fp32. Only the association of the 64
+// products and the two KS halves changes from the scalar affine-8 road.
+struct mma8_coord {
+  short fm;
+  short fn;
+};
+
+inline mma8_coord mma8_lane(uint lane) {
+  const short qid = short(lane / 4);
+  return {
+      short((qid & 4) + short((lane / 2) % 4)),
+      short((qid & 2) * 2 + short(lane % 2) * 2)};
+}
+
+template <typename T, bool TWO_BYTE = (sizeof(T) == 2)>
+struct mma8_u16 {
+  static inline T cast(ushort u) {
+    return T(0);
+  }
+};
+
+template <typename T>
+struct mma8_u16<T, true> {
+  static inline T cast(ushort u) {
+    return as_type<T>(u);
+  }
+};
+
+template <typename T>
+inline float mma8_lo(uint u) {
+  return float(mma8_u16<T>::cast(ushort(u & 0xFFFFu)));
+}
+
+template <typename T>
+inline float mma8_hi(uint u) {
+  return float(mma8_u16<T>::cast(ushort(u >> 16)));
+}
+
+// The affine-8 reference widens each bf16 before its four-value lane sum.
+// Keep those exact operands in fp32 while the matrix fragment's eight-value
+// run changes only their addition association.
+template <typename T>
+inline float mma8_affine8_runsum(uint4 r) {
+  float sum = 0.0f;
+  sum += mma8_lo<T>(r.x);
+  sum += mma8_hi<T>(r.x);
+  sum += mma8_lo<T>(r.y);
+  sum += mma8_hi<T>(r.y);
+  sum += mma8_lo<T>(r.z);
+  sum += mma8_hi<T>(r.z);
+  sum += mma8_lo<T>(r.w);
+  sum += mma8_hi<T>(r.w);
+  return sum;
+}
+
+#define MMA8_AFFINE8_SETB(BB, W, HI)              \
+  BB.thread_elements()[0] = mma8_##HI<T>(r0.W);   \
+  BB.thread_elements()[1] = mma8_##HI<T>(r1.W);
+
+#define MMA8_AFFINE8_STEP(BB, W0, W1, SHIFT)                    \
+  A.thread_elements()[0] =                                      \
+      float(extract_bits(wv.W0, uint(SHIFT), 8u));               \
+  A.thread_elements()[1] =                                      \
+      float(extract_bits(wv.W1, uint(SHIFT), 8u));               \
+  simdgroup_multiply_accumulate(C, A, BB, C);
+
+// x is [8, K], byte-packed w is [N, K / 4] uint32, scales and biases are
+// [N, K / 64], and y is [8, N]. USE_XSUM consumes DMLP-002's exact four-value
+// lane sums; the false arm derives the same input operands from the B loads.
+// KS=2 partitions whole g64 groups between the host's two simdgroups.
+template <typename T, int KS, bool USE_XSUM>
+METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device float* x_sums,
+    const device T* x,
+    device T* y,
+    const int K,
+    const int N,
+    const int n0,
+    threadgroup float2* red,
+    uint simd_gid,
+    uint simd_lid) {
+  const int G = K / 64;
+  const int gh = (G + 1) / 2;
+  const int g_begin = (KS == 2 && simd_gid == 1) ? gh : 0;
+  const int g_end = (KS == 2 && simd_gid == 0) ? gh : G;
+  const mma8_coord c = mma8_lane(simd_lid);
+
+  const device uint8_t* wrow =
+      (const device uint8_t*)w + (n0 + c.fm) * K + 8 * c.fn;
+  const device T* srow = scales + (n0 + c.fm) * G;
+  const device T* brow = biases + (n0 + c.fm) * G;
+  const device T* x0 = x + c.fn * K + 8 * c.fm;
+  const device T* x1 = x0 + K;
+
+  float acc0 = 0.0f;
+  float acc1 = 0.0f;
+  simdgroup_float8x8 A;
+  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+  for (int g = g_begin; g < g_end; ++g) {
+    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+
+    float2 rs;
+    if (USE_XSUM) {
+      const int xsum_lane = (g & 1) * 16 + int(c.fm);
+      const int xsum_index = ((g / 2) * 32 + xsum_lane) * 8 + int(c.fn);
+      rs = float2(x_sums[xsum_index], x_sums[xsum_index + 1]);
+      rs += float2(x_sums[xsum_index + 64], x_sums[xsum_index + 65]);
+    } else {
+      rs = float2(
+          mma8_affine8_runsum<T>(r0), mma8_affine8_runsum<T>(r1));
+    }
+    rs += simd_shuffle_xor(rs, 2u);
+    rs += simd_shuffle_xor(rs, 4u);
+    rs += simd_shuffle_xor(rs, 16u);
+
+    MMA8_AFFINE8_SETB(B0, x, lo)
+    MMA8_AFFINE8_SETB(B1, x, hi)
+    MMA8_AFFINE8_SETB(B2, y, lo)
+    MMA8_AFFINE8_SETB(B3, y, hi)
+    MMA8_AFFINE8_SETB(B4, z, lo)
+    MMA8_AFFINE8_SETB(B5, z, hi)
+    MMA8_AFFINE8_SETB(B6, w, lo)
+    MMA8_AFFINE8_SETB(B7, w, hi)
+
+    const uint4 wv = *((const device uint4*)(wrow + 64 * g));
+    const float s = float(srow[g]);
+    const float b = float(brow[g]);
+
+    simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+    MMA8_AFFINE8_STEP(B0, x, z, 0)
+    MMA8_AFFINE8_STEP(B1, x, z, 8)
+    MMA8_AFFINE8_STEP(B2, x, z, 16)
+    MMA8_AFFINE8_STEP(B3, x, z, 24)
+    MMA8_AFFINE8_STEP(B4, y, w, 0)
+    MMA8_AFFINE8_STEP(B5, y, w, 8)
+    MMA8_AFFINE8_STEP(B6, y, w, 16)
+    MMA8_AFFINE8_STEP(B7, y, w, 24)
+
+    acc0 += s * C.thread_elements()[0] + rs.x * b;
+    acc1 += s * C.thread_elements()[1] + rs.y * b;
+  }
+
+  if (KS == 2) {
+    if (simd_gid == 1) {
+      red[simd_lid] = float2(acc0, acc1);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_gid == 1) {
+      return;
+    }
+    const float2 other = red[simd_lid];
+    acc0 = acc0 + other.x;
+    acc1 = acc1 + other.y;
+  }
+
+  y[c.fn * N + n0 + c.fm] = static_cast<T>(acc0);
+  y[(c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc1);
+}
+
 template <typename U, int values_per_thread>
 inline U qdot_affine8_registered(
     const thread uint8_t* w,
@@ -341,6 +507,26 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
 
             const int in_vec_size = x_shape[x_ndim - 1];
             const int out_vec_size = w_shape[0];
+            // GROUP-EXACT-MMA affine-8 tier. These are ordinary compile-time
+            // constants, never Metal function constants, so the pipeline key
+            // remains unchanged. Flipping the switch restores the prior block
+            // below text-for-text.
+            constexpr bool kGemma4QmvMma8Affine8 = false;
+            constexpr int kGemma4QmvMma8Affine8FloorN = 1024;
+            if (kGemma4QmvMma8Affine8 && sizeof(T) == 2 &&
+                in_vec_size % 64 == 0 &&
+                out_vec_size >= kGemma4QmvMma8Affine8FloorN &&
+                out_vec_size % 8 == 0) {
+                if (tid.x != 0) {
+                    return;
+                }
+                threadgroup float2 red[32];
+                gemma4_qmv_mma8_affine8_g64_impl<T, 2, false>(
+                    w, scales, biases, (const device float*)x, x, y,
+                    in_vec_size, out_vec_size, 8 * int(tid.y), red,
+                    simd_gid, simd_lid);
+                return;
+            }
             const int first_m = int(tid.x) * 4;
             if (first_m >= 8) {
                 return;
@@ -402,6 +588,25 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
 
             const int in_vec_size = x_shape[x_ndim - 1];
             const int out_vec_size = w_shape[0];
+            // This is the same compile-time tier as the non-xsum body. The
+            // existing DMLP-002 table supplies the reference path's exact
+            // four-value lane sums; the prior xsum tier stays intact below.
+            constexpr bool kGemma4QmvMma8Affine8 = false;
+            constexpr int kGemma4QmvMma8Affine8FloorN = 1024;
+            if (kGemma4QmvMma8Affine8 && sizeof(T) == 2 &&
+                in_vec_size % 64 == 0 &&
+                out_vec_size >= kGemma4QmvMma8Affine8FloorN &&
+                out_vec_size % 8 == 0) {
+                if (tid.x != 0) {
+                    return;
+                }
+                threadgroup float2 red[32];
+                gemma4_qmv_mma8_affine8_g64_impl<T, 2, true>(
+                    w, scales, biases, xSums, x, y,
+                    in_vec_size, out_vec_size, 8 * int(tid.y), red,
+                    simd_gid, simd_lid);
+                return;
+            }
             const int first_m = int(tid.x) * 4;
             if (first_m >= 8) {
                 return;

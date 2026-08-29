@@ -3791,11 +3791,18 @@ template <typename T, int group_size, int bits>
     // run of four takes the quad-stream impl -- each (output, input) pair
     // keeps its own accumulator, K-loop order, and qdot, so every output
     // element's add sequence is identical to the incumbent per-arm kernels.
-    if ((run_offset & 3) != 0) {
+    // RUN-TRIPLE-3 restacked on ea110c91 (newjordan 1.8880): leader
+    // election parity mod 3, run cap 3 — triple-stream kernel verbatim.
+    // Per-row qdot/accumulator/simd_sum/store bit-identical by the quad
+    // promotion's own per-stream independence; only leader partition and
+    // streams-per-leader change. Plane's prior prices: pair mirror died
+    // −7.13% at a prior engine revision (parallelism-starved), quad is
+    // incumbent; the triple width at this revision is unpriced data.
+    if ((run_offset % 3) != 0) {
       return;
     }
     uint run_len = 1;
-    while (run_len < 4 && assignment + run_len < 64 &&
+    while (run_len < 3 && assignment + run_len < 64 &&
            rhs_indices[(assignment + run_len) * (uint)rhs_strides[0]] ==
                expert) {
       run_len++;

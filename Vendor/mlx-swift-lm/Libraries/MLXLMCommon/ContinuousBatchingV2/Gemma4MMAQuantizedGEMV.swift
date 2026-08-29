@@ -154,11 +154,12 @@ public enum Gemma4MMAQuantizedGEMV {
         case "15": return 15
         case "16": return 16
         case "26": return 26
+        case "27": return 27
         default: return defaultVersion
         }
     }()
 
-    private static let defaultVersion = 26
+    private static let defaultVersion = 27
 
     /// Kernel source. `T` is the activation/scale dtype, `K` the contraction
     /// length, `N` the output width; all three arrive as template constants so
@@ -2481,6 +2482,72 @@ public enum Gemma4MMAQuantizedGEMV {
         ensureRowContiguous: true
     )
 
+    // MARK: - Version 27 --- reused scale-row cursor
+
+    /// V26 collapsed the four packed weight-row pointers into one strided
+    /// cursor; this completes the same play on the scale side: the four
+    /// ``fragmentSRow`` row pointers are removed and each tile's group scale
+    /// is loaded through one transient cursor whose base word is computed
+    /// once per group. ``fragmentSRowN[g]`` resolves to
+    /// ``scales[(sgN0 + fragmentRow) * G_ROW + g + N_PSG * G_ROW * n]``
+    /// by plain address arithmetic, so the SAME eight bf16 scalars are read
+    /// in the SAME order as versions 16/26 and every downstream multiply-add
+    /// is untouched: loads-only rescheduling. The guarded-tail blocks never
+    /// reference these four pointers (verified at build), and each replaceOnce
+    /// precondition fails loudly if the stacked text drifts.
+    private static let sourceV27: String = {
+        var result = sourceV26
+
+        func replaceOnce(_ old: String, with new: String) {
+            let count = result.components(separatedBy: old).count
+            precondition(count == 2, "sourceV27 replacement count \(count): \(old)")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+
+        replaceOnce(
+            """
+            const device T* fragmentSRow0 =
+                scales + (sgN0 + fragmentRow) * G_ROW;
+            const device T* fragmentSRow1 =
+                scales + (sgN0 + N_PSG + fragmentRow) * G_ROW;
+            const device T* fragmentSRow2 =
+                scales + (sgN0 + N_PSG * 2 + fragmentRow) * G_ROW;
+            const device T* fragmentSRow3 =
+                scales + (sgN0 + N_PSG * 3 + fragmentRow) * G_ROW;
+            """,
+            with: """
+            """
+        )
+        replaceOnce(
+            """
+                const float rowScale0 = float(fragmentSRow0[g]);
+                const float rowScale1 = float(fragmentSRow1[g]);
+                const float rowScale2 = float(fragmentSRow2[g]);
+                const float rowScale3 = float(fragmentSRow3[g]);
+            """,
+            with: """
+                const uint scaleWord0 =
+                    (sgN0 + fragmentRow) * G_ROW + g;
+                const uint scaleTileStride = N_PSG * G_ROW;
+                const float rowScale0 = float(scales[scaleWord0]);
+                const float rowScale1 = float(scales[scaleWord0 + scaleTileStride]);
+                const float rowScale2 = float(scales[scaleWord0 + scaleTileStride * 2]);
+                const float rowScale3 = float(scales[scaleWord0 + scaleTileStride * 3]);
+            """
+        )
+        return result
+    }()
+
+    private static let kernelV27: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_affine4_qmv_m8_v27_scale_cursor",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["out"],
+        source: sourceV27,
+        header: "#include <metal_simdgroup_matrix>\n",
+        ensureRowContiguous: true
+    )
+
+
     /// Tied-head GEMV, or `nil` when any gate above fails.
     ///
     /// - Parameters:
@@ -2542,6 +2609,7 @@ public enum Gemma4MMAQuantizedGEMV {
                 outputDTypes: [.float32]
             )[0]
             switch version {
+            case 27: selected = kernelV27
             case 26: selected = kernelV26
             case 16: selected = kernelV16
             case 15: selected = kernelV15

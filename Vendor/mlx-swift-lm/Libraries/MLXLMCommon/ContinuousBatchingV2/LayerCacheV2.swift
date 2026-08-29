@@ -16,6 +16,25 @@
 import Foundation
 import MLX
 
+/// Exact full-ring decode specialization.  Public so Gemma can avoid even the
+/// one-shot position binding when the environment kill switch is OFF.
+public enum CBv2RingPositionReuse {
+    public static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_RING_POSITION_REUSE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+}
+
+/// Optional exact-decode seam for models that already captured the current
+/// batch's PRE-update absolute positions.  The binding is step-scoped and is
+/// consumed by the next `updateAndAttend`; backends that do not opt in keep
+/// the established host-derived ring-start path.
+public protocol CBv2DecodeAbsolutePositionBinding: AnyObject {
+    func bindDecodeAbsolutePositions(_ positions: MLXArray)
+}
+
 /// Shared on-device position chain for one contiguous cache bank. The bank
 /// chooses one owning cache to rebuild/advance it; every cache reads the same
 /// value, so the model can snapshot it once before entering the layer loop.
@@ -93,6 +112,9 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     private var usesUnifiedPositionOffsets = false
     private var advancesPositionOffsets = true
     private let decodeRingWriteFence = CBv2DecodeRingWriteFence()
+    /// Gemma's graph-safe PRE-update position snapshot for this exact layer
+    /// call. Consumed once so no later call can observe a stale binding.
+    private var boundDecodeAbsolutePositions: MLXArray?
 
     /// Whether a KV-shared sibling may still be attending views of this
     /// layer's storage. `CBv2LayerCacheBank` clears it for every layer nothing
@@ -188,6 +210,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         precondition(
             kind.sharesKVWithLayer == nil,
             "CBv2LayerCache: KV-shared layer \(layerIndex) must use attendBorrowing")
+        let decodeAbsolutePositions = boundDecodeAbsolutePositions
+        boundDecodeAbsolutePositions = nil
         let output = CBv2AttentionV1.updateAndAttend(
             rows: rows, kind: kind,
             queries: queries, keys: keys, values: values,
@@ -195,6 +219,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             spanContexts: boundSpanContexts,
             serializeQueries: mtpSerializesRectangularAttention,
             decodeRingWriteFence: decodeRingWriteFence,
+            decodeRingAbsolutePositions: decodeAbsolutePositions,
             allowFusedRingWrite: !retainsChunkForBorrowers)
         // Advance offsets ON-DEVICE. A unified bank elects exactly one owning
         // cache; Gemma snapshots the shared pre-step value before this call.
@@ -252,6 +277,12 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         positionOffsetsHostRebuilds += 1
         CBv2CoreInstrumentation.recordPositionOffsetsHostRebuild()
         positionOffsetsState.rebuild(from: rows)
+    }
+}
+
+extension CBv2LayerCache: CBv2DecodeAbsolutePositionBinding {
+    public func bindDecodeAbsolutePositions(_ positions: MLXArray) {
+        boundDecodeAbsolutePositions = positions
     }
 }
 

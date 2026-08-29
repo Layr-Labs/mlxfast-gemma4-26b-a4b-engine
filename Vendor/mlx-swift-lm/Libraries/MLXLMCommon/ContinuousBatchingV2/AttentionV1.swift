@@ -235,6 +235,7 @@ enum CBv2AttentionV1 {
         spanContexts: [CBv2SpanChunkContext?]? = nil,
         serializeQueries: Bool = false,
         decodeRingWriteFence: CBv2DecodeRingWriteFence? = nil,
+        decodeRingAbsolutePositions: MLXArray? = nil,
         allowFusedRingWrite: Bool = false
     ) -> MLXArray {
         let B = queries.dim(0)
@@ -299,24 +300,47 @@ enum CBv2AttentionV1 {
                         let decodeRingWriteFence
                     {
                         let preWrite = ringRows.compactMap { $0.decodeRingViewBeforeWrite }
-                        if preWrite.count == B,
-                            let fused = CBv2RaggedTwoPassDecodeAttentionV1
+                        if preWrite.count == B {
+                            // Fail closed unless every host-side ring invariant
+                            // independently proves the captured absolute
+                            // position maps to the old start byte-for-byte.
+                            let window = ringRows[0].window
+                            let positionReuseProven =
+                                CBv2RingPositionReuse.enabled
+                                && window == 1024
+                                && ringRows.allSatisfy {
+                                    $0.window == window && $0.retainedCount == window
+                                }
+                                && zip(ringRows, preWrite).allSatisfy {
+                                    (($0.absoluteOffset + 1) & (window - 1)) == $1.start
+                                }
+                            let absolutePositions =
+                                positionReuseProven
+                                ? decodeRingAbsolutePositions : nil
+                            let starts = absolutePositions == nil
+                                ? preWrite.map(\.start) : []
+                            if let fused = CBv2RaggedTwoPassDecodeAttentionV1
                                 .attendRingWriting(
                                     queries: queries,
                                     newKeys: keys, newValues: values,
                                     keys: preWrite.map(\.keys),
                                     values: preWrite.map(\.values),
-                                    starts: preWrite.map(\.start),
+                                    starts: starts,
+                                    absolutePositions: absolutePositions,
                                     previousWriteFence: decodeRingWriteFence.value,
                                     scale: scale,
                                     slidingWindowLength: ringRows[0].window)
-                        {
-                            for row in ringRows {
-                                row.advanceDecodeRingAfterFusedWrite()
+                            {
+                                for row in ringRows {
+                                    row.advanceDecodeRingAfterFusedWrite()
+                                }
+                                decodeRingWriteFence.value = fused.nextWriteFence
+                                if absolutePositions != nil {
+                                    CBv2EngageMark.once("ring-position-reuse")
+                                }
+                                CBv2EngageMark.once("write016")
+                                return fused.output
                             }
-                            decodeRingWriteFence.value = fused.nextWriteFence
-                            CBv2EngageMark.once("write016")
-                            return fused.output
                         }
                     }
 

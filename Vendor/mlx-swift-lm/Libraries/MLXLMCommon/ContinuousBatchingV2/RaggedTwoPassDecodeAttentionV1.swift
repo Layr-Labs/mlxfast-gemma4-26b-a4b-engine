@@ -22,6 +22,17 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Full-ring WRITE016 specialization that keeps pass-A's BF16 partial
+    /// boundary in registers/threadgroup memory and performs the unchanged
+    /// pass-B reduction before returning from the same dispatch. The
+    /// established two-dispatch kernels remain the same-binary fallback.
+    private static let singleDispatchEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_SLIDE_D256_SINGLE_DISPATCH"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let batch = 8
     private static let queryHeads = 16
     private static let kvHeads = 8
@@ -277,7 +288,13 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
             const device T* new_value = new_values
                 + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
-            const uint ring_start = starts[batch_index];
+            // A full ring's post-write start is `(absoluteOffset + 1) % N`.
+            // ABSOLUTE_POSITIONS reuses the bank's already-live pre-step
+            // offset tensor; the false specialization is the established
+            // host-built starts input byte for byte.
+            const uint ring_start = ABSOLUTE_POSITIONS
+                ? ((uint(starts[batch_index]) + 1u) & ring_mask)
+                : uint(starts[batch_index]);
             const uint write_slot = (ring_start + ring_mask) & ring_mask;
             if (block == 0 && query_head_in_group == 0) {
                 device T* write_key = const_cast<device T*>(keys) + write_slot * D;
@@ -336,6 +353,182 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             }
             for (int element = 0; element < values_per_lane; ++element) {
                 partial[element] = T(accumulator[element]);
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    /// WRITE016 pass A + direct pass B in one dispatch for the exact
+    /// architecture-s B=8/Hq=16/Hkv=8/D=256/N=1024/BLOCKS=64 ring.
+    ///
+    /// One 1024-thread threadgroup owns one (row, query-head). SIMDgroup `b`
+    /// replays incumbent pass-A blocks `b` and `b+32`, including its online
+    /// softmax order and explicit BF16 partial rounding. The 64 float
+    /// summaries are staged in threadgroup memory. Each SIMDgroup then
+    /// replays direct pass B's lane order: lane `b` merges blocks `b,b+32`,
+    /// followed by the same 32-lane `simd_sum`. A 32x32 float transpose lets
+    /// block-owning SIMDgroups hand those contributions to output-owning
+    /// SIMDgroups without the incumbent 4 MiB global partial round-trip.
+    private static let singleDispatchRingKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_ringwrite_sdpa_single_bf16_d256_g2_b64_v1",
+        inputNames: [
+            "queries",
+            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+            "starts", "new_keys", "new_values", "write_fence",
+        ],
+        outputNames: ["out", "fence"],
+        source: """
+            constexpr int simd_width = 32;
+            constexpr int values_per_lane = D / simd_width;
+            static_assert(BLOCKS == 64, "single-dispatch merge requires 64 blocks");
+            static_assert((N & (N - 1)) == 0, "ring length must be a power of two");
+            constexpr uint ring_mask = uint(N - 1);
+
+            const int batch_head = int(threadgroup_position_in_grid.x);
+            const int batch_index = batch_head / 16;
+            const int query_head = batch_head - batch_index * 16;
+            const int kv_head = query_head / GQA;
+            const int query_head_in_group = query_head - kv_head * GQA;
+            const int block_lane = int(simdgroup_index_in_threadgroup);
+            const int lane = int(thread_index_in_simdgroup);
+
+            const device T* keys = k0;
+            const device T* values = v0;
+            switch (batch_index) {
+                case 1: keys = k1; values = v1; break;
+                case 2: keys = k2; values = v2; break;
+                case 3: keys = k3; values = v3; break;
+                case 4: keys = k4; values = v4; break;
+                case 5: keys = k5; values = v5; break;
+                case 6: keys = k6; values = v6; break;
+                case 7: keys = k7; values = v7; break;
+                default: break;
+            }
+
+            const device T* query =
+                queries + batch_head * D + lane * values_per_lane;
+            keys += kv_head * N * D + lane * values_per_lane;
+            values += kv_head * N * D + lane * values_per_lane;
+            const device T* new_key = new_keys
+                + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
+            const device T* new_value = new_values
+                + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
+
+            // ABSOLUTE_POSITIONS reuses the bank's already-live pre-step
+            // snapshot: host-side absolute offsets need +1 to match the
+            // post-write ring start the two-dispatch fused path uses.
+            const uint ring_start = ABSOLUTE_POSITIONS
+                ? ((uint(starts[batch_index]) + 1u) & ring_mask)
+                : uint(starts[batch_index]);
+            const uint write_slot = (ring_start + ring_mask) & ring_mask;
+            if (query_head_in_group == 0 && block_lane == 0) {
+                device T* write_key = const_cast<device T*>(keys) + write_slot * D;
+                device T* write_value = const_cast<device T*>(values) + write_slot * D;
+                for (int element = 0; element < values_per_lane; ++element) {
+                    write_key[element] = new_key[element];
+                    write_value[element] = new_value[element];
+                }
+            }
+            if (batch_head == 0 && block_lane == 0 && lane == 0) {
+                fence[0] = write_fence[0] + 1;
+            }
+
+            thread float q[values_per_lane];
+            for (int element = 0; element < values_per_lane; ++element) {
+                q[element] = 1.0f * float(query[element]);
+            }
+
+            thread T rounded_partials[2][values_per_lane];
+            thread float local_maxs[2];
+            threadgroup float group_maxs[BLOCKS];
+            threadgroup float group_sums[BLOCKS];
+            threadgroup float transpose[simd_width * simd_width];
+
+            for (int wave = 0; wave < 2; ++wave) {
+                const int block = block_lane + wave * simd_width;
+                uint slot = (ring_start + uint(block)) & ring_mask;
+                thread float accumulator[values_per_lane];
+                for (int element = 0; element < values_per_lane; ++element) {
+                    accumulator[element] = 0.0f;
+                }
+                float max_score = -3.402823466e+38F;
+                float sum_exp_score = 0.0f;
+
+                for (int token = block; token < N; token += BLOCKS) {
+                    const bool current = token == N - 1;
+                    const device T* k = current ? new_key : keys + slot * D;
+                    const device T* v = current ? new_value : values + slot * D;
+                    float score = 0.0f;
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        score += q[element] * float(k[element]);
+                    }
+                    score = simd_sum(score);
+
+                    const float new_max = max(max_score, score);
+                    const float old_factor = fast::exp(max_score - new_max);
+                    const float score_factor = fast::exp(score - new_max);
+                    max_score = new_max;
+                    sum_exp_score = sum_exp_score * old_factor + score_factor;
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        accumulator[element] = accumulator[element] * old_factor
+                            + score_factor * float(v[element]);
+                    }
+                    slot = (slot + uint(BLOCKS)) & ring_mask;
+                }
+
+                local_maxs[wave] = max_score;
+                if (lane == 0) {
+                    group_maxs[block] = max_score;
+                    group_sums[block] = sum_exp_score;
+                }
+                for (int element = 0; element < values_per_lane; ++element) {
+                    rounded_partials[wave][element] = T(accumulator[element]);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float max_score = -3.402823466e+38F;
+            for (int wave = 0; wave < 2; ++wave) {
+                max_score = max(
+                    max_score, group_maxs[lane + simd_width * wave]);
+            }
+            max_score = simd_max(max_score);
+
+            float sum_exp_score = 0.0f;
+            for (int wave = 0; wave < 2; ++wave) {
+                const int block = lane + simd_width * wave;
+                const float factor = fast::exp(group_maxs[block] - max_score);
+                sum_exp_score += factor * group_sums[block];
+            }
+            sum_exp_score = simd_sum(sum_exp_score);
+
+            thread float contribution[values_per_lane];
+            for (int element = 0; element < values_per_lane; ++element) {
+                contribution[element] = 0.0f;
+            }
+            for (int wave = 0; wave < 2; ++wave) {
+                const float factor = fast::exp(local_maxs[wave] - max_score);
+                for (int element = 0; element < values_per_lane; ++element) {
+                    contribution[element] +=
+                        factor * float(rounded_partials[wave][element]);
+                }
+            }
+
+            device T* output = out
+                + batch_head * D + block_lane * values_per_lane;
+            for (int element = 0; element < values_per_lane; ++element) {
+                transpose[lane * simd_width + block_lane] = contribution[element];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                const float reduced = simd_sum(
+                    transpose[block_lane * simd_width + lane]);
+                if (lane == 0) {
+                    output[element] = T(
+                        sum_exp_score == 0.0f
+                            ? reduced
+                            : reduced / sum_exp_score);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
             }
         """,
         ensureRowContiguous: true
@@ -446,6 +639,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         keys: [MLXArray],
         values: [MLXArray],
         starts: [Int],
+        absolutePositions: MLXArray? = nil,
         previousWriteFence: MLXArray,
         scale: Float,
         slidingWindowLength: Int
@@ -465,9 +659,16 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             previousWriteFence.shape == [1],
             keys.count == batch,
             values.count == batch,
-            starts.count == batch,
-            starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength })
+            absolutePositions != nil
+                || (starts.count == batch
+                    && starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength }))
         else { return nil }
+
+        if let absolutePositions {
+            guard absolutePositions.dtype == .int32,
+                absolutePositions.shape == [batch]
+            else { return nil }
+        }
 
         for index in 0 ..< batch {
             let key = keys[index]
@@ -479,7 +680,30 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             else { return nil }
         }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = absolutePositions
+            ?? MLXArray(starts.map(UInt32.init), [batch])
+        if singleDispatchEnabled, blocks == 64 {
+            let fused = singleDispatchRingKernel(
+                [queries] + keys + values
+                    + [startArray, newKeys, newValues, previousWriteFence],
+                template: [
+                    ("T", queries.dtype),
+                    ("D", headDim),
+                    ("N", sequenceLength),
+                    ("GQA", gqa),
+                    ("KV_HEADS", kvHeads),
+                    ("BLOCKS", blocks),
+                    ("ABSOLUTE_POSITIONS", absolutePositions != nil),
+                ],
+                grid: (batch * queryHeads * 1024, 1, 1),
+                threadGroup: (1024, 1, 1),
+                outputShapes: [[batch, queryHeads, 1, headDim], [1]],
+                outputDTypes: [.bfloat16, .int32]
+            )
+            CBv2EngageMark.once("slide-d256-single-dispatch")
+            return (fused[0], fused[1])
+        }
+
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let passA = fusedRingPassAKernel(
@@ -492,6 +716,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 ("GQA", gqa),
                 ("KV_HEADS", kvHeads),
                 ("BLOCKS", blocks),
+                ("ABSOLUTE_POSITIONS", absolutePositions != nil),
             ],
             grid: (kvHeads * 32, batch * gqa, blocks),
             threadGroup: (32, gqa, 1),

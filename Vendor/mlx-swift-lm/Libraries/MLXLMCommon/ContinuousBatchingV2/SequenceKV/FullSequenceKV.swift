@@ -184,7 +184,9 @@ final class CBv2FullDecodeCohortPool {
 /// `cohortPool(binding:)`): its bytes move once into the pool's batch axis
 /// and every accessor then routes through the pool with identical semantics
 /// and identical returned-view strides.
-public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
+public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV,
+    CBv2InnerStateProviding
+{
 
     /// Extra slots allocated beyond the prompt so the first decode steps
     /// don't immediately grow the buffer.

@@ -275,6 +275,45 @@ private func geGLUClaimsPinnedDecode(_ gate: MLXArray, _ up: MLXArray) -> Bool {
 private func geGLUProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
     geGLUClaimsPinnedDecode(gate, up) ? compiledGeGLUShaped(gate, up) : compiledGeGLU(gate, up)
 }
+// MARK: - ROUTE-SIMD-RANK-64: exact decode route table
+
+/// Stable rank sort for the exact B=8/top-K=8 decode plane. One SIMDgroup
+/// loads the 64 keys once (two keys per lane), broadcasts them to every lane,
+/// and directly emits the three routing products consumed downstream.
+private let routeSimdRank64Kernel: MLXFast.MLXFastKernel =
+    MLXFast.metalKernel(
+        name: "mlx_lm_route_simd_rank_scatter_m8_u32_n64_v1",
+        inputNames: ["indices"],
+        outputNames: ["row_order", "sorted_keys", "inverse_order"],
+        source: """
+            const uint assignment = thread_position_in_grid.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint key = (uint)indices[assignment];
+            const uint key_low = (uint)indices[lane];
+            const uint key_high = (uint)indices[32u + lane];
+            uint rank = 0;
+            for (uint source = 0; source < 32; ++source) {
+                const uint other_low = simd_broadcast(key_low, ushort(source));
+                rank += (other_low < key)
+                    || (other_low == key && source < assignment);
+                const uint other_high = simd_broadcast(key_high, ushort(source));
+                const uint high_assignment = 32u + source;
+                rank += (other_high < key)
+                    || (other_high == key && high_assignment < assignment);
+            }
+            row_order[rank] = assignment / 8;
+            sorted_keys[rank] = key;
+            inverse_order[assignment] = rank;
+        """,
+        ensureRowContiguous: true
+    )
+
+private let routeSimdRank64Enabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_ROUTE_SIMD_RANK"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
 
 // MARK: - ROUTE-CSORT-64: fused counting-sort route table (donor port)
 
@@ -411,9 +450,263 @@ private func routeCountingSortFusedT64(
     return (outputs[0], outputs[1], outputs[2])
 }
 
-public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+// MARK: - PREFILL-CSORT-128 (general-geometry exact stable counting sort)
+
+/// Exact stable counting sort for the GENERAL MoE route geometry — the
+/// prefill/verification tables that ROUTE-CSORT-64 refuses (it is retiled for
+/// the n = 64 eight-row decode cohort and pays an O(n) rescan per tile).
+///
+/// Where the census puts it: in the packed 8x1024 prefill window MLX's generic
+/// `argSort` over the flattened route table (`partition_mbsort` +
+/// `merge_mbsort`, ~10 dispatches per layer x 30 layers, twice — once for
+/// `order`, once for the inverse) costs 392.6 ms of 5508 ms on the M4 (7.2%).
+/// Sorts are latency/memory bound, so they do not shrink with the ranked box's
+/// NAX GEMM speedup: the same census projects the ROUTE bucket to 19-36% of the
+/// sealed 1.254 s M5 prefill window. This lane deletes the sort, not shrinks it.
+///
+/// Three dispatches, no comparisons:
+///   1. `_hist_v1`    — one threadgroup per 256-key block builds a 256-entry
+///                      threadgroup histogram (commutative integer atomics) and
+///                      writes it to `H[block][key]`.
+///   2. `_scan_v1`    — ONE threadgroup: thread `e` sums `H[.][e]` over blocks
+///                      to get `total[e]`, a simd exclusive prefix over the 256
+///                      totals gives the global bin base `base[e]`, and a second
+///                      pass writes `O[block][e] = base[e] + sum_{b<block} H[b][e]`.
+///   3. `_scatter_v1` — one threadgroup per block stages the block's 256 keys in
+///                      threadgroup memory; thread `k` counts how many earlier
+///                      keys IN ITS OWN BLOCK carry its key (`rank`) and lands at
+///                      `pos = O[block][key] + rank`.
+///
+/// Exactness (why this is `argSort`-identical, not merely equal on tests): for
+/// the key at flat index `idx` in block `b`, `O[b][key] + rank` is by
+/// construction `#{keys with a smaller expert} + #{equal keys at a smaller flat
+/// index}`, which is exactly the rank of `idx` under a STABLE sort by key. The
+/// vendored merge argsort is stable at every stage (thread sort swaps only on
+/// strictly-less, the merge prefers A on ties), so its tie order is input order
+/// too — the two permutations agree for EVERY input, not just tested ones.
+/// At the single write point every downstream index product is already known:
+/// `idx / m` is `order.floorDivide(m)`, the key IS `indices[order]`, and `pos`
+/// is the inverse-permutation entry for `idx` (`argSort(order)`), so three
+/// dispatches replace `argSort` -> `floorDivide` -> take -> `argSort` with
+/// byte-identical integer outputs and every consumer (the `gather_qmm`
+/// `rhsIndices`/`lhsIndices`, `weightedExpertUnsort`, `scatterUnsort`) is
+/// untouched.
+///
+/// The counter table is a fixed 256 entries wide regardless of `numExperts`, so
+/// no expert count is baked into any kernel: bins above `numExperts` simply hold
+/// zero and contribute nothing to the bases. Callers must still prove keys are
+/// below that width via the `numExperts` guard (`routeCountingSortKeyBound`).
+///
+/// Every kernel indexes its inputs linearly, so all three ask MLX for
+/// `ensureRowContiguous` — free for the contiguous route tables production
+/// actually hands us (MLX skips the copy when the flag is already set) and a
+/// hard guarantee for anything else that ever reaches this helper.
+///
+/// Kill switch: `DARKBLOOM_ROUTE_CSORT_PREFILL` set to `0`/`false`/`no`/`off`
+/// restores the `argSort` chain. Engage mark: `route-csort-prefill`.
+private let routeCsortPrefillEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_ROUTE_CSORT_PREFILL"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// Keys per histogram/scatter block.
+private let routeCsortPrefillBlock = 256
+/// Counter-table width; must equal ``routeCountingSortKeyBound`` and the 256
+/// threads per threadgroup the three kernels launch with.
+private let routeCsortPrefillWidth = 256
+/// Largest `n` accepted. Positions, block offsets and grid extents are uint32 /
+/// Int32 on the Metal side; this bound keeps every one of them representable
+/// with room to spare and is ~4000x the largest production route table.
+private let routeCsortPrefillMaxKeys = 1 << 28
+
+/// One-shot stderr note of the geometries that reach the route sort. Off unless
+/// `DARKBLOOM_ROUTE_CSORT_DEBUG` is set; the hot path reads one static Bool.
+private let routeCsortDebugShapes: Bool =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROUTE_CSORT_DEBUG"] != nil
+
+private final class RouteCsortShapeLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var seen = Set<String>()
+
+    @inline(__always)
+    func note(_ make: () -> String) {
+        guard routeCsortDebugShapes else { return }
+        let key = make()
+        lock.lock()
+        let fresh = seen.insert(key).inserted
+        lock.unlock()
+        if fresh {
+            FileHandle.standardError.write(Data("[route-csort] \(key)\n".utf8))
+        }
+    }
+}
+
+private let routeCsortShapeLog = RouteCsortShapeLog()
+
+private let routeCsortPrefillHistKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "mlx_lm_route_csort128_hist_v1",
+    inputNames: ["keys"],
+    outputNames: ["block_hist"],
+    source: """
+        constexpr uint BLOCK = \(routeCsortPrefillBlock);
+        constexpr uint WIDTH = \(routeCsortPrefillWidth);
+        uint b = threadgroup_position_in_grid.x;
+        uint k = thread_position_in_threadgroup.x;
+        uint n = keys_shape[0];
+        threadgroup atomic_uint tg_count[WIDTH];
+        atomic_store_explicit(&tg_count[k], 0u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint idx = b * BLOCK + k;
+        if (idx < n) {
+            atomic_fetch_add_explicit(
+                &tg_count[keys[idx]], 1u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Integer adds commute, so the table is identical for every
+        // interleaving the hardware picks.
+        block_hist[b * WIDTH + k] =
+            atomic_load_explicit(&tg_count[k], memory_order_relaxed);
+        """,
+    ensureRowContiguous: true
+)
+
+private let routeCsortPrefillScanKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "mlx_lm_route_csort128_scan_v1",
+    inputNames: ["block_hist"],
+    outputNames: ["block_offset"],
+    source: """
+        constexpr uint WIDTH = \(routeCsortPrefillWidth);
+        uint e = thread_position_in_threadgroup.x;
+        uint simd_id = e / 32;
+        uint lane = e % 32;
+        uint nblocks = (uint)block_hist_shape[0];
+        uint total = 0u;
+        for (uint b = 0; b < nblocks; ++b) {
+            total += block_hist[b * WIDTH + e];
+        }
+        // Global bin base: exclusive prefix over the 256 expert totals.
+        uint lane_excl = simd_prefix_exclusive_sum(total);
+        threadgroup uint simd_totals[8];
+        if (lane == 31) {
+            simd_totals[simd_id] = lane_excl + total;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint running = 0u;
+        for (uint s = 0; s < simd_id; ++s) {
+            running += simd_totals[s];
+        }
+        running += lane_excl;
+        // Exclusive scan over blocks for this expert, offset by the bin base.
+        for (uint b = 0; b < nblocks; ++b) {
+            block_offset[b * WIDTH + e] = running;
+            running += block_hist[b * WIDTH + e];
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+private let routeCsortPrefillScatterKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "mlx_lm_route_csort128_scatter_v1",
+    inputNames: ["keys", "block_offset"],
+    outputNames: ["row_order", "sorted_keys", "inverse_order"],
+    source: """
+        constexpr uint BLOCK = \(routeCsortPrefillBlock);
+        constexpr uint WIDTH = \(routeCsortPrefillWidth);
+        uint b = threadgroup_position_in_grid.x;
+        uint k = thread_position_in_threadgroup.x;
+        uint n = keys_shape[0];
+        uint idx = b * BLOCK + k;
+        // Tail block: the sentinel is outside the proven key space (keys are
+        // below the 256-wide counter table), so it can never tie a real key.
+        uint key = (idx < n) ? keys[idx] : 0xffffffffu;
+        threadgroup uint tg_keys[BLOCK];
+        tg_keys[k] = key;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (idx < n) {
+            // Stable local rank: earlier keys in this block only. Read in
+            // index order from threadgroup memory, so no write position ever
+            // depends on scheduling.
+            uint rank = 0u;
+            for (uint j = 0; j < k; ++j) {
+                rank += (tg_keys[j] == key) ? 1u : 0u;
+            }
+            uint pos = block_offset[b * WIDTH + key] + rank;
+            row_order[pos] = idx / (uint)M;
+            sorted_keys[pos] = key;
+            inverse_order[idx] = pos;
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+/// Exact stable counting sort of a flat uint32 route table. Returns nil (fail
+/// closed onto `argSort`) unless every precondition of the kernels holds.
+private func routeCountingSortPrefill(
+    _ indices: MLXArray, m: Int, numExperts: Int
+) -> (rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray)? {
+    let n = indices.size
+    guard routeCsortPrefillEnabled,
+        indices.dtype == .uint32,
+        indices.ndim == 1,
+        numExperts > 0,
+        numExperts <= routeCsortPrefillWidth,
+        numExperts <= routeCountingSortKeyBound,
+        m >= 1,
+        n > routeSortTile64,
+        n <= routeCsortPrefillMaxKeys
+    else { return nil }
+    CBv2EngageMark.once("route-csort-prefill")
+    let blocks = (n + routeCsortPrefillBlock - 1) / routeCsortPrefillBlock
+    let width = routeCsortPrefillWidth
+    let hist = routeCsortPrefillHistKernel(
+        [indices],
+        grid: (blocks * width, 1, 1),
+        threadGroup: (width, 1, 1),
+        outputShapes: [[blocks, width]],
+        outputDTypes: [.uint32]
+    )[0]
+    let offsets = routeCsortPrefillScanKernel(
+        [hist],
+        grid: (width, 1, 1),
+        threadGroup: (width, 1, 1),
+        outputShapes: [[blocks, width]],
+        outputDTypes: [.uint32]
+    )[0]
+    let outputs = routeCsortPrefillScatterKernel(
+        [indices, offsets],
+        template: [("M", m)],
+        grid: (blocks * width, 1, 1),
+        threadGroup: (width, 1, 1),
+        outputShapes: [[n], [n], [n]],
+        outputDTypes: [.uint32, .uint32, .uint32]
+    )
+    return (outputs[0], outputs[1], outputs[2])
+}
+
+/// `numExperts` is the exclusive upper bound of the index key space. Callers
+/// that know it (SwitchGLU) pass it so PREFILL-CSORT-128 can prove its 256-entry
+/// counter table covers every key; the default (`Int.max`) fails closed onto the
+/// established `argSort` chain, which is what the generic MoE models that share
+/// this helper (GPTOSS, NemotronH) keep getting.
+public func gatherSort(
+    x: MLXArray, indices: MLXArray, numExperts: Int = Int.max
+) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
     let indices = indices.flattened()
+    routeCsortShapeLog.note {
+        "gatherSort n=\(indices.size) m=\(m) E=\(numExperts) "
+            + "dtype=\(indices.dtype)"
+    }
+    // PREFILL-CSORT-128: three dispatches with byte-identical outputs.
+    if let fused = routeCountingSortPrefill(indices, m: m, numExperts: numExperts) {
+        return (
+            x.flattened(start: 0, end: -3)[fused.rowOrder],
+            fused.sortedKeys,
+            fused.inverseOrder
+        )
+    }
     let order = argSort(indices)
     let inverseOrder = argSort(order)
 
@@ -431,14 +724,36 @@ public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, M
 public func gatherSortIndices(
     indices: MLXArray, numExperts: Int = Int.max
 ) -> (MLXArray, MLXArray, MLXArray) {
+    if routeSimdRank64Enabled,
+        indices.ndim == 2, indices.shape == [8, 8], indices.dtype == .uint32
+    {
+        let outputs = routeSimdRank64Kernel(
+            [indices],
+            grid: (64, 1, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [[64], [64], [64]],
+            outputDTypes: [.uint32, .uint32, .uint32]
+        )
+        return (outputs[0], outputs[1], outputs[2])
+    }
     let m = indices.dim(-1)
     let indices = indices.flattened()
-    // ROUTE-CSORT-64: one fused dispatch with byte-identical outputs
-    // (default ON; see routeCountingSort64Enabled above).
-    if numExperts <= routeCountingSortKeyBound,
-        let fused = routeCountingSortFusedT64(indices, m: m)
-    {
-        return (fused.rowOrder, fused.sortedKeys, fused.inverseOrder)
+    routeCsortShapeLog.note {
+        "gatherSortIndices n=\(indices.size) m=\(m) E=\(numExperts) "
+            + "dtype=\(indices.dtype)"
+    }
+    if numExperts <= routeCountingSortKeyBound {
+        // PREFILL-CSORT-128 owns everything wider than the retiled decode
+        // cohort; ROUTE-CSORT-64 keeps the exact n = 64 geometry it was built
+        // for (one threadgroup, no histogram/scan round trip).
+        if let fused = routeCountingSortPrefill(indices, m: m, numExperts: numExperts) {
+            return (fused.rowOrder, fused.sortedKeys, fused.inverseOrder)
+        }
+        // ROUTE-CSORT-64: one fused dispatch with byte-identical outputs
+        // (default ON; see routeCountingSort64Enabled above).
+        if let fused = routeCountingSortFusedT64(indices, m: m) {
+            return (fused.rowOrder, fused.sortedKeys, fused.inverseOrder)
+        }
     }
     let order = argSort(indices)
     return (order.floorDivide(m), indices[order], argSort(order))
@@ -591,7 +906,8 @@ public class SwitchGLU: Module {
                 (lhsIndices, idx, inverseOrder) = gatherSortIndices(
                     indices: indices, numExperts: numExperts)
             } else {
-                (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
+                (x, idx, inverseOrder) = gatherSort(
+                    x: x, indices: indices, numExperts: numExperts)
             }
         }
 

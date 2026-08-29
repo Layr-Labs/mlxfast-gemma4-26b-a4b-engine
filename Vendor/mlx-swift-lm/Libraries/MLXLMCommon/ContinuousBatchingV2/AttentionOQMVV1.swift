@@ -51,6 +51,7 @@ inline float2 attention_o_qdot_affine4_loaded_pair(
     float bias,
     float2 sum) {
   float2 accum = 0;
+  #pragma unroll
   for (int i = 0; i < 4; i++) {
     accum +=
         (float2(x0[4 * i], x1[4 * i]) * (ws[i] & 0x000f) +
@@ -87,6 +88,7 @@ METAL_FUNC void attention_o_qmv_fast_crossrow_affine4_g64_tight(
   const int in_vec_size_g = in_vec_size / 64;
 
   thread float2 pair_result[rows_per_simd];
+  #pragma unroll
   for (int r = 0; r < rows_per_simd; r++) {
     pair_result[r] = 0.0f;
   }
@@ -96,6 +98,7 @@ METAL_FUNC void attention_o_qmv_fast_crossrow_affine4_g64_tight(
     thread float scale_local[rows_per_simd];
     thread float bias_local[rows_per_simd];
 
+    #pragma unroll
     for (int r = 0; r < rows_per_simd; r++) {
       const int row = out_row + r;
       const device uint8_t* wb =
@@ -103,6 +106,7 @@ METAL_FUNC void attention_o_qmv_fast_crossrow_affine4_g64_tight(
           row * in_vec_size_w + k / 2 + simd_lid * bytes_per_lane;
       const device uint16_t* ws =
           reinterpret_cast<const device uint16_t*>(wb);
+      #pragma unroll
       for (int i = 0; i < 4; i++) {
         packed[r][i] = ws[i];
       }
@@ -121,6 +125,7 @@ METAL_FUNC void attention_o_qmv_fast_crossrow_affine4_g64_tight(
         load_vector<T, float, values_per_thread, 4>(xm0, x0);
     const float sum1 =
         load_vector<T, float, values_per_thread, 4>(xm1, x1);
+    #pragma unroll
     for (int r = 0; r < rows_per_simd; r++) {
       pair_result[r] += attention_o_qdot_affine4_loaded_pair(
           packed[r], x0, x1, scale_local[r], bias_local[r],
@@ -128,6 +133,7 @@ METAL_FUNC void attention_o_qmv_fast_crossrow_affine4_g64_tight(
     }
   }
 
+  #pragma unroll
   for (int r = 0; r < rows_per_simd; r++) {
     const float reduced0 = simd_sum(pair_result[r].x);
     const float reduced1 = simd_sum(pair_result[r].y);
@@ -315,7 +321,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
         ensureRowContiguous: true)
 
     private static let qmvKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_affine4_g64_tight_v1",
+        name: "cbv2_b8_l1_attention_o_affine4_g64_tight_v2",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """

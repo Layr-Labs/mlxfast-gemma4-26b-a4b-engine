@@ -3645,7 +3645,8 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int gemma4_down_tile_span = 4; // sweep alternate: 2
+  // 352 y-groups; the span must divide it. Swept 4, 8, 16, 32.
+  constexpr int gemma4_down_tile_span = 22; // sweep alternate: 16
   if (tid.y % uint(gemma4_down_tile_span) != 0u) {
     return;
   }

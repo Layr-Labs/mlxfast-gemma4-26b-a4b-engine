@@ -3,6 +3,8 @@
 import Foundation
 import MLX
 
+// Transparent exact-crown measurement retry after the independent RUN-COUNT
+// and EXPERT-SINGLES mechanisms failed their first combined M5 admission gate.
 /// The fundamental configuration for any MLX-based model.
 ///
 /// `BaseConfiguration` provides the metadata necessary to identify the model architecture

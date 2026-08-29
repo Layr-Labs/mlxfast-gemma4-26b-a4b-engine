@@ -80,12 +80,12 @@ private func gemma4TruthyFlag(_ raw: String?) -> Bool {
 /// later layers. This changes only when already-built work is queued; the
 /// operations and results are unchanged. Single-token decode is excluded.
 ///
-/// The 18-layer default leaves twelve layers of the 30-layer 26B model for
-/// useful CPU/GPU overlap. `DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL=0` restores
+/// The stride is the layer multiple at which an intermediate graph is handed
+/// to the queue; a thirty-layer tower submits at every multiple of it. `DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL=0` restores
 /// one final submission; another positive value tunes the layer interval.
 @inline(__always)
 internal func resolveGemma4PrefillChunkEvalLayers(_ raw: String?) -> Int {
-    guard let raw, let value = Int(raw) else { return 18 }
+    guard let raw, let value = Int(raw) else { return 10 }
     return max(0, value)
 }
 

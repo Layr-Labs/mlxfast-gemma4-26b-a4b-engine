@@ -63,24 +63,26 @@ internal func gemma4ShouldSubmitDecodeAsyncEvalLadder(
     if let set = gemma4DecodeAsyncEvalLadderSet {
         return set.contains(layerIndex)
     }
-    // Only the two EARLY boundaries pay. Submitting after layers 0 and 1
-    // starts GPU work while the host is still building the remaining 28
-    // layers; by layer 5 the device already has queued work, so the middle
-    // cadence {5, 11, 17, 23, 27} adds no overlap and only fragments the
-    // command buffer. Measured on an M1 Ultra at the ranked B=8 geometry,
-    // paired and interleaved, tokens identical in every arm:
+    // The two EARLY boundaries start GPU work while the host is still building
+    // the remaining 28 layers. Sparse refreshes after layers 12 and 24 keep
+    // that overlap alive on newer Apple GPU generations without restoring the
+    // fragment-heavy middle cadence {5, 11, 17, 23, 27}. Measured at the ranked
+    // B=8 geometry, paired and interleaved, tokens identical in every arm:
     //
     //     {} (no boundaries)          +0.17%   <- overlap genuinely lost
     //     {0,1}                       -0.52%   (64-step)  -0.51% (128-step)
-    //     {0,1,11,23}                 -0.53%
+    //     {0,1,11,23}                 -0.53%  (M1 Ultra)
+    //                                  -0.47%  (M4 Pro, 128-step)
+    //     {0,1,12,24}                 -1.62%  (M4 Pro, 128-step)
     //     {0,1,5,11,17,23,27}          baseline (previous default)
     //     {0,1,5,11,17,23,27,29}      +0.13%
     //     A/A control                 -0.09%   <- the noise floor
     //
-    // The empty-set row is the control that matters: this is not "fewer is
-    // always better", it is "the early pair carries all of the overlap".
+    // The empty-set and dense-ladder rows are the controls that matter: this
+    // is not "more submissions are always better", but a sparse cadence that
+    // replenishes the device queue without excessive fragmentation.
     switch layerIndex {
-    case 0, 1:
+    case 0, 1, 12, 24:
         return true
     default:
         return false

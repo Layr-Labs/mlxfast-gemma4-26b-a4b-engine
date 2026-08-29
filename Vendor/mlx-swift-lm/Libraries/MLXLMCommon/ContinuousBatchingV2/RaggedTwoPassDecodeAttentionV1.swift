@@ -1,3 +1,5 @@
+// Box-draw entry #2 on the unmodified crown content (entry #1, 29c4f543,
+// died to a bare infra failure — crown-identical bytes cannot fidelity-fail).
 // RaggedTwoPassDecodeAttentionV1.swift
 //
 // Batch-wide dispatch of MLX's established two-pass vector attention for the

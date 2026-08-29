@@ -1728,6 +1728,8 @@ private enum Gemma4FusedLayerGlue {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    // Cohort width and model width. nReads and tgThreads follow from axis:
+    // axis / nReads == tgThreads == 704, one threadgroup per cohort row.
     private static let rows = 8
     private static let axis = 2816
     private static let eps: Float = 1e-6

@@ -2380,23 +2380,12 @@ public class Gemma4DecoderLayer: Module {
             let perLayerInput = activePerLayerInput
         {
             let residual3 = out
-            // Same compiled graph the dense MLP site already uses, and it
-            // rounds in the same places as the two-dispatch form: `compile`
-            // keeps each node at its own dtype, so the activated intermediate
-            // is materialised bf16 either way.
-            var g = gemma4SafeGeluProduct(gate(out), perLayerInput)
+            var g = gate(out)
+            g = gemma4SafeGeluApproximate(g)
+            g = g * perLayerInput
             g = proj(g)
-            // Same `residual + rmsNorm(x, w)` at 2816 and the same eps as the
-            // post-attention site, so the prefill fusion applies unchanged.
-            if let fusedPLE = Gemma4PrefillGlueV1.normResidual(
-                x: g, weight: norm.weight, residual: residual3,
-                eps: config.rmsNormEps)
-            {
-                out = fusedPLE
-            } else {
-                g = norm(g)
-                out = residual3 + g
-            }
+            g = norm(g)
+            out = residual3 + g
         }
 
         if !scalarFolded {

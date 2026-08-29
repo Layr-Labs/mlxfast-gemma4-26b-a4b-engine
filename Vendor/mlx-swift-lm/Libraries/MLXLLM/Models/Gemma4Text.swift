@@ -812,6 +812,170 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// QKVNORM-PREFILL-001: the prefill twin of `gemma4_b8_qkv_rms_norm_v1`.
+///
+/// Same per-row arithmetic, three differences in the plumbing.
+///
+/// Rows are addressed from the shapes rather than the decode cohort's fixed
+/// geometry, so `[B, chunk, H, D]` is admitted. V rides the K reduction (this
+/// checkpoint is `attention_k_eq_v`, so `vRaw === kRaw`), which removes a
+/// whole re-read of the key projection. And each row is written straight into
+/// its `[B, H, L, D]` slot, so the `transposed(0, 2, 1, 3)` attention wants
+/// costs nothing downstream.
+///
+/// The load-bearing detail is `RPT`. A 256-wide row is 64 threads at
+/// `RMS_N_READS = 4`, and one 64-thread threadgroup per row leaves the
+/// prefill plane far off saturation — that shape, not the dispatch count, is
+/// why the stock three-norm chain is slow here. `RPT` rows share one 512-wide
+/// threadgroup, and each row keeps its own 64 threads and its own two
+/// simdgroups, so the reduction tree is the stock one row for row.
+private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
+    name: "gemma4_qkv_rms_norm_head_major_v1",
+    inputNames: ["q", "k", "q_weight", "k_weight"],
+    outputNames: ["q_out", "k_out", "v_out"],
+    source: """
+        constexpr uint reads = 4;
+        constexpr uint row_threads = D / reads;
+        const uint tid = thread_position_in_threadgroup.x;
+        const uint slot = tid / row_threads;
+        const uint lid = tid - slot * row_threads;
+        const uint row = threadgroup_position_in_grid.x * RPT + slot;
+        const uint lane = thread_index_in_simdgroup;
+        const uint row_simd = lid / 32;
+
+        threadgroup float partials[RPT][32];
+        threadgroup float inv_rms[RPT];
+
+        const device T* input = q;
+        const device T* weight = q_weight;
+        device T* output = q_out;
+        // Held inside the V allocation on Q rows, which never dereference it.
+        device T* value_output = v_out;
+        bool is_key = false;
+
+        if (row < TOTAL_ROWS) {
+            if (row < Q_ROWS) {
+                const uint b = row / (LQ * HQ);
+                const uint rem = row - b * (LQ * HQ);
+                const uint l = rem / HQ;
+                const uint h = rem - l * HQ;
+                input = q + (size_t)row * D;
+                output = q_out + (((size_t)b * HQ + h) * LQ + l) * D;
+            } else {
+                is_key = true;
+                const uint krow = row - Q_ROWS;
+                const uint b = krow / (LK * HK);
+                const uint rem = krow - b * (LK * HK);
+                const uint l = rem / HK;
+                const uint h = rem - l * HK;
+                const size_t off = (((size_t)b * HK + h) * LK + l) * D;
+                input = k + (size_t)krow * D;
+                weight = k_weight;
+                output = k_out + off;
+                value_output += off;
+            }
+        }
+
+        input += lid * reads;
+        output += lid * reads;
+        weight += lid * reads;
+        value_output += lid * reads;
+
+        float sum = 0.0f;
+        if (row < TOTAL_ROWS) {
+            for (uint i = 0; i < reads; ++i) {
+                const float value = float(input[i]);
+                sum += value * value;
+            }
+        }
+        sum = simd_sum(sum);
+
+        // Slots 2..31 stay exactly zero, so the 32-lane combine returns the
+        // two simdgroup partials' sum whatever order the tree adds them in.
+        if (row_simd == 0) partials[slot][lane] = 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) partials[slot][row_simd] = sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (row_simd == 0) {
+            sum = simd_sum(partials[slot][lane]);
+            if (lane == 0) {
+                inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (row >= TOTAL_ROWS) return;
+        const float inverse_rms = inv_rms[slot];
+        for (uint i = 0; i < reads; ++i) {
+            const T normalized = T(float(input[i]) * inverse_rms);
+            output[i] = weight[i] * normalized;
+            // K rows also carry V: same raw input, same normalizer, and
+            // `RMSNormNoScale`'s own final expression.
+            if (is_key) {
+                value_output[i] = T(1) * normalized;
+            }
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+private let gemma4QKVNormPrefillEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_QKV_NORM_PREFILL"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// `(qNorm(q), kNorm(k), vNorm(k))` already in `[B, H, L, D]`. Returns `nil`
+/// off the plane, including for every non-`k_eq_v` projection.
+private func gemma4FusedQKVNormHeadMajor(
+    q: MLXArray,
+    k: MLXArray,
+    qWeight: MLXArray,
+    kWeight: MLXArray,
+    eps: Float,
+    keyValueShared: Bool
+) -> (MLXArray, MLXArray, MLXArray)? {
+    guard gemma4QKVNormPrefillEnabled, keyValueShared, eps == 1.0e-6,
+        q.dtype == .bfloat16, k.dtype == .bfloat16,
+        qWeight.dtype == .bfloat16, kWeight.dtype == .bfloat16,
+        q.ndim == 4, k.ndim == 4,
+        q.dim(0) == k.dim(0), q.dim(0) >= 1,
+        q.dim(1) >= 1, k.dim(1) >= 1,
+        // Below ~1024 rectangle tokens the wide threadgroup stops paying for
+        // itself and the stock three-kernel chain is faster; measured, not
+        // assumed. Decode also leaves through here, back to its own kernel.
+        q.dim(0) * max(q.dim(1), k.dim(1)) >= 1024,
+        q.dim(2) == 16, q.dim(3) == k.dim(3),
+        (q.dim(3) == 256 && k.dim(2) == 8) || (q.dim(3) == 512 && k.dim(2) == 2),
+        qWeight.shape == [q.dim(3)], kWeight.shape == [q.dim(3)]
+    else { return nil }
+
+    let (batch, lq, hq, dimension) = (q.dim(0), q.dim(1), q.dim(2), q.dim(3))
+    let (lk, hk) = (k.dim(1), k.dim(2))
+    let qRows = batch * lq * hq
+    let rows = qRows + batch * lk * hk
+    let rowThreads = dimension / 4
+    let rowsPerGroup = 512 / rowThreads
+    let groups = (rows + rowsPerGroup - 1) / rowsPerGroup
+    let outputs = gemma4QKVNormPrefillKernel(
+        [q, k, qWeight, kWeight],
+        template: [
+            ("T", q.dtype), ("D", dimension), ("Q_ROWS", qRows),
+            ("TOTAL_ROWS", rows), ("RPT", rowsPerGroup),
+            ("LQ", lq), ("HQ", hq), ("LK", lk), ("HK", hk),
+        ],
+        grid: (groups * rowsPerGroup * rowThreads, 1, 1),
+        threadGroup: (rowsPerGroup * rowThreads, 1, 1),
+        outputShapes: [
+            [batch, hq, lq, dimension], [batch, hk, lk, dimension],
+            [batch, hk, lk, dimension],
+        ],
+        outputDTypes: [q.dtype, q.dtype, q.dtype]
+    )
+    return (outputs[0], outputs[1], outputs[2])
+}
+
 private func gemma4FusedQKVNorm(
     q: MLXArray,
     k: MLXArray,
@@ -1362,20 +1526,32 @@ private class Gemma4Attention: Module {
             vRaw = kRaw
         }
 
-        let normalized = gemma4FusedQKVNorm(
+        var queries: MLXArray
+        var k: MLXArray
+        var v: MLXArray
+        if let normalized = gemma4FusedQKVNorm(
             q: queryRaw, k: kRaw, v: vRaw,
             qWeight: qNorm.weight, kWeight: kNorm.weight, eps: config.rmsNormEps,
             keyValueShared: vProj == nil)
-        var queries = normalized?.0 ?? qNorm(queryRaw)
-        var k = normalized?.1 ?? kNorm(kRaw)
-        var v = normalized?.2 ?? vNorm(vRaw)
+        {
+            queries = normalized.0.transposed(0, 2, 1, 3)
+            k = normalized.1.transposed(0, 2, 1, 3)
+            v = normalized.2.transposed(0, 2, 1, 3)
+        } else if let headMajor = gemma4FusedQKVNormHeadMajor(
+            q: queryRaw, k: kRaw,
+            qWeight: qNorm.weight, kWeight: kNorm.weight, eps: config.rmsNormEps,
+            keyValueShared: vProj == nil)
+        {
+            // Written head-major, so the three transposes are already applied.
+            (queries, k, v) = headMajor
+        } else {
+            queries = qNorm(queryRaw).transposed(0, 2, 1, 3)
+            k = kNorm(kRaw).transposed(0, 2, 1, 3)
+            v = vNorm(vRaw).transposed(0, 2, 1, 3)
+        }
 
-        queries = queries.transposed(0, 2, 1, 3)
         queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: queryPositionOffset)
-        k = k.transposed(0, 2, 1, 3)
         k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
-
-        v = v.transposed(0, 2, 1, 3)
 
         let outputDType = queries.dtype
         let attentionQueries =

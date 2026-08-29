@@ -2649,6 +2649,28 @@ enum Gemma4FusedScaledEmbedding {
 
 // MARK: - Text Model
 
+func gemma4FinalNormXSumFusionEnabled(environmentValue: String?) -> Bool {
+    environmentValue != "0"
+}
+
+func gemma4ShouldDeferFinalNorm(
+    orderOnly: Bool,
+    inputShape: [Int],
+    tiedHeadEligible: Bool,
+    fusionEnabled: Bool
+) -> Bool {
+    fusionEnabled && orderOnly && tiedHeadEligible && inputShape == [8, 1]
+}
+
+private let gemma4FinalNormXSumFusionRequested = gemma4FinalNormXSumFusionEnabled(
+    environmentValue: ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_FUSED_FINAL_NORM_XSUM"])
+
+private enum Gemma4FinalNormPolicy {
+    case apply
+    case deferForFusedHead
+}
+
 /// Inner Gemma 4 trunk: embeddings + per-layer-input (PLE) + 35 decoder
 /// layers + final norm. Public so the Gemma 4 MTP drafter in
 /// `Gemma4MTP` can build its own 4-layer kv-shared trunk; not
@@ -2762,7 +2784,21 @@ public class Gemma4TextModelInner: Module {
         return forwardTrunk(
             inputs, cache: cache, captureHook: captureHook, capturePreNorm: false,
             inputEmbedding: inputEmbedding, imageTokenMask: imageTokenMask
-        ).postNorm
+        ).hidden
+    }
+
+    fileprivate func callDeferringFinalNorm(
+        _ inputs: MLXArray,
+        cache: [KVCache]? = nil
+    ) -> MLXArray {
+        let inputs = inputs.ndim == 1 ? inputs.expandedDimensions(axis: 0) : inputs
+        return forwardTrunk(
+            inputs,
+            cache: cache,
+            captureHook: nil,
+            capturePreNorm: false,
+            finalNormPolicy: .deferForFusedHead
+        ).hidden
     }
 
     /// CBv2 prompt-forward entry point. Keeping the scheduled-prefill
@@ -2776,7 +2812,7 @@ public class Gemma4TextModelInner: Module {
         forwardTrunk(
             inputs, cache: cache, captureHook: nil, capturePreNorm: false,
             inputEmbedding: inputEmbedding, schedulePrefill: true
-        ).postNorm
+        ).hidden
     }
 
     /// Variant that ALSO returns the pre-norm last-layer hidden state.
@@ -2794,7 +2830,7 @@ public class Gemma4TextModelInner: Module {
         let inputs = inputs.ndim == 1 ? inputs.expandedDimensions(axis: 0) : inputs
         let r = forwardTrunk(
             inputs, cache: cache, captureHook: captureHook, capturePreNorm: true)
-        return (r.postNorm, r.preNorm!)
+        return (r.hidden, r.preNorm!)
     }
 
     /// DFlash target-hidden capture (2026-08-25, gemma4-dflash-real-loader
@@ -2827,7 +2863,7 @@ public class Gemma4TextModelInner: Module {
             capturePreNorm: false,
             dFlashHiddenCapture: hiddenCapture,
             forceArrayMask: forceArrayMask)
-        return (r.postNorm, hiddenCapture.orderedHiddenStates())
+        return (r.hidden, hiddenCapture.orderedHiddenStates())
     }
 
     private func forwardTrunk(
@@ -2839,8 +2875,9 @@ public class Gemma4TextModelInner: Module {
         imageTokenMask: MLXArray? = nil,
         schedulePrefill: Bool = false,
         dFlashHiddenCapture: Gemma4DFlashHiddenCapture? = nil,
-        forceArrayMask requestedArrayMask: Bool = false
-    ) -> (postNorm: MLXArray, preNorm: MLXArray?) {
+        forceArrayMask requestedArrayMask: Bool = false,
+        finalNormPolicy: Gemma4FinalNormPolicy = .apply
+    ) -> (hidden: MLXArray, preNorm: MLXArray?) {
         // Shape queries cross the Swift/C boundary. Cache the two immutable
         // input dimensions once rather than paying for them at every ladder
         // policy check while the host is building the decode graph.
@@ -3059,8 +3096,14 @@ public class Gemma4TextModelInner: Module {
             }
         }
 
-        let postNorm = norm(h)
-        return (postNorm, capturePreNorm ? h : nil)
+        let hidden: MLXArray
+        switch finalNormPolicy {
+        case .apply:
+            hidden = norm(h)
+        case .deferForFusedHead:
+            hidden = h
+        }
+        return (hidden, capturePreNorm ? h : nil)
     }
 }
 
@@ -3227,6 +3270,19 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        if gemma4ShouldDeferFinalNorm(
+            orderOnly: CBv2OrderOnlyLogits.engaged,
+            inputShape: inputs.shape,
+            tiedHeadEligible: tiedLMHeadSupportsFinalNormFusion,
+            fusionEnabled: gemma4FinalNormXSumFusionRequested)
+        {
+            let preNorm = model.callDeferringFinalNorm(inputs, cache: cache)
+            if let fused = tiedLMHeadFusedFinalNorm(preNorm) {
+                CBv2EngageMark.once("final-rms-xsum")
+                return fused
+            }
+            return applyLMHead(model.norm(preNorm))
+        }
         let hidden = model(inputs, cache: cache)
         return applyLMHead(hidden)
     }
@@ -3252,6 +3308,42 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     /// tied affine-4 vocabulary plane. The implementation fails closed for
     /// every non-production geometry, allowing the promoted tight-grid QMV
     /// below to remain the exact fallback.
+    private var tiedLMHeadSupportsFinalNormFusion: Bool {
+        guard Gemma4MMAQuantizedGEMV.finalNormFusionAvailable,
+            lmHead == nil,
+            config.hiddenSize == 2816,
+            config.rmsNormEps == 1e-6,
+            config.vocabSize >= 8192,
+            config.vocabSize % 128 == 0,
+            model.norm.weight.dtype == .bfloat16,
+            model.norm.weight.shape == [2816],
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.mode == .affine,
+            quantized.groupSize == 64,
+            quantized.bits == 4,
+            quantized.biases != nil
+        else { return false }
+        return true
+    }
+
+    @inline(__always)
+    private func tiedLMHeadFusedFinalNorm(_ preNorm: MLXArray) -> MLXArray? {
+        guard lmHead == nil,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.mode == .affine,
+            let mma = Gemma4MMAQuantizedGEMV.applyWithFusedFinalNorm(
+                preNorm: preNorm,
+                normWeight: model.norm.weight,
+                epsilon: config.rmsNormEps,
+                w: quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                groupSize: quantized.groupSize,
+                bits: quantized.bits)
+        else { return nil }
+        return mma.reshaped(Array(preNorm.shape.dropLast()) + [mma.dim(-1)])
+    }
+
     @inline(__always)
     private func tiedLMHeadMMA(_ hidden: MLXArray) -> MLXArray? {
         guard lmHead == nil,

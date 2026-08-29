@@ -4,6 +4,21 @@ import Foundation
 import MLX
 import MLXFast
 
+struct Gemma4FinalNormXSumFusionRequest {
+    let enabled: Bool
+    let orderOnly: Bool
+    let batchSize: Int
+    let sequenceLength: Int
+    let hiddenSize: Int
+    let hiddenIsBF16: Bool
+    let normIsBF16: Bool
+    let epsilon: Float
+    let groupSize: Int
+    let bits: Int
+    let hasBiases: Bool
+    let vocabularySize: Int
+}
+
 /// MMA-001 --- simdgroup-matrix affine-4/8 quantized GEMV for the tied LM head.
 ///
 /// WHY. Gemma 4 26B A4B ties its embedding to the LM head, so `applyLMHead` is
@@ -77,6 +92,26 @@ import MLXFast
 /// MLP) cannot fill the machine and measured SLOWER than ordinary pair/quad
 /// QMV in isolation. Only the tied vocab plane is meant to enter.
 public enum Gemma4MMAQuantizedGEMV {
+
+    static func shouldFuseFinalNormAndXSums(
+        _ request: Gemma4FinalNormXSumFusionRequest
+    ) -> Bool {
+        request.enabled && request.orderOnly
+            && request.batchSize == 8 && request.sequenceLength == 1
+            && request.hiddenSize == 2816
+            && request.hiddenIsBF16 && request.normIsBF16
+            && request.epsilon == 1e-6
+            && request.groupSize == 64 && request.bits == 4
+            && request.hasBiases && request.vocabularySize >= 8192
+            && request.vocabularySize % 128 == 0
+    }
+
+    /// Process-level host gates needed before the text model may safely defer
+    /// its final norm. Array geometry is still revalidated by the fused entry
+    /// point before any Metal work is scheduled.
+    public static var finalNormFusionAvailable: Bool {
+        enabled && version == 26
+    }
 
     /// Rows the accumulator tile carries --- the ranked cohort's batch.
     private static let mRows = 8
@@ -1072,6 +1107,131 @@ public enum Gemma4MMAQuantizedGEMV {
             """,
         ensureRowContiguous: true
     )
+
+    /// The ranked decode's final RMSNorm and the affine-head sum prepass share
+    /// the same normalized BF16 row. Keep that row in threadgroup memory so
+    /// the sums do not require a second launch and a global-memory reread.
+    /// The reduction and output expressions intentionally mirror stock
+    /// `rms_single_row<T, 4>` and `xSumKernel` verbatim.
+    private static let finalNormXSumKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_final_rms_xsum_m8_k2816_v1",
+        inputNames: ["x", "normWeight"],
+        outputNames: ["normalized", "xSums"],
+        source: """
+            constexpr uint M_ROWS = 8;
+            constexpr uint K = 2816;
+            constexpr uint GROUP = 64;
+            constexpr uint N_GROUPS = K / GROUP;
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            const uint base = row * K + lid * 4;
+            const uint wbase = lid * 4;
+
+            threadgroup float local_inv_mean[1];
+            threadgroup float local_sums[32];
+            threadgroup T local_norm[K];
+
+            float acc = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+                float xi = x[base + i];
+                acc += xi * xi;
+            }
+            acc = simd_sum(acc);
+            if (simd_group_id == 0) {
+                local_sums[simd_lane_id] = 0.0f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_lane_id == 0) {
+                local_sums[simd_group_id] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+                acc = simd_sum(local_sums[simd_lane_id]);
+                if (simd_lane_id == 0) {
+                    local_inv_mean[0] =
+                        metal::precise::rsqrt(acc / 2816.0f + 1e-6f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (int i = 0; i < 4; ++i) {
+                const T value = normWeight[wbase + i]
+                    * static_cast<T>(x[base + i] * local_inv_mean[0]);
+                normalized[base + i] = value;
+                local_norm[wbase + i] = value;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (lid < N_GROUPS) {
+                threadgroup T* xp = local_norm + lid * GROUP;
+                float s = 0.0f;
+                for (uint c = 0; c < GROUP / 8; ++c) {
+                    const uint i = c * 8;
+                    s += xp[i + 0] + xp[i + 1] + xp[i + 2] + xp[i + 3];
+                    s += xp[i + 4] + xp[i + 5] + xp[i + 6] + xp[i + 7];
+                }
+                xSums[row * N_GROUPS + lid] = s;
+            }
+            """,
+        ensureRowContiguous: true
+    )
+
+    private static func fusedFinalNormAndXSums(
+        hidden: MLXArray,
+        normWeight: MLXArray,
+        epsilon: Float
+    ) -> (normalized: MLXArray, xSums: MLXArray)? {
+        guard epsilon == 1e-6,
+            hidden.dtype == .bfloat16,
+            hidden.ndim == 2 || (hidden.ndim == 3 && hidden.dim(1) == 1),
+            hidden.dim(0) == mRows,
+            hidden.dim(-1) == 2816,
+            hidden.size == mRows * 2816,
+            normWeight.dtype == .bfloat16,
+            normWeight.ndim == 1,
+            normWeight.dim(0) == 2816
+        else { return nil }
+
+        let flatHidden = hidden.reshaped([mRows, 2816])
+        let outputs = finalNormXSumKernel(
+            [flatHidden, normWeight],
+            template: [("T", hidden.dtype)],
+            grid: (mRows * 704, 1, 1),
+            threadGroup: (704, 1, 1),
+            outputShapes: [[mRows, 2816], [mRows * 44]],
+            outputDTypes: [.bfloat16, .float32]
+        )
+        return (outputs[0], outputs[1])
+    }
+
+    static func fusedFinalNormAndXSumsForTesting(
+        hidden: MLXArray,
+        normWeight: MLXArray,
+        epsilon: Float
+    ) -> (normalized: MLXArray, xSums: MLXArray)? {
+        fusedFinalNormAndXSums(
+            hidden: hidden, normWeight: normWeight, epsilon: epsilon)
+    }
+
+    static func xSumsForTesting(_ normalized: MLXArray) -> MLXArray? {
+        guard normalized.dtype == .bfloat16,
+            normalized.ndim == 2,
+            normalized.shape == [mRows, 2816]
+        else { return nil }
+        let sumCells = mRows * 44
+        let sumThreads = 128
+        let sumThreadgroups = (sumCells + sumThreads - 1) / sumThreads
+        return xSumKernel(
+            [normalized],
+            template: [("T", normalized.dtype), ("K", 2816)],
+            grid: (sumThreadgroups * sumThreads, 1, 1),
+            threadGroup: (sumThreads, 1, 1),
+            outputShapes: [[sumCells]],
+            outputDTypes: [.float32]
+        )[0]
+    }
 
     /// Version 5 consumes the precomputed sums and exposes the eight packed
     /// weight words for each group through two aligned vector loads. Activation,
@@ -2481,6 +2641,81 @@ public enum Gemma4MMAQuantizedGEMV {
         ensureRowContiguous: true
     )
 
+    private struct V26ProjectionInputs {
+        let flatX: MLXArray
+        let biases: MLXArray
+        let k: Int
+        let n: Int
+    }
+
+    private static func prepareV26Projection(
+        x: MLXArray,
+        w: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int
+    ) -> V26ProjectionInputs? {
+        guard enabled, version == 26 else { return nil }
+        guard let biases else { return nil }
+        guard groupSize == 64, bits == 4 else { return nil }
+        guard x.dtype == .bfloat16, scales.dtype == .bfloat16, biases.dtype == .bfloat16
+        else { return nil }
+        guard w.dtype == .uint32 else { return nil }
+        guard w.ndim == 2, scales.ndim == 2, biases.ndim == 2 else { return nil }
+        guard x.ndim == 2 || (x.ndim == 3 && x.dim(1) == 1) else { return nil }
+        guard x.dim(0) == mRows else { return nil }
+
+        let k = x.dim(-1)
+        guard k > 0, x.size == mRows * k else { return nil }
+        let n = w.dim(0)
+        let v26ColsPerThreadgroup = colsPerThreadgroup * 4
+        guard n >= minOutputWidth, n % v26ColsPerThreadgroup == 0 else { return nil }
+        guard k % groupSize == 0, k % 8 == 0 else { return nil }
+        guard w.dim(1) == k * bits / 32 else { return nil }
+        guard scales.dim(0) == n, biases.dim(0) == n else { return nil }
+        guard scales.dim(1) == k / groupSize, biases.dim(1) == k / groupSize else {
+            return nil
+        }
+        return V26ProjectionInputs(
+            flatX: x.reshaped([mRows, k]), biases: biases, k: k, n: n)
+    }
+
+    private static func computeXSums(_ flatX: MLXArray, k: Int) -> MLXArray {
+        let sumCells = mRows * (k / 64)
+        let sumThreads = 128
+        let sumThreadgroups = (sumCells + sumThreads - 1) / sumThreads
+        return xSumKernel(
+            [flatX],
+            template: [("T", flatX.dtype), ("K", k)],
+            grid: (sumThreadgroups * sumThreads, 1, 1),
+            threadGroup: (sumThreads, 1, 1),
+            outputShapes: [[sumCells]],
+            outputDTypes: [.float32]
+        )[0]
+    }
+
+    private static func projectV26(
+        normalized: MLXArray,
+        xSums: MLXArray,
+        w: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray,
+        k: Int,
+        n: Int
+    ) -> MLXArray {
+        let v26ColsPerThreadgroup = colsPerThreadgroup * 4
+        let threadgroups = n / v26ColsPerThreadgroup
+        return kernelV26(
+            [normalized, w, scales, biases, xSums],
+            template: [("T", normalized.dtype), ("K", k), ("N", n)],
+            grid: (threadgroups * threadsPerThreadgroup, 1, 1),
+            threadGroup: (threadsPerThreadgroup, 1, 1),
+            outputShapes: [[mRows, n]],
+            outputDTypes: [normalized.dtype]
+        )[0]
+    }
+
     /// Tied-head GEMV, or `nil` when any gate above fails.
     ///
     /// - Parameters:
@@ -2497,6 +2732,26 @@ public enum Gemma4MMAQuantizedGEMV {
         groupSize: Int,
         bits: Int
     ) -> MLXArray? {
+        if version == 26 {
+            guard let prepared = prepareV26Projection(
+                x: x,
+                w: w,
+                scales: scales,
+                biases: biases,
+                groupSize: groupSize,
+                bits: bits)
+            else { return nil }
+            let xSums = computeXSums(prepared.flatX, k: prepared.k)
+            return projectV26(
+                normalized: prepared.flatX,
+                xSums: xSums,
+                w: w,
+                scales: scales,
+                biases: prepared.biases,
+                k: prepared.k,
+                n: prepared.n)
+        }
+
         guard enabled else { return nil }
         guard let biases else { return nil }
         guard groupSize == 64, bits == 4 else { return nil }
@@ -2579,5 +2834,43 @@ public enum Gemma4MMAQuantizedGEMV {
             outputDTypes: [x.dtype]
         )
         return outputs[0]
+    }
+
+    /// Exact batch-8 final RMSNorm/x-sum fusion feeding the unchanged v26
+    /// projection. The caller owns the order-only routing gate; every tensor
+    /// and quantization predicate is revalidated here before fused work is
+    /// scheduled.
+    public static func applyWithFusedFinalNorm(
+        preNorm: MLXArray,
+        normWeight: MLXArray,
+        epsilon: Float,
+        w: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int
+    ) -> MLXArray? {
+        guard let prepared = prepareV26Projection(
+            x: preNorm,
+            w: w,
+            scales: scales,
+            biases: biases,
+            groupSize: groupSize,
+            bits: bits),
+            prepared.k == 2816,
+            let fused = fusedFinalNormAndXSums(
+                hidden: preNorm,
+                normWeight: normWeight,
+                epsilon: epsilon)
+        else { return nil }
+
+        return projectV26(
+            normalized: fused.normalized,
+            xSums: fused.xSums,
+            w: w,
+            scales: scales,
+            biases: prepared.biases,
+            k: prepared.k,
+            n: prepared.n)
     }
 }

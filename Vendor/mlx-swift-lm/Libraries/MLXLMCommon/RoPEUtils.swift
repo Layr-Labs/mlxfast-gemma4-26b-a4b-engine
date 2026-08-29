@@ -93,10 +93,6 @@ public class ProportionalRoPE: Module, OffsetLayer, ArrayOffsetLayer {
     let rotatedDims: Int
     let _freqs: MLXArray?
 
-    /// Shares the exact table consumed by MLX's RoPE kernel with composed
-    /// kernels that preserve the same frequency and rounding contract.
-    public var frequencyTable: MLXArray? { _freqs }
-
     init(
         dims: Int,
         traditional: Bool = false,

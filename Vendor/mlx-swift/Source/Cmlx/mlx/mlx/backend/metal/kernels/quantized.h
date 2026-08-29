@@ -3645,7 +3645,13 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int gemma4_down_tile_span = 4; // sweep alternate: 2
+  // Strip-walk width for the K = 704 down plane. 352 y-tiles divide exactly by
+  // 2, 4 and 8, so every value here is a pure repartition: tile u is always
+  // served by survivor (u / span) * span at step u % span, once and only once.
+  // Measured on the ranked box: span 2 (176 survivors, 11,264 groups) scored
+  // -5.86%, so the curve descends towards coarser partitions. This is the step
+  // the other way from the incumbent 4.
+  constexpr int gemma4_down_tile_span = 8; // measured: 2 is -5.86%, 4 was incumbent
   if (tid.y % uint(gemma4_down_tile_span) != 0u) {
     return;
   }

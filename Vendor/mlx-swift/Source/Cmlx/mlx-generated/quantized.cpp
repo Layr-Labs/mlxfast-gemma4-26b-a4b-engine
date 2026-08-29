@@ -1487,7 +1487,7 @@ METAL_FUNC void qmv_impl(
   }
 }
 
-template <typename T, const int group_size, const int bits>
+template <typename T, const int group_size, const int bits, int KFIX = 0, bool WVEC = false>
 METAL_FUNC void qmv_affine4_g64_pair_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1496,7 +1496,7 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
     const device T* x1,
     device T* y0,
     device T* y1,
-    const constant int& in_vec_size,
+    const constant int& in_vec_size_rt,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -1506,6 +1506,8 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   constexpr int block_size = values_per_thread * SIMD_SIZE;
   constexpr int bytes_per_thread = 4;
   constexpr int scale_step_per_thread = 8;
+
+  const int in_vec_size = (KFIX > 0) ? KFIX : in_vec_size_rt;
 
   const device uint8_t* ws = (const device uint8_t*)w;
   thread float x0_thread[values_per_thread];
@@ -1532,13 +1534,39 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
     float sum1 = load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
 
     for (int row = 0; row < results_per_simdgroup; row++) {
-      const device uint8_t* wl = ws + row * in_vec_size_w;
       const device T* sl = scales + row * in_vec_size_g;
       const device T* bl = biases + row * in_vec_size_g;
       float dot0;
       float dot1;
-      qdot_affine4_pair<float, values_per_thread>(
-          wl, x0_thread, x1_thread, sl[0], bl[0], sum0, sum1, dot0, dot1);
+      if (WVEC) {
+        const uint32_t v = *((const device uint32_t*)(ws + row * in_vec_size_w));
+        const uint16_t p0 = static_cast<uint16_t>(v & 0xffff);
+        const uint16_t p1 = static_cast<uint16_t>(v >> 16);
+        const float accum0 =
+            (x0_thread[0] * (p0 & 0x000f) +
+             x0_thread[1] * (p0 & 0x00f0) +
+             x0_thread[2] * (p0 & 0x0f00) +
+             x0_thread[3] * (p0 & 0xf000)) +
+            (x0_thread[4] * (p1 & 0x000f) +
+             x0_thread[5] * (p1 & 0x00f0) +
+             x0_thread[6] * (p1 & 0x0f00) +
+             x0_thread[7] * (p1 & 0xf000));
+        const float accum1 =
+            (x1_thread[0] * (p0 & 0x000f) +
+             x1_thread[1] * (p0 & 0x00f0) +
+             x1_thread[2] * (p0 & 0x0f00) +
+             x1_thread[3] * (p0 & 0xf000)) +
+            (x1_thread[4] * (p1 & 0x000f) +
+             x1_thread[5] * (p1 & 0x00f0) +
+             x1_thread[6] * (p1 & 0x0f00) +
+             x1_thread[7] * (p1 & 0xf000));
+        dot0 = sl[0] * accum0 + sum0 * bl[0];
+        dot1 = sl[0] * accum1 + sum1 * bl[0];
+      } else {
+        const device uint8_t* wl = ws + row * in_vec_size_w;
+        qdot_affine4_pair<float, values_per_thread>(
+            wl, x0_thread, x1_thread, sl[0], bl[0], sum0, sum1, dot0, dot1);
+      }
       result0[row] += dot0;
       result1[row] += dot1;
     }
@@ -1562,13 +1590,39 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
     float sum1 =
         load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      const device uint8_t* wl = ws + row * in_vec_size_w;
       const device T* sl = scales + row * in_vec_size_g;
       const device T* bl = biases + row * in_vec_size_g;
       float dot0;
       float dot1;
-      qdot_affine4_pair<float, values_per_thread>(
-          wl, x0_thread, x1_thread, sl[0], bl[0], sum0, sum1, dot0, dot1);
+      if (WVEC) {
+        const uint32_t v = *((const device uint32_t*)(ws + row * in_vec_size_w));
+        const uint16_t p0 = static_cast<uint16_t>(v & 0xffff);
+        const uint16_t p1 = static_cast<uint16_t>(v >> 16);
+        const float accum0 =
+            (x0_thread[0] * (p0 & 0x000f) +
+             x0_thread[1] * (p0 & 0x00f0) +
+             x0_thread[2] * (p0 & 0x0f00) +
+             x0_thread[3] * (p0 & 0xf000)) +
+            (x0_thread[4] * (p1 & 0x000f) +
+             x0_thread[5] * (p1 & 0x00f0) +
+             x0_thread[6] * (p1 & 0x0f00) +
+             x0_thread[7] * (p1 & 0xf000));
+        const float accum1 =
+            (x1_thread[0] * (p0 & 0x000f) +
+             x1_thread[1] * (p0 & 0x00f0) +
+             x1_thread[2] * (p0 & 0x0f00) +
+             x1_thread[3] * (p0 & 0xf000)) +
+            (x1_thread[4] * (p1 & 0x000f) +
+             x1_thread[5] * (p1 & 0x00f0) +
+             x1_thread[6] * (p1 & 0x0f00) +
+             x1_thread[7] * (p1 & 0xf000));
+        dot0 = sl[0] * accum0 + sum0 * bl[0];
+        dot1 = sl[0] * accum1 + sum1 * bl[0];
+      } else {
+        const device uint8_t* wl = ws + row * in_vec_size_w;
+        qdot_affine4_pair<float, values_per_thread>(
+            wl, x0_thread, x1_thread, sl[0], bl[0], sum0, sum1, dot0, dot1);
+      }
       result0[row] += dot0;
       result1[row] += dot1;
     }
@@ -3882,7 +3936,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     for (int t = 0; t < gemma4_down_tile_span; t++) {
       uint3 tile_tid = tid;
       tile_tid.y = tid.y + uint(t);
-      qmv_affine4_g64_pair_impl<T, group_size, bits>(
+      qmv_affine4_g64_pair_impl<T, group_size, bits, 704, true>(
           tile_w,
           tile_scales,
           tile_biases,
@@ -4012,6 +4066,36 @@ template <typename T, int group_size, int bits>
       device T* run_y0 = y + assignment * out_vec_size;
       device T* run_y1 = y + (assignment + 1) * out_vec_size;
       if (run_len == 2) {
+        if (in_vec_size == 2816) {
+          qmv_affine4_g64_pair_impl<T, group_size, bits, 2816, true>(
+              run_w,
+              run_scales,
+              run_biases,
+              run_x0,
+              run_x1,
+              run_y0,
+              run_y1,
+              in_vec_size,
+              tid,
+              simd_gid,
+              simd_lid);
+          return;
+        }
+        if (in_vec_size == 704) {
+          qmv_affine4_g64_pair_impl<T, group_size, bits, 704, true>(
+              run_w,
+              run_scales,
+              run_biases,
+              run_x0,
+              run_x1,
+              run_y0,
+              run_y1,
+              in_vec_size,
+              tid,
+              simd_gid,
+              simd_lid);
+          return;
+        }
         qmv_affine4_g64_pair_impl<T, group_size, bits>(
             run_w,
             run_scales,
@@ -4077,6 +4161,18 @@ template <typename T, int group_size, int bits>
     const device T* single_scales = scales + expert * s_strides[0];
     const device T* single_biases = biases + expert * b_strides[0];
     device T* single_y = y + assignment * (uint)out_vec_size;
+    if (in_vec_size == 2816) {
+      qmv_affine4_g64_singles_impl<T, group_size, bits, 2816, true, false>(
+          single_w, single_scales, single_biases, single_x, single_y,
+          in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+      return;
+    }
+    if (in_vec_size == 704) {
+      qmv_affine4_g64_singles_impl<T, group_size, bits, 704, true, false>(
+          single_w, single_scales, single_biases, single_x, single_y,
+          in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+      return;
+    }
     qmv_impl<T, group_size, bits>(
         single_w, single_scales, single_biases, single_x, single_y,
         in_vec_size, out_vec_size, tid, simd_gid, simd_lid);

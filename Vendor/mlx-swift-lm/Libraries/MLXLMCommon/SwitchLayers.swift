@@ -112,25 +112,43 @@ public func resetWeightedExpertUnsortStats() {
 /// permutation and writes `[tokens, hidden]` directly, avoiding that full
 /// `[tokens, topK, hidden]` intermediate.
 private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "weighted_expert_unsort",
+    name: "weighted_expert_unsort_v2",
     inputNames: ["sorted_outputs", "inverse_order", "weights"],
     outputNames: ["output"],
     source: """
-        uint feature = thread_position_in_grid.x;
-        uint token = thread_position_in_grid.y;
+        // Host launches (H, tokens) = (2816, tokens) with threadgroup
+        // (64, 4, 1). Inverse-order and weights are uniform across the
+        // feature axis: every x-lane of a token reloaded the same K uint32
+        // rows and the same K scales from device. Stage those K values
+        // once per token-in-threadgroup, then gather only sorted_outputs.
+        constexpr uint TG_Y = 4;
+        const uint feature = thread_position_in_grid.x;
+        const uint token = thread_position_in_grid.y;
+        const uint local_t = thread_position_in_threadgroup.y;
+        const uint local_x = thread_position_in_threadgroup.x;
+        const uint hidden = threads_per_grid.x;
+        const uint assignment_base = token * (uint)K;
+
+        threadgroup uint tg_rows[TG_Y][K];
+        threadgroup float tg_w[TG_Y][K];
+        if (local_x < (uint)K) {
+            const uint assignment = assignment_base + local_x;
+            tg_rows[local_t][local_x] = (uint)inverse_order[assignment];
+            tg_w[local_t][local_x] = (float)weights[assignment];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         T accumulator = (T)0;
-        const uint assignment_base = token * (uint)K;
+        #pragma unroll
         for (uint slot = 0; slot < (uint)K; ++slot) {
-            const uint assignment = assignment_base + slot;
-            const uint sorted_row = (uint)inverse_order[assignment];
+            const uint sorted_row = tg_rows[local_t][slot];
             // Preserve the legacy bfloat16 multiply-then-reduce rounding.
             const T weighted = (T)(
-                (float)sorted_outputs[sorted_row * threads_per_grid.x + feature]
-                * (float)weights[assignment]);
+                (float)sorted_outputs[sorted_row * hidden + feature]
+                * tg_w[local_t][slot]);
             accumulator = accumulator + weighted;
         }
-        output[token * threads_per_grid.x + feature] = accumulator;
+        output[token * hidden + feature] = accumulator;
     """,
     ensureRowContiguous: true
 )
@@ -271,74 +289,9 @@ private func geGLUClaimsPinnedDecode(_ gate: MLXArray, _ up: MLXArray) -> Bool {
     return false
 }
 
-/// GELU-FUSE-PREFILL: a bounded set of additionally admitted shapes.
-///
-/// GELU-FUSE left prefill on the shapeless closure for one stated reason — a
-/// shape-specialised compile adds a compiler-cache entry per distinct input
-/// shape, the lookup is a linear scan, and prefill row counts vary per prompt,
-/// so an unbounded admission would keep growing the scan the decode hot path
-/// walks. That reason is about the *number* of entries, not about prefill, so a
-/// hard cap answers it directly: at most ``shapedGeluPrefillShapeCap`` distinct
-/// rectangles are ever admitted, and the cap+1st falls open to the shapeless
-/// closure forever after.
-///
-/// The decode signatures are matched before this is consulted, so the decode
-/// plane never takes the lock and never sees a behaviour change.
-public final class ShapedGeluPrefillShapes: @unchecked Sendable {
-    private let lock = NSLock()
-    private var shapes: [[Int]] = []
-    private let cap: Int
-
-    public init(cap: Int) { self.cap = cap }
-
-    @inline(__always)
-    public func admits(_ shape: [Int]) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        if shapes.contains(shape) { return true }
-        guard shapes.count < cap else { return false }
-        shapes.append(shape)
-        return true
-    }
-}
-
-/// Four is one more than the distinct rectangles a cohort prefill produces (the
-/// full batched step, a short final chunk, and the single-stream local verb).
-public let shapedGeluPrefillShapeCap = 4
-
-/// Smallest rectangle worth a cache entry. The prefill routed-expert plane is
-/// 65,536 rows; every speculative verify width is at most 256, so nothing in
-/// production lands near this floor from either side.
-public let shapedGeluPrefillMinElements = 1 << 20
-
-private let switchGeluPrefillFuseEnabled: Bool = {
-    guard let raw = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_GELU_SHAPED_FUSE_PREFILL"]
-    else { return true }
-    return !["0", "false", "no", "off"].contains(raw.lowercased())
-}()
-
-private let switchGeluPrefillShapes = ShapedGeluPrefillShapes(
-    cap: shapedGeluPrefillShapeCap)
-
-@inline(__always)
-private func geGLUClaimsPrefill(_ gate: MLXArray, _ up: MLXArray) -> Bool {
-    guard switchGeluPrefillFuseEnabled,
-        gate.dtype == .bfloat16, up.dtype == .bfloat16,
-        gate.shape == up.shape,
-        gate.size >= shapedGeluPrefillMinElements,
-        switchGeluPrefillShapes.admits(gate.shape)
-    else { return false }
-    CBv2EngageMark.once("gelu-shaped-prefill-experts")
-    return true
-}
-
 @inline(__always)
 private func geGLUProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
-    if geGLUClaimsPinnedDecode(gate, up) || geGLUClaimsPrefill(gate, up) {
-        return compiledGeGLUShaped(gate, up)
-    }
-    return compiledGeGLU(gate, up)
+    geGLUClaimsPinnedDecode(gate, up) ? compiledGeGLUShaped(gate, up) : compiledGeGLU(gate, up)
 }
 // MARK: - ROUTE-SIMD-RANK-64: exact decode route table
 

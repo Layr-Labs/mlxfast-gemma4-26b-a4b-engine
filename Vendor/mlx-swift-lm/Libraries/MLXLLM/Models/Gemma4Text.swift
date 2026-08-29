@@ -934,8 +934,10 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
 /// threadgroup, and each row keeps its own 64 threads and its own two
 /// simdgroups, so the reduction tree is the stock one row for row.
 private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
-    name: "gemma4_qkv_rms_norm_head_major_v1",
-    inputNames: ["q", "k", "q_weight", "k_weight"],
+    name: "gemma4_qkv_rms_norm_rope_head_major_v2",
+    inputNames: [
+        "q", "k", "q_weight", "k_weight", "position_offsets", "rope_freqs",
+    ],
     outputNames: ["q_out", "k_out", "v_out"],
     source: """
         constexpr uint reads = 4;
@@ -949,6 +951,7 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
 
         threadgroup float partials[RPT][32];
         threadgroup float inv_rms[RPT];
+        threadgroup T rounded[RPT][D];
 
         const device T* input = q;
         const device T* weight = q_weight;
@@ -956,6 +959,8 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
         // Held inside the V allocation on Q rows, which never dereference it.
         device T* value_output = v_out;
         bool is_key = false;
+        uint batch_index = 0;
+        uint row_position = 0;
 
         if (row < TOTAL_ROWS) {
             if (row < Q_ROWS) {
@@ -963,6 +968,8 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
                 const uint rem = row - b * (LQ * HQ);
                 const uint l = rem / HQ;
                 const uint h = rem - l * HQ;
+                batch_index = b;
+                row_position = l;
                 input = q + (size_t)row * D;
                 output = q_out + (((size_t)b * HQ + h) * LQ + l) * D;
             } else {
@@ -972,6 +979,8 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
                 const uint rem = krow - b * (LK * HK);
                 const uint l = rem / HK;
                 const uint h = rem - l * HK;
+                batch_index = b;
+                row_position = l;
                 const size_t off = (((size_t)b * HK + h) * LK + l) * D;
                 input = k + (size_t)krow * D;
                 weight = k_weight;
@@ -980,6 +989,7 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
             }
         }
 
+        device T* output_row = output;
         input += lid * reads;
         output += lid * reads;
         weight += lid * reads;
@@ -1008,15 +1018,42 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (row >= TOTAL_ROWS) return;
-        const float inverse_rms = inv_rms[slot];
-        for (uint i = 0; i < reads; ++i) {
-            const T normalized = T(float(input[i]) * inverse_rms);
-            output[i] = weight[i] * normalized;
-            // K rows also carry V: same raw input, same normalizer, and
-            // `RMSNormNoScale`'s own final expression.
-            if (is_key) {
-                value_output[i] = T(1) * normalized;
+        if (row < TOTAL_ROWS) {
+            const float inverse_rms = inv_rms[slot];
+            for (uint i = 0; i < reads; ++i) {
+                const uint element = lid * reads + i;
+                const T normalized = T(float(input[i]) * inverse_rms);
+                if (APPLY_ROPE) {
+                    // Preserve the accepted norm twin's BF16 output boundary.
+                    rounded[slot][element] = T(weight[i] * normalized);
+                } else {
+                    output[i] = weight[i] * normalized;
+                }
+                // K rows also carry V: same raw input, same normalizer, and
+                // `RMSNormNoScale`'s own final expression.
+                if (is_key) {
+                    value_output[i] = T(1) * normalized;
+                }
+            }
+        }
+        if (APPLY_ROPE) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (APPLY_ROPE && row < TOTAL_ROWS && lid * reads < D / 2) {
+            const float L = static_cast<float>(row_position)
+                + static_cast<float>(position_offsets[batch_index]);
+            for (uint i = 0; i < reads; ++i) {
+                const uint pair = lid * reads + i;
+                const float theta = L * (1.0f / rope_freqs[pair]);
+                const float costheta = metal::fast::cos(theta);
+                const float sintheta = metal::fast::sin(theta);
+                const float x1 = static_cast<float>(rounded[slot][pair]);
+                const float x2 = static_cast<float>(rounded[slot][pair + D / 2]);
+                const float rx1 = x1 * costheta - x2 * sintheta;
+                const float rx2 = x1 * sintheta + x2 * costheta;
+                output_row[pair] = static_cast<T>(rx1);
+                output_row[pair + D / 2] = static_cast<T>(rx2);
             }
         }
     """,
@@ -1030,6 +1067,16 @@ private let gemma4QKVNormPrefillEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+func gemma4QKVNormRopePrefillEnabled(environmentValue: String?) -> Bool {
+    guard let environmentValue else { return true }
+    return !["0", "false", "no", "off"].contains(environmentValue.lowercased())
+}
+
+private let gemma4QKVNormRopePrefillIsEnabled =
+    gemma4QKVNormRopePrefillEnabled(
+        environmentValue: ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_QKV_NORM_ROPE_PREFILL"])
+
 /// `(qNorm(q), kNorm(k), vNorm(k))` already in `[B, H, L, D]`. Returns `nil`
 /// off the plane, including for every non-`k_eq_v` projection.
 private func gemma4FusedQKVNormHeadMajor(
@@ -1038,12 +1085,20 @@ private func gemma4FusedQKVNormHeadMajor(
     qWeight: MLXArray,
     kWeight: MLXArray,
     eps: Float,
-    keyValueShared: Bool
-) -> (MLXArray, MLXArray, MLXArray)? {
+    keyValueShared: Bool,
+    positionOffsets: MLXArray,
+    ropeParameters: Gemma4QKVRopeParameters,
+    applyRope: Bool
+) -> (q: MLXArray, k: MLXArray, v: MLXArray, appliedRope: Bool)? {
     guard gemma4QKVNormPrefillEnabled, keyValueShared, eps == 1.0e-6,
         q.dtype == .bfloat16, k.dtype == .bfloat16,
         qWeight.dtype == .bfloat16, kWeight.dtype == .bfloat16,
         q.ndim == 4, k.ndim == 4,
+        positionOffsets.dtype == .int32,
+        positionOffsets.shape == [q.dim(0)],
+        ropeParameters.usesFrequencies,
+        ropeParameters.frequencies.dtype == .float32,
+        ropeParameters.frequencies.size == q.dim(3) / 2,
         q.dim(0) == k.dim(0), q.dim(0) >= 1,
         q.dim(1) >= 1, k.dim(1) >= 1,
         // Below ~1024 rectangle tokens the wide threadgroup stops paying for
@@ -1062,12 +1117,15 @@ private func gemma4FusedQKVNormHeadMajor(
     let rowThreads = dimension / 4
     let rowsPerGroup = 512 / rowThreads
     let groups = (rows + rowsPerGroup - 1) / rowsPerGroup
+    let fusedRope =
+        gemma4QKVNormRopeEnabled && gemma4QKVNormRopePrefillIsEnabled && applyRope
     let outputs = gemma4QKVNormPrefillKernel(
-        [q, k, qWeight, kWeight],
+        [q, k, qWeight, kWeight, positionOffsets, ropeParameters.frequencies],
         template: [
             ("T", q.dtype), ("D", dimension), ("Q_ROWS", qRows),
             ("TOTAL_ROWS", rows), ("RPT", rowsPerGroup),
             ("LQ", lq), ("HQ", hq), ("LK", lk), ("HK", hk),
+            ("APPLY_ROPE", fusedRope),
         ],
         grid: (groups * rowsPerGroup * rowThreads, 1, 1),
         threadGroup: (rowsPerGroup * rowThreads, 1, 1),
@@ -1077,7 +1135,8 @@ private func gemma4FusedQKVNormHeadMajor(
         ],
         outputDTypes: [q.dtype, q.dtype, q.dtype]
     )
-    return (outputs[0], outputs[1], outputs[2])
+    if fusedRope { CBv2EngageMark.once("qkv-norm-rope-prefill") }
+    return (outputs[0], outputs[1], outputs[2], fusedRope)
 }
 
 private func gemma4FusedQKVNorm(
@@ -1666,10 +1725,12 @@ private class Gemma4Attention: Module {
         } else if let headMajor = gemma4FusedQKVNormHeadMajor(
             q: queryRaw, k: kRaw,
             qWeight: qNorm.weight, kWeight: kNorm.weight, eps: config.rmsNormEps,
-            keyValueShared: vProj == nil)
+            keyValueShared: vProj == nil, positionOffsets: capturedOffsets,
+            ropeParameters: qkvRopeParameters, applyRope: lastQueryCache == nil)
         {
             // Written head-major, so the three transposes are already applied.
-            (queries, k, v) = headMajor
+            appliedRope = headMajor.appliedRope
+            (queries, k, v) = (headMajor.q, headMajor.k, headMajor.v)
         } else {
             queries = qNorm(queryRaw).transposed(0, 2, 1, 3)
             k = kNorm(kRaw).transposed(0, 2, 1, 3)

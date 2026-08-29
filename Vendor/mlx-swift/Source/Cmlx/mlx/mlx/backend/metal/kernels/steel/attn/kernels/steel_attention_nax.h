@@ -316,6 +316,7 @@ template <
       using mfrag_t = typename mtile_t::frag_type;
 
       if (base_row + BQ <= params->qL && base_col + BK <= params->kL) {
+        STEEL_PRAGMA_UNROLL
         for (short iq = 0; iq < TQ; iq++) {
           STEEL_PRAGMA_UNROLL
           for (short ik = 0; ik < TK; ik++) {

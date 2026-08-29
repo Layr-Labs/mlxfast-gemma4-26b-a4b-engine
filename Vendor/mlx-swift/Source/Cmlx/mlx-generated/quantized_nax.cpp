@@ -76,6 +76,7 @@ inline U load_vector(const device T* x, thread U* x_thread) {
   }
 
   else if (bits == 4) {
+    #pragma unroll
     for (int i = 0; i < values_per_thread; i += 4) {
       sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
       x_thread[i] = x[i];
@@ -250,6 +251,7 @@ inline U qdot(
 
   else if (bits == 4) {
     const device uint16_t* ws = (const device uint16_t*)w;
+    #pragma unroll
     for (int i = 0; i < (values_per_thread / 4); i++) {
       accum +=
           (x_thread[4 * i] * (ws[i] & 0x000f) +
@@ -446,6 +448,7 @@ qouter(const thread uint8_t* w, U x, U scale, U bias, thread U* result) {
 
   else if (bits == 4) {
     U s[2] = {scale, scale / 16.0f};
+    #pragma unroll
     for (int i = 0; i < (values_per_thread / 2); i++) {
       result[2 * i] += x * (s[0] * (w[i] & 0x0f) + bias);
       result[2 * i + 1] += x * (s[1] * (w[i] & 0xf0) + bias);
@@ -648,6 +651,7 @@ struct QuantizedBlockLoader {
 
     T scale = *scales;
     T bias = *biases;
+    #pragma unroll
     for (int i = 0; i < n_reads; i++) {
       dequantize<T, pack_factor, bits>(
           src + i * bytes_per_pack, scale, bias, dst + i * pack_factor);
@@ -660,6 +664,7 @@ struct QuantizedBlockLoader {
     }
 
     if (reduction_dim == 1 && bi >= src_tile_dim.x) {
+      #pragma unroll
       for (int i = 0; i < n_reads * pack_factor; i++) {
         dst[i] = T(0);
       }
@@ -667,6 +672,7 @@ struct QuantizedBlockLoader {
     }
 
     if (reduction_dim == 0 && bi >= src_tile_dim.y) {
+      #pragma unroll
       for (int i = 0; i < n_reads * pack_factor; i++) {
         dst[i] = T(0);
       }
@@ -675,6 +681,7 @@ struct QuantizedBlockLoader {
 
     T scale = *scales;
     T bias = *biases;
+    #pragma unroll
     for (int i = 0; i < n_reads; i++) {
       dequantize<T, pack_factor, bits>(
           (device uint8_t*)(src + i * bytes_per_pack),
@@ -788,6 +795,7 @@ struct QuantizedBlockLoader<
 
     T scale = *scales;
     T bias = *biases;
+    #pragma unroll
     for (int i = 0; i < n_reads; i++) {
       dequantize<T, pack_factor, bits>(
           src + i * bytes_per_pack, scale, bias, dst + i * pack_factor);
@@ -800,6 +808,7 @@ struct QuantizedBlockLoader<
     }
 
     if (reduction_dim == 1 && bi >= src_tile_dim.x) {
+      #pragma unroll
       for (int i = 0; i < n_reads * pack_factor; i++) {
         dst[i] = T(0);
       }
@@ -807,6 +816,7 @@ struct QuantizedBlockLoader<
     }
 
     if (reduction_dim == 0 && bi >= src_tile_dim.y) {
+      #pragma unroll
       for (int i = 0; i < n_reads * pack_factor; i++) {
         dst[i] = T(0);
       }
@@ -815,6 +825,7 @@ struct QuantizedBlockLoader<
 
     T scale = *scales;
     T bias = *biases;
+    #pragma unroll
     for (int i = 0; i < n_reads; i++) {
       dequantize<T, pack_factor, bits>(
           (device uint8_t*)(src + i * bytes_per_pack),

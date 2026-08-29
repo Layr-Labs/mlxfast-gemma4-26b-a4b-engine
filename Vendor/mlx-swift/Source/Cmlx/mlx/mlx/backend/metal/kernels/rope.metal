@@ -129,25 +129,27 @@ void rope_impl(
     in_index_1 += pos.x * IdxT(strides[2]);
     in_index_2 = in_index_1 + grid.x * IdxT(strides[2]);
   }
-  for (int i = 0; i < N && head_idx + i < n_head; ++i) {
-    // Read and write the output
-    float x1 = static_cast<float>(in[in_index_1]);
-    float x2 = static_cast<float>(in[in_index_2]);
-    float rx1;
-    float rx2;
-    if (forward) {
-      rx1 = x1 * costheta - x2 * sintheta;
-      rx2 = x1 * sintheta + x2 * costheta;
-    } else {
-      rx1 = x2 * sintheta + x1 * costheta;
-      rx2 = x2 * costheta - x1 * sintheta;
+  #pragma unroll
+  for (int i = 0; i < N; ++i) {
+    if (head_idx + i < n_head) {
+      float x1 = static_cast<float>(in[in_index_1]);
+      float x2 = static_cast<float>(in[in_index_2]);
+      float rx1;
+      float rx2;
+      if (forward) {
+        rx1 = x1 * costheta - x2 * sintheta;
+        rx2 = x1 * sintheta + x2 * costheta;
+      } else {
+        rx1 = x2 * sintheta + x1 * costheta;
+        rx2 = x2 * costheta - x1 * sintheta;
+      }
+      out[out_index_1] = static_cast<T>(rx1);
+      out[out_index_2] = static_cast<T>(rx2);
+      in_index_1 += IdxT(strides[0]);
+      in_index_2 += IdxT(strides[0]);
+      out_index_1 += IdxT(out_strides[0]);
+      out_index_2 += IdxT(out_strides[0]);
     }
-    out[out_index_1] = static_cast<T>(rx1);
-    out[out_index_2] = static_cast<T>(rx2);
-    in_index_1 += IdxT(strides[0]);
-    in_index_2 += IdxT(strides[0]);
-    out_index_1 += IdxT(out_strides[0]);
-    out_index_2 += IdxT(out_strides[0]);
   }
 }
 

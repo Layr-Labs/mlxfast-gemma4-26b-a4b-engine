@@ -4077,7 +4077,17 @@ template <typename T, int group_size, int bits>
     const device T* single_scales = scales + expert * s_strides[0];
     const device T* single_biases = biases + expert * b_strides[0];
     device T* single_y = y + assignment * (uint)out_vec_size;
-    qmv_impl<T, group_size, bits>(
+    // EXPERT-SINGLES-UP: wire the frontier's own KFIX/WVEC singles body
+    // (qmv_affine4_g64_singles_impl) into the UP plane (K=2816). The crown
+    // instantiated it for the DOWN plane (KFIX=704) only, while its own
+    // header states most sorted runs at b8 have length ONE and this arm is
+    // therefore the majority path of BOTH expert planes. Bit-identical by
+    // that body's own proof — identical lane->K mapping, identical 4+4
+    // qdot grouping, identical accumulator/simd_sum/store; loads-only
+    // rescheduling, and the gemma4 gate has already proven in_vec_size ==
+    // 2816 for this plane at compile time, which is exactly what KFIX
+    // needs. The dynamically safe tail is kept verbatim.
+    qmv_affine4_g64_singles_impl<T, group_size, bits, 2816, true, false>(
         single_w, single_scales, single_biases, single_x, single_y,
         in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
     return;

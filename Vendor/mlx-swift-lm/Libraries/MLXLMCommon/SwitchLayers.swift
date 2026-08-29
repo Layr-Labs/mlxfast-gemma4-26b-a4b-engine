@@ -177,6 +177,99 @@ public func weightedExpertUnsort(
     )[0]
 }
 
+/// Exact B8 decode variant of ``weightedExpertUnsort`` that also publishes
+/// the 22 first-level SIMD sums used by the fused tail's RMS reduction. Each
+/// lane owns the same four adjacent BF16 values as the tail's incumbent
+/// 704x4 reduction, so those squares are accumulated while the completed row
+/// is still resident in registers. The feature-local weighted sum remains
+/// identical to `weighted_expert_unsort`: every top-K slot is multiplied,
+/// rounded to BF16, and accumulated in slot order.
+private let weightedExpertUnsortRMSKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "weighted_expert_unsort_rms_partials_b8_2816_v1",
+    inputNames: ["sorted_outputs", "inverse_order", "weights"],
+    outputNames: ["output", "rms_partials"],
+    source: """
+        const uint group = threadgroup_position_in_grid.x;
+        const uint row = group / 3;
+        const uint tile = group - row * 3;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint simd_lane_id = thread_index_in_simdgroup;
+        const uint simd_group_id = simdgroup_index_in_threadgroup;
+        const uint row_lane = tile * 256 + lid;
+        const uint base = row * 2816 + row_lane * 4;
+        const uint assignment_base = row * 8;
+
+        // The final tile has six live SIMD groups (192 lanes). Padded lanes
+        // contribute zero and still execute the unconditional simd_sum.
+        T values[4];
+        for (uint i = 0; i < 4; ++i) {
+            T accumulator = (T)0;
+            if (row_lane < 704) {
+                const uint feature = row_lane * 4 + i;
+                for (uint slot = 0; slot < 8; ++slot) {
+                    const uint assignment = assignment_base + slot;
+                    const uint sorted_row = (uint)inverse_order[assignment];
+                    // Match weighted_expert_unsort's BF16 multiply rounding
+                    // and BF16 slot-ordered accumulation exactly.
+                    const T weighted = (T)(
+                        (float)sorted_outputs[sorted_row * 2816 + feature]
+                        * (float)weights[assignment]);
+                    accumulator = accumulator + weighted;
+                }
+                output[base + i] = accumulator;
+            }
+            values[i] = accumulator;
+        }
+
+        // This is exactly rmsReduce's lane-local four-square accumulation and
+        // first simd_sum for logical SIMD group `partial`.
+        float acc = 0;
+        for (uint i = 0; i < 4; ++i) {
+            const float value = (float)values[i];
+            acc += value * value;
+        }
+        acc = simd_sum(acc);
+        const uint partial = tile * 8 + simd_group_id;
+        if (simd_lane_id == 0 && partial < 22) {
+            rms_partials[row * 22 + partial] = acc;
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+/// Consume the exact eight-row decode cohort and return both the incumbent
+/// BF16 expert output and the row partials needed by Gemma 4's fused tail.
+/// Every near geometry stays on ``weightedExpertUnsort`` through the caller.
+private func weightedExpertUnsortWithRMS(
+    sortedOutputs: MLXArray,
+    inverseOrder: MLXArray,
+    weights: MLXArray
+) -> (output: MLXArray, rmsPartials: MLXArray) {
+    precondition(
+        sortedOutputs.ndim == 2 && sortedOutputs.shape == [64, 2816]
+            && sortedOutputs.dtype == .bfloat16,
+        "weightedExpertUnsortWithRMS outputs must be bfloat16 [64, 2816]")
+    precondition(
+        inverseOrder.ndim == 1 && inverseOrder.size == 64
+            && inverseOrder.dtype == .uint32,
+        "weightedExpertUnsortWithRMS inverse order must be uint32 [64]")
+    precondition(
+        weights.ndim == 2 && weights.shape == [8, 8]
+            && weights.dtype == .bfloat16,
+        "weightedExpertUnsortWithRMS weights must be bfloat16 [8, 8]")
+
+    weightedExpertUnsortProbe.recordEffective()
+    let outputs = weightedExpertUnsortRMSKernel(
+        [sortedOutputs, inverseOrder, weights],
+        template: [("T", sortedOutputs.dtype)],
+        grid: (8 * 3 * 256, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[8, 2816], [8, 22]],
+        outputDTypes: [.bfloat16, .float32]
+    )
+    return (outputs[0], outputs[1])
+}
+
 
 // MARK: - Compiled activation fusions (vMLX / osaurus-main port)
 
@@ -236,45 +329,45 @@ private let compiledGeGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
     return body
 }()
 
-/// GELU-FUSE: the SAME body, compiled WITHOUT `shapeless`, for the routed
-/// expert's pinned decode signatures only. Shapeless tracing adds broadcast
-/// nodes on every binary op that a shape-specialised trace omits on equal
-/// shapes; those nodes push this expression past MLX's fusion depth limit and
-/// split it into two Metal kernels with a materialised intermediate. The
-/// shape-specialised trace fits and emits one.
-private let compiledGeGLUShaped: @Sendable (MLXArray, MLXArray) -> MLXArray = {
-    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = {
-        (gate: MLXArray, up: MLXArray) -> MLXArray in
-        (0.5 * gate * (1 + tanh(sqrt(2 / Float.pi) * (gate + 0.044715 * gate * gate * gate)))) * up
-    }
-    if MLXHardwareInfo.isCompiledDecodeSupported {
-        return compile(body)
-    }
-    return body
+// MARK: - ROUTE-SIMD-RANK-64: exact decode route table
+
+/// Stable rank sort for the exact B=8/top-K=8 decode plane. One SIMDgroup
+/// loads the 64 keys once (two keys per lane), broadcasts them to every lane,
+/// and directly emits the three routing products consumed downstream.
+private let routeSimdRank64Kernel: MLXFast.MLXFastKernel =
+    MLXFast.metalKernel(
+        name: "mlx_lm_route_simd_rank_scatter_m8_u32_n64_v1",
+        inputNames: ["indices"],
+        outputNames: ["row_order", "sorted_keys", "inverse_order"],
+        source: """
+            const uint assignment = thread_position_in_grid.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint key = (uint)indices[assignment];
+            const uint key_low = (uint)indices[lane];
+            const uint key_high = (uint)indices[32u + lane];
+            uint rank = 0;
+            for (uint source = 0; source < 32; ++source) {
+                const uint other_low = simd_broadcast(key_low, ushort(source));
+                rank += (other_low < key)
+                    || (other_low == key && source < assignment);
+                const uint other_high = simd_broadcast(key_high, ushort(source));
+                const uint high_assignment = 32u + source;
+                rank += (other_high < key)
+                    || (other_high == key && high_assignment < assignment);
+            }
+            row_order[rank] = assignment / 8;
+            sorted_keys[rank] = key;
+            inverse_order[assignment] = rank;
+        """,
+        ensureRowContiguous: true
+    )
+
+private let routeSimdRank64Enabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_ROUTE_SIMD_RANK"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
-
-private let switchGeluShapedFuseEnabled: Bool =
-    ProcessInfo.processInfo.environment["DARKBLOOM_GELU_SHAPED_FUSE"] != "0"
-
-/// Admit only the routed-expert decode rectangles: `[64, 1, N]` / `[64, N]`,
-/// both operands bfloat16 with identical shapes. Prefill's per-prompt row
-/// counts stay on the shapeless closure so the compiler cache cannot grow.
-@inline(__always)
-private func geGLUClaimsPinnedDecode(_ gate: MLXArray, _ up: MLXArray) -> Bool {
-    guard switchGeluShapedFuseEnabled,
-        gate.dtype == .bfloat16, up.dtype == .bfloat16,
-        gate.shape == up.shape
-    else { return false }
-    let s = gate.shape
-    if s.count == 3, s[0] == 64, s[1] == 1 { return true }
-    if s.count == 2, s[0] == 64 { return true }
-    return false
-}
-
-@inline(__always)
-private func geGLUProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
-    geGLUClaimsPinnedDecode(gate, up) ? compiledGeGLUShaped(gate, up) : compiledGeGLU(gate, up)
-}
 
 // MARK: - ROUTE-CSORT-64: fused counting-sort route table (donor port)
 
@@ -431,6 +524,18 @@ public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, M
 public func gatherSortIndices(
     indices: MLXArray, numExperts: Int = Int.max
 ) -> (MLXArray, MLXArray, MLXArray) {
+    if routeSimdRank64Enabled,
+        indices.ndim == 2, indices.shape == [8, 8], indices.dtype == .uint32
+    {
+        let outputs = routeSimdRank64Kernel(
+            [indices],
+            grid: (64, 1, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [[64], [64], [64]],
+            outputDTypes: [.uint32, .uint32, .uint32]
+        )
+        return (outputs[0], outputs[1], outputs[2])
+    }
     let m = indices.dim(-1)
     let indices = indices.flattened()
     // ROUTE-CSORT-64: one fused dispatch with byte-identical outputs
@@ -616,7 +721,7 @@ public class SwitchGLU: Module {
         } else if isSiluActivation {
             activated = compiledSwiGLU(xGate, xUp)
         } else if isGeluActivation {
-            activated = geGLUProduct(xGate, xUp)
+            activated = compiledGeGLU(xGate, xUp)
         } else {
             activated = activation(xGate) * xUp
         }
@@ -713,6 +818,61 @@ public class SwitchGLU: Module {
             sortedOutputs: MLX.squeezed(projected.output, axis: -2),
             inverseOrder: inverseOrder,
             weights: weights)
+    }
+
+    /// Exact Gemma 4 B8 decode reduction with optional RMS-partial handoff.
+    ///
+    /// When `emitRMSPartials` is false or any topology/layout predicate fails,
+    /// this calls ``callAndWeightedReduce`` unchanged.  The alternate kernel is
+    /// therefore reachable only for the same sorted 64-assignment decode cell
+    /// already admitted by the incumbent weighted-unsort path.
+    public func callAndWeightedReduceWithRMSPartials(
+        _ x: MLXArray,
+        _ indices: MLXArray,
+        weights: MLXArray,
+        fuseSortedReduction: Bool,
+        isProductionPrefill: Bool,
+        emitRMSPartials: Bool
+    ) -> (output: MLXArray, rmsPartials: MLXArray?) {
+        guard emitRMSPartials,
+            fuseSortedReduction,
+            !isProductionPrefill,
+            x.ndim == 2,
+            x.shape == [8, 2816],
+            indices.ndim == 2,
+            indices.shape == [8, 8],
+            indices.size == 64,
+            weights.ndim == 2,
+            weights.shape == [8, 8],
+            supportsWeightedExpertUnsort(x, indices, weights: weights)
+        else {
+            return (
+                callAndWeightedReduce(
+                    x, indices, weights: weights,
+                    fuseSortedReduction: fuseSortedReduction,
+                    isProductionPrefill: isProductionPrefill),
+                nil)
+        }
+
+        let projected = projectExperts(x, indices)
+        guard projected.sorted,
+            let inverseOrder = projected.inverseOrder,
+            inverseOrder.ndim == 1,
+            inverseOrder.size == 64,
+            inverseOrder.dtype == .uint32,
+            projected.output.ndim == 3,
+            projected.output.shape == [64, 1, 2816],
+            projected.output.dtype == .bfloat16
+        else {
+            return (legacyWeightedReduction(
+                projected, indices: indices, weights: weights), nil)
+        }
+
+        let fused = weightedExpertUnsortWithRMS(
+            sortedOutputs: MLX.squeezed(projected.output, axis: -2),
+            inverseOrder: inverseOrder,
+            weights: weights)
+        return (fused.output, fused.rmsPartials)
     }
 }
 

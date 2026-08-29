@@ -1414,10 +1414,7 @@ public final class EngineLoopV2: @unchecked Sendable {
 
         let inputs = lazyTokens.reshaped([ids.count, 1])
         let forwardStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-        // SOFTCAP-SKIP: declare order-only consumption for this graph build.
-        let (last, cacheInnerState) = CBv2OrderOnlyLogits.withOrderOnly(params) {
-            decodeLogits(rowStates: rowStates, tokens: inputs)  // [B, vocab]
-        }
+        let (last, cacheInnerState) = decodeLogits(rowStates: rowStates, tokens: inputs)  // [B, vocab]
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.forward.build", seconds: CFAbsoluteTimeGetCurrent() - forwardStart)
@@ -1510,13 +1507,8 @@ public final class EngineLoopV2: @unchecked Sendable {
         if !decodeRows.isEmpty {
             let inputs = MLXArray(decodeRows.map { Int32($0.rec.tokens[$0.start]) })
                 .reshaped([decodeRows.count, 1])
-            // SOFTCAP-SKIP: same declaration on the mixed-step decode rows.
-            let (last, decodeInnerState) = CBv2OrderOnlyLogits.withOrderOnly(
-                decodeRows.map(\.rec.request.sampling)
-            ) {
-                decodeLogits(
-                    rowStates: decodeRows.map { kvStates[$0.rec.id]! }, tokens: inputs)
-            }
+            let (last, decodeInnerState) = decodeLogits(
+                rowStates: decodeRows.map { kvStates[$0.rec.id]! }, tokens: inputs)
             cacheInnerState.append(contentsOf: decodeInnerState)
             decodeSampled = sampler.sample(
                 logits: last,

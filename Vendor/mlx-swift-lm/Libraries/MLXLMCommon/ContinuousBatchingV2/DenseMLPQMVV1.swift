@@ -43,6 +43,23 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// MMA-MLP-001 kill switches, one per dense MLP plane, so a ranked
+    /// rejection can be bisected post hoc without a rebuild pair. Setting
+    /// either to 0 restores DMLP-001/DMLP-002 for that plane byte for byte.
+    public static let mma8GateUpEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MLP_MMA8_GATEUP"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    public static let mma8DownEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MLP_MMA8_DOWN"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let batch = 8
     private static let sequence = 1
     private static let groupSize = 64
@@ -330,6 +347,252 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
         return result
     }()
 
+    /// MMA-MLP-001. Verbatim transcription of the `kGemma4QmvMma8Affine8`
+    /// tier body from `zarar/t6-mma-s2` (quantized.h / quantized.cpp twins,
+    /// `gemma4_qmv_mma8_affine8_g64_impl`), hosted here the way
+    /// `CBv2AttentionOQMVV1` hosts the 4-bit o_proj MMA body. Only the
+    /// preprocessor line continuations are collapsed onto one line, which the
+    /// preprocessor does anyway and which a Swift multiline literal requires.
+    /// The arithmetic is untouched: one fp32 `simdgroup_float8x8` chain forms
+    /// all 64 products of a g64 group in ascending k, `mma8_runsum8`
+    /// reproduces `load_vector`'s bits == 8 sequential fp32 `sum` bit for bit,
+    /// and the close is the reference's own `s * C + rs * b`. KS = 2 splits
+    /// the K/64 groups across the two simdgroups; an odd count (down_proj,
+    /// G = 33) gives the extra group to simdgroup 0, deterministically.
+    private static let mma8KernelHeader = """
+#include <metal_simdgroup_matrix>
+
+#ifndef METAL_FUNC
+#define METAL_FUNC inline
+#endif
+
+struct mma8_coord {
+  short fm;
+  short fn;
+};
+
+// steel/gemm/mma.h's `get_coord` arithmetic, reproduced locally so the same
+// text compiles wherever this body is pasted: lane (fm, fn) owns elements
+// (fm, fn) and (fm, fn + 1) of every 8x8 operand.
+inline mma8_coord mma8_lane(uint lane) {
+  const short qid = short(lane / 4);
+  return {
+      short((qid & 4) + short((lane / 2) % 4)),
+      short((qid & 2) * 2 + short(lane % 2) * 2)};
+}
+
+// The x-side loads pull sixteen bytes at a time and split them into eight
+// 16-bit lanes, which only makes sense for a 2-byte T. `affine_qmv` is also
+// instantiated for `float`; the tier gate carries `sizeof(T) == 2` so the
+// float instantiation never runs this body, and this primary template is what
+// lets it still compile.
+template <typename T, bool TWO_BYTE = (sizeof(T) == 2)>
+struct mma8_u16 {
+  static inline T cast(ushort u) {
+    return T(0);
+  }
+};
+
+template <typename T>
+struct mma8_u16<T, true> {
+  static inline T cast(ushort u) {
+    return as_type<T>(u);
+  }
+};
+
+// Widening a 16-bit float to fp32 is exact, so these two reproduce the
+// reference's own operand values bit for bit.
+template <typename T>
+inline float mma8_lo(uint u) {
+  return float(mma8_u16<T>::cast(ushort(u & 0xFFFFu)));
+}
+
+template <typename T>
+inline float mma8_hi(uint u) {
+  return float(mma8_u16<T>::cast(ushort(u >> 16)));
+}
+
+// Textual twin of `load_vector<T, float, 8, 4>`'s `sum` on the same aligned
+// 8-run that the reference lane owns: the parenthesised 4-tuple is evaluated
+// on T exactly as in the reference, then the two trees are added in fp32. The
+// bias term of the affine form therefore reuses the reference's own
+// elementary values, not a re-derived sum.
+template <typename T>
+inline float mma8_runsum4(uint4 r) {
+  thread T xt[8];
+  xt[0] = mma8_u16<T>::cast(ushort(r.x & 0xFFFFu));
+  xt[1] = mma8_u16<T>::cast(ushort(r.x >> 16));
+  xt[2] = mma8_u16<T>::cast(ushort(r.y & 0xFFFFu));
+  xt[3] = mma8_u16<T>::cast(ushort(r.y >> 16));
+  xt[4] = mma8_u16<T>::cast(ushort(r.z & 0xFFFFu));
+  xt[5] = mma8_u16<T>::cast(ushort(r.z >> 16));
+  xt[6] = mma8_u16<T>::cast(ushort(r.w & 0xFFFFu));
+  xt[7] = mma8_u16<T>::cast(ushort(r.w >> 16));
+  float sum = 0;
+  sum += xt[0] + xt[1] + xt[2] + xt[3];
+  sum += xt[4] + xt[5] + xt[6] + xt[7];
+  return sum;
+}
+
+#define MMA8_SETB(BB, W, HI) BB.thread_elements()[0] = mma8_##HI<T>(r0.W); BB.thread_elements()[1] = mma8_##HI<T>(r1.W);
+
+// The 8-bit twin of the run sum. `load_vector`'s bits == 8 branch is NOT the
+// bits == 4 branch: it accumulates `sum += x[i]` one element at a time in the
+// ACCUMULATOR type (U = float), and it stores `x_thread[i] = x[i]` with no
+// pre-scaling, because the 8-bit `qdot` arm multiplies by the whole byte code
+// 0..255 rather than by a masked-and-shifted nibble. The 8-bit reference lane
+// carries values_per_thread = 4 (block 128, scale_step_per_thread = 16), so
+// its `sum` is the fp32 sequential sum of ONE aligned 4-run. This helper
+// therefore rebuilds the TWO reference 4-run sums that tile the aligned 8-run
+// this lane loads, each bit for bit, and adds them; the bias term of the
+// affine close is then built out of the reference's own `sum` values.
+template <typename T>
+inline float mma8_runsum8(uint4 r) {
+  thread T xt[8];
+  xt[0] = mma8_u16<T>::cast(ushort(r.x & 0xFFFFu));
+  xt[1] = mma8_u16<T>::cast(ushort(r.x >> 16));
+  xt[2] = mma8_u16<T>::cast(ushort(r.y & 0xFFFFu));
+  xt[3] = mma8_u16<T>::cast(ushort(r.y >> 16));
+  xt[4] = mma8_u16<T>::cast(ushort(r.z & 0xFFFFu));
+  xt[5] = mma8_u16<T>::cast(ushort(r.z >> 16));
+  xt[6] = mma8_u16<T>::cast(ushort(r.w & 0xFFFFu));
+  xt[7] = mma8_u16<T>::cast(ushort(r.w >> 16));
+  float s0 = 0;
+  s0 += xt[0];
+  s0 += xt[1];
+  s0 += xt[2];
+  s0 += xt[3];
+  float s1 = 0;
+  s1 += xt[4];
+  s1 += xt[5];
+  s1 += xt[6];
+  s1 += xt[7];
+  return s0 + s1;
+}
+
+// The 8-bit A fill. A lane (fm, fn) owns A elements (fm, fn) and (fm, fn + 1),
+// i.e. the codes at k = 64 g + 8 fn + j and k = 64 g + 8 (fn + 1) + j, which
+// are byte j and byte 8 + j of the sixteen consecutive weight bytes this lane
+// loads as one `uint4`. Byte j lives in word j / 4 at bit 8 * (j % 4), so the
+// two components and the shift are all the macro needs. The code is the whole
+// byte 0..255 and x is unscaled, exactly as the 8-bit `qdot` arm forms its
+// product; a bf16 x carries 8 significant bits and the code 8, so the product
+// needs at most 16 and is exact in fp32.
+#define MMA8_STEP8(BB, WLO, WHI, SH) A.thread_elements()[0] = float(extract_bits(wv.WLO, (SH), 8)); A.thread_elements()[1] = float(extract_bits(wv.WHI, (SH), 8)); simdgroup_multiply_accumulate(C, A, BB, C);
+
+// x is [8, K] with K % 64 == 0, w is packed [N, K / 4] uint32 (one byte per
+// code, so the row stride is K bytes and K % 64 == 0 keeps every `uint4` load
+// 16-byte aligned), scales and biases are [N, K / 64], y is [8, N]. `n0` is
+// the first of the eight output rows this threadgroup owns. KS = 2 splits the
+// K / 64 groups between the two simdgroups of the host's (32, 2, 1)
+// threadgroup; an odd group count (down_proj: K = 2112 -> G = 33 -> 17 + 16)
+// gives the extra group to simdgroup 0, which is deterministic and independent
+// of scheduling. `red` is 32 float2 of threadgroup memory for the KS = 2 close.
+template <typename T, int KS>
+METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int K,
+    const int N,
+    const int n0,
+    threadgroup float2* red,
+    uint simd_gid,
+    uint simd_lid) {
+  const int G = K / 64;
+  const int gh = (G + 1) / 2;
+  const int g_begin = (KS == 2 && simd_gid == 1) ? gh : 0;
+  const int g_end = (KS == 2 && simd_gid == 0) ? gh : G;
+  const mma8_coord c = mma8_lane(simd_lid);
+
+  const device uint8_t* wrow =
+      (const device uint8_t*)w + (n0 + c.fm) * K + 8 * c.fn;
+  const device T* srow = scales + (n0 + c.fm) * G;
+  const device T* brow = biases + (n0 + c.fm) * G;
+  const device T* x0 = x + c.fn * K + 8 * c.fm;
+  const device T* x1 = x0 + K;
+
+  float acc0 = 0.0f;
+  float acc1 = 0.0f;
+  simdgroup_float8x8 A;
+  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+  for (int g = g_begin; g < g_end; ++g) {
+    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+
+    // Each B lane owns the two 8-runs whose run sums the C lane (fm, fn)
+    // needs; three xor-butterfly steps over the fm lane bits broadcast
+    // RS[g][fn] and RS[g][fn + 1] to all eight lanes of the fn column group.
+    float2 rs = float2(mma8_runsum8<T>(r0), mma8_runsum8<T>(r1));
+    rs += simd_shuffle_xor(rs, 2u);
+    rs += simd_shuffle_xor(rs, 4u);
+    rs += simd_shuffle_xor(rs, 16u);
+
+    MMA8_SETB(B0, x, lo)
+    MMA8_SETB(B1, x, hi)
+    MMA8_SETB(B2, y, lo)
+    MMA8_SETB(B3, y, hi)
+    MMA8_SETB(B4, z, lo)
+    MMA8_SETB(B5, z, hi)
+    MMA8_SETB(B6, w, lo)
+    MMA8_SETB(B7, w, hi)
+
+    const uint4 wv = *((const device uint4*)(wrow + 64 * g));
+    const float s = float(srow[g]);
+    const float b = float(brow[g]);
+
+    simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+    MMA8_STEP8(B0, x, z, 0)
+    MMA8_STEP8(B1, x, z, 8)
+    MMA8_STEP8(B2, x, z, 16)
+    MMA8_STEP8(B3, x, z, 24)
+    MMA8_STEP8(B4, y, w, 0)
+    MMA8_STEP8(B5, y, w, 8)
+    MMA8_STEP8(B6, y, w, 16)
+    MMA8_STEP8(B7, y, w, 24)
+
+    acc0 += s * C.thread_elements()[0] + rs.x * b;
+    acc1 += s * C.thread_elements()[1] + rs.y * b;
+  }
+
+  if (KS == 2) {
+    if (simd_gid == 1) {
+      red[simd_lid] = float2(acc0, acc1);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_gid == 1) {
+      return;
+    }
+    const float2 other = red[simd_lid];
+    acc0 = acc0 + other.x;
+    acc1 = acc1 + other.y;
+  }
+
+  y[c.fn * N + n0 + c.fm] = static_cast<T>(acc0);
+  y[(c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc1);
+}
+"""
+
+    private static let mma8Kernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            gemma4_qmv_mma8_affine8_g64_impl<T, 2>(
+                w, scales, biases, x, y,
+                x_shape[x_ndim - 1], w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_v1",
         inputNames: ["x", "w", "scales", "biases"],
@@ -497,6 +760,27 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
             scales.shape == [outDim, inDim / Self.groupSize],
             biases.shape == scales.shape
         else { return nil }
+
+        // MMA-MLP-001: matrix-unit body for the two dense MLP planes. One
+        // threadgroup per 8-column output tile serves all eight cohort rows
+        // from a single weight fetch; the DMLP-001 quad-stream body below
+        // streams the same plane twice (four rows per x-group). `liveShape`
+        // above already pins the pair, so the gate/up test also names down.
+        // The MMA close builds its own `rs` with `mma8_runsum8`, so this path
+        // does not consume DMLP-002's xSums table; that table stays lazy and
+        // is simply never evaluated when both planes take this branch.
+        let isGateUp = inDim == 2816 && outDim == 2112
+        if isGateUp ? mma8GateUpEnabled : mma8DownEnabled {
+            let yTiles = outDim / outputsPerGroup
+            return mma8Kernel(
+                [x, weight, scales, biases],
+                template: [("T", x.dtype)],
+                grid: (simdWidth, yTiles * simdGroups, 1),
+                threadGroup: (simdWidth, simdGroups, 1),
+                outputShapes: [[batch, sequence, outDim]],
+                outputDTypes: [x.dtype]
+            )[0]
+        }
 
         let xGroups = batch / rowsPerGroup
         let yGroups = outDim / outputsPerGroup

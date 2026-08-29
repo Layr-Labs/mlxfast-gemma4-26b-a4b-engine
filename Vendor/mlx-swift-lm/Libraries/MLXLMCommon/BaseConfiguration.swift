@@ -1,4 +1,5 @@
 // Copyright © 2025 Apple Inc.
+// Transparent current-main reference-box draw after ddc936a; executable source is unchanged.
 
 import Foundation
 import MLX

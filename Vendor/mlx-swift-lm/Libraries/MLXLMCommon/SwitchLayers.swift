@@ -404,6 +404,45 @@ public func gatherSortIndices(
     return (order.floorDivide(m), indices[order], argSort(order))
 }
 
+/// The three sorted-expert descriptors `SwitchGLU.projectExperts` derives for
+/// the B=8 / top-K-8 decode geometry, packaged by Gemma 4's fused whole-router
+/// kernel (M-003) as extra outputs of the SAME dispatch that selects top-K.
+/// By construction the values are exactly what ``gatherSortIndices`` returns
+/// for the flattened `[8, 8]` uint32 top-K index array the router emitted:
+/// `lhsIndices` is `order.floorDivide(8)` (the token row of every sorted
+/// assignment), `sortedIndices` is `indices[order]` (the expert ids in
+/// ascending stable-sort order), and `inverseOrder` is `argSort(order)` (the
+/// inverse permutation, mapping each original assignment back to its sorted
+/// row for ``weightedExpertUnsort`` / ``scatterUnsort``).
+public struct Gemma4FusedRouterSort: @unchecked Sendable {
+    public let lhsIndices: MLXArray
+    public let sortedIndices: MLXArray
+    public let inverseOrder: MLXArray
+
+    public init(
+        lhsIndices: MLXArray, sortedIndices: MLXArray, inverseOrder: MLXArray
+    ) {
+        self.lhsIndices = lhsIndices
+        self.sortedIndices = sortedIndices
+        self.inverseOrder = inverseOrder
+    }
+
+    /// Shape/dtype guard for consuming the packet in place of
+    /// ``gatherSortIndices``. The 64-assignment contract is the exact geometry
+    /// the fused kernel fires at; the VALUES are consistent by construction
+    /// (the kernel sorted precisely the index array it emitted alongside the
+    /// packet), so this check only defends against a mismatched consumer.
+    public func matches(_ indices: MLXArray) -> Bool {
+        indices.ndim == 2 && indices.size == 64
+            && lhsIndices.ndim == 1 && lhsIndices.size == 64
+            && sortedIndices.ndim == 1 && sortedIndices.size == 64
+            && inverseOrder.ndim == 1 && inverseOrder.size == 64
+            && lhsIndices.dtype == .uint32
+            && sortedIndices.dtype == .uint32
+            && inverseOrder.dtype == .uint32
+    }
+}
+
 public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) -> MLXArray {
     var x = x[invOrder]
     if let shape {
@@ -534,7 +573,8 @@ public class SwitchGLU: Module {
     }
 
     private func projectExperts(
-        _ x: MLXArray, _ indices: MLXArray
+        _ x: MLXArray, _ indices: MLXArray,
+        fusedSort: Gemma4FusedRouterSort? = nil
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
         let useLhsIndices =
             indices.size == 64 && indices.ndim == 2 && indices.shape == [8, 8]
@@ -548,8 +588,27 @@ public class SwitchGLU: Module {
         if doSort {
             if useLhsIndices {
                 x = x.flattened(start: 0, end: -3)
-                (lhsIndices, idx, inverseOrder) = gatherSortIndices(
-                    indices: indices, numExperts: numExperts)
+                // M-003: when the fused whole-router kernel already produced
+                // the sorted-expert descriptors in the same dispatch that
+                // selected top-K, consume them instead of re-deriving them
+                // with gatherSortIndices (ROUTE-CSORT-64's fused scatter when
+                // the 256-entry key space covers numExperts, otherwise the
+                // two stock argSorts + a gather + floorDivide). `matches` is
+                // geometry-only: the VALUES are the kernel's exact sort of
+                // this same index array, so the substitution is bit-identical
+                // by construction. Every other geometry (and prefill size >
+                // 64, MTP rectangles, smaller serving cohorts) keeps the
+                // established decomposition — including the git-merged
+                // ROUTE-CSORT-64 fast path, which engages here through the
+                // `numExperts` guard when no packet is present.
+                if let fusedSort, fusedSort.matches(indices) {
+                    lhsIndices = fusedSort.lhsIndices
+                    idx = fusedSort.sortedIndices
+                    inverseOrder = fusedSort.inverseOrder
+                } else {
+                    (lhsIndices, idx, inverseOrder) = gatherSortIndices(
+                        indices: indices, numExperts: numExperts)
+                }
             } else {
                 (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
             }
@@ -623,8 +682,11 @@ public class SwitchGLU: Module {
             && indices.size >= 64
     }
 
-    public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
-        var projected = projectExperts(x, indices)
+    public func callAsFunction(
+        _ x: MLXArray, _ indices: MLXArray,
+        fusedSort: Gemma4FusedRouterSort? = nil
+    ) -> MLXArray {
+        var projected = projectExperts(x, indices, fusedSort: fusedSort)
         if let inverseOrder = projected.inverseOrder {
             projected.output = scatterUnsort(
                 x: projected.output, invOrder: inverseOrder, shape: indices.shape)
@@ -644,6 +706,7 @@ public class SwitchGLU: Module {
         _ indices: MLXArray,
         weights: MLXArray,
         fuseSortedReduction: Bool,
+        fusedSort: Gemma4FusedRouterSort? = nil,
         isProductionPrefill: Bool = true
     ) -> MLXArray {
         // At B=8 decode there are exactly 64 assignments (8 rows x top-k 8),
@@ -655,10 +718,10 @@ public class SwitchGLU: Module {
         guard fuseSortedReduction && (isProductionPrefill || isEightRowDecode),
             supportsWeightedExpertUnsort(x, indices, weights: weights)
         else {
-            return weightedExpertSum(callAsFunction(x, indices), weights)
+            return weightedExpertSum(callAsFunction(x, indices, fusedSort: fusedSort), weights)
         }
 
-        let projected = projectExperts(x, indices)
+        let projected = projectExperts(x, indices, fusedSort: fusedSort)
         guard projected.sorted,
             let inverseOrder = projected.inverseOrder,
             projected.output.ndim == 3,

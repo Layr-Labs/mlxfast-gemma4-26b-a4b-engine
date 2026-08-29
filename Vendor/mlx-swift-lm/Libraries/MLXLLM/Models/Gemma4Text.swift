@@ -789,7 +789,7 @@ private class RMSNormNoScale: Module {
     }
 }
 
-private let gemma4QKVNormKernel = MLXFast.metalKernel(
+let gemma4QKVNormKernel = MLXFast.metalKernel(
     name: "gemma4_b8_qkv_rms_norm_v1",
     inputNames: ["q", "k", "v", "q_weight", "k_weight"],
     outputNames: ["q_out", "k_out", "v_out"],
@@ -865,7 +865,20 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-private func gemma4FusedQKVNorm(
+/// Kill switch for the prefill (L>1) QKV-norm fusion. DEFAULT ON. Set
+/// `DARKBLOOM_GEMMA4_QKV_NORM_PREFILL` to `0`/`false`/`no`/`off` to keep the
+/// stock three-dispatch RMSNorm path at packed prefill. It gates only the L>1
+/// engagement; decode (L==1) always uses the fused kernel, exactly as before.
+private enum Gemma4QKVNormPrefill {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_QKV_NORM_PREFILL"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+}
+
+func gemma4FusedQKVNorm(
     q: MLXArray,
     k: MLXArray,
     v: MLXArray,
@@ -874,21 +887,33 @@ private func gemma4FusedQKVNorm(
     eps: Float,
     keyValueShared: Bool
 ) -> (MLXArray, MLXArray, MLXArray)? {
+    let sequenceLength = q.dim(1)
+    // The fused kernel is fully row-generic over the contiguous
+    // [8, L, heads, D] layout: each kernel "row" is one (batch, position,
+    // head) D-segment, and the grid spans Q_ROWS + K_ROWS + K_ROWS
+    // threadgroups (q / k / v sections). `L == 1` was an arithmetic pin, not a
+    // kernel limit: Q_ROWS = 8*L*16 and K_ROWS = 8*L*kvHeads map the grid 1:1
+    // onto flat (b, l, h) row indices for any L >= 1, so prefill (L=1024)
+    // engages the same kernel byte-identically per row. At L==1 the counts
+    // reduce to the original decode values, so decode is untouched.
     guard eps == 1.0e-6,
         q.dtype == .bfloat16, k.dtype == .bfloat16, v.dtype == .bfloat16,
         qWeight.dtype == .bfloat16, kWeight.dtype == .bfloat16,
         q.ndim == 4, k.ndim == 4, v.ndim == 4,
-        q.dim(0) == 8, q.dim(1) == 1, q.dim(2) == 16,
-        k.dim(0) == 8, k.dim(1) == 1, v.shape == k.shape,
+        q.dim(0) == 8, q.dim(1) >= 1, q.dim(2) == 16,
+        k.dim(0) == 8, k.dim(1) == q.dim(1), v.shape == k.shape,
         q.dim(3) == k.dim(3),
         (q.dim(3) == 256 && k.dim(2) == 8) || (q.dim(3) == 512 && k.dim(2) == 2),
         qWeight.shape == [q.dim(3)], kWeight.shape == [q.dim(3)],
         !keyValueShared || v.shape == k.shape
     else { return nil }
+    // Kill switch gates the prefill (L>1) extension only. Decode (L==1) is
+    // never affected and keeps its current fused path unconditionally.
+    if sequenceLength > 1, !Gemma4QKVNormPrefill.enabled { return nil }
 
     let dimension = q.dim(3)
-    let qRows = 8 * 16
-    let kRows = 8 * k.dim(2)
+    let qRows = 8 * sequenceLength * 16
+    let kRows = 8 * sequenceLength * k.dim(2)
     let threads = dimension / 4
     // In the exact K-eq-V case V reads kRaw, so one row reduction produces
     // both the weighted K and no-scale V outputs. Keep the ordinary three

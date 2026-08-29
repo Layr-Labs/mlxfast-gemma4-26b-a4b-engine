@@ -23,6 +23,8 @@
 // but disables the activation-sum table. Every non-production dtype, mode,
 // shape or quantization geometry fails closed to the prior path. Selected
 // arrays are normalized to row-contiguous layout by `MLXFast.metalKernel`.
+// `DARKBLOOM_CBV2_DENSE_MLP_MMA8=0` keeps the promoted tight-grid road while
+// disabling the matrix-unit experiment layered above it.
 
 import Foundation
 import MLX
@@ -39,6 +41,13 @@ public enum CBv2DenseMLPQMVV1 {
     public static let activationSumsEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_DENSE_MLP_XSUM"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    public static let matrixUnitEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_DENSE_MLP_MMA8"]
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
@@ -229,6 +238,162 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
 }
 """
 
+    /// DMLP-MMA8-001: the promoted dense helper already owns the exact B8/L1
+    /// affine8/group64 shapes. This alternative keeps those host guards but
+    /// elects one threadgroup per eight output rows and computes all eight
+    /// cohort columns with `simdgroup_float8x8`. Each g64 group is closed
+    /// independently before the next group, matching the architecture of the
+    /// officially promoted affine4 Q/K/V matrix-unit tier.
+    private static let matrixUnitKernelHeader = kernelHeader + """
+
+struct dmlp_mma8_coord {
+  short fm;
+  short fn;
+};
+
+inline dmlp_mma8_coord dmlp_mma8_lane(uint lane) {
+  const short qid = short(lane / 4);
+  return {
+      short((qid & 4) + short((lane / 2) % 4)),
+      short((qid & 2) * 2 + short(lane % 2) * 2)};
+}
+
+template <typename T>
+inline float dmlp_mma8_lo(uint u) {
+  return float(as_type<T>(ushort(u & 0xFFFFu)));
+}
+
+template <typename T>
+inline float dmlp_mma8_hi(uint u) {
+  return float(as_type<T>(ushort(u >> 16)));
+}
+
+template <typename T>
+inline float dmlp_mma8_runsum4(uint4 r) {
+  thread T xt[8];
+  xt[0] = as_type<T>(ushort(r.x & 0xFFFFu));
+  xt[1] = as_type<T>(ushort(r.x >> 16));
+  xt[2] = as_type<T>(ushort(r.y & 0xFFFFu));
+  xt[3] = as_type<T>(ushort(r.y >> 16));
+  xt[4] = as_type<T>(ushort(r.z & 0xFFFFu));
+  xt[5] = as_type<T>(ushort(r.z >> 16));
+  xt[6] = as_type<T>(ushort(r.w & 0xFFFFu));
+  xt[7] = as_type<T>(ushort(r.w >> 16));
+  float sum = 0.0f;
+  sum += xt[0] + xt[1] + xt[2] + xt[3];
+  sum += xt[4] + xt[5] + xt[6] + xt[7];
+  return sum;
+}
+
+template <typename T, int KS>
+METAL_FUNC void dmlp_qmv_mma8_affine8_g64_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int K,
+    const int N,
+    const int n0,
+    threadgroup float2* red,
+    uint simd_gid,
+    uint simd_lid) {
+  const int G = K / 64;
+  const int gh = (G + 1) / 2;
+  const int g_begin = (KS == 2 && simd_gid == 1) ? gh : 0;
+  const int g_end = (KS == 2 && simd_gid == 0) ? gh : G;
+  const dmlp_mma8_coord c = dmlp_mma8_lane(simd_lid);
+
+  const device uint8_t* wrow =
+      (const device uint8_t*)w + (n0 + c.fm) * K + 8 * c.fn;
+  const device T* srow = scales + (n0 + c.fm) * G;
+  const device T* brow = biases + (n0 + c.fm) * G;
+  const device T* x0 = x + c.fn * K + 8 * c.fm;
+  const device T* x1 = x0 + K;
+
+  float acc0 = 0.0f;
+  float acc1 = 0.0f;
+  simdgroup_float8x8 A;
+  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+  for (int g = g_begin; g < g_end; ++g) {
+    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+    float2 rs = float2(
+        dmlp_mma8_runsum4<T>(r0), dmlp_mma8_runsum4<T>(r1));
+    rs += simd_shuffle_xor(rs, 2u);
+    rs += simd_shuffle_xor(rs, 4u);
+    rs += simd_shuffle_xor(rs, 16u);
+
+    B0.thread_elements()[0] = dmlp_mma8_lo<T>(r0.x);
+    B0.thread_elements()[1] = dmlp_mma8_lo<T>(r1.x);
+    B1.thread_elements()[0] = dmlp_mma8_hi<T>(r0.x);
+    B1.thread_elements()[1] = dmlp_mma8_hi<T>(r1.x);
+    B2.thread_elements()[0] = dmlp_mma8_lo<T>(r0.y);
+    B2.thread_elements()[1] = dmlp_mma8_lo<T>(r1.y);
+    B3.thread_elements()[0] = dmlp_mma8_hi<T>(r0.y);
+    B3.thread_elements()[1] = dmlp_mma8_hi<T>(r1.y);
+    B4.thread_elements()[0] = dmlp_mma8_lo<T>(r0.z);
+    B4.thread_elements()[1] = dmlp_mma8_lo<T>(r1.z);
+    B5.thread_elements()[0] = dmlp_mma8_hi<T>(r0.z);
+    B5.thread_elements()[1] = dmlp_mma8_hi<T>(r1.z);
+    B6.thread_elements()[0] = dmlp_mma8_lo<T>(r0.w);
+    B6.thread_elements()[1] = dmlp_mma8_lo<T>(r1.w);
+    B7.thread_elements()[0] = dmlp_mma8_hi<T>(r0.w);
+    B7.thread_elements()[1] = dmlp_mma8_hi<T>(r1.w);
+
+    const uint4 wv = *((const device uint4*)(wrow + 64 * g));
+    const float s = float(srow[g]);
+    const float b = float(brow[g]);
+    simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+    A.thread_elements()[0] = float(wv.x & 0xFFu);
+    A.thread_elements()[1] = float(wv.z & 0xFFu);
+    simdgroup_multiply_accumulate(C, A, B0, C);
+    A.thread_elements()[0] = float((wv.x >> 8) & 0xFFu);
+    A.thread_elements()[1] = float((wv.z >> 8) & 0xFFu);
+    simdgroup_multiply_accumulate(C, A, B1, C);
+    A.thread_elements()[0] = float((wv.x >> 16) & 0xFFu);
+    A.thread_elements()[1] = float((wv.z >> 16) & 0xFFu);
+    simdgroup_multiply_accumulate(C, A, B2, C);
+    A.thread_elements()[0] = float(wv.x >> 24);
+    A.thread_elements()[1] = float(wv.z >> 24);
+    simdgroup_multiply_accumulate(C, A, B3, C);
+    A.thread_elements()[0] = float(wv.y & 0xFFu);
+    A.thread_elements()[1] = float(wv.w & 0xFFu);
+    simdgroup_multiply_accumulate(C, A, B4, C);
+    A.thread_elements()[0] = float((wv.y >> 8) & 0xFFu);
+    A.thread_elements()[1] = float((wv.w >> 8) & 0xFFu);
+    simdgroup_multiply_accumulate(C, A, B5, C);
+    A.thread_elements()[0] = float((wv.y >> 16) & 0xFFu);
+    A.thread_elements()[1] = float((wv.w >> 16) & 0xFFu);
+    simdgroup_multiply_accumulate(C, A, B6, C);
+    A.thread_elements()[0] = float(wv.y >> 24);
+    A.thread_elements()[1] = float(wv.w >> 24);
+    simdgroup_multiply_accumulate(C, A, B7, C);
+
+    acc0 += s * C.thread_elements()[0] + rs.x * b;
+    acc1 += s * C.thread_elements()[1] + rs.y * b;
+  }
+
+  if (KS == 2) {
+    if (simd_gid == 1) {
+      red[simd_lid] = float2(acc0, acc1);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_gid == 1) {
+      return;
+    }
+    const float2 other = red[simd_lid];
+    acc0 = acc0 + other.x;
+    acc1 = acc1 + other.y;
+  }
+
+  y[c.fn * N + n0 + c.fm] = static_cast<T>(acc0);
+  y[(c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc1);
+}
+
+"""
+
     /// DMLP-002 keeps DMLP-001's kernel text intact and derives a second body
     /// which replaces only the four-value activation sum. The x values are
     /// still loaded into the same register array, in the same order, and every
@@ -367,6 +532,27 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
         ensureRowContiguous: true
     )
 
+    private static let matrixUnitKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_qmv_mma8_affine8_g64_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const int in_vec_size = x_shape[x_ndim - 1];
+            const int out_vec_size = w_shape[0];
+            const int n0 = int(tid.y) * 8;
+            threadgroup float2 red[32];
+            dmlp_qmv_mma8_affine8_g64_impl<T, 2>(
+                w, scales, biases, x, y,
+                in_vec_size, out_vec_size, n0, red, simd_gid, simd_lid);
+            return;
+            """,
+        header: matrixUnitKernelHeader,
+        ensureRowContiguous: true
+    )
+
     /// One exact float sum for each `(K/128 block, simd lane, cohort row)`.
     /// The expression is the bits==8 arm of stock `load_vector`: a float zero
     /// followed by four ascending `sum += bf16` operations. Row is the unit-
@@ -440,6 +626,7 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
     /// a plausible shape; all other inputs keep DMLP-001 unchanged.
     public static func activationSums(for x: MLXArray) -> ActivationSums? {
         guard enabled,
+            !matrixUnitEnabled,
             activationSumsEnabled,
             x.dtype == .bfloat16,
             x.ndim == 3,
@@ -500,6 +687,16 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
 
         let xGroups = batch / rowsPerGroup
         let yGroups = outDim / outputsPerGroup
+        if matrixUnitEnabled {
+            return matrixUnitKernel(
+                [x, weight, scales, biases],
+                template: [("T", x.dtype)],
+                grid: (simdWidth, yGroups * simdGroups, 1),
+                threadGroup: (simdWidth, simdGroups, 1),
+                outputShapes: [[batch, sequence, outDim]],
+                outputDTypes: [x.dtype]
+            )[0]
+        }
         let useActivationSums = activationSums != nil
             && inDim == 2816
             && outDim == 2112

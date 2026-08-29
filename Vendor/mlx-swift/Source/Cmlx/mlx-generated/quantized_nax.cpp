@@ -1495,6 +1495,46 @@ METAL_FUNC void gather_rhs_load_frag_row(
   }
 }
 
+// Loads one NAX A-tile fragment row through the compact production-prefill
+// row map written by gather_front. Each logical output row resolves to the
+// exact token-major source row that the full gather would have copied.
+template <typename U, typename ATile>
+METAL_FUNC void gather_rhs_load_compact_frag_row(
+    const short mm,
+    thread ATile& Atile,
+    const device U* src,
+    const device uint32_t* row_map,
+    const int output_row_base,
+    const int k_offset,
+    const int ld,
+    const short valid_rows,
+    const short valid_cols) {
+  const short2 sc = ATile::NAXFrag_t::get_coord();
+  STEEL_PRAGMA_UNROLL
+  for (short kk = 0; kk < ATile::kTileCols; ++kk) {
+    thread auto& frag = Atile.frag_at(mm, kk);
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < ATile::NAXFrag_t::kElemRows; ++i) {
+      const short local_row =
+          short(mm * ATile::kFragRows + sc.y +
+                i * ATile::NAXFrag_t::kElemRowsJump);
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < ATile::NAXFrag_t::kElemCols; ++j) {
+        const short local_col =
+            short(kk * ATile::kFragCols + sc.x + j);
+        if (local_row < valid_rows && local_col < valid_cols) {
+          const uint32_t source_row =
+              row_map[output_row_base + local_row];
+          frag[i * ATile::NAXFrag_t::kElemCols + j] =
+              src[source_row * ld + k_offset + local_col];
+        } else {
+          frag[i * ATile::NAXFrag_t::kElemCols + j] = U(0);
+        }
+      }
+    }
+  }
+}
+
 // Issues the mm-th fragment row's MMA op sequence of tile_matmad_nax's
 // TN-even branch, unchanged: same operands, same per-fragment
 // accumulation chain, only the dead fragment rows' ops are absent.
@@ -1565,6 +1605,20 @@ template <
 
   threadgroup T Ws[transpose ? BN * BK_padded : BK * BN_padded];
 
+  // GEMMA4-PREFILL-COMPACT-X. The trusted host still sees and dispatches the
+  // logical M=65,536 grouped RHS matmul. For the exact gate/up plane only,
+  // gather_front stores 8,192 unique token rows followed by a uint32 source
+  // row for every logical assignment. The weight segmentation, tile geometry,
+  // MMA sequence, accumulators, stores and sorted expert vector are unchanged;
+  // only each A-fragment's global address is resolved through that map.
+  constexpr int gemma4_compact_source_rows = 8192;
+  const bool gemma4_compact =
+      transpose && group_size == 64 && bits == 4 &&
+      M == 65536 && N == 704 && K == 2816;
+  const device T* compact_x = x;
+  const device uint32_t* compact_row_map =
+      (const device uint32_t*)(x + gemma4_compact_source_rows * K);
+
   // Compute the block
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
@@ -1589,7 +1643,9 @@ template <
 
   // Move x and output to the correct block
   auto wl = (const device uint8_t*)w;
-  x += y_row_long * K;
+  if (!gemma4_compact) {
+    x += y_row_long * K;
+  }
   y += y_row_long * N + y_col_long;
   wl += transpose ? y_col_long * K_w : y_col * bytes_per_pack / pack_factor;
   scales += transpose ? y_col_long * K_g : y_col / group_size;
@@ -1651,6 +1707,7 @@ template <
     Dtile.clear();
 
     const device T* xn = x + tm * K;
+    int k_base = 0;
 
     // This simdgroup's stored row band for the current expert segment,
     // hoisted ahead of the K-loop (it depends only on offset, offset_next,
@@ -1714,7 +1771,20 @@ template <
               for (short mm = 0; mm < TM; mm++) {
                 const short fr = short(mm * Dtile.kFragRows);
                 if (fr < seg_hi && short(fr + Dtile.kFragRows) > seg_lo) {
-                  gather_rhs_load_frag_row(mm, Atile, xn + kk1, K);
+                  if (gemma4_compact) {
+                    gather_rhs_load_compact_frag_row(
+                        mm,
+                        Atile,
+                        compact_x,
+                        compact_row_map,
+                        y_row + tm,
+                        k_base + kk1,
+                        K,
+                        sgp_sm,
+                        SK);
+                  } else {
+                    gather_rhs_load_frag_row(mm, Atile, xn + kk1, K);
+                  }
                   gather_rhs_mma_frag_row(
                       mm,
                       Dtile,
@@ -1734,7 +1804,21 @@ template <
 
               volatile int compiler_barrier;
 
-              if constexpr (kAlignedM.value) {
+              if (gemma4_compact) {
+                STEEL_PRAGMA_UNROLL
+                for (short mm = 0; mm < TM; ++mm) {
+                  gather_rhs_load_compact_frag_row(
+                      mm,
+                      Atile,
+                      compact_x,
+                      compact_row_map,
+                      y_row + tm,
+                      k_base + kk1,
+                      K,
+                      sgp_sm,
+                      SK);
+                }
+              } else if constexpr (kAlignedM.value) {
                 Atile.load(xn + kk1, K);
               } else {
                 Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
@@ -1760,6 +1844,7 @@ template <
           }
 
           xn += BK;
+          k_base += BK;
           loader_w.next();
         }
 

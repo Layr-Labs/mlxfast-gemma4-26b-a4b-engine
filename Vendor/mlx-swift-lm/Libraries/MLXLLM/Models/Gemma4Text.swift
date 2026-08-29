@@ -1692,6 +1692,12 @@ private enum Gemma4FusedRouterTop8 {
     private static let experts = 128
     private static let selected = 8
 
+    /// ROUTE-001P admission floor. The verify blocks a speculative round hands
+    /// the target are [8, 2], [8, 3] and [8, 4], i.e. 16 to 32 rows — the same
+    /// launch-overhead regime the B=8 gate above measured a loss in. The
+    /// cohort prefill rectangle is 8192 rows. Nothing lands between them.
+    private static let minPrefillRows = 512
+
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_fused_router_top8_e128_k8_bf16_v1",
         inputNames: ["scores", "pes"],
@@ -1858,6 +1864,69 @@ private enum Gemma4FusedRouterTop8 {
             outputDTypes: [.uint32, .bfloat16]
         )
         return (outputs[0], outputs[1])
+    }
+
+    /// ROUTE-001P: the same kernel, the same exactness argument, over the
+    /// cohort PREFILL rectangle instead of the decode row.
+    ///
+    /// The kernel is already row-parallel — one 32-thread threadgroup reads
+    /// `scores + row * E` and writes `row * K`, with no cross-row state — so
+    /// the row count enters only through the grid. Widening the gate changes
+    /// no arithmetic on any row.
+    ///
+    /// Why the decode measurement does not carry over: the B=8 gate is
+    /// default-off because deleting four dispatches did not pay against eight
+    /// threadgroups of work the concurrent encoder was already overlapping.
+    /// At [8, 1024, 128] the deleted chain is not small. `argPartition` is a
+    /// full merge sort over 8192 rows that materializes 8192x128 int32 and
+    /// then throws 120 of every 128 indices away; the strided `[kth...]` slice
+    /// forces a contiguous copy; `takeAlong`, `softmax`, the `perExpertScale`
+    /// gather and the multiply each walk their own tensor. That is roughly ten
+    /// megabytes of round-tripped intermediates per MoE layer, thirty layers
+    /// per prefill step, and the fused kernel round-trips none of it.
+    ///
+    /// Decode is untouched: `apply` above keeps its exact gate and its default,
+    /// and this entry point refuses anything under `minPrefillRows`.
+    /// Kill switch: `DARKBLOOM_GEMMA4_FUSED_ROUTER_TOP8_PREFILL=0`.
+    static let prefillEnabled: Bool = {
+        guard
+            let raw = ProcessInfo.processInfo.environment[
+                "DARKBLOOM_GEMMA4_FUSED_ROUTER_TOP8_PREFILL"]
+        else { return true }
+        return ["1", "true", "yes", "on"].contains(raw.lowercased())
+    }()
+
+    static func applyPrefill(
+        expertScores: MLXArray, perExpertScale: MLXArray, topK: Int
+    ) -> (indices: MLXArray, weights: MLXArray)? {
+        guard prefillEnabled,
+            topK == selected,
+            expertScores.ndim == 3,
+            expertScores.dim(1) > 1,
+            expertScores.dim(2) == experts,
+            expertScores.dtype == .bfloat16,
+            perExpertScale.ndim == 1,
+            perExpertScale.dim(0) == experts,
+            perExpertScale.dtype == .bfloat16
+        else { return nil }
+        let n = expertScores.dim(0) * expertScores.dim(1)
+        guard n >= minPrefillRows else { return nil }
+        CBv2EngageMark.once("router-top8-prefill")
+
+        let outputs = kernel(
+            [expertScores, perExpertScale],
+            template: [
+                ("T", expertScores.dtype),
+                ("E", experts),
+                ("K", selected),
+            ],
+            grid: (n * 32, 1, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[n, selected], [n, selected]],
+            outputDTypes: [.uint32, .bfloat16]
+        )
+        let shape = [expertScores.dim(0), expertScores.dim(1), selected]
+        return (outputs[0].reshaped(shape), outputs[1].reshaped(shape))
     }
 }
 
@@ -2227,6 +2296,14 @@ private class Gemma4Router: Module {
         {
             Gemma4RouterProbe.recorder?(expertScores, fused.indices)
             return (fused.indices, fused.weights)
+        }
+
+        // ROUTE-001P: the same kernel over the cohort prefill rectangle.
+        if let fusedPrefill = Gemma4FusedRouterTop8.applyPrefill(
+            expertScores: expertScores, perExpertScale: perExpertScale, topK: topK)
+        {
+            Gemma4RouterProbe.recorder?(expertScores, fusedPrefill.indices)
+            return (fusedPrefill.indices, fusedPrefill.weights)
         }
 
         var topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)

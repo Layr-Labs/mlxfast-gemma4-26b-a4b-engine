@@ -343,13 +343,18 @@ public enum Gemma4MMAQuantizedGEMV {
         for (uint idx = lid; idx < M_ROWS * N_SG * N_PSG; idx += N_SG * 32) {
             const uint m = idx / (N_SG * N_PSG);
             const uint c = idx % (N_SG * N_PSG);
-            out[m * N + n0 + c] = T(Os[c / N_PSG][m * N_PSG + (c % N_PSG)]);
+            float v = Os[c / N_PSG][m * N_PSG + (c % N_PSG)];
+            if (HAS_SOFTCAP) {
+                const float cp = cap[0];
+                v = precise::tanh(v * (1.0f / cp)) * cp;
+            }
+            out[m * N + n0 + c] = T(v);
         }
         """
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_mma_affine4_qmv_m8_v1",
-        inputNames: ["x", "w", "scales", "biases"],
+        inputNames: ["x", "w", "scales", "biases", "cap"],
         outputNames: ["out"],
         source: source,
         header: "#include <metal_simdgroup_matrix>\n",
@@ -569,13 +574,18 @@ public enum Gemma4MMAQuantizedGEMV {
         for (uint idx = lid; idx < M_ROWS * N_SG * N_PSG; idx += N_SG * 32) {
             const uint m = idx / (N_SG * N_PSG);
             const uint c = idx % (N_SG * N_PSG);
-            out[m * N + n0 + c] = T(Os[c / N_PSG][m * N_PSG + (c % N_PSG)]);
+            float v = Os[c / N_PSG][m * N_PSG + (c % N_PSG)];
+            if (HAS_SOFTCAP) {
+                const float cp = cap[0];
+                v = precise::tanh(v * (1.0f / cp)) * cp;
+            }
+            out[m * N + n0 + c] = T(v);
         }
         """
 
     private static let kernelV2: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_mma_affine4_qmv_m8_v2",
-        inputNames: ["x", "w", "scales", "biases"],
+        inputNames: ["x", "w", "scales", "biases", "cap"],
         outputNames: ["out"],
         source: sourceV2,
         header: "#include <metal_simdgroup_matrix>\n",
@@ -847,13 +857,18 @@ public enum Gemma4MMAQuantizedGEMV {
         for (uint idx = lid; idx < M_ROWS * N_SG * N_PSG; idx += N_SG * 32) {
             const uint m = idx / (N_SG * N_PSG);
             const uint c = idx % (N_SG * N_PSG);
-            out[m * N + n0 + c] = T(Sd[c / N_PSG][(c % N_PSG) * N_PSG + m]);
+            float v = Sd[c / N_PSG][(c % N_PSG) * N_PSG + m];
+            if (HAS_SOFTCAP) {
+                const float cp = cap[0];
+                v = precise::tanh(v * (1.0f / cp)) * cp;
+            }
+            out[m * N + n0 + c] = T(v);
         }
         """
 
     private static let kernelV3: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_mma_affine4_qmv_m8_v3",
-        inputNames: ["x", "w", "scales", "biases"],
+        inputNames: ["x", "w", "scales", "biases", "cap"],
         outputNames: ["out"],
         source: sourceV3,
         header: "#include <metal_simdgroup_matrix>\n",
@@ -1036,7 +1051,7 @@ public enum Gemma4MMAQuantizedGEMV {
 
     private static let kernelV4: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_mma_affine4_qmv_m8_v4",
-        inputNames: ["x", "w", "scales", "biases"],
+        inputNames: ["x", "w", "scales", "biases", "cap"],
         outputNames: ["out"],
         source: sourceV4,
         header: "#include <metal_simdgroup_matrix>\n",
@@ -1139,7 +1154,7 @@ public enum Gemma4MMAQuantizedGEMV {
 
     private static let kernelV5: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_mma_affine4_qmv_m8_v5",
-        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        inputNames: ["x", "w", "scales", "biases", "xSums", "cap"],
         outputNames: ["out"],
         source: sourceV5,
         header: "#include <metal_simdgroup_matrix>\n",
@@ -1200,7 +1215,7 @@ public enum Gemma4MMAQuantizedGEMV {
 
     private static let kernelV6: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_mma_affine4_qmv_m8_v6",
-        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        inputNames: ["x", "w", "scales", "biases", "xSums", "cap"],
         outputNames: ["out"],
         source: sourceV6,
         header: "#include <metal_simdgroup_matrix>\n",
@@ -1232,7 +1247,12 @@ public enum Gemma4MMAQuantizedGEMV {
             for (uint idx = lid; idx < M_ROWS * N_SG * N_PSG; idx += N_SG * 32) {
                 const uint m = idx / (N_SG * N_PSG);
                 const uint c = idx % (N_SG * N_PSG);
-                out[m * N + n0 + c] = T(Sd[c / N_PSG][(c % N_PSG) * N_PSG + m]);
+                float v = Sd[c / N_PSG][(c % N_PSG) * N_PSG + m];
+                if (HAS_SOFTCAP) {
+                    const float cp = cap[0];
+                    v = precise::tanh(v * (1.0f / cp)) * cp;
+                }
+                out[m * N + n0 + c] = T(v);
             }
             """,
             with: """
@@ -1241,8 +1261,16 @@ public enum Gemma4MMAQuantizedGEMV {
             const uint outputPair =
                 ((lane & 1u) << 1u) + ((lane & 8u) >> 1u);
             const uint outputN = sgN0 + outputRow;
-            out[outputPair * N + outputN] = T(acc.thread_elements()[0]);
-            out[(outputPair + 1) * N + outputN] = T(acc.thread_elements()[1]);
+            float r0 = acc.thread_elements()[0];
+            float r1 = acc.thread_elements()[1];
+            if (HAS_SOFTCAP) {
+                const float cp = cap[0];
+                const float inv_cp = 1.0f / cp;
+                r0 = precise::tanh(r0 * inv_cp) * cp;
+                r1 = precise::tanh(r1 * inv_cp) * cp;
+            }
+            out[outputPair * N + outputN] = T(r0);
+            out[(outputPair + 1) * N + outputN] = T(r1);
             """
         )
 
@@ -1251,7 +1279,7 @@ public enum Gemma4MMAQuantizedGEMV {
 
     private static let kernelV7: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_mma_affine4_qmv_m8_v7",
-        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        inputNames: ["x", "w", "scales", "biases", "xSums", "cap"],
         outputNames: ["out"],
         source: sourceV7,
         header: "#include <metal_simdgroup_matrix>\n",
@@ -1330,13 +1358,29 @@ public enum Gemma4MMAQuantizedGEMV {
             const uint outputPair =
                 ((lane & 1u) << 1u) + ((lane & 8u) >> 1u);
             const uint outputN = sgN0 + outputRow;
-            out[outputPair * N + outputN] = T(acc.thread_elements()[0]);
-            out[(outputPair + 1) * N + outputN] = T(acc.thread_elements()[1]);
+            float r0 = acc.thread_elements()[0];
+            float r1 = acc.thread_elements()[1];
+            if (HAS_SOFTCAP) {
+                const float cp = cap[0];
+                const float inv_cp = 1.0f / cp;
+                r0 = precise::tanh(r0 * inv_cp) * cp;
+                r1 = precise::tanh(r1 * inv_cp) * cp;
+            }
+            out[outputPair * N + outputN] = T(r0);
+            out[(outputPair + 1) * N + outputN] = T(r1);
             """,
             with: """
             const uint outputN = sgN0 + fragmentRow;
-            out[fragmentCol * N + outputN] = T(acc.thread_elements()[0]);
-            out[(fragmentCol + 1) * N + outputN] = T(acc.thread_elements()[1]);
+            float r0 = acc.thread_elements()[0];
+            float r1 = acc.thread_elements()[1];
+            if (HAS_SOFTCAP) {
+                const float cp = cap[0];
+                const float inv_cp = 1.0f / cp;
+                r0 = precise::tanh(r0 * inv_cp) * cp;
+                r1 = precise::tanh(r1 * inv_cp) * cp;
+            }
+            out[fragmentCol * N + outputN] = T(r0);
+            out[(fragmentCol + 1) * N + outputN] = T(r1);
             """
         )
 
@@ -1345,7 +1389,7 @@ public enum Gemma4MMAQuantizedGEMV {
 
     private static let kernelV8: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_mma_affine4_qmv_m8_v8",
-        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        inputNames: ["x", "w", "scales", "biases", "xSums", "cap"],
         outputNames: ["out"],
         source: sourceV8,
         header: "#include <metal_simdgroup_matrix>\n",
@@ -1413,7 +1457,7 @@ public enum Gemma4MMAQuantizedGEMV {
 
     private static let kernelV9: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_mma_affine4_qmv_m8_v9",
-        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        inputNames: ["x", "w", "scales", "biases", "xSums", "cap"],
         outputNames: ["out"],
         source: sourceV9,
         header: "#include <metal_simdgroup_matrix>\n",
@@ -1545,7 +1589,7 @@ public enum Gemma4MMAQuantizedGEMV {
 
     private static let kernelV10: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_mma_affine4_qmv_m8_v10",
-        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        inputNames: ["x", "w", "scales", "biases", "xSums", "cap"],
         outputNames: ["out"],
         source: sourceV10,
         header: "#include <metal_simdgroup_matrix>\n",
@@ -1624,7 +1668,7 @@ public enum Gemma4MMAQuantizedGEMV {
 
     private static let kernelV11: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_mma_affine4_qmv_m8_v11",
-        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        inputNames: ["x", "w", "scales", "biases", "xSums", "cap"],
         outputNames: ["out"],
         source: sourceV11,
         header: "#include <metal_simdgroup_matrix>\n",
@@ -1686,7 +1730,7 @@ public enum Gemma4MMAQuantizedGEMV {
 
     private static let kernelV12: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_mma_affine4_qmv_m8_v12",
-        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        inputNames: ["x", "w", "scales", "biases", "xSums", "cap"],
         outputNames: ["out"],
         source: sourceV12,
         header: "#include <metal_simdgroup_matrix>\n",
@@ -1736,7 +1780,7 @@ public enum Gemma4MMAQuantizedGEMV {
 
     private static let kernelV13: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_mma_affine4_qmv_m8_v13",
-        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        inputNames: ["x", "w", "scales", "biases", "xSums", "cap"],
         outputNames: ["out"],
         source: sourceV13,
         header: "#include <metal_simdgroup_matrix>\n",
@@ -1799,7 +1843,7 @@ public enum Gemma4MMAQuantizedGEMV {
 
     private static let kernelV14: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_mma_affine4_qmv_m8_v14",
-        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        inputNames: ["x", "w", "scales", "biases", "xSums", "cap"],
         outputNames: ["out"],
         source: sourceV14,
         header: "#include <metal_simdgroup_matrix>\n",
@@ -2020,16 +2064,36 @@ public enum Gemma4MMAQuantizedGEMV {
         replaceOnce(
             """
             const uint outputN = sgN0 + fragmentRow;
-            out[fragmentCol * N + outputN] = T(acc.thread_elements()[0]);
-            out[(fragmentCol + 1) * N + outputN] = T(acc.thread_elements()[1]);
+            float r0 = acc.thread_elements()[0];
+            float r1 = acc.thread_elements()[1];
+            if (HAS_SOFTCAP) {
+                const float cp = cap[0];
+                const float inv_cp = 1.0f / cp;
+                r0 = precise::tanh(r0 * inv_cp) * cp;
+                r1 = precise::tanh(r1 * inv_cp) * cp;
+            }
+            out[fragmentCol * N + outputN] = T(r0);
+            out[(fragmentCol + 1) * N + outputN] = T(r1);
             """,
             with: """
             const uint outputN0 = sgN0 + fragmentRow;
             const uint outputN1 = outputN0 + N_PSG;
-            out[fragmentCol * N + outputN0] = T(acc0.thread_elements()[0]);
-            out[(fragmentCol + 1) * N + outputN0] = T(acc0.thread_elements()[1]);
-            out[fragmentCol * N + outputN1] = T(acc1.thread_elements()[0]);
-            out[(fragmentCol + 1) * N + outputN1] = T(acc1.thread_elements()[1]);
+            float r00 = acc0.thread_elements()[0];
+            float r01 = acc0.thread_elements()[1];
+            float r10 = acc1.thread_elements()[0];
+            float r11 = acc1.thread_elements()[1];
+            if (HAS_SOFTCAP) {
+                const float cp = cap[0];
+                const float inv_cp = 1.0f / cp;
+                r00 = precise::tanh(r00 * inv_cp) * cp;
+                r01 = precise::tanh(r01 * inv_cp) * cp;
+                r10 = precise::tanh(r10 * inv_cp) * cp;
+                r11 = precise::tanh(r11 * inv_cp) * cp;
+            }
+            out[fragmentCol * N + outputN0] = T(r00);
+            out[(fragmentCol + 1) * N + outputN0] = T(r01);
+            out[fragmentCol * N + outputN1] = T(r10);
+            out[(fragmentCol + 1) * N + outputN1] = T(r11);
             """
         )
         return result
@@ -2037,7 +2101,7 @@ public enum Gemma4MMAQuantizedGEMV {
 
     private static let kernelV15: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_mma_affine4_qmv_m8_v15_dualtile",
-        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        inputNames: ["x", "w", "scales", "biases", "xSums", "cap"],
         outputNames: ["out"],
         source: sourceV15,
         header: "#include <metal_simdgroup_matrix>\n",
@@ -2364,24 +2428,56 @@ public enum Gemma4MMAQuantizedGEMV {
             """
             const uint outputN0 = sgN0 + fragmentRow;
             const uint outputN1 = outputN0 + N_PSG;
-            out[fragmentCol * N + outputN0] = T(acc0.thread_elements()[0]);
-            out[(fragmentCol + 1) * N + outputN0] = T(acc0.thread_elements()[1]);
-            out[fragmentCol * N + outputN1] = T(acc1.thread_elements()[0]);
-            out[(fragmentCol + 1) * N + outputN1] = T(acc1.thread_elements()[1]);
+            float r00 = acc0.thread_elements()[0];
+            float r01 = acc0.thread_elements()[1];
+            float r10 = acc1.thread_elements()[0];
+            float r11 = acc1.thread_elements()[1];
+            if (HAS_SOFTCAP) {
+                const float cp = cap[0];
+                const float inv_cp = 1.0f / cp;
+                r00 = precise::tanh(r00 * inv_cp) * cp;
+                r01 = precise::tanh(r01 * inv_cp) * cp;
+                r10 = precise::tanh(r10 * inv_cp) * cp;
+                r11 = precise::tanh(r11 * inv_cp) * cp;
+            }
+            out[fragmentCol * N + outputN0] = T(r00);
+            out[(fragmentCol + 1) * N + outputN0] = T(r01);
+            out[fragmentCol * N + outputN1] = T(r10);
+            out[(fragmentCol + 1) * N + outputN1] = T(r11);
             """,
             with: """
             const uint outputN0 = sgN0 + fragmentRow;
             const uint outputN1 = outputN0 + N_PSG;
             const uint outputN2 = outputN0 + N_PSG * 2;
             const uint outputN3 = outputN0 + N_PSG * 3;
-            out[fragmentCol * N + outputN0] = T(acc0.thread_elements()[0]);
-            out[(fragmentCol + 1) * N + outputN0] = T(acc0.thread_elements()[1]);
-            out[fragmentCol * N + outputN1] = T(acc1.thread_elements()[0]);
-            out[(fragmentCol + 1) * N + outputN1] = T(acc1.thread_elements()[1]);
-            out[fragmentCol * N + outputN2] = T(acc2.thread_elements()[0]);
-            out[(fragmentCol + 1) * N + outputN2] = T(acc2.thread_elements()[1]);
-            out[fragmentCol * N + outputN3] = T(acc3.thread_elements()[0]);
-            out[(fragmentCol + 1) * N + outputN3] = T(acc3.thread_elements()[1]);
+            float r00 = acc0.thread_elements()[0];
+            float r01 = acc0.thread_elements()[1];
+            float r10 = acc1.thread_elements()[0];
+            float r11 = acc1.thread_elements()[1];
+            float r20 = acc2.thread_elements()[0];
+            float r21 = acc2.thread_elements()[1];
+            float r30 = acc3.thread_elements()[0];
+            float r31 = acc3.thread_elements()[1];
+            if (HAS_SOFTCAP) {
+                const float cp = cap[0];
+                const float inv_cp = 1.0f / cp;
+                r00 = precise::tanh(r00 * inv_cp) * cp;
+                r01 = precise::tanh(r01 * inv_cp) * cp;
+                r10 = precise::tanh(r10 * inv_cp) * cp;
+                r11 = precise::tanh(r11 * inv_cp) * cp;
+                r20 = precise::tanh(r20 * inv_cp) * cp;
+                r21 = precise::tanh(r21 * inv_cp) * cp;
+                r30 = precise::tanh(r30 * inv_cp) * cp;
+                r31 = precise::tanh(r31 * inv_cp) * cp;
+            }
+            out[fragmentCol * N + outputN0] = T(r00);
+            out[(fragmentCol + 1) * N + outputN0] = T(r01);
+            out[fragmentCol * N + outputN1] = T(r10);
+            out[(fragmentCol + 1) * N + outputN1] = T(r11);
+            out[fragmentCol * N + outputN2] = T(r20);
+            out[(fragmentCol + 1) * N + outputN2] = T(r21);
+            out[fragmentCol * N + outputN3] = T(r30);
+            out[(fragmentCol + 1) * N + outputN3] = T(r31);
             """
         )
         return result
@@ -2389,7 +2485,7 @@ public enum Gemma4MMAQuantizedGEMV {
 
     private static let kernelV16: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_mma_affine4_qmv_m8_v16_quadtile",
-        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        inputNames: ["x", "w", "scales", "biases", "xSums", "cap"],
         outputNames: ["out"],
         source: sourceV16,
         header: "#include <metal_simdgroup_matrix>\n",
@@ -2474,12 +2570,31 @@ public enum Gemma4MMAQuantizedGEMV {
 
     private static let kernelV26: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_mma_affine4_qmv_m8_v26_weight_cursor",
-        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        inputNames: ["x", "w", "scales", "biases", "xSums", "cap"],
         outputNames: ["out"],
         source: sourceV26,
         header: "#include <metal_simdgroup_matrix>\n",
         ensureRowContiguous: true
     )
+
+    /// Convenience wrapper for tied LM head decode GEMV matching the PROJECT.md contract.
+    public static func tiedLMHeadMMA(
+        x: MLXArray,
+        w: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        softcap: Float? = nil
+    ) -> MLXArray? {
+        apply(
+            x: x,
+            w: w,
+            scales: scales,
+            biases: biases,
+            groupSize: 64,
+            bits: 4,
+            softcap: softcap
+        )
+    }
 
     /// Tied-head GEMV, or `nil` when any gate above fails.
     ///
@@ -2488,6 +2603,10 @@ public enum Gemma4MMAQuantizedGEMV {
     ///   - w: packed affine codes, `[N, K * bits / 32]` uint32.
     ///   - scales: `[N, K / groupSize]`, same dtype as `x`.
     ///   - biases: `[N, K / groupSize]`, same dtype as `x`.
+    ///   - groupSize: quantization group size (must be 64).
+    ///   - bits: quantization bit depth (must be 4).
+    ///   - softcap: optional final logit softcap scalar. When provided and > 0,
+    ///     the softcap tanh is evaluated in-register before storing the output.
     /// - Returns: `[8, N]` in `x`'s dtype, or `nil`.
     public static func apply(
         x: MLXArray,
@@ -2495,7 +2614,8 @@ public enum Gemma4MMAQuantizedGEMV {
         scales: MLXArray,
         biases: MLXArray?,
         groupSize: Int,
-        bits: Int
+        bits: Int,
+        softcap: Float? = nil
     ) -> MLXArray? {
         guard enabled else { return nil }
         guard let biases else { return nil }
@@ -2523,6 +2643,9 @@ public enum Gemma4MMAQuantizedGEMV {
         guard w.dim(1) == k * bits / 32 else { return nil }
         guard scales.dim(0) == n, biases.dim(0) == n else { return nil }
         guard scales.dim(1) == k / groupSize, biases.dim(1) == k / groupSize else { return nil }
+
+        let hasSoftcap = softcap != nil && softcap! > 0
+        let cap = MLXArray([Float(softcap ?? 0.0)])
 
         let flatX = x.reshaped([mRows, k])
         let threadgroups = n / selectedColsPerThreadgroup
@@ -2556,23 +2679,23 @@ public enum Gemma4MMAQuantizedGEMV {
             case 6: selected = kernelV6
             default: selected = kernelV5
             }
-            inputs = [flatX, w, scales, biases, xSums]
+            inputs = [flatX, w, scales, biases, xSums, cap]
         case 4:
             selected = kernelV4
-            inputs = [flatX, w, scales, biases]
+            inputs = [flatX, w, scales, biases, cap]
         case 3:
             selected = kernelV3
-            inputs = [flatX, w, scales, biases]
+            inputs = [flatX, w, scales, biases, cap]
         case 2:
             selected = kernelV2
-            inputs = [flatX, w, scales, biases]
+            inputs = [flatX, w, scales, biases, cap]
         default:
             selected = kernel
-            inputs = [flatX, w, scales, biases]
+            inputs = [flatX, w, scales, biases, cap]
         }
         let outputs = selected(
             inputs,
-            template: [("T", x.dtype), ("K", k), ("N", n)],
+            template: [("T", x.dtype), ("K", k), ("N", n), ("HAS_SOFTCAP", hasSoftcap)],
             grid: (threadgroups * threadsPerThreadgroup, 1, 1),
             threadGroup: (threadsPerThreadgroup, 1, 1),
             outputShapes: [[mRows, n]],

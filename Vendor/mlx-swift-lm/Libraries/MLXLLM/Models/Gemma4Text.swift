@@ -3805,7 +3805,7 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     /// every non-production geometry, allowing the promoted tight-grid QMV
     /// below to remain the exact fallback.
     @inline(__always)
-    private func tiedLMHeadMMA(_ hidden: MLXArray) -> MLXArray? {
+    private func tiedLMHeadMMA(_ hidden: MLXArray, softcap: Float? = nil) -> MLXArray? {
         guard lmHead == nil,
             let quantized = model.embedTokens as? QuantizedEmbedding,
             quantized.mode == .affine,
@@ -3815,7 +3815,8 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 scales: quantized.scales,
                 biases: quantized.biases,
                 groupSize: quantized.groupSize,
-                bits: quantized.bits)
+                bits: quantized.bits,
+                softcap: softcap)
         else { return nil }
         return mma.reshaped(Array(hidden.shape.dropLast()) + [mma.dim(-1)])
     }
@@ -3849,10 +3850,17 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
     func applyLMHead(_ hidden: MLXArray) -> MLXArray {
         var out: MLXArray
+        var fusedSoftcap = false
         if let lmHead {
             out = lmHead(hidden)
-        } else if let mma = tiedLMHeadMMA(hidden) {
+        } else if let mma = tiedLMHeadMMA(
+            hidden,
+            softcap: config.finalLogitSoftcapping > 0 ? config.finalLogitSoftcapping : nil
+        ) {
             out = mma
+            if config.finalLogitSoftcapping > 0 {
+                fusedSoftcap = true
+            }
         } else if let tight = tiedLMHeadTightGrid(hidden) {
             out = tight
         } else {
@@ -3868,7 +3876,7 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         // identical with or without it and the dispatch is pure overhead —
         // one transcendental pass over the whole vocabulary plus the float32
         // widening the untyped cap forces on the tensor the sampler reads.
-        if config.finalLogitSoftcapping > 0, !CBv2OrderOnlyLogits.engaged {
+        if !fusedSoftcap, config.finalLogitSoftcapping > 0, !CBv2OrderOnlyLogits.engaged {
             out = gemma4CompiledLogitSoftcap(
                 out, MLXArray(config.finalLogitSoftcapping))
         }
@@ -3886,6 +3894,9 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     func applyRawLMHead(_ hidden: MLXArray) -> MLXArray {
         if let lmHead {
             return lmHead(hidden)
+        }
+        if let mma = tiedLMHeadMMA(hidden, softcap: nil) {
+            return mma
         }
         if let tight = tiedLMHeadTightGrid(hidden) {
             return tight

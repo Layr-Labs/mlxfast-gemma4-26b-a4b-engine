@@ -61,7 +61,11 @@ internal func gemma4ShouldSubmitDecodeAsyncEvalLadder(
     else { return false }
 
     switch layerIndex {
-    case 0, 1, 5, 11, 17, 23, 27:
+    // Layer 1 made the second submitted fragment only one layer long. Keep
+    // the established early layer-0 launch, then give the GPU a four-layer
+    // fragment before the next submission so C-API/command-buffer overhead
+    // is amortized without changing any graph node or cache mutation.
+    case 0, 5, 11, 17, 23, 27:
         return true
     default:
         return false

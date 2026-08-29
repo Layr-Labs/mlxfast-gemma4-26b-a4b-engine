@@ -3650,13 +3650,21 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     return;
   }
   const uint assignment = tid.z;
-  const uint32_t expert = rhs_indices[assignment * rhs_stride];
+  const uint32_t packed_expert = rhs_indices[assignment * rhs_stride];
+  const uint32_t expert = packed_expert & 0xffu;
+  const bool has_packed_run = (packed_expert & 0x80000000u) != 0u;
   uint run_offset = 0;
-  for (uint prior = assignment; prior > 0; --prior) {
-    if (rhs_indices[(prior - 1) * rhs_stride] != expert) {
-      break;
+  uint run_count = 0;
+  if (has_packed_run) {
+    run_offset = (packed_expert >> 8) & 0xffffu;
+    run_count = (packed_expert >> 24) & 0x7fu;
+  } else {
+    for (uint prior = assignment; prior > 0; --prior) {
+      if ((rhs_indices[(prior - 1) * rhs_stride] & 0xffu) != expert) {
+        break;
+      }
+      run_offset++;
     }
-    run_offset++;
   }
   // Odd positions are produced by the immediately preceding pair leader.
   if ((run_offset & 1) != 0) {
@@ -3668,9 +3676,10 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   const device T* tile_x0 =
       x + lhs_indices[assignment * lhs_stride] * x_stride;
   device T* tile_y0 = y + assignment * out_vec_size;
-  const bool has_pair =
-      assignment + 1 < 64 &&
-      rhs_indices[(assignment + 1) * rhs_stride] == expert;
+  const bool has_pair = has_packed_run
+      ? run_offset + 1 < run_count
+      : assignment + 1 < 64 &&
+          (rhs_indices[(assignment + 1) * rhs_stride] & 0xffu) == expert;
   if (has_pair) {
     const device T* tile_x1 =
         x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
@@ -3771,14 +3780,23 @@ template <typename T, int group_size, int bits>
       return;
     }
     const uint assignment = tid.z;
-    const uint32_t expert =
+    const uint32_t packed_expert =
         rhs_indices[assignment * (uint)rhs_strides[0]];
+    const uint32_t expert = packed_expert & 0xffu;
+    const bool has_packed_run = (packed_expert & 0x80000000u) != 0u;
     uint run_offset = 0;
-    for (uint prior = assignment; prior > 0; --prior) {
-      if (rhs_indices[(prior - 1) * (uint)rhs_strides[0]] != expert) {
-        break;
+    uint run_count = 0;
+    if (has_packed_run) {
+      run_offset = (packed_expert >> 8) & 0xffffu;
+      run_count = (packed_expert >> 24) & 0x7fu;
+    } else {
+      for (uint prior = assignment; prior > 0; --prior) {
+        if ((rhs_indices[(prior - 1) * (uint)rhs_strides[0]] & 0xffu) !=
+            expert) {
+          break;
+        }
+        run_offset++;
       }
-      run_offset++;
     }
 
     // RUN-QUAD: leaders sit at run_offset % 4 == 0 and serve up to four
@@ -3792,10 +3810,15 @@ template <typename T, int group_size, int bits>
       return;
     }
     uint run_len = 1;
-    while (run_len < 4 && assignment + run_len < 64 &&
-           rhs_indices[(assignment + run_len) * (uint)rhs_strides[0]] ==
-               expert) {
-      run_len++;
+    if (has_packed_run) {
+      run_len = min(4u, run_count - run_offset);
+    } else {
+      while (run_len < 4 && assignment + run_len < 64 &&
+             (rhs_indices[(assignment + run_len) * (uint)rhs_strides[0]] &
+              0xffu) ==
+                 expert) {
+        run_len++;
+      }
     }
     if (run_len > 1) {
       const device uint32_t* run_w = w + expert * w_strides[0];

@@ -577,6 +577,35 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// (fail-open: an unstamped batch is never delayed).
     private var admitBatchFirstEnqueue: ContinuousClock.Instant?
 
+    // MARK: ADMIT-COALESCE-002 (closed-loop coalescing window)
+    //
+    // ADMIT-COALESCE-001 fixed the open-loop guess: every closed burst waits
+    // the same `admitCoalesceWindowMS` (default 3 ms) regardless of how the
+    // caller's submission burst actually behaves. Two observed regimes then
+    // leak: on loaded machines the enqueue-to-enqueue tail of an 8-stream
+    // burst routinely exceeds 3 ms, so the window expires mid-burst and the
+    // step still admits ragged — exactly the cost the window exists to pay
+    // down — while on quiet machines the full 3 ms is dead latency paid on
+    // bursts that were already complete. This block closes the loop: the
+    // engine measures the width it actually admitted at the end of every
+    // coalesced burst and adapts the next window — doubling it after two
+    // consecutive ragged admits (the tail is longer than the window), and
+    // shaving 1 ms back after four consecutive capacity admits (the window is
+    // only buying latency). Bounds: never below 1 ms, never above the same
+    // `admitCoalesceWindowCapMS` the fixed window honors, engine-thread
+    // confined. `DARKBLOOM_ADMIT_COALESCE_ADAPTIVE=0` pins the window to
+    // the leader's constant, restoring ADMIT-COALESCE-001 byte-for-byte.
+    static let adaptiveCoalesceEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_ADMIT_COALESCE_ADAPTIVE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+    static let adaptiveCoalesceFloorMS = 1
+    private var admitWindowMS = Self.admitCoalesceWindowMS
+    private var coalesceRaggedStreak = 0
+    private var coalesceFullStreak = 0
+
     private var drainWaiters: [CBv2DrainWaiter] = []
     /// True after a rejecting MTP round advanced rows OUTSIDE the eager
     /// provider's caches' host truth: the next eager bind must be forced to
@@ -1213,17 +1242,23 @@ public final class EngineLoopV2: @unchecked Sendable {
         // running (a live decode is never delayed by a late arrival), never
         // exceeds `admitCoalesceWindowMS`, and never inspects the request
         // contents or the cohort size.
-        if Self.admitCoalesceWindowMS > 0,
+        let effectiveWindowMS = Self.adaptiveCoalesceEnabled
+            ? admitWindowMS : Self.admitCoalesceWindowMS
+        if effectiveWindowMS > 0,
             let batchStart = admitBatchFirstEnqueue,
             scheduler.runningCount == 0,
             scheduler.waitingCount > 0,
             scheduler.waitingCount < scheduler.config.maxConcurrentRequests,
-            stepNow - batchStart < .milliseconds(Self.admitCoalesceWindowMS)
+            stepNow - batchStart < .milliseconds(effectiveWindowMS)
         {
             publishGauges()
             scheduleIdleRecheck()
             return
         }
+        // ADMIT-COALESCE-002: remember that this step was the expiry of a
+        // coalescing window before clearing the stamp; the admission width
+        // measured below against capacity is the feedback signal.
+        let coalesceExpired = admitBatchFirstEnqueue != nil
         admitBatchFirstEnqueue = nil
 
         beginMTPPlan()
@@ -1232,6 +1267,34 @@ public final class EngineLoopV2: @unchecked Sendable {
         // running rows in markAdmitted below.
         let waitingBeforePlan = Set(scheduler.waiting.map(\.id))
         let plan = scheduler.plan()
+        // ADMIT-COALESCE-002 feedback: newly admitted rows of this burst vs
+        // capacity. Ragged (more admitted streams left waiting than fit, or
+        // simply below capacity with nothing left running) doubles the window
+        // after two strikes; capacity admits shave it back after four.
+        if Self.adaptiveCoalesceEnabled, coalesceExpired {
+            let cap = scheduler.config.maxConcurrentRequests
+            let freshAdmits = plan.assignments.filter {
+                waitingBeforePlan.contains($0.0)
+            }.count
+            if freshAdmits > 0 && freshAdmits < cap {
+                coalesceRaggedStreak += 1
+                coalesceFullStreak = 0
+                if coalesceRaggedStreak >= 2 {
+                    admitWindowMS = Swift.min(
+                        Self.admitCoalesceWindowCapMS,
+                        Swift.max(admitWindowMS * 2, admitWindowMS + 1))
+                    coalesceRaggedStreak = 0
+                }
+            } else if freshAdmits >= cap {
+                coalesceFullStreak += 1
+                coalesceRaggedStreak = 0
+                if coalesceFullStreak >= 4 {
+                    admitWindowMS = Swift.max(
+                        Self.adaptiveCoalesceFloorMS, admitWindowMS - 1)
+                    coalesceFullStreak = 0
+                }
+            }
+        }
         handlePreemptions(plan.preemptions)
         guard !plan.assignments.isEmpty else {
             publishGauges()

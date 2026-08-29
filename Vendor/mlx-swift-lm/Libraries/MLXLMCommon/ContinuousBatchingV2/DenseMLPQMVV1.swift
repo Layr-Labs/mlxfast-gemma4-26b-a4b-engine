@@ -37,6 +37,31 @@ import Foundation
 import MLX
 import MLXFast
 
+struct ExactB8DenseMLPRequest {
+    let enabled: Bool
+    let batch: Int
+    let sequence: Int
+    let input: Int
+    let output: Int
+    let groupSize: Int
+    let bits: Int
+    let affine: Bool
+    let bf16: Bool
+    let hasBiases: Bool
+}
+
+func shouldUseExactB8DenseMLP(_ request: ExactB8DenseMLPRequest) -> Bool {
+    request.enabled
+        && request.batch == 8 && request.sequence == 1
+        && request.input == 2816 && request.output == 2112
+        && request.groupSize == 64 && request.bits == 8
+        && request.affine && request.bf16 && request.hasBiases
+}
+
+func exactB8DenseMLPEnabled(environmentValue: String?) -> Bool {
+    environmentValue != "0"
+}
+
 public enum CBv2DenseMLPQMVV1 {
     public static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
@@ -86,6 +111,10 @@ public enum CBv2DenseMLPQMVV1 {
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
+
+    private static let exactB8GateUpEnabled = exactB8DenseMLPEnabled(
+        environmentValue: ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MLP_EXACT_B8_GATEUP"])
 
     private static let batch = 8
     private static let sequence = 1
@@ -268,6 +297,111 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
       y1[row] = static_cast<T>(result1[row]);
       y2[row] = static_cast<T>(result2[row]);
       y3[row] = static_cast<T>(result3[row]);
+    }
+  }
+}
+"""
+
+    /// Exact eight-row scalar twin of the promoted four-row helper. The
+    /// packed weight metadata is loaded once, then consumed by all cohort rows
+    /// with the incumbent qdot, K-block accumulation and SIMD reduction order.
+    private static let exactB8KernelHeader = activationSumKernelHeader + """
+
+template <typename T, const int group_size, const int bits>
+METAL_FUNC void qmv_affine8_g64_oct_stream_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device float* x_sums,
+    const device T* x,
+    device T* y,
+    const int in_vec_size,
+    const int out_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int cohort_rows = 8;
+  constexpr int values_per_thread = 4;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 16;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread float x_thread[values_per_thread];
+  thread uint8_t packed[results_per_simdgroup][bytes_per_thread];
+  thread float scale_local[results_per_simdgroup];
+  thread float bias_local[results_per_simdgroup];
+  thread float result[cohort_rows][results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+
+  int k = 0;
+  for (; k <= in_vec_size - block_size; k += block_size) {
+    for (int row = 0; row < results_per_simdgroup; ++row) {
+      const device uint8_t* wl = ws + row * in_vec_size_w + k;
+      for (int i = 0; i < bytes_per_thread; ++i) {
+        packed[row][i] = wl[i];
+      }
+      scale_local[row] = scales[row * in_vec_size_g + k / 64];
+      bias_local[row] = biases[row * in_vec_size_g + k / 64];
+    }
+
+    #pragma clang loop unroll(full)
+    for (int m = 0; m < cohort_rows; ++m) {
+      const device T* xm = x + m * in_vec_size + k +
+          simd_lid * values_per_thread;
+      load_affine8_values<T, float, values_per_thread>(xm, x_thread);
+      const float sum = x_sums[
+          ((k / block_size) * SIMD_SIZE + int(simd_lid)) * 8 + m];
+      for (int row = 0; row < results_per_simdgroup; ++row) {
+        result[m][row] += qdot_affine8_registered<float, values_per_thread>(
+            packed[row], x_thread, scale_local[row], bias_local[row], sum);
+      }
+    }
+  }
+
+  const uint active_tail_lanes =
+      uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
+    for (int row = 0; row < results_per_simdgroup; ++row) {
+      const device uint8_t* wl = ws + row * in_vec_size_w + k;
+      for (int i = 0; i < bytes_per_thread; ++i) {
+        packed[row][i] = wl[i];
+      }
+      scale_local[row] = scales[row * in_vec_size_g + k / 64];
+      bias_local[row] = biases[row * in_vec_size_g + k / 64];
+    }
+
+    #pragma clang loop unroll(full)
+    for (int m = 0; m < cohort_rows; ++m) {
+      const device T* xm = x + m * in_vec_size + k +
+          simd_lid * values_per_thread;
+      load_affine8_values<T, float, values_per_thread>(xm, x_thread);
+      const float sum = x_sums[
+          ((k / block_size) * SIMD_SIZE + int(simd_lid)) * 8 + m];
+      for (int row = 0; row < results_per_simdgroup; ++row) {
+        result[m][row] += qdot_affine8_registered<float, values_per_thread>(
+            packed[row], x_thread, scale_local[row], bias_local[row], sum);
+      }
+    }
+  }
+
+  for (int row = 0; row < results_per_simdgroup; ++row) {
+    #pragma clang loop unroll(full)
+    for (int m = 0; m < cohort_rows; ++m) {
+      result[m][row] = simd_sum(result[m][row]);
+      if (simd_lid == 0) {
+        y[m * out_vec_size + out_row + row] = static_cast<T>(result[m][row]);
+      }
     }
   }
 }
@@ -657,6 +791,23 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         ensureRowContiguous: true
     )
 
+    private static let exactB8Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_oct_stream_v1",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["y"],
+        source: """
+            qmv_affine8_g64_oct_stream_impl<T, 64, 8>(
+                w, scales, biases, xSums, x, y,
+                x_shape[x_ndim - 1], w_shape[0],
+                threadgroup_position_in_grid,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: exactB8KernelHeader,
+        ensureRowContiguous: true
+    )
+
     /// One exact float sum for each `(K/128 block, simd lane, cohort row)`.
     /// The expression is the bits==8 arm of stock `load_vector`: a float zero
     /// followed by four ascending `sum += bf16` operations. Row is the unit-
@@ -723,6 +874,86 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     private static func liveShape(inDim: Int, outDim: Int) -> Bool {
         (inDim == 2816 && outDim == 2112)
             || (inDim == 2112 && outDim == 2816)
+    }
+
+    private static func exactB8InputsAreValid(
+        x: MLXArray,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?
+    ) -> Bool {
+        guard let biases else { return false }
+        return shouldUseExactB8DenseMLP(.init(
+            enabled: exactB8GateUpEnabled,
+            batch: x.ndim == 3 ? x.dim(0) : -1,
+            sequence: x.ndim == 3 ? x.dim(1) : -1,
+            input: x.ndim == 3 ? x.dim(2) : -1,
+            output: weight.ndim == 2 ? weight.dim(0) : -1,
+            groupSize: groupSize,
+            bits: bits,
+            affine: true,
+            bf16: x.dtype == .bfloat16 && scales.dtype == .bfloat16
+                && biases.dtype == .bfloat16,
+            hasBiases: true))
+            && weight.dtype == .uint32
+            && weight.shape == [2112, 704]
+            && scales.shape == [2112, 44]
+            && biases.shape == scales.shape
+    }
+
+    private static func dispatchExactB8(
+        x: MLXArray,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray,
+        activationSums: ActivationSums
+    ) -> MLXArray {
+        let yGroups = 2112 / outputsPerGroup
+        return exactB8Kernel(
+            [x, weight, scales, biases, activationSums.values],
+            template: [("T", x.dtype)],
+            grid: (simdWidth, yGroups * simdGroups, 1),
+            threadGroup: (simdWidth, simdGroups, 1),
+            outputShapes: [[batch, sequence, 2112]],
+            outputDTypes: [x.dtype]
+        )[0]
+    }
+
+    static func quadStreamForTesting(
+        x: MLXArray,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray
+    ) -> MLXArray? {
+        guard exactB8InputsAreValid(
+            x: x, weight: weight, scales: scales, biases: biases)
+        else { return nil }
+        guard let activationSums = activationSums(for: x) else { return nil }
+        let xGroups = batch / rowsPerGroup
+        let yGroups = 2112 / outputsPerGroup
+        return activationSumQMVKernel(
+            [x, weight, scales, biases, activationSums.values],
+            template: [("T", x.dtype)],
+            grid: (xGroups * simdWidth, yGroups * simdGroups, 1),
+            threadGroup: (simdWidth, simdGroups, 1),
+            outputShapes: [[batch, sequence, 2112]],
+            outputDTypes: [x.dtype]
+        )[0]
+    }
+
+    static func exactB8ForTesting(
+        x: MLXArray,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray
+    ) -> MLXArray? {
+        guard exactB8InputsAreValid(
+            x: x, weight: weight, scales: scales, biases: biases)
+        else { return nil }
+        guard let activationSums = activationSums(for: x) else { return nil }
+        return dispatchExactB8(
+            x: x, weight: weight, scales: scales, biases: biases,
+            activationSums: activationSums)
     }
 
     /// Builds the shared gate/up table only for the exact dense decode input.
@@ -800,6 +1031,16 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         // table is still built and consumed for the gate/up plane exactly as on
         // the tip -- the fall-through below is the promoted path unchanged.
         let isGateUp = inDim == 2816 && outDim == 2112
+        if isGateUp,
+            !mma8GateUpEnabled,
+            let activationSums,
+            exactB8InputsAreValid(
+                x: x, weight: weight, scales: scales, biases: biases)
+        {
+            return dispatchExactB8(
+                x: x, weight: weight, scales: scales, biases: biases,
+                activationSums: activationSums)
+        }
         if isGateUp ? mma8GateUpEnabled : mma8DownEnabled {
             let yTiles = outDim / outputsPerGroup
             return mma8Kernel(

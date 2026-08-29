@@ -29,6 +29,16 @@ public protocol CBv2SteppableModel: AnyObject {
     func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray
 }
 
+/// Optional steady-state decode interface for models that can compute exact
+/// greedy winners without materializing dense logits. Returning `nil` is a
+/// fail-closed request for the incumbent forward-and-sample path.
+public protocol CBv2OrderOnlySteppableModel: CBv2SteppableModel {
+    var supportsOrderOnlyTokens: Bool { get }
+    func forwardOrderOnlyTokens(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> MLXArray?
+}
+
 /// Builds per-layer batch-facing cache views for a set of rows
 /// (`rowStates[b][layer]`, row order == batch row order). WS-A's
 /// `LayerCacheV2` conforms; see CONTRACT-ISSUES-B-scheduler.md §1.
@@ -78,6 +88,9 @@ extension CBv2LayerCacheProvider {
 ///    CONFIRMED output tokens). Copies token arrays — only call it on
 ///    membership change, never on the chained fast path.
 public protocol CBv2StepSampler: AnyObject {
+    /// True only when an exact order-only model winner may bypass `sample`.
+    /// Custom samplers fail closed through the default below.
+    var supportsPreselectedOrderOnlyTokens: Bool { get }
     /// True only when this sampler implements the full token-constraint
     /// lifecycle: configure, hard-mask, confirm, failure reporting, and
     /// request-id retirement. EngineV2 rejects constrained requests unless
@@ -120,6 +133,7 @@ public protocol CBv2StepSampler: AnyObject {
 }
 
 extension CBv2StepSampler {
+    public var supportsPreselectedOrderOnlyTokens: Bool { false }
     public var supportsTokenConstraints: Bool { false }
     public func takeStepLogprobs() -> CBv2StepLogprobs? { nil }
     public func requestDidFinish(_ id: CBv2RequestID) {}
@@ -136,6 +150,7 @@ public final class CBv2GreedySampler: CBv2StepSampler {
     private var configuredIDs: [CBv2RequestID] = []
 
     public var supportsTokenConstraints: Bool { true }
+    public var supportsPreselectedOrderOnlyTokens: Bool { true }
 
     public init() {}
     public func sample(
@@ -1485,28 +1500,68 @@ public final class EngineLoopV2: @unchecked Sendable {
         let rowStates = ids.map { kvStates[$0]! }  // presence pre-checked
         var params: [CBv2SamplingParams] = []
         params.reserveCapacity(ids.count)
-        for id in ids { params.append(scheduler.record(for: id)!.request.sampling) }
+        var hasTokenConstraints = false
+        for id in ids {
+            let request = scheduler.record(for: id)!.request
+            params.append(request.sampling)
+            hasTokenConstraints = hasTokenConstraints || request.tokenConstraint != nil
+        }
 
         let inputs = lazyTokens.reshaped([ids.count, 1])
         let forwardStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-        // SOFTCAP-SKIP: declare order-only consumption for this graph build.
-        let (last, cacheInnerState) = CBv2OrderOnlyLogits.withOrderOnly(params) {
-            decodeLogits(rowStates: rowStates, tokens: inputs)  // [B, vocab]
+        let orderOnlyModel = model as? CBv2OrderOnlySteppableModel
+        let requestDirectWinner = cbv2ShouldRequestOrderOnlyWinner(
+            params: params,
+            hasTokenConstraints: hasTokenConstraints,
+            batchSize: ids.count,
+            modelSupportsWinner: orderOnlyModel?.supportsOrderOnlyTokens == true
+                && sampler.supportsPreselectedOrderOnlyTokens)
+
+        var directWinner: (tokens: MLXArray, cacheInnerState: [MLXArray])?
+        if requestDirectWinner, let orderOnlyModel {
+            let caches = eagerCaches(rowStates: rowStates)
+            if let tokens = orderOnlyModel.forwardOrderOnlyTokens(
+                tokens: inputs, caches: caches)
+            {
+                directWinner = (tokens, eagerCacheInnerState(caches))
+            }
+        }
+
+        var incumbentForward: (logits: MLXArray, cacheInnerState: [MLXArray])?
+        if directWinner == nil {
+            // SOFTCAP-SKIP: declare order-only consumption for this graph build.
+            incumbentForward = CBv2OrderOnlyLogits.withOrderOnly(params) {
+                decodeLogits(rowStates: rowStates, tokens: inputs)  // [B, vocab]
+            }
         }
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.forward.build", seconds: CFAbsoluteTimeGetCurrent() - forwardStart)
         }
+
         // `pendingSampledTokens` = the fed lazy tokens: each row has exactly
         // one launched-but-unconfirmed sample here (the chain invariant).
         let samplerStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-        let sampled = sampler.sample(
-            logits: last, params: params, requestIDs: ids, stepIndex: stepCount,
-            pendingSampledTokens: lazyTokens,
-            rowContext: { [scheduler] in
-                ids.map { Self.samplerRow(scheduler.record(for: $0)!) }
-            })
-        let stepLogprobs = sampler.takeStepLogprobs()
+        let sampled: MLXArray
+        let cacheInnerState: [MLXArray]
+        let stepLogprobs: CBv2StepLogprobs?
+        if let directWinner {
+            sampled = directWinner.tokens
+            cacheInnerState = directWinner.cacheInnerState
+            stepLogprobs = nil
+        } else if let incumbentForward {
+            sampled = sampler.sample(
+                logits: incumbentForward.logits,
+                params: params, requestIDs: ids, stepIndex: stepCount,
+                pendingSampledTokens: lazyTokens,
+                rowContext: { [scheduler] in
+                    ids.map { Self.samplerRow(scheduler.record(for: $0)!) }
+                })
+            cacheInnerState = incumbentForward.cacheInnerState
+            stepLogprobs = sampler.takeStepLogprobs()
+        } else {
+            preconditionFailure("order-only decode produced neither winners nor logits")
+        }
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.sampler.build", seconds: CFAbsoluteTimeGetCurrent() - samplerStart)

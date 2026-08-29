@@ -3992,11 +3992,18 @@ template <typename T, int group_size, int bits>
     // run of four takes the quad-stream impl -- each (output, input) pair
     // keeps its own accumulator, K-loop order, and qdot, so every output
     // element's add sequence is identical to the incumbent per-arm kernels.
-    if ((run_offset & 3) != 0) {
+    // RUN-TRIPLE-3 (restacked verbatim from jonathan308 `3899f6e9`, PR 683,
+    // scored 4/4 pairs on this exact base 2884889 with decode_gain 2.06010):
+    // leader election parity mod 3, run cap 3. Per-row qdot/accumulator/
+    // simd_sum/store stay bit-identical by the quad promotion's own per-stream
+    // independence; only the leader partition and streams-per-leader change.
+    // Rationale: this plane is parallelism-starved at B=8 (KERN-UP-TILE pair
+    // mirror died -7.13%), so a narrower sharing width raises leader count.
+    if ((run_offset % 3) != 0) {
       return;
     }
     uint run_len = 1;
-    while (run_len < 4 && assignment + run_len < 64 &&
+    while (run_len < 3 && assignment + run_len < 64 &&
            rhs_indices[(assignment + run_len) * (uint)rhs_strides[0]] ==
                expert) {
       run_len++;

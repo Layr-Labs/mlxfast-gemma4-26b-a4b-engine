@@ -77,18 +77,6 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         usesUnifiedPositionOffsets ? positionOffsetsState.value : nil
     }
 
-    /// Stable identity of the bank-owned shared position state. Comparing
-    /// the MLXArray values themselves would evaluate them; the adapter uses
-    /// this host-only identity to prove every layer shares one chain.
-    var unifiedPositionStateIdentity: ObjectIdentifier? {
-        usesUnifiedPositionOffsets ? ObjectIdentifier(positionOffsetsState) : nil
-    }
-
-    /// Explicit ordering root for the fused in-place sliding-ring write.
-    /// Kept in the initial conservative compaction even though the logits
-    /// graph also reaches the multi-output primitive that produces it.
-    var decodeRingWriteFenceEvaluationRoot: MLXArray { decodeRingWriteFence.value }
-
     private var positionOffsetsState: CBv2PositionOffsetsState
     private var usesUnifiedPositionOffsets = false
     private var advancesPositionOffsets = true

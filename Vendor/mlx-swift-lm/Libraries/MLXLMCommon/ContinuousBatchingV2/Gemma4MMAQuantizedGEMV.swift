@@ -2408,7 +2408,8 @@ public enum Gemma4MMAQuantizedGEMV {
         scales: MLXArray,
         biases: MLXArray?,
         groupSize: Int,
-        bits: Int
+        bits: Int,
+        softcap: Float? = nil
     ) -> MLXArray? {
         guard enabled else { return nil }
         guard let biases else { return nil }

@@ -398,10 +398,10 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     result2[row] = simd_sum(result2[row]);
     result3[row] = simd_sum(result3[row]);
     if (simd_lid == 0) {
-      y0[row] = static_cast<T>(result0[row]);
-      y1[row] = static_cast<T>(result1[row]);
-      y2[row] = static_cast<T>(result2[row]);
-      y3[row] = static_cast<T>(result3[row]);
+      y0[row] = static_cast<T>(APPLY_SOFTCAP(result0[row]));
+      y1[row] = static_cast<T>(APPLY_SOFTCAP(result1[row]));
+      y2[row] = static_cast<T>(APPLY_SOFTCAP(result2[row]));
+      y3[row] = static_cast<T>(APPLY_SOFTCAP(result3[row]));
     }
   }
 }
@@ -412,6 +412,7 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
+            #define APPLY_SOFTCAP(v) (SOFTCAP_INT > 0 ? (metal::precise::tanh(float(v) * (1.0f / (float(SOFTCAP_INT) * 0.001f))) * (float(SOFTCAP_INT) * 0.001f)) : float(v))
             const uint3 tid = threadgroup_position_in_grid;
             const uint simd_gid = simdgroup_index_in_threadgroup;
             const uint simd_lid = thread_index_in_simdgroup;
@@ -452,7 +453,8 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
         scales: MLXArray,
         biases: MLXArray?,
         inDim: Int,
-        outDim: Int
+        outDim: Int,
+        softcap: Float? = nil
     ) -> MLXArray? {
         // Every dimension is validated against every other, so the gate is a
         // full shape pin at runtime even though the tower's hidden size is not
@@ -482,12 +484,14 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
 
         let xGroups = batch / rowsPerGroup
         let yGroups = outDim / outputsPerGroup
+        let softcapInt = softcap.map { Int(round($0 * 1000.0)) } ?? 0
         return kernel(
             [x, weight, scales, biases],
             template: [
                 ("T", x.dtype),
                 ("K", inDim),
                 ("OUTN", outDim),
+                ("SOFTCAP_INT", softcapInt),
             ],
             grid: (xGroups * simdWidth, yGroups * simdGroups, 1),
             threadGroup: (simdWidth, simdGroups, 1),

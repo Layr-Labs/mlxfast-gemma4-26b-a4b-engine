@@ -81,9 +81,11 @@ template <typename T, int D, int V = D>
   out += o_offset * V + simd_gid * v_per_thread;
 
   // Read the query and 0 the output accumulator
+  #pragma unroll
   for (int i = 0; i < qk_per_thread; i++) {
     q[i] = static_cast<U>(scale) * queries[i];
   }
+  #pragma unroll
   for (int i = 0; i < v_per_thread; i++) {
     o[i] = 0;
   }
@@ -272,6 +274,7 @@ template <typename T, int D, int V = D>
     if (use_key) {
       // Compute the i-th score
       U score = 0;
+      #pragma unroll
       for (int i = 0; i < qk_per_thread; i++) {
         score += q[i] * keys[i];
       }
@@ -290,6 +293,7 @@ template <typename T, int D, int V = D>
       sum_exp_score = sum_exp_score * factor + exp_score;
 
       // Update the output accumulator
+      #pragma unroll
       for (int i = 0; i < v_per_thread; i++) {
         o[i] = o[i] * factor + exp_score * values[i];
       }

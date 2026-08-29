@@ -865,166 +865,154 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-/// QKVNORM-PREFILL-001: the prefill twin of `gemma4_b8_qkv_rms_norm_v1`.
-///
-/// Same per-row arithmetic, three differences in the plumbing.
-///
-/// Rows are addressed from the shapes rather than the decode cohort's fixed
-/// geometry, so `[B, chunk, H, D]` is admitted. V rides the K reduction (this
-/// checkpoint is `attention_k_eq_v`, so `vRaw === kRaw`), which removes a
-/// whole re-read of the key projection. And each row is written straight into
-/// its `[B, H, L, D]` slot, so the `transposed(0, 2, 1, 3)` attention wants
-/// costs nothing downstream.
-///
-/// The load-bearing detail is `RPT`. A 256-wide row is 64 threads at
-/// `RMS_N_READS = 4`, and one 64-thread threadgroup per row leaves the
-/// prefill plane far off saturation — that shape, not the dispatch count, is
-/// why the stock three-norm chain is slow here. `RPT` rows share one 512-wide
-/// threadgroup, and each row keeps its own 64 threads and its own two
-/// simdgroups, so the reduction tree is the stock one row for row.
-private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
-    name: "gemma4_qkv_rms_norm_head_major_v1",
-    inputNames: ["q", "k", "q_weight", "k_weight"],
+// QK-ROPE-001: the fused Q/K/V RMSNorm above, extended with the rope
+// rotation for the SLIDING decode plane (D = 256, full rotation, the plain
+// RoPE road: theta = offset * exp2(-(i / 128) * log2(base)), fast::cos/sin,
+// non-traditional halves pairing -- transcribed from rope.metal's
+// rope_single_impl/rope_impl at pos.y = 0). The stock chain rounds the norm
+// output to bf16 in memory before the rope kernel reads it; here the rounded
+// bf16 value crosses through threadgroup memory instead, so every rope input
+// is the stock chain's own value and the trig/rotation arithmetic is the
+// stock kernel's own expression order. Q and K rows rotate; V rows pass
+// through unchanged. Full-attention layers (D = 512, proportional partial
+// rope) keep the stock two-dispatch road.
+private let gemma4QKVNormRopeKernel = MLXFast.metalKernel(
+    name: "gemma4_b8_qkv_rms_norm_rope_v1",
+    inputNames: ["q", "k", "v", "q_weight", "k_weight", "offsets", "rope_params"],
     outputNames: ["q_out", "k_out", "v_out"],
     source: """
         constexpr uint reads = 4;
-        constexpr uint row_threads = D / reads;
-        const uint tid = thread_position_in_threadgroup.x;
-        const uint slot = tid / row_threads;
-        const uint lid = tid - slot * row_threads;
-        const uint row = threadgroup_position_in_grid.x * RPT + slot;
+        constexpr uint rot = D / 2;
+        const uint row = threadgroup_position_in_grid.x;
+        const uint lid = thread_position_in_threadgroup.x;
         const uint lane = thread_index_in_simdgroup;
-        const uint row_simd = lid / 32;
-
-        threadgroup float partials[RPT][32];
-        threadgroup float inv_rms[RPT];
+        const uint simd_group = simdgroup_index_in_threadgroup;
 
         const device T* input = q;
         const device T* weight = q_weight;
         device T* output = q_out;
-        // Held inside the V allocation on Q rows, which never dereference it.
-        device T* value_output = v_out;
-        bool is_key = false;
-
-        if (row < TOTAL_ROWS) {
-            if (row < Q_ROWS) {
-                const uint b = row / (LQ * HQ);
-                const uint rem = row - b * (LQ * HQ);
-                const uint l = rem / HQ;
-                const uint h = rem - l * HQ;
-                input = q + (size_t)row * D;
-                output = q_out + (((size_t)b * HQ + h) * LQ + l) * D;
-            } else {
-                is_key = true;
-                const uint krow = row - Q_ROWS;
-                const uint b = krow / (LK * HK);
-                const uint rem = krow - b * (LK * HK);
-                const uint l = rem / HK;
-                const uint h = rem - l * HK;
-                const size_t off = (((size_t)b * HK + h) * LK + l) * D;
-                input = k + (size_t)krow * D;
-                weight = k_weight;
-                output = k_out + off;
-                value_output += off;
-            }
+        uint local_row = row;
+        uint batch = row / Q_HEADS;
+        bool weighted = true;
+        bool roped = true;
+        if (row >= Q_ROWS + K_ROWS) {
+            input = v;
+            output = v_out;
+            local_row = row - Q_ROWS - K_ROWS;
+            batch = local_row / K_HEADS;
+            weighted = false;
+            roped = false;
+        } else if (row >= Q_ROWS) {
+            input = k;
+            weight = k_weight;
+            output = k_out;
+            local_row = row - Q_ROWS;
+            batch = local_row / K_HEADS;
         }
 
-        input += lid * reads;
-        output += lid * reads;
+        input += local_row * D + lid * reads;
+        output += local_row * D;
         weight += lid * reads;
-        value_output += lid * reads;
 
         float sum = 0.0f;
-        if (row < TOTAL_ROWS) {
-            for (uint i = 0; i < reads; ++i) {
-                const float value = float(input[i]);
-                sum += value * value;
-            }
+        for (uint i = 0; i < reads; ++i) {
+            const float value = float(input[i]);
+            sum += value * value;
         }
         sum = simd_sum(sum);
 
-        // Slots 2..31 stay exactly zero, so the 32-lane combine returns the
-        // two simdgroup partials' sum whatever order the tree adds them in.
-        if (row_simd == 0) partials[slot][lane] = 0.0f;
+        threadgroup float partials[32];
+        threadgroup float inverse_rms;
+        threadgroup T normed_row[D];
+        if (simd_group == 0) partials[lane] = 0.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (lane == 0) partials[slot][row_simd] = sum;
+        if (lane == 0) partials[simd_group] = sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (row_simd == 0) {
-            sum = simd_sum(partials[slot][lane]);
+        if (simd_group == 0) {
+            sum = simd_sum(partials[lane]);
             if (lane == 0) {
-                inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+                inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (row >= TOTAL_ROWS) return;
-        const float inverse_rms = inv_rms[slot];
+        // Norm phase: the stock kernel's exact final expression, held in
+        // threadgroup memory at the stock chain's bf16 rounding.
         for (uint i = 0; i < reads; ++i) {
             const T normalized = T(float(input[i]) * inverse_rms);
-            output[i] = weight[i] * normalized;
-            // K rows also carry V: same raw input, same normalizer, and
-            // `RMSNormNoScale`'s own final expression.
-            if (is_key) {
-                value_output[i] = T(1) * normalized;
+            normed_row[lid * reads + i] =
+                weighted ? weight[i] * normalized : T(1) * normalized;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Rope phase: rope.metal's expression at pos.y = 0, grid.x = rot.
+        if (!roped) {
+            for (uint i = 0; i < reads; ++i) {
+                output[lid * reads + i] = normed_row[lid * reads + i];
+            }
+        } else {
+            const float base_log2 = rope_params[0];
+            const float rope_scale = rope_params[1];
+            const float L = rope_scale * float(offsets[batch]);
+            if (lid * reads < rot) {
+                for (uint i = 0; i < reads; ++i) {
+                    const uint j = lid * reads + i;
+                    const float d = float(j) / float(rot);
+                    const float inv_freq = metal::exp2(-d * base_log2);
+                    const float theta = L * inv_freq;
+                    const float costheta = metal::fast::cos(theta);
+                    const float sintheta = metal::fast::sin(theta);
+                    const float x1 = float(normed_row[j]);
+                    const float x2 = float(normed_row[j + rot]);
+                    output[j] = T(x1 * costheta - x2 * sintheta);
+                    output[j + rot] = T(x1 * sintheta + x2 * costheta);
+                }
             }
         }
     """,
     ensureRowContiguous: true
 )
 
-private let gemma4QKVNormPrefillEnabled: Bool = {
-    guard let raw = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_GEMMA4_QKV_NORM_PREFILL"]
-    else { return true }
-    return !["0", "false", "no", "off"].contains(raw.lowercased())
-}()
-
-/// `(qNorm(q), kNorm(k), vNorm(k))` already in `[B, H, L, D]`. Returns `nil`
-/// off the plane, including for every non-`k_eq_v` projection.
-private func gemma4FusedQKVNormHeadMajor(
+private func gemma4FusedQKVNormRope(
     q: MLXArray,
     k: MLXArray,
+    v: MLXArray,
     qWeight: MLXArray,
     kWeight: MLXArray,
     eps: Float,
-    keyValueShared: Bool
+    offsets: MLXArray,
+    ropeBase: Float,
+    ropeScale: Float
 ) -> (MLXArray, MLXArray, MLXArray)? {
-    guard gemma4QKVNormPrefillEnabled, keyValueShared, eps == 1.0e-6,
-        q.dtype == .bfloat16, k.dtype == .bfloat16,
+    guard eps == 1.0e-6,
+        q.dtype == .bfloat16, k.dtype == .bfloat16, v.dtype == .bfloat16,
         qWeight.dtype == .bfloat16, kWeight.dtype == .bfloat16,
-        q.ndim == 4, k.ndim == 4,
-        q.dim(0) == k.dim(0), q.dim(0) >= 1,
-        q.dim(1) >= 1, k.dim(1) >= 1,
-        // Below ~1024 rectangle tokens the wide threadgroup stops paying for
-        // itself and the stock three-kernel chain is faster; measured, not
-        // assumed. Decode also leaves through here, back to its own kernel.
-        q.dim(0) * max(q.dim(1), k.dim(1)) >= 1024,
-        q.dim(2) == 16, q.dim(3) == k.dim(3),
-        (q.dim(3) == 256 && k.dim(2) == 8) || (q.dim(3) == 512 && k.dim(2) == 2),
-        qWeight.shape == [q.dim(3)], kWeight.shape == [q.dim(3)]
+        q.ndim == 4, k.ndim == 4, v.ndim == 4,
+        q.dim(0) == 8, q.dim(1) == 1, q.dim(2) == 16, q.dim(3) == 256,
+        k.dim(0) == 8, k.dim(1) == 1, k.dim(2) == 8, k.dim(3) == 256,
+        v.shape == k.shape,
+        qWeight.shape == [256], kWeight.shape == [256],
+        offsets.dtype == .int32, offsets.size == 8,
+        ropeBase > 0
     else { return nil }
 
-    let (batch, lq, hq, dimension) = (q.dim(0), q.dim(1), q.dim(2), q.dim(3))
-    let (lk, hk) = (k.dim(1), k.dim(2))
-    let qRows = batch * lq * hq
-    let rows = qRows + batch * lk * hk
-    let rowThreads = dimension / 4
-    let rowsPerGroup = 512 / rowThreads
-    let groups = (rows + rowsPerGroup - 1) / rowsPerGroup
-    let outputs = gemma4QKVNormPrefillKernel(
-        [q, k, qWeight, kWeight],
+    // The host passes log2(base) to rope.metal (`float base = std::log2(base_)`
+    // in rope.cpp); libm's log2f here reproduces that float bit for bit.
+    let params = MLXArray([log2(ropeBase), ropeScale])
+    let qRows = 8 * 16
+    let kRows = 8 * 8
+    let threads = 64
+    let normRows = qRows + kRows + kRows
+    let outputs = gemma4QKVNormRopeKernel(
+        [q, k, v, qWeight, kWeight, offsets, params],
         template: [
-            ("T", q.dtype), ("D", dimension), ("Q_ROWS", qRows),
-            ("TOTAL_ROWS", rows), ("RPT", rowsPerGroup),
-            ("LQ", lq), ("HQ", hq), ("LK", lk), ("HK", hk),
+            ("T", q.dtype), ("D", 256), ("Q_ROWS", qRows), ("K_ROWS", kRows),
+            ("Q_HEADS", 16), ("K_HEADS", 8),
         ],
-        grid: (groups * rowsPerGroup * rowThreads, 1, 1),
-        threadGroup: (rowsPerGroup * rowThreads, 1, 1),
-        outputShapes: [
-            [batch, hq, lq, dimension], [batch, hk, lk, dimension],
-            [batch, hk, lk, dimension],
-        ],
-        outputDTypes: [q.dtype, q.dtype, q.dtype]
+        grid: (normRows * threads, 1, 1),
+        threadGroup: (threads, 1, 1),
+        outputShapes: [q.shape, k.shape, v.shape],
+        outputDTypes: [q.dtype, k.dtype, v.dtype]
     )
     return (outputs[0], outputs[1], outputs[2])
 }
@@ -1579,32 +1567,45 @@ private class Gemma4Attention: Module {
             vRaw = kRaw
         }
 
+        // QK-ROPE-001: on the sliding decode plane the rope rotation fuses
+        // into the QKV norm dispatch. Q and K share the same per-row offsets
+        // at decode (queryPositionOffset == captured whenever last-query
+        // prefill is off), which the admission requires.
+        var fusedRoped = false
         var queries: MLXArray
         var k: MLXArray
         var v: MLXArray
-        if let normalized = gemma4FusedQKVNorm(
-            q: queryRaw, k: kRaw, v: vRaw,
-            qWeight: qNorm.weight, kWeight: kNorm.weight, eps: config.rmsNormEps,
-            keyValueShared: vProj == nil)
+        if isSliding, lastQueryCache == nil, vProj != nil,
+            let ropedTriple = gemma4FusedQKVNormRope(
+                q: queryRaw, k: kRaw, v: vRaw,
+                qWeight: qNorm.weight, kWeight: kNorm.weight,
+                eps: config.rmsNormEps,
+                offsets: capturedOffsets,
+                ropeBase: config.slidingRopeTheta,
+                ropeScale: 1.0)
         {
-            queries = normalized.0.transposed(0, 2, 1, 3)
-            k = normalized.1.transposed(0, 2, 1, 3)
-            v = normalized.2.transposed(0, 2, 1, 3)
-        } else if let headMajor = gemma4FusedQKVNormHeadMajor(
-            q: queryRaw, k: kRaw,
-            qWeight: qNorm.weight, kWeight: kNorm.weight, eps: config.rmsNormEps,
-            keyValueShared: vProj == nil)
-        {
-            // Written head-major, so the three transposes are already applied.
-            (queries, k, v) = headMajor
+            queries = ropedTriple.0
+            k = ropedTriple.1
+            v = ropedTriple.2
+            fusedRoped = true
         } else {
-            queries = qNorm(queryRaw).transposed(0, 2, 1, 3)
-            k = kNorm(kRaw).transposed(0, 2, 1, 3)
-            v = vNorm(vRaw).transposed(0, 2, 1, 3)
+            let normalized = gemma4FusedQKVNorm(
+                q: queryRaw, k: kRaw, v: vRaw,
+                qWeight: qNorm.weight, kWeight: kNorm.weight, eps: config.rmsNormEps,
+                keyValueShared: vProj == nil)
+            queries = normalized?.0 ?? qNorm(queryRaw)
+            k = normalized?.1 ?? kNorm(kRaw)
+            v = normalized?.2 ?? vNorm(vRaw)
         }
 
-        queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: queryPositionOffset)
-        k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
+        queries = queries.transposed(0, 2, 1, 3)
+        k = k.transposed(0, 2, 1, 3)
+        if !fusedRoped {
+            queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: queryPositionOffset)
+            k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
+        }
+
+        v = v.transposed(0, 2, 1, 3)
 
         let outputDType = queries.dtype
         let attentionQueries =
@@ -2598,23 +2599,6 @@ public class Gemma4DecoderLayer: Module {
                 out = fusedTail
                 tailApplied = true
                 scalarFolded = true
-            } else if canFoldScalar, let chain = glueChain,
-                let nextWeight = nextInputLayernormWeight,
-                let chained = Gemma4PrefillGlueV1.branchTailChained(
-                    h1: h1Raw,
-                    h2: h2Raw,
-                    w1: postFeedforwardLayernorm1.weight,
-                    w2: postFeedforwardLayernorm2.weight,
-                    w3: postFeedforwardLayernorm.weight,
-                    residual2: residual2,
-                    layerScalar: layerScalar,
-                    nextInputNormWeight: nextWeight,
-                    eps: config.rmsNormEps)
-            {
-                out = chained.out
-                chain.pending = (source: chained.out, normed: chained.normedNext)
-                tailApplied = true
-                scalarFolded = true
             } else if let fusedTail = Gemma4PrefillGlueV1.branchTail(
                 h1: h1Raw,
                 h2: h2Raw,
@@ -2672,171 +2656,6 @@ public class Gemma4DecoderLayer: Module {
         }
 
         return (out, kvPair, attnPositionOffset)
-    }
-}
-
-// MARK: - EMB-001: fused scaled input embedding
-
-/// EMB-001 (revived). The trunk entry evaluates
-///
-///     h = embedTokens(inputs) * embedScale
-///
-/// which on this checkpoint is FIVE dependent GPU operations over a
-/// `QuantizedEmbedding`: three row gathers (packed uint32 weight, bf16 scales,
-/// bf16 biases), the generic `affine_dequantize` kernel, and finally a separate
-/// full-width elementwise multiply by `sqrt(hiddenSize)`. On the scored prefill
-/// rectangle `[8, 1024]` that materialises a 11.5 MB gathered-weight
-/// intermediate, a 45 MB dequantized intermediate, and then reads and rewrites
-/// that 45 MB once more just to apply one scalar.
-///
-/// This enum collapses the whole chain into one kernel: each thread owns one
-/// packed uint32 word of one vocabulary row, reads the single (scale, bias)
-/// pair its 8 codes share, and writes 8 already-scaled bf16 features. Nothing
-/// is gathered into a temporary; the only traffic is the packed row in and the
-/// finished hidden state out.
-///
-/// ## Bit-exactness
-///
-/// The kernel is a transcription of the two rounding boundaries the stock
-/// chain has, in the same order:
-///
-///  1. `affine_dequantize` (`mlx-generated/metal/quantized.h`) is instantiated
-///     at `T = out.dtype()`, and `ops.cpp` infers that dtype as
-///     `result_type(scales, biases)` — bf16 here. Its body is literally
-///     `out[i] = scale * d + bias;` with `uint8_t d = (val >> (bits*i)) & 0x0f`
-///     and `gindex = oindex / group_size`. The same expression, the same
-///     operand types, and the same store-to-`T` rounding are reproduced below.
-///  2. `MLXArray * Float` (`MLXArray+Ops.swift`) forwards through
-///     `ScalarOrArray.asMLXArray(dtype: lhs.dtype)`, so the Float scale is
-///     ROUNDED TO bf16 BEFORE the multiply — `sqrt(2816)` becomes exactly
-///     `53.0`. The multiplier below is built by calling that very same
-///     `asMLXArray(dtype:)`, so the constant cannot drift from the stock one.
-///
-/// The affine expression is therefore never reassociated with the embedding
-/// scale and the intermediate is never promoted to float: `dequantized` is a
-/// named `T` value, which pins the first rounding exactly where stock puts it.
-/// Negative token ids are wrapped by the vocabulary size, matching MLX's
-/// `offset_neg_idx` gather semantics; out-of-range positive ids are undefined
-/// in both paths.
-///
-/// ## Gating (PLE-GLUE-028 lesson)
-///
-/// Admitted for the PREFILL rectangle only (`L > 1`). At `[B, 1]` the whole
-/// chain produces 22,528 values and a custom-kernel launch is not reliably
-/// cheaper than the five small dispatches it replaces — the same trap
-/// PLE-GLUE-028 and `Gemma4FusedRouterTop8` fell into. Decode keeps the stock
-/// chain byte-identically.
-///
-/// Kill switch: `DARKBLOOM_GEMMA4_SCALED_EMBEDDING=0` (also `false`/`no`/`off`)
-/// restores the stock expression on the same binary.
-///
-/// Internal rather than file-private only so the local full-vocabulary parity
-/// test can drive this exact kernel instead of a transcription of it.
-enum Gemma4FusedScaledEmbedding {
-    /// DEFAULT ON for the prefill rectangle.
-    static let enabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_SCALED_EMBEDDING"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
-    /// This checkpoint's embedding quantization. Anything else fails closed.
-    private static let groupSize = 64
-    private static let bits = 4
-    /// 32 / 4: affine-4 codes packed per uint32 word.
-    private static let codesPerWord = 8
-    /// 64 / 8: packed words covered by one (scale, bias) pair.
-    private static let wordsPerGroup = 8
-
-    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_fused_scaled_embedding_affine4_g64_v1",
-        inputNames: ["tokens", "w", "scales", "biases", "embed_scale"],
-        outputNames: ["out"],
-        source: """
-            const uint col = thread_position_in_grid.x;
-            const uint row = thread_position_in_grid.y;
-            // The launch is exactly one thread per packed word of one token
-            // row, so the grid carries the row geometry with no shape buffer.
-            const uint words_per_row = threads_per_grid.x;
-            const uint groups_per_row = words_per_row >> 3;
-
-            // Stock `weight[x]` gathers through `offset_neg_idx`: a negative
-            // id wraps by the axis size. Positive out-of-range ids are
-            // undefined in the stock gather too and are not redefined here.
-            const int raw_token = tokens[row];
-            const int vocab = w_shape[0];
-            const size_t t = size_t(raw_token < 0 ? raw_token + vocab : raw_token);
-
-            const uint packed = w[t * size_t(words_per_row) + size_t(col)];
-            const size_t gindex = t * size_t(groups_per_row) + size_t(col >> 3);
-
-            T scale = scales[gindex];
-            T bias = biases[gindex];
-            T es = embed_scale;
-
-            device T* o = out
-                + (size_t(row) * size_t(words_per_row) + size_t(col)) * 8;
-
-            #pragma clang loop unroll(full)
-            for (int i = 0; i < 8; i++) {
-                uint8_t d = (packed >> (4 * i)) & 0x0f;
-                // Boundary 1 — identical to `affine_dequantize`'s store.
-                const T dequantized = scale * d + bias;
-                // Boundary 2 — identical to the stock `* embedScale` multiply.
-                o[i] = dequantized * es;
-            }
-            """,
-        ensureRowContiguous: true
-    )
-
-    /// Returns the scaled hidden state, or `nil` when any pin fails — the
-    /// caller then evaluates the pre-existing expression unchanged.
-    static func apply(
-        tokens: MLXArray, embedding: Embedding, embedScale: Float, hiddenSize: Int
-    ) -> MLXArray? {
-        guard enabled,
-            tokens.ndim == 2,
-            tokens.dtype == .int32,
-            // Prefill rectangle only; [B, 1] decode keeps the stock chain.
-            tokens.dim(1) > 1,
-            let quantized = embedding as? QuantizedEmbedding,
-            quantized.mode == .affine,
-            quantized.bits == bits,
-            quantized.groupSize == groupSize,
-            let biases = quantized.biases
-        else { return nil }
-
-        let weight = quantized.weight
-        let scales = quantized.scales
-        guard weight.dtype == .uint32,
-            weight.ndim == 2,
-            scales.dtype == .bfloat16,
-            biases.dtype == .bfloat16,
-            scales.ndim == 2,
-            biases.shape == scales.shape,
-            scales.dim(0) == weight.dim(0),
-            weight.dim(1) == hiddenSize / codesPerWord,
-            weight.dim(1) % wordsPerGroup == 0,
-            scales.dim(1) == hiddenSize / groupSize,
-            hiddenSize % groupSize == 0
-        else { return nil }
-
-        let batch = tokens.dim(0)
-        let length = tokens.dim(1)
-        let wordsPerRow = weight.dim(1)
-
-        CBv2EngageMark.once("scaled-embedding")
-        return kernel(
-            // `asMLXArray(dtype:)` is the exact conversion the stock
-            // `MLXArray * Float` overload performs on the scalar.
-            [tokens, weight, scales, biases, embedScale.asMLXArray(dtype: .bfloat16)],
-            template: [("T", DType.bfloat16)],
-            grid: (wordsPerRow, batch * length, 1),
-            threadGroup: (32, 8, 1),
-            outputShapes: [[batch, length, hiddenSize]],
-            outputDTypes: [.bfloat16]
-        )[0]
     }
 }
 
@@ -3049,14 +2868,7 @@ public class Gemma4TextModelInner: Module {
         if let inputEmbedding {
             h = inputEmbedding.ndim == 2 ? inputEmbedding.expandedDimensions(axis: 0) : inputEmbedding
         } else {
-            if let fused = Gemma4FusedScaledEmbedding.apply(
-                tokens: inputs, embedding: embedTokens, embedScale: embedScale,
-                hiddenSize: config.hiddenSize)
-            {
-                h = fused
-            } else {
-                h = embedTokens(inputs) * embedScale
-            }
+            h = embedTokens(inputs) * embedScale
         }
 
         // Compute per-layer inputs (PLE)

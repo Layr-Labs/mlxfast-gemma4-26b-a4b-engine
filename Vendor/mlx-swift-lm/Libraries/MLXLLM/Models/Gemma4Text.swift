@@ -3833,6 +3833,11 @@ extension Gemma4TextModel: CBv2LanguageModelPrefillForwardable {
     }
 }
 
+/// Every storage-owning CBv2 attention result is consumed by the sequential
+/// Gemma trunk and final LM head, so ordinary decode logits transitively root
+/// that forward's K/V mutations. Cache-layout gates remain in the adapter.
+extension Gemma4TextModel: CBv2LanguageModelDecodeOutputCoversCacheMutations {}
+
 // MARK: - ContinuousBatchingV2 multimodal (vision prefill)
 
 /// The CBv2 engine's embedding-spliced prefill surface

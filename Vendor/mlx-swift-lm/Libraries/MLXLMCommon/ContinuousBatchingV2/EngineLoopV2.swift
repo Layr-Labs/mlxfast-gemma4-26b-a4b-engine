@@ -27,7 +27,35 @@ import MLX
 /// layer with rows matching batch rows. Returns logits [B, L, vocab].
 public protocol CBv2SteppableModel: AnyObject {
     func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray
+
+    /// Optional decode-only proof surface. A model may return the minimal
+    /// roots that force all cache mutations represented by `forwardOutput`.
+    /// nil keeps the established full cache-inner-state evaluation.
+    func compactDecodeEvaluationRoots(
+        forwardOutput: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> [MLXArray]?
 }
+
+extension CBv2SteppableModel {
+    public func compactDecodeEvaluationRoots(
+        forwardOutput: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> [MLXArray]? {
+        nil
+    }
+}
+
+/// CBV2-COMPACT-DECODE-ROOTS kill switch. Compaction is ON by default (the
+/// ranked runner sets no environment); `DARKBLOOM_CBV2_COMPACT_DECODE_ROOTS`
+/// set to `0`/`false`/`no`/`off` restores the full cache-inner-state root
+/// list for attribution and emergency bisection.
+@inline(__always)
+internal func resolveCBv2CompactDecodeRootsEnabled(_ raw: String?) -> Bool {
+    guard let raw else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}
+
+private let cbv2CompactDecodeRootsEnabled = resolveCBv2CompactDecodeRootsEnabled(
+    ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_COMPACT_DECODE_ROOTS"])
 
 /// Builds per-layer batch-facing cache views for a set of rows
 /// (`rowStates[b][layer]`, row order == batch row order). WS-A's
@@ -1296,6 +1324,22 @@ public final class EngineLoopV2: @unchecked Sendable {
         caches.flatMap { ($0 as? KVCache)?.innerState() ?? [] }
     }
 
+    /// Decode-only counterpart to `eagerCacheInnerState`. The MODEL, not just
+    /// the cache provider, must affirm that its output graph consumes every
+    /// cache mutation. This matters because `CBv2SteppableModel` permits
+    /// custom/scripted forwards that ignore their caches entirely.
+    func eagerDecodeEvaluationRoots(
+        _ caches: [CBv2AttendingLayerCache], logitsRoot: MLXArray
+    ) -> [MLXArray] {
+        if cbv2CompactDecodeRootsEnabled,
+            let compact = model.compactDecodeEvaluationRoots(
+                forwardOutput: logitsRoot, caches: caches)
+        {
+            return compact
+        }
+        return eagerCacheInnerState(caches)
+    }
+
     /// Last-position logits [B, vocab] for a rectangular [B, 1] decode
     /// batch. The second tuple element is the eager caches' inner state
     /// (offset chain + KV buffers) that must ride the step's `asyncEval`
@@ -1305,7 +1349,8 @@ public final class EngineLoopV2: @unchecked Sendable {
     ) -> (logits: MLXArray, cacheInnerState: [MLXArray]) {
         let caches = eagerCaches(rowStates: rowStates)
         let logits = model.forward(tokens: tokens, caches: caches)
-        return (logits[0..., -1, 0...], eagerCacheInnerState(caches))
+        let last = logits[0..., -1, 0...]
+        return (last, eagerDecodeEvaluationRoots(caches, logitsRoot: last))
     }
 
     /// Prompt-only output seam (see PrefillOutputV2.swift). Capable models

@@ -1973,6 +1973,14 @@ private class Gemma4Attention: Module {
             attention = lastQueryCache.updateAndAttendLastQuery(
                 queries: attentionQueries, keys: k, values: v, scale: scale, sinks: nil)
         } else {
+            // Bind the SAME graph-safe pre-step snapshot used by Q/K RoPE.
+            // The contiguous cache may reuse it to derive full-ring starts;
+            // other backends simply do not conform to the optional seam.
+            if CBv2RingPositionReuse.enabled, B == 8, queryLength == 1,
+                let binding = layerCache as? any CBv2DecodeAbsolutePositionBinding
+            {
+                binding.bindDecodeAbsolutePositions(capturedOffsets)
+            }
             attention = layerCache.updateAndAttend(
                 queries: attentionQueries, keys: k, values: v, scale: scale, sinks: nil)
         }

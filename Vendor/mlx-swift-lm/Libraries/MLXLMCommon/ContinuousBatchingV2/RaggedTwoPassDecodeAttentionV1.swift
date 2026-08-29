@@ -277,7 +277,13 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
             const device T* new_value = new_values
                 + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
-            const uint ring_start = starts[batch_index];
+            // A full ring's post-write start is `(absoluteOffset + 1) % N`.
+            // ABSOLUTE_POSITIONS reuses the bank's already-live pre-step
+            // offset tensor; the false specialization is the established
+            // host-built starts input byte for byte.
+            const uint ring_start = ABSOLUTE_POSITIONS
+                ? ((uint(starts[batch_index]) + 1u) & ring_mask)
+                : uint(starts[batch_index]);
             const uint write_slot = (ring_start + ring_mask) & ring_mask;
             if (block == 0 && query_head_in_group == 0) {
                 device T* write_key = const_cast<device T*>(keys) + write_slot * D;
@@ -446,6 +452,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         keys: [MLXArray],
         values: [MLXArray],
         starts: [Int],
+        absolutePositions: MLXArray? = nil,
         previousWriteFence: MLXArray,
         scale: Float,
         slidingWindowLength: Int
@@ -465,9 +472,16 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             previousWriteFence.shape == [1],
             keys.count == batch,
             values.count == batch,
-            starts.count == batch,
-            starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength })
+            absolutePositions != nil
+                || (starts.count == batch
+                    && starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength }))
         else { return nil }
+
+        if let absolutePositions {
+            guard absolutePositions.dtype == .int32,
+                absolutePositions.shape == [batch]
+            else { return nil }
+        }
 
         for index in 0 ..< batch {
             let key = keys[index]
@@ -479,7 +493,8 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             else { return nil }
         }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = absolutePositions
+            ?? MLXArray(starts.map(UInt32.init), [batch])
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let passA = fusedRingPassAKernel(
@@ -492,6 +507,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 ("GQA", gqa),
                 ("KV_HEADS", kvHeads),
                 ("BLOCKS", blocks),
+                ("ABSOLUTE_POSITIONS", absolutePositions != nil),
             ],
             grid: (kvHeads * 32, batch * gqa, blocks),
             threadGroup: (32, gqa, 1),

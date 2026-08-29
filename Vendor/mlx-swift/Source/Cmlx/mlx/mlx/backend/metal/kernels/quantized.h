@@ -3645,7 +3645,10 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int gemma4_down_tile_span = 4; // sweep alternate: 2
+  // The span must divide the 352 y-groups the frozen host launches.
+  // Swept 4, 8, 16, 22, 32 -> 0.042619, 0.042001, 0.041200, 0.041304,
+  // 0.041574 s/token decode; sixteen is the interior optimum.
+  constexpr int gemma4_down_tile_span = 16; // sweep alternate: 22
   if (tid.y % uint(gemma4_down_tile_span) != 0u) {
     return;
   }

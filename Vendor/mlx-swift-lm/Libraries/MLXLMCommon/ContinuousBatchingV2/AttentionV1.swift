@@ -371,6 +371,27 @@ enum CBv2AttentionV1 {
                 return concatenated(outputs, axis: 0)
             }
 
+            // Resample ticket #2 for this stack: byte-delta only, so the
+            // dedup-keyed archive re-enters validation. See the submission
+            // note for the two-leg noise reading it re-samples.
+            // WRITE-016-D512: the D512 chain with the new token's K/V stored
+            // in place by the QK dispatch (fence-chained like WRITE-016)
+            // instead of 16 copy-on-write slice appends. Fails closed to the
+            // append-then-attend call below (kill switch:
+            // DARKBLOOM_GEMMA4_D512_FUSED_WRITE=0).
+            if let decodeRingWriteFence, allowFusedRingWrite,
+                let fused = CBv2RaggedComposedD512DecodeAttentionV1
+                    .updateAndAttendWriting(
+                        rows: rows, kind: kind,
+                        queries: queries, keys: keys, values: values,
+                        previousWriteFence: decodeRingWriteFence.value,
+                        scale: scale, sinks: effectiveSinks, softcap: softcap)
+            {
+                decodeRingWriteFence.value = fused.nextWriteFence
+                CBv2EngageMark.once("write016d512")
+                return fused.output
+            }
+
             // D512-SDPA: batched 3-dispatch full-attention decode with the
             // unfused chain's exact numerics (kill switch:
             // DARKBLOOM_GEMMA4_D512_DECODE_SDPA=0). Precedes ATT-008 so rows

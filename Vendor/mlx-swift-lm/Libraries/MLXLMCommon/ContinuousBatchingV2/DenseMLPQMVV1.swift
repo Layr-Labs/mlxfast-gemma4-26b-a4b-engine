@@ -433,6 +433,9 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
     private static func liveShape(inDim: Int, outDim: Int) -> Bool {
         (inDim == 2816 && outDim == 2112)
             || (inDim == 2112 && outDim == 2816)
+            // The gate and up banks share this input and this geometry, so the
+            // pair can ride one launch over their stacked output rows.
+            || (inDim == 2816 && outDim == 4224)
     }
 
     /// Builds the shared gate/up table only for the exact dense decode input.
@@ -502,7 +505,7 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
         let yGroups = outDim / outputsPerGroup
         let useActivationSums = activationSums != nil
             && inDim == 2816
-            && outDim == 2112
+            && (outDim == 2112 || outDim == 4224)
         let selected = useActivationSums ? activationSumQMVKernel : kernel
         let inputs = useActivationSums
             ? [x, weight, scales, biases, activationSums!.values]

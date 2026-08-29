@@ -2107,11 +2107,63 @@ private class Gemma4MLP: Module {
         return tight
     }
 
+    /// DMLP-003: the gate and up banks read the same input and have the same
+    /// geometry, so their output rows are stacked once and projected in a
+    /// single launch. Resolved on first use; if either bank is not the pinned
+    /// affine8 cell the pair keeps its two launches.
+    private var stackedBank:
+        (MLXArray, MLXArray, MLXArray?, Int, Int, QuantizationMode)?
+    private var stackedBankResolved = false
+
+    private func resolveStackedBank()
+        -> (MLXArray, MLXArray, MLXArray?, Int, Int, QuantizationMode)?
+    {
+        if stackedBankResolved { return stackedBank }
+        stackedBankResolved = true
+        guard let g = gateProj as? QuantizedLinear,
+            let u = upProj as? QuantizedLinear,
+            g.bias == nil, u.bias == nil,
+            g.groupSize == u.groupSize, g.bits == u.bits, g.mode == u.mode,
+            g.weight.ndim == 2, g.weight.shape == u.weight.shape,
+            g.scales.shape == u.scales.shape
+        else { return nil }
+        let bi: MLXArray?
+        switch (g.biases, u.biases) {
+        case let (gb?, ub?):
+            guard gb.shape == ub.shape else { return nil }
+            bi = concatenated([gb, ub], axis: 0)
+        case (nil, nil):
+            bi = nil
+        default:
+            return nil
+        }
+        stackedBank = (
+            concatenated([g.weight, u.weight], axis: 0),
+            concatenated([g.scales, u.scales], axis: 0),
+            bi,
+            g.groupSize, g.bits, g.mode)
+        return stackedBank
+    }
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         // DMLP-002: one exact activation-sum prepass feeds both fallback
         // projections. If either projection is not the pinned affine8 cell,
         // the candidate arrays remain unevaluated and stock takes over.
         let activationSums = CBv2DenseMLPQMVV1.activationSums(for: x)
+        if let (w, sc, bi, gs, bits, mode) = resolveStackedBank(),
+            let stacked = CBv2DenseMLPQMVV1.matmul(
+                x: x, weight: w, scales: sc, biases: bi,
+                groupSize: gs, bits: bits, mode: mode,
+                activationSums: activationSums)
+        {
+            CBv2EngageMark.once("dmlp-stacked-gateup")
+            let half = stacked.dim(2) / 2
+            return denseProjection(
+                downProj,
+                gemma4SafeGeluProduct(
+                    stacked[0..., 0..., 0 ..< half],
+                    stacked[0..., 0..., half...]))
+        }
         return denseProjection(
             downProj,
             gemma4SafeGeluProduct(

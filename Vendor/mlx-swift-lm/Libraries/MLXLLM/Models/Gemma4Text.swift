@@ -2088,6 +2088,11 @@ private class Gemma4Experts: Module {
             numExperts: numExperts,
             activation: { gemma4SafeGeluApproximate($0) },
             bias: false,
+            // MOE-FUSE-GATEUP: one packed gather per expert stack instead of
+            // two. `sanitize` concatenates the checkpoint's separate gate and
+            // up tensors along the output-row axis, so the rows, codes, scales
+            // and biases are the ones that shipped.
+            fuseGateUp: true,
             weightedReductionProfile: .gemma4ProductionGeGLU
         )
         super.init()
@@ -3430,7 +3435,58 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
             sanitized[k] = v
         }
-        return sanitized
+        return Self.packExpertGateUp(sanitized)
+    }
+
+    /// MOE-FUSE-GATEUP: rewrite each expert stack's separate `gate_proj` and
+    /// `up_proj` into the single `gate_up_proj` the fused `SwitchGLU` topology
+    /// owns, so the routed decode path issues one gather per stack instead of
+    /// two. The three quantized components concatenate along the output-row
+    /// axis: `weight` is `[E, N, K/8]`, `scales` and `biases` are `[E, N, K/64]`,
+    /// and rows are independent, so this moves each row's existing 4-bit codes,
+    /// scale and bias into a taller tensor without touching any of them. It is
+    /// a relayout, not a requantization.
+    ///
+    /// A stack is rewritten only when all six tensors are present and their
+    /// shapes agree on everything but the row count; anything else is left
+    /// exactly as it arrived, so a checkpoint that already ships a packed
+    /// `gate_up_proj`, or one that ships an unquantized stack, falls through
+    /// untouched.
+    static func packExpertGateUp(_ weights: [String: MLXArray]) -> [String: MLXArray] {
+        let components = ["weight", "scales", "biases"]
+        var bases = Set<String>()
+        for k in weights.keys
+        where k.contains(".switch_glu.") && k.hasSuffix(".gate_proj.weight") {
+            bases.insert(String(k.dropLast(".gate_proj.weight".count)))
+        }
+
+        var out = weights
+        for base in bases.sorted() {
+            guard out["\(base).gate_up_proj.weight"] == nil else { continue }
+
+            var packed = [String: MLXArray]()
+            for component in components {
+                guard let gate = out["\(base).gate_proj.\(component)"],
+                    let up = out["\(base).up_proj.\(component)"],
+                    gate.ndim == 3, up.ndim == 3,
+                    gate.dtype == up.dtype,
+                    gate.shape[0] == up.shape[0],
+                    gate.shape[2] == up.shape[2]
+                else {
+                    break
+                }
+                packed["\(base).gate_up_proj.\(component)"] =
+                    MLX.concatenated([gate, up], axis: -2)
+            }
+            guard packed.count == components.count else { continue }
+
+            for component in components {
+                out["\(base).gate_proj.\(component)"] = nil
+                out["\(base).up_proj.\(component)"] = nil
+            }
+            for (k, v) in packed { out[k] = v }
+        }
+        return out
     }
 
     public func newCache(parameters: GenerateParameters?) -> [any KVCache] {

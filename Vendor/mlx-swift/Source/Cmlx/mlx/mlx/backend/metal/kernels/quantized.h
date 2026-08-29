@@ -3741,7 +3741,14 @@ template <typename T, int group_size, int bits>
       group_size == 64 && bits == 4 && M == 1 && batch_ndims == 1 &&
       batch_shape[0] == 64 && x_batch_ndims == 1 && w_batch_ndims == 1 &&
       ((in_vec_size == 2816 && out_vec_size == 704) ||
-       (in_vec_size == 704 && out_vec_size == 2816));
+       (in_vec_size == 704 && out_vec_size == 2816) ||
+       // MOE-FUSE-GATEUP: the packed gate|up plane. Same K = 2816 stream,
+       // same group size, bits, batch shape and M as the split gate and up
+       // planes this replaces -- only the row count doubles, and every arm
+       // below derives its output row from tid.y rather than out_vec_size,
+       // so admitting 1408 changes which rows a group covers and nothing
+       // about how any one row is computed.
+       (in_vec_size == 2816 && out_vec_size == 1408));
   if (gemma4_pair_geometry) {
     // KERN-DOWN-TILE gate (strip-walk pattern): compile-time flip; ON
     // here -- the K = 704 down plane takes the y-tile-coarsened arm above.

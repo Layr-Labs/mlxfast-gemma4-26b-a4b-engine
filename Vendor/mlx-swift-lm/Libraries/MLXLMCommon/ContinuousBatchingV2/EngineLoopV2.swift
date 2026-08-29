@@ -669,7 +669,12 @@ public final class EngineLoopV2: @unchecked Sendable {
             guard !running else { return }
             running = true
             startWatchdog()
-            engineQueue.async { [weak self] in self?.engineStep() }
+            // Give a newly started cohort one idle interval to enqueue its
+            // cold-start burst before the first plan. Without this, the
+            // nested queue hop can land between request 0 and requests 1...7,
+            // forcing two full prefill traversals (1 + 7) instead of one B=8
+            // traversal. Later idle/refill steps keep their existing policy.
+            scheduleIdleRecheck()
         }
     }
 

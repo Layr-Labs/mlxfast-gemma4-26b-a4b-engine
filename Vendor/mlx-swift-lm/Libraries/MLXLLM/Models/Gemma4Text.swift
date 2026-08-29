@@ -155,6 +155,31 @@ func gemma4SupportsProductionExpertTopology(_ config: Gemma4TextConfiguration) -
         && config.useBidirectionalAttention == "vision"
 }
 
+/// The post-attention fanout kernel is intentionally narrower than the
+/// generic expert optimizations above. It encodes the complete scored 26B-A4B
+/// text topology because its Metal reduction is specialized to B=8, S=1,
+/// H=2816 and every decoder layer must expose the same three MoE norm
+/// consumers. Near matches keep the established kernels.
+private func gemma4SupportsPostAttentionFanoutFusion(
+    _ config: Gemma4TextConfiguration
+) -> Bool {
+    gemma4SupportsProductionExpertTopology(config)
+        && config.intermediateSize == 2112
+        && config.numAttentionHeads == 16
+        && config.numKeyValueHeads == 8
+        && config.numGlobalKeyValueHeads == 2
+        && config.numKvSharedLayers == 0
+        && config.headDim == 256
+        && config.globalHeadDim == 512
+        && config.attentionKeqV
+        && config.hiddenSizePerLayerInput == 0
+        && config.rmsNormEps == 1e-6
+        && config.layerTypes.count == config.numHiddenLayers
+        && config.layerTypes.enumerated().allSatisfy { index, type in
+            type == (index % 6 == 5 ? "full_attention" : "sliding_attention")
+        }
+}
+
 /// The safe Gemma 4 expert-QMM selector (`classify_gemma4_expert_qmm`) rejects
 /// anything that is not affine 4-bit at group size 64 with
 /// `fallback_quantization`, before it ever looks at topology. The remaining
@@ -1620,16 +1645,20 @@ public final class Gemma4GlueChainBox {
     public init() {}
 }
 
-/// GLUE-001: fused decode-plane layer glue. Three single-dispatch kernels
+/// GLUE-001: fused decode-plane layer glue. Four single-dispatch kernels
 /// replace the strictly SERIAL RMSNorm/add chains between the layer's matmuls
 /// at the exact ranked decode geometry ([8, 1, 2816] bfloat16):
 ///
-///   1. `dualPreNorm` — `preFeedforwardLayernorm(out)` and
+///   1. `postAttentionFanout` — materialize
+///      `residual + postAttentionLayernorm(attnOut)`, then share its exact bf16
+///      RMS reduction across router, dense, and expert weighted norms
+///      (3 kernels -> 1).
+///   2. `dualPreNorm` — `preFeedforwardLayernorm(out)` and
 ///      `preFeedforwardLayernorm2(out)` norm the SAME tensor; one reduction
 ///      feeds both weight applications (2 kernels -> 1).
-///   2. `tail` — `postFFLN1(h1) + postFFLN2(h2)` -> `postFFLN` -> `+ residual`
+///   3. `tail` — `postFFLN1(h1) + postFFLN2(h2)` -> `postFFLN` -> `+ residual`
 ///      (5 kernels -> 1).
-///   3. `normResidual` — `residual + postAttentionLayernorm(attnOut)`
+///   4. `normResidual` — `residual + postAttentionLayernorm(attnOut)`
 ///      (2 kernels -> 1).
 ///
 /// Unlike the (default-off) fused router above, every op fused here sits on
@@ -1710,6 +1739,51 @@ private enum Gemma4FusedLayerGlue {
         """,
         ensureRowContiguous: true
     )
+
+    /// One exact post-attention fanout for the scored MoE decode shape. The
+    /// established graph first materializes `out = residual + norm(attnOut)`,
+    /// then independently reads `out` for the router RMS norm and for the two
+    /// pre-feedforward RMS norms. This kernel retains that materialized bf16
+    /// boundary in `outv`, performs the second reduction over those exact bf16
+    /// values, and emits all three weighted norms from the shared reduction.
+    private static let postAttentionFanoutKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_glue_post_attention_fanout_2816_bf16_v1",
+            inputNames: ["x", "res", "wpost", "wrouter", "wdense", "wexpert"],
+            outputNames: ["out", "router_norm", "dense_norm", "expert_norm"],
+            source: """
+                const uint row = threadgroup_position_in_grid.x;
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint simd_lane_id = thread_index_in_simdgroup;
+                const uint simd_group_id = simdgroup_index_in_threadgroup;
+                threadgroup float local_inv[1];
+                threadgroup float local_sums[32];
+                const uint base = row * 2816 + lid * 4;
+                const uint wbase = lid * 4;
+            \(rmsReduce("x", into: "local_inv[0]"))
+                const float post_inv = local_inv[0];
+                T outv[4];
+                for (int i = 0; i < 4; i++) {
+                    // Preserve both stock bf16 roundings: RMS output before
+                    // the residual add, then the materialized residual sum.
+                    const T normed = static_cast<T>(
+                        wpost[wbase + i]
+                        * static_cast<T>((float)x[base + i] * post_inv));
+                    outv[i] = res[base + i] + normed;
+                    out[base + i] = outv[i];
+                }
+            \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
+                of: "(float)outv[base + i]", with: "(float)outv[i]"))
+                const float fanout_inv = local_inv[0];
+                for (int i = 0; i < 4; i++) {
+                    const T nx = static_cast<T>((float)outv[i] * fanout_inv);
+                    router_norm[base + i] = wrouter[wbase + i] * nx;
+                    dense_norm[base + i] = wdense[wbase + i] * nx;
+                    expert_norm[base + i] = wexpert[wbase + i] * nx;
+                }
+            """,
+            ensureRowContiguous: true
+        )
 
     private static let dualPreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_glue_dual_prenorm_2816_bf16_v1",
@@ -1802,6 +1876,36 @@ private enum Gemma4FusedLayerGlue {
             outputShapes: [[rows, 1, axis]],
             outputDTypes: [.bfloat16]
         )[0]
+    }
+
+    static func postAttentionFanout(
+        x: MLXArray, residual: MLXArray, postWeight: MLXArray,
+        routerWeight: MLXArray, denseWeight: MLXArray, expertWeight: MLXArray,
+        eps: Float, isProductionTopology: Bool
+    ) -> (
+        out: MLXArray, routerNorm: MLXArray,
+        denseNorm: MLXArray, expertNorm: MLXArray
+    )? {
+        guard isProductionTopology,
+            admits(x, weight: postWeight, eps: eps),
+            residual.shape == x.shape, residual.dtype == .bfloat16,
+            routerWeight.ndim == 1, routerWeight.dim(0) == axis,
+            routerWeight.dtype == .bfloat16,
+            denseWeight.ndim == 1, denseWeight.dim(0) == axis,
+            denseWeight.dtype == .bfloat16,
+            expertWeight.ndim == 1, expertWeight.dim(0) == axis,
+            expertWeight.dtype == .bfloat16
+        else { return nil }
+        CBv2EngageMark.once("glue-post-attention-fanout")
+        let outs = postAttentionFanoutKernel(
+            [x, residual, postWeight, routerWeight, denseWeight, expertWeight],
+            template: [("T", x.dtype)],
+            grid: (rows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: Array(repeating: [rows, 1, axis], count: 4),
+            outputDTypes: Array(repeating: .bfloat16, count: 4)
+        )
+        return (outs[0], outs[1], outs[2], outs[3])
     }
 
     static func dualPreNorm(
@@ -1956,16 +2060,25 @@ private class Gemma4Router: Module {
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
-        let effScale: MLXArray
+    /// The router's RMS weight after the checkpoint scale's required
+    /// hidden-width factor. Sharing this exact cached array with the fused
+    /// fanout preserves the established weight dtype and multiplication.
+    func effectiveNormalizationWeight() -> MLXArray {
         if let cached = cachedEffectiveScale {
-            effScale = cached
+            return cached
         } else {
             let eff = scale * rootSize
             cachedEffectiveScale = eff
-            effScale = eff
+            return eff
         }
-        let normed = MLXFast.rmsNorm(x, weight: effScale, eps: eps)
+    }
+
+    func callAsFunction(
+        _ x: MLXArray, preNormalized: MLXArray? = nil
+    ) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
+        let normed = preNormalized
+            ?? MLXFast.rmsNorm(
+                x, weight: effectiveNormalizationWeight(), eps: eps)
         let expertScores = proj(normed)
 
         // ROUTE-001: single-dispatch byte-identical replacement of the chain
@@ -2134,6 +2247,7 @@ public class Gemma4DecoderLayer: Module {
     @ModuleInfo(key: "layer_scalar") var layerScalar: MLXArray
 
     let isMoE: Bool
+    let fusePostAttentionFanout: Bool
 
     public init(
         _ config: Gemma4TextConfiguration, layerIdx: Int, forceSharedKV: Bool = false,
@@ -2144,6 +2258,8 @@ public class Gemma4DecoderLayer: Module {
         self.layerType = config.layerTypes[layerIdx]
         self.hiddenSizePerLayerInput = config.hiddenSizePerLayerInput
         self.isMoE = config.enableMoeBlock
+        self.fusePostAttentionFanout =
+            gemma4SupportsPostAttentionFanoutFusion(config)
 
         self._selfAttn.wrappedValue = Gemma4Attention(
             config, layerIdx: layerIdx, forceSharedKV: forceSharedKV)
@@ -2243,8 +2359,29 @@ public class Gemma4DecoderLayer: Module {
             h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset,
             v2SharedSource: v2SharedSource, outputStart: outputStart,
             useLastQueryPrefill: useLastQueryPrefill)
+        var postAttentionFanout: (
+            out: MLXArray, routerNorm: MLXArray,
+            denseNorm: MLXArray, expertNorm: MLXArray
+        )?
         var out: MLXArray
-        if let fusedOut = Gemma4FusedLayerGlue.normResidual(
+        if fusePostAttentionFanout,
+            outputStart == 0,
+            !isExpertPrefill,
+            let router,
+            let preFeedforwardLayernorm2,
+            let fused = Gemma4FusedLayerGlue.postAttentionFanout(
+                x: attnOut,
+                residual: residual,
+                postWeight: postAttentionLayernorm.weight,
+                routerWeight: router.effectiveNormalizationWeight(),
+                denseWeight: preFeedforwardLayernorm.weight,
+                expertWeight: preFeedforwardLayernorm2.weight,
+                eps: config.rmsNormEps,
+                isProductionTopology: fusePostAttentionFanout)
+        {
+            postAttentionFanout = fused
+            out = fused.out
+        } else if let fusedOut = Gemma4FusedLayerGlue.normResidual(
             x: attnOut, residual: residual,
             weight: postAttentionLayernorm.weight, eps: config.rmsNormEps)
         {
@@ -2279,11 +2416,19 @@ public class Gemma4DecoderLayer: Module {
             let postFeedforwardLayernorm2
         {
             // Dense + sparse branches in parallel, summed into one residual.
-            let (topKIndices, topKWeights) = router(out)
+            let (topKIndices, topKWeights) = router(
+                out, preNormalized: postAttentionFanout?.routerNorm)
 
             let h1Raw: MLXArray
             let h2Raw: MLXArray
-            if let (n1, n2) = Gemma4FusedLayerGlue.dualPreNorm(
+            if let postAttentionFanout {
+                h1Raw = mlp(postAttentionFanout.denseNorm)
+                h2Raw = experts(
+                    postAttentionFanout.expertNorm,
+                    topKIndices: topKIndices,
+                    topKWeights: topKWeights,
+                    isExpertPrefill: isExpertPrefill)
+            } else if let (n1, n2) = Gemma4FusedLayerGlue.dualPreNorm(
                 x: out,
                 w1: preFeedforwardLayernorm.weight,
                 w2: preFeedforwardLayernorm2.weight,

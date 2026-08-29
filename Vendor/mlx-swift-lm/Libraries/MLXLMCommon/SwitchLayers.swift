@@ -576,6 +576,19 @@ private let routeCsortPrefillEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+/// Keep production Gemma prefill activations in token-major form and pass the
+/// stable route permutation to gather-QMM as `lhsIndices`.  The established
+/// path instead materializes the same 2816-wide activation row once per route
+/// before the expert projections.  This switch changes only where the existing
+/// gather occurs; the sorted expert ids, per-row activation values, quantized
+/// dot products, inverse permutation, and weighted reduction are unchanged.
+private let gemma4PrefillIndexOnlyEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_PREFILL_INDEX_ONLY"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// Keys per histogram/scatter block.
 private let routeCsortPrefillBlock = 256
 /// Counter-table width; must equal ``routeCountingSortKeyBound`` and the 256
@@ -956,9 +969,22 @@ public class SwitchGLU: Module {
     private func projectExperts(
         _ x: MLXArray, _ indices: MLXArray
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
-        let useLhsIndices =
+        let isEightRowDecode =
             indices.size == 64 && indices.ndim == 2 && indices.shape == [8, 8]
             && x.ndim == 2 && x.shape == [8, inputDims]
+        let isProductionGemmaPrefill =
+            gemma4PrefillIndexOnlyEnabled
+            && weightedReductionProfile == .gemma4ProductionGeGLU
+            && inputDims == 2816
+            && hiddenDims == 704
+            && numExperts == 128
+            && x.ndim == 2
+            && x.shape == [8192, 2816]
+            && x.dtype == .bfloat16
+            && indices.ndim == 2
+            && indices.shape == [8192, 8]
+            && indices.dtype == .uint32
+        let useLhsIndices = isEightRowDecode || isProductionGemmaPrefill
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
         let doSort = indices.size >= 64
 
@@ -967,6 +993,9 @@ public class SwitchGLU: Module {
         var lhsIndices: MLXArray?
         if doSort {
             if useLhsIndices {
+                if isProductionGemmaPrefill {
+                    CBv2EngageMark.once("prefill-index-only-experts")
+                }
                 x = x.flattened(start: 0, end: -3)
                 (lhsIndices, idx, inverseOrder) = gatherSortIndices(
                     indices: indices, numExperts: numExperts)

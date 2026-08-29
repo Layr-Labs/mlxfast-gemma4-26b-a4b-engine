@@ -1482,6 +1482,46 @@ METAL_FUNC void gather_rhs_load_frag_row(
   }
 }
 
+// Load one NAX A-tile fragment row through the gather-QMM left permutation.
+// Each output assignment keeps the same activation row it had in the
+// materialized gather_front tensor; only the global copy is removed.
+template <typename U, typename ATile>
+METAL_FUNC void gather_rhs_load_indexed_frag_row(
+    const short mm,
+    thread ATile& Atile,
+    const device U* src,
+    const device uint32_t* lhs_indices,
+    const int output_row_base,
+    const int k_offset,
+    const int ld,
+    const short valid_rows,
+    const short valid_cols) {
+  const short2 sc = ATile::NAXFrag_t::get_coord();
+  STEEL_PRAGMA_UNROLL
+  for (short kk = 0; kk < ATile::kTileCols; ++kk) {
+    thread auto& frag = Atile.frag_at(mm, kk);
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < ATile::NAXFrag_t::kElemRows; ++i) {
+      const short local_row =
+          short(mm * ATile::kFragRows + sc.y +
+                i * ATile::NAXFrag_t::kElemRowsJump);
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < ATile::NAXFrag_t::kElemCols; ++j) {
+        const short local_col =
+            short(kk * ATile::kFragCols + sc.x + j);
+        if (local_row < valid_rows && local_col < valid_cols) {
+          const uint32_t source_row =
+              lhs_indices[output_row_base + local_row];
+          frag[i * ATile::NAXFrag_t::kElemCols + j] =
+              src[source_row * ld + k_offset + local_col];
+        } else {
+          frag[i * ATile::NAXFrag_t::kElemCols + j] = U(0);
+        }
+      }
+    }
+  }
+}
+
 // Issues the mm-th fragment row's MMA op sequence of tile_matmad_nax's
 // TN-even branch, unchanged: same operands, same per-fragment
 // accumulation chain, only the dead fragment rows' ops are absent.
@@ -1527,11 +1567,12 @@ template <
     const device uint32_t* w [[buffer(1)]],
     const device T* scales [[buffer(2)]],
     const device T* biases [[buffer(3)]],
-    const device uint32_t* indices [[buffer(4)]],
-    device T* y [[buffer(5)]],
-    const constant int& M [[buffer(6)]],
-    const constant int& N [[buffer(7)]],
-    const constant int& K [[buffer(8)]],
+    const device uint32_t* lhs_indices [[buffer(4)]],
+    const device uint32_t* indices [[buffer(5)]],
+    device T* y [[buffer(6)]],
+    const constant int& M [[buffer(7)]],
+    const constant int& N [[buffer(8)]],
+    const constant int& K [[buffer(9)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint simd_lane_id [[thread_index_in_simdgroup]]) {
@@ -1576,7 +1617,6 @@ template <
 
   // Move x and output to the correct block
   auto wl = (const device uint8_t*)w;
-  x += y_row_long * K;
   y += y_row_long * N + y_col_long;
   wl += transpose ? y_col_long * K_w : y_col * bytes_per_pack / pack_factor;
   scales += transpose ? y_col_long * K_g : y_col / group_size;
@@ -1637,7 +1677,7 @@ template <
     NAXTile<AccumType, TM, TN> Dtile;
     Dtile.clear();
 
-    const device T* xn = x + tm * K;
+    int k_base = 0;
 
     // This simdgroup's stored row band for the current expert segment,
     // hoisted ahead of the K-loop (it depends only on offset, offset_next,
@@ -1701,7 +1741,16 @@ template <
               for (short mm = 0; mm < TM; mm++) {
                 const short fr = short(mm * Dtile.kFragRows);
                 if (fr < seg_hi && short(fr + Dtile.kFragRows) > seg_lo) {
-                  gather_rhs_load_frag_row(mm, Atile, xn + kk1, K);
+                  gather_rhs_load_indexed_frag_row(
+                      mm,
+                      Atile,
+                      x,
+                      lhs_indices,
+                      y_row + tm,
+                      k_base + kk1,
+                      K,
+                      sgp_sm,
+                      SK);
                   gather_rhs_mma_frag_row(
                       mm,
                       Dtile,
@@ -1721,10 +1770,18 @@ template <
 
               volatile int compiler_barrier;
 
-              if constexpr (kAlignedM.value) {
-                Atile.load(xn + kk1, K);
-              } else {
-                Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+              STEEL_PRAGMA_UNROLL
+              for (short mm = 0; mm < TM; ++mm) {
+                gather_rhs_load_indexed_frag_row(
+                    mm,
+                    Atile,
+                    x,
+                    lhs_indices,
+                    y_row + tm,
+                    k_base + kk1,
+                    K,
+                    sgp_sm,
+                    SK);
               }
 
               if constexpr (transpose) {
@@ -1746,7 +1803,7 @@ template <
             }
           }
 
-          xn += BK;
+          k_base += BK;
           loader_w.next();
         }
 
@@ -1767,7 +1824,19 @@ template <
               volatile int compiler_barrier;
 
               const short psk = min(int(SK), max(0, (BK - kk1)));
-              Atile.load_safe(xn + kk1, K, short2(psk, sgp_sm));
+              STEEL_PRAGMA_UNROLL
+              for (short mm = 0; mm < TM; ++mm) {
+                gather_rhs_load_indexed_frag_row(
+                    mm,
+                    Atile,
+                    x,
+                    lhs_indices,
+                    y_row + tm,
+                    k_base + kk1,
+                    K,
+                    sgp_sm,
+                    psk);
+              }
 
               if constexpr (transpose) {
                 Btile.template load<T, BK_padded, 1>(

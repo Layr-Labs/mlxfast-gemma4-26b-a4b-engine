@@ -19,10 +19,12 @@
 // The tight grids submit the 52,800 groups that already did all useful work.
 //
 // `DARKBLOOM_CBV2_DENSE_MLP_QMV=0` restores the stock QuantizedLinear path in
-// the same executable. `DARKBLOOM_CBV2_DENSE_MLP_XSUM=0` keeps the tight grid
-// but disables the activation-sum table. Every non-production dtype, mode,
-// shape or quantization geometry fails closed to the prior path. Selected
-// arrays are normalized to row-contiguous layout by `MLXFast.metalKernel`.
+// the same executable. The activation-sum table is default-off because its
+// extra dispatch and float-table traffic cost more than recomputing the four-
+// value sums on the promoted decode graph; `DARKBLOOM_CBV2_DENSE_MLP_XSUM=1`
+// retains it as an attribution switch. Every non-production dtype, mode, shape
+// or quantization geometry fails closed to the prior path. Selected arrays are
+// normalized to row-contiguous layout by `MLXFast.metalKernel`.
 
 import Foundation
 import MLX
@@ -39,7 +41,7 @@ public enum CBv2DenseMLPQMVV1 {
     public static let activationSumsEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_DENSE_MLP_XSUM"]
-        else { return true }
+        else { return false }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 

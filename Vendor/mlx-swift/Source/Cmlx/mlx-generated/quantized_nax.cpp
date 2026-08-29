@@ -496,9 +496,9 @@ qouter(const thread uint8_t* w, U x, U scale, U bias, thread U* result) {
   }
 }
 
-template <typename U, int N, int bits>
+template <typename U, int N, int bits, typename DstU>
 inline void
-dequantize(const device uint8_t* w, U scale, U bias, threadgroup U* w_local) {
+dequantize(const device uint8_t* w, U scale, U bias, DstU w_local) {
   static_assert(
       bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
           bits == 8,
@@ -684,6 +684,79 @@ struct QuantizedBlockLoader {
     }
   }
 
+  // -- Software-pipeline producer helpers (double-buffered staging) -------
+  // Stage 1 (prefetch_*): read and dequantize a tile into per-thread
+  // registers. Touches only device memory and thread-local storage, so it
+  // runs overlapped with the consumer (MMA) phase without any barrier. The
+  // dequantize expressions and their per-element order match load_unsafe /
+  // load_safe exactly, so the staged values are bit-identical.
+  MLX_MTL_CONST short kRegsPerThread = n_reads * pack_factor;
+
+  thread T regs[kRegsPerThread];
+
+  void prefetch_unsafe() {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+
+    T scale = *scales;
+    T bias = *biases;
+    for (int i = 0; i < n_reads; i++) {
+      dequantize<T, pack_factor, bits>(
+          src + i * bytes_per_pack, scale, bias, regs + i * pack_factor);
+    }
+  }
+
+  void prefetch_safe(short2 src_tile_dim) {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+
+    if (reduction_dim == 1 && bi >= src_tile_dim.x) {
+      for (int i = 0; i < n_reads * pack_factor; i++) {
+        regs[i] = T(0);
+      }
+      return;
+    }
+
+    if (reduction_dim == 0 && bi >= src_tile_dim.y) {
+      for (int i = 0; i < n_reads * pack_factor; i++) {
+        regs[i] = T(0);
+      }
+      return;
+    }
+
+    T scale = *scales;
+    T bias = *biases;
+    for (int i = 0; i < n_reads; i++) {
+      dequantize<T, pack_factor, bits>(
+          src + i * bytes_per_pack, scale, bias, regs + i * pack_factor);
+    }
+  }
+
+  // Stage 2 (store_regs): copy the staged tile from registers into the
+  // threadgroup staging buffer. Must run strictly between two
+  // threadgroup_barriers -- the frontier single-buffer kernel's store
+  // placement: after every consumer has finished its MMA reads of the
+  // target buffer (two iterations earlier) and before any consumer starts
+  // reading the freshly staged values. Writes exactly the cells
+  // load_unsafe / load_safe would write, with identical values.
+  void store_regs() {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+    for (int i = 0; i < n_reads * pack_factor; i++) {
+      dst[i] = regs[i];
+    }
+  }
+
+  // Retarget the threadgroup destination by delta elements. Used by the
+  // software-pipelined kernels to alternate the staging buffer between
+  // tiles; the device-side source walk is unaffected.
+  void shift_dst(const int delta) {
+    dst += delta;
+  }
+
   void next() {
     src += tile_stride;
     if (reduction_dim == 1) {
@@ -822,6 +895,82 @@ struct QuantizedBlockLoader<
           bias,
           dst + i * pack_factor);
     }
+  }
+
+  // -- Software-pipeline producer helpers (double-buffered staging) -------
+  // Stage 1 (prefetch_*): read and dequantize a tile into per-thread
+  // registers. Touches only device memory and thread-local storage, so it
+  // runs overlapped with the consumer (MMA) phase without any barrier. The
+  // dequantize expressions and their per-element order match load_unsafe /
+  // load_safe exactly, so the staged values are bit-identical.
+  MLX_MTL_CONST short kRegsPerThread = n_reads * pack_factor;
+
+  thread T regs[kRegsPerThread];
+
+  void prefetch_unsafe() {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+
+    T scale = *scales;
+    T bias = *biases;
+    for (int i = 0; i < n_reads; i++) {
+      dequantize<T, pack_factor, bits>(
+          src + i * bytes_per_pack, scale, bias, regs + i * pack_factor);
+    }
+  }
+
+  void prefetch_safe(short2 src_tile_dim) {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+
+    if (reduction_dim == 1 && bi >= src_tile_dim.x) {
+      for (int i = 0; i < n_reads * pack_factor; i++) {
+        regs[i] = T(0);
+      }
+      return;
+    }
+
+    if (reduction_dim == 0 && bi >= src_tile_dim.y) {
+      for (int i = 0; i < n_reads * pack_factor; i++) {
+        regs[i] = T(0);
+      }
+      return;
+    }
+
+    T scale = *scales;
+    T bias = *biases;
+    for (int i = 0; i < n_reads; i++) {
+      dequantize<T, pack_factor, bits>(
+          (device uint8_t*)(src + i * bytes_per_pack),
+          scale,
+          bias,
+          regs + i * pack_factor);
+    }
+  }
+
+  // Stage 2 (store_regs): copy the staged tile from registers into the
+  // threadgroup staging buffer. Must run strictly between two
+  // threadgroup_barriers -- the frontier single-buffer kernel's store
+  // placement: after every consumer has finished its MMA reads of the
+  // target buffer (two iterations earlier) and before any consumer starts
+  // reading the freshly staged values. Writes exactly the cells
+  // load_unsafe / load_safe would write, with identical values.
+  void store_regs() {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+    for (int i = 0; i < n_reads * pack_factor; i++) {
+      dst[i] = regs[i];
+    }
+  }
+
+  // Retarget the threadgroup destination by delta elements. Used by the
+  // software-pipelined kernels to alternate the staging buffer between
+  // tiles; the device-side source walk is unaffected.
+  void shift_dst(const int delta) {
+    dst += delta;
   }
 
   void next() {
@@ -1030,15 +1179,44 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
   dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
-      for (int k = 0; k < K; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+      // Software-pipelined (double-buffered) weight staging. Each weight
+      // tile is staged in two phases: (1) a per-thread device read +
+      // dequantize into registers (prefetch_*: no threadgroup traffic, so
+      // it overlaps the consumer MMA below without a barrier), then (2) a
+      // threadgroup copy (store_regs) placed strictly between two
+      // threadgroup_barriers -- exactly the frontier single-buffer
+      // kernel's store placement. Every buffer has one barrier per phase
+      // transition: writer -> reader is the barrier after the store,
+      // reader -> writer (two iterations later) is the barrier after the
+      // MMA. The MMA accumulation (Dtile/Atile/Btile sequence below) and
+      // the dequantize arithmetic are byte-for-byte the frontier kernel;
+      // only the staging destination and the schedule differ.
+      constexpr int Ws_tile = BN * BK_padded;
+
+      if (K > 0) {
         if constexpr (kAlignedN.value) {
           loader_w.load_unsafe();
         } else {
           loader_w.load_safe(short2(BK, tgp_bn));
         }
+        loader_w.next();
+        loader_w.shift_dst(Ws_tile);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+      short cur = 0;
+      for (int k = 0; k < K; k += BK) {
+        // Producer stage 1: stage tile k+1's weights into registers while
+        // the MMA below is in flight. Purely per-thread work.
+        if (k + BK < K) {
+          if constexpr (kAlignedN.value) {
+            loader_w.prefetch_unsafe();
+          } else {
+            loader_w.prefetch_safe(short2(BK, tgp_bn));
+          }
+        }
+
+        const threadgroup T* Wk = Ws + cur * Ws_tile;
 
         STEEL_PRAGMA_NO_UNROLL
         for (int kk1 = 0; kk1 < BK; kk1 += SK) {
@@ -1053,7 +1231,7 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
             Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
           }
 
-          Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+          Btile.template load<T, BK_padded, 1>(Wk + tn * BK_padded + kk1);
 
           tile_matmad_nax(
               Dtile,
@@ -1066,7 +1244,26 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
         }
 
         x += BK;
+
+        // Reader -> writer transition for buffer `1-cur`: every thread has
+        // finished the MMA reads of buffer `cur` above before any thread
+        // starts writing buffer `1-cur`.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Producer stage 2: copy the staged tile k+1 into the other
+        // threadgroup half. Strictly between two barriers.
+        if (k + BK < K) {
+          loader_w.store_regs();
+        }
+
+        // Writer -> reader transition for buffer `1-cur`: the stores of
+        // tile k+1 are visible to every thread before the next iteration's
+        // MMA reads them.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
         loader_w.next();
+        loader_w.shift_dst(cur ? Ws_tile : -Ws_tile);
+        cur ^= 1;
       }
 
       // Store results to device memory
@@ -1240,7 +1437,7 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  threadgroup T Ws[BN * BK_padded];
+  threadgroup T Ws[2 * BN * BK_padded];
 
   if (batched) {
     adjust_matrix_offsets<T>(
@@ -1365,7 +1562,7 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  threadgroup T Ws[BN * BK_padded];
+  threadgroup T Ws[2 * BN * BK_padded];
 
   adjust_matrix_offsets<T>(
       x,

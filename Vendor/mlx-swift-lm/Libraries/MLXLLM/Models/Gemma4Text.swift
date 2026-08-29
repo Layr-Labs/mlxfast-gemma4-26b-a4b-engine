@@ -9,6 +9,9 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+// Leader-control resample: executable source remains identical to 2884889.
+// RUNKEYS retry: executable kernel source is unchanged after a scoreless infrastructure failure.
+
 // MARK: - vMLX decode hot-path helpers (ported from osaurus/main Gemma4Text)
 //
 // File-private, self-contained compiled fusions. They do NOT depend on the

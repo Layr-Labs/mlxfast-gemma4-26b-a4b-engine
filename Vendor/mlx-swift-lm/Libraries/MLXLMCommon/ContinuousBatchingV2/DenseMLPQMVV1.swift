@@ -342,9 +342,6 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
             const int in_vec_size = x_shape[x_ndim - 1];
             const int out_vec_size = w_shape[0];
             const int first_m = int(tid.x) * 4;
-            if (first_m >= 8) {
-                return;
-            }
             qmv_affine8_g64_quad_stream_impl<T, 64, 8>(
                 w,
                 scales,
@@ -403,9 +400,6 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
             const int in_vec_size = x_shape[x_ndim - 1];
             const int out_vec_size = w_shape[0];
             const int first_m = int(tid.x) * 4;
-            if (first_m >= 8) {
-                return;
-            }
             qmv_affine8_g64_quad_stream_xsum_impl<T, 64, 8>(
                 w,
                 scales,
@@ -435,6 +429,26 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
             || (inDim == 2112 && outDim == 2816)
     }
 
+    /// Pins the scored decode activation to `[8, 1, K]`. A squeezed `[8, K]`
+    /// cohort is the same eight rows; anything else (including `[1, 8, K]`
+    /// prefill) stays unbound so stock QuantizedLinear keeps those geometries.
+    public static func decodeActivation(_ x: MLXArray) -> MLXArray? {
+        if x.ndim == 3,
+            x.dim(0) == batch,
+            x.dim(1) == sequence,
+            x.size == batch * sequence * x.dim(2)
+        {
+            return x
+        }
+        if x.ndim == 2,
+            x.dim(0) == batch,
+            x.size == batch * x.dim(1)
+        {
+            return x.reshaped([batch, sequence, x.dim(1)])
+        }
+        return nil
+    }
+
     /// Builds the shared gate/up table only for the exact dense decode input.
     /// Returning an opaque value prevents callers from fabricating a table with
     /// a plausible shape; all other inputs keep DMLP-001 unchanged.
@@ -442,9 +456,7 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
         guard enabled,
             activationSumsEnabled,
             x.dtype == .bfloat16,
-            x.ndim == 3,
-            x.dim(0) == batch,
-            x.dim(1) == sequence,
+            let x = decodeActivation(x),
             x.dim(2) == 2816,
             x.size == batch * sequence * 2816
         else { return nil }
@@ -481,9 +493,7 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
             scales.dtype == x.dtype,
             biases.dtype == x.dtype,
             weight.dtype == .uint32,
-            x.ndim == 3,
-            x.dim(0) == batch,
-            x.dim(1) == sequence
+            let x = decodeActivation(x)
         else { return nil }
 
         let inDim = x.dim(2)

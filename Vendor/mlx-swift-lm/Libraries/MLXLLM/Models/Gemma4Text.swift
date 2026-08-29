@@ -2060,41 +2060,44 @@ private class Gemma4MLP: Module {
         super.init()
     }
 
-    /// DMLP-001: route only the pinned batch-eight/decode-one affine-8 dense
-    /// MLP geometries through the exact quad-stream kernel's tight grid.
-    /// Everything else, including prefill and any strided input, keeps the
-    /// original layer call.
+    /// DMLP-003: bind-only. All three affine-8 dense projections take the
+    /// tight-grid QMV together, or none do. A mixed custom/stock triple would
+    /// still be numerically close but would reintroduce the empty x-groups on
+    /// whichever leg missed, so the pinned decode cell is all-or-nothing.
     @inline(__always)
     private func denseProjection(
         _ layer: Linear,
         _ x: MLXArray,
         activationSums: CBv2DenseMLPQMVV1.ActivationSums? = nil
-    ) -> MLXArray {
-        guard let quantized = layer as? QuantizedLinear,
-            quantized.bias == nil,
-            let tight = CBv2DenseMLPQMVV1.matmul(
-                x: x,
-                weight: quantized.weight,
-                scales: quantized.scales,
-                biases: quantized.biases,
-                groupSize: quantized.groupSize,
-                bits: quantized.bits,
-                mode: quantized.mode,
-                activationSums: activationSums)
-        else { return layer(x) }
-        return tight
+    ) -> MLXArray? {
+        guard let quantized = layer as? QuantizedLinear, quantized.bias == nil
+        else { return nil }
+        return CBv2DenseMLPQMVV1.matmul(
+            x: x,
+            weight: quantized.weight,
+            scales: quantized.scales,
+            biases: quantized.biases,
+            groupSize: quantized.groupSize,
+            bits: quantized.bits,
+            mode: quantized.mode,
+            activationSums: activationSums)
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        // DMLP-002: one exact activation-sum prepass feeds both fallback
-        // projections. If either projection is not the pinned affine8 cell,
-        // the candidate arrays remain unevaluated and stock takes over.
-        let activationSums = CBv2DenseMLPQMVV1.activationSums(for: x)
-        return denseProjection(
-            downProj,
-            gemma4SafeGeluProduct(
-                denseProjection(gateProj, x, activationSums: activationSums),
-                denseProjection(upProj, x, activationSums: activationSums)))
+        // Rank-fold `[8, K] → [8, 1, K]` so a squeezed cohort still binds.
+        // One xsum table feeds gate and up; down is K=2112 and stays on the
+        // DMLP-001 body. Any miss (prefill, wrong dtype, non-quantized) keeps
+        // the original QuantizedLinear triple on the caller's activation.
+        let activation = CBv2DenseMLPQMVV1.decodeActivation(x) ?? x
+        let activationSums = CBv2DenseMLPQMVV1.activationSums(for: activation)
+        if let gate = denseProjection(gateProj, activation, activationSums: activationSums),
+            let up = denseProjection(upProj, activation, activationSums: activationSums),
+            let down = denseProjection(
+                downProj, gemma4SafeGeluProduct(gate, up))
+        {
+            return down.shape == x.shape ? down : down.reshaped(x.shape)
+        }
+        return downProj(gemma4SafeGeluProduct(gateProj(x), upProj(x)))
     }
 }
 

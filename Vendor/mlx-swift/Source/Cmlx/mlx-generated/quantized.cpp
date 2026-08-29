@@ -3648,7 +3648,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int gemma4_down_tile_span = 4; // sweep alternate: 2
+  constexpr int gemma4_down_tile_span = 2; // KERN-DOWN-TILE-SPAN2 RESTACKED on 8658814 (xadenryan 1.8797): span sweep box-priced complete {8: −7.11%, 4: incumbent, 2: PROMOTED +0.18% (our 5f12e46e), 1: −2.93%} — span 2 is the priced peak; this tip reverted to 4 (synced pre-promotion), restacking the proven peak as an orthogonal additive mechanism
   if (tid.y % uint(gemma4_down_tile_span) != 0u) {
     return;
   }

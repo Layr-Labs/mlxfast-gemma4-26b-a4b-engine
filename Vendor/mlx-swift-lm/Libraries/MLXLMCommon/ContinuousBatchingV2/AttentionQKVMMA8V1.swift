@@ -198,7 +198,13 @@ METAL_FUNC void qkv_mma8_affine4_g64_impl(
     @inline(__always)
     private static func liveOutputWidth(_ width: Int) -> Bool {
         width == 1024 || width == 2048 || width == 4096 || width == 8192
+            || width == tiedVocabularyWidth
     }
+
+    /// The tied lm_head output width. Its `[8, 1, 2816]` decode rectangle is
+    /// the same one the projection planes use, and the MLX-side mma8 tier
+    /// already claims it on the stock road, so the tight grid applies verbatim.
+    static let tiedVocabularyWidth = 262144
 
     public static func matmul(
         x: MLXArray,

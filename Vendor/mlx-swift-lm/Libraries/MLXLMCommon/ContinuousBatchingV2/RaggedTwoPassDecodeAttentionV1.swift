@@ -134,6 +134,8 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         source: """
             constexpr int simd_width = 32;
             constexpr int values_per_lane = D / simd_width;
+            static_assert((N & (N - 1)) == 0, "ring length must be a power of two");
+            constexpr int ring_mask = N - 1;
 
             const int kv_head = int(threadgroup_position_in_grid.x);
             const int batch_index = int(threadgroup_position_in_grid.y);
@@ -161,7 +163,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 queries + batch_head * D + lane * values_per_lane;
             keys += kv_head * N * D + lane * values_per_lane;
             values += kv_head * N * D + lane * values_per_lane;
-            int slot = int((start + block) % N);
+            int slot = int((start + uint(block)) & uint(ring_mask));
             device T* partial = partials
                 + batch_head * BLOCKS * D + block * D + lane * values_per_lane;
             device float* sum_out = sums + batch_head * BLOCKS + block;
@@ -195,8 +197,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         + score_factor * float(v[element]);
                 }
 
-                slot += BLOCKS;
-                if (slot >= N) slot -= N;
+                slot = (slot + BLOCKS) & ring_mask;
             }
 
             if (lane == 0) {
@@ -240,6 +241,8 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         source: """
             constexpr int simd_width = 32;
             constexpr int values_per_lane = D / simd_width;
+            static_assert((N & (N - 1)) == 0, "ring length must be a power of two");
+            constexpr uint ring_mask = uint(N - 1);
 
             const int kv_head = int(threadgroup_position_in_grid.x);
             const int batch_index = int(threadgroup_position_in_grid.y);
@@ -271,7 +274,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             const device T* new_value = new_values
                 + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
             const uint ring_start = starts[batch_index];
-            const uint write_slot = (ring_start + uint(N - 1)) % uint(N);
+            const uint write_slot = (ring_start + ring_mask) & ring_mask;
             if (block == 0 && query_head_in_group == 0) {
                 device T* write_key = const_cast<device T*>(keys) + write_slot * D;
                 device T* write_value = const_cast<device T*>(values) + write_slot * D;
@@ -297,7 +300,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 accumulator[element] = 0.0f;
             }
 
-            uint slot = (ring_start + uint(block)) % uint(N);
+            uint slot = (ring_start + uint(block)) & ring_mask;
             float max_score = -3.402823466e+38F;
             float sum_exp_score = 0.0f;
             for (int token = block; token < N; token += BLOCKS) {
@@ -320,10 +323,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         + score_factor * float(v[element]);
                 }
 
-                slot += BLOCKS;
-                if (slot >= uint(N)) {
-                    slot -= uint(N);
-                }
+                slot = (slot + uint(BLOCKS)) & ring_mask;
             }
 
             if (lane == 0) {

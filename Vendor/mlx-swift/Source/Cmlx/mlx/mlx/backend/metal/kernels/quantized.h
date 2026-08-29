@@ -1418,51 +1418,23 @@ METAL_FUNC void qmv_impl(
       biases += block_size / group_size;
       x += block_size;
     }
-    const int tail_values = static_cast<int>(in_vec_size - k);
-    if (tail_values > 0) {
-      // Affine callers keep K a whole number of quantization groups and k
-      // advances by whole blocks, so the tail is a whole number of
-      // values_per_thread lane packets: routed-expert down_proj K=704 leaves
-      // 192 values = 24 complete packets, dense down_proj K=2112 (8-bit)
-      // leaves 64 = 16.  Active lanes run the fixed unrolled loader and qdot;
-      // the dynamic safe-tail remains only for a genuinely partial packet,
-      // which no affine caller presents.
-      if (tail_values % values_per_thread == 0) {
-        const uint active_tail_lanes = uint(tail_values / values_per_thread);
-        if (simd_lid < active_tail_lanes) {
-          U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+    const int remaining = clamp(
+        static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
+        0,
+        values_per_thread);
+    if (remaining > 0) {
+      U sum = load_vector_safe<T, U, values_per_thread, bits>(
+          x, x_thread, remaining);
 
-          for (int row = 0; row < results_per_simdgroup; row++) {
-            auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-            const device T* sl = scales + row * in_vec_size_g;
-            const device T* bl = biases + row * in_vec_size_g;
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+        const device T* sl = scales + row * in_vec_size_g;
+        const device T* bl = biases + row * in_vec_size_g;
 
-            U s = sl[0];
-            U b = bl[0];
-            result[row] +=
-                qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
-          }
-        }
-      } else {
-        const int remaining = clamp(
-            static_cast<int>(tail_values - simd_lid * values_per_thread),
-            0,
-            values_per_thread);
-        if (remaining > 0) {
-          U sum = load_vector_safe<T, U, values_per_thread, bits>(
-              x, x_thread, remaining);
-
-          for (int row = 0; row < results_per_simdgroup; row++) {
-            auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-            const device T* sl = scales + row * in_vec_size_g;
-            const device T* bl = biases + row * in_vec_size_g;
-
-            U s = sl[0];
-            U b = bl[0];
-            result[row] += qdot_safe<U, values_per_thread, bits>(
-                wl, x_thread, s, b, sum, remaining);
-          }
-        }
+        U s = sl[0];
+        U b = bl[0];
+        result[row] += qdot_safe<U, values_per_thread, bits>(
+            wl, x_thread, s, b, sum, remaining);
       }
     }
     for (int row = 0; row < results_per_simdgroup; row++) {
@@ -2941,7 +2913,7 @@ template <typename T, const int group_size, const int bits, bool batched>
     // returns individual planes the same way. (MSL forbids a program-scope
     // `constexpr`, so the two switches live at the top of the tier they guard.)
     constexpr bool kGemma4QmvMma8Affine4 = true;
-    constexpr int kGemma4QmvMma8Affine4FloorN = 1024;
+    constexpr int kGemma4QmvMma8Affine4FloorN = 64;
     if (kGemma4QmvMma8Affine4 && sizeof(T) == 2 && ntg.z == 1 &&
         in_vec_size % 64 == 0 &&
         out_vec_size >= kGemma4QmvMma8Affine4FloorN && out_vec_size % 8 == 0) {
@@ -3679,20 +3651,6 @@ template <typename T, int group_size, int bits>
           simd_lid);
       return;
     }
-
-    // Singleton experts and odd-run tails still need one ordinary QMV, but
-    // their one-dimensional offsets are already resolved by this guard.
-    const uint32_t single_lhs =
-        lhs_indices[assignment * (uint)lhs_strides[0]];
-    const device T* single_x = x + single_lhs * x_strides[0];
-    const device uint32_t* single_w = w + expert * w_strides[0];
-    const device T* single_scales = scales + expert * s_strides[0];
-    const device T* single_biases = biases + expert * b_strides[0];
-    device T* single_y = y + assignment * (uint)out_vec_size;
-    qmv_impl<T, group_size, bits>(
-        single_w, single_scales, single_biases, single_x, single_y,
-        in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
-    return;
   }
   adjust_matrix_offsets<T>(
       x,

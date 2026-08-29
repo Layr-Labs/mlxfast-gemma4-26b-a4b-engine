@@ -371,19 +371,6 @@ enum CBv2AttentionV1 {
                 return concatenated(outputs, axis: 0)
             }
 
-            // D512-SDPA: batched 3-dispatch full-attention decode with the
-            // unfused chain's exact numerics (kill switch:
-            // DARKBLOOM_GEMMA4_D512_DECODE_SDPA=0). Precedes ATT-008 so rows
-            // stay unpooled; pooled rows fail its gate closed.
-            if let output = CBv2RaggedComposedD512DecodeAttentionV1.updateAndAttend(
-                rows: rows, kind: kind,
-                queries: queries, keys: keys, values: values,
-                scale: scale, sinks: effectiveSinks, softcap: softcap)
-            {
-                CBv2EngageMark.once("d512sdpa")
-                return output
-            }
-
             // ATT-008: batch-wide FULL-attention decode. One pooled append +
             // one batched call replaces 8 per-row appends + 8 row-local
             // composed SDPA graphs, with bit-identical per-row numerics (see

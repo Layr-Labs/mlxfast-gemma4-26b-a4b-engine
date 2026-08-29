@@ -1653,25 +1653,86 @@ private enum Gemma4FusedLayerGlue {
         \(rmsReduce("b", into: "local_inv[1]"))
             const float inv1 = local_inv[0];
             const float inv2 = local_inv[1];
-            T sv[4];
+            // Stage the branch sum through `out` rather than a per-thread
+            // array: each thread reads back only the four elements it wrote,
+            // so the third reduction needs no barrier and no register array.
             for (int i = 0; i < 4; i++) {
                 const T h1 = w1[wbase + i] * static_cast<T>((float)a[base + i] * inv1);
                 const T h2 = w2[wbase + i] * static_cast<T>((float)b[base + i] * inv2);
-                sv[i] = h1 + h2;
+                out[base + i] = h1 + h2;
             }
-        \(rmsReduce("sv", into: "local_inv[0]").replacingOccurrences(
-            of: "(float)sv[base + i]", with: "(float)sv[i]"))
+        \(rmsReduce("out", into: "local_inv[0]"))
             const float inv3 = local_inv[0];
             for (int i = 0; i < 4; i++) {
                 // Same double rounding as the stock norm-then-add pair.
                 const T normed = static_cast<T>(
-                    w3[wbase + i] * static_cast<T>((float)sv[i] * inv3));
+                    w3[wbase + i] * static_cast<T>((float)out[base + i] * inv3));
                 out[base + i] = res[base + i] + normed;
             }
         """,
         ensureRowContiguous: true
     )
 
+
+    /// GLUE-004: normResidual's output is consumed immediately by dualPreNorm,
+    /// which re-reads the whole [8,1,2816] row set to run a second reduction.
+    /// The residual sum is already in registers here, so the second reduction
+    /// runs on it in place and the pre-norm pair is emitted from the same
+    /// dispatch. Same double rounding as the two-kernel chain.
+    private static let normResidualDualPreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_glue_norm_residual_dual_prenorm_2816_bf16_v1",
+        inputNames: ["x", "res", "w", "w1", "w2"],
+        outputNames: ["out", "out1", "out2"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float local_inv[2];
+            threadgroup float local_sums[32];
+            const uint base = row * 2816 + lid * 4;
+            const uint wbase = lid * 4;
+        \(rmsReduce("x", into: "local_inv[0]"))
+            const float inv = local_inv[0];
+            // Each thread reads back only the four elements it just wrote, so
+            // the second reduction needs no barrier and no register array: the
+            // load forwards from this thread's own store.
+            for (int i = 0; i < 4; i++) {
+                const T normed = static_cast<T>(
+                    w[wbase + i] * static_cast<T>((float)x[base + i] * inv));
+                out[base + i] = res[base + i] + normed;
+            }
+        \(rmsReduce("out", into: "local_inv[1]"))
+            const float inv2 = local_inv[1];
+            for (int i = 0; i < 4; i++) {
+                const T nx = static_cast<T>((float)out[base + i] * inv2);
+                out1[base + i] = w1[wbase + i] * nx;
+                out2[base + i] = w2[wbase + i] * nx;
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    static func normResidualDualPreNorm(
+        x: MLXArray, residual: MLXArray, w: MLXArray,
+        w1: MLXArray, w2: MLXArray, eps: Float
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard admits(x, weight: w, eps: eps),
+            residual.shape == x.shape, residual.dtype == .bfloat16,
+            w1.ndim == 1, w1.dim(0) == axis, w1.dtype == .bfloat16,
+            w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16
+        else { return nil }
+        CBv2EngageMark.once("glue-norm-residual-dual-prenorm")
+        let outs = normResidualDualPreNormKernel(
+            [x, residual, w, w1, w2],
+            template: [("T", x.dtype)],
+            grid: (rows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: [[rows, 1, axis], [rows, 1, axis], [rows, 1, axis]],
+            outputDTypes: [.bfloat16, .bfloat16, .bfloat16]
+        )
+        return (outs[0], outs[1], outs[2])
+    }
     private static func admits(_ x: MLXArray, weight: MLXArray, eps: Float) -> Bool {
         enabled
             && eps == Self.eps
@@ -2011,7 +2072,19 @@ public class Gemma4DecoderLayer: Module {
             v2SharedSource: v2SharedSource, outputStart: outputStart,
             useLastQueryPrefill: useLastQueryPrefill)
         var out: MLXArray
-        if let fusedOut = Gemma4FusedLayerGlue.normResidual(
+        // GLUE-004: when the MoE pre-norm pair consumes this residual sum next,
+        // both pre-norms are emitted from the same dispatch that produces it.
+        var gluePreNormed: (MLXArray, MLXArray)? = nil
+        if isMoE, let pff2 = preFeedforwardLayernorm2,
+            let triple = Gemma4FusedLayerGlue.normResidualDualPreNorm(
+                x: attnOut, residual: residual,
+                w: postAttentionLayernorm.weight,
+                w1: preFeedforwardLayernorm.weight, w2: pff2.weight,
+                eps: config.rmsNormEps)
+        {
+            out = triple.0
+            gluePreNormed = (triple.1, triple.2)
+        } else if let fusedOut = Gemma4FusedLayerGlue.normResidual(
             x: attnOut, residual: residual,
             weight: postAttentionLayernorm.weight, eps: config.rmsNormEps)
         {
@@ -2039,7 +2112,7 @@ public class Gemma4DecoderLayer: Module {
 
             let h1Raw: MLXArray
             let h2Raw: MLXArray
-            if let (n1, n2) = Gemma4FusedLayerGlue.dualPreNorm(
+            if let (n1, n2) = gluePreNormed ?? Gemma4FusedLayerGlue.dualPreNorm(
                 x: out,
                 w1: preFeedforwardLayernorm.weight,
                 w2: preFeedforwardLayernorm2.weight,

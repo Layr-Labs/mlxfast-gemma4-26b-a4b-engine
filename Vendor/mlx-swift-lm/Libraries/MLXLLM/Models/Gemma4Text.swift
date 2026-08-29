@@ -26,6 +26,48 @@ private let gemma4CompiledDecodeSupported: Bool = {
     return true
 }()
 
+// MARK: - CBv2 B=8 decode graph-submission ladder
+
+/// Earlier graph submission is ON by default for the one scored decode
+/// geometry below. `DARKBLOOM_GEMMA4_DECODE_ASYNC_EVAL_LADDER=0` (also
+/// `false`/`no`/`off`) is the attribution and emergency kill switch.
+@inline(__always)
+internal func resolveGemma4DecodeAsyncEvalLadderEnabled(_ raw: String?) -> Bool {
+    guard let raw else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}
+
+private let gemma4DecodeAsyncEvalLadderEnabled =
+    resolveGemma4DecodeAsyncEvalLadderEnabled(
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_DECODE_ASYNC_EVAL_LADDER"])
+
+/// Pure, fail-closed policy for the Gemma 4 decode submission ladder.
+///
+/// Layer indices name boundaries AFTER a complete decoder layer. In
+/// particular, the MoE layer has already recombined its dense and sparse
+/// branches before a selected boundary is submitted, so both branches retain
+/// their natural concurrency inside the same graph frontier.
+@inline(__always)
+internal func gemma4ShouldSubmitDecodeAsyncEvalLadder(
+    enabled: Bool,
+    schedulePrefill: Bool,
+    isCBv2: Bool,
+    batchSize: Int,
+    inputLength: Int,
+    layerIndex: Int
+) -> Bool {
+    guard enabled, isCBv2, !schedulePrefill, batchSize == 8, inputLength == 1
+    else { return false }
+
+    switch layerIndex {
+    case 0, 1, 5, 11, 17, 23, 27:
+        return true
+    default:
+        return false
+    }
+}
+
 // MARK: - CBv2 prompt-path knobs (prefill only; decode never reads these)
 
 @inline(__always)
@@ -710,7 +752,7 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
         device T* output = q_out;
         uint local_row = row;
         bool weighted = true;
-        if (row >= Q_ROWS + K_ROWS) {
+        if (!KEY_VALUE_SHARED && row >= Q_ROWS + K_ROWS) {
             input = v;
             output = v_out;
             local_row = row - Q_ROWS - K_ROWS;
@@ -725,6 +767,13 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
         input += local_row * D + lid * reads;
         output += local_row * D + lid * reads;
         weight += lid * reads;
+        // Keep the pointer inside the V allocation for Q rows even though
+        // those rows never dereference it. K rows advance to their matching
+        // V row only in the compile-time shared-input variant.
+        device T* shared_value_output = v_out;
+        if (KEY_VALUE_SHARED && row >= Q_ROWS) {
+            shared_value_output += local_row * D + lid * reads;
+        }
 
         float sum = 0.0f;
         for (uint i = 0; i < reads; ++i) {
@@ -750,6 +799,14 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
         for (uint i = 0; i < reads; ++i) {
             const T normalized = T(float(input[i]) * inverse_rms);
             output[i] = weighted ? weight[i] * normalized : T(1) * normalized;
+            // Gemma's full-attention K-eq-V layers feed the same raw key
+            // projection to K RMSNorm and V RMSNormNoScale. The reduction
+            // above is therefore identical for both outputs; keep each
+            // output's established final expression, but write V while the
+            // exact normalizer and input value are live.
+            if (KEY_VALUE_SHARED && row >= Q_ROWS) {
+                shared_value_output[i] = T(1) * normalized;
+            }
         }
     """,
     ensureRowContiguous: true
@@ -761,7 +818,8 @@ private func gemma4FusedQKVNorm(
     v: MLXArray,
     qWeight: MLXArray,
     kWeight: MLXArray,
-    eps: Float
+    eps: Float,
+    keyValueShared: Bool
 ) -> (MLXArray, MLXArray, MLXArray)? {
     guard eps == 1.0e-6,
         q.dtype == .bfloat16, k.dtype == .bfloat16, v.dtype == .bfloat16,
@@ -771,22 +829,228 @@ private func gemma4FusedQKVNorm(
         k.dim(0) == 8, k.dim(1) == 1, v.shape == k.shape,
         q.dim(3) == k.dim(3),
         (q.dim(3) == 256 && k.dim(2) == 8) || (q.dim(3) == 512 && k.dim(2) == 2),
-        qWeight.shape == [q.dim(3)], kWeight.shape == [q.dim(3)]
+        qWeight.shape == [q.dim(3)], kWeight.shape == [q.dim(3)],
+        !keyValueShared || v.shape == k.shape
     else { return nil }
 
     let dimension = q.dim(3)
     let qRows = 8 * 16
     let kRows = 8 * k.dim(2)
     let threads = dimension / 4
+    // In the exact K-eq-V case V reads kRaw, so one row reduction produces
+    // both the weighted K and no-scale V outputs. Keep the ordinary three
+    // banks for every non-shared projection and for all guard failures.
+    let normRows = qRows + kRows + (keyValueShared ? 0 : kRows)
     let outputs = gemma4QKVNormKernel(
         [q, k, v, qWeight, kWeight],
-        template: [("T", q.dtype), ("D", dimension), ("Q_ROWS", qRows), ("K_ROWS", kRows)],
-        grid: ((qRows + 2 * kRows) * threads, 1, 1),
+        template: [
+            ("T", q.dtype), ("D", dimension), ("Q_ROWS", qRows), ("K_ROWS", kRows),
+            ("KEY_VALUE_SHARED", keyValueShared),
+        ],
+        grid: (normRows * threads, 1, 1),
         threadGroup: (threads, 1, 1),
         outputShapes: [q.shape, k.shape, v.shape],
         outputDTypes: [q.dtype, k.dtype, v.dtype]
     )
     return (outputs[0], outputs[1], outputs[2])
+}
+
+/// Prefill Q/K preparation. One threadgroup owns one `(token, head)` row:
+/// D/4 threads preserve the incumbent RMS reduction tree, then write final
+/// `[B,H,L,D]` Q/K with stock nontraditional RoPE. Decode is disjoint
+/// (`L >= 2` here, exact B8/L1 above).
+private let gemma4PrefillQKNormLayoutRoPEKernel = MLXFast.metalKernel(
+    name: "gemma4_prefill_qk_rms_layout_rope_h1_v2",
+    inputNames: ["q", "k", "q_weight", "k_weight", "offsets", "rope_operand"],
+    outputNames: ["q_out", "k_out"],
+    source: """
+        constexpr uint reads = 4;
+        constexpr uint dimension = D;
+        constexpr uint half_dimension = D / 2;
+        constexpr uint query_heads = Q_HEADS;
+        constexpr uint key_heads = K_HEADS;
+
+        const uint combined_heads = query_heads + key_heads;
+        const uint batch_head = threadgroup_position_in_grid.x;
+        const uint batch = batch_head / combined_heads;
+        const uint combined_head = batch_head % combined_heads;
+        const uint token = threadgroup_position_in_grid.y;
+        const uint length = threadgroups_per_grid.y;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint simd_group = simdgroup_index_in_threadgroup;
+        const bool is_query = combined_head < query_heads;
+        const uint head = is_query ? combined_head : combined_head - query_heads;
+        const uint heads = is_query ? query_heads : key_heads;
+
+        const device T* input = is_query ? q : k;
+        const device T* weight = is_query ? q_weight : k_weight;
+        device T* output = is_query ? q_out : k_out;
+        input += ((batch * length + token) * heads + head) * dimension;
+        output += ((batch * heads + head) * length + token) * dimension;
+
+        float sum = 0.0f;
+        for (uint i = 0; i < reads; ++i) {
+            const float value = float(input[lid * reads + i]);
+            sum += value * value;
+        }
+        sum = simd_sum(sum);
+
+        threadgroup float partials[32];
+        threadgroup float inverse_rms;
+        if (simd_group == 0) partials[lane] = 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) partials[simd_group] = sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            sum = simd_sum(partials[lane]);
+            if (lane == 0) {
+                inverse_rms = metal::precise::rsqrt(
+                    sum / float(dimension) + 1.0e-6f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup bfloat normalized[dimension];
+        for (uint i = 0; i < reads; ++i) {
+            const uint element = lid * reads + i;
+            const T rms_value = T(float(input[element]) * inverse_rms);
+            normalized[element] = T(weight[element] * rms_value);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // The leading D/8 threads own all D/2 rotary pairs (one SIMDgroup at
+        // sliding D=256; two at full D=512). Every pair's arithmetic and BF16
+        // stores match `rope.metal` exactly.
+        if (lid < half_dimension / reads) {
+            const float position = float(int(token) + offsets[batch]);
+            for (uint i = 0; i < reads; ++i) {
+                const uint pair = lid * reads + i;
+                const float exponent = float(pair) / float(half_dimension);
+                const float inverse_frequency = USE_FREQS != 0
+                    ? 1.0f / rope_operand[pair]
+                    : metal::exp2(-exponent * rope_operand[0]);
+                const float theta = position * inverse_frequency;
+                const float cosine = metal::fast::cos(theta);
+                const float sine = metal::fast::sin(theta);
+                const float x1 = float(normalized[pair]);
+                const float x2 = float(normalized[pair + half_dimension]);
+                output[pair] = T(x1 * cosine - x2 * sine);
+                output[pair + half_dimension] = T(x1 * sine + x2 * cosine);
+            }
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+private func gemma4PrefillSlidingQKNormLayoutRoPE(
+    q: MLXArray,
+    k: MLXArray,
+    qWeight: MLXArray,
+    kWeight: MLXArray,
+    offsets: MLXArray,
+    ropeOperand: MLXArray,
+    eps: Float
+) -> (queries: MLXArray, keys: MLXArray)? {
+    guard gemma4PrefillSlidingQKNormLayoutRoPEEnabled,
+        eps == 1.0e-6,
+        q.dtype == .bfloat16, k.dtype == .bfloat16,
+        qWeight.dtype == .bfloat16, kWeight.dtype == .bfloat16,
+        offsets.dtype == .int32, ropeOperand.dtype == .float32,
+        q.ndim == 4, k.ndim == 4,
+        q.dim(0) == 8, k.dim(0) == 8,
+        q.dim(1) == k.dim(1), q.dim(1) >= 2, q.dim(1) <= 1_024,
+        q.dim(2) == 16, k.dim(2) == 8,
+        q.dim(3) == 256, k.dim(3) == 256,
+        qWeight.shape == [256], kWeight.shape == [256],
+        offsets.shape == [q.dim(0)], ropeOperand.shape == [128]
+    else { return nil }
+
+    CBv2EngageMark.once("gemma4-prefill-sliding-qk-norm-layout-rope")
+    let batch = q.dim(0)
+    let length = q.dim(1)
+    let heads = 16 + 8
+    let threads = 64
+    let outputs = gemma4PrefillQKNormLayoutRoPEKernel(
+        [q, k, qWeight, kWeight, offsets, ropeOperand],
+        template: [
+            ("T", q.dtype), ("D", 256),
+            ("Q_HEADS", 16), ("K_HEADS", 8), ("USE_FREQS", 0),
+        ],
+        grid: (batch * heads * threads, length, 1),
+        threadGroup: (threads, 1, 1),
+        outputShapes: [
+            [batch, 16, length, 256],
+            [batch, 8, length, 256],
+        ],
+        outputDTypes: [q.dtype, k.dtype]
+    )
+    return (outputs[0], outputs[1])
+}
+
+private let gemma4PrefillSlidingQKNormLayoutRoPEEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_PREFILL_SLIDING_QK_NORM_ROPE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+private func gemma4PrefillFullQKNormLayoutRoPE(
+    q: MLXArray,
+    k: MLXArray,
+    qWeight: MLXArray,
+    kWeight: MLXArray,
+    offsets: MLXArray,
+    ropeOperand: MLXArray,
+    eps: Float
+) -> (queries: MLXArray, keys: MLXArray)? {
+    guard gemma4PrefillFullQKNormLayoutRoPEEnabled,
+        eps == 1.0e-6,
+        q.dtype == .bfloat16, k.dtype == .bfloat16,
+        qWeight.dtype == .bfloat16, kWeight.dtype == .bfloat16,
+        offsets.dtype == .int32, ropeOperand.dtype == .float32,
+        q.ndim == 4, k.ndim == 4,
+        q.dim(0) == 8, k.dim(0) == 8,
+        q.dim(1) == k.dim(1), q.dim(1) >= 2, q.dim(1) <= 1_024,
+        q.dim(2) == 16, k.dim(2) == 2,
+        q.dim(3) == 512, k.dim(3) == 512,
+        qWeight.shape == [512], kWeight.shape == [512],
+        offsets.shape == [q.dim(0)], ropeOperand.shape == [256]
+    else { return nil }
+
+    CBv2EngageMark.once("gemma4-prefill-full-qk-norm-layout-rope")
+    let batch = q.dim(0)
+    let length = q.dim(1)
+    let heads = 16 + 2
+    let threads = 128
+    let outputs = gemma4PrefillQKNormLayoutRoPEKernel(
+        [q, k, qWeight, kWeight, offsets, ropeOperand],
+        template: [
+            ("T", q.dtype), ("D", 512),
+            ("Q_HEADS", 16), ("K_HEADS", 2), ("USE_FREQS", 1),
+        ],
+        grid: (batch * heads * threads, length, 1),
+        threadGroup: (threads, 1, 1),
+        outputShapes: [
+            [batch, 16, length, 512],
+            [batch, 2, length, 512],
+        ],
+        outputDTypes: [q.dtype, k.dtype]
+    )
+    return (outputs[0], outputs[1])
+}
+
+private let gemma4PrefillFullQKNormLayoutRoPEEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_PREFILL_FULL_QK_NORM_ROPE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// Prefill-only RoPE operand storage. The wrapper keeps derived arrays out of
+/// `Module` parameter reflection without enabling or touching a decode path.
+private struct Gemma4PrefillRoPEConfiguration {
+    let operand: MLXArray
 }
 
 private class ScaledLinear: Module {
@@ -926,6 +1190,7 @@ private class Gemma4Attention: Module {
     let useKeqV: Bool
     let usesSharedKV: Bool
     let scale: Float
+    let prefillRoPEConfiguration: Gemma4PrefillRoPEConfiguration
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
     @ModuleInfo(key: "k_proj") var kProj: Linear?
@@ -969,6 +1234,34 @@ private class Gemma4Attention: Module {
 
         self.scale = 1.0
 
+        // Derive only the operand the prefill Q/K kernel consumes. Keeping it
+        // in a prefill-specific wrapper leaves PR428's decode norm, transpose
+        // and RoPE graph unchanged.
+        if isSliding {
+            self.prefillRoPEConfiguration = Gemma4PrefillRoPEConfiguration(
+                operand: MLXArray(
+                    Array(
+                        repeating: log2(config.slidingRopeTheta),
+                        count: effectiveHeadDim / 2)))
+        } else {
+            let rotatedDims =
+                Int(config.fullPartialRotaryFactor * Float(effectiveHeadDim) / 2) * 2
+            let exponents =
+                MLXArray(stride(from: 0, to: rotatedDims, by: 2)).asType(.float32)
+                / Float(effectiveHeadDim)
+            let realFreqs = MLX.pow(config.fullRopeTheta, exponents)
+            let padCount = (effectiveHeadDim - rotatedDims) / 2
+            if padCount > 0 {
+                let padding = MLXArray(
+                    Array(repeating: Float.infinity, count: padCount))
+                self.prefillRoPEConfiguration = Gemma4PrefillRoPEConfiguration(
+                    operand: concatenated([realFreqs, padding], axis: -1))
+            } else {
+                self.prefillRoPEConfiguration = Gemma4PrefillRoPEConfiguration(
+                    operand: realFreqs)
+            }
+        }
+
         self._qProj.wrappedValue = Linear(dim, nHeads * effectiveHeadDim, bias: false)
         if !usesSharedKV {
             self._kProj.wrappedValue = Linear(dim, nKvHeads * effectiveHeadDim, bias: false)
@@ -998,6 +1291,48 @@ private class Gemma4Attention: Module {
         }
 
         super.init()
+    }
+
+    /// Route only exact production CBv2 Q/K projections through the shared
+    /// activation-sum QMV. The ordinary layer call remains the fail-closed
+    /// path for prefill, assistants, representation drift, and V/O matrices.
+    @inline(__always)
+    private func qkProjection(
+        _ layer: Linear,
+        _ x: MLXArray,
+        activationSums: CBv2AttentionQKQMVV1.ActivationSums?
+    ) -> MLXArray {
+        guard let quantized = layer as? QuantizedLinear,
+            quantized.bias == nil,
+            let projected = CBv2AttentionQKQMVV1.matmul(
+                x: x,
+                weight: quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                groupSize: quantized.groupSize,
+                bits: quantized.bits,
+                mode: quantized.mode,
+                activationSums: activationSums)
+        else { return layer(x) }
+        return projected
+    }
+
+    /// Exact B8/L1 attention output projection. Sliding/full K widths select
+    /// the tight affine4 fast-QMV replica; every other path keeps the layer.
+    @inline(__always)
+    private func outputProjection(_ x: MLXArray) -> MLXArray {
+        guard let quantized = oProj as? QuantizedLinear,
+            quantized.bias == nil,
+            let projected = CBv2AttentionOQMVV1.matmul(
+                x: x,
+                weight: quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                groupSize: quantized.groupSize,
+                bits: quantized.bits,
+                mode: quantized.mode)
+        else { return oProj(x) }
+        return projected
     }
 
     func callAsFunction(
@@ -1138,7 +1473,7 @@ private class Gemma4Attention: Module {
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
 
-        return (oProj(output), (keys, values), activePositionOffset)
+        return (outputProjection(output), (keys, values), activePositionOffset)
     }
 
     /// ContinuousBatchingV2 attention path. The `CBv2AttendingLayerCache`
@@ -1182,7 +1517,14 @@ private class Gemma4Attention: Module {
         let queryInput = lastQueryCache == nil ? x : x[0..., outputStart..., 0...]
         let queryLength = queryInput.dim(1)
 
-        let queryRaw = qProj(queryInput).reshaped(B, queryLength, nHeads, effectiveHeadDim)
+        // One exact affine activation-sum table feeds both Q and K. Forced
+        // shared-KV assistants have no K projection and stay on their stock Q
+        // path; target CBv2 decode has a non-shared K on every layer.
+        let qkActivationSums = usesSharedKV
+            ? nil : CBv2AttentionQKQMVV1.activationSums(for: x)
+        let queryRaw = qkProjection(
+            qProj, queryInput, activationSums: qkActivationSums
+        ).reshaped(B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
             // KV-shared layer: projects queries only and borrows (K, V) from
@@ -1212,7 +1554,7 @@ private class Gemma4Attention: Module {
             if output.dtype != outputDType {
                 output = output.asType(outputDType)
             }
-            return (oProj(output), sharedKV, positionOffset)
+            return (outputProjection(output), sharedKV, positionOffset)
         }
 
         guard let kProj, let kNorm, let vNorm else {
@@ -1244,7 +1586,9 @@ private class Gemma4Attention: Module {
             lastQueryCache == nil
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
-        let kRaw = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+        let kRaw = qkProjection(
+            kProj, x, activationSums: qkActivationSums
+        ).reshaped(B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
         if let vProj {
             vRaw = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
@@ -1252,19 +1596,56 @@ private class Gemma4Attention: Module {
             vRaw = kRaw
         }
 
-        let normalized = gemma4FusedQKVNorm(
-            q: queryRaw, k: kRaw, v: vRaw,
-            qWeight: qNorm.weight, kWeight: kNorm.weight, eps: config.rmsNormEps)
-        var queries = normalized?.0 ?? qNorm(queryRaw)
-        var k = normalized?.1 ?? kNorm(kRaw)
-        var v = normalized?.2 ?? vNorm(vRaw)
+        // PREP-ONLY: decode (L == 1) never calls either helper. Full-attention
+        // last-query prefill also stays stock because its Q and K lengths
+        // intentionally differ.
+        let prefillPrepared: (queries: MLXArray, keys: MLXArray)?
+        if B == 8 && L >= 2 && lastQueryCache == nil {
+            if isSliding {
+                prefillPrepared = gemma4PrefillSlidingQKNormLayoutRoPE(
+                    q: queryRaw, k: kRaw,
+                    qWeight: qNorm.weight, kWeight: kNorm.weight,
+                    offsets: capturedOffsets,
+                    ropeOperand: prefillRoPEConfiguration.operand,
+                    eps: config.rmsNormEps)
+            } else {
+                prefillPrepared = gemma4PrefillFullQKNormLayoutRoPE(
+                    q: queryRaw, k: kRaw,
+                    qWeight: qNorm.weight, kWeight: kNorm.weight,
+                    offsets: capturedOffsets,
+                    ropeOperand: prefillRoPEConfiguration.operand,
+                    eps: config.rmsNormEps)
+            }
+        } else {
+            prefillPrepared = nil
+        }
 
-        queries = queries.transposed(0, 2, 1, 3)
-        queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: queryPositionOffset)
-        k = k.transposed(0, 2, 1, 3)
-        k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
+        let normalized = prefillPrepared == nil
+            ? gemma4FusedQKVNorm(
+                q: queryRaw, k: kRaw, v: vRaw,
+                qWeight: qNorm.weight, kWeight: kNorm.weight,
+                eps: config.rmsNormEps, keyValueShared: vProj == nil)
+            : nil
 
-        v = v.transposed(0, 2, 1, 3)
+        var queries: MLXArray
+        var k: MLXArray
+        var v: MLXArray
+        if let prefillPrepared {
+            queries = prefillPrepared.queries
+            k = prefillPrepared.keys
+            v = vNorm(vRaw).transposed(0, 2, 1, 3)
+        } else {
+            queries = normalized?.0 ?? qNorm(queryRaw)
+            k = normalized?.1 ?? kNorm(kRaw)
+            v = normalized?.2 ?? vNorm(vRaw)
+
+            queries = queries.transposed(0, 2, 1, 3)
+            queries = gemma4ApplyRotaryPosition(
+                rope, to: queries, offset: queryPositionOffset)
+            k = k.transposed(0, 2, 1, 3)
+            k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
+            v = v.transposed(0, 2, 1, 3)
+        }
 
         let outputDType = queries.dtype
         let attentionQueries =
@@ -1285,7 +1666,7 @@ private class Gemma4Attention: Module {
         if output.dtype != outputDType {
             output = output.asType(outputDType)
         }
-        return (oProj(output), (k, v), captured)
+        return (outputProjection(output), (k, v), captured)
     }
 }
 
@@ -1521,6 +1902,16 @@ private enum Gemma4FusedRouterTop8 {
     }
 }
 
+/// GLUE-003: one-per-forward chain box. Layer L's fused tail deposits the
+/// (output, next-layer-input-norm) pair; layer L+1 consumes the norm instead
+/// of re-reading and re-normalizing the same tensor — guarded by pointer
+/// identity on the source array, so any intervening transformation falls back
+/// to the stock `inputLayernorm(x)`.
+public final class Gemma4GlueChainBox {
+    var pending: (source: MLXArray, normed: MLXArray)?
+    public init() {}
+}
+
 /// GLUE-001: fused decode-plane layer glue. Three single-dispatch kernels
 /// replace the strictly SERIAL RMSNorm/add chains between the layer's matmuls
 /// at the exact ranked decode geometry ([8, 1, 2816] bfloat16):
@@ -1637,8 +2028,8 @@ private enum Gemma4FusedLayerGlue {
     )
 
     private static let tailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_2816_bf16_v1",
-        inputNames: ["a", "b", "res", "w1", "w2", "w3"],
+        name: "gemma4_glue_tail_2816_bf16_v2",
+        inputNames: ["a", "b", "res", "w1", "w2", "w3", "s"],
         outputNames: ["out"],
         source: """
             const uint row = threadgroup_position_in_grid.x;
@@ -1662,11 +2053,17 @@ private enum Gemma4FusedLayerGlue {
         \(rmsReduce("sv", into: "local_inv[0]").replacingOccurrences(
             of: "(float)sv[base + i]", with: "(float)sv[i]"))
             const float inv3 = local_inv[0];
+            const T scalar = s[0];
             for (int i = 0; i < 4; i++) {
-                // Same double rounding as the stock norm-then-add pair.
+                // Same double rounding as the stock norm-then-add pair, then
+                // the layer-scalar multiply with its own stock rounding: the
+                // residual sum rounds to T in a register exactly where the
+                // stock graph stored it to memory, and the T*T product rounds
+                // once on the store exactly like the stock multiply kernel.
                 const T normed = static_cast<T>(
                     w3[wbase + i] * static_cast<T>((float)sv[i] * inv3));
-                out[base + i] = res[base + i] + normed;
+                const T summed = res[base + i] + normed;
+                out[base + i] = summed * scalar;
             }
         """,
         ensureRowContiguous: true
@@ -1717,19 +2114,100 @@ private enum Gemma4FusedLayerGlue {
         return (outs[0], outs[1])
     }
 
+    /// GLUE-003: tail variant that ALSO emits the NEXT layer's input norm.
+    /// The threadgroup already holds the finished output row in registers, so
+    /// the next layer's `inputLayernorm(out)` costs one more in-kernel
+    /// reduction instead of a standalone serial dispatch plus a full re-read
+    /// of the row. The normed output replicates the stock rms sequence over
+    /// the exact stored bf16 output values.
+    private static let tailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_glue_tail_chain_2816_bf16_v1",
+        inputNames: ["a", "b", "res", "w1", "w2", "w3", "s", "wn"],
+        outputNames: ["out", "normed"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float local_inv[2];
+            threadgroup float local_sums[32];
+            const uint base = row * 2816 + lid * 4;
+            const uint wbase = lid * 4;
+        \(rmsReduce("a", into: "local_inv[0]"))
+        \(rmsReduce("b", into: "local_inv[1]"))
+            const float inv1 = local_inv[0];
+            const float inv2 = local_inv[1];
+            T sv[4];
+            for (int i = 0; i < 4; i++) {
+                const T h1 = w1[wbase + i] * static_cast<T>((float)a[base + i] * inv1);
+                const T h2 = w2[wbase + i] * static_cast<T>((float)b[base + i] * inv2);
+                sv[i] = h1 + h2;
+            }
+        \(rmsReduce("sv", into: "local_inv[0]").replacingOccurrences(
+            of: "(float)sv[base + i]", with: "(float)sv[i]"))
+            const float inv3 = local_inv[0];
+            const T scalar = s[0];
+            T outv[4];
+            for (int i = 0; i < 4; i++) {
+                const T normed3 = static_cast<T>(
+                    w3[wbase + i] * static_cast<T>((float)sv[i] * inv3));
+                const T summed = res[base + i] + normed3;
+                outv[i] = summed * scalar;
+                out[base + i] = outv[i];
+            }
+        \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
+            of: "(float)outv[base + i]", with: "(float)outv[i]"))
+            const float inv4 = local_inv[0];
+            for (int i = 0; i < 4; i++) {
+                normed[base + i] =
+                    wn[wbase + i] * static_cast<T>((float)outv[i] * inv4);
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    static func tailChained(
+        mlpOut: MLXArray, expertOut: MLXArray, residual: MLXArray,
+        w1: MLXArray, w2: MLXArray, w3: MLXArray, layerScalar: MLXArray,
+        nextInputNormWeight: MLXArray, eps: Float
+    ) -> (out: MLXArray, normedNext: MLXArray)? {
+        guard admits(mlpOut, weight: w1, eps: eps),
+            expertOut.shape == mlpOut.shape, expertOut.dtype == .bfloat16,
+            residual.shape == mlpOut.shape, residual.dtype == .bfloat16,
+            w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16,
+            w3.ndim == 1, w3.dim(0) == axis, w3.dtype == .bfloat16,
+            layerScalar.size == 1, layerScalar.dtype == .bfloat16,
+            nextInputNormWeight.ndim == 1, nextInputNormWeight.dim(0) == axis,
+            nextInputNormWeight.dtype == .bfloat16
+        else { return nil }
+        CBv2EngageMark.once("glue-tail-chain")
+        let outs = tailChainKernel(
+            [mlpOut, expertOut, residual, w1, w2, w3, layerScalar,
+             nextInputNormWeight],
+            template: [("T", mlpOut.dtype)],
+            grid: (rows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: [[rows, 1, axis], [rows, 1, axis]],
+            outputDTypes: [.bfloat16, .bfloat16]
+        )
+        return (outs[0], outs[1])
+    }
+
     static func tail(
         mlpOut: MLXArray, expertOut: MLXArray, residual: MLXArray,
-        w1: MLXArray, w2: MLXArray, w3: MLXArray, eps: Float
+        w1: MLXArray, w2: MLXArray, w3: MLXArray, layerScalar: MLXArray,
+        eps: Float
     ) -> MLXArray? {
         guard admits(mlpOut, weight: w1, eps: eps),
             expertOut.shape == mlpOut.shape, expertOut.dtype == .bfloat16,
             residual.shape == mlpOut.shape, residual.dtype == .bfloat16,
             w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16,
-            w3.ndim == 1, w3.dim(0) == axis, w3.dtype == .bfloat16
+            w3.ndim == 1, w3.dim(0) == axis, w3.dtype == .bfloat16,
+            layerScalar.size == 1, layerScalar.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-tail")
         return tailKernel(
-            [mlpOut, expertOut, residual, w1, w2, w3],
+            [mlpOut, expertOut, residual, w1, w2, w3, layerScalar],
             template: [("T", mlpOut.dtype)],
             grid: (rows * tgThreads, 1, 1),
             threadGroup: (tgThreads, 1, 1),
@@ -1874,8 +2352,41 @@ private class Gemma4MLP: Module {
         super.init()
     }
 
+    /// DMLP-001: route only the pinned batch-eight/decode-one affine-8 dense
+    /// MLP geometries through the exact quad-stream kernel's tight grid.
+    /// Everything else, including prefill and any strided input, keeps the
+    /// original layer call.
+    @inline(__always)
+    private func denseProjection(
+        _ layer: Linear,
+        _ x: MLXArray,
+        activationSums: CBv2DenseMLPQMVV1.ActivationSums? = nil
+    ) -> MLXArray {
+        guard let quantized = layer as? QuantizedLinear,
+            quantized.bias == nil,
+            let tight = CBv2DenseMLPQMVV1.matmul(
+                x: x,
+                weight: quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                groupSize: quantized.groupSize,
+                bits: quantized.bits,
+                mode: quantized.mode,
+                activationSums: activationSums)
+        else { return layer(x) }
+        return tight
+    }
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(gemma4SafeGeluProduct(gateProj(x), upProj(x)))
+        // DMLP-002: one exact activation-sum prepass feeds both fallback
+        // projections. If either projection is not the pinned affine8 cell,
+        // the candidate arrays remain unevaluated and stock takes over.
+        let activationSums = CBv2DenseMLPQMVV1.activationSums(for: x)
+        return denseProjection(
+            downProj,
+            gemma4SafeGeluProduct(
+                denseProjection(gateProj, x, activationSums: activationSums),
+                denseProjection(upProj, x, activationSums: activationSums)))
     }
 }
 
@@ -1976,7 +2487,9 @@ public class Gemma4DecoderLayer: Module {
         v2SharedSource: (any CBv2AttendingLayerCache)? = nil,
         outputTailRows: Int? = nil,
         useLastQueryPrefill: Bool = false,
-        isExpertPrefill: Bool = false
+        isExpertPrefill: Bool = false,
+        glueChain: Gemma4GlueChainBox? = nil,
+        nextInputLayernormWeight: MLXArray? = nil
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         // Prompt-path narrowing (CBv2 only): attention and every K/V write
         // still cover the full chunk; only the token-local work AFTER
@@ -2005,7 +2518,19 @@ public class Gemma4DecoderLayer: Module {
             activePerLayerInput = perLayerInput
         }
 
-        let h = inputLayernorm(x)
+        // GLUE-003 consumption: the previous layer's fused tail already
+        // produced this layer's input norm. Pointer identity on the source
+        // guarantees the normed tensor was computed from exactly this input.
+        let h: MLXArray
+        if let chain = glueChain, let pending = chain.pending,
+            pending.source === x
+        {
+            chain.pending = nil
+            h = pending.normed
+        } else {
+            glueChain?.pending = nil
+            h = inputLayernorm(x)
+        }
         let (attnOut, kvPair, attnPositionOffset) = selfAttn(
             h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset,
             v2SharedSource: v2SharedSource, outputStart: outputStart,
@@ -2014,6 +2539,13 @@ public class Gemma4DecoderLayer: Module {
         if let fusedOut = Gemma4FusedLayerGlue.normResidual(
             x: attnOut, residual: residual,
             weight: postAttentionLayernorm.weight, eps: config.rmsNormEps)
+        {
+            out = fusedOut
+        } else if let fusedOut = Gemma4PrefillGlueV1.normResidual(
+            x: attnOut,
+            weight: postAttentionLayernorm.weight,
+            residual: residual,
+            eps: config.rmsNormEps)
         {
             out = fusedOut
         } else {
@@ -2026,6 +2558,10 @@ public class Gemma4DecoderLayer: Module {
         // sum + postFFLN + residual) into one dispatch; when it engages, the
         // common tail below must not run again.
         var tailApplied = false
+        // Decode GLUE-002 also folds the terminal layer-scalar multiply. The
+        // prefill tail deliberately stops before it, preserving the stock
+        // materialization boundary and applying the scalar below.
+        var scalarFolded = false
 
         if isMoE,
             let router,
@@ -2051,6 +2587,18 @@ public class Gemma4DecoderLayer: Module {
                     topKIndices: topKIndices,
                     topKWeights: topKWeights,
                     isExpertPrefill: isExpertPrefill)
+            } else if let (n1, n2) = Gemma4PrefillGlueV1.dualPreNorm(
+                x: out,
+                w1: preFeedforwardLayernorm.weight,
+                w2: preFeedforwardLayernorm2.weight,
+                eps: config.rmsNormEps)
+            {
+                h1Raw = mlp(n1)
+                h2Raw = experts(
+                    n2,
+                    topKIndices: topKIndices,
+                    topKWeights: topKWeights,
+                    isExpertPrefill: isExpertPrefill)
             } else {
                 h1Raw = mlp(preFeedforwardLayernorm(out))
                 h2Raw = experts(
@@ -2060,11 +2608,44 @@ public class Gemma4DecoderLayer: Module {
                     isExpertPrefill: isExpertPrefill)
             }
 
-            if let fusedTail = Gemma4FusedLayerGlue.tail(
-                mlpOut: h1Raw, expertOut: h2Raw, residual: residual2,
+            // The scalar fold is only valid when nothing sits between the
+            // tail and the layer-scalar multiply (PLE absent on this model).
+            let canFoldScalar =
+                perLayerInputGate == nil || activePerLayerInput == nil
+            if canFoldScalar, let chain = glueChain,
+                let nextWeight = nextInputLayernormWeight,
+                let chained = Gemma4FusedLayerGlue.tailChained(
+                    mlpOut: h1Raw, expertOut: h2Raw, residual: residual2,
+                    w1: postFeedforwardLayernorm1.weight,
+                    w2: postFeedforwardLayernorm2.weight,
+                    w3: postFeedforwardLayernorm.weight,
+                    layerScalar: layerScalar,
+                    nextInputNormWeight: nextWeight,
+                    eps: config.rmsNormEps)
+            {
+                out = chained.out
+                chain.pending = (source: chained.out, normed: chained.normedNext)
+                tailApplied = true
+                scalarFolded = true
+            } else if canFoldScalar,
+                let fusedTail = Gemma4FusedLayerGlue.tail(
+                    mlpOut: h1Raw, expertOut: h2Raw, residual: residual2,
+                    w1: postFeedforwardLayernorm1.weight,
+                    w2: postFeedforwardLayernorm2.weight,
+                    w3: postFeedforwardLayernorm.weight,
+                    layerScalar: layerScalar,
+                    eps: config.rmsNormEps)
+            {
+                out = fusedTail
+                tailApplied = true
+                scalarFolded = true
+            } else if let fusedTail = Gemma4PrefillGlueV1.branchTail(
+                h1: h1Raw,
+                h2: h2Raw,
                 w1: postFeedforwardLayernorm1.weight,
                 w2: postFeedforwardLayernorm2.weight,
                 w3: postFeedforwardLayernorm.weight,
+                residual2: residual2,
                 eps: config.rmsNormEps)
             {
                 out = fusedTail
@@ -2099,7 +2680,9 @@ public class Gemma4DecoderLayer: Module {
             out = residual3 + g
         }
 
-        out = out * layerScalar
+        if !scalarFolded {
+            out = out * layerScalar
+        }
 
         return (out, kvPair, attnPositionOffset)
     }
@@ -2299,6 +2882,12 @@ public class Gemma4TextModelInner: Module {
         dFlashHiddenCapture: Gemma4DFlashHiddenCapture? = nil,
         forceArrayMask requestedArrayMask: Bool = false
     ) -> (postNorm: MLXArray, preNorm: MLXArray?) {
+        // Shape queries cross the Swift/C boundary. Cache the two immutable
+        // input dimensions once rather than paying for them at every ladder
+        // policy check while the host is building the decode graph.
+        let inputBatchSize = inputs.dim(0)
+        let inputLength = inputs.dim(1)
+
         // Vision prefill (mirrors the inline VLM twin `TextModel.callAsFunction`):
         // `inputEmbedding` — the scaled text embeddings with image soft-token
         // embeddings spliced at placeholder positions — replaces the trunk's
@@ -2416,6 +3005,9 @@ public class Gemma4TextModelInner: Module {
         var intermediates = [(kv: (MLXArray, MLXArray)?, positionOffset: Gemma4.PositionOffset?)](
             repeating: (nil, nil), count: config.numHiddenLayers)
 
+        // GLUE-003: one chain box per forward; layer L's fused tail hands
+        // layer L+1 its input norm through it.
+        let glueChain = Gemma4GlueChainBox()
         for (idx, layer) in layers.enumerated() {
             let prevIdx = previousKvs[idx]
             let sharedKV = intermediates[prevIdx].kv
@@ -2461,18 +3053,38 @@ public class Gemma4TextModelInner: Module {
                 // enabling it there regressed the raw-prefill control without
                 // affecting the serving path selected by the benchmark.
                 isExpertPrefill: gemma4AllowsWeightedExpertUnsort(
-                    schedulePrefill: schedulePrefill)
+                    schedulePrefill: schedulePrefill),
+                glueChain: glueChain,
+                nextInputLayernormWeight: idx + 1 < layers.count
+                    ? layers[idx + 1].inputLayernorm.weight : nil
             )
             h = out
             intermediates[idx] = (kvPair, positionOffset)
             captureHook?(idx, kvPair)
             dFlashHiddenCapture?.capture(h, layer: idx)
 
+            // `layer` returns the recombined dense+sparse result. Submitting
+            // only here starts the completed prefix early without serializing
+            // those independent per-layer branches or changing any math.
+            if gemma4ShouldSubmitDecodeAsyncEvalLadder(
+                enabled: gemma4DecodeAsyncEvalLadderEnabled,
+                schedulePrefill: schedulePrefill,
+                isCBv2: isCBv2,
+                batchSize: inputBatchSize,
+                inputLength: inputLength,
+                layerIndex: idx)
+            {
+                asyncEval(h)
+                CBv2EngageMark.once("gemma4-b8-decode-async-ladder")
+                CBv2StepProfiler.recordEvent(
+                    "v2.gemma4.decode.async_eval_ladder")
+            }
+
             let layerNumber = idx + 1
             if gemma4ShouldSubmitPrefillChunkEval(
                 schedulePrefill: schedulePrefill,
                 isCBv2: isCBv2,
-                inputLength: inputs.dim(1),
+                inputLength: inputLength,
                 layerNumber: layerNumber,
                 interval: gemma4PrefillChunkEvalLayers)
             {

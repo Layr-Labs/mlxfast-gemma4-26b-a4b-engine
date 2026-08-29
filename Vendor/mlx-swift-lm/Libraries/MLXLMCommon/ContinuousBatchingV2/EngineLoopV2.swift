@@ -36,6 +36,19 @@ public protocol CBv2SteppableModel: AnyObject {
     ) -> [MLXArray]?
 }
 
+/// Optional order-only decode surface. A conforming model may return the
+/// target-authoritative top-1 token ids `[B]` without materializing
+/// `[B, vocab]` logits. The engine reaches this only when every sampling
+/// transform is order-insensitive and the installed sampler explicitly
+/// permits the bypass.
+public protocol CBv2GreedyTop1SteppableModel: CBv2SteppableModel {
+    /// Must decide support without constructing a cache-mutating forward.
+    func canGreedyTop1(tokens: MLXArray) -> Bool
+    func greedyTop1(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> MLXArray
+}
+
 extension CBv2SteppableModel {
     public func compactDecodeEvaluationRoots(
         forwardOutput: MLXArray, caches: [CBv2AttendingLayerCache]
@@ -111,6 +124,9 @@ public protocol CBv2StepSampler: AnyObject {
     /// request-id retirement. EngineV2 rejects constrained requests unless
     /// the installed sampler opts in.
     var supportsTokenConstraints: Bool { get }
+    /// True when an all-greedy, transform-free, constraint-free step may use
+    /// model-owned top-1 ids directly instead of calling `sample(logits:)`.
+    var supportsOrderOnlyTop1Bypass: Bool { get }
 
     func sample(
         logits: MLXArray, params: [CBv2SamplingParams], requestIDs: [CBv2RequestID],
@@ -149,6 +165,7 @@ public protocol CBv2StepSampler: AnyObject {
 
 extension CBv2StepSampler {
     public var supportsTokenConstraints: Bool { false }
+    public var supportsOrderOnlyTop1Bypass: Bool { false }
     public func takeStepLogprobs() -> CBv2StepLogprobs? { nil }
     public func requestDidFinish(_ id: CBv2RequestID) {}
     public func confirmSampledTokens(_ tokens: [Int], requestIDs: [CBv2RequestID]) {}
@@ -164,6 +181,7 @@ public final class CBv2GreedySampler: CBv2StepSampler {
     private var configuredIDs: [CBv2RequestID] = []
 
     public var supportsTokenConstraints: Bool { true }
+    public var supportsOrderOnlyTop1Bypass: Bool { true }
 
     public init() {}
     public func sample(
@@ -1353,6 +1371,25 @@ public final class EngineLoopV2: @unchecked Sendable {
         return (last, eagerDecodeEvaluationRoots(caches, logitsRoot: last))
     }
 
+    /// Order-only counterpart to `decodeLogits`. Returns nil unless the model
+    /// owns an exact top-1 implementation for this concrete geometry.
+    private func decodeGreedyTop1(
+        rowStates: [[CBv2SequenceKV?]], tokens: MLXArray
+    ) -> (tokens: MLXArray, cacheInnerState: [MLXArray])? {
+        guard let top1Model = model as? CBv2GreedyTop1SteppableModel,
+            top1Model.canGreedyTop1(tokens: tokens)
+        else {
+            return nil
+        }
+        let caches = eagerCaches(rowStates: rowStates)
+        let tokens = top1Model.greedyTop1(tokens: tokens, caches: caches)
+        precondition(
+            tokens.ndim == 1 && tokens.dim(0) == rowStates.count,
+            "CBv2 greedy top-1 must return one token per decode row")
+        CBv2EngageMark.once("greedy-top1")
+        return (tokens, eagerDecodeEvaluationRoots(caches, logitsRoot: tokens))
+    }
+
     /// Prompt-only output seam (see PrefillOutputV2.swift). Capable models
     /// skip the vocabulary projection for discarded prompt positions;
     /// everything else keeps the established full-logits forward and is
@@ -1534,27 +1571,50 @@ public final class EngineLoopV2: @unchecked Sendable {
 
         let inputs = lazyTokens.reshaped([ids.count, 1])
         let forwardStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-        // SOFTCAP-SKIP: declare order-only consumption for this graph build.
-        let (last, cacheInnerState) = CBv2OrderOnlyLogits.withOrderOnly(params) {
-            decodeLogits(rowStates: rowStates, tokens: inputs)  // [B, vocab]
-        }
-        if CBv2StepProfiler.enabled {
-            CBv2StepProfiler.record(
-                "v2.forward.build", seconds: CFAbsoluteTimeGetCurrent() - forwardStart)
-        }
-        // `pendingSampledTokens` = the fed lazy tokens: each row has exactly
-        // one launched-but-unconfirmed sample here (the chain invariant).
-        let samplerStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-        let sampled = sampler.sample(
-            logits: last, params: params, requestIDs: ids, stepIndex: stepCount,
-            pendingSampledTokens: lazyTokens,
-            rowContext: { [scheduler] in
-                ids.map { Self.samplerRow(scheduler.record(for: $0)!) }
-            })
-        let stepLogprobs = sampler.takeStepLogprobs()
-        if CBv2StepProfiler.enabled {
-            CBv2StepProfiler.record(
-                "v2.sampler.build", seconds: CFAbsoluteTimeGetCurrent() - samplerStart)
+        let directTop1 =
+            sampler.supportsOrderOnlyTop1Bypass
+            && CBv2OrderOnlyLogits.orderOnly(params)
+            && ids.allSatisfy {
+                scheduler.record(for: $0)?.request.tokenConstraint == nil
+            }
+            ? decodeGreedyTop1(rowStates: rowStates, tokens: inputs)
+            : nil
+        let sampled: MLXArray
+        let cacheInnerState: [MLXArray]
+        let stepLogprobs: CBv2StepLogprobs?
+        if let directTop1 {
+            sampled = directTop1.tokens
+            cacheInnerState = directTop1.cacheInnerState
+            stepLogprobs = nil
+            if CBv2StepProfiler.enabled {
+                CBv2StepProfiler.record(
+                    "v2.forward.build", seconds: CFAbsoluteTimeGetCurrent() - forwardStart)
+                CBv2StepProfiler.record("v2.sampler.build", seconds: 0)
+            }
+        } else {
+            // SOFTCAP-SKIP: declare order-only consumption for this graph build.
+            let output = CBv2OrderOnlyLogits.withOrderOnly(params) {
+                decodeLogits(rowStates: rowStates, tokens: inputs)  // [B, vocab]
+            }
+            cacheInnerState = output.cacheInnerState
+            if CBv2StepProfiler.enabled {
+                CBv2StepProfiler.record(
+                    "v2.forward.build", seconds: CFAbsoluteTimeGetCurrent() - forwardStart)
+            }
+            // `pendingSampledTokens` = the fed lazy tokens: each row has exactly
+            // one launched-but-unconfirmed sample here (the chain invariant).
+            let samplerStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+            sampled = sampler.sample(
+                logits: output.logits, params: params, requestIDs: ids,
+                stepIndex: stepCount, pendingSampledTokens: lazyTokens,
+                rowContext: { [scheduler] in
+                    ids.map { Self.samplerRow(scheduler.record(for: $0)!) }
+                })
+            stepLogprobs = sampler.takeStepLogprobs()
+            if CBv2StepProfiler.enabled {
+                CBv2StepProfiler.record(
+                    "v2.sampler.build", seconds: CFAbsoluteTimeGetCurrent() - samplerStart)
+            }
         }
         scheduler.markPendingSamples(ids: ids)
         var toEval = [sampled]
@@ -1630,23 +1690,36 @@ public final class EngineLoopV2: @unchecked Sendable {
         if !decodeRows.isEmpty {
             let inputs = MLXArray(decodeRows.map { Int32($0.rec.tokens[$0.start]) })
                 .reshaped([decodeRows.count, 1])
-            // SOFTCAP-SKIP: same declaration on the mixed-step decode rows.
-            let (last, decodeInnerState) = CBv2OrderOnlyLogits.withOrderOnly(
-                decodeRows.map(\.rec.request.sampling)
-            ) {
-                decodeLogits(
-                    rowStates: decodeRows.map { kvStates[$0.rec.id]! }, tokens: inputs)
-            }
-            cacheInnerState.append(contentsOf: decodeInnerState)
-            decodeSampled = sampler.sample(
-                logits: last,
-                params: decodeRows.map(\.rec.request.sampling),
-                requestIDs: decodeRows.map(\.rec.id),
-                stepIndex: stepCount,
-                pendingSampledTokens: nil,  // finalize preceded: all confirmed
-                rowContext: { decodeRows.map { Self.samplerRow($0.rec) } })
-            if let stepLogprobs = sampler.takeStepLogprobs() {
-                logprobSegments.append(stepLogprobs)
+            let params = decodeRows.map(\.rec.request.sampling)
+            let directTop1 =
+                sampler.supportsOrderOnlyTop1Bypass
+                && CBv2OrderOnlyLogits.orderOnly(params)
+                && decodeRows.allSatisfy { $0.rec.request.tokenConstraint == nil }
+                ? decodeGreedyTop1(
+                    rowStates: decodeRows.map { kvStates[$0.rec.id]! },
+                    tokens: inputs)
+                : nil
+            if let directTop1 {
+                decodeSampled = directTop1.tokens
+                cacheInnerState.append(contentsOf: directTop1.cacheInnerState)
+            } else {
+                // SOFTCAP-SKIP: same declaration on the mixed-step decode rows.
+                let output = CBv2OrderOnlyLogits.withOrderOnly(params) {
+                    decodeLogits(
+                        rowStates: decodeRows.map { kvStates[$0.rec.id]! },
+                        tokens: inputs)
+                }
+                cacheInnerState.append(contentsOf: output.cacheInnerState)
+                decodeSampled = sampler.sample(
+                    logits: output.logits,
+                    params: params,
+                    requestIDs: decodeRows.map(\.rec.id),
+                    stepIndex: stepCount,
+                    pendingSampledTokens: nil,  // finalize preceded: all confirmed
+                    rowContext: { decodeRows.map { Self.samplerRow($0.rec) } })
+                if let stepLogprobs = sampler.takeStepLogprobs() {
+                    logprobSegments.append(stepLogprobs)
+                }
             }
         }
 

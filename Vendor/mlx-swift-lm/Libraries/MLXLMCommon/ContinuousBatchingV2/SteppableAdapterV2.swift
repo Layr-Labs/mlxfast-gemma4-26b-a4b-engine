@@ -14,6 +14,13 @@
 import Foundation
 import MLX
 
+/// Model-level twin of `CBv2GreedyTop1SteppableModel`, using the vendored
+/// language-model cache surface.
+public protocol CBv2GreedyTop1Forwardable: AnyObject {
+    func cbv2CanGreedyTop1(_ tokens: MLXArray) -> Bool
+    func cbv2GreedyTop1(_ tokens: MLXArray, caches: [KVCache]) -> MLXArray
+}
+
 /// Model-level proof that an ordinary CBv2 decode output transitively
 /// consumes every K/V mutation performed by that forward. This is deliberately
 /// narrower than `LanguageModel`: an adapter cannot infer the dependency from
@@ -90,6 +97,22 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
             }
             return kv
         }
+    }
+}
+
+extension CBv2SteppableLanguageModelAdapter: CBv2GreedyTop1SteppableModel {
+    public func canGreedyTop1(tokens: MLXArray) -> Bool {
+        guard let model = model as? CBv2GreedyTop1Forwardable else { return false }
+        return model.cbv2CanGreedyTop1(tokens)
+    }
+
+    public func greedyTop1(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> MLXArray {
+        guard let model = model as? CBv2GreedyTop1Forwardable else {
+            preconditionFailure("greedyTop1 called after a false capability check")
+        }
+        return model.cbv2GreedyTop1(tokens, caches: asKVCaches(caches))
     }
 }
 

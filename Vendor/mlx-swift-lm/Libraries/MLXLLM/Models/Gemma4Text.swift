@@ -4122,6 +4122,46 @@ extension Gemma4TextModel: CBv2LanguageModelPrefillForwardable {
 /// that forward's K/V mutations. Cache-layout gates remain in the adapter.
 extension Gemma4TextModel: CBv2LanguageModelDecodeOutputCoversCacheMutations {}
 
+// MARK: - ContinuousBatchingV2 order-only greedy decode
+
+extension Gemma4TextModel: CBv2GreedyTop1Forwardable {
+    public func cbv2CanGreedyTop1(_ tokens: MLXArray) -> Bool {
+        guard tokens.ndim == 2, tokens.dim(0) == 8, tokens.dim(1) == 1,
+            lmHead == nil,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.mode == .affine
+        else { return false }
+
+        return Gemma4MMAQuantizedGEMV.supportsArgmax(
+            w: quantized.weight,
+            scales: quantized.scales,
+            biases: quantized.biases,
+            groupSize: quantized.groupSize,
+            bits: quantized.bits,
+            k: config.hiddenSize)
+    }
+
+    public func cbv2GreedyTop1(
+        _ tokens: MLXArray, caches: [KVCache]
+    ) -> MLXArray {
+        precondition(cbv2CanGreedyTop1(tokens))
+        let quantized = model.embedTokens as! QuantizedEmbedding
+        let hidden = model(tokens, cache: caches)
+        guard
+            let tokens = Gemma4MMAQuantizedGEMV.applyArgmax(
+                x: hidden,
+                w: quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                groupSize: quantized.groupSize,
+                bits: quantized.bits)
+        else {
+            preconditionFailure("Gemma greedy top-1 capability changed during graph build")
+        }
+        return tokens
+    }
+}
+
 // MARK: - ContinuousBatchingV2 multimodal (vision prefill)
 
 /// The CBv2 engine's embedding-spliced prefill surface

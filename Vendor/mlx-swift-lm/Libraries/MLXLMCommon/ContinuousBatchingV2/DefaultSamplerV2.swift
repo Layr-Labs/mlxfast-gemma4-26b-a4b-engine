@@ -40,6 +40,7 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
     /// Test hook: the composed pipeline's logprob-capture counter.
     var pipelineLogprobBuildCount: Int { pipeline?.logprobBuildCount ?? 0 }
     public var supportsTokenConstraints: Bool { true }
+    public var supportsOrderOnlyTop1Bypass: Bool { true }
 
     /// - Parameter fallbackSeed: engine-level seed for rows without a
     ///   per-request seed (fixed at init so nil-seed rows stay

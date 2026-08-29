@@ -69,8 +69,8 @@ extension EngineLoopV2 {
             hiddenColumns.reserveCapacity(columns.count)
             for column in columns {
                 precondition(column.dim(1) == 1, "CBv2 MTP: serial target column must have L=1")
-                let output = mtp.model.forwardWithHidden(tokens: column, caches: caches)
-                let columnArgmax = argMax(output.logits, axis: -1).asType(.int32)
+                let output = mtp.model.forwardArgmaxWithHidden(tokens: column, caches: caches)
+                let columnArgmax = output.argmax
                 // Building several eager decode calls in one lazy graph can
                 // let mutable KV buffers observe a later version. Complete
                 // each canonical target step before constructing the next.
@@ -87,8 +87,8 @@ extension EngineLoopV2 {
                 for cache in serializingCaches { cache.mtpSerializesRectangularAttention = false }
             }
             let tokens = concatenated(columns, axis: 1)
-            let output = mtp.model.forwardWithHidden(tokens: tokens, caches: caches)
-            argmax = argMax(output.logits, axis: -1).asType(.int32)
+            let output = mtp.model.forwardArgmaxWithHidden(tokens: tokens, caches: caches)
+            argmax = output.argmax
             hidden = output.lastHidden
         }
 

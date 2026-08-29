@@ -361,6 +361,17 @@ func geluFusionClaimsPrefill(_ gate: MLXArray, _ up: MLXArray) -> Bool {
 /// one-kernel trace.
 @inline(__always)
 func gemma4GeluProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
+    if gate.shape == up.shape,
+        gate.ndim == 3, gate.dim(0) == 8,
+        gate.dim(1) > 1, gate.dim(1) <= 4
+    {
+        let columns = (0 ..< gate.dim(1)).map { offset in
+            gemma4SafeGeluProductShaped(
+                gate[0..., offset ..< (offset + 1), 0...],
+                up[0..., offset ..< (offset + 1), 0...])
+        }
+        return concatenated(columns, axis: 1)
+    }
     if geluFusionClaimsPinnedDecode(gate, up) || geluFusionClaimsPrefill(gate, up) {
         return gemma4SafeGeluProductShaped(gate, up)
     }
@@ -1412,7 +1423,16 @@ private class ScaledLinear: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        matmul(x, weight.T) * scalar
+        if x.ndim == 3, x.dim(0) == 8, x.dim(1) > 1, x.dim(1) <= 4 {
+            return concatenated(
+                (0 ..< x.dim(1)).map { offset in
+                    matmul(
+                        x[0..., offset ..< (offset + 1), 0...],
+                        weight.T) * scalar
+                },
+                axis: 1)
+        }
+        return matmul(x, weight.T) * scalar
     }
 }
 
@@ -1631,7 +1651,7 @@ private class Gemma4Attention: Module {
     /// keeps the quantized module, which reaches the tier through MLX.
     @inline(__always)
     private func tierProjection(_ layer: Linear, _ x: MLXArray) -> MLXArray {
-        guard let quantized = layer as? QuantizedLinear,
+        if let quantized = layer as? QuantizedLinear,
             quantized.bias == nil,
             let projected = CBv2AttentionQKVMMA8V1.matmul(
                 x: x,
@@ -1641,15 +1661,26 @@ private class Gemma4Attention: Module {
                 groupSize: quantized.groupSize,
                 bits: quantized.bits,
                 mode: quantized.mode)
-        else { return layer(x) }
-        return projected
+        {
+            return projected
+        }
+        if x.ndim == 3, x.dim(0) == 8, x.dim(1) > 1, x.dim(1) <= 4 {
+            return concatenated(
+                (0 ..< x.dim(1)).map { offset in
+                    tierProjection(
+                        layer,
+                        x[0..., offset ..< (offset + 1), 0...])
+                },
+                axis: 1)
+        }
+        return layer(x)
     }
 
     /// Exact B8/L1 attention output projection. Sliding/full K widths select
     /// the tight affine4 fast-QMV replica; every other path keeps the layer.
     @inline(__always)
     private func outputProjection(_ x: MLXArray) -> MLXArray {
-        guard let quantized = oProj as? QuantizedLinear,
+        if let quantized = oProj as? QuantizedLinear,
             quantized.bias == nil,
             let projected = CBv2AttentionOQMVV1.matmul(
                 x: x,
@@ -1659,8 +1690,18 @@ private class Gemma4Attention: Module {
                 groupSize: quantized.groupSize,
                 bits: quantized.bits,
                 mode: quantized.mode)
-        else { return oProj(x) }
-        return projected
+        {
+            return projected
+        }
+        if x.ndim == 3, x.dim(0) == 8, x.dim(1) > 1, x.dim(1) <= 4 {
+            return concatenated(
+                (0 ..< x.dim(1)).map { offset in
+                    outputProjection(
+                        x[0..., offset ..< (offset + 1), 0...])
+                },
+                axis: 1)
+        }
+        return oProj(x)
     }
 
     func callAsFunction(
@@ -2639,6 +2680,20 @@ private class Gemma4Experts: Module {
         // contract; every other case performs the established unsort + sum.
         let (B, S, H) = (x.dim(0), x.dim(1), x.dim(2))
         let K = topKIndices.dim(-1)
+        if B == 8, S > 1, S <= 4 {
+            let columns = (0 ..< S).map { offset in
+                switchGLU.callAndWeightedReduce(
+                    x[0..., offset ..< (offset + 1), 0...].reshaped(B, H),
+                    topKIndices[0..., offset ..< (offset + 1), 0...]
+                        .reshaped(B, K),
+                    weights: topKWeights[0..., offset ..< (offset + 1), 0...]
+                        .reshaped(B, K),
+                    fuseSortedReduction: fuseWeightedUnsort,
+                    isProductionPrefill: false)
+                    .reshaped(B, 1, H)
+            }
+            return concatenated(columns, axis: 1)
+        }
         let y = switchGLU.callAndWeightedReduce(
             x.reshaped(B * S, H),
             topKIndices.reshaped(B * S, K),
@@ -2696,6 +2751,40 @@ private class Gemma4MLP: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if x.ndim == 3, x.dim(0) == 8, x.dim(1) == 2 {
+            let columns = (0 ..< 2).map { offset in
+                x[0..., offset ..< (offset + 1), 0...]
+            }
+            let activationSums = columns.map {
+                CBv2DenseMLPQMVV1.activationSums(for: $0)
+            }
+            let gateColumns = (0 ..< 2).map {
+                denseProjection(gateProj, columns[$0], activationSums: activationSums[$0])
+            }
+            let upColumns = (0 ..< 2).map {
+                denseProjection(upProj, columns[$0], activationSums: activationSums[$0])
+            }
+            return denseProjection(
+                downProj,
+                gemma4GeluProduct(
+                    concatenated(gateColumns, axis: 1),
+                    concatenated(upColumns, axis: 1)))
+        }
+        if x.ndim == 3, x.dim(0) == 8, x.dim(1) > 2, x.dim(1) <= 4 {
+            return concatenated(
+                (0 ..< x.dim(1)).map { offset in
+                    let column = x[0..., offset ..< (offset + 1), 0...]
+                    let columnSums = CBv2DenseMLPQMVV1.activationSums(for: column)
+                    return denseProjection(
+                        downProj,
+                        gemma4GeluProduct(
+                            denseProjection(
+                                gateProj, column, activationSums: columnSums),
+                            denseProjection(
+                                upProj, column, activationSums: columnSums)))
+                },
+                axis: 1)
+        }
         // DMLP-002: one exact activation-sum prepass feeds both fallback
         // projections. If either projection is not the pinned affine8 cell,
         // the candidate arrays remain unevaluated and stock takes over.
@@ -3011,8 +3100,26 @@ public class Gemma4DecoderLayer: Module {
             // rounds in the same places as the two-dispatch form: `compile`
             // keeps each node at its own dtype, so the activated intermediate
             // is materialised bf16 either way.
-            var g = gemma4GeluProduct(gate(out), perLayerInput)
-            g = proj(g)
+            let gated: MLXArray
+            if out.ndim == 3, out.dim(0) == 8, out.dim(1) > 1, out.dim(1) <= 4 {
+                gated = concatenated(
+                    (0 ..< out.dim(1)).map { offset in
+                        gate(out[0..., offset ..< (offset + 1), 0...])
+                    },
+                    axis: 1)
+            } else {
+                gated = gate(out)
+            }
+            var g = gemma4GeluProduct(gated, perLayerInput)
+            if g.ndim == 3, g.dim(0) == 8, g.dim(1) > 1, g.dim(1) <= 4 {
+                g = concatenated(
+                    (0 ..< g.dim(1)).map { offset in
+                        proj(g[0..., offset ..< (offset + 1), 0...])
+                    },
+                    axis: 1)
+            } else {
+                g = proj(g)
+            }
             // Same `residual + rmsNorm(x, w)` at 2816 and the same eps as the
             // post-attention site, so the prefill fusion applies unchanged.
             if let fusedPLE = Gemma4PrefillGlueV1.normResidual(
@@ -3436,7 +3543,17 @@ public class Gemma4TextModelInner: Module {
                 config.numHiddenLayers, config.hiddenSizePerLayerInput)
 
             // Model projection PLE
-            let modelPLE = modelProj(h).reshaped(
+            let projectedModelPLE: MLXArray
+            if h.ndim == 3, h.dim(0) == 8, h.dim(1) > 1, h.dim(1) <= 4 {
+                projectedModelPLE = concatenated(
+                    (0 ..< h.dim(1)).map { offset in
+                        modelProj(h[0..., offset ..< (offset + 1), 0...])
+                    },
+                    axis: 1)
+            } else {
+                projectedModelPLE = modelProj(h)
+            }
+            let modelPLE = projectedModelPLE.reshaped(
                 h.dim(0), h.dim(1),
                 config.numHiddenLayers, config.hiddenSizePerLayerInput)
             let normedModelPLE = projNorm(modelPLE)
@@ -3847,16 +3964,27 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             outDim: config.vocabSize)
     }
 
+    private func projectLMHead(_ hidden: MLXArray) -> MLXArray {
+        if let lmHead {
+            return lmHead(hidden)
+        }
+        if let mma = tiedLMHeadMMA(hidden) { return mma }
+        if let tight = tiedLMHeadTightGrid(hidden) { return tight }
+        return model.embedTokens.asLinear(hidden)
+    }
+
     func applyLMHead(_ hidden: MLXArray) -> MLXArray {
         var out: MLXArray
-        if let lmHead {
-            out = lmHead(hidden)
-        } else if let mma = tiedLMHeadMMA(hidden) {
-            out = mma
-        } else if let tight = tiedLMHeadTightGrid(hidden) {
-            out = tight
+        if hidden.ndim == 3, hidden.dim(0) == 8,
+            hidden.dim(1) > 1, hidden.dim(1) <= 4
+        {
+            out = concatenated(
+                (0 ..< hidden.dim(1)).map { offset in
+                    projectLMHead(hidden[0..., offset ..< (offset + 1), 0...])
+                },
+                axis: 1)
         } else {
-            out = model.embedTokens.asLinear(hidden)
+            out = projectLMHead(hidden)
         }
         // The VLM omission profile uses zero to represent the former optional
         // softcap's nil/disabled state.
@@ -4178,5 +4306,68 @@ extension Gemma4TextModel: CBv2MTPForwardable {
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         let (postNorm, preNorm) = model.callCapturingPreNorm(tokens, cache: caches)
         return (applyLMHead(postNorm), preNorm)
+    }
+
+    /// MTP verification consumes only the target's top-1 ids and pre-norm
+    /// hidden. At the ranked B=8 geometry, project each verification column
+    /// through the exact version-26 tied-head reduction and never construct
+    /// the [8, L, 262144] logits tensor. Every unsupported shape falls back to
+    /// the established head plus argmax.
+    public func cbv2ForwardArgmaxWithHidden(
+        _ tokens: MLXArray, caches: [KVCache]
+    ) -> (argmax: MLXArray, lastHidden: MLXArray) {
+        let (postNorm, preNorm) = model.callCapturingPreNorm(tokens, cache: caches)
+        let length = postNorm.dim(1)
+        if postNorm.dim(0) == 8, length == 2, lmHead == nil,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.mode == .affine
+        {
+            let columnMajor = concatenated(
+                [
+                    postNorm[0..., 0 ..< 1, 0...],
+                    postNorm[0..., 1 ..< 2, 0...],
+                ],
+                axis: 0
+            ).reshaped([16, postNorm.dim(-1)])
+            if let top1 = Gemma4MMAQuantizedGEMV.applyArgmaxM16(
+                x: columnMajor,
+                w: quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                groupSize: quantized.groupSize,
+                bits: quantized.bits)
+            {
+                return (
+                    concatenated(
+                        [
+                            top1[0 ..< 8].reshaped([8, 1]),
+                            top1[8 ..< 16].reshaped([8, 1]),
+                        ],
+                        axis: 1),
+                    preNorm
+                )
+            }
+        }
+        let columns = (0 ..< length).map { offset -> MLXArray in
+            let hidden = postNorm[0..., offset ..< (offset + 1), 0...]
+            guard lmHead == nil,
+                let quantized = model.embedTokens as? QuantizedEmbedding,
+                quantized.mode == .affine,
+                let top1 = Gemma4MMAQuantizedGEMV.applyArgmax(
+                    x: hidden,
+                    w: quantized.weight,
+                    scales: quantized.scales,
+                    biases: quantized.biases,
+                    groupSize: quantized.groupSize,
+                    bits: quantized.bits)
+            else {
+                return argMax(applyLMHead(hidden), axis: -1).asType(.int32)
+            }
+            return top1.reshaped([hidden.dim(0), 1])
+        }
+        return (
+            columns.count == 1 ? columns[0] : concatenated(columns, axis: 1),
+            preNorm
+        )
     }
 }

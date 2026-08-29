@@ -2580,4 +2580,575 @@ public enum Gemma4MMAQuantizedGEMV {
         )
         return outputs[0]
     }
+
+    // MARK: - MTP logitsless top-1 on the promoted version-26 head
+
+    /// Version 26 with its final vocabulary store replaced by a reduction.
+    /// The compared value is `float(T(acc))`, exactly the bf16 value the
+    /// promoted head would have written before ordinary argmax. Ties retain
+    /// the lower vocabulary index, matching MLX argmax.
+    private static let sourceV26Argmax: String = {
+        var result = sourceV26
+
+        func replaceOnce(_ old: String, with new: String) {
+            let count = result.components(separatedBy: old).count
+            precondition(count == 2, "sourceV26Argmax replacement count \(count): \(old)")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+
+        replaceOnce(
+            """
+            const uint outputN0 = sgN0 + fragmentRow;
+            const uint outputN1 = outputN0 + N_PSG;
+            const uint outputN2 = outputN0 + N_PSG * 2;
+            const uint outputN3 = outputN0 + N_PSG * 3;
+            out[fragmentCol * N + outputN0] = T(acc0.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN0] = T(acc0.thread_elements()[1]);
+            out[fragmentCol * N + outputN1] = T(acc1.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN1] = T(acc1.thread_elements()[1]);
+            out[fragmentCol * N + outputN2] = T(acc2.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN2] = T(acc2.thread_elements()[1]);
+            out[fragmentCol * N + outputN3] = T(acc3.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN3] = T(acc3.thread_elements()[1]);
+            """,
+            with: """
+            constexpr uint TILES = uint(N) / (N_SG * N_PSG * 4);
+            threadgroup float bestVal[N_SG * M_ROWS];
+            threadgroup uint bestIdx[N_SG * M_ROWS];
+
+            const uint outputN0 = sgN0 + fragmentRow;
+            float va = float(T(acc0.thread_elements()[0]));
+            float vb = float(T(acc0.thread_elements()[1]));
+            uint ia = outputN0;
+            uint ib = outputN0;
+            const float va1 = float(T(acc1.thread_elements()[0]));
+            const float vb1 = float(T(acc1.thread_elements()[1]));
+            if (va1 > va) { va = va1; ia = outputN0 + N_PSG; }
+            if (vb1 > vb) { vb = vb1; ib = outputN0 + N_PSG; }
+            const float va2 = float(T(acc2.thread_elements()[0]));
+            const float vb2 = float(T(acc2.thread_elements()[1]));
+            if (va2 > va) { va = va2; ia = outputN0 + N_PSG * 2; }
+            if (vb2 > vb) { vb = vb2; ib = outputN0 + N_PSG * 2; }
+            const float va3 = float(T(acc3.thread_elements()[0]));
+            const float vb3 = float(T(acc3.thread_elements()[1]));
+            if (va3 > va) { va = va3; ia = outputN0 + N_PSG * 3; }
+            if (vb3 > vb) { vb = vb3; ib = outputN0 + N_PSG * 3; }
+
+            // `fragmentRow` is lane bits 1, 2 and 4. These three butterflies
+            // close the 32 vocabulary columns owned by one simdgroup for both
+            // activation rows held by this lane.
+            for (uint s = 0; s < 3; ++s) {
+                const ushort xm = s == 0 ? 2 : (s == 1 ? 4 : 16);
+                const float oa = simd_shuffle_xor(va, xm);
+                const uint oia = simd_shuffle_xor(ia, xm);
+                if (oa > va || (oa == va && oia < ia)) { va = oa; ia = oia; }
+                const float ob = simd_shuffle_xor(vb, xm);
+                const uint oib = simd_shuffle_xor(ib, xm);
+                if (ob > vb || (ob == vb && oib < ib)) { vb = ob; ib = oib; }
+            }
+
+            // Lanes 0, 1, 8 and 9 carry the eight activation rows exactly
+            // once. Fold the four simdgroups, then publish one partial record
+            // per threadgroup and row.
+            if ((lane & 22u) == 0u) {
+                bestVal[sg * M_ROWS + fragmentCol] = va;
+                bestIdx[sg * M_ROWS + fragmentCol] = ia;
+                bestVal[sg * M_ROWS + fragmentCol + 1] = vb;
+                bestIdx[sg * M_ROWS + fragmentCol + 1] = ib;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lid < M_ROWS) {
+                float rv = bestVal[lid];
+                uint ri = bestIdx[lid];
+                for (uint s = 1; s < N_SG; ++s) {
+                    const float ov = bestVal[s * M_ROWS + lid];
+                    const uint oi = bestIdx[s * M_ROWS + lid];
+                    if (ov > rv || (ov == rv && oi < ri)) { rv = ov; ri = oi; }
+                }
+                pv[lid * TILES + tg] = rv;
+                pi[lid * TILES + tg] = ri;
+            }
+            """
+        )
+        precondition(!result.contains("out["), "sourceV26Argmax still stores logits")
+        return result
+    }()
+
+    private static let kernelV26Argmax: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_affine4_qmv_m8_v26_argmax",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["pv", "pi"],
+        source: sourceV26Argmax,
+        header: "#include <metal_simdgroup_matrix>\n",
+        ensureRowContiguous: true
+    )
+
+    /// One simdgroup per activation row folds the vocabulary-tile partials.
+    private static let argmaxReduceKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_head_argmax_reduce_v26",
+        inputNames: ["pv", "pi"],
+        outputNames: ["tokens"],
+        source: """
+            const uint m = threadgroup_position_in_grid.x;
+            const uint lane = thread_index_in_simdgroup;
+            float rv = -INFINITY;
+            uint ri = 0xFFFFFFFFu;
+            for (uint i = lane; i < uint(NT); i += 32) {
+                const float ov = pv[m * uint(NT) + i];
+                const uint oi = pi[m * uint(NT) + i];
+                if (ov > rv || (ov == rv && oi < ri)) { rv = ov; ri = oi; }
+            }
+            for (ushort xm = 1; xm < 32; xm <<= 1) {
+                const float ov = simd_shuffle_xor(rv, xm);
+                const uint oi = simd_shuffle_xor(ri, xm);
+                if (ov > rv || (ov == rv && oi < ri)) { rv = ov; ri = oi; }
+            }
+            if (lane == 0) {
+                tokens[m] = int32_t(ri);
+            }
+            """,
+        ensureRowContiguous: true
+    )
+
+    /// The exact version-26 tied-head top-1 token per B=8 activation row.
+    /// Unsupported geometry returns nil so callers retain the stock head.
+    public static func applyArgmax(
+        x: MLXArray,
+        w: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int
+    ) -> MLXArray? {
+        guard enabled, version == 26, let biases else { return nil }
+        guard groupSize == 64, bits == 4 else { return nil }
+        guard x.dtype == .bfloat16, scales.dtype == .bfloat16, biases.dtype == .bfloat16
+        else { return nil }
+        guard w.dtype == .uint32 else { return nil }
+        guard w.ndim == 2, scales.ndim == 2, biases.ndim == 2 else { return nil }
+        guard x.ndim == 2 || (x.ndim == 3 && x.dim(1) == 1) else { return nil }
+        guard x.dim(0) == mRows else { return nil }
+        let k = x.dim(-1)
+        guard k > 0, x.size == mRows * k else { return nil }
+
+        let n = w.dim(0)
+        let cols = colsPerThreadgroup * 4
+        guard n >= minOutputWidth, n % cols == 0 else { return nil }
+        guard k % groupSize == 0, k % 8 == 0 else { return nil }
+        guard w.dim(1) == k * bits / 32 else { return nil }
+        guard scales.dim(0) == n, biases.dim(0) == n else { return nil }
+        guard scales.dim(1) == k / groupSize, biases.dim(1) == k / groupSize else {
+            return nil
+        }
+
+        let flatX = x.reshaped([mRows, k])
+        let threadgroups = n / cols
+        let sumCells = mRows * (k / groupSize)
+        let sumThreads = 128
+        let sumThreadgroups = (sumCells + sumThreads - 1) / sumThreads
+        let xSums = xSumKernel(
+            [flatX],
+            template: [("T", x.dtype), ("K", k)],
+            grid: (sumThreadgroups * sumThreads, 1, 1),
+            threadGroup: (sumThreads, 1, 1),
+            outputShapes: [[sumCells]],
+            outputDTypes: [.float32]
+        )[0]
+
+        let partials = kernelV26Argmax(
+            [flatX, w, scales, biases, xSums],
+            template: [("T", x.dtype), ("K", k), ("N", n)],
+            grid: (threadgroups * threadsPerThreadgroup, 1, 1),
+            threadGroup: (threadsPerThreadgroup, 1, 1),
+            outputShapes: [[mRows * threadgroups], [mRows * threadgroups]],
+            outputDTypes: [.float32, .uint32]
+        )
+
+        return argmaxReduceKernel(
+            [partials[0], partials[1]],
+            template: [("NT", threadgroups)],
+            grid: (mRows * 32, 1, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[mRows]],
+            outputDTypes: [.int32]
+        )[0]
+    }
+
+    // MARK: - Two-column MTP head: 16 activations per weight stream
+
+    /// M=16 twin of the promoted affine-bias activation-sum prepass.
+    private static let xSumKernelM16: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_affine4_xsum_m16",
+        inputNames: ["x"],
+        outputNames: ["xSums"],
+        source: """
+            constexpr uint M_ROWS = 16;
+            constexpr uint GROUP = 64;
+            constexpr uint N_GROUPS = K / GROUP;
+            const uint cell = thread_position_in_grid.x;
+            if (cell >= M_ROWS * N_GROUPS) return;
+
+            const device T* xp =
+                x + (cell / N_GROUPS) * K + (cell % N_GROUPS) * GROUP;
+            float s = 0.0f;
+            for (uint c = 0; c < GROUP / 8; ++c) {
+                const uint i = c * 8;
+                s += xp[i + 0] + xp[i + 1] + xp[i + 2] + xp[i + 3];
+                s += xp[i + 4] + xp[i + 5] + xp[i + 6] + xp[i + 7];
+            }
+            xSums[cell] = s;
+            """,
+        ensureRowContiguous: true
+    )
+
+    /// The version-15 dual-output-tile arithmetic widened from 8 to 16
+    /// activation rows. Version 15 and promoted version 26 differ only in
+    /// packed-weight cursor lifetime; their per-output arithmetic is the same.
+    /// Two independent activation fragments therefore consume each loaded
+    /// weight fragment, halving tied-head weight traffic versus two M=8 calls.
+    private static let sourceM16Argmax: String = {
+        var result = sourceV15
+
+        func replaceOnce(_ old: String, with new: String) {
+            let count = result.components(separatedBy: old).count
+            precondition(count == 2, "sourceM16Argmax replacement count \(count): \(old)")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+
+        replaceOnce("constexpr uint M_ROWS = 8;", with: "constexpr uint M_ROWS = 16;")
+
+        replaceOnce(
+            """
+            simdgroup_matrix<float, 8, 8> acc0 = simdgroup_matrix<float, 8, 8>(0.0f);
+            simdgroup_matrix<float, 8, 8> acc1 = simdgroup_matrix<float, 8, 8>(0.0f);
+            """,
+            with: """
+            simdgroup_matrix<float, 8, 8> acc0a = simdgroup_matrix<float, 8, 8>(0.0f);
+            simdgroup_matrix<float, 8, 8> acc1a = simdgroup_matrix<float, 8, 8>(0.0f);
+            simdgroup_matrix<float, 8, 8> acc0b = simdgroup_matrix<float, 8, 8>(0.0f);
+            simdgroup_matrix<float, 8, 8> acc1b = simdgroup_matrix<float, 8, 8>(0.0f);
+            """
+        )
+
+        replaceOnce(
+            """
+                simdgroup_matrix<float, 8, 8> accg0 =
+                    simdgroup_matrix<float, 8, 8>(0.0f);
+                simdgroup_matrix<float, 8, 8> accg1 =
+                    simdgroup_matrix<float, 8, 8>(0.0f);
+            """,
+            with: """
+                simdgroup_matrix<float, 8, 8> accg0a =
+                    simdgroup_matrix<float, 8, 8>(0.0f);
+                simdgroup_matrix<float, 8, 8> accg1a =
+                    simdgroup_matrix<float, 8, 8>(0.0f);
+                simdgroup_matrix<float, 8, 8> accg0b =
+                    simdgroup_matrix<float, 8, 8>(0.0f);
+                simdgroup_matrix<float, 8, 8> accg1b =
+                    simdgroup_matrix<float, 8, 8>(0.0f);
+            """
+        )
+
+        replaceOnce(
+            """
+                    simdgroup_matrix<T, 8, 8> A0;
+                    simdgroup_matrix<T, 8, 8> A1;
+                    simdgroup_matrix<T, 8, 8> B;
+                    const uint packed0 = t < 4 ? packedLo0[t] : packedHi0[t - 4];
+                    const uint packed1 = t < 4 ? packedLo1[t] : packedHi1[t - 4];
+                    A0.thread_elements()[0] =
+                        T(float((packed0 >> (4 * fragmentCol)) & 0xFu));
+                    A0.thread_elements()[1] =
+                        T(float((packed0 >> (4 * (fragmentCol + 1))) & 0xFu));
+                    A1.thread_elements()[0] =
+                        T(float((packed1 >> (4 * fragmentCol)) & 0xFu));
+                    A1.thread_elements()[1] =
+                        T(float((packed1 >> (4 * (fragmentCol + 1))) & 0xFu));
+                    const uint activationK = g * GROUP + t * 8 + fragmentRow;
+                    B.thread_elements()[0] = x[fragmentCol * K + activationK];
+                    B.thread_elements()[1] =
+                        x[(fragmentCol + 1) * K + activationK];
+                    simdgroup_multiply_accumulate(accg0, A0, B, accg0);
+                    simdgroup_multiply_accumulate(accg1, A1, B, accg1);
+            """,
+            with: """
+                    simdgroup_matrix<T, 8, 8> A0;
+                    simdgroup_matrix<T, 8, 8> A1;
+                    simdgroup_matrix<T, 8, 8> Ba;
+                    simdgroup_matrix<T, 8, 8> Bb;
+                    const uint packed0 = t < 4 ? packedLo0[t] : packedHi0[t - 4];
+                    const uint packed1 = t < 4 ? packedLo1[t] : packedHi1[t - 4];
+                    A0.thread_elements()[0] =
+                        T(float((packed0 >> (4 * fragmentCol)) & 0xFu));
+                    A0.thread_elements()[1] =
+                        T(float((packed0 >> (4 * (fragmentCol + 1))) & 0xFu));
+                    A1.thread_elements()[0] =
+                        T(float((packed1 >> (4 * fragmentCol)) & 0xFu));
+                    A1.thread_elements()[1] =
+                        T(float((packed1 >> (4 * (fragmentCol + 1))) & 0xFu));
+                    const uint activationK = g * GROUP + t * 8 + fragmentRow;
+                    Ba.thread_elements()[0] = x[fragmentCol * K + activationK];
+                    Ba.thread_elements()[1] =
+                        x[(fragmentCol + 1) * K + activationK];
+                    Bb.thread_elements()[0] =
+                        x[(fragmentCol + 8) * K + activationK];
+                    Bb.thread_elements()[1] =
+                        x[(fragmentCol + 9) * K + activationK];
+                    simdgroup_multiply_accumulate(accg0a, A0, Ba, accg0a);
+                    simdgroup_multiply_accumulate(accg1a, A1, Ba, accg1a);
+                    simdgroup_multiply_accumulate(accg0b, A0, Bb, accg0b);
+                    simdgroup_multiply_accumulate(accg1b, A1, Bb, accg1b);
+            """
+        )
+
+        replaceOnce(
+            """
+            acc0.thread_elements()[0] = metal::fma(
+                rowScale0, accg0.thread_elements()[0], acc0.thread_elements()[0]);
+            acc0.thread_elements()[1] = metal::fma(
+                rowScale0, accg0.thread_elements()[1], acc0.thread_elements()[1]);
+            acc1.thread_elements()[0] = metal::fma(
+                rowScale1, accg1.thread_elements()[0], acc1.thread_elements()[0]);
+            acc1.thread_elements()[1] = metal::fma(
+                rowScale1, accg1.thread_elements()[1], acc1.thread_elements()[1]);
+            """,
+            with: """
+            acc0a.thread_elements()[0] = metal::fma(
+                rowScale0, accg0a.thread_elements()[0], acc0a.thread_elements()[0]);
+            acc0a.thread_elements()[1] = metal::fma(
+                rowScale0, accg0a.thread_elements()[1], acc0a.thread_elements()[1]);
+            acc1a.thread_elements()[0] = metal::fma(
+                rowScale1, accg1a.thread_elements()[0], acc1a.thread_elements()[0]);
+            acc1a.thread_elements()[1] = metal::fma(
+                rowScale1, accg1a.thread_elements()[1], acc1a.thread_elements()[1]);
+            acc0b.thread_elements()[0] = metal::fma(
+                rowScale0, accg0b.thread_elements()[0], acc0b.thread_elements()[0]);
+            acc0b.thread_elements()[1] = metal::fma(
+                rowScale0, accg0b.thread_elements()[1], acc0b.thread_elements()[1]);
+            acc1b.thread_elements()[0] = metal::fma(
+                rowScale1, accg1b.thread_elements()[0], acc1b.thread_elements()[0]);
+            acc1b.thread_elements()[1] = metal::fma(
+                rowScale1, accg1b.thread_elements()[1], acc1b.thread_elements()[1]);
+            """
+        )
+
+        replaceOnce(
+            """
+                    simdgroup_matrix<float, 8, 8> BBm0;
+                    simdgroup_matrix<float, 8, 8> BBm1;
+                    simdgroup_matrix<float, 8, 8> XBm;
+            """,
+            with: """
+                    simdgroup_matrix<float, 8, 8> BBm0;
+                    simdgroup_matrix<float, 8, 8> BBm1;
+                    simdgroup_matrix<float, 8, 8> XBma;
+                    simdgroup_matrix<float, 8, 8> XBmb;
+            """
+        )
+
+        replaceOnce(
+            """
+                        XBm.thread_elements()[0] =
+                            xSums[fragmentCol * N_GROUPS + biasRow];
+                        XBm.thread_elements()[1] =
+                            xSums[(fragmentCol + 1) * N_GROUPS + biasRow];
+            """,
+            with: """
+                        XBma.thread_elements()[0] =
+                            xSums[fragmentCol * N_GROUPS + biasRow];
+                        XBma.thread_elements()[1] =
+                            xSums[(fragmentCol + 1) * N_GROUPS + biasRow];
+                        XBmb.thread_elements()[0] =
+                            xSums[(fragmentCol + 8) * N_GROUPS + biasRow];
+                        XBmb.thread_elements()[1] =
+                            xSums[(fragmentCol + 9) * N_GROUPS + biasRow];
+            """
+        )
+
+        replaceOnce(
+            """
+                        XBm.thread_elements()[0] = biasRow < N_GROUPS
+                            ? xSums[fragmentCol * N_GROUPS + biasRow] : 0.0f;
+                        XBm.thread_elements()[1] = biasRow < N_GROUPS
+                            ? xSums[(fragmentCol + 1) * N_GROUPS + biasRow] : 0.0f;
+            """,
+            with: """
+                        XBma.thread_elements()[0] = biasRow < N_GROUPS
+                            ? xSums[fragmentCol * N_GROUPS + biasRow] : 0.0f;
+                        XBma.thread_elements()[1] = biasRow < N_GROUPS
+                            ? xSums[(fragmentCol + 1) * N_GROUPS + biasRow] : 0.0f;
+                        XBmb.thread_elements()[0] = biasRow < N_GROUPS
+                            ? xSums[(fragmentCol + 8) * N_GROUPS + biasRow] : 0.0f;
+                        XBmb.thread_elements()[1] = biasRow < N_GROUPS
+                            ? xSums[(fragmentCol + 9) * N_GROUPS + biasRow] : 0.0f;
+            """
+        )
+
+        replaceOnce(
+            """
+                    simdgroup_multiply_accumulate(acc0, BBm0, XBm, acc0);
+                    simdgroup_multiply_accumulate(acc1, BBm1, XBm, acc1);
+            """,
+            with: """
+                    simdgroup_multiply_accumulate(acc0a, BBm0, XBma, acc0a);
+                    simdgroup_multiply_accumulate(acc1a, BBm1, XBma, acc1a);
+                    simdgroup_multiply_accumulate(acc0b, BBm0, XBmb, acc0b);
+                    simdgroup_multiply_accumulate(acc1b, BBm1, XBmb, acc1b);
+            """
+        )
+
+        replaceOnce(
+            """
+            const uint outputN0 = sgN0 + fragmentRow;
+            const uint outputN1 = outputN0 + N_PSG;
+            out[fragmentCol * N + outputN0] = T(acc0.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN0] = T(acc0.thread_elements()[1]);
+            out[fragmentCol * N + outputN1] = T(acc1.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN1] = T(acc1.thread_elements()[1]);
+            """,
+            with: """
+            constexpr uint TILES = uint(N) / (N_SG * N_PSG * 2);
+            threadgroup float bestVal[N_SG * M_ROWS];
+            threadgroup uint bestIdx[N_SG * M_ROWS];
+
+            const uint outputN0 = sgN0 + fragmentRow;
+            float va0 = float(T(acc0a.thread_elements()[0]));
+            float va1 = float(T(acc0a.thread_elements()[1]));
+            float vb0 = float(T(acc0b.thread_elements()[0]));
+            float vb1 = float(T(acc0b.thread_elements()[1]));
+            uint ia0 = outputN0;
+            uint ia1 = outputN0;
+            uint ib0 = outputN0;
+            uint ib1 = outputN0;
+            const float oa0 = float(T(acc1a.thread_elements()[0]));
+            const float oa1 = float(T(acc1a.thread_elements()[1]));
+            const float ob0 = float(T(acc1b.thread_elements()[0]));
+            const float ob1 = float(T(acc1b.thread_elements()[1]));
+            if (oa0 > va0) { va0 = oa0; ia0 = outputN0 + N_PSG; }
+            if (oa1 > va1) { va1 = oa1; ia1 = outputN0 + N_PSG; }
+            if (ob0 > vb0) { vb0 = ob0; ib0 = outputN0 + N_PSG; }
+            if (ob1 > vb1) { vb1 = ob1; ib1 = outputN0 + N_PSG; }
+
+            for (uint s = 0; s < 3; ++s) {
+                const ushort xm = s == 0 ? 2 : (s == 1 ? 4 : 16);
+                const float ova0 = simd_shuffle_xor(va0, xm);
+                const uint oia0 = simd_shuffle_xor(ia0, xm);
+                if (ova0 > va0 || (ova0 == va0 && oia0 < ia0)) {
+                    va0 = ova0; ia0 = oia0;
+                }
+                const float ova1 = simd_shuffle_xor(va1, xm);
+                const uint oia1 = simd_shuffle_xor(ia1, xm);
+                if (ova1 > va1 || (ova1 == va1 && oia1 < ia1)) {
+                    va1 = ova1; ia1 = oia1;
+                }
+                const float ovb0 = simd_shuffle_xor(vb0, xm);
+                const uint oib0 = simd_shuffle_xor(ib0, xm);
+                if (ovb0 > vb0 || (ovb0 == vb0 && oib0 < ib0)) {
+                    vb0 = ovb0; ib0 = oib0;
+                }
+                const float ovb1 = simd_shuffle_xor(vb1, xm);
+                const uint oib1 = simd_shuffle_xor(ib1, xm);
+                if (ovb1 > vb1 || (ovb1 == vb1 && oib1 < ib1)) {
+                    vb1 = ovb1; ib1 = oib1;
+                }
+            }
+
+            if ((lane & 22u) == 0u) {
+                bestVal[sg * M_ROWS + fragmentCol] = va0;
+                bestIdx[sg * M_ROWS + fragmentCol] = ia0;
+                bestVal[sg * M_ROWS + fragmentCol + 1] = va1;
+                bestIdx[sg * M_ROWS + fragmentCol + 1] = ia1;
+                bestVal[sg * M_ROWS + fragmentCol + 8] = vb0;
+                bestIdx[sg * M_ROWS + fragmentCol + 8] = ib0;
+                bestVal[sg * M_ROWS + fragmentCol + 9] = vb1;
+                bestIdx[sg * M_ROWS + fragmentCol + 9] = ib1;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lid < M_ROWS) {
+                float rv = bestVal[lid];
+                uint ri = bestIdx[lid];
+                for (uint s = 1; s < N_SG; ++s) {
+                    const float ov = bestVal[s * M_ROWS + lid];
+                    const uint oi = bestIdx[s * M_ROWS + lid];
+                    if (ov > rv || (ov == rv && oi < ri)) { rv = ov; ri = oi; }
+                }
+                pv[lid * TILES + tg] = rv;
+                pi[lid * TILES + tg] = ri;
+            }
+            """
+        )
+        precondition(!result.contains("out["), "sourceM16Argmax still stores logits")
+        return result
+    }()
+
+    private static let kernelM16Argmax: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_affine4_qmv_m16_argmax",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["pv", "pi"],
+        source: sourceM16Argmax,
+        header: "#include <metal_simdgroup_matrix>\n",
+        ensureRowContiguous: true
+    )
+
+    /// Top-1 for exactly 16 bf16 activations, using one vocabulary-weight
+    /// stream. The first eight rows and final eight rows remain independent.
+    public static func applyArgmaxM16(
+        x: MLXArray,
+        w: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int
+    ) -> MLXArray? {
+        guard enabled, version == 26, let biases else { return nil }
+        guard groupSize == 64, bits == 4 else { return nil }
+        guard x.dtype == .bfloat16, scales.dtype == .bfloat16, biases.dtype == .bfloat16
+        else { return nil }
+        guard w.dtype == .uint32 else { return nil }
+        guard w.ndim == 2, scales.ndim == 2, biases.ndim == 2 else { return nil }
+        guard x.ndim == 2, x.dim(0) == 16 else { return nil }
+        let k = x.dim(1)
+        guard k > 0, x.size == 16 * k else { return nil }
+
+        let n = w.dim(0)
+        let cols = colsPerThreadgroup * 2
+        guard n >= minOutputWidth, n % cols == 0 else { return nil }
+        guard k % groupSize == 0, k % 8 == 0 else { return nil }
+        guard w.dim(1) == k * bits / 32 else { return nil }
+        guard scales.dim(0) == n, biases.dim(0) == n else { return nil }
+        guard scales.dim(1) == k / groupSize, biases.dim(1) == k / groupSize else {
+            return nil
+        }
+
+        let threadgroups = n / cols
+        let sumCells = 16 * (k / groupSize)
+        let sumThreads = 128
+        let sumThreadgroups = (sumCells + sumThreads - 1) / sumThreads
+        let xSums = xSumKernelM16(
+            [x],
+            template: [("T", x.dtype), ("K", k)],
+            grid: (sumThreadgroups * sumThreads, 1, 1),
+            threadGroup: (sumThreads, 1, 1),
+            outputShapes: [[sumCells]],
+            outputDTypes: [.float32]
+        )[0]
+
+        let partials = kernelM16Argmax(
+            [x, w, scales, biases, xSums],
+            template: [("T", x.dtype), ("K", k), ("N", n)],
+            grid: (threadgroups * threadsPerThreadgroup, 1, 1),
+            threadGroup: (threadsPerThreadgroup, 1, 1),
+            outputShapes: [[16 * threadgroups], [16 * threadgroups]],
+            outputDTypes: [.float32, .uint32]
+        )
+
+        return argmaxReduceKernel(
+            [partials[0], partials[1]],
+            template: [("NT", threadgroups)],
+            grid: (16 * 32, 1, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[16]],
+            outputDTypes: [.int32]
+        )[0]
+    }
 }

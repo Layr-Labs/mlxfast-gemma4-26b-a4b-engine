@@ -455,16 +455,26 @@ enum CBv2AttentionV1 {
         }
 
         // Rectangular [B > 1, L > 1] packed prefill or MTP verify: every row
-        // takes the same per-row path as a singleton chunk and attends
-        // exactly its own KV. Serialized queries remain MTP-only; ordinary
-        // packed prefill keeps q-blocking and optional row-local span masks.
+        // takes the same path as a singleton chunk and attends exactly its
+        // own KV. MTP serializes by COLUMN so each `[B, 1]` slice retains the
+        // promoted decode kernels and update ordering; ordinary packed
+        // prefill keeps q-blocking and optional row-local span masks.
         if serializeQueries {
-            return packedPerRow(batch: B) { index, slice in
-                updateAndAttendRowSerialQueries(
-                    row: rows[index], kind: kind,
-                    queries: slice(queries), keys: slice(keys), values: slice(values),
-                    scale: scale, sinks: effectiveSinks, softcap: softcap)
+            var outputs: [MLXArray] = []
+            outputs.reserveCapacity(L)
+            for offset in 0 ..< L {
+                outputs.append(
+                    updateAndAttend(
+                        rows: rows, kind: kind,
+                        queries: queries[.ellipsis, offset ..< (offset + 1), 0...],
+                        keys: keys[.ellipsis, offset ..< (offset + 1), 0...],
+                        values: values[.ellipsis, offset ..< (offset + 1), 0...],
+                        scale: scale, sinks: sinks, softcap: softcap,
+                        spanContexts: nil, serializeQueries: false,
+                        decodeRingWriteFence: decodeRingWriteFence,
+                        allowFusedRingWrite: allowFusedRingWrite))
             }
+            return concatenated(outputs, axis: 2)
         }
 
         // Commit every row's K/V FIRST, in row order. `update` appends to that
@@ -706,11 +716,21 @@ enum CBv2AttentionV1 {
         scale: Float, sinks: MLXArray?, softcap: Float?
     ) -> MLXArray {
         let L = queries.dim(2)
-        let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
-        return attendSerialQueries(
-            queries: queries, keys: cachedKeys, values: cachedValues,
-            newTokenCount: L, window: window(of: kind), scale: scale,
-            sinks: sinks, softcap: softcap)
+        precondition(L > 1, "serialized rectangular attention requires L > 1")
+        var outputs: [MLXArray] = []
+        outputs.reserveCapacity(L)
+        for offset in 0 ..< L {
+            let (cachedKeys, cachedValues) = row.update(
+                keys: keys[.ellipsis, offset ..< (offset + 1), 0...],
+                values: values[.ellipsis, offset ..< (offset + 1), 0...])
+            outputs.append(
+                attend(
+                    queries: queries[.ellipsis, offset ..< (offset + 1), 0...],
+                    keys: cachedKeys, values: cachedValues,
+                    scale: scale, L: 1, kL: cachedKeys.dim(2), window: nil,
+                    sinks: sinks, softcap: softcap))
+        }
+        return concatenated(outputs, axis: 2)
     }
 
     /// Attend against `sourceRows`' KV WITHOUT updating (Gemma-4 cross-layer
@@ -757,14 +777,13 @@ enum CBv2AttentionV1 {
             sinks, kind: kind, queries: queries, softcap: softcap)
 
         if L > 1 {
+            if serializeQueries {
+                return attendBorrowedSerialQueries(
+                    sourceRows: sourceRows, sourceKind: sourceKind, kind: kind,
+                    queries: queries, scale: scale,
+                    sinks: effectiveSinks, softcap: softcap)
+            }
             if B == 1 {
-                if serializeQueries {
-                    let (keys, values) = chunkBorrowViews(of: sourceRows[0])
-                    return attendSerialQueries(
-                        queries: queries, keys: keys, values: values,
-                        newTokenCount: L, window: window(of: sourceKind), scale: scale,
-                        sinks: effectiveSinks, softcap: softcap)
-                }
                 return borrowAndAttendRow(
                     sourceRow: sourceRows[0], sourceKind: sourceKind,
                     queries: queries, scale: scale, sinks: effectiveSinks, softcap: softcap,
@@ -801,22 +820,12 @@ enum CBv2AttentionV1 {
             var outputs: [MLXArray] = []
             outputs.reserveCapacity(B)
             for (index, row) in sourceRows.enumerated() {
-                if serializeQueries {
-                    let (keys, values) = chunkBorrowViews(of: row)
-                    outputs.append(
-                        attendSerialQueries(
-                            queries: queries[index ..< (index + 1)],
-                            keys: keys, values: values, newTokenCount: L,
-                            window: window(of: sourceKind), scale: scale,
-                            sinks: effectiveSinks, softcap: softcap))
-                } else {
-                    outputs.append(
-                        borrowAndAttendRow(
+                outputs.append(
+                    borrowAndAttendRow(
                         sourceRow: row, sourceKind: sourceKind,
                         queries: queries[index ..< (index + 1)],
                         scale: scale, sinks: effectiveSinks, softcap: softcap,
                         spanContext: spanContexts?[index]))
-                }
             }
             return concatenated(outputs, axis: 0)
         }
@@ -881,6 +890,77 @@ enum CBv2AttentionV1 {
                     sinks: effectiveSinks, softcap: softcap))
         }
         return B == 1 ? outputs[0] : concatenated(outputs, axis: 0)
+    }
+
+    /// Reconstruct each serialized query's exact post-update source view.
+    ///
+    /// The storage-owning layer has already appended all L columns before a
+    /// KV-sharing sibling executes. Its final retained ring is insufficient
+    /// for an early sliding query because that query must still see entries
+    /// evicted by later columns. A speculative snapshot retains the complete
+    /// logical pre-round history plus staged tail, so slice the prefix ending
+    /// at each query and then retain exactly the ordinary decode window.
+    private static func attendBorrowedSerialQueries(
+        sourceRows: [CBv2SequenceKV], sourceKind: CBv2LayerKind,
+        kind: CBv2LayerKind,
+        queries: MLXArray, scale: Float, sinks: MLXArray?, softcap: Float?
+    ) -> MLXArray {
+        let B = queries.dim(0)
+        let L = queries.dim(2)
+        precondition(L > 1, "serialized borrowed attention requires L > 1")
+        precondition(
+            B == sourceRows.count,
+            "serialized borrowed attention requires one source row per query row")
+        let snapshots = sourceRows.map { $0.snapshot() }
+        let histories = snapshots.map { snapshot -> Int in
+            let total = snapshot.keys.dim(2)
+            precondition(
+                total >= L && snapshot.values.dim(2) == total,
+                "serialized borrowed attention requires the complete staged tail")
+            return total - L
+        }
+        let retainedWindow = window(of: sourceKind)
+        var columnOutputs: [MLXArray] = []
+        columnOutputs.reserveCapacity(L)
+        for offset in 0 ..< L {
+            var cachedKeys: [MLXArray] = []
+            var cachedValues: [MLXArray] = []
+            cachedKeys.reserveCapacity(B)
+            cachedValues.reserveCapacity(B)
+            for index in 0 ..< B {
+                let end = histories[index] + offset + 1
+                let start = retainedWindow.map { max(0, end - $0) } ?? 0
+                cachedKeys.append(
+                    snapshots[index].keys[.ellipsis, start ..< end, 0...])
+                cachedValues.append(
+                    snapshots[index].values[.ellipsis, start ..< end, 0...])
+            }
+            let columnQueries =
+                queries[.ellipsis, offset ..< (offset + 1), 0...]
+            if canUseRaggedTwoPassDecode(
+                batch: B, cacheKind: sourceKind, queryKind: kind,
+                scale: scale, sinks: sinks, softcap: softcap),
+                let output = CBv2RaggedTwoPassDecodeAttentionV1.attend(
+                    queries: columnQueries, keys: cachedKeys, values: cachedValues,
+                    scale: scale)
+            {
+                columnOutputs.append(output)
+                continue
+            }
+            var rowOutputs: [MLXArray] = []
+            rowOutputs.reserveCapacity(B)
+            for index in 0 ..< B {
+                rowOutputs.append(
+                    attend(
+                        queries: columnQueries[index ..< (index + 1)],
+                        keys: cachedKeys[index], values: cachedValues[index],
+                        scale: scale, L: 1, kL: cachedKeys[index].dim(2), window: nil,
+                        sinks: sinks, softcap: softcap))
+            }
+            columnOutputs.append(
+                B == 1 ? rowOutputs[0] : concatenated(rowOutputs, axis: 0))
+        }
+        return concatenated(columnOutputs, axis: 2)
     }
 
     /// One row's chunk borrow + attention — verbatim the single-request

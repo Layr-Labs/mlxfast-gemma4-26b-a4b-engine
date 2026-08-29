@@ -295,6 +295,128 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
   y[c.fn * N + n0 + c.fm] = static_cast<T>(acc0);
   y[(c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc1);
 }
+
+template <typename T, int KS>
+METAL_FUNC void attention_o_qmv_mma16_affine4_g64_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int K,
+    const int N,
+    const int n0,
+    threadgroup float4* red,
+    uint simd_gid,
+    uint simd_lid) {
+  const int G = K / 64;
+  const int gh = (G + 1) / 2;
+  const int g_begin = (KS == 2 && simd_gid == 1) ? gh : 0;
+  const int g_end = (KS == 2 && simd_gid == 0) ? gh : G;
+  const mma8_coord c = mma8_lane(simd_lid);
+
+  const device uint8_t* wrow =
+      (const device uint8_t*)w + (n0 + c.fm) * (K / 2) + 4 * c.fn;
+  const device T* srow = scales + (n0 + c.fm) * G;
+  const device T* brow = biases + (n0 + c.fm) * G;
+  const device T* x00 = x + (2 * c.fn) * K + 8 * c.fm;
+  const device T* x01 = x00 + 2 * K;
+  const device T* x10 = x00 + K;
+  const device T* x11 = x10 + 2 * K;
+
+  float acc00 = 0.0f;
+  float acc01 = 0.0f;
+  float acc10 = 0.0f;
+  float acc11 = 0.0f;
+  simdgroup_float8x8 A;
+  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+  for (int g = g_begin; g < g_end; ++g) {
+    const uint2 wv = *((const device uint2*)(wrow + 32 * g));
+    const float s = float(srow[g]);
+    const float b = float(brow[g]);
+
+    {
+      const uint4 r0 = *((const device uint4*)(x00 + 64 * g));
+      const uint4 r1 = *((const device uint4*)(x01 + 64 * g));
+      float2 rs = float2(mma8_runsum4<T>(r0), mma8_runsum4<T>(r1));
+      rs += simd_shuffle_xor(rs, 2u);
+      rs += simd_shuffle_xor(rs, 4u);
+      rs += simd_shuffle_xor(rs, 16u);
+
+      MMA8_SETB(B0, x, lo)
+      MMA8_SETB(B1, x, hi)
+      MMA8_SETB(B2, y, lo)
+      MMA8_SETB(B3, y, hi)
+      MMA8_SETB(B4, z, lo)
+      MMA8_SETB(B5, z, hi)
+      MMA8_SETB(B6, w, lo)
+      MMA8_SETB(B7, w, hi)
+
+      simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+      MMA8_STEP(B0, 0)
+      MMA8_STEP(B1, 1)
+      MMA8_STEP(B2, 2)
+      MMA8_STEP(B3, 3)
+      MMA8_STEP(B4, 4)
+      MMA8_STEP(B5, 5)
+      MMA8_STEP(B6, 6)
+      MMA8_STEP(B7, 7)
+      acc00 += s * C.thread_elements()[0] + rs.x * b;
+      acc01 += s * C.thread_elements()[1] + rs.y * b;
+    }
+
+    {
+      const uint4 r0 = *((const device uint4*)(x10 + 64 * g));
+      const uint4 r1 = *((const device uint4*)(x11 + 64 * g));
+      float2 rs = float2(mma8_runsum4<T>(r0), mma8_runsum4<T>(r1));
+      rs += simd_shuffle_xor(rs, 2u);
+      rs += simd_shuffle_xor(rs, 4u);
+      rs += simd_shuffle_xor(rs, 16u);
+
+      MMA8_SETB(B0, x, lo)
+      MMA8_SETB(B1, x, hi)
+      MMA8_SETB(B2, y, lo)
+      MMA8_SETB(B3, y, hi)
+      MMA8_SETB(B4, z, lo)
+      MMA8_SETB(B5, z, hi)
+      MMA8_SETB(B6, w, lo)
+      MMA8_SETB(B7, w, hi)
+
+      simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+      MMA8_STEP(B0, 0)
+      MMA8_STEP(B1, 1)
+      MMA8_STEP(B2, 2)
+      MMA8_STEP(B3, 3)
+      MMA8_STEP(B4, 4)
+      MMA8_STEP(B5, 5)
+      MMA8_STEP(B6, 6)
+      MMA8_STEP(B7, 7)
+      acc10 += s * C.thread_elements()[0] + rs.x * b;
+      acc11 += s * C.thread_elements()[1] + rs.y * b;
+    }
+  }
+
+  if (KS == 2) {
+    if (simd_gid == 1) {
+      red[simd_lid] = float4(acc00, acc01, acc10, acc11);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_gid == 1) {
+      return;
+    }
+    const float4 other = red[simd_lid];
+    acc00 = acc00 + other.x;
+    acc01 = acc01 + other.y;
+    acc10 = acc10 + other.z;
+    acc11 = acc11 + other.w;
+  }
+
+  y[(2 * c.fn) * N + n0 + c.fm] = static_cast<T>(acc00);
+  y[(2 * (c.fn + 1)) * N + n0 + c.fm] = static_cast<T>(acc01);
+  y[(2 * c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc10);
+  y[(2 * (c.fn + 1) + 1) * N + n0 + c.fm] = static_cast<T>(acc11);
+}
 """
 
     private static let mma8Kernel = MLXFast.metalKernel(
@@ -305,6 +427,23 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
             const uint3 tid = threadgroup_position_in_grid;
             threadgroup float2 red[32];
             attention_o_qmv_mma8_affine4_g64_impl<T, 2>(
+                w, scales, biases, x, y,
+                x_shape[x_ndim - 1], w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
+    private static let mma16Kernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l2_attention_o_mma16_affine4_g64_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float4 red[32];
+            attention_o_qmv_mma16_affine4_g64_impl<T, 2>(
                 w, scales, biases, x, y,
                 x_shape[x_ndim - 1], w_shape[0], int(tid.y) * 8, red,
                 simdgroup_index_in_threadgroup,
@@ -355,13 +494,13 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
             weight.dtype == .uint32,
             x.ndim == 3,
             x.dim(0) == batch,
-            x.dim(1) == sequence,
+            x.dim(1) == sequence || x.dim(1) == 2,
             weight.ndim == 2
         else { return nil }
 
         let inDim = x.dim(2)
         guard liveInputWidth(inDim),
-            x.size == batch * sequence * inDim,
+            x.size == batch * x.dim(1) * inDim,
             weight.shape == [outputWidth, inDim * Self.bits / 32],
             scales.shape == [outputWidth, inDim / Self.groupSize],
             biases.shape == scales.shape
@@ -373,12 +512,13 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
             // streamed once per round instead of four times. Grid is in
             // threads: (32, 2, 1) threads per group, N/8 groups along y.
             let yTiles = outputWidth / outputsPerGroup
-            return mma8Kernel(
+            let kernel = x.dim(1) == 2 ? mma16Kernel : mma8Kernel
+            return kernel(
                 [x, weight, scales, biases],
                 template: [("T", x.dtype)],
                 grid: (simdWidth, yTiles * simdGroups, 1),
                 threadGroup: (simdWidth, simdGroups, 1),
-                outputShapes: [[batch, sequence, outputWidth]],
+                outputShapes: [[batch, x.dim(1), outputWidth]],
                 outputDTypes: [x.dtype]
             )[0]
         }

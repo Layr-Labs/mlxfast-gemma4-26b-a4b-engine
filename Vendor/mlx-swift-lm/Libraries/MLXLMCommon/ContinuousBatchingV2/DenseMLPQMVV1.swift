@@ -601,6 +601,132 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
   y[c.fn * N + n0 + c.fm] = static_cast<T>(acc0);
   y[(c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc1);
 }
+
+// B=8,L=2 dense-down verifier.  This is two independent copies of the
+// promoted M8 arithmetic under one packed-weight stream; native [B,L,K]
+// interleaving is addressed directly, so no transpose materialization is
+// introduced between GELU and down_proj.
+template <typename T, int KS>
+METAL_FUNC void gemma4_qmv_mma16_affine8_g64_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int K,
+    const int N,
+    const int n0,
+    threadgroup float4* red,
+    uint simd_gid,
+    uint simd_lid) {
+  const int G = K / 64;
+  const int gh = (G + 1) / 2;
+  const int g_begin = (KS == 2 && simd_gid == 1) ? gh : 0;
+  const int g_end = (KS == 2 && simd_gid == 0) ? gh : G;
+  const mma8_coord c = mma8_lane(simd_lid);
+
+  const device uint8_t* wrow =
+      (const device uint8_t*)w + (n0 + c.fm) * K + 8 * c.fn;
+  const device T* srow = scales + (n0 + c.fm) * G;
+  const device T* brow = biases + (n0 + c.fm) * G;
+  const device T* x00 = x + (2 * c.fn) * K + 8 * c.fm;
+  const device T* x01 = x00 + 2 * K;
+  const device T* x10 = x00 + K;
+  const device T* x11 = x10 + 2 * K;
+
+  float acc00 = 0.0f;
+  float acc01 = 0.0f;
+  float acc10 = 0.0f;
+  float acc11 = 0.0f;
+  simdgroup_float8x8 A;
+  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+  for (int g = g_begin; g < g_end; ++g) {
+    const uint4 wv = *((const device uint4*)(wrow + 64 * g));
+    const float s = float(srow[g]);
+    const float b = float(brow[g]);
+
+    {
+      const uint4 r0 = *((const device uint4*)(x00 + 64 * g));
+      const uint4 r1 = *((const device uint4*)(x01 + 64 * g));
+      float2 rs = float2(mma8_runsum8<T>(r0), mma8_runsum8<T>(r1));
+      rs += simd_shuffle_xor(rs, 2u);
+      rs += simd_shuffle_xor(rs, 4u);
+      rs += simd_shuffle_xor(rs, 16u);
+
+      MMA8_SETB(B0, x, lo)
+      MMA8_SETB(B1, x, hi)
+      MMA8_SETB(B2, y, lo)
+      MMA8_SETB(B3, y, hi)
+      MMA8_SETB(B4, z, lo)
+      MMA8_SETB(B5, z, hi)
+      MMA8_SETB(B6, w, lo)
+      MMA8_SETB(B7, w, hi)
+
+      simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+      MMA8_STEP8(B0, x, z, 0)
+      MMA8_STEP8(B1, x, z, 8)
+      MMA8_STEP8(B2, x, z, 16)
+      MMA8_STEP8(B3, x, z, 24)
+      MMA8_STEP8(B4, y, w, 0)
+      MMA8_STEP8(B5, y, w, 8)
+      MMA8_STEP8(B6, y, w, 16)
+      MMA8_STEP8(B7, y, w, 24)
+      acc00 += s * C.thread_elements()[0] + rs.x * b;
+      acc01 += s * C.thread_elements()[1] + rs.y * b;
+    }
+
+    {
+      const uint4 r0 = *((const device uint4*)(x10 + 64 * g));
+      const uint4 r1 = *((const device uint4*)(x11 + 64 * g));
+      float2 rs = float2(mma8_runsum8<T>(r0), mma8_runsum8<T>(r1));
+      rs += simd_shuffle_xor(rs, 2u);
+      rs += simd_shuffle_xor(rs, 4u);
+      rs += simd_shuffle_xor(rs, 16u);
+
+      MMA8_SETB(B0, x, lo)
+      MMA8_SETB(B1, x, hi)
+      MMA8_SETB(B2, y, lo)
+      MMA8_SETB(B3, y, hi)
+      MMA8_SETB(B4, z, lo)
+      MMA8_SETB(B5, z, hi)
+      MMA8_SETB(B6, w, lo)
+      MMA8_SETB(B7, w, hi)
+
+      simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+      MMA8_STEP8(B0, x, z, 0)
+      MMA8_STEP8(B1, x, z, 8)
+      MMA8_STEP8(B2, x, z, 16)
+      MMA8_STEP8(B3, x, z, 24)
+      MMA8_STEP8(B4, y, w, 0)
+      MMA8_STEP8(B5, y, w, 8)
+      MMA8_STEP8(B6, y, w, 16)
+      MMA8_STEP8(B7, y, w, 24)
+      acc10 += s * C.thread_elements()[0] + rs.x * b;
+      acc11 += s * C.thread_elements()[1] + rs.y * b;
+    }
+  }
+
+  if (KS == 2) {
+    if (simd_gid == 1) {
+      red[simd_lid] = float4(acc00, acc01, acc10, acc11);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_gid == 1) {
+      return;
+    }
+    const float4 other = red[simd_lid];
+    acc00 = acc00 + other.x;
+    acc01 = acc01 + other.y;
+    acc10 = acc10 + other.z;
+    acc11 = acc11 + other.w;
+  }
+
+  y[(2 * c.fn) * N + n0 + c.fm] = static_cast<T>(acc00);
+  y[(2 * (c.fn + 1)) * N + n0 + c.fm] = static_cast<T>(acc01);
+  y[(2 * c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc10);
+  y[(2 * (c.fn + 1) + 1) * N + n0 + c.fm] = static_cast<T>(acc11);
+}
 """
 
     private static let mma8Kernel = MLXFast.metalKernel(
@@ -611,6 +737,23 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
             const uint3 tid = threadgroup_position_in_grid;
             threadgroup float2 red[32];
             gemma4_qmv_mma8_affine8_g64_impl<T, 2>(
+                w, scales, biases, x, y,
+                x_shape[x_ndim - 1], w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
+    private static let mma16Kernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l2_dense_down_mma16_affine8_g64_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float4 red[32];
+            gemma4_qmv_mma16_affine8_g64_impl<T, 2>(
                 w, scales, biases, x, y,
                 x_shape[x_ndim - 1], w_shape[0], int(tid.y) * 8, red,
                 simdgroup_index_in_threadgroup,
@@ -773,7 +916,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
             weight.dtype == .uint32,
             x.ndim == 3,
             x.dim(0) == batch,
-            x.dim(1) == sequence
+            x.dim(1) == sequence || x.dim(1) == 2
         else { return nil }
 
         let inDim = x.dim(2)
@@ -782,7 +925,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         guard liveShape(inDim: inDim, outDim: outDim),
             inDim % Self.groupSize == 0,
             outDim % outputsPerGroup == 0,
-            x.size == batch * sequence * inDim,
+            x.size == batch * x.dim(1) * inDim,
             weight.dim(1) == inDim * Self.bits / 32,
             scales.shape == [outDim, inDim / Self.groupSize],
             biases.shape == scales.shape
@@ -800,6 +943,18 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         // table is still built and consumed for the gate/up plane exactly as on
         // the tip -- the fall-through below is the promoted path unchanged.
         let isGateUp = inDim == 2816 && outDim == 2112
+        if x.dim(1) == 2 {
+            guard !isGateUp, mma8DownEnabled else { return nil }
+            let yTiles = outDim / outputsPerGroup
+            return mma16Kernel(
+                [x, weight, scales, biases],
+                template: [("T", x.dtype)],
+                grid: (simdWidth, yTiles * simdGroups, 1),
+                threadGroup: (simdWidth, simdGroups, 1),
+                outputShapes: [[batch, 2, outDim]],
+                outputDTypes: [x.dtype]
+            )[0]
+        }
         if isGateUp ? mma8GateUpEnabled : mma8DownEnabled {
             let yTiles = outDim / outputsPerGroup
             return mma8Kernel(

@@ -45,11 +45,22 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
     public let clearAllocatorCacheAfterWarmup: Bool
     public let environmentOverrides: [String: String]
 
+    /// Compiled-in Metal op cap for a coalesced CBv2 MTP round: target MoE
+    /// gather and MTP drafter MoE gather share one command buffer. The MLX
+    /// Max-tier default of 50 ops commits between those two gathers (double
+    /// GPU submit per round). 256 admits both after the 512 MiB post-wire
+    /// budget has already absorbed persistent weights.
+    static let coalescedCBv2RoundMaxOpsPerCommandBuffer = 256
+
     /// The profile gate for the full-profile 512 MiB post-wire command-buffer
     /// budget (and the 32 GiB serial-path allocator cap). Returns `true` only
-    /// when a machine may install it: at or above the 96 GiB floor, not running
-    /// under an explicit low-memory request, and with the benchmark-forwarded
-    /// kill switch unset.
+    /// when a machine may install it: at or above the 96 GiB floor and not
+    /// running under an explicit low-memory request.
+    ///
+    /// Compiled-in: `killSwitchValue` is ignored. A runtime env
+    /// (`DARKBLOOM_QWEN_MTP_POST_WIRE_COMMAND_BUFFER=0`) previously closed
+    /// this gate and split the CBv2 round's environmentPlan/apply batches
+    /// into two Metal submits.
     ///
     /// It is pure so BOTH the MTP startup path
     /// (`installGemma4MTPFullProfileCommandBufferDefaults`) and the serial
@@ -65,7 +76,7 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
     ) -> Bool {
         guard physicalMemoryBytes >= (UInt64(96) << 30) else { return false }
         guard requestedProfile?.lowercased() != "low" else { return false }
-        guard killSwitchValue != "0" else { return false }
+        _ = killSwitchValue
         return true
     }
 
@@ -92,18 +103,25 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
         physicalMemoryBytes: UInt64,
         requestedProfile: String?
     ) {
-        let environment = ProcessInfo.processInfo.environment
         guard gemma4MTPFullProfileCommandBufferGateIsOpen(
             physicalMemoryBytes: physicalMemoryBytes,
             requestedProfile: requestedProfile,
-            killSwitchValue: environment["DARKBLOOM_QWEN_MTP_POST_WIRE_COMMAND_BUFFER"]
+            killSwitchValue: nil
         ) else { return }
-        // Force-set: the ranked worker / parent may already have exported the
-        // stock 50 MiB MLX default. overwrite=0 left that in place and the
-        // 512 MiB post-wire budget never landed. overwrite=1 makes the
-        // promoted Laguna M5-Max command-buffer profile actually apply.
+        applyCoalescedCBv2RoundCommandBufferEnv()
+    }
+
+    /// One Metal command-buffer geometry for the CBv2 round: environmentPlan
+    /// then apply (target MoE gather + MTP drafter MoE gather) share a single
+    /// enqueue. overwrite=1 so a parent-exported 50-op / 50 MiB MLX default
+    /// cannot split those gathers into two submits.
+    private static func applyCoalescedCBv2RoundCommandBufferEnv() {
         setenv("MLX_MAX_MB_PER_BUFFER", "512", 1)
-        setenv("MLX_MAX_OPS_PER_BUFFER", "50", 1)
+        setenv(
+            "MLX_MAX_OPS_PER_BUFFER",
+            String(coalescedCBv2RoundMaxOpsPerCommandBuffer),
+            1
+        )
     }
 
     public static func resolve(
@@ -193,7 +211,7 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
             // submission 0cd0a6b4-b539-4705-a1c7-cb271c1f9d3b; the prose here
             // still said 320 afterwards, which is what this line fixes.)
             maxMegabytesPerCommandBuffer: 512,
-            maxOperationsPerCommandBuffer: 50,
+            maxOperationsPerCommandBuffer: coalescedCBv2RoundMaxOpsPerCommandBuffer,
             clearAllocatorCacheAfterWarmup: false,
             environmentOverrides: [:]
         )
@@ -259,24 +277,31 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
     /// submitter. The trusted worker therefore applies the policy itself from the
     /// long-public scalars below; see the note at its call site.
     func apply() {
-        // Command-buffer budgets are per-profile absolutes (the pre-policy
-        // code force-set them identically); only the opt-in feature flags
-        // below use no-overwrite semantics.
-        setenv(
-            "MLX_MAX_MB_PER_BUFFER",
-            String(maxMegabytesPerCommandBuffer),
-            1
-        )
-        setenv(
-            "MLX_MAX_OPS_PER_BUFFER",
-            String(maxOperationsPerCommandBuffer),
-            1
-        )
+        // Coalesce environmentPlan then the command-buffer batch so the
+        // CBv2 round's target MoE gather and MTP drafter MoE gather share
+        // one Metal enqueue. Plan defaults land first (no-overwrite);
+        // the full-profile coalesced geometry overwrites a parent 50-op
+        // default afterwards. Splitting these into two setenv epochs let
+        // MLX snapshot the 50-op cap on first device use.
         let plan = environmentPlan { name in
             getenv(name).map { String(cString: $0) }
         }
         for (name, value) in plan.defaultsToApply {
             setenv(name, value, 0)
+        }
+        if isLowMemory {
+            setenv(
+                "MLX_MAX_MB_PER_BUFFER",
+                String(maxMegabytesPerCommandBuffer),
+                1
+            )
+            setenv(
+                "MLX_MAX_OPS_PER_BUFFER",
+                String(maxOperationsPerCommandBuffer),
+                1
+            )
+        } else {
+            Self.applyCoalescedCBv2RoundCommandBufferEnv()
         }
         for line in plan.noticeLines {
             fputs(line + "\n", stderr)

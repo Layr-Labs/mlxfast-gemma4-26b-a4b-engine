@@ -173,6 +173,13 @@ final class CBv2MTPRoundDriver {
     /// a whole block at once. The constant you edit is the same on both arms.
     static let submissionDraftDepth = 0
 
+    /// Compiled-in full-profile CBv2 round command-buffer coalesce. Target
+    /// MoE gather and MTP drafter MoE gather share one Metal enqueue
+    /// (`environmentPlan` then `apply`). No runtime env. The matching
+    /// `MLX_MAX_*` geometry is installed by
+    /// `RuntimeStartupMemoryPolicy.installGemma4MTPFullProfileCommandBufferDefaults`.
+    static let coalesceFullProfileRoundCommandBuffer = true
+
     /// The effective adaptive-depth ceiling: the trusted envelope's max, bounded
     /// by the participant's `submissionDraftDepth`. Pure and static so the cap is
     /// unit-testable without a full driver. It is a CEILING the controller adapts
@@ -576,5 +583,45 @@ enum CBv2MTPHiddenIndex {
     static func carryColumn(targetOutputIndex: Int, draftDepth: Int) -> Int {
         precondition(targetOutputIndex >= 0 && targetOutputIndex <= draftDepth)
         return targetOutputIndex
+    }
+}
+
+/// Full-profile CBv2 MTP round: coalesce environmentPlan then apply into
+/// one Metal command buffer so target MoE gather and MTP drafter MoE gather
+/// are a single enqueue. Public so the Gemma 4 text tower can suppress its
+/// per-layer async-eval ladder while a coalesced round graph is live.
+public enum CBv2MTPFullProfileCommandBuffer {
+    public static let isOpen = CBv2MTPRoundDriver.coalesceFullProfileRoundCommandBuffer
+
+    static var coalesceDepth = 0
+    static var pendingEvalTargets: [MLXArray] = []
+
+    public static var isCoalescing: Bool { isOpen && coalesceDepth > 0 }
+
+    static func withCoalescedRound<T>(_ body: () -> T) -> T {
+        guard isOpen else { return body() }
+        coalesceDepth += 1
+        if coalesceDepth == 1 { pendingEvalTargets.removeAll(keepingCapacity: true) }
+        defer {
+            coalesceDepth -= 1
+            if coalesceDepth == 0 { pendingEvalTargets.removeAll(keepingCapacity: true) }
+        }
+        return body()
+    }
+
+    static func enqueue(_ arrays: [MLXArray]) {
+        var combined = pendingEvalTargets
+        pendingEvalTargets.removeAll(keepingCapacity: true)
+        combined.append(contentsOf: arrays)
+        guard !combined.isEmpty else { return }
+        asyncEval(combined)
+    }
+
+    static func absorbUnfenceable(_ arrays: [MLXArray]) {
+        if isCoalescing {
+            pendingEvalTargets.append(contentsOf: arrays)
+        } else if !arrays.isEmpty {
+            eval(arrays)
+        }
     }
 }

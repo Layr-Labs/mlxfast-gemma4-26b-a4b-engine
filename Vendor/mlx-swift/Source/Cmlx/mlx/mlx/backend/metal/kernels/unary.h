@@ -12,6 +12,7 @@ template <typename T, typename U, typename Op, int N = WorkPerThread<T>::n>
       out[index + i] = static_cast<U>(Op()(in[index + i]));
     }
   } else {
+    #pragma unroll
     for (int i = 0; i < N; ++i) {
       out[index + i] = static_cast<U>(Op()(in[index + i]));
     }
@@ -31,6 +32,7 @@ template <typename T, typename U, typename Op, int N = WorkPerThread<T>::n>
       out[offset + i] = static_cast<U>(Op()(in[offset + i]));
     }
   } else {
+    #pragma unroll
     for (int i = 0; i < N; ++i) {
       out[offset + i] = static_cast<U>(Op()(in[offset + i]));
     }
@@ -56,8 +58,11 @@ template <
   auto xshape = in_shape[ndim - 1];
   IdxT xstride = in_strides[ndim - 1];
   IdxT out_idx = N * index.x + xshape * (index.y + IdxT(grid_dim.y) * index.z);
-  for (int i = 0; i < N && (int(N * index.x) + i) < xshape; ++i) {
-    out[out_idx++] = static_cast<U>(Op()(in[idx]));
-    idx += xstride;
+  #pragma unroll
+  for (int i = 0; i < N; ++i) {
+    if ((int(N * index.x) + i) < xshape) {
+      out[out_idx++] = static_cast<U>(Op()(in[idx]));
+      idx += xstride;
+    }
   }
 }

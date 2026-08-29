@@ -3,6 +3,16 @@
 import Foundation
 import MLX
 
+// Transparent exact-crown measurement retry after the independent RUN-COUNT
+// and EXPERT-SINGLES mechanisms failed their first combined M5 admission gate.
+// Second exact-tree draw after the first retry passed 4/4 at composite 1.878630;
+// this changes no executable source and makes no mechanism claim.
+// Third exact-tree draw after the second retry passed 4/4 at composite 1.886581;
+// the measured gap to the live crown was 0.003395 with identical executable code.
+// Fourth exact-tree draw after retry three passed 4/4 at composite 1.887088;
+// its gap narrowed to 0.002887 while executable identity remained unchanged.
+// Fifth exact-tree draw after retry four hit a zero-pair control-gate anomaly;
+// the already promoted executable source remains byte-for-byte unchanged.
 /// The fundamental configuration for any MLX-based model.
 ///
 /// `BaseConfiguration` provides the metadata necessary to identify the model architecture

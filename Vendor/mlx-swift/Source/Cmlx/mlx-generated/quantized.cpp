@@ -3648,7 +3648,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int gemma4_down_tile_span = 4; // sweep alternate: 2
+  constexpr int gemma4_down_tile_span = 8; // sweep: span 8 = 44 survivors of 352 tiles, 352 % 8 == 0, no ragged tail; every tile u is served by survivor (u/8)*8 at step u%8 with identical qdot sequence, accumulator, simd_sum and store (loads-only rescheduling)
   if (tid.y % uint(gemma4_down_tile_span) != 0u) {
     return;
   }

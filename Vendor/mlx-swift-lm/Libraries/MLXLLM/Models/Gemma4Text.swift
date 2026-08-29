@@ -1810,6 +1810,40 @@ private enum Gemma4FusedLayerGlue {
         ensureRowContiguous: true
     )
 
+    /// Layer-0 decode seam: materialize the scaled embedding exactly once and
+    /// derive the first attention input norm from those stored bf16 values in
+    /// the same dispatch. The two outputs preserve the residual/norm split the
+    /// stock `embedding * scale` then `inputLayernorm` chain exposes.
+    private static let embeddingScaleNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_glue_embedding_scale_norm_2816_bf16_v1",
+        inputNames: ["x", "w", "s"],
+        outputNames: ["scaled", "normed"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float local_inv[1];
+            threadgroup float local_sums[32];
+            const uint base = row * 2816 + lid * 4;
+            const uint wbase = lid * 4;
+            const T scalar = static_cast<T>(s[0]);
+            T sv[4];
+            for (int i = 0; i < 4; i++) {
+                sv[i] = x[base + i] * scalar;
+                scaled[base + i] = sv[i];
+            }
+        \(rmsReduce("sv", into: "local_inv[0]").replacingOccurrences(
+            of: "(float)sv[base + i]", with: "(float)sv[i]"))
+            const float inv = local_inv[0];
+            for (int i = 0; i < 4; i++) {
+                normed[base + i] = w[wbase + i]
+                    * static_cast<T>((float)sv[i] * inv);
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
     private static let tailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_glue_tail_2816_bf16_v2",
         inputNames: ["a", "b", "res", "w1", "w2", "w3", "s"],
@@ -1888,6 +1922,22 @@ private enum Gemma4FusedLayerGlue {
         CBv2EngageMark.once("glue-dual-prenorm")
         let outs = dualPreNormKernel(
             [x, w1, w2],
+            template: [("T", x.dtype)],
+            grid: (rows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: [[rows, 1, axis], [rows, 1, axis]],
+            outputDTypes: [.bfloat16, .bfloat16]
+        )
+        return (outs[0], outs[1])
+    }
+
+    static func embeddingScaleAndInputNorm(
+        x: MLXArray, weight: MLXArray, scale: Float, eps: Float
+    ) -> (scaled: MLXArray, normed: MLXArray)? {
+        guard admits(x, weight: weight, eps: eps) else { return nil }
+        CBv2EngageMark.once("glue-embedding-scale-input-norm")
+        let outs = embeddingScaleNormKernel(
+            [x, weight, MLXArray(scale)],
             template: [("T", x.dtype)],
             grid: (rows * tgThreads, 1, 1),
             threadGroup: (tgThreads, 1, 1),
@@ -2852,14 +2902,38 @@ public class Gemma4TextModelInner: Module {
         // embeddings spliced at placeholder positions — replaces the trunk's
         // own lookup; token ids still feed the per-layer embeddings (PLE)
         // below. nil keeps the text path byte-identical.
+        let inputCacheIsCBv2 = cache?.contains {
+            ($0 as? (any CBv2AttendingLayerCache)) != nil
+        } ?? false
+        var fusedLayer0InputNorm: MLXArray?
         var h: MLXArray
         if let inputEmbedding {
             h = inputEmbedding.ndim == 2 ? inputEmbedding.expandedDimensions(axis: 0) : inputEmbedding
         } else {
-            if let fused = Gemma4FusedScaledEmbedding.apply(
+            if inputCacheIsCBv2 && !schedulePrefill
+                && inputBatchSize == 8 && inputLength == 1,
+                let firstLayer = layers.first
+            {
+                // Ranked decode: fuse the scaled residual and layer-0 input
+                // norm. The promoted scaled-embedding kernel below is gated
+                // to L > 1, so these two paths are mutually exclusive.
+                let rawEmbedding = embedTokens(inputs)
+                if let fused = Gemma4FusedLayerGlue.embeddingScaleAndInputNorm(
+                    x: rawEmbedding,
+                    weight: firstLayer.inputLayernorm.weight,
+                    scale: embedScale,
+                    eps: config.rmsNormEps)
+                {
+                    h = fused.scaled
+                    fusedLayer0InputNorm = fused.normed
+                } else {
+                    h = rawEmbedding * embedScale
+                }
+            } else if let fused = Gemma4FusedScaledEmbedding.apply(
                 tokens: inputs, embedding: embedTokens, embedScale: embedScale,
                 hiddenSize: config.hiddenSize)
             {
+                // Promoted c357cb7 prefill-only fused gather + scale.
                 h = fused
             } else {
                 h = embedTokens(inputs) * embedScale
@@ -2974,6 +3048,9 @@ public class Gemma4TextModelInner: Module {
         // GLUE-003: one chain box per forward; layer L's fused tail hands
         // layer L+1 its input norm through it.
         let glueChain = Gemma4GlueChainBox()
+        if let fusedLayer0InputNorm {
+            glueChain.pending = (source: h, normed: fusedLayer0InputNorm)
+        }
         for (idx, layer) in layers.enumerated() {
             let prevIdx = previousKvs[idx]
             let sharedKV = intermediates[prevIdx].kv

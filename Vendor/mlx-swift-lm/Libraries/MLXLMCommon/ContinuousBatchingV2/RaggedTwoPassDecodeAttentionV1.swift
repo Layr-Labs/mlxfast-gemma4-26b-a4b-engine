@@ -1,3 +1,5 @@
+// TIER-REVERT entry #3 (empty-queue B-window). Entries 1-2 drew the fast
+// box and sealed 2.2282/2.2266 — five concordant tier-free readings now.
 // Box-draw entry #3 on the unmodified crown content. Entry #2 (4198c2b2)
 // drew the fast-serial box — the line's eighth consecutive — and sealed
 // candidate decode ~2.2276, the crown's own content level, as the ledger

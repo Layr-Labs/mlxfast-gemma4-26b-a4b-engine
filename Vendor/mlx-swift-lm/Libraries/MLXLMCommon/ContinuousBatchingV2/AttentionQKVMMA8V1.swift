@@ -323,11 +323,24 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    /// Output tiles per simdgroup. Two is the shipped width: it halves the
-    /// x-side work per output column while keeping the incumbent's
-    /// threadgroup count within a factor of two, which on the local box is
-    /// where the amortisation stops paying for the extra live registers.
+    /// MMA-MT4-001 arm. Default ON.
+    /// `DARKBLOOM_GEMMA4_QKV_MMA8_MT4=0` falls back to the promoted two-tile
+    /// dispatch, and `DARKBLOOM_GEMMA4_QKV_MMA8_MULTITILE=0` past that to the
+    /// promoted single-tile one.
+    public static let multiTile4Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_QKV_MMA8_MT4"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Output tiles per simdgroup for the promoted arm.
     private static let tilesPerGroup = 2
+
+    /// Output tiles per simdgroup for the MT4 arm. Four quarters the x-side
+    /// work per output column instead of halving it. Eight was measured and is
+    /// deliberately absent: it spills and runs 63% slower.
+    private static let tilesPerGroup4 = 4
 
     private static let multiTileKernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_v1",
@@ -339,6 +352,23 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
             qkv_mma8_affine4_g64_mt<T, 2, 2>(
                 w, scales, biases, x, y,
                 x_shape[x_ndim - 1], w_shape[0], int(tid.y) * 16, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
+    private static let multiTile4Kernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt4_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[128];
+            qkv_mma8_affine4_g64_mt<T, 2, 4>(
+                w, scales, biases, x, y,
+                x_shape[x_ndim - 1], w_shape[0], int(tid.y) * 32, red,
                 simdgroup_index_in_threadgroup,
                 thread_index_in_simdgroup);
             return;
@@ -402,6 +432,16 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
         else { return nil }
 
         let yTiles = outputWidth / outputsPerGroup
+        if multiTileEnabled, multiTile4Enabled, yTiles % tilesPerGroup4 == 0 {
+            return multiTile4Kernel(
+                [x, weight, scales, biases],
+                template: [("T", x.dtype)],
+                grid: (simdWidth, (yTiles / tilesPerGroup4) * simdGroups, 1),
+                threadGroup: (simdWidth, simdGroups, 1),
+                outputShapes: [[batch, sequence, outputWidth]],
+                outputDTypes: [x.dtype]
+            )[0]
+        }
         if multiTileEnabled, yTiles % tilesPerGroup == 0 {
             return multiTileKernel(
                 [x, weight, scales, biases],

@@ -1,3 +1,6 @@
+// Box-draw entry #3 on this crown, timed to a slow-serial-box idle window
+// (the ledger suggests verdict-triggered resubmission self-pins to the box
+// that just ran this line; this entry tests the decorrelated timing).
 // Box-draw entry #3 on the unmodified crown content. Entry #2 (4198c2b2)
 // drew the fast-serial box — the line's eighth consecutive — and sealed
 // candidate decode ~2.2276, the crown's own content level, as the ledger

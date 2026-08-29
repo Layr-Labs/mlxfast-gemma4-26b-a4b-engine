@@ -171,7 +171,7 @@ final class CBv2MTPRoundDriver {
     /// 1. The per-arm behaviour differs. MTP adapts up to this ceiling each round.
     /// DFlash proposes a fixed block of this size, because block diffusion drafts
     /// a whole block at once. The constant you edit is the same on both arms.
-    static let submissionDraftDepth = 0
+    static let submissionDraftDepth = 3 // MTP-CEILING-3: spec-sanctioned participant lever, envelope cap at batch 8; widens the adaptive range, never forces speculation
 
     /// The effective adaptive-depth ceiling: the trusted envelope's max, bounded
     /// by the participant's `submissionDraftDepth`. Pure and static so the cap is

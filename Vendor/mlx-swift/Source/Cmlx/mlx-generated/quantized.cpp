@@ -3648,7 +3648,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int gemma4_down_tile_span = 4; // sweep alternate: 2
+  constexpr int gemma4_down_tile_span = 2; // KERN-DOWN-TILE-SPAN2: 176 survivors of 352 tiles (352 % 2 == 0, no ragged tail); same survivor((u/span)*span, step u%span) ownership that is bit-identical per assignment for every span — spans 2 and 4 uint16-exact vs the per-assignment oracle upstream; span 8 ranked-rejected (-7.11%), span 2 is the last unranked interior point of the bracket
   if (tid.y % uint(gemma4_down_tile_span) != 0u) {
     return;
   }

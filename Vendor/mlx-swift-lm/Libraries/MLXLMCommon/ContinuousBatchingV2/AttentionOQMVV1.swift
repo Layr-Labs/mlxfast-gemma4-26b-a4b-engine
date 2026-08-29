@@ -38,14 +38,23 @@ inline float2 attention_o_qdot_affine4_loaded_pair(
     float scale,
     float bias,
     float2 sum) {
-  float2 accum = 0;
-  for (int i = 0; i < 4; i++) {
-    accum +=
-        (float2(x0[4 * i], x1[4 * i]) * (ws[i] & 0x000f) +
-         float2(x0[4 * i + 1], x1[4 * i + 1]) * (ws[i] & 0x00f0) +
-         float2(x0[4 * i + 2], x1[4 * i + 2]) * (ws[i] & 0x0f00) +
-         float2(x0[4 * i + 3], x1[4 * i + 3]) * (ws[i] & 0xf000));
-  }
+  float2 accum =
+      (float2(x0[0], x1[0]) * (ws[0] & 0x000f) +
+       float2(x0[1], x1[1]) * (ws[0] & 0x00f0) +
+       float2(x0[2], x1[2]) * (ws[0] & 0x0f00) +
+       float2(x0[3], x1[3]) * (ws[0] & 0xf000)) +
+      (float2(x0[4], x1[4]) * (ws[1] & 0x000f) +
+       float2(x0[5], x1[5]) * (ws[1] & 0x00f0) +
+       float2(x0[6], x1[6]) * (ws[1] & 0x0f00) +
+       float2(x0[7], x1[7]) * (ws[1] & 0xf000)) +
+      (float2(x0[8], x1[8]) * (ws[2] & 0x000f) +
+       float2(x0[9], x1[9]) * (ws[2] & 0x00f0) +
+       float2(x0[10], x1[10]) * (ws[2] & 0x0f00) +
+       float2(x0[11], x1[11]) * (ws[2] & 0xf000)) +
+      (float2(x0[12], x1[12]) * (ws[3] & 0x000f) +
+       float2(x0[13], x1[13]) * (ws[3] & 0x00f0) +
+       float2(x0[14], x1[14]) * (ws[3] & 0x0f00) +
+       float2(x0[15], x1[15]) * (ws[3] & 0xf000));
   return scale * accum + sum * bias;
 }
 

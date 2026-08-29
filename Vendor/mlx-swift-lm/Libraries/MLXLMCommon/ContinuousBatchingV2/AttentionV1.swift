@@ -299,6 +299,9 @@ enum CBv2AttentionV1 {
                         let decodeRingWriteFence
                     {
                         let preWrite = ringRows.compactMap { $0.decodeRingViewBeforeWrite }
+                        // KVQ-001: all-or-nothing — the quantized kernels
+                        // engage only when every row exposes its mirror.
+                        let quantViews = ringRows.compactMap { $0.decodeRingQuantView }
                         if preWrite.count == B,
                             let fused = CBv2RaggedTwoPassDecodeAttentionV1
                                 .attendRingWriting(
@@ -309,7 +312,8 @@ enum CBv2AttentionV1 {
                                     starts: preWrite.map(\.start),
                                     previousWriteFence: decodeRingWriteFence.value,
                                     scale: scale,
-                                    slidingWindowLength: ringRows[0].window)
+                                    slidingWindowLength: ringRows[0].window,
+                                    mirrors: quantViews.count == B ? quantViews : nil)
                         {
                             for row in ringRows {
                                 row.advanceDecodeRingAfterFusedWrite()
@@ -326,11 +330,13 @@ enum CBv2AttentionV1 {
                             values: values[index ..< (index + 1)])
                     }
                     let views = ringRows.compactMap { $0.decodeRingView }
+                    let ringQuantViews = ringRows.compactMap { $0.decodeRingQuantView }
                     if views.count == B,
                         let output = CBv2RaggedTwoPassDecodeAttentionV1.attendRing(
                             queries: queries, keys: views.map(\.keys),
                             values: views.map(\.values), starts: views.map(\.start),
-                            scale: scale, slidingWindowLength: ringRows[0].window)
+                            scale: scale, slidingWindowLength: ringRows[0].window,
+                            mirrors: ringQuantViews.count == B ? ringQuantViews : nil)
                     {
                         return output
                     }

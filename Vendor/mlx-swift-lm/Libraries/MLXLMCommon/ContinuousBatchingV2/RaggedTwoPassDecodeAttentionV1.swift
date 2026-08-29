@@ -647,6 +647,16 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Kill switch for the fused append only: `DARKBLOOM_GEMMA4_D512_DECODE_FUSED_WRITE`
+    /// set to `0`/`false`/`no`/`off` keeps the 3-dispatch attention and
+    /// restores the copying `SliceUpdate` appends. Default ON.
+    private static let fusedAppendEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_DECODE_FUSED_WRITE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let batch = 8
     private static let queryHeads = 16
     private static let kvHeads = 2
@@ -668,15 +678,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// TM=4 score rows, for all 8 heads of the GQA group at once.
     /// params: [0]=kL, [1]=K (=D, runtime like the stock buffer-passed
     /// sizes), [2+row]=that row's KV buffer capacity.
-    private static let qkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_qk_bf16_g8_v1",
-        inputNames: [
-            "queries",
-            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
-            "params",
-        ],
-        outputNames: ["scores"],
-        source: """
+    private static let qkSource: String = """
             constexpr int D = 512;
             constexpr int GQA = 8;
 
@@ -779,9 +781,128 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     }
                 }
             }
+        """
+
+    private static let qkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_qk_bf16_g8_v1",
+        inputNames: [
+            "queries",
+            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+            "params",
+        ],
+        outputNames: ["scores"],
+        source: qkSource,
+        ensureRowContiguous: true
+    )
+
+    /// The same dispatch, plus one trailing input the body never reads.
+    ///
+    /// WRITE-022 needs the QKᵀ pass to be ordered after `ringStoreKernel`,
+    /// and the store is invisible to the array graph (it writes through a
+    /// `const_cast` on an input pointer). Consuming the store's fence as an
+    /// input is what turns that invisible write into a real graph edge, and
+    /// MLX's barrier for an inter-kernel dependency is `BarrierScopeBuffers`
+    /// — encoder-wide — so it orders every buffer write the store issued, not
+    /// just the fence.
+    ///
+    /// The source is the SAME string constant as `qkKernel`, so the arithmetic
+    /// is identical by construction rather than by review. An unused buffer
+    /// argument cannot change the unrolled inner loop.
+    private static let qkFencedKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_qk_fenced_bf16_g8_v1",
+        inputNames: [
+            "queries",
+            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+            "params", "write_fence",
+        ],
+        outputNames: ["scores"],
+        source: qkSource,
+        ensureRowContiguous: true
+    )
+
+    /// Dispatch 0 — the step's K/V append, done in place (WRITE-022).
+    ///
+    /// `CBv2FullSequenceKV.update` commits a decode token with an
+    /// `mlx_slice_update`, which cannot donate here because the class property
+    /// retains the destination for the row's whole lifetime — so every append
+    /// copies the entire capacity-sized allocation. At the ranked geometry
+    /// that is 5 full layers × 8 rows × {K, V} = 80 whole-cache copies per
+    /// decode round.
+    ///
+    /// This kernel replaces all of them with the write they were carrying:
+    /// one threadgroup per (row, kv head), 128 threads × 4 contiguous
+    /// elements, straight into slot `kL - 1` of that row's private buffer
+    /// through a `const_cast<device T*>` on the input pointer. Same
+    /// destination, same slot, same bytes as the `SliceUpdate`.
+    ///
+    /// It is a separate dispatch rather than a fold into dispatch 1 on
+    /// purpose. Folding it in (the measured predecessor of this chip) forced
+    /// the QKᵀ inner loop to select its key row pointer per tile so that no
+    /// group read the slot some group wrote, and that indirection cost more
+    /// than the copies saved. Kept apart, the attention kernels are the stock
+    /// ones byte-for-byte and the ordering comes from the barrier instead.
+    ///
+    /// `fence[0] = write_fence[0] + 1` is the graph edge; see
+    /// `qkFencedKernel`.
+    private static let ringStoreKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_ring_store_bf16_v1",
+        inputNames: [
+            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+            "new_keys", "new_values", "params", "write_fence",
+        ],
+        outputNames: ["fence"],
+        source: """
+            constexpr int D = 512;
+            constexpr int KV_HEADS = 2;
+
+            const int key_length = int(params[0]);
+            const int row_kv = int(threadgroup_position_in_grid.z);
+            const int row = row_kv / KV_HEADS;
+            const int kv_head = row_kv % KV_HEADS;
+            const int sg = int(simdgroup_index_in_threadgroup);
+            const int lane = int(thread_index_in_simdgroup);
+
+            const int row_capacity = int(params[2 + row]);
+
+            const device T* key_plane = k0;
+            const device T* value_plane = v0;
+            switch (row) {
+                case 1: key_plane = k1; value_plane = v1; break;
+                case 2: key_plane = k2; value_plane = v2; break;
+                case 3: key_plane = k3; value_plane = v3; break;
+                case 4: key_plane = k4; value_plane = v4; break;
+                case 5: key_plane = k5; value_plane = v5; break;
+                case 6: key_plane = k6; value_plane = v6; break;
+                case 7: key_plane = k7; value_plane = v7; break;
+                default: break;
+            }
+            const size_t slot_offset =
+                size_t(kv_head) * size_t(row_capacity) * D
+                + size_t(key_length - 1) * D;
+            device T* store_key =
+                const_cast<device T*>(key_plane) + slot_offset;
+            device T* store_value =
+                const_cast<device T*>(value_plane) + slot_offset;
+
+            const size_t new_offset = size_t(row * KV_HEADS + kv_head) * D;
+            const device T* new_key = new_keys + new_offset;
+            const device T* new_value = new_values + new_offset;
+
+            const int base = (sg * 32 + lane) * 4;
+            #pragma clang loop unroll(full)
+            for (int element = 0; element < 4; ++element) {
+                store_key[base + element] = new_key[base + element];
+                store_value[base + element] = new_value[base + element];
+            }
+
+            if (row_kv == 0 && sg == 0 && lane == 0) {
+                fence[0] = write_fence[0] + 1;
+            }
         """,
         ensureRowContiguous: true
     )
+
 
     /// Dispatch 2 — softmax. A verbatim transcription of
     /// `softmax_single_row` (block_softmax_precise, AccT=float, N_READS=4)
@@ -1010,7 +1131,9 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     static func updateAndAttend(
         rows: [CBv2SequenceKV], kind: CBv2LayerKind,
         queries: MLXArray, keys: MLXArray, values: MLXArray,
-        scale: Float, sinks: MLXArray?, softcap: Float?
+        scale: Float, sinks: MLXArray?, softcap: Float?,
+        writeFence: CBv2DecodeRingWriteFence? = nil,
+        allowFusedAppend: Bool = false
     ) -> MLXArray? {
         guard enabled,
             rows.count == batch,
@@ -1059,6 +1182,18 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             else { return nil }
         }
 
+        // WRITE-022: serve this step's append from a dedicated store dispatch
+        // when every row offers a plain in-bounds slot in an already-allocated
+        // private buffer. Resolved for ALL rows before anything is written, so
+        // the refusal below can never leave a partial append behind.
+        var fusedSlots: [(keys: MLXArray, values: MLXArray, slot: Int)]? = nil
+        if fusedAppendEnabled, allowFusedAppend, writeFence != nil {
+            let slots = fullRows.compactMap { $0.fusedAppendSlotBeforeWrite }
+            if slots.count == batch, slots.allSatisfy({ $0.slot == offset }) {
+                fusedSlots = slots
+            }
+        }
+
         // Byte-identical per-row appends — the same `update` calls, in the
         // same row order, as the established per-row loop. Only the
         // returned temporal views go unused; the kernels read the full
@@ -1070,14 +1205,22 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         valueBuffers.reserveCapacity(batch)
         var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
         params.reserveCapacity(batch + 2)
-        for (index, row) in fullRows.enumerated() {
-            _ = row.update(
-                keys: keys[index ..< (index + 1)],
-                values: values[index ..< (index + 1)])
-            let state = row.cbv2InnerState()
-            keyBuffers.append(state[0])
-            valueBuffers.append(state[1])
-            params.append(UInt32(state[0].dim(2)))
+        if let fusedSlots {
+            for slot in fusedSlots {
+                keyBuffers.append(slot.keys)
+                valueBuffers.append(slot.values)
+                params.append(UInt32(slot.keys.dim(2)))
+            }
+        } else {
+            for (index, row) in fullRows.enumerated() {
+                _ = row.update(
+                    keys: keys[index ..< (index + 1)],
+                    values: values[index ..< (index + 1)])
+                let state = row.cbv2InnerState()
+                keyBuffers.append(state[0])
+                valueBuffers.append(state[1])
+                params.append(UInt32(state[0].dim(2)))
+            }
         }
         let paramsArray = MLXArray(params)
 
@@ -1087,14 +1230,38 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let scratchShape = [batch, queryHeads, 1, keyLength]
 
         let chunks = (keyLength + 63) / 64
-        let scores = qkKernel(
-            [queries] + keyBuffers + [paramsArray],
-            template: template,
-            grid: (32, 4, batch * kvHeads * chunks),
-            threadGroup: (32, 4, 1),
-            outputShapes: [scratchShape],
-            outputDTypes: [.bfloat16]
-        )[0]
+        let scores: MLXArray
+        if let writeFence, fusedSlots != nil {
+            let fence = ringStoreKernel(
+                keyBuffers + valueBuffers
+                    + [keys, values, paramsArray, writeFence.value],
+                template: template,
+                grid: (128, 1, batch * kvHeads),
+                threadGroup: (128, 1, 1),
+                outputShapes: [[1]],
+                outputDTypes: [.int32]
+            )[0]
+            writeFence.value = fence
+            scores = qkFencedKernel(
+                [queries] + keyBuffers + [paramsArray, fence],
+                template: template,
+                grid: (32, 4, batch * kvHeads * chunks),
+                threadGroup: (32, 4, 1),
+                outputShapes: [scratchShape],
+                outputDTypes: [.bfloat16]
+            )[0]
+            for row in fullRows { row.advanceAfterFusedAppend() }
+            CBv2EngageMark.once("write022")
+        } else {
+            scores = qkKernel(
+                [queries] + keyBuffers + [paramsArray],
+                template: template,
+                grid: (32, 4, batch * kvHeads * chunks),
+                threadGroup: (32, 4, 1),
+                outputShapes: [scratchShape],
+                outputDTypes: [.bfloat16]
+            )[0]
+        }
 
         // Threadgroup sizing verbatim from softmax.cpp:64-68.
         let softmaxThreads = ((keyLength + 3) / 4 + 31) / 32 * 32

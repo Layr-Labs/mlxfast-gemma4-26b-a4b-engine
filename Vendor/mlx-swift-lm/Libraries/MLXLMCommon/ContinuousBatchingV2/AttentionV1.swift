@@ -378,7 +378,9 @@ enum CBv2AttentionV1 {
             if let output = CBv2RaggedComposedD512DecodeAttentionV1.updateAndAttend(
                 rows: rows, kind: kind,
                 queries: queries, keys: keys, values: values,
-                scale: scale, sinks: effectiveSinks, softcap: softcap)
+                scale: scale, sinks: effectiveSinks, softcap: softcap,
+                writeFence: decodeRingWriteFence,
+                allowFusedAppend: allowFusedRingWrite)
             {
                 CBv2EngageMark.once("d512sdpa")
                 return output

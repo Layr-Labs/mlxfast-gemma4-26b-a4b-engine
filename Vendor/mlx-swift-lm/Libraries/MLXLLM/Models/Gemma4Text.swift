@@ -3083,7 +3083,15 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
         // The VLM omission profile uses zero to represent the former optional
         // softcap's nil/disabled state.
-        if config.finalLogitSoftcapping > 0 {
+        //
+        // SOFTCAP-SKIP: `tanh(x / cap) * cap` is strictly increasing, so it
+        // cannot reorder the vocabulary axis. When the engine has declared
+        // that this step's logits are consumed for their order alone (every
+        // row greedy, no logprobs, bias or penalties), the emitted token is
+        // identical with or without it and the dispatch is pure overhead —
+        // one transcendental pass over the whole vocabulary plus the float32
+        // widening the untyped cap forces on the tensor the sampler reads.
+        if config.finalLogitSoftcapping > 0, !CBv2OrderOnlyLogits.engaged {
             out = gemma4CompiledLogitSoftcap(
                 out, MLXArray(config.finalLogitSoftcapping))
         }

@@ -1554,6 +1554,13 @@ private enum Gemma4FusedLayerGlue {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    static let preFeedEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_FUSED_PREFEED_GLUE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let rows = 8
     private static let axis = 2816
     private static let eps: Float = 1e-6
@@ -1607,6 +1614,41 @@ private enum Gemma4FusedLayerGlue {
                 const T normed = static_cast<T>(
                     w[wbase + i] * static_cast<T>((float)x[base + i] * inv));
                 out[base + i] = res[base + i] + normed;
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    private static let normResidualPreFeedKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_glue_norm_residual_prefeed_2816_bf16_v1",
+        inputNames: ["x", "res", "post_w", "router_w", "pre_w1", "pre_w2"],
+        outputNames: ["out", "router_norm", "pre1", "pre2"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float local_inv[1];
+            threadgroup float local_sums[32];
+            const uint base = row * 2816 + lid * 4;
+            const uint wbase = lid * 4;
+        \(rmsReduce("x", into: "local_inv[0]"))
+            const float post_inv = local_inv[0];
+            T outv[4];
+            for (int i = 0; i < 4; i++) {
+                const T post = static_cast<T>(
+                    post_w[wbase + i] * static_cast<T>((float)x[base + i] * post_inv));
+                outv[i] = res[base + i] + post;
+                out[base + i] = outv[i];
+            }
+        \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
+            of: "(float)outv[base + i]", with: "(float)outv[i]"))
+            const float pre_inv = local_inv[0];
+            for (int i = 0; i < 4; i++) {
+                const T normalized = static_cast<T>((float)outv[i] * pre_inv);
+                router_norm[base + i] = router_w[wbase + i] * normalized;
+                pre1[base + i] = pre_w1[wbase + i] * normalized;
+                pre2[base + i] = pre_w2[wbase + i] * normalized;
             }
         """,
         ensureRowContiguous: true
@@ -1699,6 +1741,32 @@ private enum Gemma4FusedLayerGlue {
         )[0]
     }
 
+    static func normResidualPreFeed(
+        x: MLXArray, residual: MLXArray, postWeight: MLXArray,
+        routerWeight: MLXArray, preWeight1: MLXArray, preWeight2: MLXArray,
+        eps: Float
+    ) -> (output: MLXArray, router: MLXArray, pre1: MLXArray, pre2: MLXArray)? {
+        guard preFeedEnabled,
+            admits(x, weight: postWeight, eps: eps),
+            residual.shape == x.shape, residual.dtype == .bfloat16,
+            routerWeight.ndim == 1, routerWeight.dim(0) == axis,
+            routerWeight.dtype == .bfloat16,
+            preWeight1.ndim == 1, preWeight1.dim(0) == axis,
+            preWeight1.dtype == .bfloat16,
+            preWeight2.ndim == 1, preWeight2.dim(0) == axis,
+            preWeight2.dtype == .bfloat16
+        else { return nil }
+        let outputs = normResidualPreFeedKernel(
+            [x, residual, postWeight, routerWeight, preWeight1, preWeight2],
+            template: [("T", x.dtype)],
+            grid: (rows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: Array(repeating: [rows, 1, axis], count: 4),
+            outputDTypes: Array(repeating: .bfloat16, count: 4)
+        )
+        return (outputs[0], outputs[1], outputs[2], outputs[3])
+    }
+
     static func dualPreNorm(
         x: MLXArray, w1: MLXArray, w2: MLXArray, eps: Float
     ) -> (MLXArray, MLXArray)? {
@@ -1770,16 +1838,21 @@ private class Gemma4Router: Module {
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
-        let effScale: MLXArray
+    var effectiveRMSWeight: MLXArray {
         if let cached = cachedEffectiveScale {
-            effScale = cached
+            return cached
         } else {
             let eff = scale * rootSize
             cachedEffectiveScale = eff
-            effScale = eff
+            return eff
         }
-        let normed = MLXFast.rmsNorm(x, weight: effScale, eps: eps)
+    }
+
+    func callAsFunction(
+        _ x: MLXArray, preNormalized: MLXArray? = nil
+    ) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
+        let normed = preNormalized
+            ?? MLXFast.rmsNorm(x, weight: effectiveRMSWeight, eps: eps)
         let expertScores = proj(normed)
 
         // ROUTE-001: single-dispatch byte-identical replacement of the chain
@@ -2010,8 +2083,24 @@ public class Gemma4DecoderLayer: Module {
             h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset,
             v2SharedSource: v2SharedSource, outputStart: outputStart,
             useLastQueryPrefill: useLastQueryPrefill)
+        let preFeed: (
+            output: MLXArray, router: MLXArray, pre1: MLXArray, pre2: MLXArray
+        )?
+        if isMoE, let router, let preFeedforwardLayernorm2 {
+            preFeed = Gemma4FusedLayerGlue.normResidualPreFeed(
+                x: attnOut, residual: residual,
+                postWeight: postAttentionLayernorm.weight,
+                routerWeight: router.effectiveRMSWeight,
+                preWeight1: preFeedforwardLayernorm.weight,
+                preWeight2: preFeedforwardLayernorm2.weight,
+                eps: config.rmsNormEps)
+        } else {
+            preFeed = nil
+        }
         var out: MLXArray
-        if let fusedOut = Gemma4FusedLayerGlue.normResidual(
+        if let preFeed {
+            out = preFeed.output
+        } else if let fusedOut = Gemma4FusedLayerGlue.normResidual(
             x: attnOut, residual: residual,
             weight: postAttentionLayernorm.weight, eps: config.rmsNormEps)
         {
@@ -2035,11 +2124,19 @@ public class Gemma4DecoderLayer: Module {
             let postFeedforwardLayernorm2
         {
             // Dense + sparse branches in parallel, summed into one residual.
-            let (topKIndices, topKWeights) = router(out)
+            let (topKIndices, topKWeights) = router(
+                out, preNormalized: preFeed?.router)
 
             let h1Raw: MLXArray
             let h2Raw: MLXArray
-            if let (n1, n2) = Gemma4FusedLayerGlue.dualPreNorm(
+            if let preFeed {
+                h1Raw = mlp(preFeed.pre1)
+                h2Raw = experts(
+                    preFeed.pre2,
+                    topKIndices: topKIndices,
+                    topKWeights: topKWeights,
+                    isExpertPrefill: isExpertPrefill)
+            } else if let (n1, n2) = Gemma4FusedLayerGlue.dualPreNorm(
                 x: out,
                 w1: preFeedforwardLayernorm.weight,
                 w2: preFeedforwardLayernorm2.weight,

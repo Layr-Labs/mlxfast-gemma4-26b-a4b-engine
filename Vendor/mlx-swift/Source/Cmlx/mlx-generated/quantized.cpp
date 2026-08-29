@@ -4077,7 +4077,20 @@ template <typename T, int group_size, int bits>
     const device T* single_scales = scales + expert * s_strides[0];
     const device T* single_biases = biases + expert * b_strides[0];
     device T* single_y = y + assignment * (uint)out_vec_size;
-    qmv_impl<T, group_size, bits>(
+    // SINGLES-SIBLING: complete EXPERT-SINGLES' second arm. The singleton /
+    // odd-run-tail dispatch of the gate/up plane was still stock `qmv_impl`;
+    // EXPERT-SINGLES had only been wired into `gather_qmv_gemma4_down_tile`
+    // (KFIX = 704). Reaching this line proves in_vec_size == 2816: the caller
+    // gate admits only {2816 -> 704, 704 -> 2816} and the K = 704 plane has
+    // already returned through the down-tile arm above, so KFIX = 2816 is
+    // exact rather than assumed. K = 2816 is 11 whole blocks of 256, so
+    // tail_values == 0 and the dynamic safe tail is not even reached -- a
+    // strictly cleaner instantiation than the K = 704 one already promoted.
+    // WVEC's 4-byte weight loads stay aligned (in_vec_size_w = 1408, lane
+    // offset simd_lid * 4, block stride 128 -- all multiples of 4), which is
+    // the alignment condition EXPERT-SINGLES states for K in {2816, 704}.
+    // PF is left false to match the promoted down-arm choice: one variable.
+    qmv_affine4_g64_singles_impl<T, group_size, bits, 2816, true, false>(
         single_w, single_scales, single_biases, single_x, single_y,
         in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
     return;

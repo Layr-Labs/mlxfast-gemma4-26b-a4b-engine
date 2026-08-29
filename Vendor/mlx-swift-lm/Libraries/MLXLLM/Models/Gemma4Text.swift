@@ -1396,28 +1396,18 @@ public enum Gemma4RouterProbe {
         ((_ expertScores: MLXArray, _ topKIndices: MLXArray) -> Void)?
 }
 
-/// ROUTE-001: one-dispatch, byte-identical replacement of the decode router's
-/// selection chain — `argPartition(kth: E-8)` → slice → `takeAlong` →
-/// `softmax(precise)` over 8 → `perExpertScale` gather + multiply — for the
-/// exact B=8 decode geometry (`expertScores` [8, 1, 128] bf16). Five sort /
-/// gather / softmax / gather / multiply dispatches per MoE layer per step
-/// (plus the contiguous copy the strided index slice forces downstream)
-/// collapse into one 8-threadgroup kernel.
+/// ROUTE-001: byte-identical replacement of `argPartition(kth: E-8)` plus its
+/// strided tail slice for the exact B=8 decode geometry (`expertScores`
+/// [8, 1, 128] bf16). A stable 128-way bitonic network emits the ascending
+/// top-8 indices directly; the established take/precise-softmax/scale chain
+/// remains unchanged.
 ///
 /// Exactness (counting-predecessors lemma): `ArgPartition::eval_gpu` on Metal
 /// is `gpu_merge_sort(argsort=true)` — a FULL stable merge sort (sort.cpp) —
 /// so the sliced `[kth...]` output is the stable ascending argsort tail. Under
 /// sort.h's `LessThan` comparator (NaN ordered after every non-NaN, ties kept
-/// in original index order by stability) each element's stable-sort position
-/// equals its predecessor count, which the kernel evaluates directly; the
-/// selected values then run a verbatim transcription of
-/// `softmax_single_row<bfloat16_t, float, N_READS=4>` (softmax.h — same lane
-/// layout, same `Limits<float>::min` padding, same `fast::exp`, same
-/// `simd_max`/`simd_sum` reduction order on one 32-thread simdgroup) and the
-/// stock bf16 `Multiply` expression against the gathered per-expert scale.
-/// Bit-exact parity vs the stock op chain verified on uniform / tied /
-/// ulp-near-tie / ±inf / NaN / realistic rows (indices and uint16-viewed
-/// weights).
+/// in original index order by stability), lexicographic `(score, index)`
+/// compare-exchanges reproduce the stable full-sort tail exactly.
 ///
 /// Fail-closed: any other row count, sequence length, expert count, top-K, or
 /// dtype takes the established chain (cohort prefill at [8, 1024, ·] never
@@ -1425,16 +1415,14 @@ public enum Gemma4RouterProbe {
 /// bit-identical there too). Kill switch:
 /// `DARKBLOOM_GEMMA4_FUSED_ROUTER_TOP8=0`.
 private enum Gemma4FusedRouterTop8 {
-    /// DEFAULT OFF (`DARKBLOOM_GEMMA4_FUSED_ROUTER_TOP8=1` enables): the
-    /// fused chain is bit-exact (113/113 adversarial parity) but measured
-    /// +~0.1 ms/round inside the +0.27 ms consolidation cost of three
-    /// counterbalanced local B=8 probe pairs — dispatch deletion does not
-    /// pay while the concurrent encoder overlaps these small kernels.
+    /// DEFAULT ON after replacing the quadratic predecessor count with a
+    /// stable 128-way bitonic network. Set the variable to 0 to restore the
+    /// established argPartition/gather/softmax chain.
     static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_FUSED_ROUTER_TOP8"]
-        else { return false }
-        return ["1", "true", "yes", "on"].contains(raw.lowercased())
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
     private static let rows = 8
@@ -1442,136 +1430,172 @@ private enum Gemma4FusedRouterTop8 {
     private static let selected = 8
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_fused_router_top8_e128_k8_bf16_v1",
-        inputNames: ["scores", "pes"],
-        outputNames: ["inds", "wts"],
+        name: "gemma4_fused_router_top8_e128_k8_bf16_bitonic_v2",
+        inputNames: ["scores"],
+        outputNames: ["inds"],
         source: """
-            constexpr int SIMD_SIZE = 32;
-            constexpr int N_READS = 4;
             constexpr int KTH = E - K;
 
             const int row = int(threadgroup_position_in_grid.x);
             const int lid = int(thread_position_in_threadgroup.x);
 
             threadgroup float vals[E];
-            threadgroup float topv[K];
-            threadgroup uint topi[K];
-            threadgroup float local_max[SIMD_SIZE];
-            threadgroup float local_normalizer[SIMD_SIZE];
+            threadgroup uint ord[E];
+            threadgroup float vals_next[E];
+            threadgroup uint ord_next[E];
 
             const device T* srow = scores + row * E;
-            for (int i = lid; i < E; i += SIMD_SIZE) {
-                vals[i] = float(srow[i]);
-            }
+            vals[lid] = float(srow[lid]);
+            ord[lid] = uint(lid);
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // Stable-argsort position by predecessor counting under sort.h's
-            // LessThan comparator (NaN orders after every non-NaN; ties keep
-            // the original index order because the merge sort is stable).
-            // Position == #{i : less(v_i, v_e)} + #{i < e : neither less} —
-            // a permutation, so the writes below never collide.
-            for (int j = 0; j < E / SIMD_SIZE; ++j) {
-                const int e = lid + j * SIMD_SIZE;
-                const float v = vals[e];
-                const bool v_nan = isnan(v);
-                int rank = 0;
-                for (int i = 0; i < E; ++i) {
-                    const float u = vals[i];
-                    const bool u_nan = isnan(u);
-                    bool u_less_v;
-                    bool v_less_u;
-                    if (u_nan || v_nan) {
-                        u_less_v = !u_nan && v_nan;
-                        v_less_u = !v_nan && u_nan;
+            // Stable full ascending sort of (score, original index). Ping-pong
+            // storage makes every stage race-free: each thread reads its pair
+            // from the old table and writes only its own slot in the new one.
+            bool source_is_next = false;
+            for (uint width = 2; width <= E; width <<= 1) {
+                for (uint stride = width >> 1; stride > 0; stride >>= 1) {
+                    const uint partner = uint(lid) ^ stride;
+                    const float a = source_is_next ? vals_next[lid] : vals[lid];
+                    const float b = source_is_next ? vals_next[partner] : vals[partner];
+                    const uint ai = source_is_next ? ord_next[lid] : ord[lid];
+                    const uint bi = source_is_next ? ord_next[partner] : ord[partner];
+                    const bool a_nan = isnan(a);
+                    const bool b_nan = isnan(b);
+                    bool a_less_b;
+                    bool b_less_a;
+                    if (a_nan || b_nan) {
+                        a_less_b = !a_nan && b_nan;
+                        b_less_a = !b_nan && a_nan;
                     } else {
-                        u_less_v = u < v;
-                        v_less_u = v < u;
+                        a_less_b = a < b;
+                        b_less_a = b < a;
                     }
-                    if (u_less_v || (!v_less_u && i < e)) {
-                        ++rank;
+                    const bool a_before_b =
+                        a_less_b || (!b_less_a && ai < bi);
+                    const bool ascending = (uint(lid) & width) == 0;
+                    const bool lower_half = (uint(lid) & stride) == 0;
+                    const bool want_min = ascending == lower_half;
+                    const bool keep_a = want_min ? a_before_b : !a_before_b;
+                    if (source_is_next) {
+                        vals[lid] = keep_a ? a : b;
+                        ord[lid] = keep_a ? ai : bi;
+                    } else {
+                        vals_next[lid] = keep_a ? a : b;
+                        ord_next[lid] = keep_a ? ai : bi;
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    source_is_next = !source_is_next;
+                }
+            }
+            if (lid < K) {
+                const uint expert = source_is_next
+                    ? ord_next[KTH + lid]
+                    : ord[KTH + lid];
+                inds[row * K + lid] = expert;
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    private static let hierarchicalEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_HIERARCHICAL_ROUTER_TOP8"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Four SIMD-local stable sorts retain 8 candidates each; one final
+    /// SIMD-local sort over those 32 candidates emits the global stable top 8.
+    private static let hierarchicalKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_router_top8_e128_k8_bf16_hierarchical_v3",
+        inputNames: ["scores"],
+        outputNames: ["inds"],
+        source: """
+            constexpr uint SIMD_SIZE = 32;
+            constexpr uint LOCAL_KEEP = 8;
+
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint simdgroup = simdgroup_index_in_threadgroup;
+            uint index = simdgroup * SIMD_SIZE + lane;
+            float value = float(scores[row * E + index]);
+
+            // Stable ascending bitonic sort inside each independent SIMDgroup.
+            for (uint width = 2; width <= SIMD_SIZE; width <<= 1) {
+                for (uint stride = width >> 1; stride > 0; stride >>= 1) {
+                    const float other_value =
+                        simd_shuffle_xor(value, ushort(stride));
+                    const uint other_index =
+                        simd_shuffle_xor(index, ushort(stride));
+                    const bool value_nan = isnan(value);
+                    const bool other_nan = isnan(other_value);
+                    bool value_less;
+                    bool other_less;
+                    if (value_nan || other_nan) {
+                        value_less = !value_nan && other_nan;
+                        other_less = !other_nan && value_nan;
+                    } else {
+                        value_less = value < other_value;
+                        other_less = other_value < value;
+                    }
+                    const bool value_before =
+                        value_less || (!other_less && index < other_index);
+                    const bool ascending = (lane & width) == 0;
+                    const bool lower_half = (lane & stride) == 0;
+                    const bool want_min = ascending == lower_half;
+                    const bool keep_value = want_min
+                        ? value_before
+                        : !value_before;
+                    value = keep_value ? value : other_value;
+                    index = keep_value ? index : other_index;
+                }
+            }
+
+            threadgroup float candidates[SIMD_SIZE];
+            threadgroup uint candidate_indices[SIMD_SIZE];
+            if (lane >= SIMD_SIZE - LOCAL_KEEP) {
+                const uint slot =
+                    simdgroup * LOCAL_KEEP + lane - (SIMD_SIZE - LOCAL_KEEP);
+                candidates[slot] = value;
+                candidate_indices[slot] = index;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (simdgroup == 0) {
+                value = candidates[lane];
+                index = candidate_indices[lane];
+                for (uint width = 2; width <= SIMD_SIZE; width <<= 1) {
+                    for (uint stride = width >> 1; stride > 0; stride >>= 1) {
+                        const float other_value =
+                            simd_shuffle_xor(value, ushort(stride));
+                        const uint other_index =
+                            simd_shuffle_xor(index, ushort(stride));
+                        const bool value_nan = isnan(value);
+                        const bool other_nan = isnan(other_value);
+                        bool value_less;
+                        bool other_less;
+                        if (value_nan || other_nan) {
+                            value_less = !value_nan && other_nan;
+                            other_less = !other_nan && value_nan;
+                        } else {
+                            value_less = value < other_value;
+                            other_less = other_value < value;
+                        }
+                        const bool value_before =
+                            value_less || (!other_less && index < other_index);
+                        const bool ascending = (lane & width) == 0;
+                        const bool lower_half = (lane & stride) == 0;
+                        const bool want_min = ascending == lower_half;
+                        const bool keep_value = want_min
+                            ? value_before
+                            : !value_before;
+                        value = keep_value ? value : other_value;
+                        index = keep_value ? index : other_index;
                     }
                 }
-                if (rank >= KTH) {
-                    const int p = rank - KTH;
-                    inds[row * K + p] = uint(e);
-                    topi[p] = uint(e);
-                    topv[p] = v;
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            // softmax_single_row<T, float, N_READS=4> transcription
-            // (softmax.h) at axis_size = K on one 32-thread simdgroup, with
-            // the stock bf16 per-expert-scale multiply fused into the write.
-            const int simd_lane_id = int(thread_index_in_simdgroup);
-            const int simd_group_id = int(simdgroup_index_in_threadgroup);
-
-            float ld[N_READS];
-            const int base = lid * N_READS;
-            if (base + N_READS <= K) {
-                for (int i = 0; i < N_READS; i++) {
-                    ld[i] = topv[base + i];
-                }
-            } else {
-                for (int i = 0; i < N_READS; i++) {
-                    ld[i] = ((base + i) < K) ? topv[base + i] : Limits<float>::min;
-                }
-            }
-            if (simd_group_id == 0) {
-                local_max[simd_lane_id] = Limits<float>::min;
-                local_normalizer[simd_lane_id] = 0;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            float maxval = Limits<float>::finite_min;
-            for (int i = 0; i < N_READS; i++) {
-                maxval = (maxval < ld[i]) ? ld[i] : maxval;
-            }
-            maxval = simd_max(maxval);
-            if (simd_lane_id == 0) {
-                local_max[simd_group_id] = maxval;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_group_id == 0) {
-                maxval = simd_max(local_max[simd_lane_id]);
-                if (simd_lane_id == 0) {
-                    local_max[0] = maxval;
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            maxval = local_max[0];
-
-            float normalizer = 0;
-            for (int i = 0; i < N_READS; i++) {
-                float exp_x = fast::exp(ld[i] - maxval);
-                ld[i] = exp_x;
-                normalizer += exp_x;
-            }
-            normalizer = simd_sum(normalizer);
-            if (simd_lane_id == 0) {
-                local_normalizer[simd_group_id] = normalizer;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_group_id == 0) {
-                normalizer = simd_sum(local_normalizer[simd_lane_id]);
-                if (simd_lane_id == 0) {
-                    local_normalizer[0] = normalizer;
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            normalizer = 1 / local_normalizer[0];
-
-            if (base + N_READS <= K) {
-                for (int i = 0; i < N_READS; i++) {
-                    const T w = T(ld[i] * normalizer);
-                    wts[row * K + base + i] = w * pes[topi[base + i]];
-                }
-            } else {
-                for (int i = 0; i < N_READS; i++) {
-                    if ((base + i) < K) {
-                        const T w = T(ld[i] * normalizer);
-                        wts[row * K + base + i] = w * pes[topi[base + i]];
-                    }
+                if (lane >= SIMD_SIZE - K) {
+                    inds[row * K + lane - (SIMD_SIZE - K)] = index;
                 }
             }
         """,
@@ -1594,19 +1618,23 @@ private enum Gemma4FusedRouterTop8 {
         else { return nil }
         CBv2EngageMark.once("router-top8")
 
-        let outputs = kernel(
-            [expertScores, perExpertScale],
+        let selectedKernel = hierarchicalEnabled ? hierarchicalKernel : kernel
+        let outputs = selectedKernel(
+            [expertScores],
             template: [
                 ("T", expertScores.dtype),
                 ("E", experts),
                 ("K", selected),
             ],
-            grid: (rows * 32, 1, 1),
-            threadGroup: (32, 1, 1),
-            outputShapes: [[rows, 1, selected], [rows, 1, selected]],
-            outputDTypes: [.uint32, .bfloat16]
+            grid: (rows * 128, 1, 1),
+            threadGroup: (128, 1, 1),
+            outputShapes: [[rows, 1, selected]],
+            outputDTypes: [.uint32]
         )
-        return (outputs[0], outputs[1])
+        var weights = MLX.takeAlong(expertScores, outputs[0], axis: -1)
+        weights = MLX.softmax(weights, axis: -1, precise: true)
+        weights = weights * perExpertScale[outputs[0]]
+        return (outputs[0], weights)
     }
 }
 
@@ -1632,7 +1660,7 @@ public final class Gemma4GlueChainBox {
 ///   3. `normResidual` — `residual + postAttentionLayernorm(attnOut)`
 ///      (2 kernels -> 1).
 ///
-/// Unlike the (default-off) fused router above, every op fused here sits on
+/// Unlike the router selector above, every op fused here sits on
 /// the layer's DEPENDENT chain — none of them can hide under the concurrent
 /// encoder's overlap with the expert branch — so dispatch deletion shortens
 /// the critical path rather than deleting already-hidden work.

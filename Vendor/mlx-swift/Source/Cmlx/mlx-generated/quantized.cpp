@@ -3648,7 +3648,9 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int gemma4_down_tile_span = 4; // sweep alternate: 2
+  // 352 y-groups; the span must divide them so each tile has one
+  // survivor. Swept 4/8/16/22/32; sixteen is the interior optimum.
+  constexpr int gemma4_down_tile_span = 16; // sweep alternate: 8
   if (tid.y % uint(gemma4_down_tile_span) != 0u) {
     return;
   }

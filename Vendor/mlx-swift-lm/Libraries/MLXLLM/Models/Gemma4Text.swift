@@ -1072,6 +1072,215 @@ private func gemma4FusedQKVNorm(
     return (outputs[0], outputs[1], outputs[2])
 }
 
+/// Keep derived RoPE constants out of `Module`'s parameter reflection. A bare
+/// stored `MLXArray` would be interpreted as a checkpoint weight.
+private struct Gemma4FusedRoPEConfiguration {
+    let operand: MLXArray
+    let usesFreqs: Bool
+}
+
+/// DECODE-SAFE-003 rider (donor: submission 3a023d0d, josusanmartin, PR 429,
+/// commit e821204, section 2 "gemma4-qkv-norm-layout-rope").
+///
+/// Fused B8/L1 Q/K/V preparation: RMSNorm, the final `[B, H, 1, D]` layout and
+/// the nontraditional RoPE for Q/K all leave one dispatch. The RMS reduction
+/// tree and the BF16 post-norm boundary are copied row-for-row from
+/// `gemma4QKVNormKernel`; the rotary close is copied from MLX's `rope.metal`
+/// (`rope_impl` / `rope` / `rope_freqs`). Full attention's K-eq-V pair shares
+/// the raw key reduction while keeping the weighted-K and `T(1) * rms` V
+/// stores separate, exactly as the incumbent norm kernel does.
+///
+/// Layout is free at `L == 1`: `[B, 1, H, D]` and `[B, H, 1, D]` have the same
+/// flat address for every element, so writing `local_row * D + d` produces the
+/// head-major array that `transposed(0, 2, 1, 3)` used to hand to RoPE.
+private let gemma4QKVNormLayoutRoPEKernel = MLXFast.metalKernel(
+    name: "gemma4_b8_l1_qkv_rms_layout_rope_v1",
+    inputNames: ["q", "k", "v", "q_weight", "k_weight", "offsets", "rope_operand"],
+    outputNames: ["q_out", "k_out", "v_out"],
+    source: """
+        constexpr uint reads = 4;
+        const uint row = threadgroup_position_in_grid.x;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint simd_group = simdgroup_index_in_threadgroup;
+
+        const device T* row_input = q;
+        const device T* row_weight = q_weight;
+        device T* row_output = q_out;
+        uint local_row = row;
+        uint heads = Q_HEADS;
+        bool weighted = true;
+        bool rotate = true;
+        bool key_row = false;
+        if (KV_SHARED == 0 && row >= Q_ROWS + K_ROWS) {
+            row_input = v;
+            row_output = v_out;
+            local_row = row - Q_ROWS - K_ROWS;
+            heads = K_HEADS;
+            weighted = false;
+            rotate = false;
+        } else if (row >= Q_ROWS) {
+            row_input = k;
+            row_weight = k_weight;
+            row_output = k_out;
+            local_row = row - Q_ROWS;
+            heads = K_HEADS;
+            key_row = true;
+        }
+
+        row_input += local_row * D;
+        const uint output_base = local_row * D;
+
+        float sum = 0.0f;
+        for (uint i = 0; i < reads; ++i) {
+            const float value = float(row_input[lid * reads + i]);
+            sum += value * value;
+        }
+        sum = simd_sum(sum);
+
+        threadgroup float partials[32];
+        threadgroup float inverse_rms;
+        if (simd_group == 0) partials[lane] = 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) partials[simd_group] = sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            sum = simd_sum(partials[lane]);
+            if (lane == 0) {
+                inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // RoPE consumes the BF16 result written by RMSNorm, so preserve that
+        // storage boundary in threadgroup memory before rotating pairs.
+        threadgroup bfloat normalized[D];
+        for (uint i = 0; i < reads; ++i) {
+            const uint dimension = lid * reads + i;
+            const T rms_value = T(float(row_input[dimension]) * inverse_rms);
+            const T current = weighted
+                ? T(row_weight[dimension] * rms_value)
+                : T(T(1) * rms_value);
+            normalized[dimension] = current;
+            if (KV_SHARED != 0 && key_row) {
+                v_out[output_base + dimension] = T(T(1) * rms_value);
+            }
+            if (!rotate) {
+                row_output[output_base + dimension] = current;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (rotate) {
+            const uint half_dimension = D / 2;
+            const int position = offsets[local_row / heads];
+            for (uint i = 0; i < reads; ++i) {
+                const uint dimension = lid * reads + i;
+                const uint pair_dimension = dimension < half_dimension
+                    ? dimension + half_dimension
+                    : dimension - half_dimension;
+                const uint frequency_index = dimension % half_dimension;
+                const float inverse_frequency = USE_FREQS != 0
+                    ? 1.0f / rope_operand[frequency_index]
+                    : metal::exp2(
+                        -(float(frequency_index) / float(half_dimension))
+                        * rope_operand[0]);
+                const float theta = float(position) * inverse_frequency;
+                const float cosine = metal::fast::cos(theta);
+                const float sine = metal::fast::sin(theta);
+                const float x1 = float(normalized[
+                    dimension < half_dimension ? dimension : pair_dimension]);
+                const float x2 = float(normalized[
+                    dimension < half_dimension ? pair_dimension : dimension]);
+                row_output[output_base + dimension] = dimension < half_dimension
+                    ? T(x1 * cosine - x2 * sine)
+                    : T(x1 * sine + x2 * cosine);
+            }
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+/// Kill switch: `DARKBLOOM_GEMMA4_QKV_NORM_LAYOUT_ROPE=0` (also
+/// `false`/`no`/`off`) restores the norm + transpose + two-RoPE chain. The
+/// ranked runner sets no environment, so the default is the fused path and the
+/// guard below - not the variable - is what keeps the mechanism correct.
+private let gemma4QKVNormLayoutRoPEEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_QKV_NORM_LAYOUT_ROPE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// `(rope(qNorm(q)), rope(kNorm(k)), vNorm(v))` already in `[B, H, 1, D]`.
+/// Returns `nil` off the two exact decode planes.
+///
+/// Sliding: `[8, 1, 16, 256]` Q with `[8, 1, 8, 256]` K/V, full nontraditional
+/// rotation, `exp2(-(d / 128) * log2(10000))` frequencies - the same closed
+/// form `rope.metal`'s `rope` kernel uses with `base = log2(base_)`.
+/// Full: `[8, 1, 16, 512]` Q with `[8, 1, 2, 512]` structural K = V, and the
+/// checkpoint's proportional `_freqs` (64 live `/512` exponents padded with
+/// `+inf` to 256), read as `1 / freqs[i]` exactly like `rope_freqs`. The
+/// `+inf` entries give `theta == 0`, so those pairs pass through unrotated.
+private func gemma4FusedQKVNormLayoutRoPE(
+    q: MLXArray,
+    k: MLXArray,
+    v: MLXArray,
+    qWeight: MLXArray,
+    kWeight: MLXArray,
+    offsets: MLXArray,
+    ropeOperand: MLXArray,
+    usesFreqs: Bool,
+    keyValueShared: Bool,
+    eps: Float
+) -> (queries: MLXArray, keys: MLXArray, values: MLXArray)? {
+    guard gemma4QKVNormLayoutRoPEEnabled,
+        eps == 1.0e-6,
+        q.dtype == .bfloat16, k.dtype == .bfloat16, v.dtype == .bfloat16,
+        qWeight.dtype == .bfloat16, kWeight.dtype == .bfloat16,
+        offsets.dtype == .int32, ropeOperand.dtype == .float32,
+        q.ndim == 4, k.ndim == 4, v.ndim == 4,
+        q.dim(0) == 8, q.dim(1) == 1, q.dim(2) == 16,
+        k.dim(0) == 8, k.dim(1) == 1, v.shape == k.shape,
+        q.dim(3) == k.dim(3),
+        qWeight.shape == [q.dim(3)], kWeight.shape == [q.dim(3)],
+        offsets.shape == [8], ropeOperand.shape == [q.dim(3) / 2]
+    else { return nil }
+
+    let dimension = q.dim(3)
+    let keyHeads = k.dim(2)
+    let sliding = dimension == 256 && keyHeads == 8
+        && !usesFreqs && !keyValueShared
+    let full = dimension == 512 && keyHeads == 2
+        && usesFreqs && keyValueShared
+    guard sliding || full else { return nil }
+    CBv2EngageMark.once("gemma4-qkv-norm-layout-rope")
+
+    let queryHeads = 16
+    let queryRows = 8 * queryHeads
+    let keyRows = 8 * keyHeads
+    let threads = dimension / 4
+    let outputs = gemma4QKVNormLayoutRoPEKernel(
+        [q, k, v, qWeight, kWeight, offsets, ropeOperand],
+        template: [
+            ("T", q.dtype), ("D", dimension),
+            ("Q_ROWS", queryRows), ("K_ROWS", keyRows),
+            ("Q_HEADS", queryHeads), ("K_HEADS", keyHeads),
+            ("USE_FREQS", usesFreqs ? 1 : 0),
+            ("KV_SHARED", keyValueShared ? 1 : 0),
+        ],
+        grid: ((queryRows + (keyValueShared ? keyRows : 2 * keyRows)) * threads, 1, 1),
+        threadGroup: (threads, 1, 1),
+        outputShapes: [
+            [8, queryHeads, 1, dimension],
+            [8, keyHeads, 1, dimension],
+            [8, keyHeads, 1, dimension],
+        ],
+        outputDTypes: [q.dtype, k.dtype, v.dtype]
+    )
+    return (outputs[0], outputs[1], outputs[2])
+}
+
 private class ScaledLinear: Module {
     let weight: MLXArray
     let scalar: Float
@@ -1209,6 +1418,7 @@ private class Gemma4Attention: Module {
     let useKeqV: Bool
     let usesSharedKV: Bool
     let scale: Float
+    let fusedRoPEConfiguration: Gemma4FusedRoPEConfiguration
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
     @ModuleInfo(key: "k_proj") var kProj: Linear?
@@ -1251,6 +1461,46 @@ private class Gemma4Attention: Module {
         }
 
         self.scale = 1.0
+
+        // The fused decode kernel's RoPE operand, rebuilt from the SAME
+        // expressions the `rope` module below feeds `MLXFast.RoPE`:
+        //   sliding -> `rope.metal`'s `rope` kernel reads `base = log2(base_)`
+        //              (mlx/backend/metal/rope.cpp) and forms
+        //              `exp2(-(d / (dims/2)) * base)`;
+        //   full    -> `rope_freqs` reads `1 / freqs[i]` from
+        //              `ProportionalRoPE._freqs`, i.e.
+        //              `pow(theta, [0, 2, ..., rotatedDims) / dims)` padded
+        //              with `+inf` for the pass-through pairs (factor == 1).
+        // `_freqs` is internal to MLXLMCommon, so the array is reconstructed
+        // here rather than borrowed; every operation is identical, so the two
+        // arrays are bit-identical.
+        if isSliding {
+            self.fusedRoPEConfiguration = Gemma4FusedRoPEConfiguration(
+                operand: MLXArray(
+                    Array(
+                        repeating: log2(config.slidingRopeTheta),
+                        count: effectiveHeadDim / 2)),
+                usesFreqs: false)
+        } else {
+            let rotatedDims =
+                Int(config.fullPartialRotaryFactor * Float(effectiveHeadDim) / 2) * 2
+            let exponents =
+                MLXArray(stride(from: 0, to: rotatedDims, by: 2)).asType(.float32)
+                / Float(effectiveHeadDim)
+            let realFreqs = MLX.pow(config.fullRopeTheta, exponents)
+            let padCount = (effectiveHeadDim - rotatedDims) / 2
+            if padCount > 0 {
+                let padding = MLXArray(
+                    Array(repeating: Float.infinity, count: padCount))
+                self.fusedRoPEConfiguration = Gemma4FusedRoPEConfiguration(
+                    operand: concatenated([realFreqs, padding], axis: -1),
+                    usesFreqs: true)
+            } else {
+                self.fusedRoPEConfiguration = Gemma4FusedRoPEConfiguration(
+                    operand: realFreqs,
+                    usesFreqs: true)
+            }
+        }
 
         self._qProj.wrappedValue = Linear(dim, nHeads * effectiveHeadDim, bias: false)
         if !usesSharedKV {
@@ -1582,29 +1832,49 @@ private class Gemma4Attention: Module {
         var queries: MLXArray
         var k: MLXArray
         var v: MLXArray
-        if let normalized = gemma4FusedQKVNorm(
-            q: queryRaw, k: kRaw, v: vRaw,
-            qWeight: qNorm.weight, kWeight: kNorm.weight, eps: config.rmsNormEps,
-            keyValueShared: vProj == nil)
+        // DECODE-SAFE-003: norm + final layout + RoPE in one dispatch on the
+        // two exact decode planes. `lastQueryCache != nil` requires `L > 1`
+        // (see the precondition above), so on this arm `queryPositionOffset`
+        // and `captured` are the same snapshot and one offset buffer serves
+        // Q and K. Every guard failure falls back to today's exact chain.
+        if lastQueryCache == nil,
+            let prepared = gemma4FusedQKVNormLayoutRoPE(
+                q: queryRaw, k: kRaw, v: vRaw,
+                qWeight: qNorm.weight, kWeight: kNorm.weight,
+                offsets: capturedOffsets,
+                ropeOperand: fusedRoPEConfiguration.operand,
+                usesFreqs: fusedRoPEConfiguration.usesFreqs,
+                keyValueShared: vProj == nil,
+                eps: config.rmsNormEps)
         {
-            queries = normalized.0.transposed(0, 2, 1, 3)
-            k = normalized.1.transposed(0, 2, 1, 3)
-            v = normalized.2.transposed(0, 2, 1, 3)
-        } else if let headMajor = gemma4FusedQKVNormHeadMajor(
-            q: queryRaw, k: kRaw,
-            qWeight: qNorm.weight, kWeight: kNorm.weight, eps: config.rmsNormEps,
-            keyValueShared: vProj == nil)
-        {
-            // Written head-major, so the three transposes are already applied.
-            (queries, k, v) = headMajor
+            queries = prepared.queries
+            k = prepared.keys
+            v = prepared.values
         } else {
-            queries = qNorm(queryRaw).transposed(0, 2, 1, 3)
-            k = kNorm(kRaw).transposed(0, 2, 1, 3)
-            v = vNorm(vRaw).transposed(0, 2, 1, 3)
-        }
+            if let normalized = gemma4FusedQKVNorm(
+                q: queryRaw, k: kRaw, v: vRaw,
+                qWeight: qNorm.weight, kWeight: kNorm.weight, eps: config.rmsNormEps,
+                keyValueShared: vProj == nil)
+            {
+                queries = normalized.0.transposed(0, 2, 1, 3)
+                k = normalized.1.transposed(0, 2, 1, 3)
+                v = normalized.2.transposed(0, 2, 1, 3)
+            } else if let headMajor = gemma4FusedQKVNormHeadMajor(
+                q: queryRaw, k: kRaw,
+                qWeight: qNorm.weight, kWeight: kNorm.weight, eps: config.rmsNormEps,
+                keyValueShared: vProj == nil)
+            {
+                // Written head-major, so the three transposes are already applied.
+                (queries, k, v) = headMajor
+            } else {
+                queries = qNorm(queryRaw).transposed(0, 2, 1, 3)
+                k = kNorm(kRaw).transposed(0, 2, 1, 3)
+                v = vNorm(vRaw).transposed(0, 2, 1, 3)
+            }
 
-        queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: queryPositionOffset)
-        k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
+            queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: queryPositionOffset)
+            k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
+        }
 
         let outputDType = queries.dtype
         let attentionQueries =
@@ -3757,6 +4027,11 @@ extension Gemma4TextModel: CBv2LanguageModelPrefillForwardable {
         }
     }
 }
+
+/// Every storage-owning CBv2 attention result is consumed by the sequential
+/// Gemma trunk and final LM head, so ordinary decode logits transitively root
+/// that forward's K/V mutations. Cache-layout gates remain in the adapter.
+extension Gemma4TextModel: CBv2LanguageModelDecodeOutputCoversCacheMutations {}
 
 // MARK: - ContinuousBatchingV2 multimodal (vision prefill)
 

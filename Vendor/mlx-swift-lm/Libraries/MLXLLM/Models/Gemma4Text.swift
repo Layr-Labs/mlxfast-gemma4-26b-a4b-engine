@@ -3033,7 +3033,7 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     /// kernel whose own x extent is two, so only the groups that were already
     /// doing the work are launched. Returns `nil` unless every pin holds, and
     /// the caller then keeps the stock path.
-    private func tiedLMHeadTightGrid(_ hidden: MLXArray) -> MLXArray? {
+    private func tiedLMHeadTightGrid(_ hidden: MLXArray, softcap: Float = 0.0) -> MLXArray? {
         guard lmHead == nil,
             let quantized = model.embedTokens as? QuantizedEmbedding,
             quantized.groupSize == 64,
@@ -3045,25 +3045,28 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             scales: quantized.scales,
             biases: quantized.biases,
             inDim: config.hiddenSize,
-            outDim: config.vocabSize)
+            outDim: config.vocabSize,
+            softcap: softcap)
     }
 
     func applyLMHead(_ hidden: MLXArray) -> MLXArray {
+        let softcap = config.finalLogitSoftcapping
+        if let tight = tiedLMHeadTightGrid(hidden, softcap: softcap) {
+            return tight
+        }
         var out: MLXArray
         if let lmHead {
             out = lmHead(hidden)
         } else if let mma = tiedLMHeadMMA(hidden) {
             out = mma
-        } else if let tight = tiedLMHeadTightGrid(hidden) {
-            out = tight
         } else {
             out = model.embedTokens.asLinear(hidden)
         }
         // The VLM omission profile uses zero to represent the former optional
         // softcap's nil/disabled state.
-        if config.finalLogitSoftcapping > 0 {
+        if softcap > 0 {
             out = gemma4CompiledLogitSoftcap(
-                out, MLXArray(config.finalLogitSoftcapping))
+                out, MLXArray(softcap))
         }
         return out
     }

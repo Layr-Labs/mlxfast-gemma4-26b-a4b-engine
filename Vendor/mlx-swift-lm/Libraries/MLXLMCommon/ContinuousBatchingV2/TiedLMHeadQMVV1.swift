@@ -398,10 +398,17 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     result2[row] = simd_sum(result2[row]);
     result3[row] = simd_sum(result3[row]);
     if (simd_lid == 0) {
-      y0[row] = static_cast<T>(result0[row]);
-      y1[row] = static_cast<T>(result1[row]);
-      y2[row] = static_cast<T>(result2[row]);
-      y3[row] = static_cast<T>(result3[row]);
+      if (USE_SOFTCAP) {
+        y0[row] = static_cast<T>(metal::precise::tanh(result0[row] * (1.0f / 30.0f)) * 30.0f);
+        y1[row] = static_cast<T>(metal::precise::tanh(result1[row] * (1.0f / 30.0f)) * 30.0f);
+        y2[row] = static_cast<T>(metal::precise::tanh(result2[row] * (1.0f / 30.0f)) * 30.0f);
+        y3[row] = static_cast<T>(metal::precise::tanh(result3[row] * (1.0f / 30.0f)) * 30.0f);
+      } else {
+        y0[row] = static_cast<T>(result0[row]);
+        y1[row] = static_cast<T>(result1[row]);
+        y2[row] = static_cast<T>(result2[row]);
+        y3[row] = static_cast<T>(result3[row]);
+      }
     }
   }
 }
@@ -423,6 +430,7 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
             if (first_m >= 8) {
                 return;
             }
+
             qmv_affine4_g64_quad_stream_impl<T, 64, 4>(
                 w,
                 scales,
@@ -452,7 +460,8 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
         scales: MLXArray,
         biases: MLXArray?,
         inDim: Int,
-        outDim: Int
+        outDim: Int,
+        softcap: Float = 0.0
     ) -> MLXArray? {
         // Every dimension is validated against every other, so the gate is a
         // full shape pin at runtime even though the tower's hidden size is not
@@ -488,6 +497,7 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
                 ("T", x.dtype),
                 ("K", inDim),
                 ("OUTN", outDim),
+                ("USE_SOFTCAP", softcap > 0),
             ],
             grid: (xGroups * simdWidth, yGroups * simdGroups, 1),
             threadGroup: (simdWidth, simdGroups, 1),

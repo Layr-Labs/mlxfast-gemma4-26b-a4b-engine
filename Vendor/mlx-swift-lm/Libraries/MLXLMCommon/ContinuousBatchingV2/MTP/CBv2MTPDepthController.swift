@@ -46,17 +46,14 @@ final class CBv2MTPDepthController {
     /// PARTICIPANT POLICY LEVER (editable; the participant contract names
     /// this controller as the adaptive policy a submission may change).
     ///
-    /// This submission runs TARGET-ONLY: the controller never selects a
-    /// positive draft depth, so no seed step, no verify step, and no cost
-    /// probe is ever planned. The sealed verification mode for this track is
-    /// `.serialTarget`, where a depth-k round costs 1+k FULL target forwards;
-    /// the adaptive policy therefore converges to depth 0 on its own, but it
-    /// keeps re-proving that at every probe cadence (a seed step plus a
-    /// 1+k verify step) — pure loss on this arm. Pinning the policy at 0
-    /// removes those rounds. Every committed token is still produced by an
-    /// ordinary target decode step, so the emitted stream stays bit-identical
-    /// to serial decode.
-    static let speculationEnabled = false
+    /// This submission ENABLES MTP speculation. The controller will select
+    /// the best draft depth from 0 to `submissionDraftDepth` based on
+    /// observed goodput (acceptance * committed_per_round / wall_time).
+    /// The sealed verification mode is `.serialTarget` (1+k full target
+    /// forwards per round), so argmax exactness is preserved and the only
+    /// risk is the 10% token-tolerance gate, which the adaptive controller
+    /// monitors through the acceptance EWMA.
+    static let speculationEnabled = true
 
     private struct CostState {
         var samples = 0

@@ -1050,7 +1050,7 @@ public enum Gemma4MMAQuantizedGEMV {
     /// tile. At N=262144 that repeats the same 352 sums in 8,192 threadgroups.
     /// This prepass writes those exact FP32 sums once.
     private static let xSumKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_xsum_m8_v5",
+        name: "gemma4_mma_affine4_xsum_m8_v6",
         inputNames: ["x"],
         outputNames: ["xSums"],
         source: """
@@ -1063,6 +1063,7 @@ public enum Gemma4MMAQuantizedGEMV {
             const device T* xp =
                 x + (cell / N_GROUPS) * K + (cell % N_GROUPS) * GROUP;
             float s = 0.0f;
+            #pragma clang loop unroll(full)
             for (uint c = 0; c < GROUP / 8; ++c) {
                 const uint i = c * 8;
                 s += xp[i + 0] + xp[i + 1] + xp[i + 2] + xp[i + 3];
@@ -1713,9 +1714,12 @@ public enum Gemma4MMAQuantizedGEMV {
                 const uint gg = g % 8;
             """,
             with: """
+            #pragma clang loop unroll(full)
             for (uint biasBlock = 0; biasBlock < N_GROUPS; biasBlock += 8) {
                 const uint blockGroups = min(8u, N_GROUPS - biasBlock);
-                for (uint gg = 0; gg < blockGroups; ++gg) {
+                #pragma clang loop unroll(full)
+                for (uint gg = 0; gg < 8; ++gg) {
+                    if (gg >= blockGroups) continue;
                     const uint g = biasBlock + gg;
             """
         )
@@ -1735,7 +1739,7 @@ public enum Gemma4MMAQuantizedGEMV {
     }()
 
     private static let kernelV13: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v13",
+        name: "gemma4_mma_affine4_qmv_m8_v13_gg8",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["out"],
         source: sourceV13,
@@ -1798,7 +1802,7 @@ public enum Gemma4MMAQuantizedGEMV {
     }()
 
     private static let kernelV14: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v14",
+        name: "gemma4_mma_affine4_qmv_m8_v14_gg8",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["out"],
         source: sourceV14,
@@ -2036,7 +2040,7 @@ public enum Gemma4MMAQuantizedGEMV {
     }()
 
     private static let kernelV15: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v15_dualtile",
+        name: "gemma4_mma_affine4_qmv_m8_v15_dualtile_gg8",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["out"],
         source: sourceV15,
@@ -2388,7 +2392,7 @@ public enum Gemma4MMAQuantizedGEMV {
     }()
 
     private static let kernelV16: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v16_quadtile",
+        name: "gemma4_mma_affine4_qmv_m8_v16_quadtile_gg8",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["out"],
         source: sourceV16,
@@ -2473,7 +2477,7 @@ public enum Gemma4MMAQuantizedGEMV {
     }()
 
     private static let kernelV26: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v26_weight_cursor",
+        name: "gemma4_mma_affine4_qmv_m8_v26_weight_cursor_gg8",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["out"],
         source: sourceV26,

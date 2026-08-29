@@ -1675,6 +1675,15 @@ private enum Gemma4FusedLayerGlue {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// A/B switch: DARKBLOOM_GEMMA4_LEAN_RMS=0 restores the zeroing pass and
+    /// the barrier that published it, in the same binary.
+    private static let leanReduce: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_LEAN_RMS"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let rows = 8
     private static let axis = 2816
     private static let eps: Float = 1e-6
@@ -1692,12 +1701,14 @@ private enum Gemma4FusedLayerGlue {
                     acc += xi * xi;
                 }
                 acc = simd_sum(acc);
+        \(leanReduce ? "" : """
                 if (simd_group_id == 0) local_sums[simd_lane_id] = 0;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
+        """)
                 if (simd_lane_id == 0) local_sums[simd_group_id] = acc;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 if (simd_group_id == 0) {
-                    acc = simd_sum(local_sums[simd_lane_id]);
+                    acc = simd_sum(\(leanReduce ? "simd_lane_id < 22 ? local_sums[simd_lane_id] : 0.0f" : "local_sums[simd_lane_id]"));
                     if (simd_lane_id == 0) {
                         \(slot) = metal::precise::rsqrt(acc / 2816.0f + 1e-06f);
                     }

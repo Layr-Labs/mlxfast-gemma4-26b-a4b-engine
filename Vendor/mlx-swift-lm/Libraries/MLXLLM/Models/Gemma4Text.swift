@@ -3022,7 +3022,7 @@ public class Gemma4TextModelInner: Module {
                     schedulePrefill: schedulePrefill),
                 glueChain: glueChain,
                 nextInputLayernormWeight: idx + 1 < layers.count
-                    ? layers[idx + 1].inputLayernorm.weight : nil
+                    ? layers[idx + 1].inputLayernorm.weight : norm.weight
             )
             h = out
             intermediates[idx] = (kvPair, positionOffset)
@@ -3059,7 +3059,13 @@ public class Gemma4TextModelInner: Module {
             }
         }
 
-        let postNorm = norm(h)
+        let postNorm: MLXArray
+        if let pending = glueChain.pending, pending.source === h {
+            glueChain.pending = nil
+            postNorm = pending.normed
+        } else {
+            postNorm = norm(h)
+        }
         return (postNorm, capturePreNorm ? h : nil)
     }
 }

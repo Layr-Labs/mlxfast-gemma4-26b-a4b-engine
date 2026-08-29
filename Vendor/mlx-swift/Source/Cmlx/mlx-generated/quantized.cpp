@@ -3849,7 +3849,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int gemma4_down_tile_span = 4; // sweep alternate: 2
+  constexpr int gemma4_down_tile_span = 8; // DOWN-SPAN8@REV2: the span axis on the rope-revised engine is unpriced above the incumbent — span2 died −6.29% here (22e54071) which says the fine side is wrong at this revision, while span4 stands as incumbent and span8 was only ever priced −7.11% at the PRE-rope revision (03129e9b). Constant-only change, existing instantiated pair body (the runner-pipeline law banked in tonight's ledger: this ticket adds no new symbols). 352 % 8 == 0, no ragged tail, survivor((u/span)*span)/step-u%span ownership identical, bit-exact by construction
   if (tid.y % uint(gemma4_down_tile_span) != 0u) {
     return;
   }

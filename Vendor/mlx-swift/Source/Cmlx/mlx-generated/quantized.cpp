@@ -73,6 +73,7 @@ inline U load_vector(const device T* x, thread U* x_thread) {
   }
 
   else if (bits == 4) {
+    #pragma unroll
     for (int i = 0; i < values_per_thread; i += 4) {
       sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
       x_thread[i] = x[i];
@@ -247,6 +248,7 @@ inline U qdot(
 
   else if (bits == 4) {
     const device uint16_t* ws = (const device uint16_t*)w;
+    #pragma unroll
     for (int i = 0; i < (values_per_thread / 4); i++) {
       accum +=
           (x_thread[4 * i] * (ws[i] & 0x000f) +
@@ -316,6 +318,7 @@ inline U qdot_affine4_registered(
     U bias,
     U sum) {
   U accum = 0;
+  #pragma unroll
   for (int i = 0; i < (values_per_thread / 4); i++) {
     accum +=
         (x_thread[4 * i] * (w[i] & 0x000f) +
@@ -343,6 +346,7 @@ inline void qdot_affine4_pair(
   U accum0 = 0;
   U accum1 = 0;
   const device uint16_t* ws = (const device uint16_t*)w;
+  #pragma unroll
   for (int i = 0; i < (values_per_thread / 4); i++) {
     const uint16_t packed = ws[i];
     accum0 +=
@@ -543,6 +547,7 @@ qouter(const thread uint8_t* w, U x, U scale, U bias, thread U* result) {
 
   else if (bits == 4) {
     U s[2] = {scale, scale / 16.0f};
+    #pragma unroll
     for (int i = 0; i < (values_per_thread / 2); i++) {
       result[2 * i] += x * (s[0] * (w[i] & 0x0f) + bias);
       result[2 * i + 1] += x * (s[1] * (w[i] & 0xf0) + bias);
@@ -941,6 +946,7 @@ inline U qdot_affine4_loaded(
     U bias,
     U sum) {
   U accum = 0;
+  #pragma unroll
   for (int i = 0; i < 4; i++) {
     accum +=
         (x_thread[4 * i] * (ws[i] & 0x000f) +
@@ -959,6 +965,7 @@ inline float2 qdot_affine4_loaded_pair(
     float bias,
     float2 sum) {
   float2 accum = 0;
+  #pragma unroll
   for (int i = 0; i < 4; i++) {
     accum +=
         (float2(x0[4 * i], x1[4 * i]) * (ws[i] & 0x000f) +
@@ -1017,6 +1024,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
           row * in_vec_size_w + k / 2 + simd_lid * bytes_per_lane;
       const device uint16_t* ws =
           reinterpret_cast<const device uint16_t*>(wb);
+      #pragma unroll
       for (int i = 0; i < 4; i++) {
         packed[r][i] = ws[i];
       }
@@ -1113,6 +1121,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
       const device uint16_t* ws = reinterpret_cast<const device uint16_t*>(
           reinterpret_cast<const device uint8_t*>(w) + row * in_vec_size_w +
           k / 2 + simd_lid * bytes_per_lane);
+      #pragma unroll
       for (int i = 0; i < 4; i++) {
         packed[r][i] = ws[i];
       }
@@ -1126,6 +1135,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
     for (int r = 0; r < rows_per_simd; r++) {
       partial[r] = VF(0.0f);
     }
+    #pragma unroll
     for (int i = 0; i < 4; i++) {
       VF a0, a1, a2, a3;
       for (int m = 0; m < NA; m++) {

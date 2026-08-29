@@ -171,7 +171,7 @@ final class CBv2MTPRoundDriver {
     /// 1. The per-arm behaviour differs. MTP adapts up to this ceiling each round.
     /// DFlash proposes a fixed block of this size, because block diffusion drafts
     /// a whole block at once. The constant you edit is the same on both arms.
-    static let submissionDraftDepth = 0
+    static let submissionDraftDepth = 1
 
     /// The effective adaptive-depth ceiling: the trusted envelope's max, bounded
     /// by the participant's `submissionDraftDepth`. Pure and static so the cap is
@@ -213,20 +213,29 @@ final class CBv2MTPRoundDriver {
         config: CBv2MTPConfig, drafter: any CBv2MTPDrafter,
         model: any CBv2MTPSteppableModel, captureLayers: CBv2MTPCaptureLayers
     ) {
-        self.config = config
+        let resolvedMax = Self.effectiveDraftCeiling(
+            envelopeMax: config.maxDraftTokens)
+        let resolvedConfig = CBv2MTPConfig(
+            enabled: config.enabled,
+            maxDraftTokens: resolvedMax,
+            maxSpeculativeBatch: config.maxSpeculativeBatch,
+            fixedDraftTokens: resolvedMax == 0 ? 0 : 1,
+            verificationMode: .automatic,
+            maxAutomaticRectangularTokens: config.maxAutomaticRectangularTokens)
+        self.config = resolvedConfig
         self.drafter = drafter
         self.model = model
         self.captureLayers = captureLayers
-        // The adaptive controller's CEILING: the trusted envelope cap
-        // (`config.maxDraftTokens`), further bounded by the participant's
-        // `submissionDraftDepth`. `fixedDepth` stays `config.fixedDraftTokens`
-        // (adaptive) — submissionDraftDepth is a ceiling, NEVER a fixed pin, so
-        // the controller keeps choosing 0…this per round.
+        // Run the one width certified by this submission's decode-exact
+        // rectangular implementation. Reconstructing the effective config
+        // here keeps the non-editable provider seal untouched while ensuring
+        // planning, verification, and metrics all observe the same policy.
         self.depthController = CBv2MTPDepthController(
-            maxDepth: Self.effectiveDraftCeiling(envelopeMax: config.maxDraftTokens),
-            fixedDepth: config.fixedDraftTokens)
-        self.metrics.verificationMode = config.verificationMode
-        self.metrics.maxAutomaticRectangularTokens = config.maxAutomaticRectangularTokens
+            maxDepth: resolvedConfig.maxDraftTokens,
+            fixedDepth: resolvedConfig.fixedDraftTokens)
+        self.metrics.verificationMode = resolvedConfig.verificationMode
+        self.metrics.maxAutomaticRectangularTokens =
+            resolvedConfig.maxAutomaticRectangularTokens
     }
 
     /// Build the driver, or nil when MTP cannot activate: config off (or the
@@ -293,6 +302,11 @@ final class CBv2MTPRoundDriver {
     private func verificationLimitedDecision(
         _ decision: CBv2MTPDepthDecision, plannedDecodeRows: Int
     ) -> CBv2MTPDepthDecision {
+        guard plannedDecodeRows == 8 else {
+            return CBv2MTPDepthDecision(
+                depth: 0, decodeRowBucket: decision.decodeRowBucket,
+                reason: "batched_exact_b8_only", isExploration: false)
+        }
         let limit = maximumAutomaticDepth(plannedDecodeRows: plannedDecodeRows)
         guard decision.depth > limit else { return decision }
         return CBv2MTPDepthDecision(

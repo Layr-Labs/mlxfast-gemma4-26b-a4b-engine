@@ -361,6 +361,17 @@ func geluFusionClaimsPrefill(_ gate: MLXArray, _ up: MLXArray) -> Bool {
 /// one-kernel trace.
 @inline(__always)
 func gemma4GeluProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
+    if gate.shape == up.shape,
+        gate.ndim == 3, gate.dim(0) == 8,
+        gate.dim(1) > 1, gate.dim(1) <= 4
+    {
+        let columns = (0 ..< gate.dim(1)).map { offset in
+            gemma4SafeGeluProductShaped(
+                gate[0..., offset ..< (offset + 1), 0...],
+                up[0..., offset ..< (offset + 1), 0...])
+        }
+        return concatenated(columns, axis: 1)
+    }
     if geluFusionClaimsPinnedDecode(gate, up) || geluFusionClaimsPrefill(gate, up) {
         return gemma4SafeGeluProductShaped(gate, up)
     }
@@ -1412,6 +1423,15 @@ private class ScaledLinear: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if x.ndim == 3, x.dim(0) == 8, x.dim(1) > 1, x.dim(1) <= 4 {
+            return concatenated(
+                (0 ..< x.dim(1)).map { offset in
+                    matmul(
+                        x[0..., offset ..< (offset + 1), 0...],
+                        weight.T) * scalar
+                },
+                axis: 1)
+        }
         matmul(x, weight.T) * scalar
     }
 }
@@ -2639,6 +2659,20 @@ private class Gemma4Experts: Module {
         // contract; every other case performs the established unsort + sum.
         let (B, S, H) = (x.dim(0), x.dim(1), x.dim(2))
         let K = topKIndices.dim(-1)
+        if B == 8, S > 1, S <= 4 {
+            let columns = (0 ..< S).map { offset in
+                switchGLU.callAndWeightedReduce(
+                    x[0..., offset ..< (offset + 1), 0...].reshaped(B, H),
+                    topKIndices[0..., offset ..< (offset + 1), 0...]
+                        .reshaped(B, K),
+                    weights: topKWeights[0..., offset ..< (offset + 1), 0...]
+                        .reshaped(B, K),
+                    fuseSortedReduction: fuseWeightedUnsort,
+                    isProductionPrefill: false)
+                    .reshaped(B, 1, H)
+            }
+            return concatenated(columns, axis: 1)
+        }
         let y = switchGLU.callAndWeightedReduce(
             x.reshaped(B * S, H),
             topKIndices.reshaped(B * S, K),
@@ -3011,8 +3045,26 @@ public class Gemma4DecoderLayer: Module {
             // rounds in the same places as the two-dispatch form: `compile`
             // keeps each node at its own dtype, so the activated intermediate
             // is materialised bf16 either way.
-            var g = gemma4GeluProduct(gate(out), perLayerInput)
-            g = proj(g)
+            let gated: MLXArray
+            if out.ndim == 3, out.dim(0) == 8, out.dim(1) > 1, out.dim(1) <= 4 {
+                gated = concatenated(
+                    (0 ..< out.dim(1)).map { offset in
+                        gate(out[0..., offset ..< (offset + 1), 0...])
+                    },
+                    axis: 1)
+            } else {
+                gated = gate(out)
+            }
+            var g = gemma4GeluProduct(gated, perLayerInput)
+            if g.ndim == 3, g.dim(0) == 8, g.dim(1) > 1, g.dim(1) <= 4 {
+                g = concatenated(
+                    (0 ..< g.dim(1)).map { offset in
+                        proj(g[0..., offset ..< (offset + 1), 0...])
+                    },
+                    axis: 1)
+            } else {
+                g = proj(g)
+            }
             // Same `residual + rmsNorm(x, w)` at 2816 and the same eps as the
             // post-attention site, so the prefill fusion applies unchanged.
             if let fusedPLE = Gemma4PrefillGlueV1.normResidual(
@@ -3847,16 +3899,27 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             outDim: config.vocabSize)
     }
 
+    private func projectLMHead(_ hidden: MLXArray) -> MLXArray {
+        if let lmHead {
+            return lmHead(hidden)
+        }
+        if let mma = tiedLMHeadMMA(hidden) { return mma }
+        if let tight = tiedLMHeadTightGrid(hidden) { return tight }
+        return model.embedTokens.asLinear(hidden)
+    }
+
     func applyLMHead(_ hidden: MLXArray) -> MLXArray {
         var out: MLXArray
-        if let lmHead {
-            out = lmHead(hidden)
-        } else if let mma = tiedLMHeadMMA(hidden) {
-            out = mma
-        } else if let tight = tiedLMHeadTightGrid(hidden) {
-            out = tight
+        if hidden.ndim == 3, hidden.dim(0) == 8,
+            hidden.dim(1) > 1, hidden.dim(1) <= 4
+        {
+            out = concatenated(
+                (0 ..< hidden.dim(1)).map { offset in
+                    projectLMHead(hidden[0..., offset ..< (offset + 1), 0...])
+                },
+                axis: 1)
         } else {
-            out = model.embedTokens.asLinear(hidden)
+            out = projectLMHead(hidden)
         }
         // The VLM omission profile uses zero to represent the former optional
         // softcap's nil/disabled state.

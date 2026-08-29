@@ -411,6 +411,31 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
         return pool
     }
 
+    /// MTP-KV-PACK: a zero-copy batch-prefix view when all eight capture rows
+    /// are the ordered members of one full-attention cohort pool at one common
+    /// logical frontier. Formation may perform the pool's established one-time
+    /// migration; warm rounds only slice the shared allocation. Any ragged,
+    /// mixed, unpooled-incompatible, or non-full set fails closed.
+    static func mtpBatchSnapshotView(
+        rows: [CBv2SequenceKV]
+    ) -> (keys: MLXArray, values: MLXArray)? {
+        guard rows.count == 8 else { return nil }
+        let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
+        guard fullRows.count == rows.count else { return nil }
+        let offset = fullRows[0].absoluteOffset
+        guard offset > 0,
+            fullRows.allSatisfy({
+                $0.absoluteOffset == offset && $0.retainedCount == offset
+            }),
+            let pool = cohortPool(binding: fullRows)
+        else { return nil }
+        let view = pool.batchViews(upTo: offset)
+        guard view.0.shape == [8, pool.kvHeads, offset, pool.headDim],
+            view.1.shape == view.0.shape
+        else { return nil }
+        return (view.0, view.1)
+    }
+
     // MARK: - Private
 
     private func ensureCapacity(_ needed: Int, keyTemplate: MLXArray, valueTemplate: MLXArray) {

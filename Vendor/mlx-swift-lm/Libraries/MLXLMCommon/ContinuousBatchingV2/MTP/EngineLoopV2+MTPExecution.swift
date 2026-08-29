@@ -227,6 +227,21 @@ extension EngineLoopV2 {
         captures.reserveCapacity(batch)
         captured.reserveCapacity(2 * batch)
 
+        // Full-attention rows in a lockstep contiguous cohort already share
+        // one `[B, H, capacity, D]` allocation. Resolve/form that established
+        // pool before taking row snapshots so the drafter can borrow one
+        // batch-prefix view instead of repacking eight discontiguous slices.
+        // Ragged, paged, windowed, or otherwise unproven layouts return nil.
+        let fullCaptureRows: [CBv2SequenceKV] = verifyRows.compactMap { row in
+            guard let state = kvStates[row.rec.id],
+                let capture = state[mtp.captureLayers.full]
+            else { return nil }
+            return capture
+        }
+        let fullBatchView = fullCaptureRows.count == batch
+            ? CBv2FullSequenceKV.mtpBatchSnapshotView(rows: fullCaptureRows)
+            : nil
+
         for row in verifyRows {
             let state = kvStates[row.rec.id]!
             let carry = row.carry!
@@ -261,7 +276,10 @@ extension EngineLoopV2 {
 
         mtpFreezeCaptures(captured)
 
-        let prepared = mtp.drafter.prepare(rows: captures)
+        let batchViews = fullBatchView.map {
+            CBv2MTPBatchCaptureViews(fullAttention: $0)
+        }
+        let prepared = mtp.drafter.prepare(rows: captures, batchViews: batchViews)
         let seedColumn = MLXArray(seedTokens).reshaped([batch, 1])
         var draftInput = seedColumn
         var draftHidden = concatenated(carryHiddens, axis: 0)

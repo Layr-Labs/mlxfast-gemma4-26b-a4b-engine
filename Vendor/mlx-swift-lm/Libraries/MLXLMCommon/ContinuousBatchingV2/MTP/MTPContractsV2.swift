@@ -123,6 +123,23 @@ public struct CBv2MTPRowCapture {
 /// per-row captures (padded/stacked batch KV, per-row masks, positions).
 public protocol CBv2MTPPreparedCapture: AnyObject {}
 
+/// Optional batch-wide snapshot views supplied by a storage backend that can
+/// prove every row is a slice of one common allocation.  Missing slots retain
+/// the ordinary per-row packing path; callers must never synthesize a batch
+/// view from unrelated row arrays.
+public struct CBv2MTPBatchCaptureViews: @unchecked Sendable {
+    public var fullAttention: (keys: MLXArray, values: MLXArray)?
+    public var slidingAttention: (keys: MLXArray, values: MLXArray)?
+
+    public init(
+        fullAttention: (keys: MLXArray, values: MLXArray)? = nil,
+        slidingAttention: (keys: MLXArray, values: MLXArray)? = nil
+    ) {
+        self.fullAttention = fullAttention
+        self.slidingAttention = slidingAttention
+    }
+}
+
 /// The engine's view of a drafter. Implemented in MLXLLM by an adapter over
 /// `Gemma4AssistantDraftModel` bound to the engine's target model (the
 /// adapter owns target-embedding lookup, mask construction, and greedy
@@ -136,6 +153,11 @@ public protocol CBv2MTPDrafter: AnyObject {
     /// Build round-scoped batch state from per-row captures. `rows` order
     /// == the round's speculating-row order.
     func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture
+    /// Storage-aware twin of `prepare(rows:)`. A conformer that does not
+    /// understand common-allocation views inherits the exact legacy path.
+    func prepare(
+        rows: [CBv2MTPRowCapture], batchViews: CBv2MTPBatchCaptureViews?
+    ) -> CBv2MTPPreparedCapture
     /// One draft-chain step over all speculating rows.
     ///  - tokens: [B, 1] int32 (lazy) — seed tokens (round start: each
     ///    row's newest confirmed token; later steps: previous draft).
@@ -151,6 +173,12 @@ public protocol CBv2MTPDrafter: AnyObject {
 
 extension CBv2MTPDrafter {
     public var mtpTargetIdentity: ObjectIdentifier? { nil }
+
+    public func prepare(
+        rows: [CBv2MTPRowCapture], batchViews: CBv2MTPBatchCaptureViews?
+    ) -> CBv2MTPPreparedCapture {
+        prepare(rows: rows)
+    }
 }
 
 // MARK: - Config

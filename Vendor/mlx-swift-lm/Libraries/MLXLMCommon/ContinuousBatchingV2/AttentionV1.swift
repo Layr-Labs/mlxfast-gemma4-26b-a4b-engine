@@ -1090,6 +1090,19 @@ enum CBv2AttentionV1 {
         precondition(historyCount >= 0)
         var outputs: [MLXArray] = []
         outputs.reserveCapacity((newTokenCount + blockSize - 1) / blockSize)
+        // PREFILL-QSCALE-ELIDE: split the query head axis ONCE on the
+        // row-contiguous chunk (a pure view) so no q-block has to be
+        // materialized for the composed path. nil keeps every block on the
+        // established `MLXFast.scaledDotProductAttention` call.
+        // `blockSize <= 8` is the pinned MTP serial-query path (and any other
+        // narrow verify block): those calls never reach the composed arm, so
+        // build no graph nodes for them at all.
+        let queryPlane: MLXArray? =
+            (blockSize > 8 && newTokenCount > 8)
+            ? CBv2ComposedPrefillSDPAV1.queryPlane(
+                queries: queries, keys: keys, values: values,
+                scale: scale, sinks: sinks, softcap: softcap)
+            : nil
         var offset = 0
         while offset < newTokenCount {
             let count = min(blockSize, newTokenCount - offset)
@@ -1133,11 +1146,15 @@ enum CBv2AttentionV1 {
                         window: window, blocks: blocks,
                         sinks: sinks, softcap: softcap))
             } else {
+                let planeSlice = queryPlane.map {
+                    $0[0..., 0..., 0..., offset ..< (offset + count), 0...]
+                }
                 outputs.append(
                     attend(
                         queries: querySlice, keys: keySlice, values: valueSlice,
                         scale: scale, L: count, kL: visibleEnd - visibleStart,
-                        window: window, sinks: sinks, softcap: softcap))
+                        window: window, sinks: sinks, softcap: softcap,
+                        queryPlaneSlice: planeSlice))
             }
             offset += count
         }
@@ -1164,7 +1181,7 @@ enum CBv2AttentionV1 {
     private static func attend(
         queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float,
         L: Int, kL: Int, window: Int?, sinks: MLXArray?, softcap: Float?,
-        bidirectional: Bool = false
+        bidirectional: Bool = false, queryPlaneSlice: MLXArray? = nil
     ) -> MLXArray {
         // A model may widen Q for safer attention math while retaining compact
         // K/V storage. SDPA requires one dtype, so widen only these views.
@@ -1179,6 +1196,19 @@ enum CBv2AttentionV1 {
             assert(
                 sinks == nil || sinks!.dtype == queries.dtype,
                 "CBv2AttentionV1: sinks must be normalized to the query dtype before SDPA")
+            // PREFILL-QSCALE-ELIDE: on the prompt plane MLX takes its unfused
+            // fallback (head dim 256/512, L > 8) whose first op is an identity
+            // `scale * q` at Gemma 4's `scale == 1.0`. The transcription below
+            // is that fallback with the identity deleted; it refuses every
+            // input it cannot prove is the same graph.
+            if let composed = CBv2ComposedPrefillSDPAV1.attend(
+                queries: queries, keys: attentionKeys, values: attentionValues,
+                scale: scale, L: L, kL: kL, window: window,
+                bidirectional: bidirectional, sinks: sinks,
+                queryPlaneSlice: queryPlaneSlice)
+            {
+                return composed
+            }
             return MLXFast.scaledDotProductAttention(
                 queries: queries, keys: attentionKeys, values: attentionValues, scale: scale,
                 mask: maskMode(

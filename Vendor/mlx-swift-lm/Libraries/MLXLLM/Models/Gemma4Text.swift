@@ -2220,6 +2220,192 @@ private enum Gemma4FusedRouterTop8 {
     }
 }
 
+/// ROUTE-EPILOGUE-001: one-dispatch, byte-identical replacement of the FIVE
+/// ops that follow `argPartition` in the decode router -- the `[kth...]`
+/// slice (which MLX materializes with a strided uint32 copy), `takeAlong`,
+/// `softmax(precise)` over K, the `perExpertScale[topKIndices]` gather and
+/// the bfloat16 product -- for the exact B=8 decode geometry.
+///
+/// It differs from the (default-off) `Gemma4FusedRouterTop8` above in exactly
+/// one respect: the selection itself is NOT recomputed. The stock
+/// `argPartition` merge sort still runs and this kernel simply READS its
+/// output at offset `kth`, so none of that kernel's O(E^2) predecessor scan
+/// is paid. Three counterbalanced warm A/B rounds measured the full ROUTE-001
+/// consolidation at +1.0% on this tree because of that scan; deleting only
+/// the trailing five dispatches keeps the sort's parallelism.
+///
+/// Exactness. `inds` is a verbatim copy of the uint32 values the stock slice
+/// materializes. `topv` reloads the SAME bfloat16 score words `takeAlong`
+/// would have gathered, and the normalization is the identical
+/// `softmax_single_row<T, float, N_READS=4>` transcription
+/// `Gemma4FusedRouterTop8` uses (same lane layout, same `Limits<float>::min`
+/// padding, same `fast::exp`, same `simd_max`/`simd_sum` reduction order on
+/// one 32-thread simdgroup) followed by the stock bfloat16 `Multiply` against
+/// the gathered per-expert scale, with its single store rounding. That
+/// transcription is the one whose 128-step warm receipt is byte-identical to
+/// the stock chain's.
+///
+/// Fail-closed: any other row count, sequence length, expert count, top-K or
+/// dtype takes the established chain. Kill switch:
+/// `DARKBLOOM_GEMMA4_ROUTER_EPILOGUE=0`.
+private enum Gemma4FusedRouterEpilogue {
+    /// DEFAULT ON; `DARKBLOOM_GEMMA4_ROUTER_EPILOGUE=0` restores the stock
+    /// slice/takeAlong/softmax/gather/multiply chain.
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ROUTER_EPILOGUE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let rows = 8
+    private static let experts = 128
+    private static let selected = 8
+
+    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_router_epilogue_e128_k8_bf16_v1",
+        inputNames: ["part", "scores", "pes"],
+        outputNames: ["inds", "wts"],
+        source: """
+            constexpr int SIMD_SIZE = 32;
+            constexpr int N_READS = 4;
+            constexpr int KTH = E - K;
+
+            const int row = int(threadgroup_position_in_grid.x);
+            const int lid = int(thread_position_in_threadgroup.x);
+
+            threadgroup float topv[K];
+            threadgroup uint topi[K];
+            threadgroup float local_max[SIMD_SIZE];
+            threadgroup float local_normalizer[SIMD_SIZE];
+
+            // The stock `argPartition(kth: E - K)` output is the stable
+            // ascending argsort; its trailing K entries are exactly what the
+            // `[kth...]` slice materializes, in the same order.
+            const device T* srow = scores + row * E;
+            if (lid < K) {
+                const uint e = part[row * E + KTH + lid];
+                topi[lid] = e;
+                topv[lid] = float(srow[e]);
+                inds[row * K + lid] = e;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // softmax_single_row<T, float, N_READS=4> transcription
+            // (softmax.h) at axis_size = K on one 32-thread simdgroup, with
+            // the stock bf16 per-expert-scale multiply fused into the write.
+            const int simd_lane_id = int(thread_index_in_simdgroup);
+            const int simd_group_id = int(simdgroup_index_in_threadgroup);
+
+            float ld[N_READS];
+            const int base = lid * N_READS;
+            if (base + N_READS <= K) {
+                for (int i = 0; i < N_READS; i++) {
+                    ld[i] = topv[base + i];
+                }
+            } else {
+                for (int i = 0; i < N_READS; i++) {
+                    ld[i] = ((base + i) < K) ? topv[base + i] : Limits<float>::min;
+                }
+            }
+            if (simd_group_id == 0) {
+                local_max[simd_lane_id] = Limits<float>::min;
+                local_normalizer[simd_lane_id] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float maxval = Limits<float>::finite_min;
+            for (int i = 0; i < N_READS; i++) {
+                maxval = (maxval < ld[i]) ? ld[i] : maxval;
+            }
+            maxval = simd_max(maxval);
+            if (simd_lane_id == 0) {
+                local_max[simd_group_id] = maxval;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+                maxval = simd_max(local_max[simd_lane_id]);
+                if (simd_lane_id == 0) {
+                    local_max[0] = maxval;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            maxval = local_max[0];
+
+            float normalizer = 0;
+            for (int i = 0; i < N_READS; i++) {
+                float exp_x = fast::exp(ld[i] - maxval);
+                ld[i] = exp_x;
+                normalizer += exp_x;
+            }
+            normalizer = simd_sum(normalizer);
+            if (simd_lane_id == 0) {
+                local_normalizer[simd_group_id] = normalizer;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+                normalizer = simd_sum(local_normalizer[simd_lane_id]);
+                if (simd_lane_id == 0) {
+                    local_normalizer[0] = normalizer;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            normalizer = 1 / local_normalizer[0];
+
+            if (base + N_READS <= K) {
+                for (int i = 0; i < N_READS; i++) {
+                    const T w = T(ld[i] * normalizer);
+                    wts[row * K + base + i] = w * pes[topi[base + i]];
+                }
+            } else {
+                for (int i = 0; i < N_READS; i++) {
+                    if ((base + i) < K) {
+                        const T w = T(ld[i] * normalizer);
+                        wts[row * K + base + i] = w * pes[topi[base + i]];
+                    }
+                }
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    /// `partitioned` is the raw `argPartition(kth:)` output, NOT the slice.
+    static func apply(
+        partitioned: MLXArray, expertScores: MLXArray, perExpertScale: MLXArray,
+        topK: Int, kth: Int
+    ) -> (indices: MLXArray, weights: MLXArray)? {
+        guard enabled,
+            topK == selected,
+            kth == experts - selected,
+            expertScores.ndim == 3,
+            expertScores.dim(0) == rows,
+            expertScores.dim(1) == 1,
+            expertScores.dim(2) == experts,
+            expertScores.dtype == .bfloat16,
+            partitioned.shape == expertScores.shape,
+            partitioned.dtype == .uint32,
+            perExpertScale.ndim == 1,
+            perExpertScale.dim(0) == experts,
+            perExpertScale.dtype == .bfloat16
+        else { return nil }
+        CBv2EngageMark.once("router-epilogue")
+
+        let outputs = kernel(
+            [partitioned, expertScores, perExpertScale],
+            template: [
+                ("T", expertScores.dtype),
+                ("E", experts),
+                ("K", selected),
+            ],
+            grid: (rows * 32, 1, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[rows, 1, selected], [rows, 1, selected]],
+            outputDTypes: [.uint32, .bfloat16]
+        )
+        return (outputs[0], outputs[1])
+    }
+}
+
 /// GLUE-003: one-per-forward chain box. Layer L's fused tail deposits the
 /// (output, next-layer-input-norm) pair; layer L+1 consumes the norm instead
 /// of re-reading and re-normalizing the same tensor — guarded by pointer
@@ -2345,6 +2531,74 @@ private enum Gemma4FusedLayerGlue {
         ensureRowContiguous: true
     )
 
+    /// GLUE-QUAD-001: `normResidual` and BOTH consumers of its output in one
+    /// dispatch. The post-attention residual row is finished in registers, so
+    /// the second reduction -- the one `dualPreNorm` and the router's own
+    /// `MLXFast.rmsNorm` each pay separately after re-reading the row from
+    /// memory -- runs on the values already held, and the three weight
+    /// applications (`preFeedforwardLayernorm`, `preFeedforwardLayernorm2`,
+    /// the router's `scale * hidden^-0.5`) share it.
+    ///
+    /// Three STRICTLY SERIAL dispatches collapse to one: the stock chain is
+    /// `norm_residual -> {rms(router), dual_prenorm}` and the router's
+    /// quantized `proj` GEMV -- the head of the expert branch's dependency
+    /// chain -- cannot start until that rms lands. Nothing here can hide
+    /// under the concurrent encoder: every op is on the layer's critical
+    /// path.
+    ///
+    /// Numerics are the two established kernels concatenated, unchanged:
+    /// `out` is `normResidualKernel`'s expression with the residual sum kept
+    /// in a register at exactly the point the stock graph stored it to
+    /// memory (the same single bfloat16 rounding `tailKernel` already
+    /// relies on), and the three normed outputs are `dualPreNormKernel`'s
+    /// `w * static_cast<T>(x * inv)` over those same stored values.
+    ///
+    /// Kill switch: `DARKBLOOM_GEMMA4_GLUE_QUAD=0`.
+    static let quadEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_GLUE_QUAD"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let quadKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_glue_quad_2816_bf16_v1",
+        inputNames: ["x", "res", "wp", "w1", "w2", "w3"],
+        outputNames: ["out", "n1", "n2", "n3"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float local_inv[1];
+            threadgroup float local_sums[32];
+            const uint base = row * 2816 + lid * 4;
+            const uint wbase = lid * 4;
+        \(rmsReduce("x", into: "local_inv[0]"))
+            const float inv = local_inv[0];
+            T ov[4];
+            for (int i = 0; i < 4; i++) {
+                // The stock chain rounds the norm's output to T in memory
+                // before the residual add reads it; reproduce both roundings.
+                const T normed = static_cast<T>(
+                    wp[wbase + i] * static_cast<T>((float)x[base + i] * inv));
+                const T summed = res[base + i] + normed;
+                ov[i] = summed;
+                out[base + i] = summed;
+            }
+        \(rmsReduce("ov", into: "local_inv[0]").replacingOccurrences(
+            of: "(float)ov[base + i]", with: "(float)ov[i]"))
+            const float inv2 = local_inv[0];
+            for (int i = 0; i < 4; i++) {
+                const T nx = static_cast<T>((float)ov[i] * inv2);
+                n1[base + i] = w1[wbase + i] * nx;
+                n2[base + i] = w2[wbase + i] * nx;
+                n3[base + i] = w3[wbase + i] * nx;
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
     private static let tailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_glue_tail_2816_bf16_v2",
         inputNames: ["a", "b", "res", "w1", "w2", "w3", "s"],
@@ -2412,6 +2666,32 @@ private enum Gemma4FusedLayerGlue {
             outputShapes: [[rows, 1, axis]],
             outputDTypes: [.bfloat16]
         )[0]
+    }
+
+    /// GLUE-QUAD-001 entry point. `x` is the attention output, `res` the
+    /// layer residual, `wp` the post-attention norm weight, `w1`/`w2` the two
+    /// pre-feedforward norm weights and `w3` the router's effective scale.
+    static func quadNormResidual(
+        x: MLXArray, residual: MLXArray, wp: MLXArray,
+        w1: MLXArray, w2: MLXArray, w3: MLXArray, eps: Float
+    ) -> (out: MLXArray, n1: MLXArray, n2: MLXArray, n3: MLXArray)? {
+        guard quadEnabled,
+            admits(x, weight: wp, eps: eps),
+            residual.shape == x.shape, residual.dtype == .bfloat16,
+            w1.ndim == 1, w1.dim(0) == axis, w1.dtype == .bfloat16,
+            w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16,
+            w3.ndim == 1, w3.dim(0) == axis, w3.dtype == .bfloat16
+        else { return nil }
+        CBv2EngageMark.once("glue-quad")
+        let outs = quadKernel(
+            [x, residual, wp, w1, w2, w3],
+            template: [("T", x.dtype)],
+            grid: (rows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: [[rows, 1, axis], [rows, 1, axis], [rows, 1, axis], [rows, 1, axis]],
+            outputDTypes: [.bfloat16, .bfloat16, .bfloat16, .bfloat16]
+        )
+        return (outs[0], outs[1], outs[2], outs[3])
     }
 
     static func dualPreNorm(
@@ -2566,17 +2846,34 @@ private class Gemma4Router: Module {
         super.init()
     }
 
+    /// The `scale * hidden^-0.5` product the router's RMSNorm consumes,
+    /// materialized once per router and cached. Exposed so GLUE-QUAD-001 can
+    /// fold this norm into the layer's fused post-attention glue: the fused
+    /// kernel applies exactly this weight vector, in exactly the stock
+    /// `w * static_cast<T>(x * inv)` order.
+    var effectiveScale: MLXArray {
+        if let cached = cachedEffectiveScale { return cached }
+        let eff = scale * rootSize
+        cachedEffectiveScale = eff
+        return eff
+    }
+
+    /// Selection half of the router, fed a tensor that is ALREADY
+    /// `rmsNorm(x, weight: effectiveScale, eps:)`. Byte-identical to
+    /// `callAsFunction` from `proj` onward -- the only difference is who
+    /// computed the norm.
+    func selectFromNormed(_ normed: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
+        select(expertScores: proj(normed))
+    }
+
     func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
-        let effScale: MLXArray
-        if let cached = cachedEffectiveScale {
-            effScale = cached
-        } else {
-            let eff = scale * rootSize
-            cachedEffectiveScale = eff
-            effScale = eff
-        }
-        let normed = MLXFast.rmsNorm(x, weight: effScale, eps: eps)
-        let expertScores = proj(normed)
+        let normed = MLXFast.rmsNorm(x, weight: effectiveScale, eps: eps)
+        return select(expertScores: proj(normed))
+    }
+
+    private func select(
+        expertScores: MLXArray
+    ) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
 
         // ROUTE-001: single-dispatch byte-identical replacement of the chain
         // below for the B=8 decode geometry. Every other geometry, dtype, or
@@ -2588,8 +2885,19 @@ private class Gemma4Router: Module {
             return (fused.indices, fused.weights)
         }
 
-        var topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
-        topKIndices = topKIndices[.ellipsis, kth...]
+        let partitioned = MLX.argPartition(expertScores, kth: kth, axis: -1)
+
+        // ROUTE-EPILOGUE-001: slice + takeAlong + softmax + scale gather +
+        // multiply in one dispatch, reading the SAME argPartition output.
+        if let fused = Gemma4FusedRouterEpilogue.apply(
+            partitioned: partitioned, expertScores: expertScores,
+            perExpertScale: perExpertScale, topK: topK, kth: kth)
+        {
+            Gemma4RouterProbe.recorder?(expertScores, fused.indices)
+            return (fused.indices, fused.weights)
+        }
+
+        var topKIndices = partitioned[.ellipsis, kth...]
 
         var topKWeights = MLX.takeAlong(expertScores, topKIndices, axis: -1)
         topKWeights = MLX.softmax(topKWeights, axis: -1, precise: true)
@@ -2854,7 +3162,23 @@ public class Gemma4DecoderLayer: Module {
             v2SharedSource: v2SharedSource, outputStart: outputStart,
             useLastQueryPrefill: useLastQueryPrefill)
         var out: MLXArray
-        if let fusedOut = Gemma4FusedLayerGlue.normResidual(
+        // GLUE-QUAD-001: on the MoE decode plane the post-attention
+        // norm+residual and BOTH of its consumers (the two pre-feedforward
+        // norms and the router's own RMSNorm) run as one dispatch. `quadPre`
+        // carries the three normed tensors to their use sites below; nil
+        // means the stock chain runs there.
+        var quadPre: (n1: MLXArray, n2: MLXArray, n3: MLXArray)?
+        if isMoE, let router, let preFeedforwardLayernorm2,
+            let quad = Gemma4FusedLayerGlue.quadNormResidual(
+                x: attnOut, residual: residual,
+                wp: postAttentionLayernorm.weight,
+                w1: preFeedforwardLayernorm.weight,
+                w2: preFeedforwardLayernorm2.weight,
+                w3: router.effectiveScale, eps: config.rmsNormEps)
+        {
+            out = quad.out
+            quadPre = (quad.n1, quad.n2, quad.n3)
+        } else if let fusedOut = Gemma4FusedLayerGlue.normResidual(
             x: attnOut, residual: residual,
             weight: postAttentionLayernorm.weight, eps: config.rmsNormEps)
         {
@@ -2889,11 +3213,19 @@ public class Gemma4DecoderLayer: Module {
             let postFeedforwardLayernorm2
         {
             // Dense + sparse branches in parallel, summed into one residual.
-            let (topKIndices, topKWeights) = router(out)
+            let (topKIndices, topKWeights) =
+                quadPre.map { router.selectFromNormed($0.n3) } ?? router(out)
 
             let h1Raw: MLXArray
             let h2Raw: MLXArray
-            if let (n1, n2) = Gemma4FusedLayerGlue.dualPreNorm(
+            if let quadPre {
+                h1Raw = mlp(quadPre.n1)
+                h2Raw = experts(
+                    quadPre.n2,
+                    topKIndices: topKIndices,
+                    topKWeights: topKWeights,
+                    isExpertPrefill: isExpertPrefill)
+            } else if let (n1, n2) = Gemma4FusedLayerGlue.dualPreNorm(
                 x: out,
                 w1: preFeedforwardLayernorm.weight,
                 w2: preFeedforwardLayernorm2.weight,
@@ -3100,6 +3432,23 @@ enum Gemma4FusedScaledEmbedding {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// EMBED-DECODE-001: also admit the `[B, 1]` decode row. The doc above
+    /// declined it on the PLE-GLUE-028 rule of thumb ("a custom-kernel launch
+    /// is not reliably cheaper than the five small dispatches it replaces"),
+    /// which was a judgement call, never a measurement on this tree. The five
+    /// dispatches sit at the very head of the step -- gather(weight),
+    /// gather(scales), gather(biases), affine_dequantize, multiply -- with
+    /// nothing else in flight to overlap them, so unlike the router tail they
+    /// are on the naked critical path. Numerics are unchanged: the SAME
+    /// kernel, the same two rounding boundaries, only the shape gate moves.
+    /// Kill switch: `DARKBLOOM_GEMMA4_SCALED_EMBEDDING_DECODE=0`.
+    static let decodeEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_SCALED_EMBEDDING_DECODE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// This checkpoint's embedding quantization. Anything else fails closed.
     private static let groupSize = 64
     private static let bits = 4
@@ -3157,8 +3506,9 @@ enum Gemma4FusedScaledEmbedding {
         guard enabled,
             tokens.ndim == 2,
             tokens.dtype == .int32,
-            // Prefill rectangle only; [B, 1] decode keeps the stock chain.
-            tokens.dim(1) > 1,
+            // Prefill rectangle always; the [B, 1] decode row only under
+            // EMBED-DECODE-001.
+            tokens.dim(1) > 1 || decodeEnabled,
             let quantized = embedding as? QuantizedEmbedding,
             quantized.mode == .affine,
             quantized.bits == bits,

@@ -347,6 +347,45 @@ inline void qdot_affine4_pair(
   out1 = scale * accum1 + sum1 * bias;
 }
 
+// DOWN-PAIR-WVEC: the WVEC form of `qdot_affine4_pair`. The two adjacent
+// `uint16_t` loads the loop above emits per (row, K-block) become ONE aligned
+// 4-byte load; `lo` and `hi` are the low and high half-words of that word, so
+// the four nibble masks, the two four-term sums, and each accumulator's add
+// order are exactly the ones above. Only the shape of the weight load changes.
+template <typename U, int values_per_thread>
+inline void qdot_affine4_word_pair(
+    uint v,
+    const thread U* x0,
+    const thread U* x1,
+    U scale,
+    U bias,
+    U sum0,
+    U sum1,
+    thread U& out0,
+    thread U& out1) {
+  static_assert(
+      values_per_thread == 8,
+      "qdot_affine4_word_pair packs exactly one 4-byte word");
+  const uint lo = v & 0x0000FFFFu;
+  const uint hi = v >> 16;
+  U accum0 = 0;
+  U accum1 = 0;
+  accum0 +=
+      (x0[0] * (lo & 0x000fu) + x0[1] * (lo & 0x00f0u) +
+       x0[2] * (lo & 0x0f00u) + x0[3] * (lo & 0xf000u));
+  accum1 +=
+      (x1[0] * (lo & 0x000fu) + x1[1] * (lo & 0x00f0u) +
+       x1[2] * (lo & 0x0f00u) + x1[3] * (lo & 0xf000u));
+  accum0 +=
+      (x0[4] * (hi & 0x000fu) + x0[5] * (hi & 0x00f0u) +
+       x0[6] * (hi & 0x0f00u) + x0[7] * (hi & 0xf000u));
+  accum1 +=
+      (x1[4] * (hi & 0x000fu) + x1[5] * (hi & 0x00f0u) +
+       x1[6] * (hi & 0x0f00u) + x1[7] * (hi & 0xf000u));
+  out0 = scale * accum0 + sum0 * bias;
+  out1 = scale * accum1 + sum1 * bias;
+}
+
 // One affine-8 dot product against a byte weight vector ALREADY held in
 // registers. Byte-for-byte the bits == 8 arm of qdot: same per-element
 // multiply, same accumulation order over i, same `scale * accum + sum * bias`
@@ -1474,7 +1513,26 @@ METAL_FUNC void qmv_impl(
   }
 }
 
-template <typename T, const int group_size, const int bits>
+// DOWN-PAIR-WVEC-KFIX. KFIX and WVEC carry the two knobs EXPERT-SINGLES
+// proved on the singleton arm of the same routed-expert down tile over to the
+// PAIR arm, which still ran the runtime-shaped body:
+//
+//   KFIX : in_vec_size as a compile-time constant. The gemma4 gate has already
+//          proven in_vec_size is 2816 (gate/up) or 704 (down), so the K-loop
+//          trip count, both derived strides and the tail lane count
+//          constant-fold instead of being reloaded from the constant buffer.
+//   WVEC : the two adjacent `uint16_t` weight loads per (row, K-block) become
+//          one aligned 4-byte load. The packed row base is uint32-aligned at
+//          every block boundary (in_vec_size_w = K / 2 with K in {2816, 704},
+//          lane offset simd_lid * 4, block stride 128).
+//
+// Both defaults keep the incumbent body for every existing caller.
+template <
+    typename T,
+    const int group_size,
+    const int bits,
+    const int KFIX = 0,
+    const bool WVEC = false>
 METAL_FUNC void qmv_affine4_g64_pair_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1483,10 +1541,11 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
     const device T* x1,
     device T* y0,
     device T* y1,
-    const constant int& in_vec_size,
+    const constant int& in_vec_size_rt,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
+  const int in_vec_size = (KFIX > 0) ? KFIX : in_vec_size_rt;
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int values_per_thread = 8;
@@ -1519,13 +1578,19 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
     float sum1 = load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
 
     for (int row = 0; row < results_per_simdgroup; row++) {
-      const device uint8_t* wl = ws + row * in_vec_size_w;
       const device T* sl = scales + row * in_vec_size_g;
       const device T* bl = biases + row * in_vec_size_g;
       float dot0;
       float dot1;
-      qdot_affine4_pair<float, values_per_thread>(
-          wl, x0_thread, x1_thread, sl[0], bl[0], sum0, sum1, dot0, dot1);
+      if (WVEC) {
+        const uint v = *((const device uint*)(ws + row * in_vec_size_w));
+        qdot_affine4_word_pair<float, values_per_thread>(
+            v, x0_thread, x1_thread, sl[0], bl[0], sum0, sum1, dot0, dot1);
+      } else {
+        const device uint8_t* wl = ws + row * in_vec_size_w;
+        qdot_affine4_pair<float, values_per_thread>(
+            wl, x0_thread, x1_thread, sl[0], bl[0], sum0, sum1, dot0, dot1);
+      }
       result0[row] += dot0;
       result1[row] += dot1;
     }
@@ -1549,13 +1614,19 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
     float sum1 =
         load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      const device uint8_t* wl = ws + row * in_vec_size_w;
       const device T* sl = scales + row * in_vec_size_g;
       const device T* bl = biases + row * in_vec_size_g;
       float dot0;
       float dot1;
-      qdot_affine4_pair<float, values_per_thread>(
-          wl, x0_thread, x1_thread, sl[0], bl[0], sum0, sum1, dot0, dot1);
+      if (WVEC) {
+        const uint v = *((const device uint*)(ws + row * in_vec_size_w));
+        qdot_affine4_word_pair<float, values_per_thread>(
+            v, x0_thread, x1_thread, sl[0], bl[0], sum0, sum1, dot0, dot1);
+      } else {
+        const device uint8_t* wl = ws + row * in_vec_size_w;
+        qdot_affine4_pair<float, values_per_thread>(
+            wl, x0_thread, x1_thread, sl[0], bl[0], sum0, sum1, dot0, dot1);
+      }
       result0[row] += dot0;
       result1[row] += dot1;
     }
@@ -3879,7 +3950,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     for (int t = 0; t < gemma4_down_tile_span; t++) {
       uint3 tile_tid = tid;
       tile_tid.y = tid.y + uint(t);
-      qmv_affine4_g64_pair_impl<T, group_size, bits>(
+      qmv_affine4_g64_pair_impl<T, group_size, bits, 704, true>(
           tile_w,
           tile_scales,
           tile_biases,

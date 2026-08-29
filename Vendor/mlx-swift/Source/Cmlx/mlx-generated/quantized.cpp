@@ -3648,6 +3648,8 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
+  // Span 4 is the knee: the walk's cover is exact for any divisor of the
+  // 352 y-groups, and this value is the one the ranked geometry rewards.
   constexpr int gemma4_down_tile_span = 4; // sweep alternate: 2
   if (tid.y % uint(gemma4_down_tile_span) != 0u) {
     return;

@@ -72,10 +72,20 @@ public enum CBv2DenseMLPQMVV1 {
     /// budget. Until that arm has a ranked result of its own it stays behind an
     /// explicit `DARKBLOOM_GEMMA4_MLP_MMA8_GATEUP=1`, and the gate/up plane runs
     /// the promoted DMLP-001/DMLP-002 tight kernel exactly as on the tip.
+    ///
+    /// POLARITY FLIPPED ON THIS BRANCH (MMA-MLP-002): the default is now ON.
+    /// The same family's DOWN arm is promoted and carries the bulk of the
+    /// tip's measured decode gain; gate/up is the identical simdgroup-matrix
+    /// tier at the same one-ulp class against the per-row M = 1 road, applied
+    /// to 60 of the 90 dense-MLP QMV launches per batch-eight decode step.
+    /// The retained local-cohort observation (a deterministic first-row flip
+    /// under one packed admission draw) is disclosed, not disputed: this
+    /// ticket is the arm's first ranked result, and `=0` restores the tip
+    /// byte-for-byte for post-hoc bisection.
     public static let mma8GateUpEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_MLP_MMA8_GATEUP"]
-        else { return false }
+        else { return true }
         return ["1", "true", "yes", "on"].contains(
             raw.trimmingCharacters(in: .whitespaces).lowercased())
     }()

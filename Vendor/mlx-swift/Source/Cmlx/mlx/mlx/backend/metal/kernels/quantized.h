@@ -2314,6 +2314,109 @@ METAL_FUNC void gemma4_qmv_mma8_affine4_g64_impl(
   y[(c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc1);
 }
 
+
+// GROUP-EXACT-MMA, byte-weight twin -- the same fp32 `simdgroup_float8x8`
+// body for the M = 8 decode cohort on 8-bit affine g64 weights (the dense
+// MLP planes: gate/up N = 2112 over K = 2816, down N = 2816 over K = 2112).
+// Identical structure to gemma4_qmv_mma8_affine4_g64_impl: `A` holds the raw
+// byte codes, `B` holds X^T, `C` is zeroed per g64 group, and the group
+// closes with the single fused `acc += s * C + rs * b` in ascending k. A
+// bf16 x (8 significant bits) times a byte code (8 bits) needs at most 16
+// significant bits, so every elementary product is exact in fp32 and the
+// ONLY numeric deviation is the same 64-wide group-dot reassociation the
+// promoted affine-4 tier already priced (plus the KS = 2 two-halves add).
+// Lane (fm, fn)'s A fragment is one contiguous 16-byte load per group:
+// bytes k = 64 g + 8 fn + [0, 8) and 64 g + 8 (fn + 1) + [0, 8) of one
+// weight row, i.e. one `uint4`.
+#define MMA8B_STEP(BB, W1, W2, JJ)                                \
+  A.thread_elements()[0] = float(extract_bits(wv4.W1, 8 * (JJ), 8)); \
+  A.thread_elements()[1] = float(extract_bits(wv4.W2, 8 * (JJ), 8)); \
+  simdgroup_multiply_accumulate(C, A, BB, C);
+
+template <typename T, int KS>
+METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int K,
+    const int N,
+    const int n0,
+    threadgroup float2* red,
+    uint simd_gid,
+    uint simd_lid) {
+  const int G = K / 64;
+  const int gh = (G + 1) / 2;
+  const int g_begin = (KS == 2 && simd_gid == 1) ? gh : 0;
+  const int g_end = (KS == 2 && simd_gid == 0) ? gh : G;
+  const mma8_coord c = mma8_lane(simd_lid);
+
+  const device uint8_t* wrow =
+      (const device uint8_t*)w + (n0 + c.fm) * K + 8 * c.fn;
+  const device T* srow = scales + (n0 + c.fm) * G;
+  const device T* brow = biases + (n0 + c.fm) * G;
+  const device T* x0 = x + c.fn * K + 8 * c.fm;
+  const device T* x1 = x0 + K;
+
+  float acc0 = 0.0f;
+  float acc1 = 0.0f;
+  simdgroup_float8x8 A;
+  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+  for (int g = g_begin; g < g_end; ++g) {
+    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+
+    float2 rs = float2(mma8_runsum4<T>(r0), mma8_runsum4<T>(r1));
+    rs += simd_shuffle_xor(rs, 2u);
+    rs += simd_shuffle_xor(rs, 4u);
+    rs += simd_shuffle_xor(rs, 16u);
+
+    MMA8_SETB(B0, x, lo)
+    MMA8_SETB(B1, x, hi)
+    MMA8_SETB(B2, y, lo)
+    MMA8_SETB(B3, y, hi)
+    MMA8_SETB(B4, z, lo)
+    MMA8_SETB(B5, z, hi)
+    MMA8_SETB(B6, w, lo)
+    MMA8_SETB(B7, w, hi)
+
+    const uint4 wv4 = *((const device uint4*)(wrow + 64 * g));
+    const float s = float(srow[g]);
+    const float b = float(brow[g]);
+
+    simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+    MMA8B_STEP(B0, x, z, 0)
+    MMA8B_STEP(B1, x, z, 1)
+    MMA8B_STEP(B2, x, z, 2)
+    MMA8B_STEP(B3, x, z, 3)
+    MMA8B_STEP(B4, y, w, 0)
+    MMA8B_STEP(B5, y, w, 1)
+    MMA8B_STEP(B6, y, w, 2)
+    MMA8B_STEP(B7, y, w, 3)
+
+    acc0 += s * C.thread_elements()[0] + rs.x * b;
+    acc1 += s * C.thread_elements()[1] + rs.y * b;
+  }
+
+  if (KS == 2) {
+    if (simd_gid == 1) {
+      red[simd_lid] = float2(acc0, acc1);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_gid == 1) {
+      return;
+    }
+    const float2 other = red[simd_lid];
+    acc0 = acc0 + other.x;
+    acc1 = acc1 + other.y;
+  }
+
+  y[c.fn * N + n0 + c.fm] = static_cast<T>(acc0);
+  y[(c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc1);
+}
+
 template <typename T, const int group_size, const int bits>
 METAL_FUNC void qvm_impl(
     const device uint32_t* w,
@@ -2882,6 +2985,39 @@ template <typename T, int group_size, int bits, bool batched>
         simd_lid);
     return;
   }
+  // MMA-O -- the GROUP-EXACT-MMA tier for the fast-entry 4-bit decode plane
+  // (o_proj: N = 2816 over K = 4096, the one hot plane whose K % 512 == 0
+  // routes it here instead of the ordinary entry that carries the promoted
+  // MMA-QKV tier). Same body, same admission shape, same reassociation
+  // class. KILL SWITCH: kGemma4QmvMma8Affine4Fast = false restores the
+  // crossrow tiers below byte for byte.
+  {
+    constexpr bool kGemma4QmvMma8Affine4Fast = false;
+    constexpr int kGemma4QmvMma8Affine4FastFloorN = 1024;
+    if (kGemma4QmvMma8Affine4Fast && !batched && group_size == 64 &&
+        bits == 4 && sizeof(T) == 2 && ntg.x == 8 && ntg.z == 1 &&
+        in_vec_size % 64 == 0 &&
+        out_vec_size >= kGemma4QmvMma8Affine4FastFloorN &&
+        out_vec_size % 8 == 0) {
+      if (tid.x != 0) {
+        return;
+      }
+      threadgroup float2 red[32];
+      gemma4_qmv_mma8_affine4_g64_impl<T, 2>(
+          w,
+          scales,
+          biases,
+          x,
+          y,
+          in_vec_size,
+          out_vec_size,
+          8 * int(tid.y),
+          red,
+          simd_gid,
+          simd_lid);
+      return;
+    }
+  }
   if (!batched && group_size == 64 && bits == 4 && out_vec_size >= 1024) {
     if (out_vec_size >= 4096) {
       // Wide row sharing needs enough output tiles to keep the machine fed;
@@ -3168,6 +3304,37 @@ template <typename T, const int group_size, const int bits, bool batched>
   if (!batched && group_size == 64 && bits == 8 && ntg.x == 8 &&
       ntg.z == 1 && in_vec_size % 64 == 0 && out_vec_size >= 8 &&
       out_vec_size % 8 == 0) {
+    // MMA-DENSE -- GROUP-EXACT-MMA tier for the byte-weight dense planes
+    // (gate/up N = 2112 over K = 2816, down N = 2816 over K = 2112), the
+    // exact analogue of the promoted affine-4 MMA-QKV tier above: same
+    // simdgroup_float8x8 body, same runsum/close semantics, same 1-ulp
+    // group-dot reassociation class (a byte code times a bf16 x is exact in
+    // fp32). KILL SWITCH: kGemma4QmvMma8Affine8 = false restores the
+    // four-row stream and pair tiers below byte for byte.
+    constexpr bool kGemma4QmvMma8Affine8 = true;
+    constexpr int kGemma4QmvMma8Affine8FloorN = 1024;
+    if (kGemma4QmvMma8Affine8 && sizeof(T) == 2 &&
+        out_vec_size >= kGemma4QmvMma8Affine8FloorN) {
+      // Seven of the eight host x-groups retire before any load; the eighth
+      // produces all eight cohort columns of its eight output rows.
+      if (tid.x != 0) {
+        return;
+      }
+      threadgroup float2 red[32];
+      gemma4_qmv_mma8_affine8_g64_impl<T, 2>(
+          w,
+          scales,
+          biases,
+          x,
+          y,
+          in_vec_size,
+          out_vec_size,
+          8 * int(tid.y),
+          red,
+          simd_gid,
+          simd_lid);
+      return;
+    }
     // Dense decode projections use byte weights.
     if (out_vec_size >= 1024) {
       // WIDE-N tier -- the dense MLP of all 30 layers: gate_proj and up_proj

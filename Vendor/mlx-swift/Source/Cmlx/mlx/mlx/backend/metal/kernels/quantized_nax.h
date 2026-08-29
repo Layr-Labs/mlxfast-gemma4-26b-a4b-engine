@@ -17,6 +17,14 @@ using namespace metal;
 MLX_MTL_CONST int SIMD_SIZE = 32;
 MLX_MTL_CONST int QUAD_SIZE = 4;
 
+MLX_MTL_CONST bool QMV_M8_DIRECT_NIBBLES = true;
+MLX_MTL_CONST int QMV_M8_IPG = 2;
+MLX_MTL_CONST int QMV_M8_TILE = 16;
+MLX_MTL_CONST int QMV_M8_UNROLL = 2;
+MLX_MTL_CONST int QMV_M8_ROUNDS = 1;
+MLX_MTL_CONST int QMV_M8_CANDIDATES = 8;
+MLX_MTL_CONST bool QMV_M8_SINGLE_PASS_BUDGET = true;
+
 template <int bits, int wsize = 8>
 inline constexpr short get_pack_factor() {
   return (bits == 3 || bits == 5) ? 8 : (bits == 6 ? 4 : wsize / bits);
@@ -988,7 +996,7 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
   constexpr short SM = BM / WM;
   constexpr short SN = BN / WN;
-  constexpr short SK = 32;
+  constexpr short SK = QMV_M8_TILE;
 
   constexpr short TM = SM / 16;
   constexpr short TN = SN / 16;
@@ -1135,7 +1143,7 @@ METAL_FUNC void qmm_n_nax_tgp_impl(
 
   constexpr short SM = BM / WM;
   constexpr short SN = BN / WN;
-  constexpr short SK = 32;
+  constexpr short SK = QMV_M8_TILE;
 
   constexpr short TM = SM / 16;
   constexpr short TN = SN / 16;
@@ -1498,7 +1506,7 @@ METAL_FUNC void gather_rhs_mma_frag_row(
   static_assert(TN % 2 == 0, "Segment elision expects even TN");
   STEEL_PRAGMA_UNROLL
   for (short nn = 0; nn < TN; nn += 2) {
-    STEEL_PRAGMA_UNROLL
+    #pragma clang loop unroll_count(2)
     for (short kk = 0; kk < TK; ++kk) {
       CTile::NAXFrag_t::mma(
           C.frag_at(mm, nn),
@@ -1584,7 +1592,7 @@ template <
 
   constexpr short SM = BM / WM;
   constexpr short SN = BN / WN;
-  constexpr short SK = 32;
+  constexpr short SK = QMV_M8_TILE;
 
   constexpr short TM = SM / 16;
   constexpr short TN = SN / 16;

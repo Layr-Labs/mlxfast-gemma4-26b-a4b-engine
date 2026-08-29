@@ -11,6 +11,8 @@
 
 using namespace metal;
 
+#define MLX_MTL_PRAGMA_UNROLL_2 _Pragma("clang loop unroll_count(2)")
+
 ///////////////////////////////////////////////////////////////////////////////
 /// Matrix vector multiplication
 ///////////////////////////////////////////////////////////////////////////////
@@ -208,13 +210,13 @@ struct GEMVKernel {
 
       // Per thread work loop
       int mat_offset = 0;
-      MLX_MTL_PRAGMA_UNROLL
+      MLX_MTL_PRAGMA_UNROLL_2
       for (int tm = 0; tm < TM; tm++) {
         // Load for the row
         load_unsafe(mat, inter, mat_offset + bn);
 
         // Accumulate results
-        MLX_MTL_PRAGMA_UNROLL
+        MLX_MTL_PRAGMA_UNROLL_2
         for (int tn = 0; tn < TN; tn++) {
           result[tm] += inter[tn] * v_coeff[tn];
         }
@@ -229,13 +231,13 @@ struct GEMVKernel {
       load_safe<AccT>(in_vec, v_coeff, bn, in_size);
 
       // Per thread work loop
-      MLX_MTL_PRAGMA_UNROLL
+      MLX_MTL_PRAGMA_UNROLL_2
       for (int tm = 0; tm < TM; tm++) {
         // Load for the row
         load_safe(&mat[tm * matrix_ld], inter, bn, in_size);
 
         // Accumulate results
-        MLX_MTL_PRAGMA_UNROLL
+        MLX_MTL_PRAGMA_UNROLL_2
         for (int tn = 0; tn < TN; tn++) {
           result[tm] += inter[tn] * v_coeff[tn];
         }
@@ -393,12 +395,12 @@ struct GEMVTKernel {
         // This is possibly it may help exploit cache better
         threadgroup_barrier(mem_flags::mem_none);
 
-        MLX_MTL_PRAGMA_UNROLL
+        MLX_MTL_PRAGMA_UNROLL_2
         for (int tm = 0; tm < TM; tm++) {
           v_coeff[tm] = static_cast<AccT>(in_vec[bm + tm]);
         }
 
-        MLX_MTL_PRAGMA_UNROLL
+        MLX_MTL_PRAGMA_UNROLL_2
         for (int tm = 0; tm < TM; tm++) {
           auto vc = static_cast<AccT>(v_coeff[tm]);
           for (int tn = 0; tn < TN; tn++) {

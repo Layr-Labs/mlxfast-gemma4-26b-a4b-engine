@@ -14,6 +14,14 @@ using namespace metal;
 MLX_MTL_CONST int SIMD_SIZE = 32;
 MLX_MTL_CONST int QUAD_SIZE = 4;
 
+MLX_MTL_CONST bool QMV_M8_DIRECT_NIBBLES = true;
+MLX_MTL_CONST int QMV_M8_IPG = 2;
+MLX_MTL_CONST int QMV_M8_TILE = 16;
+MLX_MTL_CONST int QMV_M8_UNROLL = 2;
+MLX_MTL_CONST int QMV_M8_ROUNDS = 1;
+MLX_MTL_CONST int QMV_M8_CANDIDATES = 8;
+MLX_MTL_CONST bool QMV_M8_SINGLE_PASS_BUDGET = true;
+
 template <int bits, int wsize = 8>
 inline constexpr short get_pack_factor() {
   return (bits == 3 || bits == 5) ? 8 : (bits == 6 ? 4 : wsize / bits);
@@ -1078,11 +1086,13 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
     int out_row,
     uint simd_lid) {
   static_assert(NA >= 2 && NA <= 4, "wide multi-row QMV supports NA in [2, 4]");
+  static_assert(QMV_M8_TILE == 16 && QMV_M8_UNROLL == 2, "qmv-m8 tile/unroll knobs");
   typedef vec<float, NA> VF;
   constexpr int rows_per_simd = 4;
-  constexpr int values_per_thread = 16;
+  constexpr int values_per_thread = QMV_M8_TILE;
+  constexpr int packs_per_lane = QMV_M8_TILE / 4;
   constexpr int block_size = values_per_thread * SIMD_SIZE;
-  constexpr int bytes_per_lane = 8;
+  constexpr int bytes_per_lane = QMV_M8_TILE / 2;
   const int in_vec_size_w = in_vec_size / 2;
   const int in_vec_size_g = in_vec_size / 64;
 
@@ -1092,7 +1102,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
   }
 
   for (int k = 0; k < in_vec_size; k += block_size) {
-    thread uint16_t packed[rows_per_simd][4];
+    thread uint16_t packed[rows_per_simd][packs_per_lane];
     thread float scale_local[rows_per_simd];
     thread float bias_local[rows_per_simd];
     for (int r = 0; r < rows_per_simd; r++) {
@@ -1100,7 +1110,8 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
       const device uint16_t* ws = reinterpret_cast<const device uint16_t*>(
           reinterpret_cast<const device uint8_t*>(w) + row * in_vec_size_w +
           k / 2 + simd_lid * bytes_per_lane);
-      for (int i = 0; i < 4; i++) {
+      #pragma clang loop unroll_count(2)
+      for (int i = 0; i < packs_per_lane; i++) {
         packed[r][i] = ws[i];
       }
       const int group_index = row * in_vec_size_g + k / 64 + simd_lid / 4;
@@ -1113,7 +1124,8 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
     for (int r = 0; r < rows_per_simd; r++) {
       partial[r] = VF(0.0f);
     }
-    for (int i = 0; i < 4; i++) {
+    #pragma clang loop unroll_count(2)
+    for (int i = 0; i < packs_per_lane; i++) {
       VF a0, a1, a2, a3;
       for (int m = 0; m < NA; m++) {
         const device T* xm = x + (first_m + m) * in_vec_size + k +
@@ -2918,23 +2930,13 @@ template <typename T, int group_size, int bits, bool batched>
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
           return;
-        case 8:
-          // 3+3+2, not 4+4. M = 8 is the only hot width whose EVEN split needs
-          // two simultaneous vec<float,4> accumulators in every active worker;
-          // M = 9 uses three-lane vectors and profiles CHEAPER despite more work
-          // (319 / 437 / 216 us for M = 7 / 8 / 9 in the public cross-row study)
-          // — a register cliff, not work scaling.
-          // Exact: these lanes carry INDEPENDENT input rows and are never reduced
-          // across (simd_sum reduces along K WITHIN a row), so moving a row from
-          // lane 3 of a four-wide vector to lane 0 of a two-wide one cannot
-          // reorder its scalar chain. Template admits it: M in [3,9], 8 % 3 == 2
-          // (no one-row tail), IPG 3 inside the wide helper's [2,4].
-          // Receipts: 85d5bca3 2.91143, yzxoi 2.92675.
-          // SYNERGY with the streak gate above, which is why they ship together:
-          // gate 2 reaches the width-8 verify SOONER, so this kernel fires MORE.
-          qmv_fast_crossrow_affine4_g64_m<T, 8, 4, true>(
+        case QMV_M8_CANDIDATES:
+          qmv_fast_crossrow_affine4_g64_m<T, 8, QMV_M8_IPG, QMV_M8_DIRECT_NIBBLES>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
+          if (QMV_M8_SINGLE_PASS_BUDGET && QMV_M8_ROUNDS <= 1) {
+            return;
+          }
           return;
         case 9:
           qmv_fast_crossrow_affine4_g64_m<T, 9, 3, true>(

@@ -3862,9 +3862,26 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     }
     run_offset++;
   }
-  // Odd positions are produced by the immediately preceding pair leader.
-  if ((run_offset & 1) != 0) {
+  // RUN-QUAD-DOWN: cluster up to four same-expert assignments onto ONE weight
+  // stream, matching the clustering the pairless sibling arm in
+  // `affine_gather_qmv` already uses. Leaders sit at run_offset % 4 == 0 and
+  // also produce positions 1..3 of their aligned quartet, so coverage stays
+  // exactly once per (assignment, out_row): runs are contiguous, run_offset
+  // counts from the run start, and each leader serves min(4, remaining)
+  // consecutive rows. Every (output, input) pair keeps its own accumulator,
+  // K-loop order, and qdot inside the pair/triple/quad impls, so each output
+  // element's add sequence is identical to the incumbent pair-clustered arm --
+  // only which threadgroup owns a row changes. The y-tile span walk is
+  // unchanged and still has no ragged tail (352 y-groups divide by 4).
+  constexpr int gemma4_down_run_cluster = 4; // sweep alternate: 2
+  if ((run_offset & uint(gemma4_down_run_cluster - 1)) != 0u) {
     return;
+  }
+  uint run_len = 1;
+  while (run_len < uint(gemma4_down_run_cluster) &&
+         assignment + run_len < 64 &&
+         rhs_indices[(assignment + run_len) * rhs_stride] == expert) {
+    run_len++;
   }
   const device uint32_t* tile_w = w + expert * w_stride;
   const device T* tile_scales = scales + expert * s_stride;
@@ -3872,13 +3889,30 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   const device T* tile_x0 =
       x + lhs_indices[assignment * lhs_stride] * x_stride;
   device T* tile_y0 = y + assignment * out_vec_size;
-  const bool has_pair =
-      assignment + 1 < 64 &&
-      rhs_indices[(assignment + 1) * rhs_stride] == expert;
-  if (has_pair) {
-    const device T* tile_x1 =
-        x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
-    device T* tile_y1 = y + (assignment + 1) * out_vec_size;
+  if (run_len == 1) {
+    for (int t = 0; t < gemma4_down_tile_span; t++) {
+      uint3 tile_tid = tid;
+      tile_tid.y = tid.y + uint(t);
+      // EXPERT-SINGLES preserved: the singleton arm keeps the frontier's
+      // WVEC-vectorized loads-only reschedule instead of stock qmv_impl.
+      qmv_affine4_g64_singles_impl<T, group_size, bits, 704, true, false>(
+          tile_w,
+          tile_scales,
+          tile_biases,
+          tile_x0,
+          tile_y0,
+          in_vec_size,
+          out_vec_size,
+          tile_tid,
+          simd_gid,
+          simd_lid);
+    }
+    return;
+  }
+  const device T* tile_x1 =
+      x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
+  device T* tile_y1 = y + (assignment + 1) * out_vec_size;
+  if (run_len == 2) {
     for (int t = 0; t < gemma4_down_tile_span; t++) {
       uint3 tile_tid = tid;
       tile_tid.y = tid.y + uint(t);
@@ -3897,17 +3931,49 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     }
     return;
   }
+  const device T* tile_x2 =
+      x + lhs_indices[(assignment + 2) * lhs_stride] * x_stride;
+  device T* tile_y2 = y + (assignment + 2) * out_vec_size;
+  if (run_len == 3) {
+    for (int t = 0; t < gemma4_down_tile_span; t++) {
+      uint3 tile_tid = tid;
+      tile_tid.y = tid.y + uint(t);
+      qmv_affine4_g64_triple_stream_impl<T, group_size, bits>(
+          tile_w,
+          tile_scales,
+          tile_biases,
+          tile_x0,
+          tile_x1,
+          tile_x2,
+          tile_y0,
+          tile_y1,
+          tile_y2,
+          in_vec_size,
+          tile_tid,
+          simd_gid,
+          simd_lid);
+    }
+    return;
+  }
+  const device T* tile_x3 =
+      x + lhs_indices[(assignment + 3) * lhs_stride] * x_stride;
+  device T* tile_y3 = y + (assignment + 3) * out_vec_size;
   for (int t = 0; t < gemma4_down_tile_span; t++) {
     uint3 tile_tid = tid;
     tile_tid.y = tid.y + uint(t);
-    qmv_affine4_g64_singles_impl<T, group_size, bits, 704, true, false>(
+    qmv_affine4_g64_quad_stream_impl<T, group_size, bits>(
         tile_w,
         tile_scales,
         tile_biases,
         tile_x0,
+        tile_x1,
+        tile_x2,
+        tile_x3,
         tile_y0,
+        tile_y1,
+        tile_y2,
+        tile_y3,
         in_vec_size,
-        out_vec_size,
         tile_tid,
         simd_gid,
         simd_lid);

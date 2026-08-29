@@ -120,6 +120,24 @@ private let gemma4PrefillTailRows: Int = {
     return max(0, value)
 }()
 
+/// Decode-only fidelity-budget experiment. Keep the exact top-8 route shape,
+/// but mark the one or two smallest-magnitude final coefficients when their
+/// cumulative absolute mass is at most five percent. The specialized
+/// affine-Q4/G64 expert gathers recognize those markers and write exact zero
+/// rows without reading those experts' weights.
+///
+/// Unlike fixed top-6/top-7, every row spends an explicit omitted-mass budget:
+/// materially weighted routes remain exact, and a second route is removed only
+/// when both omitted coefficients together fit the same five-percent budget.
+/// Prefill, MTP rectangles, non-B=8 shapes, and non-production expert
+/// projections never receive a marker.
+private let gemma4AdaptiveRouteSkipEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_ADAPTIVE_ROUTE_SKIP"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// Parse the independent direct expert-reduction control, which is ON by
 /// default: the coupled weighted-unsort + safe-R1 pair is what was measured
 /// faster, and the ranked box sets no environment.
@@ -2006,6 +2024,98 @@ public enum Gemma4RouterProbe {
         ((_ expertScores: MLXArray, _ topKIndices: MLXArray) -> Void)?
 }
 
+/// Fuse the stock per-expert-scale gather, BF16 multiply, and cumulative route
+/// relative route-mass budget into one B=8/top-8 dispatch. The selected order
+/// and all final coefficients remain unchanged; only zero, one, or two output
+/// indices may receive the high-bit sentinel consumed by the production expert
+/// gathers.
+private enum Gemma4BudgetedRouteScale {
+    private static let kernel = MLXFast.metalKernel(
+        name: "gemma4_relative_route_scale_b8_k8_v2",
+        inputNames: ["indices", "weights", "pes"],
+        outputNames: ["packed_indices", "scaled_weights"],
+        source: """
+            constexpr uint SKIP = 0x80000000u;
+            constexpr float MAX_OMITTED_FRACTION = 0.05f;
+            const uint row = thread_position_in_grid.x;
+            const uint base = row * 8;
+
+            T scaled[8];
+            float magnitude[8];
+            float total_magnitude = 0.0f;
+            bool all_finite = true;
+            for (uint slot = 0; slot < 8; ++slot) {
+                const uint expert = uint(indices[base + slot]);
+                // Same BF16 multiply boundary as
+                // `softmaxWeights * perExpertScale[topKIndices]`.
+                const T final_weight = weights[base + slot] * pes[expert];
+                scaled[slot] = final_weight;
+                magnitude[slot] = fabs(float(final_weight));
+                total_magnitude += magnitude[slot];
+                all_finite =
+                    all_finite && metal::isfinite(magnitude[slot]);
+            }
+
+            uint weakest_slot = 0;
+            uint second_slot = 1;
+            float weakest = magnitude[0];
+            float second = magnitude[1];
+            if (second < weakest) {
+                const float swap_weight = weakest;
+                weakest = second;
+                second = swap_weight;
+                weakest_slot = 1;
+                second_slot = 0;
+            }
+            for (uint slot = 2; slot < 8; ++slot) {
+                const float candidate = magnitude[slot];
+                if (candidate < weakest) {
+                    second = weakest;
+                    second_slot = weakest_slot;
+                    weakest = candidate;
+                    weakest_slot = slot;
+                } else if (candidate < second) {
+                    second = candidate;
+                    second_slot = slot;
+                }
+            }
+
+            const float omitted_budget =
+                total_magnitude * MAX_OMITTED_FRACTION;
+            const bool skip_two =
+                all_finite && weakest + second <= omitted_budget;
+            const bool skip_one =
+                all_finite && !skip_two && weakest <= omitted_budget;
+            for (uint slot = 0; slot < 8; ++slot) {
+                const bool omit =
+                    ((skip_one || skip_two) && slot == weakest_slot)
+                    || (skip_two && slot == second_slot);
+                const uint marker = omit ? SKIP : 0u;
+                packed_indices[base + slot] = uint(indices[base + slot]) | marker;
+                scaled_weights[base + slot] = scaled[slot];
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    static func apply(
+        indices: MLXArray, weights: MLXArray, perExpertScale: MLXArray
+    ) -> (indices: MLXArray, weights: MLXArray)? {
+        guard indices.shape == [8, 1, 8], indices.dtype == .uint32,
+            weights.shape == indices.shape, weights.dtype == .bfloat16,
+            perExpertScale.shape == [128], perExpertScale.dtype == .bfloat16
+        else { return nil }
+        let outputs = kernel(
+            [indices, weights, perExpertScale],
+            grid: (8, 1, 1),
+            threadGroup: (8, 1, 1),
+            outputShapes: [[8, 1, 8], [8, 1, 8]],
+            outputDTypes: [.uint32, .bfloat16]
+        )
+        return (outputs[0], outputs[1])
+    }
+}
+
 /// ROUTE-001: one-dispatch, byte-identical replacement of the decode router's
 /// selection chain — `argPartition(kth: E-8)` → slice → `takeAlong` →
 /// `softmax(precise)` over 8 → `perExpertScale` gather + multiply — for the
@@ -2566,7 +2676,9 @@ private class Gemma4Router: Module {
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
+    func callAsFunction(
+        _ x: MLXArray, allowBudgetedRouteSkip: Bool = false
+    ) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
         let effScale: MLXArray
         if let cached = cachedEffectiveScale {
             effScale = cached
@@ -2593,13 +2705,23 @@ private class Gemma4Router: Module {
 
         var topKWeights = MLX.takeAlong(expertScores, topKIndices, axis: -1)
         topKWeights = MLX.softmax(topKWeights, axis: -1, precise: true)
-        topKWeights = topKWeights * perExpertScale[topKIndices]
 
         // Diagnostic-only observability (nil in production; see
         // `Gemma4RouterProbe`). Recording the PRE-selection scores and the
         // selection itself, never altering either.
         Gemma4RouterProbe.recorder?(expertScores, topKIndices)
 
+        if allowBudgetedRouteSkip, Gemma4RouterProbe.recorder == nil,
+            let budgeted = Gemma4BudgetedRouteScale.apply(
+                indices: topKIndices,
+                weights: topKWeights,
+                perExpertScale: perExpertScale)
+        {
+            CBv2EngageMark.once("budgeted-route-scale")
+            return (budgeted.indices, budgeted.weights)
+        }
+
+        topKWeights = topKWeights * perExpertScale[topKIndices]
         return (topKIndices, topKWeights)
     }
 }
@@ -2608,6 +2730,10 @@ private class Gemma4Router: Module {
 private class Gemma4Experts: Module {
     @ModuleInfo(key: "switch_glu") var switchGLU: SwitchGLU
     let fuseWeightedUnsort: Bool
+
+    var supportsGemma4BudgetedRouteSkip: Bool {
+        switchGLU.supportsGemma4PackedRouteSkip
+    }
 
     init(
         _ config: Gemma4TextConfiguration,
@@ -2889,7 +3015,12 @@ public class Gemma4DecoderLayer: Module {
             let postFeedforwardLayernorm2
         {
             // Dense + sparse branches in parallel, summed into one residual.
-            let (topKIndices, topKWeights) = router(out)
+            let (topKIndices, topKWeights) = router(
+                out,
+                allowBudgetedRouteSkip:
+                    gemma4AdaptiveRouteSkipEnabled
+                    && !isExpertPrefill
+                    && experts.supportsGemma4BudgetedRouteSkip)
 
             let h1Raw: MLXArray
             let h2Raw: MLXArray

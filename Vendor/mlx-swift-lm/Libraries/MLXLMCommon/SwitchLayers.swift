@@ -858,6 +858,29 @@ public class SwitchGLU: Module {
     let activationProduct: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
     let weightedReductionProfile: SwitchGLUWeightedReductionProfile
 
+    @inline(__always)
+    private func supportsGemma4PackedRouteProjection(_ projection: SwitchLinear?) -> Bool {
+        guard let projection = projection as? QuantizedSwitchLinear else { return false }
+        return projection.groupSize == 64 && projection.bits == 4
+            && projection.mode.rawValue == QuantizationMode.affine.rawValue
+            && projection.bias == nil
+    }
+
+    /// True only when every expert projection reaches the specialized
+    /// affine-Q4/G64 gather kernel that understands Gemma's high-bit skip
+    /// sentinel. Generic, unquantized, biased, and near-topology SwitchGLUs
+    /// remain ineligible so a packed index can never reach an ordinary gather.
+    public var supportsGemma4PackedRouteSkip: Bool {
+        guard routeSimdRank64Enabled,
+            weightedReductionProfile == .gemma4ProductionGeGLU,
+            inputDims == 2816, hiddenDims == 704, numExperts == 128,
+            gateUpProj == nil,
+            supportsGemma4PackedRouteProjection(downProj)
+        else { return false }
+        return supportsGemma4PackedRouteProjection(gateProj)
+            && supportsGemma4PackedRouteProjection(upProj)
+    }
+
     /// Activation-type flags detected once at init from a tiny test input (vMLX
     /// approach — no per-token check). Only consulted when `activationProduct` is
     /// nil (the custom-activation path): they let SiLU/GELU custom activations use

@@ -3947,6 +3947,28 @@ template <typename T, int group_size, int bits>
       ((in_vec_size == 2816 && out_vec_size == 704) ||
        (in_vec_size == 704 && out_vec_size == 2816));
   if (gemma4_pair_geometry) {
+    // BUDGETED-ROUTE-SKIP. The production router may set the high bit on up to
+    // two assignments whose cumulative final coefficient fits its explicit
+    // omitted-mass budget. Keep the established 64-assignment shape and write
+    // exact zero expert rows directly, avoiding every gate/up/down weight read
+    // for those assignments. Only the fail-closed Swift topology gate can
+    // create this marker.
+    constexpr uint32_t gemma4_skip_route = 0x80000000u;
+    const uint assignment = tid.z;
+    const uint32_t packed_expert =
+        rhs_indices[assignment * (uint)rhs_strides[0]];
+    if ((packed_expert & gemma4_skip_route) != 0u) {
+      const uint local_thread = simd_gid * 32u + simd_lid;
+      if (local_thread < 8u) {
+        const uint output_col = tid.y * 8u + local_thread;
+        if (output_col < (uint)out_vec_size) {
+          y[assignment * (uint)out_vec_size + output_col] = static_cast<T>(0);
+        }
+      }
+      return;
+    }
+    const uint32_t expert = packed_expert;
+
     // KERN-DOWN-TILE gate (strip-walk pattern): compile-time flip; ON
     // here -- the K = 704 down plane takes the y-tile-coarsened arm above.
     // Flip to false to return every plane to the incumbent per-y-group
@@ -3974,9 +3996,6 @@ template <typename T, int group_size, int bits>
           simd_lid);
       return;
     }
-    const uint assignment = tid.z;
-    const uint32_t expert =
-        rhs_indices[assignment * (uint)rhs_strides[0]];
     uint run_offset = 0;
     for (uint prior = assignment; prior > 0; --prior) {
       if (rhs_indices[(prior - 1) * (uint)rhs_strides[0]] != expert) {

@@ -789,9 +789,25 @@ private class RMSNormNoScale: Module {
     }
 }
 
+private struct Gemma4QKVRopeParameters {
+    let log2Base: MLXArray
+    let frequencies: MLXArray
+    let usesFrequencies: Bool
+}
+
+private let gemma4QKVNormRopeEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_QKV_NORM_ROPE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 private let gemma4QKVNormKernel = MLXFast.metalKernel(
-    name: "gemma4_b8_qkv_rms_norm_v1",
-    inputNames: ["q", "k", "v", "q_weight", "k_weight"],
+    name: "gemma4_b8_qkv_rms_norm_rope_v2",
+    inputNames: [
+        "q", "k", "v", "q_weight", "k_weight",
+        "position_offsets", "rope_log2_base", "rope_freqs",
+    ],
     outputNames: ["q_out", "k_out", "v_out"],
     source: """
         constexpr uint reads = 4;
@@ -800,31 +816,33 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
         const uint lane = thread_index_in_simdgroup;
         const uint simd_group = simdgroup_index_in_threadgroup;
 
+        const bool is_query = row < Q_ROWS;
+        const bool is_key = row >= Q_ROWS && row < Q_ROWS + K_ROWS;
+        const bool weighted = is_query || is_key;
         const device T* input = q;
         const device T* weight = q_weight;
-        device T* output = q_out;
+        device T* output_row = q_out;
         uint local_row = row;
-        bool weighted = true;
         if (!KEY_VALUE_SHARED && row >= Q_ROWS + K_ROWS) {
             input = v;
-            output = v_out;
+            output_row = v_out;
             local_row = row - Q_ROWS - K_ROWS;
-            weighted = false;
-        } else if (row >= Q_ROWS) {
+        } else if (is_key) {
             input = k;
             weight = k_weight;
-            output = k_out;
+            output_row = k_out;
             local_row = row - Q_ROWS;
         }
 
         input += local_row * D + lid * reads;
-        output += local_row * D + lid * reads;
+        output_row += local_row * D;
+        device T* output = output_row + lid * reads;
         weight += lid * reads;
         // Keep the pointer inside the V allocation for Q rows even though
         // those rows never dereference it. K rows advance to their matching
         // V row only in the compile-time shared-input variant.
         device T* shared_value_output = v_out;
-        if (KEY_VALUE_SHARED && row >= Q_ROWS) {
+        if (KEY_VALUE_SHARED && is_key) {
             shared_value_output += local_row * D + lid * reads;
         }
 
@@ -837,6 +855,7 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
 
         threadgroup float partials[32];
         threadgroup float inverse_rms;
+        threadgroup T rounded[D];
         if (simd_group == 0) partials[lane] = 0.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (lane == 0) partials[simd_group] = sum;
@@ -850,15 +869,47 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (uint i = 0; i < reads; ++i) {
+            const uint element = lid * reads + i;
             const T normalized = T(float(input[i]) * inverse_rms);
-            output[i] = weighted ? weight[i] * normalized : T(1) * normalized;
+            if (APPLY_ROPE && weighted) {
+                // Reproduce the separate norm kernel's BF16 output-store
+                // boundary before any RoPE arithmetic reads the value.
+                rounded[element] = T(weight[i] * normalized);
+            } else {
+                output[i] = weighted ? weight[i] * normalized : T(1) * normalized;
+            }
             // Gemma's full-attention K-eq-V layers feed the same raw key
             // projection to K RMSNorm and V RMSNormNoScale. The reduction
             // above is therefore identical for both outputs; keep each
             // output's established final expression, but write V while the
             // exact normalizer and input value are live.
-            if (KEY_VALUE_SHARED && row >= Q_ROWS) {
+            if (KEY_VALUE_SHARED && is_key) {
                 shared_value_output[i] = T(1) * normalized;
+            }
+        }
+        if (APPLY_ROPE) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (APPLY_ROPE && weighted && lid * reads < D / 2) {
+            const uint heads = is_query ? Q_HEADS : K_HEADS;
+            const uint batch = local_row / heads;
+            const float L = static_cast<float>(position_offsets[batch]);
+            for (uint i = 0; i < reads; ++i) {
+                const uint pair = lid * reads + i;
+                const float d = static_cast<float>(pair) / static_cast<float>(D / 2);
+                const float inv_freq = USE_FREQS
+                    ? 1.0f / rope_freqs[pair]
+                    : metal::exp2(-d * rope_log2_base[0]);
+                const float theta = L * inv_freq;
+                const float costheta = metal::fast::cos(theta);
+                const float sintheta = metal::fast::sin(theta);
+                const float x1 = static_cast<float>(rounded[pair]);
+                const float x2 = static_cast<float>(rounded[pair + D / 2]);
+                const float rx1 = x1 * costheta - x2 * sintheta;
+                const float rx2 = x1 * sintheta + x2 * costheta;
+                output_row[pair] = static_cast<T>(rx1);
+                output_row[pair + D / 2] = static_cast<T>(rx2);
             }
         }
     """,
@@ -1030,46 +1081,51 @@ private func gemma4FusedQKVNormHeadMajor(
 }
 
 private func gemma4FusedQKVNorm(
-    q: MLXArray,
-    k: MLXArray,
-    v: MLXArray,
-    qWeight: MLXArray,
-    kWeight: MLXArray,
-    eps: Float,
-    keyValueShared: Bool
-) -> (MLXArray, MLXArray, MLXArray)? {
+    q: MLXArray, k: MLXArray, v: MLXArray,
+    qWeight: MLXArray, kWeight: MLXArray, eps: Float,
+    keyValueShared: Bool, positionOffsets: MLXArray,
+    ropeParameters: Gemma4QKVRopeParameters, applyRope: Bool
+) -> (q: MLXArray, k: MLXArray, v: MLXArray, appliedRope: Bool)? {
     guard eps == 1.0e-6,
         q.dtype == .bfloat16, k.dtype == .bfloat16, v.dtype == .bfloat16,
         qWeight.dtype == .bfloat16, kWeight.dtype == .bfloat16,
+        positionOffsets.dtype == .int32, positionOffsets.shape == [8],
+        ropeParameters.log2Base.dtype == .float32, ropeParameters.log2Base.size == 1,
+        ropeParameters.frequencies.dtype == .float32,
         q.ndim == 4, k.ndim == 4, v.ndim == 4,
         q.dim(0) == 8, q.dim(1) == 1, q.dim(2) == 16,
         k.dim(0) == 8, k.dim(1) == 1, v.shape == k.shape,
         q.dim(3) == k.dim(3),
         (q.dim(3) == 256 && k.dim(2) == 8) || (q.dim(3) == 512 && k.dim(2) == 2),
         qWeight.shape == [q.dim(3)], kWeight.shape == [q.dim(3)],
-        !keyValueShared || v.shape == k.shape
+        !keyValueShared || v.shape == k.shape,
+        !ropeParameters.usesFrequencies
+            || ropeParameters.frequencies.size == q.dim(3) / 2
     else { return nil }
 
     let dimension = q.dim(3)
     let qRows = 8 * 16
     let kRows = 8 * k.dim(2)
     let threads = dimension / 4
-    // In the exact K-eq-V case V reads kRaw, so one row reduction produces
-    // both the weighted K and no-scale V outputs. Keep the ordinary three
-    // banks for every non-shared projection and for all guard failures.
+    let fusedRope = gemma4QKVNormRopeEnabled && applyRope
     let normRows = qRows + kRows + (keyValueShared ? 0 : kRows)
     let outputs = gemma4QKVNormKernel(
-        [q, k, v, qWeight, kWeight],
+        [q, k, v, qWeight, kWeight, positionOffsets,
+         ropeParameters.log2Base, ropeParameters.frequencies],
         template: [
             ("T", q.dtype), ("D", dimension), ("Q_ROWS", qRows), ("K_ROWS", kRows),
-            ("KEY_VALUE_SHARED", keyValueShared),
+            ("Q_HEADS", 16), ("K_HEADS", k.dim(2)),
+            ("KEY_VALUE_SHARED", keyValueShared), ("APPLY_ROPE", fusedRope),
+            ("USE_FREQS", ropeParameters.usesFrequencies),
         ],
-        grid: (normRows * threads, 1, 1),
-        threadGroup: (threads, 1, 1),
-        outputShapes: [q.shape, k.shape, v.shape],
+        grid: (normRows * threads, 1, 1), threadGroup: (threads, 1, 1),
+        outputShapes: fusedRope
+            ? [[8, 16, 1, dimension], [8, k.dim(2), 1, dimension], v.shape]
+            : [q.shape, k.shape, v.shape],
         outputDTypes: [q.dtype, k.dtype, v.dtype]
     )
-    return (outputs[0], outputs[1], outputs[2])
+    if fusedRope { CBv2EngageMark.once("qkv-norm-rope") }
+    return (outputs[0], outputs[1], outputs[2], fusedRope)
 }
 
 private class ScaledLinear: Module {
@@ -1209,6 +1265,7 @@ private class Gemma4Attention: Module {
     let useKeqV: Bool
     let usesSharedKV: Bool
     let scale: Float
+    let qkvRopeParameters: Gemma4QKVRopeParameters
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
     @ModuleInfo(key: "k_proj") var kProj: Linear?
@@ -1265,19 +1322,32 @@ private class Gemma4Attention: Module {
 
         self._qNorm.wrappedValue = RMSNorm(dimensions: effectiveHeadDim, eps: config.rmsNormEps)
 
-        // RoPE: sliding uses default, full uses proportional with partial rotation
+        // RoPE: sliding uses the base route; full attention reuses the exact
+        // proportional frequency table (including +inf pass-through pairs).
         if isSliding {
             self.rope = initializeRope(
                 dims: effectiveHeadDim, base: config.slidingRopeTheta, traditional: false,
                 scalingConfig: nil, maxPositionEmbeddings: nil)
+            self.qkvRopeParameters = Gemma4QKVRopeParameters(
+                log2Base: MLXArray([log2f(config.slidingRopeTheta)]),
+                frequencies: MLXArray([Float.infinity]), usesFrequencies: false)
         } else {
-            self.rope = initializeRope(
+            let fullRope = initializeRope(
                 dims: effectiveHeadDim, base: config.fullRopeTheta, traditional: false,
                 scalingConfig: [
                     "type": .string("proportional"),
                     "partial_rotary_factor": .float(config.fullPartialRotaryFactor),
                 ],
                 maxPositionEmbeddings: nil)
+            guard let proportional = fullRope as? ProportionalRoPE,
+                let frequencies = proportional.frequencyTable
+            else {
+                preconditionFailure("Gemma4 full-attention RoPE requires a frequency table")
+            }
+            self.rope = proportional
+            self.qkvRopeParameters = Gemma4QKVRopeParameters(
+                log2Base: MLXArray([Float.zero]), frequencies: frequencies,
+                usesFrequencies: true)
         }
 
         super.init()
@@ -1582,14 +1652,17 @@ private class Gemma4Attention: Module {
         var queries: MLXArray
         var k: MLXArray
         var v: MLXArray
+        var appliedRope = false
         if let normalized = gemma4FusedQKVNorm(
             q: queryRaw, k: kRaw, v: vRaw,
             qWeight: qNorm.weight, kWeight: kNorm.weight, eps: config.rmsNormEps,
-            keyValueShared: vProj == nil)
+            keyValueShared: vProj == nil, positionOffsets: capturedOffsets,
+            ropeParameters: qkvRopeParameters, applyRope: lastQueryCache == nil)
         {
-            queries = normalized.0.transposed(0, 2, 1, 3)
-            k = normalized.1.transposed(0, 2, 1, 3)
-            v = normalized.2.transposed(0, 2, 1, 3)
+            appliedRope = normalized.appliedRope
+            queries = appliedRope ? normalized.q : normalized.q.transposed(0, 2, 1, 3)
+            k = appliedRope ? normalized.k : normalized.k.transposed(0, 2, 1, 3)
+            v = normalized.v.transposed(0, 2, 1, 3)
         } else if let headMajor = gemma4FusedQKVNormHeadMajor(
             q: queryRaw, k: kRaw,
             qWeight: qNorm.weight, kWeight: kNorm.weight, eps: config.rmsNormEps,
@@ -1603,8 +1676,10 @@ private class Gemma4Attention: Module {
             v = vNorm(vRaw).transposed(0, 2, 1, 3)
         }
 
-        queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: queryPositionOffset)
-        k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
+        if !appliedRope {
+            queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: queryPositionOffset)
+            k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
+        }
 
         let outputDType = queries.dtype
         let attentionQueries =

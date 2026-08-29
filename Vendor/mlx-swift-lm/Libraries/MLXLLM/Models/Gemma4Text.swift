@@ -1066,25 +1066,6 @@ private class Gemma4Attention: Module {
         super.init()
     }
 
-    /// Exact B8/L1 Q/K/V projection: the tight-grid host for the promoted
-    /// matrix-unit tier (same kernel text, grid.x = 1). Any guard failure
-    /// keeps the quantized module, which reaches the tier through MLX.
-    @inline(__always)
-    private func tierProjection(_ layer: Linear, _ x: MLXArray) -> MLXArray {
-        guard let quantized = layer as? QuantizedLinear,
-            quantized.bias == nil,
-            let projected = CBv2AttentionQKVMMA8V1.matmul(
-                x: x,
-                weight: quantized.weight,
-                scales: quantized.scales,
-                biases: quantized.biases,
-                groupSize: quantized.groupSize,
-                bits: quantized.bits,
-                mode: quantized.mode)
-        else { return layer(x) }
-        return projected
-    }
-
     /// Exact B8/L1 attention output projection. Sliding/full K widths select
     /// the tight affine4 fast-QMV replica; every other path keeps the layer.
     @inline(__always)
@@ -1285,13 +1266,10 @@ private class Gemma4Attention: Module {
         let queryInput = lastQueryCache == nil ? x : x[0..., outputStart..., 0...]
         let queryLength = queryInput.dim(1)
 
-        // Keep Q/K/V on the promoted matrix-unit tier's arithmetic. At the
-        // exact B=8/L=1 decode shapes the tight-grid host re-dispatches the
-        // tier's own kernel text with grid.x = 1 (the frozen MLX host launches
-        // 8 x-groups and the tier returns from 7 of them); every other shape
-        // keeps the module's affine_qmv road. Routing Q or K through the older
-        // custom helper would silently bypass the winning kernel.
-        let queryRaw = tierProjection(qProj, queryInput).reshaped(
+        // Keep Q/K/V on the promoted affine_qmv road. The current crown's
+        // matrix-unit tier owns those projections; routing Q or K through the
+        // older custom helper would silently bypass its winning kernel.
+        let queryRaw = qProj(queryInput).reshaped(
             B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
@@ -1354,10 +1332,10 @@ private class Gemma4Attention: Module {
             lastQueryCache == nil
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
-        let kRaw = tierProjection(kProj, x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+        let kRaw = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
         if let vProj {
-            vRaw = tierProjection(vProj, x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            vRaw = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
         } else {
             vRaw = kRaw
         }

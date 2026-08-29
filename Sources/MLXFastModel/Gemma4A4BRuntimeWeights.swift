@@ -296,11 +296,56 @@ public final class Gemma4A4BRuntimeWeightCache {
         eval(model(prefillTokens, cache: caches))
         eval(model(MLXArray([bosToken], [1, 1]), cache: caches))
         warmCohortShapes(model, config: config)
+        warmSpeculativeVerifyWidths(model, config: config)
         // Retire the warm's own buffers HERE, unscored: the trusted
         // phase-start clearCache runs inside the charged window, so any
         // free buffers the warm leaves behind would be deallocated on the
         // measured clock.
         Memory.clearCache()
+    }
+
+    /// Prompt-independent constructor warmup at the scored B=8 SPECULATIVE
+    /// verify widths.
+    ///
+    /// `warmCohortShapes` below builds its engine with no drafter, so every
+    /// shape it compiles is a serial one: `[8, 1024]` for the seed prefill and
+    /// `[8, 1]` for a plain decode round. The measured candidate leg runs the
+    /// mtp arm, where a round hands the target `1 + k` tokens per row and the
+    /// depth controller moves `k` over `0 ... 3`. The verify forwards are
+    /// therefore `[8, 2]`, `[8, 3]` and `[8, 4]`, and none of them is a width
+    /// the serial warm reaches: the quantized row-pair kernels and the routed
+    /// expert gather are selected on the row count, so each first-compiles
+    /// inside a parent-clocked decode window.
+    ///
+    /// The warm primes a throwaway cache to a saturated sliding window first,
+    /// so the widths compile against the same ring geometry the scored rounds
+    /// see rather than an empty cache. Inputs are constant BOS tokens and every
+    /// output is discarded, so this is prompt-independent and cannot affect
+    /// model output; the only durable effect is compiled-pipeline state.
+    private static func warmSpeculativeVerifyWidths(
+        _ model: Gemma4TextModel, config: Gemma4A4BConfig
+    ) {
+        // 1 + maxDraftTokens, the widest verify block the pinned MTP envelope
+        // admits. Held as a literal because the envelope lives in the harness
+        // target, which the model target cannot import.
+        let widestVerifyBlock = 4
+        let batch = 8
+        let bosToken = Int32(config.bosTokenId)
+        let caches = model.newCache(parameters: nil)
+        let seed = MLXArray(
+            Array(
+                repeating: bosToken,
+                count: batch * MLXFastConstants.correctnessPromptTokens),
+            [batch, MLXFastConstants.correctnessPromptTokens]
+        )
+        eval(model(seed, cache: caches))
+        for width in 1 ... widestVerifyBlock {
+            let block = MLXArray(
+                Array(repeating: bosToken, count: batch * width),
+                [batch, width]
+            )
+            eval(model(block, cache: caches))
+        }
     }
 
     /// Prompt-independent constructor warmup at the scored B=8 cohort shapes.

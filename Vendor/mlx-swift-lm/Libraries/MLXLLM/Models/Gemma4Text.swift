@@ -157,6 +157,17 @@ func gemma4ShouldFuseWeightedUnsort(
     requested && gemma4SupportsCoupledExpertOptimizations(config)
 }
 
+/// Decode-only output-axis concat of the exact production sliding-layer Q/K/V
+/// banks. The reflected q/k/v modules remain untouched; the fused bank is an
+/// auxiliary holder used only for BF16 `[8, 1, 2816]` CBv2 decode.
+/// Adapted in isolation from the public FUSE-003 lineage in submission 78a38e7.
+internal let gemma4FuseQKVRequested: Bool = {
+    guard
+        let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_FUSE_QKV"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
 
 /// Chunks shorter than this keep the unnarrowed final layer: the saving
 /// scales with the discarded row count, and tiny chunks are dominated by
@@ -789,6 +800,99 @@ private func gemma4FusedQKVNorm(
     return (outputs[0], outputs[1], outputs[2])
 }
 
+/// Companion of `gemma4QKVNormKernel` for one fused sliding-decode projection
+/// `[8, 1, 8192]`. Per-row RMS arithmetic and BF16 write boundaries are
+/// unchanged; only the input row addressing selects the Q, K, or V bank.
+private let gemma4FusedQKVProjNormKernel = MLXFast.metalKernel(
+    name: "gemma4_b8_qkv_fused_proj_rms_norm_v1",
+    inputNames: ["qkv", "q_weight", "k_weight"],
+    outputNames: ["q_out", "k_out", "v_out"],
+    source: """
+        constexpr uint reads = 4;
+        constexpr uint chunks = Q_HEADS + 2 * K_HEADS;
+        const uint row = threadgroup_position_in_grid.x;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint simd_group = simdgroup_index_in_threadgroup;
+
+        const uint batch = row / chunks;
+        const uint chunk = row - batch * chunks;
+
+        const device T* weight = q_weight;
+        device T* output = q_out;
+        bool weighted = true;
+        uint local_row;
+        if (chunk >= Q_HEADS + K_HEADS) {
+            output = v_out;
+            weighted = false;
+            local_row = batch * K_HEADS + (chunk - Q_HEADS - K_HEADS);
+        } else if (chunk >= Q_HEADS) {
+            weight = k_weight;
+            output = k_out;
+            local_row = batch * K_HEADS + (chunk - Q_HEADS);
+        } else {
+            local_row = batch * Q_HEADS + chunk;
+        }
+
+        const device T* input = qkv + row * D + lid * reads;
+        output += local_row * D + lid * reads;
+        weight += lid * reads;
+
+        float sum = 0.0f;
+        for (uint i = 0; i < reads; ++i) {
+            const float value = float(input[i]);
+            sum += value * value;
+        }
+        sum = simd_sum(sum);
+
+        threadgroup float partials[32];
+        threadgroup float inverse_rms;
+        if (simd_group == 0) partials[lane] = 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) partials[simd_group] = sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            sum = simd_sum(partials[lane]);
+            if (lane == 0) {
+                inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = 0; i < reads; ++i) {
+            const T normalized = T(float(input[i]) * inverse_rms);
+            output[i] = weighted ? weight[i] * normalized : T(1) * normalized;
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+private func gemma4FusedQKVProjNorm(
+    qkv: MLXArray,
+    qWeight: MLXArray,
+    kWeight: MLXArray,
+    eps: Float
+) -> (MLXArray, MLXArray, MLXArray)? {
+    guard eps == 1.0e-6,
+        qkv.dtype == .bfloat16,
+        qWeight.dtype == .bfloat16, kWeight.dtype == .bfloat16,
+        qkv.ndim == 3, qkv.dim(0) == 8, qkv.dim(1) == 1, qkv.dim(2) == 8192,
+        qWeight.shape == [256], kWeight.shape == [256]
+    else { return nil }
+
+    let threads = 256 / 4
+    let rows = 8 * (16 + 8 + 8)
+    let outputs = gemma4FusedQKVProjNormKernel(
+        [qkv, qWeight, kWeight],
+        template: [("T", qkv.dtype), ("D", 256), ("Q_HEADS", 16), ("K_HEADS", 8)],
+        grid: (rows * threads, 1, 1),
+        threadGroup: (threads, 1, 1),
+        outputShapes: [[8, 1, 16, 256], [8, 1, 8, 256], [8, 1, 8, 256]],
+        outputDTypes: [qkv.dtype, qkv.dtype, qkv.dtype]
+    )
+    return (outputs[0], outputs[1], outputs[2])
+}
+
 private class ScaledLinear: Module {
     let weight: MLXArray
     let scalar: Float
@@ -915,6 +1019,30 @@ private func gemma4AttentionFallback(
 
 // MARK: - Attention
 
+/// Non-module holder for the exact production sliding-decode fused [q|k|v]
+/// bank. Keeping the concatenated arrays outside `Module` reflection leaves
+/// the three frozen quantized checkpoint modules and trusted walk unchanged.
+private final class Gemma4FusedQKVOperands {
+    let weight: MLXArray
+    let scales: MLXArray
+    let biases: MLXArray
+    let groupSize: Int
+    let bits: Int
+    let mode: QuantizationMode
+
+    init(
+        weight: MLXArray, scales: MLXArray, biases: MLXArray,
+        groupSize: Int, bits: Int, mode: QuantizationMode
+    ) {
+        self.weight = weight
+        self.scales = scales
+        self.biases = biases
+        self.groupSize = groupSize
+        self.bits = bits
+        self.mode = mode
+    }
+}
+
 private class Gemma4Attention: Module {
     let config: Gemma4TextConfiguration
     let layerIdx: Int
@@ -926,6 +1054,11 @@ private class Gemma4Attention: Module {
     let useKeqV: Bool
     let usesSharedKV: Bool
     let scale: Float
+
+    /// Resolved once on the first exact sliding decode after the projection
+    /// modules have been quantized by the checkpoint loader.
+    private var fusedQKVOperands: Gemma4FusedQKVOperands?
+    private var fusedQKVResolved = false
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
     @ModuleInfo(key: "k_proj") var kProj: Linear?
@@ -1141,6 +1274,59 @@ private class Gemma4Attention: Module {
         return (oProj(output), (keys, values), activePositionOffset)
     }
 
+    /// Resolve the fused sliding Q/K/V bank once. Every guard pins the exact
+    /// production 4-bit/group-64 affine geometry; any near miss permanently
+    /// retains the established split projection path.
+    private func resolveFusedQKVOperands() -> Gemma4FusedQKVOperands? {
+        if fusedQKVResolved { return fusedQKVOperands }
+        fusedQKVResolved = true
+
+        guard gemma4FuseQKVRequested,
+            isSliding, !usesSharedKV, !useKeqV,
+            effectiveHeadDim == 256, nHeads == 16, nKvHeads == 8,
+            config.rmsNormEps == 1.0e-6,
+            let q = qProj as? QuantizedLinear,
+            let k = kProj as? QuantizedLinear,
+            let v = vProj as? QuantizedLinear,
+            let kNorm
+        else { return nil }
+
+        guard q.bits == 4, k.bits == 4, v.bits == 4,
+            q.groupSize == 64, k.groupSize == 64, v.groupSize == 64,
+            q.mode == .affine, k.mode == .affine, v.mode == .affine,
+            q.bias == nil, k.bias == nil, v.bias == nil,
+            let qBiases = q.biases, let kBiases = k.biases, let vBiases = v.biases
+        else { return nil }
+
+        guard q.weight.dtype == .uint32, k.weight.dtype == .uint32,
+            v.weight.dtype == .uint32,
+            q.scales.dtype == .bfloat16, k.scales.dtype == .bfloat16,
+            v.scales.dtype == .bfloat16,
+            qBiases.dtype == .bfloat16, kBiases.dtype == .bfloat16,
+            vBiases.dtype == .bfloat16,
+            q.weight.shape == [4096, 352],
+            k.weight.shape == [2048, 352],
+            v.weight.shape == [2048, 352],
+            q.scales.shape == [4096, 44],
+            k.scales.shape == [2048, 44],
+            v.scales.shape == [2048, 44],
+            qBiases.shape == q.scales.shape,
+            kBiases.shape == k.scales.shape,
+            vBiases.shape == v.scales.shape,
+            qNorm.weight.shape == [256], qNorm.weight.dtype == .bfloat16,
+            kNorm.weight.shape == [256], kNorm.weight.dtype == .bfloat16
+        else { return nil }
+
+        let fused = Gemma4FusedQKVOperands(
+            weight: concatenated([q.weight, k.weight, v.weight], axis: 0),
+            scales: concatenated([q.scales, k.scales, v.scales], axis: 0),
+            biases: concatenated([qBiases, kBiases, vBiases], axis: 0),
+            groupSize: 64, bits: 4, mode: .affine)
+        eval(fused.weight, fused.scales, fused.biases)
+        fusedQKVOperands = fused
+        return fused
+    }
+
     /// ContinuousBatchingV2 attention path. The `CBv2AttendingLayerCache`
     /// owns the KV update AND the attention computation, so this method only
     /// projects/normalizes/ropes Q (and K/V for non-shared layers) and
@@ -1182,8 +1368,6 @@ private class Gemma4Attention: Module {
         let queryInput = lastQueryCache == nil ? x : x[0..., outputStart..., 0...]
         let queryLength = queryInput.dim(1)
 
-        let queryRaw = qProj(queryInput).reshaped(B, queryLength, nHeads, effectiveHeadDim)
-
         if usesSharedKV {
             // KV-shared layer: projects queries only and borrows (K, V) from
             // the source layer's cache at attention time. The RoPE offsets
@@ -1198,6 +1382,8 @@ private class Gemma4Attention: Module {
                     K/V (threaded by Gemma4TextModelInner)
                     """)
             }
+            let queryRaw =
+                qProj(queryInput).reshaped(B, queryLength, nHeads, effectiveHeadDim)
             var queries = qNorm(queryRaw).transposed(0, 2, 1, 3)
             queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: positionOffset)
             let outputDType = queries.dtype
@@ -1244,20 +1430,42 @@ private class Gemma4Attention: Module {
             lastQueryCache == nil
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
-        let kRaw = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
-        let vRaw: MLXArray
-        if let vProj {
-            vRaw = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
-        } else {
-            vRaw = kRaw
-        }
 
-        let normalized = gemma4FusedQKVNorm(
-            q: queryRaw, k: kRaw, v: vRaw,
-            qWeight: qNorm.weight, kWeight: kNorm.weight, eps: config.rmsNormEps)
-        var queries = normalized?.0 ?? qNorm(queryRaw)
-        var k = normalized?.1 ?? kNorm(kRaw)
-        var v = normalized?.2 ?? vNorm(vRaw)
+        var queries: MLXArray
+        var k: MLXArray
+        var v: MLXArray
+        if B == 8, L == 1, lastQueryCache == nil, outputStart == 0,
+            x.dtype == .bfloat16, x.dim(2) == 2816,
+            let bank = resolveFusedQKVOperands(),
+            let normalized = gemma4FusedQKVProjNorm(
+                qkv: quantizedMM(
+                    x, bank.weight, scales: bank.scales, biases: bank.biases,
+                    transpose: true, groupSize: bank.groupSize, bits: bank.bits,
+                    mode: bank.mode),
+                qWeight: qNorm.weight, kWeight: kNorm.weight,
+                eps: config.rmsNormEps)
+        {
+            queries = normalized.0
+            k = normalized.1
+            v = normalized.2
+        } else {
+            let queryRaw =
+                qProj(queryInput).reshaped(B, queryLength, nHeads, effectiveHeadDim)
+            let kRaw = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            let vRaw: MLXArray
+            if let vProj {
+                vRaw = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            } else {
+                vRaw = kRaw
+            }
+
+            let normalized = gemma4FusedQKVNorm(
+                q: queryRaw, k: kRaw, v: vRaw,
+                qWeight: qNorm.weight, kWeight: kNorm.weight, eps: config.rmsNormEps)
+            queries = normalized?.0 ?? qNorm(queryRaw)
+            k = normalized?.1 ?? kNorm(kRaw)
+            v = normalized?.2 ?? vNorm(vRaw)
+        }
 
         queries = queries.transposed(0, 2, 1, 3)
         queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: queryPositionOffset)

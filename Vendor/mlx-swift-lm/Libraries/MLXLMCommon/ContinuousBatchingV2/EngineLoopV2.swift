@@ -1013,7 +1013,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
     }
 
-    // MARK: The step loop
+    // Local diagnostics only (armed by CBV2_STEP_PROFILE): dump a rolling
+    // 48-step phase table to stderr so steady-state steps are decomposable
+    // after the warm phase's first-touch compiles have flushed.
+    private var profileDumpTick = 0
 
     private func engineStep() {
         guard running else { return }
@@ -1024,6 +1027,13 @@ public final class EngineLoopV2: @unchecked Sendable {
             if CBv2StepProfiler.enabled {
                 CBv2StepProfiler.record(
                     "v2.step.wall", seconds: CFAbsoluteTimeGetCurrent() - stepStart)
+                profileDumpTick &+= 1
+                if profileDumpTick % 48 == 0 {
+                    FileHandle.standardError.write(
+                        Data(("[step-profile tick \(profileDumpTick)]\n"
+                            + CBv2StepProfiler.summaryTable() + "\n").utf8))
+                    CBv2StepProfiler.reset()
+                }
             }
         }
 

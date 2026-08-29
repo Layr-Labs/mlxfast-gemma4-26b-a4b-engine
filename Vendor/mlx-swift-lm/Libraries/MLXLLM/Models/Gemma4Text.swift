@@ -1728,6 +1728,7 @@ private enum Gemma4FusedLayerGlue {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    // The cohort width and the model width these kernels are written for.
     private static let rows = 8
     private static let axis = 2816
     private static let eps: Float = 1e-6

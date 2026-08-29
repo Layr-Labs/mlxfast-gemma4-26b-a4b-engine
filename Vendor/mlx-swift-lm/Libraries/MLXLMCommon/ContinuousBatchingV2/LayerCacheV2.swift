@@ -241,6 +241,42 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         CBv2CoreInstrumentation.recordPositionOffsetsHostRebuild()
         positionOffsetsState.rebuild(from: rows)
     }
+
+    /// Append only the cache roots that can acquire a new lazy value in an
+    /// all-contiguous bank.  The bank owns the proof that every cache shares
+    /// one position chain, so only its canonical advancing layer contributes
+    /// that root.  A decode-ring fence changes only for an unborrowed sliding
+    /// owner: full-attention caches have no ring, borrowing caches own no rows,
+    /// and a source retained for borrowers is explicitly refused by the fused
+    /// in-place writer.
+    ///
+    /// This is intentionally bank-only.  `innerState()` below keeps its
+    /// standalone contract unchanged for custom providers and tests.
+    func appendBankEvaluationRoots(
+        to roots: inout [MLXArray], includeSharedPositionRoot: Bool
+    ) {
+        if includeSharedPositionRoot {
+            roots.append(positionOffsetsState.value)
+        }
+
+        let canAdvanceDecodeRingFence: Bool
+        switch kind.attention {
+        case .slidingWindow:
+            canAdvanceDecodeRingFence =
+                kind.sharesKVWithLayer == nil && !retainsChunkForBorrowers
+        case .full:
+            canAdvanceDecodeRingFence = false
+        }
+        if canAdvanceDecodeRingFence {
+            roots.append(decodeRingWriteFence.value)
+        }
+
+        for row in rows {
+            if let provider = row as? CBv2InnerStateProviding {
+                roots.append(contentsOf: provider.cbv2InnerState())
+            }
+        }
+    }
 }
 
 // MARK: - Borrower retention (fused ring-write eligibility)

@@ -58,6 +58,16 @@ extension CBv2LayerCacheProvider {
     public var supportsPackedMultimodalSpans: Bool { false }
 }
 
+/// Optional provider-side fast path for the arrays that must be submitted as
+/// cache evaluation roots after a forward.  The generic loop cannot know when
+/// several layer caches deliberately share one state object, so its fallback
+/// asks every cache independently.  A bank that owns that sharing relation can
+/// return the same dependency set without duplicate roots or per-cache
+/// temporary arrays.
+protocol CBv2CacheEvaluationRootsProvider: AnyObject {
+    func cacheEvaluationRoots() -> [MLXArray]
+}
+
 // MARK: - Sampler interface (WS-E's CBv2DefaultSampler is the production impl)
 
 /// Samples next tokens from last-position logits [B, vocab] → lazy token
@@ -1293,7 +1303,10 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// of unevaluated graph — the DAR-325 bug class (legacy `BatchKVCache`
     /// had exactly this). Empty for caches that vend no inner state (mocks).
     func eagerCacheInnerState(_ caches: [CBv2AttendingLayerCache]) -> [MLXArray] {
-        caches.flatMap { ($0 as? KVCache)?.innerState() ?? [] }
+        if let compact = cacheProvider as? CBv2CacheEvaluationRootsProvider {
+            return compact.cacheEvaluationRoots()
+        }
+        return caches.flatMap { ($0 as? KVCache)?.innerState() ?? [] }
     }
 
     /// Last-position logits [B, vocab] for a rectangular [B, 1] decode

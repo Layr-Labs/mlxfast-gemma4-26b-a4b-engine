@@ -19,6 +19,7 @@
 // Engine-thread-confined (no locking) — the loop is the only caller.
 
 import Foundation
+import MLX
 
 /// A layer-cache provider whose composition fingerprint can be forced
 /// stale. The engine loop invalidates when rows advanced OUTSIDE the
@@ -257,5 +258,39 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
         }
         contiguous.setRows(
             rows, rebuildPositionOffsets: cache.layerIndex == unifiedPositionLayerIndex)
+    }
+}
+
+// MARK: - Compact evaluation roots
+
+extension CBv2LayerCacheBank: CBv2CacheEvaluationRootsProvider {
+    /// Collect the all-contiguous bank's dependency roots once per logical
+    /// state object instead of once per layer cache.  For Gemma 4's 30-layer
+    /// bank this removes 29 duplicate position roots and every inert
+    /// full/borrowing-layer ring fence from each decode submission.  Row K/V
+    /// roots remain untouched and in layer/row order.
+    func cacheEvaluationRoots() -> [MLXArray] {
+        guard let canonicalLayer = unifiedPositionLayerIndex else {
+            // Mixed, paged, and custom banks retain the exact generic contract.
+            return caches.flatMap { ($0 as? KVCache)?.innerState() ?? [] }
+        }
+
+        let contiguous = caches.compactMap { $0 as? CBv2LayerCache }
+        precondition(
+            contiguous.count == caches.count,
+            "CBv2LayerCacheBank: unified position state requires an all-contiguous bank")
+
+        // Two K/V roots per bound row dominate this list.  Reserving their
+        // common count avoids the repeated growth caused by thirty temporary
+        // per-cache arrays without depending on a row implementation detail.
+        let rowRootCapacity = contiguous.reduce(0) { $0 + $1.rows.count * 2 }
+        var roots: [MLXArray] = []
+        roots.reserveCapacity(1 + contiguous.count + rowRootCapacity)
+        for cache in contiguous {
+            cache.appendBankEvaluationRoots(
+                to: &roots,
+                includeSharedPositionRoot: cache.layerIndex == canonicalLayer)
+        }
+        return roots
     }
 }

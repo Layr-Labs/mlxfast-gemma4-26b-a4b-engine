@@ -93,6 +93,14 @@ public class ProportionalRoPE: Module, OffsetLayer, ArrayOffsetLayer {
     let rotatedDims: Int
     let _freqs: MLXArray?
 
+    /// The exact float32 divisor table consumed by `MLXFast.RoPE`.
+    ///
+    /// Gemma 4's decode terminal reuses this array when it fuses RMSNorm and
+    /// RoPE. Sharing the already-constructed table preserves both the `/dims`
+    /// proportional frequencies and the `+inf` pass-through entries used by
+    /// partial rotary attention.
+    public var frequencies: MLXArray? { _freqs }
+
     init(
         dims: Int,
         traditional: Bool = false,

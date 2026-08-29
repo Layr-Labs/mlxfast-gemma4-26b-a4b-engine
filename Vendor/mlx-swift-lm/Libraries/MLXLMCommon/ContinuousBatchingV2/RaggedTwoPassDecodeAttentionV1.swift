@@ -1,7 +1,3 @@
-// Box-draw entry #3 on the unmodified crown content. Entry #2 (4198c2b2)
-// drew the fast-serial box — the line's eighth consecutive — and sealed
-// candidate decode ~2.2276, the crown's own content level, as the ledger
-// predicts. Submitted off-cadence to decouple from any scheduler phase.
 // RaggedTwoPassDecodeAttentionV1.swift
 //
 // Batch-wide dispatch of MLX's established two-pass vector attention for the

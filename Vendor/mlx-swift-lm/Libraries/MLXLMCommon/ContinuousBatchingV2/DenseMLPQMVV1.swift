@@ -24,6 +24,21 @@
 // shape or quantization geometry fails closed to the prior path. Selected
 // arrays are normalized to row-contiguous layout by `MLXFast.metalKernel`.
 //
+// DMLP-003 changes only the gate/up plane's two 4-row workers to a 3+3+2
+// launch. A public cross-row study measured 319/437/216 us for M=7/8/9:
+// three-lane groups did more work at M=9 yet ran faster than M=8, identifying
+// a register cliff rather than ordinary work scaling. Separate triple- and
+// pair-stream bodies let Metal allocate each group's narrower register set.
+//
+// Each surviving row keeps the quad body's exact statement sequence: the same
+// `load_vector`, qdot loop, ascending K blocks, aligned tail and `simd_sum`
+// close update an independent result array. Moving rows into 3+3+2 therefore
+// cannot change their scalar accumulation chains. The activation-sum twins
+// replace only each row's already-bit-exact four-value sum, as in DMLP-002.
+// `DARKBLOOM_CBV2_DENSE_MLP_IPG3=0` restores the 4+4 gate/up path byte for
+// byte. The down plane and its quad fallback are out of scope. Ranked receipts:
+// 85d5bca3 (2.91143) and yzxoi (2.92675).
+//
 // MMA-MLP-001-DOWN adds a second body under the same dispatch and the same
 // guards: an 8-bit affine g64 simdgroup-matrix (`simdgroup_float8x8`) tier that
 // serves all eight cohort rows from ONE weight fetch, engaged on the DOWN plane
@@ -48,6 +63,13 @@ public enum CBv2DenseMLPQMVV1 {
     public static let activationSumsEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_DENSE_MLP_XSUM"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    public static let ipg3Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_DENSE_MLP_IPG3"]
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
@@ -92,6 +114,9 @@ public enum CBv2DenseMLPQMVV1 {
     private static let groupSize = 64
     private static let bits = 8
     private static let rowsPerGroup = 4
+    private static let ipg3RowsPerGroup = 3
+    private static let ipg3XGroups =
+        (batch + ipg3RowsPerGroup - 1) / ipg3RowsPerGroup
     private static let simdWidth = 32
     private static let simdGroups = 2
     private static let outputsPerGroup = 8
@@ -273,6 +298,129 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
 }
 """
 
+    /// DMLP-003 derives the two narrow bodies by deleting complete stream-local
+    /// fragments from the incumbent quad body. Every retained statement is
+    /// therefore the quad statement for that same stream, rather than a manual
+    /// transcription that could silently reassociate an accumulation.
+    private static let ipg3NarrowBodies: (triple: String, pair: String) = {
+        let quadMarker = """
+        template <typename T, const int group_size, const int bits>
+        METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
+        """
+        precondition(
+            kernelHeader.components(separatedBy: quadMarker).count == 2,
+            "DMLP-003 quad-body marker must occur exactly once")
+        guard let quadStart = kernelHeader.range(of: quadMarker)?.lowerBound else {
+            preconditionFailure("DMLP-003 quad-body marker is missing")
+        }
+
+        let quadBody = String(kernelHeader[quadStart...])
+
+        func replaceExactly(
+            _ old: String,
+            with new: String,
+            in source: inout String,
+            expectedCount: Int,
+            context: String
+        ) {
+            let count = source.components(separatedBy: old).count - 1
+            precondition(
+                count == expectedCount,
+                "DMLP-003 \(context) marker count \(count), expected \(expectedCount)")
+            source = source.replacingOccurrences(of: old, with: new)
+        }
+
+        func removeStream(_ stream: Int, from source: inout String, body: String) {
+            replaceExactly(
+                "    const device T* x\(stream),\n",
+                with: "",
+                in: &source,
+                expectedCount: 1,
+                context: "\(body) x\(stream) parameter")
+            replaceExactly(
+                "    device T* y\(stream),\n",
+                with: "",
+                in: &source,
+                expectedCount: 1,
+                context: "\(body) y\(stream) parameter")
+            replaceExactly(
+                "  thread float result\(stream)[results_per_simdgroup] = {0};\n",
+                with: "",
+                in: &source,
+                expectedCount: 1,
+                context: "\(body) result\(stream) declaration")
+            replaceExactly(
+                "  x\(stream) += simd_lid * values_per_thread;\n",
+                with: "",
+                in: &source,
+                expectedCount: 1,
+                context: "\(body) x\(stream) lane offset")
+            replaceExactly(
+                "  y\(stream) += out_row;\n",
+                with: "",
+                in: &source,
+                expectedCount: 1,
+                context: "\(body) y\(stream) row offset")
+            replaceExactly(
+                """
+                    sum = load_vector<T, float, values_per_thread, 8>(x\(stream), x_thread);
+                    for (int row = 0; row < results_per_simdgroup; row++) {
+                      result\(stream)[row] += qdot_affine8_registered<float, values_per_thread>(
+                          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+                    }
+                """,
+                with: "",
+                in: &source,
+                expectedCount: 2,
+                context: "\(body) stream-\(stream) qdot block")
+            replaceExactly(
+                "  x\(stream) += block_size;\n",
+                with: "",
+                in: &source,
+                expectedCount: 1,
+                context: "\(body) x\(stream) K advance")
+            replaceExactly(
+                "    result\(stream)[row] = simd_sum(result\(stream)[row]);\n",
+                with: "",
+                in: &source,
+                expectedCount: 1,
+                context: "\(body) result\(stream) simd close")
+            replaceExactly(
+                "      y\(stream)[row] = static_cast<T>(result\(stream)[row]);\n",
+                with: "",
+                in: &source,
+                expectedCount: 1,
+                context: "\(body) y\(stream) store")
+        }
+
+        var triple = quadBody
+        replaceExactly(
+            "qmv_affine8_g64_quad_stream_impl",
+            with: "qmv_affine8_g64_triple_stream_impl",
+            in: &triple,
+            expectedCount: 1,
+            context: "triple function name")
+        removeStream(3, from: &triple, body: "triple")
+
+        var pair = triple
+        replaceExactly(
+            "qmv_affine8_g64_triple_stream_impl",
+            with: "qmv_affine8_g64_pair_stream_impl",
+            in: &pair,
+            expectedCount: 1,
+            context: "pair function name")
+        removeStream(2, from: &pair, body: "pair")
+
+        return (triple, pair)
+    }()
+
+    /// The IPG3 source retains the incumbent quad body first, followed by the
+    /// separate triple and pair METAL_FUNCs so each narrow body receives its
+    /// own register allocation.
+    private static let ipg3KernelHeader = kernelHeader
+        + "\n" + ipg3NarrowBodies.triple
+        + "\n" + ipg3NarrowBodies.pair
+
     /// DMLP-002 keeps DMLP-001's kernel text intact and derives a second body
     /// which replaces only the four-value activation sum. The x values are
     /// still loaded into the same register array, in the same order, and every
@@ -372,6 +520,90 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
             result = result.replacingOccurrences(of: old, with: new)
         }
         return result
+    }()
+
+    /// DMLP-003 xsum twins are scoped to the new bodies. The transforms have
+    /// exact marker counts so a source drift cannot partially derive a kernel.
+    private static let ipg3ActivationSumKernelHeader: String = {
+        func replaceExactly(
+            _ old: String,
+            with new: String,
+            in source: inout String,
+            expectedCount: Int,
+            context: String
+        ) {
+            let count = source.components(separatedBy: old).count - 1
+            precondition(
+                count == expectedCount,
+                "DMLP-003 xsum \(context) marker count \(count), expected \(expectedCount)")
+            source = source.replacingOccurrences(of: old, with: new)
+        }
+
+        func transform(
+            _ body: String,
+            streamCount: Int,
+            name: String
+        ) -> String {
+            var result = body
+            replaceExactly(
+                "qmv_affine8_g64_\(name)_stream_impl",
+                with: "qmv_affine8_g64_\(name)_stream_xsum_impl",
+                in: &result,
+                expectedCount: 1,
+                context: "\(name) function name")
+            replaceExactly(
+                """
+                    const device T* biases,
+                    const device T* x0,
+                """,
+                with: """
+                    const device T* biases,
+                    const device float* x_sums,
+                    const device T* x0,
+                """,
+                in: &result,
+                expectedCount: 1,
+                context: "\(name) x_sums parameter")
+            replaceExactly(
+                """
+                  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+                      simd_gid * results_per_simdgroup;
+                """,
+                with: """
+                  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+                      simd_gid * results_per_simdgroup;
+                  const int first_m = int(tid.x) * 3;
+                """,
+                in: &result,
+                expectedCount: 1,
+                context: "\(name) first_m insertion")
+
+            for stream in 0..<streamCount {
+                let declaration = stream == 0 ? "float sum" : "sum"
+                let offset = stream == 0 ? "" : " + \(stream)"
+                replaceExactly(
+                    "\(declaration) = load_vector<T, float, values_per_thread, 8>(x\(stream), x_thread);",
+                    with: """
+                    load_affine8_values<T, float, values_per_thread>(x\(stream), x_thread);
+                    \(declaration) = x_sums[
+                        ((k / block_size) * SIMD_SIZE + int(simd_lid)) * 8 + first_m\(offset)];
+                    """,
+                    in: &result,
+                    expectedCount: 2,
+                    context: "\(name) stream-\(stream) activation load")
+            }
+            return result
+        }
+
+        let triple = transform(
+            ipg3NarrowBodies.triple,
+            streamCount: 3,
+            name: "triple")
+        let pair = transform(
+            ipg3NarrowBodies.pair,
+            streamCount: 2,
+            name: "pair")
+        return activationSumKernelHeader + "\n" + triple + "\n" + pair
     }()
 
     /// MMA-MLP-001. Verbatim transcription of the `kGemma4QmvMma8Affine8`
@@ -657,6 +889,56 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         ensureRowContiguous: true
     )
 
+    private static let ipg3Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_ipg3_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+
+            const int in_vec_size = x_shape[x_ndim - 1];
+            const int out_vec_size = w_shape[0];
+            const int first_m = int(tid.x) * 3;
+            if (first_m >= 8) {
+                return;
+            }
+            if (first_m + 3 <= 8) {
+                qmv_affine8_g64_triple_stream_impl<T, 64, 8>(
+                    w,
+                    scales,
+                    biases,
+                    x + first_m * in_vec_size,
+                    x + (first_m + 1) * in_vec_size,
+                    x + (first_m + 2) * in_vec_size,
+                    y + first_m * out_vec_size,
+                    y + (first_m + 1) * out_vec_size,
+                    y + (first_m + 2) * out_vec_size,
+                    in_vec_size,
+                    tid,
+                    simd_gid,
+                    simd_lid);
+            } else {
+                qmv_affine8_g64_pair_stream_impl<T, 64, 8>(
+                    w,
+                    scales,
+                    biases,
+                    x + first_m * in_vec_size,
+                    x + (first_m + 1) * in_vec_size,
+                    y + first_m * out_vec_size,
+                    y + (first_m + 1) * out_vec_size,
+                    in_vec_size,
+                    tid,
+                    simd_gid,
+                    simd_lid);
+            }
+            return;
+            """,
+        header: ipg3KernelHeader,
+        ensureRowContiguous: true
+    )
+
     /// One exact float sum for each `(K/128 block, simd lane, cohort row)`.
     /// The expression is the bits==8 arm of stock `load_vector`: a float zero
     /// followed by four ascending `sum += bf16` operations. Row is the unit-
@@ -716,6 +998,58 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
             return;
             """,
         header: activationSumKernelHeader,
+        ensureRowContiguous: true
+    )
+
+    private static let ipg3XSumKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_ipg3_xsum_v1",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+
+            const int in_vec_size = x_shape[x_ndim - 1];
+            const int out_vec_size = w_shape[0];
+            const int first_m = int(tid.x) * 3;
+            if (first_m >= 8) {
+                return;
+            }
+            if (first_m + 3 <= 8) {
+                qmv_affine8_g64_triple_stream_xsum_impl<T, 64, 8>(
+                    w,
+                    scales,
+                    biases,
+                    xSums,
+                    x + first_m * in_vec_size,
+                    x + (first_m + 1) * in_vec_size,
+                    x + (first_m + 2) * in_vec_size,
+                    y + first_m * out_vec_size,
+                    y + (first_m + 1) * out_vec_size,
+                    y + (first_m + 2) * out_vec_size,
+                    in_vec_size,
+                    tid,
+                    simd_gid,
+                    simd_lid);
+            } else {
+                qmv_affine8_g64_pair_stream_xsum_impl<T, 64, 8>(
+                    w,
+                    scales,
+                    biases,
+                    xSums,
+                    x + first_m * in_vec_size,
+                    x + (first_m + 1) * in_vec_size,
+                    y + first_m * out_vec_size,
+                    y + (first_m + 1) * out_vec_size,
+                    in_vec_size,
+                    tid,
+                    simd_gid,
+                    simd_lid);
+            }
+            return;
+            """,
+        header: ipg3ActivationSumKernelHeader,
         ensureRowContiguous: true
     )
 
@@ -812,12 +1146,22 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
             )[0]
         }
 
-        let xGroups = batch / rowsPerGroup
+        // DMLP-003 is gate/up-only. Its three x threadgroups own rows 0...2,
+        // 3...5 and 6...7; disabling it selects the incumbent objects and 4+4
+        // grid below, while down always retains that same fallback.
+        let useIPG3 = ipg3Enabled && isGateUp
+        let xGroups = useIPG3 ? ipg3XGroups : batch / rowsPerGroup
         let yGroups = outDim / outputsPerGroup
         let useActivationSums = activationSums != nil
             && inDim == 2816
             && outDim == 2112
-        let selected = useActivationSums ? activationSumQMVKernel : kernel
+        let selected: MLXFast.MLXFastKernel
+        if useIPG3 {
+            CBv2EngageMark.once("ipg3-gateup")
+            selected = useActivationSums ? ipg3XSumKernel : ipg3Kernel
+        } else {
+            selected = useActivationSums ? activationSumQMVKernel : kernel
+        }
         let inputs = useActivationSums
             ? [x, weight, scales, biases, activationSums!.values]
             : [x, weight, scales, biases]

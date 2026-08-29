@@ -371,31 +371,30 @@ enum CBv2AttentionV1 {
                 return concatenated(outputs, axis: 0)
             }
 
-            // D512-SDPA: batched 3-dispatch full-attention decode with the
-            // unfused chain's exact numerics (kill switch:
-            // DARKBLOOM_GEMMA4_D512_DECODE_SDPA=0). Precedes ATT-008 so rows
-            // stay unpooled; pooled rows fail its gate closed.
-            if let output = CBv2RaggedComposedD512DecodeAttentionV1.updateAndAttend(
-                rows: rows, kind: kind,
-                queries: queries, keys: keys, values: values,
-                scale: scale, sinks: effectiveSinks, softcap: softcap)
-            {
-                CBv2EngageMark.once("d512sdpa")
-                return output
-            }
-
-            // ATT-008: batch-wide FULL-attention decode. One pooled append +
-            // one batched call replaces 8 per-row appends + 8 row-local
-            // composed SDPA graphs, with bit-identical per-row numerics (see
-            // `batchedFullDecodeUpdateAndAttend`). Fails closed to the
-            // established per-row loop below, which stays correct on pooled
-            // and unpooled rows alike.
+            // ATT-008 first: pooled D=512 vector 2-pass over the cohort
+            // buffers. Default OFF (`DARKBLOOM_GEMMA4_BATCHED_FULL_ATTENTION`);
+            // when on, this must precede the ragged D512 path or the latter
+            // consumes unpooled rows and ATT-008 never fires. Host SDPA
+            // still will not pick D=512, so this launches 2pass/single-pass
+            // itself. Sliding D=256 fusedRingWrite is untouched above.
             if let output = batchedFullDecodeUpdateAndAttend(
                 rows: rows, kind: kind,
                 queries: queries, keys: keys, values: values,
                 scale: scale, sinks: effectiveSinks, softcap: softcap)
             {
                 CBv2EngageMark.once("att008")
+                return output
+            }
+
+            // D512-SDPA: ragged vector 2-pass / single-pass full-attention
+            // decode (kill switch: DARKBLOOM_GEMMA4_D512_DECODE_SDPA=0).
+            // Live ranked path: default ON, B=8 full-attn, unpooled rows.
+            if let output = CBv2RaggedComposedD512DecodeAttentionV1.updateAndAttend(
+                rows: rows, kind: kind,
+                queries: queries, keys: keys, values: values,
+                scale: scale, sinks: effectiveSinks, softcap: softcap)
+            {
+                CBv2EngageMark.once("d512sdpa")
                 return output
             }
 
@@ -897,28 +896,12 @@ enum CBv2AttentionV1 {
     /// full-attention decode cohort (B=8, 16 query heads, 2 KV heads, D=512,
     /// bf16, scale 1.0, no sinks/softcap, mask-free L=1).
     ///
-    /// D=512 has NO fused SDPA kernel (`sdpa_vector` supports 64/96/128/256),
-    /// so `MLXFast.scaledDotProductAttention` always lowers these calls to
-    /// the fast.cpp fallback graph: scale-multiply → GQA unflatten →
-    /// `matmul` QKᵀ (gemv) → precise softmax → `matmul` scores·V (gemv_t).
-    /// That graph is shape-generic in the batch extent, and for these M=1
-    /// shapes every Metal dispatch decision it reaches — the gemv/gemv_t
-    /// block configuration, the `gemv_al` alignment gate (requires
-    /// `batch_size_out == 1`, never true here), the softmax variant and
-    /// threadgroup size (functions of the key length only), and the
-    /// `check_transpose` no-copy branches — depends only on
-    /// (M, N, K, dtype, last-two-dim strides), never on the batch extent,
-    /// which only scales `grid.z` / the row count. Issuing ONE B=8 call over
-    /// the pooled `[8, 2, kL, 512]` views therefore reproduces each row's
-    /// per-output add order bit-exactly BY CONSTRUCTION (verified uint16-
-    /// identical against the per-row chain at kL ∈ {1024, 1025, 1100, 1152}
-    /// and across simulated append steps).
-    ///
-    /// Per full layer per decode step this replaces 8×2 per-row cache slice
-    /// assignments + 8 row-local 4-dispatch attention graphs + 1 output
-    /// concat (~49 dispatches) with 2 slice assignments + 1 batched 4-dispatch
-    /// graph (~6), with zero per-step copies (the pool is written in place;
-    /// rows migrate once per cohort).
+    /// Host `MLXFast.scaledDotProductAttention` will not pick D=512 (frozen
+    /// `sdpa_vector_supported_head_dim` is 64/96/128/256), so this path
+    /// launches `sdpa_vector_2pass_1` then `sdpa_vector_2pass_2` (or
+    /// single-pass `sdpa_vector` when kL < 1024 on M-series) over the pool's
+    /// per-row contiguous buffers — same decode-time split as the host, same
+    /// BD=32 / BN=32 / qk_per_thread=16 instantiation.
     ///
     /// Fails closed (returns nil, caller keeps the pinned per-row loop) on
     /// any other batch size, geometry, dtype, scale, sinks, softcap,
@@ -932,6 +915,7 @@ enum CBv2AttentionV1 {
         scale: Float, sinks: MLXArray?, softcap: Float?
     ) -> MLXArray? {
         guard batchedFullDecodeEnabled,
+            CBv2RaggedComposedD512DecodeAttentionV1.isPrepared,
             rows.count == 8,
             scale == 1.0,
             sinks == nil,
@@ -964,16 +948,28 @@ enum CBv2AttentionV1 {
             return nil
         }
 
+        let keyLength = offset + 1
         pool.batchAppend(keys: keys, values: values, at: offset)
         for row in fullRows {
             row.confirmPooledBatchAppend(1)
         }
 
-        let (cachedKeys, cachedValues) = pool.batchViews(upTo: offset + 1)
-        return attend(
-            queries: queries, keys: cachedKeys, values: cachedValues,
-            scale: scale, L: 1, kL: offset + 1, window: nil,
-            sinks: nil, softcap: nil)
+        var keyBuffers: [MLXArray] = []
+        var valueBuffers: [MLXArray] = []
+        keyBuffers.reserveCapacity(8)
+        valueBuffers.reserveCapacity(8)
+        for index in 0 ..< 8 {
+            keyBuffers.append(pool.keys[index ..< (index + 1)])
+            valueBuffers.append(pool.values[index ..< (index + 1)])
+        }
+        guard let output = CBv2RaggedComposedD512DecodeAttentionV1.attendVector(
+            queries: queries, keys: keyBuffers, values: valueBuffers,
+            keyLength: keyLength, scale: scale)
+        else {
+            preconditionFailure(
+                "CBv2AttentionV1: D=512 vector SDPA refused after pooled append")
+        }
+        return output
     }
 
     /// The only shape for which the custom batch-wide dispatch is a literal

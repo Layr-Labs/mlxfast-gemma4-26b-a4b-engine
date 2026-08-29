@@ -573,69 +573,26 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
 
 /// D512-SDPA: batch-wide FULL-attention decode for the exact Gemma 4 decode
 /// cohort (B=8, 16 query heads, 2 KV heads, D=512, GQA=8, bf16, scale 1.0,
-/// no sinks/softcap, mask-free L=1) as THREE batched dispatches per layer
-/// with the numerics of the UNFUSED chain.
+/// no sinks/softcap, mask-free L=1).
 ///
-/// D=512 has NO fused SDPA kernel (`sdpa_vector` supports 64/96/128/256), so
-/// the serial control leg lowers every one of these calls to the fast.cpp
-/// fallback graph (fast.cpp:717-790): scale-multiply (scale == 1.0 — an
-/// exact bf16 identity) → GQA unflatten → `matmul` QKᵀ → precise softmax →
-/// `matmul` scores·V. These kernels are an EXACT TRANSCRIPTION of the three
-/// Metal kernels the frozen host picks for those ops at these shapes — not a
-/// re-derivation:
-///
-/// 1. QKᵀ at M=1/N=kL/K=512 routes to `gemv` (matmul.cpp:1307) with
-///    bm=4/bn=1/sm=1/sn=32/tm=4/tn=4 (kL < 4096 keeps bm=4; the `gemv_al`
-///    twin needs `batch_size_out == 1` and can never fire here). Per score:
-///    each of 32 lanes accumulates an ordered fp32 chain of 16 products
-///    (4 K-blocks of 128 × TN=4 columns, `result += bf16·float`), then a
-///    shuffle-down butterfly (16,8,4,2,1) folds the lanes; lane 0 stores
-///    bf16 (mlx-generated/gemv.cpp:1297-1436, GEMVKernel).
-/// 2. softmax over kL routes to `block_softmax_precise_bfloat16`
-///    (kL ≤ 4096 → non-looped; softmax.cpp:64-68 sizes the threadgroup at
-///    32·ceil(ceil(kL/4)/32) ≤ 1024). Per row: thread t owns elements
-///    [4t, 4t+4) (pad -inf), fp32 max/sum via simd_max/simd_sum plus a
-///    32-slot cross-simdgroup reduce, output = bf16(exp·(1/sum))
-///    (kernels/softmax.h `softmax_single_row`, AccT=float, N_READS=4).
-/// 3. scores·V at M=1/N=512/K=kL routes to `gemv_t` with
-///    bm=1/bn=4/sm=8/sn=4/tm=4/tn=4 (out=512 → bn=4; kL < 8192 → sm=8/sn=4).
-///    Per output element: 8 thrM lanes accumulate ordered fp32 chains over
-///    K rows {thrM·4+tm+32·i}, then a shuffle-down butterfly (16,8,4) folds
-///    them; thrM==0 stores bf16 (mlx-generated/gemv.cpp:1486-1623,
-///    GEMVTKernel).
-///
-/// What changes vs. the per-row chain is LOADS ONLY (the promoted-kernel
-/// invariant: loads may be shared/reordered, adds may not move):
-/// - The QKᵀ kernel computes all 8 query heads of a GQA group in one
-///   threadgroup, so each K tile is loaded ONCE instead of 8×. Every score
-///   keeps its own accumulators, its own per-lane chain, and the stock
-///   butterfly — bit-identical per output.
-/// - The AV kernel likewise shares each V tile across the 8 heads.
-/// - The bf16 score/probability rows ride a `[8, 16, 1, kL]` device scratch
-///   (the unfused chain materializes the identical bf16 values in its own
-///   intermediates); every rounding point (each score, each probability,
-///   each output element) is reproduced with explicit casts.
-/// This cuts the ~288 MB of 8×-redundant SLC traffic per layer to ~37 MB
-/// and ~41 dispatches to 3. kL and the per-row buffer capacities are
-/// RUNTIME scalars (a tiny uint32 params array), so the per-step kL growth
-/// (lockstep 1024 + step) never recompiles a pipeline; only the
-/// launch geometry (chunk count, softmax threadgroup size) varies per call.
-///
-/// Parity: verified uint16 bit-exact against the per-row unfused chain at
-/// kL ∈ {1024, 1027, 1100, 1152, 1055, 2048, 4095} with per-row capacities
-/// ≠ kL and poisoned buffer tails (any out-of-bounds read would show), and
-/// deterministic across repeat dispatch (the duplicate tail-row writes are
-/// value-identical by construction). Directional chained timing at kL=1100:
-/// ~131 µs/layer saved vs. the per-row chain (~940 → ~300 µs per
-/// 5-layer step).
+/// The AOT metallib now exports `sdpa_vector_*_512_512` and
+/// `sdpa_vector_2pass_{1,2}_*_512`, but the frozen host gate
+/// (`sdpa_vector_supported_head_dim`) still only lists 64/96/128/256, so
+/// `MLXFast.scaledDotProductAttention` will not pick D=512. This helper
+/// launches the same kernels the host would: `sdpa_vector_2pass_1` then
+/// `sdpa_vector_2pass_2` when `kL >= 1024` on M-series (else single-pass
+/// `sdpa_vector`), transcribed at BD=32 / BN=32 / `qk_per_thread = D/BD = 16`
+/// — the template already legal at D=512, never instantiated until now.
+/// Decode-time split, not a compile-time macro. kL and per-row capacities
+/// stay RUNTIME scalars so lockstep growth never recompiles a pipeline.
 ///
 /// Fails closed (nil → caller keeps the pinned per-row loop, byte-preserved)
-/// on: env kill-switch (DEFAULT ON), any other batch size,
-/// geometry, dtype, scale, sinks, softcap, bidirectional kind, non-full
-/// kind, non-`CBv2FullSequenceKV` rows, ATT-008-pooled rows, offsets not in
-/// lockstep, kL outside [4, 4095] (the transcribed kernel-selection window),
-/// or missing/mismatched backing buffers. All gates are checked BEFORE any
-/// append, so failing closed can never leave a double-append behind.
+/// on: env kill-switch (DEFAULT ON), any other batch size, geometry, dtype,
+/// scale, sinks, softcap, bidirectional kind, non-full kind,
+/// non-`CBv2FullSequenceKV` rows, ATT-008-pooled rows, offsets not in
+/// lockstep, or missing/mismatched backing buffers. All gates are checked
+/// BEFORE any append, so failing closed can never leave a double-append
+/// behind. Sliding D=256 `fusedRingWrite` / `attendRingWriting` is untouched.
 enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// Kill switch: `DARKBLOOM_GEMMA4_D512_DECODE_SDPA` set to
     /// `0`/`false`/`no`/`off` restores the established per-row chain.
@@ -647,363 +604,393 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// True when the vector launch can fire (kill-switch, block count).
+    /// Callers that append first must check this before mutating KV.
+    static var isPrepared: Bool {
+        enabled && blocks > 0 && blocks.isMultiple(of: 32)
+    }
+
     private static let batch = 8
     private static let queryHeads = 16
     private static let kvHeads = 2
     private static let gqa = 8
     private static let headDim = 512
 
-    /// kL bounds that keep every frozen-host kernel decision inside the
-    /// transcribed geometry: `gemv` bm=4 requires kL < 4096
-    /// (matmul.cpp:1115), block (non-looped) softmax requires kL ≤ 4096 with
-    /// a ≤1024-thread group (softmax.cpp:53,64-68), and the gemv tail shift
-    /// requires kL ≥ TM = 4.
-    private static let minKeyLength = 4
-    private static let maxKeyLength = 4095
+    /// Mirrors `sdpa_vector_2pass` block count. Honor `MLX_SDPA_BLOCKS`.
+    private static let blocks: Int = {
+        if let raw = ProcessInfo.processInfo.environment["MLX_SDPA_BLOCKS"],
+            let value = Int(raw), value > 0
+        {
+            return value
+        }
+        switch MLX.GPU.deviceInfo().architecture.last {
+        case "s": return 64
+        case "d": return 128
+        default: return 32
+        }
+    }()
 
-    /// Dispatch 1 — QKᵀ. Grid: (row, kv head, chunk of 4 virtual gemv
-    /// threadgroups = 64 score rows) × 128 threads (4 simdgroups — exactly
-    /// the stock gemv threadgroup shape). Each simdgroup replays the stock
-    /// GEMVKernel<bf16,4,1,1,32,4,4> lane→column mapping and tail shift for
-    /// TM=4 score rows, for all 8 heads of the GQA group at once.
-    /// params: [0]=kL, [1]=K (=D, runtime like the stock buffer-passed
-    /// sizes), [2+row]=that row's KV buffer capacity.
-    private static let qkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_qk_bf16_g8_v1",
+    /// Host `eval_gpu` 2-pass split: M-series (`s`/`d`) uses 2-pass at
+    /// `kL >= 1024`; GQA also 2-passes at `kL >= 4096` on other Apple GPUs.
+    private static let isMSeries: Bool = {
+        switch MLX.GPU.deviceInfo().architecture.last {
+        case "s", "d": return true
+        default: return false
+        }
+    }()
+
+    /// `sdpa_vector_2pass_1` at D=512 / GQA=8. Grid is total threads
+    /// `(kvHeads*32, B*GQA, blocks)` so threadgroups are `(kvHeads, B, blocks)`
+    /// with group `(32, GQA, 1)` — same encoding as the sliding D=256 2-pass.
+    /// `params[0] = kL`, `params[1+row] = that row's KV capacity`.
+    private static let passAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_2pass_a_bf16_d512_g8_b\(blocks)_v1",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
             "params",
         ],
-        outputNames: ["scores"],
+        outputNames: ["partials", "sums", "maxs"],
         source: """
-            constexpr int D = 512;
             constexpr int GQA = 8;
+            constexpr int simd_width = 32;
+            constexpr int qk_per_thread = D / simd_width;
 
-            const int key_length = int(params[0]);
-            const int in_vec_size = int(params[1]);
-
-            const int n_chunks = (key_length + 63) / 64;
-            const int z = int(threadgroup_position_in_grid.z);
-            const int chunk = z % n_chunks;
-            const int row_kv = z / n_chunks;
-            const int row = row_kv / 2;
-            const int kv_head = row_kv % 2;
-            const int sg = int(simdgroup_index_in_threadgroup);
+            const int kv_head = int(threadgroup_position_in_grid.x);
+            const int batch_index = int(threadgroup_position_in_grid.y);
+            const int block = int(threadgroup_position_in_grid.z);
+            const int query_head_in_group = int(thread_position_in_threadgroup.y);
+            const int query_head = GQA * kv_head + query_head_in_group;
+            const int batch_head = batch_index * 16 + query_head;
             const int lane = int(thread_index_in_simdgroup);
 
-            const int row_capacity = int(params[2 + row]);
+            const int key_length = int(params[0]);
+            const int row_capacity = int(params[1 + batch_index]);
 
-            const device T* key_plane = k0;
-            switch (row) {
-                case 1: key_plane = k1; break;
-                case 2: key_plane = k2; break;
-                case 3: key_plane = k3; break;
-                case 4: key_plane = k4; break;
-                case 5: key_plane = k5; break;
-                case 6: key_plane = k6; break;
-                case 7: key_plane = k7; break;
+            const device T* keys = k0;
+            const device T* values = v0;
+            switch (batch_index) {
+                case 1: keys = k1; values = v1; break;
+                case 2: keys = k2; values = v2; break;
+                case 3: keys = k3; values = v3; break;
+                case 4: keys = k4; values = v4; break;
+                case 5: keys = k5; values = v5; break;
+                case 6: keys = k6; values = v6; break;
+                case 7: keys = k7; values = v7; break;
                 default: break;
             }
-            key_plane += size_t(kv_head) * size_t(row_capacity) * D;
 
             const device T* query =
-                queries + size_t(row * 16 + kv_head * GQA) * D;
-            device T* score_rows =
-                scores + size_t(row * 16 + kv_head * GQA) * key_length;
+                queries + size_t(batch_head) * D + lane * qk_per_thread;
+            keys += size_t(kv_head) * size_t(row_capacity) * D
+                + size_t(block) * D + lane * qk_per_thread;
+            values += size_t(kv_head) * size_t(row_capacity) * D
+                + size_t(block) * D + lane * qk_per_thread;
+            device T* partial = partials
+                + size_t(batch_head) * BLOCKS * D
+                + size_t(block) * D + lane * qk_per_thread;
+            device float* sum_out = sums + size_t(batch_head) * BLOCKS + block;
+            device float* max_out = maxs + size_t(batch_head) * BLOCKS + block;
 
-            const int virtual_groups = (key_length + 15) / 16;
-            const int vtg_lo = chunk * 4;
-            const int vtg_hi = min(vtg_lo + 4, virtual_groups);
-            const int n_iter = in_vec_size / 128;
+            thread float q[qk_per_thread];
+            thread float accumulator[qk_per_thread];
+            for (int element = 0; element < qk_per_thread; ++element) {
+                q[element] = 1.0f * float(query[element]);
+                accumulator[element] = 0.0f;
+            }
 
-            for (int vtg = vtg_lo; vtg < vtg_hi; ++vtg) {
-                int out_row = vtg * 16 + sg * 4;
-                if (out_row >= key_length) continue;
-                out_row = out_row + 4 <= key_length
-                    ? out_row : key_length - 4;
+            float max_score = -3.402823466e+38F;
+            float sum_exp_score = 0.0f;
+            for (int token = block; token < key_length; token += BLOCKS) {
+                float score = 0.0f;
+                for (int element = 0; element < qk_per_thread; ++element) {
+                    score += q[element] * float(keys[element]);
+                }
+                score = simd_sum(score);
 
-                const device T* mat = key_plane + size_t(out_row) * D;
-                float result[GQA][4] = {{0.0f}};
-                T inter[4];
-                float v_coeff[GQA][4];
-                int bn = lane * 4;
-                for (int i = 0; i < n_iter; ++i) {
-                    #pragma clang loop unroll(full)
-                    for (int h = 0; h < GQA; ++h) {
-                        #pragma clang loop unroll(full)
-                        for (int tn = 0; tn < 4; ++tn) {
-                            v_coeff[h][tn] = static_cast<float>(
-                                query[h * D + bn + tn]);
-                        }
-                    }
-                    int mat_offset = 0;
-                    #pragma clang loop unroll(full)
-                    for (int tm = 0; tm < 4; ++tm) {
-                        #pragma clang loop unroll(full)
-                        for (int tn = 0; tn < 4; ++tn) {
-                            inter[tn] = mat[mat_offset + bn + tn];
-                        }
-                        #pragma clang loop unroll(full)
-                        for (int h = 0; h < GQA; ++h) {
-                            #pragma clang loop unroll(full)
-                            for (int tn = 0; tn < 4; ++tn) {
-                                result[h][tm] +=
-                                    inter[tn] * v_coeff[h][tn];
-                            }
-                        }
-                        mat_offset += D;
-                    }
-                    bn += 128;
+                const float new_max = max(max_score, score);
+                const float old_factor = fast::exp(max_score - new_max);
+                const float score_factor = fast::exp(score - new_max);
+                max_score = new_max;
+                sum_exp_score = sum_exp_score * old_factor + score_factor;
+                for (int element = 0; element < qk_per_thread; ++element) {
+                    accumulator[element] = accumulator[element] * old_factor
+                        + score_factor * float(values[element]);
                 }
-                #pragma clang loop unroll(full)
-                for (int h = 0; h < GQA; ++h) {
-                    #pragma clang loop unroll(full)
-                    for (int tm = 0; tm < 4; ++tm) {
-                        #pragma clang loop unroll(full)
-                        for (ushort delta = 16; delta >= 1; delta >>= 1) {
-                            result[h][tm] +=
-                                simd_shuffle_down(result[h][tm], delta);
-                        }
-                    }
-                }
-                if (lane == 0) {
-                    #pragma clang loop unroll(full)
-                    for (int h = 0; h < GQA; ++h) {
-                        #pragma clang loop unroll(full)
-                        for (int tm = 0; tm < 4; ++tm) {
-                            score_rows[
-                                size_t(h) * key_length + out_row + tm] =
-                                static_cast<T>(result[h][tm]);
-                        }
-                    }
-                }
+
+                keys += BLOCKS * D;
+                values += BLOCKS * D;
+            }
+
+            if (lane == 0) {
+                sum_out[0] = sum_exp_score;
+                max_out[0] = max_score;
+            }
+            for (int element = 0; element < qk_per_thread; ++element) {
+                partial[element] = T(accumulator[element]);
             }
         """,
         ensureRowContiguous: true
     )
 
-    /// Dispatch 2 — softmax. A verbatim transcription of
-    /// `softmax_single_row` (block_softmax_precise, AccT=float, N_READS=4)
-    /// over the 128 score rows; the CALLER sizes the threadgroup exactly
-    /// like softmax.cpp:64-68 (32·ceil(ceil(kL/4)/32)). params[0] = kL.
-    private static let softmaxKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_softmax_bf16_v1",
-        inputNames: ["scores", "params"],
-        outputNames: ["probs"],
+    /// `sdpa_vector_2pass_2` at D=512. Same 1024-thread merge as sliding D=256;
+    /// `values_per_lane = D/32 = 16` fills the 512-wide output.
+    private static let passBKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_2pass_b_direct_bf16_d512_b\(blocks)_v1",
+        inputNames: ["partials", "sums", "maxs"],
+        outputNames: ["out"],
         source: """
-            const int axis_size = int(params[0]);
-            const int gid = int(threadgroup_position_in_grid.x);
-            const int lid = int(thread_position_in_threadgroup.x);
-            const int simd_lane_id = int(thread_index_in_simdgroup);
-            const int simd_group_id = int(simdgroup_index_in_threadgroup);
+            constexpr int simd_width = 32;
+            constexpr int values_per_lane = D / simd_width;
 
-            threadgroup float local_max[32];
-            threadgroup float local_normalizer[32];
+            const int batch_head = int(threadgroup_position_in_grid.x);
+            const int output_group = int(simdgroup_index_in_threadgroup);
+            const int block_lane = int(thread_index_in_simdgroup);
 
-            float ld[4];
-            const device T* in =
-                scores + size_t(gid) * axis_size + lid * 4;
-            if (lid * 4 + 4 <= axis_size) {
-                for (int i = 0; i < 4; i++) {
-                    ld[i] = static_cast<float>(in[i]);
-                }
-            } else {
-                for (int i = 0; i < 4; i++) {
-                    ld[i] = ((lid * 4 + i) < axis_size)
-                        ? static_cast<float>(in[i]) : -INFINITY;
-                }
-            }
-            if (simd_group_id == 0) {
-                local_max[simd_lane_id] = -INFINITY;
-                local_normalizer[simd_lane_id] = 0.0f;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            partials += batch_head * BLOCKS * D
+                + block_lane * D + output_group * values_per_lane;
+            sums += batch_head * BLOCKS;
+            maxs += batch_head * BLOCKS;
+            out += batch_head * D + output_group * values_per_lane;
 
-            float maxval = -3.402823466e+38F;
-            for (int i = 0; i < 4; i++) {
-                maxval = (maxval < ld[i]) ? ld[i] : maxval;
+            thread float accumulator[values_per_lane];
+            for (int element = 0; element < values_per_lane; ++element) {
+                accumulator[element] = 0.0f;
             }
-            maxval = simd_max(maxval);
-            if (simd_lane_id == 0) {
-                local_max[simd_group_id] = maxval;
+            float sum_exp_score = 0.0f;
+            float max_score = -3.402823466e+38F;
+            for (int block = 0; block < BLOCKS / simd_width; ++block) {
+                max_score = max(
+                    max_score, maxs[block_lane + simd_width * block]);
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_group_id == 0) {
-                maxval = simd_max(local_max[simd_lane_id]);
-                if (simd_lane_id == 0) {
-                    local_max[0] = maxval;
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            maxval = local_max[0];
+            max_score = simd_max(max_score);
 
-            float normalizer = 0.0f;
-            for (int i = 0; i < 4; i++) {
-                float exp_x = fast::exp(ld[i] - maxval);
-                ld[i] = exp_x;
-                normalizer += exp_x;
+            for (int block = 0; block < BLOCKS / simd_width; ++block) {
+                const float factor = fast::exp(
+                    maxs[block_lane + simd_width * block] - max_score);
+                sum_exp_score +=
+                    factor * sums[block_lane + simd_width * block];
             }
-            normalizer = simd_sum(normalizer);
-            if (simd_lane_id == 0) {
-                local_normalizer[simd_group_id] = normalizer;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_group_id == 0) {
-                normalizer = simd_sum(local_normalizer[simd_lane_id]);
-                if (simd_lane_id == 0) {
-                    local_normalizer[0] = normalizer;
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            normalizer = 1 / local_normalizer[0];
+            sum_exp_score = simd_sum(sum_exp_score);
 
-            device T* out_row =
-                probs + size_t(gid) * axis_size + lid * 4;
-            if (lid * 4 + 4 <= axis_size) {
-                for (int i = 0; i < 4; i++) {
-                    out_row[i] = static_cast<T>(ld[i] * normalizer);
+            for (int block = 0; block < BLOCKS / simd_width; ++block) {
+                const float factor = fast::exp(maxs[block_lane] - max_score);
+                for (int element = 0; element < values_per_lane; ++element) {
+                    accumulator[element] +=
+                        factor * float(partials[element]);
                 }
-            } else {
-                for (int i = 0; i < 4; i++) {
-                    if ((lid * 4 + i) < axis_size) {
-                        out_row[i] = static_cast<T>(ld[i] * normalizer);
-                    }
+                maxs += simd_width;
+                sums += simd_width;
+                partials += simd_width * D;
+            }
+
+            for (int element = 0; element < values_per_lane; ++element) {
+                const float reduced = simd_sum(accumulator[element]);
+                if (block_lane == 0) {
+                    out[element] = T(
+                        sum_exp_score == 0.0f
+                            ? reduced
+                            : reduced / sum_exp_score);
                 }
             }
         """,
         ensureRowContiguous: true
     )
 
-    /// Dispatch 3 — probs·V. Grid: (row, kv head, column tile of 64) × 128
-    /// threads (4 simdgroups — exactly the stock gemv_t threadgroup shape).
-    /// Replays the stock GEMVTKernel<bf16,1,4,8,4,4,4> row-striding and
-    /// butterfly for all 8 heads of the GQA group at once (shared V tile
-    /// loads). params as dispatch 1.
-    private static let avKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_v1",
+    /// `sdpa_vector` single-pass at D=512. One 1024-thread group per
+    /// (row, query head); 32 simdgroups walk kL with BN=32.
+    private static let singlePassKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_vector_bf16_d512_g8_v1",
         inputNames: [
-            "probs",
-            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+            "queries",
+            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
             "params",
         ],
         outputNames: ["out"],
         source: """
             constexpr int D = 512;
             constexpr int GQA = 8;
+            constexpr int BN = 32;
+            constexpr int BD = 32;
+            constexpr int qk_per_thread = D / BD;
+
+            const int batch_head = int(threadgroup_position_in_grid.x);
+            const int batch_index = batch_head / 16;
+            const int query_head = batch_head % 16;
+            const int kv_head = query_head / GQA;
+            const int simd_gid = int(simdgroup_index_in_threadgroup);
+            const int simd_lid = int(thread_index_in_simdgroup);
 
             const int key_length = int(params[0]);
+            const int row_capacity = int(params[1 + batch_index]);
 
-            const int z = int(threadgroup_position_in_grid.z);
-            const int tile = z % 8;
-            const int row_kv = z / 8;
-            const int row = row_kv / 2;
-            const int kv_head = row_kv % 2;
-            const int sg = int(simdgroup_index_in_threadgroup);
-            const int lane = int(thread_index_in_simdgroup);
-
-            const int row_capacity = int(params[2 + row]);
-
-            const device T* value_plane = v0;
-            switch (row) {
-                case 1: value_plane = v1; break;
-                case 2: value_plane = v2; break;
-                case 3: value_plane = v3; break;
-                case 4: value_plane = v4; break;
-                case 5: value_plane = v5; break;
-                case 6: value_plane = v6; break;
-                case 7: value_plane = v7; break;
+            const device T* keys = k0;
+            const device T* values = v0;
+            switch (batch_index) {
+                case 1: keys = k1; values = v1; break;
+                case 2: keys = k2; values = v2; break;
+                case 3: keys = k3; values = v3; break;
+                case 4: keys = k4; values = v4; break;
+                case 5: keys = k5; values = v5; break;
+                case 6: keys = k6; values = v6; break;
+                case 7: keys = k7; values = v7; break;
                 default: break;
             }
-            value_plane += size_t(kv_head) * size_t(row_capacity) * D;
 
-            const device T* prob_rows =
-                probs + size_t(row * 16 + kv_head * GQA) * key_length;
+            const device T* query =
+                queries + size_t(batch_head) * D + simd_lid * qk_per_thread;
+            keys += size_t(kv_head) * size_t(row_capacity) * D
+                + size_t(simd_gid) * D + simd_lid * qk_per_thread;
+            values += size_t(kv_head) * size_t(row_capacity) * D
+                + size_t(simd_gid) * D + simd_lid * qk_per_thread;
 
-            const int thrM = lane / 4;
-            const int thrN = lane % 4;
-            int bm = thrM * 4;
-            const int out_col = tile * 64 + (4 * sg + thrN) * 4;
+            threadgroup float outputs[BN * BD];
+            threadgroup float max_scores[BN];
+            threadgroup float sum_exp_scores[BN];
 
-            float result[GQA][4] = {{0.0f}};
-            T inter[4];
-            float v_coeff[GQA][4];
-            const int n_iter = key_length / 32;
-            const int leftover = key_length - n_iter * 32;
-
-            for (int i = 0; i < n_iter; ++i) {
-                threadgroup_barrier(mem_flags::mem_none);
-                #pragma clang loop unroll(full)
-                for (int h = 0; h < GQA; ++h) {
-                    #pragma clang loop unroll(full)
-                    for (int tm = 0; tm < 4; ++tm) {
-                        v_coeff[h][tm] = static_cast<float>(
-                            prob_rows[size_t(h) * key_length + bm + tm]);
-                    }
-                }
-                #pragma clang loop unroll(full)
-                for (int tm = 0; tm < 4; ++tm) {
-                    for (int tn = 0; tn < 4; ++tn) {
-                        inter[tn] = value_plane[
-                            size_t(bm + tm) * D + out_col + tn];
-                    }
-                    #pragma clang loop unroll(full)
-                    for (int h = 0; h < GQA; ++h) {
-                        float vc = v_coeff[h][tm];
-                        for (int tn = 0; tn < 4; ++tn) {
-                            result[h][tn] += vc * inter[tn];
-                        }
-                    }
-                }
-                bm += 32;
+            thread float q[qk_per_thread];
+            thread float o[qk_per_thread];
+            for (int element = 0; element < qk_per_thread; ++element) {
+                q[element] = 1.0f * float(query[element]);
+                o[element] = 0.0f;
             }
-            if (leftover > 0) {
-                for (int tm = 0; tm < 4 && bm + tm < key_length; ++tm) {
-                    #pragma clang loop unroll(full)
-                    for (int h = 0; h < GQA; ++h) {
-                        v_coeff[h][tm] = static_cast<float>(
-                            prob_rows[size_t(h) * key_length + bm + tm]);
-                    }
-                    #pragma clang loop unroll(full)
-                    for (int tn = 0; tn < 4; ++tn) {
-                        inter[tn] = value_plane[
-                            size_t(bm + tm) * D + out_col + tn];
-                    }
-                    #pragma clang loop unroll(full)
-                    for (int h = 0; h < GQA; ++h) {
-                        #pragma clang loop unroll(full)
-                        for (int tn = 0; tn < 4; ++tn) {
-                            result[h][tn] += v_coeff[h][tm] * inter[tn];
-                        }
-                    }
+
+            float max_score = -3.402823466e+38F;
+            float sum_exp_score = 0.0f;
+            for (int token = simd_gid; token < key_length; token += BN) {
+                float score = 0.0f;
+                for (int element = 0; element < qk_per_thread; ++element) {
+                    score += q[element] * float(keys[element]);
                 }
-            }
-            #pragma clang loop unroll(full)
-            for (int h = 0; h < GQA; ++h) {
-                #pragma clang loop unroll(full)
-                for (int tn = 0; tn < 4; ++tn) {
-                    #pragma clang loop unroll(full)
-                    for (ushort delta = 4; delta >= 1; delta >>= 1) {
-                        result[h][tn] +=
-                            simd_shuffle_down(result[h][tn], 4 * delta);
-                    }
+                score = simd_sum(score);
+
+                const float new_max = max(max_score, score);
+                const float factor = fast::exp(max_score - new_max);
+                const float exp_score = fast::exp(score - new_max);
+                max_score = new_max;
+                sum_exp_score = sum_exp_score * factor + exp_score;
+                for (int element = 0; element < qk_per_thread; ++element) {
+                    o[element] = o[element] * factor
+                        + exp_score * float(values[element]);
                 }
+
+                keys += BN * D;
+                values += BN * D;
             }
-            if (thrM == 0) {
-                #pragma clang loop unroll(full)
-                for (int h = 0; h < GQA; ++h) {
-                    device T* out_ptr = out
-                        + size_t(row * 16 + kv_head * GQA + h) * D
-                        + out_col;
-                    #pragma clang loop unroll(full)
-                    for (int j = 0; j < 4; ++j) {
-                        out_ptr[j] = static_cast<T>(result[h][j]);
-                    }
+
+            if (simd_lid == 0) {
+                max_scores[simd_gid] = max_score;
+                sum_exp_scores[simd_gid] = sum_exp_score;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            max_score = max_scores[simd_lid];
+            const float new_max = simd_max(max_score);
+            const float factor = fast::exp(max_score - new_max);
+            sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
+
+            for (int element = 0; element < qk_per_thread; ++element) {
+                outputs[simd_lid * BD + simd_gid] = o[element];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                o[element] = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
+                o[element] = sum_exp_score == 0.0f
+                    ? o[element]
+                    : (o[element] / sum_exp_score);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            device T* out_ptr =
+                out + size_t(batch_head) * D + simd_gid * qk_per_thread;
+            if (simd_lid == 0) {
+                for (int element = 0; element < qk_per_thread; ++element) {
+                    out_ptr[element] = T(o[element]);
                 }
             }
         """,
         ensureRowContiguous: true
     )
+
+    /// Launch vector SDPA over already-appended ragged K/V, or nil when any
+    /// launch gate fails. Callers must not append before this returns nil.
+    static func attendVector(
+        queries: MLXArray,
+        keys: [MLXArray],
+        values: [MLXArray],
+        keyLength: Int,
+        scale: Float
+    ) -> MLXArray? {
+        guard enabled,
+            blocks > 0,
+            blocks.isMultiple(of: 32),
+            scale == 1.0,
+            keyLength >= 1,
+            queries.dtype == .bfloat16,
+            queries.shape == [batch, queryHeads, 1, headDim],
+            keys.count == batch,
+            values.count == batch
+        else { return nil }
+
+        var params: [UInt32] = [UInt32(keyLength)]
+        params.reserveCapacity(batch + 1)
+        for index in 0 ..< batch {
+            let key = keys[index]
+            let value = values[index]
+            guard key.dtype == .bfloat16,
+                value.dtype == .bfloat16,
+                key.ndim == 4,
+                key.dim(0) == 1,
+                key.dim(1) == kvHeads,
+                key.dim(2) >= keyLength,
+                key.dim(3) == headDim,
+                value.shape == key.shape
+            else { return nil }
+            params.append(UInt32(key.dim(2)))
+        }
+
+        let paramsArray = MLXArray(params)
+        let template: [(String, any KernelTemplateArg)] = [
+            ("T", queries.dtype)
+        ]
+        let useTwoPass =
+            (isMSeries && keyLength >= 1024)
+            || keyLength >= 4096
+
+        if useTwoPass {
+            let partialShape = [batch, queryHeads, 1, blocks, headDim]
+            let summaryShape = [batch, queryHeads, 1, blocks]
+            let passA = passAKernel(
+                [queries] + keys + values + [paramsArray],
+                template: template + [
+                    ("D", headDim),
+                    ("BLOCKS", blocks),
+                ],
+                grid: (kvHeads * 32, batch * gqa, blocks),
+                threadGroup: (32, gqa, 1),
+                outputShapes: [partialShape, summaryShape, summaryShape],
+                outputDTypes: [.bfloat16, .float32, .float32]
+            )
+            return passBKernel(
+                passA,
+                template: [
+                    ("T", queries.dtype),
+                    ("D", headDim),
+                    ("BLOCKS", blocks),
+                ],
+                grid: (batch * queryHeads * 1024, 1, 1),
+                threadGroup: (1024, 1, 1),
+                outputShapes: [[batch, queryHeads, 1, headDim]],
+                outputDTypes: [.bfloat16]
+            )[0]
+        }
+
+        return singlePassKernel(
+            [queries] + keys + values + [paramsArray],
+            template: template,
+            grid: (batch * queryHeads * 1024, 1, 1),
+            threadGroup: (1024, 1, 1),
+            outputShapes: [[batch, queryHeads, 1, headDim]],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
 
     /// Batched update + attend for the D=512 full-attention decode cohort,
     /// or nil (with NO side effects) when any gate fails.
@@ -1013,6 +1000,8 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         scale: Float, sinks: MLXArray?, softcap: Float?
     ) -> MLXArray? {
         guard enabled,
+            blocks > 0,
+            blocks.isMultiple(of: 32),
             rows.count == batch,
             scale == 1.0,
             sinks == nil,
@@ -1039,8 +1028,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let offset = fullRows[0].absoluteOffset
         let keyLength = offset + 1
         guard offset > 0,
-            keyLength >= minKeyLength,
-            keyLength <= maxKeyLength,
+            keyLength >= 1,
             fullRows.allSatisfy({ $0.cohortPool == nil }),
             fullRows.allSatisfy({ $0.absoluteOffset == offset }),
             fullRows.allSatisfy({ keyLength <= $0.maxLength })
@@ -1068,8 +1056,6 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         var valueBuffers: [MLXArray] = []
         keyBuffers.reserveCapacity(batch)
         valueBuffers.reserveCapacity(batch)
-        var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
-        params.reserveCapacity(batch + 2)
         for (index, row) in fullRows.enumerated() {
             _ = row.update(
                 keys: keys[index ..< (index + 1)],
@@ -1077,43 +1063,14 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             let state = row.cbv2InnerState()
             keyBuffers.append(state[0])
             valueBuffers.append(state[1])
-            params.append(UInt32(state[0].dim(2)))
         }
-        let paramsArray = MLXArray(params)
-
-        let template: [(String, any KernelTemplateArg)] = [
-            ("T", queries.dtype)
-        ]
-        let scratchShape = [batch, queryHeads, 1, keyLength]
-
-        let chunks = (keyLength + 63) / 64
-        let scores = qkKernel(
-            [queries] + keyBuffers + [paramsArray],
-            template: template,
-            grid: (32, 4, batch * kvHeads * chunks),
-            threadGroup: (32, 4, 1),
-            outputShapes: [scratchShape],
-            outputDTypes: [.bfloat16]
-        )[0]
-
-        // Threadgroup sizing verbatim from softmax.cpp:64-68.
-        let softmaxThreads = ((keyLength + 3) / 4 + 31) / 32 * 32
-        let probs = softmaxKernel(
-            [scores, paramsArray],
-            template: template,
-            grid: (softmaxThreads * batch * queryHeads, 1, 1),
-            threadGroup: (softmaxThreads, 1, 1),
-            outputShapes: [scratchShape],
-            outputDTypes: [.bfloat16]
-        )[0]
-
-        return avKernel(
-            [probs] + valueBuffers + [paramsArray],
-            template: template,
-            grid: (32, 4, batch * kvHeads * 8),
-            threadGroup: (32, 4, 1),
-            outputShapes: [[batch, queryHeads, 1, headDim]],
-            outputDTypes: [.bfloat16]
-        )[0]
+        guard let output = attendVector(
+            queries: queries, keys: keyBuffers, values: valueBuffers,
+            keyLength: keyLength, scale: scale)
+        else {
+            preconditionFailure(
+                "CBv2RaggedComposedD512DecodeAttentionV1: vector SDPA refused after append")
+        }
+        return output
     }
 }

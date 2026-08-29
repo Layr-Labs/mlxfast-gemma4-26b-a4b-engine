@@ -68,6 +68,16 @@ final class CBv2EngineGauges: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// SCHED-001: requests accepted on a caller thread whose `enqueue` block
+    /// has not reached the engine queue yet — i.e. "more of this cohort is
+    /// still on its way". Read on the engine queue by the cold-cohort
+    /// coalescing gate.
+    var pendingSubmitCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return pendingSubmits
+    }
+
     /// Point update for runtime KV-capacity changes: an idle engine
     /// publishes no step snapshots, so `capacity()` must reflect a
     /// re-sliced ceiling — AND the backend's post-resize truth (the

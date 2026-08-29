@@ -1151,6 +1151,11 @@ public final class EngineLoopV2: @unchecked Sendable {
             return
         }
 
+        // SCHED-001: a cohort submitted in a burst can straddle the idle
+        // re-check poll and prefill as k + (B - k). Hold the cold step for a
+        // bounded moment so the whole cohort lands in ONE plan.
+        if coalesceColdCohort(now: stepNow) { return }
+
         beginMTPPlan()
         // Snapshot the waiting set BEFORE plan() so re-admissions (rows this
         // plan moves waiting→running) are distinguishable from continuing
@@ -1169,6 +1174,11 @@ public final class EngineLoopV2: @unchecked Sendable {
         // expired during the stall-exempt queue wait). Idempotent for
         // continuing rows (a preempted requeue never re-arms admission).
         markAdmitted(plan, now: stepNow, readmittedFrom: waitingBeforePlan)
+        if CBv2AdmissionCoalescing.observing {
+            let prefillRows = plan.assignments.reduce(0) { $0 + ($1.numTokens > 1 ? 1 : 0) }
+            CBv2AdmissionCoalescing.recordPlanPrefillRows(
+                prefillRows, decodeRows: plan.assignments.count - prefillRows)
+        }
         // MTP round steps (1+k verify assignments and/or seed decodes)
         // branch BEFORE executeMixed — its rec.tokens slicing and samples
         // predicate are structurally wrong for speculative tokens.
@@ -1188,6 +1198,76 @@ public final class EngineLoopV2: @unchecked Sendable {
         engineQueue.asyncAfter(deadline: .now() + config.idleRecheckInterval) { [weak self] in
             self?.engineStep()
         }
+    }
+
+    // MARK: SCHED-001 — cold-cohort admission coalescing
+
+    /// Engine-queue state for the deferral in flight (nil ⇒ not deferring).
+    private var coalesceArmedAt: ContinuousClock.Instant?
+    private var coalesceLastGrowthAt: ContinuousClock.Instant?
+    private var coalesceLastWaiting = 0
+
+    /// Hold a COLD step briefly so a cohort still arriving on the engine
+    /// queue is admitted as one prefill plan instead of k + (B - k).
+    /// Returns true when the step deferred itself (a re-check is armed).
+    ///
+    /// Every exit that is not a deferral clears the armed state, so the next
+    /// cold period starts a fresh (and equally bounded) window. See
+    /// `AdmissionCoalescingV1.swift` for why this cannot wedge, cannot touch
+    /// decode, and cannot reorder rows.
+    private func coalesceColdCohort(now: ContinuousClock.Instant) -> Bool {
+        guard CBv2AdmissionCoalescing.enabled,
+            !draining,
+            inFlight == nil,
+            // COLD ONLY: one running row (decoding or mid-prefill) means the
+            // cohort is already admitted — never delay a step that has work.
+            scheduler.runningCount == 0,
+            // A single-slot engine has no cohort to wait for: byte-identical
+            // to stock, zero added latency, which is what keeps the
+            // single-stream legs honest.
+            scheduler.config.maxConcurrentRequests > 1
+        else {
+            coalesceArmedAt = nil
+            return false
+        }
+        let waiting = scheduler.waitingCount
+        let target = min(
+            scheduler.config.maxConcurrentRequests, scheduler.config.maxWaiting)
+        guard waiting > 0, waiting < target else {
+            coalesceArmedAt = nil
+            return false
+        }
+        guard let armedAt = coalesceArmedAt else {
+            CBv2EngageMark.once("sched001")
+            coalesceArmedAt = now
+            coalesceLastGrowthAt = now
+            coalesceLastWaiting = waiting
+            engineQueue.asyncAfter(
+                deadline: .now() + CBv2AdmissionCoalescing.pollSeconds
+            ) { [weak self] in self?.engineStep() }
+            return true
+        }
+        // The queue is still "growing" while a row arrived since the last
+        // look OR a submit is mid-flight (accepted on a caller thread, its
+        // `enqueue` block not yet dequeued) — the latter keeps a submit loop
+        // slower than `quiet` from releasing the window early.
+        if waiting > coalesceLastWaiting || gauges.pendingSubmitCount > 0 {
+            coalesceLastWaiting = waiting
+            coalesceLastGrowthAt = now
+        }
+        let quietSince = coalesceLastGrowthAt ?? armedAt
+        guard now - armedAt < CBv2AdmissionCoalescing.window,
+            now - quietSince < CBv2AdmissionCoalescing.quiet
+        else {
+            CBv2AdmissionCoalescing.note(
+                "coalesce release waiting=\(waiting) target=\(target)")
+            coalesceArmedAt = nil
+            return false
+        }
+        engineQueue.asyncAfter(
+            deadline: .now() + CBv2AdmissionCoalescing.pollSeconds
+        ) { [weak self] in self?.engineStep() }
+        return true
     }
 
     // MARK: Step execution
@@ -1571,6 +1651,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                             .map(Int32.init))
                 }
                 let inputs = MLXArray(flatTokens).reshaped([group.rows.count, group.count])
+                CBv2AdmissionCoalescing.recordPrefillForwardWidth(
+                    group.rows.count, chunk: group.count)
                 let caches = eagerCaches(rowStates: group.rows.map { kvStates[$0.rec.id]! })
                 let requirement: CBv2PrefillRequirement =
                     group.samples ? .lastPositionLogits : .evaluationOnly
@@ -1633,6 +1715,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             if packedIDs.contains(rec.id) { continue }
             let slice = rec.tokens[row.start ..< row.start + row.count]
             let inputs = MLXArray(slice.map(Int32.init)).reshaped([1, row.count])
+            CBv2AdmissionCoalescing.recordPrefillForwardWidth(1, chunk: row.count)
             let caches = eagerCaches(rowStates: [kvStates[rec.id]!])
             let requirement: CBv2PrefillRequirement =
                 row.samples ? .lastPositionLogits : .evaluationOnly

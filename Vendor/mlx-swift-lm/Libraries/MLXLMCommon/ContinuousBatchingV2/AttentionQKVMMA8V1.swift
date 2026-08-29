@@ -195,6 +195,131 @@ METAL_FUNC void qkv_mma8_affine4_g64_impl(
         header: mma8KernelHeader,
         ensureRowContiguous: true)
 
+    // QKV-ONEDISPATCH: Q, K and V read the SAME `x` at the B=8/L=1 decode
+    // shape, so the three tight-grid launches above differ only in which
+    // weight bank their y-tiles address. These two kernels concatenate the
+    // tile spaces and pick the bank from `tid.y`, so one launch covers the
+    // whole projection group. Each output element is produced by the same
+    // `qkv_mma8_affine4_g64_impl<T, 2>` call, over the same pointers, at the
+    // same `n0` and with its own `red[32]` scratch, so the arithmetic is
+    // byte-for-byte the three-launch result.
+    private static let fusedBody = """
+        const uint3 tid = threadgroup_position_in_grid;
+        threadgroup float2 red[32];
+        const int K = x_shape[x_ndim - 1];
+        const int t = int(tid.y);
+        const int nq = wq_shape[0];
+        const int nk = wk_shape[0];
+        const int tq = nq / 8;
+        const int tk = nk / 8;
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint sl = thread_index_in_simdgroup;
+        if (t < tq) {
+          qkv_mma8_affine4_g64_impl<T, 2>(
+              wq, sq, bq, x, yq, K, nq, t * 8, red, sg, sl);
+          return;
+        }
+        if (t < tq + tk) {
+          qkv_mma8_affine4_g64_impl<T, 2>(
+              wk, sk, bk, x, yk, K, nk, (t - tq) * 8, red, sg, sl);
+          return;
+        }
+        """
+
+    private static let fused3Kernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_qkv3_mma8_affine4_g64_tight_v1",
+        inputNames: ["x", "wq", "sq", "bq", "wk", "sk", "bk", "wv", "sv", "bv"],
+        outputNames: ["yq", "yk", "yv"],
+        source: fusedBody + """
+            qkv_mma8_affine4_g64_impl<T, 2>(
+                wv, sv, bv, x, yv, K, wv_shape[0], (t - tq - tk) * 8, red, sg, sl);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
+    private static let fused2Kernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_qkv2_mma8_affine4_g64_tight_v1",
+        inputNames: ["x", "wq", "sq", "bq", "wk", "sk", "bk"],
+        outputNames: ["yq", "yk"],
+        source: fusedBody + """
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
+    /// One weight bank of a fused projection group.
+    public struct Plane {
+        public let weight: MLXArray
+        public let scales: MLXArray
+        public let biases: MLXArray?
+        public let groupSize: Int
+        public let bits: Int
+        public let mode: QuantizationMode
+
+        public init(
+            weight: MLXArray, scales: MLXArray, biases: MLXArray?,
+            groupSize: Int, bits: Int, mode: QuantizationMode
+        ) {
+            self.weight = weight
+            self.scales = scales
+            self.biases = biases
+            self.groupSize = groupSize
+            self.bits = bits
+            self.mode = mode
+        }
+    }
+
+    @inline(__always)
+    private static func admissible(_ plane: Plane, _ x: MLXArray) -> Bool {
+        guard plane.groupSize == Self.groupSize, plane.bits == Self.bits,
+            plane.mode == .affine, let biases = plane.biases,
+            plane.scales.dtype == x.dtype, biases.dtype == x.dtype,
+            plane.weight.dtype == .uint32, plane.weight.ndim == 2,
+            plane.weight.dim(1) == inputWidth * Self.bits / 32
+        else { return false }
+        let width = plane.weight.dim(0)
+        return liveOutputWidth(width)
+            && plane.scales.shape == [width, inputWidth / Self.groupSize]
+            && biases.shape == plane.scales.shape
+    }
+
+    /// Two or three same-`x` projections in a single dispatch. Returns nil on
+    /// any guard failure, which keeps the per-plane `matmul` road.
+    public static let groupEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_QKV_ONE_DISPATCH"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    public static func matmulGroup(x: MLXArray, planes: [Plane]) -> [MLXArray]? {
+        guard enabled, groupEnabled, planes.count == 2 || planes.count == 3,
+            x.dtype == .bfloat16, x.ndim == 3,
+            x.dim(0) == batch, x.dim(1) == sequence, x.dim(2) == inputWidth,
+            x.size == batch * sequence * inputWidth,
+            planes.allSatisfy({ admissible($0, x) })
+        else { return nil }
+
+        let widths = planes.map { $0.weight.dim(0) }
+        let tiles = widths.reduce(0) { $0 + $1 } / outputsPerGroup
+        var inputs: [MLXArray] = [x]
+        for plane in planes {
+            inputs.append(plane.weight)
+            inputs.append(plane.scales)
+            inputs.append(plane.biases!)
+        }
+        let kernel = planes.count == 3 ? fused3Kernel : fused2Kernel
+        return kernel(
+            inputs,
+            template: [("T", x.dtype)],
+            grid: (simdWidth, tiles * simdGroups, 1),
+            threadGroup: (simdWidth, simdGroups, 1),
+            outputShapes: widths.map { [batch, sequence, $0] },
+            outputDTypes: Array(repeating: x.dtype, count: widths.count)
+        )
+    }
+
     @inline(__always)
     private static func liveOutputWidth(_ width: Int) -> Bool {
         width == 1024 || width == 2048 || width == 4096 || width == 8192

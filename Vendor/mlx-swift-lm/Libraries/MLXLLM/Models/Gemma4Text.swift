@@ -1645,6 +1645,34 @@ private class Gemma4Attention: Module {
         return projected
     }
 
+    /// Q, K and V as ONE tight-grid dispatch when they all read the same `x`
+    /// at the B8/L1 decode rectangle. `nil` means every caller keeps its own
+    /// `tierProjection`. Ordering is [q, k] or [q, k, v]; a `k_eq_v` layer has
+    /// no `v_proj` and so contributes two banks.
+    @inline(__always)
+    private func fusedProjectionGroup(_ x: MLXArray, eligible: Bool) -> [MLXArray]? {
+        guard eligible,
+            let q = qProj as? QuantizedLinear, q.bias == nil,
+            let k = kProj as? QuantizedLinear, k.bias == nil
+        else { return nil }
+        var planes: [CBv2AttentionQKVMMA8V1.Plane] = [
+            .init(
+                weight: q.weight, scales: q.scales, biases: q.biases,
+                groupSize: q.groupSize, bits: q.bits, mode: q.mode),
+            .init(
+                weight: k.weight, scales: k.scales, biases: k.biases,
+                groupSize: k.groupSize, bits: k.bits, mode: k.mode),
+        ]
+        if let vProj {
+            guard let v = vProj as? QuantizedLinear, v.bias == nil else { return nil }
+            planes.append(
+                .init(
+                    weight: v.weight, scales: v.scales, biases: v.biases,
+                    groupSize: v.groupSize, bits: v.bits, mode: v.mode))
+        }
+        return CBv2AttentionQKVMMA8V1.matmulGroup(x: x, planes: planes)
+    }
+
     /// Exact B8/L1 attention output projection. Sliding/full K widths select
     /// the tight affine4 fast-QMV replica; every other path keeps the layer.
     @inline(__always)
@@ -1851,7 +1879,14 @@ private class Gemma4Attention: Module {
         // 8 x-groups and the tier returns from 7 of them); every other shape
         // keeps the module's affine_qmv road. Routing Q or K through the older
         // custom helper would silently bypass the winning kernel.
-        let queryRaw = tierProjection(qProj, queryInput).reshaped(
+        // QKV-ONEDISPATCH: at the decode rectangle Q, K and V read the SAME
+        // `x`, so the three tight-grid launches differ only in which weight
+        // bank their y-tiles address. One launch over the concatenated tile
+        // space produces every output element from the identical kernel call
+        // at the identical `n0`, so it is byte-for-byte the three-launch
+        // result. Any guard failure leaves the per-plane road untouched.
+        let fusedQKV = fusedProjectionGroup(x, eligible: lastQueryCache == nil && !usesSharedKV)
+        let queryRaw = (fusedQKV?[0] ?? tierProjection(qProj, queryInput)).reshaped(
             B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
@@ -1914,10 +1949,12 @@ private class Gemma4Attention: Module {
             lastQueryCache == nil
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
-        let kRaw = tierProjection(kProj, x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+        let kRaw = (fusedQKV?[1] ?? tierProjection(kProj, x)).reshaped(
+            B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
         if let vProj {
-            vRaw = tierProjection(vProj, x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            vRaw = (fusedQKV?[2] ?? tierProjection(vProj, x)).reshaped(
+                B, L, nKvHeads, effectiveHeadDim)
         } else {
             vRaw = kRaw
         }

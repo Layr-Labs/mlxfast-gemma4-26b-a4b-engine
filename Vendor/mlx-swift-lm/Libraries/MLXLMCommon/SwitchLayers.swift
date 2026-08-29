@@ -371,6 +371,235 @@ private func routeCountingSortFusedT64(
     return (outputs[0], outputs[1], outputs[2])
 }
 
+// MARK: - ROUTE-CSORT-LINEAR: O(n) route table for cohort prefill
+
+/// A third tier above `ROUTE-CSORT-64` for PREFILL-scale route tables. Decode
+/// is untouched and keeps the promoted fused kernel.
+///
+/// WHY. `routeFusedScatterKernelT64` folds histogram, scan and scatter into one
+/// dispatch, and it pays for that with two superlinear terms:
+///
+///   * every tile's threadgroup walks the WHOLE key array to build its own
+///     `tg_total`/`tg_before` histogram, so the histogram is `O(tiles * n)` =
+///     `O(n^2 / 64)`;
+///   * the scatter has all 256 key-owning threads re-walk each tile, so it is
+///     `O(256 n)`.
+///
+/// At decode the table is one tile of 64 keys and neither term is visible,
+/// which is exactly why that kernel is the right one there. At prefill the
+/// cohort driver sizes `maxBatchedTokensPerStep >= batchSize * seedTokenCount`
+/// so ONE planned step prefills all eight streams' prompts together
+/// (`Gemma4RuntimeCohortDriver.swift`). Each MoE layer's table is then
+/// `batch * prompt * top_k` keys — tens of thousands — and the quadratic term
+/// dominates the routing leg.
+///
+/// WHAT. The same stable-counting-sort definition, split into three phases each
+/// linear in `n`:
+///
+///   1. per-tile histogram — each threadgroup reads only its own 64 keys;
+///   2. scan — one 256-thread group turns those into each tile's exclusive
+///      prefix per key plus the key-major global base, reusing the fused
+///      kernel's own simd reduction unchanged;
+///   3. scatter — one thread per assignment resolves its own within-tile rank,
+///      so a tile is walked once per POSITION rather than once per key value in
+///      the 256-entry alphabet.
+///
+/// EXACTNESS. Byte-identical by construction, for the same reason the fused
+/// kernel is `argSort`-identical. For key `k` in tile `t` the fused kernel
+/// writes at `global_base[k] + (count of k in tiles < t)` and then walks its
+/// tile in input order. This path writes at
+/// `global_base[k] + prefix[t][k] + (count of k at earlier positions of tile
+/// t)`, and `prefix[t][k]` IS the count of `k` in tiles `< t`. Same base, same
+/// input order, same permutation — for every input, not merely tested ones. All
+/// three outputs are pure functions of that permutation. Counters are
+/// commutative integer adds, so no accumulation order can change a table.
+///
+/// Shares the `DARKBLOOM_ROUTE_COUNTING_SORT` kill switch with the fused tier,
+/// so turning it off returns BOTH counting sorts to the established `argSort`
+/// chain and the fused path cannot be isolated by environment alone.
+/// `DARKBLOOM_ROUTE_CSORT_LINEAR` set to `0`/`false`/`no`/`off` drops just this
+/// tier back onto the fused kernel. `DARKBLOOM_ROUTE_CSORT_LINEAR_MIN_N` moves
+/// the floor. Engage mark: `route-csort-linear`.
+private let routeCountingSortLinearEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_ROUTE_CSORT_LINEAR"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// Measured crossover, not a guess. Timed against the fused kernel on this
+/// machine at `top_k = 8`, 128 experts, microseconds per route table:
+///
+///     keys      2048   4096   8192   16384   32768   73728
+///     fused     68.8   98.4  134.6   147.5   329.0  1078.6
+///     linear   110.7  127.9  166.2   131.4   147.4   208.0
+///
+/// The fused kernel's three extra dispatch launches are not amortized until its
+/// `O(n^2 / 64)` histogram overtakes them, which happens between 8192 and 16384
+/// keys. The floor therefore sits at 16384: below it the promoted kernel is
+/// left alone, above it the margin only widens (2.2x at 32768, 5.2x at 73728).
+/// Decode's single 64-key tile is three orders of magnitude below the floor and
+/// can never reach this tier.
+private let routeCountingSortLinearMinN: Int = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_ROUTE_CSORT_LINEAR_MIN_N"],
+        let value = Int(raw), value > 0
+    else { return 16384 }
+    return value
+}()
+
+/// Kept at the fused kernel's 64 so the two tiers tile identically. The tile
+/// width trades scatter work (`~TILE/2` per assignment) against scan work
+/// (`256 * n / TILE`); 64 sits at the flat bottom of that curve.
+private let routeSortTileLinear = 64
+
+private let routeLinearHistKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "mlx_lm_route_csort_linear_hist_u32_t64_v1",
+    inputNames: ["keys"],
+    outputNames: ["tile_counts"],
+    source: """
+        constexpr uint TILE = \(routeSortTileLinear);
+        uint t = threadgroup_position_in_grid.x;
+        uint k = thread_position_in_threadgroup.x;
+        uint n = keys_shape[0];
+        // Each threadgroup histograms ONLY its own tile. This is the whole
+        // difference from the fused kernel, whose every threadgroup walks all
+        // of `keys`.
+        threadgroup atomic_uint tg_hist[256];
+        atomic_store_explicit(&tg_hist[k], 0u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint idx = t * TILE + k;
+        if (k < TILE && idx < n) {
+            atomic_fetch_add_explicit(
+                &tg_hist[keys[idx]], 1u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        tile_counts[t * 256 + k] =
+            atomic_load_explicit(&tg_hist[k], memory_order_relaxed);
+        """,
+    ensureRowContiguous: false
+)
+
+private let routeLinearScanKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "mlx_lm_route_csort_linear_scan_u32_v1",
+    inputNames: ["tile_counts"],
+    outputNames: ["tile_prefix", "key_base"],
+    source: """
+        uint k = thread_position_in_threadgroup.x;
+        uint lane = k % 32;
+        uint simd_id = k / 32;
+        uint tiles = tile_counts_shape[0] / 256;
+        // Thread k owns key k across every tile: the running sum before tile t
+        // IS the count of k in tiles < t, which is the fused kernel's
+        // `tg_before` without re-reading a single key.
+        uint running = 0;
+        for (uint t = 0; t < tiles; ++t) {
+            uint c = tile_counts[t * 256 + k];
+            tile_prefix[t * 256 + k] = running;
+            running += c;
+        }
+        // Key-major global base, byte for byte the fused kernel's reduction.
+        uint lane_excl = simd_prefix_exclusive_sum(running);
+        threadgroup uint simd_totals[8];
+        if (lane == 31) {
+            simd_totals[simd_id] = lane_excl + running;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint simd_base = 0;
+        for (uint s = 0; s < simd_id; ++s) {
+            simd_base += simd_totals[s];
+        }
+        key_base[k] = simd_base + lane_excl;
+        """,
+    ensureRowContiguous: false
+)
+
+private let routeLinearScatterKernel: MLXFast.MLXFastKernel = {
+    let m = routeFusedScatterTopK
+    return MLXFast.metalKernel(
+        name: "mlx_lm_route_csort_linear_scatter_m\(m)_u32_t64_v1",
+        inputNames: ["keys", "tile_prefix", "key_base"],
+        outputNames: ["row_order", "sorted_keys", "inverse_order"],
+        source: """
+            constexpr uint TILE = \(routeSortTileLinear);
+            constexpr uint M = \(m);
+            uint n = keys_shape[0];
+            uint gid = thread_position_in_grid.x;
+            uint k = thread_position_in_threadgroup.x;
+            // Threadgroups are 256 wide and TILE divides 256, so a group covers
+            // whole tiles and a thread's tile never straddles the stage buffer.
+            threadgroup uint tg_keys[256];
+            // Keys are < 256 by the `numExperts` guard, so this sentinel can
+            // never compare equal to a real key in the rank walk below.
+            tg_keys[k] = gid < n ? keys[gid] : 0xFFFFFFFFu;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (gid < n) {
+                uint key = tg_keys[k];
+                // Stable rank: how many earlier POSITIONS of this tile hold the
+                // same key. The fused scatter instead walks the tile once per
+                // key value, all 256 of them, for every tile.
+                uint tile_start = (k / TILE) * TILE;
+                uint rank = 0;
+                for (uint j = tile_start; j < k; ++j) {
+                    rank += (tg_keys[j] == key) ? 1u : 0u;
+                }
+                uint t = gid / TILE;
+                uint off = key_base[key] + tile_prefix[t * 256 + key] + rank;
+                row_order[off] = gid / M;
+                sorted_keys[off] = key;
+                inverse_order[gid] = off;
+            }
+            """,
+        ensureRowContiguous: false
+    )
+}()
+
+private func routeCountingSortLinear(
+    _ indices: MLXArray, m: Int
+) -> (rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray)? {
+    let n = indices.size
+    guard routeCountingSort64Enabled, routeCountingSortLinearEnabled,
+        indices.dtype == .uint32,
+        n >= routeCountingSortLinearMinN,
+        m == routeFusedScatterTopK
+    else { return nil }
+    CBv2EngageMark.once("route-csort-linear")
+
+    let tiles = (n + routeSortTileLinear - 1) / routeSortTileLinear
+    let tileCounts = routeLinearHistKernel(
+        [indices],
+        grid: (tiles * 256, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[tiles * 256]],
+        outputDTypes: [.uint32]
+    )[0]
+
+    let scanned = routeLinearScanKernel(
+        [tileCounts],
+        grid: (256, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[tiles * 256], [256]],
+        outputDTypes: [.uint32, .uint32]
+    )
+
+    // Metal requires the grid to be a multiple of the threadgroup. The
+    // fused kernel launches `tiles * 256` and requires `n % 64 == 0`; this
+    // path also has to accept tables the ranked prompts actually produce,
+    // whose length is `tokens * top_k` and is not a multiple of 256.
+    // `afe996c` launched `tiles * 64` x 256 and the worker died on the first
+    // unaligned prefill table — `failed`, not `rejected`. Pad to 256 and
+    // let the existing `gid < n` guard drop the extra lanes.
+    let scatterThreads = ((n + 255) / 256) * 256
+    let outputs = routeLinearScatterKernel(
+        [indices, scanned[0], scanned[1]],
+        grid: (scatterThreads, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[n], [n], [n]],
+        outputDTypes: [.uint32, .uint32, .uint32]
+    )
+    return (outputs[0], outputs[1], outputs[2])
+}
+
 public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
     let indices = indices.flattened()
@@ -393,12 +622,18 @@ public func gatherSortIndices(
 ) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
     let indices = indices.flattened()
-    // ROUTE-CSORT-64: one fused dispatch with byte-identical outputs
-    // (default ON; see routeCountingSort64Enabled above).
-    if numExperts <= routeCountingSortKeyBound,
-        let fused = routeCountingSortFusedT64(indices, m: m)
-    {
-        return (fused.rowOrder, fused.sortedKeys, fused.inverseOrder)
+    if numExperts <= routeCountingSortKeyBound {
+        // ROUTE-CSORT-LINEAR: prefill-scale tables, where the fused kernel's
+        // O(n^2 / 64) histogram dominates. Byte-identical outputs; refuses
+        // below its floor so decode keeps the promoted fused kernel.
+        if let linear = routeCountingSortLinear(indices, m: m) {
+            return (linear.rowOrder, linear.sortedKeys, linear.inverseOrder)
+        }
+        // ROUTE-CSORT-64: one fused dispatch with byte-identical outputs
+        // (default ON; see routeCountingSort64Enabled above).
+        if let fused = routeCountingSortFusedT64(indices, m: m) {
+            return (fused.rowOrder, fused.sortedKeys, fused.inverseOrder)
+        }
     }
     let order = argSort(indices)
     return (order.floorDivide(m), indices[order], argSort(order))

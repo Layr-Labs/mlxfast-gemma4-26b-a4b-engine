@@ -1685,6 +1685,47 @@ private enum Gemma4FusedLayerGlue {
         """
     }
 
+    /// Both tail reductions in one pass. `a` and `b` are independent, so their
+    /// per-simdgroup partials ride the same barriers instead of one set each.
+    /// Same tree, same operands, same order as the two sequential reductions.
+    private static func rmsReduce2(
+        _ srcA: String, _ srcB: String, into slotA: String, _ slotB: String
+    ) -> String {
+        """
+            {
+                float acc_a = 0;
+                float acc_b = 0;
+                for (int i = 0; i < 4; i++) {
+                    float xa = (float)\(srcA)[base + i];
+                    float xb = (float)\(srcB)[base + i];
+                    acc_a += xa * xa;
+                    acc_b += xb * xb;
+                }
+                acc_a = simd_sum(acc_a);
+                acc_b = simd_sum(acc_b);
+                if (simd_group_id == 0) {
+                    local_sums[simd_lane_id] = 0;
+                    local_sums_b[simd_lane_id] = 0;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simd_lane_id == 0) {
+                    local_sums[simd_group_id] = acc_a;
+                    local_sums_b[simd_group_id] = acc_b;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simd_group_id == 0) {
+                    acc_a = simd_sum(local_sums[simd_lane_id]);
+                    acc_b = simd_sum(local_sums_b[simd_lane_id]);
+                    if (simd_lane_id == 0) {
+                        \(slotA) = metal::precise::rsqrt(acc_a / 2816.0f + 1e-06f);
+                        \(slotB) = metal::precise::rsqrt(acc_b / 2816.0f + 1e-06f);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        """
+    }
+
     private static let normResidualKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_glue_norm_residual_2816_bf16_v1",
         inputNames: ["x", "res", "w"],
@@ -1746,10 +1787,10 @@ private enum Gemma4FusedLayerGlue {
             const uint simd_group_id = simdgroup_index_in_threadgroup;
             threadgroup float local_inv[2];
             threadgroup float local_sums[32];
+            threadgroup float local_sums_b[32];
             const uint base = row * 2816 + lid * 4;
             const uint wbase = lid * 4;
-        \(rmsReduce("a", into: "local_inv[0]"))
-        \(rmsReduce("b", into: "local_inv[1]"))
+        \(rmsReduce2("a", "b", into: "local_inv[0]", "local_inv[1]"))
             const float inv1 = local_inv[0];
             const float inv2 = local_inv[1];
             T sv[4];
@@ -1839,10 +1880,10 @@ private enum Gemma4FusedLayerGlue {
             const uint simd_group_id = simdgroup_index_in_threadgroup;
             threadgroup float local_inv[2];
             threadgroup float local_sums[32];
+            threadgroup float local_sums_b[32];
             const uint base = row * 2816 + lid * 4;
             const uint wbase = lid * 4;
-        \(rmsReduce("a", into: "local_inv[0]"))
-        \(rmsReduce("b", into: "local_inv[1]"))
+        \(rmsReduce2("a", "b", into: "local_inv[0]", "local_inv[1]"))
             const float inv1 = local_inv[0];
             const float inv2 = local_inv[1];
             T sv[4];

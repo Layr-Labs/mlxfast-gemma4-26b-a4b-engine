@@ -135,6 +135,61 @@ private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
     ensureRowContiguous: true
 )
 
+/// Exact B=8 decode variant that amortizes the tiny route-table loads across
+/// four independent hidden features. Each accumulator retains the established
+/// slot order and bfloat16 multiply/add boundary; only four feature chains are
+/// interleaved in one thread. Features are separated by 704 so every SIMD lane
+/// still reads a contiguous strip on each of the four passes.
+private let weightedExpertUnsortFeature4Enabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_WEIGHTED_UNSORT_FEATURE4"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+private let weightedExpertUnsortFeature4Kernel: MLXFast.MLXFastKernel =
+    MLXFast.metalKernel(
+        name: "weighted_expert_unsort_feature4_b8_v1",
+        inputNames: ["sorted_outputs", "inverse_order", "weights"],
+        outputNames: ["output"],
+        source: """
+            const uint feature = thread_position_in_grid.x;
+            const uint token = thread_position_in_grid.y;
+            const uint assignment_base = token * (uint)K;
+
+            T accumulator0 = (T)0;
+            T accumulator1 = (T)0;
+            T accumulator2 = (T)0;
+            T accumulator3 = (T)0;
+            for (uint slot = 0; slot < (uint)K; ++slot) {
+                const uint assignment = assignment_base + slot;
+                const uint sorted_row = (uint)inverse_order[assignment];
+                const uint row_base = sorted_row * (uint)HIDDEN;
+                const float weight = (float)weights[assignment];
+
+                const T weighted0 = (T)(
+                    (float)sorted_outputs[row_base + feature] * weight);
+                const T weighted1 = (T)(
+                    (float)sorted_outputs[row_base + feature + (uint)TILE] * weight);
+                const T weighted2 = (T)(
+                    (float)sorted_outputs[row_base + feature + 2u * (uint)TILE] * weight);
+                const T weighted3 = (T)(
+                    (float)sorted_outputs[row_base + feature + 3u * (uint)TILE] * weight);
+                accumulator0 = accumulator0 + weighted0;
+                accumulator1 = accumulator1 + weighted1;
+                accumulator2 = accumulator2 + weighted2;
+                accumulator3 = accumulator3 + weighted3;
+            }
+
+            const uint output_base = token * (uint)HIDDEN + feature;
+            output[output_base] = accumulator0;
+            output[output_base + (uint)TILE] = accumulator1;
+            output[output_base + 2u * (uint)TILE] = accumulator2;
+            output[output_base + 3u * (uint)TILE] = accumulator3;
+        """,
+        ensureRowContiguous: true
+    )
+
 /// Consume production-shaped sorted Gemma 4 expert rows through their inverse
 /// permutation and reduce original top-K slots into `[tokens, hidden]`.
 ///
@@ -164,6 +219,27 @@ public func weightedExpertUnsort(
 
     let tokens = weights.dim(0)
     weightedExpertUnsortProbe.recordEffective()
+    if weightedExpertUnsortFeature4Enabled,
+        tokens == 8,
+        sortedOutputs.shape == [64, 2816],
+        inverseOrder.shape == [64],
+        weights.shape == [8, 8]
+    {
+        CBv2EngageMark.once("wunsort-feature4")
+        return weightedExpertUnsortFeature4Kernel(
+            [sortedOutputs, inverseOrder, weights],
+            template: [
+                ("T", sortedOutputs.dtype),
+                ("K", 8),
+                ("HIDDEN", 2816),
+                ("TILE", 704),
+            ],
+            grid: (704, 8, 1),
+            threadGroup: (64, 4, 1),
+            outputShapes: [[8, 2816]],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
     return weightedExpertUnsortKernel(
         [sortedOutputs, inverseOrder, weights],
         template: [

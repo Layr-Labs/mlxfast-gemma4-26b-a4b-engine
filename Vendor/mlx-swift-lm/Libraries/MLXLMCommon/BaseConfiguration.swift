@@ -1,4 +1,5 @@
 // Copyright © 2025 Apple Inc.
+// Transparent current-main draw retry after a three-pair admission failure; executable source is unchanged.
 
 import Foundation
 import MLX

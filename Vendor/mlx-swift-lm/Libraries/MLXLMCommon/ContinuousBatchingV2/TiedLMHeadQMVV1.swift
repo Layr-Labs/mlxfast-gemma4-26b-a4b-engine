@@ -257,7 +257,7 @@ inline U qdot_affine4_registered(
   return scale * accum + sum * bias;
 }
 
-template <typename T, const int group_size, const int bits>
+template <typename T, const int group_size, const int bits, const int SOFTCAP_INT = 0>
 METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -398,10 +398,19 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     result2[row] = simd_sum(result2[row]);
     result3[row] = simd_sum(result3[row]);
     if (simd_lid == 0) {
-      y0[row] = static_cast<T>(result0[row]);
-      y1[row] = static_cast<T>(result1[row]);
-      y2[row] = static_cast<T>(result2[row]);
-      y3[row] = static_cast<T>(result3[row]);
+      if constexpr (SOFTCAP_INT > 0) {
+        constexpr const float cap = float(SOFTCAP_INT) * 0.001f;
+        constexpr const float inv_cap = 1.0f / cap;
+        y0[row] = static_cast<T>(metal::precise::tanh(result0[row] * inv_cap) * cap);
+        y1[row] = static_cast<T>(metal::precise::tanh(result1[row] * inv_cap) * cap);
+        y2[row] = static_cast<T>(metal::precise::tanh(result2[row] * inv_cap) * cap);
+        y3[row] = static_cast<T>(metal::precise::tanh(result3[row] * inv_cap) * cap);
+      } else {
+        y0[row] = static_cast<T>(result0[row]);
+        y1[row] = static_cast<T>(result1[row]);
+        y2[row] = static_cast<T>(result2[row]);
+        y3[row] = static_cast<T>(result3[row]);
+      }
     }
   }
 }
@@ -423,7 +432,7 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
             if (first_m >= 8) {
                 return;
             }
-            qmv_affine4_g64_quad_stream_impl<T, 64, 4>(
+            qmv_affine4_g64_quad_stream_impl<T, 64, 4, SOFTCAP_INT>(
                 w,
                 scales,
                 biases,
@@ -452,7 +461,8 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
         scales: MLXArray,
         biases: MLXArray?,
         inDim: Int,
-        outDim: Int
+        outDim: Int,
+        softcap: Float? = nil
     ) -> MLXArray? {
         // Every dimension is validated against every other, so the gate is a
         // full shape pin at runtime even though the tower's hidden size is not
@@ -482,12 +492,14 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
 
         let xGroups = batch / rowsPerGroup
         let yGroups = outDim / outputsPerGroup
+        let softcapInt = softcap.map { Int(round($0 * 1000.0)) } ?? 0
         return kernel(
             [x, weight, scales, biases],
             template: [
                 ("T", x.dtype),
                 ("K", inDim),
                 ("OUTN", outDim),
+                ("SOFTCAP_INT", softcapInt),
             ],
             grid: (xGroups * simdWidth, yGroups * simdGroups, 1),
             threadGroup: (simdWidth, simdGroups, 1),

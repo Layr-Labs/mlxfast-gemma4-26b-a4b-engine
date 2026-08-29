@@ -2368,18 +2368,19 @@ public enum Gemma4MMAQuantizedGEMV {
             out[(fragmentCol + 1) * N + outputN1] = T(acc1.thread_elements()[1]);
             """,
             with: """
+            #define APPLY_SOFTCAP(v) (SOFTCAP_INT > 0 ? (metal::precise::tanh(float(v) * (1.0f / (float(SOFTCAP_INT) * 0.001f))) * (float(SOFTCAP_INT) * 0.001f)) : float(v))
             const uint outputN0 = sgN0 + fragmentRow;
             const uint outputN1 = outputN0 + N_PSG;
             const uint outputN2 = outputN0 + N_PSG * 2;
             const uint outputN3 = outputN0 + N_PSG * 3;
-            out[fragmentCol * N + outputN0] = T(acc0.thread_elements()[0]);
-            out[(fragmentCol + 1) * N + outputN0] = T(acc0.thread_elements()[1]);
-            out[fragmentCol * N + outputN1] = T(acc1.thread_elements()[0]);
-            out[(fragmentCol + 1) * N + outputN1] = T(acc1.thread_elements()[1]);
-            out[fragmentCol * N + outputN2] = T(acc2.thread_elements()[0]);
-            out[(fragmentCol + 1) * N + outputN2] = T(acc2.thread_elements()[1]);
-            out[fragmentCol * N + outputN3] = T(acc3.thread_elements()[0]);
-            out[(fragmentCol + 1) * N + outputN3] = T(acc3.thread_elements()[1]);
+            out[fragmentCol * N + outputN0] = T(APPLY_SOFTCAP(acc0.thread_elements()[0]));
+            out[(fragmentCol + 1) * N + outputN0] = T(APPLY_SOFTCAP(acc0.thread_elements()[1]));
+            out[fragmentCol * N + outputN1] = T(APPLY_SOFTCAP(acc1.thread_elements()[0]));
+            out[(fragmentCol + 1) * N + outputN1] = T(APPLY_SOFTCAP(acc1.thread_elements()[1]));
+            out[fragmentCol * N + outputN2] = T(APPLY_SOFTCAP(acc2.thread_elements()[0]));
+            out[(fragmentCol + 1) * N + outputN2] = T(APPLY_SOFTCAP(acc2.thread_elements()[1]));
+            out[fragmentCol * N + outputN3] = T(APPLY_SOFTCAP(acc3.thread_elements()[0]));
+            out[(fragmentCol + 1) * N + outputN3] = T(APPLY_SOFTCAP(acc3.thread_elements()[1]));
             """
         )
         return result
@@ -2408,7 +2409,8 @@ public enum Gemma4MMAQuantizedGEMV {
         scales: MLXArray,
         biases: MLXArray?,
         groupSize: Int,
-        bits: Int
+        bits: Int,
+        softcap: Float? = nil
     ) -> MLXArray? {
         guard enabled else { return nil }
         guard let biases else { return nil }
@@ -2482,9 +2484,18 @@ public enum Gemma4MMAQuantizedGEMV {
             selected = kernel
             inputs = [flatX, w, scales, biases]
         }
+        var templateEntries: [(String, any KernelTemplateArg)] = [
+            ("T", x.dtype),
+            ("K", k),
+            ("N", n),
+        ]
+        if version == 16 {
+            let softcapInt = softcap.map { Int(round($0 * 1000.0)) } ?? 0
+            templateEntries.append(("SOFTCAP_INT", softcapInt))
+        }
         let outputs = selected(
             inputs,
-            template: [("T", x.dtype), ("K", k), ("N", n)],
+            template: templateEntries,
             grid: (threadgroups * threadsPerThreadgroup, 1, 1),
             threadGroup: (threadsPerThreadgroup, 1, 1),
             outputShapes: [[mRows, n]],

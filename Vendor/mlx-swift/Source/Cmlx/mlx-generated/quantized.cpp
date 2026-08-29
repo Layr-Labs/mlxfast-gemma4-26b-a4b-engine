@@ -3648,7 +3648,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int gemma4_down_tile_span = 4; // sweep alternate: 2
+  constexpr int gemma4_down_tile_span = 2; // KERN-DOWN-TILE-SPAN2 restacked on fe3d327 leader: 176 survivors of 352, span 4 knee, span 8 ranked −7.11%; bit-identical ownership per upstream uint16-exact parity for spans {2,4}
   if (tid.y % uint(gemma4_down_tile_span) != 0u) {
     return;
   }

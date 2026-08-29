@@ -1393,7 +1393,7 @@ private func gemma4FusedQKVNorm(
         ],
         grid: (normRows * threads, 1, 1), threadGroup: (threads, 1, 1),
         outputShapes: fusedRope
-            ? [[8, 16, 1, dimension], [8, k.dim(2), 1, dimension], v.shape]
+            ? [[8, 16, 1, dimension], [8, k.dim(2), 1, dimension], [8, k.dim(2), 1, dimension]]
             : [q.shape, k.shape, v.shape],
         outputDTypes: [q.dtype, k.dtype, v.dtype]
     )
@@ -1875,7 +1875,7 @@ private class Gemma4Attention: Module {
                 outputDType == .float16 ? queries.asType(.float32) : queries
             let attention = layerCache.attendBorrowing(
                 source: source, queries: attentionQueries, scale: scale, sinks: nil)
-            var output = attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+            var output = (L == 1 ? attention.reshaped(B, 1, -1) : attention.transposed(0, 2, 1, 3).reshaped(B, L, -1))
             if outputStart > 0 {
                 output = output[0..., outputStart..., 0...]
             }
@@ -1935,7 +1935,7 @@ private class Gemma4Attention: Module {
             appliedRope = normalized.appliedRope
             queries = appliedRope ? normalized.q : normalized.q.transposed(0, 2, 1, 3)
             k = appliedRope ? normalized.k : normalized.k.transposed(0, 2, 1, 3)
-            v = normalized.v.transposed(0, 2, 1, 3)
+            v = appliedRope ? normalized.v : normalized.v.transposed(0, 2, 1, 3)
         } else if let headMajor = gemma4FusedQKVNormHeadMajor(
             q: queryRaw, k: kRaw,
             qWeight: qNorm.weight, kWeight: kNorm.weight, eps: config.rmsNormEps,
@@ -1977,7 +1977,7 @@ private class Gemma4Attention: Module {
                 queries: attentionQueries, keys: k, values: v, scale: scale, sinks: nil)
         }
 
-        var output = attention.transposed(0, 2, 1, 3).reshaped(B, queryLength, -1)
+        var output = (queryLength == 1 ? attention.reshaped(B, 1, -1) : attention.transposed(0, 2, 1, 3).reshaped(B, queryLength, -1))
         if lastQueryCache == nil && outputStart > 0 {
             output = output[0..., outputStart..., 0...]
         }

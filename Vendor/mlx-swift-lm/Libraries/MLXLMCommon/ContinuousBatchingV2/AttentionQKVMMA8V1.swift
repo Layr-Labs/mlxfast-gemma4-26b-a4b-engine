@@ -195,10 +195,20 @@ METAL_FUNC void qkv_mma8_affine4_g64_impl(
         header: mma8KernelHeader,
         ensureRowContiguous: true)
 
+    /// The MLX-side mma8 tier's own N gate, transcribed from
+    /// `mlx-generated/quantized.cpp`: `out_vec_size >=
+    /// kGemma4QmvMma8Affine4FloorN && out_vec_size % 8 == 0`. This host used to
+    /// enumerate the four attention plane widths instead. Enumerating is
+    /// narrower than the tier it hosts, so any other plane that the stock road
+    /// already sends to mma8 was being served here by a slower tier. Matching
+    /// the tier's own predicate keeps the two in step by construction; a width
+    /// the tier declines still falls through to the caller's own body.
     @inline(__always)
     private static func liveOutputWidth(_ width: Int) -> Bool {
-        width == 1024 || width == 2048 || width == 4096 || width == 8192
+        width >= mma8FloorN && width % outputsPerGroup == 0
     }
+
+    private static let mma8FloorN = 1024
 
     public static func matmul(
         x: MLXArray,

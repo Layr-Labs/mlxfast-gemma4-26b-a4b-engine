@@ -60,6 +60,13 @@ public enum CBv2TiedLMHeadQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    public static let mma8Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_TIED_LMHEAD_MMA8"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// Pinned to the ruled decode cohort and this checkpoint's tower.
     private static let batch = 8
     private static let groupSize = 64
@@ -452,7 +459,8 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
         scales: MLXArray,
         biases: MLXArray?,
         inDim: Int,
-        outDim: Int
+        outDim: Int,
+        mma8: Bool? = nil
     ) -> MLXArray? {
         // Every dimension is validated against every other, so the gate is a
         // full shape pin at runtime even though the tower's hidden size is not
@@ -479,6 +487,26 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
             scales.dim(1) == inDim / groupSize,
             biases.shape == scales.shape
         else { return nil }
+
+        // LMH-MMA8: this file's body is the register-streamed QUAD tier, which
+        // was the promoted wide-N road when the tight grid was written. The
+        // promoted wide-N road is now the matrix-unit tier
+        // (`gemma4_qmv_mma8_affine4_g64_impl`, floor N = 1024), which the tied
+        // head's `[8, 1, 2816] x [262144, 2816]` rectangle clears. Dispatching
+        // the quad body here therefore overrides the faster tier with the one
+        // it replaced. The two sibling tight-grid hosts (o_proj, dense MLP)
+        // were both re-pointed at the matrix-unit tier when it landed; the
+        // tied head is the one that was left behind. Hand the shape to the
+        // mma8 tight-grid host instead: it
+        // is the SAME arithmetic the stock road performs for this rectangle
+        // (verified bitwise below), at grid.x = 1 rather than the stock 8.
+        if mma8 ?? mma8Enabled,
+            let y = CBv2AttentionQKVMMA8V1.matmul(
+                x: x, weight: weight, scales: scales, biases: biases,
+                groupSize: groupSize, bits: bits, mode: .affine)
+        {
+            return y
+        }
 
         let xGroups = batch / rowsPerGroup
         let yGroups = outDim / outputsPerGroup

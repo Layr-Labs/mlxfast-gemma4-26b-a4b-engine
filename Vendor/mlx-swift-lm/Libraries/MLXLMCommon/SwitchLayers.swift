@@ -357,17 +357,38 @@ private let routeSimdRank64Kernel: MLXFast.MLXFastKernel =
             const uint key_low = (uint)indices[lane];
             const uint key_high = (uint)indices[32u + lane];
             uint rank = 0;
+            uint run_offset = 0;
+            uint run_count = 0;
             for (uint source = 0; source < 32; ++source) {
                 const uint other_low = simd_broadcast(key_low, ushort(source));
+                const bool low_equal = other_low == key;
                 rank += (other_low < key)
-                    || (other_low == key && source < assignment);
+                    || (low_equal && source < assignment);
+                if (PACK_RUN_OFFSETS) {
+                    run_offset += low_equal && source < assignment;
+                    run_count += low_equal;
+                }
                 const uint other_high = simd_broadcast(key_high, ushort(source));
                 const uint high_assignment = 32u + source;
+                const bool high_equal = other_high == key;
                 rank += (other_high < key)
-                    || (other_high == key && high_assignment < assignment);
+                    || (high_equal && high_assignment < assignment);
+                if (PACK_RUN_OFFSETS) {
+                    run_offset += high_equal && high_assignment < assignment;
+                    run_count += high_equal;
+                }
             }
+            // The quantized gather kernels consume expert ids from the low
+            // byte.  Carry the already-known stable run offset in otherwise
+            // unused bits for assignments covered by a same-expert pair;
+            // odd tails stay as ordinary expert ids and take the exact
+            // backward-scan fallback.
+            const uint paired_count = run_count & ~1u;
+            const uint packed_key = PACK_RUN_OFFSETS && run_offset < paired_count
+                ? (0x80000000u | (run_offset << 8) | key)
+                : key;
             row_order[rank] = assignment / 8;
-            sorted_keys[rank] = key;
+            sorted_keys[rank] = packed_key;
             inverse_order[assignment] = rank;
         """,
         ensureRowContiguous: true
@@ -787,13 +808,19 @@ public func gatherSort(
 /// its 256-entry counter table covers every key. The default (`Int.max`)
 /// fails closed onto the established `argSort` chain.
 public func gatherSortIndices(
-    indices: MLXArray, numExperts: Int = Int.max
+    indices: MLXArray, numExperts: Int = Int.max,
+    packRunOffsets: Bool = false
 ) -> (MLXArray, MLXArray, MLXArray) {
     if routeSimdRank64Enabled,
+        !packRunOffsets || (numExperts > 0 && numExperts <= 255),
         indices.ndim == 2, indices.shape == [8, 8], indices.dtype == .uint32
     {
+        if packRunOffsets {
+            CBv2EngageMark.once("route-run-offsets")
+        }
         let outputs = routeSimdRank64Kernel(
             [indices],
+            template: [("PACK_RUN_OFFSETS", packRunOffsets)],
             grid: (64, 1, 1),
             threadGroup: (64, 1, 1),
             outputShapes: [[64], [64], [64]],
@@ -857,6 +884,32 @@ public class SwitchGLU: Module {
     /// supplied (we then fall back to `activation(gate) * up`). Upstream ef85ed0.
     let activationProduct: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
     let weightedReductionProfile: SwitchGLUWeightedReductionProfile
+
+    /// Packed route keys are legal only when every projection consumes them
+    /// through the exact affine Q4/G64 gather kernel that masks the low byte.
+    /// This excludes generic/unquantized SwitchGLU instances and all optional
+    /// expert-bias gathers, which require ordinary expert ids.
+    @inline(__always)
+    private func packedRunOffsetProjectionCompatible(_ projection: SwitchLinear?) -> Bool {
+        guard let projection = projection as? QuantizedSwitchLinear else { return false }
+        return projection.groupSize == 64 && projection.bits == 4
+            && projection.mode.rawValue == QuantizationMode.affine.rawValue
+            && projection.bias == nil
+    }
+
+    @inline(__always)
+    private var claimsPackedRunOffsets: Bool {
+        // The masked Metal fast path owns separate 704-wide gate/up gathers;
+        // a fused 1408-wide projection would fall through to the generic
+        // gather kernel, which requires ordinary expert ids.
+        if let _ = gateUpProj { return false }
+        guard weightedReductionProfile == .gemma4ProductionGeGLU,
+            inputDims == 2816, hiddenDims == 704, numExperts == 128,
+            packedRunOffsetProjectionCompatible(downProj)
+        else { return false }
+        return packedRunOffsetProjectionCompatible(gateProj)
+            && packedRunOffsetProjectionCompatible(upProj)
+    }
 
     /// Activation-type flags detected once at init from a tiny test input (vMLX
     /// approach — no per-token check). Only consulted when `activationProduct` is
@@ -969,7 +1022,8 @@ public class SwitchGLU: Module {
             if useLhsIndices {
                 x = x.flattened(start: 0, end: -3)
                 (lhsIndices, idx, inverseOrder) = gatherSortIndices(
-                    indices: indices, numExperts: numExperts)
+                    indices: indices, numExperts: numExperts,
+                    packRunOffsets: claimsPackedRunOffsets)
             } else {
                 (x, idx, inverseOrder) = gatherSort(
                     x: x, indices: indices, numExperts: numExperts)

@@ -7,12 +7,6 @@
 // launches, identical arithmetic, identical weight traffic (already one pass).
 // The pattern is the established tight-grid family (TiedLMHeadQMVV1,
 // DenseMLPQMVV1, AttentionOQMVV1).
-//
-// MMA-MT-001 adds a second body under the same host and the same guards: two
-// eight-column output tiles per simdgroup sharing one build of the x-side
-// simdgroup operands and one run-sum reduction per K group. Same arithmetic,
-// same accumulation order, bit-identical outputs;
-// `DARKBLOOM_GEMMA4_QKV_MMA8_MULTITILE=0` restores the single-tile dispatch.
 
 import Foundation
 import MLX
@@ -182,169 +176,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_impl(
   y[c.fn * N + n0 + c.fm] = static_cast<T>(acc0);
   y[(c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc1);
 }
-
-// MMA-MT-001: the promoted Q/K/V matrix-unit body with TWO eight-column output
-// tiles per simdgroup instead of one.
-//
-// The incumbent rebuilds the whole x side of the product for every output
-// tile: two `uint4` activation loads, two `mma8_runsum4` reductions (sixteen
-// bf16 -> fp32 widenings and fourteen adds), three `simd_shuffle_xor`
-// butterflies and eight `simdgroup_float8x8` operand fills, per K group, per
-// tile. Only the weight side differs between tiles. At N = 8192 that x-side
-// work runs 1024 times per projection over the same eight activation rows.
-//
-// This body hoists it out of the tile dimension: one fragment build per K
-// group feeds both tiles, and the eight `simdgroup_multiply_accumulate` chains
-// per tile are the only thing that repeats.
-//
-// Bit-exactness. `rs` and B0..B7 are values, not addresses, produced by the
-// same expressions in the same order as the incumbent, so both tiles see
-// exactly the operands the incumbent's own two threadgroups saw. Each tile
-// keeps a private `C`, a private `s`/`b` pair and a private accumulator, and
-// accumulates over the same ascending `g` range with the identical
-// `acc += s * C.thread_elements()[i] + rs[i] * b` step. KS = 2 keeps the
-// identical [0, gh) / [gh, G) split across the threadgroup's two simdgroups
-// and the identical simdgroup-0-adds-simdgroup-1 close, per tile. Every output
-// word is therefore the same float sum accumulated in the same order.
-template <typename T, int KS, int TILES>
-METAL_FUNC void qkv_mma8_affine4_g64_mt(
-    const device uint32_t* w,
-    const device T* scales,
-    const device T* biases,
-    const device T* x,
-    device T* y,
-    const int K,
-    const int N,
-    const int n0,
-    threadgroup float2* red,
-    uint simd_gid,
-    uint simd_lid) {
-  const int G = K / 64;
-  const int gh = (G + 1) / 2;
-  const int g_begin = (KS == 2 && simd_gid == 1) ? gh : 0;
-  const int g_end = (KS == 2 && simd_gid == 0) ? gh : G;
-  const mma8_coord c = mma8_lane(simd_lid);
-
-  const device uint8_t* wrow[TILES];
-  const device T* srow[TILES];
-  const device T* brow[TILES];
-  thread float acc0[TILES];
-  thread float acc1[TILES];
-#pragma clang loop unroll(full)
-  for (int t = 0; t < TILES; ++t) {
-    const int nt = n0 + t * 8;
-    wrow[t] = (const device uint8_t*)w + (nt + c.fm) * (K / 2) + 4 * c.fn;
-    srow[t] = scales + (nt + c.fm) * G;
-    brow[t] = biases + (nt + c.fm) * G;
-    acc0[t] = 0.0f;
-    acc1[t] = 0.0f;
-  }
-
-  const device T* x0 = x + c.fn * K + 8 * c.fm;
-  const device T* x1 = x0 + K;
-
-  simdgroup_float8x8 A;
-  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
-
-  for (int g = g_begin; g < g_end; ++g) {
-    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
-    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
-
-    float2 rs = float2(mma8_runsum4<T>(r0), mma8_runsum4<T>(r1));
-    rs += simd_shuffle_xor(rs, 2u);
-    rs += simd_shuffle_xor(rs, 4u);
-    rs += simd_shuffle_xor(rs, 16u);
-
-    MMA8_SETB(B0, x, lo)
-    MMA8_SETB(B1, x, hi)
-    MMA8_SETB(B2, y, lo)
-    MMA8_SETB(B3, y, hi)
-    MMA8_SETB(B4, z, lo)
-    MMA8_SETB(B5, z, hi)
-    MMA8_SETB(B6, w, lo)
-    MMA8_SETB(B7, w, hi)
-
-#pragma clang loop unroll(full)
-    for (int t = 0; t < TILES; ++t) {
-      const uint2 wv = *((const device uint2*)(wrow[t] + 32 * g));
-      const float s = float(srow[t][g]);
-      const float b = float(brow[t][g]);
-
-      simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
-      MMA8_STEP(B0, 0)
-      MMA8_STEP(B1, 1)
-      MMA8_STEP(B2, 2)
-      MMA8_STEP(B3, 3)
-      MMA8_STEP(B4, 4)
-      MMA8_STEP(B5, 5)
-      MMA8_STEP(B6, 6)
-      MMA8_STEP(B7, 7)
-
-      acc0[t] += s * C.thread_elements()[0] + rs.x * b;
-      acc1[t] += s * C.thread_elements()[1] + rs.y * b;
-    }
-  }
-
-  if (KS == 2) {
-    if (simd_gid == 1) {
-#pragma clang loop unroll(full)
-      for (int t = 0; t < TILES; ++t) {
-        red[t * 32 + simd_lid] = float2(acc0[t], acc1[t]);
-      }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (simd_gid == 1) {
-      return;
-    }
-#pragma clang loop unroll(full)
-    for (int t = 0; t < TILES; ++t) {
-      const float2 other = red[t * 32 + simd_lid];
-      acc0[t] = acc0[t] + other.x;
-      acc1[t] = acc1[t] + other.y;
-    }
-  }
-
-#pragma clang loop unroll(full)
-  for (int t = 0; t < TILES; ++t) {
-    const int nt = n0 + t * 8;
-    y[c.fn * N + nt + c.fm] = static_cast<T>(acc0[t]);
-    y[(c.fn + 1) * N + nt + c.fm] = static_cast<T>(acc1[t]);
-  }
-}
 """
-
-    /// MMA-MT-001 arm. Default ON.
-    /// `DARKBLOOM_GEMMA4_QKV_MMA8_MULTITILE=0` restores the promoted
-    /// single-tile dispatch byte for byte in the same executable.
-    public static let multiTileEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_QKV_MMA8_MULTITILE"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
-    /// Output tiles per simdgroup. Two is the shipped width: it halves the
-    /// x-side work per output column while keeping the incumbent's
-    /// threadgroup count within a factor of two, which on the local box is
-    /// where the amortisation stops paying for the extra live registers.
-    private static let tilesPerGroup = 2
-
-    private static let multiTileKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_v1",
-        inputNames: ["x", "w", "scales", "biases"],
-        outputNames: ["y"],
-        source: """
-            const uint3 tid = threadgroup_position_in_grid;
-            threadgroup float2 red[64];
-            qkv_mma8_affine4_g64_mt<T, 2, 2>(
-                w, scales, biases, x, y,
-                x_shape[x_ndim - 1], w_shape[0], int(tid.y) * 16, red,
-                simdgroup_index_in_threadgroup,
-                thread_index_in_simdgroup);
-            return;
-            """,
-        header: mma8KernelHeader,
-        ensureRowContiguous: true)
 
     private static let mma8Kernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_v1",
@@ -402,16 +234,6 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
         else { return nil }
 
         let yTiles = outputWidth / outputsPerGroup
-        if multiTileEnabled, yTiles % tilesPerGroup == 0 {
-            return multiTileKernel(
-                [x, weight, scales, biases],
-                template: [("T", x.dtype)],
-                grid: (simdWidth, (yTiles / tilesPerGroup) * simdGroups, 1),
-                threadGroup: (simdWidth, simdGroups, 1),
-                outputShapes: [[batch, sequence, outputWidth]],
-                outputDTypes: [x.dtype]
-            )[0]
-        }
         return mma8Kernel(
             [x, weight, scales, biases],
             template: [("T", x.dtype)],

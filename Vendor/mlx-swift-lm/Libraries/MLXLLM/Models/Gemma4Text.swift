@@ -2014,13 +2014,15 @@ public enum Gemma4RouterProbe {
 /// (plus the contiguous copy the strided index slice forces downstream)
 /// collapse into one 8-threadgroup kernel.
 ///
-/// Exactness (counting-predecessors lemma): `ArgPartition::eval_gpu` on Metal
-/// is `gpu_merge_sort(argsort=true)` — a FULL stable merge sort (sort.cpp) —
-/// so the sliced `[kth...]` output is the stable ascending argsort tail. Under
-/// sort.h's `LessThan` comparator (NaN ordered after every non-NaN, ties kept
-/// in original index order by stability) each element's stable-sort position
-/// equals its predecessor count, which the kernel evaluates directly; the
-/// selected values then run a verbatim transcription of
+/// Exactness: `ArgPartition::eval_gpu` on Metal is
+/// `gpu_merge_sort(argsort=true)` — a FULL stable merge sort (sort.cpp) — so
+/// the sliced `[kth...]` output is the stable ascending argsort tail. The
+/// decode kernel sorts `(value, originalIndex)` tuples with a 128-entry bitonic
+/// network under the same `LessThan` relation (NaN after every non-NaN, stable
+/// ties by original index), then takes that same tail. This replaces the
+/// closed quadratic predecessor-count implementation with 1,792 compare /
+/// exchanges per row rather than 16,384 pair comparisons. Selected values run
+/// a verbatim transcription of
 /// `softmax_single_row<bfloat16_t, float, N_READS=4>` (softmax.h — same lane
 /// layout, same `Limits<float>::min` padding, same `fast::exp`, same
 /// `simd_max`/`simd_sum` reduction order on one 32-thread simdgroup) and the
@@ -2035,16 +2037,13 @@ public enum Gemma4RouterProbe {
 /// bit-identical there too). Kill switch:
 /// `DARKBLOOM_GEMMA4_FUSED_ROUTER_TOP8=0`.
 private enum Gemma4FusedRouterTop8 {
-    /// DEFAULT OFF (`DARKBLOOM_GEMMA4_FUSED_ROUTER_TOP8=1` enables): the
-    /// fused chain is bit-exact (113/113 adversarial parity) but measured
-    /// +~0.1 ms/round inside the +0.27 ms consolidation cost of three
-    /// counterbalanced local B=8 probe pairs — dispatch deletion does not
-    /// pay while the concurrent encoder overlaps these small kernels.
+    /// Default ON. Setting `DARKBLOOM_GEMMA4_ROUTER_BITONIC_TOP8=0` restores
+    /// the established five-dispatch chain in the same executable.
     static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_FUSED_ROUTER_TOP8"]
-        else { return false }
-        return ["1", "true", "yes", "on"].contains(raw.lowercased())
+            "DARKBLOOM_GEMMA4_ROUTER_BITONIC_TOP8"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
     private static let rows = 8
@@ -2052,7 +2051,7 @@ private enum Gemma4FusedRouterTop8 {
     private static let selected = 8
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_fused_router_top8_e128_k8_bf16_v1",
+        name: "gemma4_router_bitonic_top8_e128_k8_bf16_v1",
         inputNames: ["scores", "pes"],
         outputNames: ["inds", "wts"],
         source: """
@@ -2064,6 +2063,7 @@ private enum Gemma4FusedRouterTop8 {
             const int lid = int(thread_position_in_threadgroup.x);
 
             threadgroup float vals[E];
+            threadgroup uint stable_indices[E];
             threadgroup float topv[K];
             threadgroup uint topi[K];
             threadgroup float local_max[SIMD_SIZE];
@@ -2072,41 +2072,60 @@ private enum Gemma4FusedRouterTop8 {
             const device T* srow = scores + row * E;
             for (int i = lid; i < E; i += SIMD_SIZE) {
                 vals[i] = float(srow[i]);
+                stable_indices[i] = uint(i);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // Stable-argsort position by predecessor counting under sort.h's
-            // LessThan comparator (NaN orders after every non-NaN; ties keep
-            // the original index order because the merge sort is stable).
-            // Position == #{i : less(v_i, v_e)} + #{i < e : neither less} —
-            // a permutation, so the writes below never collide.
-            for (int j = 0; j < E / SIMD_SIZE; ++j) {
-                const int e = lid + j * SIMD_SIZE;
-                const float v = vals[e];
-                const bool v_nan = isnan(v);
-                int rank = 0;
-                for (int i = 0; i < E; ++i) {
-                    const float u = vals[i];
-                    const bool u_nan = isnan(u);
-                    bool u_less_v;
-                    bool v_less_u;
-                    if (u_nan || v_nan) {
-                        u_less_v = !u_nan && v_nan;
-                        v_less_u = !v_nan && u_nan;
-                    } else {
-                        u_less_v = u < v;
-                        v_less_u = v < u;
+            // Stable full argsort. Each of the 32 lanes owns two disjoint
+            // compare/exchanges at every stage; the barrier completes the
+            // stage before its results feed the next one.
+            for (int width = 2; width <= E; width <<= 1) {
+                for (int stride = width >> 1; stride > 0; stride >>= 1) {
+                    for (int pair = lid; pair < E / 2; pair += SIMD_SIZE) {
+                        const int block = pair / stride;
+                        const int offset = pair - block * stride;
+                        const int a = block * (stride << 1) + offset;
+                        const int b = a + stride;
+
+                        const float av = vals[a];
+                        const float bv = vals[b];
+                        const uint ai = stable_indices[a];
+                        const uint bi = stable_indices[b];
+                        const bool a_nan = isnan(av);
+                        const bool b_nan = isnan(bv);
+
+                        bool a_before_b;
+                        if (a_nan != b_nan) {
+                            a_before_b = !a_nan;
+                        } else if (a_nan) {
+                            a_before_b = ai < bi;
+                        } else if (av < bv) {
+                            a_before_b = true;
+                        } else if (bv < av) {
+                            a_before_b = false;
+                        } else {
+                            a_before_b = ai < bi;
+                        }
+
+                        const bool ascending = (a & width) == 0;
+                        const bool do_swap = ascending ? !a_before_b : a_before_b;
+                        if (do_swap) {
+                            vals[a] = bv;
+                            vals[b] = av;
+                            stable_indices[a] = bi;
+                            stable_indices[b] = ai;
+                        }
                     }
-                    if (u_less_v || (!v_less_u && i < e)) {
-                        ++rank;
-                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
                 }
-                if (rank >= KTH) {
-                    const int p = rank - KTH;
-                    inds[row * K + p] = uint(e);
-                    topi[p] = uint(e);
-                    topv[p] = v;
-                }
+            }
+
+            if (lid < K) {
+                const int sorted_position = KTH + lid;
+                const uint expert = stable_indices[sorted_position];
+                inds[row * K + lid] = expert;
+                topi[lid] = expert;
+                topv[lid] = vals[sorted_position];
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -2202,7 +2221,7 @@ private enum Gemma4FusedRouterTop8 {
             perExpertScale.dim(0) == experts,
             perExpertScale.dtype == .bfloat16
         else { return nil }
-        CBv2EngageMark.once("router-top8")
+        CBv2EngageMark.once("router-bitonic-top8")
 
         let outputs = kernel(
             [expertScores, perExpertScale],
@@ -2259,6 +2278,15 @@ private enum Gemma4FusedLayerGlue {
     static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_FUSED_LAYER_GLUE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Attribution and emergency switch for GLUE-004 alone. The control keeps
+    /// every promoted layer-glue kernel and disables only router RMS sharing.
+    private static let triplePreNormEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_TRIPLE_PRENORM"]
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
@@ -2345,6 +2373,36 @@ private enum Gemma4FusedLayerGlue {
         ensureRowContiguous: true
     )
 
+/// GLUE-004: the router and both feed-forward branches normalize the same
+    /// post-attention row with the same epsilon. Share the exact stock RMS
+    /// reduction and emit the router's differently weighted normalization as
+    /// a third result. This removes one serial RMS dispatch and one full reread
+    /// of `x` without changing any materialization or rounding boundary.
+    private static let triplePreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_glue_triple_prenorm_2816_bf16_v1",
+        inputNames: ["x", "w1", "w2", "wr"],
+        outputNames: ["out1", "out2", "router_normed"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float local_inv[1];
+            threadgroup float local_sums[32];
+            const uint base = row * 2816 + lid * 4;
+            const uint wbase = lid * 4;
+        \(rmsReduce("x", into: "local_inv[0]"))
+            const float inv = local_inv[0];
+            for (int i = 0; i < 4; i++) {
+                const T nx = static_cast<T>((float)x[base + i] * inv);
+                out1[base + i] = w1[wbase + i] * nx;
+                out2[base + i] = w2[wbase + i] * nx;
+                router_normed[base + i] = wr[wbase + i] * nx;
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
     private static let tailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_glue_tail_2816_bf16_v2",
         inputNames: ["a", "b", "res", "w1", "w2", "w3", "s"],
@@ -2414,6 +2472,7 @@ private enum Gemma4FusedLayerGlue {
         )[0]
     }
 
+    
     static func dualPreNorm(
         x: MLXArray, w1: MLXArray, w2: MLXArray, eps: Float
     ) -> (MLXArray, MLXArray)? {
@@ -2431,6 +2490,32 @@ private enum Gemma4FusedLayerGlue {
         )
         return (outs[0], outs[1])
     }
+
+
+    static func triplePreNorm(
+        x: MLXArray, w1: MLXArray, w2: MLXArray,
+        routerWeight: MLXArray, eps: Float
+    ) -> (router: MLXArray, dense: MLXArray, experts: MLXArray)? {
+        guard triplePreNormEnabled,
+            admits(x, weight: w1, eps: eps),
+            w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16,
+            routerWeight.ndim == 1, routerWeight.dim(0) == axis,
+            routerWeight.dtype == .bfloat16
+        else { return nil }
+        CBv2EngageMark.once("glue-triple-prenorm")
+        let outs = triplePreNormKernel(
+            [x, w1, w2, routerWeight],
+            template: [("T", x.dtype)],
+            grid: (rows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: [
+                [rows, 1, axis], [rows, 1, axis], [rows, 1, axis],
+            ],
+            outputDTypes: [.bfloat16, .bfloat16, .bfloat16]
+        )
+        return (router: outs[2], dense: outs[0], experts: outs[1])
+    }
+
 
     /// GLUE-003: tail variant that ALSO emits the NEXT layer's input norm.
     /// The threadgroup already holds the finished output row in registers, so
@@ -2566,16 +2651,21 @@ private class Gemma4Router: Module {
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
-        let effScale: MLXArray
+    func effectiveScale() -> MLXArray {
         if let cached = cachedEffectiveScale {
-            effScale = cached
-        } else {
-            let eff = scale * rootSize
-            cachedEffectiveScale = eff
-            effScale = eff
+            return cached
         }
-        let normed = MLXFast.rmsNorm(x, weight: effScale, eps: eps)
+        let effective = scale * rootSize
+        cachedEffectiveScale = effective
+        return effective
+    }
+
+    /// Route an input that already crossed the router's exact RMSNorm
+    /// materialization boundary. GLUE-004 uses this after sharing the RMS
+    /// reduction with the dense and expert branch pre-norms.
+    func routeNormalized(_ normed: MLXArray) -> (
+        topKIndices: MLXArray, topKWeights: MLXArray
+    ) {
         let expertScores = proj(normed)
 
         // ROUTE-001: single-dispatch byte-identical replacement of the chain
@@ -2601,6 +2691,11 @@ private class Gemma4Router: Module {
         Gemma4RouterProbe.recorder?(expertScores, topKIndices)
 
         return (topKIndices, topKWeights)
+    }
+
+    func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
+        let normed = MLXFast.rmsNorm(x, weight: effectiveScale(), eps: eps)
+        return routeNormalized(normed)
     }
 }
 
@@ -2889,42 +2984,48 @@ public class Gemma4DecoderLayer: Module {
             let postFeedforwardLayernorm2
         {
             // Dense + sparse branches in parallel, summed into one residual.
-            let (topKIndices, topKWeights) = router(out)
-
-            let h1Raw: MLXArray
-            let h2Raw: MLXArray
-            if let (n1, n2) = Gemma4FusedLayerGlue.dualPreNorm(
+            let routing: (topKIndices: MLXArray, topKWeights: MLXArray)
+            let branchInputs: (dense: MLXArray, experts: MLXArray)
+            if let fused = Gemma4FusedLayerGlue.triplePreNorm(
                 x: out,
                 w1: preFeedforwardLayernorm.weight,
                 w2: preFeedforwardLayernorm2.weight,
+                routerWeight: router.effectiveScale(),
                 eps: config.rmsNormEps)
             {
-                h1Raw = mlp(n1)
-                h2Raw = experts(
-                    n2,
-                    topKIndices: topKIndices,
-                    topKWeights: topKWeights,
-                    isExpertPrefill: isExpertPrefill)
-            } else if let (n1, n2) = Gemma4PrefillGlueV1.dualPreNorm(
-                x: out,
-                w1: preFeedforwardLayernorm.weight,
-                w2: preFeedforwardLayernorm2.weight,
-                eps: config.rmsNormEps)
-            {
-                h1Raw = mlp(n1)
-                h2Raw = experts(
-                    n2,
-                    topKIndices: topKIndices,
-                    topKWeights: topKWeights,
-                    isExpertPrefill: isExpertPrefill)
+                routing = router.routeNormalized(fused.router)
+                branchInputs = (dense: fused.dense, experts: fused.experts)
             } else {
-                h1Raw = mlp(preFeedforwardLayernorm(out))
-                h2Raw = experts(
-                    preFeedforwardLayernorm2(out),
-                    topKIndices: topKIndices,
-                    topKWeights: topKWeights,
-                    isExpertPrefill: isExpertPrefill)
+                // Preserve the established fallback's graph-construction
+                // order: route first, then select the branch pre-norm path.
+                routing = router(out)
+                if let (n1, n2) = Gemma4FusedLayerGlue.dualPreNorm(
+                    x: out,
+                    w1: preFeedforwardLayernorm.weight,
+                    w2: preFeedforwardLayernorm2.weight,
+                    eps: config.rmsNormEps)
+                {
+                    branchInputs = (dense: n1, experts: n2)
+                } else if let (n1, n2) = Gemma4PrefillGlueV1.dualPreNorm(
+                    x: out,
+                    w1: preFeedforwardLayernorm.weight,
+                    w2: preFeedforwardLayernorm2.weight,
+                    eps: config.rmsNormEps)
+                {
+                    branchInputs = (dense: n1, experts: n2)
+                } else {
+                    branchInputs = (
+                        dense: preFeedforwardLayernorm(out),
+                        experts: preFeedforwardLayernorm2(out))
+                }
             }
+
+            let h1Raw = mlp(branchInputs.dense)
+            let h2Raw = experts(
+                branchInputs.experts,
+                topKIndices: routing.topKIndices,
+                topKWeights: routing.topKWeights,
+                isExpertPrefill: isExpertPrefill)
 
             // The scalar fold is only valid when nothing sits between the
             // tail and the layer-scalar multiply (PLE absent on this model).

@@ -194,8 +194,24 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         }
         // Mirror runGemma4MTPGreedyRound: seed = concat(target embedding of
         // the token, carried hidden) along the feature axis.
+        let targetEmbedding = target.embedTokensForDrafter(tokens)
+        // B > 1 carries can omit the singleton token axis, causing a
+        // rank-mismatched concat.
+        let alignedHidden: MLXArray
+        if targetEmbedding.ndim == rotatedHidden.ndim {
+            alignedHidden = rotatedHidden
+        } else if targetEmbedding.ndim == rotatedHidden.ndim + 1,
+            targetEmbedding.dim(-2) == 1,
+            Array(targetEmbedding.shape.dropLast(2)) == Array(rotatedHidden.shape.dropLast())
+        {
+            alignedHidden = rotatedHidden.expandedDimensions(axis: -2)
+        } else {
+            preconditionFailure(
+                "Gemma4CBv2MTPDrafter.draftStep: cannot align target embedding "
+                    + "\(targetEmbedding.shape) with hidden \(rotatedHidden.shape)")
+        }
         let inputsEmbeds = concatenated(
-            [target.embedTokensForDrafter(tokens), rotatedHidden], axis: -1)
+            [targetEmbedding, alignedHidden], axis: -1)
         let (newHidden, logits) = drafter(
             inputsEmbeds: inputsEmbeds,
             sharedKV: prepared.sharedKV,
@@ -334,12 +350,31 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         hidden: MLXArray, table: DrafterRoPETable,
         positionOffset: Gemma4.PositionOffset
     ) -> MLXArray {
+        let batchSize: Int
+        switch hidden.ndim {
+        case 2:
+            batchSize = hidden.dim(0)
+        case 3 where hidden.dim(1) == 1:
+            batchSize = hidden.dim(0)
+        default:
+            preconditionFailure(
+                "Gemma4CBv2MTPDrafter.applyCachedDrafterRoPE: expected [B, H] or "
+                    + "[B, 1, H], got \(hidden.shape)")
+        }
+
         let rotaryPrefix = table.dims
         let featureDim = hidden.dim(-1)
         guard rotaryPrefix > 0, rotaryPrefix <= featureDim else {
             return hidden
         }
         let halfDim = rotaryPrefix / 2
+        precondition(
+            table.windowAhead > 0
+                && table.cos.ndim == 2 && table.sin.ndim == 2
+                && table.cos.shape == [table.windowAhead, halfDim]
+                && table.sin.shape == [table.windowAhead, halfDim],
+            "Gemma4CBv2MTPDrafter.applyCachedDrafterRoPE: invalid table shapes "
+                + "cos=\(table.cos.shape) sin=\(table.sin.shape)")
 
         // Read the per-row query position from the position offset. The
         // round is a drafter step (B rows, query length 1) so the offset
@@ -348,10 +383,21 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         let perRow: [Int32]
         switch positionOffset {
         case .scalar(let v):
+            precondition(
+                batchSize == 1,
+                "Gemma4CBv2MTPDrafter.applyCachedDrafterRoPE: scalar offset requires B=1")
             perRow = [Int32(v)]
         case .batch(let arr):
+            precondition(
+                arr.ndim == 1 && arr.dim(0) == batchSize,
+                "Gemma4CBv2MTPDrafter.applyCachedDrafterRoPE: batch offset "
+                    + "\(arr.shape) does not match B=\(batchSize)")
             perRow = arr.asArray(Int32.self)
         case .graphArray(let arr):
+            precondition(
+                arr.ndim == 1 && arr.dim(0) == batchSize,
+                "Gemma4CBv2MTPDrafter.applyCachedDrafterRoPE: graph offset "
+                    + "\(arr.shape) does not match B=\(batchSize)")
             perRow = arr.asArray(Int32.self)
         }
 
@@ -361,30 +407,53 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         guard inRange else { return hidden }
 
         let indices = MLXArray(steps, [perRow.count, 1])
-        let cosRows = table.cos[indices]  // [B, halfDim]
-        let sinRows = table.sin[indices]  // [B, halfDim]
+        let cosRows = table.cos[indices]  // [B, 1, halfDim]
+        let sinRows = table.sin[indices]  // [B, 1, halfDim]
 
-        // Reshape hidden so the rotary prefix is `[B, L, 1, halfDim, 2]`.
+        // Preserve the old one-row graph operation-for-operation.
+        if batchSize == 1 {
+            let leadShape = Array(hidden.shape.dropLast())
+            let flat = hidden.reshaped(leadShape + [featureDim])
+            let prefixLead = leadShape.dropLast()
+            let prefixShape = Array(prefixLead) + [1, halfDim, 2]
+            let pairs = flat[.ellipsis, 0 ..< rotaryPrefix]
+                .reshaped(Array(prefixShape))
+            let a = pairs[.ellipsis, 0]
+            let b = pairs[.ellipsis, 1]
+            let cosBroadcastShape = Array(prefixLead) + [1, halfDim]
+            let sinBroadcastShape = Array(prefixLead) + [1, halfDim]
+            let cosB = cosRows.reshaped(cosBroadcastShape)
+            let sinB = sinRows.reshaped(sinBroadcastShape)
+            let aRot = a * cosB - b * sinB
+            let bRot = a * sinB + b * cosB
+            let rotatedPrefix = MLX.stacked([aRot, bRot], axis: -1)
+                .reshaped(Array(prefixShape))
+                .reshaped(Array(prefixLead) + [rotaryPrefix])
+            let tail = flat[.ellipsis, rotaryPrefix ..< featureDim]
+            return MLX.concatenated([rotatedPrefix, tail], axis: -1)
+        }
+
+        // The single-row lead-shape math collapsed B; rotate the prefix
+        // row-wise as [B, H].
         let leadShape = Array(hidden.shape.dropLast())
-        let flat = hidden.reshaped(leadShape + [featureDim])
-        let prefixLead = leadShape.dropLast()
-        let prefixShape = Array(prefixLead) + [1, halfDim, 2]
+        let flat = hidden.reshaped([batchSize, featureDim])
+        let prefixShape = [batchSize, halfDim, 2]
         let pairs = flat[.ellipsis, 0 ..< rotaryPrefix]
-            .reshaped(Array(prefixShape))
-        let a = pairs[.ellipsis, 0]  // [.., halfDim]
-        let b = pairs[.ellipsis, 1]  // [.., halfDim]
+            .reshaped(prefixShape)
+        let a = pairs[.ellipsis, 0]  // [B, halfDim]
+        let b = pairs[.ellipsis, 1]  // [B, halfDim]
 
-        // Broadcast cos/sin to the query/head axes.
-        let cosBroadcastShape = Array(prefixLead) + [1, halfDim]
-        let sinBroadcastShape = Array(prefixLead) + [1, halfDim]
-        let cosB = cosRows.reshaped(cosBroadcastShape)
-        let sinB = sinRows.reshaped(sinBroadcastShape)
-        let aRot = a * cosB - b * sinB
-        let bRot = a * sinB + b * cosB
+        // A [B, 1] gather retains its singleton axis, which cross-broadcasts
+        // rows on multiply.
+        let perRowCos = cosRows.squeezed(axis: 1)
+        let perRowSin = sinRows.squeezed(axis: 1)
+        let aRot = a * perRowCos - b * perRowSin
+        let bRot = a * perRowSin + b * perRowCos
         let rotatedPrefix = MLX.stacked([aRot, bRot], axis: -1)
-            .reshaped(Array(prefixShape))
-            .reshaped(Array(prefixLead) + [rotaryPrefix])
+            .reshaped(prefixShape)
+            .reshaped([batchSize, rotaryPrefix])
         let tail = flat[.ellipsis, rotaryPrefix ..< featureDim]
         return MLX.concatenated([rotatedPrefix, tail], axis: -1)
+            .reshaped(leadShape + [featureDim])
     }
 }

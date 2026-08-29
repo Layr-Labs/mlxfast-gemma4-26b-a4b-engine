@@ -26,6 +26,17 @@ public protocol CBv2LanguageModelDecodeOutputCoversCacheMutations: AnyObject {}
 private let cbv2CompactDecodeRootMarksArmed =
     ProcessInfo.processInfo.environment["MLXFAST_ENGAGE_MARKS"] != nil
 
+/// Once the model has affirmed that its decode output covers every cache
+/// mutation, the per-layer write fences are already transitive dependencies of
+/// that output. Keep a same-binary fallback to the promoted conservative list
+/// for attribution and emergency bisection.
+private let cbv2MinimalDecodeRootsEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_CBV2_MINIMAL_DECODE_ROOTS"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// `CBv2SteppableModel` over any `LanguageModel` whose forward path
 /// understands `CBv2AttendingLayerCache` (Gemma 4, GPT-OSS, test fixtures).
 public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
@@ -42,9 +53,9 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
 
     /// Initial fail-closed decode compaction: only an affirming model over an
     /// all-owning, all-contiguous bank with one shared position state. The
-    /// output root forces every K/V mutation; the post-forward position root
-    /// collapses the next-step offset chain; per-layer fences conservatively
-    /// retain explicit ordering for fused in-place sliding-ring writes.
+    /// output root forces every K/V mutation and the post-forward position root
+    /// collapses the next-step offset chain. A kill switch restores the
+    /// promoted per-layer fence roots for attribution or emergency bisection.
     public func compactDecodeEvaluationRoots(
         forwardOutput: MLXArray, caches: [CBv2AttendingLayerCache]
     ) -> [MLXArray]? {
@@ -71,8 +82,10 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
         else { return nil }
 
         var roots = [forwardOutput, offsets]
-        roots.reserveCapacity(2 + contiguous.count)
-        roots.append(contentsOf: contiguous.map(\.decodeRingWriteFenceEvaluationRoot))
+        if !cbv2MinimalDecodeRootsEnabled {
+            roots.reserveCapacity(2 + contiguous.count)
+            roots.append(contentsOf: contiguous.map(\.decodeRingWriteFenceEvaluationRoot))
+        }
         if cbv2CompactDecodeRootMarksArmed {
             CBv2EngageMark.once(
                 "compact-decode-roots rows=\(rowCount) layers=\(contiguous.count) "

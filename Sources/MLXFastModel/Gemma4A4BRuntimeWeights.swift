@@ -254,17 +254,40 @@ public final class Gemma4A4BRuntimeWeightCache {
         }
 
         var appliedOverrides = 0
-        quantize(model: model) { path, _ in
-            guard sanitized["\(path).scales"] != nil else { return nil }
-            let checkpointPath = prefix + path
-            let spec = config.quantization.spec(forPath: checkpointPath)
-            if config.quantization.overrides[checkpointPath] != nil {
-                appliedOverrides += 1
-            }
-            return (
-                groupSize: spec.groupSize, bits: spec.bits, mode: mode
-            )
-        }
+        // Preserve the target's pinned packed tensors and quantization triple.
+        // The embedding path receives a QuantizedEmbedding subclass whose
+        // only override is the exact B=8 lookup implementation; asLinear
+        // (the tied LM head), parameter loading, and the two target-format
+        // validators continue to use QuantizedEmbedding's established state.
+        var directEmbeddingModules = Set<ObjectIdentifier>()
+        quantize(
+            model: model,
+            filter: { path, module in
+                guard sanitized["\(path).scales"] != nil else { return nil }
+                let checkpointPath = prefix + path
+                let spec = config.quantization.spec(forPath: checkpointPath)
+                if config.quantization.overrides[checkpointPath] != nil {
+                    appliedOverrides += 1
+                }
+                if path == "model.embed_tokens" {
+                    directEmbeddingModules.insert(ObjectIdentifier(module))
+                }
+                return (
+                    groupSize: spec.groupSize, bits: spec.bits, mode: mode
+                )
+            },
+            apply: { module, groupSize, bits, quantizationMode in
+                if directEmbeddingModules.contains(ObjectIdentifier(module)),
+                    let embedding = module as? Embedding
+                {
+                    return CBv2DirectQuantizedEmbeddingV1(
+                        embedding, groupSize: groupSize, bits: bits,
+                        mode: quantizationMode)
+                }
+                return quantizeSingle(
+                    layer: module, groupSize: groupSize, bits: bits,
+                    mode: quantizationMode)
+            })
 
         // Every declared override must have been applied to a real module. A
         // count short of the table means the config named a path the model

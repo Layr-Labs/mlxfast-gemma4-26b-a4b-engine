@@ -3,6 +3,8 @@
 import Foundation
 import MLX
 
+// Transparent ZIP-ROUTER retry after its first ranked M5 receipt admitted
+// three of four pairs; executable scheduling and arithmetic are unchanged.
 /// The fundamental configuration for any MLX-based model.
 ///
 /// `BaseConfiguration` provides the metadata necessary to identify the model architecture

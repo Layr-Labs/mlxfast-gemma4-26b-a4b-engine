@@ -112,25 +112,31 @@ public func resetWeightedExpertUnsortStats() {
 /// permutation and writes `[tokens, hidden]` directly, avoiding that full
 /// `[tokens, topK, hidden]` intermediate.
 private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "weighted_expert_unsort",
+    name: "weighted_expert_unsort_v2",
     inputNames: ["sorted_outputs", "inverse_order", "weights"],
     outputNames: ["output"],
     source: """
-        uint feature = thread_position_in_grid.x;
-        uint token = thread_position_in_grid.y;
+        constexpr uint reads = 4;
+        const uint feature_base = thread_position_in_grid.x * reads;
+        const uint token = thread_position_in_grid.y;
+        if (feature_base >= 2816) return;
 
-        T accumulator = (T)0;
+        T accum[reads] = {(T)0, (T)0, (T)0, (T)0};
         const uint assignment_base = token * (uint)K;
         for (uint slot = 0; slot < (uint)K; ++slot) {
             const uint assignment = assignment_base + slot;
             const uint sorted_row = (uint)inverse_order[assignment];
-            // Preserve the legacy bfloat16 multiply-then-reduce rounding.
-            const T weighted = (T)(
-                (float)sorted_outputs[sorted_row * threads_per_grid.x + feature]
-                * (float)weights[assignment]);
-            accumulator = accumulator + weighted;
+            const float w = (float)weights[assignment];
+            const device T* src = sorted_outputs + sorted_row * 2816 + feature_base;
+            for (uint i = 0; i < reads; ++i) {
+                const T weighted = (T)((float)src[i] * w);
+                accum[i] = accum[i] + weighted;
+            }
         }
-        output[token * threads_per_grid.x + feature] = accumulator;
+        device T* dst = output + token * 2816 + feature_base;
+        for (uint i = 0; i < reads; ++i) {
+            dst[i] = accum[i];
+        }
     """,
     ensureRowContiguous: true
 )
@@ -170,7 +176,7 @@ public func weightedExpertUnsort(
             ("T", sortedOutputs.dtype),
             ("K", 8),
         ],
-        grid: (2816, tokens, 1),
+        grid: (2816 / 4, tokens, 1),
         threadGroup: (64, 4, 1),
         outputShapes: [[tokens, 2816]],
         outputDTypes: [.bfloat16]

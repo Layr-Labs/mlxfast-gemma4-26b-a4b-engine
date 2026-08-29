@@ -153,6 +153,22 @@ private let gemma4PrefillTailRows: Int = {
     return max(0, value)
 }()
 
+/// Decode-only fidelity-budget experiment. Preserve the top-8 table shape but
+/// turn one sufficiently weak route into a zero-weight duplicate of the row's
+/// strongest route. Stable expert sorting then places those assignments in one
+/// same-expert pair, so the promoted gather kernels reuse a single expert
+/// weight stream without requiring a new packed-index protocol.
+///
+/// Every row spends an explicit two-percent budget over the final BF16
+/// coefficients. Prefill, MTP rectangles, diagnostic probes, and non-production
+/// expert topologies remain exact.
+private let gemma4DuplicateZeroRouteEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DUPLICATE_ZERO_ROUTE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// Parse the independent direct expert-reduction control, which is ON by
 /// default: the coupled weighted-unsort + safe-R1 pair is what was measured
 /// faster, and the ranked box sets no environment.
@@ -2039,6 +2055,91 @@ public enum Gemma4RouterProbe {
         ((_ expertScores: MLXArray, _ topKIndices: MLXArray) -> Void)?
 }
 
+/// Fuse the stock per-expert-scale gather and BF16 multiply with an explicit
+/// relative route-mass budget. An omitted assignment keeps its original input
+/// row but borrows the strongest selected expert ID and receives an exact-zero
+/// coefficient. The stable route sort therefore makes the omitted assignment
+/// adjacent to a real assignment, activating the already-promoted same-expert
+/// pair weight-stream sharing in gate, up, and down projections.
+private enum Gemma4DuplicateZeroRouteScale {
+    private static let kernel = MLXFast.metalKernel(
+        name: "gemma4_relative_route_duplicate_zero_b8_k8_v1",
+        inputNames: ["indices", "weights", "pes"],
+        outputNames: ["shared_indices", "scaled_weights"],
+        source: """
+            constexpr float MAX_OMITTED_FRACTION = 0.02f;
+            const uint row = thread_position_in_grid.x;
+            const uint base = row * 8;
+
+            T scaled[8];
+            float magnitude[8];
+            float total_magnitude = 0.0f;
+            bool all_finite = true;
+            uint strongest_slot = 0;
+            float strongest = -1.0f;
+            for (uint slot = 0; slot < 8; ++slot) {
+                const uint expert = uint(indices[base + slot]);
+                // Preserve the stock BF16 multiply boundary before any
+                // fidelity-budget decision.
+                const T final_weight = weights[base + slot] * pes[expert];
+                scaled[slot] = final_weight;
+                magnitude[slot] = fabs(float(final_weight));
+                total_magnitude += magnitude[slot];
+                all_finite =
+                    all_finite && metal::isfinite(magnitude[slot]);
+                if (magnitude[slot] > strongest) {
+                    strongest = magnitude[slot];
+                    strongest_slot = slot;
+                }
+            }
+
+            uint weakest_slot = 0;
+            float weakest = magnitude[0];
+            for (uint slot = 1; slot < 8; ++slot) {
+                const float candidate = magnitude[slot];
+                if (candidate < weakest) {
+                    weakest = candidate;
+                    weakest_slot = slot;
+                }
+            }
+
+            const float omitted_budget =
+                total_magnitude * MAX_OMITTED_FRACTION;
+            const bool omit_one =
+                all_finite && weakest <= omitted_budget;
+            const uint strongest_expert =
+                uint(indices[base + strongest_slot]);
+            for (uint slot = 0; slot < 8; ++slot) {
+                const bool omit_weakest =
+                    omit_one && slot == weakest_slot;
+                shared_indices[base + slot] = omit_weakest
+                    ? strongest_expert
+                    : uint(indices[base + slot]);
+                scaled_weights[base + slot] =
+                    omit_weakest ? T(0) : scaled[slot];
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    static func apply(
+        indices: MLXArray, weights: MLXArray, perExpertScale: MLXArray
+    ) -> (indices: MLXArray, weights: MLXArray)? {
+        guard indices.shape == [8, 1, 8], indices.dtype == .uint32,
+            weights.shape == indices.shape, weights.dtype == .bfloat16,
+            perExpertScale.shape == [128], perExpertScale.dtype == .bfloat16
+        else { return nil }
+        let outputs = kernel(
+            [indices, weights, perExpertScale],
+            grid: (8, 1, 1),
+            threadGroup: (8, 1, 1),
+            outputShapes: [[8, 1, 8], [8, 1, 8]],
+            outputDTypes: [.uint32, .bfloat16]
+        )
+        return (outputs[0], outputs[1])
+    }
+}
+
 /// ROUTE-001: one-dispatch, byte-identical replacement of the decode router's
 /// selection chain — `argPartition(kth: E-8)` → slice → `takeAlong` →
 /// `softmax(precise)` over 8 → `perExpertScale` gather + multiply — for the
@@ -2599,7 +2700,9 @@ private class Gemma4Router: Module {
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
+    func callAsFunction(
+        _ x: MLXArray, allowDuplicateZeroRoute: Bool = false
+    ) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
         let effScale: MLXArray
         if let cached = cachedEffectiveScale {
             effScale = cached
@@ -2626,13 +2729,23 @@ private class Gemma4Router: Module {
 
         var topKWeights = MLX.takeAlong(expertScores, topKIndices, axis: -1)
         topKWeights = MLX.softmax(topKWeights, axis: -1, precise: true)
-        topKWeights = topKWeights * perExpertScale[topKIndices]
 
         // Diagnostic-only observability (nil in production; see
         // `Gemma4RouterProbe`). Recording the PRE-selection scores and the
         // selection itself, never altering either.
         Gemma4RouterProbe.recorder?(expertScores, topKIndices)
 
+        if allowDuplicateZeroRoute, Gemma4RouterProbe.recorder == nil,
+            let budgeted = Gemma4DuplicateZeroRouteScale.apply(
+                indices: topKIndices,
+                weights: topKWeights,
+                perExpertScale: perExpertScale)
+        {
+            CBv2EngageMark.once("duplicate-zero-route")
+            return (budgeted.indices, budgeted.weights)
+        }
+
+        topKWeights = topKWeights * perExpertScale[topKIndices]
         return (topKIndices, topKWeights)
     }
 }
@@ -2641,6 +2754,10 @@ private class Gemma4Router: Module {
 private class Gemma4Experts: Module {
     @ModuleInfo(key: "switch_glu") var switchGLU: SwitchGLU
     let fuseWeightedUnsort: Bool
+
+    var supportsGemma4DuplicateRouteSharing: Bool {
+        switchGLU.supportsGemma4DuplicateRouteSharing
+    }
 
     init(
         _ config: Gemma4TextConfiguration,
@@ -2922,7 +3039,12 @@ public class Gemma4DecoderLayer: Module {
             let postFeedforwardLayernorm2
         {
             // Dense + sparse branches in parallel, summed into one residual.
-            let (topKIndices, topKWeights) = router(out)
+            let (topKIndices, topKWeights) = router(
+                out,
+                allowDuplicateZeroRoute:
+                    gemma4DuplicateZeroRouteEnabled
+                    && !isExpertPrefill
+                    && experts.supportsGemma4DuplicateRouteSharing)
 
             let h1Raw: MLXArray
             let h2Raw: MLXArray

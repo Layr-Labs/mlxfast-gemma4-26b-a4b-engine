@@ -858,6 +858,29 @@ public class SwitchGLU: Module {
     let activationProduct: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
     let weightedReductionProfile: SwitchGLUWeightedReductionProfile
 
+    @inline(__always)
+    private func supportsGemma4SharedRouteProjection(_ projection: SwitchLinear?) -> Bool {
+        guard let projection = projection as? QuantizedSwitchLinear else { return false }
+        return projection.groupSize == 64 && projection.bits == 4
+            && projection.mode.rawValue == QuantizationMode.affine.rawValue
+            && projection.bias == nil
+    }
+
+    /// True only when stable B=8 route ranking and every expert projection use
+    /// the promoted affine-Q4/G64 same-expert pair/run kernels. This prevents a
+    /// duplicate route from being introduced on a topology that cannot share
+    /// its borrowed expert's weight stream.
+    public var supportsGemma4DuplicateRouteSharing: Bool {
+        guard routeSimdRank64Enabled,
+            weightedReductionProfile == .gemma4ProductionGeGLU,
+            inputDims == 2816, hiddenDims == 704, numExperts == 128,
+            gateUpProj == nil,
+            supportsGemma4SharedRouteProjection(downProj)
+        else { return false }
+        return supportsGemma4SharedRouteProjection(gateProj)
+            && supportsGemma4SharedRouteProjection(upProj)
+    }
+
     /// Activation-type flags detected once at init from a tiny test input (vMLX
     /// approach — no per-token check). Only consulted when `activationProduct` is
     /// nil (the custom-activation path): they let SiLU/GELU custom activations use

@@ -3648,7 +3648,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int gemma4_down_tile_span = 2; // KERN-DOWN-TILE-SPAN2 restacked on fe3d327 leader: 176 survivors of 352, span 4 knee, span 8 ranked −7.11%; bit-identical ownership per upstream uint16-exact parity for spans {2,4}
+  constexpr int gemma4_down_tile_span = 1; // KERN-DOWN-TILE-SPAN1: span sweep monotone direction established at the box — span 8 −7.11%, span 2 PROMOTED +0.18% over span 4. Span 1 retires the serial tile walk entirely: every even run-offset pair leader serves exactly ONE tile (t<1 loop collapses; ownership arithmetic unchanged, 352 leaders of 352 tiles, 352 % 1 == 0). Bit-identical per-assignment add sequences by the same survivor((u/span)*span) argument — the span=1 specialization is the degenerate case where each leader's walk length is the singleton
   if (tid.y % uint(gemma4_down_tile_span) != 0u) {
     return;
   }

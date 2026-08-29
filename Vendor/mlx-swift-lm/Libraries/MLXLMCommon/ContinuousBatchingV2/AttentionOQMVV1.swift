@@ -295,7 +295,237 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
   y[c.fn * N + n0 + c.fm] = static_cast<T>(acc0);
   y[(c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc1);
 }
+
+// PAIRK: the body above, consuming the K-group loop two groups at a time.
+//
+// Two things change, neither of them arithmetic:
+//
+//  1. The scale and bias planes are the only two streams in this kernel that
+//     are contiguous in the loop index `g` (the weight stride is 32 bytes and
+//     the activation stride is 128 bytes). Two consecutive groups of one row
+//     therefore share one aligned 32-bit word, so a pair of scales and a pair
+//     of biases arrive as two loads instead of four. Counting the weight
+//     words, the inner body issues four loads per two groups where the
+//     incumbent issues six.
+//  2. Both weight words are issued before either is consumed, widening the
+//     outstanding-load window on the weight stream.
+//
+// Exactness. Each group runs the incumbent body verbatim -- its own `r0`/`r1`
+// loads, its own `mma8_runsum4` pair, its own three-step `float2` butterfly,
+// its own `s`, `b` and private `C` -- and `acc0`/`acc1` still take group `g`
+// before group `g + 1` in ascending order through the same
+// `acc += s * C.thread_elements()[i] + rs[i] * b` step. Nothing is
+// reassociated and no accumulator is split or merged. Only the issue order and
+// width of independent loads moves.
+//
+// An earlier cut of this also batched the two groups' run-sum butterflies into
+// one `float4` reduction. That is algebraically identical -- `simd_shuffle_xor`
+// is componentwise -- but it measured 1 ULP off the incumbent on every
+// geometry where the paired loop ran, because hoisting all four run-sums
+// changes which of the surrounding float expressions the compiler contracts
+// into an FMA. It is not shipped. Anything that moves the run-sum out of its
+// own group's block has to be re-verified bitwise, not reasoned about.
+//
+// Alignment. The paired word spans groups `g` and `g + 1` of ONE row, at
+// element index `G * row + g`, so it is 32-bit aligned only when BOTH `G` and
+// `g` are even -- with an odd `G` the parity of the row base alternates and
+// half the rows would issue an unaligned load. Anything failing that guard
+// falls through to the scalar body below. Live o_proj is K = 4096 (G = 64) and
+// K = 8192 (G = 128), with `g_begin` in {0, 32} and {0, 64}, so the paired
+// loop covers both shapes end to end.
+template <typename T, int KS>
+METAL_FUNC void attention_o_qmv_mma8_affine4_g64_pairk(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int K,
+    const int N,
+    const int n0,
+    threadgroup float2* red,
+    uint simd_gid,
+    uint simd_lid) {
+  const int G = K / 64;
+  const int gh = (G + 1) / 2;
+  const int g_begin = (KS == 2 && simd_gid == 1) ? gh : 0;
+  const int g_end = (KS == 2 && simd_gid == 0) ? gh : G;
+  const mma8_coord c = mma8_lane(simd_lid);
+
+  const device uint8_t* wrow =
+      (const device uint8_t*)w + (n0 + c.fm) * (K / 2) + 4 * c.fn;
+  const device T* srow = scales + (n0 + c.fm) * G;
+  const device T* brow = biases + (n0 + c.fm) * G;
+  const device T* x0 = x + c.fn * K + 8 * c.fm;
+  const device T* x1 = x0 + K;
+
+  float acc0 = 0.0f;
+  float acc1 = 0.0f;
+  simdgroup_float8x8 A;
+  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+  int g = g_begin;
+  if ((G & 1) == 0 && (g_begin & 1) == 0) {
+    for (; g + 1 < g_end; g += 2) {
+      const uint2 wva = *((const device uint2*)(wrow + 32 * g));
+      const uint2 wvb = *((const device uint2*)(wrow + 32 * (g + 1)));
+      const uint sw = *((const device uint*)(srow + g));
+      const uint bw = *((const device uint*)(brow + g));
+
+      {
+        const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+        const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+
+        float2 rs = float2(mma8_runsum4<T>(r0), mma8_runsum4<T>(r1));
+        rs += simd_shuffle_xor(rs, 2u);
+        rs += simd_shuffle_xor(rs, 4u);
+        rs += simd_shuffle_xor(rs, 16u);
+
+        MMA8_SETB(B0, x, lo)
+        MMA8_SETB(B1, x, hi)
+        MMA8_SETB(B2, y, lo)
+        MMA8_SETB(B3, y, hi)
+        MMA8_SETB(B4, z, lo)
+        MMA8_SETB(B5, z, hi)
+        MMA8_SETB(B6, w, lo)
+        MMA8_SETB(B7, w, hi)
+
+        const uint2 wv = wva;
+        const float s = float(mma8_u16<T>::cast(ushort(sw & 0xFFFFu)));
+        const float b = float(mma8_u16<T>::cast(ushort(bw & 0xFFFFu)));
+
+        simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+        MMA8_STEP(B0, 0)
+        MMA8_STEP(B1, 1)
+        MMA8_STEP(B2, 2)
+        MMA8_STEP(B3, 3)
+        MMA8_STEP(B4, 4)
+        MMA8_STEP(B5, 5)
+        MMA8_STEP(B6, 6)
+        MMA8_STEP(B7, 7)
+
+        acc0 += s * C.thread_elements()[0] + rs.x * b;
+        acc1 += s * C.thread_elements()[1] + rs.y * b;
+      }
+
+      {
+        const uint4 r0 = *((const device uint4*)(x0 + 64 * (g + 1)));
+        const uint4 r1 = *((const device uint4*)(x1 + 64 * (g + 1)));
+
+        float2 rs = float2(mma8_runsum4<T>(r0), mma8_runsum4<T>(r1));
+        rs += simd_shuffle_xor(rs, 2u);
+        rs += simd_shuffle_xor(rs, 4u);
+        rs += simd_shuffle_xor(rs, 16u);
+
+        MMA8_SETB(B0, x, lo)
+        MMA8_SETB(B1, x, hi)
+        MMA8_SETB(B2, y, lo)
+        MMA8_SETB(B3, y, hi)
+        MMA8_SETB(B4, z, lo)
+        MMA8_SETB(B5, z, hi)
+        MMA8_SETB(B6, w, lo)
+        MMA8_SETB(B7, w, hi)
+
+        const uint2 wv = wvb;
+        const float s = float(mma8_u16<T>::cast(ushort(sw >> 16)));
+        const float b = float(mma8_u16<T>::cast(ushort(bw >> 16)));
+
+        simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+        MMA8_STEP(B0, 0)
+        MMA8_STEP(B1, 1)
+        MMA8_STEP(B2, 2)
+        MMA8_STEP(B3, 3)
+        MMA8_STEP(B4, 4)
+        MMA8_STEP(B5, 5)
+        MMA8_STEP(B6, 6)
+        MMA8_STEP(B7, 7)
+
+        acc0 += s * C.thread_elements()[0] + rs.x * b;
+        acc1 += s * C.thread_elements()[1] + rs.y * b;
+      }
+    }
+  }
+
+  for (; g < g_end; ++g) {
+    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+
+    float2 rs = float2(mma8_runsum4<T>(r0), mma8_runsum4<T>(r1));
+    rs += simd_shuffle_xor(rs, 2u);
+    rs += simd_shuffle_xor(rs, 4u);
+    rs += simd_shuffle_xor(rs, 16u);
+
+    MMA8_SETB(B0, x, lo)
+    MMA8_SETB(B1, x, hi)
+    MMA8_SETB(B2, y, lo)
+    MMA8_SETB(B3, y, hi)
+    MMA8_SETB(B4, z, lo)
+    MMA8_SETB(B5, z, hi)
+    MMA8_SETB(B6, w, lo)
+    MMA8_SETB(B7, w, hi)
+
+    const uint2 wv = *((const device uint2*)(wrow + 32 * g));
+    const float s = float(srow[g]);
+    const float b = float(brow[g]);
+
+    simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+    MMA8_STEP(B0, 0)
+    MMA8_STEP(B1, 1)
+    MMA8_STEP(B2, 2)
+    MMA8_STEP(B3, 3)
+    MMA8_STEP(B4, 4)
+    MMA8_STEP(B5, 5)
+    MMA8_STEP(B6, 6)
+    MMA8_STEP(B7, 7)
+
+    acc0 += s * C.thread_elements()[0] + rs.x * b;
+    acc1 += s * C.thread_elements()[1] + rs.y * b;
+  }
+
+  if (KS == 2) {
+    if (simd_gid == 1) {
+      red[simd_lid] = float2(acc0, acc1);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_gid == 1) {
+      return;
+    }
+    const float2 other = red[simd_lid];
+    acc0 = acc0 + other.x;
+    acc1 = acc1 + other.y;
+  }
+
+  y[c.fn * N + n0 + c.fm] = static_cast<T>(acc0);
+  y[(c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc1);
+}
 """
+
+    /// PAIRK arm for the o_proj matrix-unit tier. Default ON.
+    /// `DARKBLOOM_GEMMA4_ATTN_O_MMA8_PAIRK=0` restores the promoted
+    /// single-group dispatch byte for byte in the same executable.
+    public static let pairKEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ATTN_O_MMA8_PAIRK"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let pairKKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_pairk_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            attention_o_qmv_mma8_affine4_g64_pairk<T, 2>(
+                w, scales, biases, x, y,
+                x_shape[x_ndim - 1], w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
 
     private static let mma8Kernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_v1",
@@ -373,7 +603,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
             // streamed once per round instead of four times. Grid is in
             // threads: (32, 2, 1) threads per group, N/8 groups along y.
             let yTiles = outputWidth / outputsPerGroup
-            return mma8Kernel(
+            return (pairKEnabled ? pairKKernel : mma8Kernel)(
                 [x, weight, scales, biases],
                 template: [("T", x.dtype)],
                 grid: (simdWidth, yTiles * simdGroups, 1),

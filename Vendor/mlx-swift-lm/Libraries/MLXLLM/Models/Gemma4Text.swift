@@ -1670,12 +1670,15 @@ private enum Gemma4FusedLayerGlue {
                     acc += xi * xi;
                 }
                 acc = simd_sum(acc);
-                if (simd_group_id == 0) local_sums[simd_lane_id] = 0;
-                threadgroup_barrier(mem_flags::mem_threadgroup);
+                // 704 threads is exactly 22 simdgroups, so only 22 of the 32
+                // slots are ever written. Selecting zero for the rest on the
+                // read side feeds `simd_sum` the same 32 values the zeroing
+                // pass produced, without the write or the barrier.
                 if (simd_lane_id == 0) local_sums[simd_group_id] = acc;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 if (simd_group_id == 0) {
-                    acc = simd_sum(local_sums[simd_lane_id]);
+                    acc = simd_sum(
+                        simd_lane_id < 22 ? local_sums[simd_lane_id] : 0.0f);
                     if (simd_lane_id == 0) {
                         \(slot) = metal::precise::rsqrt(acc / 2816.0f + 1e-06f);
                     }
@@ -1752,14 +1755,15 @@ private enum Gemma4FusedLayerGlue {
         \(rmsReduce("b", into: "local_inv[1]"))
             const float inv1 = local_inv[0];
             const float inv2 = local_inv[1];
-            T sv[4];
+            // Each thread owns exactly the four elements at its own offset,
+            // so the branch sum stages through `out` instead of a per-thread
+            // array: the read back forwards from this thread's own store.
             for (int i = 0; i < 4; i++) {
                 const T h1 = w1[wbase + i] * static_cast<T>((float)a[base + i] * inv1);
                 const T h2 = w2[wbase + i] * static_cast<T>((float)b[base + i] * inv2);
-                sv[i] = h1 + h2;
+                out[base + i] = h1 + h2;
             }
-        \(rmsReduce("sv", into: "local_inv[0]").replacingOccurrences(
-            of: "(float)sv[base + i]", with: "(float)sv[i]"))
+        \(rmsReduce("out", into: "local_inv[0]"))
             const float inv3 = local_inv[0];
             const T scalar = s[0];
             for (int i = 0; i < 4; i++) {
@@ -1769,7 +1773,7 @@ private enum Gemma4FusedLayerGlue {
                 // stock graph stored it to memory, and the T*T product rounds
                 // once on the store exactly like the stock multiply kernel.
                 const T normed = static_cast<T>(
-                    w3[wbase + i] * static_cast<T>((float)sv[i] * inv3));
+                    w3[wbase + i] * static_cast<T>((float)out[base + i] * inv3));
                 const T summed = res[base + i] + normed;
                 out[base + i] = summed * scalar;
             }
@@ -1845,30 +1849,28 @@ private enum Gemma4FusedLayerGlue {
         \(rmsReduce("b", into: "local_inv[1]"))
             const float inv1 = local_inv[0];
             const float inv2 = local_inv[1];
-            T sv[4];
+            // Each thread owns exactly the four elements at its own offset,
+            // so the branch sum stages through `out` instead of a per-thread
+            // array: the read back forwards from this thread's own store.
             for (int i = 0; i < 4; i++) {
                 const T h1 = w1[wbase + i] * static_cast<T>((float)a[base + i] * inv1);
                 const T h2 = w2[wbase + i] * static_cast<T>((float)b[base + i] * inv2);
-                sv[i] = h1 + h2;
+                out[base + i] = h1 + h2;
             }
-        \(rmsReduce("sv", into: "local_inv[0]").replacingOccurrences(
-            of: "(float)sv[base + i]", with: "(float)sv[i]"))
+        \(rmsReduce("out", into: "local_inv[0]"))
             const float inv3 = local_inv[0];
             const T scalar = s[0];
-            T outv[4];
             for (int i = 0; i < 4; i++) {
                 const T normed3 = static_cast<T>(
-                    w3[wbase + i] * static_cast<T>((float)sv[i] * inv3));
+                    w3[wbase + i] * static_cast<T>((float)out[base + i] * inv3));
                 const T summed = res[base + i] + normed3;
-                outv[i] = summed * scalar;
-                out[base + i] = outv[i];
+                out[base + i] = summed * scalar;
             }
-        \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
-            of: "(float)outv[base + i]", with: "(float)outv[i]"))
+        \(rmsReduce("out", into: "local_inv[0]"))
             const float inv4 = local_inv[0];
             for (int i = 0; i < 4; i++) {
                 normed[base + i] =
-                    wn[wbase + i] * static_cast<T>((float)outv[i] * inv4);
+                    wn[wbase + i] * static_cast<T>((float)out[base + i] * inv4);
             }
         """,
         ensureRowContiguous: true

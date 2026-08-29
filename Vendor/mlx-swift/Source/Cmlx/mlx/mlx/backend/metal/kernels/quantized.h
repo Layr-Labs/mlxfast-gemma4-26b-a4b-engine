@@ -2095,43 +2095,54 @@ METAL_FUNC void gemma4_qmv_mma8_affine4_g64_impl(
   simdgroup_float8x8 A;
   simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
 
-  for (int g = g_begin; g < g_end; ++g) {
-    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
-    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+  if (g_begin < g_end) {
+    uint4 r0 = *((const device uint4*)(x0 + 64 * g_begin));
+    uint4 r1 = *((const device uint4*)(x1 + 64 * g_begin));
+    uint2 wv = *((const device uint2*)(wrow + 32 * g_begin));
+    float s = float(srow[g_begin]);
+    float b = float(brow[g_begin]);
 
-    // Each B lane owns the two 8-runs whose run sums the C lane (fm, fn)
-    // needs; three xor-butterfly steps over the fm lane bits broadcast
-    // RS[g][fn] and RS[g][fn + 1] to all eight lanes of the fn column group.
-    float2 rs = float2(mma8_runsum4<T>(r0), mma8_runsum4<T>(r1));
-    rs += simd_shuffle_xor(rs, 2u);
-    rs += simd_shuffle_xor(rs, 4u);
-    rs += simd_shuffle_xor(rs, 16u);
+    for (int g = g_begin; g < g_end; ++g) {
+      const bool has_next = (g + 1 < g_end);
+      const uint4 r0_next = has_next ? *((const device uint4*)(x0 + 64 * (g + 1))) : uint4(0);
+      const uint4 r1_next = has_next ? *((const device uint4*)(x1 + 64 * (g + 1))) : uint4(0);
+      const uint2 wv_next = has_next ? *((const device uint2*)(wrow + 32 * (g + 1))) : uint2(0);
+      const float s_next = has_next ? float(srow[g + 1]) : 0.0f;
+      const float b_next = has_next ? float(brow[g + 1]) : 0.0f;
 
-    MMA8_SETB(B0, x, lo)
-    MMA8_SETB(B1, x, hi)
-    MMA8_SETB(B2, y, lo)
-    MMA8_SETB(B3, y, hi)
-    MMA8_SETB(B4, z, lo)
-    MMA8_SETB(B5, z, hi)
-    MMA8_SETB(B6, w, lo)
-    MMA8_SETB(B7, w, hi)
+      float2 rs = float2(mma8_runsum4<T>(r0), mma8_runsum4<T>(r1));
+      rs += simd_shuffle_xor(rs, 2u);
+      rs += simd_shuffle_xor(rs, 4u);
+      rs += simd_shuffle_xor(rs, 16u);
 
-    const uint2 wv = *((const device uint2*)(wrow + 32 * g));
-    const float s = float(srow[g]);
-    const float b = float(brow[g]);
+      MMA8_SETB(B0, x, lo)
+      MMA8_SETB(B1, x, hi)
+      MMA8_SETB(B2, y, lo)
+      MMA8_SETB(B3, y, hi)
+      MMA8_SETB(B4, z, lo)
+      MMA8_SETB(B5, z, hi)
+      MMA8_SETB(B6, w, lo)
+      MMA8_SETB(B7, w, hi)
 
-    simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
-    MMA8_STEP(B0, 0)
-    MMA8_STEP(B1, 1)
-    MMA8_STEP(B2, 2)
-    MMA8_STEP(B3, 3)
-    MMA8_STEP(B4, 4)
-    MMA8_STEP(B5, 5)
-    MMA8_STEP(B6, 6)
-    MMA8_STEP(B7, 7)
+      simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+      MMA8_STEP(B0, 0)
+      MMA8_STEP(B1, 1)
+      MMA8_STEP(B2, 2)
+      MMA8_STEP(B3, 3)
+      MMA8_STEP(B4, 4)
+      MMA8_STEP(B5, 5)
+      MMA8_STEP(B6, 6)
+      MMA8_STEP(B7, 7)
 
-    acc0 += s * C.thread_elements()[0] + rs.x * b;
-    acc1 += s * C.thread_elements()[1] + rs.y * b;
+      acc0 += s * C.thread_elements()[0] + rs.x * b;
+      acc1 += s * C.thread_elements()[1] + rs.y * b;
+
+      r0 = r0_next;
+      r1 = r1_next;
+      wv = wv_next;
+      s = s_next;
+      b = b_next;
+    }
   }
 
   if (KS == 2) {

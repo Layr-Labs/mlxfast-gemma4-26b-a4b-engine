@@ -855,6 +855,204 @@ private func gemma4FusedQKVNorm(
     return (outputs[0], outputs[1], outputs[2])
 }
 
+/// Prefill Q/K preparation. One threadgroup owns one `(token, head)` row:
+/// D/4 threads preserve the incumbent RMS reduction tree, then write final
+/// `[B,H,L,D]` Q/K with stock nontraditional RoPE. Decode is disjoint
+/// (`L >= 2` here, exact B8/L1 above).
+private let gemma4PrefillQKNormLayoutRoPEKernel = MLXFast.metalKernel(
+    name: "gemma4_prefill_qk_rms_layout_rope_h1_v2",
+    inputNames: ["q", "k", "q_weight", "k_weight", "offsets", "rope_operand"],
+    outputNames: ["q_out", "k_out"],
+    source: """
+        constexpr uint reads = 4;
+        constexpr uint dimension = D;
+        constexpr uint half_dimension = D / 2;
+        constexpr uint query_heads = Q_HEADS;
+        constexpr uint key_heads = K_HEADS;
+
+        const uint combined_heads = query_heads + key_heads;
+        const uint batch_head = threadgroup_position_in_grid.x;
+        const uint batch = batch_head / combined_heads;
+        const uint combined_head = batch_head % combined_heads;
+        const uint token = threadgroup_position_in_grid.y;
+        const uint length = threadgroups_per_grid.y;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint simd_group = simdgroup_index_in_threadgroup;
+        const bool is_query = combined_head < query_heads;
+        const uint head = is_query ? combined_head : combined_head - query_heads;
+        const uint heads = is_query ? query_heads : key_heads;
+
+        const device T* input = is_query ? q : k;
+        const device T* weight = is_query ? q_weight : k_weight;
+        device T* output = is_query ? q_out : k_out;
+        input += ((batch * length + token) * heads + head) * dimension;
+        output += ((batch * heads + head) * length + token) * dimension;
+
+        float sum = 0.0f;
+        for (uint i = 0; i < reads; ++i) {
+            const float value = float(input[lid * reads + i]);
+            sum += value * value;
+        }
+        sum = simd_sum(sum);
+
+        threadgroup float partials[32];
+        threadgroup float inverse_rms;
+        if (simd_group == 0) partials[lane] = 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) partials[simd_group] = sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            sum = simd_sum(partials[lane]);
+            if (lane == 0) {
+                inverse_rms = metal::precise::rsqrt(
+                    sum / float(dimension) + 1.0e-6f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup bfloat normalized[dimension];
+        for (uint i = 0; i < reads; ++i) {
+            const uint element = lid * reads + i;
+            const T rms_value = T(float(input[element]) * inverse_rms);
+            normalized[element] = T(weight[element] * rms_value);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // The leading D/8 threads own all D/2 rotary pairs (one SIMDgroup at
+        // sliding D=256; two at full D=512). Every pair's arithmetic and BF16
+        // stores match `rope.metal` exactly.
+        if (lid < half_dimension / reads) {
+            const float position = float(int(token) + offsets[batch]);
+            for (uint i = 0; i < reads; ++i) {
+                const uint pair = lid * reads + i;
+                const float exponent = float(pair) / float(half_dimension);
+                const float inverse_frequency = USE_FREQS != 0
+                    ? 1.0f / rope_operand[pair]
+                    : metal::exp2(-exponent * rope_operand[0]);
+                const float theta = position * inverse_frequency;
+                const float cosine = metal::fast::cos(theta);
+                const float sine = metal::fast::sin(theta);
+                const float x1 = float(normalized[pair]);
+                const float x2 = float(normalized[pair + half_dimension]);
+                output[pair] = T(x1 * cosine - x2 * sine);
+                output[pair + half_dimension] = T(x1 * sine + x2 * cosine);
+            }
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+private func gemma4PrefillSlidingQKNormLayoutRoPE(
+    q: MLXArray,
+    k: MLXArray,
+    qWeight: MLXArray,
+    kWeight: MLXArray,
+    offsets: MLXArray,
+    ropeOperand: MLXArray,
+    eps: Float
+) -> (queries: MLXArray, keys: MLXArray)? {
+    guard gemma4PrefillSlidingQKNormLayoutRoPEEnabled,
+        eps == 1.0e-6,
+        q.dtype == .bfloat16, k.dtype == .bfloat16,
+        qWeight.dtype == .bfloat16, kWeight.dtype == .bfloat16,
+        offsets.dtype == .int32, ropeOperand.dtype == .float32,
+        q.ndim == 4, k.ndim == 4,
+        q.dim(0) == 8, k.dim(0) == 8,
+        q.dim(1) == k.dim(1), q.dim(1) >= 2, q.dim(1) <= 1_024,
+        q.dim(2) == 16, k.dim(2) == 8,
+        q.dim(3) == 256, k.dim(3) == 256,
+        qWeight.shape == [256], kWeight.shape == [256],
+        offsets.shape == [q.dim(0)], ropeOperand.shape == [128]
+    else { return nil }
+
+    CBv2EngageMark.once("gemma4-prefill-sliding-qk-norm-layout-rope")
+    let batch = q.dim(0)
+    let length = q.dim(1)
+    let heads = 16 + 8
+    let threads = 64
+    let outputs = gemma4PrefillQKNormLayoutRoPEKernel(
+        [q, k, qWeight, kWeight, offsets, ropeOperand],
+        template: [
+            ("T", q.dtype), ("D", 256),
+            ("Q_HEADS", 16), ("K_HEADS", 8), ("USE_FREQS", 0),
+        ],
+        grid: (batch * heads * threads, length, 1),
+        threadGroup: (threads, 1, 1),
+        outputShapes: [
+            [batch, 16, length, 256],
+            [batch, 8, length, 256],
+        ],
+        outputDTypes: [q.dtype, k.dtype]
+    )
+    return (outputs[0], outputs[1])
+}
+
+private let gemma4PrefillSlidingQKNormLayoutRoPEEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_PREFILL_SLIDING_QK_NORM_ROPE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+private func gemma4PrefillFullQKNormLayoutRoPE(
+    q: MLXArray,
+    k: MLXArray,
+    qWeight: MLXArray,
+    kWeight: MLXArray,
+    offsets: MLXArray,
+    ropeOperand: MLXArray,
+    eps: Float
+) -> (queries: MLXArray, keys: MLXArray)? {
+    guard gemma4PrefillFullQKNormLayoutRoPEEnabled,
+        eps == 1.0e-6,
+        q.dtype == .bfloat16, k.dtype == .bfloat16,
+        qWeight.dtype == .bfloat16, kWeight.dtype == .bfloat16,
+        offsets.dtype == .int32, ropeOperand.dtype == .float32,
+        q.ndim == 4, k.ndim == 4,
+        q.dim(0) == 8, k.dim(0) == 8,
+        q.dim(1) == k.dim(1), q.dim(1) >= 2, q.dim(1) <= 1_024,
+        q.dim(2) == 16, k.dim(2) == 2,
+        q.dim(3) == 512, k.dim(3) == 512,
+        qWeight.shape == [512], kWeight.shape == [512],
+        offsets.shape == [q.dim(0)], ropeOperand.shape == [256]
+    else { return nil }
+
+    CBv2EngageMark.once("gemma4-prefill-full-qk-norm-layout-rope")
+    let batch = q.dim(0)
+    let length = q.dim(1)
+    let heads = 16 + 2
+    let threads = 128
+    let outputs = gemma4PrefillQKNormLayoutRoPEKernel(
+        [q, k, qWeight, kWeight, offsets, ropeOperand],
+        template: [
+            ("T", q.dtype), ("D", 512),
+            ("Q_HEADS", 16), ("K_HEADS", 2), ("USE_FREQS", 1),
+        ],
+        grid: (batch * heads * threads, length, 1),
+        threadGroup: (threads, 1, 1),
+        outputShapes: [
+            [batch, 16, length, 512],
+            [batch, 2, length, 512],
+        ],
+        outputDTypes: [q.dtype, k.dtype]
+    )
+    return (outputs[0], outputs[1])
+}
+
+private let gemma4PrefillFullQKNormLayoutRoPEEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_PREFILL_FULL_QK_NORM_ROPE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// Prefill-only RoPE operand storage. The wrapper keeps derived arrays out of
+/// `Module` parameter reflection without enabling or touching a decode path.
+private struct Gemma4PrefillRoPEConfiguration {
+    let operand: MLXArray
+}
+
 private class ScaledLinear: Module {
     let weight: MLXArray
     let scalar: Float
@@ -992,6 +1190,7 @@ private class Gemma4Attention: Module {
     let useKeqV: Bool
     let usesSharedKV: Bool
     let scale: Float
+    let prefillRoPEConfiguration: Gemma4PrefillRoPEConfiguration
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
     @ModuleInfo(key: "k_proj") var kProj: Linear?
@@ -1034,6 +1233,34 @@ private class Gemma4Attention: Module {
         }
 
         self.scale = 1.0
+
+        // Derive only the operand the prefill Q/K kernel consumes. Keeping it
+        // in a prefill-specific wrapper leaves PR428's decode norm, transpose
+        // and RoPE graph unchanged.
+        if isSliding {
+            self.prefillRoPEConfiguration = Gemma4PrefillRoPEConfiguration(
+                operand: MLXArray(
+                    Array(
+                        repeating: log2(config.slidingRopeTheta),
+                        count: effectiveHeadDim / 2)))
+        } else {
+            let rotatedDims =
+                Int(config.fullPartialRotaryFactor * Float(effectiveHeadDim) / 2) * 2
+            let exponents =
+                MLXArray(stride(from: 0, to: rotatedDims, by: 2)).asType(.float32)
+                / Float(effectiveHeadDim)
+            let realFreqs = MLX.pow(config.fullRopeTheta, exponents)
+            let padCount = (effectiveHeadDim - rotatedDims) / 2
+            if padCount > 0 {
+                let padding = MLXArray(
+                    Array(repeating: Float.infinity, count: padCount))
+                self.prefillRoPEConfiguration = Gemma4PrefillRoPEConfiguration(
+                    operand: concatenated([realFreqs, padding], axis: -1))
+            } else {
+                self.prefillRoPEConfiguration = Gemma4PrefillRoPEConfiguration(
+                    operand: realFreqs)
+            }
+        }
 
         self._qProj.wrappedValue = Linear(dim, nHeads * effectiveHeadDim, bias: false)
         if !usesSharedKV {
@@ -1340,20 +1567,56 @@ private class Gemma4Attention: Module {
             vRaw = kRaw
         }
 
-        let normalized = gemma4FusedQKVNorm(
-            q: queryRaw, k: kRaw, v: vRaw,
-            qWeight: qNorm.weight, kWeight: kNorm.weight, eps: config.rmsNormEps,
-            keyValueShared: vProj == nil)
-        var queries = normalized?.0 ?? qNorm(queryRaw)
-        var k = normalized?.1 ?? kNorm(kRaw)
-        var v = normalized?.2 ?? vNorm(vRaw)
+        // PREP-ONLY: decode (L == 1) never calls either helper. Full-attention
+        // last-query prefill also stays stock because its Q and K lengths
+        // intentionally differ.
+        let prefillPrepared: (queries: MLXArray, keys: MLXArray)?
+        if B == 8 && L >= 2 && lastQueryCache == nil {
+            if isSliding {
+                prefillPrepared = gemma4PrefillSlidingQKNormLayoutRoPE(
+                    q: queryRaw, k: kRaw,
+                    qWeight: qNorm.weight, kWeight: kNorm.weight,
+                    offsets: capturedOffsets,
+                    ropeOperand: prefillRoPEConfiguration.operand,
+                    eps: config.rmsNormEps)
+            } else {
+                prefillPrepared = gemma4PrefillFullQKNormLayoutRoPE(
+                    q: queryRaw, k: kRaw,
+                    qWeight: qNorm.weight, kWeight: kNorm.weight,
+                    offsets: capturedOffsets,
+                    ropeOperand: prefillRoPEConfiguration.operand,
+                    eps: config.rmsNormEps)
+            }
+        } else {
+            prefillPrepared = nil
+        }
 
-        queries = queries.transposed(0, 2, 1, 3)
-        queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: queryPositionOffset)
-        k = k.transposed(0, 2, 1, 3)
-        k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
+        let normalized = prefillPrepared == nil
+            ? gemma4FusedQKVNorm(
+                q: queryRaw, k: kRaw, v: vRaw,
+                qWeight: qNorm.weight, kWeight: kNorm.weight,
+                eps: config.rmsNormEps, keyValueShared: vProj == nil)
+            : nil
 
-        v = v.transposed(0, 2, 1, 3)
+        var queries: MLXArray
+        var k: MLXArray
+        var v: MLXArray
+        if let prefillPrepared {
+            queries = prefillPrepared.queries
+            k = prefillPrepared.keys
+            v = vNorm(vRaw).transposed(0, 2, 1, 3)
+        } else {
+            queries = normalized?.0 ?? qNorm(queryRaw)
+            k = normalized?.1 ?? kNorm(kRaw)
+            v = normalized?.2 ?? vNorm(vRaw)
+
+            queries = queries.transposed(0, 2, 1, 3)
+            queries = gemma4ApplyRotaryPosition(
+                rope, to: queries, offset: queryPositionOffset)
+            k = k.transposed(0, 2, 1, 3)
+            k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
+            v = v.transposed(0, 2, 1, 3)
+        }
 
         let outputDType = queries.dtype
         let attentionQueries =

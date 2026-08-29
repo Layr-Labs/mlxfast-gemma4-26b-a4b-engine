@@ -2031,6 +2031,63 @@ private class Gemma4Router: Module {
         super.init()
     }
 
+    /// ROUTER-TAU: spend the per-stream token-tolerance budget on the expert
+    /// plane. On the B=8 decode geometry, a token's LOWEST-weighted routed
+    /// expert is dropped when it carries less than `tauRel` of that token's
+    /// heaviest weight: its assignment is redirected to the heaviest expert
+    /// with weight ZERO, so the weighted reduction contributes nothing for it
+    /// (the output is the tau-truncated 7/8-expert mixture — a bounded,
+    /// model-general approximation the fidelity gate prices), while the
+    /// counting sort makes the duplicate adjacent to the heavy expert's run
+    /// and the landed pair/run kernels share its weight stream — the dropped
+    /// expert's gate/up/down planes are simply never read. At most one
+    /// expert is dropped per token per layer, and only when its relative
+    /// weight says the mixture barely misses it.
+    private static let tauEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ROUTER_TAU"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+    private static let tauRel: Float = 0.15
+
+    /// One compiled graph (house pattern: compile(shapeless:)) so the
+    /// truncation costs ~one fused dispatch per MoE layer instead of five —
+    /// rung 2 of the ladder measured the unfused op chain's overhead at
+    /// ~-1.6% composite with a threshold too low to ever fire.
+    private static let tauTruncateCompiled:
+        @Sendable ([MLXArray]) -> [MLXArray] = MLX.compile(
+            shapeless: true
+        ) { (inputs: [MLXArray]) in
+            let indices = inputs[0]
+            let weights = inputs[1]
+            let top = MLX.max(weights, axis: -1, keepDims: true)
+            let low = MLX.min(weights, axis: -1, keepDims: true)
+            let topIdx = MLX.takeAlong(
+                indices, MLX.argMax(weights, axis: -1, keepDims: true),
+                axis: -1)
+            let dropSlot = MLX.logicalAnd(
+                low .< (top * Gemma4Router.tauRel), weights .== low)
+            return [
+                MLX.which(dropSlot, topIdx, indices),
+                MLX.which(
+                    dropSlot, MLXArray(Float(0)).asType(weights.dtype),
+                    weights),
+            ]
+        }
+
+    private func tauTruncate(
+        _ indices: MLXArray, _ weights: MLXArray
+    ) -> (MLXArray, MLXArray) {
+        guard Gemma4Router.tauEnabled,
+            weights.ndim == 3,
+            weights.dim(0) == 8,
+            weights.dim(1) == 1
+        else { return (indices, weights) }
+        let outs = Gemma4Router.tauTruncateCompiled([indices, weights])
+        return (outs[0], outs[1])
+    }
+
     func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
         let effScale: MLXArray
         if let cached = cachedEffectiveScale {
@@ -2050,7 +2107,8 @@ private class Gemma4Router: Module {
             expertScores: expertScores, perExpertScale: perExpertScale, topK: topK)
         {
             Gemma4RouterProbe.recorder?(expertScores, fused.indices)
-            return (fused.indices, fused.weights)
+            let truncated = tauTruncate(fused.indices, fused.weights)
+            return (truncated.0, truncated.1)
         }
 
         var topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
@@ -2065,7 +2123,8 @@ private class Gemma4Router: Module {
         // selection itself, never altering either.
         Gemma4RouterProbe.recorder?(expertScores, topKIndices)
 
-        return (topKIndices, topKWeights)
+        let truncated = tauTruncate(topKIndices, topKWeights)
+        return (truncated.0, truncated.1)
     }
 }
 

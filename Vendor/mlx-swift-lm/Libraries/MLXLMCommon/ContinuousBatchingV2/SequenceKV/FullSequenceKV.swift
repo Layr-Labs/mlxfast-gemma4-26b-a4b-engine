@@ -237,6 +237,22 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
         return (keys?.nbytes ?? 0) + (values?.nbytes ?? 0)
     }
 
+    /// WRITE-016-D512: the `update()` bookkeeping advance without the two
+    /// slice assignments, for a token whose K/V bytes were already stored in
+    /// place by the fused QK dispatch. The caller (the fused wrapper) gates
+    /// capacity >= the new length before the store, so this never needs
+    /// `ensureCapacity`; a step that would grow the buffer falls back to the
+    /// append path instead.
+    public func advanceAfterFusedAppend() {
+        precondition(
+            cohortPool == nil && keys != nil && values != nil,
+            "CBv2FullSequenceKV: fused append advance requires private storage")
+        precondition(
+            absoluteOffset + 1 <= maxLength,
+            "CBv2FullSequenceKV: fused append past maxLength — admission bug")
+        absoluteOffset += 1
+    }
+
     public func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
         let n = newKeys.dim(2)
         precondition(newKeys.dim(0) == 1 && newValues.dim(0) == 1,

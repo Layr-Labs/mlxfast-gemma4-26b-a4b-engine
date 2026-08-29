@@ -2858,6 +2858,7 @@ template <typename T, const int group_size, const int bits, bool batched>
     const constant int64_t* w_strides [[buffer(12)]],
     const constant int64_t* s_strides [[buffer(13)]],
     const constant int64_t* b_strides [[buffer(14)]],
+    const constant int& matrix_rows [[buffer(15)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 ntg [[threadgroups_per_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -2881,7 +2882,8 @@ template <typename T, const int group_size, const int bits, bool batched>
         b_strides,
         tid);
   }
-  if (!batched && group_size == 64 && bits == 4 && ntg.x == 8 &&
+  if (!batched && group_size == 64 && bits == 4 && matrix_rows == 8 &&
+      ntg.x == 1 &&
       ntg.z == 1 && in_vec_size % 64 == 0 && out_vec_size >= 8 &&
       out_vec_size % 8 == 0) {
     // The ruled decode cohort presents eight input rows to ordinary QMV.
@@ -2917,11 +2919,8 @@ template <typename T, const int group_size, const int bits, bool batched>
     if (kGemma4QmvMma8Affine4 && sizeof(T) == 2 && ntg.z == 1 &&
         in_vec_size % 64 == 0 &&
         out_vec_size >= kGemma4QmvMma8Affine4FloorN && out_vec_size % 8 == 0) {
-      // Seven of the eight host x-groups retire before any load; the eighth
+      // The host contracts the ruled M = 8 dispatch to one x-group, which
       // produces all eight cohort columns of its eight output rows.
-      if (tid.x != 0) {
-        return;
-      }
       threadgroup float2 red[32];
       gemma4_qmv_mma8_affine4_g64_impl<T, 2>(
           w,

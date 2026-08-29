@@ -3645,6 +3645,8 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
+  // Tile y is covered by the survivor at y - (y % span); the residue
+  // classes partition the 352 y-groups, so the cover is exact.
   constexpr int gemma4_down_tile_span = 4; // sweep alternate: 2
   if (tid.y % uint(gemma4_down_tile_span) != 0u) {
     return;

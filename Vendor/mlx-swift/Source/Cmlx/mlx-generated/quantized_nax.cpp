@@ -1471,7 +1471,6 @@ template <
 // Compile-time source constant by design: an enable must never ride a
 // function constant magnitude (pipeline-key law).
 MLX_MTL_CONST bool kGatherRhsSegmentElide = true;
-MLX_MTL_CONST bool kGatherRhsSortedEndpointElide = true;
 
 // Loads one 16-row fragment row of an A tile from device memory. The
 // address arithmetic matches NAXTile::load exactly for that fragment row
@@ -1630,19 +1629,11 @@ template <
     offset = offset_next;
     index = index_next;
     offset_next = tgp_bm;
-    // gather_qmm_rhs is dispatched only for right-sorted indices. If this
-    // segment's expert matches the tile endpoint, sortedness proves that the
-    // remaining suffix is one segment and the per-row probe can stop here.
-    if (kGatherRhsSortedEndpointElide &&
-        indices[y_row + tgp_bm - 1] == index) {
-      n = tgp_bm;
-    } else {
-      for (; n < tgp_bm; n++) {
-        if (indices[y_row + n] != index) {
-          offset_next = n;
-          index_next = indices[y_row + n];
-          break;
-        }
+    for (; n < tgp_bm; n++) {
+      if (indices[y_row + n] != index) {
+        offset_next = n;
+        index_next = indices[y_row + n];
+        break;
       }
     }
     threadgroup_barrier(mem_flags::mem_none);

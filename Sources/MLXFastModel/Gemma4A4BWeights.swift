@@ -130,6 +130,26 @@ public struct Gemma4A4BWeightLoader {
         inFeatures / groupSize
     }
 
+    /// Compile-in affine-8 IPG3 pack for B8 dense MLP gate/up/down decode.
+    /// Weight layout stays `packedColumns` / `groupColumns`; this selects the
+    /// 3+3+2 tight x-group schedule those projections actually run.
+    static let denseMlpAffine8M8Ipg = 3
+    static let denseMlpAffine8Ipg3Tight = true
+    static let denseMlpAffine8PackHead = 3
+    static let denseMlpAffine8PackTail = 2
+    static let denseMlpAffine8DirectNibbles = false
+
+    /// Tight x-group count for a batch-eight affine-8 dense MLP QMV: three
+    /// groups packing 3+3+2 (TAIL=2), not `batch / 4` quads.
+    static func denseMlpAffine8Ipg3XGroups(batch: Int) -> Int {
+        precondition(denseMlpAffine8Ipg3Tight)
+        precondition(!denseMlpAffine8DirectNibbles)
+        precondition(denseMlpAffine8M8Ipg == denseMlpAffine8PackHead)
+        let ipg = denseMlpAffine8M8Ipg
+        let tail = batch % ipg
+        return (batch / ipg) + (tail == denseMlpAffine8PackTail ? 1 : 0)
+    }
+
     // MARK: - Inventory
 
     /// The complete expected tensor-name set, derived from the config rather
@@ -352,6 +372,19 @@ public struct Gemma4A4BWeightLoader {
         for component in ["scales", "biases"] {
             try validateDenseTensorMetadata(
                 named: "\(stem).\(component)", expectedShape: groupShape)
+        }
+        if spec.bits == 8,
+            stem.contains("mlp.gate_proj")
+                || stem.contains("mlp.up_proj")
+                || stem.contains("mlp.down_proj")
+        {
+            let xGroups = Self.denseMlpAffine8Ipg3XGroups(batch: 8)
+            guard xGroups == 3 else {
+                throw MLXFastError.invalidInput(
+                    "Gemma 4 26B A4B tensor \(stem) affine-8 dense MLP must "
+                        + "decode on the IPG3 3+3+2 pack, got \(xGroups) x-groups"
+                )
+            }
         }
     }
 

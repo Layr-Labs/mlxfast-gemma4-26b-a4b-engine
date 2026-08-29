@@ -1973,6 +1973,133 @@ METAL_FUNC void qmv_affine8_g64_pair_impl(
   }
 }
 
+// Three-row byte-weight-stream sharing for the affine8/g64 QMV. The quad
+// lemma with the fourth input row deleted: one live x buffer, same K-loop
+// order, per-(output, input) accumulators, and qdot_affine8_registered
+// arithmetic, so every output element's add sequence remains identical to
+// stock qmv_impl. Makes the host 3+3+2 pack (TAIL=2) on ntg.x==8 legal.
+template <typename T, const int group_size, const int bits>
+METAL_FUNC void qmv_affine8_g64_triple_stream_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x0,
+    const device T* x1,
+    const device T* x2,
+    device T* y0,
+    device T* y1,
+    device T* y2,
+    const constant int& in_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 4;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 16;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread float x_thread[values_per_thread];
+  thread uint8_t packed[results_per_simdgroup][bytes_per_thread];
+  thread float scale_local[results_per_simdgroup];
+  thread float bias_local[results_per_simdgroup];
+  thread float result0[results_per_simdgroup] = {0};
+  thread float result1[results_per_simdgroup] = {0};
+  thread float result2[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x0 += simd_lid * values_per_thread;
+  x1 += simd_lid * values_per_thread;
+  x2 += simd_lid * values_per_thread;
+  y0 += out_row;
+  y1 += out_row;
+  y2 += out_row;
+
+  int k = 0;
+  for (; k <= in_vec_size - block_size; k += block_size) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      for (int i = 0; i < bytes_per_thread; i++) {
+        packed[row][i] = wl[i];
+      }
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    float sum = load_vector<T, float, values_per_thread, 8>(x0, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x1, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result1[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x2, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result2[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+
+    ws += block_size;
+    scales += block_size / 64;
+    biases += block_size / 64;
+    x0 += block_size;
+    x1 += block_size;
+    x2 += block_size;
+  }
+
+  const uint active_tail_lanes =
+      uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      for (int i = 0; i < bytes_per_thread; i++) {
+        packed[row][i] = wl[i];
+      }
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    float sum = load_vector<T, float, values_per_thread, 8>(x0, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x1, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result1[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x2, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result2[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result0[row] = simd_sum(result0[row]);
+    result1[row] = simd_sum(result1[row]);
+    result2[row] = simd_sum(result2[row]);
+    if (simd_lid == 0) {
+      y0[row] = static_cast<T>(result0[row]);
+      y1[row] = static_cast<T>(result1[row]);
+      y2[row] = static_cast<T>(result2[row]);
+    }
+  }
+}
+
 // Four-row byte-weight-stream sharing for the affine8/g64 QMV, held to a
 // PAIR-SIZED register footprint, exactly as
 // qmv_affine4_g64_quad_stream_impl does for the nibble path. Same geometry as
@@ -3171,36 +3298,52 @@ template <typename T, const int group_size, const int bits, bool batched>
     // Dense decode projections use byte weights.
     if (out_vec_size >= 1024) {
       // WIDE-N tier -- the dense MLP of all 30 layers: gate_proj and up_proj
-      // N = 2112 over K = 2816, down_proj N = 2816 over K = 2112. One
-      // byte-weight stream feeds FOUR cohort rows in two active x-groups
-      // (4+4); the remaining host groups return, and per-row qdot, K-loop and
-      // simd_sum stay the stock qmv_impl sequence.
+      // N = 2112 over K = 2816, down_proj N = 2816 over K = 2112.
       //
-      // Measured on the ranked box (M4 Pro, B = 8, streamed weight pool),
-      // us/dispatch, incumbent pair -> this:
-      //   N = 2112 (gate/up)  64.4 -> 56.2     N = 2816 (down)  67.4 -> 59.0
-      // Same 1024 floor as the nibble tier, which keeps router.proj (N = 128)
-      // on the promoted pair kernel byte-for-byte.
-      const int first_m = int(tid.x) * 4;
-      if (first_m >= 8) {
+      // IPG3 consider on ntg.x==8: M=8, M8_IPG=3, PACK=3+3+2, TAIL=2,
+      // DIRECT_NIBBLES=false. Groups 0 and 1 take the affine8 triple lemma;
+      // group 2 takes the incumbent pair. Not two quads, not a clamp of
+      // qmv_fast_crossrow_affine4_g64_m<T, 8, 4, true>. Pair+quad lemmas stay.
+      constexpr int M8_IPG = 3;
+      constexpr int M = 8;
+      constexpr int TAIL = M % M8_IPG;
+      constexpr bool IPG3_TIGHT = true;
+      constexpr bool DIRECT_NIBBLES = false;
+      (void)IPG3_TIGHT;
+      (void)DIRECT_NIBBLES;
+      const int first_m = int(tid.x) * M8_IPG;
+      if (first_m >= M) {
         return;
       }
-      qmv_affine8_g64_quad_stream_impl<T, 64, 8>(
-          w,
-          scales,
-          biases,
-          x + first_m * in_vec_size,
-          x + (first_m + 1) * in_vec_size,
-          x + (first_m + 2) * in_vec_size,
-          x + (first_m + 3) * in_vec_size,
-          y + first_m * out_vec_size,
-          y + (first_m + 1) * out_vec_size,
-          y + (first_m + 2) * out_vec_size,
-          y + (first_m + 3) * out_vec_size,
-          in_vec_size,
-          tid,
-          simd_gid,
-          simd_lid);
+      if (TAIL == 0 || M - first_m >= M8_IPG) {
+        qmv_affine8_g64_triple_stream_impl<T, 64, 8>(
+            w,
+            scales,
+            biases,
+            x + first_m * in_vec_size,
+            x + (first_m + 1) * in_vec_size,
+            x + (first_m + 2) * in_vec_size,
+            y + first_m * out_vec_size,
+            y + (first_m + 1) * out_vec_size,
+            y + (first_m + 2) * out_vec_size,
+            in_vec_size,
+            tid,
+            simd_gid,
+            simd_lid);
+      } else {
+        qmv_affine8_g64_pair_impl<T, 64, 8>(
+            w,
+            scales,
+            biases,
+            x + first_m * in_vec_size,
+            x + (first_m + 1) * in_vec_size,
+            y + first_m * out_vec_size,
+            y + (first_m + 1) * out_vec_size,
+            in_vec_size,
+            tid,
+            simd_gid,
+            simd_lid);
+      }
       return;
     }
     // Pair adjacent cohort rows so each weight byte feeds both exact per-row
@@ -3658,9 +3801,18 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     }
     run_offset++;
   }
-  // Odd positions are produced by the immediately preceding pair leader.
-  if ((run_offset & 1) != 0) {
+  // RUN-QUAD (down plane): leaders sit at run_offset % 4 == 0 and serve up
+  // to four same-expert assignments from one weight stream per y-tile --
+  // the same coverage rule as the gate/up arm, walked over the down plane's
+  // y-tile span. Each (output, input) pair keeps its own accumulator,
+  // K-loop order, and qdot, so per-output add sequences are unchanged.
+  if ((run_offset & 3) != 0) {
     return;
+  }
+  uint run_len = 1;
+  while (run_len < 4 && assignment + run_len < 64 &&
+         rhs_indices[(assignment + run_len) * rhs_stride] == expert) {
+    run_len++;
   }
   const device uint32_t* tile_w = w + expert * w_stride;
   const device T* tile_scales = scales + expert * s_stride;
@@ -3668,24 +3820,71 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   const device T* tile_x0 =
       x + lhs_indices[assignment * lhs_stride] * x_stride;
   device T* tile_y0 = y + assignment * out_vec_size;
-  const bool has_pair =
-      assignment + 1 < 64 &&
-      rhs_indices[(assignment + 1) * rhs_stride] == expert;
-  if (has_pair) {
+  if (run_len > 1) {
     const device T* tile_x1 =
         x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
     device T* tile_y1 = y + (assignment + 1) * out_vec_size;
+    if (run_len == 2) {
+      for (int t = 0; t < gemma4_down_tile_span; t++) {
+        uint3 tile_tid = tid;
+        tile_tid.y = tid.y + uint(t);
+        qmv_affine4_g64_pair_impl<T, group_size, bits>(
+            tile_w,
+            tile_scales,
+            tile_biases,
+            tile_x0,
+            tile_x1,
+            tile_y0,
+            tile_y1,
+            in_vec_size,
+            tile_tid,
+            simd_gid,
+            simd_lid);
+      }
+      return;
+    }
+    const device T* tile_x2 =
+        x + lhs_indices[(assignment + 2) * lhs_stride] * x_stride;
+    device T* tile_y2 = y + (assignment + 2) * out_vec_size;
+    if (run_len == 3) {
+      for (int t = 0; t < gemma4_down_tile_span; t++) {
+        uint3 tile_tid = tid;
+        tile_tid.y = tid.y + uint(t);
+        qmv_affine4_g64_triple_stream_impl<T, group_size, bits>(
+            tile_w,
+            tile_scales,
+            tile_biases,
+            tile_x0,
+            tile_x1,
+            tile_x2,
+            tile_y0,
+            tile_y1,
+            tile_y2,
+            in_vec_size,
+            tile_tid,
+            simd_gid,
+            simd_lid);
+      }
+      return;
+    }
+    const device T* tile_x3 =
+        x + lhs_indices[(assignment + 3) * lhs_stride] * x_stride;
+    device T* tile_y3 = y + (assignment + 3) * out_vec_size;
     for (int t = 0; t < gemma4_down_tile_span; t++) {
       uint3 tile_tid = tid;
       tile_tid.y = tid.y + uint(t);
-      qmv_affine4_g64_pair_impl<T, group_size, bits>(
+      qmv_affine4_g64_quad_stream_impl<T, group_size, bits>(
           tile_w,
           tile_scales,
           tile_biases,
           tile_x0,
           tile_x1,
+          tile_x2,
+          tile_x3,
           tile_y0,
           tile_y1,
+          tile_y2,
+          tile_y3,
           in_vec_size,
           tile_tid,
           simd_gid,

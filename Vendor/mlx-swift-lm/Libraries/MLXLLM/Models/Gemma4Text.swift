@@ -2014,13 +2014,23 @@ private class Gemma4Router: Module {
     let kth: Int
     private var cachedEffectiveScale: MLXArray?
 
-    init(_ config: Gemma4TextConfiguration) {
+    init(_ config: Gemma4TextConfiguration, layerIdx: Int) {
         precondition(
             config.numExperts != nil && config.topKExperts != nil,
             "Gemma4Router requires num_experts and top_k_experts in the config"
         )
         let numExperts = config.numExperts ?? 0
-        self.topK = config.topKExperts ?? 0
+        let configuredTopK = config.topKExperts ?? 0
+        let top7Enabled: Bool = {
+            guard let raw = ProcessInfo.processInfo.environment[
+                "DARKBLOOM_GEMMA4_ROUTE_TOP7"]
+            else { return true }
+            return !["0", "false", "no", "off"].contains(raw.lowercased())
+        }()
+        let admitsTop7 = layerIdx < 3 && config.hiddenSize == 2816
+            && numExperts == 128 && configuredTopK == 8
+            && config.moeIntermediateSize == 704
+        self.topK = admitsTop7 && top7Enabled ? 7 : configuredTopK
         self.eps = config.rmsNormEps
         self.rootSize = pow(Float(config.hiddenSize), -0.5)
         self.kth = numExperts - self.topK
@@ -2234,7 +2244,7 @@ public class Gemma4DecoderLayer: Module {
             dimensions: config.hiddenSize, eps: config.rmsNormEps)
 
         if config.enableMoeBlock {
-            self._router.wrappedValue = Gemma4Router(config)
+            self._router.wrappedValue = Gemma4Router(config, layerIdx: layerIdx)
             self._experts.wrappedValue = Gemma4Experts(
                 config,
                 fuseWeightedUnsort: fuseWeightedUnsort)

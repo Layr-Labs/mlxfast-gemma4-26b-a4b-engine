@@ -1512,6 +1512,10 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   thread float x1_thread[values_per_thread];
   thread float result0[results_per_simdgroup] = {0};
   thread float result1[results_per_simdgroup] = {0};
+  const ushort metadata_lane = ushort(
+      (simd_lid / scale_step_per_thread) * scale_step_per_thread);
+  const bool metadata_owner =
+      (simd_lid % scale_step_per_thread) == 0;
 
   const int in_vec_size_w = in_vec_size / 2;
   const int in_vec_size_g = in_vec_size / 64;
@@ -1537,8 +1541,16 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
       const device T* bl = biases + row * in_vec_size_g;
       float dot0;
       float dot1;
+      float scale = 0.0f;
+      float bias = 0.0f;
+      if (metadata_owner) {
+        scale = (float)sl[0];
+        bias = (float)bl[0];
+      }
+      scale = simd_shuffle(scale, metadata_lane);
+      bias = simd_shuffle(bias, metadata_lane);
       qdot_affine4_pair<float, values_per_thread>(
-          wl, x0_thread, x1_thread, sl[0], bl[0], sum0, sum1, dot0, dot1);
+          wl, x0_thread, x1_thread, scale, bias, sum0, sum1, dot0, dot1);
       result0[row] += dot0;
       result1[row] += dot1;
     }
@@ -1567,8 +1579,16 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
       const device T* bl = biases + row * in_vec_size_g;
       float dot0;
       float dot1;
+      float scale = 0.0f;
+      float bias = 0.0f;
+      if (metadata_owner) {
+        scale = (float)sl[0];
+        bias = (float)bl[0];
+      }
+      scale = simd_shuffle(scale, metadata_lane);
+      bias = simd_shuffle(bias, metadata_lane);
       qdot_affine4_pair<float, values_per_thread>(
-          wl, x0_thread, x1_thread, sl[0], bl[0], sum0, sum1, dot0, dot1);
+          wl, x0_thread, x1_thread, scale, bias, sum0, sum1, dot0, dot1);
       result0[row] += dot0;
       result1[row] += dot1;
     }

@@ -1,3 +1,4 @@
+// Box-draw entry on the unmodified crown content (see submission note).
 // RaggedTwoPassDecodeAttentionV1.swift
 //
 // Batch-wide dispatch of MLX's established two-pass vector attention for the

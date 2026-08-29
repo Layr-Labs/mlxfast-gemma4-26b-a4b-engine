@@ -272,6 +272,36 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
         )
     }
 
+    /// Pre-write storage handle for a fused one-token decode append: the
+    /// private contiguous K/V allocations plus the slot this step's token
+    /// will occupy. The twin of `CBv2WindowedSequenceKV`'s
+    /// `decodeRingViewBeforeWrite`, for the full-attention rows.
+    ///
+    /// nil — so the caller keeps the copying `update` — whenever the fused
+    /// store would not be a plain in-bounds write into an already-allocated
+    /// private buffer: pooled rows (the pool owns the layout), an
+    /// unallocated row, or a step that would need `ensureCapacity` to grow.
+    var fusedAppendSlotBeforeWrite: (keys: MLXArray, values: MLXArray, slot: Int)? {
+        guard cohortPool == nil, let keys, let values,
+            absoluteOffset >= 0,
+            absoluteOffset < keys.dim(2),
+            values.dim(2) == keys.dim(2)
+        else { return nil }
+        return (keys, values, absoluteOffset)
+    }
+
+    /// Bookkeeping half of a fused decode step. The attention kernel already
+    /// stored this step's K/V into the retained allocation in place, so
+    /// advance exactly the counter `update` would and construct no
+    /// `SliceUpdate`. Precondition mirrors `fusedAppendSlotBeforeWrite`,
+    /// which the caller must have consulted for the very same step.
+    func advanceAfterFusedAppend() {
+        precondition(
+            cohortPool == nil && keys != nil && absoluteOffset < keys!.dim(2),
+            "CBv2FullSequenceKV: fused append advance outside a private-buffer decode step")
+        absoluteOffset += 1
+    }
+
     /// Confirm this row's slot of a pool-level `batchAppend` (the batched
     /// decode path commits all rows' K/V in one slice assignment, then bumps
     /// each row's offset here instead of calling `update`).

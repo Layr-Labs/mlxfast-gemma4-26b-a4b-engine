@@ -647,6 +647,16 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Kill switch for the fused append only: `DARKBLOOM_GEMMA4_D512_DECODE_FUSED_WRITE`
+    /// set to `0`/`false`/`no`/`off` keeps the 3-dispatch attention and
+    /// restores the copying `SliceUpdate` appends. Default ON.
+    private static let fusedAppendEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_DECODE_FUSED_WRITE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let batch = 8
     private static let queryHeads = 16
     private static let kvHeads = 2
@@ -753,6 +763,183 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                             }
                         }
                         mat_offset += D;
+                    }
+                    bn += 128;
+                }
+                #pragma clang loop unroll(full)
+                for (int h = 0; h < GQA; ++h) {
+                    #pragma clang loop unroll(full)
+                    for (int tm = 0; tm < 4; ++tm) {
+                        #pragma clang loop unroll(full)
+                        for (ushort delta = 16; delta >= 1; delta >>= 1) {
+                            result[h][tm] +=
+                                simd_shuffle_down(result[h][tm], delta);
+                        }
+                    }
+                }
+                if (lane == 0) {
+                    #pragma clang loop unroll(full)
+                    for (int h = 0; h < GQA; ++h) {
+                        #pragma clang loop unroll(full)
+                        for (int tm = 0; tm < 4; ++tm) {
+                            score_rows[
+                                size_t(h) * key_length + out_row + tm] =
+                                static_cast<T>(result[h][tm]);
+                        }
+                    }
+                }
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    /// Dispatch 1F — QKᵀ with the step's K/V append folded in (WRITE-021).
+    ///
+    /// Identical arithmetic to `qkKernel`; the only additions are the store
+    /// and the substitution that makes the store unobservable inside its own
+    /// dispatch:
+    ///
+    /// - The `chunk == 0` group of each (row, kv head) copies this step's K
+    ///   AND V into slot `kL - 1` of that row's private buffers, in place,
+    ///   128 threads × 4 elements each. That is the exact allocation and the
+    ///   exact slot the `SliceUpdate` in `CBv2FullSequenceKV.update` would
+    ///   have written, with the same values.
+    /// - Every group serves logical key `kL - 1` from `new_keys` instead of
+    ///   the buffer, so no group reads a slot any group writes and the result
+    ///   does not depend on store visibility within the dispatch. Groups
+    ///   other than the writer never touch the slot at all.
+    ///
+    /// The `write_fence` in / `fence` out pair is the same device-side
+    /// ordering edge WRITE-016 uses: the in-place store is invisible to the
+    /// array graph, so the next step's writing pass consumes the fence this
+    /// one produced and the store joins the evaluated chain instead of
+    /// relying on host timing. `CBv2LayerCache.innerState()` already
+    /// publishes the fence, so the loop's per-step `asyncEval` collapses it.
+    ///
+    /// Dispatch 3 (probs·V) reads the V slot this dispatch wrote. It is
+    /// ordered after this one by the `scores → probs → out` chain, and MLX's
+    /// inter-kernel barrier for that dependency is `BarrierScopeBuffers`,
+    /// which is encoder-wide — it orders every preceding buffer write,
+    /// including one the array graph cannot see.
+    private static let qkWritingKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_qk_write_bf16_g8_v1",
+        inputNames: [
+            "queries",
+            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+            "new_keys", "new_values", "params", "write_fence",
+        ],
+        outputNames: ["scores", "fence"],
+        source: """
+            constexpr int D = 512;
+            constexpr int GQA = 8;
+            constexpr int KV_HEADS = 2;
+
+            const int key_length = int(params[0]);
+            const int in_vec_size = int(params[1]);
+
+            const int n_chunks = (key_length + 63) / 64;
+            const int z = int(threadgroup_position_in_grid.z);
+            const int chunk = z % n_chunks;
+            const int row_kv = z / n_chunks;
+            const int row = row_kv / 2;
+            const int kv_head = row_kv % 2;
+            const int sg = int(simdgroup_index_in_threadgroup);
+            const int lane = int(thread_index_in_simdgroup);
+
+            const int row_capacity = int(params[2 + row]);
+
+            const device T* key_plane = k0;
+            const device T* value_plane = v0;
+            switch (row) {
+                case 1: key_plane = k1; value_plane = v1; break;
+                case 2: key_plane = k2; value_plane = v2; break;
+                case 3: key_plane = k3; value_plane = v3; break;
+                case 4: key_plane = k4; value_plane = v4; break;
+                case 5: key_plane = k5; value_plane = v5; break;
+                case 6: key_plane = k6; value_plane = v6; break;
+                case 7: key_plane = k7; value_plane = v7; break;
+                default: break;
+            }
+            const size_t plane_offset = size_t(kv_head) * size_t(row_capacity) * D;
+            key_plane += plane_offset;
+            value_plane += plane_offset;
+
+            const size_t new_offset = size_t(row * KV_HEADS + kv_head) * D;
+            const device T* new_key = new_keys + new_offset;
+            const device T* new_value = new_values + new_offset;
+
+            const int write_slot = key_length - 1;
+            if (chunk == 0) {
+                device T* store_key =
+                    const_cast<device T*>(key_plane) + size_t(write_slot) * D;
+                device T* store_value =
+                    const_cast<device T*>(value_plane) + size_t(write_slot) * D;
+                const int base = (sg * 32 + lane) * 4;
+                for (int element = 0; element < 4; ++element) {
+                    store_key[base + element] = new_key[base + element];
+                    store_value[base + element] = new_value[base + element];
+                }
+            }
+            if (z == 0 && sg == 0 && lane == 0) {
+                fence[0] = write_fence[0] + 1;
+            }
+
+            const device T* query =
+                queries + size_t(row * 16 + kv_head * GQA) * D;
+            device T* score_rows =
+                scores + size_t(row * 16 + kv_head * GQA) * key_length;
+
+            const int virtual_groups = (key_length + 15) / 16;
+            const int vtg_lo = chunk * 4;
+            const int vtg_hi = min(vtg_lo + 4, virtual_groups);
+            const int n_iter = in_vec_size / 128;
+
+            for (int vtg = vtg_lo; vtg < vtg_hi; ++vtg) {
+                int out_row = vtg * 16 + sg * 4;
+                if (out_row >= key_length) continue;
+                out_row = out_row + 4 <= key_length
+                    ? out_row : key_length - 4;
+
+                // Key row pointers, chosen once per group. The only row that
+                // can differ from the stock kernel's `key_plane + r * D` is
+                // the slot this dispatch writes, and it is served from the
+                // source array the write copies from — identical bytes.
+                const device T* key_rows[4];
+                #pragma clang loop unroll(full)
+                for (int tm = 0; tm < 4; ++tm) {
+                    key_rows[tm] = (out_row + tm == write_slot)
+                        ? new_key
+                        : (key_plane + size_t(out_row + tm) * D);
+                }
+
+                float result[GQA][4] = {{0.0f}};
+                T inter[4];
+                float v_coeff[GQA][4];
+                int bn = lane * 4;
+                for (int i = 0; i < n_iter; ++i) {
+                    #pragma clang loop unroll(full)
+                    for (int h = 0; h < GQA; ++h) {
+                        #pragma clang loop unroll(full)
+                        for (int tn = 0; tn < 4; ++tn) {
+                            v_coeff[h][tn] = static_cast<float>(
+                                query[h * D + bn + tn]);
+                        }
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int tm = 0; tm < 4; ++tm) {
+                        #pragma clang loop unroll(full)
+                        for (int tn = 0; tn < 4; ++tn) {
+                            inter[tn] = key_rows[tm][bn + tn];
+                        }
+                        #pragma clang loop unroll(full)
+                        for (int h = 0; h < GQA; ++h) {
+                            #pragma clang loop unroll(full)
+                            for (int tn = 0; tn < 4; ++tn) {
+                                result[h][tm] +=
+                                    inter[tn] * v_coeff[h][tn];
+                            }
+                        }
                     }
                     bn += 128;
                 }
@@ -1010,7 +1197,9 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     static func updateAndAttend(
         rows: [CBv2SequenceKV], kind: CBv2LayerKind,
         queries: MLXArray, keys: MLXArray, values: MLXArray,
-        scale: Float, sinks: MLXArray?, softcap: Float?
+        scale: Float, sinks: MLXArray?, softcap: Float?,
+        writeFence: CBv2DecodeRingWriteFence? = nil,
+        allowFusedAppend: Bool = false
     ) -> MLXArray? {
         guard enabled,
             rows.count == batch,
@@ -1059,6 +1248,18 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             else { return nil }
         }
 
+        // WRITE-021: fold this step's append into dispatch 1 when every row
+        // offers a plain in-bounds slot in an already-allocated private
+        // buffer. Resolved for ALL rows before anything is written, so the
+        // refusal below can never leave a partial append behind.
+        var fusedSlots: [(keys: MLXArray, values: MLXArray, slot: Int)]? = nil
+        if fusedAppendEnabled, allowFusedAppend, writeFence != nil {
+            let slots = fullRows.compactMap { $0.fusedAppendSlotBeforeWrite }
+            if slots.count == batch, slots.allSatisfy({ $0.slot == offset }) {
+                fusedSlots = slots
+            }
+        }
+
         // Byte-identical per-row appends — the same `update` calls, in the
         // same row order, as the established per-row loop. Only the
         // returned temporal views go unused; the kernels read the full
@@ -1070,14 +1271,22 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         valueBuffers.reserveCapacity(batch)
         var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
         params.reserveCapacity(batch + 2)
-        for (index, row) in fullRows.enumerated() {
-            _ = row.update(
-                keys: keys[index ..< (index + 1)],
-                values: values[index ..< (index + 1)])
-            let state = row.cbv2InnerState()
-            keyBuffers.append(state[0])
-            valueBuffers.append(state[1])
-            params.append(UInt32(state[0].dim(2)))
+        if let fusedSlots {
+            for slot in fusedSlots {
+                keyBuffers.append(slot.keys)
+                valueBuffers.append(slot.values)
+                params.append(UInt32(slot.keys.dim(2)))
+            }
+        } else {
+            for (index, row) in fullRows.enumerated() {
+                _ = row.update(
+                    keys: keys[index ..< (index + 1)],
+                    values: values[index ..< (index + 1)])
+                let state = row.cbv2InnerState()
+                keyBuffers.append(state[0])
+                valueBuffers.append(state[1])
+                params.append(UInt32(state[0].dim(2)))
+            }
         }
         let paramsArray = MLXArray(params)
 
@@ -1087,14 +1296,31 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let scratchShape = [batch, queryHeads, 1, keyLength]
 
         let chunks = (keyLength + 63) / 64
-        let scores = qkKernel(
-            [queries] + keyBuffers + [paramsArray],
-            template: template,
-            grid: (32, 4, batch * kvHeads * chunks),
-            threadGroup: (32, 4, 1),
-            outputShapes: [scratchShape],
-            outputDTypes: [.bfloat16]
-        )[0]
+        let scores: MLXArray
+        if let writeFence, fusedSlots != nil {
+            let outs = qkWritingKernel(
+                [queries] + keyBuffers + valueBuffers
+                    + [keys, values, paramsArray, writeFence.value],
+                template: template,
+                grid: (32, 4, batch * kvHeads * chunks),
+                threadGroup: (32, 4, 1),
+                outputShapes: [scratchShape, [1]],
+                outputDTypes: [.bfloat16, .int32]
+            )
+            scores = outs[0]
+            writeFence.value = outs[1]
+            for row in fullRows { row.advanceAfterFusedAppend() }
+            CBv2EngageMark.once("write021")
+        } else {
+            scores = qkKernel(
+                [queries] + keyBuffers + [paramsArray],
+                template: template,
+                grid: (32, 4, batch * kvHeads * chunks),
+                threadGroup: (32, 4, 1),
+                outputShapes: [scratchShape],
+                outputDTypes: [.bfloat16]
+            )[0]
+        }
 
         // Threadgroup sizing verbatim from softmax.cpp:64-68.
         let softmaxThreads = ((keyLength + 3) / 4 + 31) / 32 * 32

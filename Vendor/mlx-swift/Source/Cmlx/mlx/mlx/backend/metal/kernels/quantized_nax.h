@@ -628,6 +628,29 @@ struct QuantizedBlockLoader {
         scales(scales_ + bi * src_ld / group_size),
         biases(biases_ + bi * src_ld / group_size) {}
 
+  // WVEC-NAX: one 16-byte load in place of sixteen 1-byte loads.
+  //
+  // The bits == 4 arm of `dequantize` consumes exactly ONE byte per call, and
+  // the staging loop below calls it over `n_reads` CONSECUTIVE bytes. At the
+  // affine-4 / g64 geometry this tower dispatches, `n_reads` is 16, so each
+  // thread issues sixteen single-byte device loads per weight block for what
+  // is one aligned 16-byte span. This folds each such run into a single
+  // `uint4` and dequantizes out of registers.
+  //
+  // Every produced value keeps the identical `s[0] * (b & 0x0f) + bias` and
+  // `s[1] * (b & 0xf0) + bias` expression, the identical `s` pair built as
+  // `{scale, scale / T(16)}`, the identical `uint8_t` operand type and the
+  // identical destination index. Only the shape of the load changes, so the
+  // staged tile is bit-for-bit what the byte-wise loop stages.
+  static METAL_FUNC void wvec_word(
+      uint word, const thread T* s, T bias, threadgroup T* d) {
+    for (int k = 0; k < 4; k++) {
+      const uint8_t b = uint8_t((word >> (8 * k)) & 0xffu);
+      d[2 * k] = s[0] * (b & 0x0f) + bias;
+      d[2 * k + 1] = s[1] * (b & 0xf0) + bias;
+    }
+  }
+
   void load_unsafe() const {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
       return;
@@ -635,6 +658,31 @@ struct QuantizedBlockLoader {
 
     T scale = *scales;
     T bias = *biases;
+
+    // Alignment is tested on the pointer itself, not derived from the shapes.
+    // The shape terms below are all statically true at this tower's geometry,
+    // but the base `w` the callers hand in comes from the allocator, and no
+    // promoted kernel on this track has yet loaded a weight wider than eight
+    // bytes, so there is no established 16-byte guarantee to lean on. `src`
+    // advances by `tile_stride`, a multiple of 16 here, so its low bits do not
+    // change across blocks and one test per call covers every load. A pointer
+    // that fails it takes the byte-wise loop below, which is the incumbent.
+    if (bits == 4 && pack_factor == 2 && bytes_per_pack == 1 &&
+        (n_reads % 16) == 0 && (bj % 16) == 0 && (src_ld % 32) == 0 &&
+        (BCOLS_PACKED % 16) == 0 &&
+        ((reinterpret_cast<size_t>(src) & 15) == 0)) {
+      const thread T s[2] = {scale, scale / static_cast<T>(16.0f)};
+      for (int i = 0; i < n_reads; i += 16) {
+        const uint4 wv = *((const device uint4*)(src + i));
+        threadgroup T* d = dst + 2 * i;
+        wvec_word(wv.x, s, bias, d);
+        wvec_word(wv.y, s, bias, d + 8);
+        wvec_word(wv.z, s, bias, d + 16);
+        wvec_word(wv.w, s, bias, d + 24);
+      }
+      return;
+    }
+
     for (int i = 0; i < n_reads; i++) {
       dequantize<T, pack_factor, bits>(
           src + i * bytes_per_pack, scale, bias, dst + i * pack_factor);

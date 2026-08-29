@@ -197,7 +197,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_impl(
 
     @inline(__always)
     private static func liveOutputWidth(_ width: Int) -> Bool {
-        width == 1024 || width == 2048 || width == 4096 || width == 8192
+        width == 256 || width == 512 || width == 1024 || width == 2048 || width == 4096 || width == 8192
     }
 
     public static func matmul(

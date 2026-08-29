@@ -2402,11 +2402,21 @@ public class Gemma4DecoderLayer: Module {
             let perLayerInput = activePerLayerInput
         {
             let residual3 = out
-            // Same compiled graph the dense MLP site already uses, and it
-            // rounds in the same places as the two-dispatch form: `compile`
-            // keeps each node at its own dtype, so the activated intermediate
-            // is materialised bf16 either way.
-            var g = gemma4SafeGeluProduct(gate(out), perLayerInput)
+            let gateOut: MLXArray
+            if let quantized = gate as? QuantizedLinear,
+                let tight = CBv2AttentionQKVMMA8V1.matmul(
+                    x: out,
+                    weight: quantized.weight,
+                    scales: quantized.scales,
+                    biases: quantized.biases,
+                    groupSize: quantized.groupSize,
+                    bits: quantized.bits,
+                    mode: quantized.mode) {
+                gateOut = tight
+            } else {
+                gateOut = gate(out)
+            }
+            var g = gemma4SafeGeluProduct(gateOut, perLayerInput)
             g = proj(g)
             // Same `residual + rmsNorm(x, w)` at 2816 and the same eps as the
             // post-attention site, so the prefill fusion applies unchanged.

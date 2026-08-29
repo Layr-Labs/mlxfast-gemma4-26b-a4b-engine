@@ -276,6 +276,46 @@ private func geGLUProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
     geGLUClaimsPinnedDecode(gate, up) ? compiledGeGLUShaped(gate, up) : compiledGeGLU(gate, up)
 }
 
+// MARK: - ROUTE-SIMD-RANK-64: exact decode route table
+
+/// Stable rank sort for the exact B=8/top-K=8 decode plane. One SIMDgroup
+/// loads the 64 keys once (two keys per lane), broadcasts them to every lane,
+/// and directly emits the three routing products consumed downstream.
+private let routeSimdRank64Kernel: MLXFast.MLXFastKernel =
+    MLXFast.metalKernel(
+        name: "mlx_lm_route_simd_rank_scatter_m8_u32_n64_v1",
+        inputNames: ["indices"],
+        outputNames: ["row_order", "sorted_keys", "inverse_order"],
+        source: """
+            const uint assignment = thread_position_in_grid.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint key = (uint)indices[assignment];
+            const uint key_low = (uint)indices[lane];
+            const uint key_high = (uint)indices[32u + lane];
+            uint rank = 0;
+            for (uint source = 0; source < 32; ++source) {
+                const uint other_low = simd_broadcast(key_low, ushort(source));
+                rank += (other_low < key)
+                    || (other_low == key && source < assignment);
+                const uint other_high = simd_broadcast(key_high, ushort(source));
+                const uint high_assignment = 32u + source;
+                rank += (other_high < key)
+                    || (other_high == key && high_assignment < assignment);
+            }
+            row_order[rank] = assignment / 8;
+            sorted_keys[rank] = key;
+            inverse_order[assignment] = rank;
+        """,
+        ensureRowContiguous: true
+    )
+
+private let routeSimdRank64Enabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_ROUTE_SIMD_RANK"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 // MARK: - ROUTE-CSORT-64: fused counting-sort route table (donor port)
 
 /// Stable counting sort for the flattened B=8 decode route table (64 uint32
@@ -431,6 +471,18 @@ public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, M
 public func gatherSortIndices(
     indices: MLXArray, numExperts: Int = Int.max
 ) -> (MLXArray, MLXArray, MLXArray) {
+    if routeSimdRank64Enabled,
+        indices.ndim == 2, indices.shape == [8, 8], indices.dtype == .uint32
+    {
+        let outputs = routeSimdRank64Kernel(
+            [indices],
+            grid: (64, 1, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [[64], [64], [64]],
+            outputDTypes: [.uint32, .uint32, .uint32]
+        )
+        return (outputs[0], outputs[1], outputs[2])
+    }
     let m = indices.dim(-1)
     let indices = indices.flattened()
     // ROUTE-CSORT-64: one fused dispatch with byte-identical outputs

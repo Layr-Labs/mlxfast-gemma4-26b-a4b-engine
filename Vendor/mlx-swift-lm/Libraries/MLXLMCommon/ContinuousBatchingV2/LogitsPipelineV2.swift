@@ -624,3 +624,20 @@ public enum CBv2OrderOnlyLogits {
         return build()
     }
 }
+
+/// Exact, host-only admission for bypassing dense logits and the sampler on
+/// the steady-state chained decode path. Model-specific tensor geometry is
+/// deliberately owned by the optional model interface rather than repeated
+/// here.
+func cbv2ShouldRequestOrderOnlyWinner(
+    params: [CBv2SamplingParams],
+    hasTokenConstraints: Bool,
+    batchSize: Int,
+    modelSupportsWinner: Bool
+) -> Bool {
+    modelSupportsWinner
+        && batchSize == 8
+        && params.count == batchSize
+        && !hasTokenConstraints
+        && CBv2OrderOnlyLogits.orderOnly(params)
+}

@@ -40,6 +40,30 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
     }
 }
 
+/// Model-level twin of `CBv2OrderOnlySteppableModel`. The language-model
+/// adapter owns the KV-cache conversion so implementations only see their
+/// established `KVCache` interface.
+public protocol CBv2LanguageModelOrderOnlyForwardable {
+    var cbv2SupportsOrderOnlyTokens: Bool { get }
+    func cbv2OrderOnlyTokens(_ tokens: MLXArray, cache: [KVCache]?) -> MLXArray?
+}
+
+extension CBv2SteppableLanguageModelAdapter: CBv2OrderOnlySteppableModel {
+    public var supportsOrderOnlyTokens: Bool {
+        (model as? CBv2LanguageModelOrderOnlyForwardable)?
+            .cbv2SupportsOrderOnlyTokens ?? false
+    }
+
+    public func forwardOrderOnlyTokens(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> MLXArray? {
+        guard let forwardable = model as? CBv2LanguageModelOrderOnlyForwardable,
+            forwardable.cbv2SupportsOrderOnlyTokens
+        else { return nil }
+        return forwardable.cbv2OrderOnlyTokens(tokens, cache: asKVCaches(caches))
+    }
+}
+
 // MARK: - Prompt-output narrowing (prefill only)
 
 /// Answered at RUNTIME like the multimodal/MTP capabilities: only models

@@ -206,7 +206,18 @@ METAL_FUNC void qkv_mma8_affine4_g64_impl(
 // identical [0, gh) / [gh, G) split across the threadgroup's two simdgroups
 // and the identical simdgroup-0-adds-simdgroup-1 close, per tile. Every output
 // word is therefore the same float sum accumulated in the same order.
-template <typename T, int KS, int TILES>
+//
+// SBPAIR extends the same body with one more instruction-count lever on the
+// same tier. `srow[t][g]` and `brow[t][g]` are two-byte loads, and successive
+// K groups are ADJACENT in both planes, so consuming the group loop two at a
+// time lets each pair arrive as one aligned 32-bit word. Per tile per two
+// groups the inner body then issues four loads (two weight `uint2`, one scale
+// word, one bias word) where the incumbent issues six. Both weight words are
+// also in flight before either is consumed. The scalars are unpacked with the
+// file's own `mma8_u16<T>::cast`, the same reinterpretation `mma8_lo`/`mma8_hi`
+// already apply to the activation stream, so the values are the bytes the
+// incumbent's two separate loads returned.
+template <typename T, int KS, int TILES, bool SBP = false>
 METAL_FUNC void qkv_mma8_affine4_g64_mt(
     const device uint32_t* w,
     const device T* scales,
@@ -246,7 +257,107 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
   simdgroup_float8x8 A;
   simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
 
-  for (int g = g_begin; g < g_end; ++g) {
+  int g = g_begin;
+  // The paired word straddles groups g and g+1 of ONE row of the scale and
+  // bias planes, so the read is only aligned when the element index
+  // `G * row + g` is even for every row. That needs both G and g even: an odd
+  // G flips the parity of the row base and half the rows would issue an
+  // unaligned 32-bit load. Live geometry is K = 2816, G = 44, g_begin in
+  // {0, 22}, so the shipped path always takes the paired loop; anything else
+  // falls through to the incumbent body below.
+  if (SBP && (G & 1) == 0 && (g_begin & 1) == 0) {
+    for (; g + 1 < g_end; g += 2) {
+      thread uint sw[TILES];
+      thread uint bw[TILES];
+      thread uint2 wa[TILES];
+      thread uint2 wb[TILES];
+#pragma clang loop unroll(full)
+      for (int t = 0; t < TILES; ++t) {
+        sw[t] = *((const device uint*)(srow[t] + g));
+        bw[t] = *((const device uint*)(brow[t] + g));
+        wa[t] = *((const device uint2*)(wrow[t] + 32 * g));
+        wb[t] = *((const device uint2*)(wrow[t] + 32 * (g + 1)));
+      }
+      {
+        const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+        const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+
+        float2 rs = float2(mma8_runsum4<T>(r0), mma8_runsum4<T>(r1));
+        rs += simd_shuffle_xor(rs, 2u);
+        rs += simd_shuffle_xor(rs, 4u);
+        rs += simd_shuffle_xor(rs, 16u);
+
+        MMA8_SETB(B0, x, lo)
+        MMA8_SETB(B1, x, hi)
+        MMA8_SETB(B2, y, lo)
+        MMA8_SETB(B3, y, hi)
+        MMA8_SETB(B4, z, lo)
+        MMA8_SETB(B5, z, hi)
+        MMA8_SETB(B6, w, lo)
+        MMA8_SETB(B7, w, hi)
+
+#pragma clang loop unroll(full)
+        for (int t = 0; t < TILES; ++t) {
+          const uint2 wv = wa[t];
+          const float s = float(mma8_u16<T>::cast(ushort(sw[t] & 0xFFFFu)));
+          const float b = float(mma8_u16<T>::cast(ushort(bw[t] & 0xFFFFu)));
+
+          simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+          MMA8_STEP(B0, 0)
+          MMA8_STEP(B1, 1)
+          MMA8_STEP(B2, 2)
+          MMA8_STEP(B3, 3)
+          MMA8_STEP(B4, 4)
+          MMA8_STEP(B5, 5)
+          MMA8_STEP(B6, 6)
+          MMA8_STEP(B7, 7)
+
+          acc0[t] += s * C.thread_elements()[0] + rs.x * b;
+          acc1[t] += s * C.thread_elements()[1] + rs.y * b;
+        }
+      }
+      {
+        const uint4 r0 = *((const device uint4*)(x0 + 64 * (g + 1)));
+        const uint4 r1 = *((const device uint4*)(x1 + 64 * (g + 1)));
+
+        float2 rs = float2(mma8_runsum4<T>(r0), mma8_runsum4<T>(r1));
+        rs += simd_shuffle_xor(rs, 2u);
+        rs += simd_shuffle_xor(rs, 4u);
+        rs += simd_shuffle_xor(rs, 16u);
+
+        MMA8_SETB(B0, x, lo)
+        MMA8_SETB(B1, x, hi)
+        MMA8_SETB(B2, y, lo)
+        MMA8_SETB(B3, y, hi)
+        MMA8_SETB(B4, z, lo)
+        MMA8_SETB(B5, z, hi)
+        MMA8_SETB(B6, w, lo)
+        MMA8_SETB(B7, w, hi)
+
+#pragma clang loop unroll(full)
+        for (int t = 0; t < TILES; ++t) {
+          const uint2 wv = wb[t];
+          const float s = float(mma8_u16<T>::cast(ushort(sw[t] >> 16)));
+          const float b = float(mma8_u16<T>::cast(ushort(bw[t] >> 16)));
+
+          simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+          MMA8_STEP(B0, 0)
+          MMA8_STEP(B1, 1)
+          MMA8_STEP(B2, 2)
+          MMA8_STEP(B3, 3)
+          MMA8_STEP(B4, 4)
+          MMA8_STEP(B5, 5)
+          MMA8_STEP(B6, 6)
+          MMA8_STEP(B7, 7)
+
+          acc0[t] += s * C.thread_elements()[0] + rs.x * b;
+          acc1[t] += s * C.thread_elements()[1] + rs.y * b;
+        }
+      }
+    }
+  }
+
+  for (; g < g_end; ++g) {
     const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
     const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
 
@@ -329,6 +440,32 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
     /// where the amortisation stops paying for the extra live registers.
     private static let tilesPerGroup = 2
 
+    /// SBPAIR arm. Default ON. `DARKBLOOM_GEMMA4_QKV_MMA8_SBPAIR=0` restores
+    /// the promoted multi-tile dispatch byte for byte in the same executable.
+    public static let scaleBiasPairEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_QKV_MMA8_SBPAIR"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let sbPairKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_sbp_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            qkv_mma8_affine4_g64_mt<T, 2, 2, true>(
+                w, scales, biases, x, y,
+                x_shape[x_ndim - 1], w_shape[0], int(tid.y) * 16, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
     private static let multiTileKernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_v1",
         inputNames: ["x", "w", "scales", "biases"],
@@ -403,7 +540,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
 
         let yTiles = outputWidth / outputsPerGroup
         if multiTileEnabled, yTiles % tilesPerGroup == 0 {
-            return multiTileKernel(
+            return (scaleBiasPairEnabled ? sbPairKernel : multiTileKernel)(
                 [x, weight, scales, biases],
                 template: [("T", x.dtype)],
                 grid: (simdWidth, (yTiles / tilesPerGroup) * simdGroups, 1),

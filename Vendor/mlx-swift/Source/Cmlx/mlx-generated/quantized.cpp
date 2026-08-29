@@ -3862,9 +3862,22 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     }
     run_offset++;
   }
-  // Odd positions are produced by the immediately preceding pair leader.
-  if ((run_offset & 1) != 0) {
+  // DOWN-TRIO-3 restacked on 6042598 (i34-9): run_offset % 3 parity,
+  // width-3 scan; trio -> promoted triple_stream body, pair -> pair body,
+  // singleton -> i34-9's own new KFIX singles body (stacks, never competes
+  // with their specialization). Bit-identical per-row arithmetic via the
+  // stream impls' per-stream independence; tile walk untouched. Priced
+  // flanks: quad −1.03% (82519f21), pair incumbent; trio is the only
+  // unpriced width cell, and the UP-plane triple (-0.45% composite, +0.26%
+  // decode, 3899f6e9) shows triples buy decode concurrency at a
+  // prefill-restream cost this plane has never had measured.
+  if ((run_offset % 3) != 0) {
     return;
+  }
+  uint run_len = 1;
+  while (run_len < 3 && assignment + run_len < 64 &&
+         rhs_indices[(assignment + run_len) * rhs_stride] == expert) {
+    run_len++;
   }
   const device uint32_t* tile_w = w + expert * w_stride;
   const device T* tile_scales = scales + expert * s_stride;
@@ -3872,13 +3885,28 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   const device T* tile_x0 =
       x + lhs_indices[assignment * lhs_stride] * x_stride;
   device T* tile_y0 = y + assignment * out_vec_size;
-  const bool has_pair =
-      assignment + 1 < 64 &&
-      rhs_indices[(assignment + 1) * rhs_stride] == expert;
-  if (has_pair) {
-    const device T* tile_x1 =
-        x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
-    device T* tile_y1 = y + (assignment + 1) * out_vec_size;
+  if (run_len == 1) {
+    for (int t = 0; t < gemma4_down_tile_span; t++) {
+      uint3 tile_tid = tid;
+      tile_tid.y = tid.y + uint(t);
+      qmv_affine4_g64_singles_impl<T, group_size, bits, 704, true, false>(
+          tile_w,
+          tile_scales,
+          tile_biases,
+          tile_x0,
+          tile_y0,
+          in_vec_size,
+          out_vec_size,
+          tile_tid,
+          simd_gid,
+          simd_lid);
+    }
+    return;
+  }
+  const device T* tile_x1 =
+      x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
+  device T* tile_y1 = y + (assignment + 1) * out_vec_size;
+  if (run_len == 2) {
     for (int t = 0; t < gemma4_down_tile_span; t++) {
       uint3 tile_tid = tid;
       tile_tid.y = tid.y + uint(t);
@@ -3897,17 +3925,23 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     }
     return;
   }
+  const device T* tile_x2 =
+      x + lhs_indices[(assignment + 2) * lhs_stride] * x_stride;
+  device T* tile_y2 = y + (assignment + 2) * out_vec_size;
   for (int t = 0; t < gemma4_down_tile_span; t++) {
     uint3 tile_tid = tid;
     tile_tid.y = tid.y + uint(t);
-    qmv_affine4_g64_singles_impl<T, group_size, bits, 704, true, false>(
+    qmv_affine4_g64_triple_stream_impl<T, group_size, bits>(
         tile_w,
         tile_scales,
         tile_biases,
         tile_x0,
+        tile_x1,
+        tile_x2,
         tile_y0,
+        tile_y1,
+        tile_y2,
         in_vec_size,
-        out_vec_size,
         tile_tid,
         simd_gid,
         simd_lid);

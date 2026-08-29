@@ -3664,7 +3664,14 @@ inline float qdot_affine4_g64_word(
 // compile-time false unless group_size == 64 && bits == 4; the affine-4 /
 // g64 constants below are hardcoded exactly as `qmv_affine4_g64_pair_impl`
 // hardcodes them.
-template <typename T, int group_size, int bits, int KFIX, bool WVEC, bool PF>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int KFIX,
+    bool WVEC,
+    bool PF,
+    bool MLP2 = false>
 METAL_FUNC void qmv_affine4_g64_singles_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -3717,7 +3724,62 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
     }
   }
 
-  for (int blk = 0; blk < nblocks; blk++) {
+  // MLP2: consume the full K-blocks two at a time, issuing BOTH blocks'
+  // four weight words before either is used. The incumbent keeps four
+  // loads in flight per K step and cannot start block b + 1's loads until
+  // block b's `qdot`s have retired its registers; this doubles the
+  // outstanding-load window to eight without holding a second x buffer.
+  //
+  // It is aimed at the K = 704 down plane, where the whole K-loop is two
+  // full blocks plus a 24-lane tail, so the incumbent gets no steady state
+  // to hide latency in -- three dependent memory rounds and done. The
+  // K = 2816 gate/up planes have eleven blocks and already run at a higher
+  // per-byte rate, so they are left on the incumbent body.
+  //
+  // Per-row accumulation order is unchanged: row r still takes block 0,
+  // then block 1, then the tail, into the same accumulator. Only the load
+  // schedule moves, exactly as for WVEC. Instantiated only with
+  // WVEC == true and PF == false; the two prefetch schemes would fight
+  // over the same registers and are mutually exclusive by construction.
+  int blk = 0;
+  if (MLP2 && WVEC && !PF) {
+    for (; blk + 1 < nblocks; blk += 2) {
+      thread uint v0[results_per_simdgroup];
+      thread uint v1[results_per_simdgroup];
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        v0[row] = *((const device uint*)(ws + row * in_vec_size_w));
+        v1[row] =
+            *((const device uint*)(ws + block_bytes + row * in_vec_size_w));
+      }
+      U s0 = load_vector<T, U, values_per_thread, 4>(x, x_thread);
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        result[row] += qdot_affine4_g64_word(
+            v0[row],
+            x_thread,
+            U(scales[row * in_vec_size_g]),
+            U(biases[row * in_vec_size_g]),
+            s0);
+      }
+      ws += block_bytes;
+      scales += block_size / qgroup;
+      biases += block_size / qgroup;
+      x += block_size;
+      U s1 = load_vector<T, U, values_per_thread, 4>(x, x_thread);
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        result[row] += qdot_affine4_g64_word(
+            v1[row],
+            x_thread,
+            U(scales[row * in_vec_size_g]),
+            U(biases[row * in_vec_size_g]),
+            s1);
+      }
+      ws += block_bytes;
+      scales += block_size / qgroup;
+      biases += block_size / qgroup;
+      x += block_size;
+    }
+  }
+  for (; blk < nblocks; blk++) {
     U sum = load_vector<T, U, values_per_thread, 4>(x, x_thread);
 
     thread uint wcur[results_per_simdgroup];
@@ -3900,7 +3962,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   for (int t = 0; t < gemma4_down_tile_span; t++) {
     uint3 tile_tid = tid;
     tile_tid.y = tid.y + uint(t);
-    qmv_affine4_g64_singles_impl<T, group_size, bits, 704, true, false>(
+    qmv_affine4_g64_singles_impl<T, group_size, bits, 704, true, false, true>(
         tile_w,
         tile_scales,
         tile_biases,
@@ -4077,6 +4139,18 @@ template <typename T, int group_size, int bits>
     const device T* single_scales = scales + expert * s_strides[0];
     const device T* single_biases = biases + expert * b_strides[0];
     device T* single_y = y + assignment * (uint)out_vec_size;
+    if (in_vec_size == 2816) {
+      qmv_affine4_g64_singles_impl<T, group_size, bits, 2816, true, false>(
+          single_w, single_scales, single_biases, single_x, single_y,
+          in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+      return;
+    }
+    if (in_vec_size == 704) {
+      qmv_affine4_g64_singles_impl<T, group_size, bits, 704, true, false>(
+          single_w, single_scales, single_biases, single_x, single_y,
+          in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+      return;
+    }
     qmv_impl<T, group_size, bits>(
         single_w, single_scales, single_biases, single_x, single_y,
         in_vec_size, out_vec_size, tid, simd_gid, simd_lid);

@@ -2387,8 +2387,14 @@ public class Gemma4DecoderLayer: Module {
             var g = gemma4SafeGeluProduct(gate(out), perLayerInput)
             g = proj(g)
             // Same `residual + rmsNorm(x, w)` at 2816 and the same eps as the
-            // post-attention site, so the prefill fusion applies unchanged.
-            if let fusedPLE = Gemma4PrefillGlueV1.normResidual(
+            // post-attention site. Decode uses FusedLayerGlue (PrefillGlueV1
+            // refuses [B, 1, 2816]); prefill still takes PrefillGlueV1.
+            if let fusedPLE = Gemma4FusedLayerGlue.normResidual(
+                x: g, residual: residual3,
+                weight: norm.weight, eps: config.rmsNormEps)
+            {
+                out = fusedPLE
+            } else if let fusedPLE = Gemma4PrefillGlueV1.normResidual(
                 x: g, weight: norm.weight, residual: residual3,
                 eps: config.rmsNormEps)
             {

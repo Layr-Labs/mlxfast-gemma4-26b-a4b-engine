@@ -3658,8 +3658,9 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     }
     run_offset++;
   }
-  // Odd positions are produced by the immediately preceding pair leader.
-  if ((run_offset & 1) != 0) {
+  // Leaders own up to four consecutive assignments from one sorted expert
+  // run. Followers are produced by the leader's shared-weight kernel.
+  if ((run_offset & 3) != 0) {
     return;
   }
   const device uint32_t* tile_w = w + expert * w_stride;
@@ -3668,10 +3669,52 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   const device T* tile_x0 =
       x + lhs_indices[assignment * lhs_stride] * x_stride;
   device T* tile_y0 = y + assignment * out_vec_size;
-  const bool has_pair =
-      assignment + 1 < 64 &&
-      rhs_indices[(assignment + 1) * rhs_stride] == expert;
-  if (has_pair) {
+  uint run_span = 1;
+  for (; run_span < 4 && assignment + run_span < 64; ++run_span) {
+    if (rhs_indices[(assignment + run_span) * rhs_stride] != expert) {
+      break;
+    }
+  }
+  if (run_span == 4) {
+    const device T* tile_x1 =
+        x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
+    const device T* tile_x2 =
+        x + lhs_indices[(assignment + 2) * lhs_stride] * x_stride;
+    const device T* tile_x3 =
+        x + lhs_indices[(assignment + 3) * lhs_stride] * x_stride;
+    device T* tile_y1 = y + (assignment + 1) * out_vec_size;
+    device T* tile_y2 = y + (assignment + 2) * out_vec_size;
+    device T* tile_y3 = y + (assignment + 3) * out_vec_size;
+    for (int t = 0; t < gemma4_down_tile_span; t++) {
+      uint3 tile_tid = tid;
+      tile_tid.y = tid.y + uint(t);
+      qmv_affine4_g64_quad_stream_impl<T, group_size, bits>(
+          tile_w, tile_scales, tile_biases,
+          tile_x0, tile_x1, tile_x2, tile_x3,
+          tile_y0, tile_y1, tile_y2, tile_y3,
+          in_vec_size, tile_tid, simd_gid, simd_lid);
+    }
+    return;
+  }
+  if (run_span == 3) {
+    const device T* tile_x1 =
+        x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
+    const device T* tile_x2 =
+        x + lhs_indices[(assignment + 2) * lhs_stride] * x_stride;
+    device T* tile_y1 = y + (assignment + 1) * out_vec_size;
+    device T* tile_y2 = y + (assignment + 2) * out_vec_size;
+    for (int t = 0; t < gemma4_down_tile_span; t++) {
+      uint3 tile_tid = tid;
+      tile_tid.y = tid.y + uint(t);
+      qmv_affine4_g64_triple_stream_impl<T, group_size, bits>(
+          tile_w, tile_scales, tile_biases,
+          tile_x0, tile_x1, tile_x2,
+          tile_y0, tile_y1, tile_y2,
+          in_vec_size, tile_tid, simd_gid, simd_lid);
+    }
+    return;
+  }
+  if (run_span == 2) {
     const device T* tile_x1 =
         x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
     device T* tile_y1 = y + (assignment + 1) * out_vec_size;

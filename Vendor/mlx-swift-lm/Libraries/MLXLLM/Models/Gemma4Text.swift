@@ -280,6 +280,51 @@ private let gemma4SafeGeluProduct: @Sendable (
     return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
 
+/// GELU-FUSE-001: shape-specialised twin of `gemma4SafeGeluProduct`.
+///
+/// Same body, same op sequence, but compiled WITHOUT `shapeless`, which is the
+/// difference between two Metal dispatches and one. `compile(shapeless: true)`
+/// traces under `detail::InTracing{dynamic: true}`
+/// (`Vendor/mlx-swift/Source/Cmlx/mlx/mlx/compile.cpp:402`), forcing
+/// `broadcast_arrays` down the dynamic branch (`.../mlx/ops.cpp:1727`, `:1776`)
+/// which emits a `BroadcastAxes` node for BOTH operands of every binary op even
+/// when the shapes already match. The doubled tape depth makes `compile_fuse`
+/// stop at `max_compile_depth = 11` (`compile.cpp:23`, `:840`) partway through
+/// `0.044715 * gate * gate * gate`, so MLX splits the closure into a cube-term
+/// kernel plus the rest. Without `shapeless`, `broadcast_to` short circuits on
+/// equal shapes (`ops.cpp:1677`), the tape fits under the limit, and the whole
+/// expression becomes one kernel. `Broadcast` moves data without rounding and
+/// every tape node keeps its own dtype in the generated kernel, so the result
+/// is bit-identical -- `ScratchGeluAnomalyTests` checks that with a uint16
+/// comparison over 50 random inputs at both live geometries.
+///
+/// Claimed only for the pinned decode signatures (see
+/// `CompiledGeluFusion.claimsPinnedDecode`), because a shape-specialised
+/// compile adds one linear-scan `CompilerCache` entry per distinct input shape
+/// and prefill sees a new sequence length per prompt. Every other shape keeps
+/// the shapeless closure. `DARKBLOOM_GELU_SHAPED_FUSE=0` restores it.
+private let gemma4SafeGeluProductShaped: @Sendable (
+    MLXArray, MLXArray
+) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+        (gate: MLXArray, up: MLXArray) -> MLXArray in
+        let activated = 0.5 * gate
+            * (1 + tanh(sqrt(2 / Float.pi) * (gate + 0.044715 * gate * gate * gate)))
+        return activated * up
+    }
+    return gemma4CompiledDecodeSupported ? compile(shapeless: false, body) : body
+}()
+
+/// `gemma4SafeGeluProduct` with the one-dispatch twin claimed for the pinned
+/// decode geometries and the incumbent shapeless closure everywhere else.
+@inline(__always)
+private func gemma4GeluProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
+    guard gemma4CompiledDecodeSupported,
+        CompiledGeluFusion.claimsPinnedDecode(gate, up)
+    else { return gemma4SafeGeluProduct(gate, up) }
+    return gemma4SafeGeluProductShaped(gate, up)
+}
+
 /// Final-logit softcap (`tanh(x / cap) * cap`) fused into one Metal dispatch
 /// (vMLX `compiledLogitSoftcap`). The untyped (float32) cap keeps the softcap
 /// math — and the logits handed to the sampler — full precision.
@@ -2092,7 +2137,7 @@ private class Gemma4MLP: Module {
         let activationSums = CBv2DenseMLPQMVV1.activationSums(for: x)
         return denseProjection(
             downProj,
-            gemma4SafeGeluProduct(
+            gemma4GeluProduct(
                 denseProjection(gateProj, x, activationSums: activationSums),
                 denseProjection(upProj, x, activationSums: activationSums)))
     }
@@ -2384,7 +2429,7 @@ public class Gemma4DecoderLayer: Module {
             // rounds in the same places as the two-dispatch form: `compile`
             // keeps each node at its own dtype, so the activated intermediate
             // is materialised bf16 either way.
-            var g = gemma4SafeGeluProduct(gate(out), perLayerInput)
+            var g = gemma4GeluProduct(gate(out), perLayerInput)
             g = proj(g)
             // Same `residual + rmsNorm(x, w)` at 2816 and the same eps as the
             // post-attention site, so the prefill fusion applies unchanged.

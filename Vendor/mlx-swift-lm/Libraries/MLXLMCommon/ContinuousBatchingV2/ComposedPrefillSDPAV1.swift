@@ -57,6 +57,17 @@ enum CBv2ComposedPrefillSDPAV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+// PREFILL-MASK-FUSE second sample marker (r2): byte-identical to ranked ba183194 (box 1, candidate prefill 1.1779 s) apart from this comment.
+    /// PREFILL-MASK-FUSE. Applies the causal mask in the QK^T GEMM's own
+    /// epilogue (`addmm`) instead of as a separate `where` pass over the
+    /// score matrix. Kill switch: `DARKBLOOM_CBV2_PREFILL_MASK_FUSE=0`.
+    static let maskFuseEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PREFILL_MASK_FUSE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// Lowest finite bfloat16 (bits 0xFF7F), i.e. `finfo(bfloat16).min` --
     /// the value MLX's fallback substitutes for masked score entries. The
     /// fp32 bit pattern 0xFF7F0000 is exactly this number, so the conversion
@@ -71,6 +82,19 @@ enum CBv2ComposedPrefillSDPAV1 {
     /// share across graphs: it is an input, never a mutated output.
     nonisolated(unsafe) private static let bfloat16LowestScalar: MLXArray =
         MLXArray(Float(bitPattern: 0xFF7F_0000), dtype: .bfloat16)
+
+    /// bfloat16 NEGATIVE zero (bits 0x8000) -- the additive identity the
+    /// fused-mask bias carries on every UNMASKED score.
+    ///
+    /// `-0.0` and not `+0.0`: IEEE-754 round-to-nearest makes `x + (-0.0)`
+    /// return `x` for EVERY float, signed zeros included (`(+0) + (-0) = +0`,
+    /// `(-0) + (-0) = -0`), whereas `x + (+0.0)` maps `-0.0` to `+0.0` and
+    /// would flip one bit of a score that happened to be a negative zero.
+    /// With `-0.0` the GEMM epilogue is the exact identity on the fp32
+    /// accumulator, so an unmasked entry rounds to the same bfloat16 word the
+    /// plain `matmul` would have stored.
+    nonisolated(unsafe) private static let bfloat16NegativeZeroScalar: MLXArray =
+        MLXArray(Float(bitPattern: 0x8000_0000), dtype: .bfloat16)
 
     /// Causal masks, memoized on `(L, kL)`.
     ///
@@ -104,6 +128,35 @@ enum CBv2ComposedPrefillSDPAV1 {
         maskCache[key] = mask
         maskCacheLock.unlock()
         return mask
+    }
+
+    /// Causal mask BIAS, memoized on `(L, kL)` exactly like the boolean mask:
+    /// `-0.0` where the mask admits the key, `finfo(bfloat16).min` (0xFF7F)
+    /// where it does not. Same purity argument -- a read-only constant that is
+    /// a pure function of the two block lengths, eight distinct values per
+    /// 1024-token chunk -- and the same bounded table.
+    nonisolated(unsafe) private static var maskBiasCache: [Int: MLXArray] = [:]
+
+    private static func causalMaskBias(L: Int, kL: Int) -> MLXArray {
+        let key = L &* 1_000_003 &+ kL
+        maskCacheLock.lock()
+        if let hit = maskBiasCache[key] {
+            maskCacheLock.unlock()
+            return hit
+        }
+        maskCacheLock.unlock()
+        let bias = MLX.where(
+            causalMask(L: L, kL: kL),
+            bfloat16NegativeZeroScalar,
+            bfloat16LowestScalar)
+        eval(bias)
+        maskCacheLock.lock()
+        if maskBiasCache.count >= maxCachedMasks {
+            maskBiasCache.removeAll(keepingCapacity: true)
+        }
+        maskBiasCache[key] = bias
+        maskCacheLock.unlock()
+        return bias
     }
 
     /// Head dims for which MLX has a fused kernel; those calls must keep
@@ -205,9 +258,31 @@ enum CBv2ComposedPrefillSDPAV1 {
         }
 
         CBv2EngageMark.once("prefill-sdpa-compose")
-        var scores = matmul(q, k.swappedAxes(-1, -2))
-
-        scores = MLX.where(causalMask(L: L, kL: kL), scores, bfloat16LowestScalar)
+        // PREFILL-MASK-FUSE: the causal mask is applied by the QK^T GEMM's
+        // OWN epilogue instead of by a second full pass over the score
+        // rectangle. `steel_gemm_fused`'s `use_out_source` epilogue is
+        // `TransformAdd::apply(acc, C) = float(acc) + float(C)` evaluated on
+        // the fp32 accumulator BEFORE the single bfloat16 store, so:
+        //   * unmasked (bias -0.0): `acc + (-0.0) == acc` for every fp32
+        //     value, signed zeros included, and the store rounds exactly as
+        //     the plain matmul's `TransformNone` store does;
+        //   * masked (bias 0xFF7F = -3.3895e38): ulp(3.39e38) is 2^104, so
+        //     `acc + bias` rounds to `bias` for any score with |acc| < 2^103
+        //     -- every attention score this model produces by many orders of
+        //     magnitude -- and the store yields exactly 0xFF7F, the same word
+        //     `where(mask, scores, finfo(bf16).min)` writes.
+        // `c` rides the GEMM as a broadcast (batch strides 0, ldc = kL): MLX
+        // passes its strides straight through to the kernel, so nothing is
+        // materialized and the [L, kL] bias is read once per output tile out
+        // of cache instead of the whole rectangle being read and rewritten.
+        var scores: MLXArray
+        if maskFuseEnabled {
+            CBv2EngageMark.once("prefill-mask-fuse")
+            scores = addMM(causalMaskBias(L: L, kL: kL), q, k.swappedAxes(-1, -2))
+        } else {
+            scores = matmul(q, k.swappedAxes(-1, -2))
+            scores = MLX.where(causalMask(L: L, kL: kL), scores, bfloat16LowestScalar)
+        }
 
         scores = MLX.softmax(scores, axis: -1, precise: true)
         var output = matmul(scores, v)

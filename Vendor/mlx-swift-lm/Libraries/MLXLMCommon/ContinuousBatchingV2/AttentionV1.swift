@@ -376,23 +376,6 @@ enum CBv2AttentionV1 {
             // instead of 16 copy-on-write slice appends. Fails closed to the
             // append-then-attend call below (kill switch:
             // DARKBLOOM_GEMMA4_D512_FUSED_WRITE=0).
-            // WRITE-022: the append as its own fenced store dispatch ahead of
-            // the byte-for-byte stock D512 chain (samfenwick's db4ef5e design,
-            // re-implemented with credit) — removes the same copies as the v2
-            // fold below without its inner-loop addressing cost.
-            if let decodeRingWriteFence, allowFusedRingWrite,
-                let fused = CBv2RaggedComposedD512DecodeAttentionV1
-                    .updateAndAttendWriting22(
-                        rows: rows, kind: kind,
-                        queries: queries, keys: keys, values: values,
-                        previousWriteFence: decodeRingWriteFence.value,
-                        scale: scale, sinks: effectiveSinks, softcap: softcap)
-            {
-                decodeRingWriteFence.value = fused.nextWriteFence
-                CBv2EngageMark.once("write022d512")
-                return fused.output
-            }
-
             if let decodeRingWriteFence, allowFusedRingWrite,
                 let fused = CBv2RaggedComposedD512DecodeAttentionV1
                     .updateAndAttendWriting(

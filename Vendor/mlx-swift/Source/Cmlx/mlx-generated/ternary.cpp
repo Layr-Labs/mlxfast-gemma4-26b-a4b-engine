@@ -34,6 +34,7 @@ template <
       d[index + i] = Op()(a[index + i], b[bidx], c[cidx]);
     }
   } else {
+    #pragma unroll
     for (int i = 0; i < N; ++i) {
       auto bidx = BSCALAR ? 0 : index + i;
       auto cidx = CSCALAR ? 0 : index + i;
@@ -64,6 +65,7 @@ template <
       d[offset + i] = Op()(a[offset + i], b[bidx], c[cidx]);
     }
   } else {
+    #pragma unroll
     for (int i = 0; i < N; ++i) {
       auto bidx = BSCALAR ? 0 : offset + i;
       auto cidx = CSCALAR ? 0 : offset + i;
@@ -149,11 +151,14 @@ template <typename T, typename Op, int N = 1, typename IdxT = int64_t>
   IdxT a_xstride = a_strides[ndim - 1];
   IdxT b_xstride = b_strides[ndim - 1];
   IdxT c_xstride = c_strides[ndim - 1];
-  for (int i = 0; i < N && (int(N * index.x) + i) < xshape; ++i) {
-    d[out_idx++] = Op()(a[idx.x], b[idx.y], c[idx.z]);
-    idx.x += a_xstride;
-    idx.y += b_xstride;
-    idx.z += c_xstride;
+  #pragma unroll
+  for (int i = 0; i < N; ++i) {
+    if ((int(N * index.x) + i) < xshape) {
+      d[out_idx++] = Op()(a[idx.x], b[idx.y], c[idx.z]);
+      idx.x += a_xstride;
+      idx.y += b_xstride;
+      idx.z += c_xstride;
+    }
   }
 }
 

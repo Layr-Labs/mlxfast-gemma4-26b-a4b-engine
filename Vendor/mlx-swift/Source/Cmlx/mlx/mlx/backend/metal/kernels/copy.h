@@ -12,6 +12,7 @@ template <typename T, typename U, int N = WorkPerThread<U>::n>
       dst[index + i] = static_cast<U>(src[0]);
     }
   } else {
+    #pragma unroll
     for (int i = 0; i < N; ++i) {
       dst[index + i] = static_cast<U>(src[0]);
     }
@@ -30,6 +31,7 @@ template <typename T, typename U, int N = WorkPerThread<U>::n>
       dst[index + i] = static_cast<U>(src[index + i]);
     }
   } else {
+    #pragma unroll
     for (int i = 0; i < N; ++i) {
       dst[index + i] = static_cast<U>(src[index + i]);
     }
@@ -49,6 +51,7 @@ template <typename T, typename U, int N = WorkPerThread<U>::n>
       dst[offset + i] = static_cast<U>(src[0]);
     }
   } else {
+    #pragma unroll
     for (int i = 0; i < N; ++i) {
       dst[offset + i] = static_cast<U>(src[0]);
     }
@@ -68,6 +71,7 @@ template <typename T, typename U, int N = WorkPerThread<U>::n>
       dst[offset + i] = static_cast<U>(src[offset + i]);
     }
   } else {
+    #pragma unroll
     for (int i = 0; i < N; ++i) {
       dst[offset + i] = static_cast<U>(src[offset + i]);
     }
@@ -129,9 +133,12 @@ template <typename T, typename U, int N = 1, typename IdxT = int64_t>
   auto xshape = src_shape[ndim - 1];
   IdxT dst_idx = N * index.x + xshape * (index.y + IdxT(grid_dim.y) * index.z);
   auto src_xstride = src_strides[ndim - 1];
-  for (int i = 0; i < N && (int(N * index.x) + i) < xshape; ++i) {
-    dst[dst_idx + i] = static_cast<U>(src[src_idx]);
-    src_idx += src_xstride;
+  #pragma unroll
+  for (int i = 0; i < N; ++i) {
+    if ((int(N * index.x) + i) < xshape) {
+      dst[dst_idx + i] = static_cast<U>(src[src_idx]);
+      src_idx += src_xstride;
+    }
   }
 }
 
@@ -193,10 +200,13 @@ template <typename T, typename U, int N = 1, typename IdxT = int64_t>
   IdxT src_xstride = src_strides[ndim - 1];
   IdxT dst_xstride = dst_strides[ndim - 1];
   auto xshape = src_shape[ndim - 1];
-  for (int i = 0; i < N && (int(N * index.x) + i) < xshape; ++i) {
-    dst[idx.y] = static_cast<U>(src[idx.x]);
-    idx.x += src_xstride;
-    idx.y += dst_xstride;
+  #pragma unroll
+  for (int i = 0; i < N; ++i) {
+    if ((int(N * index.x) + i) < xshape) {
+      dst[idx.y] = static_cast<U>(src[idx.x]);
+      idx.x += src_xstride;
+      idx.y += dst_xstride;
+    }
   }
 }
 
@@ -268,9 +278,12 @@ template <typename T, typename U, int N = 1, typename IdxT = int64_t>
   IdxT src_xstride = src_strides[ndim - 1];
   IdxT dst_xstride = dst_strides[ndim - 1];
   auto xshape = src_shape[ndim - 1];
-  for (int i = 0; i < N && (int(N * index.x) + i) < xshape; ++i) {
-    dst[idx.y] = src[idx.x];
-    idx.x += src_xstride;
-    idx.y += dst_xstride;
+  #pragma unroll
+  for (int i = 0; i < N; ++i) {
+    if ((int(N * index.x) + i) < xshape) {
+      dst[idx.y] = src[idx.x];
+      idx.x += src_xstride;
+      idx.y += dst_xstride;
+    }
   }
 }

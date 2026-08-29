@@ -27,10 +27,12 @@ template <typename T, typename AccT = T, int N_READS = SOFTMAX_N_READS>
 
   in += gid * size_t(axis_size) + lid * N_READS;
   if (lid * N_READS + N_READS <= axis_size) {
+    #pragma unroll
     for (int i = 0; i < N_READS; i++) {
       ld[i] = AccT(in[i]);
     }
   } else {
+    #pragma unroll
     for (int i = 0; i < N_READS; i++) {
       ld[i] =
           ((lid * N_READS + i) < axis_size) ? AccT(in[i]) : Limits<AccT>::min;
@@ -44,6 +46,7 @@ template <typename T, typename AccT = T, int N_READS = SOFTMAX_N_READS>
 
   // Get the max
   AccT maxval = Limits<AccT>::finite_min;
+  #pragma unroll
   for (int i = 0; i < N_READS; i++) {
     maxval = (maxval < ld[i]) ? ld[i] : maxval;
   }
@@ -63,6 +66,7 @@ template <typename T, typename AccT = T, int N_READS = SOFTMAX_N_READS>
 
   // Compute exp(x_i - maxval) and store the partial sums in local_normalizer
   AccT normalizer = 0;
+  #pragma unroll
   for (int i = 0; i < N_READS; i++) {
     AccT exp_x = softmax_exp(ld[i] - maxval);
     ld[i] = exp_x;
@@ -85,10 +89,12 @@ template <typename T, typename AccT = T, int N_READS = SOFTMAX_N_READS>
   // Normalize and write to the output
   out += gid * size_t(axis_size) + lid * N_READS;
   if (lid * N_READS + N_READS <= axis_size) {
+    #pragma unroll
     for (int i = 0; i < N_READS; i++) {
       out[i] = T(ld[i] * normalizer);
     }
   } else {
+    #pragma unroll
     for (int i = 0; i < N_READS; i++) {
       if ((lid * N_READS + i) < axis_size) {
         out[i] = T(ld[i] * normalizer);
@@ -123,20 +129,24 @@ template <typename T, typename AccT = T, int N_READS = SOFTMAX_N_READS>
     int offset = r * lsize * N_READS + lid * N_READS;
     AccT vals[N_READS];
     if (offset + N_READS <= axis_size) {
+      #pragma unroll
       for (int i = 0; i < N_READS; i++) {
         vals[i] = AccT(in[offset + i]);
       }
     } else {
+      #pragma unroll
       for (int i = 0; i < N_READS; i++) {
         vals[i] =
             (offset + i < axis_size) ? AccT(in[offset + i]) : Limits<AccT>::min;
       }
     }
     prevmax = maxval;
+    #pragma unroll
     for (int i = 0; i < N_READS; i++) {
       maxval = (maxval < vals[i]) ? vals[i] : maxval;
     }
     normalizer *= softmax_exp(prevmax - maxval);
+    #pragma unroll
     for (int i = 0; i < N_READS; i++) {
       normalizer += softmax_exp(vals[i] - maxval);
     }
@@ -175,10 +185,12 @@ template <typename T, typename AccT = T, int N_READS = SOFTMAX_N_READS>
        r++) {
     int offset = r * lsize * N_READS + lid * N_READS;
     if (offset + N_READS <= axis_size) {
+      #pragma unroll
       for (int i = 0; i < N_READS; i++) {
         out[offset + i] = T(softmax_exp(in[offset + i] - maxval) * normalizer);
       }
     } else {
+      #pragma unroll
       for (int i = 0; i < N_READS; i++) {
         if (offset + i < axis_size) {
           out[offset + i] =

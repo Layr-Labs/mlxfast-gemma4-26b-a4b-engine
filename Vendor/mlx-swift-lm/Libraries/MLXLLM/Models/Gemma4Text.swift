@@ -2263,6 +2263,15 @@ private enum Gemma4FusedLayerGlue {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Attribution and emergency switch for GLUE-004 alone. The control keeps
+    /// every promoted layer-glue kernel and disables only router RMS sharing.
+    private static let triplePreNormEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_TRIPLE_PRENORM"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let rows = 8
     private static let axis = 2816
     private static let eps: Float = 1e-6
@@ -2344,6 +2353,107 @@ private enum Gemma4FusedLayerGlue {
         """,
         ensureRowContiguous: true
     )
+
+/// GLUE-004: the router and both feed-forward branches normalize the same
+    /// post-attention row with the same epsilon. Share the exact stock RMS
+    /// reduction and emit the router's differently weighted normalization as
+    /// a third result. This removes one serial RMS dispatch and one full reread
+    /// of `x` without changing any materialization or rounding boundary.
+    private static let triplePreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_glue_triple_prenorm_2816_bf16_v1",
+        inputNames: ["x", "w1", "w2", "wr"],
+        outputNames: ["out1", "out2", "router_normed"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float local_inv[1];
+            threadgroup float local_sums[32];
+            const uint base = row * 2816 + lid * 4;
+            const uint wbase = lid * 4;
+        \(rmsReduce("x", into: "local_inv[0]"))
+            const float inv = local_inv[0];
+            for (int i = 0; i < 4; i++) {
+                const T nx = static_cast<T>((float)x[base + i] * inv);
+                out1[base + i] = w1[wbase + i] * nx;
+                out2[base + i] = w2[wbase + i] * nx;
+                router_normed[base + i] = wr[wbase + i] * nx;
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    private static let tailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_glue_tail_2816_bf16_v2",
+        inputNames: ["a", "b", "res", "w1", "w2", "w3", "s"],
+        outputNames: ["out"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float local_inv[2];
+            threadgroup float local_sums[32];
+            const uint base = row * 2816 + lid * 4;
+            const uint wbase = lid * 4;
+        \(rmsReduce("a", into: "local_inv[0]"))
+        \(rmsReduce("b", into: "local_inv[1]"))
+            const float inv1 = local_inv[0];
+            const float inv2 = local_inv[1];
+            T sv[4];
+            for (int i = 0; i < 4; i++) {
+                const T h1 = w1[wbase + i] * static_cast<T>((float)a[base + i] * inv1);
+                const T h2 = w2[wbase + i] * static_cast<T>((float)b[base + i] * inv2);
+                sv[i] = h1 + h2;
+            }
+        \(rmsReduce("sv", into: "local_inv[0]").replacingOccurrences(
+            of: "(float)sv[base + i]", with: "(float)sv[i]"))
+            const float inv3 = local_inv[0];
+            const T scalar = s[0];
+            for (int i = 0; i < 4; i++) {
+                // Same double rounding as the stock norm-then-add pair, then
+                // the layer-scalar multiply with its own stock rounding: the
+                // residual sum rounds to T in a register exactly where the
+                // stock graph stored it to memory, and the T*T product rounds
+                // once on the store exactly like the stock multiply kernel.
+                const T normed = static_cast<T>(
+                    w3[wbase + i] * static_cast<T>((float)sv[i] * inv3));
+                const T summed = res[base + i] + normed;
+                out[base + i] = summed * scalar;
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    private static func admits(_ x: MLXArray, weight: MLXArray, eps: Float) -> Bool {
+        enabled
+            && eps == Self.eps
+            && x.ndim == 3
+            && x.dim(0) == rows && x.dim(1) == 1 && x.dim(2) == axis
+            && x.dtype == .bfloat16
+            && weight.ndim == 1 && weight.dim(0) == axis
+            && weight.dtype == .bfloat16
+    }
+
+    static func normResidual(
+        x: MLXArray, residual: MLXArray, weight: MLXArray, eps: Float
+    ) -> MLXArray? {
+        guard admits(x, weight: weight, eps: eps),
+            residual.shape == x.shape, residual.dtype == .bfloat16
+        else { return nil }
+        CBv2EngageMark.once("glue-norm-residual")
+        return normResidualKernel(
+            [x, residual, weight],
+            template: [("T", x.dtype)],
+            grid: (rows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: [[rows, 1, axis]],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
+
+    
 
     private static let tailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_glue_tail_2816_bf16_v2",
@@ -2431,6 +2541,32 @@ private enum Gemma4FusedLayerGlue {
         )
         return (outs[0], outs[1])
     }
+
+
+    static func triplePreNorm(
+        x: MLXArray, w1: MLXArray, w2: MLXArray,
+        routerWeight: MLXArray, eps: Float
+    ) -> (router: MLXArray, dense: MLXArray, experts: MLXArray)? {
+        guard triplePreNormEnabled,
+            admits(x, weight: w1, eps: eps),
+            w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16,
+            routerWeight.ndim == 1, routerWeight.dim(0) == axis,
+            routerWeight.dtype == .bfloat16
+        else { return nil }
+        CBv2EngageMark.once("glue-triple-prenorm")
+        let outs = triplePreNormKernel(
+            [x, w1, w2, routerWeight],
+            template: [("T", x.dtype)],
+            grid: (rows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: [
+                [rows, 1, axis], [rows, 1, axis], [rows, 1, axis],
+            ],
+            outputDTypes: [.bfloat16, .bfloat16, .bfloat16]
+        )
+        return (router: outs[2], dense: outs[0], experts: outs[1])
+    }
+
 
     /// GLUE-003: tail variant that ALSO emits the NEXT layer's input norm.
     /// The threadgroup already holds the finished output row in registers, so
@@ -2566,16 +2702,21 @@ private class Gemma4Router: Module {
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
-        let effScale: MLXArray
+    func effectiveScale() -> MLXArray {
         if let cached = cachedEffectiveScale {
-            effScale = cached
-        } else {
-            let eff = scale * rootSize
-            cachedEffectiveScale = eff
-            effScale = eff
+            return cached
         }
-        let normed = MLXFast.rmsNorm(x, weight: effScale, eps: eps)
+        let effective = scale * rootSize
+        cachedEffectiveScale = effective
+        return effective
+    }
+
+    /// Route an input that already crossed the router's exact RMSNorm
+    /// materialization boundary. GLUE-004 uses this after sharing the RMS
+    /// reduction with the dense and expert branch pre-norms.
+    func routeNormalized(_ normed: MLXArray) -> (
+        topKIndices: MLXArray, topKWeights: MLXArray
+    ) {
         let expertScores = proj(normed)
 
         // ROUTE-001: single-dispatch byte-identical replacement of the chain
@@ -2601,6 +2742,11 @@ private class Gemma4Router: Module {
         Gemma4RouterProbe.recorder?(expertScores, topKIndices)
 
         return (topKIndices, topKWeights)
+    }
+
+    func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
+        let normed = MLXFast.rmsNorm(x, weight: effectiveScale(), eps: eps)
+        return routeNormalized(normed)
     }
 }
 
@@ -2889,42 +3035,48 @@ public class Gemma4DecoderLayer: Module {
             let postFeedforwardLayernorm2
         {
             // Dense + sparse branches in parallel, summed into one residual.
-            let (topKIndices, topKWeights) = router(out)
-
-            let h1Raw: MLXArray
-            let h2Raw: MLXArray
-            if let (n1, n2) = Gemma4FusedLayerGlue.dualPreNorm(
+            let routing: (topKIndices: MLXArray, topKWeights: MLXArray)
+            let branchInputs: (dense: MLXArray, experts: MLXArray)
+            if let fused = Gemma4FusedLayerGlue.triplePreNorm(
                 x: out,
                 w1: preFeedforwardLayernorm.weight,
                 w2: preFeedforwardLayernorm2.weight,
+                routerWeight: router.effectiveScale(),
                 eps: config.rmsNormEps)
             {
-                h1Raw = mlp(n1)
-                h2Raw = experts(
-                    n2,
-                    topKIndices: topKIndices,
-                    topKWeights: topKWeights,
-                    isExpertPrefill: isExpertPrefill)
-            } else if let (n1, n2) = Gemma4PrefillGlueV1.dualPreNorm(
-                x: out,
-                w1: preFeedforwardLayernorm.weight,
-                w2: preFeedforwardLayernorm2.weight,
-                eps: config.rmsNormEps)
-            {
-                h1Raw = mlp(n1)
-                h2Raw = experts(
-                    n2,
-                    topKIndices: topKIndices,
-                    topKWeights: topKWeights,
-                    isExpertPrefill: isExpertPrefill)
+                routing = router.routeNormalized(fused.router)
+                branchInputs = (dense: fused.dense, experts: fused.experts)
             } else {
-                h1Raw = mlp(preFeedforwardLayernorm(out))
-                h2Raw = experts(
-                    preFeedforwardLayernorm2(out),
-                    topKIndices: topKIndices,
-                    topKWeights: topKWeights,
-                    isExpertPrefill: isExpertPrefill)
+                // Preserve the established fallback's graph-construction
+                // order: route first, then select the branch pre-norm path.
+                routing = router(out)
+                if let (n1, n2) = Gemma4FusedLayerGlue.dualPreNorm(
+                    x: out,
+                    w1: preFeedforwardLayernorm.weight,
+                    w2: preFeedforwardLayernorm2.weight,
+                    eps: config.rmsNormEps)
+                {
+                    branchInputs = (dense: n1, experts: n2)
+                } else if let (n1, n2) = Gemma4PrefillGlueV1.dualPreNorm(
+                    x: out,
+                    w1: preFeedforwardLayernorm.weight,
+                    w2: preFeedforwardLayernorm2.weight,
+                    eps: config.rmsNormEps)
+                {
+                    branchInputs = (dense: n1, experts: n2)
+                } else {
+                    branchInputs = (
+                        dense: preFeedforwardLayernorm(out),
+                        experts: preFeedforwardLayernorm2(out))
+                }
             }
+
+            let h1Raw = mlp(branchInputs.dense)
+            let h2Raw = experts(
+                branchInputs.experts,
+                topKIndices: routing.topKIndices,
+                topKWeights: routing.topKWeights,
+                isExpertPrefill: isExpertPrefill)
 
             // The scalar fold is only valid when nothing sits between the
             // tail and the layer-scalar multiply (PLE absent on this model).

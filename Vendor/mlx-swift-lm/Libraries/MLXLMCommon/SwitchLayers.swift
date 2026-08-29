@@ -357,6 +357,7 @@ private let routeSimdRank64Kernel: MLXFast.MLXFastKernel =
             const uint key_low = (uint)indices[lane];
             const uint key_high = (uint)indices[32u + lane];
             uint rank = 0;
+            #pragma unroll
             for (uint source = 0; source < 32; ++source) {
                 const uint other_low = simd_broadcast(key_low, ushort(source));
                 rank += (other_low < key)
@@ -426,68 +427,99 @@ let routeCountingSortKeyBound = 256
 private let routeFusedScatterKernelT64: MLXFast.MLXFastKernel = {
     let m = routeFusedScatterTopK
     return MLXFast.metalKernel(
-        name: "mlx_lm_route_csort_scatter_fused_m\(m)_u32_t64_v1",
+        name: "mlx_lm_route_csort_scatter_fused_m\(m)_u32_t64_v2",
         inputNames: ["keys"],
         outputNames: ["row_order", "sorted_keys", "inverse_order"],
         source: """
             constexpr uint TILE = \(routeSortTile64);
             constexpr uint M = \(m);
             uint t = threadgroup_position_in_grid.x;
-            uint k = thread_position_in_threadgroup.x;
-            uint simd_id = k / 32;
-            uint lane = k % 32;
+            uint i = thread_position_in_threadgroup.x;
             uint n = keys_shape[0];
-            // In-threadgroup histograms replace both the standalone hist
-            // dispatch and the scan dispatch: one cooperative pass counts
-            // every key (totals) and every key in earlier tiles (before),
-            // then a simd exclusive prefix over the 256 totals yields the
-            // base table. Counts and sums are commutative integer adds, so
-            // any accumulation order produces the byte-identical tables.
+            uint idx = t * TILE + i;
+
+            threadgroup uint tg_tile_keys[TILE];
+            if (idx < n) {
+                tg_tile_keys[i] = keys[idx];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (n <= TILE) {
+                if (idx < n) {
+                    uint my_key = tg_tile_keys[i];
+                    uint rank = 0;
+                    #pragma unroll
+                    for (uint j = 0; j < TILE; ++j) {
+                        uint other = tg_tile_keys[j];
+                        rank += (other < my_key) || (other == my_key && j < i);
+                    }
+                    row_order[rank] = idx / M;
+                    sorted_keys[rank] = my_key;
+                    inverse_order[idx] = rank;
+                }
+                return;
+            }
+
             threadgroup atomic_uint tg_total[256];
             threadgroup atomic_uint tg_before[256];
-            atomic_store_explicit(&tg_total[k], 0u, memory_order_relaxed);
-            atomic_store_explicit(&tg_before[k], 0u, memory_order_relaxed);
+            for (uint b = i; b < 256; b += 64) {
+                atomic_store_explicit(&tg_total[b], 0u, memory_order_relaxed);
+                atomic_store_explicit(&tg_before[b], 0u, memory_order_relaxed);
+            }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            // Split at the before-limit boundary so the tail segment
-            // carries no branch; identical counters, identical adds.
+
             uint before_limit = t * TILE;
-            uint idx = k;
-            for (; idx < before_limit; idx += 256) {
-                uint key = keys[idx];
+            for (uint k_idx = i; k_idx < before_limit; k_idx += 64) {
+                uint key_val = keys[k_idx];
                 atomic_fetch_add_explicit(
-                    &tg_total[key], 1u, memory_order_relaxed);
+                    &tg_total[key_val], 1u, memory_order_relaxed);
                 atomic_fetch_add_explicit(
-                    &tg_before[key], 1u, memory_order_relaxed);
+                    &tg_before[key_val], 1u, memory_order_relaxed);
             }
-            for (; idx < n; idx += 256) {
+            for (uint k_idx = before_limit + i; k_idx < n; k_idx += 64) {
+                uint key_val = keys[k_idx];
                 atomic_fetch_add_explicit(
-                    &tg_total[keys[idx]], 1u, memory_order_relaxed);
+                    &tg_total[key_val], 1u, memory_order_relaxed);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            uint total = atomic_load_explicit(&tg_total[k], memory_order_relaxed);
-            uint lane_excl = simd_prefix_exclusive_sum(total);
-            threadgroup uint simd_totals[8];
+
+            threadgroup uint tg_prefix[256];
+            uint c_k = 0;
+            for (uint u = 0; u < 4; ++u) {
+                c_k += atomic_load_explicit(
+                    &tg_total[4 * i + u], memory_order_relaxed);
+            }
+            uint simd_id = i / 32;
+            uint lane = i % 32;
+            uint lane_excl = simd_prefix_exclusive_sum(c_k);
+            threadgroup uint simd_chunk_totals[2];
             if (lane == 31) {
-                simd_totals[simd_id] = lane_excl + total;
+                simd_chunk_totals[simd_id] = lane_excl + c_k;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            uint simd_base = 0;
-            for (uint s = 0; s < simd_id; ++s) {
-                simd_base += simd_totals[s];
+            uint chunk_base = (simd_id == 1 ? simd_chunk_totals[0] : 0u) + lane_excl;
+            uint cur = chunk_base;
+            for (uint u = 0; u < 4; ++u) {
+                uint b = 4 * i + u;
+                tg_prefix[b] = cur;
+                cur += atomic_load_explicit(
+                    &tg_total[b], memory_order_relaxed);
             }
-            // Rank base for key k in tile t: global base + earlier tiles.
-            uint off = simd_base + lane_excl +
-                atomic_load_explicit(&tg_before[k], memory_order_relaxed);
-            // Walk this tile's slice in input order: stability by
-            // construction, exactly the stock scatter's write order.
-            for (uint i = 0; i < TILE; ++i) {
-                uint idx = t * TILE + i;
-                if (keys[idx] == k) {
-                    row_order[off] = idx / M;
-                    sorted_keys[off] = k;
-                    inverse_order[idx] = off;
-                    ++off;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (idx < n) {
+                uint my_key = tg_tile_keys[i];
+                uint global_smaller = tg_prefix[my_key];
+                uint earlier_equal = atomic_load_explicit(
+                    &tg_before[my_key], memory_order_relaxed);
+                uint local_equal = 0;
+                for (uint j = 0; j < i; ++j) {
+                    local_equal += (tg_tile_keys[j] == my_key);
                 }
+                uint off = global_smaller + earlier_equal + local_equal;
+                row_order[off] = idx / M;
+                sorted_keys[off] = my_key;
+                inverse_order[idx] = off;
             }
             """,
         ensureRowContiguous: false
@@ -507,8 +539,8 @@ private func routeCountingSortFusedT64(
     let tiles = n / routeSortTile64
     let outputs = routeFusedScatterKernelT64(
         [indices],
-        grid: (tiles * 256, 1, 1),
-        threadGroup: (256, 1, 1),
+        grid: (tiles * 64, 1, 1),
+        threadGroup: (64, 1, 1),
         outputShapes: [[n], [n], [n]],
         outputDTypes: [.uint32, .uint32, .uint32]
     )
@@ -758,6 +790,24 @@ private func routeCountingSortPrefill(
 public func gatherSort(
     x: MLXArray, indices: MLXArray, numExperts: Int = Int.max
 ) -> (MLXArray, MLXArray, MLXArray) {
+    if routeSimdRank64Enabled,
+        (indices.shape == [8, 8] || (indices.ndim == 1 && indices.size == 64)),
+        indices.dtype == .uint32
+    {
+        let flat = indices.flattened()
+        let outputs = routeSimdRank64Kernel(
+            [flat],
+            grid: (64, 1, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [[64], [64], [64]],
+            outputDTypes: [.uint32, .uint32, .uint32]
+        )
+        return (
+            x.flattened(start: 0, end: -3)[outputs[0]],
+            outputs[1],
+            outputs[2]
+        )
+    }
     let m = indices.dim(-1)
     let indices = indices.flattened()
     routeCsortShapeLog.note {
@@ -771,6 +821,15 @@ public func gatherSort(
             fused.sortedKeys,
             fused.inverseOrder
         )
+    }
+    if numExperts <= routeCountingSortKeyBound {
+        if let fused = routeCountingSortFusedT64(indices, m: m) {
+            return (
+                x.flattened(start: 0, end: -3)[fused.rowOrder],
+                fused.sortedKeys,
+                fused.inverseOrder
+            )
+        }
     }
     let order = argSort(indices)
     let inverseOrder = argSort(order)
@@ -790,10 +849,12 @@ public func gatherSortIndices(
     indices: MLXArray, numExperts: Int = Int.max
 ) -> (MLXArray, MLXArray, MLXArray) {
     if routeSimdRank64Enabled,
-        indices.ndim == 2, indices.shape == [8, 8], indices.dtype == .uint32
+        (indices.shape == [8, 8] || (indices.ndim == 1 && indices.size == 64)),
+        indices.dtype == .uint32
     {
+        let flat = indices.flattened()
         let outputs = routeSimdRank64Kernel(
-            [indices],
+            [flat],
             grid: (64, 1, 1),
             threadGroup: (64, 1, 1),
             outputShapes: [[64], [64], [64]],

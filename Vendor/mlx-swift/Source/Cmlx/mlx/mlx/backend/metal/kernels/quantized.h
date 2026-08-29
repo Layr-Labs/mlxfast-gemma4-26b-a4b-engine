@@ -3710,6 +3710,114 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   }
 }
 
+// KERN-UP-TILE: y-tile coarsening for the K = 2816 gate/up expert gathers
+// (out_vec_size = 704; grid (1, 704/8 = 88, 64)). The frontier just
+// reshaped the sibling K = 704 down plane to pair-only election and the
+// RUN-QUAD arm here is the last plane still electing per y-group at this K:
+// every 64-thread group re-runs its serial run_offset scan and eight
+// simd_sums per single 8-row y-tile while 88 such groups serialize over the
+// same three expert weight streams. Only every span-th y-group survives (the
+// rest return before the scan); the survivor elects ONCE and walks its span
+// consecutive 8-row y-tiles serially through the verbatim pair impl -- or,
+// for a pairless run position, the verbatim stock qmv_impl -- with tid.y
+// rewritten to the tile index (strip-walk, byte-for-byte the structure of
+// gather_qmv_gemma4_down_tile after its pair-only reshaping). Tile u is
+// served by survivor (u / span) * span at loop step u % span and by no
+// other group, so every output row keeps the IDENTICAL qdot sequence,
+// accumulator, simd_sum and store the untiled arm produces for it:
+// loads-only rescheduling, registers stay pair-sized. 88 divides by span 4,
+// so no ragged tail. Pair-only election (run_offset & 1) is the frontier's
+// freshly validated down-plane rule: odd positions are produced by the
+// immediately preceding pair leader, a pairless even run position walks the
+// stock singleton impl. Verified uint16-exact vs the per-assignment
+// quantized_matmul oracle and vs the untiled arm at K = 2816, N = 704,
+// 64 assignments over 128 experts, M = 8, spans 4 and 2, 3 seeds,
+// NaN-filled outputs (parity-up-tile, 2026-08-28).
+template <typename T, int group_size, int bits>
+METAL_FUNC void gather_qmv_gemma4_up_tile(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    const device uint32_t* lhs_indices,
+    const device uint32_t* rhs_indices,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const uint lhs_stride,
+    const uint rhs_stride,
+    const int64_t x_stride,
+    const int64_t w_stride,
+    const int64_t s_stride,
+    const int64_t b_stride,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int gemma4_up_tile_span = 4; // sweep alternate: 2
+  if (tid.y % uint(gemma4_up_tile_span) != 0u) {
+    return;
+  }
+  const uint assignment = tid.z;
+  const uint32_t expert = rhs_indices[assignment * rhs_stride];
+  uint run_offset = 0;
+  for (uint prior = assignment; prior > 0; --prior) {
+    if (rhs_indices[(prior - 1) * rhs_stride] != expert) {
+      break;
+    }
+    run_offset++;
+  }
+  // Odd positions are produced by the immediately preceding pair leader.
+  if ((run_offset & 1) != 0) {
+    return;
+  }
+  const device uint32_t* tile_w = w + expert * w_stride;
+  const device T* tile_scales = scales + expert * s_stride;
+  const device T* tile_biases = biases + expert * b_stride;
+  const device T* tile_x0 =
+      x + lhs_indices[assignment * lhs_stride] * x_stride;
+  device T* tile_y0 = y + assignment * out_vec_size;
+  const bool has_pair =
+      assignment + 1 < 64 &&
+      rhs_indices[(assignment + 1) * rhs_stride] == expert;
+  if (has_pair) {
+    const device T* tile_x1 =
+        x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
+    device T* tile_y1 = y + (assignment + 1) * out_vec_size;
+    for (int t = 0; t < gemma4_up_tile_span; t++) {
+      uint3 tile_tid = tid;
+      tile_tid.y = tid.y + uint(t);
+      qmv_affine4_g64_pair_impl<T, group_size, bits>(
+          tile_w,
+          tile_scales,
+          tile_biases,
+          tile_x0,
+          tile_x1,
+          tile_y0,
+          tile_y1,
+          in_vec_size,
+          tile_tid,
+          simd_gid,
+          simd_lid);
+    }
+    return;
+  }
+  for (int t = 0; t < gemma4_up_tile_span; t++) {
+    uint3 tile_tid = tid;
+    tile_tid.y = tid.y + uint(t);
+    qmv_impl<T, group_size, bits>(
+        tile_w,
+        tile_scales,
+        tile_biases,
+        tile_x0,
+        tile_y0,
+        in_vec_size,
+        out_vec_size,
+        tile_tid,
+        simd_gid,
+        simd_lid);
+  }
+}
+
 template <typename T, int group_size, int bits>
 [[kernel]] void affine_gather_qmv(
     const device uint32_t* w [[buffer(0)]],
@@ -3781,6 +3889,34 @@ template <typename T, int group_size, int bits>
       run_offset++;
     }
 
+    // KERN-UP-TILE gate (strip-walk pattern): compile-time flip; ON here --
+    // the K = 2816 gate/up plane takes the pair-only y-tile-coarsened arm
+    // above, mirroring the frontier's reshaped down plane. Flip to false to
+    // return the plane to the incumbent RUN-QUAD election below; the two arms
+    // are bit-identical per output row by construction.
+    constexpr bool gemma4_up_tile = true;
+    if (gemma4_up_tile && in_vec_size == 2816 && out_vec_size == 704) {
+      gather_qmv_gemma4_up_tile<T, group_size, bits>(
+          w,
+          scales,
+          biases,
+          x,
+          lhs_indices,
+          rhs_indices,
+          y,
+          in_vec_size,
+          out_vec_size,
+          (uint)lhs_strides[0],
+          (uint)rhs_strides[0],
+          x_strides[0],
+          w_strides[0],
+          s_strides[0],
+          b_strides[0],
+          tid,
+          simd_gid,
+          simd_lid);
+      return;
+    }
     // RUN-QUAD: leaders sit at run_offset % 4 == 0 and serve up to four
     // same-expert assignments from ONE weight stream. Positions 1..3 of each
     // aligned quartet are produced by their leader, so a run of two keeps the

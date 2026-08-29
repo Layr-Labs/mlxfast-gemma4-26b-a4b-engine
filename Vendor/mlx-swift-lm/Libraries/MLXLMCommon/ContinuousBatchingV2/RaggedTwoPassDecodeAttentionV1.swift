@@ -1,3 +1,6 @@
+// TIER-REVERT entry #2. Entry #1 drew the fast box and sealed candidate
+// ~2.2282 — the fourth concordant reading for the -0.4% tier claim
+// (tier-free 2.2282/2.2297 vs tier-carrying 2.2391/2.2396).
 // Box-draw entry #3 on the unmodified crown content. Entry #2 (4198c2b2)
 // drew the fast-serial box — the line's eighth consecutive — and sealed
 // candidate decode ~2.2276, the crown's own content level, as the ledger

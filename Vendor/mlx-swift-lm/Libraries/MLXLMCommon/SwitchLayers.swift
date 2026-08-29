@@ -304,7 +304,7 @@ public final class ShapedGeluPrefillShapes: @unchecked Sendable {
 
 /// Four is one more than the distinct rectangles a cohort prefill produces (the
 /// full batched step, a short final chunk, and the single-stream local verb).
-public let shapedGeluPrefillShapeCap = 4
+public let shapedGeluPrefillShapeCap = 16
 
 /// Smallest rectangle worth a cache entry. The prefill routed-expert plane is
 /// 65,536 rows; every speculative verify width is at most 256, so nothing in

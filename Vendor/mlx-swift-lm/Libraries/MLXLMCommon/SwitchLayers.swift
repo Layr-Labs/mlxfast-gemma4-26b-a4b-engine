@@ -271,9 +271,74 @@ private func geGLUClaimsPinnedDecode(_ gate: MLXArray, _ up: MLXArray) -> Bool {
     return false
 }
 
+/// GELU-FUSE-PREFILL: a bounded set of additionally admitted shapes.
+///
+/// GELU-FUSE left prefill on the shapeless closure for one stated reason — a
+/// shape-specialised compile adds a compiler-cache entry per distinct input
+/// shape, the lookup is a linear scan, and prefill row counts vary per prompt,
+/// so an unbounded admission would keep growing the scan the decode hot path
+/// walks. That reason is about the *number* of entries, not about prefill, so a
+/// hard cap answers it directly: at most ``shapedGeluPrefillShapeCap`` distinct
+/// rectangles are ever admitted, and the cap+1st falls open to the shapeless
+/// closure forever after.
+///
+/// The decode signatures are matched before this is consulted, so the decode
+/// plane never takes the lock and never sees a behaviour change.
+public final class ShapedGeluPrefillShapes: @unchecked Sendable {
+    private let lock = NSLock()
+    private var shapes: [[Int]] = []
+    private let cap: Int
+
+    public init(cap: Int) { self.cap = cap }
+
+    @inline(__always)
+    public func admits(_ shape: [Int]) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if shapes.contains(shape) { return true }
+        guard shapes.count < cap else { return false }
+        shapes.append(shape)
+        return true
+    }
+}
+
+/// Four is one more than the distinct rectangles a cohort prefill produces (the
+/// full batched step, a short final chunk, and the single-stream local verb).
+public let shapedGeluPrefillShapeCap = 4
+
+/// Smallest rectangle worth a cache entry. The prefill routed-expert plane is
+/// 65,536 rows; every speculative verify width is at most 256, so nothing in
+/// production lands near this floor from either side.
+public let shapedGeluPrefillMinElements = 1 << 20
+
+private let switchGeluPrefillFuseEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GELU_SHAPED_FUSE_PREFILL"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+private let switchGeluPrefillShapes = ShapedGeluPrefillShapes(
+    cap: shapedGeluPrefillShapeCap)
+
+@inline(__always)
+private func geGLUClaimsPrefill(_ gate: MLXArray, _ up: MLXArray) -> Bool {
+    guard switchGeluPrefillFuseEnabled,
+        gate.dtype == .bfloat16, up.dtype == .bfloat16,
+        gate.shape == up.shape,
+        gate.size >= shapedGeluPrefillMinElements,
+        switchGeluPrefillShapes.admits(gate.shape)
+    else { return false }
+    CBv2EngageMark.once("gelu-shaped-prefill-experts")
+    return true
+}
+
 @inline(__always)
 private func geGLUProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
-    geGLUClaimsPinnedDecode(gate, up) ? compiledGeGLUShaped(gate, up) : compiledGeGLU(gate, up)
+    if geGLUClaimsPinnedDecode(gate, up) || geGLUClaimsPrefill(gate, up) {
+        return compiledGeGLUShaped(gate, up)
+    }
+    return compiledGeGLU(gate, up)
 }
 // MARK: - ROUTE-SIMD-RANK-64: exact decode route table
 

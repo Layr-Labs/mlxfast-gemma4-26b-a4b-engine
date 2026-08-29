@@ -81,11 +81,9 @@ template <typename T, int D, int V = D>
   out += o_offset * V + simd_gid * v_per_thread;
 
   // Read the query and 0 the output accumulator
-  #pragma unroll
   for (int i = 0; i < qk_per_thread; i++) {
     q[i] = static_cast<U>(scale) * queries[i];
   }
-  #pragma unroll
   for (int i = 0; i < v_per_thread; i++) {
     o[i] = 0;
   }
@@ -109,14 +107,12 @@ template <typename T, int D, int V = D>
     }
     if (use_key) {
       // Read the key
-      #pragma unroll
       for (int j = 0; j < qk_per_thread; j++) {
         k[j] = keys[j];
       }
 
       // Compute the i-th score
       U score = 0;
-      #pragma unroll
       for (int j = 0; j < qk_per_thread; j++) {
         score += q[j] * k[j];
       }
@@ -134,7 +130,6 @@ template <typename T, int D, int V = D>
       sum_exp_score = sum_exp_score * factor + exp_score;
 
       // Update the output accumulator
-      #pragma unroll
       for (int j = 0; j < v_per_thread; j++) {
         o[j] = o[j] * factor + exp_score * values[j];
       }
@@ -165,7 +160,6 @@ template <typename T, int D, int V = D>
   sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
 
   // Now we need to aggregate all the outputs
-  #pragma unroll
   for (int i = 0; i < v_per_thread; i++) {
     outputs[simd_lid * BD + simd_gid] = o[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -176,7 +170,6 @@ template <typename T, int D, int V = D>
 
   // And write the output
   if (simd_lid == 0) {
-    #pragma unroll
     for (int i = 0; i < v_per_thread; i++) {
       out[i] = static_cast<T>(o[i]);
     }
@@ -255,7 +248,6 @@ template <typename T, int D, int V = D>
   maxs += o_offset * blocks + block_idx;
 
   // Read the query
-  #pragma unroll
   for (int i = 0; i < qk_per_thread; i++) {
     q[i] = static_cast<U>(scale) * queries[i];
   }
@@ -280,7 +272,6 @@ template <typename T, int D, int V = D>
     if (use_key) {
       // Compute the i-th score
       U score = 0;
-      #pragma unroll
       for (int i = 0; i < qk_per_thread; i++) {
         score += q[i] * keys[i];
       }
@@ -299,7 +290,6 @@ template <typename T, int D, int V = D>
       sum_exp_score = sum_exp_score * factor + exp_score;
 
       // Update the output accumulator
-      #pragma unroll
       for (int i = 0; i < v_per_thread; i++) {
         o[i] = o[i] * factor + exp_score * values[i];
       }
@@ -322,7 +312,6 @@ template <typename T, int D, int V = D>
     maxs[0] = max_score;
   }
 
-  #pragma unroll
   for (int i = 0; i < v_per_thread; i++) {
     out[i] = static_cast<T>(o[i]);
   }
@@ -379,7 +368,6 @@ template <typename T, int D>
     U factor = fast::exp(maxs[simd_gid] - max_score);
 
     // Update the output accumulator
-    #pragma unroll
     for (int i = 0; i < elem_per_thread; i++) {
       o[i] += factor * static_cast<U>(partials[i]);
     }
@@ -389,7 +377,6 @@ template <typename T, int D>
   }
 
   // Use shared memory to transpose and reduce the final block
-  #pragma unroll
   for (int i = 0; i < elem_per_thread; i++) {
     outputs[simd_lid * BD + simd_gid] = o[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -400,7 +387,6 @@ template <typename T, int D>
 
   // And write the output
   if (simd_lid == 0) {
-    #pragma unroll
     for (int i = 0; i < elem_per_thread; i++) {
       out[i] = static_cast<T>(o[i]);
     }

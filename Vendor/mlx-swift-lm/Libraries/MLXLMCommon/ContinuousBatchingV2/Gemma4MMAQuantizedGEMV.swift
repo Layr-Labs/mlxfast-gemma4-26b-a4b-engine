@@ -128,8 +128,7 @@ public enum Gemma4MMAQuantizedGEMV {
     /// the guarded four-group tail. Version `15` gives every SIMD group two
     /// adjacent output tiles, reusing each activation fragment across both and
     /// doubling one threadgroup's output width. Version `16` extends the same
-    /// reuse to four output tiles per SIMD group. Version `26` probes one reused
-    /// packed-weight cursor across those tiles. Versions 1...16 are shippable and
+    /// reuse to four output tiles per SIMD group. All sixteen are shippable and
     /// numerically validated; see each version's source for what differs.
     /// Anything unrecognised takes the default.
     private static let version: Int = {
@@ -153,12 +152,11 @@ public enum Gemma4MMAQuantizedGEMV {
         case "14": return 14
         case "15": return 15
         case "16": return 16
-        case "26": return 26
         default: return defaultVersion
         }
     }()
 
-    private static let defaultVersion = 26
+    private static let defaultVersion = 16
 
     /// Kernel source. `T` is the activation/scale dtype, `K` the contraction
     /// length, `N` the output width; all three arrive as template constants so
@@ -2396,91 +2394,6 @@ public enum Gemma4MMAQuantizedGEMV {
         ensureRowContiguous: true
     )
 
-    // MARK: - Version 26 --- reused packed-weight cursor
-
-    /// Removes four long-lived weight-row pointers and reuses one transient
-    /// packed cursor while loading each tile. The same eight uint4 values are
-    /// loaded in the same tile order as version 16.
-    private static let sourceV26: String = {
-        var result = sourceV16
-
-        func replaceOnce(_ old: String, with new: String) {
-            let count = result.components(separatedBy: old).count
-            precondition(count == 2, "sourceV26 replacement count \(count): \(old)")
-            result = result.replacingOccurrences(of: old, with: new)
-        }
-
-        replaceOnce(
-            """
-            const device uint32_t* fragmentWRow0 =
-                w + (sgN0 + fragmentRow) * W_ROW_U32;
-            const device uint32_t* fragmentWRow1 =
-                w + (sgN0 + N_PSG + fragmentRow) * W_ROW_U32;
-            const device uint32_t* fragmentWRow2 =
-                w + (sgN0 + N_PSG * 2 + fragmentRow) * W_ROW_U32;
-            const device uint32_t* fragmentWRow3 =
-                w + (sgN0 + N_PSG * 3 + fragmentRow) * W_ROW_U32;
-            """,
-            with: """
-            """
-        )
-        replaceOnce(
-            """
-                const device uint4* packedGroup0 =
-                    reinterpret_cast<const device uint4*>(
-                        fragmentWRow0 + g * (GROUP / 8));
-                const device uint4* packedGroup1 =
-                    reinterpret_cast<const device uint4*>(
-                        fragmentWRow1 + g * (GROUP / 8));
-                const device uint4* packedGroup2 =
-                    reinterpret_cast<const device uint4*>(
-                        fragmentWRow2 + g * (GROUP / 8));
-                const device uint4* packedGroup3 =
-                    reinterpret_cast<const device uint4*>(
-                        fragmentWRow3 + g * (GROUP / 8));
-                const uint4 packedLo0 = packedGroup0[0];
-                const uint4 packedHi0 = packedGroup0[1];
-                const uint4 packedLo1 = packedGroup1[0];
-                const uint4 packedHi1 = packedGroup1[1];
-                const uint4 packedLo2 = packedGroup2[0];
-                const uint4 packedHi2 = packedGroup2[1];
-                const uint4 packedLo3 = packedGroup3[0];
-                const uint4 packedHi3 = packedGroup3[1];
-            """,
-            with: """
-                const uint packedWord0 =
-                    (sgN0 + fragmentRow) * W_ROW_U32 + g * (GROUP / 8);
-                const uint packedTileStride = N_PSG * W_ROW_U32;
-                const device uint4* packedGroup =
-                    reinterpret_cast<const device uint4*>(w + packedWord0);
-                const uint4 packedLo0 = packedGroup[0];
-                const uint4 packedHi0 = packedGroup[1];
-                packedGroup = reinterpret_cast<const device uint4*>(
-                    w + packedWord0 + packedTileStride);
-                const uint4 packedLo1 = packedGroup[0];
-                const uint4 packedHi1 = packedGroup[1];
-                packedGroup = reinterpret_cast<const device uint4*>(
-                    w + packedWord0 + packedTileStride * 2);
-                const uint4 packedLo2 = packedGroup[0];
-                const uint4 packedHi2 = packedGroup[1];
-                packedGroup = reinterpret_cast<const device uint4*>(
-                    w + packedWord0 + packedTileStride * 3);
-                const uint4 packedLo3 = packedGroup[0];
-                const uint4 packedHi3 = packedGroup[1];
-            """
-        )
-        return result
-    }()
-
-    private static let kernelV26: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v26_weight_cursor",
-        inputNames: ["x", "w", "scales", "biases", "xSums"],
-        outputNames: ["out"],
-        source: sourceV26,
-        header: "#include <metal_simdgroup_matrix>\n",
-        ensureRowContiguous: true
-    )
-
     /// Tied-head GEMV, or `nil` when any gate above fails.
     ///
     /// - Parameters:
@@ -2515,7 +2428,7 @@ public enum Gemma4MMAQuantizedGEMV {
         guard k > 0, x.size == mRows * k else { return nil }
 
         let n = w.dim(0)
-        let selectedColsPerThreadgroup = version == 16 || version == 26
+        let selectedColsPerThreadgroup = version == 16
             ? colsPerThreadgroup * 4
             : (version == 15 ? colsPerThreadgroup * 2 : colsPerThreadgroup)
         guard n >= minOutputWidth, n % selectedColsPerThreadgroup == 0 else { return nil }
@@ -2529,7 +2442,7 @@ public enum Gemma4MMAQuantizedGEMV {
         let selected: MLXFast.MLXFastKernel
         let inputs: [MLXArray]
         switch version {
-        case 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 26:
+        case 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16:
             let sumCells = mRows * (k / groupSize)
             let sumThreads = 128
             let sumThreadgroups = (sumCells + sumThreads - 1) / sumThreads
@@ -2542,7 +2455,6 @@ public enum Gemma4MMAQuantizedGEMV {
                 outputDTypes: [.float32]
             )[0]
             switch version {
-            case 26: selected = kernelV26
             case 16: selected = kernelV16
             case 15: selected = kernelV15
             case 14: selected = kernelV14

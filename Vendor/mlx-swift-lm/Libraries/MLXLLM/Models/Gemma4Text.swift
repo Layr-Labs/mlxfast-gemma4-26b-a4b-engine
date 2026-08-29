@@ -280,59 +280,6 @@ private let gemma4SafeGeluProduct: @Sendable (
     return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
 
-/// GELU-FUSE: the SAME body, compiled WITHOUT `shapeless`.
-///
-/// Shapeless tracing runs under a dynamic-broadcast regime, so every binary op
-/// in the body contributes broadcast nodes that a shape-specialised trace omits
-/// on equal shapes. The extra nodes push this expression past MLX's compile
-/// fusion depth limit, and the closure is emitted as TWO Metal kernels — the
-/// cube term and the rest — with a materialised intermediate between them. The
-/// shape-specialised trace fits under the limit and emits one.
-///
-/// Admission is deliberately narrow (`geluFusionClaimsPinnedDecode`): a
-/// shape-specialised compile adds a compiler-cache entry per distinct input
-/// shape and that lookup is a linear scan, so admitting prefill — whose
-/// sequence length changes per prompt — would grow the scan on the decode hot
-/// path. Everything not pinned falls open to the shapeless closure above.
-private let gemma4SafeGeluProductShaped: @Sendable (
-    MLXArray, MLXArray
-) -> MLXArray = {
-    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = {
-        (gate: MLXArray, up: MLXArray) -> MLXArray in
-        let activated = 0.5 * gate
-            * (1 + tanh(sqrt(2 / Float.pi) * (gate + 0.044715 * gate * gate * gate)))
-        return activated * up
-    }
-    return gemma4CompiledDecodeSupported ? compile(body) : body
-}()
-
-/// The pinned decode signatures of the two GELU-product sites: dense/PLE rows
-/// `[8, 1, N]` and routed-expert rows `[64, 1, N]` / `[64, N]`, both operands
-/// bfloat16 with identical shapes. Anything else keeps the shapeless path.
-@inline(__always)
-func geluFusionClaimsPinnedDecode(_ gate: MLXArray, _ up: MLXArray) -> Bool {
-    guard gemma4ShapedGeluFuseEnabled,
-        gate.dtype == .bfloat16, up.dtype == .bfloat16,
-        gate.shape == up.shape
-    else { return false }
-    let s = gate.shape
-    if s.count == 3, s[1] == 1, s[0] == 8 || s[0] == 64 { return true }
-    if s.count == 2, s[0] == 64 { return true }
-    return false
-}
-
-/// Kill switch for the shape-specialised fusion.
-let gemma4ShapedGeluFuseEnabled: Bool =
-    ProcessInfo.processInfo.environment["DARKBLOOM_GELU_SHAPED_FUSE"] != "0"
-
-/// Route the pinned decode signatures to the one-kernel trace.
-@inline(__always)
-func gemma4GeluProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
-    geluFusionClaimsPinnedDecode(gate, up)
-        ? gemma4SafeGeluProductShaped(gate, up)
-        : gemma4SafeGeluProduct(gate, up)
-}
-
 /// Final-logit softcap (`tanh(x / cap) * cap`) fused into one Metal dispatch
 /// (vMLX `compiledLogitSoftcap`). The untyped (float32) cap keeps the softcap
 /// math — and the logits handed to the sampler — full precision.
@@ -2167,7 +2114,7 @@ private class Gemma4MLP: Module {
         let activationSums = CBv2DenseMLPQMVV1.activationSums(for: x)
         return denseProjection(
             downProj,
-            gemma4GeluProduct(
+            gemma4SafeGeluProduct(
                 denseProjection(gateProj, x, activationSums: activationSums),
                 denseProjection(upProj, x, activationSums: activationSums)))
     }
@@ -2459,7 +2406,7 @@ public class Gemma4DecoderLayer: Module {
             // rounds in the same places as the two-dispatch form: `compile`
             // keeps each node at its own dtype, so the activated intermediate
             // is materialised bf16 either way.
-            var g = gemma4GeluProduct(gate(out), perLayerInput)
+            var g = gemma4SafeGeluProduct(gate(out), perLayerInput)
             g = proj(g)
             // Same `residual + rmsNorm(x, w)` at 2816 and the same eps as the
             // post-attention site, so the prefill fusion applies unchanged.
@@ -3136,15 +3083,7 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
         // The VLM omission profile uses zero to represent the former optional
         // softcap's nil/disabled state.
-        //
-        // SOFTCAP-SKIP: `tanh(x / cap) * cap` is strictly increasing, so it
-        // cannot reorder the vocabulary axis. When the engine has declared
-        // that this step's logits are consumed for their order alone (every
-        // row greedy, no logprobs, bias or penalties), the emitted token is
-        // identical with or without it and the dispatch is pure overhead —
-        // one transcendental pass over the whole vocabulary plus the float32
-        // widening the untyped cap forces on the tensor the sampler reads.
-        if config.finalLogitSoftcapping > 0, !CBv2OrderOnlyLogits.engaged {
+        if config.finalLogitSoftcapping > 0 {
             out = gemma4CompiledLogitSoftcap(
                 out, MLXArray(config.finalLogitSoftcapping))
         }

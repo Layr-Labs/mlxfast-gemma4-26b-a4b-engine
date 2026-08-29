@@ -236,46 +236,6 @@ private let compiledGeGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
     return body
 }()
 
-/// GELU-FUSE: the SAME body, compiled WITHOUT `shapeless`, for the routed
-/// expert's pinned decode signatures only. Shapeless tracing adds broadcast
-/// nodes on every binary op that a shape-specialised trace omits on equal
-/// shapes; those nodes push this expression past MLX's fusion depth limit and
-/// split it into two Metal kernels with a materialised intermediate. The
-/// shape-specialised trace fits and emits one.
-private let compiledGeGLUShaped: @Sendable (MLXArray, MLXArray) -> MLXArray = {
-    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = {
-        (gate: MLXArray, up: MLXArray) -> MLXArray in
-        (0.5 * gate * (1 + tanh(sqrt(2 / Float.pi) * (gate + 0.044715 * gate * gate * gate)))) * up
-    }
-    if MLXHardwareInfo.isCompiledDecodeSupported {
-        return compile(body)
-    }
-    return body
-}()
-
-private let switchGeluShapedFuseEnabled: Bool =
-    ProcessInfo.processInfo.environment["DARKBLOOM_GELU_SHAPED_FUSE"] != "0"
-
-/// Admit only the routed-expert decode rectangles: `[64, 1, N]` / `[64, N]`,
-/// both operands bfloat16 with identical shapes. Prefill's per-prompt row
-/// counts stay on the shapeless closure so the compiler cache cannot grow.
-@inline(__always)
-private func geGLUClaimsPinnedDecode(_ gate: MLXArray, _ up: MLXArray) -> Bool {
-    guard switchGeluShapedFuseEnabled,
-        gate.dtype == .bfloat16, up.dtype == .bfloat16,
-        gate.shape == up.shape
-    else { return false }
-    let s = gate.shape
-    if s.count == 3, s[0] == 64, s[1] == 1 { return true }
-    if s.count == 2, s[0] == 64 { return true }
-    return false
-}
-
-@inline(__always)
-private func geGLUProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
-    geGLUClaimsPinnedDecode(gate, up) ? compiledGeGLUShaped(gate, up) : compiledGeGLU(gate, up)
-}
-
 // MARK: - ROUTE-CSORT-64: fused counting-sort route table (donor port)
 
 /// Stable counting sort for the flattened B=8 decode route table (64 uint32
@@ -616,7 +576,7 @@ public class SwitchGLU: Module {
         } else if isSiluActivation {
             activated = compiledSwiGLU(xGate, xUp)
         } else if isGeluActivation {
-            activated = geGLUProduct(xGate, xUp)
+            activated = compiledGeGLU(xGate, xUp)
         } else {
             activated = activation(xGate) * xUp
         }

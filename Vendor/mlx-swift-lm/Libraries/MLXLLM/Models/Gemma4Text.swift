@@ -61,7 +61,10 @@ internal func gemma4ShouldSubmitDecodeAsyncEvalLadder(
     else { return false }
 
     switch layerIndex {
-    case 0, 1, 5, 11, 17, 23, 27:
+    // The layer-27 submission is only four layers after layer 23 and sits
+    // immediately before the final norm/head tail. Let the retained layer-23
+    // launch cover that tail so one late command-buffer boundary is removed.
+    case 0, 1, 5, 11, 17, 23:
         return true
     default:
         return false

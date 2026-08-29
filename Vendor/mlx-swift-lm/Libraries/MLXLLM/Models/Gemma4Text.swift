@@ -1629,6 +1629,26 @@ private class Gemma4Attention: Module {
     /// Exact B8/L1 Q/K/V projection: the tight-grid host for the promoted
     /// matrix-unit tier (same kernel text, grid.x = 1). Any guard failure
     /// keeps the quantized module, which reaches the tier through MLX.
+    /// QKV-ONEDISPATCH: q/k/v in one tight-grid launch when every bank is on
+    /// the promoted matrix-unit tier. Returns nil whenever the three-dispatch
+    /// road would have been taken, so the fallback below is byte-identical.
+    @inline(__always)
+    private func tierProjectionQKV(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray)? {
+        guard let q = qProj as? QuantizedLinear, q.bias == nil,
+            let k = kProj as? QuantizedLinear, k.bias == nil,
+            let vLayer = vProj, let v = vLayer as? QuantizedLinear, v.bias == nil,
+            q.groupSize == k.groupSize, k.groupSize == v.groupSize,
+            q.bits == k.bits, k.bits == v.bits,
+            q.mode == k.mode, k.mode == v.mode
+        else { return nil }
+        return CBv2AttentionQKVMMA8V1.matmulQKV(
+            x: x,
+            qWeight: q.weight, qScales: q.scales, qBiases: q.biases,
+            kWeight: k.weight, kScales: k.scales, kBiases: k.biases,
+            vWeight: v.weight, vScales: v.scales, vBiases: v.biases,
+            groupSize: q.groupSize, bits: q.bits, mode: q.mode)
+    }
+
     @inline(__always)
     private func tierProjection(_ layer: Linear, _ x: MLXArray) -> MLXArray {
         guard let quantized = layer as? QuantizedLinear,
@@ -1851,7 +1871,13 @@ private class Gemma4Attention: Module {
         // 8 x-groups and the tier returns from 7 of them); every other shape
         // keeps the module's affine_qmv road. Routing Q or K through the older
         // custom helper would silently bypass the winning kernel.
-        let queryRaw = tierProjection(qProj, queryInput).reshaped(
+        // QKV-ONEDISPATCH is admissible only when Q shares K/V's input tensor
+        // (no last-query slice) and this layer owns its own K/V banks. Any other
+        // shape falls through to the established three-dispatch road below.
+        let fusedQKV: (MLXArray, MLXArray, MLXArray)? =
+            (lastQueryCache == nil && !usesSharedKV)
+            ? tierProjectionQKV(x) : nil
+        let queryRaw = (fusedQKV?.0 ?? tierProjection(qProj, queryInput)).reshaped(
             B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
@@ -1914,9 +1940,12 @@ private class Gemma4Attention: Module {
             lastQueryCache == nil
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
-        let kRaw = tierProjection(kProj, x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+        let kRaw = (fusedQKV?.1 ?? tierProjection(kProj, x))
+            .reshaped(B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
-        if let vProj {
+        if let fused = fusedQKV {
+            vRaw = fused.2.reshaped(B, L, nKvHeads, effectiveHeadDim)
+        } else if let vProj {
             vRaw = tierProjection(vProj, x).reshaped(B, L, nKvHeads, effectiveHeadDim)
         } else {
             vRaw = kRaw

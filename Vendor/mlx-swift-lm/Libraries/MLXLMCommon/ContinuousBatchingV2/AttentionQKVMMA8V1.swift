@@ -243,4 +243,109 @@ METAL_FUNC void qkv_mma8_affine4_g64_impl(
             outputDTypes: [x.dtype]
         )[0]
     }
+
+    // ── QKV-ONEDISPATCH ────────────────────────────────────────────────────
+    // Q, K and V as ONE tight-grid launch. The kernel TEXT is unchanged: each
+    // y-tile still calls `qkv_mma8_affine4_g64_impl<T, 2>` with the same row
+    // offset into the same bank it would have had in its own dispatch, so the
+    // arithmetic, the accumulation order and every stored value are identical
+    // to the three-dispatch road. What disappears is two of every three command
+    // encodings and grid teardowns per attention layer.
+    //
+    // LINEAGE. The tight-grid host below is the promoted crown's. The fusion is
+    // samfenwick's QKV-ONEDISPATCH (submission `08-29 14:51`, official
+    // 1.83439860146395 against a 1.86+ crown — measured, then lost to the queue,
+    // never landed in the tree). Their same-machine M4 Pro A/B at the decode
+    // rectangle: sliding 3x-tight 0.2336 ms -> fused 0.1449 ms (1.61x); full
+    // 0.1990 ms -> 0.1358 ms (1.47x).
+    //
+    // Kill switch: `DARKBLOOM_GEMMA4_QKV_ONEDISPATCH=0` restores three launches.
+    public static let oneDispatchEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_QKV_ONEDISPATCH"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let mma8FusedKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_onedispatch_v1",
+        inputNames: ["x", "wq", "sq", "bq", "wk", "sk", "bk", "wv", "sv", "bv"],
+        outputNames: ["yq", "yk", "yv"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            const int kdim = x_shape[x_ndim - 1];
+            const int nq = wq_shape[0];
+            const int nk = wk_shape[0];
+            const int nv = wv_shape[0];
+            const int row = int(tid.y) * 8;
+            if (row < nq) {
+                qkv_mma8_affine4_g64_impl<T, 2>(
+                    wq, sq, bq, x, yq, kdim, nq, row, red,
+                    simdgroup_index_in_threadgroup,
+                    thread_index_in_simdgroup);
+            } else if (row < nq + nk) {
+                qkv_mma8_affine4_g64_impl<T, 2>(
+                    wk, sk, bk, x, yk, kdim, nk, row - nq, red,
+                    simdgroup_index_in_threadgroup,
+                    thread_index_in_simdgroup);
+            } else {
+                qkv_mma8_affine4_g64_impl<T, 2>(
+                    wv, sv, bv, x, yv, kdim, nv, row - nq - nk, red,
+                    simdgroup_index_in_threadgroup,
+                    thread_index_in_simdgroup);
+            }
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
+    /// One bank's admissibility, identical to `matmul`'s guards.
+    @inline(__always)
+    private static func bankOK(
+        _ w: MLXArray, _ s: MLXArray, _ b: MLXArray?,
+        _ groupSize: Int, _ bits: Int, _ mode: QuantizationMode, _ dtype: DType
+    ) -> Bool {
+        guard groupSize == Self.groupSize, bits == Self.bits, mode == .affine,
+            let b, s.dtype == dtype, b.dtype == dtype, w.dtype == .uint32,
+            w.ndim == 2, w.dim(1) == inputWidth * Self.bits / 32
+        else { return false }
+        let n = w.dim(0)
+        return liveOutputWidth(n)
+            && s.shape == [n, inputWidth / Self.groupSize]
+            && b.shape == s.shape
+    }
+
+    /// Fused Q/K/V. Returns nil — fail-closed — on any shape, dtype,
+    /// quantization or geometry the three-dispatch road would have taken.
+    public static func matmulQKV(
+        x: MLXArray,
+        qWeight: MLXArray, qScales: MLXArray, qBiases: MLXArray?,
+        kWeight: MLXArray, kScales: MLXArray, kBiases: MLXArray?,
+        vWeight: MLXArray, vScales: MLXArray, vBiases: MLXArray?,
+        groupSize: Int, bits: Int, mode: QuantizationMode
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard enabled, oneDispatchEnabled,
+            x.dtype == .bfloat16, x.ndim == 3,
+            x.dim(0) == batch, x.dim(1) == sequence, x.dim(2) == inputWidth,
+            x.size == batch * sequence * inputWidth,
+            let qb = qBiases, let kb = kBiases, let vb = vBiases,
+            bankOK(qWeight, qScales, qb, groupSize, bits, mode, x.dtype),
+            bankOK(kWeight, kScales, kb, groupSize, bits, mode, x.dtype),
+            bankOK(vWeight, vScales, vb, groupSize, bits, mode, x.dtype)
+        else { return nil }
+
+        let nq = qWeight.dim(0), nk = kWeight.dim(0), nv = vWeight.dim(0)
+        let yTiles = (nq + nk + nv) / outputsPerGroup
+        let out = mma8FusedKernel(
+            [x, qWeight, qScales, qb, kWeight, kScales, kb, vWeight, vScales, vb],
+            template: [("T", x.dtype)],
+            grid: (simdWidth, yTiles * simdGroups, 1),
+            threadGroup: (simdWidth, simdGroups, 1),
+            outputShapes: [
+                [batch, sequence, nq], [batch, sequence, nk], [batch, sequence, nv],
+            ],
+            outputDTypes: [x.dtype, x.dtype, x.dtype])
+        return (out[0], out[1], out[2])
+    }
 }

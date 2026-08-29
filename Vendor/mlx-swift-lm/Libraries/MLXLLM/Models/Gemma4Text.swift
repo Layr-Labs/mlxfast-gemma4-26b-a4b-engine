@@ -60,13 +60,46 @@ internal func gemma4ShouldSubmitDecodeAsyncEvalLadder(
     guard enabled, isCBv2, !schedulePrefill, batchSize == 8, inputLength == 1
     else { return false }
 
+    if let set = gemma4DecodeAsyncEvalLadderSet {
+        return set.contains(layerIndex)
+    }
+    // Only the two EARLY boundaries pay. Submitting after layers 0 and 1
+    // starts GPU work while the host is still building the remaining 28
+    // layers; by layer 5 the device already has queued work, so the middle
+    // cadence {5, 11, 17, 23, 27} adds no overlap and only fragments the
+    // command buffer. Measured on an M1 Ultra at the ranked B=8 geometry,
+    // paired and interleaved, tokens identical in every arm:
+    //
+    //     {} (no boundaries)          +0.17%   <- overlap genuinely lost
+    //     {0,1}                       -0.52%   (64-step)  -0.51% (128-step)
+    //     {0,1,11,23}                 -0.53%
+    //     {0,1,5,11,17,23,27}          baseline (previous default)
+    //     {0,1,5,11,17,23,27,29}      +0.13%
+    //     A/A control                 -0.09%   <- the noise floor
+    //
+    // The empty-set row is the control that matters: this is not "fewer is
+    // always better", it is "the early pair carries all of the overlap".
     switch layerIndex {
-    case 0, 1, 5, 11, 17, 23, 27:
+    case 0, 1:
         return true
     default:
         return false
     }
 }
+
+/// LOCAL EXPERIMENT ONLY. `DARKBLOOM_GEMMA4_DECODE_LADDER_SET` overrides the
+/// shipped boundary list with a comma-separated set of layer indices, so the
+/// geometry can be swept on one binary instead of one rebuild per candidate.
+/// The ranked runner sets no environment, so an unset variable keeps the
+/// shipped switch above verbatim and this is inert in a submission. An empty
+/// value means "no boundaries", which is distinct from unset.
+private let gemma4DecodeAsyncEvalLadderSet: Set<Int>? = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DECODE_LADDER_SET"]
+    else { return nil }
+    return Set(raw.split(separator: ",").compactMap { Int($0.trimmingCharacters(
+        in: .whitespaces)) })
+}()
 
 // MARK: - CBv2 prompt-path knobs (prefill only; decode never reads these)
 

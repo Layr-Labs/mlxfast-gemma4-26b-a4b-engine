@@ -3661,9 +3661,25 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     }
     run_offset++;
   }
-  // Odd positions are produced by the immediately preceding pair leader.
-  if ((run_offset & 1) != 0) {
+  // DOWN-QUAD-4: the tile arm's pair election widened to the UP arm's
+  // RUN-QUAD idiom — leaders at run_offset % 4 == 0, run scan capped at 4,
+  // dispatch 4 -> quad_stream_impl, 3 -> triple_stream_impl, 2 -> pair_impl,
+  // 1 -> qmv_impl, each called inside the identical span tile walk so the
+  // per-tile row stores keep their exact addresses. Every stream keeps its
+  // own accumulator, K-loop order and qdot: bit-identical to the pair arm
+  // by the same per-stream independence the UP arm's quad promotion shipped
+  // on. Direction rationale (ranked, this engine revision): down span-2
+  // died at −6.29% (22e54071) — the down plane at the rope-revised engine
+  // wants FEWER, WIDER leaders, not more; the UP arm triple width costs
+  // prefill (−0.45% composite, 3899f6e9) — quads stay standard there; this
+  // is the down-plane's own priced direction, never tried as stream width.
+  if ((run_offset & 3) != 0) {
     return;
+  }
+  uint run_len = 1;
+  while (run_len < 4 && assignment + run_len < 64 &&
+         rhs_indices[(assignment + run_len) * rhs_stride] == expert) {
+    run_len++;
   }
   const device uint32_t* tile_w = w + expert * w_stride;
   const device T* tile_scales = scales + expert * s_stride;
@@ -3671,13 +3687,28 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   const device T* tile_x0 =
       x + lhs_indices[assignment * lhs_stride] * x_stride;
   device T* tile_y0 = y + assignment * out_vec_size;
-  const bool has_pair =
-      assignment + 1 < 64 &&
-      rhs_indices[(assignment + 1) * rhs_stride] == expert;
-  if (has_pair) {
-    const device T* tile_x1 =
-        x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
-    device T* tile_y1 = y + (assignment + 1) * out_vec_size;
+  if (run_len == 1) {
+    for (int t = 0; t < gemma4_down_tile_span; t++) {
+      uint3 tile_tid = tid;
+      tile_tid.y = tid.y + uint(t);
+      qmv_impl<T, group_size, bits>(
+          tile_w,
+          tile_scales,
+          tile_biases,
+          tile_x0,
+          tile_y0,
+          in_vec_size,
+          out_vec_size,
+          tile_tid,
+          simd_gid,
+          simd_lid);
+    }
+    return;
+  }
+  const device T* tile_x1 =
+      x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
+  device T* tile_y1 = y + (assignment + 1) * out_vec_size;
+  if (run_len == 2) {
     for (int t = 0; t < gemma4_down_tile_span; t++) {
       uint3 tile_tid = tid;
       tile_tid.y = tid.y + uint(t);
@@ -3696,17 +3727,49 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     }
     return;
   }
+  const device T* tile_x2 =
+      x + lhs_indices[(assignment + 2) * lhs_stride] * x_stride;
+  device T* tile_y2 = y + (assignment + 2) * out_vec_size;
+  if (run_len == 3) {
+    for (int t = 0; t < gemma4_down_tile_span; t++) {
+      uint3 tile_tid = tid;
+      tile_tid.y = tid.y + uint(t);
+      qmv_affine4_g64_triple_stream_impl<T, group_size, bits>(
+          tile_w,
+          tile_scales,
+          tile_biases,
+          tile_x0,
+          tile_x1,
+          tile_x2,
+          tile_y0,
+          tile_y1,
+          tile_y2,
+          in_vec_size,
+          tile_tid,
+          simd_gid,
+          simd_lid);
+    }
+    return;
+  }
+  const device T* tile_x3 =
+      x + lhs_indices[(assignment + 3) * lhs_stride] * x_stride;
+  device T* tile_y3 = y + (assignment + 3) * out_vec_size;
   for (int t = 0; t < gemma4_down_tile_span; t++) {
     uint3 tile_tid = tid;
     tile_tid.y = tid.y + uint(t);
-    qmv_impl<T, group_size, bits>(
+    qmv_affine4_g64_quad_stream_impl<T, group_size, bits>(
         tile_w,
         tile_scales,
         tile_biases,
         tile_x0,
+        tile_x1,
+        tile_x2,
+        tile_x3,
         tile_y0,
+        tile_y1,
+        tile_y2,
+        tile_y3,
         in_vec_size,
-        out_vec_size,
         tile_tid,
         simd_gid,
         simd_lid);

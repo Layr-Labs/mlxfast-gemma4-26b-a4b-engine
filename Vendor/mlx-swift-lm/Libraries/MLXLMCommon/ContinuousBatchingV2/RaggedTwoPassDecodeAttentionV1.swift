@@ -1,3 +1,5 @@
+// Box-draw entry on the unmodified crown content (see submission note for
+// the draw ledger; the prior entry in this series promoted at 1.88976).
 // Box-draw entry #3 on the unmodified crown content. Entry #2 (4198c2b2)
 // drew the fast-serial box — the line's eighth consecutive — and sealed
 // candidate decode ~2.2276, the crown's own content level, as the ledger

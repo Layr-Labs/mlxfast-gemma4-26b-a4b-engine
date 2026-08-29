@@ -336,13 +336,15 @@ private let routeFusedScatterKernelT64: MLXFast.MLXFastKernel = {
                 atomic_load_explicit(&tg_before[k], memory_order_relaxed);
             // Walk this tile's slice in input order: stability by
             // construction, exactly the stock scatter's write order.
-            for (uint i = 0; i < TILE; ++i) {
-                uint idx = t * TILE + i;
-                if (keys[idx] == k) {
-                    row_order[off] = idx / M;
-                    sorted_keys[off] = k;
-                    inverse_order[idx] = off;
-                    ++off;
+            if (total > 0) {
+                for (uint i = 0; i < TILE; ++i) {
+                    uint idx = t * TILE + i;
+                    if (keys[idx] == k) {
+                        row_order[off] = idx / M;
+                        sorted_keys[off] = k;
+                        inverse_order[idx] = off;
+                        ++off;
+                    }
                 }
             }
             """,

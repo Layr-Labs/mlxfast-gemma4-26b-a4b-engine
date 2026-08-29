@@ -3648,7 +3648,15 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int gemma4_down_tile_span = 4; // sweep alternate: 2
+  // KERN-SPAN-8: the strip walk's span, swept 4 -> 8, following a measured
+  // gradient rather than a guess. Span 2 (176 surviving y-groups, 11264
+  // threadgroups) scored 5.86% below span 4 (88 survivors, 5632
+  // threadgroups) on the ranked box. Fewer, longer-lived groups won, so
+  // this takes one more step the same way: 44 survivors, 2816
+  // threadgroups, each walking 8 consecutive 8-row y-tiles. Same
+  // ownership argument (352 divides by 8), same registers, same impls,
+  // same per-output add sequence -- only the partition changes.
+  constexpr int gemma4_down_tile_span = 8; // swept: 2 scored -5.86%, 4 is the incumbent
   if (tid.y % uint(gemma4_down_tile_span) != 0u) {
     return;
   }

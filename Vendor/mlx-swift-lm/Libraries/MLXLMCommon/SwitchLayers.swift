@@ -236,6 +236,93 @@ private let compiledGeGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
     return body
 }()
 
+// MARK: - GELU-FUSE-001: one kernel instead of two for the pinned decode shapes
+
+/// WHY THE TANH-GELU PRODUCT COSTS TWO DISPATCHES TODAY.
+///
+/// `compile(shapeless: true)` traces the body inside
+/// `detail::InTracing{dynamic: true}`
+/// (`Vendor/mlx-swift/Source/Cmlx/mlx/mlx/compile.cpp:402`). That flag sends
+/// every `broadcast_arrays` call down the dynamic branch
+/// (`.../mlx/ops.cpp:1727` and `:1776`), which emits a `BroadcastAxes` node for
+/// BOTH operands of every binary op even when the two shapes already match --
+/// shapeless tracing cannot prove they do. The traced tape therefore carries
+/// two extra nodes per binary op, and `compile_fuse` stops recursing once
+/// `depth >= max_compile_depth` (`compile.cpp:840`, limit 11 at
+/// `compile.cpp:23`). For this expression the cut lands inside
+/// `0.044715 * gate * gate * gate`, so MLX emits TWO Metal kernels -- a
+/// cube-term kernel and the rest -- and the decode step pays two dispatches,
+/// two command buffers and one extra intermediate for a single element-wise
+/// expression.
+///
+/// Compiling the SAME body WITHOUT `shapeless` lets `broadcast_to` short
+/// circuit on equal shapes (`ops.cpp:1677`), so no `Broadcast` node is created,
+/// the tape fits under the depth limit, and the whole expression fuses into one
+/// kernel. Nothing about the arithmetic changes: the op sequence is identical
+/// and `Broadcast` moves data without rounding, so every intermediate is still
+/// materialised at its own dtype in the generated kernel. `Compiled`'s kernel
+/// name is built from the tape and dtypes only, so both geometries keep sharing
+/// one JIT-compiled Metal library.
+///
+/// WHY IT IS CLAIMED ONLY FOR THE PINNED DECODE SHAPES. A shape-specialised
+/// compile adds one `CompilerCache` entry per distinct input shape, and the
+/// cache lookup is a linear scan (`compile.cpp:345`). Prefill sees a new
+/// sequence length per prompt, so letting it in would grow the scan without
+/// bound on the decode hot path. The gate below admits only the batch-eight /
+/// decode-one element-wise signatures the scored tower actually runs, which is
+/// a handful of entries. Everything else -- prefill, any other batch, any other
+/// dtype, mismatched operand shapes -- keeps the shapeless closure untouched.
+/// `DARKBLOOM_GELU_SHAPED_FUSE=0` (also `false`/`no`/`off`) restores it.
+public enum CompiledGeluFusion {
+    public static let shapedEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GELU_SHAPED_FUSE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// True only for the pinned decode element-wise geometries: both operands
+    /// bfloat16, identical shape, and a leading signature that the B=8 decode
+    /// step produces ([8, 1, N] dense / PLE rows, [64, 1, N] or [64, N] routed
+    /// expert rows).
+    @inline(__always)
+    public static func claimsPinnedDecode(_ gate: MLXArray, _ up: MLXArray) -> Bool {
+        guard shapedEnabled,
+            MLXHardwareInfo.isCompiledDecodeSupported,
+            gate.dtype == .bfloat16,
+            up.dtype == .bfloat16
+        else { return false }
+        let shape = gate.shape
+        guard shape == up.shape else { return false }
+        switch shape.count {
+        case 2: return shape[0] == 8 || shape[0] == 64
+        case 3: return shape[1] == 1 && (shape[0] == 8 || shape[0] == 64)
+        default: return false
+        }
+    }
+}
+
+/// Shape-specialised twin of `compiledGeGLU`: identical body, identical op
+/// sequence, one Metal dispatch instead of two. See `CompiledGeluFusion`.
+private let compiledGeGLUShaped: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+        (gate: MLXArray, up: MLXArray) -> MLXArray in
+        (0.5 * gate * (1 + tanh(sqrt(2 / Float.pi) * (gate + 0.044715 * gate * gate * gate)))) * up
+    }
+    if MLXHardwareInfo.isCompiledDecodeSupported {
+        return compile(shapeless: false, body)
+    }
+    return body
+}()
+
+/// `compiledGeGLU` with the one-dispatch twin claimed for the pinned decode
+/// geometries and the incumbent shapeless closure everywhere else.
+@inline(__always)
+private func geGLUProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
+    CompiledGeluFusion.claimsPinnedDecode(gate, up)
+        ? compiledGeGLUShaped(gate, up)
+        : compiledGeGLU(gate, up)
+}
+
 // MARK: - ROUTE-CSORT-64: fused counting-sort route table (donor port)
 
 /// Stable counting sort for the flattened B=8 decode route table (64 uint32
@@ -576,7 +663,7 @@ public class SwitchGLU: Module {
         } else if isSiluActivation {
             activated = compiledSwiGLU(xGate, xUp)
         } else if isGeluActivation {
-            activated = compiledGeGLU(xGate, xUp)
+            activated = geGLUProduct(xGate, xUp)
         } else {
             activated = activation(xGate) * xUp
         }

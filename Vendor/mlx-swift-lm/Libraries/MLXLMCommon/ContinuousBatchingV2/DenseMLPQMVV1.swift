@@ -81,10 +81,7 @@ inline U qdot_affine8_registered(
     U scale,
     U bias,
     U sum) {
-  U accum = 0;
-  for (int i = 0; i < values_per_thread; i++) {
-    accum += x_thread[i] * w[i];
-  }
+  U accum = x_thread[0] * w[0] + x_thread[1] * w[1] + x_thread[2] * w[2] + x_thread[3] * w[3];
   return scale * accum + sum * bias;
 }
 

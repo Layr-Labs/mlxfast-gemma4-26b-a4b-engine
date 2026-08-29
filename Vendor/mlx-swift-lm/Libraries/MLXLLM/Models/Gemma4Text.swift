@@ -325,12 +325,46 @@ func geluFusionClaimsPinnedDecode(_ gate: MLXArray, _ up: MLXArray) -> Bool {
 let gemma4ShapedGeluFuseEnabled: Bool =
     ProcessInfo.processInfo.environment["DARKBLOOM_GELU_SHAPED_FUSE"] != "0"
 
-/// Route the pinned decode signatures to the one-kernel trace.
+/// GELU-FUSE-PREFILL: the same one-kernel trace for the prefill rectangles,
+/// under a hard cap on how many distinct shapes may ever be admitted.
+///
+/// The comment above states why prefill was excluded: a shape-specialised
+/// compile costs one compiler-cache entry per distinct shape, the lookup is a
+/// linear scan, and per-prompt sequence lengths would grow it without bound.
+/// That is an argument about the entry *count*, so the cap answers it — at most
+/// ``shapedGeluPrefillShapeCap`` rectangles are admitted for the process
+/// lifetime and everything after falls open to the shapeless closure. The
+/// decode signatures are matched first and never reach the set.
+private let gemma4GeluPrefillFuseEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GELU_SHAPED_FUSE_PREFILL"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+private let gemma4GeluPrefillShapes = ShapedGeluPrefillShapes(
+    cap: shapedGeluPrefillShapeCap)
+
+@inline(__always)
+func geluFusionClaimsPrefill(_ gate: MLXArray, _ up: MLXArray) -> Bool {
+    guard gemma4ShapedGeluFuseEnabled, gemma4GeluPrefillFuseEnabled,
+        gate.dtype == .bfloat16, up.dtype == .bfloat16,
+        gate.shape == up.shape,
+        gate.size >= shapedGeluPrefillMinElements,
+        gemma4GeluPrefillShapes.admits(gate.shape)
+    else { return false }
+    CBv2EngageMark.once("gelu-shaped-prefill-dense")
+    return true
+}
+
+/// Route the pinned decode signatures and the capped prefill rectangles to the
+/// one-kernel trace.
 @inline(__always)
 func gemma4GeluProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
-    geluFusionClaimsPinnedDecode(gate, up)
-        ? gemma4SafeGeluProductShaped(gate, up)
-        : gemma4SafeGeluProduct(gate, up)
+    if geluFusionClaimsPinnedDecode(gate, up) || geluFusionClaimsPrefill(gate, up) {
+        return gemma4SafeGeluProductShaped(gate, up)
+    }
+    return gemma4SafeGeluProduct(gate, up)
 }
 
 /// Final-logit softcap (`tanh(x / cap) * cap`) fused into one Metal dispatch

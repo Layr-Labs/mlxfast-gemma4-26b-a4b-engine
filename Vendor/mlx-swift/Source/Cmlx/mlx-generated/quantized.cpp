@@ -3791,11 +3791,24 @@ template <typename T, int group_size, int bits>
     // run of four takes the quad-stream impl -- each (output, input) pair
     // keeps its own accumulator, K-loop order, and qdot, so every output
     // element's add sequence is identical to the incumbent per-arm kernels.
-    if ((run_offset & 3) != 0) {
+    // RUN-TRIPLE-3: leader election parity (run_offset % 3) and a run
+    // length capped at 3 — the triple-stream impl below is the already
+    // promoted kernel used verbatim whenever a run yields run_len == 3;
+    // a run of length 4..5 now takes 2–3 triple/single leaders instead of
+    // one quad leader. Per-row qdot, accumulator, simd_sum and store are
+    // bit-identical to the quad arm by the same per-stream independence
+    // argument the quad promotion shipped on: each (output,input) pair
+    // keeps its own add sequence; only leader partition and the number of
+    // streams per leader change. Motivation: this tip's engine rewrote the
+    // attention+rope legs and the down-plane span-2 no longer stacks
+    // (-6.29%, 22e54071) — parallelism width IS still priced fine at b8
+    // on this plane family (span-2 promoted +0.18% at span-4 incumbent);
+    // the up plane has never had a width retune at this revision.
+    if ((run_offset % 3) != 0) {
       return;
     }
     uint run_len = 1;
-    while (run_len < 4 && assignment + run_len < 64 &&
+    while (run_len < 3 && assignment + run_len < 64 &&
            rhs_indices[(assignment + run_len) * (uint)rhs_strides[0]] ==
                expert) {
       run_len++;

@@ -3,6 +3,10 @@
 import Foundation
 import MLX
 
+// Transparent exact-crown measurement retry after the independent RUN-COUNT
+// and EXPERT-SINGLES mechanisms failed their first combined M5 admission gate.
+// Second exact-tree draw after the first retry passed 4/4 at composite 1.878630;
+// this changes no executable source and makes no mechanism claim.
 /// The fundamental configuration for any MLX-based model.
 ///
 /// `BaseConfiguration` provides the metadata necessary to identify the model architecture

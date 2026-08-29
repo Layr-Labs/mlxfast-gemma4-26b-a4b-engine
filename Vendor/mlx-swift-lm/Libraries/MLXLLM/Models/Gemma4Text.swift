@@ -2534,6 +2534,287 @@ private enum Gemma4FusedLayerGlue {
         )[0]
     }
 }
+/// ROUTER-NORM-QMV-001: exact decode-only fusion of the router's RMSNorm and
+/// affine-8/group-64 projection. Four threadgroups per cohort row preserve
+/// enough projection parallelism; each group independently reproduces the
+/// stock 704-thread `rms_single_row` reduction, rounds the normalized vector to
+/// bf16 in threadgroup memory, then assigns 32 score rows to eight simdgroups.
+/// Each score simdgroup transcribes the incumbent non-fast `qmv_impl` path:
+/// four values per lane, 128-value blocks, affine `qdot`, and `simd_sum`.
+///
+/// Every admission fact is exact and fail-closed. Default-on follows passing
+/// actual-weight adversarial parity, heterogeneous B8 begin/run parity, and
+/// the counterbalanced pair microbench; `DARKBLOOM_GEMMA4_ROUTER_NORM_QMV=0`
+/// restores the established two-dispatch path.
+enum Gemma4FusedRouterNormQMV {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ROUTER_NORM_QMV"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let rows = 8
+    private static let sequence = 1
+    private static let axis = 2816
+    private static let experts = 128
+    private static let selected = 8
+    private static let groupSize = 64
+    private static let bits = 8
+    private static let packedAxis = axis * bits / 32
+    private static let groupsPerRow = axis / groupSize
+    private static let partitionsPerRow = 4
+    private static let rmsReads = 4
+    private static let threadGroupSize = axis / rmsReads
+
+    struct Projection {
+        fileprivate let weight: MLXArray
+        fileprivate let scales: MLXArray
+        fileprivate let biases: MLXArray
+    }
+
+    /// Resolve immutable projection facts once per router. Weight arrays are
+    /// loaded before the first forward and never mutate on the scored target.
+    static func prepare(_ layer: Linear) -> Projection? {
+        guard let quantized = layer as? QuantizedLinear,
+            quantized.bias == nil,
+            quantized.mode == .affine,
+            quantized.groupSize == groupSize,
+            quantized.bits == bits,
+            let biases = quantized.biases,
+            quantized.weight.ndim == 2,
+            quantized.weight.dim(0) == experts,
+            quantized.weight.dim(1) == packedAxis,
+            quantized.weight.dtype == .uint32,
+            quantized.scales.ndim == 2,
+            quantized.scales.dim(0) == experts,
+            quantized.scales.dim(1) == groupsPerRow,
+            quantized.scales.dtype == .bfloat16,
+            biases.ndim == 2,
+            biases.dim(0) == experts,
+            biases.dim(1) == groupsPerRow,
+            biases.dtype == .bfloat16
+        else { return nil }
+
+        // Custom Metal inputs are not normalized by an MLX primitive first.
+        // Reject noncanonical backing rather than letting the helper reinterpret
+        // a view with row-major pointer arithmetic.
+        let weightStrides = quantized.weight.strides
+        let scaleStrides = quantized.scales.strides
+        let biasStrides = biases.strides
+        guard weightStrides == [packedAxis, 1],
+            scaleStrides == [groupsPerRow, 1],
+            biasStrides == [groupsPerRow, 1]
+        else { return nil }
+
+        return Projection(
+            weight: quantized.weight, scales: quantized.scales, biases: biases)
+    }
+
+    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_router_norm_qmv_affine8_g64_b8_v1",
+        inputNames: ["x", "norm_weight", "qweight", "scales", "biases"],
+        outputNames: ["scores"],
+        source: """
+            constexpr uint AXIS = 2816;
+            constexpr uint EXPERTS = 128;
+            constexpr uint PARTITIONS = 4;
+            constexpr uint SCORES_PER_PARTITION = 32;
+            constexpr uint RMS_READS = 4;
+            constexpr uint QMV_READS = 4;
+            constexpr uint QMV_BLOCK = 128;
+            constexpr uint GROUP_SIZE = 64;
+            constexpr uint GROUPS_PER_ROW = 44;
+            constexpr uint RESULT_ROWS = 4;
+            constexpr uint QMV_SIMDGROUPS = 8;
+
+            const int in_vec_size = x_shape[x_ndim - 1];
+            const int in_vec_size_g = in_vec_size / int(GROUP_SIZE);
+            const uint tg = threadgroup_position_in_grid.x;
+            const uint row = tg / PARTITIONS;
+            const uint partition = tg - row * PARTITIONS;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+
+            threadgroup float local_inv_mean[1];
+            threadgroup float local_sums[32];
+            threadgroup T normed[AXIS];
+
+            // Verbatim rms_single_row<T, N_READS=4> reduction geometry and
+            // operation order for axis_size=2816, followed by its exact bf16
+            // output expression. Each partition deliberately recomputes this
+            // reduction so projection work can occupy 32 GPU cores.
+            const uint x_row = row * uint(in_vec_size);
+            const uint rms_base = lid * RMS_READS;
+            float rms_acc = 0;
+            for (uint i = 0; i < RMS_READS; i++) {
+                float xi = x[x_row + rms_base + i];
+                rms_acc += xi * xi;
+            }
+            rms_acc = simd_sum(rms_acc);
+            if (simd_group_id == 0) {
+                local_sums[simd_lane_id] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_lane_id == 0) {
+                local_sums[simd_group_id] = rms_acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+                rms_acc = simd_sum(local_sums[simd_lane_id]);
+                if (simd_lane_id == 0) {
+                    local_inv_mean[0] = metal::precise::rsqrt(
+                        rms_acc / in_vec_size + 1.0e-6f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint i = 0; i < RMS_READS; i++) {
+                normed[rms_base + i] =
+                    norm_weight[rms_base + i] *
+                    static_cast<T>(
+                        x[x_row + rms_base + i] * local_inv_mean[0]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Stock affine qmv_impl at N=128, K=2816, bits=8, group=64.
+            // Only the input address space changes from device to threadgroup;
+            // normed[] contains the exact bf16 values the standalone RMS kernel
+            // would have materialized.
+            if (simd_group_id < QMV_SIMDGROUPS) {
+                const uint out_row =
+                    partition * SCORES_PER_PARTITION +
+                    simd_group_id * RESULT_ROWS;
+                const device uint8_t* ws =
+                    (const device uint8_t*)qweight +
+                    out_row * in_vec_size + simd_lane_id * QMV_READS;
+                const device T* sl =
+                    scales + out_row * in_vec_size_g +
+                    simd_lane_id / (GROUP_SIZE / QMV_READS);
+                const device T* bl =
+                    biases + out_row * in_vec_size_g +
+                    simd_lane_id / (GROUP_SIZE / QMV_READS);
+
+                thread float x_thread[QMV_READS];
+                thread float result[RESULT_ROWS] = {0};
+
+                uint k = 0;
+                for (; k < uint(in_vec_size) - QMV_BLOCK; k += QMV_BLOCK) {
+                    float sum = 0;
+                    for (uint i = 0; i < QMV_READS; i++) {
+                        const float xi =
+                            normed[k + simd_lane_id * QMV_READS + i];
+                        sum += xi;
+                        x_thread[i] = xi;
+                    }
+                    for (uint result_row = 0;
+                         result_row < RESULT_ROWS;
+                         result_row++) {
+                        const device uint8_t* wl =
+                            ws + result_row * in_vec_size;
+                        const float scale =
+                            sl[result_row * in_vec_size_g];
+                        const float bias =
+                            bl[result_row * in_vec_size_g];
+                        float accum = 0;
+                        for (uint i = 0; i < QMV_READS; i++) {
+                            accum += x_thread[i] * wl[i];
+                        }
+                        result[result_row] +=
+                            scale * accum + sum * bias;
+                    }
+                    ws += QMV_BLOCK;
+                    sl += QMV_BLOCK / GROUP_SIZE;
+                    bl += QMV_BLOCK / GROUP_SIZE;
+                }
+
+                const int remaining = clamp(
+                    in_vec_size - int(k) - int(simd_lane_id * QMV_READS),
+                    0,
+                    int(QMV_READS));
+                if (remaining > 0) {
+                    float sum = 0;
+                    for (int i = 0; i < remaining; i++) {
+                        const float xi =
+                            normed[k + simd_lane_id * QMV_READS + uint(i)];
+                        sum += xi;
+                        x_thread[i] = xi;
+                    }
+                    for (int i = remaining; i < int(QMV_READS); i++) {
+                        x_thread[i] = 0;
+                    }
+                    for (uint result_row = 0;
+                         result_row < RESULT_ROWS;
+                         result_row++) {
+                        const device uint8_t* wl =
+                            ws + result_row * in_vec_size;
+                        const float scale =
+                            sl[result_row * in_vec_size_g];
+                        const float bias =
+                            bl[result_row * in_vec_size_g];
+                        float accum = 0;
+                        for (int i = 0; i < remaining; i++) {
+                            accum += x_thread[i] * wl[i];
+                        }
+                        result[result_row] +=
+                            scale * accum + sum * bias;
+                    }
+                }
+
+                for (uint result_row = 0;
+                     result_row < RESULT_ROWS;
+                     result_row++) {
+                    result[result_row] = simd_sum(result[result_row]);
+                    if (simd_lane_id == 0) {
+                        scores[row * EXPERTS + out_row + result_row] =
+                            static_cast<T>(result[result_row]);
+                    }
+                }
+            }
+        """,
+        ensureRowContiguous: false
+    )
+
+    static func scores(
+        x: MLXArray, effectiveScale: MLXArray, projection: Projection,
+        eps: Float, topK: Int
+    ) -> MLXArray? {
+        guard enabled,
+            eps == 1.0e-6,
+            topK == selected,
+            x.ndim == 3,
+            x.dim(0) == rows,
+            x.dim(1) == sequence,
+            x.dim(2) == axis,
+            x.dtype == .bfloat16,
+            effectiveScale.ndim == 1,
+            effectiveScale.dim(0) == axis,
+            effectiveScale.dtype == .bfloat16
+        else { return nil }
+
+        let xStrides = x.strides
+        let scaleStrides = effectiveScale.strides
+        guard xStrides == [axis, axis, 1], scaleStrides == [1]
+        else { return nil }
+
+        return kernel(
+            [
+                x, effectiveScale, projection.weight,
+                projection.scales, projection.biases,
+            ],
+            template: [("T", x.dtype)],
+            grid: (
+                rows * partitionsPerRow * threadGroupSize,
+                1,
+                1
+            ),
+            threadGroup: (threadGroupSize, 1, 1),
+            outputShapes: [[rows, sequence, experts]],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
+}
+
 
 /// Expert router. Norms `x` with a learnable scale, projects to expert
 /// scores, and returns top-K (indices, weights) where weights are
@@ -2548,6 +2829,8 @@ private class Gemma4Router: Module {
     let rootSize: Float
     let kth: Int
     private var cachedEffectiveScale: MLXArray?
+    private var fusedProjection: Gemma4FusedRouterNormQMV.Projection?
+    private var didResolveFusedProjection = false
 
     init(_ config: Gemma4TextConfiguration) {
         precondition(
@@ -2575,8 +2858,27 @@ private class Gemma4Router: Module {
             cachedEffectiveScale = eff
             effScale = eff
         }
-        let normed = MLXFast.rmsNorm(x, weight: effScale, eps: eps)
-        let expertScores = proj(normed)
+        let expertScores: MLXArray
+        if Gemma4FusedRouterNormQMV.enabled {
+            if !didResolveFusedProjection {
+                fusedProjection = Gemma4FusedRouterNormQMV.prepare(proj)
+                didResolveFusedProjection = true
+            }
+            if let fusedProjection,
+                let fused = Gemma4FusedRouterNormQMV.scores(
+                    x: x, effectiveScale: effScale,
+                    projection: fusedProjection, eps: eps, topK: topK)
+            {
+                CBv2EngageMark.once("router-norm-qmv")
+                expertScores = fused
+            } else {
+                let normed = MLXFast.rmsNorm(x, weight: effScale, eps: eps)
+                expertScores = proj(normed)
+            }
+        } else {
+            let normed = MLXFast.rmsNorm(x, weight: effScale, eps: eps)
+            expertScores = proj(normed)
+        }
 
         // ROUTE-001: single-dispatch byte-identical replacement of the chain
         // below for the B=8 decode geometry. Every other geometry, dtype, or

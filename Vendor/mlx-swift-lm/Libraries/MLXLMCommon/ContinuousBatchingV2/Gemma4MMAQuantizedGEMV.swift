@@ -2481,6 +2481,240 @@ public enum Gemma4MMAQuantizedGEMV {
         ensureRowContiguous: true
     )
 
+
+    // MARK: - MPP/NAX arm --- Apple tensor unit (M5 and later)
+
+// MPP-HEAD-001 resubmission marker (r2): the first ranked pair of this tree, submission 75f6a845, failed without a score on box 3 at the benchmark step; content unchanged.
+    /// MPP-HEAD-001. The same tied-head GEMV run on the Apple tensor unit
+    /// (`MetalPerformancePrimitives`, `mpp::tensor_ops::matmul2d`) instead of
+    /// the simdgroup matrix units.
+    ///
+    /// GEOMETRY. Identical dispatch to version 26: one threadgroup of four
+    /// simdgroups (128 threads) per 128 output columns, `N / 128` threadgroups.
+    /// Each simdgroup owns 32 of those columns and holds ONE fp32 destination
+    /// cooperative tensor across the whole K sweep. K is walked one affine
+    /// group (64) at a time and each group is consumed by four `matmul2d`
+    /// steps of tile depth 16, so K = 2816 is 44 groups / 176 tensor steps.
+    ///
+    /// THE 8 -> 16 PAD. `matmul2d` accepts m == 16 or m == 32 only (the
+    /// static_assert lives in MPPTensorOpsMatMul2dImpl.h). The cohort has eight
+    /// rows, so the activation tile carries eight zero rows and their eight
+    /// output rows are dropped at the drain. Half the tensor tile is therefore
+    /// idle; the weight traffic -- the whole point of the head kernel -- is
+    /// unchanged, because the B operand is the full 32-column tile either way.
+    ///
+    /// OPERAND STAGING is MLX's own, not invented here:
+    /// `mpp_head_dequantize` is `dequantize<U, N, bits>` copied from the
+    /// vendored `kernels/quantized_nax.h` (the routine `QuantizedBlockLoader`
+    /// calls to fill a threadgroup operand tile for every NAX quantized GEMM
+    /// MLX ships), with the non-affine-4 branches dropped. One lane dequantises
+    /// one weight row per group: 32 packed bytes in, 64 bf16 out, contiguous.
+    ///
+    /// EXACTNESS. This arm is NOT bit-identical to versions 1...26 and is a
+    /// COARSER deviation class than they are, for a reason that is structural
+    /// rather than incidental: the tensor unit consumes bf16 operands, so the
+    /// dequantised weight `s_g * q_k + b_g` must be ROUNDED TO BF16 before it
+    /// is multiplied, whereas versions 1...26 keep `s_g * q_k` exact in fp32
+    /// and add the affine bias as a separate exact term. `s_g` alone already
+    /// carries eight significand bits and `q_k` four, so `s_g * q_k` needs up
+    /// to twelve and does not fit bf16: there is no rearrangement of this
+    /// algebra that makes a bf16-operand tensor op reproduce the fp32-operand
+    /// answer. What IS held: the accumulation is fp32 (`relaxed_precision` is
+    /// explicitly false), the products are the standard per-output dot product
+    /// over the same terms in the same K order, and the deviation is a
+    /// weight-quantisation rounding of at most half a bf16 ulp per element --
+    /// the same class MLX accepts for every NAX quantized matmul. See
+    /// $T/mpp/NOTE.md for why this cannot be validated on non-NAX hardware.
+    ///
+    /// FAIL-CLOSED. Everything `apply` already requires, plus a NAX probe that
+    /// mirrors `mlx::core::metal::is_nax_available()` (device.cpp:913) exactly.
+    /// On any GPU older than gen 17 -- this M4 Max reports `applegpu_g16s` --
+    /// the arm is never selected and the tree is byte-for-byte version 26.
+    private static let mppHeader = """
+#include <metal_stdlib>
+#include <metal_simdgroup>
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+// MLX's own affine dequantiser, copied from the vendored
+// mlx/backend/metal/kernels/quantized_nax.h:486-529 -- the routine every NAX
+// quantized GEMM in MLX uses to fill a threadgroup operand tile. The signature
+// and the bits==4 body are byte-identical to that source; the other bit widths
+// are dropped because this head plane is affine-4 only.
+template <typename U, int NV, int bits>
+inline void
+mpp_head_dequantize(const device uint8_t* w, U scale, U bias, threadgroup U* w_local) {
+  static_assert(bits == 4, "head MPP arm is affine-4 only");
+  U s[2] = {scale, scale / static_cast<U>(16.0f)};
+  for (int i = 0; i < (NV / 2); i++) {
+    w_local[2 * i] = s[0] * (w[i] & 0x0f) + bias;
+    w_local[2 * i + 1] = s[1] * (w[i] & 0xf0) + bias;
+  }
+}
+"""
+
+    private static let mppSource = """
+        constexpr uint M_ROWS = 8;      // real cohort rows
+        constexpr uint M_PAD = 16;      // matmul2d needs m == 16 or 32
+        constexpr uint GROUP = 64;      // affine group
+        constexpr uint TN = 32;         // output columns per simdgroup
+        constexpr uint TK = 16;         // k depth of one matmul2d step
+        constexpr uint SGS = 4;         // simdgroups per threadgroup
+        constexpr uint TG_THREADS = SGS * 32;
+        constexpr uint COLS_PER_TG = SGS * TN;
+        constexpr uint W_ROW_U32 = K / 8;
+        constexpr uint GROUPS = K / GROUP;
+
+        const uint sg = simdgroup_index_in_threadgroup;
+        const uint sl = thread_index_in_simdgroup;
+        const uint tid = sg * 32 + sl;
+        const uint tgN0 = threadgroup_position_in_grid.x * COLS_PER_TG;
+        const uint sgN0 = tgN0 + sg * TN;
+
+        // A tile: Axs[m * GROUP + k], m in 0..15 (rows 8..15 are the zero pad).
+        threadgroup T Axs[M_PAD * GROUP];
+        // B tile: Bws[sg][n * GROUP + k] -- one dequantised weight row per lane.
+        threadgroup T Bws[SGS * TN * GROUP];
+        // C tile: Cts[sg][m * TN + n], fp32, used to zero and to drain.
+        threadgroup float Cts[SGS * M_PAD * TN];
+
+        using ext2 = metal::dextents<int32_t, 2>;
+        using tileT = metal::tensor<threadgroup T, ext2, metal::tensor_inline>;
+        using tileF = metal::tensor<threadgroup float, ext2, metal::tensor_inline>;
+
+        // NT form: left is [k, m] (transpose_left = false), right is [k, n]
+        // (transpose_right = true), destination is [n, m).  Extent 0 is the
+        // fastest-varying dimension, so the packed layouts above are exactly
+        // A[m][k] and B[n][k] -- see MPPTensorOpsMatMul2d.h:80-200.
+        constexpr auto mppDesc = mpp::tensor_ops::matmul2d_descriptor(
+            int(M_PAD), int(TN), int(TK),
+            false,   // transpose_left
+            true,    // transpose_right
+            false,   // relaxed_precision: keep the fp32 accumulate honest
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+        mpp::tensor_ops::matmul2d<mppDesc, metal::execution_simdgroup> mppOp;
+
+        tileF Ct(Cts + sg * (M_PAD * TN), ext2(int(TN), int(M_PAD)));
+        for (uint i = sl; i < M_PAD * TN; i += 32) {
+            Cts[sg * (M_PAD * TN) + i] = 0.0f;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        auto acc = mppOp.get_destination_cooperative_tensor<tileT, tileT, float>();
+        acc.load(Ct);
+
+        const metal::array<int32_t, 2> subStride = {1, int32_t(GROUP)};
+        const uint wRow = sgN0 + sl;
+
+        for (uint g = 0; g < GROUPS; ++g) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint i = tid; i < M_PAD * GROUP; i += TG_THREADS) {
+                const uint m = i / GROUP;
+                const uint kk = i % GROUP;
+                Axs[i] = (m < M_ROWS) ? x[m * K + g * GROUP + kk] : T(0);
+            }
+            mpp_head_dequantize<T, int(GROUP), 4>(
+                reinterpret_cast<const device uint8_t*>(
+                    w + wRow * W_ROW_U32 + g * (GROUP / 8)),
+                scales[wRow * GROUPS + g],
+                biases[wRow * GROUPS + g],
+                Bws + sg * (TN * GROUP) + sl * GROUP);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint kk = 0; kk < GROUP; kk += TK) {
+                tileT tA(Axs + kk, ext2(int(TK), int(M_PAD)), subStride);
+                tileT tB(Bws + sg * (TN * GROUP) + kk, ext2(int(TK), int(TN)), subStride);
+                mppOp.run(tA, tB, acc);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        acc.store(Ct);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = sl; i < M_ROWS * TN; i += 32) {
+            const uint m = i / TN;
+            const uint n = i % TN;
+            out[m * N + sgN0 + n] = T(Cts[sg * (M_PAD * TN) + m * TN + n]);
+        }
+        """
+
+    private static let kernelMPP: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mpp_affine4_qmv_m8_v40_tensorunit",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["out"],
+        source: mppSource,
+        header: mppHeader,
+        ensureRowContiguous: true
+    )
+
+    /// Output columns one threadgroup owns in the MPP arm. Deliberately equal
+    /// to version 16/26's width so the dispatch geometry is unchanged.
+    private static let mppColsPerThreadgroup = 128
+
+    /// `arch_gen` exactly as `metal::Device` computes it (device.cpp:565-572):
+    /// the two characters before the final one, each mapped to 0 when it is not
+    /// a digit, read as a two-digit number.
+    public static func naxArchitectureGen(_ architecture: String) -> Int {
+        let chars = Array(architecture)
+        guard chars.count >= 3 else { return 0 }
+        func digit(_ c: Character) -> Int {
+            guard let v = c.wholeNumberValue, v >= 0, v < 10 else { return 0 }
+            return v
+        }
+        return digit(chars[chars.count - 3]) * 10 + digit(chars[chars.count - 2])
+    }
+
+    /// `is_nax_available()` (device.cpp:913) transcribed for the Swift road.
+    /// `is_nax_available` is not exported through mlx-c, so it is mirrored, not
+    /// called. `MLX_METAL_GPU_ARCH` overrides the reported string exactly as
+    /// `env::metal_gpu_arch()` (mlx/utils.h:205) does inside MLX.
+    public static func naxAvailable(architecture: String) -> Bool {
+        // MLX_METAL_NO_NAX is a compile-time kill switch inside MLX; honour an
+        // environment form of it here so one variable disables both roads.
+        if let raw = ProcessInfo.processInfo.environment["MLX_METAL_NO_NAX"],
+            !raw.isEmpty, raw != "0"
+        {
+            return false
+        }
+        guard #available(macOS 26.2, iOS 26.2, tvOS 26.2, visionOS 26.2, *) else {
+            return false
+        }
+        guard let last = architecture.last else { return false }
+        let gen = naxArchitectureGen(architecture)
+        return gen >= (last == "p" ? 18 : 17)
+    }
+
+    /// The architecture string MLX itself would use.
+    private static let reportedArchitecture: String = {
+        if let raw = ProcessInfo.processInfo.environment["MLX_METAL_GPU_ARCH"],
+            !raw.isEmpty
+        {
+            return raw
+        }
+        return MLX.GPU.deviceInfo().architecture
+    }()
+
+    /// DEBUG ONLY. Runs the tensor-unit arm on hardware whose architecture
+    /// generation says it has no tensor unit. `__HAVE_TENSOR__` is a property
+    /// of the Metal 4 language version, not of the device, so the kernel still
+    /// COMPILES on an M4 -- what the hardware then does with a tensor
+    /// instruction is undefined. Never leave this set.
+    private static let mppForced: Bool = {
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_HEAD_MPP_FORCE"] == "1"
+    }()
+
+    /// `true` only on hardware that reports a tensor unit, and only when the
+    /// kill switch is not an explicit off value.
+    private static let mppEnabled: Bool = {
+        if let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_HEAD_MPP"] {
+            switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+            case "0", "false", "no", "off": return false
+            default: break
+            }
+        }
+        if mppForced { return true }
+        return naxAvailable(architecture: reportedArchitecture)
+    }()
+
     /// Tied-head GEMV, or `nil` when any gate above fails.
     ///
     /// - Parameters:
@@ -2525,6 +2759,19 @@ public enum Gemma4MMAQuantizedGEMV {
         guard scales.dim(1) == k / groupSize, biases.dim(1) == k / groupSize else { return nil }
 
         let flatX = x.reshaped([mRows, k])
+
+        // MPP-HEAD-001: the tensor-unit arm, when the GPU reports one.
+        if mppEnabled, n % mppColsPerThreadgroup == 0 {
+            return kernelMPP(
+                [flatX, w, scales, biases],
+                template: [("T", x.dtype), ("K", k), ("N", n)],
+                grid: ((n / mppColsPerThreadgroup) * threadsPerThreadgroup, 1, 1),
+                threadGroup: (threadsPerThreadgroup, 1, 1),
+                outputShapes: [[mRows, n]],
+                outputDTypes: [x.dtype]
+            )[0]
+        }
+
         let threadgroups = n / selectedColsPerThreadgroup
         let selected: MLXFast.MLXFastKernel
         let inputs: [MLXArray]

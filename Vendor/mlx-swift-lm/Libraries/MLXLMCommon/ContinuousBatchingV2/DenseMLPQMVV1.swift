@@ -87,15 +87,6 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    /// Reuse each down-plane lane's exact affine bias sum across output
-    /// tiles. Disabling this restores the original per-tile MMA8 reduction.
-    private static let mma8DownLaneSumsEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_MLP_MMA8_DOWN_LANE_SUMS"]
-        else { return false }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
     private static let batch = 8
     private static let sequence = 1
     private static let groupSize = 64
@@ -112,14 +103,6 @@ public enum CBv2DenseMLPQMVV1 {
     /// whose exact B8/L1/K2816 gate also pins the table geometry.
     public struct ActivationSums {
         fileprivate let values: MLXArray
-
-        /// ZIP-ROUTER-001 ordering handle. Read-only view of the table's own
-        /// output array so a caller can name this dispatch as an
-        /// `MLX.depends` edge when it interleaves the dense chain with an
-        /// independent chain. `Depends` emits no dispatch and its output
-        /// aliases its input's buffer, so handing the array out cannot change
-        /// what any kernel reads or writes.
-        public var dependencyHandle: MLXArray { values }
     }
 
     /// The affine-8 helper below is the current promoted
@@ -143,6 +126,7 @@ inline U qdot_affine8_registered(
     U bias,
     U sum) {
   U accum = 0;
+  #pragma unroll
   for (int i = 0; i < values_per_thread; i++) {
     accum += x_thread[i] * w[i];
   }
@@ -202,8 +186,10 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
 
   int k = 0;
   for (; k <= in_vec_size - block_size; k += block_size) {
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* wl = ws + row * in_vec_size_w;
+      #pragma unroll
       for (int i = 0; i < bytes_per_thread; i++) {
         packed[row][i] = wl[i];
       }
@@ -212,21 +198,25 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
     }
 
     float sum = load_vector<T, float, values_per_thread, 8>(x0, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine8_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 8>(x1, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine8_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 8>(x2, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine8_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 8>(x3, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result3[row] += qdot_affine8_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
@@ -244,8 +234,10 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
   const uint active_tail_lanes =
       uint((in_vec_size - k) / values_per_thread);
   if (simd_lid < active_tail_lanes) {
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* wl = ws + row * in_vec_size_w;
+      #pragma unroll
       for (int i = 0; i < bytes_per_thread; i++) {
         packed[row][i] = wl[i];
       }
@@ -254,27 +246,32 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
     }
 
     float sum = load_vector<T, float, values_per_thread, 8>(x0, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine8_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 8>(x1, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine8_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 8>(x2, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine8_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 8>(x3, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result3[row] += qdot_affine8_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
   }
 
+  #pragma unroll
   for (int row = 0; row < results_per_simdgroup; row++) {
     result0[row] = simd_sum(result0[row]);
     result1[row] = simd_sum(result1[row]);
@@ -322,6 +319,7 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
             inline void load_affine8_values(
                 const device T* x,
                 thread U* x_thread) {
+              #pragma unroll
               for (int i = 0; i < values_per_thread; i++) {
                 x_thread[i] = x[i];
               }
@@ -637,87 +635,8 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         header: mma8KernelHeader,
         ensureRowContiguous: true)
 
-    /// One complete SIMD group per g64 group. Keep all lane results rather
-    /// than canonicalizing row sums: the consumer reads its own lane's tree.
-    private static let mma8DownLaneSumKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_down_lane_sums_v1",
-        inputNames: ["x"],
-        outputNames: ["laneSums"],
-        source: """
-            const uint lane = thread_index_in_simdgroup;
-            const int g = int(threadgroup_position_in_grid.y);
-            const int K = x_shape[x_ndim - 1];
-            const mma8_coord c = mma8_lane(lane);
-            const device T* x0 = x + c.fn * K + 8 * c.fm;
-            const device T* x1 = x0 + K;
-            const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
-            const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
-            float2 rs = float2(mma8_runsum8<T>(r0), mma8_runsum8<T>(r1));
-            rs += simd_shuffle_xor(rs, 2u);
-            rs += simd_shuffle_xor(rs, 4u);
-            rs += simd_shuffle_xor(rs, 16u);
-            ((device float2*)laneSums)[g * 32 + lane] = rs;
-            """,
-        header: mma8KernelHeader,
-        ensureRowContiguous: true)
-
-    private static let mma8DownLaneSumHeader: String = {
-        var result = mma8KernelHeader
-        func replaceOnce(_ old: String, with new: String) {
-            precondition(result.components(separatedBy: old).count == 2)
-            result = result.replacingOccurrences(of: old, with: new)
-        }
-        replaceOnce(
-            "gemma4_qmv_mma8_affine8_g64_impl(",
-            with: "gemma4_qmv_mma8_affine8_g64_lane_sums_impl(")
-        replaceOnce(
-            """
-                const device T* x,
-                device T* y,
-                const int K,
-            """,
-            with: """
-                const device T* x,
-                const device float2* laneSums,
-                device T* y,
-                const int K,
-            """)
-        replaceOnce(
-            """
-                // Each B lane owns the two 8-runs whose run sums the C lane (fm, fn)
-                // needs; three xor-butterfly steps over the fm lane bits broadcast
-                // RS[g][fn] and RS[g][fn + 1] to all eight lanes of the fn column group.
-                float2 rs = float2(mma8_runsum8<T>(r0), mma8_runsum8<T>(r1));
-                rs += simd_shuffle_xor(rs, 2u);
-                rs += simd_shuffle_xor(rs, 4u);
-                rs += simd_shuffle_xor(rs, 16u);
-            """,
-            with: """
-                // Producer retained this exact lane's original reduction tree.
-                const float2 rs = laneSums[g * 32 + simd_lid];
-            """)
-        return result
-    }()
-
-    private static let mma8DownLaneSumQMVKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_lane_sums_v1",
-        inputNames: ["x", "w", "scales", "biases", "laneSums"],
-        outputNames: ["y"],
-        source: """
-            const uint3 tid = threadgroup_position_in_grid;
-            threadgroup float2 red[32];
-            gemma4_qmv_mma8_affine8_g64_lane_sums_impl<T, 2>(
-                w, scales, biases, x, (const device float2*)laneSums, y,
-                x_shape[x_ndim - 1], w_shape[0], int(tid.y) * 8, red,
-                simdgroup_index_in_threadgroup,
-                thread_index_in_simdgroup);
-            return;
-            """,
-        header: mma8DownLaneSumHeader,
-        ensureRowContiguous: true)
-
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_v1",
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_v2",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -758,7 +677,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     /// followed by four ascending `sum += bf16` operations. Row is the unit-
     /// stride dimension so one table serves both gate and up projections.
     private static let activationSumKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_affine8_xsum_v1",
+        name: "cbv2_b8_l1_dense_mlp_affine8_xsum_v2",
         inputNames: ["x"],
         outputNames: ["xSums"],
         source: """
@@ -769,6 +688,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
             const device T* xp =
                 x + row * in_vec_size + k_block * 128 + lane * 4;
             float sum = 0.0f;
+            #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 sum += xp[i];
             }
@@ -778,7 +698,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     )
 
     private static let activationSumQMVKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_v1",
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_v2",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["y"],
         source: """
@@ -846,29 +766,6 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         return ActivationSums(values: values)
     }
 
-    /// Adopts an exact producer-emitted table for the same pinned decode
-    /// geometry as `activationSums(for:)`. The layer-glue producer writes the
-    /// table while its BF16 dense input is still resident in registers, using
-    /// the identical four-value accumulation order as the standalone kernel.
-    public static func activationSums(
-        produced values: MLXArray, for x: MLXArray
-    ) -> ActivationSums? {
-        let blocks = 2816 / kBlock
-        guard enabled,
-            activationSumsEnabled,
-            x.dtype == .bfloat16,
-            x.ndim == 3,
-            x.dim(0) == batch,
-            x.dim(1) == sequence,
-            x.dim(2) == 2816,
-            x.size == batch * sequence * 2816,
-            values.dtype == .float32,
-            values.ndim == 1,
-            values.size == blocks * simdWidth * batch
-        else { return nil }
-        return ActivationSums(values: values)
-    }
-
     /// Returns `nil` unless every production pin holds. The caller then invokes
     /// the original QuantizedLinear unchanged.
     public static func matmul(
@@ -921,25 +818,6 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         let isGateUp = inDim == 2816 && outDim == 2112
         if isGateUp ? mma8GateUpEnabled : mma8DownEnabled {
             let yTiles = outDim / outputsPerGroup
-            if !isGateUp && mma8DownLaneSumsEnabled {
-                let groups = inDim / Self.groupSize
-                let laneSums = mma8DownLaneSumKernel(
-                    [x],
-                    template: [("T", x.dtype)],
-                    grid: (simdWidth, groups, 1),
-                    threadGroup: (simdWidth, 1, 1),
-                    outputShapes: [[groups, simdWidth, 2]],
-                    outputDTypes: [.float32]
-                )[0]
-                return mma8DownLaneSumQMVKernel(
-                    [x, weight, scales, biases, laneSums],
-                    template: [("T", x.dtype)],
-                    grid: (simdWidth, yTiles * simdGroups, 1),
-                    threadGroup: (simdWidth, simdGroups, 1),
-                    outputShapes: [[batch, sequence, outDim]],
-                    outputDTypes: [x.dtype]
-                )[0]
-            }
             return mma8Kernel(
                 [x, weight, scales, biases],
                 template: [("T", x.dtype)],

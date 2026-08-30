@@ -294,7 +294,7 @@ git commit -m 'perf: add exact shared Gemma B1 MTP projection'
 
 **Does NOT cover:** B8 route behavior; the existing B8 binders remain byte-for-byte callable and separately tested.
 
-- [ ] **Step 1: Add failing B1 cases to every projection suite**
+- [x] **Step 1: Add failing B1 cases to every projection suite**
 
 For C2-C4, build `x` as `[1, columns, K]`, compare the new B1 binder to concatenated ordinary B1 calls, and require exact BF16 storage equality. For the head, use `outDim = 262_144` in the artifact-width test.
 
@@ -314,11 +314,11 @@ bindB1Verifier(
 
 Dense and attention-output variants retain their existing `inDim`/`outDim` arguments.
 
-- [ ] **Step 2: Run all four focused suites**
+- [x] **Step 2: Run all four focused suites**
 
 Expected: FAIL because the B1 binders are absent.
 
-- [ ] **Step 3: Implement direct B1 bindings**
+- [x] **Step 3: Implement direct B1 bindings**
 
 Each `bindB1Verifier` performs its existing weight/topology checks once, then returns the closure from `Gemma4B1MTPQuantizedProjection.bind`. No enabled-path closure may call `matmul(...)`, inspect environment variables, or fall back to stock.
 
@@ -338,11 +338,11 @@ public static func bindB1Verifier(
 }
 ```
 
-- [ ] **Step 4: Run the projection suites and the original B8 suites**
+- [x] **Step 4: Run the projection suites and the original B8 suites**
 
 Expected: B1 and B8 tests all pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/AttentionQKVMMA8V1.swift Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/AttentionOQMVV1.swift Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/DenseMLPQMVV1.swift Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/Gemma4MMAQuantizedGEMV.swift Tests/MLXFastTests/Gemma4MTPVerifierQKVKernelTests.swift Tests/MLXFastTests/Gemma4MTPVerifierAttentionOKernelTests.swift Tests/MLXFastTests/Gemma4MTPVerifierDenseMLPKernelTests.swift Tests/MLXFastTests/Gemma4MTPVerifierHeadKernelTests.swift

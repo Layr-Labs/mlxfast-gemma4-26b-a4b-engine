@@ -103,14 +103,6 @@ public enum CBv2DenseMLPQMVV1 {
     /// whose exact B8/L1/K2816 gate also pins the table geometry.
     public struct ActivationSums {
         fileprivate let values: MLXArray
-
-        /// ZIP-ROUTER-001 ordering handle. Read-only view of the table's own
-        /// output array so a caller can name this dispatch as an
-        /// `MLX.depends` edge when it interleaves the dense chain with an
-        /// independent chain. `Depends` emits no dispatch and its output
-        /// aliases its input's buffer, so handing the array out cannot change
-        /// what any kernel reads or writes.
-        public var dependencyHandle: MLXArray { values }
     }
 
     /// The affine-8 helper below is the current promoted
@@ -134,6 +126,7 @@ inline U qdot_affine8_registered(
     U bias,
     U sum) {
   U accum = 0;
+  #pragma unroll
   for (int i = 0; i < values_per_thread; i++) {
     accum += x_thread[i] * w[i];
   }
@@ -193,8 +186,10 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
 
   int k = 0;
   for (; k <= in_vec_size - block_size; k += block_size) {
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* wl = ws + row * in_vec_size_w;
+      #pragma unroll
       for (int i = 0; i < bytes_per_thread; i++) {
         packed[row][i] = wl[i];
       }
@@ -203,21 +198,25 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
     }
 
     float sum = load_vector<T, float, values_per_thread, 8>(x0, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine8_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 8>(x1, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine8_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 8>(x2, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine8_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 8>(x3, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result3[row] += qdot_affine8_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
@@ -235,8 +234,10 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
   const uint active_tail_lanes =
       uint((in_vec_size - k) / values_per_thread);
   if (simd_lid < active_tail_lanes) {
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* wl = ws + row * in_vec_size_w;
+      #pragma unroll
       for (int i = 0; i < bytes_per_thread; i++) {
         packed[row][i] = wl[i];
       }
@@ -245,27 +246,32 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
     }
 
     float sum = load_vector<T, float, values_per_thread, 8>(x0, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine8_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 8>(x1, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine8_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 8>(x2, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine8_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 8>(x3, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result3[row] += qdot_affine8_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
   }
 
+  #pragma unroll
   for (int row = 0; row < results_per_simdgroup; row++) {
     result0[row] = simd_sum(result0[row]);
     result1[row] = simd_sum(result1[row]);
@@ -629,7 +635,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         ensureRowContiguous: true)
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_v1",
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_v2",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -755,29 +761,6 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
             outputShapes: [[blocks * simdWidth * batch]],
             outputDTypes: [.float32]
         )[0]
-        return ActivationSums(values: values)
-    }
-
-    /// Adopts an exact producer-emitted table for the same pinned decode
-    /// geometry as `activationSums(for:)`. The layer-glue producer writes the
-    /// table while its BF16 dense input is still resident in registers, using
-    /// the identical four-value accumulation order as the standalone kernel.
-    public static func activationSums(
-        produced values: MLXArray, for x: MLXArray
-    ) -> ActivationSums? {
-        let blocks = 2816 / kBlock
-        guard enabled,
-            activationSumsEnabled,
-            x.dtype == .bfloat16,
-            x.ndim == 3,
-            x.dim(0) == batch,
-            x.dim(1) == sequence,
-            x.dim(2) == 2816,
-            x.size == batch * sequence * 2816,
-            values.dtype == .float32,
-            values.ndim == 1,
-            values.size == blocks * simdWidth * batch
-        else { return nil }
         return ActivationSums(values: values)
     }
 

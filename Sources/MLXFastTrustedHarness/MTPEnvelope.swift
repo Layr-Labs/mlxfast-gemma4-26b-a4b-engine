@@ -22,30 +22,14 @@ import MLXLMCommon
 //     a nonzero depth, and then quietly performs no rectangular verification
 //     at all.
 //
-//     CORRECTION (2026-08-25, exactness defect): the same vendored doc
-//     comment also states what a POSITIVE cap means — "a positive envelope
-//     is the integrator's explicit claim that rectangular target evaluation
-//     is argmax-exact for the deployed chip/OS/MLX/model tuple at every
-//     shape inside it". No such certification exists for this track's tuple,
-//     and this repo's own port notes record the opposite finding
-//     (docs/gemma4-port-notes.md section 3.1: on M5 with the production QAT
-//     checkpoint, `[B,1]` and `[B,L]` quantized-matmul shapes "are not
-//     bit-identical", first divergence in the layer-0 Q/K projection). The
-//     first live single-stream MTP run (2026-08-25, engine 8c0bfec2)
-//     confirmed it: with `.automatic` + cap 32 sealed here, 7 of 8 hidden
-//     prompts diverged from the serial oracle at deterministic
-//     prompt-specific steps, committing text-equivalent boundary-shifted
-//     re-tokenizations — the near-tie argmax signature of the rectangular
-//     `[1, 1+k]` verify forward, not a round-accounting error (every
-//     acceptance/rollback/stop boundary was separately proven token-exact;
-//     see Tests/MLXFastTests/MTPVerificationStrategySealTests.swift).
-//     `resolveConfig` therefore seals `.serialTarget` — the vendored
-//     chip-independent oracle whose verify columns are bit-identical to
-//     ordinary serial decode BY CONSTRUCTION — until a rectangular exactness
-//     certification for the deployed tuple exists. The cap below stays
-//     pinned as the DECLARED CANDIDATE envelope such a certification would
-//     re-enable; while `.serialTarget` is sealed it is inert (vendored:
-//     "Ignored by explicit serial/rectangular modes").
+//     A positive rectangular envelope is an exactness claim, not merely a
+//     throughput knob. The production Gemma artifact now installs immutable
+//     physical-B1 verifier contexts for C2, C3, and C4 at construction; each
+//     fixed-width projection is exact against independent B1/L1 projection
+//     calls. This seal therefore selects explicit `.rectangular` verification
+//     only with `maxSpeculativeBatch == 1` and fixed depths 1...3. Unsupported
+//     shapes fail at the installed model route instead of recovering to stock
+//     execution inside the measured path.
 //   * The attention query-block width (`CBv2AttentionV1.queryBlockSize`,
 //     AttentionV1.swift) is general v1-attention-dispatch infrastructure,
 //     env-var-controlled (`DARKBLOOM_CBV2_ATTN_QUERY_BLOCK`, default 128,
@@ -87,44 +71,18 @@ enum Gemma4MTPEnvelope {
 
     // MARK: - Declaration
 
-    /// The rectangular-verification width cap: `batch * (1 + k)` target rows
-    /// eligible for the vendored `.automatic` verification mode's rectangular
-    /// (per-column-serialized, exact-by-construction) scoring path. Pinned to
-    /// admit this track's full widened envelope: B=8 seeds x (1+k) for k in
-    /// 1...3, i.e. rectangular widths 16, 24, 32 — so the cap is 32, the
-    /// largest of the three admitted widths.
-    ///
-    /// NOT a per-chip draft DEPTH ceiling (a different knob, on a different
-    /// axis; this engine's own depth ceiling is `maxDraftTokens` below).
-    /// `docs/gemma4-port-notes.md` OQ-5 names a vendored
-    /// `MTPAutomaticVerificationPolicy` returning "8 on M3/M4/M5, 4 on
-    /// M1/M2" for that per-chip ceiling — that symbol does NOT exist in the
-    /// adopted vendored tree (doc-only lineage from an earlier design pass;
-    /// confirmed by whole-repo search), so it is cited here only as the
-    /// provenance of the number, not as live code this file calls. Conflating
-    /// the port-notes depth ceiling with this file's token cap was flagged
-    /// explicitly as a hazard during this increment's design and is called
-    /// out here so it is not re-made.
-    ///
-    /// Independently verified against the vendored planner rather than
-    /// asserted: `CBv2MTPRoundDriver.maximumAutomaticDepth`
-    /// (`CBv2MTPRoundDriver.swift:253-259`) computes
-    /// `maxWidth = maxAutomaticRectangularTokens / plannedDecodeRows`, then
-    /// clamps depth to `max(0, maxWidth - 1)`. At the planned decode-row
-    /// bucket `plannedDecodeRows == 8` (this track's B=8), `32 / 8 == 4`, so
-    /// `k` is pre-clamped to exactly 3 — this cap and `maxDraftTokens` below
-    /// are the SAME envelope stated on two axes, not independently chosen
-    /// numbers that happen to agree.
+    /// Existing positive rectangular-work pin. Explicit `.rectangular` mode
+    /// does not use this value to choose a strategy, but keeping it nonzero
+    /// preserves the construction-time refusal and records the reviewed
+    /// envelope in engine metrics. The physical route itself is narrower and
+    /// authoritative: B1 with columns 2...4 only.
     static let maxAutomaticRectangularTokens = 32
 
     /// The MTP arm's own per-round draft depth ceiling (k), independent of the
     /// vendored per-chip tested maximum (7): this engine pins a fixed,
-    /// task-scoped ceiling of 3 because the basic wide-verification kernel
-    /// this increment ships is exercised only up to rectangular width 32
-    /// (`8 * (1 + 3)`). Raising this past 3 without also raising
-    /// `maxAutomaticRectangularTokens` would silently starve the widened
-    /// depths back down to `.serialTarget` fallback — the relationship is
-    /// checked directly in `RuntimeWorkerSpecConfigTests`.
+    /// task-scoped ceiling of 3 because the installed physical-B1 verifier
+    /// table contains exactly C2, C3, and C4 entrypoints. Raising this value
+    /// requires construction and exactness certification for another width.
     static let maxDraftTokens = 3
 
     /// The attention query-block width (`CBv2AttentionV1.queryBlockSize`) a
@@ -209,26 +167,18 @@ enum Gemma4MTPEnvelope {
     /// single-stream v1.1 `free_decode_begin` mtp arm (Gemma4RuntimeWorker.swift)
     /// and the v1.2 batched cohort begin (Gemma4RuntimeCohortDriver.swift).
     ///
-    /// VERIFICATION STRATEGY — `.serialTarget`, sealed 2026-08-25 (see the
-    /// file-header CORRECTION for the full evidence trail). The serial oracle
-    /// scores every verify column through the same `[B, 1]` eager forward
-    /// ordinary decode uses, so a committed token is bit-identical to what
-    /// the serial control would have committed BY CONSTRUCTION, on every
-    /// chip. `.automatic` with this file's positive rectangular cap was an
-    /// uncertified argmax-exactness claim for the deployed tuple; the first
-    /// live single-stream run refuted it (7 of 8 hidden prompts diverged
-    /// inside drafting rounds' rectangular `[1, 1+k]` verify forwards).
-    /// Re-enabling rectangular scoring requires an on-box exactness
-    /// certification at every admitted width FIRST — flip the mode back only
-    /// together with that artifact, never on its own.
+    /// VERIFICATION STRATEGY — explicit `.rectangular` over the immutable B1
+    /// exact contexts installed by the production artifact. Depth is fixed per
+    /// request so C2/C3/C4 select the corresponding prebound entrypoint; depth
+    /// zero disables MTP rather than presenting target-only work as speculative.
     static func resolveConfig(depth: Int) throws -> CBv2MTPConfig {
         try requirePinned()
         return CBv2MTPConfig(
-            enabled: true,
-            maxDraftTokens: depth,
-            maxSpeculativeBatch: 8,
+            enabled: depth > 0,
+            maxDraftTokens: maxDraftTokens,
+            maxSpeculativeBatch: 1,
             fixedDraftTokens: depth,
-            verificationMode: .serialTarget,
+            verificationMode: .rectangular,
             maxAutomaticRectangularTokens: maxAutomaticRectangularTokens
         )
     }

@@ -6,75 +6,39 @@ import MLXRandom
 @testable import MLXFastRuntimeWorkerSupport
 import Testing
 
-// TOKEN-EXACTNESS SEAL for the MTP verify strategy (2026-08-25).
+// Production-strategy seal for the certified physical-B1 Gemma verifier.
 //
-// The first live single-stream v1.1 MTP run (benchd FreeRunV1_1, depth 2,
-// engine 8c0bfec2) failed token-exactness on 7 of 8 hidden prompts at a
-// DETERMINISTIC prompt-specific step, committing text-equivalent
-// boundary-shifted token variants of the serial oracle's tokens (147083
-// 'chamber' vs 18782 ' chamber'; 1345 ' end' vs 643 'end'; 1018 '**' vs
-// 236779 '_'), and committing an early stop token mid-window on the eighth.
-// That signature is a near-tie argmax flip inside the drafting rounds'
-// verify forward, not a KV/position accounting error: every structural
-// boundary (full-acceptance + bonus, partial acceptance, zero-acceptance
-// rollback truncation, ring-wrap staged transactions, stop-token clamp) was
-// exercised token-exact through the REAL vendored engine while diagnosing
-// this (see `acceptancePatternsStayLockstepAndTokenExact` below, which keeps
-// that coverage), and the committed serial-shaped rounds of the live run
-// matched the oracle for tens of steps before each divergence.
-//
-// The defect is the sealed verification strategy. The vendored contract is
-// explicit (`CBv2MTPConfig.maxAutomaticRectangularTokens`,
-// MTPContractsV2.swift): "a positive envelope is the integrator's explicit
-// claim that rectangular target evaluation is argmax-exact for the deployed
-// chip/OS/MLX/model tuple at every shape inside it" — and this repo's own
-// port notes (docs/gemma4-port-notes.md section 3.1) record the darkbloom
-// finding that `[B,1]` and `[B,L]` shapes select different quantized-matmul
-// reduction paths on the production QAT checkpoint and "are not
-// bit-identical". `Gemma4MTPEnvelope.resolveConfig` nevertheless sealed
-// `.automatic` with a positive cap (32), so every drafting round scored its
-// 1+k verify columns through the UNCERTIFIED rectangular `[B, 1+k]` forward
-// instead of the vendored chip-independent serial oracle ("every column
-// executes the same [B, 1] eager forward used by ordinary decode ... It
-// works independently of chip-specific multi-position kernel numerics").
-//
-// These tests seal the strategy: until a rectangular exactness certification
-// exists for the deployed tuple, the production config must select
-// `.serialTarget`, and a production-config single-stream session must run
-// ZERO rectangular verify rounds while still doing real draft/verify work.
+// The production artifact now installs immutable exact verifier contexts for
+// B1/C2, B1/C3, and B1/C4 at construction. This suite therefore seals the
+// engine-facing half of that contract: requested depths 1...3 select explicit
+// rectangular verification at physical batch one, and a complete real-engine
+// fixture stays lockstep with the serial verifier in every observable round
+// dimension. The weight-free fixture below proves engine strategy selection,
+// acceptance, commit, and KV-accounting semantics; it does not claim to
+// exercise the artifact-bound exact projection kernels. The real-artifact
+// route and digest gate belongs to the guarded benchmark task.
 
 @Suite("MTPVerificationStrategySeal", .serialized)
 struct MTPVerificationStrategySealTests {
 
-    // MARK: - (1) GPU-free: the sealed config selects the serial oracle
+    // MARK: - (1) GPU-free: the production seal selects certified B1 rectangles
 
-    /// The production seam both free-run legs construct their engine from
-    /// (`free_decode_begin` mtp arm, `handleCohortFreeDecodeBegin`) must seal
-    /// the chip-independent `.serialTarget` oracle — the only strategy whose
-    /// verify columns are bit-identical to ordinary serial decode BY
-    /// CONSTRUCTION — while keeping the speculative apparatus fully armed
-    /// (enabled, request-fixed depth, the pinned batch gate). A `.automatic` seal
-    /// with a positive rectangular cap is an argmax-exactness claim for the
-    /// deployed chip/OS/MLX/model tuple that this engine cannot make (no
-    /// certification artifact exists; the 2026-08-25 box run refuted it).
+    /// The same seam used by both free-run legs must select only the certified
+    /// physical-B1 widths. Depth zero remains disabled and is not a production
+    /// MTP route; depths 1...3 map directly to C2...C4.
     @Test
-    func resolveConfigSealsTheChipIndependentSerialOracle() throws {
-        for depth in 0 ... Gemma4MTPEnvelope.maxDraftTokens {
+    func resolveConfigSealsCertifiedPhysicalB1Rectangles() throws {
+        let disabled = try Gemma4MTPEnvelope.resolveConfig(depth: 0)
+        #expect(!disabled.enabled)
+        #expect(disabled.fixedDraftTokens == 0)
+
+        for depth in 1 ... Gemma4MTPEnvelope.maxDraftTokens {
             let config = try Gemma4MTPEnvelope.resolveConfig(depth: depth)
-            #expect(
-                config.verificationMode == .serialTarget,
-                """
-                depth \(depth): production MTP rounds must score verify \
-                columns through the vendored serial oracle until rectangular \
-                verification is exactness-certified for the deployed tuple \
-                (got \(config.verificationMode))
-                """)
-            // The seal is a strategy choice, never a disarm: real speculative
-            // work stays configured exactly as before.
+            #expect(config.verificationMode == .rectangular)
             #expect(config.enabled)
-            #expect(config.maxDraftTokens == depth)
+            #expect(config.maxDraftTokens == Gemma4MTPEnvelope.maxDraftTokens)
             #expect(config.fixedDraftTokens == depth)
-            #expect(config.maxSpeculativeBatch == 8)
+            #expect(config.maxSpeculativeBatch == 1)
         }
     }
 
@@ -86,6 +50,108 @@ struct MTPVerificationStrategySealTests {
     /// the staged-transaction regime the production 25-of-30 sliding layers
     /// live in (port-notes 5.3).
     private let slidingWindow = 12
+
+    /// Exact-by-construction phase fixture. Its logits are a table lookup on
+    /// each input token, so `[1, C]` and C independent `[1, 1]` calls return
+    /// literally the same stored Float values. Dummy full/sliding attention
+    /// still advances real CBv2 caches, allowing complete MTP round and
+    /// rollback accounting to run through the production engine seam.
+    private final class ExactCycleTarget: CBv2MTPSteppableModel {
+        static let vocabularySize = 64
+        private static let headDimension = 16
+        private static let hiddenDimension = 8
+
+        let layerKinds = [
+            CBv2LayerKind(
+                attention: .full, headDim: headDimension,
+                kvHeads: 1, queryHeads: 1),
+            CBv2LayerKind(
+                attention: .slidingWindow(12), headDim: headDimension,
+                kvHeads: 1, queryHeads: 1),
+        ]
+        let mtpCaptureLayers: CBv2MTPCaptureLayers? = .init(full: 0, sliding: 1)
+        var mtpTargetIdentity: ObjectIdentifier? { ObjectIdentifier(self) }
+
+        private let table: MLXArray
+        private let recordLock = NSLock()
+        private var recordedVerificationLogits: [MLXArray] = []
+
+        init() {
+            var values = [Float](
+                repeating: -8,
+                count: Self.vocabularySize * Self.vocabularySize)
+            for token in 0 ..< Self.vocabularySize {
+                values[token * Self.vocabularySize + token] = 8
+            }
+            table = MLXArray(
+                values, [Self.vocabularySize, Self.vocabularySize])
+        }
+
+        func forward(
+            tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+        ) -> MLXArray {
+            exactForward(tokens: tokens, caches: caches, record: false).logits
+        }
+
+        func forwardWithHidden(
+            tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+        ) -> (logits: MLXArray, lastHidden: MLXArray) {
+            exactForward(tokens: tokens, caches: caches, record: true)
+        }
+
+        func forwardRectangularVerificationWithHidden(
+            tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+        ) -> (logits: MLXArray, lastHidden: MLXArray) {
+            exactForward(tokens: tokens, caches: caches, record: true)
+        }
+
+        private func exactForward(
+            tokens: MLXArray, caches: [CBv2AttendingLayerCache], record: Bool
+        ) -> (logits: MLXArray, lastHidden: MLXArray) {
+            let batch = tokens.dim(0)
+            let columns = tokens.dim(1)
+            let qkv = MLXArray.zeros(
+                [batch, 1, columns, Self.headDimension], dtype: .float32)
+            var cacheDependency = MLXArray.zeros([1], dtype: .float32)
+            for cache in caches {
+                cacheDependency = cacheDependency + cache.updateAndAttend(
+                    queries: qkv, keys: qkv, values: qkv,
+                    scale: 0.25, sinks: nil).sum()
+            }
+            let next = (tokens + 1) % Self.vocabularySize
+            // The zero-valued dependency is intentional: it keeps the dummy
+            // attention/cache write graph live without changing a table bit.
+            let logits = take(table, next, axis: 0) + cacheDependency * 0
+            let hidden =
+                MLXArray.zeros(
+                    [batch, columns, Self.hiddenDimension], dtype: .float32)
+                + cacheDependency * 0
+            if record {
+                recordLock.lock()
+                recordedVerificationLogits.append(logits + 0)
+                recordLock.unlock()
+            }
+            return (logits, hidden)
+        }
+
+        /// Flatten call grouping into one exact logit row per scored token.
+        /// Serial produces C singleton calls while rectangular produces one
+        /// C-column call; this normalization compares their actual values.
+        func verificationLogitRows() -> [[Float]] {
+            recordLock.lock()
+            let arrays = recordedVerificationLogits
+            recordLock.unlock()
+            eval(arrays)
+            return arrays.flatMap { array in
+                let values = array.reshaped([-1]).asArray(Float.self)
+                return stride(
+                    from: 0, to: values.count, by: Self.vocabularySize
+                ).map {
+                    Array(values[$0 ..< $0 + Self.vocabularySize])
+                }
+            }
+        }
+    }
 
     private func targetConfig() throws -> Gemma4TextConfiguration {
         let json = """
@@ -158,7 +224,7 @@ struct MTPVerificationStrategySealTests {
 
         init(
             script: [Int], promptLength: Int, vocabSize: Int,
-            target: Gemma4TextModel, wrong: @escaping (Int, Int) -> Bool
+            target: AnyObject, wrong: @escaping (Int, Int) -> Bool
         ) {
             self.script = script
             self.promptLength = promptLength
@@ -206,89 +272,135 @@ struct MTPVerificationStrategySealTests {
         return [session.seedTokenByStream[0]] + result.tokensByStream[0]
     }
 
-    // MARK: - (2) MLX-gated: production-config rounds use ONLY the oracle
+    // MARK: - (2) MLX-gated: serial and rectangular full rounds are lockstep
 
-    /// Drive the REAL single-stream v1.1 session (`RuntimeWorkerMTPSession`)
-    /// with the PRODUCTION-SEALED config (`Gemma4MTPEnvelope.resolveConfig`,
-    /// the exact seam `free_decode_begin`'s mtp arm calls) over the
-    /// weight-free fixture, with an oracle drafter so every round performs
-    /// the deepest verify (full acceptance + bonus — the widest rectangular
-    /// candidate shape). The engine's own strategy accounting must show ZERO
-    /// rectangular verify rounds: every drafting round scored through the
-    /// chip-independent serial oracle, while real draft/verify work happened
-    /// (draftedTotal > 0 — the seal is not a silent disarm).
-    ///
-    /// Gated behind `MLXFAST_RUN_MLX_RUNTIME_TESTS=1` plus
-    /// `tools/build-mlx-metallib.sh --all-build-roots` once per checkout —
-    /// this repo's standing convention for MLX-runtime tests.
-    @Test
-    func productionConfigSingleStreamRoundsNeverUseRectangularVerification() throws {
-        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
-            return
+    private struct StrategyRun {
+        let seedToken: Int
+        let result: RuntimeWorkerFreeRunResult
+        let metrics: CBv2MTPMetrics
+        let logitRows: [[Float]]
+
+        /// The target's authoritative argmax for every verify column.
+        var targetArgmaxes: [[Int]] { metrics.roundAudits.map(\.targetTokens) }
+        var finalCacheLengths: [Int] {
+            guard let last = metrics.roundAudits.last else { return [] }
+            return [last.tokensCountAfter, last.numComputedAfter]
         }
-        let target = try makeTarget(seed: 0x5EED_0001)
-        let prompt = promptTokens(length: 14, seed: 11)
-        let n = 48
-        let maxTokens = n + 8
+    }
 
-        let baseline = try serialReference(
-            target: target, prompt: prompt, n: n, maxTokens: maxTokens)
-
-        let drafter = ScriptedDrafter(
-            script: baseline, promptLength: prompt.count, vocabSize: vocabSize,
-            target: target, wrong: { _, _ in false })
-        // THE PRODUCTION SEAM — byte-for-byte the config free_decode_begin
-        // seals for a `{"mode":"mtp","mtp":{"depth":2}}` spec. Only
-        // `fixedDraftTokens` is overridden, to pin the round pattern: the
-        // adaptive controller's depth choices are wall-time-driven and would
-        // make the exercised pattern (and so this test) nondeterministic.
-        // Strategy selection is independent of that knob
-        // (`mtpBuildTargetVerification` reads only verificationMode, the cap,
-        // and the round's width).
-        var config = try Gemma4MTPEnvelope.resolveConfig(depth: 2)
-        config.fixedDraftTokens = 2
-        let engine = try Gemma4Runtime.makeCohortEngine(
-            model: target, batchSize: 1, seedTokenCount: prompt.count,
-            maxTokensPerStream: maxTokens,
+    private func makeExactEngine(
+        target: ExactCycleTarget,
+        promptLength: Int,
+        drafter: (any CBv2MTPDrafter)?,
+        config: CBv2MTPConfig
+    ) -> EngineV2 {
+        let caches = target.layerKinds.enumerated().map {
+            CBv2LayerCache(layerIndex: $0.offset, kind: $0.element)
+        }
+        return EngineV2(
+            model: target,
+            layerKinds: target.layerKinds,
+            backend: CBv2ContiguousKVBackend(
+                config: .init(bytesCapacity: 1 << 24)),
+            cacheProvider: CBv2LayerCacheBank(caches: caches),
+            sampler: CBv2DefaultSampler(),
+            schedulerConfig: CBv2SchedulerConfig(
+                maxConcurrentRequests: 1,
+                maxBatchedTokensPerStep: 2048,
+                prefillChunkSize: max(512, promptLength),
+                maxWaiting: 1,
+                enablePrefixCache: false),
             mtpDrafter: drafter,
             mtpConfig: config)
+    }
+
+    private func runStrategy(
+        _ mode: CBv2MTPVerificationMode,
+        depth: Int,
+        prompt: [Int],
+        baseline: [Int],
+        n: Int,
+        maxTokens: Int
+    ) throws -> StrategyRun {
+        let target = ExactCycleTarget()
+        let drafter = ScriptedDrafter(
+            script: baseline, promptLength: prompt.count,
+            vocabSize: ExactCycleTarget.vocabularySize,
+            target: target, wrong: { _, _ in false })
+        var config = try Gemma4MTPEnvelope.resolveConfig(depth: depth)
+        config.enabled = true
+        config.maxSpeculativeBatch = 1
+        config.fixedDraftTokens = depth
+        config.verificationMode = mode
+        let engine = makeExactEngine(
+            target: target, promptLength: prompt.count,
+            drafter: drafter, config: config)
         try Gemma4Runtime.requireMTPActive(engine)
         let session = try RuntimeWorkerMTPSession(
             engine: engine, seedTokens: prompt, maxTokens: maxTokens, stopTokens: [])
         let result = try session.run(targetN: n)
-        let speculative = [session.seedToken] + result.tokens
         let metrics = try #require(engine.mtpMetricsSnapshot())
+        return StrategyRun(
+            seedToken: session.seedToken, result: result, metrics: metrics,
+            logitRows: target.verificationLogitRows())
+    }
 
-        // Real speculative work happened — the seal is a strategy choice,
-        // not a disarm (the envelope header's "silent-no-spec-work" hazard).
-        #expect(result.draftedTotal > 0)
-        #expect(metrics.rounds > 0)
+    /// Run every production depth once through the serial verifier and once
+    /// through explicit rectangular verification. The target, prompt,
+    /// scripted proposals, requested token budget, and physical batch are
+    /// matched. `maxTokens == seed + N` prevents a cancelled in-flight tail,
+    /// making strategy round counts and final KV accounting directly
+    /// comparable.
+    @Test
+    func productionDepthsMatchSerialFullRoundEvidence() throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
+        let prompt = promptTokens(length: 14, seed: 11)
+        let n = 36
+        let maxTokens = n + 1
 
-        // THE SEAL: no verify round may score through the rectangular
-        // [B, 1+k] forward — the strategy whose argmax-exactness on the
-        // deployed chip/OS/MLX/model tuple is uncertified (port-notes 3.1;
-        // the 2026-08-25 box run's 7-of-8-prompt divergence). Every drafting
-        // round must use the vendored serial oracle.
-        #expect(
-            metrics.rectangularVerificationRounds == 0,
-            """
-            \(metrics.rectangularVerificationRounds) of \(metrics.rounds) \
-            verify rounds scored through the uncertified rectangular \
-            strategy; production rounds must use the chip-independent \
-            serial oracle
-            """)
-        // Strategy is recorded at round LAUNCH (`recordVerificationStrategy`,
-        // graph build) while `rounds` increments at FINALIZE (`recordRound`),
-        // and the session's cancel at N can cut the last launched round
-        // before its finalize — so launched-strategy counts can exceed
-        // finalized rounds by the in-flight tail, never trail them.
-        #expect(metrics.serialVerificationRounds >= metrics.rounds)
+        for depth in 1 ... Gemma4MTPEnvelope.maxDraftTokens {
+            let start = try #require(prompt.last)
+            let baseline = (1 ... (n + 1)).map {
+                (start + $0) % ExactCycleTarget.vocabularySize
+            }
+            let serial = try runStrategy(
+                .serialTarget, depth: depth, prompt: prompt,
+                baseline: baseline, n: n, maxTokens: maxTokens)
+            let rectangular = try runStrategy(
+                .rectangular, depth: depth, prompt: prompt,
+                baseline: baseline, n: n, maxTokens: maxTokens)
 
-        // Greedy losslessness at fixture scale, plus the benchd §2.6 triple.
-        #expect(speculative == baseline)
-        #expect(result.committedTotal == n)
-        #expect(result.acceptanceLengths.reduce(0, +) == n)
-        #expect(result.completedWork == result.rounds + 1)
+            #expect(serial.seedToken == rectangular.seedToken, "depth \(depth)")
+            #expect(serial.logitRows == rectangular.logitRows, "depth \(depth): logits")
+            #expect(serial.targetArgmaxes == rectangular.targetArgmaxes, "depth \(depth)")
+            #expect(
+                serial.metrics.roundAudits.map(\.accepted)
+                    == rectangular.metrics.roundAudits.map(\.accepted),
+                "depth \(depth): accepted draft counts")
+            #expect(
+                serial.result.acceptanceLengths == rectangular.result.acceptanceLengths,
+                "depth \(depth): committed widths")
+            #expect(serial.result.tokens == rectangular.result.tokens, "depth \(depth)")
+            #expect(serial.finalCacheLengths == rectangular.finalCacheLengths, "depth \(depth)")
+            #expect([serial.seedToken] + serial.result.tokens == baseline, "depth \(depth)")
+
+            #expect(serial.metrics.rounds > 0, "depth \(depth)")
+            #expect(serial.metrics.rectangularVerificationRounds == 0, "depth \(depth)")
+            #expect(
+                serial.metrics.serialVerificationRounds == serial.metrics.rounds,
+                "depth \(depth)")
+            #expect(rectangular.metrics.rounds > 0, "depth \(depth)")
+            #expect(
+                rectangular.metrics.rectangularVerificationRounds
+                    == rectangular.metrics.rounds,
+                "depth \(depth)")
+            #expect(rectangular.metrics.serialVerificationRounds == 0, "depth \(depth)")
+            #expect(rectangular.result.draftedTotal > 0, "depth \(depth)")
+            #expect(rectangular.result.committedTotal == n, "depth \(depth)")
+            #expect(rectangular.result.acceptanceLengths.reduce(0, +) == n, "depth \(depth)")
+        }
     }
 
     // MARK: - (3) MLX-gated: acceptance-pattern lockstep (hardening)

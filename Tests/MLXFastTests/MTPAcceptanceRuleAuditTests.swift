@@ -330,8 +330,17 @@ struct MTPAcceptanceRuleAuditTests {
             ("row1-accept-1-of-2", { _, step in step == 1 }, 2),
         ]
         for (name, row1Wrong, expectedMaxWidth) in rowPatterns {
-            var config = try Gemma4MTPEnvelope.resolveConfig(depth: 2)
-            config.fixedDraftTokens = 2
+            // Explicit generic B2 fixture config. Production Gemma installs
+            // exact verifier routes only for physical B1; this test-local
+            // envelope exercises the vendored cross-row accept/min semantics
+            // and makes no B2 production-route claim.
+            let config = CBv2MTPConfig(
+                enabled: true,
+                maxDraftTokens: 2,
+                maxSpeculativeBatch: batchSize,
+                fixedDraftTokens: 2,
+                verificationMode: .automatic,
+                maxAutomaticRectangularTokens: 64)
             let drafter = ScriptedDrafter(
                 scripts: references, promptLength: prompts[0].count,
                 vocabSize: vocabSize, target: target,

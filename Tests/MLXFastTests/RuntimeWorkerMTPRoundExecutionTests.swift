@@ -144,6 +144,10 @@ struct RuntimeWorkerMTPRoundExecutionTests {
         }
     }
 
+    /// Generic tiny-fixture configuration. This deliberately remains an
+    /// explicit test-local envelope so the B2 case below keeps exercising
+    /// vendored rectangular round semantics without implying that production
+    /// installs exact Gemma verifier kernels for any physical batch above one.
     private func mtpConfig(maxDraftTokens: Int, maxSpeculativeBatch: Int) -> CBv2MTPConfig {
         CBv2MTPConfig(
             enabled: true, maxDraftTokens: maxDraftTokens,
@@ -197,6 +201,7 @@ struct RuntimeWorkerMTPRoundExecutionTests {
             engine: onEngine, seedTokens: seed, maxTokens: maxTokens, stopTokens: [])
         let onResult = try onSession.run(targetN: n)
         let speculative = [onSession.seedToken] + onResult.tokens
+        let onMetrics = try #require(onEngine.mtpMetricsSnapshot())
 
         // GREEDY LOSSLESSNESS: MTP-on output is token-exact vs MTP-off,
         // exactly the invariant the vendored round driver is built to
@@ -216,6 +221,7 @@ struct RuntimeWorkerMTPRoundExecutionTests {
         // target-only fallback wearing an mtp label.
         #expect(onResult.draftedTotal > 0)
         #expect(onResult.acceptanceLengths.allSatisfy { $0 >= 1 })
+        #expect(onMetrics.rectangularVerificationRounds > 0)
     }
 
     // MARK: - (2) Batched cohort (v1.2): real rounds, the quadruple
@@ -254,6 +260,7 @@ struct RuntimeWorkerMTPRoundExecutionTests {
         let onResult = try onSession.runMTP(targetN: n)
         let speculative = zip(onSession.seedTokenByStream, onResult.tokensByStream)
             .map { [$0] + $1 }
+        let onMetrics = try #require(onEngine.mtpMetricsSnapshot())
 
         #expect(
             speculative == baseline,
@@ -268,6 +275,9 @@ struct RuntimeWorkerMTPRoundExecutionTests {
         #expect(onResult.draftedTotal >= onResult.acceptedTotal)
         #expect(onResult.draftedTotal > 0)
         #expect(onResult.rounds >= 1)
+        // Engagement belongs only to this explicit tiny B2 fixture. The
+        // production envelope is B1-only and is sealed separately.
+        #expect(onMetrics.rectangularVerificationRounds > 0)
         #expect(onResult.activeStreamsByRound == Array(repeating: batchSize, count: onResult.rounds))
         #expect(onResult.naturalAcceptedByStream.count == batchSize)
         for stream in onResult.naturalAcceptedByStream {

@@ -51,7 +51,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         }
     }()
 
-    /// PARTITION-002: the partition this dispatch actually uses.
+    /// PARTITION-003: the partition this dispatch actually uses.
     ///
     /// PARTITION-001 stopped at 32 for a reason that was about the merge
     /// kernel, not about the machine: pass B indexed its columns with one SIMD
@@ -71,10 +71,21 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// ~225 KB a 450 GB/s part needs to cover its own DRAM latency.
     ///
     /// Everything below the target is scratch that does not have to be written.
+    ///
+    /// PARTITION-003 takes the same argument one step further, to 4. The launch
+    /// is then 256 threadgroups of two simdgroups, so 512 simdgroups each hold a
+    /// 512-byte K load and a 512-byte V load outstanding: ~512 KB in flight,
+    /// still more than twice the ~225 KB a 450 GB/s part needs to cover its own
+    /// DRAM latency. What it buys is the other half of the scratch (13 MB per
+    /// decode step) and half of pass B's per-column merge work, and it leaves
+    /// the launch granularity coarse only by a factor of two, which is the
+    /// quantity the fused single-dispatch experiment showed this part cares
+    /// about far more than it cares about scratch bytes.
+    ///
     /// `MLX_SDPA_BLOCKS` keeps its stock meaning and still wins, so a process
     /// can never run mismatched partitions; `DARKBLOOM_CBV2_2PASS_BLOCKS`
     /// restores the stock answer (`=0`) or selects any other divisor of the
-    /// ring for bisection.
+    /// ring for bisection, including PARTITION-002's 8.
     private static let blocks: Int = {
         if let raw = ProcessInfo.processInfo.environment["MLX_SDPA_BLOCKS"],
             let value = Int(raw), value > 0
@@ -87,7 +98,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             return value > 0 && sequenceLength.isMultiple(of: value)
                 ? value : stockBlocks
         }
-        return min(8, stockBlocks)
+        return min(4, stockBlocks)
     }()
 
     private static let passAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(

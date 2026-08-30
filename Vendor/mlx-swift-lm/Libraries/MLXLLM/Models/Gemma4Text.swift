@@ -2285,6 +2285,121 @@ private enum Gemma4FusedRouterTop8 {
     }
 }
 
+/// ROUTER-FINALISTS32-R3: replace only ZIP router partition+slice at the
+/// exact ranked selection geometry. Each SIMDgroup stably sorts one 32-expert
+/// quarter and keeps its largest eight; a final SIMDgroup stably sorts those
+/// 32 survivors and writes the global largest eight in ascending order.
+/// An omitted element cannot be global top-eight because its own quarter
+/// already contains at least eight elements ordered after it.
+private enum Gemma4RouterFinalists32R3 {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ROUTER_FINALISTS32_R3"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let rows = 8
+    private static let experts = 128
+    private static let selected = 8
+    private static let partitionKth = experts - selected
+
+    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_router_finalists32_stable_bf16_r3",
+        inputNames: ["scores"],
+        outputNames: ["indices"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint group = simdgroup_index_in_threadgroup;
+            const uint expert = group * 32u + lane;
+
+            // Preserve the BF16 payload exactly. The low seven bits carry the
+            // unique global index used only to make LessThan a total, stable
+            // ordering; floating comparisons still use the original BF16.
+            uint item =
+                (uint(bfloat16_to_uint16(scores[row * 128u + expert])) << 7)
+                | expert;
+            threadgroup uint finalists[32];
+
+            for (uint width = 2u; width <= 32u; width <<= 1) {
+                for (uint stride = width >> 1; stride > 0u; stride >>= 1) {
+                    const uint other = simd_shuffle_xor(item, ushort(stride));
+                    const bool other_before =
+                        gemma4_router_finalists32_before(other, item);
+                    const bool take_minimum = ((lane & width) == 0u)
+                        == ((lane & stride) == 0u);
+                    if (take_minimum ? other_before : !other_before) {
+                        item = other;
+                    }
+                }
+            }
+
+            if (lane >= 24u) {
+                finalists[group * 8u + lane - 24u] = item;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (group == 0u) {
+                item = finalists[lane];
+                for (uint width = 2u; width <= 32u; width <<= 1) {
+                    for (uint stride = width >> 1; stride > 0u; stride >>= 1) {
+                        const uint other = simd_shuffle_xor(item, ushort(stride));
+                        const bool other_before =
+                            gemma4_router_finalists32_before(other, item);
+                        const bool take_minimum = ((lane & width) == 0u)
+                            == ((lane & stride) == 0u);
+                        if (take_minimum ? other_before : !other_before) {
+                            item = other;
+                        }
+                    }
+                }
+                if (lane >= 24u) {
+                    indices[row * 8u + lane - 24u] = item & 127u;
+                }
+            }
+        """,
+        header: """
+            inline bool gemma4_router_finalists32_before(uint a, uint b) {
+                const bfloat16_t av = uint16_to_bfloat16(uint16_t(a >> 7));
+                const bfloat16_t bv = uint16_to_bfloat16(uint16_t(b >> 7));
+                const bool an = metal::isnan(av);
+                const bool bn = metal::isnan(bv);
+                bool ab;
+                bool ba;
+                if (an | bn) {
+                    ab = (!an) & bn;
+                    ba = (!bn) & an;
+                } else {
+                    ab = av < bv;
+                    ba = bv < av;
+                }
+                return ab || (!ba && (a & 127u) < (b & 127u));
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    static func apply(_ scores: MLXArray, topK: Int, kth: Int) -> MLXArray? {
+        guard enabled,
+            topK == selected, kth == partitionKth,
+            scores.ndim == 3,
+            scores.dim(0) == rows,
+            scores.dim(1) == 1,
+            scores.dim(2) == experts,
+            scores.dtype == .bfloat16
+        else { return nil }
+
+        return kernel(
+            [scores],
+            grid: (rows * 128, 1, 1),
+            threadGroup: (128, 1, 1),
+            outputShapes: [[rows, 1, selected]],
+            outputDTypes: [.uint32]
+        )[0]
+    }
+}
+
 /// GLUE-003: one-per-forward chain box. Layer L's fused tail deposits the
 /// (output, next-layer-input-norm) pair; layer L+1 consumes the norm instead
 /// of re-reading and re-normalizing the same tensor — guarded by pointer
@@ -2818,11 +2933,27 @@ private class Gemma4Router: Module {
     }
 
     fileprivate func zipPartition(_ expertScores: MLXArray) -> MLXArray {
-        MLX.argPartition(expertScores, kth: kth, axis: -1)
+        if let finalists = Gemma4RouterFinalists32R3.apply(
+            expertScores, topK: topK, kth: kth)
+        {
+            return finalists
+        }
+        return MLX.argPartition(expertScores, kth: kth, axis: -1)
     }
 
     fileprivate func zipSelected(_ partition: MLXArray) -> MLXArray {
-        partition[.ellipsis, kth...]
+        // The admitted custom producer is the only partition stage with the
+        // compact tail shape. Depends preserves that shape in ZIP plan 2.
+        if topK == 8, kth == 120,
+            partition.ndim == 3,
+            partition.dim(0) == 8,
+            partition.dim(1) == 1,
+            partition.dim(2) == 8,
+            partition.dtype == .uint32
+        {
+            return partition
+        }
+        return partition[.ellipsis, kth...]
     }
 
     fileprivate func zipWeights(

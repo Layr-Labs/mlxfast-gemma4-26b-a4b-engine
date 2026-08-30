@@ -158,7 +158,7 @@ enum CBv2AttentionV1 {
         // Final cadence draw: the second run held 2.086433s decode and missed
         // promotion by 0.30%; only ~10ms of serial-prefill control movement
         // separated its sealed components from the stored threshold.
-        else { return true }
+        else { return false }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 

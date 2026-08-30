@@ -148,7 +148,17 @@ enum CBv2AttentionV1 {
     static let joinKernelEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_PREFILL_JOIN_KERNEL"]
-        else { return false }
+        // Attribution: default-on join selection and 16-head grouping below
+        // are adapted from newjordan's public, parity-passed submissions
+        // `c4557ca8-e1a2-4569-8d96-95061f6d1eef` and
+        // `1e63caf5-c028-4c38-abc7-6b5f5c2b5bb6`.
+        // Off-cadence retest: the first clean stack passed parity at
+        // 1.151572s prefill / 2.089284s decode, but its serial prefill control
+        // shifted 73.768ms faster than the stored record run.
+        // Final cadence draw: the second run held 2.086433s decode and missed
+        // promotion by 0.30%; only ~10ms of serial-prefill control movement
+        // separated its sealed components from the stored threshold.
+        else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
@@ -232,7 +242,8 @@ enum CBv2AttentionV1 {
         let lanes = D / 8
         guard lanes <= 1024, B * L * H * D < (1 << 31) else { return nil }
         var headsPerGroup = 1
-        for candidate in [8, 4, 2] where H % candidate == 0 && lanes * candidate <= 1024 {
+        for candidate in [16, 8, 4, 2]
+        where H % candidate == 0 && lanes * candidate <= 1024 {
             headsPerGroup = candidate
             break
         }

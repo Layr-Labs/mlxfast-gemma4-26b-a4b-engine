@@ -32,6 +32,16 @@ public enum CBv2AttentionOQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Share the activation fragment and affine run sum across two adjacent
+    /// output tiles. Each tile retains the incumbent MMA and accumulation
+    /// order; the kill switch restores its one-tile threadgroup exactly.
+    public static let mma8MultiTileEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ATTN_O_MMA8_MULTITILE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let batch = 8
     private static let sequence = 1
     private static let outputWidth = 2816
@@ -41,6 +51,7 @@ public enum CBv2AttentionOQMVV1 {
     private static let simdWidth = 32
     private static let simdGroups = 2
     private static let outputsPerGroup = 8
+    private static let mma8TilesPerGroup = 2
     private static let kernelHeader = CBv2TiedLMHeadQMVV1.kernelHeader + """
 
 inline float2 attention_o_qdot_affine4_loaded_pair(
@@ -297,7 +308,152 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
   y[c.fn * N + n0 + c.fm] = static_cast<T>(acc0);
   y[(c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc1);
 }
+
+// Two adjacent output tiles share the x-side fragment construction. The
+// per-tile weight load, MMA chain, affine term, K-group accumulation and
+// two-simdgroup close are unchanged from the incumbent body above.
+template <typename T, int KS, int TILES, int KFIX>
+METAL_FUNC void attention_o_qmv_mma8_affine4_g64_mt(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int N,
+    const int n0,
+    threadgroup float2* red,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int K = KFIX;
+  constexpr int G = K / 64;
+  constexpr int gh = (G + 1) / 2;
+  constexpr int nGroups = (KS == 2) ? gh : G;
+  const int g0 = (KS == 2 && simd_gid == 1) ? gh : 0;
+  const mma8_coord c = mma8_lane(simd_lid);
+
+  const device uint8_t* wrow[TILES];
+  const device T* srow[TILES];
+  const device T* brow[TILES];
+  thread float acc0[TILES];
+  thread float acc1[TILES];
+#pragma clang loop unroll(full)
+  for (int t = 0; t < TILES; ++t) {
+    const int nt = n0 + t * 8;
+    wrow[t] = (const device uint8_t*)w + (nt + c.fm) * (K / 2) + 4 * c.fn;
+    srow[t] = scales + (nt + c.fm) * G;
+    brow[t] = biases + (nt + c.fm) * G;
+    acc0[t] = 0.0f;
+    acc1[t] = 0.0f;
+  }
+
+  const device T* x0 = x + c.fn * K + 8 * c.fm;
+  const device T* x1 = x0 + K;
+
+  simdgroup_float8x8 A;
+  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+#pragma unroll
+  for (int gi = 0; gi < nGroups; ++gi) {
+    const int g = g0 + gi;
+    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+
+    float2 rs = float2(mma8_runsum4<T>(r0), mma8_runsum4<T>(r1));
+    rs += simd_shuffle_xor(rs, 2u);
+    rs += simd_shuffle_xor(rs, 4u);
+    rs += simd_shuffle_xor(rs, 16u);
+
+    MMA8_SETB(B0, x, lo)
+    MMA8_SETB(B1, x, hi)
+    MMA8_SETB(B2, y, lo)
+    MMA8_SETB(B3, y, hi)
+    MMA8_SETB(B4, z, lo)
+    MMA8_SETB(B5, z, hi)
+    MMA8_SETB(B6, w, lo)
+    MMA8_SETB(B7, w, hi)
+
+#pragma clang loop unroll(full)
+    for (int t = 0; t < TILES; ++t) {
+      const uint2 wv = *((const device uint2*)(wrow[t] + 32 * g));
+      const float s = float(srow[t][g]);
+      const float b = float(brow[t][g]);
+
+      simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+      MMA8_STEP(B0, 0)
+      MMA8_STEP(B1, 1)
+      MMA8_STEP(B2, 2)
+      MMA8_STEP(B3, 3)
+      MMA8_STEP(B4, 4)
+      MMA8_STEP(B5, 5)
+      MMA8_STEP(B6, 6)
+      MMA8_STEP(B7, 7)
+
+      acc0[t] += s * C.thread_elements()[0] + rs.x * b;
+      acc1[t] += s * C.thread_elements()[1] + rs.y * b;
+    }
+  }
+
+  if (KS == 2) {
+    if (simd_gid == 1) {
+#pragma clang loop unroll(full)
+      for (int t = 0; t < TILES; ++t) {
+        red[t * 32 + simd_lid] = float2(acc0[t], acc1[t]);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_gid == 1) {
+      return;
+    }
+#pragma clang loop unroll(full)
+    for (int t = 0; t < TILES; ++t) {
+      const float2 other = red[t * 32 + simd_lid];
+      acc0[t] = acc0[t] + other.x;
+      acc1[t] = acc1[t] + other.y;
+    }
+  }
+
+#pragma clang loop unroll(full)
+  for (int t = 0; t < TILES; ++t) {
+    const int nt = n0 + t * 8;
+    y[c.fn * N + nt + c.fm] = static_cast<T>(acc0[t]);
+    y[(c.fn + 1) * N + nt + c.fm] = static_cast<T>(acc1[t]);
+  }
+}
 """
+
+    private static let mma8MultiTileKernelK4096 = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_mt2_k4096_unroll_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            attention_o_qmv_mma8_affine4_g64_mt<T, 2, 2, 4096>(
+                w, scales, biases, x, y,
+                w_shape[0], int(tid.y) * 16, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
+    private static let mma8MultiTileKernelK8192 = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_mt2_k8192_unroll_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            attention_o_qmv_mma8_affine4_g64_mt<T, 2, 2, 8192>(
+                w, scales, biases, x, y,
+                w_shape[0], int(tid.y) * 16, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
 
     private static let mma8KernelK4096 = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_unroll_v2",
@@ -392,6 +548,23 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
             // streamed once per round instead of four times. Grid is in
             // threads: (32, 2, 1) threads per group, N/8 groups along y.
             let yTiles = outputWidth / outputsPerGroup
+            if mma8MultiTileEnabled,
+                yTiles.isMultiple(of: mma8TilesPerGroup)
+            {
+                let kernel = inDim == 8192
+                    ? mma8MultiTileKernelK8192 : mma8MultiTileKernelK4096
+                return kernel(
+                    [x, weight, scales, biases],
+                    template: [("T", x.dtype)],
+                    grid: (
+                        simdWidth,
+                        (yTiles / mma8TilesPerGroup) * simdGroups,
+                        1),
+                    threadGroup: (simdWidth, simdGroups, 1),
+                    outputShapes: [[batch, sequence, outputWidth]],
+                    outputDTypes: [x.dtype]
+                )[0]
+            }
             let kernel = inDim == 8192 ? mma8KernelK8192 : mma8KernelK4096
             return kernel(
                 [x, weight, scales, biases],

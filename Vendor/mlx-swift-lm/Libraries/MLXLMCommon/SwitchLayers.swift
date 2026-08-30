@@ -474,6 +474,26 @@ private let expertPrefixBoundsEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+/// mlxfast-h004: teaches PREFILL-CSORT-128 (the prefill route sorter) to
+/// emit the same EXPERT-PREFIX-BOUNDS carrier the T64 decode sorter already
+/// emits, and teaches `affine_gather_qmm_rhs_nax` - the M5 NAX-family
+/// kernel `gather_qmm_rhs` dispatches to for prefill's gathered MoE GEMM -
+/// to read it instead of rescanning `rhs_indices` for each expert-run
+/// boundary it crosses inside a tile. Independent of
+/// `DARKBLOOM_GEMMA4_EXPERT_PREFIX_BOUNDS` above: that switch only controls
+/// the exact-64-row decode carrier. DEFAULT ON. Kill switch:
+/// `DARKBLOOM_GEMMA4_NAX_PREFILL_GATHER` set to `0`/`false`/`no`/`off`
+/// restores the untagged literal sorter output; the consumer kernel already
+/// falls back to its incumbent per-tile scan unconditionally whenever bit 31
+/// is clear, so this is the only switch needed. Engage mark:
+/// `nax-prefill-gather-bounds`.
+private let naxPrefillGatherBoundsEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_NAX_PREFILL_GATHER"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 private let routeSortTile64 = 64
 private let routeFusedScatterTopK = 8
 /// Key-space bound of the fused scatter's 256-entry counter table.
@@ -835,10 +855,103 @@ private let routeCsortPrefillScatterKernel: MLXFast.MLXFastKernel = MLXFast.meta
     ensureRowContiguous: true
 )
 
+/// PREFILL-CSORT-128 scan twin that additionally emits each expert's total
+/// assignment count (`totals[e]`), which the bounds-emitting scatter kernel
+/// needs to compute each row's assignments-remaining tag field. Dispatched
+/// only when the caller requests EXPERT-PREFIX-BOUNDS output; the plain scan
+/// kernel above is untouched and remains the default path.
+private let routeCsortPrefillScanBoundsKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "mlx_lm_route_csort128_scan_bounds_v1",
+    inputNames: ["block_hist"],
+    outputNames: ["block_offset", "totals"],
+    source: """
+        constexpr uint WIDTH = \(routeCsortPrefillWidth);
+        uint e = thread_position_in_threadgroup.x;
+        uint simd_id = e / 32;
+        uint lane = e % 32;
+        uint nblocks = (uint)block_hist_shape[0];
+        uint total = 0u;
+        for (uint b = 0; b < nblocks; ++b) {
+            total += block_hist[b * WIDTH + e];
+        }
+        totals[e] = total;
+        // Global bin base: exclusive prefix over the 256 expert totals.
+        uint lane_excl = simd_prefix_exclusive_sum(total);
+        threadgroup uint simd_totals[8];
+        if (lane == 31) {
+            simd_totals[simd_id] = lane_excl + total;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint running = 0u;
+        for (uint s = 0; s < simd_id; ++s) {
+            running += simd_totals[s];
+        }
+        running += lane_excl;
+        // Exclusive scan over blocks for this expert, offset by the bin base.
+        for (uint b = 0; b < nblocks; ++b) {
+            block_offset[b * WIDTH + e] = running;
+            running += block_hist[b * WIDTH + e];
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+/// PREFILL-CSORT-128 scatter twin that emits the EXPERT-PREFIX-BOUNDS
+/// carrier (mlxfast-h004): bit 31 sidecar-valid, bits 0-7 expert id, bits
+/// 8-13 offset-from-run-start, bits 14-19 assignments-remaining-minus-1 -
+/// the exact bit layout EXPERT-PREFIX-BOUNDS-001 defined for the T64 decode
+/// sorter. `run_offset`/`run_remaining` are min-clamped to the 6-bit field's
+/// 63-value ceiling: a prefill expert run can be far longer than a decode
+/// run (up to `n`, not just 64), and the clamp is a floor on the true value,
+/// never a ceiling, so `affine_gather_qmm_rhs_nax`'s tag-guided boundary
+/// jump can undershoot a very long run (it falls back to rediscovering the
+/// next boundary from there, exactly as for an untagged word) but can never
+/// claim a boundary that has not actually been reached - see the consumer
+/// kernel's own comment for the read-side half of that proof.
+private let routeCsortPrefillScatterBoundsKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "mlx_lm_route_csort128_scatter_bounds_v1",
+    inputNames: ["keys", "block_offset", "totals"],
+    outputNames: ["row_order", "sorted_keys", "inverse_order"],
+    source: """
+        constexpr uint BLOCK = \(routeCsortPrefillBlock);
+        constexpr uint WIDTH = \(routeCsortPrefillWidth);
+        uint b = threadgroup_position_in_grid.x;
+        uint k = thread_position_in_threadgroup.x;
+        uint n = keys_shape[0];
+        uint idx = b * BLOCK + k;
+        // Tail block: the sentinel is outside the proven key space (keys are
+        // below the 256-wide counter table), so it can never tie a real key.
+        uint key = (idx < n) ? keys[idx] : 0xffffffffu;
+        threadgroup uint tg_keys[BLOCK];
+        tg_keys[k] = key;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (idx < n) {
+            // Stable local rank: earlier keys in this block only. Read in
+            // index order from threadgroup memory, so no write position ever
+            // depends on scheduling.
+            uint rank = 0u;
+            for (uint j = 0; j < k; ++j) {
+                rank += (tg_keys[j] == key) ? 1u : 0u;
+            }
+            uint base = block_offset[0 * WIDTH + key];
+            uint pos = block_offset[b * WIDTH + key] + rank;
+            uint run_offset = pos - base;
+            uint run_remaining_m1 = totals[key] - run_offset - 1u;
+            uint tagged = 0x80000000u | key
+                | (min(run_offset, 63u) << 8)
+                | (min(run_remaining_m1, 63u) << 14);
+            row_order[pos] = idx / (uint)M;
+            sorted_keys[pos] = tagged;
+            inverse_order[idx] = pos;
+        }
+        """,
+    ensureRowContiguous: true
+)
+
 /// Exact stable counting sort of a flat uint32 route table. Returns nil (fail
 /// closed onto `argSort`) unless every precondition of the kernels holds.
 private func routeCountingSortPrefill(
-    _ indices: MLXArray, m: Int, numExperts: Int
+    _ indices: MLXArray, m: Int, numExperts: Int, expertPrefixBounds: Bool = false
 ) -> (rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray)? {
     let n = indices.size
     guard routeCsortPrefillEnabled,
@@ -861,6 +974,25 @@ private func routeCountingSortPrefill(
         outputShapes: [[blocks, width]],
         outputDTypes: [.uint32]
     )[0]
+    if expertPrefixBounds {
+        CBv2EngageMark.once("nax-prefill-gather-bounds")
+        let scanOutputs = routeCsortPrefillScanBoundsKernel(
+            [hist],
+            grid: (width, 1, 1),
+            threadGroup: (width, 1, 1),
+            outputShapes: [[blocks, width], [width]],
+            outputDTypes: [.uint32, .uint32]
+        )
+        let outputs = routeCsortPrefillScatterBoundsKernel(
+            [indices, scanOutputs[0], scanOutputs[1]],
+            template: [("M", m)],
+            grid: (blocks * width, 1, 1),
+            threadGroup: (width, 1, 1),
+            outputShapes: [[n], [n], [n]],
+            outputDTypes: [.uint32, .uint32, .uint32]
+        )
+        return (outputs[0], outputs[1], outputs[2])
+    }
     let offsets = routeCsortPrefillScanKernel(
         [hist],
         grid: (width, 1, 1),
@@ -885,7 +1017,8 @@ private func routeCountingSortPrefill(
 /// established `argSort` chain, which is what the generic MoE models that share
 /// this helper (GPTOSS, NemotronH) keep getting.
 public func gatherSort(
-    x: MLXArray, indices: MLXArray, numExperts: Int = Int.max
+    x: MLXArray, indices: MLXArray, numExperts: Int = Int.max,
+    expertPrefixBounds: Bool = false
 ) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
     let indices = indices.flattened()
@@ -894,7 +1027,9 @@ public func gatherSort(
             + "dtype=\(indices.dtype)"
     }
     // PREFILL-CSORT-128: three dispatches with byte-identical outputs.
-    if let fused = routeCountingSortPrefill(indices, m: m, numExperts: numExperts) {
+    if let fused = routeCountingSortPrefill(
+        indices, m: m, numExperts: numExperts, expertPrefixBounds: expertPrefixBounds)
+    {
         return (
             x.flattened(start: 0, end: -3)[fused.rowOrder],
             fused.sortedKeys,
@@ -1113,8 +1248,13 @@ public class SwitchGLU: Module {
                     indices: indices, numExperts: numExperts,
                     expertPrefixBounds: useExpertPrefixBounds)
             } else {
+                let useNaxPrefillGatherBounds =
+                    naxPrefillGatherBoundsEnabled
+                    && indices.dtype == .uint32 && x.dtype == .bfloat16
+                    && expertPrefixBoundsProjectionsEligible
                 (x, idx, inverseOrder) = gatherSort(
-                    x: x, indices: indices, numExperts: numExperts)
+                    x: x, indices: indices, numExperts: numExperts,
+                    expertPrefixBounds: useNaxPrefillGatherBounds)
             }
         }
 

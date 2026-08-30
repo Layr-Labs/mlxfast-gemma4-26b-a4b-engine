@@ -1472,6 +1472,7 @@ template <
 // function constant magnitude (pipeline-key law).
 MLX_MTL_CONST bool kGatherRhsSegmentElide = true;
 MLX_MTL_CONST bool kGatherRhsSortedEndpointElide = true;
+MLX_MTL_CONST bool kGatherRhsExpertPrefixBounds = true;
 
 // Loads one 16-row fragment row of an A tile from device memory. The
 // address arithmetic matches NAXTile::load exactly for that fragment row
@@ -1622,25 +1623,50 @@ template <
   // Do as many matmuls as necessary
   uint32_t index;
   short offset;
-  uint32_t index_next = indices[y_row];
+  uint32_t word_next = indices[y_row];
+  uint32_t index_next =
+      (word_next & 0x80000000u) ? (word_next & 0xffu) : word_next;
   short offset_next = 0;
   int n = 0;
   while (n < tgp_bm) {
     n++;
     offset = offset_next;
     index = index_next;
+    const uint32_t word = word_next;
     offset_next = tgp_bm;
     // gather_qmm_rhs is dispatched only for right-sorted indices. If this
     // segment's expert matches the tile endpoint, sortedness proves that the
     // remaining suffix is one segment and the per-row probe can stop here.
-    if (kGatherRhsSortedEndpointElide &&
-        indices[y_row + tgp_bm - 1] == index) {
+    const uint32_t endpoint_word = indices[y_row + tgp_bm - 1];
+    const uint32_t endpoint_index = (endpoint_word & 0x80000000u)
+        ? (endpoint_word & 0xffu) : endpoint_word;
+    if (kGatherRhsSortedEndpointElide && endpoint_index == index) {
       n = tgp_bm;
+    } else if (kGatherRhsExpertPrefixBounds && (word & 0x80000000u) != 0u) {
+      // EXPERT-PREFIX-BOUNDS carrier (mlxfast-h004): the sorter already
+      // proved this row's remaining same-expert run length in-band, clamped
+      // to 63 and never an overestimate (see SwitchLayers.swift's
+      // PREFILL-CSORT-128 bounds-emitting scatter kernel), so the next
+      // segment boundary is one arithmetic step and one indices[] read
+      // instead of an up-to-tgp_bm-row device-memory scan.
+      const short run_end = offset + short(((word >> 14) & 0x3fu) + 1u);
+      if (run_end >= tgp_bm) {
+        n = tgp_bm;
+      } else {
+        n = run_end;
+        offset_next = run_end;
+        word_next = indices[y_row + run_end];
+        index_next = (word_next & 0x80000000u)
+            ? (word_next & 0xffu) : word_next;
+      }
     } else {
       for (; n < tgp_bm; n++) {
-        if (indices[y_row + n] != index) {
+        word_next = indices[y_row + n];
+        const uint32_t candidate = (word_next & 0x80000000u)
+            ? (word_next & 0xffu) : word_next;
+        if (candidate != index) {
           offset_next = n;
-          index_next = indices[y_row + n];
+          index_next = candidate;
           break;
         }
       }

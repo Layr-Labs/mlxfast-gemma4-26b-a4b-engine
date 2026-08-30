@@ -495,7 +495,7 @@ git commit -m 'perf: install exact Gemma B1 verifier contexts'
 
 **Does NOT cover:** automatic shape fallback, batch greater than one, or silent serial recovery after a verifier error.
 
-- [ ] **Step 1: Replace the old serial seal with failing B1 exact-route tests**
+- [x] **Step 1: Replace the old serial seal with failing B1 exact-route tests**
 
 For depths 1, 2, and 3 require:
 
@@ -508,11 +508,11 @@ let config = try Gemma4MTPEnvelope.resolveConfig(depth: depth)
 
 Run the fixture once with serial verification and once with rectangular verification. Require identical logits/argmax tokens, acceptance lengths, committed sequence, and final cache lengths; require `rectangularVerificationRounds == rounds` for the candidate and zero for the serial control.
 
-- [ ] **Step 2: Run the two suites**
+- [x] **Step 2: Run the two suites**
 
 Expected: FAIL because the envelope remains `.serialTarget`.
 
-- [ ] **Step 3: Change both envelope twins identically**
+- [x] **Step 3: Change both envelope twins identically**
 
 ```swift
 return CBv2MTPConfig(
@@ -526,7 +526,7 @@ return CBv2MTPConfig(
 
 Keep the twin files byte-identical and remove comments that claim the production seal is serial.
 
-- [ ] **Step 4: Run twin equality, strategy seal, acceptance audit, and round execution**
+- [x] **Step 4: Run twin equality, strategy seal, acceptance audit, and round execution**
 
 Use one guarded child:
 
@@ -536,7 +536,7 @@ swift test --filter 'MTPWorkerTwinEquality|MTPVerificationStrategySeal|MTPAccept
 
 Expected: all tests pass, including the existing single and batch token-losslessness cases; batch tests keep their explicit test config and do not imply B2+ production installation.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add Sources/MLXFastHarness/MTPEnvelope.swift Sources/MLXFastTrustedHarness/MTPEnvelope.swift Tests/MLXFastTests/MTPVerificationStrategySealTests.swift Tests/MLXFastTests/RuntimeWorkerMTPRoundExecutionTests.swift

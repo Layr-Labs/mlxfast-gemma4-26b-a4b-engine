@@ -30,11 +30,13 @@ template <typename T, int N_READS = RMS_N_READS>
   x += gid * size_t(axis_size) + lid * N_READS;
   w += w_stride * lid * N_READS;
   if (lid * N_READS + N_READS <= axis_size) {
+    #pragma unroll
     for (int i = 0; i < N_READS; i++) {
       float xi = x[i];
       acc += xi * xi;
     }
   } else {
+    #pragma unroll
     for (int i = 0; i < N_READS; i++) {
       if ((lid * N_READS + i) < axis_size) {
         float xi = x[i];
@@ -67,10 +69,12 @@ template <typename T, int N_READS = RMS_N_READS>
   // Write the outputs
   out += gid * size_t(axis_size) + lid * N_READS;
   if (lid * N_READS + N_READS <= axis_size) {
+    #pragma unroll
     for (int i = 0; i < N_READS; i++) {
       out[i] = w[w_stride * i] * static_cast<T>(x[i] * local_inv_mean[0]);
     }
   } else {
+    #pragma unroll
     for (int i = 0; i < N_READS; i++) {
       if ((lid * N_READS + i) < axis_size) {
         out[i] = w[w_stride * i] * static_cast<T>(x[i] * local_inv_mean[0]);
@@ -101,11 +105,13 @@ template <typename T, int N_READS = RMS_N_READS>
   w += w_stride * lid * N_READS;
   for (uint r = 0; r < axis_size; r += lsize * N_READS) {
     if (r + lid * N_READS + N_READS <= axis_size) {
+      #pragma unroll
       for (int i = 0; i < N_READS; i++) {
         float xi = x[i + r];
         acc += xi * xi;
       }
     } else {
+      #pragma unroll
       for (int i = 0; i < N_READS; i++) {
         if ((r + lid * N_READS + i) < axis_size) {
           float xi = x[i + r];
@@ -140,11 +146,13 @@ template <typename T, int N_READS = RMS_N_READS>
   out += gid * size_t(axis_size) + lid * N_READS;
   for (uint r = 0; r < axis_size; r += lsize * N_READS) {
     if (r + lid * N_READS + N_READS <= axis_size) {
+      #pragma unroll
       for (int i = 0; i < N_READS; i++) {
         out[r + i] = w[w_stride * (i + r)] *
             static_cast<T>(x[r + i] * local_inv_mean[0]);
       }
     } else {
+      #pragma unroll
       for (int i = 0; i < N_READS; i++) {
         if ((r + lid * N_READS + i) < axis_size) {
           out[r + i] = w[w_stride * (i + r)] *

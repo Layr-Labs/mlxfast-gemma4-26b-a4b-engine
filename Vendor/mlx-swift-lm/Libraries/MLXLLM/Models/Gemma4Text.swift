@@ -2285,6 +2285,103 @@ private enum Gemma4FusedRouterTop8 {
     }
 }
 
+/// ROUTER-FINALISTS-017: selection only, within the existing ZIP stage.
+/// Keep the stable ascending argsort tail: each 32-entry subset retains its
+/// largest eight, then one SIMD group sorts the 32 survivors. A discarded
+/// element already has eight successors in its own subset. The total order
+/// is sort.h LessThan plus original expert index, including NaNs and zeros.
+/// No score arithmetic, weight fusion, or expert-assignment sort is changed.
+private enum Gemma4RouterFinalistsV1 {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ROUTER_FINALISTS32"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_router_finalists32_stable_bf16_v1",
+        inputNames: ["scores"],
+        outputNames: ["indices"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint group = simdgroup_index_in_threadgroup;
+            const uint expert = group * 32u + lane;
+            // Pack the unchanged BF16 bits and the original expert index.
+            // This is a payload, NOT an unsigned floating-point ordinal:
+            // comparisons below retain native BF16 LessThan semantics.
+            uint item = (uint(bfloat16_to_uint16(scores[row * 128u + expert])) << 7)
+                | expert;
+            threadgroup uint finalists[32];
+
+            for (uint width = 2u; width <= 32u; width <<= 1) {
+                for (uint stride = width >> 1; stride > 0u; stride >>= 1) {
+                    const uint other = simd_shuffle_xor(item, ushort(stride));
+                    const bool otherBefore = gemma4_finalists_before(other, item);
+                    const bool takeMinimum = ((lane & width) == 0u)
+                        == ((lane & stride) == 0u);
+                    if (takeMinimum ? otherBefore : !otherBefore) item = other;
+                }
+            }
+
+            if (lane >= 24u) {
+                finalists[group * 8u + lane - 24u] = item;
+            }
+            // All four complete SIMD groups participate in this barrier.
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (group == 0u) {
+                item = finalists[lane];
+                for (uint width = 2u; width <= 32u; width <<= 1) {
+                    for (uint stride = width >> 1; stride > 0u; stride >>= 1) {
+                        const uint other = simd_shuffle_xor(item, ushort(stride));
+                        const bool otherBefore = gemma4_finalists_before(other, item);
+                        const bool takeMinimum = ((lane & width) == 0u)
+                            == ((lane & stride) == 0u);
+                        if (takeMinimum ? otherBefore : !otherBefore) item = other;
+                    }
+                }
+                if (lane >= 24u) indices[row * 8u + lane - 24u] = item & 127u;
+            }
+        """,
+        header: """
+            inline bool gemma4_finalists_before(uint a, uint b) {
+                const bfloat16_t av = uint16_to_bfloat16(uint16_t(a >> 7));
+                const bfloat16_t bv = uint16_to_bfloat16(uint16_t(b >> 7));
+                const bool an = metal::isnan(av);
+                const bool bn = metal::isnan(bv);
+                bool ab;
+                bool ba;
+                if (an | bn) {
+                    ab = (!an) & bn;
+                    ba = (!bn) & an;
+                } else {
+                    ab = av < bv;
+                    ba = bv < av;
+                }
+                return ab || (!ba && (a & 127u) < (b & 127u));
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    static func apply(_ scores: MLXArray, topK: Int, kth: Int) -> MLXArray? {
+        guard enabled, topK == 8, kth == 120,
+            scores.ndim == 3, scores.dim(0) == 8,
+            scores.dim(1) == 1, scores.dim(2) == 128,
+            scores.dtype == .bfloat16
+        else { return nil }
+        return kernel(
+            [scores],
+            grid: (8 * 128, 1, 1),
+            threadGroup: (128, 1, 1),
+            outputShapes: [[8, 1, 8]],
+            outputDTypes: [.uint32]
+        )[0]
+    }
+}
+
 /// GLUE-003: one-per-forward chain box. Layer L's fused tail deposits the
 /// (output, next-layer-input-norm) pair; layer L+1 consumes the norm instead
 /// of re-reading and re-normalizing the same tensor — guarded by pointer
@@ -2794,11 +2891,9 @@ private class Gemma4Router: Module {
 
     // MARK: ZIP-ROUTER-001 stages
     //
-    // The five statements of `callAsFunction` above, re-exposed one dependent
-    // stage at a time so `Gemma4ZipRouterV1` can emit them interleaved with
-    // the independent dense-MLP chain. Each helper is the verbatim statement
-    // it names; nothing is reordered inside a stage and no operand is
-    // recomputed.
+    // Stages retain the independent dense-MLP interleave. FINALISTS-017 can
+    // replace only partition+slice with a compact stable tail; the norm,
+    // projection, score gather, softmax and scale operations remain stock.
 
     fileprivate var zipAdmits: Bool { !Gemma4FusedRouterTop8.enabled }
 
@@ -2818,11 +2913,25 @@ private class Gemma4Router: Module {
     }
 
     fileprivate func zipPartition(_ expertScores: MLXArray) -> MLXArray {
-        MLX.argPartition(expertScores, kth: kth, axis: -1)
+        if let selected = Gemma4RouterFinalistsV1.apply(
+            expertScores, topK: topK, kth: kth)
+        {
+            return selected
+        }
+        return MLX.argPartition(expertScores, kth: kth, axis: -1)
     }
 
     fileprivate func zipSelected(_ partition: MLXArray) -> MLXArray {
-        partition[.ellipsis, kth...]
+        // Only the private admitted producer above returns the compact tail.
+        // A depends node wrapped around it by ZIP plan2 keeps that shape and
+        // remains the returned value, preserving the activated dependency.
+        if topK == 8, kth == 120, partition.ndim == 3,
+            partition.dim(0) == 8, partition.dim(1) == 1,
+            partition.dim(2) == 8, partition.dtype == .uint32
+        {
+            return partition
+        }
+        return partition[.ellipsis, kth...]
     }
 
     fileprivate func zipWeights(
@@ -3005,9 +3114,10 @@ private class Gemma4MLP: Module {
 /// today: `Depends` aliases, and because its output shares the input's
 /// `array::Data` the shared buffer is never donatable, so no downstream
 /// primitive can write through the alias. No expression is re-associated, no
-/// dispatch is added or removed, and the router's own outputs
-/// (`topKIndices` / `topKWeights`) are produced by the same statements in the
-/// same order. Kill switch `DARKBLOOM_GEMMA4_ZIP_ROUTER=0` restores the stock
+/// dispatch is added or removed by the ordering edges themselves. The optional
+/// FINALISTS-017 stage separately replaces partition+slice with the same
+/// ordered eight indices; its score/weight tail stays stock. Kill switch
+/// `DARKBLOOM_GEMMA4_ZIP_ROUTER=0` restores the stock
 /// call; every geometry outside the pinned B=8 decode cell fails closed onto
 /// it because the dense activation table (`CBv2DenseMLPQMVV1.activationSums`)
 /// returns nil there.

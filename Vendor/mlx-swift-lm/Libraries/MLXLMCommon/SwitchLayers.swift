@@ -112,25 +112,31 @@ public func resetWeightedExpertUnsortStats() {
 /// permutation and writes `[tokens, hidden]` directly, avoiding that full
 /// `[tokens, topK, hidden]` intermediate.
 private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "weighted_expert_unsort",
+    name: "weighted_expert_unsort_v2",
     inputNames: ["sorted_outputs", "inverse_order", "weights"],
     outputNames: ["output"],
     source: """
-        uint feature = thread_position_in_grid.x;
-        uint token = thread_position_in_grid.y;
+        constexpr uint reads = 4;
+        const uint feature_base = thread_position_in_grid.x * reads;
+        const uint token = thread_position_in_grid.y;
+        if (feature_base >= 2816) return;
 
-        T accumulator = (T)0;
+        T accum[reads] = {(T)0, (T)0, (T)0, (T)0};
         const uint assignment_base = token * (uint)K;
         for (uint slot = 0; slot < (uint)K; ++slot) {
             const uint assignment = assignment_base + slot;
             const uint sorted_row = (uint)inverse_order[assignment];
-            // Preserve the legacy bfloat16 multiply-then-reduce rounding.
-            const T weighted = (T)(
-                (float)sorted_outputs[sorted_row * threads_per_grid.x + feature]
-                * (float)weights[assignment]);
-            accumulator = accumulator + weighted;
+            const float w = (float)weights[assignment];
+            const device T* src = sorted_outputs + sorted_row * 2816 + feature_base;
+            for (uint i = 0; i < reads; ++i) {
+                const T weighted = (T)((float)src[i] * w);
+                accum[i] = accum[i] + weighted;
+            }
         }
-        output[token * threads_per_grid.x + feature] = accumulator;
+        device T* dst = output + token * 2816 + feature_base;
+        for (uint i = 0; i < reads; ++i) {
+            dst[i] = accum[i];
+        }
     """,
     ensureRowContiguous: true
 )
@@ -170,7 +176,7 @@ public func weightedExpertUnsort(
             ("T", sortedOutputs.dtype),
             ("K", 8),
         ],
-        grid: (2816, tokens, 1),
+        grid: (2816 / 4, tokens, 1),
         threadGroup: (64, 4, 1),
         outputShapes: [[tokens, 2816]],
         outputDTypes: [.bfloat16]
@@ -342,43 +348,6 @@ private func geGLUProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
 }
 // MARK: - ROUTE-SIMD-RANK-64: exact decode route table
 
-/// Stable rank sort for the exact B=8/top-K=8 decode plane. One SIMDgroup
-/// loads the 64 keys once (two keys per lane), broadcasts them to every lane,
-/// and directly emits the three routing products consumed downstream.
-private let routeSimdRank64Kernel: MLXFast.MLXFastKernel =
-    MLXFast.metalKernel(
-        name: "mlx_lm_route_simd_rank_scatter_m8_u32_n64_v1",
-        inputNames: ["indices"],
-        outputNames: ["row_order", "sorted_keys", "inverse_order"],
-        source: """
-            const uint assignment = thread_position_in_grid.x;
-            const uint lane = thread_index_in_simdgroup;
-            const uint key = (uint)indices[assignment];
-            const uint key_low = (uint)indices[lane];
-            const uint key_high = (uint)indices[32u + lane];
-            uint rank = 0;
-            for (uint source = 0; source < 32; ++source) {
-                const uint other_low = simd_broadcast(key_low, ushort(source));
-                rank += (other_low < key)
-                    || (other_low == key && source < assignment);
-                const uint other_high = simd_broadcast(key_high, ushort(source));
-                const uint high_assignment = 32u + source;
-                rank += (other_high < key)
-                    || (other_high == key && high_assignment < assignment);
-            }
-            row_order[rank] = assignment / 8;
-            sorted_keys[rank] = key;
-            inverse_order[assignment] = rank;
-        """,
-        ensureRowContiguous: true
-    )
-
-private let routeSimdRank64Enabled: Bool = {
-    guard let raw = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_ROUTE_SIMD_RANK"]
-    else { return true }
-    return !["0", "false", "no", "off"].contains(raw.lowercased())
-}()
 
 // MARK: - ROUTE-CSORT-64: fused counting-sort route table (donor port)
 
@@ -789,18 +758,6 @@ public func gatherSort(
 public func gatherSortIndices(
     indices: MLXArray, numExperts: Int = Int.max
 ) -> (MLXArray, MLXArray, MLXArray) {
-    if routeSimdRank64Enabled,
-        indices.ndim == 2, indices.shape == [8, 8], indices.dtype == .uint32
-    {
-        let outputs = routeSimdRank64Kernel(
-            [indices],
-            grid: (64, 1, 1),
-            threadGroup: (64, 1, 1),
-            outputShapes: [[64], [64], [64]],
-            outputDTypes: [.uint32, .uint32, .uint32]
-        )
-        return (outputs[0], outputs[1], outputs[2])
-    }
     let m = indices.dim(-1)
     let indices = indices.flattened()
     routeCsortShapeLog.note {

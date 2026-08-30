@@ -1041,6 +1041,28 @@ public enum CBv2Gemma4MTPRouterProjection {
                 axis: 1)
         }
     }
+
+    /// Prebind the physical-B1 verifier router. Quantization and tensor
+    /// eligibility are resolved once here; the returned projection directly
+    /// executes the exact shared-column QMV installed for this shape.
+    public static func bindB1Verifier(
+        columns: Int,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode
+    ) -> ((MLXArray) -> MLXArray)? {
+        guard supportsVerifierColumns(columns), supportsProductionQuantization(
+            groupSize: groupSize, bits: bits, mode: mode)
+        else { return nil }
+
+        return Gemma4B1MTPQuantizedProjection.bind(
+            columns: columns, inDim: inputWidth, outDim: outputWidth,
+            weight: weight, scales: scales, biases: biases,
+            groupSize: groupSize, bits: bits)
+    }
 }
 
 /// Pure construction-bound Gemma 4 expert projections. Task 2 owns model
@@ -1116,6 +1138,37 @@ public enum CBv2Gemma4MTPExpertProjection {
                 x: positionMajorX, indices: positionMajorIndices,
                 routeWeights: positionMajorWeights, captured: captured)
             return flat.reshaped([columns, batch, hidden]).transposed(1, 0, 2)
+        }
+    }
+
+    /// Prebind the physical-B1 C2...C4 expert verifier. The complete immutable
+    /// quantized expert surface is captured once. At execution, stable expert
+    /// sorting groups only equal IDs; each gathered projection continues to
+    /// select its own rhs plane before the unchanged inverse permutation and
+    /// weighted reduction restore position/slot order.
+    public static func bindB1Verifier(
+        columns: Int,
+        gateWeight: MLXArray, gateScales: MLXArray, gateBiases: MLXArray?,
+        upWeight: MLXArray, upScales: MLXArray, upBiases: MLXArray?,
+        downWeight: MLXArray, downScales: MLXArray, downBiases: MLXArray?,
+        groupSize: Int, bits: Int, mode: QuantizationMode
+    ) -> Projection? {
+        guard supportsVerifierColumns(columns), let captured = bindWeights(
+            gateWeight: gateWeight, gateScales: gateScales,
+            gateBiases: gateBiases, upWeight: upWeight, upScales: upScales,
+            upBiases: upBiases, downWeight: downWeight,
+            downScales: downScales, downBiases: downBiases,
+            groupSize: groupSize, bits: bits, mode: mode)
+        else { return nil }
+
+        return { x, indices, routeWeights in
+            let positionMajorX = x.reshaped([columns, hidden])
+            let positionMajorIndices = indices.reshaped([columns, topK])
+            let positionMajorWeights = routeWeights.reshaped([columns, topK])
+            return runCombined(
+                x: positionMajorX, indices: positionMajorIndices,
+                routeWeights: positionMajorWeights,
+                captured: captured).reshaped([1, columns, hidden])
         }
     }
 

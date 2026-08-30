@@ -152,6 +152,51 @@ struct Gemma4MTPVerifierExpertKernelTests {
     }
 
     @Test(.enabled(if: runtimeEnabled))
+    func physicalB1RouterPreservesIndependentQ8ScoresForC2ThroughC4() throws {
+        let inDim = 2816
+        let outDim = 128
+        let bits = 8
+        let weightValues: [UInt32] = (0..<(outDim * inDim / 4)).map { index in
+            UInt32(truncatingIfNeeded: index &* 2_654_435_761 &+ 103)
+        }
+        let scaleValues: [Float] = (0..<(outDim * inDim / 64)).map { index in
+            Float(128 + (index * 31) % 43) / 128.0
+        }
+        let biasValues: [Float] = (0..<(outDim * inDim / 64)).map { index in
+            Float((index * 19) % 41 - 20) / 128.0
+        }
+        let weight = MLXArray(weightValues).reshaped([outDim, inDim / 4])
+        let scales = MLXArray(scaleValues).reshaped([outDim, inDim / 64])
+            .asType(.bfloat16)
+        let biases = MLXArray(biasValues).reshaped([outDim, inDim / 64])
+            .asType(.bfloat16)
+
+        for columns in 2...4 {
+            let router = try #require(CBv2Gemma4MTPRouterProjection.bindB1Verifier(
+                columns: columns, weight: weight, scales: scales, biases: biases,
+                groupSize: 64, bits: bits, mode: .affine))
+            let xValues: [Float] = (0..<(columns * inDim)).map { index in
+                Float((index * 59 + columns * 29) % 293 - 146) / 128.0
+            }
+            let x = MLXArray(xValues).reshaped([1, columns, inDim])
+                .asType(.bfloat16)
+            let candidate = router(x)
+            let reference = concatenated(
+                (0..<columns).map { column in
+                    quantizedMM(
+                        x[0..., column..<(column + 1), 0...], weight,
+                        scales: scales, biases: biases, transpose: true,
+                        groupSize: 64, bits: bits, mode: .affine)
+                },
+                axis: 1)
+            eval(candidate, reference)
+
+            #expect(candidate.shape == [1, columns, outDim])
+            #expect(allClose(candidate, reference, rtol: 0, atol: 0).item(Bool.self))
+        }
+    }
+
+    @Test(.enabled(if: runtimeEnabled))
     func combinedProductionGeGLUBlockIsExactToIndependentB8Positions() throws {
         let experts = 128
         let hidden = 2816
@@ -194,6 +239,57 @@ struct Gemma4MTPVerifierExpertKernelTests {
             eval(candidate, reference)
 
             #expect(candidate.shape == [8, columns, hidden])
+            #expect(allClose(candidate, reference, rtol: 0, atol: 0).item(Bool.self))
+        }
+    }
+
+    @Test(.enabled(if: runtimeEnabled), arguments: [false, true])
+    func physicalB1ExpertsPreserveIndependentPositionsForRepeatedAndDisjointAssignments(
+        disjoint: Bool
+    ) throws {
+        let experts = 128
+        let hidden = 2816
+        let intermediate = 704
+        let gate = expertPlane(experts: experts, inDim: hidden, outDim: intermediate, seed: 37)
+        let up = expertPlane(experts: experts, inDim: hidden, outDim: intermediate, seed: 53)
+        let down = expertPlane(experts: experts, inDim: intermediate, outDim: hidden, seed: 71)
+
+        MLXRandom.seed(disjoint ? 4_704_2817 : 4_704_2818)
+        for columns in 2...4 {
+            let combined = try #require(CBv2Gemma4MTPExpertProjection.bindB1Verifier(
+                columns: columns,
+                gateWeight: gate.0, gateScales: gate.1, gateBiases: gate.2,
+                upWeight: up.0, upScales: up.1, upBiases: up.2,
+                downWeight: down.0, downScales: down.1, downBiases: down.2,
+                groupSize: 64, bits: 4, mode: .affine))
+            let x = MLXRandom.normal([1, columns, hidden], dtype: .bfloat16)
+            let indices = MLXArray(
+                (0..<(columns * 8)).map { assignment in
+                    let column = assignment / 8
+                    let slot = assignment % 8
+                    // Repeated assignments deliberately share each slot's plane
+                    // across columns. Disjoint assignments give every position a
+                    // separate expert plane, exposing any cross-expert aliasing.
+                    return UInt32(disjoint ? column * 8 + slot : slot * 7)
+                }
+            ).reshaped([1, columns, 8])
+            let routeWeights = MLXRandom.uniform(
+                low: 0, high: 1, [1, columns, 8]).asType(.bfloat16)
+
+            let candidate = combined(x, indices, routeWeights)
+            let reference = concatenated(
+                (0..<columns).map { column in
+                    ordinaryB8ExpertBlock(
+                        x: x[0..., column, 0...].reshaped([1, hidden]),
+                        indices: indices[0..., column, 0...].reshaped([1, 8]),
+                        routeWeights: routeWeights[0..., column, 0...].reshaped([1, 8]),
+                        gate: gate, up: up, down: down
+                    ).reshaped([1, 1, hidden])
+                },
+                axis: 1)
+            eval(candidate, reference)
+
+            #expect(candidate.shape == [1, columns, hidden])
             #expect(allClose(candidate, reference, rtol: 0, atol: 0).item(Bool.self))
         }
     }

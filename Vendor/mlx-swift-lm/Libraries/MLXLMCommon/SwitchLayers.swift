@@ -979,6 +979,302 @@ public enum SwitchGLUWeightedReductionProfile: Sendable {
     case gemma4ProductionGeGLU
 }
 
+/// Construction-time envelope for Gemma 4's C2...C4 verifier. Each position
+/// contributes eight rows times top-k eight, hence one 64-assignment block.
+public enum CBv2Gemma4ExpertVerifierGeometry {
+    public static func supports(assignments: Int) -> Bool {
+        assignments >= 128 && assignments <= 256 && assignments.isMultiple(of: 64)
+    }
+}
+
+/// Prebound ordinary-B8 router projection for the exact Gemma 4 verifier.
+/// The router intentionally does not combine physical rows: each position
+/// reaches the same quantized-MM reduction selected by an ordinary B8 call.
+public enum CBv2Gemma4MTPRouterProjection {
+    private static let batch = 8
+    private static let inputWidth = 2816
+    private static let outputWidth = 128
+
+    public static func supportsVerifierColumns(_ columns: Int) -> Bool {
+        (2...4).contains(columns)
+    }
+
+    public static func supportsProductionQuantization(
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode
+    ) -> Bool {
+        groupSize == 64 && bits == 8 && mode == .affine
+    }
+
+    public static func bindIndependentB8(
+        columns: Int,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode
+    ) -> ((MLXArray) -> MLXArray)? {
+        guard supportsVerifierColumns(columns), supportsProductionQuantization(
+            groupSize: groupSize, bits: bits, mode: mode),
+            let biases,
+            weight.dtype == .uint32,
+            scales.dtype == .bfloat16,
+            biases.dtype == .bfloat16,
+            weight.shape == [outputWidth, inputWidth * bits / 32],
+            scales.shape == [outputWidth, inputWidth / groupSize],
+            biases.shape == scales.shape
+        else { return nil }
+
+        return { x in
+            concatenated(
+                (0..<columns).map { column in
+                    let cohort = x[
+                        0..., column..<(column + 1), 0...
+                    ].reshaped([batch, 1, inputWidth])
+                    return quantizedMM(
+                        cohort, weight, scales: scales, biases: biases,
+                        transpose: true, groupSize: groupSize, bits: bits,
+                        mode: mode)
+                },
+                axis: 1)
+        }
+    }
+}
+
+/// Pure construction-bound Gemma 4 expert projections. Task 2 owns model
+/// installation; these closures capture immutable q4 expert tensors only.
+public enum CBv2Gemma4MTPExpertProjection {
+    public typealias Projection = (MLXArray, MLXArray, MLXArray) -> MLXArray
+
+    private static let batch = 8
+    private static let hidden = 2816
+    private static let intermediate = 704
+    private static let experts = 128
+    private static let topK = 8
+
+    public static func supportsVerifierColumns(_ columns: Int) -> Bool {
+        (2...4).contains(columns)
+    }
+
+    /// The production Gemma expert activation, exposed so parity oracles can
+    /// independently compose the ordinary gather projections around it.
+    public static func productionGeGLU(
+        gate: MLXArray, up: MLXArray
+    ) -> MLXArray {
+        geGLUProduct(gate, up)
+    }
+
+    private struct Weights {
+        let gateWeight: MLXArray
+        let gateScales: MLXArray
+        let gateBiases: MLXArray
+        let upWeight: MLXArray
+        let upScales: MLXArray
+        let upBiases: MLXArray
+        let downWeight: MLXArray
+        let downScales: MLXArray
+        let downBiases: MLXArray
+    }
+
+    public static func bindVerifier(
+        columns: Int,
+        gateWeight: MLXArray, gateScales: MLXArray, gateBiases: MLXArray?,
+        upWeight: MLXArray, upScales: MLXArray, upBiases: MLXArray?,
+        downWeight: MLXArray, downScales: MLXArray, downBiases: MLXArray?,
+        groupSize: Int, bits: Int, mode: QuantizationMode
+    ) -> Projection? {
+        guard supportsVerifierColumns(columns), let captured = bindWeights(
+            gateWeight: gateWeight, gateScales: gateScales,
+            gateBiases: gateBiases, upWeight: upWeight, upScales: upScales,
+            upBiases: upBiases, downWeight: downWeight,
+            downScales: downScales, downBiases: downBiases,
+            groupSize: groupSize, bits: bits, mode: mode)
+        else { return nil }
+
+        return { x, indices, routeWeights in
+            let positionMajorX = concatenated(
+                (0..<columns).map { column in
+                    x[0..., column..<(column + 1), 0...]
+                        .reshaped([batch, hidden])
+                },
+                axis: 0)
+            let positionMajorIndices = concatenated(
+                (0..<columns).map { column in
+                    indices[0..., column..<(column + 1), 0...]
+                        .reshaped([batch, topK])
+                },
+                axis: 0)
+            let positionMajorWeights = concatenated(
+                (0..<columns).map { column in
+                    routeWeights[0..., column..<(column + 1), 0...]
+                        .reshaped([batch, topK])
+                },
+                axis: 0)
+            let flat = runCombined(
+                x: positionMajorX, indices: positionMajorIndices,
+                routeWeights: positionMajorWeights, captured: captured)
+            return flat.reshaped([columns, batch, hidden]).transposed(1, 0, 2)
+        }
+    }
+
+    public static func bindIndependentB8(
+        columns: Int,
+        gateWeight: MLXArray, gateScales: MLXArray, gateBiases: MLXArray?,
+        upWeight: MLXArray, upScales: MLXArray, upBiases: MLXArray?,
+        downWeight: MLXArray, downScales: MLXArray, downBiases: MLXArray?,
+        groupSize: Int, bits: Int, mode: QuantizationMode
+    ) -> Projection? {
+        guard supportsVerifierColumns(columns), let captured = bindWeights(
+            gateWeight: gateWeight, gateScales: gateScales,
+            gateBiases: gateBiases, upWeight: upWeight, upScales: upScales,
+            upBiases: upBiases, downWeight: downWeight,
+            downScales: downScales, downBiases: downBiases,
+            groupSize: groupSize, bits: bits, mode: mode)
+        else { return nil }
+
+        let routeKernel = expertPrefixBoundsEnabled
+            ? routeSimdRank64PrefixBoundsKernel : routeSimdRank64Kernel
+        let activation = switchGeluShapedFuseEnabled
+            ? compiledGeGLUShaped : compiledGeGLU
+
+        return { x, indices, routeWeights in
+            concatenated(
+                (0..<columns).map { column in
+                    runIndependentB8(
+                        x: x[0..., column, 0...],
+                        indices: indices[0..., column, 0...],
+                        routeWeights: routeWeights[0..., column, 0...],
+                        routeKernel: routeKernel, activation: activation,
+                        captured: captured).reshaped([batch, 1, hidden])
+                },
+                axis: 1)
+        }
+    }
+
+    private static func bindWeights(
+        gateWeight: MLXArray, gateScales: MLXArray, gateBiases: MLXArray?,
+        upWeight: MLXArray, upScales: MLXArray, upBiases: MLXArray?,
+        downWeight: MLXArray, downScales: MLXArray, downBiases: MLXArray?,
+        groupSize: Int, bits: Int, mode: QuantizationMode
+    ) -> Weights? {
+        guard groupSize == 64, bits == 4, mode == .affine,
+            let gateBiases, let upBiases, let downBiases
+        else { return nil }
+
+        func valid(
+            weight: MLXArray, scales: MLXArray, biases: MLXArray,
+            inDim: Int, outDim: Int
+        ) -> Bool {
+            weight.dtype == .uint32
+                && scales.dtype == .bfloat16 && biases.dtype == .bfloat16
+                && weight.shape == [experts, outDim, inDim * bits / 32]
+                && scales.shape == [experts, outDim, inDim / groupSize]
+                && biases.shape == scales.shape
+        }
+        guard valid(
+            weight: gateWeight, scales: gateScales, biases: gateBiases,
+            inDim: hidden, outDim: intermediate),
+            valid(
+                weight: upWeight, scales: upScales, biases: upBiases,
+                inDim: hidden, outDim: intermediate),
+            valid(
+                weight: downWeight, scales: downScales, biases: downBiases,
+                inDim: intermediate, outDim: hidden)
+        else { return nil }
+
+        return Weights(
+            gateWeight: gateWeight, gateScales: gateScales,
+            gateBiases: gateBiases, upWeight: upWeight, upScales: upScales,
+            upBiases: upBiases, downWeight: downWeight,
+            downScales: downScales, downBiases: downBiases)
+    }
+
+    private static func project(
+        _ x: MLXArray,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray,
+        lhsIndices: MLXArray?,
+        rhsIndices: MLXArray
+    ) -> MLXArray {
+        gatherQuantizedMM(
+            x, weight, scales: scales, biases: biases,
+            lhsIndices: lhsIndices, rhsIndices: rhsIndices,
+            transpose: true, groupSize: 64, bits: 4, mode: .affine,
+            sortedIndices: true)
+    }
+
+    private static func finish(
+        sortedX: MLXArray,
+        sortedIndices: MLXArray,
+        lhsIndices: MLXArray?,
+        inverseOrder: MLXArray,
+        routeWeights: MLXArray,
+        rowShape: [Int],
+        activation: (MLXArray, MLXArray) -> MLXArray,
+        captured: Weights
+    ) -> MLXArray {
+        let up = project(
+            sortedX, weight: captured.upWeight, scales: captured.upScales,
+            biases: captured.upBiases, lhsIndices: lhsIndices,
+            rhsIndices: sortedIndices)
+        let gate = project(
+            sortedX, weight: captured.gateWeight, scales: captured.gateScales,
+            biases: captured.gateBiases, lhsIndices: lhsIndices,
+            rhsIndices: sortedIndices)
+        let activated = activation(gate, up)
+        let down = project(
+            activated, weight: captured.downWeight,
+            scales: captured.downScales, biases: captured.downBiases,
+            lhsIndices: nil, rhsIndices: sortedIndices)
+        let unsorted = unflatten(down[inverseOrder], axis: 0, shape: rowShape)
+        return weightedExpertSum(MLX.squeezed(unsorted, axis: -2), routeWeights)
+    }
+
+    private static func runCombined(
+        x: MLXArray,
+        indices: MLXArray,
+        routeWeights: MLXArray,
+        captured: Weights
+    ) -> MLXArray {
+        let flatIndices = indices.flattened()
+        let order = argSort(flatIndices)
+        let inverseOrder = argSort(order)
+        let sortedX = MLX.expandedDimensions(x, axes: [-2, -3])
+            .flattened(start: 0, end: -3)[order.floorDivide(topK)]
+        return finish(
+            sortedX: sortedX, sortedIndices: flatIndices[order],
+            lhsIndices: nil, inverseOrder: inverseOrder,
+            routeWeights: routeWeights, rowShape: indices.shape,
+            activation: compiledGeGLU, captured: captured)
+    }
+
+    private static func runIndependentB8(
+        x: MLXArray,
+        indices: MLXArray,
+        routeWeights: MLXArray,
+        routeKernel: MLXFast.MLXFastKernel,
+        activation: (MLXArray, MLXArray) -> MLXArray,
+        captured: Weights
+    ) -> MLXArray {
+        let outputs = routeKernel(
+            [indices],
+            grid: (64, 1, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [[64], [64], [64]],
+            outputDTypes: [.uint32, .uint32, .uint32])
+        let sortedX = MLX.expandedDimensions(x, axes: [-2, -3])
+            .flattened(start: 0, end: -3)
+        return finish(
+            sortedX: sortedX, sortedIndices: outputs[1],
+            lhsIndices: outputs[0], inverseOrder: outputs[2],
+            routeWeights: routeWeights, rowShape: [batch, topK],
+            activation: activation, captured: captured)
+    }
+}
+
 public class SwitchGLU: Module {
     @ModuleInfo(key: "gate_proj") var gateProj: SwitchLinear?
     @ModuleInfo(key: "up_proj") var upProj: SwitchLinear?

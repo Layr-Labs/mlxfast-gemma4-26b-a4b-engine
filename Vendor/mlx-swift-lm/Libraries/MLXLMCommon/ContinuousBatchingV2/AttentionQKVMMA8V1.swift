@@ -35,6 +35,31 @@ public enum CBv2AttentionQKVMMA8V1 {
     private static let simdGroups = 2
     private static let outputsPerGroup = 8
 
+    /// Exact verifier launch shapes. The arithmetic body is identical; only
+    /// the number of K partitions and adjacent eight-column tiles owned by a
+    /// threadgroup changes. Production remains `ks2Tile2` until a measured
+    /// route table proves another shape on the pinned projection dimensions.
+    public enum VerifierGeometry: String, CaseIterable, Sendable {
+        case ks1Tile1
+        case ks1Tile2
+        case ks2Tile1
+        case ks2Tile2
+
+        fileprivate var kSplits: Int {
+            switch self {
+            case .ks1Tile1, .ks1Tile2: 1
+            case .ks2Tile1, .ks2Tile2: 2
+            }
+        }
+
+        fileprivate var tiles: Int {
+            switch self {
+            case .ks1Tile1, .ks2Tile1: 1
+            case .ks1Tile2, .ks2Tile2: 2
+            }
+        }
+    }
+
     private static let mma8KernelHeader = """
 #include <metal_simdgroup_matrix>
 
@@ -311,6 +336,140 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
     y[(c.fn + 1) * N + nt + c.fm] = static_cast<T>(acc1[t]);
   }
 }
+
+// MTP verifier body. Each position owns a private pair of accumulators and
+// consumes the same B8 activation rows as an independent call. Packed weights,
+// scales and affine biases are invariant across positions and are loaded once
+// per output tile and K group.
+template <typename T, int KS, int TILES, int POSITIONS>
+METAL_FUNC void qkv_mma8_affine4_g64_verify(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int K,
+    const int N,
+    const int n0,
+    threadgroup float2* red,
+    uint simd_gid,
+    uint simd_lid) {
+  const int G = K / 64;
+  const int gh = (G + 1) / 2;
+  const int g_begin = (KS == 2 && simd_gid == 1) ? gh : 0;
+  const int g_end = (KS == 2 && simd_gid == 0) ? gh : G;
+  const mma8_coord c = mma8_lane(simd_lid);
+
+  const device uint8_t* wrow[TILES];
+  const device T* srow[TILES];
+  const device T* brow[TILES];
+  thread float acc0[TILES][POSITIONS];
+  thread float acc1[TILES][POSITIONS];
+#pragma clang loop unroll(full)
+  for (int t = 0; t < TILES; ++t) {
+    const int nt = n0 + t * 8;
+    wrow[t] = (const device uint8_t*)w + (nt + c.fm) * (K / 2) + 4 * c.fn;
+    srow[t] = scales + (nt + c.fm) * G;
+    brow[t] = biases + (nt + c.fm) * G;
+#pragma clang loop unroll(full)
+    for (int p = 0; p < POSITIONS; ++p) {
+      acc0[t][p] = 0.0f;
+      acc1[t][p] = 0.0f;
+    }
+  }
+
+  simdgroup_float8x8 A;
+
+  for (int g = g_begin; g < g_end; ++g) {
+    thread uint2 packedWeight[TILES];
+    thread float groupScale[TILES];
+    thread float groupBias[TILES];
+#pragma clang loop unroll(full)
+    for (int t = 0; t < TILES; ++t) {
+      packedWeight[t] = *((const device uint2*)(wrow[t] + 32 * g));
+      groupScale[t] = float(srow[t][g]);
+      groupBias[t] = float(brow[t][g]);
+    }
+
+#pragma clang loop unroll(full)
+    for (int p = 0; p < POSITIONS; ++p) {
+      const device T* x0 = x + (p * 8 + c.fn) * K + 8 * c.fm;
+      const device T* x1 = x0 + K;
+      const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+      const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+
+      float2 rs = float2(mma8_runsum4<T>(r0), mma8_runsum4<T>(r1));
+      rs += simd_shuffle_xor(rs, 2u);
+      rs += simd_shuffle_xor(rs, 4u);
+      rs += simd_shuffle_xor(rs, 16u);
+
+      simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+      MMA8_SETB(B0, x, lo)
+      MMA8_SETB(B1, x, hi)
+      MMA8_SETB(B2, y, lo)
+      MMA8_SETB(B3, y, hi)
+      MMA8_SETB(B4, z, lo)
+      MMA8_SETB(B5, z, hi)
+      MMA8_SETB(B6, w, lo)
+      MMA8_SETB(B7, w, hi)
+
+#pragma clang loop unroll(full)
+      for (int t = 0; t < TILES; ++t) {
+        const uint2 wv = packedWeight[t];
+        simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+        MMA8_STEP(B0, 0)
+        MMA8_STEP(B1, 1)
+        MMA8_STEP(B2, 2)
+        MMA8_STEP(B3, 3)
+        MMA8_STEP(B4, 4)
+        MMA8_STEP(B5, 5)
+        MMA8_STEP(B6, 6)
+        MMA8_STEP(B7, 7)
+
+        acc0[t][p] +=
+            groupScale[t] * C.thread_elements()[0] + rs.x * groupBias[t];
+        acc1[t][p] +=
+            groupScale[t] * C.thread_elements()[1] + rs.y * groupBias[t];
+      }
+    }
+  }
+
+  if (KS == 2) {
+    if (simd_gid == 1) {
+#pragma clang loop unroll(full)
+      for (int t = 0; t < TILES; ++t) {
+#pragma clang loop unroll(full)
+        for (int p = 0; p < POSITIONS; ++p) {
+          red[(t * POSITIONS + p) * 32 + simd_lid] =
+              float2(acc0[t][p], acc1[t][p]);
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_gid == 1) {
+      return;
+    }
+#pragma clang loop unroll(full)
+    for (int t = 0; t < TILES; ++t) {
+#pragma clang loop unroll(full)
+      for (int p = 0; p < POSITIONS; ++p) {
+        const float2 other = red[(t * POSITIONS + p) * 32 + simd_lid];
+        acc0[t][p] = acc0[t][p] + other.x;
+        acc1[t][p] = acc1[t][p] + other.y;
+      }
+    }
+  }
+
+#pragma clang loop unroll(full)
+  for (int t = 0; t < TILES; ++t) {
+    const int nt = n0 + t * 8;
+#pragma clang loop unroll(full)
+    for (int p = 0; p < POSITIONS; ++p) {
+      y[(p * 8 + c.fn) * N + nt + c.fm] = static_cast<T>(acc0[t][p]);
+      y[(p * 8 + c.fn + 1) * N + nt + c.fm] = static_cast<T>(acc1[t][p]);
+    }
+  }
+}
 """
 
     /// MMA-MT-001 arm. Default ON.
@@ -363,9 +522,48 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
         header: mma8KernelHeader,
         ensureRowContiguous: true)
 
+    private static func makeVerifierKernel(
+        name: String, kSplits: Int, tiles: Int, reductionCells: Int
+    ) -> MLXFast.MLXFastKernel {
+        MLXFast.metalKernel(
+            name: name,
+            inputNames: ["x", "w", "scales", "biases"],
+            outputNames: ["y"],
+            source: """
+                const uint3 tid = threadgroup_position_in_grid;
+                threadgroup float2 red[\(reductionCells)];
+                qkv_mma8_affine4_g64_verify<T, \(kSplits), \(tiles), COLUMNS>(
+                    w, scales, biases, x, y,
+                    x_shape[x_ndim - 1], w_shape[0],
+                    int(tid.y) * \(tiles * outputsPerGroup), red,
+                    simdgroup_index_in_threadgroup,
+                    thread_index_in_simdgroup);
+                return;
+                """,
+            header: mma8KernelHeader,
+            ensureRowContiguous: true)
+    }
+
+    private static let verifierKS1Tile1Kernel = makeVerifierKernel(
+        name: "cbv2_b8_mtp_qkv_mma8_affine4_g64_ks1_t1_v1",
+        kSplits: 1, tiles: 1, reductionCells: 1)
+    private static let verifierKS1Tile2Kernel = makeVerifierKernel(
+        name: "cbv2_b8_mtp_qkv_mma8_affine4_g64_ks1_t2_v1",
+        kSplits: 1, tiles: 2, reductionCells: 1)
+    private static let verifierKS2Tile1Kernel = makeVerifierKernel(
+        name: "cbv2_b8_mtp_qkv_mma8_affine4_g64_ks2_t1_v1",
+        kSplits: 2, tiles: 1, reductionCells: 128)
+    private static let verifierKS2Tile2Kernel = makeVerifierKernel(
+        name: "cbv2_b8_mtp_qkv_mma8_affine4_g64_ks2_t2_v1",
+        kSplits: 2, tiles: 2, reductionCells: 256)
+
     @inline(__always)
     private static func liveOutputWidth(_ width: Int) -> Bool {
         width == 1024 || width == 2048 || width == 4096 || width == 8192
+    }
+
+    public static func supportsVerifierColumns(_ columns: Int) -> Bool {
+        (2...4).contains(columns)
     }
 
     public static func matmul(
@@ -420,5 +618,143 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
             outputShapes: [[batch, sequence, outputWidth]],
             outputDTypes: [x.dtype]
         )[0]
+    }
+
+    /// Bind immutable verifier weights once at model installation. The
+    /// returned fixed-shape entrypoint contains no eligibility branch or
+    /// stock fallback. Its C2/C3/C4 physical width is captured here.
+    public static func bindVerifier(
+        columns: Int,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode
+    ) -> ((MLXArray) -> MLXArray)? {
+        guard enabled, multiTileEnabled, supportsVerifierColumns(columns),
+            groupSize == Self.groupSize, bits == Self.bits, mode == .affine,
+            let biases,
+            scales.dtype == .bfloat16, biases.dtype == .bfloat16,
+            weight.dtype == .uint32,
+            weight.ndim == 2, weight.dim(1) == inputWidth * Self.bits / 32
+        else { return nil }
+
+        let outputWidth = weight.dim(0)
+        guard liveOutputWidth(outputWidth),
+            scales.shape == [outputWidth, inputWidth / Self.groupSize],
+            biases.shape == scales.shape
+        else { return nil }
+
+        guard let geometry = CBv2Gemma4MTPVerifierRoute.production.qkvGeometry(
+            outputWidth: outputWidth, columns: columns)
+        else { return nil }
+        let selected = boundGeometry(geometry)
+        return { x in
+            return runVerifier(
+                x: x, weight: weight, scales: scales, biases: biases,
+                outputWidth: outputWidth, columns: columns,
+                kernel: selected.kernel, kSplits: selected.kSplits,
+                tiles: selected.tiles)
+        }
+    }
+
+    /// Construction-bound probe used by the exact launch-geometry race. It
+    /// repeats the same installation checks as production, then returns a
+    /// direct fixed-geometry entrypoint with no enabled-path fallback.
+    public static func bindVerifierProbe(
+        columns: Int,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode,
+        geometry: VerifierGeometry
+    ) -> ((MLXArray) -> MLXArray)? {
+        guard enabled, multiTileEnabled, supportsVerifierColumns(columns),
+            groupSize == Self.groupSize, bits == Self.bits, mode == .affine,
+            let biases,
+            scales.dtype == .bfloat16, biases.dtype == .bfloat16,
+            weight.dtype == .uint32,
+            weight.ndim == 2, weight.dim(1) == inputWidth * Self.bits / 32
+        else { return nil }
+
+        let outputWidth = weight.dim(0)
+        guard liveOutputWidth(outputWidth),
+            (outputWidth / outputsPerGroup).isMultiple(of: geometry.tiles),
+            scales.shape == [outputWidth, inputWidth / Self.groupSize],
+            biases.shape == scales.shape
+        else { return nil }
+
+        let selected = boundGeometry(geometry)
+        return { x in
+            runVerifier(
+                x: x, weight: weight, scales: scales, biases: biases,
+                outputWidth: outputWidth, columns: columns,
+                kernel: selected.kernel, kSplits: selected.kSplits,
+                tiles: selected.tiles)
+        }
+    }
+
+    private static func boundGeometry(
+        _ geometry: VerifierGeometry
+    ) -> (kernel: MLXFast.MLXFastKernel, kSplits: Int, tiles: Int) {
+        switch geometry {
+        case .ks1Tile1: return (verifierKS1Tile1Kernel, 1, 1)
+        case .ks1Tile2: return (verifierKS1Tile2Kernel, 1, 2)
+        case .ks2Tile1: return (verifierKS2Tile1Kernel, 2, 1)
+        case .ks2Tile2: return (verifierKS2Tile2Kernel, 2, 2)
+        }
+    }
+
+    private static func runVerifier(
+        x: MLXArray,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray,
+        outputWidth: Int,
+        columns: Int,
+        kernel: MLXFast.MLXFastKernel,
+        kSplits: Int,
+        tiles: Int
+    ) -> MLXArray {
+        let positionMajor = concatenated(
+            (0..<columns).map { column in
+                x[0..., column..<(column + 1), 0...].reshaped([batch, inputWidth])
+            },
+            axis: 0)
+        let yTiles = outputWidth / outputsPerGroup
+        let flat = kernel(
+            [positionMajor, weight, scales, biases],
+            template: [("T", DType.bfloat16), ("COLUMNS", columns)],
+            grid: (simdWidth, (yTiles / tiles) * kSplits, 1),
+            threadGroup: (simdWidth, kSplits, 1),
+            outputShapes: [[batch * columns, outputWidth]],
+            outputDTypes: [.bfloat16]
+        )[0]
+        return flat.reshaped([columns, batch, outputWidth]).transposed(1, 0, 2)
+    }
+
+    /// Checked probe surface retained for kernel parity tests. Production
+    /// binds once through `bindVerifier` and calls the returned entrypoint.
+    public static func matmulVerifier(
+        x: MLXArray,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode
+    ) -> MLXArray? {
+        guard x.dtype == .bfloat16,
+            x.ndim == 3, x.dim(0) == batch, (2...4).contains(x.dim(1)),
+            x.dim(2) == inputWidth,
+            let bound = bindVerifier(
+                columns: x.dim(1),
+                weight: weight, scales: scales, biases: biases,
+                groupSize: groupSize, bits: bits, mode: mode)
+        else { return nil }
+        return bound(x)
     }
 }

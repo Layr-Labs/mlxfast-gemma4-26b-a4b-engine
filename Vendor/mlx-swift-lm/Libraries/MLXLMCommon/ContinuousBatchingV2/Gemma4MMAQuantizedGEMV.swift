@@ -165,6 +165,18 @@ public enum Gemma4MMAQuantizedGEMV {
         }
     }()
 
+    /// Resolved once from the process configuration before verifier binding.
+    public static var activeVersion: Int { version }
+
+    /// The verifier body was expanded from v14. Versions 15 and 16 only add
+    /// independent adjacent output accumulators around that unchanged v14
+    /// per-output group loop; v26 changes v16's packed-weight address cursor,
+    /// not its loads, multiply-accumulates, or reduction order. These are the
+    /// only source-derived trees admitted for a combined verifier binding.
+    public static func isVerifierCompatible(version: Int) -> Bool {
+        version == 14 || version == 15 || version == 16 || version == 26
+    }
+
     private static let defaultVersion = 26
 
     /// Whether the selected tied-head implementation consumes the exact
@@ -1114,6 +1126,32 @@ public enum Gemma4MMAQuantizedGEMV {
         ensureRowContiguous: true
     )
 
+    /// The verifier probe lays its positions out as consecutive eight-row
+    /// cohorts.  Keep the stock-compatible BF16 quad-sum identical to the
+    /// decode kernel while allowing two through four cohorts in one dispatch.
+    private static let verifierXSumKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_affine4_xsum_verifier_v1",
+        inputNames: ["x"],
+        outputNames: ["xSums"],
+        source: """
+            constexpr uint GROUP = 64;
+            constexpr uint N_GROUPS = K / GROUP;
+            const uint cell = thread_position_in_grid.x;
+            if (cell >= ROWS * N_GROUPS) return;
+
+            const device T* xp =
+                x + (cell / N_GROUPS) * K + (cell % N_GROUPS) * GROUP;
+            float s = 0.0f;
+            for (uint c = 0; c < GROUP / 8; ++c) {
+                const uint i = c * 8;
+                s += xp[i + 0] + xp[i + 1] + xp[i + 2] + xp[i + 3];
+                s += xp[i + 4] + xp[i + 5] + xp[i + 6] + xp[i + 7];
+            }
+            xSums[cell] = s;
+            """,
+        ensureRowContiguous: true
+    )
+
     /// Version 5 consumes the precomputed sums and exposes the eight packed
     /// weight words for each group through two aligned vector loads. Activation,
     /// scale, bias, accumulation, and output statement order remain version 4's.
@@ -1847,6 +1885,262 @@ public enum Gemma4MMAQuantizedGEMV {
         ensureRowContiguous: true
     )
 
+    // MARK: - MTP verifier probe --- shared weights, independent B8 reductions
+
+    /// Preserve version 14's arithmetic independently for every verifier
+    /// position, but load each packed vocabulary tile once.  The input is
+    /// position-major `[COLUMNS * 8, K]`; each accumulator still owns exactly
+    /// the same eight batch rows and follows the same group/MMA/FMA order as a
+    /// standalone B8 call.
+    private static let sourceVerifier: String = {
+        var result = sourceV14
+
+        func replaceOnce(_ old: String, with new: String) {
+            let count = result.components(separatedBy: old).count
+            precondition(count == 2, "sourceVerifier replacement count \(count): \(old)")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+
+        replaceOnce(
+            "simdgroup_matrix<float, 8, 8> acc = simdgroup_matrix<float, 8, 8>(0.0f);",
+            with: """
+            simdgroup_matrix<float, 8, 8> acc0 = simdgroup_matrix<float, 8, 8>(0.0f);
+            simdgroup_matrix<float, 8, 8> acc1 = simdgroup_matrix<float, 8, 8>(0.0f);
+            simdgroup_matrix<float, 8, 8> acc2 = simdgroup_matrix<float, 8, 8>(0.0f);
+            simdgroup_matrix<float, 8, 8> acc3 = simdgroup_matrix<float, 8, 8>(0.0f);
+            """
+        )
+        replaceOnce(
+            """
+                simdgroup_matrix<float, 8, 8> accg =
+                    simdgroup_matrix<float, 8, 8>(0.0f);
+            """,
+            with: """
+                simdgroup_matrix<float, 8, 8> accg0 =
+                    simdgroup_matrix<float, 8, 8>(0.0f);
+                simdgroup_matrix<float, 8, 8> accg1 =
+                    simdgroup_matrix<float, 8, 8>(0.0f);
+                simdgroup_matrix<float, 8, 8> accg2 =
+                    simdgroup_matrix<float, 8, 8>(0.0f);
+                simdgroup_matrix<float, 8, 8> accg3 =
+                    simdgroup_matrix<float, 8, 8>(0.0f);
+            """
+        )
+        replaceOnce(
+            """
+                    simdgroup_matrix<T, 8, 8> A;
+                    simdgroup_matrix<T, 8, 8> B;
+                    const uint packed = t < 4 ? packedLo[t] : packedHi[t - 4];
+                    A.thread_elements()[0] =
+                        T(float((packed >> (4 * fragmentCol)) & 0xFu));
+                    A.thread_elements()[1] =
+                        T(float((packed >> (4 * (fragmentCol + 1))) & 0xFu));
+                    const uint activationK = g * GROUP + t * 8 + fragmentRow;
+                    B.thread_elements()[0] = x[fragmentCol * K + activationK];
+                    B.thread_elements()[1] =
+                        x[(fragmentCol + 1) * K + activationK];
+                    simdgroup_multiply_accumulate(accg, A, B, accg);
+            """,
+            with: """
+                    simdgroup_matrix<T, 8, 8> A;
+                    const uint packed = t < 4 ? packedLo[t] : packedHi[t - 4];
+                    A.thread_elements()[0] =
+                        T(float((packed >> (4 * fragmentCol)) & 0xFu));
+                    A.thread_elements()[1] =
+                        T(float((packed >> (4 * (fragmentCol + 1))) & 0xFu));
+                    const uint activationK = g * GROUP + t * 8 + fragmentRow;
+                    {
+                        simdgroup_matrix<T, 8, 8> B;
+                        B.thread_elements()[0] = x[fragmentCol * K + activationK];
+                        B.thread_elements()[1] =
+                            x[(fragmentCol + 1) * K + activationK];
+                        simdgroup_multiply_accumulate(accg0, A, B, accg0);
+                    }
+                    if (COLUMNS > 1) {
+                        simdgroup_matrix<T, 8, 8> B;
+                        B.thread_elements()[0] = x[(8 + fragmentCol) * K + activationK];
+                        B.thread_elements()[1] =
+                            x[(8 + fragmentCol + 1) * K + activationK];
+                        simdgroup_multiply_accumulate(accg1, A, B, accg1);
+                    }
+                    if (COLUMNS > 2) {
+                        simdgroup_matrix<T, 8, 8> B;
+                        B.thread_elements()[0] = x[(16 + fragmentCol) * K + activationK];
+                        B.thread_elements()[1] =
+                            x[(16 + fragmentCol + 1) * K + activationK];
+                        simdgroup_multiply_accumulate(accg2, A, B, accg2);
+                    }
+                    if (COLUMNS > 3) {
+                        simdgroup_matrix<T, 8, 8> B;
+                        B.thread_elements()[0] = x[(24 + fragmentCol) * K + activationK];
+                        B.thread_elements()[1] =
+                            x[(24 + fragmentCol + 1) * K + activationK];
+                        simdgroup_multiply_accumulate(accg3, A, B, accg3);
+                    }
+            """
+        )
+        replaceOnce(
+            """
+            acc.thread_elements()[0] = metal::fma(
+                rowScale, accg.thread_elements()[0], acc.thread_elements()[0]);
+            acc.thread_elements()[1] = metal::fma(
+                rowScale, accg.thread_elements()[1], acc.thread_elements()[1]);
+            """,
+            with: """
+            acc0.thread_elements()[0] = metal::fma(
+                rowScale, accg0.thread_elements()[0], acc0.thread_elements()[0]);
+            acc0.thread_elements()[1] = metal::fma(
+                rowScale, accg0.thread_elements()[1], acc0.thread_elements()[1]);
+            if (COLUMNS > 1) {
+                acc1.thread_elements()[0] = metal::fma(
+                    rowScale, accg1.thread_elements()[0], acc1.thread_elements()[0]);
+                acc1.thread_elements()[1] = metal::fma(
+                    rowScale, accg1.thread_elements()[1], acc1.thread_elements()[1]);
+            }
+            if (COLUMNS > 2) {
+                acc2.thread_elements()[0] = metal::fma(
+                    rowScale, accg2.thread_elements()[0], acc2.thread_elements()[0]);
+                acc2.thread_elements()[1] = metal::fma(
+                    rowScale, accg2.thread_elements()[1], acc2.thread_elements()[1]);
+            }
+            if (COLUMNS > 3) {
+                acc3.thread_elements()[0] = metal::fma(
+                    rowScale, accg3.thread_elements()[0], acc3.thread_elements()[0]);
+                acc3.thread_elements()[1] = metal::fma(
+                    rowScale, accg3.thread_elements()[1], acc3.thread_elements()[1]);
+            }
+            """
+        )
+        replaceOnce(
+            """
+                    simdgroup_matrix<float, 8, 8> BBm;
+                    simdgroup_matrix<float, 8, 8> XBm;
+                    if (biasBlock + 8 <= N_GROUPS) {
+                        BBm.thread_elements()[0] = float(fragmentBRow[biasCol0]);
+                        BBm.thread_elements()[1] = float(fragmentBRow[biasCol1]);
+                        XBm.thread_elements()[0] =
+                            xSums[fragmentCol * N_GROUPS + biasRow];
+                        XBm.thread_elements()[1] =
+                            xSums[(fragmentCol + 1) * N_GROUPS + biasRow];
+                    } else {
+                        BBm.thread_elements()[0] = biasCol0 < N_GROUPS
+                            ? float(fragmentBRow[biasCol0]) : 0.0f;
+                        BBm.thread_elements()[1] = biasCol1 < N_GROUPS
+                            ? float(fragmentBRow[biasCol1]) : 0.0f;
+                        XBm.thread_elements()[0] = biasRow < N_GROUPS
+                            ? xSums[fragmentCol * N_GROUPS + biasRow] : 0.0f;
+                        XBm.thread_elements()[1] = biasRow < N_GROUPS
+                            ? xSums[(fragmentCol + 1) * N_GROUPS + biasRow] : 0.0f;
+                    }
+                    simdgroup_multiply_accumulate(acc, BBm, XBm, acc);
+            """,
+            with: """
+                    simdgroup_matrix<float, 8, 8> BBm;
+                    simdgroup_matrix<float, 8, 8> XBm0;
+                    simdgroup_matrix<float, 8, 8> XBm1;
+                    simdgroup_matrix<float, 8, 8> XBm2;
+                    simdgroup_matrix<float, 8, 8> XBm3;
+                    if (biasBlock + 8 <= N_GROUPS) {
+                        BBm.thread_elements()[0] = float(fragmentBRow[biasCol0]);
+                        BBm.thread_elements()[1] = float(fragmentBRow[biasCol1]);
+                        XBm0.thread_elements()[0] =
+                            xSums[fragmentCol * N_GROUPS + biasRow];
+                        XBm0.thread_elements()[1] =
+                            xSums[(fragmentCol + 1) * N_GROUPS + biasRow];
+                        if (COLUMNS > 1) {
+                            XBm1.thread_elements()[0] =
+                                xSums[(8 + fragmentCol) * N_GROUPS + biasRow];
+                            XBm1.thread_elements()[1] =
+                                xSums[(8 + fragmentCol + 1) * N_GROUPS + biasRow];
+                        }
+                        if (COLUMNS > 2) {
+                            XBm2.thread_elements()[0] =
+                                xSums[(16 + fragmentCol) * N_GROUPS + biasRow];
+                            XBm2.thread_elements()[1] =
+                                xSums[(16 + fragmentCol + 1) * N_GROUPS + biasRow];
+                        }
+                        if (COLUMNS > 3) {
+                            XBm3.thread_elements()[0] =
+                                xSums[(24 + fragmentCol) * N_GROUPS + biasRow];
+                            XBm3.thread_elements()[1] =
+                                xSums[(24 + fragmentCol + 1) * N_GROUPS + biasRow];
+                        }
+                    } else {
+                        BBm.thread_elements()[0] = biasCol0 < N_GROUPS
+                            ? float(fragmentBRow[biasCol0]) : 0.0f;
+                        BBm.thread_elements()[1] = biasCol1 < N_GROUPS
+                            ? float(fragmentBRow[biasCol1]) : 0.0f;
+                        XBm0.thread_elements()[0] = biasRow < N_GROUPS
+                            ? xSums[fragmentCol * N_GROUPS + biasRow] : 0.0f;
+                        XBm0.thread_elements()[1] = biasRow < N_GROUPS
+                            ? xSums[(fragmentCol + 1) * N_GROUPS + biasRow] : 0.0f;
+                        if (COLUMNS > 1) {
+                            XBm1.thread_elements()[0] = biasRow < N_GROUPS
+                                ? xSums[(8 + fragmentCol) * N_GROUPS + biasRow] : 0.0f;
+                            XBm1.thread_elements()[1] = biasRow < N_GROUPS
+                                ? xSums[(8 + fragmentCol + 1) * N_GROUPS + biasRow] : 0.0f;
+                        }
+                        if (COLUMNS > 2) {
+                            XBm2.thread_elements()[0] = biasRow < N_GROUPS
+                                ? xSums[(16 + fragmentCol) * N_GROUPS + biasRow] : 0.0f;
+                            XBm2.thread_elements()[1] = biasRow < N_GROUPS
+                                ? xSums[(16 + fragmentCol + 1) * N_GROUPS + biasRow] : 0.0f;
+                        }
+                        if (COLUMNS > 3) {
+                            XBm3.thread_elements()[0] = biasRow < N_GROUPS
+                                ? xSums[(24 + fragmentCol) * N_GROUPS + biasRow] : 0.0f;
+                            XBm3.thread_elements()[1] = biasRow < N_GROUPS
+                                ? xSums[(24 + fragmentCol + 1) * N_GROUPS + biasRow] : 0.0f;
+                        }
+                    }
+                    simdgroup_multiply_accumulate(acc0, BBm, XBm0, acc0);
+                    if (COLUMNS > 1) {
+                        simdgroup_multiply_accumulate(acc1, BBm, XBm1, acc1);
+                    }
+                    if (COLUMNS > 2) {
+                        simdgroup_multiply_accumulate(acc2, BBm, XBm2, acc2);
+                    }
+                    if (COLUMNS > 3) {
+                        simdgroup_multiply_accumulate(acc3, BBm, XBm3, acc3);
+                    }
+            """
+        )
+        replaceOnce(
+            """
+            const uint outputN = sgN0 + fragmentRow;
+            out[fragmentCol * N + outputN] = T(acc.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN] = T(acc.thread_elements()[1]);
+            """,
+            with: """
+            const uint outputN = sgN0 + fragmentRow;
+            out[fragmentCol * N + outputN] = T(acc0.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN] = T(acc0.thread_elements()[1]);
+            if (COLUMNS > 1) {
+                out[(8 + fragmentCol) * N + outputN] = T(acc1.thread_elements()[0]);
+                out[(8 + fragmentCol + 1) * N + outputN] = T(acc1.thread_elements()[1]);
+            }
+            if (COLUMNS > 2) {
+                out[(16 + fragmentCol) * N + outputN] = T(acc2.thread_elements()[0]);
+                out[(16 + fragmentCol + 1) * N + outputN] = T(acc2.thread_elements()[1]);
+            }
+            if (COLUMNS > 3) {
+                out[(24 + fragmentCol) * N + outputN] = T(acc3.thread_elements()[0]);
+                out[(24 + fragmentCol + 1) * N + outputN] = T(acc3.thread_elements()[1]);
+            }
+            """
+        )
+        return result
+    }()
+
+    private static let verifierKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_affine4_qmv_mtp_verifier_v1",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["out"],
+        source: sourceVerifier,
+        header: "#include <metal_simdgroup_matrix>\n",
+        ensureRowContiguous: true
+    )
+
     // MARK: - Version 15 --- two output tiles per SIMD group
 
     /// Each SIMD group owns sixteen output rows through two independent 8x8
@@ -2522,6 +2816,142 @@ public enum Gemma4MMAQuantizedGEMV {
         ensureRowContiguous: true
     )
 
+    /// Construction-time shape predicate for the fixed B8 MTP verifier probe.
+    /// A verifier cycle contains the current token plus one through three
+    /// drafts, hence two through four independent position columns.
+    public static func supportsVerifierShape(batch: Int, columns: Int) -> Bool {
+        batch == mRows && (2...4).contains(columns)
+    }
+
+    public static func supportsVerifierColumns(_ columns: Int) -> Bool {
+        (2...4).contains(columns)
+    }
+
+    static func supportsVerifierWeightRank(_ rank: Int) -> Bool {
+        rank == 2
+    }
+
+    struct IndependentB8Assembly: Equatable, Sendable {
+        let columnShape: [Int]
+        let concatenationAxis: Int
+        let outputShape: [Int]
+    }
+
+    /// CPU-visible shape contract consumed by the independent verifier
+    /// binder. Each ordinary B8 result gains a singleton position dimension
+    /// before concatenation, preserving `[8, C, N]` rather than flattening
+    /// positions into the vocabulary dimension.
+    static func independentB8Assembly(
+        columns: Int, outDim: Int
+    ) -> IndependentB8Assembly? {
+        guard supportsVerifierColumns(columns), outDim > 0 else { return nil }
+        return IndependentB8Assembly(
+            columnShape: [mRows, 1, outDim],
+            concatenationAxis: 1,
+            outputShape: [mRows, columns, outDim])
+    }
+
+    /// Bind the exact verifier head after construction-time topology and
+    /// quantization validation. The returned entrypoint has no fallback.
+    public static func bindVerifier(
+        columns: Int,
+        inDim k: Int,
+        outDim n: Int,
+        w: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int
+    ) -> ((MLXArray) -> MLXArray)? {
+        guard enabled, supportsVerifierColumns(columns),
+            isVerifierCompatible(version: version), let biases
+        else { return nil }
+        guard groupSize == 64, bits == 4 else { return nil }
+        guard scales.dtype == .bfloat16,
+            biases.dtype == .bfloat16, w.dtype == .uint32
+        else { return nil }
+        guard w.ndim == 2, scales.ndim == 2, biases.ndim == 2 else { return nil }
+        guard k > 0, k % groupSize == 0, k % 8 == 0 else { return nil }
+        let ordinaryTileWidth = version == 26 || version == 16
+            ? colsPerThreadgroup * 4
+            : (version == 15 ? colsPerThreadgroup * 2 : colsPerThreadgroup)
+        guard n >= minOutputWidth, n % ordinaryTileWidth == 0 else { return nil }
+        guard w.dim(0) == n else { return nil }
+        guard w.dim(1) == k * bits / 32 else { return nil }
+        guard scales.shape == [n, k / groupSize], biases.shape == scales.shape
+        else { return nil }
+
+        return { x in
+            runVerifier(
+                x: x, w: w, scales: scales, biases: biases,
+                k: k, n: n, columns: columns)
+        }
+    }
+
+    private static func runVerifier(
+        x: MLXArray,
+        w: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray,
+        k: Int,
+        n: Int,
+        columns: Int
+    ) -> MLXArray {
+        // `[8, C, K]` is batch-major.  The Metal entrypoint consumes C
+        // consecutive independent `[8, K]` cohorts so every tile has the same
+        // row addresses as a standalone decode-head call.
+        let positionMajor = concatenated(
+            (0..<columns).map { column in
+                x[0..., column..<(column + 1), 0...].reshaped([mRows, k])
+            },
+            axis: 0)
+        let rows = mRows * columns
+        let sumCells = rows * (k / 64)
+        let sumThreads = 128
+        let sumThreadgroups = (sumCells + sumThreads - 1) / sumThreads
+        let xSums = verifierXSumKernel(
+            [positionMajor],
+            template: [("T", DType.bfloat16), ("K", k), ("ROWS", rows)],
+            grid: (sumThreadgroups * sumThreads, 1, 1),
+            threadGroup: (sumThreads, 1, 1),
+            outputShapes: [[sumCells]],
+            outputDTypes: [.float32]
+        )[0]
+
+        let threadgroups = n / colsPerThreadgroup
+        let flatOutput = verifierKernel(
+            [positionMajor, w, scales, biases, xSums],
+            template: [
+                ("T", DType.bfloat16), ("K", k), ("N", n), ("COLUMNS", columns),
+            ],
+            grid: (threadgroups * threadsPerThreadgroup, 1, 1),
+            threadGroup: (threadsPerThreadgroup, 1, 1),
+            outputShapes: [[rows, n]],
+            outputDTypes: [.bfloat16]
+        )[0]
+        return flatOutput.reshaped([columns, mRows, n]).transposed(1, 0, 2)
+    }
+
+    /// Checked probe surface retained for isolated parity tests.
+    public static func applyVerifier(
+        x: MLXArray,
+        w: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int
+    ) -> MLXArray? {
+        guard x.dtype == .bfloat16,
+            x.ndim == 3, supportsVerifierShape(batch: x.dim(0), columns: x.dim(1)),
+            supportsVerifierWeightRank(w.ndim),
+            let bound = bindVerifier(
+                columns: x.dim(1), inDim: x.dim(2), outDim: w.dim(0),
+                w: w, scales: scales,
+                biases: biases, groupSize: groupSize, bits: bits)
+        else { return nil }
+        return bound(x)
+    }
+
     /// Tied-head GEMV, or `nil` when any gate above fails.
     ///
     /// - Parameters:
@@ -2530,6 +2960,119 @@ public enum Gemma4MMAQuantizedGEMV {
     ///   - scales: `[N, K / groupSize]`, same dtype as `x`.
     ///   - biases: `[N, K / groupSize]`, same dtype as `x`.
     /// - Returns: `[8, N]` in `x`'s dtype, or `nil`.
+    public static func bindIndependentB8(
+        columns: Int,
+        inDim k: Int,
+        outDim n: Int,
+        w: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int
+    ) -> ((MLXArray) -> MLXArray)? {
+        guard enabled,
+            let assembly = independentB8Assembly(columns: columns, outDim: n),
+            let biases,
+            groupSize == 64, bits == 4,
+            scales.dtype == .bfloat16, biases.dtype == .bfloat16,
+            w.dtype == .uint32,
+            w.ndim == 2, scales.ndim == 2, biases.ndim == 2
+        else { return nil }
+        let selectedColsPerThreadgroup = version == 16 || version == 26
+            ? colsPerThreadgroup * 4
+            : (version == 15 ? colsPerThreadgroup * 2 : colsPerThreadgroup)
+        guard n >= minOutputWidth, n % selectedColsPerThreadgroup == 0,
+            k > 0, k % groupSize == 0, k % 8 == 0,
+            w.shape == [n, k * bits / 32],
+            scales.shape == [n, k / groupSize], biases.shape == scales.shape
+        else { return nil }
+        let selected: MLXFast.MLXFastKernel
+        switch version {
+        case 26: selected = kernelV26
+        case 16: selected = kernelV16
+        case 15: selected = kernelV15
+        case 14: selected = kernelV14
+        case 13: selected = kernelV13
+        case 12: selected = kernelV12
+        case 11: selected = kernelV11
+        case 10: selected = kernelV10
+        case 9: selected = kernelV9
+        case 8: selected = kernelV8
+        case 7: selected = kernelV7
+        case 6: selected = kernelV6
+        case 5: selected = kernelV5
+        case 4: selected = kernelV4
+        case 3: selected = kernelV3
+        case 2: selected = kernelV2
+        default: selected = kernel
+        }
+        let ordinaryB8: (MLXArray) -> MLXArray
+        if [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 26].contains(version) {
+            ordinaryB8 = { x in
+                runBoundB8WithSums(
+                    x: x, w: w, scales: scales, biases: biases,
+                    groupSize: groupSize, k: k, n: n,
+                    selectedColsPerThreadgroup: selectedColsPerThreadgroup,
+                    selected: selected)
+            }
+        } else {
+            ordinaryB8 = { x in
+                runBoundB8WithoutSums(
+                    x: x, w: w, scales: scales, biases: biases,
+                    k: k, n: n,
+                    selectedColsPerThreadgroup: selectedColsPerThreadgroup,
+                    selected: selected)
+            }
+        }
+        return { x in
+            concatenated(
+                (0..<columns).map { column in
+                    ordinaryB8(x[0..., column..<(column + 1), 0...])
+                        .reshaped(assembly.columnShape)
+                },
+                axis: assembly.concatenationAxis)
+        }
+    }
+
+    private static func runBoundB8WithSums(
+        x: MLXArray, w: MLXArray, scales: MLXArray, biases: MLXArray,
+        groupSize: Int, k: Int, n: Int,
+        selectedColsPerThreadgroup: Int, selected: MLXFast.MLXFastKernel
+    ) -> MLXArray {
+        let flatX = x.reshaped([mRows, k])
+        let sumCells = mRows * (k / groupSize)
+        let sumThreads = 128
+        let sumThreadgroups = (sumCells + sumThreads - 1) / sumThreads
+        let xSums = xSumKernel(
+            [flatX],
+            template: [("T", DType.bfloat16), ("K", k)],
+            grid: (sumThreadgroups * sumThreads, 1, 1),
+            threadGroup: (sumThreads, 1, 1),
+            outputShapes: [[sumCells]], outputDTypes: [.float32]
+        )[0]
+        return selected(
+            [flatX, w, scales, biases, xSums],
+            template: [("T", DType.bfloat16), ("K", k), ("N", n)],
+            grid: ((n / selectedColsPerThreadgroup) * threadsPerThreadgroup, 1, 1),
+            threadGroup: (threadsPerThreadgroup, 1, 1),
+            outputShapes: [[mRows, n]], outputDTypes: [.bfloat16]
+        )[0]
+    }
+
+    private static func runBoundB8WithoutSums(
+        x: MLXArray, w: MLXArray, scales: MLXArray, biases: MLXArray,
+        k: Int, n: Int, selectedColsPerThreadgroup: Int,
+        selected: MLXFast.MLXFastKernel
+    ) -> MLXArray {
+        selected(
+            [x.reshaped([mRows, k]), w, scales, biases],
+            template: [("T", DType.bfloat16), ("K", k), ("N", n)],
+            grid: ((n / selectedColsPerThreadgroup) * threadsPerThreadgroup, 1, 1),
+            threadGroup: (threadsPerThreadgroup, 1, 1),
+            outputShapes: [[mRows, n]], outputDTypes: [.bfloat16]
+        )[0]
+    }
+
     public static func apply(
         x: MLXArray,
         w: MLXArray,
@@ -2566,6 +3109,24 @@ public enum Gemma4MMAQuantizedGEMV {
         guard scales.dim(0) == n, biases.dim(0) == n else { return nil }
         guard scales.dim(1) == k / groupSize, biases.dim(1) == k / groupSize else { return nil }
 
+        return runB8(
+            x: x, w: w, scales: scales, biases: biases,
+            groupSize: groupSize, k: k, n: n,
+            selectedColsPerThreadgroup: selectedColsPerThreadgroup,
+            activationSums: activationSums)
+    }
+
+    private static func runB8(
+        x: MLXArray,
+        w: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray,
+        groupSize: Int,
+        k: Int,
+        n: Int,
+        selectedColsPerThreadgroup: Int,
+        activationSums: ActivationSums?
+    ) -> MLXArray {
         let flatX = x.reshaped([mRows, k])
         let threadgroups = n / selectedColsPerThreadgroup
         let selected: MLXFast.MLXFastKernel

@@ -80,7 +80,7 @@ internal func gemma4ShouldSubmitDecodeAsyncEvalLadder(
     // The empty-set row is the control that matters: this is not "fewer is
     // always better", it is "the early pair carries all of the overlap".
     switch layerIndex {
-    case 0, 1:
+    case 0, 1, 5, 11, 17, 23, 27:
         return true
     default:
         return false
@@ -118,44 +118,12 @@ private func gemma4TruthyFlag(_ raw: String?) -> Bool {
 /// one final submission; another positive value tunes the layer interval.
 @inline(__always)
 internal func resolveGemma4PrefillChunkEvalLayers(_ raw: String?) -> Int {
-    guard let raw, let value = Int(raw) else { return 18 }
+    guard let raw, let value = Int(raw) else { return 15 }
     return max(0, value)
 }
 
 private let gemma4PrefillChunkEvalLayers = resolveGemma4PrefillChunkEvalLayers(
     ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL"])
-
-/// Submission cadence used when a prompt pass is long enough to run on the
-/// blocked-query prefill path. The documented 18-layer serving default, the
-/// zero kill switch and every explicit non-default tuning value are preserved;
-/// only a pass already in that regime takes the narrower cadence.
-///
-/// `0` disables the specialization (the cadence falls back to the configured
-/// value), which is the kill switch.
-private let gemma4LongPrefillChunkEvalLayers: Int = {
-    guard let raw = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL_LONG"],
-        let value = Int(raw), value >= 0
-    else { return 6 }
-    return value
-}()
-
-/// The query-row block width above which a prompt pass is blocked by
-/// `CBv2AttentionV1` (`queryBlockSize`). A pass at or below it is not blocked
-/// and keeps the configured cadence.
-private let gemma4BlockedQueryPrefillThreshold = 128
-
-@inline(__always)
-private func gemma4EffectivePrefillChunkEvalLayers(
-    configured: Int, inputLength: Int
-) -> Int {
-    guard configured == 18,
-        gemma4LongPrefillChunkEvalLayers > 0,
-        gemma4LongPrefillChunkEvalLayers < configured,
-        inputLength > gemma4BlockedQueryPrefillThreshold
-    else { return configured }
-    return gemma4LongPrefillChunkEvalLayers
-}
 
 @inline(__always)
 internal func gemma4ShouldSubmitPrefillChunkEval(
@@ -1180,6 +1148,7 @@ private func gemma4FusedQKVNormHeadMajor(
     ropeParameters: Gemma4QKVRopeParameters, applyRope: Bool
 ) -> (q: MLXArray, k: MLXArray, v: MLXArray, appliedRope: Bool)? {
     guard gemma4QKVNormPrefillEnabled, keyValueShared, eps == 1.0e-6,
+        ropeParameters.usesFrequencies,
         positionOffsets.dtype == .int32,
         positionOffsets.size == q.dim(0),
         ropeParameters.frequencies.dtype == .float32,
@@ -2292,6 +2261,7 @@ private enum Gemma4FusedRouterTop8 {
 /// to the stock `inputLayernorm(x)`.
 public final class Gemma4GlueChainBox {
     var pending: (source: MLXArray, normed: MLXArray)?
+    var finalHead: (source: MLXArray, postNorm: MLXArray, sums: Gemma4MMAQuantizedGEMV.ActivationSums)?
     public init() {}
 }
 
@@ -2386,55 +2356,44 @@ private enum Gemma4FusedLayerGlue {
         ensureRowContiguous: true
     )
 
-    /// PREFIX-001: join the two serial normalization producers at the
-    /// attention/feed-forward boundary. The first reduction reproduces
-    /// `residual + postAttentionLayernorm(attnOut)` and stores that BF16
-    /// boundary in `outv`. The second reduction consumes those exact rounded
-    /// values in registers and emits the dense, expert and router pre-norms
-    /// plus the promoted dense activation-sum table.
-// T28 second sample marker (r2): content identical to ranked 32f5d19f apart from this comment.
-    private static let attentionBranchPrefixKernel: MLXFast.MLXFastKernel =
-        MLXFast.metalKernel(
-            name: "gemma4_glue_attention_branch_prefix_2816_bf16_v1",
-            inputNames: ["attn", "res", "wa", "wd", "we", "wr"],
-            outputNames: ["out", "dense", "expert", "router", "xSums"],
-            source: """
-                const uint row = threadgroup_position_in_grid.x;
-                const uint lid = thread_position_in_threadgroup.x;
-                const uint simd_lane_id = thread_index_in_simdgroup;
-                const uint simd_group_id = simdgroup_index_in_threadgroup;
-                threadgroup float local_inv[1];
-                threadgroup float local_sums[32];
-                const uint base = row * 2816 + lid * 4;
-                const uint wbase = lid * 4;
-            \(rmsReduce("attn", into: "local_inv[0]"))
-                const float attn_inv = local_inv[0];
-                T outv[4];
-                for (int i = 0; i < 4; i++) {
-                    const T normed = static_cast<T>(
-                        wa[wbase + i]
-                            * static_cast<T>(
-                                (float)attn[base + i] * attn_inv));
-                    outv[i] = res[base + i] + normed;
-                    out[base + i] = outv[i];
-                }
-            \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
-                of: "(float)outv[base + i]", with: "(float)outv[i]"))
-                const float branch_inv = local_inv[0];
-                float xsum = 0.0f;
-                for (int i = 0; i < 4; i++) {
-                    const T nx =
-                        static_cast<T>((float)outv[i] * branch_inv);
-                    const T densev = wd[wbase + i] * nx;
-                    dense[base + i] = densev;
-                    expert[base + i] = we[wbase + i] * nx;
-                    router[base + i] = wr[wbase + i] * nx;
-                    xsum += densev;
-                }
-                xSums[lid * 8 + row] = xsum;
-            """,
-            ensureRowContiguous: true
-        )
+    private static let normResidualDualPreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_glue_norm_res_dual_prenorm_xsum_2816_bf16_v1",
+        inputNames: ["x", "res", "w_attn", "w1_dense", "w2_moe"],
+        outputNames: ["out_res", "out_dense", "out_moe", "xSums"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float local_inv[1];
+            threadgroup float local_sums[32];
+            const uint base = row * 2816 + lid * 4;
+            const uint wbase = lid * 4;
+        \(rmsReduce("x", into: "local_inv[0]"))
+            const float inv1 = local_inv[0];
+            T sv[4];
+            for (int i = 0; i < 4; i++) {
+                const T normed = static_cast<T>(
+                    w_attn[wbase + i] * static_cast<T>((float)x[base + i] * inv1));
+                const T summed = res[base + i] + normed;
+                sv[i] = summed;
+                out_res[base + i] = summed;
+            }
+        \(rmsReduce("sv", into: "local_inv[0]").replacingOccurrences(
+            of: "(float)sv[base + i]", with: "(float)sv[i]"))
+            const float inv2 = local_inv[0];
+            float xsum = 0.0f;
+            for (int i = 0; i < 4; i++) {
+                const T nx = static_cast<T>((float)sv[i] * inv2);
+                const T dense = w1_dense[wbase + i] * nx;
+                out_dense[base + i] = dense;
+                out_moe[base + i] = w2_moe[wbase + i] * nx;
+                xsum += dense;
+            }
+            xSums[lid * 8 + row] = xsum;
+        """,
+        ensureRowContiguous: true
+    )
 
     private static let dualPreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_glue_dual_prenorm_xsum_2816_bf16_v2",
@@ -2535,66 +2494,32 @@ private enum Gemma4FusedLayerGlue {
         )[0]
     }
 
-    struct AttentionBranchPrefix {
-        let out: MLXArray
-        let denseNorm: MLXArray
-        let expertNorm: MLXArray
-        let routerNorm: MLXArray
-        let denseSums: CBv2DenseMLPQMVV1.ActivationSums
-    }
-
-    /// PREFIX-001. The returned `out` is still materialized because the layer
-    /// tail consumes it as its residual. Only its otherwise-serial reread and
-    /// the second dispatch disappear.
-    static func attentionBranchPrefix(
-        attn: MLXArray,
-        residual: MLXArray,
-        postAttentionWeight: MLXArray,
-        denseWeight: MLXArray,
-        expertWeight: MLXArray,
-        routerWeight: MLXArray,
-        eps: Float
-    ) -> AttentionBranchPrefix? {
-        guard CBv2DenseMLPQMVV1.enabled,
-            CBv2DenseMLPQMVV1.activationSumsEnabled,
-            admits(attn, weight: postAttentionWeight, eps: eps),
-            residual.shape == attn.shape, residual.dtype == .bfloat16,
-            denseWeight.ndim == 1, denseWeight.dim(0) == axis,
-            denseWeight.dtype == .bfloat16,
-            expertWeight.ndim == 1, expertWeight.dim(0) == axis,
-            expertWeight.dtype == .bfloat16,
-            routerWeight.ndim == 1, routerWeight.dim(0) == axis,
-            routerWeight.dtype == .bfloat16
+    static func normResidualDualPreNorm(
+        attnOut: MLXArray, residual: MLXArray, postAttnWeight: MLXArray,
+        preFFLN1Weight: MLXArray, preFFLN2Weight: MLXArray, eps: Float
+    ) -> (out: MLXArray, n1: MLXArray, n2: MLXArray, sums: CBv2DenseMLPQMVV1.ActivationSums?)? {
+        guard admits(attnOut, weight: postAttnWeight, eps: eps),
+            residual.shape == attnOut.shape, residual.dtype == .bfloat16,
+            preFFLN1Weight.ndim == 1, preFFLN1Weight.dim(0) == axis, preFFLN1Weight.dtype == .bfloat16,
+            preFFLN2Weight.ndim == 1, preFFLN2Weight.dim(0) == axis, preFFLN2Weight.dtype == .bfloat16
         else { return nil }
-        let outs = attentionBranchPrefixKernel(
-            [
-                attn, residual, postAttentionWeight, denseWeight,
-                expertWeight, routerWeight,
-            ],
-            template: [("T", attn.dtype)],
+        CBv2EngageMark.once("glue-norm-res-dual-prenorm")
+        let outs = normResidualDualPreNormKernel(
+            [attnOut, residual, postAttnWeight, preFFLN1Weight, preFFLN2Weight],
+            template: [("T", attnOut.dtype)],
             grid: (rows * tgThreads, 1, 1),
             threadGroup: (tgThreads, 1, 1),
             outputShapes: [
                 [rows, 1, axis],
                 [rows, 1, axis],
                 [rows, 1, axis],
-                [rows, 1, axis],
                 [(axis / 128) * 32 * rows],
             ],
-            outputDTypes: [
-                .bfloat16, .bfloat16, .bfloat16, .bfloat16, .float32,
-            ]
+            outputDTypes: [.bfloat16, .bfloat16, .bfloat16, .float32]
         )
-        guard let denseSums = CBv2DenseMLPQMVV1.activationSums(
-            produced: outs[4], for: outs[1])
-        else { return nil }
-        CBv2EngageMark.once("attention-branch-prefix")
-        return AttentionBranchPrefix(
-            out: outs[0],
-            denseNorm: outs[1],
-            expertNorm: outs[2],
-            routerNorm: outs[3],
-            denseSums: denseSums)
+        let sums = CBv2DenseMLPQMVV1.activationSums(
+            produced: outs[3], for: outs[1])
+        return (outs[0], outs[1], outs[2], sums)
     }
 
     static func dualPreNorm(
@@ -2672,6 +2597,100 @@ private enum Gemma4FusedLayerGlue {
         """,
         ensureRowContiguous: true
     )
+
+    private static let tailFinalHeadSumsKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_glue_final_tail_head_xsum_2816_bf16_v1",
+        inputNames: ["a", "b", "res", "w1", "w2", "w3", "s", "w_final"],
+        outputNames: ["out", "postNorm", "xSums"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float local_inv[2];
+            threadgroup float local_sums[32];
+            threadgroup float quad_sums[704];
+
+            const uint base = row * 2816 + lid * 4;
+            const uint wbase = lid * 4;
+        \(rmsReduce("a", into: "local_inv[0]"))
+        \(rmsReduce("b", into: "local_inv[1]"))
+            const float inv1 = local_inv[0];
+            const float inv2 = local_inv[1];
+            T sv[4];
+            for (int i = 0; i < 4; i++) {
+                const T h1 = w1[wbase + i] * static_cast<T>((float)a[base + i] * inv1);
+                const T h2 = w2[wbase + i] * static_cast<T>((float)b[base + i] * inv2);
+                sv[i] = h1 + h2;
+            }
+        \(rmsReduce("sv", into: "local_inv[0]").replacingOccurrences(
+            of: "(float)sv[base + i]", with: "(float)sv[i]"))
+            const float inv3 = local_inv[0];
+            const T scalar = s[0];
+            T outv[4];
+            for (int i = 0; i < 4; i++) {
+                const T normed3 = static_cast<T>(
+                    w3[wbase + i] * static_cast<T>((float)sv[i] * inv3));
+                const T summed = res[base + i] + normed3;
+                outv[i] = summed * scalar;
+                out[base + i] = outv[i];
+            }
+        \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
+            of: "(float)outv[base + i]", with: "(float)outv[i]"))
+            const float inv4 = local_inv[0];
+            T postv[4];
+            for (int i = 0; i < 4; i++) {
+                postv[i] = w_final[wbase + i] * static_cast<T>((float)outv[i] * inv4);
+                postNorm[base + i] = postv[i];
+            }
+            quad_sums[lid] = postv[0] + postv[1] + postv[2] + postv[3];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if ((lid % 16) == 0) {
+                float s = 0.0f;
+                for (uint c = 0; c < 8; ++c) {
+                    const uint q = lid + c * 2;
+                    s += quad_sums[q];
+                    s += quad_sums[q + 1];
+                }
+                xSums[row * 44 + lid / 16] = s;
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    static func tailFinalHeadSums(
+        mlpOut: MLXArray, expertOut: MLXArray, residual: MLXArray,
+        w1: MLXArray, w2: MLXArray, w3: MLXArray, layerScalar: MLXArray,
+        finalNormWeight: MLXArray, eps: Float
+    ) -> (out: MLXArray, postNorm: MLXArray, sums: Gemma4MMAQuantizedGEMV.ActivationSums)? {
+        guard Gemma4MMAQuantizedGEMV.consumesActivationSums,
+            admits(mlpOut, weight: w1, eps: eps),
+            expertOut.shape == mlpOut.shape, expertOut.dtype == .bfloat16,
+            residual.shape == mlpOut.shape, residual.dtype == .bfloat16,
+            w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16,
+            w3.ndim == 1, w3.dim(0) == axis, w3.dtype == .bfloat16,
+            layerScalar.size == 1, layerScalar.dtype == .bfloat16,
+            finalNormWeight.ndim == 1, finalNormWeight.dim(0) == axis,
+            finalNormWeight.dtype == .bfloat16
+        else { return nil }
+        CBv2EngageMark.once("glue-tail-final-head-xsum")
+        let outs = tailFinalHeadSumsKernel(
+            [mlpOut, expertOut, residual, w1, w2, w3, layerScalar, finalNormWeight],
+            template: [("T", mlpOut.dtype)],
+            grid: (rows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: [
+                [rows, 1, axis],
+                [rows, 1, axis],
+                [rows * (axis / 64)],
+            ],
+            outputDTypes: [.bfloat16, .bfloat16, .float32]
+        )
+        guard let sums = Gemma4MMAQuantizedGEMV.activationSums(
+            produced: outs[2], for: outs[1])
+        else { return nil }
+        return (outs[0], outs[1], sums)
+    }
 
     static func tailChained(
         mlpOut: MLXArray, expertOut: MLXArray, residual: MLXArray,
@@ -3043,29 +3062,6 @@ private enum Gemma4ZipRouterV1 {
         let topKWeights: MLXArray
     }
 
-    /// PREFIX-001 admission lives beside the ZIP admission so the eager
-    /// custom producer is never built unless this exact consumer will use all
-    /// of its outputs.
-    static func makeAttentionBranchPrefix(
-        router: Gemma4Router,
-        attn: MLXArray,
-        residual: MLXArray,
-        postAttentionWeight: MLXArray,
-        denseWeight: MLXArray,
-        expertWeight: MLXArray,
-        eps: Float
-    ) -> Gemma4FusedLayerGlue.AttentionBranchPrefix? {
-        guard enabled, router.zipAdmits else { return nil }
-        return Gemma4FusedLayerGlue.attentionBranchPrefix(
-            attn: attn,
-            residual: residual,
-            postAttentionWeight: postAttentionWeight,
-            denseWeight: denseWeight,
-            expertWeight: expertWeight,
-            routerWeight: router.zipEffectiveScale(),
-            eps: eps)
-    }
-
     static func run(
         router: Gemma4Router,
         mlp: Gemma4MLP,
@@ -3073,7 +3069,7 @@ private enum Gemma4ZipRouterV1 {
         w1: MLXArray,
         w2: MLXArray,
         eps: Float,
-        prefix: Gemma4FusedLayerGlue.AttentionBranchPrefix? = nil
+        prenorms: (n1: MLXArray, n2: MLXArray, sums: CBv2DenseMLPQMVV1.ActivationSums?)? = nil
     ) -> Zipped? {
         // Pure shape predicate first: no graph node exists until every pin
         // below holds, so prefill, MTP rectangles and any other cohort walk
@@ -3089,17 +3085,16 @@ private enum Gemma4ZipRouterV1 {
         let n1: MLXArray
         let n2: MLXArray
         let producerSums: CBv2DenseMLPQMVV1.ActivationSums?
-        let carriedRouterNorm: MLXArray?
-        if let prefix, prefix.out === out {
-            (n1, n2, producerSums, carriedRouterNorm) = (
-                prefix.denseNorm,
-                 prefix.expertNorm,
-                 prefix.denseSums,
-                 prefix.routerNorm)
-        } else if let (d1, d2, dSums) = Gemma4FusedLayerGlue.dualPreNorm(
+        if let p = prenorms {
+            n1 = p.n1
+            n2 = p.n2
+            producerSums = p.sums
+        } else if let (pn1, pn2, psums) = Gemma4FusedLayerGlue.dualPreNorm(
             x: out, w1: w1, w2: w2, eps: eps)
         {
-            (n1, n2, producerSums, carriedRouterNorm) = (d1, d2, dSums, nil)
+            n1 = pn1
+            n2 = pn2
+            producerSums = psums
         } else {
             return nil
         }
@@ -3110,7 +3105,7 @@ private enum Gemma4ZipRouterV1 {
         // dual pre-norm arrays unreferenced, so MLX never evaluates them and
         // the caller's stock path rebuilds the identical pair.
         guard let sums = producerSums ?? mlp.zipActivationSums(n1) else { return nil }
-        let normed = carriedRouterNorm ?? router.zipNorm(out)
+        let normed = router.zipNorm(out)
 
         // Stage 2: router QMV | dense gate + up.
         let expertScores = router.zipScores(
@@ -3268,7 +3263,7 @@ public class Gemma4DecoderLayer: Module {
         isExpertPrefill: Bool = false,
         glueChain: Gemma4GlueChainBox? = nil,
         nextInputLayernormWeight: MLXArray? = nil,
-        enableAttentionBranchPrefix: Bool = false
+        finalHeadNormWeight: MLXArray? = nil
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         // Prompt-path narrowing (CBv2 only): attention and every K/V write
         // still cover the full chunk; only the token-local work AFTER
@@ -3314,27 +3309,25 @@ public class Gemma4DecoderLayer: Module {
             h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset,
             v2SharedSource: v2SharedSource, outputStart: outputStart,
             useLastQueryPrefill: useLastQueryPrefill)
-        // PREFIX-001: only build the joined producer when the ZIP consumer is
-        // guaranteed to accept it. A nil leaves the established attention
-        // residual and branch pre-norm paths untouched.
-        let attentionBranchPrefix: Gemma4FusedLayerGlue.AttentionBranchPrefix? = {
-            guard enableAttentionBranchPrefix,
-                isMoE, let router, let preFeedforwardLayernorm2
-            else {
-                return nil
-            }
-            return Gemma4ZipRouterV1.makeAttentionBranchPrefix(
-                router: router,
-                attn: attnOut,
-                residual: residual,
-                postAttentionWeight: postAttentionLayernorm.weight,
-                denseWeight: preFeedforwardLayernorm.weight,
-                expertWeight: preFeedforwardLayernorm2.weight,
-                eps: config.rmsNormEps)
-        }()
         var out: MLXArray
-        if let attentionBranchPrefix {
-            out = attentionBranchPrefix.out
+        var prenormN1: MLXArray?
+        var prenormN2: MLXArray?
+        var prenormSums: CBv2DenseMLPQMVV1.ActivationSums?
+
+        if isMoE,
+            let preFeedforwardLayernorm2,
+            let fusedPre = Gemma4FusedLayerGlue.normResidualDualPreNorm(
+                attnOut: attnOut,
+                residual: residual,
+                postAttnWeight: postAttentionLayernorm.weight,
+                preFFLN1Weight: preFeedforwardLayernorm.weight,
+                preFFLN2Weight: preFeedforwardLayernorm2.weight,
+                eps: config.rmsNormEps)
+        {
+            out = fusedPre.out
+            prenormN1 = fusedPre.n1
+            prenormN2 = fusedPre.n2
+            prenormSums = fusedPre.sums
         } else if let fusedOut = Gemma4FusedLayerGlue.normResidual(
             x: attnOut, residual: residual,
             weight: postAttentionLayernorm.weight, eps: config.rmsNormEps)
@@ -3372,6 +3365,10 @@ public class Gemma4DecoderLayer: Module {
             // Dense + sparse branches in parallel, summed into one residual.
             let h1Raw: MLXArray
             let h2Raw: MLXArray
+            let prenorms: (n1: MLXArray, n2: MLXArray, sums: CBv2DenseMLPQMVV1.ActivationSums?)? =
+                (prenormN1 != nil && prenormN2 != nil)
+                ? (n1: prenormN1!, n2: prenormN2!, sums: prenormSums) : nil
+
             // ZIP-ROUTER-001: emit the router chain and the dense chain
             // interleaved so the encoder pairs them into shared barrier
             // stages. Returns nil for every geometry but the pinned B=8
@@ -3383,7 +3380,7 @@ public class Gemma4DecoderLayer: Module {
                 w1: preFeedforwardLayernorm.weight,
                 w2: preFeedforwardLayernorm2.weight,
                 eps: config.rmsNormEps,
-                prefix: attentionBranchPrefix)
+                prenorms: prenorms)
             {
                 h1Raw = zipped.denseOut
                 h2Raw = experts(
@@ -3394,7 +3391,14 @@ public class Gemma4DecoderLayer: Module {
             } else {
                 let (topKIndices, topKWeights) = router(out)
 
-                if let (n1, n2, denseSums) = Gemma4FusedLayerGlue.dualPreNorm(
+                if let p = prenorms {
+                    h1Raw = mlp(p.n1, activationSums: p.sums)
+                    h2Raw = experts(
+                        p.n2,
+                        topKIndices: topKIndices,
+                        topKWeights: topKWeights,
+                        isExpertPrefill: isExpertPrefill)
+                } else if let (n1, n2, denseSums) = Gemma4FusedLayerGlue.dualPreNorm(
                     x: out,
                     w1: preFeedforwardLayernorm.weight,
                     w2: preFeedforwardLayernorm2.weight,
@@ -3445,6 +3449,21 @@ public class Gemma4DecoderLayer: Module {
             {
                 out = chained.out
                 chain.pending = (source: chained.out, normed: chained.normedNext)
+                tailApplied = true
+                scalarFolded = true
+            } else if canFoldScalar, let chain = glueChain,
+                let finalWeight = finalHeadNormWeight,
+                let finalHead = Gemma4FusedLayerGlue.tailFinalHeadSums(
+                    mlpOut: h1Raw, expertOut: h2Raw, residual: residual2,
+                    w1: postFeedforwardLayernorm1.weight,
+                    w2: postFeedforwardLayernorm2.weight,
+                    w3: postFeedforwardLayernorm.weight,
+                    layerScalar: layerScalar,
+                    finalNormWeight: finalWeight,
+                    eps: config.rmsNormEps)
+            {
+                out = finalHead.out
+                chain.finalHead = (source: finalHead.out, postNorm: finalHead.postNorm, sums: finalHead.sums)
                 tailApplied = true
                 scalarFolded = true
             } else if canFoldScalar,
@@ -4213,10 +4232,8 @@ public class Gemma4TextModelInner: Module {
                 glueChain: glueChain,
                 nextInputLayernormWeight: idx + 1 < layers.count
                     ? layers[idx + 1].inputLayernorm.weight : nil,
-                enableAttentionBranchPrefix:
-                    isCBv2 && !schedulePrefill
-                    && inputBatchSize == 8 && inputLength == 1
-                    && !capturePreNorm && dFlashHiddenCapture == nil
+                finalHeadNormWeight: (idx == layers.count - 1 && emitMMAHeadSums)
+                    ? norm.weight : nil
             )
             h = out
             intermediates[idx] = (kvPair, positionOffset)
@@ -4246,9 +4263,7 @@ public class Gemma4TextModelInner: Module {
                 isCBv2: isCBv2,
                 inputLength: inputLength,
                 layerNumber: layerNumber,
-                interval: gemma4EffectivePrefillChunkEvalLayers(
-                    configured: gemma4PrefillChunkEvalLayers,
-                    inputLength: inputLength))
+                interval: gemma4PrefillChunkEvalLayers)
             {
                 asyncEval(h)
                 CBv2StepProfiler.recordEvent("v2.gemma4.prefill.chunk_eval")
@@ -4258,6 +4273,13 @@ public class Gemma4TextModelInner: Module {
         let postNorm: MLXArray
         let mmaHeadSums: Gemma4MMAQuantizedGEMV.ActivationSums?
         if emitMMAHeadSums,
+            let finalHead = glueChain.finalHead,
+            finalHead.source === h
+        {
+            postNorm = finalHead.postNorm
+            mmaHeadSums = finalHead.sums
+            CBv2EngageMark.once("final-tail-head-xsum")
+        } else if emitMMAHeadSums,
             let produced = Gemma4FinalNormMMAHeadSumsV1.apply(
                 h, weight: norm.weight, eps: norm.eps)
         {

@@ -52,43 +52,6 @@ enum CBv2AttentionV1 {
         return value
     }()
 
-    /// Query-block width used when a prompt pass is already on the blocked
-    /// path and the layer's heads are wide (head dim 256 or 512). Wide heads
-    /// do not enter the fused SDPA path, so a blocked prompt pass materializes
-    /// one score rectangle per block; a narrower block holds a smaller
-    /// rectangle. Only the grouping of the query rows changes: every row's
-    /// softmax reduction still runs over the whole key axis, in the same
-    /// order, so the produced values are unchanged.
-    ///
-    /// `0` disables the specialization (the block width falls back to
-    /// `queryBlockSize`), which is the kill switch.
-    static let wideHeadQueryBlockSize: Int = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_ATTN_QUERY_BLOCK_WIDE"],
-            let value = Int(raw), value >= 0
-        else { return 64 }
-        return value
-    }()
-
-    /// Block width for one attention call: the wide-head width when the call
-    /// is on the blocked-query prompt path (`L > queryBlockSize`) and the
-    /// layer's head dim is 256 or 512; the configured width otherwise. Decode
-    /// has `L == 1` and can never enter. An explicit
-    /// `DARKBLOOM_CBV2_ATTN_QUERY_BLOCK` override that moves the configured
-    /// width off its default also returns the configured width.
-    @inline(__always)
-    private static func effectiveQueryBlockSize(
-        kind: CBv2LayerKind, queryLength: Int
-    ) -> Int {
-        guard queryBlockSize == 128,
-            wideHeadQueryBlockSize > 0,
-            wideHeadQueryBlockSize < queryBlockSize,
-            queryLength > queryBlockSize,
-            kind.headDim == 256 || kind.headDim == 512
-        else { return queryBlockSize }
-        return wideHeadQueryBlockSize
-    }
-
     /// Ceiling, in MiB, on the K+V a PACKED prefill may restack on the batch
     /// axis for one batched SDPA (`batchedPackedAttention`).
     ///
@@ -621,12 +584,11 @@ enum CBv2AttentionV1 {
         spanContext: CBv2SpanChunkContext?
     ) -> MLXArray {
         let L = queries.dim(2)
-        let blockSize = effectiveQueryBlockSize(kind: kind, queryLength: L)
-        if blockSize > 0 && L > blockSize && !kind.isBidirectional {
+        if shouldBlockQueries(L) && !kind.isBidirectional {
             return attendQueryBlocks(
                 queries: queries, keys: cachedKeys, values: cachedValues,
                 newTokenCount: L, window: window, scale: scale,
-                sinks: sinks, softcap: softcap, blockSize: blockSize,
+                sinks: sinks, softcap: softcap, blockSize: queryBlockSize,
                 spanContext: spanContext)
         }
         if let spanContext {
@@ -942,12 +904,11 @@ enum CBv2AttentionV1 {
     ) -> MLXArray {
         let L = queries.dim(2)
         let (cachedKeys, cachedValues) = chunkBorrowViews(of: sourceRow)
-        let blockSize = effectiveQueryBlockSize(kind: sourceKind, queryLength: L)
-        if blockSize > 0 && L > blockSize && !sourceKind.isBidirectional {
+        if shouldBlockQueries(L) && !sourceKind.isBidirectional {
             return attendQueryBlocks(
                 queries: queries, keys: cachedKeys, values: cachedValues,
                 newTokenCount: L, window: window(of: sourceKind), scale: scale,
-                sinks: sinks, softcap: softcap, blockSize: blockSize,
+                sinks: sinks, softcap: softcap, blockSize: queryBlockSize,
                 spanContext: spanContext)
         }
         if let spanContext {

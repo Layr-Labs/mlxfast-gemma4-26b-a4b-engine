@@ -52,6 +52,22 @@ enum CBv2AttentionV1 {
         return value
     }()
 
+    /// The pinned Gemma 4 cohort prompt benefits from a narrower block than
+    /// the general serving default. Keep the public/default knob at 128 (and
+    /// preserve every explicit environment override), but specialize the exact
+    /// 1024-token, 16q/8kv-head Gemma geometry to 64. Decode has L == 1 and can
+    /// never enter. Other models and prompt lengths retain the configured size.
+    @inline(__always)
+    private static func effectiveQueryBlockSize(
+        kind: CBv2LayerKind, queryLength: Int
+    ) -> Int {
+        guard queryBlockSize == 128, queryLength == 1024,
+            kind.queryHeads == 16, kind.kvHeads == 8,
+            kind.headDim == 256 || kind.headDim == 512
+        else { return queryBlockSize }
+        return 64
+    }
+
     /// Ceiling, in MiB, on the K+V a PACKED prefill may restack on the batch
     /// axis for one batched SDPA (`batchedPackedAttention`).
     ///
@@ -584,11 +600,12 @@ enum CBv2AttentionV1 {
         spanContext: CBv2SpanChunkContext?
     ) -> MLXArray {
         let L = queries.dim(2)
-        if shouldBlockQueries(L) && !kind.isBidirectional {
+        let blockSize = effectiveQueryBlockSize(kind: kind, queryLength: L)
+        if blockSize > 0 && L > blockSize && !kind.isBidirectional {
             return attendQueryBlocks(
                 queries: queries, keys: cachedKeys, values: cachedValues,
                 newTokenCount: L, window: window, scale: scale,
-                sinks: sinks, softcap: softcap, blockSize: queryBlockSize,
+                sinks: sinks, softcap: softcap, blockSize: blockSize,
                 spanContext: spanContext)
         }
         if let spanContext {
@@ -904,11 +921,12 @@ enum CBv2AttentionV1 {
     ) -> MLXArray {
         let L = queries.dim(2)
         let (cachedKeys, cachedValues) = chunkBorrowViews(of: sourceRow)
-        if shouldBlockQueries(L) && !sourceKind.isBidirectional {
+        let blockSize = effectiveQueryBlockSize(kind: sourceKind, queryLength: L)
+        if blockSize > 0 && L > blockSize && !sourceKind.isBidirectional {
             return attendQueryBlocks(
                 queries: queries, keys: cachedKeys, values: cachedValues,
                 newTokenCount: L, window: window(of: sourceKind), scale: scale,
-                sinks: sinks, softcap: softcap, blockSize: queryBlockSize,
+                sinks: sinks, softcap: softcap, blockSize: blockSize,
                 spanContext: spanContext)
         }
         if let spanContext {

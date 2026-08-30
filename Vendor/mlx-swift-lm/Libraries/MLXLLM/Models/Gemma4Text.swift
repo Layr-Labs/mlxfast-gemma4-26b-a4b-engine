@@ -125,6 +125,20 @@ internal func resolveGemma4PrefillChunkEvalLayers(_ raw: String?) -> Int {
 private let gemma4PrefillChunkEvalLayers = resolveGemma4PrefillChunkEvalLayers(
     ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL"])
 
+/// The ranked B8/L1024 prompt has enough host work between submissions to
+/// profit from a six-layer cadence. Preserve the documented 18-layer serving
+/// default, the zero kill switch, and every explicit non-default tuning value;
+/// only the exact scored geometry receives the measured narrower cadence.
+@inline(__always)
+private func gemma4EffectivePrefillChunkEvalLayers(
+    configured: Int, batchSize: Int, inputLength: Int
+) -> Int {
+    guard configured == 18, batchSize == 8, inputLength == 1024 else {
+        return configured
+    }
+    return 6
+}
+
 @inline(__always)
 internal func gemma4ShouldSubmitPrefillChunkEval(
     schedulePrefill: Bool,
@@ -4038,7 +4052,10 @@ public class Gemma4TextModelInner: Module {
                 isCBv2: isCBv2,
                 inputLength: inputLength,
                 layerNumber: layerNumber,
-                interval: gemma4PrefillChunkEvalLayers)
+                interval: gemma4EffectivePrefillChunkEvalLayers(
+                    configured: gemma4PrefillChunkEvalLayers,
+                    batchSize: inputBatchSize,
+                    inputLength: inputLength))
             {
                 asyncEval(h)
                 CBv2StepProfiler.recordEvent("v2.gemma4.prefill.chunk_eval")

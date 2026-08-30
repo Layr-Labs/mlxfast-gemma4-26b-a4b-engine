@@ -1281,6 +1281,9 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
         // Apply weights.
         let params = ModuleParameters.unflattened(sanitized)
         try drafter.update(parameters: params, verify: [.all])
+        if document.baseConfiguration.perLayerQuantization == nil {
+            quantize(model: drafter, groupSize: 64, bits: 8) { _, _ in true }
+        }
         eval(drafter)
 
         return drafter

@@ -90,40 +90,6 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         return min(8, stockBlocks)
     }()
 
-    /// Attribution: COMBINE-PACK-001 and COMBINE-HOIST-001 below are adapted
-    /// from samfenwick's public Yukon submission
-    /// `0ca873cb-d1b3-43e0-b75d-88d49c206812` (`3dcce32`). That sealed run
-    /// passed parity and measured the fastest absolute decode window among the
-    /// recent public candidates (2.085229 seconds).
-    /// Off-cadence retest: the first stacked run also passed parity and kept
-    /// 13.871 ms of absolute decode gain, but missed promotion after its paired
-    /// serial prefill control shifted by 25.274 ms versus the record run.
-    ///
-    /// COMBINE-PACK-001: how many partition columns one simdgroup of the merge
-    /// dispatch carries.
-    ///
-    /// The merge indexes a partition column with a lane, so with the partition
-    /// PARTITION-002 settled on it runs eight live lanes and twenty-four dead
-    /// ones in every simdgroup of every threadgroup. Packing `32 / COLS`
-    /// output groups into the one simdgroup fills those lanes instead. It is
-    /// the same reduction over the same columns in the same order, so the
-    /// merge is unchanged arithmetically; only the lane a column lands on and
-    /// the number of threads launched move.
-    ///
-    /// At a partition of a simdgroup or wider this is `32`, `sets` is one and
-    /// the packing is the incumbent one thread per column, so the stock
-    /// partitions and the `DARKBLOOM_CBV2_2PASS_BLOCKS` bisection route keep
-    /// the shape they had.
-    private static let combineColumns: Int = {
-        let capped = min(blocks, 32)
-        return capped > 0 && (capped & (capped - 1)) == 0 ? capped : 32
-    }()
-
-    /// Output groups per simdgroup. `D / values_per_lane` is always 32, so the
-    /// merge needs `32 / combineSets` simdgroups to cover the head.
-    private static let combineSets = 32 / combineColumns
-    private static let combineThreads = (32 / combineSets) * 32
-
     private static let passAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "cbv2_ragged8_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v1",
         inputNames: [
@@ -422,29 +388,22 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     )
 
     private static let passBKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name:
-            "cbv2_ragged8_sdpa_2pass_b_direct_bf16_d256_b\(blocks)"
-            + "_c\(combineColumns)_v5",
+        name: "cbv2_ragged8_sdpa_2pass_b_direct_bf16_d256_b\(blocks)_v3",
         inputNames: ["partials", "sums", "maxs"],
         outputNames: ["out"],
         source: """
             constexpr int simd_width = 32;
             constexpr int values_per_lane = D / simd_width;
-            // COMBINE-PACK-001: a lane owns one partition column of one output
-            // group, and a simdgroup carries `sets` output groups side by
-            // side. COLS is min(BLOCKS, simd_width) rounded to a power of two,
-            // so every lane holds a live column and the surplus-lane guard
-            // below is the constant true whenever the partition fits a
-            // simdgroup. At COLS == simd_width this is the incumbent one
-            // output group per simdgroup, one column per lane.
-            constexpr int sets = simd_width / COLS;
-            constexpr int rounds = (BLOCKS + COLS - 1) / COLS;
+            // One lane per partition column, so a partition narrower than a
+            // simdgroup parks the surplus lanes on the identity of each
+            // reduction rather than dropping columns. At BLOCKS >= simd_width
+            // every lane is live in every round and the guard is the constant
+            // true, which leaves the arithmetic and its order untouched.
+            constexpr int rounds = (BLOCKS + simd_width - 1) / simd_width;
 
             const int batch_head = int(threadgroup_position_in_grid.x);
-            const int lane = int(thread_index_in_simdgroup);
-            const int block_lane = lane % COLS;
-            const int output_group =
-                int(simdgroup_index_in_threadgroup) * sets + lane / COLS;
+            const int output_group = int(simdgroup_index_in_threadgroup);
+            const int block_lane = int(thread_index_in_simdgroup);
 
             partials += batch_head * BLOCKS * D
                 + output_group * values_per_lane;
@@ -456,47 +415,29 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             for (int element = 0; element < values_per_lane; ++element) {
                 accumulator[element] = 0.0f;
             }
-            // COMBINE-HOIST-001: a lane's column summaries are invariant
-            // across the three passes below, and its rescale factor is
-            // invariant across the last two. The incumbent re-read `maxs`
-            // three times and `sums` once, and evaluated the same
-            // `fast::exp` twice per column. Each is kept in a register
-            // instead. `rounds` is a compile-time constant, so these are
-            // named registers rather than an indexed stack array.
-            thread float lane_max[rounds];
-            thread float lane_sum[rounds];
-            thread float lane_factor[rounds];
             float sum_exp_score = 0.0f;
             float max_score = -3.402823466e+38F;
             for (int round = 0; round < rounds; ++round) {
-                const int column = block_lane + COLS * round;
-                const bool live = column < BLOCKS;
-                lane_max[round] = live ? maxs[column] : -3.402823466e+38F;
-                lane_sum[round] = live ? sums[column] : 0.0f;
-                max_score = max(max_score, lane_max[round]);
-            }
-            // The columns of one output group sit on the contiguous lane run
-            // [set * COLS, set * COLS + COLS), so an ascending xor butterfly
-            // bounded at COLS never leaves the set. It is the same tree the
-            // full-width reduction ran over the live columns, with the rounds
-            // that only folded in the identity dropped.
-            for (int stride = 1; stride < COLS; stride <<= 1) {
-                max_score =
-                    max(max_score, simd_shuffle_xor(max_score, ushort(stride)));
-            }
-
-            for (int round = 0; round < rounds; ++round) {
-                lane_factor[round] = fast::exp(lane_max[round] - max_score);
-                sum_exp_score += lane_factor[round] * lane_sum[round];
-            }
-            for (int stride = 1; stride < COLS; stride <<= 1) {
-                sum_exp_score += simd_shuffle_xor(sum_exp_score, ushort(stride));
-            }
-
-            for (int round = 0; round < rounds; ++round) {
-                const int column = block_lane + COLS * round;
+                const int column = block_lane + simd_width * round;
                 if (column < BLOCKS) {
-                    const float factor = lane_factor[round];
+                    max_score = max(max_score, maxs[column]);
+                }
+            }
+            max_score = simd_max(max_score);
+
+            for (int round = 0; round < rounds; ++round) {
+                const int column = block_lane + simd_width * round;
+                if (column < BLOCKS) {
+                    sum_exp_score +=
+                        fast::exp(maxs[column] - max_score) * sums[column];
+                }
+            }
+            sum_exp_score = simd_sum(sum_exp_score);
+
+            for (int round = 0; round < rounds; ++round) {
+                const int column = block_lane + simd_width * round;
+                if (column < BLOCKS) {
+                    const float factor = fast::exp(maxs[column] - max_score);
                     for (int element = 0; element < values_per_lane; ++element) {
                         accumulator[element] +=
                             factor * float(partials[column * D + element]);
@@ -505,10 +446,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             }
 
             for (int element = 0; element < values_per_lane; ++element) {
-                float reduced = accumulator[element];
-                for (int stride = 1; stride < COLS; stride <<= 1) {
-                    reduced += simd_shuffle_xor(reduced, ushort(stride));
-                }
+                const float reduced = simd_sum(accumulator[element]);
                 if (block_lane == 0) {
                     out[element] = T(
                         sum_exp_score == 0.0f
@@ -622,10 +560,9 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 ("T", queries.dtype),
                 ("D", headDim),
                 ("BLOCKS", blocks),
-                ("COLS", combineColumns),
             ],
-            grid: (batch * queryHeads * combineThreads, 1, 1),
-            threadGroup: (combineThreads, 1, 1),
+            grid: (batch * queryHeads * 1024, 1, 1),
+            threadGroup: (1024, 1, 1),
             outputShapes: [[batch, queryHeads, 1, headDim]],
             outputDTypes: [.bfloat16]
         )[0]
@@ -684,10 +621,9 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 ("T", queries.dtype),
                 ("D", headDim),
                 ("BLOCKS", blocks),
-                ("COLS", combineColumns),
             ],
-            grid: (batch * queryHeads * combineThreads, 1, 1),
-            threadGroup: (combineThreads, 1, 1),
+            grid: (batch * queryHeads * 1024, 1, 1),
+            threadGroup: (1024, 1, 1),
             outputShapes: [[batch, queryHeads, 1, headDim]],
             outputDTypes: [.bfloat16]
         )[0]

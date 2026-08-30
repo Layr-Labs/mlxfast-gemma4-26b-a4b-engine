@@ -4,9 +4,9 @@
 // Consumes the transformed [B, vocab] logits produced by
 // `LogitsPipelineV2.process` and returns one token per row [B].
 //
-//  - All-greedy fast path: an exact tiled argmax for large vocabularies,
-//    with the stock `argMax` fallback, when every row is greedy
-//    (temperature < 1e-5).
+//  - All-greedy fast path: a single `argMax` when every row is greedy
+//    (temperature < 1e-5), matching the legacy vectorized greedy path
+//    bit for bit.
 //  - Mixed batches: Gumbel-max via the exponential-noise race
 //    (`argmax(probs / e)`, e ~ Exp(1)) so there is no multinomial and no
 //    host sync. Greedy and sampled picks are merged with a per-row
@@ -87,13 +87,12 @@ public final class SamplerV2 {
             logits.dim(0) == rows.count,
             "logits rows (\(logits.dim(0))) != configured rows (\(rows.count)) — call setRows")
 
-        // The pipeline, grammar and raw-logprob capture already ran before
-        // this boundary. Change only how a large all-greedy axis is reduced.
-        if allGreedy {
-            return CBv2ParallelArgMaxV1.apply(logits)
-                ?? argMax(logits, axis: -1).asType(.int32)
-        }
+        // Fast path: every row greedy ⇒ one argMax, bit-identical to the
+        // legacy vectorized greedy decode.
         let greedyTokens = argMax(logits, axis: -1).asType(.int32)
+        if allGreedy {
+            return greedyTokens
+        }
 
         // Mixed batch: exponential-race Gumbel-max. probs/e keeps masked
         // tokens (-inf logits → probability 0) unreachable, and argmax of

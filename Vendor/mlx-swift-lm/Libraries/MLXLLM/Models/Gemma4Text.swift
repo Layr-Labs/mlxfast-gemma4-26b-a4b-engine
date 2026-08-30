@@ -901,6 +901,13 @@ private let gemma4QKVNormRopeEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+private let gemma4QKVInputReg4Enabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_QKV_INPUT_REG4"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 private let gemma4QKVNormKernel = MLXFast.metalKernel(
     name: "gemma4_b8_qkv_rms_norm_rope_v2",
     inputNames: [
@@ -945,9 +952,12 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
             shared_value_output += local_row * D + lid * reads;
         }
 
+        thread T held[reads];
         float sum = 0.0f;
         for (uint i = 0; i < reads; ++i) {
-            const float value = float(input[i]);
+            const T raw = input[i];
+            if (RETAIN_INPUT) held[i] = raw;
+            const float value = float(raw);
             sum += value * value;
         }
         sum = simd_sum(sum);
@@ -969,7 +979,8 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
 
         for (uint i = 0; i < reads; ++i) {
             const uint element = lid * reads + i;
-            const T normalized = T(float(input[i]) * inverse_rms);
+            const T raw = RETAIN_INPUT ? held[i] : input[i];
+            const T normalized = T(float(raw) * inverse_rms);
             if (APPLY_ROPE && weighted) {
                 // Reproduce the separate norm kernel's BF16 output-store
                 // boundary before any RoPE arithmetic reads the value.
@@ -1455,6 +1466,7 @@ private func gemma4FusedQKVNorm(
             ("Q_HEADS", 16), ("K_HEADS", k.dim(2)),
             ("KEY_VALUE_SHARED", keyValueShared), ("APPLY_ROPE", fusedRope),
             ("USE_FREQS", ropeParameters.usesFrequencies),
+            ("RETAIN_INPUT", gemma4QKVInputReg4Enabled),
         ],
         grid: (normRows * threads, 1, 1), threadGroup: (threads, 1, 1),
         outputShapes: fusedRope
@@ -2392,11 +2404,9 @@ public final class Gemma4GlueChainBox {
     public init() {}
 }
 
-/// GLUE-001: fused B8/L1 layer glue. Three single-dispatch kernels
+/// GLUE-001: fused decode-plane layer glue. Three single-dispatch kernels
 /// replace the strictly SERIAL RMSNorm/add chains between the layer's matmuls
-/// at the exact ranked decode geometry ([8, 1, 2816] bfloat16). These
-/// shape-based gates also admit eligible final-prefill tails narrowed to
-/// the same geometry:
+/// at the exact ranked decode geometry ([8, 1, 2816] bfloat16):
 ///
 ///   1. `dualPreNorm` — `preFeedforwardLayernorm(out)` and
 ///      `preFeedforwardLayernorm2(out)` norm the SAME tensor; one reduction
@@ -2423,17 +2433,6 @@ private enum Gemma4FusedLayerGlue {
     static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_FUSED_LAYER_GLUE"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
-    /// Pair only the two independent branch reductions in the existing
-    /// [8, 1, 2816] tails. The shape gate includes decode and eligible final
-    /// prefill tails narrowed to L=1. Disabling this selects their unchanged
-    /// original kernels.
-    private static let pairedRmsEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_DECODE_PAIRED_RMS"]
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
@@ -2468,67 +2467,6 @@ private enum Gemma4FusedLayerGlue {
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
         """
-    }
-
-    /// Same independent trees as prefill's glue_inv_rms2: four ordered
-    /// squares per input, the original SIMD and cross-SIMD sums, then precise
-    /// rsqrt. Share three barriers instead of running two three-barrier
-    /// reductions. Keep the widened BF16 values for the following norm step.
-    private static let pairedRmsSource = """
-        float av[4];
-        float bv[4];
-        threadgroup float local_sums_b[32];
-        {
-            float acc_a = 0;
-            float acc_b = 0;
-            for (int i = 0; i < 4; i++) {
-                av[i] = (float)a[base + i];
-                bv[i] = (float)b[base + i];
-                acc_a += av[i] * av[i];
-                acc_b += bv[i] * bv[i];
-            }
-            acc_a = simd_sum(acc_a);
-            acc_b = simd_sum(acc_b);
-            if (simd_group_id == 0) {
-                local_sums[simd_lane_id] = 0;
-                local_sums_b[simd_lane_id] = 0;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_lane_id == 0) {
-                local_sums[simd_group_id] = acc_a;
-                local_sums_b[simd_group_id] = acc_b;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_group_id == 0) {
-                acc_a = simd_sum(local_sums[simd_lane_id]);
-                acc_b = simd_sum(local_sums_b[simd_lane_id]);
-                if (simd_lane_id == 0) {
-                    local_inv[0] = metal::precise::rsqrt(acc_a / 2816.0f + 1e-06f);
-                    local_inv[1] = metal::precise::rsqrt(acc_b / 2816.0f + 1e-06f);
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        """
-
-    /// Derive both variants from the complete incumbent tail sources. Only
-    /// the first two reductions and their later device reloads are replaced;
-    /// every BF16 norm/product/add and the remaining reductions stay intact.
-    private static func pairedRmsTailSource(_ source: String) -> String {
-        var result = source
-        func replaceOnce(_ old: String, with new: String) {
-            precondition(result.components(separatedBy: old).count == 2)
-            result = result.replacingOccurrences(of: old, with: new)
-        }
-        replaceOnce(rmsReduce("a", into: "local_inv[0]"), with: pairedRmsSource)
-        replaceOnce(rmsReduce("b", into: "local_inv[1]"), with: "")
-        replaceOnce(
-            "const T h1 = w1[wbase + i] * static_cast<T>((float)a[base + i] * inv1);",
-            with: "const T h1 = w1[wbase + i] * static_cast<T>(av[i] * inv1);")
-        replaceOnce(
-            "const T h2 = w2[wbase + i] * static_cast<T>((float)b[base + i] * inv2);",
-            with: "const T h2 = w2[wbase + i] * static_cast<T>(bv[i] * inv2);")
-        return result
     }
 
     private static let normResidualKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
@@ -2637,7 +2575,11 @@ private enum Gemma4FusedLayerGlue {
         ensureRowContiguous: true
     )
 
-    private static let tailSource = """
+    private static let tailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_glue_tail_2816_bf16_v2",
+        inputNames: ["a", "b", "res", "w1", "w2", "w3", "s"],
+        outputNames: ["out"],
+        source: """
             const uint row = threadgroup_position_in_grid.x;
             const uint lid = thread_position_in_threadgroup.x;
             const uint simd_lane_id = thread_index_in_simdgroup;
@@ -2671,21 +2613,7 @@ private enum Gemma4FusedLayerGlue {
                 const T summed = res[base + i] + normed;
                 out[base + i] = summed * scalar;
             }
-        """
-
-    private static let tailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_2816_bf16_v2",
-        inputNames: ["a", "b", "res", "w1", "w2", "w3", "s"],
-        outputNames: ["out"],
-        source: tailSource,
-        ensureRowContiguous: true
-    )
-
-    private static let pairedTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_paired_rms_2816_bf16_v1",
-        inputNames: ["a", "b", "res", "w1", "w2", "w3", "s"],
-        outputNames: ["out"],
-        source: pairedRmsTailSource(tailSource),
+        """,
         ensureRowContiguous: true
     )
 
@@ -2808,7 +2736,11 @@ private enum Gemma4FusedLayerGlue {
     /// reduction instead of a standalone serial dispatch plus a full re-read
     /// of the row. The normed output replicates the stock rms sequence over
     /// the exact stored bf16 output values.
-    private static let tailChainSource = """
+    private static let tailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_glue_tail_chain_2816_bf16_v1",
+        inputNames: ["a", "b", "res", "w1", "w2", "w3", "s", "wn"],
+        outputNames: ["out", "normed"],
+        source: """
             const uint row = threadgroup_position_in_grid.x;
             const uint lid = thread_position_in_threadgroup.x;
             const uint simd_lane_id = thread_index_in_simdgroup;
@@ -2846,21 +2778,7 @@ private enum Gemma4FusedLayerGlue {
                 normed[base + i] =
                     wn[wbase + i] * static_cast<T>((float)outv[i] * inv4);
             }
-        """
-
-    private static let tailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_chain_2816_bf16_v1",
-        inputNames: ["a", "b", "res", "w1", "w2", "w3", "s", "wn"],
-        outputNames: ["out", "normed"],
-        source: tailChainSource,
-        ensureRowContiguous: true
-    )
-
-    private static let pairedTailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_chain_paired_rms_2816_bf16_v1",
-        inputNames: ["a", "b", "res", "w1", "w2", "w3", "s", "wn"],
-        outputNames: ["out", "normed"],
-        source: pairedRmsTailSource(tailChainSource),
+        """,
         ensureRowContiguous: true
     )
 
@@ -3082,8 +3000,7 @@ private enum Gemma4FusedLayerGlue {
             nextInputNormWeight.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-tail-chain")
-        let selected = pairedRmsEnabled ? pairedTailChainKernel : tailChainKernel
-        let outs = selected(
+        let outs = tailChainKernel(
             [mlpOut, expertOut, residual, w1, w2, w3, layerScalar,
              nextInputNormWeight],
             template: [("T", mlpOut.dtype)],
@@ -3108,8 +3025,7 @@ private enum Gemma4FusedLayerGlue {
             layerScalar.size == 1, layerScalar.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-tail")
-        let selected = pairedRmsEnabled ? pairedTailKernel : tailKernel
-        return selected(
+        return tailKernel(
             [mlpOut, expertOut, residual, w1, w2, w3, layerScalar],
             template: [("T", mlpOut.dtype)],
             grid: (rows * tgThreads, 1, 1),

@@ -458,6 +458,233 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         ensureRowContiguous: true
     )
 
+    /// FUSE-001: does the merge fit inside the pass-A threadgroup?
+    ///
+    /// The two passes were split because the merge has to see every partition
+    /// column and the columns were separate threadgroups. Making them one
+    /// threadgroup costs `GQA * BLOCKS * D` BF16 of threadgroup memory and
+    /// `GQA * BLOCKS` simdgroups of width, both of which scale with the
+    /// partition. At the stock partition of 128 the staging alone is 128 KiB
+    /// and the launch is 8192 threads, so the split was forced. PARTITION-002
+    /// took the partition to 8, which puts the staging at 8 KiB and the launch
+    /// at 512 threads, and the split stops being forced.
+    ///
+    /// `DARKBLOOM_CBV2_FUSED_MERGE=0` returns the dispatch to the two-pass pair
+    /// on the same partition, so the fusion and the partition bisect
+    /// separately.
+    private static let fuseMerge: Bool = {
+        if let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_FUSED_MERGE"], let value = Int(raw)
+        {
+            return value != 0
+        }
+        return blocks > 0
+            && sequenceLength.isMultiple(of: blocks)
+            && 32 * gqa * blocks <= 1024
+            && gqa * blocks * headDim * 2 <= 32768
+    }()
+
+    /// `fusedRingPassAKernel` and `passBKernel` as ONE dispatch.
+    ///
+    /// The threadgroup is `(32, GQA, BLOCKS)`, so the partition columns that
+    /// used to be separate threadgroups on the grid's z axis are now
+    /// simdgroups of one threadgroup and the per-column partials never leave
+    /// the core. The accumulation half of the body is `fusedRingPassAKernel`
+    /// character for character, including the in-place ring write, the
+    /// `token == N - 1` substitution and the BF16 rounding of the partial; the
+    /// only change is that the partial is staged into threadgroup memory
+    /// instead of a device allocation.
+    ///
+    /// The merge half is `passBKernel`'s body run as a job loop. Pass B splits
+    /// its work into one simdgroup per `(batch_head, output_group)` and gives
+    /// each partition column one lane; this kernel has `GQA * BLOCKS`
+    /// simdgroups covering `GQA * (D / values_per_lane)` such jobs, so each one
+    /// runs the same lane assignment, the same `simd_max`, the same two
+    /// `simd_sum` reductions and the same final divide on the same values. It
+    /// is not a re-derivation of the merge, it is the merge, so the output is
+    /// bit-identical to the pair by construction rather than by tolerance.
+    private static let fusedRingSinglePassKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name:
+                "cbv2_ragged8_ringwrite_sdpa_fused_bf16_d256_g2_b\(blocks)_v1",
+            inputNames: [
+                "queries",
+                "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+                "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+                "starts", "new_keys", "new_values", "write_fence",
+            ],
+            outputNames: ["out", "fence"],
+            source: """
+                constexpr int simd_width = 32;
+                constexpr int values_per_lane = D / simd_width;
+                constexpr int output_groups = D / values_per_lane;
+                constexpr int merge_simdgroups = GQA * BLOCKS;
+                constexpr int merge_rounds =
+                    (BLOCKS + simd_width - 1) / simd_width;
+                static_assert((N & (N - 1)) == 0, "ring length must be a power of two");
+                static_assert(N % BLOCKS == 0, "every column walks the same slot count");
+                constexpr uint ring_mask = uint(N - 1);
+
+                threadgroup T staged_partials[GQA][BLOCKS][D];
+                threadgroup float staged_sums[GQA][BLOCKS];
+                threadgroup float staged_maxs[GQA][BLOCKS];
+
+                const int kv_head = int(threadgroup_position_in_grid.x);
+                const int batch_index = int(threadgroup_position_in_grid.y);
+                const int block = int(thread_position_in_threadgroup.z);
+                const int query_head_in_group = int(thread_position_in_threadgroup.y);
+                const int query_head = GQA * kv_head + query_head_in_group;
+                const int batch_head = batch_index * 16 + query_head;
+                const int lane = int(thread_index_in_simdgroup);
+
+                const device T* keys = k0;
+                const device T* values = v0;
+                switch (batch_index) {
+                    case 1: keys = k1; values = v1; break;
+                    case 2: keys = k2; values = v2; break;
+                    case 3: keys = k3; values = v3; break;
+                    case 4: keys = k4; values = v4; break;
+                    case 5: keys = k5; values = v5; break;
+                    case 6: keys = k6; values = v6; break;
+                    case 7: keys = k7; values = v7; break;
+                    default: break;
+                }
+
+                const device T* query =
+                    queries + batch_head * D + lane * values_per_lane;
+                keys += kv_head * N * D + lane * values_per_lane;
+                values += kv_head * N * D + lane * values_per_lane;
+                const device T* new_key = new_keys
+                    + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
+                const device T* new_value = new_values
+                    + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
+                const uint ring_start = starts[batch_index];
+                const uint write_slot = (ring_start + ring_mask) & ring_mask;
+                if (block == 0 && query_head_in_group == 0) {
+                    device T* write_key = const_cast<device T*>(keys) + write_slot * D;
+                    device T* write_value = const_cast<device T*>(values) + write_slot * D;
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        write_key[element] = new_key[element];
+                        write_value[element] = new_value[element];
+                    }
+                }
+                if (batch_index == 0 && kv_head == 0 && block == 0
+                    && query_head_in_group == 0 && lane == 0) {
+                    fence[0] = write_fence[0] + 1;
+                }
+
+                thread float q[values_per_lane];
+                thread float accumulator[values_per_lane];
+                for (int element = 0; element < values_per_lane; ++element) {
+                    q[element] = 1.0f * float(query[element]);
+                    accumulator[element] = 0.0f;
+                }
+
+                uint slot = (ring_start + uint(block)) & ring_mask;
+                float max_score = -3.402823466e+38F;
+                float sum_exp_score = 0.0f;
+                for (int token = block; token < N; token += BLOCKS) {
+                    const bool current = token == N - 1;
+                    const device T* k = current ? new_key : keys + slot * D;
+                    const device T* v = current ? new_value : values + slot * D;
+                    float score = 0.0f;
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        score += q[element] * float(k[element]);
+                    }
+                    score = simd_sum(score);
+
+                    const float new_max = max(max_score, score);
+                    const float old_factor = fast::exp(max_score - new_max);
+                    const float score_factor = fast::exp(score - new_max);
+                    max_score = new_max;
+                    sum_exp_score = sum_exp_score * old_factor + score_factor;
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        accumulator[element] = accumulator[element] * old_factor
+                            + score_factor * float(v[element]);
+                    }
+
+                    slot = (slot + uint(BLOCKS)) & ring_mask;
+                }
+
+                if (lane == 0) {
+                    staged_sums[query_head_in_group][block] = sum_exp_score;
+                    staged_maxs[query_head_in_group][block] = max_score;
+                }
+                threadgroup T* staged =
+                    &staged_partials[query_head_in_group][block][lane * values_per_lane];
+                for (int element = 0; element < values_per_lane; ++element) {
+                    staged[element] = T(accumulator[element]);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                // Pass B's body, once per (query head, output group) job. The
+                // job index is uniform across a simdgroup, so every `simd_max`
+                // and `simd_sum` below is reached by all 32 lanes.
+                const int merge_simdgroup = query_head_in_group + GQA * block;
+                const int block_lane = lane;
+                for (int job = merge_simdgroup; job < GQA * output_groups;
+                    job += merge_simdgroups) {
+                    const int merged_head_in_group = job / output_groups;
+                    const int output_group = job - merged_head_in_group * output_groups;
+                    const threadgroup T* partials =
+                        &staged_partials[merged_head_in_group][0]
+                            [output_group * values_per_lane];
+                    const threadgroup float* sums =
+                        &staged_sums[merged_head_in_group][0];
+                    const threadgroup float* maxs =
+                        &staged_maxs[merged_head_in_group][0];
+                    device T* merged_out = out
+                        + (batch_index * 16 + GQA * kv_head + merged_head_in_group) * D
+                        + output_group * values_per_lane;
+
+                    thread float merged[values_per_lane];
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        merged[element] = 0.0f;
+                    }
+                    float merged_sum = 0.0f;
+                    float merged_max = -3.402823466e+38F;
+                    for (int round = 0; round < merge_rounds; ++round) {
+                        const int column = block_lane + simd_width * round;
+                        if (column < BLOCKS) {
+                            merged_max = max(merged_max, maxs[column]);
+                        }
+                    }
+                    merged_max = simd_max(merged_max);
+
+                    for (int round = 0; round < merge_rounds; ++round) {
+                        const int column = block_lane + simd_width * round;
+                        if (column < BLOCKS) {
+                            merged_sum +=
+                                fast::exp(maxs[column] - merged_max) * sums[column];
+                        }
+                    }
+                    merged_sum = simd_sum(merged_sum);
+
+                    for (int round = 0; round < merge_rounds; ++round) {
+                        const int column = block_lane + simd_width * round;
+                        if (column < BLOCKS) {
+                            const float factor = fast::exp(maxs[column] - merged_max);
+                            for (int element = 0; element < values_per_lane; ++element) {
+                                merged[element] +=
+                                    factor * float(partials[column * D + element]);
+                            }
+                        }
+                    }
+
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        const float reduced = simd_sum(merged[element]);
+                        if (block_lane == 0) {
+                            merged_out[element] = T(
+                                merged_sum == 0.0f
+                                    ? reduced
+                                    : reduced / merged_sum);
+                        }
+                    }
+                }
+            """,
+            ensureRowContiguous: true
+        )
+
     static func attend(
         queries: MLXArray,
         keys: [MLXArray],
@@ -535,6 +762,25 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         }
 
         let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        if fuseMerge {
+            let fused = fusedRingSinglePassKernel(
+                [queries] + keys + values
+                    + [startArray, newKeys, newValues, previousWriteFence],
+                template: [
+                    ("T", queries.dtype),
+                    ("D", headDim),
+                    ("N", sequenceLength),
+                    ("GQA", gqa),
+                    ("KV_HEADS", kvHeads),
+                    ("BLOCKS", blocks),
+                ],
+                grid: (kvHeads * 32, batch * gqa, blocks),
+                threadGroup: (32, gqa, blocks),
+                outputShapes: [[batch, queryHeads, 1, headDim], [1]],
+                outputDTypes: [.bfloat16, .int32]
+            )
+            return (fused[0], fused[1])
+        }
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let passA = fusedRingPassAKernel(

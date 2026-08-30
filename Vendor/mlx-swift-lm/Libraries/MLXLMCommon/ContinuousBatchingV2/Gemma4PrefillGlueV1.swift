@@ -64,6 +64,13 @@ public enum Gemma4PrefillGlueV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    private static let expertTailFusionEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_EXPERT_TAIL_FUSION"
+        ] else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// This checkpoint's hidden size, and the `rms_single_row` launch geometry
     /// the stock host derives from it (`RMS_N_READS` 4, so 2816 / 4 = 704
     /// threads, 22 simdgroups, one threadgroup per row).
@@ -359,6 +366,11 @@ public enum Gemma4PrefillGlueV1 {
     /// The threadgroup already holds the finished row in registers when it
     /// stores `out`, so both cost one extra in-kernel reduction rather than a
     /// re-read of the row plus two launches.
+    ///
+    /// LOCKSTEP: `unsortTailChainKernel` below embeds this body verbatim from
+    /// the `glue_inv_rms2` call onward. Any numerics change here must be
+    /// mirrored there in the same commit, or the two tails drift apart at a
+    /// bfloat16 rounding boundary.
     private static let tailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_prefill_glue_tail_chain_2816_v1",
         inputNames: ["h1", "h2", "w1", "w2", "w3", "res2", "s", "wn"],
@@ -451,6 +463,150 @@ public enum Gemma4PrefillGlueV1 {
             threadGroup: (threadsPerRow, 1, 1),
             outputShapes: [h1.shape, h1.shape],
             outputDTypes: [h1.dtype, h1.dtype]
+        )
+        return (outs[0], outs[1])
+    }
+
+    // MARK: - sorted expert reduction + branch tail, chained
+
+    /// The chained prefill tail with its expert input consumed directly from
+    /// the sorted projection rows. The reduction preserves the incumbent
+    /// weighted-unsort slot order and every bfloat16 rounding boundary.
+    ///
+    /// PREFILL ONLY, AND THAT IS THE POINT. The identical fusion applied at the
+    /// B=8 decode plane is a REGRESSION, measured here at 17.318 ms/round fused
+    /// versus 17.058 unfused (+1.53%) in a same-binary cool-gated A/B, with
+    /// identical token planes -- exact, and slower. Prefill's eliminated
+    /// intermediate is 46 MB and the phase is bandwidth-bound, so deleting a
+    /// write and a re-read dominates. Decode's is 45 KB and the round is
+    /// latency-bound: the encoder already overlaps that dispatch with
+    /// independent work, so fusing serializes the tail behind both producers
+    /// and loses more overlap than the deleted dispatch saves -- the same
+    /// effect that keeps this file's sibling router-tail fusion default-off.
+    /// Do not port this consumer to decode.
+    ///
+    /// LOCKSTEP: everything from the `glue_inv_rms2` call onward is
+    /// `tailChainKernel`'s body verbatim; the reducer prologue is
+    /// `weightedExpertUnsortKernel`'s slot loop verbatim. Change either donor
+    /// and this body must change in the same commit.
+    private static let unsortTailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_prefill_expert_unsort_tail_chain_2816_v1",
+        inputNames: [
+            "h1", "sorted_outputs", "inverse_order", "weights",
+            "w1", "w2", "w3", "res2", "s", "wn",
+        ],
+        outputNames: ["out", "normed"],
+        source: """
+            threadgroup float local_sums_a[32];
+            threadgroup float local_sums_b[32];
+            threadgroup float local_inv2[2];
+
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+
+            const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+
+            float av[GLUE_NREADS];
+            float bv[GLUE_NREADS];
+            const uint assignment_base = row * (uint)K;
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                av[i] = static_cast<float>(h1[base + i]);
+                T accumulator = (T)0;
+                const uint feature = lid * GLUE_NREADS + i;
+                for (uint slot = 0; slot < (uint)K; ++slot) {
+                    const uint assignment = assignment_base + slot;
+                    const uint sorted_row = (uint)inverse_order[assignment];
+                    const T weighted = (T)(
+                        (float)sorted_outputs[sorted_row * GLUE_AXIS + feature]
+                        * (float)weights[assignment]);
+                    accumulator = accumulator + weighted;
+                }
+                bv[i] = static_cast<float>(accumulator);
+            }
+
+            float inv_a = 0;
+            float inv_b = 0;
+            glue_inv_rms2(
+                av, bv, local_sums_a, local_sums_b, local_inv2,
+                simd_lane_id, simd_group_id, GLUE_EPS, inv_a, inv_b);
+
+            float tv[GLUE_NREADS];
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                const uint j = lid * GLUE_NREADS + i;
+                const T n1 = static_cast<T>(w1[j] * static_cast<T>(av[i] * inv_a));
+                const T n2 = static_cast<T>(w2[j] * static_cast<T>(bv[i] * inv_b));
+                tv[i] = static_cast<float>(static_cast<T>(n1 + n2));
+            }
+
+            const float inv_t = glue_inv_rms(
+                tv, local_sums_a, local_inv2, simd_lane_id, simd_group_id, GLUE_EPS);
+
+            // The stock graph stores the residual sum to bf16, then the scalar
+            // multiply reads it back and stores again. Both roundings are
+            // explicit here, so `out` is the same array either way.
+            const T scalar = s[0];
+            float ov[GLUE_NREADS];
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                const uint j = lid * GLUE_NREADS + i;
+                const T normed3 = static_cast<T>(w3[j] * static_cast<T>(tv[i] * inv_t));
+                const T summed = static_cast<T>(res2[base + i] + normed3);
+                const T scaled = static_cast<T>(summed * scalar);
+                out[base + i] = scaled;
+                ov[i] = static_cast<float>(scaled);
+            }
+
+            // The next layer's input norm, over exactly the bf16 values just
+            // stored to `out`.
+            const float inv_n = glue_inv_rms(
+                ov, local_sums_a, local_inv2, simd_lane_id, simd_group_id, GLUE_EPS);
+
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                const uint j = lid * GLUE_NREADS + i;
+                normed[base + i] = wn[j] * static_cast<T>(ov[i] * inv_n);
+            }
+            """,
+        header: kernelHeader,
+        ensureRowContiguous: true
+    )
+
+    public static func branchTailChainedUnsort(
+        h1: MLXArray, carrier: WeightedExpertUnsortCarrier,
+        w1: MLXArray, w2: MLXArray, w3: MLXArray,
+        residual2: MLXArray, layerScalar: MLXArray, nextInputNormWeight: MLXArray,
+        eps epsIn: Float
+    ) -> (out: MLXArray, normedNext: MLXArray)? {
+        guard expertTailFusionEnabled,
+            let rows = planeRows(h1, weight: w1, eps: epsIn),
+            residual2.shape == h1.shape, residual2.dtype == .bfloat16,
+            carrier.sortedOutputs.ndim == 2,
+            carrier.sortedOutputs.shape == [rows * 8, axis],
+            carrier.sortedOutputs.dtype == .bfloat16,
+            carrier.inverseOrder.ndim == 1,
+            carrier.inverseOrder.size == rows * 8,
+            carrier.inverseOrder.dtype == .uint32,
+            carrier.weights.ndim == 2,
+            carrier.weights.shape == [rows, 8],
+            carrier.weights.dtype == .bfloat16,
+            w2.shape == w1.shape, w2.dtype == .bfloat16,
+            w3.shape == w1.shape, w3.dtype == .bfloat16,
+            layerScalar.size == 1, layerScalar.dtype == .bfloat16,
+            nextInputNormWeight.shape == w1.shape,
+            nextInputNormWeight.dtype == .bfloat16
+        else { return nil }
+
+        CBv2EngageMark.once("prefill-expert-tail-fuse")
+        let outs = unsortTailChainKernel(
+            [
+                h1, carrier.sortedOutputs, carrier.inverseOrder, carrier.weights,
+                w1, w2, w3, residual2, layerScalar, nextInputNormWeight,
+            ],
+            template: [("T", h1.dtype), ("K", 8)],
+            grid: (threadsPerRow, rows, 1),
+            threadGroup: (threadsPerRow, 1, 1),
+            outputShapes: [h1.shape, h1.shape],
+            outputDTypes: [.bfloat16, .bfloat16]
         )
         return (outs[0], outs[1])
     }

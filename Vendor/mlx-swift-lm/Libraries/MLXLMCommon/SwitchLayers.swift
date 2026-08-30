@@ -49,6 +49,24 @@ public struct WeightedExpertUnsortProvenance: Sendable, Equatable {
     public var missingExpectedEngagement: Bool { requested && !engaged }
 }
 
+/// Lazy inputs for a consumer that can combine the direct sorted-expert
+/// reduction with its immediately following operation.
+public struct WeightedExpertUnsortCarrier {
+    public let sortedOutputs: MLXArray
+    public let inverseOrder: MLXArray
+    public let weights: MLXArray
+
+    public init(
+        sortedOutputs: MLXArray,
+        inverseOrder: MLXArray,
+        weights: MLXArray
+    ) {
+        self.sortedOutputs = sortedOutputs
+        self.inverseOrder = inverseOrder
+        self.weights = weights
+    }
+}
+
 private final class WeightedExpertUnsortProbe: @unchecked Sendable {
     private let lock = NSLock()
     private var effectiveCalls = 0
@@ -163,6 +181,12 @@ public func weightedExpertUnsort(
         "weightedExpertUnsort assignment counts must match")
 
     let tokens = weights.dim(0)
+    // Counter semantics: this records "the direct sorted-reduction path was
+    // selected", at graph-construction time. When the prefill tail fusion
+    // consumes the carrier instead, this node stays unrooted and MLX never
+    // dispatches it, but the count still stands: the sorted reduction did
+    // engage (its combine step ran inside the fused tail). The counter is a
+    // path-selection signal, not a dispatch count.
     weightedExpertUnsortProbe.recordEffective()
     return weightedExpertUnsortKernel(
         [sortedOutputs, inverseOrder, weights],
@@ -1268,6 +1292,25 @@ public class SwitchGLU: Module {
         fuseSortedReduction: Bool,
         isProductionPrefill: Bool = true
     ) -> MLXArray {
+        callAndWeightedReduceWithUnsortCarrier(
+            x,
+            indices,
+            weights: weights,
+            fuseSortedReduction: fuseSortedReduction,
+            isProductionPrefill: isProductionPrefill
+        ).output
+    }
+
+    /// Direct sorted reduction plus its production-prefill inputs for an
+    /// eligible immediately-following fused consumer. All fallbacks retain the
+    /// established output and return no carrier.
+    public func callAndWeightedReduceWithUnsortCarrier(
+        _ x: MLXArray,
+        _ indices: MLXArray,
+        weights: MLXArray,
+        fuseSortedReduction: Bool,
+        isProductionPrefill: Bool = true
+    ) -> (output: MLXArray, carrier: WeightedExpertUnsortCarrier?) {
         // At B=8 decode there are exactly 64 assignments (8 rows x top-k 8),
         // which is the sorting threshold and the minimum geometry accepted by
         // weightedExpertUnsort.  Keep the decode gate exact so MTP rectangles
@@ -1277,7 +1320,7 @@ public class SwitchGLU: Module {
         guard fuseSortedReduction && (isProductionPrefill || isEightRowDecode),
             supportsWeightedExpertUnsort(x, indices, weights: weights)
         else {
-            return weightedExpertSum(callAsFunction(x, indices), weights)
+            return (weightedExpertSum(callAsFunction(x, indices), weights), nil)
         }
 
         let projected = projectExperts(x, indices)
@@ -1288,13 +1331,23 @@ public class SwitchGLU: Module {
             projected.output.dim(-1) == 2816,
             projected.output.dtype == .bfloat16
         else {
-            return legacyWeightedReduction(projected, indices: indices, weights: weights)
+            return (
+                legacyWeightedReduction(projected, indices: indices, weights: weights),
+                nil)
         }
 
-        return weightedExpertUnsort(
-            sortedOutputs: MLX.squeezed(projected.output, axis: -2),
+        let sortedOutputs = MLX.squeezed(projected.output, axis: -2)
+        let output = weightedExpertUnsort(
+            sortedOutputs: sortedOutputs,
             inverseOrder: inverseOrder,
             weights: weights)
+        let carrier = isProductionPrefill
+            ? WeightedExpertUnsortCarrier(
+                sortedOutputs: sortedOutputs,
+                inverseOrder: inverseOrder,
+                weights: weights)
+            : nil
+        return (output, carrier)
     }
 }
 

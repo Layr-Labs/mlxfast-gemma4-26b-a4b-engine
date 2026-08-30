@@ -2836,6 +2836,11 @@ private class Gemma4Router: Module {
 
 /// Sparse MoE feed-forward block. Wraps `SwitchGLU` with GeGLU activation.
 private class Gemma4Experts: Module {
+    struct Output {
+        let output: MLXArray
+        let carrier: WeightedExpertUnsortCarrier?
+    }
+
     @ModuleInfo(key: "switch_glu") var switchGLU: SwitchGLU
     let fuseWeightedUnsort: Bool
 
@@ -2863,13 +2868,13 @@ private class Gemma4Experts: Module {
         topKIndices: MLXArray,
         topKWeights: MLXArray,
         isExpertPrefill: Bool
-    ) -> MLXArray {
+    ) -> Output {
         // Flatten [B, S, H] and always enter SwitchGLU's combined API. It
         // selects direct sorted reduction only for the exact production
         // contract; every other case performs the established unsort + sum.
         let (B, S, H) = (x.dim(0), x.dim(1), x.dim(2))
         let K = topKIndices.dim(-1)
-        let y = switchGLU.callAndWeightedReduce(
+        let result = switchGLU.callAndWeightedReduceWithUnsortCarrier(
             x.reshaped(B * S, H),
             topKIndices.reshaped(B * S, K),
             weights: topKWeights.reshaped(B * S, K),
@@ -2877,7 +2882,9 @@ private class Gemma4Experts: Module {
             // Ordinary/direct VLM and CBv2 prompt entry points may engage.
             // Rectangular MTP verification explicitly passes false.
             isProductionPrefill: isExpertPrefill)
-        return y.reshaped(B, S, H)
+        return Output(
+            output: result.output.reshaped(B, S, H),
+            carrier: result.carrier)
     }
 }
 
@@ -3371,7 +3378,7 @@ public class Gemma4DecoderLayer: Module {
         {
             // Dense + sparse branches in parallel, summed into one residual.
             let h1Raw: MLXArray
-            let h2Raw: MLXArray
+            let expertResult: Gemma4Experts.Output
             // ZIP-ROUTER-001: emit the router chain and the dense chain
             // interleaved so the encoder pairs them into shared barrier
             // stages. Returns nil for every geometry but the pinned B=8
@@ -3386,7 +3393,7 @@ public class Gemma4DecoderLayer: Module {
                 prefix: attentionBranchPrefix)
             {
                 h1Raw = zipped.denseOut
-                h2Raw = experts(
+                expertResult = experts(
                     zipped.expertNorm,
                     topKIndices: zipped.topKIndices,
                     topKWeights: zipped.topKWeights,
@@ -3401,7 +3408,7 @@ public class Gemma4DecoderLayer: Module {
                     eps: config.rmsNormEps)
                 {
                     h1Raw = mlp(n1, activationSums: denseSums)
-                    h2Raw = experts(
+                    expertResult = experts(
                         n2,
                         topKIndices: topKIndices,
                         topKWeights: topKWeights,
@@ -3413,14 +3420,14 @@ public class Gemma4DecoderLayer: Module {
                     eps: config.rmsNormEps)
                 {
                     h1Raw = mlp(n1)
-                    h2Raw = experts(
+                    expertResult = experts(
                         n2,
                         topKIndices: topKIndices,
                         topKWeights: topKWeights,
                         isExpertPrefill: isExpertPrefill)
                 } else {
                     h1Raw = mlp(preFeedforwardLayernorm(out))
-                    h2Raw = experts(
+                    expertResult = experts(
                         preFeedforwardLayernorm2(out),
                         topKIndices: topKIndices,
                         topKWeights: topKWeights,
@@ -3435,7 +3442,7 @@ public class Gemma4DecoderLayer: Module {
             if canFoldScalar, let chain = glueChain,
                 let nextWeight = nextInputLayernormWeight,
                 let chained = Gemma4FusedLayerGlue.tailChained(
-                    mlpOut: h1Raw, expertOut: h2Raw, residual: residual2,
+                    mlpOut: h1Raw, expertOut: expertResult.output, residual: residual2,
                     w1: postFeedforwardLayernorm1.weight,
                     w2: postFeedforwardLayernorm2.weight,
                     w3: postFeedforwardLayernorm.weight,
@@ -3449,7 +3456,7 @@ public class Gemma4DecoderLayer: Module {
                 scalarFolded = true
             } else if canFoldScalar,
                 let fusedTail = Gemma4FusedLayerGlue.tail(
-                    mlpOut: h1Raw, expertOut: h2Raw, residual: residual2,
+                    mlpOut: h1Raw, expertOut: expertResult.output, residual: residual2,
                     w1: postFeedforwardLayernorm1.weight,
                     w2: postFeedforwardLayernorm2.weight,
                     w3: postFeedforwardLayernorm.weight,
@@ -3461,9 +3468,27 @@ public class Gemma4DecoderLayer: Module {
                 scalarFolded = true
             } else if canFoldScalar, let chain = glueChain,
                 let nextWeight = nextInputLayernormWeight,
+                let carrier = expertResult.carrier,
+                let chained = Gemma4PrefillGlueV1.branchTailChainedUnsort(
+                    h1: h1Raw,
+                    carrier: carrier,
+                    w1: postFeedforwardLayernorm1.weight,
+                    w2: postFeedforwardLayernorm2.weight,
+                    w3: postFeedforwardLayernorm.weight,
+                    residual2: residual2,
+                    layerScalar: layerScalar,
+                    nextInputNormWeight: nextWeight,
+                    eps: config.rmsNormEps)
+            {
+                out = chained.out
+                chain.pending = (source: chained.out, normed: chained.normedNext)
+                tailApplied = true
+                scalarFolded = true
+            } else if canFoldScalar, let chain = glueChain,
+                let nextWeight = nextInputLayernormWeight,
                 let chained = Gemma4PrefillGlueV1.branchTailChained(
                     h1: h1Raw,
-                    h2: h2Raw,
+                    h2: expertResult.output,
                     w1: postFeedforwardLayernorm1.weight,
                     w2: postFeedforwardLayernorm2.weight,
                     w3: postFeedforwardLayernorm.weight,
@@ -3478,7 +3503,7 @@ public class Gemma4DecoderLayer: Module {
                 scalarFolded = true
             } else if let fusedTail = Gemma4PrefillGlueV1.branchTail(
                 h1: h1Raw,
-                h2: h2Raw,
+                h2: expertResult.output,
                 w1: postFeedforwardLayernorm1.weight,
                 w2: postFeedforwardLayernorm2.weight,
                 w3: postFeedforwardLayernorm.weight,
@@ -3489,7 +3514,7 @@ public class Gemma4DecoderLayer: Module {
                 tailApplied = true
             } else {
                 let h1 = postFeedforwardLayernorm1(h1Raw)
-                let h2 = postFeedforwardLayernorm2(h2Raw)
+                let h2 = postFeedforwardLayernorm2(expertResult.output)
                 out = h1 + h2
             }
         } else {

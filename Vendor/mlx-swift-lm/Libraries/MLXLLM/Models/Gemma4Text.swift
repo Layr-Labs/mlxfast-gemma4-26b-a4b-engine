@@ -118,7 +118,14 @@ private func gemma4TruthyFlag(_ raw: String?) -> Bool {
 /// one final submission; another positive value tunes the layer interval.
 @inline(__always)
 internal func resolveGemma4PrefillChunkEvalLayers(_ raw: String?) -> Int {
-    guard let raw, let value = Int(raw) else { return 18 }
+    // CHUNK-12: first board price of the prefill async-eval cadence. 18 has
+    // never been ranked; the early-boundary law this account wrote on the
+    // decode leg (SPAN promotion 3eee3c5, three-machine cadence closure)
+    // predicts the GPU pays iff idle at submit time, so move the first
+    // submission six layers earlier. Golden-verified bit-exact at 12/6/0
+    // locally on the runner fixture before packaging. Kill switch
+    // DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL unchanged.
+    guard let raw, let value = Int(raw) else { return 12 }
     return max(0, value)
 }
 

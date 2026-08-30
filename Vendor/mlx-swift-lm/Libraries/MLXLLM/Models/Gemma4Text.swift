@@ -1180,6 +1180,7 @@ private func gemma4FusedQKVNormHeadMajor(
     ropeParameters: Gemma4QKVRopeParameters, applyRope: Bool
 ) -> (q: MLXArray, k: MLXArray, v: MLXArray, appliedRope: Bool)? {
     guard gemma4QKVNormPrefillEnabled, keyValueShared, eps == 1.0e-6,
+        ropeParameters.usesFrequencies,
         positionOffsets.dtype == .int32,
         positionOffsets.size == q.dim(0),
         ropeParameters.frequencies.dtype == .float32,

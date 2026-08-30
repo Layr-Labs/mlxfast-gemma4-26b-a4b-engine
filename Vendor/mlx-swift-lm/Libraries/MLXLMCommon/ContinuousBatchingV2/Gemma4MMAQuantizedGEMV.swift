@@ -78,6 +78,13 @@ import MLXFast
 /// QMV in isolation. Only the tied vocab plane is meant to enter.
 public enum Gemma4MMAQuantizedGEMV {
 
+    /// Exact affine activation sums emitted by the final RMSNorm producer.
+    /// The initializer stays private so callers cannot fabricate a table that
+    /// merely has the right shape.
+    public struct ActivationSums {
+        fileprivate let values: MLXArray
+    }
+
     /// Rows the accumulator tile carries --- the ranked cohort's batch.
     private static let mRows = 8
     /// Output columns one simdgroup owns (one 8x8 tile).
@@ -159,6 +166,40 @@ public enum Gemma4MMAQuantizedGEMV {
     }()
 
     private static let defaultVersion = 26
+
+    /// Whether the selected tied-head implementation consumes the exact
+    /// per-row/per-group activation sums. The final RMSNorm uses this to avoid
+    /// producing a sidecar when the head is disabled or a legacy formulation
+    /// was explicitly selected.
+    public static var consumesActivationSums: Bool {
+        guard enabled else { return false }
+        switch version {
+        case 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 26:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Adopt a producer-emitted table only for the exact ranked head input.
+    /// The table layout is `[row * (K / 64) + group]`, identical to
+    /// `xSumKernel`.
+    public static func activationSums(
+        produced values: MLXArray, for x: MLXArray
+    ) -> ActivationSums? {
+        guard consumesActivationSums,
+            x.dtype == .bfloat16,
+            x.ndim == 3,
+            x.dim(0) == mRows,
+            x.dim(1) == 1,
+            x.dim(2) == 2816,
+            x.size == mRows * 2816,
+            values.dtype == .float32,
+            values.ndim == 1,
+            values.size == mRows * (2816 / 64)
+        else { return nil }
+        return ActivationSums(values: values)
+    }
 
     /// Kernel source. `T` is the activation/scale dtype, `K` the contraction
     /// length, `N` the output width; all three arrive as template constants so
@@ -2495,7 +2536,8 @@ public enum Gemma4MMAQuantizedGEMV {
         scales: MLXArray,
         biases: MLXArray?,
         groupSize: Int,
-        bits: Int
+        bits: Int,
+        activationSums: ActivationSums? = nil
     ) -> MLXArray? {
         guard enabled else { return nil }
         guard let biases else { return nil }
@@ -2531,16 +2573,25 @@ public enum Gemma4MMAQuantizedGEMV {
         switch version {
         case 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 26:
             let sumCells = mRows * (k / groupSize)
-            let sumThreads = 128
-            let sumThreadgroups = (sumCells + sumThreads - 1) / sumThreads
-            let xSums = xSumKernel(
-                [flatX],
-                template: [("T", x.dtype), ("K", k)],
-                grid: (sumThreadgroups * sumThreads, 1, 1),
-                threadGroup: (sumThreads, 1, 1),
-                outputShapes: [[sumCells]],
-                outputDTypes: [.float32]
-            )[0]
+            let xSums: MLXArray
+            if let activationSums,
+                activationSums.values.dtype == .float32,
+                activationSums.values.ndim == 1,
+                activationSums.values.size == sumCells
+            {
+                xSums = activationSums.values
+            } else {
+                let sumThreads = 128
+                let sumThreadgroups = (sumCells + sumThreads - 1) / sumThreads
+                xSums = xSumKernel(
+                    [flatX],
+                    template: [("T", x.dtype), ("K", k)],
+                    grid: (sumThreadgroups * sumThreads, 1, 1),
+                    threadGroup: (sumThreads, 1, 1),
+                    outputShapes: [[sumCells]],
+                    outputDTypes: [.float32]
+                )[0]
+            }
             switch version {
             case 26: selected = kernelV26
             case 16: selected = kernelV16

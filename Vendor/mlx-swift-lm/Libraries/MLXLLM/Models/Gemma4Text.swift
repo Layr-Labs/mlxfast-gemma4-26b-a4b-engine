@@ -3499,6 +3499,120 @@ enum Gemma4FusedScaledEmbedding {
 
 // MARK: - Text Model
 
+/// FINAL-NORM-XSum. The ranked tied head consumes one exact affine activation
+/// sum for each `[row, 64-wide hidden group]`. The stock path materializes the
+/// final BF16 RMSNorm output and then launches a second kernel that rereads all
+/// 22,528 values to build 352 sums. This producer writes the same norm output
+/// and publishes the same sums while those BF16 values are still resident.
+private enum Gemma4FinalNormMMAHeadSumsV1 {
+    private static let rows = 8
+    private static let axis = 2816
+    private static let groupSize = 64
+    private static let valuesPerThread = 4
+    private static let threadgroupSize = axis / valuesPerThread
+    private static let eps: Float = 1e-6
+
+    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_final_rmsnorm_mma_xsum_2816_bf16_v1",
+        inputNames: ["x", "w"],
+        outputNames: ["out", "xSums"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float local_inv[1];
+            threadgroup float local_sums[32];
+            threadgroup float quad_sums[704];
+
+            const uint base = row * 2816 + lid * 4;
+            const uint wbase = lid * 4;
+
+            // Exact `rms_single_row<T, 4>` reduction for axis 2816.
+            float acc = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+                const float xi = x[base + i];
+                acc += xi * xi;
+            }
+            acc = simd_sum(acc);
+            if (simd_group_id == 0) {
+                local_sums[simd_lane_id] = 0.0f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_lane_id == 0) {
+                local_sums[simd_group_id] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+                acc = simd_sum(local_sums[simd_lane_id]);
+                if (simd_lane_id == 0) {
+                    local_inv[0] =
+                        metal::precise::rsqrt(acc / 2816.0f + 1e-06f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            T outv[4];
+            for (int i = 0; i < 4; ++i) {
+                // Preserve the stock RMSNorm's BF16 boundary exactly.
+                outv[i] = w[wbase + i]
+                    * static_cast<T>((float)x[base + i] * local_inv[0]);
+                out[base + i] = outv[i];
+            }
+
+            // This four-value expression is exactly one addend of the head's
+            // stock xsum loop, evaluated at activation dtype then widened.
+            quad_sums[lid] = outv[0] + outv[1] + outv[2] + outv[3];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // One leader serially reproduces the head prepass's sixteen
+            // ascending `s += four BF16 values` statements for this 64-wide
+            // group. No SIMD reassociation is introduced.
+            if ((lid % 16) == 0) {
+                float s = 0.0f;
+                for (uint c = 0; c < 8; ++c) {
+                    const uint q = lid + c * 2;
+                    s += quad_sums[q];
+                    s += quad_sums[q + 1];
+                }
+                xSums[row * 44 + lid / 16] = s;
+            }
+            """,
+        ensureRowContiguous: true
+    )
+
+    static func apply(
+        _ x: MLXArray, weight: MLXArray, eps: Float
+    ) -> (postNorm: MLXArray, sums: Gemma4MMAQuantizedGEMV.ActivationSums)? {
+        guard Gemma4MMAQuantizedGEMV.consumesActivationSums,
+            eps == Self.eps,
+            x.dtype == .bfloat16,
+            x.ndim == 3,
+            x.dim(0) == rows,
+            x.dim(1) == 1,
+            x.dim(2) == axis,
+            x.size == rows * axis,
+            weight.dtype == .bfloat16,
+            weight.ndim == 1,
+            weight.dim(0) == axis
+        else { return nil }
+
+        let outputs = kernel(
+            [x, weight],
+            template: [("T", x.dtype)],
+            grid: (rows * threadgroupSize, 1, 1),
+            threadGroup: (threadgroupSize, 1, 1),
+            outputShapes: [[rows, 1, axis], [rows * (axis / groupSize)]],
+            outputDTypes: [.bfloat16, .float32]
+        )
+        guard let sums = Gemma4MMAQuantizedGEMV.activationSums(
+            produced: outputs[1], for: outputs[0])
+        else { return nil }
+        CBv2EngageMark.once("final-norm-mma-xsum")
+        return (outputs[0], sums)
+    }
+}
+
 /// Inner Gemma 4 trunk: embeddings + per-layer-input (PLE) + 35 decoder
 /// layers + final norm. Public so the Gemma 4 MTP drafter in
 /// `Gemma4MTP` can build its own 4-layer kv-shared trunk; not
@@ -3615,6 +3729,23 @@ public class Gemma4TextModelInner: Module {
         ).postNorm
     }
 
+    /// Ordinary target forward with an optional producer-side affine-sum
+    /// carrier for the ranked tied head. Every non-B8x1 geometry retains the
+    /// established final RMSNorm and returns a nil carrier.
+    fileprivate func callWithMMAHeadSums(
+        _ inputs: MLXArray,
+        cache: [KVCache]? = nil
+    ) -> (
+        postNorm: MLXArray,
+        activationSums: Gemma4MMAQuantizedGEMV.ActivationSums?
+    ) {
+        let inputs = inputs.ndim == 1 ? inputs.expandedDimensions(axis: 0) : inputs
+        let result = forwardTrunk(
+            inputs, cache: cache, captureHook: nil, capturePreNorm: false,
+            emitMMAHeadSums: true)
+        return (result.postNorm, result.mmaHeadSums)
+    }
+
     /// CBv2 prompt-forward entry point. Keeping the scheduled-prefill
     /// specializations behind their own entry point means legacy forwards,
     /// compiled [B, 1] decode, and MTP verification can never reach them.
@@ -3689,8 +3820,13 @@ public class Gemma4TextModelInner: Module {
         imageTokenMask: MLXArray? = nil,
         schedulePrefill: Bool = false,
         dFlashHiddenCapture: Gemma4DFlashHiddenCapture? = nil,
-        forceArrayMask requestedArrayMask: Bool = false
-    ) -> (postNorm: MLXArray, preNorm: MLXArray?) {
+        forceArrayMask requestedArrayMask: Bool = false,
+        emitMMAHeadSums: Bool = false
+    ) -> (
+        postNorm: MLXArray,
+        preNorm: MLXArray?,
+        mmaHeadSums: Gemma4MMAQuantizedGEMV.ActivationSums?
+    ) {
         // Shape queries cross the Swift/C boundary. Cache the two immutable
         // input dimensions once rather than paying for them at every ladder
         // policy check while the host is building the decode graph.
@@ -3909,8 +4045,19 @@ public class Gemma4TextModelInner: Module {
             }
         }
 
-        let postNorm = norm(h)
-        return (postNorm, capturePreNorm ? h : nil)
+        let postNorm: MLXArray
+        let mmaHeadSums: Gemma4MMAQuantizedGEMV.ActivationSums?
+        if emitMMAHeadSums,
+            let produced = Gemma4FinalNormMMAHeadSumsV1.apply(
+                h, weight: norm.weight, eps: norm.eps)
+        {
+            postNorm = produced.postNorm
+            mmaHeadSums = produced.sums
+        } else {
+            postNorm = norm(h)
+            mmaHeadSums = nil
+        }
+        return (postNorm, capturePreNorm ? h : nil, mmaHeadSums)
     }
 }
 
@@ -4077,6 +4224,20 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        if lmHead == nil,
+            inputs.ndim == 2,
+            inputs.dim(0) == 8,
+            inputs.dim(1) == 1,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.mode == .affine,
+            quantized.groupSize == 64,
+            quantized.bits == 4,
+            Gemma4MMAQuantizedGEMV.consumesActivationSums
+        {
+            let produced = model.callWithMMAHeadSums(inputs, cache: cache)
+            return applyLMHead(
+                produced.postNorm, activationSums: produced.activationSums)
+        }
         let hidden = model(inputs, cache: cache)
         return applyLMHead(hidden)
     }
@@ -4103,7 +4264,10 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     /// every non-production geometry, allowing the promoted tight-grid QMV
     /// below to remain the exact fallback.
     @inline(__always)
-    private func tiedLMHeadMMA(_ hidden: MLXArray) -> MLXArray? {
+    private func tiedLMHeadMMA(
+        _ hidden: MLXArray,
+        activationSums: Gemma4MMAQuantizedGEMV.ActivationSums? = nil
+    ) -> MLXArray? {
         guard lmHead == nil,
             let quantized = model.embedTokens as? QuantizedEmbedding,
             quantized.mode == .affine,
@@ -4113,7 +4277,8 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 scales: quantized.scales,
                 biases: quantized.biases,
                 groupSize: quantized.groupSize,
-                bits: quantized.bits)
+                bits: quantized.bits,
+                activationSums: activationSums)
         else { return nil }
         return mma.reshaped(Array(hidden.shape.dropLast()) + [mma.dim(-1)])
     }
@@ -4145,11 +4310,16 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             outDim: config.vocabSize)
     }
 
-    func applyLMHead(_ hidden: MLXArray) -> MLXArray {
+    func applyLMHead(
+        _ hidden: MLXArray,
+        activationSums: Gemma4MMAQuantizedGEMV.ActivationSums? = nil
+    ) -> MLXArray {
         var out: MLXArray
         if let lmHead {
             out = lmHead(hidden)
-        } else if let mma = tiedLMHeadMMA(hidden) {
+        } else if let mma = tiedLMHeadMMA(
+            hidden, activationSums: activationSums)
+        {
             out = mma
         } else if let tight = tiedLMHeadTightGrid(hidden) {
             out = tight

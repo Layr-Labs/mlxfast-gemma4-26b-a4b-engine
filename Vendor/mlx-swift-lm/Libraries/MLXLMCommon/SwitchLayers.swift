@@ -380,6 +380,74 @@ private let routeSimdRank64Enabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+// MARK: - ROUTE-SIMD-BITONIC-64: one SIMDgroup, two stable keys per lane
+
+private let routeSimdBitonic64Enabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_ROUTE_SIMD_BITONIC"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// A bounded expert key plus its six-bit original position is a unique uint
+/// whose order is exactly the stable expert-key order. Each lane owns logical
+/// positions lane and lane+32. All stages stay within one SIMDgroup: distance
+/// 32 exchanges the two registers; smaller distances use shuffle-xor. Generate
+/// the fixed network once so the Metal program contains no ranking loop.
+private let routeSimdBitonic64Kernel: MLXFast.MLXFastKernel = {
+    var stages = ""
+    for span in [2, 4, 8, 16, 32, 64] {
+        var distance = span / 2
+        while distance > 0 {
+            if distance == 32 {
+                // Only the ascending span-64 merge crosses register halves.
+                stages += """
+                    {
+                        const uint oldLo = lo;
+                        lo = min(oldLo, hi);
+                        hi = max(oldLo, hi);
+                    }
+
+                    """
+            } else {
+                stages += """
+                    {
+                        const uint otherLo = simd_shuffle_xor(lo, \(distance)u);
+                        const uint otherHi = simd_shuffle_xor(hi, \(distance)u);
+                        const bool lowEnd = (lane & \(distance)u) == 0u;
+                        const bool minLo = ((lane & \(span)u) == 0u) == lowEnd;
+                        const bool minHi = (((lane + 32u) & \(span)u) == 0u) == lowEnd;
+                        lo = minLo ? min(lo, otherLo) : max(lo, otherLo);
+                        hi = minHi ? min(hi, otherHi) : max(hi, otherHi);
+                    }
+
+                    """
+            }
+            distance /= 2
+        }
+    }
+    return MLXFast.metalKernel(
+        name: "mlx_lm_route_simd_bitonic_scatter_m8_u32_n64_v1",
+        inputNames: ["indices"],
+        outputNames: ["row_order", "sorted_keys", "inverse_order"],
+        source: """
+            const uint lane = thread_index_in_simdgroup;
+            uint lo = (uint(indices[lane]) << 6u) | lane;
+            uint hi = (uint(indices[lane + 32u]) << 6u) | (lane + 32u);
+            \(stages)
+            const uint originalLo = lo & 63u;
+            const uint originalHi = hi & 63u;
+            row_order[lane] = originalLo >> 3u;
+            row_order[lane + 32u] = originalHi >> 3u;
+            sorted_keys[lane] = lo >> 6u;
+            sorted_keys[lane + 32u] = hi >> 6u;
+            inverse_order[originalLo] = lane;
+            inverse_order[originalHi] = lane + 32u;
+            """,
+        ensureRowContiguous: true
+    )
+}()
+
 // MARK: - ROUTE-CSORT-64: fused counting-sort route table (donor port)
 
 /// Stable counting sort for the flattened B=8 decode route table (64 uint32
@@ -792,6 +860,18 @@ public func gatherSortIndices(
     if routeSimdRank64Enabled,
         indices.ndim == 2, indices.shape == [8, 8], indices.dtype == .uint32
     {
+        // The public expert-count bound proves the six-bit position packing
+        // cannot discard key bits. Unknown or wider key spaces retain rank64.
+        if routeSimdBitonic64Enabled, numExperts > 0, numExperts <= 256 {
+            let outputs = routeSimdBitonic64Kernel(
+                [indices],
+                grid: (32, 1, 1),
+                threadGroup: (32, 1, 1),
+                outputShapes: [[64], [64], [64]],
+                outputDTypes: [.uint32, .uint32, .uint32]
+            )
+            return (outputs[0], outputs[1], outputs[2])
+        }
         let outputs = routeSimdRank64Kernel(
             [indices],
             grid: (64, 1, 1),

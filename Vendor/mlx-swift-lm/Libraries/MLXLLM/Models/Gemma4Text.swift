@@ -3,6 +3,7 @@
 //  mlx-swift-lm
 //
 //  Port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/gemma4_text.py
+//  Yukon box-3 campaign 3 redraw 1/5: executable-equivalent frontier sample; documentation only.
 
 import Foundation
 import MLX

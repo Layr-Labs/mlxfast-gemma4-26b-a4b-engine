@@ -1168,6 +1168,13 @@ private let gemma4QKVNormPrefillEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+private let gemma4QKVNormM16HeadMajorEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_QKV_NORM_M16_HEADMAJOR"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// `(qNorm(q), kNorm(k), vNorm(k))` already in `[B, H, L, D]`. Returns `nil`
 /// off the plane, including for every non-`k_eq_v` projection.
 private func gemma4FusedQKVNormHeadMajor(
@@ -1191,7 +1198,9 @@ private func gemma4FusedQKVNormHeadMajor(
         // Below ~1024 rectangle tokens the wide threadgroup stops paying for
         // itself and the stock three-kernel chain is faster; measured, not
         // assumed. Decode also leaves through here, back to its own kernel.
-        q.dim(0) * max(q.dim(1), k.dim(1)) >= 1024,
+        q.dim(0) * max(q.dim(1), k.dim(1)) >= 1024
+            || (gemma4QKVNormM16HeadMajorEnabled
+                && q.dim(0) == 8 && q.dim(1) == 2 && k.dim(1) == 2),
         q.dim(2) == 16, q.dim(3) == k.dim(3),
         (q.dim(3) == 256 && k.dim(2) == 8) || (q.dim(3) == 512 && k.dim(2) == 2),
         qWeight.shape == [q.dim(3)], kWeight.shape == [q.dim(3)]
@@ -1383,7 +1392,9 @@ private func gemma4FusedQKVNormHeadMajorSliding(
         q.ndim == 4, k.ndim == 4, v.ndim == 4,
         q.dim(0) == k.dim(0), q.dim(0) >= 1,
         q.dim(1) >= 1, k.dim(1) >= 1, v.shape == k.shape,
-        q.dim(0) * max(q.dim(1), k.dim(1)) >= 1024,
+        q.dim(0) * max(q.dim(1), k.dim(1)) >= 1024
+            || (gemma4QKVNormM16HeadMajorEnabled
+                && q.dim(0) == 8 && q.dim(1) == 2 && k.dim(1) == 2),
         q.dim(2) == 16, q.dim(3) == 256, k.dim(2) == 8,
         qWeight.shape == [q.dim(3)], kWeight.shape == [q.dim(3)]
     else { return nil }

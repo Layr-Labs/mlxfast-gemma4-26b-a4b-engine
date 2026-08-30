@@ -299,6 +299,341 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
 }
 """
 
+    /// OCTA: stand-alone 8-row gate/up body. Uses the same qdot, K loop and
+    /// tail as quad but serves all eight cohort rows from one weight tile
+    /// (first_m = tid.x * 8, single x-group). Keeping it out of kernelHeader
+    /// preserves DMLP-002's exact replaceLast counts for the quad xsum twin.
+    private static let octaKernelHeader = CBv2TiedLMHeadQMVV1.kernelHeader + """
+
+template <typename U, int values_per_thread>
+inline U qdot_affine8_registered(
+    const thread uint8_t* w,
+    const thread U* x_thread,
+    U scale,
+    U bias,
+    U sum) {
+  U accum = 0;
+  for (int i = 0; i < values_per_thread; i++) {
+    accum += x_thread[i] * w[i];
+  }
+  return scale * accum + sum * bias;
+}
+
+template <typename T, const int group_size, const int bits>
+METAL_FUNC void qmv_affine8_g64_octa_stream_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x0,
+    const device T* x1,
+    const device T* x2,
+    const device T* x3,
+    const device T* x4,
+    const device T* x5,
+    const device T* x6,
+    const device T* x7,
+    device T* y0,
+    device T* y1,
+    device T* y2,
+    device T* y3,
+    device T* y4,
+    device T* y5,
+    device T* y6,
+    device T* y7,
+    const int in_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 4;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 16;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread float x_thread[values_per_thread];
+  thread uint8_t packed[results_per_simdgroup][bytes_per_thread];
+  thread float scale_local[results_per_simdgroup];
+  thread float bias_local[results_per_simdgroup];
+  thread float result0[results_per_simdgroup] = {0};
+  thread float result1[results_per_simdgroup] = {0};
+  thread float result2[results_per_simdgroup] = {0};
+  thread float result3[results_per_simdgroup] = {0};
+  thread float result4[results_per_simdgroup] = {0};
+  thread float result5[results_per_simdgroup] = {0};
+  thread float result6[results_per_simdgroup] = {0};
+  thread float result7[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x0 += simd_lid * values_per_thread;
+  x1 += simd_lid * values_per_thread;
+  x2 += simd_lid * values_per_thread;
+  x3 += simd_lid * values_per_thread;
+  x4 += simd_lid * values_per_thread;
+  x5 += simd_lid * values_per_thread;
+  x6 += simd_lid * values_per_thread;
+  x7 += simd_lid * values_per_thread;
+  y0 += out_row;
+  y1 += out_row;
+  y2 += out_row;
+  y3 += out_row;
+  y4 += out_row;
+  y5 += out_row;
+  y6 += out_row;
+  y7 += out_row;
+
+  int k = 0;
+  for (; k <= in_vec_size - block_size; k += block_size) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      for (int i = 0; i < bytes_per_thread; i++) {
+        packed[row][i] = wl[i];
+      }
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    float sum = load_vector<T, float, values_per_thread, 8>(x0, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x1, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result1[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x2, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result2[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x3, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result3[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x4, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result4[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x5, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result5[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x6, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result6[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x7, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result7[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+
+    ws += block_size;
+    scales += block_size / 64;
+    biases += block_size / 64;
+    x0 += block_size;
+    x1 += block_size;
+    x2 += block_size;
+    x3 += block_size;
+    x4 += block_size;
+    x5 += block_size;
+    x6 += block_size;
+    x7 += block_size;
+  }
+
+  const uint active_tail_lanes =
+      uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      for (int i = 0; i < bytes_per_thread; i++) {
+        packed[row][i] = wl[i];
+      }
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    float sum = load_vector<T, float, values_per_thread, 8>(x0, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x1, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result1[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x2, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result2[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x3, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result3[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x4, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result4[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x5, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result5[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x6, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result6[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 8>(x7, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result7[row] += qdot_affine8_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result0[row] = simd_sum(result0[row]);
+    result1[row] = simd_sum(result1[row]);
+    result2[row] = simd_sum(result2[row]);
+    result3[row] = simd_sum(result3[row]);
+    result4[row] = simd_sum(result4[row]);
+    result5[row] = simd_sum(result5[row]);
+    result6[row] = simd_sum(result6[row]);
+    result7[row] = simd_sum(result7[row]);
+    if (simd_lid == 0) {
+      y0[row] = static_cast<T>(result0[row]);
+      y1[row] = static_cast<T>(result1[row]);
+      y2[row] = static_cast<T>(result2[row]);
+      y3[row] = static_cast<T>(result3[row]);
+      y4[row] = static_cast<T>(result4[row]);
+      y5[row] = static_cast<T>(result5[row]);
+      y6[row] = static_cast<T>(result6[row]);
+      y7[row] = static_cast<T>(result7[row]);
+    }
+  }
+}
+"""
+
+    private static let octaXsumKernelHeader: String = {
+        var result = octaKernelHeader
+        func replaceLast(_ old: String, with new: String) {
+            guard let range = result.range(of: old, options: .backwards) else {
+                preconditionFailure("OCTA xsum marker missing")
+            }
+            result.replaceSubrange(range, with: new)
+        }
+        replaceLast(
+            """
+            template <typename T, const int group_size, const int bits>
+            METAL_FUNC void qmv_affine8_g64_octa_stream_impl(
+            """,
+            with: """
+            template <typename T, typename U, int values_per_thread>
+            inline void load_affine8_values(
+                const device T* x,
+                thread U* x_thread) {
+              for (int i = 0; i < values_per_thread; i++) {
+                x_thread[i] = x[i];
+              }
+            }
+
+            template <typename T, const int group_size, const int bits>
+            METAL_FUNC void qmv_affine8_g64_octa_stream_xsum_impl(
+            """)
+        replaceLast(
+            """
+                const device T* biases,
+                const device T* x0,
+            """,
+            with: """
+                const device T* biases,
+                const device float* x_sums,
+                const device T* x0,
+            """)
+        replaceLast(
+            """
+              const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+                  simd_gid * results_per_simdgroup;
+            """,
+            with: """
+              const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+                  simd_gid * results_per_simdgroup;
+              const int first_m = int(tid.x) * 8;
+            """)
+        let loads: [(String, String)] = [
+            (
+                "float sum = load_vector<T, float, values_per_thread, 8>(x0, x_thread);",
+                """
+                load_affine8_values<T, float, values_per_thread>(x0, x_thread);
+                float sum = x_sums[((k / block_size) * SIMD_SIZE + int(simd_lid)) * 8 + first_m];
+                """),
+            (
+                "sum = load_vector<T, float, values_per_thread, 8>(x1, x_thread);",
+                """
+                load_affine8_values<T, float, values_per_thread>(x1, x_thread);
+                sum = x_sums[((k / block_size) * SIMD_SIZE + int(simd_lid)) * 8 + first_m + 1];
+                """),
+            (
+                "sum = load_vector<T, float, values_per_thread, 8>(x2, x_thread);",
+                """
+                load_affine8_values<T, float, values_per_thread>(x2, x_thread);
+                sum = x_sums[((k / block_size) * SIMD_SIZE + int(simd_lid)) * 8 + first_m + 2];
+                """),
+            (
+                "sum = load_vector<T, float, values_per_thread, 8>(x3, x_thread);",
+                """
+                load_affine8_values<T, float, values_per_thread>(x3, x_thread);
+                sum = x_sums[((k / block_size) * SIMD_SIZE + int(simd_lid)) * 8 + first_m + 3];
+                """),
+            (
+                "sum = load_vector<T, float, values_per_thread, 8>(x4, x_thread);",
+                """
+                load_affine8_values<T, float, values_per_thread>(x4, x_thread);
+                sum = x_sums[((k / block_size) * SIMD_SIZE + int(simd_lid)) * 8 + first_m + 4];
+                """),
+            (
+                "sum = load_vector<T, float, values_per_thread, 8>(x5, x_thread);",
+                """
+                load_affine8_values<T, float, values_per_thread>(x5, x_thread);
+                sum = x_sums[((k / block_size) * SIMD_SIZE + int(simd_lid)) * 8 + first_m + 5];
+                """),
+            (
+                "sum = load_vector<T, float, values_per_thread, 8>(x6, x_thread);",
+                """
+                load_affine8_values<T, float, values_per_thread>(x6, x_thread);
+                sum = x_sums[((k / block_size) * SIMD_SIZE + int(simd_lid)) * 8 + first_m + 6];
+                """),
+            (
+                "sum = load_vector<T, float, values_per_thread, 8>(x7, x_thread);",
+                """
+                load_affine8_values<T, float, values_per_thread>(x7, x_thread);
+                sum = x_sums[((k / block_size) * SIMD_SIZE + int(simd_lid)) * 8 + first_m + 7];
+                """),
+        ]
+        for (old, new) in loads {
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        return result
+    }()
+
     /// DMLP-002 keeps DMLP-001's kernel text intact and derives a second body
     /// which replaces only the four-value activation sum. The x values are
     /// still loaded into the same register array, in the same order, and every
@@ -887,6 +1222,102 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         ensureRowContiguous: true
     )
 
+    private static let octaKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_octa_stream_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+
+            const int in_vec_size = x_shape[x_ndim - 1];
+            const int out_vec_size = w_shape[0];
+            const int first_m = int(tid.x) * 8;
+            if (first_m >= 8) {
+                return;
+            }
+            qmv_affine8_g64_octa_stream_impl<T, 64, 8>(
+                w,
+                scales,
+                biases,
+                x + 0 * in_vec_size,
+                x + 1 * in_vec_size,
+                x + 2 * in_vec_size,
+                x + 3 * in_vec_size,
+                x + 4 * in_vec_size,
+                x + 5 * in_vec_size,
+                x + 6 * in_vec_size,
+                x + 7 * in_vec_size,
+                y + 0 * out_vec_size,
+                y + 1 * out_vec_size,
+                y + 2 * out_vec_size,
+                y + 3 * out_vec_size,
+                y + 4 * out_vec_size,
+                y + 5 * out_vec_size,
+                y + 6 * out_vec_size,
+                y + 7 * out_vec_size,
+                in_vec_size,
+                tid,
+                simd_gid,
+                simd_lid);
+            return;
+            """,
+        header: octaKernelHeader,
+        ensureRowContiguous: true
+    )
+
+    private static let octaXsumKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_octa_stream_xsum_v1",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+
+            const int in_vec_size = x_shape[x_ndim - 1];
+            const int out_vec_size = w_shape[0];
+            const int first_m = int(tid.x) * 8;
+            if (first_m >= 8) {
+                return;
+            }
+            qmv_affine8_g64_octa_stream_xsum_impl<T, 64, 8>(
+                w,
+                scales,
+                biases,
+                xSums,
+                x + 0 * in_vec_size,
+                x + 1 * in_vec_size,
+                x + 2 * in_vec_size,
+                x + 3 * in_vec_size,
+                x + 4 * in_vec_size,
+                x + 5 * in_vec_size,
+                x + 6 * in_vec_size,
+                x + 7 * in_vec_size,
+                y + 0 * out_vec_size,
+                y + 1 * out_vec_size,
+                y + 2 * out_vec_size,
+                y + 3 * out_vec_size,
+                y + 4 * out_vec_size,
+                y + 5 * out_vec_size,
+                y + 6 * out_vec_size,
+                y + 7 * out_vec_size,
+                in_vec_size,
+                tid,
+                simd_gid,
+                simd_lid);
+            return;
+            """,
+        header: octaXsumKernelHeader,
+        ensureRowContiguous: true
+    )
+
+    public static let octaEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_DENSE_MLP_OCTA"] else { return false }
+        return ["1", "true", "yes", "on"].contains(raw.lowercased())
+    }()
+
     @inline(__always)
     private static func liveShape(inDim: Int, outDim: Int) -> Bool {
         (inDim == 2816 && outDim == 2112)
@@ -1018,6 +1449,25 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
                 [x, weight, scales, biases],
                 template: [("T", x.dtype)],
                 grid: (simdWidth, yTiles * simdGroups, 1),
+                threadGroup: (simdWidth, simdGroups, 1),
+                outputShapes: [[batch, sequence, outDim]],
+                outputDTypes: [x.dtype]
+            )[0]
+        }
+
+        // OCTA: gate/up owns all eight rows per x-group, halving the
+        // 528-group quad plane to 264. One weight tile serves eight streams.
+        if isGateUp && octaEnabled {
+            let yGroups = outDim / outputsPerGroup
+            let useXsum = activationSums != nil && inDim == 2816 && outDim == 2112
+            let selectedOcta = useXsum ? octaXsumKernel : octaKernel
+            let inputsOcta: [MLXArray] = useXsum
+                ? [x, weight, scales, biases, activationSums!.values]
+                : [x, weight, scales, biases]
+            return selectedOcta(
+                inputsOcta,
+                template: [("T", x.dtype)],
+                grid: (simdWidth, yGroups * simdGroups, 1),
                 threadGroup: (simdWidth, simdGroups, 1),
                 outputShapes: [[batch, sequence, outDim]],
                 outputDTypes: [x.dtype]

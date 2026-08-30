@@ -2384,6 +2384,42 @@ private enum Gemma4FusedLayerGlue {
         ensureRowContiguous: true
     )
 
+    /// TRINORM-001: the MoE layer normalises the SAME `[8, 1, 2816]` layer
+    /// output three times -- `preFeedforwardLayernorm` for the dense chain,
+    /// the expert pre-norm, and the router's own `rmsNorm(x, scale * H^-0.5)`.
+    /// The first two already share one reduction here; the router's is still a
+    /// standalone dispatch that re-reads the row and recomputes the identical
+    /// sum of squares. This variant carries the router's affine as a third
+    /// weight vector, so the row is read once and reduced once for all three.
+    private static let triPreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_glue_tri_prenorm_xsum_2816_bf16_v1",
+        inputNames: ["x", "w1", "w2", "w3"],
+        outputNames: ["out1", "out2", "out3", "xSums"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float local_inv[1];
+            threadgroup float local_sums[32];
+            const uint base = row * 2816 + lid * 4;
+            const uint wbase = lid * 4;
+        \(rmsReduce("x", into: "local_inv[0]"))
+            const float inv = local_inv[0];
+            float xsum = 0.0f;
+            for (int i = 0; i < 4; i++) {
+                const T nx = static_cast<T>((float)x[base + i] * inv);
+                const T dense = w1[wbase + i] * nx;
+                out1[base + i] = dense;
+                out2[base + i] = w2[wbase + i] * nx;
+                out3[base + i] = w3[wbase + i] * nx;
+                xsum += dense;
+            }
+            xSums[lid * 8 + row] = xsum;
+        """,
+        ensureRowContiguous: true
+    )
+
     private static let tailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_glue_tail_2816_bf16_v2",
         inputNames: ["a", "b", "res", "w1", "w2", "w3", "s"],
@@ -2475,6 +2511,37 @@ private enum Gemma4FusedLayerGlue {
         let sums = CBv2DenseMLPQMVV1.activationSums(
             produced: outs[2], for: outs[0])
         return (outs[0], outs[1], sums)
+    }
+
+    /// TRINORM-001. Same contract as `dualPreNorm`, plus the router's normed
+    /// row from the shared reduction. `w3` is the router's cached effective
+    /// scale (`scale * hiddenSize^-0.5`); the router's own epsilon is the
+    /// layer epsilon `admits` already pins, so the third output reproduces
+    /// `MLXFast.rmsNorm(x, weight: w3, eps: 1e-6)` value for value.
+    static func triPreNorm(
+        x: MLXArray, w1: MLXArray, w2: MLXArray, w3: MLXArray, eps: Float
+    ) -> (MLXArray, MLXArray, MLXArray, CBv2DenseMLPQMVV1.ActivationSums?)? {
+        guard admits(x, weight: w1, eps: eps),
+            w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16,
+            w3.ndim == 1, w3.dim(0) == axis, w3.dtype == .bfloat16
+        else { return nil }
+        CBv2EngageMark.once("glue-tri-prenorm")
+        let outs = triPreNormKernel(
+            [x, w1, w2, w3],
+            template: [("T", x.dtype)],
+            grid: (rows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: [
+                [rows, 1, axis],
+                [rows, 1, axis],
+                [rows, 1, axis],
+                [(axis / 128) * 32 * rows],
+            ],
+            outputDTypes: [.bfloat16, .bfloat16, .bfloat16, .float32]
+        )
+        let sums = CBv2DenseMLPQMVV1.activationSums(
+            produced: outs[3], for: outs[0])
+        return (outs[0], outs[1], outs[2], sums)
     }
 
     /// GLUE-003: tail variant that ALSO emits the NEXT layer's input norm.
@@ -2918,9 +2985,26 @@ private enum Gemma4ZipRouterV1 {
         // Stage 0, shared: the two pre-norms plus the exact dense activation
         // table. A nil here means this is not the fused-glue cell and no node
         // was built.
-        guard let (n1, n2, producerSums) = Gemma4FusedLayerGlue.dualPreNorm(
+        // TRINORM-001: prefer the three-weight carrier, which also emits the
+        // router's normed row from the same reduction. A nil from it (kill
+        // switch, non-bf16 router scale, any shape drift) falls back to the
+        // promoted two-weight carrier plus the standalone router norm below,
+        // and nothing was built on the way past.
+        let n1: MLXArray
+        let n2: MLXArray
+        let producerSums: CBv2DenseMLPQMVV1.ActivationSums?
+        let carriedRouterNorm: MLXArray?
+        if let (t1, t2, t3, tSums) = Gemma4FusedLayerGlue.triPreNorm(
+            x: out, w1: w1, w2: w2, w3: router.zipEffectiveScale(), eps: eps)
+        {
+            (n1, n2, producerSums, carriedRouterNorm) = (t1, t2, tSums, t3)
+        } else if let (d1, d2, dSums) = Gemma4FusedLayerGlue.dualPreNorm(
             x: out, w1: w1, w2: w2, eps: eps)
-        else { return nil }
+        {
+            (n1, n2, producerSums, carriedRouterNorm) = (d1, d2, dSums, nil)
+        } else {
+            return nil
+        }
 
         // Stage 1: router norm. The table is normally producer-emitted in
         // stage 0; the standalone producer survives only as the fail-closed
@@ -2928,12 +3012,26 @@ private enum Gemma4ZipRouterV1 {
         // dual pre-norm arrays unreferenced, so MLX never evaluates them and
         // the caller's stock path rebuilds the identical pair.
         guard let sums = producerSums ?? mlp.zipActivationSums(n1) else { return nil }
-        let normed = router.zipNorm(out)
+        let normed = carriedRouterNorm ?? router.zipNorm(out)
 
         // Stage 2: router QMV | dense gate + up.
-        let expertScores = router.zipScores(
-            MLX.depends(input: normed, dependencies: [sums.dependencyHandle]))
-        let denseIn = MLX.depends(input: n1, dependencies: [normed])
+        //
+        // TRINORM-002: both fences below exist to order three arrays the
+        // promoted tape produced in three separate dispatches. Under the
+        // three-weight carrier `normed`, `n1` and the sum table are outputs of
+        // ONE dispatch, so each fence is an identity edge: it encodes an
+        // ordering the single dispatch already guarantees, while still costing
+        // a `Depends` node and, worse, marking the `[8, 1, 2816]` buffer as
+        // shared so the consumer can no longer donate it. Drop them on the
+        // carrier path only; the fallback path still has three dispatches and
+        // keeps the promoted fences exactly as they are.
+        let carried = carriedRouterNorm != nil
+        let scoreIn =
+            carried
+            ? normed
+            : MLX.depends(input: normed, dependencies: [sums.dependencyHandle])
+        let expertScores = router.zipScores(scoreIn)
+        let denseIn = carried ? n1 : MLX.depends(input: n1, dependencies: [normed])
         let gate = mlp.zipGate(denseIn, sums)
         let up = mlp.zipUp(denseIn, sums)
 

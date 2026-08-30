@@ -2354,6 +2354,55 @@ private enum Gemma4FusedLayerGlue {
         ensureRowContiguous: true
     )
 
+    /// PREFIX-001: join the two serial normalization producers at the
+    /// attention/feed-forward boundary. The first reduction reproduces
+    /// `residual + postAttentionLayernorm(attnOut)` and stores that BF16
+    /// boundary in `outv`. The second reduction consumes those exact rounded
+    /// values in registers and emits the dense, expert and router pre-norms
+    /// plus the promoted dense activation-sum table.
+    private static let attentionBranchPrefixKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_glue_attention_branch_prefix_2816_bf16_v1",
+            inputNames: ["attn", "res", "wa", "wd", "we", "wr"],
+            outputNames: ["out", "dense", "expert", "router", "xSums"],
+            source: """
+                const uint row = threadgroup_position_in_grid.x;
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint simd_lane_id = thread_index_in_simdgroup;
+                const uint simd_group_id = simdgroup_index_in_threadgroup;
+                threadgroup float local_inv[1];
+                threadgroup float local_sums[32];
+                const uint base = row * 2816 + lid * 4;
+                const uint wbase = lid * 4;
+            \(rmsReduce("attn", into: "local_inv[0]"))
+                const float attn_inv = local_inv[0];
+                T outv[4];
+                for (int i = 0; i < 4; i++) {
+                    const T normed = static_cast<T>(
+                        wa[wbase + i]
+                            * static_cast<T>(
+                                (float)attn[base + i] * attn_inv));
+                    outv[i] = res[base + i] + normed;
+                    out[base + i] = outv[i];
+                }
+            \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
+                of: "(float)outv[base + i]", with: "(float)outv[i]"))
+                const float branch_inv = local_inv[0];
+                float xsum = 0.0f;
+                for (int i = 0; i < 4; i++) {
+                    const T nx =
+                        static_cast<T>((float)outv[i] * branch_inv);
+                    const T densev = wd[wbase + i] * nx;
+                    dense[base + i] = densev;
+                    expert[base + i] = we[wbase + i] * nx;
+                    router[base + i] = wr[wbase + i] * nx;
+                    xsum += densev;
+                }
+                xSums[lid * 8 + row] = xsum;
+            """,
+            ensureRowContiguous: true
+        )
+
     private static let dualPreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_glue_dual_prenorm_xsum_2816_bf16_v2",
         inputNames: ["x", "w1", "w2"],
@@ -2451,6 +2500,68 @@ private enum Gemma4FusedLayerGlue {
             outputShapes: [[rows, 1, axis]],
             outputDTypes: [.bfloat16]
         )[0]
+    }
+
+    struct AttentionBranchPrefix {
+        let out: MLXArray
+        let denseNorm: MLXArray
+        let expertNorm: MLXArray
+        let routerNorm: MLXArray
+        let denseSums: CBv2DenseMLPQMVV1.ActivationSums
+    }
+
+    /// PREFIX-001. The returned `out` is still materialized because the layer
+    /// tail consumes it as its residual. Only its otherwise-serial reread and
+    /// the second dispatch disappear.
+    static func attentionBranchPrefix(
+        attn: MLXArray,
+        residual: MLXArray,
+        postAttentionWeight: MLXArray,
+        denseWeight: MLXArray,
+        expertWeight: MLXArray,
+        routerWeight: MLXArray,
+        eps: Float
+    ) -> AttentionBranchPrefix? {
+        guard CBv2DenseMLPQMVV1.enabled,
+            CBv2DenseMLPQMVV1.activationSumsEnabled,
+            admits(attn, weight: postAttentionWeight, eps: eps),
+            residual.shape == attn.shape, residual.dtype == .bfloat16,
+            denseWeight.ndim == 1, denseWeight.dim(0) == axis,
+            denseWeight.dtype == .bfloat16,
+            expertWeight.ndim == 1, expertWeight.dim(0) == axis,
+            expertWeight.dtype == .bfloat16,
+            routerWeight.ndim == 1, routerWeight.dim(0) == axis,
+            routerWeight.dtype == .bfloat16
+        else { return nil }
+        let outs = attentionBranchPrefixKernel(
+            [
+                attn, residual, postAttentionWeight, denseWeight,
+                expertWeight, routerWeight,
+            ],
+            template: [("T", attn.dtype)],
+            grid: (rows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: [
+                [rows, 1, axis],
+                [rows, 1, axis],
+                [rows, 1, axis],
+                [rows, 1, axis],
+                [(axis / 128) * 32 * rows],
+            ],
+            outputDTypes: [
+                .bfloat16, .bfloat16, .bfloat16, .bfloat16, .float32,
+            ]
+        )
+        guard let denseSums = CBv2DenseMLPQMVV1.activationSums(
+            produced: outs[4], for: outs[1])
+        else { return nil }
+        CBv2EngageMark.once("attention-branch-prefix")
+        return AttentionBranchPrefix(
+            out: outs[0],
+            denseNorm: outs[1],
+            expertNorm: outs[2],
+            routerNorm: outs[3],
+            denseSums: denseSums)
     }
 
     static func dualPreNorm(
@@ -2899,13 +3010,37 @@ private enum Gemma4ZipRouterV1 {
         let topKWeights: MLXArray
     }
 
+    /// PREFIX-001 admission lives beside the ZIP admission so the eager
+    /// custom producer is never built unless this exact consumer will use all
+    /// of its outputs.
+    static func makeAttentionBranchPrefix(
+        router: Gemma4Router,
+        attn: MLXArray,
+        residual: MLXArray,
+        postAttentionWeight: MLXArray,
+        denseWeight: MLXArray,
+        expertWeight: MLXArray,
+        eps: Float
+    ) -> Gemma4FusedLayerGlue.AttentionBranchPrefix? {
+        guard enabled, router.zipAdmits else { return nil }
+        return Gemma4FusedLayerGlue.attentionBranchPrefix(
+            attn: attn,
+            residual: residual,
+            postAttentionWeight: postAttentionWeight,
+            denseWeight: denseWeight,
+            expertWeight: expertWeight,
+            routerWeight: router.zipEffectiveScale(),
+            eps: eps)
+    }
+
     static func run(
         router: Gemma4Router,
         mlp: Gemma4MLP,
         out: MLXArray,
         w1: MLXArray,
         w2: MLXArray,
-        eps: Float
+        eps: Float,
+        prefix: Gemma4FusedLayerGlue.AttentionBranchPrefix? = nil
     ) -> Zipped? {
         // Pure shape predicate first: no graph node exists until every pin
         // below holds, so prefill, MTP rectangles and any other cohort walk
@@ -2918,9 +3053,23 @@ private enum Gemma4ZipRouterV1 {
         // Stage 0, shared: the two pre-norms plus the exact dense activation
         // table. A nil here means this is not the fused-glue cell and no node
         // was built.
-        guard let (n1, n2, producerSums) = Gemma4FusedLayerGlue.dualPreNorm(
+        let n1: MLXArray
+        let n2: MLXArray
+        let producerSums: CBv2DenseMLPQMVV1.ActivationSums?
+        let carriedRouterNorm: MLXArray?
+        if let prefix, prefix.out === out {
+            (n1, n2, producerSums, carriedRouterNorm) = (
+                prefix.denseNorm,
+                 prefix.expertNorm,
+                 prefix.denseSums,
+                 prefix.routerNorm)
+        } else if let (d1, d2, dSums) = Gemma4FusedLayerGlue.dualPreNorm(
             x: out, w1: w1, w2: w2, eps: eps)
-        else { return nil }
+        {
+            (n1, n2, producerSums, carriedRouterNorm) = (d1, d2, dSums, nil)
+        } else {
+            return nil
+        }
 
         // Stage 1: router norm. The table is normally producer-emitted in
         // stage 0; the standalone producer survives only as the fail-closed
@@ -2928,7 +3077,7 @@ private enum Gemma4ZipRouterV1 {
         // dual pre-norm arrays unreferenced, so MLX never evaluates them and
         // the caller's stock path rebuilds the identical pair.
         guard let sums = producerSums ?? mlp.zipActivationSums(n1) else { return nil }
-        let normed = router.zipNorm(out)
+        let normed = carriedRouterNorm ?? router.zipNorm(out)
 
         // Stage 2: router QMV | dense gate + up.
         let expertScores = router.zipScores(
@@ -3085,7 +3234,8 @@ public class Gemma4DecoderLayer: Module {
         useLastQueryPrefill: Bool = false,
         isExpertPrefill: Bool = false,
         glueChain: Gemma4GlueChainBox? = nil,
-        nextInputLayernormWeight: MLXArray? = nil
+        nextInputLayernormWeight: MLXArray? = nil,
+        enableAttentionBranchPrefix: Bool = false
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         // Prompt-path narrowing (CBv2 only): attention and every K/V write
         // still cover the full chunk; only the token-local work AFTER
@@ -3131,8 +3281,28 @@ public class Gemma4DecoderLayer: Module {
             h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset,
             v2SharedSource: v2SharedSource, outputStart: outputStart,
             useLastQueryPrefill: useLastQueryPrefill)
+        // PREFIX-001: only build the joined producer when the ZIP consumer is
+        // guaranteed to accept it. A nil leaves the established attention
+        // residual and branch pre-norm paths untouched.
+        let attentionBranchPrefix: Gemma4FusedLayerGlue.AttentionBranchPrefix? = {
+            guard enableAttentionBranchPrefix,
+                isMoE, let router, let preFeedforwardLayernorm2
+            else {
+                return nil
+            }
+            return Gemma4ZipRouterV1.makeAttentionBranchPrefix(
+                router: router,
+                attn: attnOut,
+                residual: residual,
+                postAttentionWeight: postAttentionLayernorm.weight,
+                denseWeight: preFeedforwardLayernorm.weight,
+                expertWeight: preFeedforwardLayernorm2.weight,
+                eps: config.rmsNormEps)
+        }()
         var out: MLXArray
-        if let fusedOut = Gemma4FusedLayerGlue.normResidual(
+        if let attentionBranchPrefix {
+            out = attentionBranchPrefix.out
+        } else if let fusedOut = Gemma4FusedLayerGlue.normResidual(
             x: attnOut, residual: residual,
             weight: postAttentionLayernorm.weight, eps: config.rmsNormEps)
         {
@@ -3179,7 +3349,8 @@ public class Gemma4DecoderLayer: Module {
                 out: out,
                 w1: preFeedforwardLayernorm.weight,
                 w2: preFeedforwardLayernorm2.weight,
-                eps: config.rmsNormEps)
+                eps: config.rmsNormEps,
+                prefix: attentionBranchPrefix)
             {
                 h1Raw = zipped.denseOut
                 h2Raw = experts(
@@ -4008,7 +4179,11 @@ public class Gemma4TextModelInner: Module {
                     schedulePrefill: schedulePrefill),
                 glueChain: glueChain,
                 nextInputLayernormWeight: idx + 1 < layers.count
-                    ? layers[idx + 1].inputLayernorm.weight : nil
+                    ? layers[idx + 1].inputLayernorm.weight : nil,
+                enableAttentionBranchPrefix:
+                    isCBv2 && !schedulePrefill
+                    && inputBatchSize == 8 && inputLength == 1
+                    && !capturePreNorm && dFlashHiddenCapture == nil
             )
             h = out
             intermediates[idx] = (kvPair, positionOffset)

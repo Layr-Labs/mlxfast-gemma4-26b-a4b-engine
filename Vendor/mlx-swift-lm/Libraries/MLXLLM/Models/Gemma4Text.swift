@@ -4675,6 +4675,7 @@ func gemma4TextSymmetrizeMask(
 
 public enum Gemma4MTPVerifierInstallationError: Error, CustomStringConvertible {
     case incompatibleModel(String)
+    case alreadyInstalled
 
     public var description: String {
         switch self {
@@ -4682,6 +4683,9 @@ public enum Gemma4MTPVerifierInstallationError: Error, CustomStringConvertible {
             return "Gemma 4 MTP verifier rejected \(component); installation "
                 + "requires the exact 30-layer 26B-A4B topology, pinned affine "
                 + "storage, and complete B1/C2-C4 projection bindings"
+        case .alreadyInstalled:
+            return "Gemma 4 MTP verifier is already installed; its published "
+                + "B1/C2-C4 context table is immutable"
         }
     }
 }
@@ -4753,6 +4757,10 @@ struct Gemma4MTPVerifierConstructionFixture {
 
     var installedShapeCount: Int {
         installationState.installed?.shapes.count ?? 0
+    }
+
+    var installedContexts: Installed? {
+        installationState.installed
     }
 
     private static let slidingLayers = Set((0..<30).filter { ($0 + 1) % 6 != 0 })
@@ -4887,6 +4895,9 @@ struct Gemma4MTPVerifierConstructionFixture {
     }
 
     func install() throws -> Installed {
+        guard installationState.installed == nil else {
+            throw Gemma4MTPVerifierInstallationError.alreadyInstalled
+        }
         let expectedTopology = Self.production.topology
         let topologyChecks: [(String, Bool)] = [
             ("hidden size", topology.hiddenSize == expectedTopology.hiddenSize),
@@ -5049,6 +5060,9 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     /// The local table is published only after every projection succeeds, so
     /// no failure can leave a partially installed performance lane.
     public func installCBv2MTPVerifier() throws {
+        guard installedMTPVerifierContexts == nil else {
+            throw Gemma4MTPVerifierInstallationError.alreadyInstalled
+        }
         let expectedLayerTypes = (0..<30).map {
             ($0 + 1).isMultiple(of: 6) ? "full_attention" : "sliding_attention"
         }
@@ -5582,17 +5596,19 @@ extension Gemma4TextModel: CBv2MTPForwardable {
     public func cbv2ForwardWithHidden(
         _ tokens: MLXArray, caches: [KVCache]
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
-        let verifier: Gemma4MTPVerifierContext?
-        if tokens.ndim == 2, tokens.dim(1) > 1 {
-            let shape = CBv2Gemma4MTPVerifierShape(
-                batch: tokens.dim(0), columns: tokens.dim(1))
-            guard let installed = installedMTPVerifierContexts?[shape] else {
-                preconditionFailure(
-                    "Gemma 4 MTP verifier has no installed B\(shape.batch)/C\(shape.columns) route")
-            }
-            verifier = installed
-        } else {
-            verifier = nil
+        let (postNorm, preNorm) = model.callCapturingPreNorm(
+            tokens, cache: caches, verifier: nil)
+        return (applyLMHead(postNorm, verifier: nil), preNorm)
+    }
+
+    public func cbv2ForwardRectangularVerificationWithHidden(
+        _ tokens: MLXArray, caches: [KVCache]
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        let shape = CBv2Gemma4MTPVerifierShape(
+            batch: tokens.dim(0), columns: tokens.dim(1))
+        guard let verifier = installedMTPVerifierContexts?[shape] else {
+            preconditionFailure(
+                "Gemma 4 MTP verifier has no installed B\(shape.batch)/C\(shape.columns) route")
         }
         let (postNorm, preNorm) = model.callCapturingPreNorm(
             tokens, cache: caches, verifier: verifier)

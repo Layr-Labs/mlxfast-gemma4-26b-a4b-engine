@@ -178,7 +178,7 @@ struct Gemma4MTPVerifierRouteTests {
     }
 
     @Test
-    func modelInstallationAndForwardBoundaryUseExactPhysicalShapeKeys() throws {
+    func ordinaryForwardIsTableIndependentAndExplicitVerificationOwnsShapeLookup() throws {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -202,18 +202,113 @@ struct Gemma4MTPVerifierRouteTests {
         #expect(source.contains("CBv2Gemma4MTPExpertProjection.bindB1Verifier("))
         #expect(source.contains("Gemma4MMAQuantizedGEMV.bindB1Verifier("))
 
-        let forwardStart = try #require(source.range(
+        let ordinaryStart = try #require(source.range(
             of: "    public func cbv2ForwardWithHidden("))
-        let forward = String(source[forwardStart.lowerBound..<source.endIndex])
-        #expect(forward.contains(
+        let verifyStart = try #require(source.range(
+            of: "    public func cbv2ForwardRectangularVerificationWithHidden(",
+            range: ordinaryStart.upperBound..<source.endIndex))
+        let ordinary = String(
+            source[ordinaryStart.lowerBound..<verifyStart.lowerBound])
+        let verify = String(source[verifyStart.lowerBound..<source.endIndex])
+
+        // Prompt/prefill, decode seeds, and serial-oracle columns all use the
+        // ordinary seam. It must be identical whether the private table is
+        // absent or already installed because it never reads that table.
+        #expect(ordinary.contains("verifier: nil"))
+        #expect(!ordinary.contains("installedMTPVerifierContexts"))
+        #expect(!ordinary.contains("CBv2Gemma4MTPVerifierShape"))
+        #expect(!ordinary.contains("preconditionFailure"))
+
+        // Only the explicitly typed rectangular-verification seam may select
+        // the installed table, and it must exact-key without fallback.
+        #expect(verify.contains(
             "let shape = CBv2Gemma4MTPVerifierShape("))
-        #expect(forward.contains(
+        #expect(verify.contains(
             "batch: tokens.dim(0), columns: tokens.dim(1)"))
-        #expect(forward.contains(
+        #expect(verify.contains(
             "installedMTPVerifierContexts?[shape]"))
-        #expect(forward.contains(
+        #expect(verify.contains(
             #"no installed B\(shape.batch)/C\(shape.columns) route"#))
-        #expect(!forward.contains("tokens.dim(0) == 8"))
+        #expect(!verify.contains("tokens.dim(0) == 8"))
+        #expect(!verify.contains("tokens.ndim"))
+    }
+
+    @Test
+    func rectangularTargetVerificationUsesExplicitPhaseSeam() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let contracts = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/MTP/MTPContractsV2.swift"),
+            encoding: .utf8)
+        let adapter = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/SteppableAdapterV2.swift"),
+            encoding: .utf8)
+        let verification = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/MTP/EngineLoopV2+MTPTargetVerification.swift"),
+            encoding: .utf8)
+
+        #expect(contracts.contains(
+            "func cbv2ForwardRectangularVerificationWithHidden("))
+        #expect(contracts.contains(
+            "func forwardRectangularVerificationWithHidden("))
+        #expect(adapter.contains(
+            "forwardable.cbv2ForwardRectangularVerificationWithHidden("))
+
+        let serialStart = try #require(verification.range(of: "if !useRectangular"))
+        let rectangularStart = try #require(verification.range(
+            of: "        } else {", range: serialStart.upperBound..<verification.endIndex))
+        let serial = String(
+            verification[serialStart.lowerBound..<rectangularStart.lowerBound])
+        let rectangular = String(verification[rectangularStart.lowerBound..<verification.endIndex])
+        #expect(serial.contains("mtp.model.forwardWithHidden("))
+        #expect(!serial.contains("forwardRectangularVerificationWithHidden"))
+        #expect(rectangular.contains(
+            "mtp.model.forwardRectangularVerificationWithHidden("))
+    }
+
+    @Test
+    func secondInstallationIsRejectedWithoutReplacingPublishedContexts() throws {
+        let fixture = Gemma4MTPVerifierConstructionFixture.production
+        let first = try fixture.install()
+        let firstShapes = first.shapes
+        let firstCounts = firstShapes.map(first.entrypointCount(shape:))
+
+        do {
+            _ = try fixture.install()
+            Issue.record("construction replaced an already published verifier table")
+        } catch let error as Gemma4MTPVerifierInstallationError {
+            #expect(error.description.contains("already installed"))
+        } catch {
+            Issue.record("unexpected second-install error: \(error)")
+        }
+
+        #expect(fixture.cbv2MTPVerifierInstalled)
+        #expect(fixture.installedShapeCount == 3)
+        let retained = try #require(fixture.installedContexts)
+        #expect(retained.shapes == firstShapes)
+        #expect(retained.shapes.map(retained.entrypointCount(shape:)) == firstCounts)
+
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Gemma4Text.swift"),
+            encoding: .utf8)
+        let installStart = try #require(source.range(
+            of: "    public func installCBv2MTPVerifier() throws {"))
+        let oneShot = try #require(source.range(
+            of: "guard installedMTPVerifierContexts == nil else",
+            range: installStart.upperBound..<source.endIndex))
+        let topology = try #require(source.range(
+            of: "let expectedLayerTypes", range: installStart.upperBound..<source.endIndex))
+        #expect(oneShot.lowerBound < topology.lowerBound)
     }
 
     @Test

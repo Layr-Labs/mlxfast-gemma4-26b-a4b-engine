@@ -311,6 +311,25 @@ struct CBv2MTPModelSeamTests {
 
     // MARK: - (b) Logits parity: cbv2ForwardWithHidden vs plain forward
 
+    @Test func ordinaryMultiTokenForwardDoesNotRequireVerifierContext() throws {
+        MLXRandom.seed(0xB1C2)
+        let config = try targetConfig()
+        let model = Gemma4TextModel(config)
+        eval(model)
+        #expect(!model.cbv2MTPVerifierInstalled)
+
+        let prompt = makePromptTokens(length: 7, seed: 10, vocabSize: vocabSize)
+        let rig = CBv2Rig(config: config)
+        let row = try rig.newRow(promptLength: prompt.count)
+        let (logits, lastHidden) = model.cbv2ForwardWithHidden(
+            tokens2d(prompt), caches: rig.kvCaches([row]))
+        eval(logits, lastHidden)
+
+        #expect(logits.shape == [1, prompt.count, vocabSize])
+        #expect(lastHidden.shape == [1, prompt.count, hiddenSize])
+        #expect(!model.cbv2MTPVerifierInstalled)
+    }
+
     @Test func forwardWithHiddenLogitsParity() throws {
         MLXRandom.seed(0xBEEF)
         let config = try targetConfig()

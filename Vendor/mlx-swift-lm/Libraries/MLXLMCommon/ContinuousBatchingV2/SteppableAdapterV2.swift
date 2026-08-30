@@ -209,4 +209,15 @@ extension CBv2SteppableLanguageModelAdapter: CBv2MTPSteppableModel {
         }
         return forwardable.cbv2ForwardWithHidden(tokens, caches: asKVCaches(caches))
     }
+
+    public func forwardRectangularVerificationWithHidden(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        guard let forwardable = model as? CBv2MTPForwardable else {
+            preconditionFailure(
+                "CBv2 MTP: \(type(of: model)) is not CBv2MTPForwardable — engine gating failed")
+        }
+        return forwardable.cbv2ForwardRectangularVerificationWithHidden(
+            tokens, caches: asKVCaches(caches))
+    }
 }

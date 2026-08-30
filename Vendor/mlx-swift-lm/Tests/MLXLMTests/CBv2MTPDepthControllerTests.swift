@@ -364,4 +364,10 @@ private final class MTPControllerTestModel: CBv2MTPSteppableModel {
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         fatalError("controller tests do not execute model graphs")
     }
+
+    func forwardRectangularVerificationWithHidden(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        fatalError("controller tests do not execute model graphs")
+    }
 }

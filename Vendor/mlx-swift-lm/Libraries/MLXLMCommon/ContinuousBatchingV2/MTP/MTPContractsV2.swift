@@ -59,6 +59,12 @@ public protocol CBv2MTPForwardable: AnyObject {
     /// plain forward on the logits side.
     func cbv2ForwardWithHidden(_ tokens: MLXArray, caches: [KVCache])
         -> (logits: MLXArray, lastHidden: MLXArray)
+    /// Explicit target-verification phase seam. The MTP target-verification
+    /// loop calls this only after it has selected rectangular verification;
+    /// prompt/prefill, seed decode, and serial-oracle columns never call it.
+    func cbv2ForwardRectangularVerificationWithHidden(
+        _ tokens: MLXArray, caches: [KVCache]
+    ) -> (logits: MLXArray, lastHidden: MLXArray)
 }
 
 /// Steppable models that can drive MTP rounds. Additive refinement of
@@ -76,6 +82,11 @@ public protocol CBv2MTPSteppableModel: CBv2SteppableModel {
     /// [B, L, hidden]. Same cache/attention semantics as `forward`.
     func forwardWithHidden(tokens: MLXArray, caches: [CBv2AttendingLayerCache])
         -> (logits: MLXArray, lastHidden: MLXArray)
+    /// Explicit rectangular target-verification twin. This is a phase
+    /// identity, not a shape inference or a verification-policy selector.
+    func forwardRectangularVerificationWithHidden(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> (logits: MLXArray, lastHidden: MLXArray)
 }
 
 extension CBv2MTPSteppableModel {

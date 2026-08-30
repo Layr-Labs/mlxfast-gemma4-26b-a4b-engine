@@ -87,7 +87,8 @@ extension EngineLoopV2 {
                 for cache in serializingCaches { cache.mtpSerializesRectangularAttention = false }
             }
             let tokens = concatenated(columns, axis: 1)
-            let output = mtp.model.forwardWithHidden(tokens: tokens, caches: caches)
+            let output = mtp.model.forwardRectangularVerificationWithHidden(
+                tokens: tokens, caches: caches)
             argmax = argMax(output.logits, axis: -1).asType(.int32)
             hidden = output.lastHidden
         }

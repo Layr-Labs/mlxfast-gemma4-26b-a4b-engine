@@ -350,13 +350,24 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 accumulator[element] = 0.0f;
             }
 
+            // Logical token N - 1 is the only one served from new_keys, and it
+            // is always the LAST token any column visits: column c walks
+            // c, c + BLOCKS, ..., c + N - BLOCKS, so only column BLOCKS - 1
+            // ever reaches it and only on its final step. Peeling that final
+            // step out leaves the steady-state loop a branch-free affine walk
+            // over a COMPILE-TIME trip count, which is what lets the compiler
+            // keep unrolling it and keep the K load of the next step in flight
+            // across the simd_sum of the current one.
+            static_assert(N % BLOCKS == 0, "partition must divide the ring");
+            constexpr int steady_steps = N / BLOCKS - 1;
+            const bool owns_current = block == BLOCKS - 1;
+
             uint slot = (ring_start + uint(block)) & ring_mask;
             float max_score = -3.402823466e+38F;
             float sum_exp_score = 0.0f;
-            for (int token = block; token < N; token += BLOCKS) {
-                const bool current = token == N - 1;
-                const device T* k = current ? new_key : keys + slot * D;
-                const device T* v = current ? new_value : values + slot * D;
+            for (int step = 0; step < steady_steps; ++step) {
+                const device T* k = keys + slot * D;
+                const device T* v = values + slot * D;
                 float score = 0.0f;
                 for (int element = 0; element < values_per_lane; ++element) {
                     score += q[element] * float(k[element]);
@@ -374,6 +385,25 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 }
 
                 slot = (slot + uint(BLOCKS)) & ring_mask;
+            }
+            {
+                const device T* k = owns_current ? new_key : keys + slot * D;
+                const device T* v = owns_current ? new_value : values + slot * D;
+                float score = 0.0f;
+                for (int element = 0; element < values_per_lane; ++element) {
+                    score += q[element] * float(k[element]);
+                }
+                score = simd_sum(score);
+
+                const float new_max = max(max_score, score);
+                const float old_factor = fast::exp(max_score - new_max);
+                const float score_factor = fast::exp(score - new_max);
+                max_score = new_max;
+                sum_exp_score = sum_exp_score * old_factor + score_factor;
+                for (int element = 0; element < values_per_lane; ++element) {
+                    accumulator[element] = accumulator[element] * old_factor
+                        + score_factor * float(v[element]);
+                }
             }
 
             if (lane == 0) {

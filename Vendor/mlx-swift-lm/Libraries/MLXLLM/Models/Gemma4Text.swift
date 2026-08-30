@@ -130,13 +130,46 @@ private let gemma4PrefillChunkEvalLayers = resolveGemma4PrefillChunkEvalLayers(
 /// zero kill switch and every explicit non-default tuning value are preserved;
 /// only a pass already in that regime takes the narrower cadence.
 ///
-/// `0` disables the specialization (the cadence falls back to the configured
-/// value), which is the kill switch.
+/// PREFILL-BOUNDARY-WIDEN-020. `mlxfast-h008` isolated a single change on
+/// this exact lever — within this "long" regime, submitting ONLY the first
+/// of its four intermediate boundaries (layer 6, dropping 12/18/24) — and it
+/// lost a real, officially measured `-282.606` bips against the frontier at
+/// submit time (submission `04c8e5d`, base `2f319d4`), a loss far larger
+/// than the composite's 0.25 prefill exponent alone would predict from a
+/// purely local per-graph-frontier effect. That measured direction is the
+/// evidence this change acts on, not a guess: dropping boundaries on this
+/// axis cost real composite, so the predicted direction of restoring more
+/// boundaries than the shipped five (6/12/18/24/30, interval 6) is a gain,
+/// not a loss — the mirror of `29e889d`'s decode-ladder table, where the
+/// early boundaries alone captured essentially all of the measured benefit
+/// and the middle cadence was dead weight. h008 showed prefill does NOT
+/// share that "early-only" shape, so unlike the decode ladder this lever's
+/// predicted optimum has not yet been passed on the narrow side.
+///
+/// The chosen step — interval 6 -> 3, doubling the boundary count from five
+/// to ten (3/6/9/12/15/18/21/24/27/30) — is a moderate widen, not an extreme
+/// one (e.g. interval 1, thirty boundaries): h008's own loss was large
+/// enough that a compounding regression from an equally extreme move in the
+/// other direction — one submission per layer, swamping the command buffer
+/// — is a real two-sided risk this probe intentionally avoids by only
+/// doubling density in one step.
+///
+/// This changes only WHEN an already-built graph frontier already produced
+/// by this loop is handed to async evaluation; it adds no kernel, operand,
+/// dtype, shape or accumulation-order change, so prefill's emitted tokens
+/// are identical to the unmodified cadence by construction — the same class
+/// of change `h003`, `h007` and `h008` all relied on to clear `benchctl`'s
+/// per-stream token-tolerance accept gate.
+///
+/// `0` disables the specialization (the cadence falls back to the
+/// configured value), which is the kill switch; any other explicit
+/// `DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL_LONG` value still tunes the interval
+/// directly and is unaffected — only the unset default changes here.
 private let gemma4LongPrefillChunkEvalLayers: Int = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL_LONG"],
         let value = Int(raw), value >= 0
-    else { return 6 }
+    else { return 3 }
     return value
 }()
 

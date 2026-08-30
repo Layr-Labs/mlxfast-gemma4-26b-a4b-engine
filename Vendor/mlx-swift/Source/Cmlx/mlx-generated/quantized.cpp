@@ -3854,13 +3854,25 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     return;
   }
   const uint assignment = tid.z;
-  const uint32_t expert = rhs_indices[assignment * rhs_stride];
+  // ROUTE-META-SIDECAR: same packed sorted-key contract as the gate/up arm
+  // in affine_gather_qmv below -- bit 31 sentinel, expert id in the low
+  // byte, run offset at bits 8..13, capped run length at bits 16..18. A
+  // packed word answers this arm's backward scan and pair probe in O(1)
+  // with the identical values; an unpacked word (bare expert id below 256)
+  // keeps the incumbent scans untouched.
+  const uint32_t rhs_word = rhs_indices[assignment * rhs_stride];
+  const bool has_route_meta = (rhs_word & 0x80000000u) != 0u;
+  const uint32_t expert = has_route_meta ? (rhs_word & 0xffu) : rhs_word;
   uint run_offset = 0;
-  for (uint prior = assignment; prior > 0; --prior) {
-    if (rhs_indices[(prior - 1) * rhs_stride] != expert) {
-      break;
+  if (has_route_meta) {
+    run_offset = (rhs_word >> 8) & 0x3fu;
+  } else {
+    for (uint prior = assignment; prior > 0; --prior) {
+      if (rhs_indices[(prior - 1) * rhs_stride] != rhs_word) {
+        break;
+      }
+      run_offset++;
     }
-    run_offset++;
   }
   // Odd positions are produced by the immediately preceding pair leader.
   if ((run_offset & 1) != 0) {
@@ -3872,9 +3884,10 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   const device T* tile_x0 =
       x + lhs_indices[assignment * lhs_stride] * x_stride;
   device T* tile_y0 = y + assignment * out_vec_size;
-  const bool has_pair =
-      assignment + 1 < 64 &&
-      rhs_indices[(assignment + 1) * rhs_stride] == expert;
+  const bool has_pair = has_route_meta
+      ? (((rhs_word >> 16) & 0x7u) >= 2u)
+      : (assignment + 1 < 64 &&
+         rhs_indices[(assignment + 1) * rhs_stride] == rhs_word);
   if (has_pair) {
     const device T* tile_x1 =
         x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
@@ -3975,14 +3988,29 @@ template <typename T, int group_size, int bits>
       return;
     }
     const uint assignment = tid.z;
-    const uint32_t expert =
+    // ROUTE-META-SIDECAR: bit 31 marks a sorted-key word packed by the exact
+    // decode route sorter -- expert id in the low byte, run offset at bits
+    // 8..13, run length capped at 4 at bits 16..18. The sorter counts those
+    // values while it already holds every key, and they equal the backward
+    // and forward neighbor scans below by construction (equal keys are
+    // contiguous under the stable sort), so a packed word answers the
+    // leader/run decisions in O(1). Legacy tables hold bare expert ids below
+    // 256, which can never set bit 31, so an unpacked word keeps the
+    // incumbent scans untouched.
+    const uint32_t rhs_word =
         rhs_indices[assignment * (uint)rhs_strides[0]];
+    const bool has_route_meta = (rhs_word & 0x80000000u) != 0u;
+    const uint32_t expert = has_route_meta ? (rhs_word & 0xffu) : rhs_word;
     uint run_offset = 0;
-    for (uint prior = assignment; prior > 0; --prior) {
-      if (rhs_indices[(prior - 1) * (uint)rhs_strides[0]] != expert) {
-        break;
+    if (has_route_meta) {
+      run_offset = (rhs_word >> 8) & 0x3fu;
+    } else {
+      for (uint prior = assignment; prior > 0; --prior) {
+        if (rhs_indices[(prior - 1) * (uint)rhs_strides[0]] != rhs_word) {
+          break;
+        }
+        run_offset++;
       }
-      run_offset++;
     }
 
     // RUN-QUAD: leaders sit at run_offset % 4 == 0 and serve up to four
@@ -3996,10 +4024,14 @@ template <typename T, int group_size, int bits>
       return;
     }
     uint run_len = 1;
-    while (run_len < 4 && assignment + run_len < 64 &&
-           rhs_indices[(assignment + run_len) * (uint)rhs_strides[0]] ==
-               expert) {
-      run_len++;
+    if (has_route_meta) {
+      run_len = (rhs_word >> 16) & 0x7u;
+    } else {
+      while (run_len < 4 && assignment + run_len < 64 &&
+             rhs_indices[(assignment + run_len) * (uint)rhs_strides[0]] ==
+                 rhs_word) {
+        run_len++;
+      }
     }
     if (run_len > 1) {
       const device uint32_t* run_w = w + expert * w_strides[0];

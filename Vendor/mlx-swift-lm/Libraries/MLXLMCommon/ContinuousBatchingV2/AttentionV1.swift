@@ -52,43 +52,6 @@ enum CBv2AttentionV1 {
         return value
     }()
 
-    /// Query-block width used when a prompt pass is already on the blocked
-    /// path and the layer's heads are wide (head dim 256 or 512). Wide heads
-    /// do not enter the fused SDPA path, so a blocked prompt pass materializes
-    /// one score rectangle per block; a narrower block holds a smaller
-    /// rectangle. Only the grouping of the query rows changes: every row's
-    /// softmax reduction still runs over the whole key axis, in the same
-    /// order, so the produced values are unchanged.
-    ///
-    /// `0` disables the specialization (the block width falls back to
-    /// `queryBlockSize`), which is the kill switch.
-    static let wideHeadQueryBlockSize: Int = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_ATTN_QUERY_BLOCK_WIDE"],
-            let value = Int(raw), value >= 0
-        else { return 64 }
-        return value
-    }()
-
-    /// Block width for one attention call: the wide-head width when the call
-    /// is on the blocked-query prompt path (`L > queryBlockSize`) and the
-    /// layer's head dim is 256 or 512; the configured width otherwise. Decode
-    /// has `L == 1` and can never enter. An explicit
-    /// `DARKBLOOM_CBV2_ATTN_QUERY_BLOCK` override that moves the configured
-    /// width off its default also returns the configured width.
-    @inline(__always)
-    private static func effectiveQueryBlockSize(
-        kind: CBv2LayerKind, queryLength: Int
-    ) -> Int {
-        guard queryBlockSize == 128,
-            wideHeadQueryBlockSize > 0,
-            wideHeadQueryBlockSize < queryBlockSize,
-            queryLength > queryBlockSize,
-            kind.headDim == 256 || kind.headDim == 512
-        else { return queryBlockSize }
-        return wideHeadQueryBlockSize
-    }
-
     /// Ceiling, in MiB, on the K+V a PACKED prefill may restack on the batch
     /// axis for one batched SDPA (`batchedPackedAttention`).
     ///
@@ -108,17 +71,6 @@ enum CBv2AttentionV1 {
             let value = Int(raw), value >= 0
         else { return 512 << 20 }
         return value << 20
-    }()
-
-    /// Join prompt attention blocks directly into the token-major layout that
-    /// the following output projection consumes. The returned value remains a
-    /// head-major view, so callers keep the same typed interface while their
-    /// existing transpose restores the contiguous token-major buffer.
-    static let tokenMajorJoinEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_PREFILL_TOKENMAJOR_JOIN"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
     /// ATT-008 opt-in switch: batch-wide FULL-attention decode over pooled
@@ -621,12 +573,11 @@ enum CBv2AttentionV1 {
         spanContext: CBv2SpanChunkContext?
     ) -> MLXArray {
         let L = queries.dim(2)
-        let blockSize = effectiveQueryBlockSize(kind: kind, queryLength: L)
-        if blockSize > 0 && L > blockSize && !kind.isBidirectional {
+        if shouldBlockQueries(L) && !kind.isBidirectional {
             return attendQueryBlocks(
                 queries: queries, keys: cachedKeys, values: cachedValues,
                 newTokenCount: L, window: window, scale: scale,
-                sinks: sinks, softcap: softcap, blockSize: blockSize,
+                sinks: sinks, softcap: softcap, blockSize: queryBlockSize,
                 spanContext: spanContext)
         }
         if let spanContext {
@@ -942,12 +893,11 @@ enum CBv2AttentionV1 {
     ) -> MLXArray {
         let L = queries.dim(2)
         let (cachedKeys, cachedValues) = chunkBorrowViews(of: sourceRow)
-        let blockSize = effectiveQueryBlockSize(kind: sourceKind, queryLength: L)
-        if blockSize > 0 && L > blockSize && !sourceKind.isBidirectional {
+        if shouldBlockQueries(L) && !sourceKind.isBidirectional {
             return attendQueryBlocks(
                 queries: queries, keys: cachedKeys, values: cachedValues,
                 newTokenCount: L, window: window(of: sourceKind), scale: scale,
-                sinks: sinks, softcap: softcap, blockSize: blockSize,
+                sinks: sinks, softcap: softcap, blockSize: queryBlockSize,
                 spanContext: spanContext)
         }
         if let spanContext {
@@ -1140,19 +1090,6 @@ enum CBv2AttentionV1 {
         precondition(historyCount >= 0)
         var outputs: [MLXArray] = []
         outputs.reserveCapacity((newTokenCount + blockSize - 1) / blockSize)
-        // PREFILL-QSCALE-ELIDE: split the query head axis ONCE on the
-        // row-contiguous chunk (a pure view) so no q-block has to be
-        // materialized for the composed path. nil keeps every block on the
-        // established `MLXFast.scaledDotProductAttention` call.
-        // `blockSize <= 8` is the pinned MTP serial-query path (and any other
-        // narrow verify block): those calls never reach the composed arm, so
-        // build no graph nodes for them at all.
-        let queryPlane: MLXArray? =
-            (blockSize > 8 && newTokenCount > 8)
-            ? CBv2ComposedPrefillSDPAV1.queryPlane(
-                queries: queries, keys: keys, values: values,
-                scale: scale, sinks: sinks, softcap: softcap)
-            : nil
         var offset = 0
         while offset < newTokenCount {
             let count = min(blockSize, newTokenCount - offset)
@@ -1196,41 +1133,15 @@ enum CBv2AttentionV1 {
                         window: window, blocks: blocks,
                         sinks: sinks, softcap: softcap))
             } else {
-                let planeSlice = queryPlane.map {
-                    $0[0..., 0..., 0..., offset ..< (offset + count), 0...]
-                }
                 outputs.append(
                     attend(
                         queries: querySlice, keys: keySlice, values: valueSlice,
                         scale: scale, L: count, kL: visibleEnd - visibleStart,
-                        window: window, sinks: sinks, softcap: softcap,
-                        queryPlaneSlice: planeSlice))
+                        window: window, sinks: sinks, softcap: softcap))
             }
             offset += count
         }
-        if outputs.count == 1 { return outputs[0] }
-        // PREFILL-TOKENMAJOR-JOIN. The established head-major join is
-        // immediately transposed and reshaped by Gemma4Attention, forcing a
-        // second full pass over the prompt attention output. Permuting each
-        // block before concatenation writes the final token-major rectangle
-        // directly. Returning its inverse-transposed view preserves this
-        // function's `[B, H, L, D]` contract; the caller's existing transpose
-        // composes to identity and its reshape can share the buffer.
-        //
-        // `blockSize > 8 && newTokenCount > 8` is the prompt-only composed
-        // attention plane. Decode is L=1 and MTP serial verification uses
-        // blockSize=1, so neither can enter this branch.
-        if tokenMajorJoinEnabled,
-            blockSize > 8,
-            newTokenCount > 8,
-            outputs[0].ndim == 4
-        {
-            CBv2EngageMark.once("prefill-tokenmajor-join")
-            let tokenMajor = concatenated(
-                outputs.map { $0.transposed(0, 2, 1, 3) }, axis: 1)
-            return tokenMajor.transposed(0, 2, 1, 3)
-        }
-        return concatenated(outputs, axis: 2)
+        return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
     }
 
     /// One query at a time — the pinned MTP serial-verification path.
@@ -1253,7 +1164,7 @@ enum CBv2AttentionV1 {
     private static func attend(
         queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float,
         L: Int, kL: Int, window: Int?, sinks: MLXArray?, softcap: Float?,
-        bidirectional: Bool = false, queryPlaneSlice: MLXArray? = nil
+        bidirectional: Bool = false
     ) -> MLXArray {
         // A model may widen Q for safer attention math while retaining compact
         // K/V storage. SDPA requires one dtype, so widen only these views.
@@ -1268,19 +1179,6 @@ enum CBv2AttentionV1 {
             assert(
                 sinks == nil || sinks!.dtype == queries.dtype,
                 "CBv2AttentionV1: sinks must be normalized to the query dtype before SDPA")
-            // PREFILL-QSCALE-ELIDE: on the prompt plane MLX takes its unfused
-            // fallback (head dim 256/512, L > 8) whose first op is an identity
-            // `scale * q` at Gemma 4's `scale == 1.0`. The transcription below
-            // is that fallback with the identity deleted; it refuses every
-            // input it cannot prove is the same graph.
-            if let composed = CBv2ComposedPrefillSDPAV1.attend(
-                queries: queries, keys: attentionKeys, values: attentionValues,
-                scale: scale, L: L, kL: kL, window: window,
-                bidirectional: bidirectional, sinks: sinks,
-                queryPlaneSlice: queryPlaneSlice)
-            {
-                return composed
-            }
             return MLXFast.scaledDotProductAttention(
                 queries: queries, keys: attentionKeys, values: attentionValues, scale: scale,
                 mask: maskMode(

@@ -156,7 +156,7 @@ git commit -m 'test: distinguish Gemma B1 verifier shapes'
 
 **Does NOT cover:** gather/expert routing; this task handles a single immutable affine weight plane shared by C positions.
 
-- [ ] **Step 1: Write failing affine-4 and affine-8 parity tests**
+- [x] **Step 1: Write failing affine-4 and affine-8 parity tests**
 
 Use the real production input widths and deterministic synthetic weights. The core assertion is bit equality, not tolerance:
 
@@ -224,11 +224,11 @@ func b1FixedWidthProjectionMatchesIndependentB1(
 
 The fixture's `ordinaryB1` must call the same pinned `QuantizedLinear`/`quantizedMatmul` path used by the model, not another custom kernel.
 
-- [ ] **Step 2: Run the focused test under the guard**
+- [x] **Step 2: Run the focused test under the guard**
 
 Expected: FAIL because `Gemma4B1MTPQuantizedProjection` does not exist.
 
-- [ ] **Step 3: Implement the fixed-C Metal entrypoint**
+- [x] **Step 3: Implement the fixed-C Metal entrypoint**
 
 Create a construction-bound API:
 
@@ -267,11 +267,11 @@ public enum Gemma4B1MTPQuantizedProjection {
 
 The Metal body must copy the literal K-loop, dequantization, bias contribution, and `simd_sum` order from the pinned ordinary `qmv_impl<T, 64, bits>` in `Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/quantized.h`. Replace its single accumulator with `thread float acc[COLUMNS]`; load each packed weight/scales/bias value once, then update `acc[c]` for `c = 0..<COLUMNS` in the same statement order as the ordinary B1 body. Do not use matrix-multiply reductions or `affine_qmv_fast`.
 
-- [ ] **Step 4: Run bit-parity tests**
+- [x] **Step 4: Run bit-parity tests**
 
 Expected: all six B1/C2-C4 affine-4/8 cells pass bit-for-bit.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/Gemma4B1MTPQuantizedProjection.swift Tests/MLXFastTests/Gemma4MTPVerifierB1ProjectionTests.swift

@@ -4074,6 +4074,18 @@ template <typename T, int group_size, int bits>
     const device T* single_scales = scales + expert * s_strides[0];
     const device T* single_biases = biases + expert * b_strides[0];
     device T* single_y = y + assignment * (uint)out_vec_size;
+    if (in_vec_size == 2816) {
+      qmv_affine4_g64_singles_impl<T, group_size, bits, 2816, true, false>(
+          single_w, single_scales, single_biases, single_x, single_y,
+          in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+      return;
+    }
+    if (in_vec_size == 704) {
+      qmv_affine4_g64_singles_impl<T, group_size, bits, 704, true, false>(
+          single_w, single_scales, single_biases, single_x, single_y,
+          in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+      return;
+    }
     qmv_impl<T, group_size, bits>(
         single_w, single_scales, single_biases, single_x, single_y,
         in_vec_size, out_vec_size, tid, simd_gid, simd_lid);

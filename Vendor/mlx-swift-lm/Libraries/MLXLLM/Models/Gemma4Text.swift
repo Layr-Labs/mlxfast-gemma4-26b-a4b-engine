@@ -80,7 +80,7 @@ internal func gemma4ShouldSubmitDecodeAsyncEvalLadder(
     // The empty-set row is the control that matters: this is not "fewer is
     // always better", it is "the early pair carries all of the overlap".
     switch layerIndex {
-    case 0, 1:
+    case 0, 1, 5, 11, 17, 23, 27:
         return true
     default:
         return false
@@ -2355,9 +2355,9 @@ private enum Gemma4FusedLayerGlue {
     )
 
     private static let dualPreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_dual_prenorm_xsum_2816_bf16_v2",
+        name: "gemma4_glue_dual_prenorm_2816_bf16_v1",
         inputNames: ["x", "w1", "w2"],
-        outputNames: ["out1", "out2", "xSums"],
+        outputNames: ["out1", "out2"],
         source: """
             const uint row = threadgroup_position_in_grid.x;
             const uint lid = thread_position_in_threadgroup.x;
@@ -2369,17 +2369,11 @@ private enum Gemma4FusedLayerGlue {
             const uint wbase = lid * 4;
         \(rmsReduce("x", into: "local_inv[0]"))
             const float inv = local_inv[0];
-            float xsum = 0.0f;
             for (int i = 0; i < 4; i++) {
                 const T nx = static_cast<T>((float)x[base + i] * inv);
-                const T dense = w1[wbase + i] * nx;
-                out1[base + i] = dense;
+                out1[base + i] = w1[wbase + i] * nx;
                 out2[base + i] = w2[wbase + i] * nx;
-                xsum += dense;
             }
-            // `lid == k_block * 32 + lane`, exactly the standalone DMLP
-            // xsum table's first two coordinates. Row remains unit stride.
-            xSums[lid * 8 + row] = xsum;
         """,
         ensureRowContiguous: true
     )
@@ -2455,7 +2449,7 @@ private enum Gemma4FusedLayerGlue {
 
     static func dualPreNorm(
         x: MLXArray, w1: MLXArray, w2: MLXArray, eps: Float
-    ) -> (MLXArray, MLXArray, CBv2DenseMLPQMVV1.ActivationSums?)? {
+    ) -> (MLXArray, MLXArray)? {
         guard admits(x, weight: w1, eps: eps),
             w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16
         else { return nil }
@@ -2465,16 +2459,10 @@ private enum Gemma4FusedLayerGlue {
             template: [("T", x.dtype)],
             grid: (rows * tgThreads, 1, 1),
             threadGroup: (tgThreads, 1, 1),
-            outputShapes: [
-                [rows, 1, axis],
-                [rows, 1, axis],
-                [(axis / 128) * 32 * rows],
-            ],
-            outputDTypes: [.bfloat16, .bfloat16, .float32]
+            outputShapes: [[rows, 1, axis], [rows, 1, axis]],
+            outputDTypes: [.bfloat16, .bfloat16]
         )
-        let sums = CBv2DenseMLPQMVV1.activationSums(
-            produced: outs[2], for: outs[0])
-        return (outs[0], outs[1], sums)
+        return (outs[0], outs[1])
     }
 
     /// GLUE-003: tail variant that ALSO emits the NEXT layer's input norm.
@@ -2781,14 +2769,11 @@ private class Gemma4MLP: Module {
         return tight
     }
 
-    func callAsFunction(
-        _ x: MLXArray,
-        activationSums producerSums: CBv2DenseMLPQMVV1.ActivationSums? = nil
-    ) -> MLXArray {
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
         // DMLP-002: one exact activation-sum prepass feeds both fallback
         // projections. If either projection is not the pinned affine8 cell,
         // the candidate arrays remain unevaluated and stock takes over.
-        let activationSums = producerSums ?? CBv2DenseMLPQMVV1.activationSums(for: x)
+        let activationSums = CBv2DenseMLPQMVV1.activationSums(for: x)
         return denseProjection(
             downProj,
             gemma4GeluProduct(
@@ -2915,19 +2900,18 @@ private enum Gemma4ZipRouterV1 {
             out.dtype == .bfloat16
         else { return nil }
 
-        // Stage 0, shared: the two pre-norms plus the exact dense activation
-        // table. A nil here means this is not the fused-glue cell and no node
-        // was built.
-        guard let (n1, n2, producerSums) = Gemma4FusedLayerGlue.dualPreNorm(
+        // Stage 0, shared: the two pre-norms, exactly the call the stock
+        // branch makes. A nil here means this is not the fused-glue cell and
+        // no node was built.
+        guard let (n1, n2) = Gemma4FusedLayerGlue.dualPreNorm(
             x: out, w1: w1, w2: w2, eps: eps)
         else { return nil }
 
-        // Stage 1: router norm. The table is normally producer-emitted in
-        // stage 0; the standalone producer survives only as the fail-closed
-        // fallback for a disabled or mismatched carrier. A nil leaves the
-        // dual pre-norm arrays unreferenced, so MLX never evaluates them and
-        // the caller's stock path rebuilds the identical pair.
-        guard let sums = producerSums ?? mlp.zipActivationSums(n1) else { return nil }
+        // Stage 1: dense activation table | router norm. The table pin is the
+        // zip's geometry gate; a nil leaves the dual pre-norm arrays
+        // unreferenced, so MLX never evaluates them and the caller's stock
+        // path rebuilds the identical pair.
+        guard let sums = mlp.zipActivationSums(n1) else { return nil }
         let normed = router.zipNorm(out)
 
         // Stage 2: router QMV | dense gate + up.
@@ -3190,13 +3174,13 @@ public class Gemma4DecoderLayer: Module {
             } else {
                 let (topKIndices, topKWeights) = router(out)
 
-                if let (n1, n2, denseSums) = Gemma4FusedLayerGlue.dualPreNorm(
+                if let (n1, n2) = Gemma4FusedLayerGlue.dualPreNorm(
                     x: out,
                     w1: preFeedforwardLayernorm.weight,
                     w2: preFeedforwardLayernorm2.weight,
                     eps: config.rmsNormEps)
                 {
-                    h1Raw = mlp(n1, activationSums: denseSums)
+                    h1Raw = mlp(n1)
                     h2Raw = experts(
                         n2,
                         topKIndices: topKIndices,

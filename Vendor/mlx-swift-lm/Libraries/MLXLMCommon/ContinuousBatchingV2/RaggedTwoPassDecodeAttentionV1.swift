@@ -60,15 +60,12 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// admits any partition that divides the ring, which lets the occupancy
     /// argument finish.
     ///
-    /// The stock heuristic's answer is an occupancy target expressed in
-    /// threadgroups: on a `d` part at N=1024 and `n_simds = 2` it asks for
-    /// `kvHeads * 1 * 128 = 1024` of them, because the call it was tuned for
-    /// dispatches one row. This dispatch carries eight rows, so the partition
-    /// that reaches the same target is `128 / 8 = 16`, and the whole span from
-    /// 8 to 16 clears it: at 8 the launch is still 512 threadgroups of two
-    /// simdgroups, and each of those simdgroups keeps a 512-byte K load and a
-    /// 512-byte V load outstanding, so roughly 1 MB is in flight against the
-    /// ~225 KB a 450 GB/s part needs to cover its own DRAM latency.
+    /// The packed merge makes the remaining occupancy/traffic tradeoff
+    /// measurable below eight columns. On the public B=8/N=1024 cohort, four
+    /// columns launch 256 pass-A threadgroups of two SIMDgroups and halve the
+    /// partial round trip again; two columns cross the occupancy floor. The
+    /// matched sweep sealed candidate decode windows of 4.58259 s at eight,
+    /// 4.53159 s at four, and 4.56678 s at two, with exact parity throughout.
     ///
     /// Everything below the target is scratch that does not have to be written.
     /// `MLX_SDPA_BLOCKS` keeps its stock meaning and still wins, so a process
@@ -87,8 +84,19 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             return value > 0 && sequenceLength.isMultiple(of: value)
                 ? value : stockBlocks
         }
-        return min(8, stockBlocks)
+        return min(4, stockBlocks)
     }()
+
+    /// How many partition columns one simdgroup of the merge dispatch carries.
+    /// Packing `32 / combineColumns` output groups into one simdgroup fills the
+    /// lanes that are idle when the live partition has fewer than 32 columns.
+    private static let combineColumns: Int = {
+        let capped = min(blocks, 32)
+        return capped > 0 && (capped & (capped - 1)) == 0 ? capped : 32
+    }()
+
+    private static let combineSets = 32 / combineColumns
+    private static let combineThreads = (32 / combineSets) * 32
 
     private static let passAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "cbv2_ragged8_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v1",
@@ -388,22 +396,24 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     )
 
     private static let passBKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_2pass_b_direct_bf16_d256_b\(blocks)_v3",
+        name:
+            "cbv2_ragged8_sdpa_2pass_b_direct_bf16_d256_b\(blocks)"
+            + "_c\(combineColumns)_v5",
         inputNames: ["partials", "sums", "maxs"],
         outputNames: ["out"],
         source: """
             constexpr int simd_width = 32;
             constexpr int values_per_lane = D / simd_width;
-            // One lane per partition column, so a partition narrower than a
-            // simdgroup parks the surplus lanes on the identity of each
-            // reduction rather than dropping columns. At BLOCKS >= simd_width
-            // every lane is live in every round and the guard is the constant
-            // true, which leaves the arithmetic and its order untouched.
-            constexpr int rounds = (BLOCKS + simd_width - 1) / simd_width;
+            // A lane owns one partition column of one output group, and a
+            // simdgroup carries `sets` output groups side by side.
+            constexpr int sets = simd_width / COLS;
+            constexpr int rounds = (BLOCKS + COLS - 1) / COLS;
 
             const int batch_head = int(threadgroup_position_in_grid.x);
-            const int output_group = int(simdgroup_index_in_threadgroup);
-            const int block_lane = int(thread_index_in_simdgroup);
+            const int lane = int(thread_index_in_simdgroup);
+            const int block_lane = lane % COLS;
+            const int output_group =
+                int(simdgroup_index_in_threadgroup) * sets + lane / COLS;
 
             partials += batch_head * BLOCKS * D
                 + output_group * values_per_lane;
@@ -415,29 +425,35 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             for (int element = 0; element < values_per_lane; ++element) {
                 accumulator[element] = 0.0f;
             }
+            thread float lane_max[rounds];
+            thread float lane_sum[rounds];
+            thread float lane_factor[rounds];
             float sum_exp_score = 0.0f;
             float max_score = -3.402823466e+38F;
             for (int round = 0; round < rounds; ++round) {
-                const int column = block_lane + simd_width * round;
-                if (column < BLOCKS) {
-                    max_score = max(max_score, maxs[column]);
-                }
+                const int column = block_lane + COLS * round;
+                const bool live = column < BLOCKS;
+                lane_max[round] = live ? maxs[column] : -3.402823466e+38F;
+                lane_sum[round] = live ? sums[column] : 0.0f;
+                max_score = max(max_score, lane_max[round]);
             }
-            max_score = simd_max(max_score);
+            for (int stride = 1; stride < COLS; stride <<= 1) {
+                max_score =
+                    max(max_score, simd_shuffle_xor(max_score, ushort(stride)));
+            }
 
             for (int round = 0; round < rounds; ++round) {
-                const int column = block_lane + simd_width * round;
-                if (column < BLOCKS) {
-                    sum_exp_score +=
-                        fast::exp(maxs[column] - max_score) * sums[column];
-                }
+                lane_factor[round] = fast::exp(lane_max[round] - max_score);
+                sum_exp_score += lane_factor[round] * lane_sum[round];
             }
-            sum_exp_score = simd_sum(sum_exp_score);
+            for (int stride = 1; stride < COLS; stride <<= 1) {
+                sum_exp_score += simd_shuffle_xor(sum_exp_score, ushort(stride));
+            }
 
             for (int round = 0; round < rounds; ++round) {
-                const int column = block_lane + simd_width * round;
+                const int column = block_lane + COLS * round;
                 if (column < BLOCKS) {
-                    const float factor = fast::exp(maxs[column] - max_score);
+                    const float factor = lane_factor[round];
                     for (int element = 0; element < values_per_lane; ++element) {
                         accumulator[element] +=
                             factor * float(partials[column * D + element]);
@@ -446,7 +462,10 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             }
 
             for (int element = 0; element < values_per_lane; ++element) {
-                const float reduced = simd_sum(accumulator[element]);
+                float reduced = accumulator[element];
+                for (int stride = 1; stride < COLS; stride <<= 1) {
+                    reduced += simd_shuffle_xor(reduced, ushort(stride));
+                }
                 if (block_lane == 0) {
                     out[element] = T(
                         sum_exp_score == 0.0f
@@ -560,9 +579,10 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 ("T", queries.dtype),
                 ("D", headDim),
                 ("BLOCKS", blocks),
+                ("COLS", combineColumns),
             ],
-            grid: (batch * queryHeads * 1024, 1, 1),
-            threadGroup: (1024, 1, 1),
+            grid: (batch * queryHeads * combineThreads, 1, 1),
+            threadGroup: (combineThreads, 1, 1),
             outputShapes: [[batch, queryHeads, 1, headDim]],
             outputDTypes: [.bfloat16]
         )[0]
@@ -621,9 +641,10 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 ("T", queries.dtype),
                 ("D", headDim),
                 ("BLOCKS", blocks),
+                ("COLS", combineColumns),
             ],
-            grid: (batch * queryHeads * 1024, 1, 1),
-            threadGroup: (1024, 1, 1),
+            grid: (batch * queryHeads * combineThreads, 1, 1),
+            threadGroup: (combineThreads, 1, 1),
             outputShapes: [[batch, queryHeads, 1, headDim]],
             outputDTypes: [.bfloat16]
         )[0]

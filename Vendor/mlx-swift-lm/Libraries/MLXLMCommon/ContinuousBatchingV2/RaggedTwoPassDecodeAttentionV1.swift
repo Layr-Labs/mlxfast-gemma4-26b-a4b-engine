@@ -22,6 +22,13 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    private static let passBPackedEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PASSB_SIMD32_PACK4"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let batch = 8
     private static let queryHeads = 16
     private static let kvHeads = 8
@@ -458,6 +465,100 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         ensureRowContiguous: true
     )
 
+    /// At the ranked BLOCKS=8 shape, every pass-B SIMDgroup computes the same
+    /// normalization and then uses the full SIMD for only eight output values.
+    /// Keep that full-width reduction tree, but amortize the normalization over
+    /// four adjacent eight-value output groups. This lowers the launch from 32
+    /// to eight SIMDgroups per batch-head without changing pass-A partials or
+    /// any per-output `simd_sum`.
+    private static let packedPassBKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_2pass_b_direct_bf16_d256_b8_simd32_pack4_v1",
+        inputNames: ["partials", "sums", "maxs"],
+        outputNames: ["out"],
+        source: """
+            constexpr int simd_width = 32;
+            constexpr int values_per_lane = D / simd_width;
+            constexpr int output_groups_per_simd = 4;
+
+            const int batch_head = int(threadgroup_position_in_grid.x);
+            const int first_output_group =
+                int(simdgroup_index_in_threadgroup) * output_groups_per_simd;
+            const int block_lane = int(thread_index_in_simdgroup);
+
+            partials += batch_head * BLOCKS * D
+                + first_output_group * values_per_lane;
+            sums += batch_head * BLOCKS;
+            maxs += batch_head * BLOCKS;
+            out += batch_head * D + first_output_group * values_per_lane;
+
+            thread float accumulator[output_groups_per_simd][values_per_lane];
+            for (int group = 0; group < output_groups_per_simd; ++group) {
+                for (int element = 0; element < values_per_lane; ++element) {
+                    accumulator[group][element] = 0.0f;
+                }
+            }
+
+            float max_score = -3.402823466e+38F;
+            if (block_lane < BLOCKS) {
+                max_score = max(max_score, maxs[block_lane]);
+            }
+            max_score = simd_max(max_score);
+
+            float sum_exp_score = 0.0f;
+            if (block_lane < BLOCKS) {
+                sum_exp_score =
+                    fast::exp(maxs[block_lane] - max_score) * sums[block_lane];
+            }
+            sum_exp_score = simd_sum(sum_exp_score);
+
+            if (block_lane < BLOCKS) {
+                const float factor = fast::exp(maxs[block_lane] - max_score);
+                for (int group = 0; group < output_groups_per_simd; ++group) {
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        accumulator[group][element] += factor * float(
+                            partials[block_lane * D
+                                + group * values_per_lane + element]);
+                    }
+                }
+            }
+
+            for (int group = 0; group < output_groups_per_simd; ++group) {
+                for (int element = 0; element < values_per_lane; ++element) {
+                    const float reduced = simd_sum(accumulator[group][element]);
+                    if (block_lane == 0) {
+                        out[group * values_per_lane + element] = T(
+                            sum_exp_score == 0.0f
+                                ? reduced
+                                : reduced / sum_exp_score);
+                    }
+                }
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    private static func mergePassB(_ passA: [MLXArray]) -> MLXArray {
+        // These constants plus the callers' dtype/shape checks are the exact
+        // ranked guard. Overrides and every other geometry retain the v3 path.
+        let packed = passBPackedEnabled
+            && batch == 8 && queryHeads == 16 && kvHeads == 8
+            && headDim == 256 && sequenceLength == 1024 && blocks == 8
+        let threads = packed ? 256 : 1024
+        let kernel = packed ? packedPassBKernel : passBKernel
+        return kernel(
+            passA,
+            template: [
+                ("T", passA[0].dtype),
+                ("D", headDim),
+                ("BLOCKS", blocks),
+            ],
+            grid: (batch * queryHeads * threads, 1, 1),
+            threadGroup: (threads, 1, 1),
+            outputShapes: [[batch, queryHeads, 1, headDim]],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
+
     static func attend(
         queries: MLXArray,
         keys: [MLXArray],
@@ -554,18 +655,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             outputDTypes: [.bfloat16, .float32, .float32, .int32]
         )
 
-        let output = passBKernel(
-            Array(passA.prefix(3)),
-            template: [
-                ("T", queries.dtype),
-                ("D", headDim),
-                ("BLOCKS", blocks),
-            ],
-            grid: (batch * queryHeads * 1024, 1, 1),
-            threadGroup: (1024, 1, 1),
-            outputShapes: [[batch, queryHeads, 1, headDim]],
-            outputDTypes: [.bfloat16]
-        )[0]
+        let output = mergePassB(Array(passA.prefix(3)))
         return (output, passA[3])
     }
 
@@ -615,18 +705,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             outputDTypes: [.bfloat16, .float32, .float32]
         )
 
-        return passBKernel(
-            passA,
-            template: [
-                ("T", queries.dtype),
-                ("D", headDim),
-                ("BLOCKS", blocks),
-            ],
-            grid: (batch * queryHeads * 1024, 1, 1),
-            threadGroup: (1024, 1, 1),
-            outputShapes: [[batch, queryHeads, 1, headDim]],
-            outputDTypes: [.bfloat16]
-        )[0]
+        return mergePassB(passA)
     }
 }
 

@@ -1518,6 +1518,7 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
     float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
     float sum1 = load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
 
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* wl = ws + row * in_vec_size_w;
       const device T* sl = scales + row * in_vec_size_g;
@@ -1548,6 +1549,7 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
         load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
     float sum1 =
         load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* wl = ws + row * in_vec_size_w;
       const device T* sl = scales + row * in_vec_size_g;
@@ -1561,6 +1563,7 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
     }
   }
 
+  #pragma unroll
   for (int row = 0; row < results_per_simdgroup; row++) {
     result0[row] = simd_sum(result0[row]);
     result1[row] = simd_sum(result1[row]);
@@ -1648,9 +1651,11 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
 
   int k = 0;
   for (; k <= in_vec_size - block_size; k += block_size) {
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint16_t* wl =
           (const device uint16_t*)(ws + row * in_vec_size_w);
+      #pragma unroll
       for (int i = 0; i < uint16_per_thread; i++) {
         packed[row][i] = wl[i];
       }
@@ -1659,21 +1664,25 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     }
 
     float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x3, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result3[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
@@ -1693,9 +1702,11 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
       0,
       values_per_thread);
   if (remaining > 0) {
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint16_t* wl =
           (const device uint16_t*)(ws + row * in_vec_size_w);
+      #pragma unroll
       for (int i = 0; i < uint16_per_thread; i++) {
         packed[row][i] = wl[i];
       }
@@ -1705,30 +1716,35 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
 
     float sum =
         load_vector_safe<T, float, values_per_thread, 4>(x0, x_thread, remaining);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
         load_vector_safe<T, float, values_per_thread, 4>(x1, x_thread, remaining);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
         load_vector_safe<T, float, values_per_thread, 4>(x2, x_thread, remaining);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
         load_vector_safe<T, float, values_per_thread, 4>(x3, x_thread, remaining);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result3[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
   }
 
+  #pragma unroll
   for (int row = 0; row < results_per_simdgroup; row++) {
     result0[row] = simd_sum(result0[row]);
     result1[row] = simd_sum(result1[row]);
@@ -1797,9 +1813,11 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
 
   int k = 0;
   for (; k <= in_vec_size - block_size; k += block_size) {
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint16_t* wl =
           (const device uint16_t*)(ws + row * in_vec_size_w);
+      #pragma unroll
       for (int i = 0; i < uint16_per_thread; i++) {
         packed[row][i] = wl[i];
       }
@@ -1808,16 +1826,19 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
     }
 
     float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
@@ -1836,9 +1857,11 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
       0,
       values_per_thread);
   if (remaining > 0) {
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint16_t* wl =
           (const device uint16_t*)(ws + row * in_vec_size_w);
+      #pragma unroll
       for (int i = 0; i < uint16_per_thread; i++) {
         packed[row][i] = wl[i];
       }
@@ -1848,24 +1871,28 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
 
     float sum =
         load_vector_safe<T, float, values_per_thread, 4>(x0, x_thread, remaining);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
         load_vector_safe<T, float, values_per_thread, 4>(x1, x_thread, remaining);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
         load_vector_safe<T, float, values_per_thread, 4>(x2, x_thread, remaining);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
   }
 
+  #pragma unroll
   for (int row = 0; row < results_per_simdgroup; row++) {
     result0[row] = simd_sum(result0[row]);
     result1[row] = simd_sum(result1[row]);
@@ -3851,20 +3878,13 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     return;
   }
   const uint assignment = tid.z;
-  const uint32_t route_word = rhs_indices[assignment * rhs_stride];
-  const bool expert_prefix_bounds = (route_word & 0x80000000u) != 0u;
-  const uint32_t expert =
-      expert_prefix_bounds ? (route_word & 0xffu) : route_word;
+  const uint32_t expert = rhs_indices[assignment * rhs_stride];
   uint run_offset = 0;
-  if (expert_prefix_bounds) {
-    run_offset = (route_word >> 8) & 0x3fu;
-  } else {
-    for (uint prior = assignment; prior > 0; --prior) {
-      if (rhs_indices[(prior - 1) * rhs_stride] != expert) {
-        break;
-      }
-      run_offset++;
+  for (uint prior = assignment; prior > 0; --prior) {
+    if (rhs_indices[(prior - 1) * rhs_stride] != expert) {
+      break;
     }
+    run_offset++;
   }
   // Odd positions are produced by the immediately preceding pair leader.
   if ((run_offset & 1) != 0) {
@@ -3876,10 +3896,9 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   const device T* tile_x0 =
       x + lhs_indices[assignment * lhs_stride] * x_stride;
   device T* tile_y0 = y + assignment * out_vec_size;
-  const bool has_pair = expert_prefix_bounds
-      ? (((route_word >> 14) & 0x3fu) + 1u) > 1u
-      : assignment + 1 < 64 &&
-          rhs_indices[(assignment + 1) * rhs_stride] == expert;
+  const bool has_pair =
+      assignment + 1 < 64 &&
+      rhs_indices[(assignment + 1) * rhs_stride] == expert;
   if (has_pair) {
     const device T* tile_x1 =
         x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
@@ -3905,7 +3924,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   for (int t = 0; t < gemma4_down_tile_span; t++) {
     uint3 tile_tid = tid;
     tile_tid.y = tid.y + uint(t);
-    qmv_impl<T, group_size, bits>(
+    qmv_affine4_g64_singles_impl<T, group_size, bits, 704, true, false>(
         tile_w,
         tile_scales,
         tile_biases,
@@ -3980,21 +3999,14 @@ template <typename T, int group_size, int bits>
       return;
     }
     const uint assignment = tid.z;
-    const uint32_t route_word =
-        rhs_indices[assignment * (uint)rhs_strides[0]];
-    const bool expert_prefix_bounds = (route_word & 0x80000000u) != 0u;
     const uint32_t expert =
-        expert_prefix_bounds ? (route_word & 0xffu) : route_word;
+        rhs_indices[assignment * (uint)rhs_strides[0]];
     uint run_offset = 0;
-    if (expert_prefix_bounds) {
-      run_offset = (route_word >> 8) & 0x3fu;
-    } else {
-      for (uint prior = assignment; prior > 0; --prior) {
-        if (rhs_indices[(prior - 1) * (uint)rhs_strides[0]] != expert) {
-          break;
-        }
-        run_offset++;
+    for (uint prior = assignment; prior > 0; --prior) {
+      if (rhs_indices[(prior - 1) * (uint)rhs_strides[0]] != expert) {
+        break;
       }
+      run_offset++;
     }
 
     // RUN-QUAD: leaders sit at run_offset % 4 == 0 and serve up to four
@@ -4008,14 +4020,10 @@ template <typename T, int group_size, int bits>
       return;
     }
     uint run_len = 1;
-    if (expert_prefix_bounds) {
-      run_len = min(4u, ((route_word >> 14) & 0x3fu) + 1u);
-    } else {
-      while (run_len < 4 && assignment + run_len < 64 &&
-             rhs_indices[(assignment + run_len) * (uint)rhs_strides[0]] ==
-                 expert) {
-        run_len++;
-      }
+    while (run_len < 4 && assignment + run_len < 64 &&
+           rhs_indices[(assignment + run_len) * (uint)rhs_strides[0]] ==
+               expert) {
+      run_len++;
     }
     if (run_len > 1) {
       const device uint32_t* run_w = w + expert * w_strides[0];
@@ -4098,60 +4106,28 @@ template <typename T, int group_size, int bits>
         in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
     return;
   }
-  uint32_t x_idx;
-  uint32_t route_word;
-  if (batch_ndims == 1) {
-    x_idx = lhs_indices[tid.z * lhs_strides[0]];
-    route_word = rhs_indices[tid.z * rhs_strides[0]];
-  } else {
-    ulong2 idx = elem_to_loc_broadcast(
-        tid.z, batch_shape, lhs_strides, rhs_strides, batch_ndims);
-    x_idx = lhs_indices[idx.x];
-    route_word = rhs_indices[idx.y];
-  }
-  if ((route_word & 0x80000000u) != 0u) {
-    const uint32_t expert = route_word & 0xffu;
-    if (x_batch_ndims == 1) {
-      x += x_idx * x_strides[0];
-    } else {
-      x += elem_to_loc(x_idx, x_shape, x_strides, x_batch_ndims);
-    }
-    if (w_batch_ndims == 1) {
-      w += expert * w_strides[0];
-      scales += expert * s_strides[0];
-      biases += expert * b_strides[0];
-    } else {
-      ulong3 idx = elem_to_loc_broadcast(
-          expert, w_shape, w_strides, s_strides, b_strides, w_batch_ndims);
-      w += idx.x;
-      scales += idx.y;
-      biases += idx.z;
-    }
-    y += tid.z * (out_vec_size * M);
-  } else {
-    adjust_matrix_offsets<T>(
-        x,
-        w,
-        scales,
-        biases,
-        lhs_indices,
-        rhs_indices,
-        y,
-        out_vec_size * M,
-        batch_ndims,
-        batch_shape,
-        lhs_strides,
-        rhs_strides,
-        x_batch_ndims,
-        x_shape,
-        x_strides,
-        w_batch_ndims,
-        w_shape,
-        w_strides,
-        s_strides,
-        b_strides,
-        tid);
-  }
+  adjust_matrix_offsets<T>(
+      x,
+      w,
+      scales,
+      biases,
+      lhs_indices,
+      rhs_indices,
+      y,
+      out_vec_size * M,
+      batch_ndims,
+      batch_shape,
+      lhs_strides,
+      rhs_strides,
+      x_batch_ndims,
+      x_shape,
+      x_strides,
+      w_batch_ndims,
+      w_shape,
+      w_strides,
+      s_strides,
+      b_strides,
+      tid);
   qmv_impl<T, group_size, bits>(
       w,
       scales,

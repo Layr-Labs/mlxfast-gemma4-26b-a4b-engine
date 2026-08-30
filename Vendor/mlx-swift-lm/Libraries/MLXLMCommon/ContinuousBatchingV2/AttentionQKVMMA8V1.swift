@@ -14,6 +14,7 @@
 // same accumulation order, bit-identical outputs;
 // `DARKBLOOM_GEMMA4_QKV_MMA8_MULTITILE=0` restores the single-tile dispatch.
 
+import Cmlx
 import Foundation
 import MLX
 import MLXFast
@@ -24,6 +25,22 @@ public enum CBv2AttentionQKVMMA8V1 {
             "DARKBLOOM_GEMMA4_QKV_MMA8_TIGHT"]
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Cache only the single MT2 graph node. Keep both existing compile
+    /// opt-outs and an independent rollback to the original kernel apply.
+    private static let compileCacheEnabled: Bool = {
+        guard MLXHardwareInfo.isCompiledDecodeSupported else { return false }
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["MLX_DISABLE_COMPILE"] == nil else { return false }
+        guard let raw = environment["DARKBLOOM_GEMMA4_QKV_COMPILE_CACHE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let metalAvailable: Bool = {
+        var available = false
+        return mlx_metal_is_available(&available) == 0 && available
     }()
 
     private static let batch = 8
@@ -350,6 +367,25 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
         header: mma8KernelHeader,
         ensureRowContiguous: true)
 
+    /// All four tensors are trace inputs, so changing a layer or reloading its
+    /// weights reuses only the primitive, never a previous input or result.
+    /// Shape-specific tracing preserves the four output widths and avoids
+    /// CustomKernel's unsupported shapeless output-shape inference.
+    private static let compiledMultiTile: @Sendable ([MLXArray]) -> [MLXArray] =
+        MLX.compile(shapeless: false) { (inputs: [MLXArray]) -> [MLXArray] in
+            let x = inputs[0]
+            let outputWidth = inputs[1].dim(0)
+            let yTiles = outputWidth / outputsPerGroup
+            return multiTileKernel(
+                inputs,
+                template: [("T", x.dtype)],
+                grid: (simdWidth, (yTiles / tilesPerGroup) * simdGroups, 1),
+                threadGroup: (simdWidth, simdGroups, 1),
+                outputShapes: [[batch, sequence, outputWidth]],
+                outputDTypes: [x.dtype],
+                stream: .gpu)
+        }
+
     private static let mma8Kernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_unroll_v2",
         inputNames: ["x", "w", "scales", "biases"],
@@ -407,6 +443,16 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
 
         let yTiles = outputWidth / outputsPerGroup
         if multiTileEnabled, yTiles % tilesPerGroup == 0 {
+            // The cached primitive keeps its first stream. The native cache
+            // key does not track Swift's task-local default, so admit only
+            // the global GPU stream also passed explicitly inside the trace.
+            if compileCacheEnabled, metalAvailable,
+                StreamOrDevice.default == .gpu
+            {
+                // An empty compile result preserves any pending MLX error and
+                // returns nil to the caller's existing QuantizedLinear fallback.
+                return compiledMultiTile([x, weight, scales, biases]).first
+            }
             return multiTileKernel(
                 [x, weight, scales, biases],
                 template: [("T", x.dtype)],

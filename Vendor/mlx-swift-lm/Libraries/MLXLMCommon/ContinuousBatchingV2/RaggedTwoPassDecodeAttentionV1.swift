@@ -96,9 +96,14 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             float max_score = -3.402823466e+38F;
             float sum_exp_score = 0.0f;
             for (int token = block; token < N; token += BLOCKS) {
+                const ulong2 k_packed = *reinterpret_cast<const device ulong2*>(keys);
+                const ulong2 v_packed = *reinterpret_cast<const device ulong2*>(values);
+                const thread T* k_elems = reinterpret_cast<const thread T*>(&k_packed);
+                const thread T* v_elems = reinterpret_cast<const thread T*>(&v_packed);
+
                 float score = 0.0f;
                 for (int element = 0; element < values_per_lane; ++element) {
-                    score += q[element] * float(keys[element]);
+                    score += q[element] * float(k_elems[element]);
                 }
                 score = simd_sum(score);
 
@@ -109,7 +114,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 sum_exp_score = sum_exp_score * old_factor + score_factor;
                 for (int element = 0; element < values_per_lane; ++element) {
                     accumulator[element] = accumulator[element] * old_factor
-                        + score_factor * float(values[element]);
+                        + score_factor * float(v_elems[element]);
                 }
 
                 keys += BLOCKS * D;
@@ -185,9 +190,14 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             for (int token = block; token < N; token += BLOCKS) {
                 const device T* k = keys + slot * D;
                 const device T* v = values + slot * D;
+                const ulong2 k_packed = *reinterpret_cast<const device ulong2*>(k);
+                const ulong2 v_packed = *reinterpret_cast<const device ulong2*>(v);
+                const thread T* k_elems = reinterpret_cast<const thread T*>(&k_packed);
+                const thread T* v_elems = reinterpret_cast<const thread T*>(&v_packed);
+
                 float score = 0.0f;
                 for (int element = 0; element < values_per_lane; ++element) {
-                    score += q[element] * float(k[element]);
+                    score += q[element] * float(k_elems[element]);
                 }
                 score = simd_sum(score);
 
@@ -198,7 +208,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 sum_exp_score = sum_exp_score * old_factor + score_factor;
                 for (int element = 0; element < values_per_lane; ++element) {
                     accumulator[element] = accumulator[element] * old_factor
-                        + score_factor * float(v[element]);
+                        + score_factor * float(v_elems[element]);
                 }
 
                 slot = (slot + BLOCKS) & ring_mask;
@@ -280,12 +290,10 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             const uint ring_start = starts[batch_index];
             const uint write_slot = (ring_start + ring_mask) & ring_mask;
             if (block == 0 && query_head_in_group == 0) {
-                device T* write_key = const_cast<device T*>(keys) + write_slot * D;
-                device T* write_value = const_cast<device T*>(values) + write_slot * D;
-                for (int element = 0; element < values_per_lane; ++element) {
-                    write_key[element] = new_key[element];
-                    write_value[element] = new_value[element];
-                }
+                device ulong2* write_key = reinterpret_cast<device ulong2*>(const_cast<device T*>(keys) + write_slot * D);
+                device ulong2* write_value = reinterpret_cast<device ulong2*>(const_cast<device T*>(values) + write_slot * D);
+                *write_key = *reinterpret_cast<const device ulong2*>(new_key);
+                *write_value = *reinterpret_cast<const device ulong2*>(new_value);
             }
             if (batch_index == 0 && kv_head == 0 && block == 0
                 && query_head_in_group == 0 && lane == 0) {
@@ -311,9 +319,14 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 const bool current = token == N - 1;
                 const device T* k = current ? new_key : keys + slot * D;
                 const device T* v = current ? new_value : values + slot * D;
+                const ulong2 k_packed = *reinterpret_cast<const device ulong2*>(k);
+                const ulong2 v_packed = *reinterpret_cast<const device ulong2*>(v);
+                const thread T* k_elems = reinterpret_cast<const thread T*>(&k_packed);
+                const thread T* v_elems = reinterpret_cast<const thread T*>(&v_packed);
+
                 float score = 0.0f;
                 for (int element = 0; element < values_per_lane; ++element) {
-                    score += q[element] * float(k[element]);
+                    score += q[element] * float(k_elems[element]);
                 }
                 score = simd_sum(score);
 
@@ -324,7 +337,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 sum_exp_score = sum_exp_score * old_factor + score_factor;
                 for (int element = 0; element < values_per_lane; ++element) {
                     accumulator[element] = accumulator[element] * old_factor
-                        + score_factor * float(v[element]);
+                        + score_factor * float(v_elems[element]);
                 }
 
                 slot = (slot + uint(BLOCKS)) & ring_mask;

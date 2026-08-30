@@ -921,6 +921,22 @@ public func gatherSort(
         "gatherSort n=\(indices.size) m=\(m) E=\(numExperts) "
             + "dtype=\(indices.dtype)"
     }
+    // ROUTE-CSORT-64 for small retiled tables: the depth-3 MTP verification
+    // rectangles ([32, 8] -> n = 256) would otherwise pay PREFILL-CSORT-128's
+    // three dispatches (hist, scan, scatter) per MoE layer per verify cycle.
+    // The fused kernel is one dispatch with byte-identical outputs (exact
+    // stable counting sort; stability lemma above); its per-tile before-pass
+    // is trivial GPU work at these sizes. Large prefill windows keep the
+    // three-pass shape below, whose O(n) cost is right at n >> 512.
+    if indices.size <= 512,
+        let fused = routeCountingSortFusedT64(indices, m: m)
+    {
+        return (
+            x.flattened(start: 0, end: -3)[fused.rowOrder],
+            fused.sortedKeys,
+            fused.inverseOrder
+        )
+    }
     // PREFILL-CSORT-128: three dispatches with byte-identical outputs.
     if let fused = routeCountingSortPrefill(indices, m: m, numExperts: numExperts) {
         return (

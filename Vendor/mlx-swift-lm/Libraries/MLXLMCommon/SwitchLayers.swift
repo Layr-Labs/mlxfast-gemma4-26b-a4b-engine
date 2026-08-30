@@ -177,6 +177,246 @@ public func weightedExpertUnsort(
     )[0]
 }
 
+// MARK: - Gemma 4 fused expert down projection + ordered reduction
+
+/// Exact B=8 decode-only fusion. The established path writes 64 complete
+/// `[2816]` expert rows and then reads them back through
+/// ``weightedExpertUnsort``. This kernel keeps one eight-output tile resident,
+/// applies the original token/slot weight after the same BF16 projection cast,
+/// and performs the same slot-ordered BF16 reduction before the tile is stored.
+///
+/// The sorted route word supplies both the promoted expert run bounds and the
+/// original flattened assignment in bits 20...25. Up to four adjacent
+/// same-expert assignments share each packed weight stream, matching the
+/// incumbent run-sharing ceiling without materializing the 64-row output.
+private let gemma4FusedExpertDownWeightedEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_FUSED_EXPERT_DOWN_WEIGHTED"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+private let gemma4FusedExpertDownWeightedKernel: MLXFast.MLXFastKernel =
+    MLXFast.metalKernel(
+        name: "gemma4_b8_fused_expert_down_weighted_affine4_g64_v1",
+        inputNames: ["x", "w", "scales", "biases", "route_words", "weights"],
+        outputNames: ["output"],
+        source: """
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const uint tile = threadgroup_position_in_grid.x;
+            const uint out_row = tile * 8u + simd_gid * 4u;
+
+            constexpr uint ASSIGNMENTS = 64u;
+            constexpr uint INPUT_WIDTH = 704u;
+            constexpr uint OUTPUT_WIDTH = 2816u;
+            constexpr uint ROWS_PER_SIMD = 4u;
+            constexpr uint VALUES_PER_LANE = 8u;
+            constexpr uint BLOCK = 256u;
+            constexpr uint PACKED_ROW_BYTES = INPUT_WIDTH / 2u;
+            constexpr uint GROUPS_PER_ROW = INPUT_WIDTH / 64u;
+            constexpr uint EXPERT_PACKED_BYTES =
+                OUTPUT_WIDTH * PACKED_ROW_BYTES;
+            constexpr uint EXPERT_GROUP_VALUES =
+                OUTPUT_WIDTH * GROUPS_PER_ROW;
+
+            // One BF16 weighted value for every original assignment and every
+            // output row owned by this threadgroup.
+            threadgroup T weighted_rows[ASSIGNMENTS * 8u];
+
+            uint assignment = 0u;
+            while (assignment < ASSIGNMENTS) {
+                const uint route_word = route_words[assignment];
+                const uint expert = route_word & 0xffu;
+                const uint run_remaining =
+                    ((route_word >> 14u) & 0x3fu) + 1u;
+                const uint run_len = min(4u, run_remaining);
+
+                thread float result[4][ROWS_PER_SIMD];
+                for (uint m = 0u; m < 4u; ++m) {
+                    for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
+                        result[m][row] = 0.0f;
+                    }
+                }
+
+                uint k = 0u;
+                for (; k < INPUT_WIDTH - BLOCK; k += BLOCK) {
+                    thread uint16_t packed[ROWS_PER_SIMD][2];
+                    thread float scale_local[ROWS_PER_SIMD];
+                    thread float bias_local[ROWS_PER_SIMD];
+                    for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
+                        const uint global_row = out_row + row;
+                        const device uint8_t* wp =
+                            reinterpret_cast<const device uint8_t*>(w)
+                            + expert * EXPERT_PACKED_BYTES
+                            + global_row * PACKED_ROW_BYTES
+                            + k / 2u + simd_lid * 4u;
+                        const device uint16_t* w16 =
+                            reinterpret_cast<const device uint16_t*>(wp);
+                        packed[row][0] = w16[0];
+                        packed[row][1] = w16[1];
+                        const uint group_index =
+                            expert * EXPERT_GROUP_VALUES
+                            + global_row * GROUPS_PER_ROW
+                            + k / 64u + simd_lid / 8u;
+                        scale_local[row] = scales[group_index];
+                        bias_local[row] = biases[group_index];
+                    }
+
+                    for (uint m = 0u; m < run_len; ++m) {
+                        thread float x_thread[VALUES_PER_LANE];
+                        const device T* xp =
+                            x + (assignment + m) * INPUT_WIDTH
+                            + k + simd_lid * VALUES_PER_LANE;
+                        const float sum =
+                            load_vector<T, float, VALUES_PER_LANE, 4>(
+                                xp, x_thread);
+                        for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
+                            result[m][row] +=
+                                qdot_affine4_registered<
+                                    float, VALUES_PER_LANE>(
+                                    packed[row],
+                                    x_thread,
+                                    scale_local[row],
+                                    bias_local[row],
+                                    sum);
+                        }
+                    }
+                }
+
+                const int tail = clamp(
+                    int(INPUT_WIDTH - k)
+                        - int(simd_lid * VALUES_PER_LANE),
+                    0,
+                    int(VALUES_PER_LANE));
+                if (tail > 0) {
+                    thread uint16_t packed[ROWS_PER_SIMD][2];
+                    thread float scale_local[ROWS_PER_SIMD];
+                    thread float bias_local[ROWS_PER_SIMD];
+                    for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
+                        const uint global_row = out_row + row;
+                        const device uint8_t* wp =
+                            reinterpret_cast<const device uint8_t*>(w)
+                            + expert * EXPERT_PACKED_BYTES
+                            + global_row * PACKED_ROW_BYTES
+                            + k / 2u + simd_lid * 4u;
+                        const device uint16_t* w16 =
+                            reinterpret_cast<const device uint16_t*>(wp);
+                        packed[row][0] = w16[0];
+                        packed[row][1] = w16[1];
+                        const uint group_index =
+                            expert * EXPERT_GROUP_VALUES
+                            + global_row * GROUPS_PER_ROW
+                            + k / 64u + simd_lid / 8u;
+                        scale_local[row] = scales[group_index];
+                        bias_local[row] = biases[group_index];
+                    }
+
+                    for (uint m = 0u; m < run_len; ++m) {
+                        thread float x_thread[VALUES_PER_LANE];
+                        const device T* xp =
+                            x + (assignment + m) * INPUT_WIDTH
+                            + k + simd_lid * VALUES_PER_LANE;
+                        const float sum =
+                            load_vector_safe<T, float, VALUES_PER_LANE, 4>(
+                                xp, x_thread, tail);
+                        for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
+                            result[m][row] +=
+                                qdot_affine4_registered<
+                                    float, VALUES_PER_LANE>(
+                                    packed[row],
+                                    x_thread,
+                                    scale_local[row],
+                                    bias_local[row],
+                                    sum);
+                        }
+                    }
+                }
+
+                for (uint m = 0u; m < run_len; ++m) {
+                    const uint original =
+                        (route_words[assignment + m] >> 20u) & 0x3fu;
+                    for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
+                        const float reduced = simd_sum(result[m][row]);
+                        if (simd_lid == 0u) {
+                            // Preserve the incumbent two rounding points:
+                            // float QMV -> BF16, then float multiply -> BF16.
+                            const T projected = static_cast<T>(reduced);
+                            const T weighted = static_cast<T>(
+                                static_cast<float>(projected)
+                                * static_cast<float>(weights[original]));
+                            weighted_rows[
+                                original * 8u + simd_gid * 4u + row] =
+                                weighted;
+                        }
+                    }
+                }
+                assignment += run_len;
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_lid == 0u) {
+                for (uint token = 0u; token < 8u; ++token) {
+                    for (uint row = 0u; row < ROWS_PER_SIMD; ++row) {
+                        T accumulator = static_cast<T>(0.0f);
+                        for (uint slot = 0u; slot < 8u; ++slot) {
+                            accumulator = accumulator + weighted_rows[
+                                (token * 8u + slot) * 8u
+                                + simd_gid * 4u + row];
+                        }
+                        output[
+                            token * OUTPUT_WIDTH + out_row + row] =
+                            accumulator;
+                    }
+                }
+            }
+        """,
+        header: CBv2TiedLMHeadQMVV1.kernelHeader,
+        ensureRowContiguous: true
+    )
+
+private func gemma4FusedExpertDownWeighted(
+    activated: MLXArray,
+    down: QuantizedSwitchLinear,
+    routeWords: MLXArray,
+    weights: MLXArray
+) -> MLXArray? {
+    guard gemma4FusedExpertDownWeightedEnabled,
+        activated.dtype == .bfloat16,
+        activated.ndim == 3,
+        activated.shape == [64, 1, 704],
+        routeWords.dtype == .uint32,
+        routeWords.ndim == 1,
+        routeWords.size == 64,
+        weights.dtype == .bfloat16,
+        weights.shape == [8, 8],
+        down.inputDims == 704,
+        down.outputDims == 2816,
+        down.numExperts == 128,
+        down.groupSize == 64,
+        down.bits == 4,
+        down.mode == .affine,
+        down.bias == nil,
+        down.weight.dtype == .uint32,
+        down.weight.shape == [128, 2816, 88],
+        down.scales.dtype == .bfloat16,
+        down.scales.shape == [128, 2816, 11],
+        let biases = down.biases,
+        biases.dtype == .bfloat16,
+        biases.shape == [128, 2816, 11]
+    else { return nil }
+
+    CBv2EngageMark.once("fused-expert-down-weighted")
+    return gemma4FusedExpertDownWeightedKernel(
+        [activated, down.weight, down.scales, biases, routeWords, weights],
+        template: [("T", activated.dtype)],
+        grid: (352 * 64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[8, 2816]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 
 // MARK: - Compiled activation fusions (vMLX / osaurus-main port)
 
@@ -380,7 +620,8 @@ private let routeSimdRank64Kernel: MLXFast.MLXFastKernel =
 ///   bits  0...7   expert id
 ///   bits  8...13  assignments before this one in its expert run
 ///   bits 14...19  assignments remaining in the run, including this one, minus 1
-///   bits 20...30  zero
+///   bits 20...25  original flattened assignment (token * 8 + slot)
+///   bits 26...30  zero
 ///   bit      31   prefix-bounds-valid tag
 ///
 /// The tag makes every other producer fail closed to the incumbent raw-index
@@ -416,7 +657,8 @@ private let routeSimdRank64PrefixBoundsKernel: MLXFast.MLXFastKernel =
             const uint run_remaining = run_length - run_offset;
             row_order[rank] = assignment / 8;
             sorted_keys[rank] = 0x80000000u | key
-                | (run_offset << 8) | ((run_remaining - 1) << 14);
+                | (run_offset << 8) | ((run_remaining - 1) << 14)
+                | (assignment << 20);
             inverse_order[assignment] = rank;
         """,
         ensureRowContiguous: true
@@ -607,7 +849,8 @@ private let routeFusedScatterPrefixBoundsKernelT64: MLXFast.MLXFastKernel = {
                     const uint run_remaining = total - run_offset;
                     row_order[off] = idx / M;
                     sorted_keys[off] = 0x80000000u | k
-                        | (run_offset << 8) | ((run_remaining - 1) << 14);
+                        | (run_offset << 8) | ((run_remaining - 1) << 14)
+                        | (idx << 20);
                     inverse_order[idx] = off;
                     ++off;
                 }
@@ -1148,6 +1391,67 @@ public class SwitchGLU: Module {
         return (x, doSort ? inverseOrder : nil, doSort)
     }
 
+    /// Decode-only specialization that stops before the ordinary down gather
+    /// and hands the sorted GeGLU rows to the fused down+weighted kernel.
+    /// Every gate mirrors ``projectExperts``; returning nil preserves that
+    /// function and ``weightedExpertUnsort`` byte for byte.
+    private func fusedDecodeWeightedExperts(
+        _ x: MLXArray,
+        _ indices: MLXArray,
+        weights: MLXArray
+    ) -> MLXArray? {
+        guard expertPrefixBoundsEnabled,
+            routeSimdRank64Enabled || routeCountingSort64Enabled,
+            expertPrefixBoundsProjectionsEligible,
+            x.ndim == 2,
+            x.shape == [8, inputDims],
+            x.dtype == .bfloat16,
+            indices.dtype == .uint32,
+            indices.shape == [8, 8],
+            weights.dtype == .bfloat16,
+            weights.shape == [8, 8],
+            gateUpProj == nil,
+            let gateProj,
+            let upProj,
+            let down = downProj as? QuantizedSwitchLinear
+        else { return nil }
+
+        let (lhsIndices, routeWords, _) = gatherSortIndices(
+            indices: indices,
+            numExperts: numExperts,
+            expertPrefixBounds: true)
+        var gatheredX = MLX.expandedDimensions(x, axes: [-2, -3])
+        gatheredX = gatheredX.flattened(start: 0, end: -3)
+
+        let xUp = upProj(
+            gatheredX,
+            routeWords,
+            lhsIndices: lhsIndices,
+            sortedIndices: true)
+        let xGate = gateProj(
+            gatheredX,
+            routeWords,
+            lhsIndices: lhsIndices,
+            sortedIndices: true)
+
+        let activated: MLXArray
+        if let activationProduct {
+            activated = activationProduct(xGate, xUp)
+        } else if isSiluActivation {
+            activated = compiledSwiGLU(xGate, xUp)
+        } else if isGeluActivation {
+            activated = geGLUProduct(xGate, xUp)
+        } else {
+            activated = activation(xGate) * xUp
+        }
+
+        return gemma4FusedExpertDownWeighted(
+            activated: activated,
+            down: down,
+            routeWords: routeWords,
+            weights: weights)
+    }
+
     /// Cached eligibility: the projection tensors are bound at load time and
     /// the tag consumers defensively decode tagged words even on fallback
     /// paths, so evaluating the geometry once per module (not per forward,
@@ -1274,6 +1578,13 @@ public class SwitchGLU: Module {
         // and smaller serving cohorts remain on their established reduction.
         let isEightRowDecode =
             !isProductionPrefill && x.dim(0) == 8 && indices.size == 64
+        if fuseSortedReduction && isEightRowDecode,
+            supportsWeightedExpertUnsort(x, indices, weights: weights),
+            let fused = fusedDecodeWeightedExperts(x, indices, weights: weights)
+        {
+            weightedExpertUnsortProbe.recordEffective()
+            return fused
+        }
         guard fuseSortedReduction && (isProductionPrefill || isEightRowDecode),
             supportsWeightedExpertUnsort(x, indices, weights: weights)
         else {

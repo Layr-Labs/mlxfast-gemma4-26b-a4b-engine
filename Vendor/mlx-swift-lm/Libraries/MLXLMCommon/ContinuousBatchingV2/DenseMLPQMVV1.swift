@@ -96,6 +96,15 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// The original four-row xsum path with a compile-time 22-block K walk.
+    /// No-table, down and opt-in gate/up MMA retain their incumbent kernels.
+    private static let gateUpStaticKEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MLP_GATEUP_STATIC_K"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let batch = 8
     private static let sequence = 1
     private static let groupSize = 64
@@ -389,6 +398,60 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
             result = result.replacingOccurrences(of: old, with: new)
         }
         return result
+    }()
+
+    // DMLP-STATIC-K-019: specialize only the appended dense xsum helper;
+    // the tied-head prefix and its identically spelled loop fragments stay
+    // untouched. K=2816 consists of 22 complete 128-element blocks.
+    private static let gateUpStaticKHeader: String = {
+        let original = activationSumKernelHeader
+        let marker = """
+        template <typename T, const int group_size, const int bits>
+        METAL_FUNC void qmv_affine8_g64_quad_stream_xsum_impl(
+        """
+        guard let start = original.range(of: marker, options: .backwards) else {
+            preconditionFailure("DMLP-STATIC-K-019 dense helper is missing")
+        }
+        let prefix = String(original[..<start.lowerBound])
+        var body = String(original[start.lowerBound...])
+        func replaceOnce(_ old: String, with new: String) {
+            precondition(body.components(separatedBy: old).count == 2)
+            body = body.replacingOccurrences(of: old, with: new)
+        }
+        replaceOnce(
+            "qmv_affine8_g64_quad_stream_xsum_impl(",
+            with: "qmv_affine8_g64_quad_stream_xsum_k2816_impl(")
+        replaceOnce("    const int in_vec_size,\n", with: "")
+        replaceOnce(
+            "  constexpr int num_simdgroups = 2;",
+            with: """
+              constexpr int in_vec_size = 2816;
+              constexpr int num_simdgroups = 2;
+            """)
+        replaceOnce(
+            """
+              int k = 0;
+              for (; k <= in_vec_size - block_size; k += block_size) {
+            """,
+            with: """
+              #pragma unroll
+              for (int k = 0; k < in_vec_size; k += block_size) {
+            """)
+        // No partial block exists for this shape. Remove its entire arm, not
+        // a synthetic zero update, and leave the original SIMD close intact.
+        let tailMarker = "  const uint active_tail_lanes =\n"
+        let closeMarker = """
+          for (int row = 0; row < results_per_simdgroup; row++) {
+            result0[row] = simd_sum(result0[row]);
+        """
+        precondition(body.components(separatedBy: tailMarker).count == 2)
+        precondition(body.components(separatedBy: closeMarker).count == 2)
+        guard let tail = body.range(of: tailMarker),
+            let close = body.range(of: closeMarker),
+            tail.lowerBound < close.lowerBound
+        else { preconditionFailure("DMLP-STATIC-K-019 tail/close is missing") }
+        body.removeSubrange(tail.lowerBound..<close.lowerBound)
+        return prefix + body
     }()
 
     /// MMA-MLP-001. Verbatim transcription of the `kGemma4QmvMma8Affine8`
@@ -815,6 +878,33 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         ensureRowContiguous: true
     )
 
+    private static let gateUpStaticKKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_quad_stream_xsum_k2816_unroll_v1",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+            constexpr int in_vec_size = 2816;
+            constexpr int out_vec_size = 2112;
+            const int first_m = int(tid.x) * 4;
+            if (first_m >= 8) return;
+            qmv_affine8_g64_quad_stream_xsum_k2816_impl<T, 64, 8>(
+                w, scales, biases, xSums,
+                x + first_m * in_vec_size,
+                x + (first_m + 1) * in_vec_size,
+                x + (first_m + 2) * in_vec_size,
+                x + (first_m + 3) * in_vec_size,
+                y + first_m * out_vec_size,
+                y + (first_m + 1) * out_vec_size,
+                y + (first_m + 2) * out_vec_size,
+                y + (first_m + 3) * out_vec_size,
+                tid, simd_gid, simd_lid);
+            """,
+        header: gateUpStaticKHeader,
+        ensureRowContiguous: true)
+
     @inline(__always)
     private static func liveShape(inDim: Int, outDim: Int) -> Bool {
         (inDim == 2816 && outDim == 2112)
@@ -955,7 +1045,9 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         let useActivationSums = activationSums != nil
             && inDim == 2816
             && outDim == 2112
-        let selected = useActivationSums ? activationSumQMVKernel : kernel
+        let selected = useActivationSums
+            ? (gateUpStaticKEnabled ? gateUpStaticKKernel : activationSumQMVKernel)
+            : kernel
         let inputs = useActivationSums
             ? [x, weight, scales, biases, activationSums!.values]
             : [x, weight, scales, biases]

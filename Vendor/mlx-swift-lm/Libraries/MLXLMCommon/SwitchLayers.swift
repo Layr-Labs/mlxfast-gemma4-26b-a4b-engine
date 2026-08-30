@@ -921,6 +921,16 @@ public func gatherSort(
         "gatherSort n=\(indices.size) m=\(m) E=\(numExperts) "
             + "dtype=\(indices.dtype)"
     }
+    // ROUTE-CSORT-64: one fused dispatch with byte-identical outputs
+    // (default ON; see routeCountingSort64Enabled above).
+    // M2: Prefer fused kernel for depth-3 MTP verification ([32, 8] -> n=256)
+    if let fused = routeCountingSortFusedT64(indices, m: m, expertPrefixBounds: false) {
+        return (
+            x.flattened(start: 0, end: -3)[fused.rowOrder],
+            fused.sortedKeys,
+            fused.inverseOrder
+        )
+    }
     // PREFILL-CSORT-128: three dispatches with byte-identical outputs.
     if let fused = routeCountingSortPrefill(indices, m: m, numExperts: numExperts) {
         return (
@@ -971,17 +981,18 @@ public func gatherSortIndices(
             + "dtype=\(indices.dtype)"
     }
     if numExperts <= routeCountingSortKeyBound {
+        // ROUTE-CSORT-64: one fused dispatch with byte-identical outputs
+        // (default ON; see routeCountingSort64Enabled above).
+        // M2: Prefer fused kernel for depth-3 MTP verification ([32, 8] -> n=256)
+        if let fused = routeCountingSortFusedT64(
+            indices, m: m, expertPrefixBounds: expertPrefixBounds)
+        {
+            return (fused.rowOrder, fused.sortedKeys, fused.inverseOrder)
+        }
         // PREFILL-CSORT-128 owns everything wider than the retiled decode
         // cohort; ROUTE-CSORT-64 keeps the exact n = 64 geometry it was built
         // for (one threadgroup, no histogram/scan round trip).
         if let fused = routeCountingSortPrefill(indices, m: m, numExperts: numExperts) {
-            return (fused.rowOrder, fused.sortedKeys, fused.inverseOrder)
-        }
-        // ROUTE-CSORT-64: one fused dispatch with byte-identical outputs
-        // (default ON; see routeCountingSort64Enabled above).
-        if let fused = routeCountingSortFusedT64(
-            indices, m: m, expertPrefixBounds: expertPrefixBounds)
-        {
             return (fused.rowOrder, fused.sortedKeys, fused.inverseOrder)
         }
     }

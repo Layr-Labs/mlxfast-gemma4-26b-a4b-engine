@@ -592,7 +592,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             let raw = ProcessInfo.processInfo.environment[
                 "DARKBLOOM_ADMIT_COALESCE_MS"],
             let value = Int(raw), value >= 0
-        else { return 3 }
+        else { return 0 }
         return Swift.min(value, admitCoalesceWindowCapMS)
     }()
 

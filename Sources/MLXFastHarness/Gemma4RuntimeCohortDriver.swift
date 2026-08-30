@@ -614,9 +614,9 @@ extension Gemma4Runtime {
     // MARK: - Batched verb handlers
 
     /// v1.2 batched `free_decode_begin`: open the cohort window — allocator
-    /// reset, spec resolution (serial only in this increment), engine build,
-    /// closed-cohort admission, and the B seed forwards. Counts ONE
-    /// completed_work unit for the whole cohort seed prefill (a round is one
+    /// reset, spec resolution (general serial or certified physical-B1 MTP),
+    /// engine build, closed-cohort admission, and the B seed forwards. Counts
+    /// ONE completed_work unit for the whole cohort seed prefill (a round is one
     /// engine forward regardless of B; the phase closes at R + 1).
     static func handleCohortFreeDecodeBegin(
         _ request: RuntimeWorkerRequest,

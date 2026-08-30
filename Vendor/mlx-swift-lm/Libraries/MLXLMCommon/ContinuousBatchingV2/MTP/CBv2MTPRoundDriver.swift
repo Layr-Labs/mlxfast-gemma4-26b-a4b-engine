@@ -170,8 +170,9 @@ final class CBv2MTPRoundDriver {
     /// submission's adaptive controller uses per decode round. This is a CEILING,
     /// not a fixed depth. The controller selects a depth from 0 to this ceiling
     /// each round. A higher value widens the adaptive range. It does not force
-    /// speculation. The trusted MTP envelope (`config.maxDraftTokens`, ceiling 3
-    /// at batch 8) also bounds it, so the effective cap is
+    /// speculation. The production Gemma MTP envelope
+    /// (`config.maxDraftTokens`, ceiling 3 at certified physical batch 1) also
+    /// bounds it, so the effective cap is
     /// `min(envelope, submissionDraftDepth)`. Default 1.
     ///
     /// UNIFORM WITH DFLASH. `DFlashDraftModel.submissionDraftDepth` is the DFlash

@@ -15,8 +15,9 @@
 //     `PagedKVPool.ringPageCount` must reproduce exactly;
 //   * `CBv2PagedWindowSnapshot` — a donated sliding window and the single
 //     absolute boundary at which it may be installed;
-//   * `CBv2MTPRectangularSerializing` — the capability marker MTP
-//     rectangular verification degrades on.
+//   * `CBv2MTPRectangularSerializing` — the capability marker on which the
+//     generic `.automatic` lane may degrade to serial; an explicit
+//     `.rectangular` lane instead refuses at construction when it is absent.
 //
 // It began as a coordination register for concurrently developed tracks, and
 // carried a long comment-only block of signatures those tracks agreed to

@@ -416,7 +416,7 @@ git commit -m 'perf: bind exact Gemma B1 MTP experts'
 
 **Does NOT cover:** runtime eligibility checks or fallback; installation either publishes all three B1 contexts or throws before warmup.
 
-- [ ] **Step 1: Write failing construction tests**
+- [x] **Step 1: Write failing construction tests**
 
 Require these semantics:
 
@@ -435,11 +435,11 @@ for shape in shapes {
 
 Also test that one missing B1 projection closure throws and leaves `cbv2MTPVerifierInstalled == false`.
 
-- [ ] **Step 2: Run the construction suites**
+- [x] **Step 2: Run the construction suites**
 
 Expected: FAIL because contexts are keyed only by columns and B1 binding is not installed.
 
-- [ ] **Step 3: Replace the context key and bind B1 closures**
+- [x] **Step 3: Replace the context key and bind B1 closures**
 
 Use:
 
@@ -456,7 +456,7 @@ public func cbv2MTPVerifierContext(
 
 Build a local dictionary for B1/C2-C4, verify every layer and tied-head closure, then publish it once. Preserve `try model.installCBv2MTPVerifier()` after strict update and `eval(model)` in the runtime loader.
 
-- [ ] **Step 4: Route the model boundary by exact shape**
+- [x] **Step 4: Route the model boundary by exact shape**
 
 ```swift
 let shape = CBv2Gemma4MTPVerifierShape(
@@ -472,11 +472,11 @@ if tokens.ndim == 2, tokens.dim(1) > 1 {
 }
 ```
 
-- [ ] **Step 5: Run construction and projection suites**
+- [x] **Step 5: Run construction and projection suites**
 
 Expected: all pass; failure cases prove no partial installation.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Gemma4Text.swift Sources/MLXFastModel/Gemma4A4BRuntimeWeights.swift Tests/MLXFastTests/Gemma4MTPVerifierRouteTests.swift Tests/MLXFastTests/TargetQuantizationBindTests.swift

@@ -3,6 +3,37 @@ import MLXFastCore
 import MLXLLM
 import MLXLMCommon
 
+private final class RuntimeWorkerDrainRetirementBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: CBv2DrainRetirement?
+
+    func store(_ retirement: CBv2DrainRetirement) {
+        lock.lock()
+        value = retirement
+        lock.unlock()
+    }
+
+    func load() -> CBv2DrainRetirement {
+        lock.lock()
+        defer { lock.unlock() }
+        precondition(value != nil, "retirement result read before shutdown completed")
+        return value!
+    }
+}
+
+func runtimeWorkerShutdownReportingRetirementBlocking(
+    _ engine: EngineV2
+) -> CBv2DrainRetirement {
+    let semaphore = DispatchSemaphore(value: 0)
+    let result = RuntimeWorkerDrainRetirementBox()
+    Task.detached {
+        result.store(await engine.shutdownReportingRetirement())
+        semaphore.signal()
+    }
+    semaphore.wait()
+    return result.load()
+}
+
 // v1.1 SINGLE-STREAM free-run session — real round execution via a closed,
 // width-1 CBv2 engine. Two modes:
 //
@@ -49,6 +80,7 @@ final class RuntimeWorkerFreeRunSession {
     private let requestID: CBv2RequestID
     private let mode: Mode
     private var didShutdown = false
+    private var retirement: CBv2DrainRetirement?
     /// `engine.mtpMetricsSnapshot()` taken right after the seed token
     /// collected below, before any round has a chance to run. nil for a
     /// `.serial` (drafter-less) engine.
@@ -143,7 +175,7 @@ final class RuntimeWorkerFreeRunSession {
         // finalize (and its audit record / strategy count) is included —
         // the driver retains cumulative metrics for exactly this
         // post-shutdown poll, and the deferred shutdown is idempotent.
-        shutdownBlocking()
+        try requireNaturalRetirementBlocking()
         let drained = engine.mtpMetricsSnapshot()
         finalMetrics = drained
 
@@ -236,6 +268,26 @@ final class RuntimeWorkerFreeRunSession {
         guard !didShutdown else { return }
         didShutdown = true
         RuntimeWorkerFreeRunSession.shutdownEngineBlocking(engine)
+    }
+
+    /// Normal evidence teardown: unlike best-effort cleanup, this awaits the
+    /// registered drain outcome and refuses post-drain metrics unless the
+    /// engine queue retired naturally.
+    private func requireNaturalRetirementBlocking() throws {
+        if let retirement {
+            guard retirement == .natural else {
+                throw MLXFastError.invalidInput(
+                    "runtime worker free-run engine did not retire naturally")
+            }
+            return
+        }
+        let retirement = runtimeWorkerShutdownReportingRetirementBlocking(engine)
+        self.retirement = retirement
+        didShutdown = true
+        guard retirement == .natural else {
+            throw MLXFastError.invalidInput(
+                "runtime worker free-run engine did not retire naturally")
+        }
     }
 
     private static func shutdownEngineBlocking(_ engine: EngineV2) {

@@ -19,6 +19,16 @@ private final class RuntimeWorkerDrainJoinResultBox: @unchecked Sendable {
     }
 }
 
+private final class RuntimeWorkerLifetimeProbe {
+    private let released: DispatchSemaphore
+
+    init(released: DispatchSemaphore) {
+        self.released = released
+    }
+
+    deinit { released.signal() }
+}
+
 @Suite("Runtime worker phase-close ordering", .serialized)
 struct RuntimeWorkerPhaseCloseOrderingTests {
     @Test
@@ -102,7 +112,7 @@ struct RuntimeWorkerPhaseCloseOrderingTests {
         #expect(engineSource.contains("drains.removeFirst(pending.count)"))
 
         let registerStart = try #require(engineSource.range(
-            of: "    func register(_ task: Task<CBv2DrainRetirement, Never>) {"))
+            of: "    func registerDrain("))
         let registerEnd = try #require(engineSource.range(
             of: "\n    }",
             range: registerStart.upperBound..<engineSource.endIndex))
@@ -132,7 +142,7 @@ struct RuntimeWorkerPhaseCloseOrderingTests {
         let stop = try #require(method.range(of: "completeStop()"))
         let capture = try #require(method.range(of: "let waiters = drainWaiters"))
         let sentinel = try #require(method.range(
-            of: "engineQueue.async {"))
+            of: "CBv2DrainRetirementSentinel.enqueue(on: engineQueue) {"))
         let resume = try #require(method.range(
             of: "waiter.resume(.natural)"))
         #expect(stop.lowerBound < capture.lowerBound)
@@ -140,6 +150,27 @@ struct RuntimeWorkerPhaseCloseOrderingTests {
         #expect(sentinel.lowerBound < resume.lowerBound)
         #expect(!method[method.startIndex..<sentinel.lowerBound].contains(
             "waiter.resume(.natural)"))
+    }
+
+    @Test
+    func drainSentinelRunsAfterTheCompletingQueueClosureReleasesCaptures() throws {
+        let queue = DispatchQueue(label: "cbv2-drain-sentinel-lifetime-test")
+        let captureReleased = DispatchSemaphore(value: 0)
+        let sentinelFinished = DispatchSemaphore(value: 0)
+        let observedRelease = RuntimeWorkerDrainJoinResultBox()
+
+        queue.async {
+            let probe = RuntimeWorkerLifetimeProbe(released: captureReleased)
+            CBv2DrainRetirementSentinel.enqueue(on: queue) {
+                observedRelease.store(
+                    captureReleased.wait(timeout: .now()) == .success)
+                sentinelFinished.signal()
+            }
+            withExtendedLifetime(probe) {}
+        }
+
+        #expect(sentinelFinished.wait(timeout: .now() + 1) == .success)
+        #expect(observedRelease.load())
     }
 
     @Test
@@ -167,6 +198,13 @@ struct RuntimeWorkerPhaseCloseOrderingTests {
             range: synchronousStart.upperBound..<engineSource.endIndex))
         let synchronous = String(
             engineSource[synchronousStart.lowerBound..<synchronousEnd.lowerBound])
+        let reportingStart = try #require(engineSource.range(
+            of: "    public func shutdownReportingRetirement() async -> CBv2DrainRetirement {"))
+        let reportingEnd = try #require(engineSource.range(
+            of: "    /// Always-awaiting variant",
+            range: reportingStart.upperBound..<engineSource.endIndex))
+        let reporting = String(
+            engineSource[reportingStart.lowerBound..<reportingEnd.lowerBound])
         let registrationStart = try #require(engineSource.range(
             of: "    private func registerDrain() -> Task<CBv2DrainRetirement, Never> {"))
         let registrationEnd = try #require(engineSource.range(
@@ -187,22 +225,122 @@ struct RuntimeWorkerPhaseCloseOrderingTests {
         #expect(shutdownDrain.lowerBound < fastAckBranch.lowerBound)
         #expect(fastAckBranch.lowerBound < optionalAwait.lowerBound)
 
-        let synchronousBegin = try #require(synchronous.range(
+        let reportingBegin = try #require(reporting.range(
             of: "beginRejectingSubmissions()"))
-        let synchronousDrain = try #require(synchronous.range(
+        let reportingDrain = try #require(reporting.range(
             of: "let drain = registerDrain()"))
-        let synchronousAwait = try #require(synchronous.range(
-            of: "_ = await drain.value"))
-        #expect(synchronousBegin.lowerBound < synchronousDrain.lowerBound)
-        #expect(synchronousDrain.lowerBound < synchronousAwait.lowerBound)
+        let reportingAwait = try #require(reporting.range(
+            of: "return await drain.value"))
+        #expect(reportingBegin.lowerBound < reportingDrain.lowerBound)
+        #expect(reportingDrain.lowerBound < reportingAwait.lowerBound)
+        #expect(synchronous.contains(
+            "_ = await shutdownReportingRetirement()"))
 
         let taskCreation = try #require(registration.range(
+            of: "CBv2DetachedDrainRegistry.registerDrain"))
+        let drainOperation = try #require(registration.range(
+            of: "await loop.drain()"))
+        #expect(taskCreation.lowerBound < drainOperation.lowerBound)
+        #expect(!registration.contains("Task.detached"))
+    }
+
+    @Test
+    func normalEvidenceTeardownRequiresNaturalRetirementBeforeMetrics() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let engine = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/EngineV2.swift"),
+            encoding: .utf8)
+        #expect(engine.contains(
+            "public func shutdownReportingRetirement() async -> CBv2DrainRetirement"))
+
+        for path in [
+            "Sources/MLXFastHarness/Gemma4RuntimeMTPDriver.swift",
+            "Sources/MLXFastHarness/Gemma4RuntimeCohortDriver.swift",
+        ] {
+            let source = try String(
+                contentsOf: repositoryRoot.appendingPathComponent(path),
+                encoding: .utf8)
+            #expect(source.contains(
+                "runtimeWorkerShutdownReportingRetirementBlocking"))
+            #expect(source.contains("guard retirement == .natural else"))
+        }
+
+        let single = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Sources/MLXFastHarness/Gemma4RuntimeMTPDriver.swift"),
+            encoding: .utf8)
+        let singleRunStart = try #require(single.range(
+            of: "    func run(targetN: Int) throws -> RuntimeWorkerFreeRunResult {"))
+        let singleRunEnd = try #require(single.range(
+            of: "    private var routeName:",
+            range: singleRunStart.upperBound..<single.endIndex))
+        let singleRun = single[singleRunStart.lowerBound..<singleRunEnd.lowerBound]
+        let singleRetirement = try #require(singleRun.range(
+            of: "try requireNaturalRetirementBlocking()"))
+        let singleMetrics = try #require(singleRun.range(
+            of: "let drained = engine.mtpMetricsSnapshot()"))
+        #expect(singleRetirement.lowerBound < singleMetrics.lowerBound)
+
+        let cohort = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Sources/MLXFastHarness/Gemma4RuntimeCohortDriver.swift"),
+            encoding: .utf8)
+        let serialStart = try #require(cohort.range(
+            of: "    func runSerial(targetN: Int) throws -> RuntimeWorkerCohortFreeRunResult {"))
+        let mtpStart = try #require(cohort.range(
+            of: "    func runMTP(targetN: Int) throws -> RuntimeWorkerCohortFreeRunResult {"))
+        let teardownStart = try #require(cohort.range(
+            of: "    /// Idempotent synchronous engine shutdown.",
+            range: mtpStart.upperBound..<cohort.endIndex))
+        let serialRun = cohort[serialStart.lowerBound..<mtpStart.lowerBound]
+        let mtpRun = cohort[mtpStart.lowerBound..<teardownStart.lowerBound]
+        #expect(serialRun.contains("try requireNaturalRetirementBlocking()"))
+        let cohortRetirement = try #require(mtpRun.range(
+            of: "try requireNaturalRetirementBlocking()"))
+        let cohortMetrics = try #require(mtpRun.range(
+            of: "let finalMetrics = engine.mtpMetricsSnapshot()"))
+        #expect(cohortRetirement.lowerBound < cohortMetrics.lowerBound)
+    }
+
+    @Test
+    func registryCreatesAndPublishesDrainUnderTheJoinExclusionLock() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/EngineV2.swift"),
+            encoding: .utf8)
+        let storageStart = try #require(source.range(
+            of: "final class CBv2DetachedDrainStorage: @unchecked Sendable"))
+        let joinStart = try #require(source.range(
+            of: "    /// Wait (at most",
+            range: storageStart.upperBound..<source.endIndex))
+        let registration = source[storageStart.lowerBound..<joinStart.lowerBound]
+        let lock = try #require(registration.range(of: "joinLock.lock()"))
+        let task = try #require(registration.range(
             of: "let drain = Task.detached"))
-        let taskRegistration = try #require(registration.range(
-            of: "CBv2DetachedDrainRegistry.register(drain)"))
-        let taskReturn = try #require(registration.range(of: "return drain"))
-        #expect(taskCreation.lowerBound < taskRegistration.lowerBound)
-        #expect(taskRegistration.lowerBound < taskReturn.lowerBound)
+        let append = try #require(registration.range(of: "drains.append(drain)"))
+        let unlock = try #require(registration.range(of: "joinLock.unlock()"))
+        #expect(lock.lowerBound < task.lowerBound)
+        #expect(task.lowerBound < append.lowerBound)
+        #expect(append.lowerBound < unlock.lowerBound)
+
+        let engineRegistrationStart = try #require(source.range(
+            of: "    private func registerDrain() -> Task<CBv2DrainRetirement, Never> {"))
+        let engineRegistrationEnd = try #require(source.range(
+            of: "\n    }",
+            range: engineRegistrationStart.upperBound..<source.endIndex))
+        let engineRegistration = source[
+            engineRegistrationStart.lowerBound..<engineRegistrationEnd.upperBound]
+        #expect(engineRegistration.contains(
+            "CBv2DetachedDrainRegistry.registerDrain"))
+        #expect(!engineRegistration.contains("Task.detached"))
     }
 
     @Test
@@ -375,11 +513,11 @@ struct RuntimeWorkerPhaseCloseOrderingTests {
         let registry = CBv2DetachedDrainStorage()
         let started = DispatchSemaphore(value: 0)
         let release = AsyncStream<Void>.makeStream()
-        registry.register(Task.detached {
+        registry.registerDrain {
             started.signal()
             for await _ in release.stream { break }
             return .natural
-        })
+        }
         defer {
             release.continuation.finish()
             _ = registry.joinAll(timeout: 1)
@@ -397,9 +535,9 @@ struct RuntimeWorkerPhaseCloseOrderingTests {
     func detachedDrainRegistryRejectsAndRetainsWatchdogEscape() {
         let registry = CBv2DetachedDrainStorage()
 
-        registry.register(Task.detached {
+        registry.registerDrain {
             CBv2DrainRetirement.watchdogEscaped
-        })
+        }
 
         #expect(!registry.joinAll(timeout: 1))
         #expect(
@@ -411,10 +549,10 @@ struct RuntimeWorkerPhaseCloseOrderingTests {
     func registrationLinearizesAfterAnActiveJoin() throws {
         let registry = CBv2DetachedDrainStorage()
         let firstRelease = AsyncStream<Void>.makeStream()
-        registry.register(Task.detached {
+        registry.registerDrain {
             for await _ in firstRelease.stream { break }
             return .natural
-        })
+        }
         let snapshotted = DispatchSemaphore(value: 0)
         let joinFinished = DispatchSemaphore(value: 0)
         let joinResult = RuntimeWorkerDrainJoinResultBox()
@@ -428,7 +566,7 @@ struct RuntimeWorkerPhaseCloseOrderingTests {
 
         let registrationFinished = DispatchSemaphore(value: 0)
         DispatchQueue.global().async {
-            registry.register(Task.detached { .watchdogEscaped })
+            registry.registerDrain { .watchdogEscaped }
             registrationFinished.signal()
         }
         #expect(registrationFinished.wait(timeout: .now() + 0.01) == .timedOut)
@@ -438,5 +576,46 @@ struct RuntimeWorkerPhaseCloseOrderingTests {
         #expect(joinResult.load())
         #expect(registrationFinished.wait(timeout: .now() + 1) == .success)
         #expect(!registry.joinAll(timeout: 1))
+    }
+
+    @Test
+    func aStartedDrainCannotBeInvisibleToAConcurrentSuccessfulJoin() throws {
+        let registry = CBv2DetachedDrainStorage()
+        let operationStarted = DispatchSemaphore(value: 0)
+        let beforePublication = DispatchSemaphore(value: 0)
+        let allowPublication = DispatchSemaphore(value: 0)
+        let registrationFinished = DispatchSemaphore(value: 0)
+        let releaseOperation = AsyncStream<Void>.makeStream()
+
+        DispatchQueue.global().async {
+            registry.registerDrain(
+                operation: {
+                    operationStarted.signal()
+                    for await _ in releaseOperation.stream { break }
+                    return .natural
+                },
+                beforePublicationObserverForTesting: {
+                    beforePublication.signal()
+                    allowPublication.wait()
+                })
+            registrationFinished.signal()
+        }
+        #expect(beforePublication.wait(timeout: .now() + 1) == .success)
+        #expect(operationStarted.wait(timeout: .now() + 1) == .success)
+
+        let joinFinished = DispatchSemaphore(value: 0)
+        let joinResult = RuntimeWorkerDrainJoinResultBox()
+        DispatchQueue.global().async {
+            joinResult.store(registry.joinAll(timeout: 1))
+            joinFinished.signal()
+        }
+        #expect(joinFinished.wait(timeout: .now() + 0.01) == .timedOut)
+
+        allowPublication.signal()
+        #expect(registrationFinished.wait(timeout: .now() + 1) == .success)
+        #expect(joinFinished.wait(timeout: .now() + 0.01) == .timedOut)
+        releaseOperation.continuation.finish()
+        #expect(joinFinished.wait(timeout: .now() + 1) == .success)
+        #expect(joinResult.load())
     }
 }

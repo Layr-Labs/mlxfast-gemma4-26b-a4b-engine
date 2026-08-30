@@ -452,7 +452,7 @@ private struct CBv2Handoff<Value>: @unchecked Sendable {
 
 /// Whether an engine-loop drain actually retired the queue or only escaped
 /// through its bounded watchdog.
-enum CBv2DrainRetirement: Sendable, Equatable {
+public enum CBv2DrainRetirement: Sendable, Equatable {
     /// The engine queue stopped after all in-flight work and KV releases
     /// completed. It is safe for a process-level owner to fence the GPU and
     /// reclaim allocator cache after observing this result.
@@ -461,6 +461,18 @@ enum CBv2DrainRetirement: Sendable, Equatable {
     /// queue may still be executing. This is an escape from waiting, not a
     /// retirement fence, and must fail closed at process-level phase barriers.
     case watchdogEscaped
+}
+
+/// One subsequent turn on the engine's serial queue. Natural retirement is
+/// published through this seam only after the closure that completed the
+/// final donation/KV handoff has unwound and released its captures.
+enum CBv2DrainRetirementSentinel {
+    static func enqueue(
+        on queue: DispatchQueue,
+        retirement: @escaping @Sendable () -> Void
+    ) {
+        queue.async(execute: retirement)
+    }
 }
 
 /// Resume-exactly-once wrapper for a drain continuation: the engine queue
@@ -796,7 +808,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                     // Even an already-stopped loop reports natural retirement
                     // from a subsequent queue turn, after this request closure
                     // releases everything it captured.
-                    engineQueue.async {
+                    CBv2DrainRetirementSentinel.enqueue(on: engineQueue) {
                         waiter.resume(.natural)
                     }
                     return
@@ -850,7 +862,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         completeStop()
         let waiters = drainWaiters
         drainWaiters = []
-        engineQueue.async {
+        CBv2DrainRetirementSentinel.enqueue(on: engineQueue) {
             for waiter in waiters { waiter.resume(.natural) }
         }
     }

@@ -583,14 +583,21 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         _ = await drain.value
     }
 
+    /// Result-bearing natural-retirement boundary for callers that publish
+    /// evidence after teardown. The drain is registered before it can become
+    /// visible to a concurrent join, then this awaits its explicit outcome.
+    public func shutdownReportingRetirement() async -> CBv2DrainRetirement {
+        beginRejectingSubmissions()
+        let drain = registerDrain()
+        return await drain.value
+    }
+
     /// Always-awaiting variant for unscored callers (e.g. the constructor
     /// warm). It waits for the same registered, bounded drain regardless of
     /// the fast-ack default; a later checked registry fence still distinguishes
     /// natural retirement from a shutdown-watchdog escape.
     public func shutdownSynchronously() async {
-        beginRejectingSubmissions()
-        let drain = registerDrain()
-        _ = await drain.value
+        _ = await shutdownReportingRetirement()
     }
 
     /// Resolved once: fast-ack drains are the default; set the variable to
@@ -607,11 +614,9 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         // .userInitiated: a starved lower-priority drain would leave the
         // engine loop thread alive (and any joiner waiting) through the
         // caller's next work — measured locally as a real regression.
-        let drain = Task.detached(priority: .userInitiated) {
+        return CBv2DetachedDrainRegistry.registerDrain {
             await loop.drain()
         }
-        CBv2DetachedDrainRegistry.register(drain)
-        return drain
     }
 
     /// Synchronous helper: `NSLock` is not async-safe to hold across
@@ -681,12 +686,21 @@ final class CBv2DetachedDrainStorage: @unchecked Sendable {
     private let lock = NSLock()
     private var drains: [Task<CBv2DrainRetirement, Never>] = []
 
-    func register(_ task: Task<CBv2DrainRetirement, Never>) {
+    @discardableResult
+    func registerDrain(
+        operation: @escaping @Sendable () async -> CBv2DrainRetirement,
+        beforePublicationObserverForTesting: (() -> Void)? = nil
+    ) -> Task<CBv2DrainRetirement, Never> {
         joinLock.lock()
-        defer { joinLock.unlock() }
+        let drain = Task.detached(priority: .userInitiated) {
+            await operation()
+        }
+        beforePublicationObserverForTesting?()
         lock.lock()
-        drains.append(task)
+        drains.append(drain)
         lock.unlock()
+        joinLock.unlock()
+        return drain
     }
 
     /// Wait (at most `timeout` seconds) for every registered drain to
@@ -732,8 +746,10 @@ final class CBv2DetachedDrainStorage: @unchecked Sendable {
 public enum CBv2DetachedDrainRegistry {
     private static let storage = CBv2DetachedDrainStorage()
 
-    static func register(_ task: Task<CBv2DrainRetirement, Never>) {
-        storage.register(task)
+    static func registerDrain(
+        operation: @escaping @Sendable () async -> CBv2DrainRetirement
+    ) -> Task<CBv2DrainRetirement, Never> {
+        storage.registerDrain(operation: operation)
     }
 
     @discardableResult

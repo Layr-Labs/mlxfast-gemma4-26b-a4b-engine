@@ -385,6 +385,7 @@ final class RuntimeWorkerCohortSession {
         for id in requestIDs {
             engine.cancel(id)
         }
+        try requireNaturalRetirementBlocking()
         return try assembleSerialCohortFreeRun(
             streamsWithSeed: streamsWithSeed,
             batchSize: batchSize,
@@ -477,7 +478,7 @@ final class RuntimeWorkerCohortSession {
         // round's record. The driver retains cumulative metrics for exactly
         // this post-shutdown poll (`removeAllRequestState`'s contract), and
         // `shutdownBlocking` is idempotent for the deferred teardown above.
-        shutdownBlocking()
+        try requireNaturalRetirementBlocking()
         let finalMetrics = engine.mtpMetricsSnapshot()
         return try assembleMTPCohortFreeRun(
             perSlot: perSlot,
@@ -497,6 +498,18 @@ final class RuntimeWorkerCohortSession {
         guard !didShutdown else { return }
         didShutdown = true
         RuntimeWorkerCohortSession.shutdownEngineBlocking(engine)
+    }
+
+    /// Normal evidence teardown. A watchdog escape is bounded but is not a
+    /// retirement fence, so no post-drain cohort result or metrics may be
+    /// published from it.
+    private func requireNaturalRetirementBlocking() throws {
+        let retirement = runtimeWorkerShutdownReportingRetirementBlocking(engine)
+        didShutdown = true
+        guard retirement == .natural else {
+            throw MLXFastError.invalidInput(
+                "runtime worker cohort engine did not retire naturally")
+        }
     }
 
     private static func shutdownEngineBlocking(_ engine: EngineV2) {

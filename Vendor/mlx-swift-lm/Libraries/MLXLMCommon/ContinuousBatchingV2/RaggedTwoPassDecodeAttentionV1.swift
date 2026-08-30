@@ -388,7 +388,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     )
 
     private static let passBKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_2pass_b_direct_bf16_d256_b\(blocks)_v3",
+        name: "cbv2_ragged8_sdpa_2pass_b_direct_bf16_d256_b\(blocks)_v4",
         inputNames: ["partials", "sums", "maxs"],
         outputNames: ["out"],
         source: """
@@ -415,29 +415,39 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             for (int element = 0; element < values_per_lane; ++element) {
                 accumulator[element] = 0.0f;
             }
+            // A lane's column summaries are invariant across all three walks
+            // below, and its rescale factor is invariant across the last two.
+            // Holding them keeps the same values while dropping two reloads of
+            // `maxs`, one of `sums`, and one `fast::exp` per column. The dead
+            // lanes take the identity of each reduction through a select, as
+            // they did through the skipped body: `-FLT_MAX` folds away under
+            // `max`, and `fast::exp` of a large negative is `+0.0f`, so the
+            // `+0.0f * +0.0f` they add to a total that started at `+0.0f`
+            // leaves it `+0.0f`.
+            thread float lane_max[rounds];
+            thread float lane_sum[rounds];
+            thread float lane_factor[rounds];
             float sum_exp_score = 0.0f;
             float max_score = -3.402823466e+38F;
             for (int round = 0; round < rounds; ++round) {
                 const int column = block_lane + simd_width * round;
-                if (column < BLOCKS) {
-                    max_score = max(max_score, maxs[column]);
-                }
+                const bool live = column < BLOCKS;
+                lane_max[round] = live ? maxs[column] : -3.402823466e+38F;
+                lane_sum[round] = live ? sums[column] : 0.0f;
+                max_score = max(max_score, lane_max[round]);
             }
             max_score = simd_max(max_score);
 
             for (int round = 0; round < rounds; ++round) {
-                const int column = block_lane + simd_width * round;
-                if (column < BLOCKS) {
-                    sum_exp_score +=
-                        fast::exp(maxs[column] - max_score) * sums[column];
-                }
+                lane_factor[round] = fast::exp(lane_max[round] - max_score);
+                sum_exp_score += lane_factor[round] * lane_sum[round];
             }
             sum_exp_score = simd_sum(sum_exp_score);
 
             for (int round = 0; round < rounds; ++round) {
                 const int column = block_lane + simd_width * round;
                 if (column < BLOCKS) {
-                    const float factor = fast::exp(maxs[column] - max_score);
+                    const float factor = lane_factor[round];
                     for (int element = 0; element < values_per_lane; ++element) {
                         accumulator[element] +=
                             factor * float(partials[column * D + element]);

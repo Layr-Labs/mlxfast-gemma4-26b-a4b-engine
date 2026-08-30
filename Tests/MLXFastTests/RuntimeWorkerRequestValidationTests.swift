@@ -92,7 +92,8 @@ func specRequiresTheSpawnGate() throws {
 func specIsRejectedOnEveryKindButTheTwoDecodeBegins() throws {
     for kind in [
         "correctness", "correctness_begin", "correctness_step", "prefill",
-        "decode_step", "free_decode_run", "phase_diagnostics",
+        "decode_step", "free_decode_run", "free_decode_run_timed",
+        "free_decode_finalize", "phase_diagnostics",
     ] {
         let message = rejection(
             #"{"id":1,"kind":"\#(kind)","spec":{"mode":"serial"}}"#)
@@ -125,6 +126,8 @@ func freeRunKindsAreRefusedWhenTheSpawnGateIsOff() throws {
     for json in [
         #"{"id":1,"kind":"free_decode_begin","seed_tokens":[1,2]}"#,
         #"{"id":2,"kind":"free_decode_run","count":8}"#,
+        #"{"id":3,"kind":"free_decode_run_timed","count":8}"#,
+        #"{"id":4,"kind":"free_decode_finalize"}"#,
     ] {
         let message = rejection(json, context: gateOff)
         #expect(message?.contains("belongs to the v1.1 speculative surface") == true)
@@ -158,6 +161,39 @@ func freeRunKindsAreRefusedWhenTheSpawnGateIsOff() throws {
     ] {
         #expect(rejection(json, context: gateOff) == nil)
     }
+}
+
+@Test
+func deferredFreeRunRequiresExactlyOneUntimedFinalize() throws {
+    let open = RuntimeWorkerRequestContext(
+        hasDecodeRoute: true, advertisesSpeculativeProtocol: true)
+    #expect(
+        try accepted(
+            #"{"id":2,"kind":"free_decode_run_timed","count":8}"#,
+            context: open
+        ).freeRunCount == 8)
+    #expect(
+        rejection(#"{"id":3,"kind":"free_decode_finalize"}"#, context: open)
+            == "runtime worker free_decode_finalize without a pending timed run")
+
+    let pending = RuntimeWorkerRequestContext(
+        hasDecodeRoute: true,
+        advertisesSpeculativeProtocol: true,
+        hasPendingFreeRunFinalize: true)
+    #expect(rejection(#"{"id":3,"kind":"free_decode_finalize"}"#, context: pending) == nil)
+    #expect(
+        rejection(
+            #"{"id":4,"kind":"free_decode_run_timed","count":8}"#,
+            context: pending)
+            == "runtime worker free_decode_run_timed while a finalize is pending")
+    #expect(
+        rejection(
+            #"{"id":5,"kind":"free_decode_begin","seed_tokens":[1]}"#,
+            context: pending)
+            == "runtime worker free_decode_begin while a timed run awaits finalize")
+    #expect(
+        rejection(#"{"id":6,"kind":"phase_diagnostics"}"#, context: pending)
+            == "runtime worker phase_diagnostics before free_decode_finalize")
 }
 
 // MARK: - Guard 5: a teacher-forced decode_begin is serial-only

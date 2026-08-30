@@ -81,6 +81,7 @@ final class RuntimeWorkerFreeRunSession {
     private let mode: Mode
     private var didShutdown = false
     private var retirement: CBv2DrainRetirement?
+    private var pendingTimedResult: RuntimeWorkerFreeRunTimedResult?
     /// `engine.mtpMetricsSnapshot()` taken right after the seed token
     /// collected below, before any round has a chance to run. nil for a
     /// `.serial` (drafter-less) engine.
@@ -169,15 +170,21 @@ final class RuntimeWorkerFreeRunSession {
     /// drain-and-shutdown at run).
     func run(targetN: Int) throws -> RuntimeWorkerFreeRunResult {
         defer { shutdownBlocking() }
+        _ = try collectTimed(targetN: targetN)
+        return try finalizeTimed()
+    }
+
+    /// Timed half of the additive deferred-finalize protocol. Stop timing as
+    /// soon as target-N tokens and their real commit-chunk shape are assembled;
+    /// engine drain, registry waiting, KV release, and metrics publication are
+    /// intentionally absent from this call graph.
+    func collectTimed(targetN: Int) throws -> RuntimeWorkerFreeRunTimedResult {
+        guard pendingTimedResult == nil else {
+            throw MLXFastError.invalidInput(
+                "runtime worker free_decode_run_timed already awaits finalize")
+        }
         let (tokens, chunkSizes, finished) = collector.waitForRounds(atLeast: targetN + 1)
         engine.cancel(requestID)
-        // Shut down BEFORE the final metrics poll so the loop's in-flight
-        // finalize (and its audit record / strategy count) is included —
-        // the driver retains cumulative metrics for exactly this
-        // post-shutdown poll, and the deferred shutdown is idempotent.
-        try requireNaturalRetirementBlocking()
-        let drained = engine.mtpMetricsSnapshot()
-        finalMetrics = drained
 
         guard chunkSizes.first == 1 else {
             throw MLXFastError.invalidInput(
@@ -212,17 +219,36 @@ final class RuntimeWorkerFreeRunSession {
         }
 
         let assembled = try builder.finish()
+        let timed = RuntimeWorkerFreeRunTimedResult(
+            tokens: assembled.tokens,
+            acceptanceLengths: assembled.acceptanceLengths,
+            committedTotal: assembled.committedTotal)
+        pendingTimedResult = timed
+        return timed
+    }
+
+    /// Untimed evidence half. Natural retirement is mandatory before the
+    /// complete MTP counters/audits are snapshotted and published.
+    func finalizeTimed() throws -> RuntimeWorkerFreeRunResult {
+        guard let timed = pendingTimedResult else {
+            throw MLXFastError.invalidInput(
+                "runtime worker free_decode_finalize without a pending timed run")
+        }
+        try requireNaturalRetirementBlocking()
+        let drained = engine.mtpMetricsSnapshot()
+        finalMetrics = drained
+        pendingTimedResult = nil
         switch mode {
         case .serial:
             // A drafter-less engine drafts nothing by construction; the
             // honest serial counters are structural zeros, exactly like the
             // legacy serial loop's.
             return RuntimeWorkerFreeRunResult(
-                tokens: assembled.tokens,
-                acceptanceLengths: assembled.acceptanceLengths,
+                tokens: timed.tokens,
+                acceptanceLengths: timed.acceptanceLengths,
                 draftedTotal: 0,
                 acceptedTotal: 0,
-                committedTotal: assembled.committedTotal
+                committedTotal: timed.committedTotal
             )
         case .mtp:
             guard let drained else {
@@ -236,11 +262,11 @@ final class RuntimeWorkerFreeRunSession {
             let draftedTotal = Swift.max(0, drained.draftedTokens - baselineDrafted)
             let acceptedTotal = Swift.max(0, drained.acceptedTokens - baselineAccepted)
             return RuntimeWorkerFreeRunResult(
-                tokens: assembled.tokens,
-                acceptanceLengths: assembled.acceptanceLengths,
+                tokens: timed.tokens,
+                acceptanceLengths: timed.acceptanceLengths,
                 draftedTotal: draftedTotal,
                 acceptedTotal: acceptedTotal,
-                committedTotal: assembled.committedTotal
+                committedTotal: timed.committedTotal
             )
         }
     }

@@ -341,6 +341,10 @@ extension Gemma4Runtime {
             let data = try encoder.encode(response)
             try protocolIO.writeLine(data)
         }
+        guard state.pendingFreeRunTimedResult == nil else {
+            throw MLXFastError.invalidInput(
+                "runtime worker input closed before free_decode_finalize")
+        }
     }
 
     /// One-shot structural validation used by the trusted `preflight` command.
@@ -575,7 +579,9 @@ extension Gemma4Runtime {
                 hasDecodeRoute: state.decodeRoute != nil,
                 advertisesSpeculativeProtocol: advertisesSpeculativeProtocol,
                 cohortBatchSize: state.cohortSession?.batchSize,
-                hasRecordingSession: state.recordingSession != nil
+                hasRecordingSession: state.recordingSession != nil,
+                hasPendingFreeRunFinalize:
+                    state.pendingFreeRunTimedResult != nil
             ),
             specRegistry: specRegistry
         )
@@ -955,6 +961,56 @@ extension Gemma4Runtime {
                 committedTotal: result.committedTotal
             )
 
+        case "free_decode_run_timed":
+            guard let route = state.decodeRoute, let n = validated.freeRunCount
+            else {
+                throw MLXFastError.invalidInput(
+                    "runtime worker free_decode_run_timed before free_decode_begin")
+            }
+            guard route != .dflash else {
+                throw MLXFastError.invalidInput(
+                    "runtime worker free_decode_run_timed supports only the "
+                        + "shared CBv2 serial/mtp executor")
+            }
+            let timed = try collectFreeDecodeTimed(
+                targetN: n, route: route, state: &state)
+            state.completedWork += timed.rounds
+            return RuntimeWorkerResponse(
+                id: request.id,
+                nonce: sessionNonce,
+                ok: true,
+                tokens: timed.tokens,
+                acceptanceLengths: timed.acceptanceLengths
+            )
+
+        case "free_decode_finalize":
+            guard let route = state.decodeRoute,
+                let diagnosticsSession = state.freeRunSession
+            else {
+                throw MLXFastError.invalidInput(
+                    "runtime worker free_decode_finalize without a pending timed run")
+            }
+            let result: RuntimeWorkerFreeRunResult
+            do {
+                result = try finalizeFreeDecode(state: &state)
+            } catch {
+                emitFreeRunSessionDiagnostics(
+                    route: route, session: diagnosticsSession,
+                    state: state, result: nil)
+                throw error
+            }
+            emitFreeRunSessionDiagnostics(
+                route: route, session: diagnosticsSession,
+                state: state, result: result)
+            return RuntimeWorkerResponse(
+                id: request.id,
+                nonce: sessionNonce,
+                ok: true,
+                draftedTotal: result.draftedTotal,
+                acceptedTotal: result.acceptedTotal,
+                committedTotal: result.committedTotal
+            )
+
         case "record_reference_begin":
             // RECORDING SURFACE (trusted-CLI-only; `record-reference-tape
             // --recording-backend cbv2`). Open the SAME width-1 CBv2 engine
@@ -1276,6 +1332,52 @@ extension Gemma4Runtime {
                     + "it was already consumed — validation drift)")
         }
         let result = try session.run(targetN: targetN)
+        state.freeRunSession = nil
+        return result
+    }
+
+    /// Deferred lane's externally timed call graph. It observes target-N and
+    /// seals the committed stream/round shape, but performs no engine teardown
+    /// and publishes no MTP metrics.
+    static func collectFreeDecodeTimed(
+        targetN: Int,
+        route: RuntimeWorkerDecodeRoute,
+        state: inout RuntimeWorkerState
+    ) throws -> RuntimeWorkerFreeRunTimedResult {
+        guard state.pendingFreeRunTimedResult == nil,
+            let session = state.freeRunSession
+        else {
+            throw MLXFastError.invalidInput(
+                "runtime worker free_decode_run_timed has no collectable session")
+        }
+        guard route == .serial || route == .mtp else {
+            throw MLXFastError.invalidInput(
+                "runtime worker free_decode_run_timed supports only serial/mtp")
+        }
+        let result = try session.collectTimed(targetN: targetN)
+        state.pendingFreeRunTimedResult = result
+        return result
+    }
+
+    /// Untimed evidence boundary for the deferred lane.
+    static func finalizeFreeDecode(
+        state: inout RuntimeWorkerState
+    ) throws -> RuntimeWorkerFreeRunResult {
+        guard let pending = state.pendingFreeRunTimedResult,
+            let session = state.freeRunSession
+        else {
+            throw MLXFastError.invalidInput(
+                "runtime worker free_decode_finalize without a pending timed run")
+        }
+        let result = try session.finalizeTimed()
+        guard result.tokens == pending.tokens,
+            result.acceptanceLengths == pending.acceptanceLengths,
+            result.committedTotal == pending.committedTotal
+        else {
+            throw MLXFastError.invalidInput(
+                "runtime worker free_decode_finalize changed the sealed timed result")
+        }
+        state.pendingFreeRunTimedResult = nil
         state.freeRunSession = nil
         return result
     }
@@ -1943,6 +2045,9 @@ struct RuntimeWorkerState {
     /// phase; cleared by `free_decode_run` on completion and
     /// (belt-and-suspenders) by `phase_diagnostics`.
     var freeRunSession: RuntimeWorkerFreeRunSession?
+    /// Additive deferred-timing lane: committed tokens/round shape sealed by
+    /// `free_decode_run_timed`, consumed only by untimed finalize.
+    var pendingFreeRunTimedResult: RuntimeWorkerFreeRunTimedResult?
     /// v1.1 (SINGLE-STREAM, DFLASH ARM): the live DFlash round-loop session
     /// sealed by a `free_decode_begin` whose route resolved to `.dflash`.
     /// Its own slot rather than a case of `freeRunSession` because the arm

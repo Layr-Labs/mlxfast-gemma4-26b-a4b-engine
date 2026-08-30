@@ -72,7 +72,8 @@ func cohortCapabilityMatchesBenchdAndIsAdvertisedBesideV11() {
     #expect(runtimeWorkerPerStreamTimingCapability == "per_stream_timing")
     #expect(
         runtimeWorkerAdvertisedCapabilities == [
-            "free_run_decode", "batched_free_run_decode", "per_stream_timing",
+            "free_run_decode", "deferred_free_run_finalize",
+            "batched_free_run_decode", "per_stream_timing",
         ])
 }
 
@@ -93,12 +94,13 @@ func helloAdvertisesReplayUngatedAndTheSpeculativeCapsOnlyWhenGatedOn() {
     #expect(
         runtimeWorkerHelloCapabilities(advertisesSpeculativeProtocol: false)
             == ["cohort_reference_replay"])
-    // Gate ON: the same ungated capability PLUS the three speculative ones.
+    // Gate ON: the same ungated capability plus the speculative ones.
     #expect(
         runtimeWorkerHelloCapabilities(advertisesSpeculativeProtocol: true)
             == [
                 "cohort_reference_replay", "free_run_decode",
-                "batched_free_run_decode", "per_stream_timing",
+                "deferred_free_run_finalize", "batched_free_run_decode",
+                "per_stream_timing",
             ])
     // Stated structurally as well as by value, so a capability added to either
     // constant later has to land on the correct side of the gate to pass: the

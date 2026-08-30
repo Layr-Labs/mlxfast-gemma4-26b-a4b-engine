@@ -47,7 +47,7 @@ struct RuntimeWorkerRequestContext: Equatable {
     /// `state.poisoned`: an earlier request in this session failed.
     let poisoned: Bool
     /// Whether a `(free_)decode_begin` has sealed a route in this session
-    /// (`state.decodeRoute != nil`). Only `free_decode_run` reads it.
+    /// (`state.decodeRoute != nil`). The free-run execution verbs read it.
     let hasDecodeRoute: Bool
     /// Whether the worker advertised the v1.1 speculative surface at spawn.
     let advertisesSpeculativeProtocol: Bool
@@ -62,19 +62,24 @@ struct RuntimeWorkerRequestContext: Equatable {
     /// (sequencing) and by a second `record_reference_begin` (refused — a
     /// silently replaced session would leak a live engine).
     let hasRecordingSession: Bool
+    /// Whether `free_decode_run_timed` returned its committed shape and the
+    /// session is sealed until the untimed `free_decode_finalize` consumes it.
+    let hasPendingFreeRunFinalize: Bool
 
     init(
         poisoned: Bool = false,
         hasDecodeRoute: Bool = false,
         advertisesSpeculativeProtocol: Bool = false,
         cohortBatchSize: Int? = nil,
-        hasRecordingSession: Bool = false
+        hasRecordingSession: Bool = false,
+        hasPendingFreeRunFinalize: Bool = false
     ) {
         self.poisoned = poisoned
         self.hasDecodeRoute = hasDecodeRoute
         self.advertisesSpeculativeProtocol = advertisesSpeculativeProtocol
         self.cohortBatchSize = cohortBatchSize
         self.hasRecordingSession = hasRecordingSession
+        self.hasPendingFreeRunFinalize = hasPendingFreeRunFinalize
     }
 }
 
@@ -172,7 +177,10 @@ func validateGenericWorkerRequest(
     //    `free_decode_*` request is therefore out of contract on the caller's
     //    side before it reaches here; this is where that is said out loud.
     if !context.advertisesSpeculativeProtocol,
-        request.kind == "free_decode_begin" || request.kind == "free_decode_run"
+        request.kind == "free_decode_begin"
+            || request.kind == "free_decode_run"
+            || request.kind == "free_decode_run_timed"
+            || request.kind == "free_decode_finalize"
     {
         throw MLXFastError.invalidInput(
             "\(request.kind) belongs to the v1.1 speculative surface, which "
@@ -238,6 +246,10 @@ func validateGenericWorkerRequest(
         return RuntimeWorkerValidatedRequest(effectiveSpec: effective)
 
     case "free_decode_begin":
+        guard !context.hasPendingFreeRunFinalize else {
+            throw MLXFastError.invalidInput(
+                "runtime worker free_decode_begin while a timed run awaits finalize")
+        }
         // v1.2 (COHORT): presence of either cohort field selects the cohort
         // form — validated as such, never silently narrowed to single-stream.
         // The v1.1 branch below is byte-for-byte the pre-cohort behavior.
@@ -257,6 +269,10 @@ func validateGenericWorkerRequest(
                 request.spec, specRegistry: specRegistry))
 
     case "free_decode_run":
+        guard !context.hasPendingFreeRunFinalize else {
+            throw MLXFastError.invalidInput(
+                "runtime worker free_decode_run while a finalize is pending")
+        }
         // v1.2 (COHORT): a present `batch_size` selects the cohort form, which
         // sequences against the batched begin's sealed width instead of the
         // single-stream route. An open cohort phase conversely refuses the
@@ -295,6 +311,39 @@ func validateGenericWorkerRequest(
                     + "1...\(MLXFastConstants.experimentalDFlashMaxConfiguredTotalTokens)")
         }
         return RuntimeWorkerValidatedRequest(freeRunCount: n)
+
+    case "free_decode_run_timed":
+        guard !context.hasPendingFreeRunFinalize else {
+            throw MLXFastError.invalidInput(
+                "runtime worker free_decode_run_timed while a finalize is pending")
+        }
+        guard request.batchSize == nil, context.cohortBatchSize == nil else {
+            throw MLXFastError.invalidInput(
+                "runtime worker free_decode_run_timed is single-stream only")
+        }
+        guard context.hasDecodeRoute else {
+            throw MLXFastError.invalidInput(
+                "runtime worker free_decode_run_timed before free_decode_begin")
+        }
+        guard let n = request.rowCount, n > 0,
+              n <= MLXFastConstants.experimentalDFlashMaxConfiguredTotalTokens
+        else {
+            throw MLXFastError.invalidInput(
+                "runtime worker free_decode_run_timed count must be in "
+                    + "1...\(MLXFastConstants.experimentalDFlashMaxConfiguredTotalTokens)")
+        }
+        return RuntimeWorkerValidatedRequest(freeRunCount: n)
+
+    case "free_decode_finalize":
+        guard context.hasPendingFreeRunFinalize else {
+            throw MLXFastError.invalidInput(
+                "runtime worker free_decode_finalize without a pending timed run")
+        }
+        guard request.rowCount == nil else {
+            throw MLXFastError.invalidInput(
+                "runtime worker free_decode_finalize must not carry count")
+        }
+        return RuntimeWorkerValidatedRequest()
 
     case "record_reference_begin":
         // RECORDING (trusted-CLI-only; the CBv2-backed reference-tape
@@ -344,6 +393,13 @@ func validateGenericWorkerRequest(
         // lives in `validateCohortReferenceReplay`; the verb renders no verdict.
         return RuntimeWorkerValidatedRequest(
             cohortReferenceReplay: try validateCohortReferenceReplay(request))
+
+    case "phase_diagnostics":
+        guard !context.hasPendingFreeRunFinalize else {
+            throw MLXFastError.invalidInput(
+                "runtime worker phase_diagnostics before free_decode_finalize")
+        }
+        return RuntimeWorkerValidatedRequest()
 
     default:
         return RuntimeWorkerValidatedRequest()

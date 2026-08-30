@@ -43,6 +43,9 @@ import MLXFastCore
 /// them), so gating them costs it nothing, and fail-closed is the posture the
 /// rest of this surface takes.
 let runtimeWorkerFreeRunDecodeCapability = "free_run_decode"
+/// Additive single-stream protocol whose externally timed run stops at target-N
+/// and whose distinct untimed finalize publishes natural-retirement evidence.
+let runtimeWorkerDeferredFreeRunFinalizeCapability = "deferred_free_run_finalize"
 
 // MARK: - Speculative-protocol spawn gate (v1.1 opt-in)
 
@@ -208,6 +211,17 @@ func runtimeWorkerDecodeRoute(
 }
 
 // MARK: - Free-run assembly
+
+/// Target-N committed stream returned by the explicitly timed deferred lane.
+/// It deliberately contains no drafted/accepted metrics: those are complete
+/// only after the untimed natural-retirement finalize boundary.
+struct RuntimeWorkerFreeRunTimedResult: Equatable {
+    let tokens: [Int]
+    let acceptanceLengths: [Int]
+    let committedTotal: Int
+
+    var rounds: Int { acceptanceLengths.count }
+}
 
 /// The assembled result of a `free_decode_run(N)` phase, carrying exactly what the
 /// worker returns to benchd plus the phase-close `completed_work`.

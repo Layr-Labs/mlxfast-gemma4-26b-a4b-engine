@@ -307,6 +307,73 @@ struct RuntimeWorkerPhaseCloseOrderingTests {
     }
 
     @Test
+    func timedFreeRunCallGraphContainsNoShutdownOrRegistryWork() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let worker = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Sources/MLXFastHarness/Gemma4RuntimeWorker.swift"),
+            encoding: .utf8)
+        let timedStart = try #require(worker.range(
+            of: "        case \"free_decode_run_timed\":"))
+        let finalizeStart = try #require(worker.range(
+            of: "        case \"free_decode_finalize\":",
+            range: timedStart.upperBound..<worker.endIndex))
+        let nextStart = try #require(worker.range(
+            of: "        case \"record_reference_begin\":",
+            range: finalizeStart.upperBound..<worker.endIndex))
+        let timed = worker[timedStart.lowerBound..<finalizeStart.lowerBound]
+        let finalize = worker[finalizeStart.lowerBound..<nextStart.lowerBound]
+        #expect(timed.contains("collectFreeDecodeTimed"))
+        #expect(!timed.contains("shutdownBlocking"))
+        #expect(!timed.contains("shutdownReportingRetirement"))
+        #expect(!timed.contains("CBv2DetachedDrainRegistry"))
+        #expect(finalize.contains("finalizeFreeDecode"))
+        #expect(finalize.contains("emitFreeRunSessionDiagnostics"))
+        #expect(!finalize.contains("acceptanceLengths: result.acceptanceLengths"))
+
+        let driver = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Sources/MLXFastHarness/Gemma4RuntimeMTPDriver.swift"),
+            encoding: .utf8)
+        let collectStart = try #require(driver.range(
+            of: "    func collectTimed(targetN: Int) throws -> RuntimeWorkerFreeRunTimedResult {"))
+        let finalizeMethod = try #require(driver.range(
+            of: "    func finalizeTimed() throws -> RuntimeWorkerFreeRunResult {",
+            range: collectStart.upperBound..<driver.endIndex))
+        let collect = driver[collectStart.lowerBound..<finalizeMethod.lowerBound]
+        #expect(!collect.contains("shutdownBlocking"))
+        #expect(!collect.contains("shutdownReportingRetirement"))
+        #expect(!collect.contains("CBv2DetachedDrainRegistry"))
+    }
+
+    @Test
+    func workerRefusesProtocolEOFWhileTimedFreeRunAwaitsFinalize() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let worker = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Sources/MLXFastHarness/Gemma4RuntimeWorker.swift"),
+            encoding: .utf8)
+        let readLoop = try #require(worker.range(
+            of: "        while let line = try protocolIO.readLine() {"))
+        let nextMethod = try #require(worker.range(
+            of: "    /// One-shot structural validation used by the trusted `preflight` command.",
+            range: readLoop.upperBound..<worker.endIndex))
+        let protocolLifetime = worker[
+            readLoop.lowerBound..<nextMethod.lowerBound]
+        let pendingGuard = try #require(protocolLifetime.range(
+            of: "guard state.pendingFreeRunTimedResult == nil else {"))
+        let refusal = try #require(protocolLifetime.range(
+            of: "runtime worker input closed before free_decode_finalize"))
+        #expect(pendingGuard.lowerBound < refusal.lowerBound)
+    }
+
+    @Test
     func registryCreatesAndPublishesDrainUnderTheJoinExclusionLock() throws {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -431,7 +498,8 @@ struct RuntimeWorkerPhaseCloseOrderingTests {
             ("decode_begin", "decode_step"),
             ("decode_step", "free_decode_begin"),
             ("free_decode_begin", "free_decode_run"),
-            ("free_decode_run", "record_reference_begin"),
+            ("free_decode_run", "free_decode_run_timed"),
+            ("free_decode_run_timed", "free_decode_finalize"),
             ("record_reference_begin", "record_reference_run"),
             ("record_reference_run", "cohort_reference_replay"),
             ("cohort_reference_replay", "phase_diagnostics"),

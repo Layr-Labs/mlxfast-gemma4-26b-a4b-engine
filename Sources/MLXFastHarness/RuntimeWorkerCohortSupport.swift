@@ -62,12 +62,13 @@ let runtimeWorkerMaxCohortBatchSize = 8
 let runtimeWorkerPerStreamTimingCapability = "per_stream_timing"
 
 /// The capability list a gate-on hello advertises: the v1.1 single-stream
-/// free-run mode, its v1.2 batched (cohort) form, and the per-stream timing
-/// instrumentation the cohort form now carries. Order is stable —
+/// free-run mode, its untimed evidence-finalize protocol, the v1.2 batched
+/// (cohort) form, and the per-stream timing instrumentation. Order is stable —
 /// benchd's session only membership-tests the list, but the hello bytes are
 /// captured surface.
 let runtimeWorkerAdvertisedCapabilities = [
     runtimeWorkerFreeRunDecodeCapability,
+    runtimeWorkerDeferredFreeRunFinalizeCapability,
     runtimeWorkerBatchedFreeRunDecodeCapability,
     runtimeWorkerPerStreamTimingCapability,
 ]

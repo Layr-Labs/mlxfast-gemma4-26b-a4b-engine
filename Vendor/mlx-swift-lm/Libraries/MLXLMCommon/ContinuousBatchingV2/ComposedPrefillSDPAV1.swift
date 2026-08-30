@@ -47,6 +47,7 @@
 
 import Foundation
 import MLX
+import MLXFast
 
 enum CBv2ComposedPrefillSDPAV1 {
 
@@ -156,6 +157,144 @@ enum CBv2ComposedPrefillSDPAV1 {
         maskBiasCache[key] = bias
         maskCacheLock.unlock()
         return bias
+    }
+
+    /// PREFILL-SOFTMAX-SHAPE. The score rectangle's row length is a
+    /// COMPILE-TIME constant in this kernel instead of a `constant int&`
+    /// argument. Kill switch: `DARKBLOOM_CBV2_PREFILL_SOFTMAX_SHAPE=0`.
+    static let shapedSoftmaxEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PREFILL_SOFTMAX_SHAPE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Row lengths this rider specialises. `kL % 128 == 0` is what makes the
+    /// specialisation exact: `softmax.cpp` sizes the threadgroup at
+    /// `32 * ceil(ceil(kL/4)/32)`, which for a multiple of 128 is EXACTLY
+    /// `kL/4` threads, so every thread's `lid*4 + 4 <= axis_size` test is true
+    /// by construction and stock never enters its guarded arm. `kL <= 1024`
+    /// bounds the family at eight distinct kernels -- the ranked prefill
+    /// geometry is 8 rows x 1024 tokens in q-blocks of 128, and the sliding
+    /// window is 1024, so those eight cover every scored call. A longer
+    /// full-attention history keeps the stock call rather than adding another
+    /// JIT compile to a measured window.
+    private static let maxShapedSoftmaxAxis = 1024
+
+    nonisolated(unsafe) private static var softmaxKernelCache:
+        [Int: MLXFast.MLXFastKernel] = [:]
+    private static let softmaxKernelLock = NSLock()
+
+    /// `block_softmax_precise_bfloat16` with `axis_size` promoted from a
+    /// runtime argument to a literal, and the prologue that exists only to
+    /// initialise the reduction pads replaced by lane-bounded reads.
+    ///
+    /// Two mechanical differences from `softmax.h`, both exact:
+    ///
+    ///  1. `N` and `NSG = N/128` are literals. The load and store guards
+    ///     `lid * 4 + 4 <= axis_size` fold to `true` (the caller dispatches
+    ///     exactly `N/4` threads, so the largest `lid*4 + 4` is `N`), the
+    ///     guarded arms become dead code, and `gid * size_t(axis_size)`
+    ///     becomes a shift. Same values, same order, one branch fewer per
+    ///     thread on each of the two passes over the row.
+    ///
+    ///  2. Stock opens with simdgroup 0 writing `Limits<float>::min` and `0`
+    ///     across all 32 entries of both reduction scratch arrays, then a
+    ///     threadgroup barrier, purely so that the final cross-simdgroup
+    ///     reduction reads sane values from the `32 - NSG` lanes no simdgroup
+    ///     wrote. With `NSG` a literal those lanes can supply their own
+    ///     identity instead: `simd_lane_id < NSG ? local_max[simd_lane_id]
+    ///     : -INFINITY` and `... : 0.0f`. `Limits<float>::min` IS `-INFINITY`
+    ///     (`utils.h`, `instantiate_float_limit`), so the values entering
+    ///     `simd_max` and `simd_sum` are bit-identical to stock's in
+    ///     bit-identical lanes and the xor butterflies see the same tree. That
+    ///     deletes two threadgroup stores and one full threadgroup barrier per
+    ///     row.
+    ///
+    /// The pad identities are exact, not approximate: `max(x, -INFINITY) == x`
+    /// for every `x` including NaN-free score maxima, and `x + 0.0f == x` for
+    /// every `x` other than `-0.0f`. A simdgroup's `normalizer` partial is a
+    /// sum of `fast::exp` results, each `>= +0.0`, so it is never `-0.0`.
+    private static func shapedSoftmaxKernel(axisSize N: Int) -> MLXFast.MLXFastKernel {
+        softmaxKernelLock.lock()
+        if let hit = softmaxKernelCache[N] {
+            softmaxKernelLock.unlock()
+            return hit
+        }
+        softmaxKernelLock.unlock()
+        let kernel = MLXFast.metalKernel(
+            name: "cbv2_prefill_block_softmax_precise_n\(N)_v1",
+            inputNames: ["scores"],
+            outputNames: ["probs"],
+            source: """
+                constexpr int N = \(N);
+                constexpr int NSG = \(N / 128);
+
+                const uint gid = threadgroup_position_in_grid.x;
+                const int lid = int(thread_position_in_threadgroup.x);
+                const int simd_lane_id = int(thread_index_in_simdgroup);
+                const int simd_group_id = int(simdgroup_index_in_threadgroup);
+
+                threadgroup float local_max[32];
+                threadgroup float local_normalizer[32];
+
+                float ld[4];
+                const device T* in = scores + gid * size_t(N) + lid * 4;
+                for (int i = 0; i < 4; i++) {
+                    ld[i] = static_cast<float>(in[i]);
+                }
+
+                float maxval = -3.402823466e+38F;
+                for (int i = 0; i < 4; i++) {
+                    maxval = (maxval < ld[i]) ? ld[i] : maxval;
+                }
+                maxval = simd_max(maxval);
+                if (simd_lane_id == 0) {
+                    local_max[simd_group_id] = maxval;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simd_group_id == 0) {
+                    maxval = simd_max(
+                        (simd_lane_id < NSG) ? local_max[simd_lane_id] : -INFINITY);
+                    if (simd_lane_id == 0) {
+                        local_max[0] = maxval;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                maxval = local_max[0];
+
+                float normalizer = 0.0f;
+                for (int i = 0; i < 4; i++) {
+                    float exp_x = fast::exp(ld[i] - maxval);
+                    ld[i] = exp_x;
+                    normalizer += exp_x;
+                }
+                normalizer = simd_sum(normalizer);
+                if (simd_lane_id == 0) {
+                    local_normalizer[simd_group_id] = normalizer;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simd_group_id == 0) {
+                    normalizer = simd_sum(
+                        (simd_lane_id < NSG) ? local_normalizer[simd_lane_id] : 0.0f);
+                    if (simd_lane_id == 0) {
+                        local_normalizer[0] = normalizer;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                normalizer = 1 / local_normalizer[0];
+
+                device T* out_row = probs + gid * size_t(N) + lid * 4;
+                for (int i = 0; i < 4; i++) {
+                    out_row[i] = static_cast<T>(ld[i] * normalizer);
+                }
+                """,
+            ensureRowContiguous: true
+        )
+        softmaxKernelLock.lock()
+        softmaxKernelCache[N] = kernel
+        softmaxKernelLock.unlock()
+        return kernel
     }
 
     /// Head dims for which MLX has a fused kernel; those calls must keep
@@ -283,7 +422,28 @@ enum CBv2ComposedPrefillSDPAV1 {
             scores = MLX.where(causalMask(L: L, kL: kL), scores, bfloat16LowestScalar)
         }
 
-        scores = MLX.softmax(scores, axis: -1, precise: true)
+        // PREFILL-SOFTMAX-SHAPE: the row length is a literal in the kernel
+        // rather than a `constant int&`, and the reduction pads carry their
+        // own identity instead of being written by a prologue. Only for row
+        // lengths where stock's threadgroup is exactly `kL/4` threads, which
+        // is what makes the collapsed guards the arm stock already takes.
+        if shapedSoftmaxEnabled, scores.dtype == .bfloat16,
+            kL % 128 == 0, kL <= maxShapedSoftmaxAxis, scores.size % kL == 0
+        {
+            CBv2EngageMark.once("prefill-softmax-shape")
+            let threads = kL / 4
+            let rows = scores.size / kL
+            scores = shapedSoftmaxKernel(axisSize: kL)(
+                [scores],
+                template: [("T", scores.dtype)],
+                grid: (threads * rows, 1, 1),
+                threadGroup: (threads, 1, 1),
+                outputShapes: [scores.shape],
+                outputDTypes: [scores.dtype]
+            )[0]
+        } else {
+            scores = MLX.softmax(scores, axis: -1, precise: true)
+        }
         var output = matmul(scores, v)
         if nRepeats > 1 {
             output = output.reshaped([B, nQHeads, L, valueDim])

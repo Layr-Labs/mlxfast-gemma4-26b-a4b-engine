@@ -29,19 +29,49 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     private static let headDim = 256
     private static let sequenceLength = 1024
 
-    /// Mirrors `sdpa_vector_2pass` at N=1024 and qL=1/GQA=2. Honor the same
-    /// diagnostic override so a process can never run mismatched partitions.
+    /// PARTITION-001: the stock partition count, sized for ONE row.
+    ///
+    /// `sdpa_vector_2pass` picks `blocks` from the architecture letter, the key
+    /// length and `n_simds = GQA * qL` alone
+    /// (`scaled_dot_product_attention.cpp:443-476`). Batch never enters the
+    /// choice, because the stock call it was tuned for dispatches one row: at
+    /// N=1024/GQA=2 it wants 128 threadgroup columns on a `d` part to keep the
+    /// machine busy with `kvHeads * 1 * blocks` threadgroups.
+    ///
+    /// This dispatch is batch-wide. `kvHeads * batch * blocks` threadgroups is
+    /// eight times what the heuristic was solving for, so the stock answer
+    /// over-partitions by 8x and pays for it in the pass-A/pass-B scratch
+    /// round trip, which is `batch * queryHeads * blocks * D` BF16 written and
+    /// read once each per sliding layer.
+    private static let stockBlocks: Int = {
+        switch MLX.GPU.deviceInfo().architecture.last {
+        case "s": return 64
+        case "d": return 128
+        default: return 32
+        }
+    }()
+
+    /// The partition this dispatch actually uses.
+    ///
+    /// 32 is the floor the pass-B merge admits (`BLOCKS / simd_width >= 1`),
+    /// and at batch 8 it still leaves `kvHeads * batch * 32 = 2048`
+    /// threadgroups, i.e. twice the 1024 the stock heuristic settles for on the
+    /// row-local call it was tuned against. `MLX_SDPA_BLOCKS` keeps its stock
+    /// meaning and still wins, so a process can never run mismatched
+    /// partitions; `DARKBLOOM_CBV2_2PASS_BLOCKS` restores the stock answer
+    /// (`=0`) or any other multiple of 32 for bisection.
     private static let blocks: Int = {
         if let raw = ProcessInfo.processInfo.environment["MLX_SDPA_BLOCKS"],
             let value = Int(raw), value > 0
         {
             return value
         }
-        switch MLX.GPU.deviceInfo().architecture.last {
-        case "s": return 64
-        case "d": return 128
-        default: return 32
+        if let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_2PASS_BLOCKS"], let value = Int(raw)
+        {
+            return value > 0 && value.isMultiple(of: 32) ? value : stockBlocks
         }
+        return min(32, stockBlocks)
     }()
 
     private static let passAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(

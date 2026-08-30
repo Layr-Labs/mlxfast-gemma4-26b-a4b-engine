@@ -103,14 +103,6 @@ public enum CBv2DenseMLPQMVV1 {
     /// whose exact B8/L1/K2816 gate also pins the table geometry.
     public struct ActivationSums {
         fileprivate let values: MLXArray
-
-        /// ZIP-ROUTER-001 ordering handle. Read-only view of the table's own
-        /// output array so a caller can name this dispatch as an
-        /// `MLX.depends` edge when it interleaves the dense chain with an
-        /// independent chain. `Depends` emits no dispatch and its output
-        /// aliases its input's buffer, so handing the array out cannot change
-        /// what any kernel reads or writes.
-        public var dependencyHandle: MLXArray { values }
     }
 
     /// The affine-8 helper below is the current promoted
@@ -755,29 +747,6 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
             outputShapes: [[blocks * simdWidth * batch]],
             outputDTypes: [.float32]
         )[0]
-        return ActivationSums(values: values)
-    }
-
-    /// Adopts an exact producer-emitted table for the same pinned decode
-    /// geometry as `activationSums(for:)`. The layer-glue producer writes the
-    /// table while its BF16 dense input is still resident in registers, using
-    /// the identical four-value accumulation order as the standalone kernel.
-    public static func activationSums(
-        produced values: MLXArray, for x: MLXArray
-    ) -> ActivationSums? {
-        let blocks = 2816 / kBlock
-        guard enabled,
-            activationSumsEnabled,
-            x.dtype == .bfloat16,
-            x.ndim == 3,
-            x.dim(0) == batch,
-            x.dim(1) == sequence,
-            x.dim(2) == 2816,
-            x.size == batch * sequence * 2816,
-            values.dtype == .float32,
-            values.ndim == 1,
-            values.size == blocks * simdWidth * batch
-        else { return nil }
         return ActivationSums(values: values)
     }
 

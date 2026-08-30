@@ -868,7 +868,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// over the 128 score rows; the CALLER sizes the threadgroup exactly
     /// like softmax.cpp:64-68 (32·ceil(ceil(kL/4)/32)). params[0] = kL.
     private static let softmaxKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_softmax_bf16_v1",
+        name: "cbv2_ragged8_sdpa_d512_softmax_bf16_v2",
         inputNames: ["scores", "params"],
         outputNames: ["probs"],
         source: """
@@ -885,10 +885,17 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const device T* in =
                 scores + size_t(gid) * axis_size + lid * 4;
             if (lid * 4 + 4 <= axis_size) {
+                // The four-value walks below all have a compile-time trip
+                // count, so the loop control is pure overhead on a dispatch
+                // that runs once per full-attention layer per decode step.
+                // Unrolling only removes the counter and the branch; the
+                // reads stay ascending in `i` and no value is reassociated.
+                #pragma clang loop unroll(full)
                 for (int i = 0; i < 4; i++) {
                     ld[i] = static_cast<float>(in[i]);
                 }
             } else {
+                #pragma clang loop unroll(full)
                 for (int i = 0; i < 4; i++) {
                     ld[i] = ((lid * 4 + i) < axis_size)
                         ? static_cast<float>(in[i]) : -INFINITY;
@@ -901,6 +908,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             float maxval = -3.402823466e+38F;
+            #pragma clang loop unroll(full)
             for (int i = 0; i < 4; i++) {
                 maxval = (maxval < ld[i]) ? ld[i] : maxval;
             }
@@ -919,6 +927,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             maxval = local_max[0];
 
             float normalizer = 0.0f;
+            #pragma clang loop unroll(full)
             for (int i = 0; i < 4; i++) {
                 float exp_x = fast::exp(ld[i] - maxval);
                 ld[i] = exp_x;
@@ -941,10 +950,12 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             device T* out_row =
                 probs + size_t(gid) * axis_size + lid * 4;
             if (lid * 4 + 4 <= axis_size) {
+                #pragma clang loop unroll(full)
                 for (int i = 0; i < 4; i++) {
                     out_row[i] = static_cast<T>(ld[i] * normalizer);
                 }
             } else {
+                #pragma clang loop unroll(full)
                 for (int i = 0; i < 4; i++) {
                     if ((lid * 4 + i) < axis_size) {
                         out_row[i] = static_cast<T>(ld[i] * normalizer);
@@ -961,7 +972,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// butterfly for all 8 heads of the GQA group at once (shared V tile
     /// loads). params as dispatch 1.
     private static let avKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_v1",
+        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_v2",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -1023,6 +1034,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 }
                 #pragma clang loop unroll(full)
                 for (int tm = 0; tm < 4; ++tm) {
+                    #pragma clang loop unroll(full)
                     for (int tn = 0; tn < 4; ++tn) {
                         inter[tn] = value_plane[
                             size_t(bm + tm) * D + out_col + tn];
@@ -1030,6 +1042,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
                         float vc = v_coeff[h][tm];
+                        #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
                             result[h][tn] += vc * inter[tn];
                         }
@@ -1290,7 +1303,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// `new_values` rather than the cache slot the fused QK dispatch wrote,
     /// so this kernel has no read-after-in-place-write hazard at all.
     private static let fusedAvKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_v2",
+        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_v3",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -1357,6 +1370,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 if (bm + 4 <= key_length - 1) {
                 #pragma clang loop unroll(full)
                 for (int tm = 0; tm < 4; ++tm) {
+                    #pragma clang loop unroll(full)
                     for (int tn = 0; tn < 4; ++tn) {
                         inter[tn] = value_plane[
                             size_t(bm + tm) * D + out_col + tn];
@@ -1364,6 +1378,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
                         float vc = v_coeff[h][tm];
+                        #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
                             result[h][tn] += vc * inter[tn];
                         }
@@ -1373,6 +1388,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 #pragma clang loop unroll(full)
                 for (int tm = 0; tm < 4; ++tm) {
                     const bool is_new_token = bm + tm == key_length - 1;
+                    #pragma clang loop unroll(full)
                     for (int tn = 0; tn < 4; ++tn) {
                         inter[tn] = is_new_token
                             ? new_value_plane[out_col + tn]
@@ -1382,6 +1398,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
                         float vc = v_coeff[h][tm];
+                        #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
                             result[h][tn] += vc * inter[tn];
                         }

@@ -587,12 +587,21 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// `Gemma4RuntimeCohortDriver.swift`). It is prompt-independent,
     /// cohort-size-independent, and hard-bounded.
     static let admitCoalesceWindowCapMS = 25
+    // COALESCE-0: the 3 ms coalesce wait ships unpriced on this board. The
+    // closed-cohort free-run admits every stream's whole seed at the first
+    // planned step, so at B=8 the window can only ADD wall-clock latency —
+    // this cell removes it. Bit-exact by construction (admission set is a
+    // function of the workload, not the window; window 0 can admit only
+    // what window 3 admits once every stream has arrived, and the free-run
+    // enqueues all streams before step one). Golden-PASS on three fixtures
+    // locally; ship diff compile-verified in a scratch tree. Kill switch
+    // DARKBLOOM_ADMIT_COALESCE_MS=3 restores the shipped value.
     static let admitCoalesceWindowMS: Int = {
         guard
             let raw = ProcessInfo.processInfo.environment[
                 "DARKBLOOM_ADMIT_COALESCE_MS"],
             let value = Int(raw), value >= 0
-        else { return 3 }
+        else { return 0 }
         return Swift.min(value, admitCoalesceWindowCapMS)
     }()
 

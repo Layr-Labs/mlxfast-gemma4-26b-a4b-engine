@@ -416,10 +416,13 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
     private func ensureCapacity(_ needed: Int, keyTemplate: MLXArray, valueTemplate: MLXArray) {
         if keys == nil {
             capacity = min(maxLength, max(capacity, needed))
-            keys = MLXArray.zeros(
-                [1, kvHeads, capacity, keyTemplate.dim(3)], dtype: keyTemplate.dtype)
-            values = MLXArray.zeros(
-                [1, kvHeads, capacity, valueTemplate.dim(3)], dtype: valueTemplate.dtype)
+            // Uninitialized allocation: all reads go through the
+            // `..<absoluteOffset` views, so slots past the append frontier
+            // are never observed (see KVStorageAllocV1.swift).
+            keys = CBv2KVStorageAllocV1.storage(
+                shape: [1, kvHeads, capacity, keyTemplate.dim(3)], dtype: keyTemplate.dtype)
+            values = CBv2KVStorageAllocV1.storage(
+                shape: [1, kvHeads, capacity, valueTemplate.dim(3)], dtype: valueTemplate.dtype)
             return
         }
         guard needed > capacity else { return }
@@ -428,11 +431,22 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
         // buffer once per doubling — amortized O(1) per appended token.
         let newCapacity = min(maxLength, max(capacity * 2, needed))
         let growth = newCapacity - capacity
+        // The growth tail is uninitialized for the same reason as the
+        // initial allocation: `ensureCapacity` runs before the append that
+        // covers `needed`, and reads never pass the append frontier.
         keys = concatenated(
-            [keys!, MLXArray.zeros([1, kvHeads, growth, keys!.dim(3)], dtype: keys!.dtype)],
+            [
+                keys!,
+                CBv2KVStorageAllocV1.storage(
+                    shape: [1, kvHeads, growth, keys!.dim(3)], dtype: keys!.dtype),
+            ],
             axis: 2)
         values = concatenated(
-            [values!, MLXArray.zeros([1, kvHeads, growth, values!.dim(3)], dtype: values!.dtype)],
+            [
+                values!,
+                CBv2KVStorageAllocV1.storage(
+                    shape: [1, kvHeads, growth, values!.dim(3)], dtype: values!.dtype),
+            ],
             axis: 2)
         capacity = newCapacity
     }

@@ -110,6 +110,20 @@ enum CBv2AttentionV1 {
         return value << 20
     }()
 
+    /// PREFILL-PACKED-KV-ALIAS. When every row of a packed prefill was FRESH
+    /// (no committed history), the per-row views `update` hands back are
+    /// byte-for-byte the incoming batched K/V rectangles, and the
+    /// `concatenated` restack in `batchedPackedAttention` re-materializes a
+    /// copy of tensors the caller already holds batched. Attend the original
+    /// rectangles instead. `0`/`false`/`no`/`off` restores the established
+    /// restack, which also stays the path for every input the alias refuses.
+    static let packedKVAliasEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PREFILL_PACKED_KV_ALIAS"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// Join prompt attention blocks directly into the token-major layout that
     /// the following output projection consumes. The returned value remains a
     /// head-major view, so callers keep the same typed interface while their
@@ -537,7 +551,8 @@ enum CBv2AttentionV1 {
             kind: kind, queries: queries,
             cachedKeys: cachedKeys, cachedValues: cachedValues,
             window: window(of: kind), scale: scale,
-            sinks: effectiveSinks, softcap: softcap, spanContexts: spanContexts)
+            sinks: effectiveSinks, softcap: softcap, spanContexts: spanContexts,
+            newKeys: keys, newValues: values)
         {
             return batched
         }
@@ -572,11 +587,38 @@ enum CBv2AttentionV1 {
     /// prefix reuse or continuation offsets), a mismatched head count/head dim
     /// /dtype, any bound span context, or a restack that would exceed
     /// ``packedBatchKVBudgetBytes``.
+    ///
+    /// PREFILL-PACKED-KV-ALIAS. `newKeys`/`newValues` are the caller's
+    /// ALREADY-BATCHED `[B, kvHeads, n, headDim]` rectangles for the chunk the
+    /// per-row `update` calls just committed (nil on the borrow path, which
+    /// commits nothing). When every row's returned view spans exactly `n`
+    /// tokens, every row was fresh, and the restack below rebuilds a
+    /// byte-identical copy of those rectangles:
+    ///   * both contiguous backends return `history ++ chunk` — the windowed
+    ///     ring returns the chunk tensor ITSELF when `historyCount == 0`
+    ///     (`kParts == [newKeys]`), and the full buffer returns
+    ///     `storage[..., ..<offset, :]`, which after a fresh append holds
+    ///     exactly the chunk's bytes;
+    ///   * `kL == n` forces `historyCount == 0` on every row (returned length
+    ///     is always `history + n`), so `concatenated(cachedKeys, axis: 0)`
+    ///     reassembles the row slices of `newKeys` in row order — `newKeys`.
+    /// Attending the original rectangles therefore feeds the SAME bytes to
+    /// the same kernels and deletes the restack's full K+V round trip — at
+    /// the ranked 8 x 1024 seed geometry, ~134 MB of copy traffic per sliding
+    /// layer on the critical path (attention cannot start before the copy).
+    /// `contiguous()` pins the layout contract: a row-contiguous rectangle
+    /// (every fused QKV-norm kernel output) shares its buffer at zero cost,
+    /// and anything else (a transposed-view fallback producer) materializes
+    /// ONE copy — the exact cost of the restack this replaces — so no
+    /// downstream q-block GEMM ever sees a layout the restacked path would
+    /// not have produced. Kill switch:
+    /// `DARKBLOOM_CBV2_PREFILL_PACKED_KV_ALIAS=0`.
     private static func batchedPackedAttention(
         kind: CBv2LayerKind, queries: MLXArray,
         cachedKeys: [MLXArray], cachedValues: [MLXArray],
         window: Int?, scale: Float, sinks: MLXArray?, softcap: Float?,
-        spanContexts: [CBv2SpanChunkContext?]?
+        spanContexts: [CBv2SpanChunkContext?]?,
+        newKeys: MLXArray? = nil, newValues: MLXArray? = nil
     ) -> MLXArray? {
         guard packedBatchKVBudgetBytes > 0 else { return nil }
         guard spanContexts?.allSatisfy({ $0 == nil }) ?? true else { return nil }
@@ -601,6 +643,34 @@ enum CBv2AttentionV1 {
         let restackedBytes =
             (headKeys.nbytes + headValues.nbytes) * cachedKeys.count
         guard restackedBytes <= packedBatchKVBudgetBytes else { return nil }
+
+        // PREFILL-PACKED-KV-ALIAS: every-row-fresh admission (see the doc
+        // comment above). Anything short of the exact identity — a committed
+        // history on any row (`kL > n`), a batch/head/dim/dtype mismatch, or
+        // no rectangles at all (borrow path) — falls through to the
+        // established restack.
+        if packedKVAliasEnabled,
+            let newKeys, let newValues,
+            newKeys.ndim == 4, newValues.ndim == 4,
+            newKeys.dim(2) == kL, newValues.dim(2) == kL,
+            newKeys.dim(0) == cachedKeys.count,
+            newValues.dim(0) == cachedKeys.count,
+            newKeys.dim(1) == headKeys.dim(1),
+            newKeys.dim(3) == headKeys.dim(3),
+            newValues.dim(1) == headValues.dim(1),
+            newValues.dim(3) == headValues.dim(3),
+            newKeys.dtype == headKeys.dtype,
+            newValues.dtype == headValues.dtype
+        {
+            // BUNDLE-2 R2: comment-only byte delta for a fresh serial-anchor draw (content unchanged; board-precedented reroll).
+            CBv2EngageMark.once("prefill-packedkv-alias")
+            return attendCommittedRow(
+                kind: kind, queries: queries,
+                cachedKeys: contiguous(newKeys),
+                cachedValues: contiguous(newValues),
+                window: window, scale: scale, sinks: sinks, softcap: softcap,
+                spanContext: nil)
+        }
 
         return attendCommittedRow(
             kind: kind, queries: queries,

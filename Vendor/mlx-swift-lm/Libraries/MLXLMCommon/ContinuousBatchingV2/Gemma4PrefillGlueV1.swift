@@ -64,6 +64,16 @@ public enum Gemma4PrefillGlueV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// PREFILL-TRIPLE-PRENORM's own switch, so the third output can be taken
+    /// out without disarming the promoted dual/tail kernels.
+    /// Kill switch: `DARKBLOOM_GEMMA4_PREFILL_TRIPLE_PRENORM=0`.
+    public static let tripleEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_TRIPLE_PRENORM"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// This checkpoint's hidden size, and the `rms_single_row` launch geometry
     /// the stock host derives from it (`RMS_N_READS` 4, so 2816 / 4 = 704
     /// threads, 22 simdgroups, one threadgroup per row).
@@ -268,6 +278,89 @@ public enum Gemma4PrefillGlueV1 {
             outputDTypes: [x.dtype, x.dtype]
         )
         return (outs[0], outs[1])
+    }
+
+    // MARK: - triple pre-norm (3 dispatches -> 1)
+
+    /// PREFILL-TRIPLE-PRENORM. A THIRD weight rides the one sum of squares.
+    ///
+    /// The MoE layer normalises the SAME `out` plane three times per layer:
+    /// `preFeedforwardLayernorm`, `preFeedforwardLayernorm2` (already fused
+    /// above) and, inside `Gemma4Router.callAsFunction`, a separate
+    /// `MLXFast.rmsNorm(out, scale * hiddenSize^-0.5)` -- dispatched right
+    /// after `norm_residual` produced `out`. At the ranked prefill geometry
+    /// that third pass is 46 MB of read-plus-write per layer, 1.34 GB per
+    /// 8x1024 step, and it runs at 384 GB/s, i.e. already at the machine's
+    /// streaming roof: there is nothing to make faster, only a pass to delete.
+    ///
+    /// Folding it in turns 5 plane passes per layer (1R+2W here, 1R+1W in the
+    /// router) into 4 (1R+3W). The reduction is unchanged -- the three weights
+    /// differ, the row does not -- so the extra output costs one more store
+    /// and no arithmetic.
+    ///
+    /// EXACTNESS. `out3` is written by exactly the expression the other two
+    /// use, `w3[j] * static_cast<T>(x * inv)`, over the identical `inv` from
+    /// the identical `glue_inv_rms` tree. That is `rms_single_row`'s own
+    /// sequence, which is why the promoted `dualPreNorm` is bit-exact against
+    /// `MLXFast.rmsNorm`; the third output inherits the argument verbatim.
+    private static let triplePreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_prefill_glue_triple_prenorm_2816_v1",
+        inputNames: ["x", "w1", "w2", "w3"],
+        outputNames: ["out1", "out2", "out3"],
+        source: """
+            threadgroup float local_sums[32];
+            threadgroup float local_inv[1];
+
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+
+            const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+
+            float xv[GLUE_NREADS];
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                xv[i] = static_cast<float>(x[base + i]);
+            }
+
+            // One sum of squares serves all three weights: the three stock
+            // kernels reduce the identical input and differ only in the
+            // weight vector they apply afterwards.
+            const float inv = glue_inv_rms(
+                xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
+
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                const uint j = lid * GLUE_NREADS + i;
+                const T scaled = static_cast<T>(xv[i] * inv);
+                out1[base + i] = w1[j] * scaled;
+                out2[base + i] = w2[j] * scaled;
+                out3[base + i] = w3[j] * scaled;
+            }
+            """,
+        header: kernelHeader,
+        ensureRowContiguous: true
+    )
+
+    /// `(rmsNorm(x, w1), rmsNorm(x, w2), rmsNorm(x, w3))`.
+    /// Returns `nil` off the prefill plane.
+    public static func triplePreNorm(
+        x: MLXArray, w1: MLXArray, w2: MLXArray, w3: MLXArray, eps epsIn: Float
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard tripleEnabled,
+            let rows = planeRows(x, weight: w1, eps: epsIn),
+            w2.shape == w1.shape, w2.dtype == w1.dtype,
+            w3.shape == w1.shape, w3.dtype == w1.dtype
+        else { return nil }
+
+        let outs = triplePreNormKernel(
+            [x, w1, w2, w3],
+            template: [("T", x.dtype)],
+            grid: (threadsPerRow, rows, 1),
+            threadGroup: (threadsPerRow, 1, 1),
+            outputShapes: [x.shape, x.shape, x.shape],
+            outputDTypes: [x.dtype, x.dtype, x.dtype]
+        )
+        return (outs[0], outs[1], outs[2])
     }
 
     // MARK: - branch tail (5 dispatches -> 1)

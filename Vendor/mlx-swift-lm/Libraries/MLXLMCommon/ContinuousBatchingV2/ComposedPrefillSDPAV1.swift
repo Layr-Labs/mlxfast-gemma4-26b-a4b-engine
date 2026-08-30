@@ -283,7 +283,11 @@ enum CBv2ComposedPrefillSDPAV1 {
             scores = MLX.where(causalMask(L: L, kL: kL), scores, bfloat16LowestScalar)
         }
 
-        scores = MLX.softmax(scores, axis: -1, precise: true)
+        // PREFILL-SOFTMAX-ROWPACK: the same `softmax_single_row` reduction,
+        // with R rows packed into one threadgroup instead of one row per
+        // threadgroup. Nil off the exact plane -> the stock call.
+        scores = Gemma4PrefillSoftmaxRowsV1.softmax(scores)
+            ?? MLX.softmax(scores, axis: -1, precise: true)
         var output = matmul(scores, v)
         if nRepeats > 1 {
             output = output.reshaped([B, nQHeads, L, valueDim])

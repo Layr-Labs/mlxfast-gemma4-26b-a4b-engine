@@ -586,13 +586,31 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// caller ("one planned step admits every stream's whole seed",
     /// `Gemma4RuntimeCohortDriver.swift`). It is prompt-independent,
     /// cohort-size-independent, and hard-bounded.
+    ///
+    /// ADMIT-COALESCE-002 (`mlxfast-h012`): the unset-default fallback moves
+    /// `3` -> `10` milliseconds, still well inside the pre-existing
+    /// `admitCoalesceWindowCapMS` = 25 ceiling its own author already
+    /// audited as safe-by-construction ("must stay small and bounded ...
+    /// never tunable into an unbounded hold"). This is the same asymmetry
+    /// argument the crown's prefill-boundary lever measured directly: a
+    /// window that is too NARROW risks the full-price ragged-admission
+    /// penalty this mechanism exists to avoid (a second prefill pass plus a
+    /// below-capacity mixed step), while a window that overshoots only pays
+    /// a few extra milliseconds of ONE-TIME latency before the very first
+    /// step of an otherwise multi-second 8-stream cohort run — bounded,
+    /// small, and paid at most once per cohort, never per layer or per
+    /// round. No branch, dispatch, operand, dtype or accumulation order
+    /// changes; only the literal fallback moves, through the mechanism's
+    /// own pre-existing, already-wired switch.
+    /// `DARKBLOOM_ADMIT_COALESCE_MS=3` restores the prior default exactly;
+    /// `=0` restores the fully stock, wait-free loop as before.
     static let admitCoalesceWindowCapMS = 25
     static let admitCoalesceWindowMS: Int = {
         guard
             let raw = ProcessInfo.processInfo.environment[
                 "DARKBLOOM_ADMIT_COALESCE_MS"],
             let value = Int(raw), value >= 0
-        else { return 3 }
+        else { return 10 }
         return Swift.min(value, admitCoalesceWindowCapMS)
     }()
 

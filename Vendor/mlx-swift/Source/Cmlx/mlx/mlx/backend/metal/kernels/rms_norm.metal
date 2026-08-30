@@ -30,11 +30,13 @@ template <typename T, int N_READS = RMS_N_READS>
   x += gid * size_t(axis_size) + lid * N_READS;
   w += w_stride * lid * N_READS;
   if (lid * N_READS + N_READS <= axis_size) {
+#pragma clang loop unroll(full)
     for (int i = 0; i < N_READS; i++) {
       float xi = x[i];
       acc += xi * xi;
     }
   } else {
+#pragma clang loop unroll(full)
     for (int i = 0; i < N_READS; i++) {
       if ((lid * N_READS + i) < axis_size) {
         float xi = x[i];
@@ -67,10 +69,12 @@ template <typename T, int N_READS = RMS_N_READS>
   // Write the outputs
   out += gid * size_t(axis_size) + lid * N_READS;
   if (lid * N_READS + N_READS <= axis_size) {
+#pragma clang loop unroll(full)
     for (int i = 0; i < N_READS; i++) {
       out[i] = w[w_stride * i] * static_cast<T>(x[i] * local_inv_mean[0]);
     }
   } else {
+#pragma clang loop unroll(full)
     for (int i = 0; i < N_READS; i++) {
       if ((lid * N_READS + i) < axis_size) {
         out[i] = w[w_stride * i] * static_cast<T>(x[i] * local_inv_mean[0]);
@@ -101,11 +105,13 @@ template <typename T, int N_READS = RMS_N_READS>
   w += w_stride * lid * N_READS;
   for (uint r = 0; r < axis_size; r += lsize * N_READS) {
     if (r + lid * N_READS + N_READS <= axis_size) {
+#pragma clang loop unroll(full)
       for (int i = 0; i < N_READS; i++) {
         float xi = x[i + r];
         acc += xi * xi;
       }
     } else {
+#pragma clang loop unroll(full)
       for (int i = 0; i < N_READS; i++) {
         if ((r + lid * N_READS + i) < axis_size) {
           float xi = x[i + r];
@@ -140,11 +146,13 @@ template <typename T, int N_READS = RMS_N_READS>
   out += gid * size_t(axis_size) + lid * N_READS;
   for (uint r = 0; r < axis_size; r += lsize * N_READS) {
     if (r + lid * N_READS + N_READS <= axis_size) {
+#pragma clang loop unroll(full)
       for (int i = 0; i < N_READS; i++) {
         out[r + i] = w[w_stride * (i + r)] *
             static_cast<T>(x[r + i] * local_inv_mean[0]);
       }
     } else {
+#pragma clang loop unroll(full)
       for (int i = 0; i < N_READS; i++) {
         if ((r + lid * N_READS + i) < axis_size) {
           out[r + i] = w[w_stride * (i + r)] *
@@ -190,6 +198,7 @@ template <typename T, int N_READS = RMS_N_READS>
 
   // Read and accumulate locally
   if (lid * N_READS + N_READS <= axis_size) {
+#pragma clang loop unroll(full)
     for (int i = 0; i < N_READS; i++) {
       thread_x[i] = x[i];
       thread_w[i] = w[w_stride * i];
@@ -199,6 +208,7 @@ template <typename T, int N_READS = RMS_N_READS>
       sumgwx += thread_x[i] * thread_w[i] * thread_g[i];
     }
   } else {
+#pragma clang loop unroll(full)
     for (int i = 0; i < N_READS; i++) {
       if ((lid * N_READS + i) < axis_size) {
         thread_x[i] = x[i];
@@ -241,6 +251,7 @@ template <typename T, int N_READS = RMS_N_READS>
   gx += gid * size_t(axis_size) + lid * N_READS;
   gw += gid * size_t(axis_size) + lid * N_READS;
   if (lid * N_READS + N_READS <= axis_size) {
+#pragma clang loop unroll(full)
     for (int i = 0; i < N_READS; i++) {
       gx[i] = static_cast<T>(
           thread_g[i] * thread_w[i] * normalizer -
@@ -250,6 +261,7 @@ template <typename T, int N_READS = RMS_N_READS>
       }
     }
   } else {
+#pragma clang loop unroll(full)
     for (int i = 0; i < N_READS; i++) {
       if ((lid * N_READS + i) < axis_size) {
         gx[i] = static_cast<T>(
@@ -297,6 +309,7 @@ template <typename T, int N_READS = RMS_N_READS>
   // Read and accumulate locally
   for (uint r = 0; r < axis_size; r += lsize * N_READS) {
     if (r + lid * N_READS + N_READS <= axis_size) {
+#pragma clang loop unroll(full)
       for (int i = 0; i < N_READS; i++) {
         float xi = x[i + r];
         float wi = w[w_stride * (i + r)];
@@ -306,6 +319,7 @@ template <typename T, int N_READS = RMS_N_READS>
         sumgwx += xi * wi * gi;
       }
     } else {
+#pragma clang loop unroll(full)
       for (int i = 0; i < N_READS; i++) {
         if ((r + lid * N_READS + i) < axis_size) {
           float xi = x[i + r];
@@ -350,6 +364,7 @@ template <typename T, int N_READS = RMS_N_READS>
   gw += gid * size_t(axis_size) + lid * N_READS;
   for (uint r = 0; r < axis_size; r += lsize * N_READS) {
     if (r + lid * N_READS + N_READS <= axis_size) {
+#pragma clang loop unroll(full)
       for (int i = 0; i < N_READS; i++) {
         float xi = x[i + r];
         float wi = w[w_stride * (i + r)];
@@ -362,6 +377,7 @@ template <typename T, int N_READS = RMS_N_READS>
         }
       }
     } else {
+#pragma clang loop unroll(full)
       for (int i = 0; i < N_READS; i++) {
         if ((r + lid * N_READS + i) < axis_size) {
           float xi = x[i + r];

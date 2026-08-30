@@ -214,7 +214,7 @@ public struct CBv2MTPConfig: Sendable {
         if let raw = ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_MTP"] {
             return !["0", "false", "no", "off"].contains(raw.lowercased())
         }
-        return true
+        return false
     }()
 
     public init(

@@ -2292,6 +2292,10 @@ private enum Gemma4FusedRouterTop8 {
 /// to the stock `inputLayernorm(x)`.
 public final class Gemma4GlueChainBox {
     var pending: (source: MLXArray, normed: MLXArray)?
+    /// TAILHEAD-001. Set only when `pending.normed` is the MODEL norm rather
+    /// than a next-layer input norm, in which case it carries the tied head's
+    /// activation-sum table produced by the same dispatch.
+    var pendingHeadSums: Gemma4MMAQuantizedGEMV.ActivationSums?
     public init() {}
 }
 
@@ -2698,6 +2702,111 @@ private enum Gemma4FusedLayerGlue {
             outputDTypes: [.bfloat16, .bfloat16]
         )
         return (outs[0], outs[1])
+    }
+
+    /// TAILHEAD-001: the GLUE-003 tail chain for the LAST decoder layer, where
+    /// the norm that follows the finished output row is the model norm and not
+    /// a next-layer input norm. The extra reduction is the same one GLUE-003
+    /// already performs; what disappears is the standalone
+    /// `gemma4_final_rmsnorm_mma_xsum_2816_bf16_v1` dispatch and its full
+    /// re-read of the row, both of which sit on the strictly serial path
+    /// between the last layer and the tied head.
+    ///
+    /// The `xSums` table reproduces that kernel's construction statement for
+    /// statement: the four normed values are summed at activation dtype, the
+    /// quad totals are published to threadgroup memory, and one leader per
+    /// 64-wide group serially accumulates its sixteen quads in ascending
+    /// order. No SIMD reassociation is introduced.
+    private static let tailChainHeadKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_glue_tail_chain_head_2816_bf16_v1",
+        inputNames: ["a", "b", "res", "w1", "w2", "w3", "s", "wn"],
+        outputNames: ["out", "normed", "xSums"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float local_inv[2];
+            threadgroup float local_sums[32];
+            threadgroup float quad_sums[704];
+            const uint base = row * 2816 + lid * 4;
+            const uint wbase = lid * 4;
+        \(rmsReduce("a", into: "local_inv[0]"))
+        \(rmsReduce("b", into: "local_inv[1]"))
+            const float inv1 = local_inv[0];
+            const float inv2 = local_inv[1];
+            T sv[4];
+            for (int i = 0; i < 4; i++) {
+                const T h1 = w1[wbase + i] * static_cast<T>((float)a[base + i] * inv1);
+                const T h2 = w2[wbase + i] * static_cast<T>((float)b[base + i] * inv2);
+                sv[i] = h1 + h2;
+            }
+        \(rmsReduce("sv", into: "local_inv[0]").replacingOccurrences(
+            of: "(float)sv[base + i]", with: "(float)sv[i]"))
+            const float inv3 = local_inv[0];
+            const T scalar = s[0];
+            T outv[4];
+            for (int i = 0; i < 4; i++) {
+                const T normed3 = static_cast<T>(
+                    w3[wbase + i] * static_cast<T>((float)sv[i] * inv3));
+                const T summed = res[base + i] + normed3;
+                outv[i] = summed * scalar;
+                out[base + i] = outv[i];
+            }
+        \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
+            of: "(float)outv[base + i]", with: "(float)outv[i]"))
+            const float inv4 = local_inv[0];
+            T nv[4];
+            for (int i = 0; i < 4; i++) {
+                nv[i] = wn[wbase + i] * static_cast<T>((float)outv[i] * inv4);
+                normed[base + i] = nv[i];
+            }
+            quad_sums[lid] = nv[0] + nv[1] + nv[2] + nv[3];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if ((lid % 16) == 0) {
+                float acc_x = 0.0f;
+                for (uint c = 0; c < 8; ++c) {
+                    const uint q = lid + c * 2;
+                    acc_x += quad_sums[q];
+                    acc_x += quad_sums[q + 1];
+                }
+                xSums[row * 44 + lid / 16] = acc_x;
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    static func tailChainedHead(
+        mlpOut: MLXArray, expertOut: MLXArray, residual: MLXArray,
+        w1: MLXArray, w2: MLXArray, w3: MLXArray, layerScalar: MLXArray,
+        finalNormWeight: MLXArray, eps: Float
+    ) -> (
+        out: MLXArray, postNorm: MLXArray,
+        sums: Gemma4MMAQuantizedGEMV.ActivationSums
+    )? {
+        guard admits(mlpOut, weight: w1, eps: eps),
+            expertOut.shape == mlpOut.shape, expertOut.dtype == .bfloat16,
+            residual.shape == mlpOut.shape, residual.dtype == .bfloat16,
+            w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16,
+            w3.ndim == 1, w3.dim(0) == axis, w3.dtype == .bfloat16,
+            layerScalar.size == 1, layerScalar.dtype == .bfloat16,
+            finalNormWeight.ndim == 1, finalNormWeight.dim(0) == axis,
+            finalNormWeight.dtype == .bfloat16
+        else { return nil }
+        let outs = tailChainHeadKernel(
+            [mlpOut, expertOut, residual, w1, w2, w3, layerScalar,
+             finalNormWeight],
+            template: [("T", mlpOut.dtype)],
+            grid: (rows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: [[rows, 1, axis], [rows, 1, axis], [rows * (axis / 64)]],
+            outputDTypes: [.bfloat16, .bfloat16, .float32]
+        )
+        guard let sums = Gemma4MMAQuantizedGEMV.activationSums(
+            produced: outs[2], for: outs[1])
+        else { return nil }
+        CBv2EngageMark.once("glue-tail-chain-head")
+        return (outs[0], outs[1], sums)
     }
 
     static func tail(
@@ -3268,6 +3377,10 @@ public class Gemma4DecoderLayer: Module {
         isExpertPrefill: Bool = false,
         glueChain: Gemma4GlueChainBox? = nil,
         nextInputLayernormWeight: MLXArray? = nil,
+        // TAILHEAD-001. Non-nil only for the LAST layer, and only when the
+        // trunk is going to fold the model norm into the tied head's
+        // activation-sum contract.
+        finalNormWeight: MLXArray? = nil,
         enableAttentionBranchPrefix: Bool = false
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         // Prompt-path narrowing (CBv2 only): attention and every K/V write
@@ -3305,9 +3418,11 @@ public class Gemma4DecoderLayer: Module {
             pending.source === x
         {
             chain.pending = nil
+            chain.pendingHeadSums = nil
             h = pending.normed
         } else {
             glueChain?.pending = nil
+            glueChain?.pendingHeadSums = nil
             h = inputLayernorm(x)
         }
         let (attnOut, kvPair, attnPositionOffset) = selfAttn(
@@ -3433,6 +3548,22 @@ public class Gemma4DecoderLayer: Module {
             let canFoldScalar =
                 perLayerInputGate == nil || activePerLayerInput == nil
             if canFoldScalar, let chain = glueChain,
+                let modelNormWeight = finalNormWeight,
+                let chained = Gemma4FusedLayerGlue.tailChainedHead(
+                    mlpOut: h1Raw, expertOut: h2Raw, residual: residual2,
+                    w1: postFeedforwardLayernorm1.weight,
+                    w2: postFeedforwardLayernorm2.weight,
+                    w3: postFeedforwardLayernorm.weight,
+                    layerScalar: layerScalar,
+                    finalNormWeight: modelNormWeight,
+                    eps: config.rmsNormEps)
+            {
+                out = chained.out
+                chain.pending = (source: chained.out, normed: chained.postNorm)
+                chain.pendingHeadSums = chained.sums
+                tailApplied = true
+                scalarFolded = true
+            } else if canFoldScalar, let chain = glueChain,
                 let nextWeight = nextInputLayernormWeight,
                 let chained = Gemma4FusedLayerGlue.tailChained(
                     mlpOut: h1Raw, expertOut: h2Raw, residual: residual2,
@@ -3445,6 +3576,7 @@ public class Gemma4DecoderLayer: Module {
             {
                 out = chained.out
                 chain.pending = (source: chained.out, normed: chained.normedNext)
+                chain.pendingHeadSums = nil
                 tailApplied = true
                 scalarFolded = true
             } else if canFoldScalar,
@@ -3474,6 +3606,7 @@ public class Gemma4DecoderLayer: Module {
             {
                 out = chained.out
                 chain.pending = (source: chained.out, normed: chained.normedNext)
+                chain.pendingHeadSums = nil
                 tailApplied = true
                 scalarFolded = true
             } else if let fusedTail = Gemma4PrefillGlueV1.branchTail(
@@ -4213,6 +4346,15 @@ public class Gemma4TextModelInner: Module {
                 glueChain: glueChain,
                 nextInputLayernormWeight: idx + 1 < layers.count
                     ? layers[idx + 1].inputLayernorm.weight : nil,
+                // TAILHEAD-001: same decode cell the branch prefix admits,
+                // and only where the trunk would otherwise run the standalone
+                // final-norm/xsum dispatch on this layer's own output.
+                finalNormWeight: (idx + 1 == layers.count && emitMMAHeadSums
+                    && norm.eps == config.rmsNormEps
+                    && isCBv2 && !schedulePrefill
+                    && inputBatchSize == 8 && inputLength == 1
+                    && !capturePreNorm && dFlashHiddenCapture == nil)
+                    ? norm.weight : nil,
                 enableAttentionBranchPrefix:
                     isCBv2 && !schedulePrefill
                     && inputBatchSize == 8 && inputLength == 1
@@ -4257,7 +4399,18 @@ public class Gemma4TextModelInner: Module {
 
         let postNorm: MLXArray
         let mmaHeadSums: Gemma4MMAQuantizedGEMV.ActivationSums?
-        if emitMMAHeadSums,
+        // TAILHEAD-001 consumption. Pointer identity on the source is the same
+        // guard GLUE-003 uses: any transformation between the fused tail and
+        // here (PLE gating, a capture hook rebinding `h`) breaks it and the
+        // standalone dispatch below runs unchanged.
+        if emitMMAHeadSums, let pending = glueChain.pending,
+            let carriedSums = glueChain.pendingHeadSums, pending.source === h
+        {
+            glueChain.pending = nil
+            glueChain.pendingHeadSums = nil
+            postNorm = pending.normed
+            mmaHeadSums = carriedSums
+        } else if emitMMAHeadSums,
             let produced = Gemma4FinalNormMMAHeadSumsV1.apply(
                 h, weight: norm.weight, eps: norm.eps)
         {

@@ -380,6 +380,83 @@ private let routeSimdRank64Enabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+// MARK: - ROUTE-META-SIDECAR: run metadata packed into the sorted-key words
+
+/// ROUTE-META-SIDECAR twin of ``routeSimdRank64Kernel``. Identical rank
+/// computation (the two mutually exclusive comparison terms are counted in
+/// separate accumulators whose sum is the incumbent `rank`), identical
+/// `row_order` and `inverse_order` products - but each sorted-key word also
+/// carries the run metadata every downstream gemma4 pair-geometry gather
+/// threadgroup currently re-derives with serial neighbor scans over the key
+/// table:
+///
+///   bits  0..7  - the expert key (production keys are below 128);
+///   bits  8..13 - run offset: this assignment's position inside its
+///                 same-expert run (`equal_before`, at most 63);
+///   bits 16..18 - run length from this position, capped at 4 (the RUN-QUAD
+///                 quartet width; at least 1 for the assignment itself);
+///   bit  31     - the sentinel marking a packed word. Legacy tables hold
+///                 bare expert ids below 256, which can never set it, so a
+///                 consumer that sees the bit clear keeps its incumbent
+///                 scans untouched.
+///
+/// Exactness: the run values are pure counting products of the same 64 keys
+/// the incumbent consumers scan. `equal_before` is by construction the number
+/// of equal keys at smaller flat index, which is exactly the backward-scan
+/// `run_offset` under a stable sort (equal keys are contiguous in input-index
+/// order). `equal_total - equal_before` is the number of run positions from
+/// this assignment through the run's end, so its cap at 4 is exactly the
+/// forward-scan `run_len`. The weight, scale, bias, activation and output
+/// addressing of every gather impl is unchanged - the sidecar only replaces
+/// how the already-taken leader/run decisions are computed.
+private let routeSimdRankMeta64Kernel: MLXFast.MLXFastKernel =
+    MLXFast.metalKernel(
+        name: "mlx_lm_route_simd_rank_scatter_meta_m8_u32_n64_v1",
+        inputNames: ["indices"],
+        outputNames: ["row_order", "sorted_keys", "inverse_order"],
+        source: """
+            const uint assignment = thread_position_in_grid.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint key = (uint)indices[assignment];
+            const uint key_low = (uint)indices[lane];
+            const uint key_high = (uint)indices[32u + lane];
+            uint smaller = 0;
+            uint equal_before = 0;
+            uint equal_total = 1;
+            for (uint source = 0; source < 32; ++source) {
+                const uint other_low = simd_broadcast(key_low, ushort(source));
+                smaller += (other_low < key);
+                equal_before += (other_low == key && source < assignment);
+                equal_total += (other_low == key && source != assignment);
+                const uint other_high = simd_broadcast(key_high, ushort(source));
+                const uint high_assignment = 32u + source;
+                smaller += (other_high < key);
+                equal_before +=
+                    (other_high == key && high_assignment < assignment);
+                equal_total +=
+                    (other_high == key && high_assignment != assignment);
+            }
+            const uint rank = smaller + equal_before;
+            const uint remaining = equal_total - equal_before;
+            const uint run_len = remaining < 4u ? remaining : 4u;
+            row_order[rank] = assignment / 8;
+            sorted_keys[rank] =
+                key | 0x80000000u | (equal_before << 8) | (run_len << 16);
+            inverse_order[assignment] = rank;
+        """,
+        ensureRowContiguous: true
+    )
+
+/// Kill switch back to the unpacked ``routeSimdRank64Kernel`` table (the
+/// gather kernels then keep their incumbent neighbor scans via the sentinel
+/// check). Engage mark: `route-meta-sidecar`.
+private let routeMetaSidecarEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_ROUTE_META_SIDECAR"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 // MARK: - ROUTE-CSORT-64: fused counting-sort route table (donor port)
 
 /// Stable counting sort for the flattened B=8 decode route table (64 uint32
@@ -786,12 +863,31 @@ public func gatherSort(
 /// that know it (SwitchGLU) pass it so the counting-sort fast path can prove
 /// its 256-entry counter table covers every key. The default (`Int.max`)
 /// fails closed onto the established `argSort` chain.
+///
+/// `routeMeta` asks for ROUTE-META-SIDECAR sorted-key packing (see
+/// ``routeSimdRankMeta64Kernel``). Only a caller that has proven every
+/// consumer of the sorted keys is a gemma4 pair-geometry gather QMV plane may
+/// pass `true`; the default keeps the established unpacked table. The request
+/// is honored only on the exact rank-64 geometry with a key space the packed
+/// low byte can hold - every fallback producer stays unpacked, and the
+/// consumers' sentinel check falls back to their incumbent scans.
 public func gatherSortIndices(
-    indices: MLXArray, numExperts: Int = Int.max
+    indices: MLXArray, numExperts: Int = Int.max, routeMeta: Bool = false
 ) -> (MLXArray, MLXArray, MLXArray) {
     if routeSimdRank64Enabled,
         indices.ndim == 2, indices.shape == [8, 8], indices.dtype == .uint32
     {
+        if routeMeta, numExperts <= routeCountingSortKeyBound {
+            CBv2EngageMark.once("route-meta-sidecar")
+            let outputs = routeSimdRankMeta64Kernel(
+                [indices],
+                grid: (64, 1, 1),
+                threadGroup: (64, 1, 1),
+                outputShapes: [[64], [64], [64]],
+                outputDTypes: [.uint32, .uint32, .uint32]
+            )
+            return (outputs[0], outputs[1], outputs[2])
+        }
         let outputs = routeSimdRank64Kernel(
             [indices],
             grid: (64, 1, 1),
@@ -867,6 +963,11 @@ public class SwitchGLU: Module {
     /// equivalent fast path — it can never change results.
     let isSiluActivation: Bool
     let isGeluActivation: Bool
+
+    /// Cached ROUTE-META-SIDECAR eligibility (see `routeMetaPackedKeysEligible`).
+    /// Computed on the first sorted decode call, after load-time quantization
+    /// has replaced the projection modules, and stable thereafter.
+    private var cachedRouteMetaPackedKeys: Bool?
 
     /// Default SiLU GLU path -- uses the compiled fused (silu * up) kernel.
     public init(
@@ -953,6 +1054,37 @@ public class SwitchGLU: Module {
         super.init()
     }
 
+    /// ROUTE-META-SIDECAR admission: pack run metadata into the sorted-key
+    /// words only when every consumer of those words is one of the three
+    /// gemma4 pair-geometry gather QMV planes. The exact production expert
+    /// topology plus the affine-4/group-64 quantization contract force the
+    /// gather host onto `affine_gather_qmv` at 2816->704 / 704->2816 with a
+    /// 64-assignment batch - the only kernel arms that understand (and mask
+    /// off) the packed bits. Bias gathers index by raw key, so any bias
+    /// refuses. Everything else keeps the established unpacked table.
+    private func routeMetaPackedKeysEligible() -> Bool {
+        if let cached = cachedRouteMetaPackedKeys { return cached }
+        func isAffine4G64(_ proj: SwitchLinear?) -> Bool {
+            guard let quantized = proj as? QuantizedSwitchLinear else {
+                return false
+            }
+            return quantized.groupSize == 64 && quantized.bits == 4
+                && quantized.mode == .affine && quantized.bias == nil
+        }
+        let eligible =
+            routeMetaSidecarEnabled
+            && weightedReductionProfile == .gemma4ProductionGeGLU
+            && inputDims == 2816
+            && hiddenDims == 704
+            && numExperts == 128
+            && gateUpProj == nil
+            && isAffine4G64(gateProj)
+            && isAffine4G64(upProj)
+            && isAffine4G64(downProj)
+        cachedRouteMetaPackedKeys = eligible
+        return eligible
+    }
+
     private func projectExperts(
         _ x: MLXArray, _ indices: MLXArray
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
@@ -969,7 +1101,8 @@ public class SwitchGLU: Module {
             if useLhsIndices {
                 x = x.flattened(start: 0, end: -3)
                 (lhsIndices, idx, inverseOrder) = gatherSortIndices(
-                    indices: indices, numExperts: numExperts)
+                    indices: indices, numExperts: numExperts,
+                    routeMeta: routeMetaPackedKeysEligible())
             } else {
                 (x, idx, inverseOrder) = gatherSort(
                     x: x, indices: indices, numExperts: numExperts)

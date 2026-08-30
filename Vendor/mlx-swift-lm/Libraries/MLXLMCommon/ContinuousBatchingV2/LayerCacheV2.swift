@@ -38,9 +38,9 @@ final class CBv2PositionOffsetsState {
 /// Threading a one-element int32 through the kernel (in as `write_fence`, out
 /// as `fence`) makes it a real data dependency: the next step's writing pass A
 /// consumes the fence this step produced, so the in-place store is part of the
-/// evaluated chain instead of relying on host timing. `innerState()` publishes
-/// the value so the loop's per-step `asyncEval` collapses that chain, exactly
-/// as it does for the position-offset chain.
+/// evaluated chain instead of relying on host timing. Ordinary compact decode
+/// evaluates it transitively through the attention/logits graph; `innerState()`
+/// publishes it for fallback evaluation paths.
 final class CBv2DecodeRingWriteFence {
     var value = MLXArray.zeros([1], dtype: .int32)
 }
@@ -84,9 +84,9 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         usesUnifiedPositionOffsets ? ObjectIdentifier(positionOffsetsState) : nil
     }
 
-    /// Explicit ordering root for the fused in-place sliding-ring write.
-    /// Kept in the initial conservative compaction even though the logits
-    /// graph also reaches the multi-output primitive that produces it.
+    /// Explicit diagnostic/fallback root for the fused in-place sliding-ring
+    /// write. Ordinary compact decode reaches the same multi-output primitive
+    /// through logits and retains this value for the following step's edge.
     var decodeRingWriteFenceEvaluationRoot: MLXArray { decodeRingWriteFence.value }
 
     private var positionOffsetsState: CBv2PositionOffsetsState
@@ -298,8 +298,9 @@ extension CBv2LayerCache: KVCache {
         }
     }
 
-    /// The engine loop evaluates cache inner state each step (asyncEval) to
-    /// collapse lazy chains: per-row storage plus the positionOffsets chain.
+    /// Fallback engine paths evaluate cache inner state each step (asyncEval)
+    /// to collapse lazy chains. Compact decode instead supplies its smaller
+    /// model-proved root set.
     public func innerState() -> [MLXArray] {
         var arrays = [positionOffsetsState.value, decodeRingWriteFence.value]
         for row in rows {

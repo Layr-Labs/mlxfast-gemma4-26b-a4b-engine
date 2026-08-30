@@ -334,10 +334,11 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
     private static let tilesPerGroup = 2
 
     private static let multiTileKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_unroll_v2",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_unroll_v2_bf16fixed",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
+            using T = bfloat16_t;
             const uint3 tid = threadgroup_position_in_grid;
             threadgroup float2 red[64];
             qkv_mma8_affine4_g64_mt<T, 2, 2, 2816>(
@@ -351,10 +352,11 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
         ensureRowContiguous: true)
 
     private static let mma8Kernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_unroll_v2",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_unroll_v2_bf16fixed",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
+            using T = bfloat16_t;
             const uint3 tid = threadgroup_position_in_grid;
             threadgroup float2 red[32];
             qkv_mma8_affine4_g64_impl<T, 2, 2816>(
@@ -409,7 +411,6 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
         if multiTileEnabled, yTiles % tilesPerGroup == 0 {
             return multiTileKernel(
                 [x, weight, scales, biases],
-                template: [("T", x.dtype)],
                 grid: (simdWidth, (yTiles / tilesPerGroup) * simdGroups, 1),
                 threadGroup: (simdWidth, simdGroups, 1),
                 outputShapes: [[batch, sequence, outputWidth]],
@@ -418,7 +419,6 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
         }
         return mma8Kernel(
             [x, weight, scales, biases],
-            template: [("T", x.dtype)],
             grid: (simdWidth, yTiles * simdGroups, 1),
             threadGroup: (simdWidth, simdGroups, 1),
             outputShapes: [[batch, sequence, outputWidth]],

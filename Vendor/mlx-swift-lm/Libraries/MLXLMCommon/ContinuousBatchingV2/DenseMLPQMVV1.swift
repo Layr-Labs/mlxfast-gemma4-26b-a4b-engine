@@ -630,10 +630,11 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
 """
 
     private static let mma8Kernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_v1",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_v1_bf16fixed",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
+            using T = bfloat16_t;
             const uint3 tid = threadgroup_position_in_grid;
             threadgroup float2 red[32];
             gemma4_qmv_mma8_affine8_g64_impl<T, 2>(
@@ -694,10 +695,11 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     }()
 
     private static let mma8DownStaticKKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_unroll_v1",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_unroll_v1_bf16fixed",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
+            using T = bfloat16_t;
             const uint3 tid = threadgroup_position_in_grid;
             threadgroup float2 red[32];
             gemma4_qmv_mma8_affine8_g64_down_k2112_impl<T, 2>(
@@ -712,10 +714,11 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     /// One complete SIMD group per g64 group. Keep all lane results rather
     /// than canonicalizing row sums: the consumer reads its own lane's tree.
     private static let mma8DownLaneSumKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_down_lane_sums_v1",
+        name: "cbv2_b8_l1_dense_mlp_mma8_down_lane_sums_v1_bf16fixed",
         inputNames: ["x"],
         outputNames: ["laneSums"],
         source: """
+            using T = bfloat16_t;
             const uint lane = thread_index_in_simdgroup;
             const int g = int(threadgroup_position_in_grid.y);
             const int K = x_shape[x_ndim - 1];
@@ -772,10 +775,11 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     }()
 
     private static let mma8DownLaneSumQMVKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_lane_sums_v1",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_lane_sums_v1_bf16fixed",
         inputNames: ["x", "w", "scales", "biases", "laneSums"],
         outputNames: ["y"],
         source: """
+            using T = bfloat16_t;
             const uint3 tid = threadgroup_position_in_grid;
             threadgroup float2 red[32];
             gemma4_qmv_mma8_affine8_g64_lane_sums_impl<T, 2>(
@@ -789,10 +793,11 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         ensureRowContiguous: true)
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_v1",
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_v1_bf16fixed",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
+            using T = bfloat16_t;
             const uint3 tid = threadgroup_position_in_grid;
             const uint simd_gid = simdgroup_index_in_threadgroup;
             const uint simd_lid = thread_index_in_simdgroup;
@@ -830,10 +835,11 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     /// followed by four ascending `sum += bf16` operations. Row is the unit-
     /// stride dimension so one table serves both gate and up projections.
     private static let activationSumKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_affine8_xsum_v1",
+        name: "cbv2_b8_l1_dense_mlp_affine8_xsum_v1_bf16fixed",
         inputNames: ["x"],
         outputNames: ["xSums"],
         source: """
+            using T = bfloat16_t;
             const uint lane = thread_position_in_grid.x;
             const uint k_block = thread_position_in_grid.y;
             const uint row = thread_position_in_grid.z;
@@ -850,10 +856,11 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     )
 
     private static let activationSumQMVKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_v1",
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_v1_bf16fixed",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["y"],
         source: """
+            using T = bfloat16_t;
             const uint3 tid = threadgroup_position_in_grid;
             const uint simd_gid = simdgroup_index_in_threadgroup;
             const uint simd_lid = thread_index_in_simdgroup;
@@ -909,7 +916,6 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         let blocks = 2816 / kBlock
         let values = activationSumKernel(
             [x],
-            template: [("T", x.dtype)],
             grid: (simdWidth, blocks, batch),
             threadGroup: (simdWidth, 1, 1),
             outputShapes: [[blocks * simdWidth * batch]],
@@ -997,7 +1003,6 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
                 let groups = inDim / Self.groupSize
                 let laneSums = mma8DownLaneSumKernel(
                     [x],
-                    template: [("T", x.dtype)],
                     grid: (simdWidth, groups, 1),
                     threadGroup: (simdWidth, 1, 1),
                     outputShapes: [[groups, simdWidth, 2]],
@@ -1005,7 +1010,6 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
                 )[0]
                 return mma8DownLaneSumQMVKernel(
                     [x, weight, scales, biases, laneSums],
-                    template: [("T", x.dtype)],
                     grid: (simdWidth, yTiles * simdGroups, 1),
                     threadGroup: (simdWidth, simdGroups, 1),
                     outputShapes: [[batch, sequence, outDim]],
@@ -1016,7 +1020,6 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
                 ? mma8DownStaticKKernel : mma8Kernel
             return selectedMMA(
                 [x, weight, scales, biases],
-                template: [("T", x.dtype)],
                 grid: (simdWidth, yTiles * simdGroups, 1),
                 threadGroup: (simdWidth, simdGroups, 1),
                 outputShapes: [[batch, sequence, outDim]],
@@ -1035,7 +1038,6 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
             : [x, weight, scales, biases]
         return selected(
             inputs,
-            template: [("T", x.dtype)],
             grid: (xGroups * simdWidth, yGroups * simdGroups, 1),
             threadGroup: (simdWidth, simdGroups, 1),
             outputShapes: [[batch, sequence, outDim]],

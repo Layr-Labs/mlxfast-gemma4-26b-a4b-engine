@@ -96,6 +96,15 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Paired down output tiles share B fragments and the promoted lane table.
+    /// Feature-off keeps the accepted single-tile table consumer.
+    private static let mma8DownDualTileEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MLP_MMA8_DOWN_DUAL_TILE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let batch = 8
     private static let sequence = 1
     private static let groupSize = 64
@@ -716,6 +725,94 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         header: mma8DownLaneSumHeader,
         ensureRowContiguous: true)
 
+    /// Preserve each output's group/MMA/KS2 order while sharing the current
+    /// producer's lane-exact sums and B fragments between adjacent N tiles.
+    private static let mma8DownDualTileHeader: String = {
+        var result = mma8DownLaneSumHeader
+        func replaceOnce(_ old: String, with new: String) {
+            precondition(result.components(separatedBy: old).count == 2)
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        replaceOnce(
+            "gemma4_qmv_mma8_affine8_g64_lane_sums_impl(",
+            with: "gemma4_qmv_mma8_affine8_g64_lane_sums_dual_tile_impl(")
+        replaceOnce("threadgroup float2* red,", with: "threadgroup float4* red,")
+        replaceOnce(
+            "  float acc1 = 0.0f;",
+            with: "  float acc1 = 0.0f;\n  float acc2 = 0.0f;\n  float acc3 = 0.0f;")
+
+        let tile0 = """
+            const uint4 wv = *((const device uint4*)(wrow + 64 * g));
+            const float s = float(srow[g]);
+            const float b = float(brow[g]);
+
+            simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+            MMA8_STEP8(B0, x, z, 0)
+            MMA8_STEP8(B1, x, z, 8)
+            MMA8_STEP8(B2, x, z, 16)
+            MMA8_STEP8(B3, x, z, 24)
+            MMA8_STEP8(B4, y, w, 0)
+            MMA8_STEP8(B5, y, w, 8)
+            MMA8_STEP8(B6, y, w, 16)
+            MMA8_STEP8(B7, y, w, 24)
+
+            acc0 += s * C.thread_elements()[0] + rs.x * b;
+            acc1 += s * C.thread_elements()[1] + rs.y * b;
+        """
+        let tile1 = tile0
+            .replacingOccurrences(of: "wrow + 64 * g", with: "wrow + 8 * K + 64 * g")
+            .replacingOccurrences(of: "srow[g]", with: "srow[8 * G + g]")
+            .replacingOccurrences(of: "brow[g]", with: "brow[8 * G + g]")
+            .replacingOccurrences(of: "acc0", with: "acc2")
+            .replacingOccurrences(of: "acc1", with: "acc3")
+        replaceOnce(tile0, with: "    {\n" + tile0 + "\n    }\n    {\n" + tile1 + "\n    }")
+        replaceOnce(
+            "      red[simd_lid] = float2(acc0, acc1);",
+            with: "      red[simd_lid] = float4(acc0, acc1, acc2, acc3);")
+        replaceOnce(
+            """
+                const float2 other = red[simd_lid];
+                acc0 = acc0 + other.x;
+                acc1 = acc1 + other.y;
+            """,
+            with: """
+                const float4 other = red[simd_lid];
+                acc0 = acc0 + other.x;
+                acc1 = acc1 + other.y;
+                acc2 = acc2 + other.z;
+                acc3 = acc3 + other.w;
+            """)
+        replaceOnce(
+            """
+              y[c.fn * N + n0 + c.fm] = static_cast<T>(acc0);
+              y[(c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc1);
+            """,
+            with: """
+              y[c.fn * N + n0 + c.fm] = static_cast<T>(acc0);
+              y[(c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc1);
+              y[c.fn * N + n0 + 8 + c.fm] = static_cast<T>(acc2);
+              y[(c.fn + 1) * N + n0 + 8 + c.fm] = static_cast<T>(acc3);
+            """)
+        return result
+    }()
+
+    private static let mma8DownDualTileKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_lane_sums_dual_tile_v1",
+        inputNames: ["x", "w", "scales", "biases", "laneSums"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float4 red[32];
+            gemma4_qmv_mma8_affine8_g64_lane_sums_dual_tile_impl<T, 2>(
+                w, scales, biases, x, (const device float2*)laneSums, y,
+                x_shape[x_ndim - 1], w_shape[0], int(tid.y) * 16, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8DownDualTileHeader,
+        ensureRowContiguous: true)
+
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_v1",
         inputNames: ["x", "w", "scales", "biases"],
@@ -931,6 +1028,16 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
                     outputShapes: [[groups, simdWidth, 2]],
                     outputDTypes: [.float32]
                 )[0]
+                if mma8DownDualTileEnabled && outDim % (2 * outputsPerGroup) == 0 {
+                    return mma8DownDualTileKernel(
+                        [x, weight, scales, biases, laneSums],
+                        template: [("T", x.dtype)],
+                        grid: (simdWidth, (yTiles / 2) * simdGroups, 1),
+                        threadGroup: (simdWidth, simdGroups, 1),
+                        outputShapes: [[batch, sequence, outDim]],
+                        outputDTypes: [x.dtype]
+                    )[0]
+                }
                 return mma8DownLaneSumQMVKernel(
                     [x, weight, scales, biases, laneSums],
                     template: [("T", x.dtype)],

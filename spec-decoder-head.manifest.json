@@ -1,5 +1,6 @@
 {
   "version": 1,
   "source": "pinned",
-  "max_bytes": 2147483648
+  "max_bytes": 2147483648,
+  "arm": "mtp"
 }

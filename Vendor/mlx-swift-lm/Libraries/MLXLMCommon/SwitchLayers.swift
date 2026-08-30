@@ -706,7 +706,18 @@ private let routeCsortPrefillEnabled: Bool = {
 }()
 
 /// Keys per histogram/scatter block.
-private let routeCsortPrefillBlock = 256
+/// PREFILL-CSORT-BLOCK-128: halved 256 -> 128. Every offset in the pipeline
+/// is dynamic in `blocks`, and the stable counting-sort rank
+/// (`block_offset[b][key] + in-block rank`) is invariant to how the keys are
+/// partitioned: per-block histograms and counts commute across blocks, and
+/// within a block the stable tie order is index order regardless of thread
+/// decomposition. So the outputs are identical integer buffers for ANY block
+/// width; 128 doubles the histogram/scatter threadgroups for the packed
+/// 8x1024 route table (n=8192: 32 -> 64 blocks) and halves the per-thread
+/// serial rank loop in the scatter kernel. Kill switch
+/// DARKBLOOM_ROUTE_CSORT_PREFILL=0 restores the argSort chain; the block
+/// knob itself is pinned here by design (env-free ship value).
+private let routeCsortPrefillBlock = 128
 /// Counter-table width; must equal ``routeCountingSortKeyBound`` and the 256
 /// threads per threadgroup the three kernels launch with.
 private let routeCsortPrefillWidth = 256
@@ -740,7 +751,7 @@ private final class RouteCsortShapeLog: @unchecked Sendable {
 private let routeCsortShapeLog = RouteCsortShapeLog()
 
 private let routeCsortPrefillHistKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "mlx_lm_route_csort128_hist_v1",
+    name: "mlx_lm_route_csort128_hist_v2",
     inputNames: ["keys"],
     outputNames: ["block_hist"],
     source: """
@@ -753,7 +764,7 @@ private let routeCsortPrefillHistKernel: MLXFast.MLXFastKernel = MLXFast.metalKe
         atomic_store_explicit(&tg_count[k], 0u, memory_order_relaxed);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         uint idx = b * BLOCK + k;
-        if (idx < n) {
+        if (idx < n && k < BLOCK) {
             atomic_fetch_add_explicit(
                 &tg_count[keys[idx]], 1u, memory_order_relaxed);
         }
@@ -802,7 +813,7 @@ private let routeCsortPrefillScanKernel: MLXFast.MLXFastKernel = MLXFast.metalKe
 )
 
 private let routeCsortPrefillScatterKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "mlx_lm_route_csort128_scatter_v1",
+    name: "mlx_lm_route_csort128_scatter_v2",
     inputNames: ["keys", "block_offset"],
     outputNames: ["row_order", "sorted_keys", "inverse_order"],
     source: """
@@ -871,8 +882,11 @@ private func routeCountingSortPrefill(
     let outputs = routeCsortPrefillScatterKernel(
         [indices, offsets],
         template: [("M", m)],
-        grid: (blocks * width, 1, 1),
-        threadGroup: (width, 1, 1),
+        // Launched in block units: at BLOCK == WIDTH this is the identical
+        // geometry the kernel ran with at 256; at BLOCK < WIDTH it covers
+        // exactly the block's keys and never indexes past tg_keys[BLOCK].
+        grid: (blocks * routeCsortPrefillBlock, 1, 1),
+        threadGroup: (routeCsortPrefillBlock, 1, 1),
         outputShapes: [[n], [n], [n]],
         outputDTypes: [.uint32, .uint32, .uint32]
     )

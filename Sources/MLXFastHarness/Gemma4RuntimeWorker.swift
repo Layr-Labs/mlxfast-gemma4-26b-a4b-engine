@@ -1108,6 +1108,14 @@ extension Gemma4Runtime {
                 recordingSession.shutdownBlocking()
                 state.recordingSession = nil
             }
+            // Engine shutdown drains its serial queue, but it is not a Metal
+            // completion fence. CBv2 submits through MLX's process-global GPU
+            // stream, so retire that stream before snapshotting allocator state
+            // or clearing free buffers. Otherwise a late command-buffer
+            // retirement can repopulate cacheMemory after clearCache(), which
+            // violates the exact-zero phase barrier even though the session is
+            // already gone.
+            Stream.gpu.synchronize()
             let peakRamGB = peakResidentMemoryGB()
             let stats = expertStats(from: weightCache)
             let mlxActiveMemoryBytes = Memory.activeMemory

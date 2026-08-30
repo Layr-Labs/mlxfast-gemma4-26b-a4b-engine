@@ -2302,6 +2302,13 @@ private enum Gemma4FusedLayerGlue {
     private static let nReads = 4
     private static let tgThreads = 704  // 2816 / 4, exactly rms_single_row's shape
 
+    private static let triplePreNormEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_TRIPLE_PRENORM"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// Shared reduction preamble: the exact rms_single_row tree at 704x4.
     /// `PREFIX` names the array to reduce; `SLOT` the shared slot written.
     private static func rmsReduce(_ src: String, into slot: String) -> String {
@@ -2379,6 +2386,37 @@ private enum Gemma4FusedLayerGlue {
             }
             // `lid == k_block * 32 + lane`, exactly the standalone DMLP
             // xsum table's first two coordinates. Row remains unit stride.
+            xSums[lid * 8 + row] = xsum;
+        """,
+        ensureRowContiguous: true
+    )
+
+    /// ZIP's router normalizes the same `out` as both MLP branches. Keep its
+    /// cached effective scale intact and share only the identical RMS tree.
+    private static let triplePreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_glue_triple_prenorm_xsum_2816_bf16_v1",
+        inputNames: ["x", "w1", "w2", "wr"],
+        outputNames: ["out1", "out2", "routerNorm", "xSums"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float local_inv[1];
+            threadgroup float local_sums[32];
+            const uint base = row * 2816 + lid * 4;
+            const uint wbase = lid * 4;
+        \(rmsReduce("x", into: "local_inv[0]"))
+            const float inv = local_inv[0];
+            float xsum = 0.0f;
+            for (int i = 0; i < 4; i++) {
+                const T nx = static_cast<T>((float)x[base + i] * inv);
+                const T dense = w1[wbase + i] * nx;
+                out1[base + i] = dense;
+                out2[base + i] = w2[wbase + i] * nx;
+                routerNorm[base + i] = wr[wbase + i] * nx;
+                xsum += dense;
+            }
             xSums[lid * 8 + row] = xsum;
         """,
         ensureRowContiguous: true
@@ -2475,6 +2513,36 @@ private enum Gemma4FusedLayerGlue {
         let sums = CBv2DenseMLPQMVV1.activationSums(
             produced: outs[2], for: outs[0])
         return (outs[0], outs[1], sums)
+    }
+
+    static func triplePreNorm(
+        x: MLXArray, w1: MLXArray, w2: MLXArray, routerWeight: MLXArray,
+        eps: Float
+    ) -> (
+        dense: MLXArray, expert: MLXArray, router: MLXArray,
+        sums: CBv2DenseMLPQMVV1.ActivationSums?
+    )? {
+        guard triplePreNormEnabled,
+            admits(x, weight: w1, eps: eps),
+            w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16,
+            routerWeight.ndim == 1, routerWeight.dim(0) == axis,
+            routerWeight.dtype == .bfloat16
+        else { return nil }
+        let outs = triplePreNormKernel(
+            [x, w1, w2, routerWeight],
+            template: [("T", x.dtype)],
+            grid: (rows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: [
+                [rows, 1, axis], [rows, 1, axis], [rows, 1, axis],
+                [(axis / 128) * 32 * rows],
+            ],
+            outputDTypes: [.bfloat16, .bfloat16, .bfloat16, .float32]
+        )
+        CBv2EngageMark.once("glue-triple-prenorm")
+        let sums = CBv2DenseMLPQMVV1.activationSums(
+            produced: outs[3], for: outs[0])
+        return (outs[0], outs[1], outs[2], sums)
     }
 
     /// GLUE-003: tail variant that ALSO emits the NEXT layer's input norm.
@@ -2915,20 +2983,35 @@ private enum Gemma4ZipRouterV1 {
             out.dtype == .bfloat16
         else { return nil }
 
-        // Stage 0, shared: the two pre-norms plus the exact dense activation
-        // table. A nil here means this is not the fused-glue cell and no node
-        // was built.
-        guard let (n1, n2, producerSums) = Gemma4FusedLayerGlue.dualPreNorm(
-            x: out, w1: w1, w2: w2, eps: eps)
-        else { return nil }
+        // Stages 0+1 share one RMS reduction only when router dtype and eps
+        // agree exactly. All later ZIP edges, partitioning and expert fences
+        // remain unchanged; the router tensor is still a separate output.
+        let n1: MLXArray
+        let n2: MLXArray
+        let producerNorm: MLXArray?
+        let producerSums: CBv2DenseMLPQMVV1.ActivationSums?
+        if router.eps == eps,
+            let produced = Gemma4FusedLayerGlue.triplePreNorm(
+                x: out, w1: w1, w2: w2,
+                routerWeight: router.zipEffectiveScale(), eps: eps)
+        {
+            n1 = produced.dense
+            n2 = produced.expert
+            producerNorm = produced.router
+            producerSums = produced.sums
+        } else {
+            guard let (dense, expert, sums) = Gemma4FusedLayerGlue.dualPreNorm(
+                x: out, w1: w1, w2: w2, eps: eps)
+            else { return nil }
+            n1 = dense
+            n2 = expert
+            producerSums = sums
+            producerNorm = nil
+        }
 
-        // Stage 1: router norm. The table is normally producer-emitted in
-        // stage 0; the standalone producer survives only as the fail-closed
-        // fallback for a disabled or mismatched carrier. A nil leaves the
-        // dual pre-norm arrays unreferenced, so MLX never evaluates them and
-        // the caller's stock path rebuilds the identical pair.
+        // Preserve the standalone table fallback and its dependency carrier.
         guard let sums = producerSums ?? mlp.zipActivationSums(n1) else { return nil }
-        let normed = router.zipNorm(out)
+        let normed = producerNorm ?? router.zipNorm(out)
 
         // Stage 2: router QMV | dense gate + up.
         let expertScores = router.zipScores(

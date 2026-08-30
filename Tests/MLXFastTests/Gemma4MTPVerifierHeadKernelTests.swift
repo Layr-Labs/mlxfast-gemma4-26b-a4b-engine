@@ -61,7 +61,7 @@ struct Gemma4MTPVerifierHeadKernelTests {
     @Test(.enabled(if: runtimeEnabled))
     func verifierHeadIsBitExactToIndependentB8Columns() throws {
         let k = 2816
-        let n = 236_800
+        let n = 262_144
         let (weight, scales, biases) = deterministicHeadWeights(k: k, n: n)
 
         for columns in 2...4 {
@@ -100,7 +100,7 @@ struct Gemma4MTPVerifierHeadKernelTests {
     @Test(.enabled(if: runtimeEnabled))
     func routeSelectedC2HeadUsesPreboundIndependentB8Columns() throws {
         let k = 2816
-        let n = 236_800
+        let n = 262_144
         let (weight, scales, biases) = deterministicHeadWeights(k: k, n: n)
         let columns = 2
         let independent = try #require(Gemma4MMAQuantizedGEMV.bindIndependentB8(
@@ -129,7 +129,7 @@ struct Gemma4MTPVerifierHeadKernelTests {
     @Test(.enabled(if: profileEnabled))
     func profileVerifierHeadAtRankedDimensions() throws {
         let k = 2816
-        let n = 236_800
+        let n = 262_144
         let weight = MLXArray.zeros([n, k / 8], dtype: .uint32)
         let scales = MLXArray.zeros([n, k / 64], dtype: .bfloat16)
         let biases = MLXArray.zeros([n, k / 64], dtype: .bfloat16)

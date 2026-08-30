@@ -129,7 +129,11 @@ void rope_impl(
     in_index_1 += pos.x * IdxT(strides[2]);
     in_index_2 = in_index_1 + grid.x * IdxT(strides[2]);
   }
-  for (int i = 0; i < N && head_idx + i < n_head; ++i) {
+  #pragma unroll
+  for (int i = 0; i < N; ++i) {
+    if (head_idx + i >= n_head) {
+      continue;
+    }
     // Read and write the output
     float x1 = static_cast<float>(in[in_index_1]);
     float x2 = static_cast<float>(in[in_index_2]);

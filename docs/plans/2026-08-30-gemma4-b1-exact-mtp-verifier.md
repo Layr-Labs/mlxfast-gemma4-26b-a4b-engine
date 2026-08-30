@@ -359,7 +359,7 @@ git commit -m 'perf: bind exact Gemma B1 verifier projections'
 
 **Does NOT cover:** changing routing, top-k selection, expert ordering, weighted-unsort behavior, or sharing weights across different expert IDs.
 
-- [ ] **Step 1: Write failing B1 router and expert tests**
+- [x] **Step 1: Write failing B1 router and expert tests**
 
 Add C2-C4 cases with `[1, C, H]` inputs, `[1, C, 8]` expert indices/weights, and deterministic repeated plus disjoint expert assignments. Require exact router scores and exact expert output against C independent B1 calls.
 
@@ -370,11 +370,11 @@ Add C2-C4 cases with `[1, C, H]` inputs, `[1, C, 8]` expert indices/weights, and
     .item(Bool.self))
 ```
 
-- [ ] **Step 2: Run the expert suite**
+- [x] **Step 2: Run the expert suite**
 
 Expected: FAIL because B1 bindings are absent.
 
-- [ ] **Step 3: Implement construction-bound B1 bindings**
+- [x] **Step 3: Implement construction-bound B1 bindings**
 
 The router delegates to `Gemma4B1MTPQuantizedProjection`. The expert binder captures the immutable quantized expert planes once, groups assignments by existing expert ID without changing stable order, and invokes the same pinned gather-QMV arithmetic per assignment. It may share a plane only among positions whose expert IDs are equal.
 
@@ -393,11 +393,11 @@ public static func bindB1Verifier(
 
 The returned `Projection` accepts `(x, topKIndices, topKWeights)` and has no topology validation or fallback inside the call.
 
-- [ ] **Step 4: Run repeated and disjoint expert cases**
+- [x] **Step 4: Run repeated and disjoint expert cases**
 
 Expected: exact pass for C2-C4; disjoint assignments prove no accidental cross-expert sharing.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add Vendor/mlx-swift-lm/Libraries/MLXLMCommon/SwitchLayers.swift Tests/MLXFastTests/Gemma4MTPVerifierExpertKernelTests.swift

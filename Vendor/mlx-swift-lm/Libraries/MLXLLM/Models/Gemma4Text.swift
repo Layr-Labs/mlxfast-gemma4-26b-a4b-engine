@@ -80,7 +80,7 @@ internal func gemma4ShouldSubmitDecodeAsyncEvalLadder(
     // The empty-set row is the control that matters: this is not "fewer is
     // always better", it is "the early pair carries all of the overlap".
     switch layerIndex {
-    case 0, 1:
+    case 1, 3: // DUEL-{1,3}@158dd4c: gap-pattern vs adjacency on the token-major machine
         return true
     default:
         return false

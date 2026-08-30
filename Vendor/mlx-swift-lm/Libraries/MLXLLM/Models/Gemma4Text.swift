@@ -901,6 +901,17 @@ private let gemma4QKVNormRopeEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+// Attribution: retain-input QKV normalization is adapted from Inah-choi's
+// public Yukon submission `1fd2a909-9309-4ae4-9e66-449076bbe7d2`
+// (`36e63cb`). Its sealed run passed parity and measured 1.150953542 seconds
+// of absolute prefill versus 1.160823771 seconds for promoted `796aa22`.
+private let gemma4QKVInputReg4Enabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_QKV_INPUT_REG4"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 private let gemma4QKVNormKernel = MLXFast.metalKernel(
     name: "gemma4_b8_qkv_rms_norm_rope_v2",
     inputNames: [
@@ -945,9 +956,12 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
             shared_value_output += local_row * D + lid * reads;
         }
 
+        thread T held[reads];
         float sum = 0.0f;
         for (uint i = 0; i < reads; ++i) {
-            const float value = float(input[i]);
+            const T raw = input[i];
+            if (RETAIN_INPUT) held[i] = raw;
+            const float value = float(raw);
             sum += value * value;
         }
         sum = simd_sum(sum);
@@ -969,7 +983,8 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
 
         for (uint i = 0; i < reads; ++i) {
             const uint element = lid * reads + i;
-            const T normalized = T(float(input[i]) * inverse_rms);
+            const T raw = RETAIN_INPUT ? held[i] : input[i];
+            const T normalized = T(float(raw) * inverse_rms);
             if (APPLY_ROPE && weighted) {
                 // Reproduce the separate norm kernel's BF16 output-store
                 // boundary before any RoPE arithmetic reads the value.
@@ -1455,6 +1470,7 @@ private func gemma4FusedQKVNorm(
             ("Q_HEADS", 16), ("K_HEADS", k.dim(2)),
             ("KEY_VALUE_SHARED", keyValueShared), ("APPLY_ROPE", fusedRope),
             ("USE_FREQS", ropeParameters.usesFrequencies),
+            ("RETAIN_INPUT", gemma4QKVInputReg4Enabled),
         ],
         grid: (normRows * threads, 1, 1), threadGroup: (threads, 1, 1),
         outputShapes: fusedRope

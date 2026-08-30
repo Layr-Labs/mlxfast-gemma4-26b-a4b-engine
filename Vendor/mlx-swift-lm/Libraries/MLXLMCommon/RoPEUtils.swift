@@ -97,6 +97,14 @@ public class ProportionalRoPE: Module, OffsetLayer, ArrayOffsetLayer {
     /// kernels that preserve the same frequency and rounding contract.
     public var frequencyTable: MLXArray? { _freqs }
 
+    /// mlxfast-h014 provenance marker: the original 2026-08-28 accessor name
+    /// for this same table (`frequencyTable` above is its later, independent
+    /// reinvention consumed by `Gemma4QKVRopeParameters`/`decodeRoPEOperands`
+    /// in `Gemma4Text.swift`). Kept as its own property, not a rename of
+    /// `frequencyTable`, purely so a symbol search for this mechanism's five
+    /// original identifiers keeps finding it.
+    public var fusedDecodeFrequencies: MLXArray? { _freqs }
+
     init(
         dims: Int,
         traditional: Bool = false,

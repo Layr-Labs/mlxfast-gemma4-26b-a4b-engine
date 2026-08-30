@@ -1515,6 +1515,210 @@ internal func gemma4ApplyRotaryPosition<R: RoPELayer>(
     }
 }
 
+// MARK: - Exact batch-8 decode Q/K RoPE (mlxfast-h014, re-derived)
+//
+// History: first promoted 2026-08-28T03:08Z (submission 91c92a7e, commit
+// 465ce5c) as part of a four-mechanism bundle, then silently clobbered 28.7
+// minutes later when a same-stale-base sibling submission (41ab2004) that
+// never saw this work promoted and overwrote these editable files wholesale.
+// No later promotion reintroduced these five symbols verbatim, though the
+// underlying idea of exposing a RoPE layer's frequency table to a composed
+// kernel was independently reinvented for a much larger fusion (see
+// `gemma4FusedQKVNorm` and `ProportionalRoPE.frequencyTable` above/in
+// RoPEUtils.swift) that now claims the identical two production geometries
+// with RMSNorm folded in as well. This re-derivation therefore only fires
+// from the `!appliedRope` fallback below, which the newer fusion leaves
+// unreachable whenever it is enabled (its own default) — see the
+// submission note for the full reachability analysis.
+
+private let gemma4DecodeQKRoPEEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DECODE_QK_ROPE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// One two-output dispatch for the production `[8, heads, 1, D]` Q/K shapes.
+/// The arithmetic is the forward, non-traditional body of MLX's own AOT
+/// `rope`/`rope_freqs` kernel (`rope.metal`, unchanged since this mechanism
+/// was first promoted): same `L = float(offsets[batch])`, same
+/// `costheta`/`sintheta` via `metal::fast::{cos,sin}`, same
+/// `rx1 = x1*costheta - x2*sintheta` / `rx2 = x1*sintheta + x2*costheta`, no
+/// reassociation of any sum. Each thread handles the same four adjacent
+/// heads as that kernel; the only change is that Q and K head groups share
+/// one launch. `log2_base` is read as `log2_base[0]`, matching the
+/// one-element device-buffer convention `gemma4QKVNormKernel` above already
+/// established for the same value, rather than the 0-d scalar buffer the
+/// original 2026-08-28 version assumed.
+private let gemma4DecodeQKRoPEKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "gemma4_decode_qk_rope_b8_v1",
+    inputNames: ["queries", "keys", "offsets", "freqs", "log2_base"],
+    outputNames: ["rotated_queries", "rotated_keys"],
+    source: """
+        const uint pair = thread_position_in_grid.x;
+        const uint group = thread_position_in_grid.z;
+        constexpr uint heads_per_thread = 4;
+        constexpr uint q_groups = (Q_HEADS + heads_per_thread - 1) / heads_per_thread;
+        constexpr uint k_groups = (K_HEADS + heads_per_thread - 1) / heads_per_thread;
+        constexpr uint groups_per_batch = q_groups + k_groups;
+
+        const uint batch = group / groups_per_batch;
+        const uint local_group = group - batch * groups_per_batch;
+        const bool is_query = local_group < q_groups;
+        uint head = heads_per_thread * (is_query ? local_group : local_group - q_groups);
+        const uint head_count = is_query ? Q_HEADS : K_HEADS;
+        if (head >= head_count) {
+            return;
+        }
+
+        const float L = 1.0f * static_cast<float>(offsets[batch]);
+        float inv_freq;
+        if (USE_FREQS) {
+            inv_freq = 1.0f / freqs[pair];
+        } else {
+            const float d = static_cast<float>(pair) / static_cast<float>(DIM / 2);
+            inv_freq = metal::exp2(-d * log2_base[0]);
+        }
+        const float theta = L * inv_freq;
+        const float costheta = metal::fast::cos(theta);
+        const float sintheta = metal::fast::sin(theta);
+
+        for (uint i = 0; i < heads_per_thread && head + i < head_count; ++i) {
+            const uint matrix = batch * head_count + head + i;
+            const uint index_1 = matrix * DIM + pair;
+            const uint index_2 = index_1 + DIM / 2;
+            if (is_query) {
+                const float x1 = static_cast<float>(queries[index_1]);
+                const float x2 = static_cast<float>(queries[index_2]);
+                const float rx1 = x1 * costheta - x2 * sintheta;
+                const float rx2 = x1 * sintheta + x2 * costheta;
+                rotated_queries[index_1] = static_cast<T>(rx1);
+                rotated_queries[index_2] = static_cast<T>(rx2);
+            } else {
+                const float x1 = static_cast<float>(keys[index_1]);
+                const float x2 = static_cast<float>(keys[index_2]);
+                const float rx1 = x1 * costheta - x2 * sintheta;
+                const float rx2 = x1 * sintheta + x2 * costheta;
+                rotated_keys[index_1] = static_cast<T>(rx1);
+                rotated_keys[index_2] = static_cast<T>(rx2);
+            }
+        }
+    """,
+    // Decode's transposed `[B, H, 1, D]` views are physically linear even
+    // though the singleton sequence axis retains its old stride. Avoiding the
+    // generic row-contiguous coercion is what keeps this at one dispatch.
+    ensureRowContiguous: false
+)
+
+/// Shape/layout gate for the only geometries used by the ruled Gemma 4 batch-8
+/// decode. Every near match keeps the two established MLX RoPE primitives.
+internal func gemma4CanFuseDecodeQKRoPE(
+    queries: MLXArray,
+    keys: MLXArray,
+    offsets: MLXArray,
+    dimensions: Int,
+    frequencies: MLXArray,
+    log2Base: MLXArray,
+    useFrequencies: Bool
+) -> Bool {
+    guard gemma4DecodeQKRoPEEnabled,
+        queries.ndim == 4, keys.ndim == 4,
+        queries.dtype == .bfloat16, keys.dtype == .bfloat16,
+        queries.dim(0) == 8, keys.dim(0) == 8,
+        queries.dim(2) == 1, keys.dim(2) == 1,
+        queries.dim(3) == dimensions, keys.dim(3) == dimensions,
+        offsets.dtype == .int32, offsets.shape == [8], offsets.strides == [1],
+        frequencies.dtype == .float32, frequencies.size > 0,
+        log2Base.dtype == .float32, log2Base.size == 1
+    else { return false }
+
+    let productionGeometry =
+        (dimensions == 256 && queries.dim(1) == 16 && keys.dim(1) == 8)
+        || (dimensions == 512 && queries.dim(1) == 16 && keys.dim(1) == 2)
+    guard productionGeometry else { return false }
+
+    if useFrequencies {
+        guard frequencies.dtype == .float32,
+            frequencies.shape == [dimensions / 2], frequencies.strides == [1]
+        else { return false }
+    }
+
+    // The `!appliedRope` fallback reaches this helper immediately after
+    // `qNorm`/`kNorm` (contiguous BF16 `[8, H, 1, D]`, or the equivalent
+    // no-rope output of `gemma4FusedQKVNorm`) and `.transposed(0, 2, 1, 3)`.
+    // The sequence-axis stride is immaterial at length one; these three
+    // strides prove linear `(batch, head, feature)` addressing without
+    // asking the custom-op wrapper to copy either input.
+    func isLinearDecodeView(_ x: MLXArray) -> Bool {
+        let strides = x.strides
+        return strides.count == 4
+            && strides[0] == x.dim(1) * dimensions
+            && strides[1] == dimensions
+            && strides[3] == 1
+    }
+    return isLinearDecodeView(queries) && isLinearDecodeView(keys)
+}
+
+/// Returns nil unless the exact batch-8 decode specialization is legal.
+internal func gemma4FusedDecodeQKRoPE(
+    queries: MLXArray,
+    keys: MLXArray,
+    offsets: MLXArray,
+    dimensions: Int,
+    frequencies: MLXArray,
+    log2Base: MLXArray,
+    useFrequencies: Bool
+) -> (queries: MLXArray, keys: MLXArray)? {
+    guard gemma4CanFuseDecodeQKRoPE(
+        queries: queries,
+        keys: keys,
+        offsets: offsets,
+        dimensions: dimensions,
+        frequencies: frequencies,
+        log2Base: log2Base,
+        useFrequencies: useFrequencies)
+    else { return nil }
+
+    let qHeads = queries.dim(1)
+    let kHeads = keys.dim(1)
+    let groupsPerBatch = (qHeads + 3) / 4 + (kHeads + 3) / 4
+    let outputs = gemma4DecodeQKRoPEKernel(
+        [queries, keys, offsets, frequencies, log2Base],
+        template: [
+            ("T", queries.dtype),
+            ("DIM", dimensions),
+            ("Q_HEADS", qHeads),
+            ("K_HEADS", kHeads),
+            ("USE_FREQS", useFrequencies),
+        ],
+        grid: (dimensions / 2, 1, 8 * groupsPerBatch),
+        // MLX `get_block_dims(D / 2, 1, 8 * groupsPerBatch)` resolves to
+        // `(32, 1, 32)` for both ruled geometries (1,024 threads total).
+        threadGroup: (32, 1, 32),
+        outputShapes: [queries.shape, keys.shape],
+        outputDTypes: [queries.dtype, keys.dtype]
+    )
+    return (outputs[0], outputs[1])
+}
+
+/// Non-module holder for decode-only RoPE operands, adapted from the same
+/// `Gemma4QKVRopeParameters` triple the newer QKV-norm-RoPE fusion already
+/// carries per layer (`Gemma4Attention.qkvRopeParameters`) instead of a
+/// second, independently-computed copy. Keeping these arrays behind an
+/// ordinary reference type prevents `Module` reflection from treating them
+/// as checkpoint parameters.
+private final class Gemma4DecodeRoPEOperands {
+    let usesFrequencies: Bool
+    let frequencies: MLXArray
+    let log2Base: MLXArray
+
+    init(usesFrequencies: Bool, frequencies: MLXArray, log2Base: MLXArray) {
+        self.usesFrequencies = usesFrequencies
+        self.frequencies = frequencies
+        self.log2Base = log2Base
+    }
+}
+
 private func gemma4AttentionFallback(
     queries: MLXArray,
     keys: MLXArray,
@@ -1689,6 +1893,16 @@ private class Gemma4Attention: Module {
         }
 
         super.init()
+    }
+
+    /// mlxfast-h014 operand adapter: reuses `qkvRopeParameters` (already
+    /// correct for this layer's sliding/full route) rather than storing a
+    /// second copy computed in `init` above.
+    private var decodeRoPEOperands: Gemma4DecodeRoPEOperands {
+        Gemma4DecodeRoPEOperands(
+            usesFrequencies: qkvRopeParameters.usesFrequencies,
+            frequencies: qkvRopeParameters.frequencies,
+            log2Base: qkvRopeParameters.log2Base)
     }
 
     /// Exact B8/L1 Q/K/V projection: the tight-grid host for the promoted
@@ -2026,8 +2240,33 @@ private class Gemma4Attention: Module {
         }
 
         if !appliedRope {
-            queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: queryPositionOffset)
-            k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
+            // mlxfast-h014: exact paired Q/K RoPE decode dispatch, re-derived
+            // against today's CBv2 unified position-offset chain (`captured`
+            // is always `.batch` here; see the guard above this function).
+            // Ordinary batch decode gives Q and K the same per-row position
+            // (`queryPositionOffset == captured` whenever `lastQueryCache`
+            // is nil), so this is the same shape this mechanism always
+            // targeted. Only reachable when `gemma4FusedQKVNorm` above did
+            // not already fuse RoPE itself (see the MARK section above for
+            // why that is the common case under default settings).
+            if B == 8, lastQueryCache == nil, outputStart == 0,
+                case .batch(let offsets) = captured,
+                let rotated = gemma4FusedDecodeQKRoPE(
+                    queries: queries,
+                    keys: k,
+                    offsets: offsets,
+                    dimensions: effectiveHeadDim,
+                    frequencies: decodeRoPEOperands.frequencies,
+                    log2Base: decodeRoPEOperands.log2Base,
+                    useFrequencies: decodeRoPEOperands.usesFrequencies)
+            {
+                queries = rotated.queries
+                k = rotated.keys
+            } else {
+                queries = gemma4ApplyRotaryPosition(
+                    rope, to: queries, offset: queryPositionOffset)
+                k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
+            }
         }
 
         let outputDType = queries.dtype

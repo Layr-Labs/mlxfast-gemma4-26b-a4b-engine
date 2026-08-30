@@ -1694,8 +1694,12 @@ private class Gemma4Attention: Module {
     /// Exact B8/L1 Q/K/V projection: the tight-grid host for the promoted
     /// matrix-unit tier (same kernel text, grid.x = 1). Any guard failure
     /// keeps the quantized module, which reaches the tier through MLX.
+    /// MMA-RS-001: `rsTable` is the layer input's precomputed affine run-sum
+    /// table; nil keeps the incumbent in-kernel reductions.
     @inline(__always)
-    private func tierProjection(_ layer: Linear, _ x: MLXArray) -> MLXArray {
+    private func tierProjection(
+        _ layer: Linear, _ x: MLXArray, rsTable: MLXArray? = nil
+    ) -> MLXArray {
         guard let quantized = layer as? QuantizedLinear,
             quantized.bias == nil,
             let projected = CBv2AttentionQKVMMA8V1.matmul(
@@ -1705,13 +1709,16 @@ private class Gemma4Attention: Module {
                 biases: quantized.biases,
                 groupSize: quantized.groupSize,
                 bits: quantized.bits,
-                mode: quantized.mode)
+                mode: quantized.mode,
+                rsTable: rsTable)
         else { return layer(x) }
         return projected
     }
 
     /// Exact B8/L1 attention output projection. Sliding/full K widths select
     /// the tight affine4 fast-QMV replica; every other path keeps the layer.
+    /// MMA-RS-001: the projection input's run-sum table is computed here (the
+    /// o_proj plane consumes it alone); nil keeps the incumbent dispatch.
     @inline(__always)
     private func outputProjection(_ x: MLXArray) -> MLXArray {
         guard let quantized = oProj as? QuantizedLinear,
@@ -1723,7 +1730,8 @@ private class Gemma4Attention: Module {
                 biases: quantized.biases,
                 groupSize: quantized.groupSize,
                 bits: quantized.bits,
-                mode: quantized.mode)
+                mode: quantized.mode,
+                rsTable: CBv2AttentionOQMVV1.runsumTable(for: x))
         else { return oProj(x) }
         return projected
     }
@@ -1910,14 +1918,22 @@ private class Gemma4Attention: Module {
         let queryInput = lastQueryCache == nil ? x : x[0..., outputStart..., 0...]
         let queryLength = queryInput.dim(1)
 
+        // MMA-RS-001: one affine run-sum table for the layer input serves
+        // every Q/K/V projection that consumes x (at decode queryInput is x
+        // itself; the prefill paths leave the table nil because the guard
+        // requires the exact L=1 decode shape, and the incumbent dispatch
+        // runs). The table kernel is lazy: it executes only when a projection
+        // actually consumes it.
+        let qkvRunsumTable = CBv2AttentionQKVMMA8V1.runsumTable(for: x)
+
         // Keep Q/K/V on the promoted matrix-unit tier's arithmetic. At the
         // exact B=8/L=1 decode shapes the tight-grid host re-dispatches the
         // tier's own kernel text with grid.x = 1 (the frozen MLX host launches
         // 8 x-groups and the tier returns from 7 of them); every other shape
         // keeps the module's affine_qmv road. Routing Q or K through the older
         // custom helper would silently bypass the winning kernel.
-        let queryRaw = tierProjection(qProj, queryInput).reshaped(
-            B, queryLength, nHeads, effectiveHeadDim)
+        let queryRaw = tierProjection(qProj, queryInput, rsTable: qkvRunsumTable)
+            .reshaped(B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
             // KV-shared layer: projects queries only and borrows (K, V) from
@@ -1979,10 +1995,12 @@ private class Gemma4Attention: Module {
             lastQueryCache == nil
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
-        let kRaw = tierProjection(kProj, x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+        let kRaw = tierProjection(kProj, x, rsTable: qkvRunsumTable)
+            .reshaped(B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
         if let vProj {
-            vRaw = tierProjection(vProj, x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            vRaw = tierProjection(vProj, x, rsTable: qkvRunsumTable)
+                .reshaped(B, L, nKvHeads, effectiveHeadDim)
         } else {
             vRaw = kRaw
         }
@@ -2392,11 +2410,9 @@ public final class Gemma4GlueChainBox {
     public init() {}
 }
 
-/// GLUE-001: fused B8/L1 layer glue. Three single-dispatch kernels
+/// GLUE-001: fused decode-plane layer glue. Three single-dispatch kernels
 /// replace the strictly SERIAL RMSNorm/add chains between the layer's matmuls
-/// at the exact ranked decode geometry ([8, 1, 2816] bfloat16). These
-/// shape-based gates also admit eligible final-prefill tails narrowed to
-/// the same geometry:
+/// at the exact ranked decode geometry ([8, 1, 2816] bfloat16):
 ///
 ///   1. `dualPreNorm` — `preFeedforwardLayernorm(out)` and
 ///      `preFeedforwardLayernorm2(out)` norm the SAME tensor; one reduction
@@ -2423,17 +2439,6 @@ private enum Gemma4FusedLayerGlue {
     static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_FUSED_LAYER_GLUE"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
-    /// Pair only the two independent branch reductions in the existing
-    /// [8, 1, 2816] tails. The shape gate includes decode and eligible final
-    /// prefill tails narrowed to L=1. Disabling this selects their unchanged
-    /// original kernels.
-    private static let pairedRmsEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_DECODE_PAIRED_RMS"]
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
@@ -2468,67 +2473,6 @@ private enum Gemma4FusedLayerGlue {
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
         """
-    }
-
-    /// Same independent trees as prefill's glue_inv_rms2: four ordered
-    /// squares per input, the original SIMD and cross-SIMD sums, then precise
-    /// rsqrt. Share three barriers instead of running two three-barrier
-    /// reductions. Keep the widened BF16 values for the following norm step.
-    private static let pairedRmsSource = """
-        float av[4];
-        float bv[4];
-        threadgroup float local_sums_b[32];
-        {
-            float acc_a = 0;
-            float acc_b = 0;
-            for (int i = 0; i < 4; i++) {
-                av[i] = (float)a[base + i];
-                bv[i] = (float)b[base + i];
-                acc_a += av[i] * av[i];
-                acc_b += bv[i] * bv[i];
-            }
-            acc_a = simd_sum(acc_a);
-            acc_b = simd_sum(acc_b);
-            if (simd_group_id == 0) {
-                local_sums[simd_lane_id] = 0;
-                local_sums_b[simd_lane_id] = 0;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_lane_id == 0) {
-                local_sums[simd_group_id] = acc_a;
-                local_sums_b[simd_group_id] = acc_b;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_group_id == 0) {
-                acc_a = simd_sum(local_sums[simd_lane_id]);
-                acc_b = simd_sum(local_sums_b[simd_lane_id]);
-                if (simd_lane_id == 0) {
-                    local_inv[0] = metal::precise::rsqrt(acc_a / 2816.0f + 1e-06f);
-                    local_inv[1] = metal::precise::rsqrt(acc_b / 2816.0f + 1e-06f);
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        """
-
-    /// Derive both variants from the complete incumbent tail sources. Only
-    /// the first two reductions and their later device reloads are replaced;
-    /// every BF16 norm/product/add and the remaining reductions stay intact.
-    private static func pairedRmsTailSource(_ source: String) -> String {
-        var result = source
-        func replaceOnce(_ old: String, with new: String) {
-            precondition(result.components(separatedBy: old).count == 2)
-            result = result.replacingOccurrences(of: old, with: new)
-        }
-        replaceOnce(rmsReduce("a", into: "local_inv[0]"), with: pairedRmsSource)
-        replaceOnce(rmsReduce("b", into: "local_inv[1]"), with: "")
-        replaceOnce(
-            "const T h1 = w1[wbase + i] * static_cast<T>((float)a[base + i] * inv1);",
-            with: "const T h1 = w1[wbase + i] * static_cast<T>(av[i] * inv1);")
-        replaceOnce(
-            "const T h2 = w2[wbase + i] * static_cast<T>((float)b[base + i] * inv2);",
-            with: "const T h2 = w2[wbase + i] * static_cast<T>(bv[i] * inv2);")
-        return result
     }
 
     private static let normResidualKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
@@ -2637,7 +2581,11 @@ private enum Gemma4FusedLayerGlue {
         ensureRowContiguous: true
     )
 
-    private static let tailSource = """
+    private static let tailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_glue_tail_2816_bf16_v2",
+        inputNames: ["a", "b", "res", "w1", "w2", "w3", "s"],
+        outputNames: ["out"],
+        source: """
             const uint row = threadgroup_position_in_grid.x;
             const uint lid = thread_position_in_threadgroup.x;
             const uint simd_lane_id = thread_index_in_simdgroup;
@@ -2671,21 +2619,7 @@ private enum Gemma4FusedLayerGlue {
                 const T summed = res[base + i] + normed;
                 out[base + i] = summed * scalar;
             }
-        """
-
-    private static let tailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_2816_bf16_v2",
-        inputNames: ["a", "b", "res", "w1", "w2", "w3", "s"],
-        outputNames: ["out"],
-        source: tailSource,
-        ensureRowContiguous: true
-    )
-
-    private static let pairedTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_paired_rms_2816_bf16_v1",
-        inputNames: ["a", "b", "res", "w1", "w2", "w3", "s"],
-        outputNames: ["out"],
-        source: pairedRmsTailSource(tailSource),
+        """,
         ensureRowContiguous: true
     )
 
@@ -2808,7 +2742,11 @@ private enum Gemma4FusedLayerGlue {
     /// reduction instead of a standalone serial dispatch plus a full re-read
     /// of the row. The normed output replicates the stock rms sequence over
     /// the exact stored bf16 output values.
-    private static let tailChainSource = """
+    private static let tailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_glue_tail_chain_2816_bf16_v1",
+        inputNames: ["a", "b", "res", "w1", "w2", "w3", "s", "wn"],
+        outputNames: ["out", "normed"],
+        source: """
             const uint row = threadgroup_position_in_grid.x;
             const uint lid = thread_position_in_threadgroup.x;
             const uint simd_lane_id = thread_index_in_simdgroup;
@@ -2846,21 +2784,7 @@ private enum Gemma4FusedLayerGlue {
                 normed[base + i] =
                     wn[wbase + i] * static_cast<T>((float)outv[i] * inv4);
             }
-        """
-
-    private static let tailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_chain_2816_bf16_v1",
-        inputNames: ["a", "b", "res", "w1", "w2", "w3", "s", "wn"],
-        outputNames: ["out", "normed"],
-        source: tailChainSource,
-        ensureRowContiguous: true
-    )
-
-    private static let pairedTailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_chain_paired_rms_2816_bf16_v1",
-        inputNames: ["a", "b", "res", "w1", "w2", "w3", "s", "wn"],
-        outputNames: ["out", "normed"],
-        source: pairedRmsTailSource(tailChainSource),
+        """,
         ensureRowContiguous: true
     )
 
@@ -3082,8 +3006,7 @@ private enum Gemma4FusedLayerGlue {
             nextInputNormWeight.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-tail-chain")
-        let selected = pairedRmsEnabled ? pairedTailChainKernel : tailChainKernel
-        let outs = selected(
+        let outs = tailChainKernel(
             [mlpOut, expertOut, residual, w1, w2, w3, layerScalar,
              nextInputNormWeight],
             template: [("T", mlpOut.dtype)],
@@ -3108,8 +3031,7 @@ private enum Gemma4FusedLayerGlue {
             layerScalar.size == 1, layerScalar.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-tail")
-        let selected = pairedRmsEnabled ? pairedTailKernel : tailKernel
-        return selected(
+        return tailKernel(
             [mlpOut, expertOut, residual, w1, w2, w3, layerScalar],
             template: [("T", mlpOut.dtype)],
             grid: (rows * tgThreads, 1, 1),

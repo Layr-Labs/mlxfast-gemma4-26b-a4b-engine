@@ -421,171 +421,6 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         ensureRowContiguous: true
     )
 
-    /// GQA-PAIR-001: one simdgroup serves BOTH query heads of its GQA group.
-    ///
-    /// The incumbent lays a GQA group across two simdgroups of one threadgroup,
-    /// one query head each. Both simdgroups walk the same block-strided slot
-    /// sequence of the same `(row, kv head)` ring, so every K row and every V
-    /// row of the retained window is issued TWICE, once per simdgroup, for the
-    /// same 512 bytes. The second issue is a cache hit rather than a second
-    /// DRAM read, but it is still a full set of load instructions and a second
-    /// pass through the L1 return path, and the sliding layers stream 67 MB of
-    /// ring per decode step across 25 of the 30 layers.
-    ///
-    /// Here the lane holds both heads' queries and both heads' accumulators,
-    /// loads each K element and each V element ONCE, and feeds the two
-    /// independent online-softmax chains from that one register. The two chains
-    /// never mix: each keeps its own `max`, its own `sum`, its own accumulator
-    /// bank, and its own `simd_sum`, and each expression is character for
-    /// character the incumbent's with the shared load hoisted out. So every
-    /// output element's add sequence is unchanged and the partition, traversal
-    /// order and BF16 partial store are unchanged.
-    ///
-    /// Occupancy: the launch keeps its 512 threadgroups and drops from two
-    /// simdgroups to one, so half as many K/V loads are outstanding. The
-    /// incumbent's own sizing note puts roughly 1 MB in flight against the
-    /// ~225 KB needed to cover DRAM latency on a 450 GB/s part, so halving it
-    /// still clears that bar with margin.
-    ///
-    /// Kill switch: `DARKBLOOM_CBV2_DECODE_GQA_PAIRED_PASSA=0`.
-    static let gqaPairedPassAEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_DECODE_GQA_PAIRED_PASSA"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
-    private static let fusedRingPassAPairedKernel: MLXFast.MLXFastKernel =
-        MLXFast.metalKernel(
-            name:
-                "cbv2_ragged8_ringwrite_sdpa_2pass_a_gqapair_bf16_d256_g2"
-                + "_b\(blocks)_v1",
-            inputNames: [
-                "queries",
-                "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
-                "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
-                "starts", "new_keys", "new_values", "write_fence",
-            ],
-            outputNames: ["partials", "sums", "maxs", "fence"],
-            source: """
-                constexpr int simd_width = 32;
-                constexpr int values_per_lane = D / simd_width;
-                static_assert((N & (N - 1)) == 0, "ring length must be a power of two");
-                static_assert(GQA == 2, "this kernel pairs exactly two query heads");
-                constexpr uint ring_mask = uint(N - 1);
-
-                const int kv_head = int(threadgroup_position_in_grid.x);
-                const int batch_index = int(threadgroup_position_in_grid.y);
-                const int block = int(threadgroup_position_in_grid.z);
-                const int query_head = GQA * kv_head;
-                const int batch_head = batch_index * 16 + query_head;
-                const int lane = int(thread_index_in_simdgroup);
-
-                const device T* keys = k0;
-                const device T* values = v0;
-                switch (batch_index) {
-                    case 1: keys = k1; values = v1; break;
-                    case 2: keys = k2; values = v2; break;
-                    case 3: keys = k3; values = v3; break;
-                    case 4: keys = k4; values = v4; break;
-                    case 5: keys = k5; values = v5; break;
-                    case 6: keys = k6; values = v6; break;
-                    case 7: keys = k7; values = v7; break;
-                    default: break;
-                }
-
-                const device T* query =
-                    queries + batch_head * D + lane * values_per_lane;
-                keys += kv_head * N * D + lane * values_per_lane;
-                values += kv_head * N * D + lane * values_per_lane;
-                const device T* new_key = new_keys
-                    + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
-                const device T* new_value = new_values
-                    + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
-                const uint ring_start = starts[batch_index];
-                const uint write_slot = (ring_start + ring_mask) & ring_mask;
-                if (block == 0) {
-                    device T* write_key = const_cast<device T*>(keys) + write_slot * D;
-                    device T* write_value = const_cast<device T*>(values) + write_slot * D;
-                    for (int element = 0; element < values_per_lane; ++element) {
-                        write_key[element] = new_key[element];
-                        write_value[element] = new_value[element];
-                    }
-                }
-                if (batch_index == 0 && kv_head == 0 && block == 0 && lane == 0) {
-                    fence[0] = write_fence[0] + 1;
-                }
-
-                device T* partial = partials
-                    + batch_head * BLOCKS * D + block * D + lane * values_per_lane;
-                device float* sum_out = sums + batch_head * BLOCKS + block;
-                device float* max_out = maxs + batch_head * BLOCKS + block;
-
-                thread float q_lo[values_per_lane];
-                thread float q_hi[values_per_lane];
-                thread float acc_lo[values_per_lane];
-                thread float acc_hi[values_per_lane];
-                for (int element = 0; element < values_per_lane; ++element) {
-                    q_lo[element] = 1.0f * float(query[element]);
-                    q_hi[element] = 1.0f * float(query[D + element]);
-                    acc_lo[element] = 0.0f;
-                    acc_hi[element] = 0.0f;
-                }
-
-                uint slot = (ring_start + uint(block)) & ring_mask;
-                float max_lo = -3.402823466e+38F;
-                float max_hi = -3.402823466e+38F;
-                float sum_lo = 0.0f;
-                float sum_hi = 0.0f;
-                for (int token = block; token < N; token += BLOCKS) {
-                    const bool current = token == N - 1;
-                    const device T* k = current ? new_key : keys + slot * D;
-                    const device T* v = current ? new_value : values + slot * D;
-                    float score_lo = 0.0f;
-                    float score_hi = 0.0f;
-                    for (int element = 0; element < values_per_lane; ++element) {
-                        const float key_element = float(k[element]);
-                        score_lo += q_lo[element] * key_element;
-                        score_hi += q_hi[element] * key_element;
-                    }
-                    score_lo = simd_sum(score_lo);
-                    score_hi = simd_sum(score_hi);
-
-                    const float new_max_lo = max(max_lo, score_lo);
-                    const float new_max_hi = max(max_hi, score_hi);
-                    const float old_factor_lo = fast::exp(max_lo - new_max_lo);
-                    const float old_factor_hi = fast::exp(max_hi - new_max_hi);
-                    const float score_factor_lo = fast::exp(score_lo - new_max_lo);
-                    const float score_factor_hi = fast::exp(score_hi - new_max_hi);
-                    max_lo = new_max_lo;
-                    max_hi = new_max_hi;
-                    sum_lo = sum_lo * old_factor_lo + score_factor_lo;
-                    sum_hi = sum_hi * old_factor_hi + score_factor_hi;
-                    for (int element = 0; element < values_per_lane; ++element) {
-                        const float value_element = float(v[element]);
-                        acc_lo[element] = acc_lo[element] * old_factor_lo
-                            + score_factor_lo * value_element;
-                        acc_hi[element] = acc_hi[element] * old_factor_hi
-                            + score_factor_hi * value_element;
-                    }
-
-                    slot = (slot + uint(BLOCKS)) & ring_mask;
-                }
-
-                if (lane == 0) {
-                    sum_out[0] = sum_lo;
-                    max_out[0] = max_lo;
-                    sum_out[BLOCKS] = sum_hi;
-                    max_out[BLOCKS] = max_hi;
-                }
-                for (int element = 0; element < values_per_lane; ++element) {
-                    partial[element] = T(acc_lo[element]);
-                    partial[BLOCKS * D + element] = T(acc_hi[element]);
-                }
-            """,
-            ensureRowContiguous: true
-        )
-
     private static let passBKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name:
             "cbv2_ragged8_sdpa_2pass_b_direct_bf16_d256_b\(blocks)"
@@ -764,11 +599,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         let startArray = MLXArray(starts.map(UInt32.init), [batch])
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
-        let paired = gqaPairedPassAEnabled && gqa == 2
-        if paired {
-            CBv2EngageMark.once("decode-gqa-paired-passa")
-        }
-        let passA = (paired ? fusedRingPassAPairedKernel : fusedRingPassAKernel)(
+        let passA = fusedRingPassAKernel(
             [queries] + keys + values
                 + [startArray, newKeys, newValues, previousWriteFence],
             template: [
@@ -779,10 +610,8 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 ("KV_HEADS", kvHeads),
                 ("BLOCKS", blocks),
             ],
-            grid: paired
-                ? (kvHeads * 32, batch, blocks)
-                : (kvHeads * 32, batch * gqa, blocks),
-            threadGroup: paired ? (32, 1, 1) : (32, gqa, 1),
+            grid: (kvHeads * 32, batch * gqa, blocks),
+            threadGroup: (32, gqa, 1),
             outputShapes: [partialShape, summaryShape, summaryShape, [1]],
             outputDTypes: [.bfloat16, .float32, .float32, .int32]
         )

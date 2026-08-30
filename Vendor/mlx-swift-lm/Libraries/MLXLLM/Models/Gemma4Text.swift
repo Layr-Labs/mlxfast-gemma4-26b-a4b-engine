@@ -2885,10 +2885,18 @@ private enum Gemma4ZipRouterV1 {
     /// product instead of the 25 us down projection (measured 0.02 ms/step
     /// worse and noisier). `0` drops the expert fence, which lets the tape
     /// float the dense down back behind the expert kernels.
+    // UNFENCE-PROBE: default flipped 1 -> 0 to price the expert fence on the
+    // token-major machine. plan 1 is the twice-sealed schedule; plan 0 deletes
+    // exactly one MLX.depends edge (expertNorm n2 is no longer fenced behind
+    // the dense down projection), pure encoder ordering, operands bit-identical.
+    // Re-entry r2: first attempt 4c03f948 failed unscored inside the
+    // 7:48-8:06 PM attrition window (fkiene x2, samfenwick, 0xpg, this
+    // account -- five failures in eighteen minutes, board-wide runner
+    // attrition, not diff-specific). Executable diff unchanged from r1.
     static let plan: Int = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_ZIP_ROUTER_PLAN"], let v = Int(raw)
-        else { return 1 }
+        else { return 0 }
         return v
     }()
 

@@ -64,6 +64,13 @@ public enum Gemma4PrefillGlueV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    public static let expertTailFusionEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_EXPERT_TAIL_FUSION"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// This checkpoint's hidden size, and the `rms_single_row` launch geometry
     /// the stock host derives from it (`RMS_N_READS` 4, so 2816 / 4 = 704
     /// threads, 22 simdgroups, one threadgroup per row).
@@ -446,6 +453,144 @@ public enum Gemma4PrefillGlueV1 {
 
         let outs = tailChainKernel(
             [h1, h2, w1, w2, w3, residual2, layerScalar, nextInputNormWeight],
+            template: [("T", h1.dtype)],
+            grid: (threadsPerRow, rows, 1),
+            threadGroup: (threadsPerRow, 1, 1),
+            outputShapes: [h1.shape, h1.shape],
+            outputDTypes: [h1.dtype, h1.dtype]
+        )
+        return (outs[0], outs[1])
+    }
+
+    // MARK: - branch tail, chained with fused expert unsort (8 dispatches -> 1)
+
+    private static let tailChainUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_prefill_expert_unsort_tail_chain_2816_v1",
+        inputNames: [
+            "h1", "sorted_outputs", "inverse_order", "expert_weights",
+            "w1", "w2", "w3", "res2", "s", "wn"
+        ],
+        outputNames: ["out", "normed"],
+        source: """
+            threadgroup float local_sums_a[32];
+            threadgroup float local_sums_b[32];
+            threadgroup float local_inv2[2];
+
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+
+            const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+
+            float av[GLUE_NREADS];
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                av[i] = static_cast<float>(h1[base + i]);
+            }
+
+            T accum[GLUE_NREADS] = {(T)0, (T)0, (T)0, (T)0};
+            const uint assignment_base = row * 8u;
+            for (uint slot = 0; slot < 8u; ++slot) {
+                const uint assignment = assignment_base + slot;
+                const uint sorted_row = (uint)inverse_order[assignment];
+                const float w = static_cast<float>(expert_weights[assignment]);
+                const size_t src_base = size_t(sorted_row) * GLUE_AXIS + lid * GLUE_NREADS;
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    const T weighted = static_cast<T>(static_cast<float>(sorted_outputs[src_base + i]) * w);
+                    accum[i] = accum[i] + weighted;
+                }
+            }
+
+            float bv[GLUE_NREADS];
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                bv[i] = static_cast<float>(accum[i]);
+            }
+
+            float inv_a = 0;
+            float inv_b = 0;
+            glue_inv_rms2(
+                av, bv, local_sums_a, local_sums_b, local_inv2,
+                simd_lane_id, simd_group_id, GLUE_EPS, inv_a, inv_b);
+
+            float tv[GLUE_NREADS];
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                const uint j = lid * GLUE_NREADS + i;
+                const T n1 = static_cast<T>(w1[j] * static_cast<T>(av[i] * inv_a));
+                const T n2 = static_cast<T>(w2[j] * static_cast<T>(bv[i] * inv_b));
+                tv[i] = static_cast<float>(static_cast<T>(n1 + n2));
+            }
+
+            const float inv_t = glue_inv_rms(
+                tv, local_sums_a, local_inv2, simd_lane_id, simd_group_id, GLUE_EPS);
+
+            const T scalar = s[0];
+            float ov[GLUE_NREADS];
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                const uint j = lid * GLUE_NREADS + i;
+                const T normed3 = static_cast<T>(w3[j] * static_cast<T>(tv[i] * inv_t));
+                const T summed = static_cast<T>(res2[base + i] + normed3);
+                const T scaled = static_cast<T>(summed * scalar);
+                out[base + i] = scaled;
+                ov[i] = static_cast<float>(scaled);
+            }
+
+            const float inv_n = glue_inv_rms(
+                ov, local_sums_a, local_inv2, simd_lane_id, simd_group_id, GLUE_EPS);
+
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                const uint j = lid * GLUE_NREADS + i;
+                normed[base + i] = wn[j] * static_cast<T>(ov[i] * inv_n);
+            }
+            """,
+        header: kernelHeader,
+        ensureRowContiguous: true
+    )
+
+    /// `branchTailChained`, but with the 8-slot weighted expert unsort reduction
+    /// performed directly in thread registers before the norm chain.
+    /// Returns `nil` off the prefill plane or if disabled.
+    public static func branchTailChainedUnsort(
+        h1: MLXArray,
+        carrier: WeightedExpertUnsortCarrier,
+        w1: MLXArray,
+        w2: MLXArray,
+        w3: MLXArray,
+        residual2: MLXArray,
+        layerScalar: MLXArray,
+        nextInputNormWeight: MLXArray,
+        eps epsIn: Float
+    ) -> (out: MLXArray, normedNext: MLXArray)? {
+        guard expertTailFusionEnabled,
+            let rows = planeRows(h1, weight: w1, eps: epsIn),
+            carrier.sortedOutputs.shape == [rows * 8, axis],
+            carrier.sortedOutputs.dtype == .bfloat16,
+            carrier.inverseOrder.shape == [rows * 8],
+            carrier.inverseOrder.dtype == .uint32,
+            carrier.weights.shape == [rows, 8],
+            carrier.weights.dtype == .bfloat16,
+            residual2.shape == h1.shape, residual2.dtype == h1.dtype,
+            w2.shape == w1.shape, w2.dtype == w1.dtype,
+            w3.shape == w1.shape, w3.dtype == w1.dtype,
+            layerScalar.size == 1, layerScalar.dtype == h1.dtype,
+            nextInputNormWeight.shape == w1.shape,
+            nextInputNormWeight.dtype == w1.dtype
+        else { return nil }
+
+        CBv2EngageMark.once("prefill-expert-tail-fuse")
+
+        let outs = tailChainUnsortKernel(
+            [
+                h1,
+                carrier.sortedOutputs,
+                carrier.inverseOrder,
+                carrier.weights,
+                w1,
+                w2,
+                w3,
+                residual2,
+                layerScalar,
+                nextInputNormWeight
+            ],
             template: [("T", h1.dtype)],
             grid: (threadsPerRow, rows, 1),
             threadGroup: (threadsPerRow, 1, 1),

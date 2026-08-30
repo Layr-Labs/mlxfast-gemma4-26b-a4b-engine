@@ -665,6 +665,40 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     private static let minKeyLength = 4
     private static let maxKeyLength = 4095
 
+    /// QTILE-001 kill switch: `DARKBLOOM_GEMMA4_D512_QK_QUERY_TILE=0` emits
+    /// the incumbent source, character for character.
+    private static let queryTileEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_QK_QUERY_TILE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// QTILE-001: the `[GQA, D]` query slice this threadgroup consumes is
+    /// invariant across both of dispatch 1's loops. Every simdgroup reads all
+    /// 4096 of its words, and re-reads them once per `vtg` step, so one
+    /// threadgroup issues 16 full passes over the same 8 KiB. Staging it in
+    /// threadgroup memory once turns 15 of those passes into threadgroup
+    /// loads. The words are copied verbatim, so `static_cast<float>` sees the
+    /// identical bf16 pattern and the unrolled FMA order is untouched.
+    private static let qkQueryTilePrologue: String = queryTileEnabled
+        ? """
+
+            threadgroup T qtile[GQA * D];
+            for (int base = (sg * 32 + lane) * 4; base < GQA * D; base += 512) {
+                #pragma clang loop unroll(full)
+                for (int e = 0; e < 4; ++e) {
+                    qtile[base + e] = query[base + e];
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        """
+        : ""
+
+    private static let qkQueryOperand: String = queryTileEnabled ? "qtile" : "query"
+
+    private static let qkVariantSuffix: String = queryTileEnabled ? "_qt1" : ""
+
     /// Dispatch 1 — QKᵀ. Grid: (row, kv head, chunk of 4 virtual gemv
     /// threadgroups = 64 score rows) × 128 threads (4 simdgroups — exactly
     /// the stock gemv threadgroup shape). Each simdgroup replays the stock
@@ -714,7 +748,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 queries + size_t(row * 16 + kv_head * GQA) * D;
             device T* score_rows =
                 scores + size_t(row * 16 + kv_head * GQA) * key_length;
-
+        \(qkQueryTilePrologue)
             const int virtual_groups = (key_length + 15) / 16;
             const int vtg_lo = chunk * 4;
             const int vtg_hi = min(vtg_lo + 4, virtual_groups);
@@ -737,7 +771,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
                             v_coeff[h][tn] = static_cast<float>(
-                                query[h * D + bn + tn]);
+                                \(qkQueryOperand)[h * D + bn + tn]);
                         }
                     }
                     int mat_offset = 0;
@@ -785,7 +819,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         """
 
     private static let qkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_qk_bf16_g8_v1",
+        name: "cbv2_ragged8_sdpa_d512_qk_bf16_g8_v1\(qkVariantSuffix)",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -797,7 +831,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     )
 
     private static let qkFencedKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_qk_fenced_bf16_g8_v1",
+        name: "cbv2_ragged8_sdpa_d512_qk_fenced_bf16_g8_v1\(qkVariantSuffix)",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",

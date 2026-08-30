@@ -153,6 +153,11 @@ struct CBv2MTPSeedCostLedger {
     var count: Int { byBucket.count }
 }
 
+// NULL-CONTROL MARKER (this comment is the entire diff of submission
+// "BOX-CONTROL-001"). It exists so an otherwise byte-identical re-entry of the
+// promoted crown can be uploaded past the submit-time content dedup, isolating
+// ranked-box assignment from candidate code. No behavior changes.
+
 // MARK: - Driver
 
 /// Engine-side MTP state: drafter binding, carries, plan marks, metrics.

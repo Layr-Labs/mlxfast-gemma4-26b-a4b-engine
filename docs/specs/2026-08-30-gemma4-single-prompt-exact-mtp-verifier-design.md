@@ -1,7 +1,7 @@
 # Gemma 4 Single-Prompt Exact MTP Verifier and Performance Chart Design
 
 Date: 2026-08-30  
-Status: approved design, awaiting written-spec review  
+Status: revised after B1 applicability audit, awaiting written-spec review
 Worktree: `mlxfast-gemma4-mtp-depth3-tip`  
 Baseline revision: `dfb5d48257de703e235f54f8cb6bf45b914fe6df`
 
@@ -24,38 +24,74 @@ are not numerically equivalent.
 
 An exact fixed-width verifier implementation already exists as three clean
 commits based on the same upstream tip: `3128eb5`, `5eea619`, and `764e9eb`.
-Those commits install construction-bound C2/C3/C4 projection routes but do not
-enable rectangular MTP verification. Reusing those clean commits, then wiring
-them under an exact parity gate, is proportional to the measured bottleneck.
-The dirty verifier worktree is evidence only and is not a source of code.
+Those commits are useful arithmetic scaffolding, but a plan-time applicability
+audit found that every verifier kernel test uses `[8, C, ...]` tensors and the
+model route is explicitly gated by `tokens.dim(0) == 8`. The authoritative
+single-prompt receipt says `batch_size: 1`, and CBv2 does not pad that request to
+eight rows. The clean verifier therefore cannot be enabled unchanged: it would
+never engage for the requested workload.
+
+The corrected design extends the clean fixed-width machinery with a physical
+B1/C2-C4 route whose projection reductions are certified against independent
+B1/L1 calls. The dirty verifier worktree remains evidence only and is not a
+source of code.
+
+## Approaches considered
+
+### A. Exact B1/C2-C4 weight-sharing verifier — selected
+
+Generalize the clean fixed-width projection kernels so one weight traversal
+serves two through four speculative positions while each position retains the
+ordinary B1/L1 reduction order. Serialize attention positions exactly as the
+current rectangular cache contract requires. This directly attacks repeated
+weight reads and is the only approach with a credible multi-token throughput
+gain while preserving token identity.
+
+### B. Lazy serial target graph
+
+Keep independent B1/L1 target calls but defer their evaluation into one graph.
+This has a smaller patch, but an earlier experiment showed that mutable KV can
+observe later graph state unless every column is evaluated immediately. Fixing
+that ownership hazard restores much of the synchronization cost, and the model
+still rereads weights for every column. It remains a diagnostic, not the chosen
+production path.
+
+### C. Stock rectangular forward
+
+Evaluate `[1, C]` with stock kernels. This is simplest and likely fast, but it
+already changes output tokens on 7 of 8 hidden prompts. It is rejected because
+the user did not authorize approximate verification.
 
 ## Scope
 
 This project will:
 
-1. Integrate only the three clean exact-verifier commits onto the current clean
-   fixed-depth Gemma branch.
-2. Route MTP verification widths C2, C3, and C4 through the installed exact
-   fixed-width verifier after construction-time topology, quantization, storage,
-   dtype, and artifact validation.
-3. Preserve serial width-1 arithmetic and token output exactly for every tested
+1. Integrate the three clean exact-verifier commits onto the current clean
+   fixed-depth Gemma branch as the reviewed fixed-width arithmetic base.
+2. Add and certify physical B1 verifier projections for C2, C3, and C4 against
+   independent ordinary B1/L1 projection calls.
+3. Route single-prompt MTP verification widths C2, C3, and C4 through the
+   installed B1 exact verifier after construction-time topology, quantization,
+   storage, dtype, and artifact validation.
+4. Preserve serial width-1 arithmetic and token output exactly for every tested
    prompt and depth.
-4. Profile drafter, target verification, head, synchronization, and round
+5. Profile drafter, target verification, head, synchronization, and round
    overhead outside the measured hot path.
-5. Tune fixed MTP depths 1, 2, and 3 using a 16K prefix, a 1,024-token Python
+6. Tune fixed MTP depths 1, 2, and 3 using a 16K prefix, a 1,024-token Python
    coding suffix, 1,024 decoded tokens, batch 1, concurrency 1, and three timed
    repetitions per depth.
-6. Benchmark the winning exact configuration and the unchanged autoregressive
+7. Benchmark the winning exact configuration and the unchanged autoregressive
    control at 0, 64K, and 128K prefix, always followed by the same 1,024-token
    Python coding suffix and 1,024 decoded tokens, with three timed repetitions
    per cell.
-7. Produce a deterministic, publication-quality single-prompt performance chart
+8. Produce a deterministic, publication-quality single-prompt performance chart
    from the final JSON receipt, with prefill and decode throughput shown as
    separate metrics.
 
 ## Non-goals
 
 - Batch sizes or concurrency greater than one.
+- Promoting or benchmarking the existing physical-B8 verifier route.
 - Approximate verification, tolerance-based token equivalence, or accepting a
   different generated stream for speed.
 - A hot-path fallback from the exact verifier to stock or serial execution.
@@ -70,9 +106,11 @@ This project will:
 
 Model loading validates the fixed Gemma 4 target topology, artifact width,
 quantization metadata, tensor storage, and supported verifier widths once. If
-all invariants hold, it installs typed C2/C3/C4 verifier contexts and a fixed
-route table. If any invariant fails, construction fails before warmup with a
-specific error; an experimental route is never partially installed.
+all invariants hold, it installs typed B1/C2, B1/C3, and B1/C4 verifier contexts
+and a fixed route table. The installed context includes the physical batch and
+column width, so a B8 context cannot satisfy a B1 request. If any invariant
+fails, construction fails before warmup with a specific error; an experimental
+route is never partially installed.
 
 ### Decode round
 
@@ -80,7 +118,7 @@ For fixed draft depth `d`:
 
 1. The drafter proposes `d` tokens using the existing cache-correct MTP path.
 2. The round forms the target verification window of width `d + 1`.
-3. The construction-installed route directly selects C2, C3, or C4.
+3. The construction-installed route directly selects B1/C2, B1/C3, or B1/C4.
 4. The exact verifier evaluates that width with fixed-shape kernels whose
    arithmetic matches independent serial `[1, 1]` target calls.
 5. The existing acceptance rule commits the matching prefix plus the target
@@ -120,9 +158,13 @@ Prefill and decode never share a scale or become one aggregate TPS number.
 
 ### Exact verifier contract
 
-- Supported logical widths are exactly 2, 3, and 4.
+- The promoted physical batch is exactly one; supported logical widths are
+  exactly 2, 3, and 4.
 - For each width, target logits, chosen tokens, accepted count, committed token
   sequence, and final cache lengths match the serial verifier.
+- Every fixed-width projection is bit-exact to concatenating `C` independent
+  ordinary `[1, 1, ...]` projection results; comparison against the existing
+  B8 oracle is insufficient.
 - The verifier head uses the artifact-declared width; tests may not substitute a
   smaller convenient vocabulary or hidden width for route certification.
 - Route installation is immutable after model construction.
@@ -148,7 +190,8 @@ Prefill and decode never share a scale or become one aggregate TPS number.
 
 ### Promotion gates
 
-1. Focused C2/C3/C4 kernel and route tests pass.
+1. Focused B1/C2-C4 kernel and route tests pass against independent B1/L1
+   projection calls.
 2. Multi-prompt real-model token/digest and cache parity against serial
    verification pass at depths 1, 2, and 3.
 3. The unchanged AR control remains within its repeatability band.
@@ -166,8 +209,8 @@ if the gain is smaller.
 Implementation follows test-driven development:
 
 1. Add failing construction and route tests before enabling any verifier route.
-2. Add failing fixed-width projection parity tests for C2, C3, and C4 before
-   integrating the corresponding kernel implementation.
+2. Add failing physical-B1 fixed-width projection parity tests for C2, C3, and
+   C4 before integrating the corresponding kernel implementation.
 3. Add failing full-round tests for logits, selected tokens, accepted tokens,
    committed sequence, and cache lengths before changing the engine strategy.
 4. Run existing real-engine single and batch token-losslessness tests to ensure
@@ -213,7 +256,16 @@ that remains at or below the AR mean is not called a success and is not used as
 the chart headline. The final chart still shows that best exact MTP result as an
 honest comparison, with AR labeled as the winner.
 
-### 3. Construction accepts an artifact with incompatible fixed-width geometry — critical
+### 3. A physical-B8 verifier is mistaken for the single-prompt route — critical
+
+The clean verifier commits compile and install on the real artifact but are
+gated to `tokens.dim(0) == 8`, so tests that inspect only installation would
+produce a false engagement claim. The revised route key includes both physical
+batch and columns, full-round tests assert B1/C2-C4 engagement from the model
+boundary, and the receipt must report `batch_size: 1` and positive rectangular
+verification rounds.
+
+### 4. Construction accepts an artifact with incompatible fixed-width geometry — critical
 
 A test-only or adjacent model shape could compile yet violate the real Gemma
 artifact's width or quantized layout. The verifier is bound only after validating
@@ -225,8 +277,10 @@ fallback. Mismatch fails before warmup.
 1. Cherry-pick the three clean verifier commits into the isolated clean-tip
    worktree and resolve only conflicts caused by the four already-committed MTP
    depth/cache fixes.
-2. Prove construction and C2/C3/C4 component parity.
-3. Wire exact verification and prove full-round parity.
+2. Add physical-B1 route keys and prove B1/C2-C4 projection parity against
+   independent B1/L1 calls.
+3. Wire only the B1 exact verification route for this workload and prove
+   full-round token, logit, acceptance, and cache parity.
 4. Profile and tune one change at a time at 16K + 1K.
 5. Run the full guarded 0/64K/128K three-repeat matrix.
 6. Generate the chart from the final receipt and visually inspect the SVG/PNG

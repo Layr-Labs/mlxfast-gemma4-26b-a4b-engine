@@ -470,7 +470,7 @@ private let routeCountingSort64Enabled: Bool = {
 private let expertPrefixBoundsEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_GEMMA4_EXPERT_PREFIX_BOUNDS"]
-    else { return true }
+    else { return false }
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
@@ -979,6 +979,32 @@ public enum SwitchGLUWeightedReductionProfile: Sendable {
     case gemma4ProductionGeGLU
 }
 
+/// ZIP-XDOWN-001 co-scheduling handles for `SwitchGLU`'s expert chain.
+///
+/// Ordering device only. A caller that owns a chain which is independent of
+/// the expert projections can hand one of these to
+/// ``SwitchGLU/callAndWeightedReduce(_:_:weights:fuseSortedReduction:isProductionPrefill:coSchedule:)``.
+/// Each callback receives a handle produced by the expert chain; the caller
+/// builds its own stage with an `MLX.depends` edge onto that handle, so the
+/// two chains alternate in any topological order of the graph and MLX's
+/// concurrent Metal encoder pairs them into shared barrier stages
+/// (`backend/metal/device.cpp`, `maybeInsertBarrier`).
+///
+/// No callback may connect the two chains arithmetically: `MLX.depends`
+/// aliases its input's buffer and emits no dispatch, so every expert kernel
+/// still reads exactly the operands it reads today.
+public final class SwitchGLUCoSchedule {
+    /// Receives the expert gate and up projections. The returned handle, when
+    /// non-nil, is named as a dependency of the expert activation product, so
+    /// the caller's stage stays in the gate/up barrier stage.
+    public var rideGateUp: ((MLXArray, MLXArray) -> MLXArray?)?
+    /// Receives the expert activation product (the GeGLU stage's output).
+    public var rideActivated: ((MLXArray) -> Void)?
+    /// Receives the sorted expert down projection.
+    public var rideDown: ((MLXArray) -> Void)?
+    public init() {}
+}
+
 public class SwitchGLU: Module {
     @ModuleInfo(key: "gate_proj") var gateProj: SwitchLinear?
     @ModuleInfo(key: "up_proj") var upProj: SwitchLinear?
@@ -1091,7 +1117,8 @@ public class SwitchGLU: Module {
     }
 
     private func projectExperts(
-        _ x: MLXArray, _ indices: MLXArray
+        _ x: MLXArray, _ indices: MLXArray,
+        coSchedule: SwitchGLUCoSchedule? = nil
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
         let useLhsIndices =
             indices.size == 64 && indices.ndim == 2 && indices.shape == [8, 8]
@@ -1133,18 +1160,31 @@ public class SwitchGLU: Module {
             xGate = gateProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
         }
 
-        let activated: MLXArray
-        if let activationProduct {
-            activated = activationProduct(xGate, xUp)
-        } else if isSiluActivation {
-            activated = compiledSwiGLU(xGate, xUp)
-        } else if isGeluActivation {
-            activated = geGLUProduct(xGate, xUp)
-        } else {
-            activated = activation(xGate) * xUp
+        // ZIP-XDOWN-001: the co-scheduled chain's first stage is emitted here,
+        // named as a dependency of the activation product below. `gateOperand`
+        // is `xGate` itself when nothing rides along, and otherwise an
+        // `MLX.depends` alias of it -- same buffer, shape, strides and flags.
+        var gateOperand = xGate
+        if let coSchedule, let ride = coSchedule.rideGateUp,
+            let fence = ride(xGate, xUp)
+        {
+            gateOperand = MLX.depends(input: xGate, dependencies: [fence])
         }
 
+        let activated: MLXArray
+        if let activationProduct {
+            activated = activationProduct(gateOperand, xUp)
+        } else if isSiluActivation {
+            activated = compiledSwiGLU(gateOperand, xUp)
+        } else if isGeluActivation {
+            activated = geGLUProduct(gateOperand, xUp)
+        } else {
+            activated = activation(gateOperand) * xUp
+        }
+        coSchedule?.rideActivated?(activated)
+
         x = downProj(activated, idx, sortedIndices: doSort)
+        coSchedule?.rideDown?(x)
         return (x, doSort ? inverseOrder : nil, doSort)
     }
 
@@ -1266,7 +1306,8 @@ public class SwitchGLU: Module {
         _ indices: MLXArray,
         weights: MLXArray,
         fuseSortedReduction: Bool,
-        isProductionPrefill: Bool = true
+        isProductionPrefill: Bool = true,
+        coSchedule: SwitchGLUCoSchedule? = nil
     ) -> MLXArray {
         // At B=8 decode there are exactly 64 assignments (8 rows x top-k 8),
         // which is the sorting threshold and the minimum geometry accepted by
@@ -1280,7 +1321,7 @@ public class SwitchGLU: Module {
             return weightedExpertSum(callAsFunction(x, indices), weights)
         }
 
-        let projected = projectExperts(x, indices)
+        let projected = projectExperts(x, indices, coSchedule: coSchedule)
         guard projected.sorted,
             let inverseOrder = projected.inverseOrder,
             projected.output.ndim == 3,

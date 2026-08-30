@@ -165,7 +165,17 @@ public enum Gemma4MMAQuantizedGEMV {
         }
     }()
 
-    private static let defaultVersion = 26
+    // MMA-HV16: price the four-tile-per-SIMD-group formulation (v16) against
+    // the shipped v26 single-reused-cursor probe. Tonight's board law says
+    // schedule churn costs ~6% and every kernel-family rung {2,3,4,5,6,7,10,
+    // 13,15,16,26} of this ladder is golden-PASS byte-identical on both the
+    // ranked fixture and the deep 1024_1024 fixture -- the tied-head GEMV is
+    // the hot decode kernel (n=vocab >= 8192 admits at B=8), and v16 halves
+    // per-tile staging traffic by reusing each activation fragment across
+    // adjacent output tiles without touching accumulation order. Ship diff
+    // compile-verified from a clean scratch tree. Kill switch via
+    // DARKBLOOM_GEMMA4_MMA_HEAD_VERSION=26.
+    private static let defaultVersion = 16
 
     /// Whether the selected tied-head implementation consumes the exact
     /// per-row/per-group activation sums. The final RMSNorm uses this to avoid

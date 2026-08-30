@@ -1,9 +1,55 @@
 @testable import MLXLMCommon
 @testable import MLXLLM
+import Foundation
 import Testing
 
 @Suite("Gemma 4 MTP verifier route")
 struct Gemma4MTPVerifierRouteTests {
+    @Test
+    func installedLayerPathHasNoFailableDecodeHelperFallbacks() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourceURL = repositoryRoot.appendingPathComponent(
+            "Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Gemma4Text.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+
+        let routerStart = try #require(source.range(
+            of: "fileprivate func bindMTPVerifier(\n"
+                + "        columns: Int\n"
+                + "    ) throws -> (MLXArray) -> MLXArray"))
+        let routerEnd = try #require(source.range(
+            of: "    // MARK: ZIP-ROUTER-001 stages",
+            range: routerStart.upperBound..<source.endIndex))
+        let routerPath = String(source[routerStart.lowerBound..<routerEnd.lowerBound])
+        let verifierSelection = try #require(
+            routerPath.range(of: "return selectTopK(verifier(normed))"))
+        let decodeOnlyFusedSelection = try #require(
+            routerPath.range(of: "Gemma4FusedRouterTop8.apply"))
+        #expect(verifierSelection.upperBound < decodeOnlyFusedSelection.lowerBound)
+
+        let layerStart = try #require(source.range(
+            of: "    public func callAsFunction(\n"
+                + "        _ x: MLXArray,\n"
+                + "        mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,"))
+        let ordinaryRoute = try #require(source.range(
+            of: "        // PREFIX-001: only build the joined producer",
+            range: layerStart.upperBound..<source.endIndex))
+        let verifierLayerPath = String(
+            source[layerStart.lowerBound..<ordinaryRoute.lowerBound])
+        #expect(verifierLayerPath.contains("if verifier != nil"))
+        #expect(verifierLayerPath.contains("if let verifier {"))
+        #expect(verifierLayerPath.contains("let postAttn = postAttentionLayernorm(attnOut)"))
+        #expect(verifierLayerPath.contains(
+            "let n1 = preFeedforwardLayernorm(out)"))
+        #expect(verifierLayerPath.contains(
+            "let n2 = preFeedforwardLayernorm2(out)"))
+        #expect(verifierLayerPath.contains("return (out, kvPair, attnPositionOffset)"))
+        #expect(!verifierLayerPath.contains("Gemma4FusedLayerGlue"))
+        #expect(!verifierLayerPath.contains("Gemma4PrefillGlueV1"))
+    }
+
     @Test
     func exactProductionConstructionFixtureInstallsEveryFixedWidthEntrypoint() throws {
         let fixture = Gemma4MTPVerifierConstructionFixture.production

@@ -2871,6 +2871,24 @@ private class Gemma4Router: Module {
         return bound
     }
 
+    private func selectTopK(
+        _ expertScores: MLXArray
+    ) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
+        var topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
+        topKIndices = topKIndices[.ellipsis, kth...]
+
+        var topKWeights = MLX.takeAlong(expertScores, topKIndices, axis: -1)
+        topKWeights = MLX.softmax(topKWeights, axis: -1, precise: true)
+        topKWeights = topKWeights * perExpertScale[topKIndices]
+
+        // Diagnostic-only observability (nil in production; see
+        // `Gemma4RouterProbe`). Recording the PRE-selection scores and the
+        // selection itself, never altering either.
+        Gemma4RouterProbe.recorder?(expertScores, topKIndices)
+
+        return (topKIndices, topKWeights)
+    }
+
     func callAsFunction(
         _ x: MLXArray, verifier: ((MLXArray) -> MLXArray)? = nil
     ) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
@@ -2883,12 +2901,14 @@ private class Gemma4Router: Module {
             effScale = eff
         }
         let normed = MLXFast.rmsNorm(x, weight: effScale, eps: eps)
-        let expertScores: MLXArray
         if let verifier {
-            expertScores = verifier(normed)
-        } else {
-            expertScores = proj(normed)
+            // The installed verifier owns a rectangular C2-C4 route. Its
+            // construction contract already pins every invariant, so execute
+            // the exact selection chain directly instead of probing the
+            // decode-only L=1 fused helper and falling through every layer.
+            return selectTopK(verifier(normed))
         }
+        let expertScores = proj(normed)
 
         // ROUTE-001: single-dispatch byte-identical replacement of the chain
         // below for the B=8 decode geometry. Every other geometry, dtype, or
@@ -3563,7 +3583,12 @@ public class Gemma4DecoderLayer: Module {
         // produced this layer's input norm. Pointer identity on the source
         // guarantees the normed tensor was computed from exactly this input.
         let h: MLXArray
-        if let chain = glueChain, let pending = chain.pending,
+        if verifier != nil {
+            // Verifier installation pins the direct rectangular route; it
+            // never consumes or produces the decode-only glue chain.
+            glueChain?.pending = nil
+            h = inputLayernorm(x)
+        } else if let chain = glueChain, let pending = chain.pending,
             pending.source === x
         {
             chain.pending = nil
@@ -3577,6 +3602,38 @@ public class Gemma4DecoderLayer: Module {
             v2SharedSource: v2SharedSource, outputStart: outputStart,
             useLastQueryPrefill: useLastQueryPrefill,
             verifier: verifier?.attention)
+
+        if let verifier {
+            // The installed C2-C4 verifier route is direct by construction.
+            // Preserve the exact arithmetic of the former stock fallbacks,
+            // but return before any failable L=1 decode or prefill helper.
+            let router = router!
+            let experts = experts!
+            let preFeedforwardLayernorm2 = preFeedforwardLayernorm2!
+            let postFeedforwardLayernorm1 = postFeedforwardLayernorm1!
+            let postFeedforwardLayernorm2 = postFeedforwardLayernorm2!
+
+            let postAttn = postAttentionLayernorm(attnOut)
+            var out = residual + postAttn
+            let residual2 = out
+            let (topKIndices, topKWeights) = router(
+                out, verifier: verifier.router)
+            let n1 = preFeedforwardLayernorm(out)
+            let n2 = preFeedforwardLayernorm2(out)
+            let h1Raw = mlp(n1, verifier: verifier.dense)
+            let h2Raw = experts(
+                n2, topKIndices: topKIndices,
+                topKWeights: topKWeights,
+                isExpertPrefill: false, verifier: verifier.expert)
+            let h1 = postFeedforwardLayernorm1(h1Raw)
+            let h2 = postFeedforwardLayernorm2(h2Raw)
+            out = h1 + h2
+            out = postFeedforwardLayernorm(out)
+            out = residual2 + out
+            out = out * layerScalar
+            return (out, kvPair, attnPositionOffset)
+        }
+
         // PREFIX-001: only build the joined producer when the ZIP consumer is
         // guaranteed to accept it. A nil leaves the established attention
         // residual and branch pre-norm paths untouched.
@@ -3639,30 +3696,7 @@ public class Gemma4DecoderLayer: Module {
             // interleaved so the encoder pairs them into shared barrier
             // stages. Returns nil for every geometry but the pinned B=8
             // decode cell, and under the kill switch.
-            if let verifier {
-                let (topKIndices, topKWeights) = router(
-                    out, verifier: verifier.router)
-                if let (n1, n2, _) = Gemma4FusedLayerGlue.dualPreNorm(
-                    x: out,
-                    w1: preFeedforwardLayernorm.weight,
-                    w2: preFeedforwardLayernorm2.weight,
-                    eps: config.rmsNormEps)
-                {
-                    h1Raw = mlp(n1, verifier: verifier.dense)
-                    h2Raw = experts(
-                        n2, topKIndices: topKIndices,
-                        topKWeights: topKWeights,
-                        isExpertPrefill: false, verifier: verifier.expert)
-                } else {
-                    let n1 = preFeedforwardLayernorm(out)
-                    let n2 = preFeedforwardLayernorm2(out)
-                    h1Raw = mlp(n1, verifier: verifier.dense)
-                    h2Raw = experts(
-                        n2, topKIndices: topKIndices,
-                        topKWeights: topKWeights,
-                        isExpertPrefill: false, verifier: verifier.expert)
-                }
-            } else if let zipped = Gemma4ZipRouterV1.run(
+            if let zipped = Gemma4ZipRouterV1.run(
                 router: router,
                 mlp: mlp,
                 out: out,

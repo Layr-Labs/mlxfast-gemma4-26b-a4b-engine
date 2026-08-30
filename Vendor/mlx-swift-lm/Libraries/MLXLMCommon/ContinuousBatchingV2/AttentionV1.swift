@@ -148,7 +148,7 @@ enum CBv2AttentionV1 {
     static let joinKernelEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_PREFILL_JOIN_KERNEL"]
-        else { return false }
+        else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
@@ -232,7 +232,7 @@ enum CBv2AttentionV1 {
         let lanes = D / 8
         guard lanes <= 1024, B * L * H * D < (1 << 31) else { return nil }
         var headsPerGroup = 1
-        for candidate in [8, 4, 2] where H % candidate == 0 && lanes * candidate <= 1024 {
+        for candidate in [16, 8, 4, 2] where H % candidate == 0 && lanes * candidate <= 1024 {
             headsPerGroup = candidate
             break
         }

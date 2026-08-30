@@ -3712,6 +3712,7 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
 
   thread uint wpf[results_per_simdgroup];
   if (PF) {
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       wpf[row] = *((const device uint*)(ws0 + row * in_vec_size_w));
     }
@@ -3722,16 +3723,19 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
 
     thread uint wcur[results_per_simdgroup];
     if (PF) {
+      #pragma unroll
       for (int row = 0; row < results_per_simdgroup; row++) {
         wcur[row] = wpf[row];
       }
       const int nextblk = (blk + 1 < nblocks) ? (blk + 1) : blk;
       const device uint8_t* wsn = ws0 + nextblk * block_bytes;
+      #pragma unroll
       for (int row = 0; row < results_per_simdgroup; row++) {
         wpf[row] = *((const device uint*)(wsn + row * in_vec_size_w));
       }
     }
 
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device T* sl = scales + row * in_vec_size_g;
       const device T* bl = biases + row * in_vec_size_g;
@@ -3769,6 +3773,7 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
       if (remaining > 0) {
         U sum = load_vector_safe<T, U, values_per_thread, 4>(
             x, x_thread, remaining);
+        #pragma unroll
         for (int row = 0; row < results_per_simdgroup; row++) {
           auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
           const device T* sl = scales + row * in_vec_size_g;
@@ -3783,6 +3788,7 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
     const uint active_tail_lanes = uint(tail_values / values_per_thread);
     if (tail_values % values_per_thread == 0 && simd_lid < active_tail_lanes) {
       U sum = load_vector<T, U, values_per_thread, 4>(x, x_thread);
+      #pragma unroll
       for (int row = 0; row < results_per_simdgroup; row++) {
         const device T* sl = scales + row * in_vec_size_g;
         const device T* bl = biases + row * in_vec_size_g;
@@ -3799,6 +3805,7 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
     }
   }
 
+    #pragma unroll
   for (int row = 0; row < results_per_simdgroup; row++) {
     result[row] = simd_sum(result[row]);
     if (simd_lid == 0) {
@@ -3887,6 +3894,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     const device T* tile_x1 =
         x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
     device T* tile_y1 = y + (assignment + 1) * out_vec_size;
+    #pragma unroll
     for (int t = 0; t < gemma4_down_tile_span; t++) {
       uint3 tile_tid = tid;
       tile_tid.y = tid.y + uint(t);
@@ -3905,6 +3913,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     }
     return;
   }
+  #pragma unroll
   for (int t = 0; t < gemma4_down_tile_span; t++) {
     uint3 tile_tid = tid;
     tile_tid.y = tid.y + uint(t);
@@ -4096,9 +4105,15 @@ template <typename T, int group_size, int bits>
     const device T* single_scales = scales + expert * s_strides[0];
     const device T* single_biases = biases + expert * b_strides[0];
     device T* single_y = y + assignment * (uint)out_vec_size;
-    qmv_impl<T, group_size, bits>(
-        single_w, single_scales, single_biases, single_x, single_y,
-        in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+    if (in_vec_size == 2816) {
+      qmv_affine4_g64_singles_impl<T, group_size, bits, 2816, true, true>(
+          single_w, single_scales, single_biases, single_x, single_y,
+          in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+    } else {
+      qmv_impl<T, group_size, bits>(
+          single_w, single_scales, single_biases, single_x, single_y,
+          in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+    }
     return;
   }
   uint32_t x_idx;

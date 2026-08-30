@@ -1,7 +1,7 @@
 import Foundation
 import MLX
 import MLXFastCore
-import MLXLLM
+@testable import MLXLLM
 import MLXLMCommon
 import MLXRandom
 @testable import MLXFastRuntimeWorkerSupport
@@ -30,6 +30,30 @@ struct RuntimeWorkerMTPRoundExecutionTests {
     /// Small window so decode + verify rounds wrap the sliding ring early,
     /// exactly like the vendored smoke test's own rationale.
     private let slidingWindow = 12
+
+    @Test
+    func cachedDrafterRoPEPreservesSingletonQueryAxis() {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
+        let hidden = MLXArray((0 ..< 128).map(Float.init)).reshaped([2, 1, 64])
+        let table = DrafterRoPETable(
+            cos: MLXArray.ones([2, 16], dtype: .float32),
+            sin: MLXArray.zeros([2, 16], dtype: .float32),
+            dims: 32,
+            startPosition: 11,
+            windowAhead: 2,
+            base: 10_000)
+
+        let rotated = Gemma4CBv2MTPDrafter.applyCachedDrafterRoPE(
+            hidden: hidden,
+            table: table,
+            positionOffset: .batch(MLXArray([Int32(11), Int32(12)])))
+        eval(rotated)
+
+        #expect(rotated.shape == [2, 1, 64])
+        #expect(allClose(rotated, hidden, rtol: 0, atol: 0).item(Bool.self))
+    }
 
     // MARK: - Fixtures (mirrors CBv2MTPRoundSmokeTests, scaled down further)
 

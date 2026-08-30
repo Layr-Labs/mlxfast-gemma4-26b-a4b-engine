@@ -63,6 +63,26 @@ struct CBv2MTPModelSeamTests {
                 tMax: slidingWindow - 1, window: slidingWindow, dtype: .float32) == nil)
     }
 
+    @Test func cachedDrafterRoPEPreservesSingletonQueryAxis() {
+        let hidden = MLXArray((0 ..< 128).map(Float.init)).reshaped([2, 1, 64])
+        let table = DrafterRoPETable(
+            cos: MLXArray.ones([2, 16], dtype: .float32),
+            sin: MLXArray.zeros([2, 16], dtype: .float32),
+            dims: 32,
+            startPosition: 11,
+            windowAhead: 2,
+            base: 10_000)
+
+        let rotated = Gemma4CBv2MTPDrafter.applyCachedDrafterRoPE(
+            hidden: hidden,
+            table: table,
+            positionOffset: .batch(MLXArray([Int32(11), Int32(12)])))
+        eval(rotated)
+
+        #expect(rotated.shape == [2, 1, 64])
+        #expect(allClose(rotated, hidden, rtol: 0, atol: 0).item(Bool.self))
+    }
+
     /// 6-layer target, last 2 KV-shared. Non-shared prefix layer types
     /// [sliding, full, full, sliding] ⇒ capture layers full=2, sliding=3.
     private func targetConfig() throws -> Gemma4TextConfiguration {

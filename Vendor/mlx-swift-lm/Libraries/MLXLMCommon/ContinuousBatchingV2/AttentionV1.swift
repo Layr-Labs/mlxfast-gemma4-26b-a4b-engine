@@ -110,6 +110,20 @@ enum CBv2AttentionV1 {
         return value << 20
     }()
 
+    /// PREFILL-PACKED-KV-ALIAS. When every row of a packed prefill was FRESH
+    /// (no committed history), the per-row views `update` hands back are
+    /// byte-for-byte the incoming batched K/V rectangles, and the
+    /// `concatenated` restack in `batchedPackedAttention` re-materializes a
+    /// copy of tensors the caller already holds batched. Attend the original
+    /// rectangles instead. `0`/`false`/`no`/`off` restores the established
+    /// restack, which also stays the path for every input the alias refuses.
+    static let packedKVAliasEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PREFILL_PACKED_KV_ALIAS"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// Join prompt attention blocks directly into the token-major layout that
     /// the following output projection consumes. The returned value remains a
     /// head-major view, so callers keep the same typed interface while their
@@ -120,6 +134,121 @@ enum CBv2AttentionV1 {
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
+
+    /// PREFILL-JOIN-KERNEL. One dispatch writes the token-major prompt
+    /// attention rectangle from all of a chunk's query-block outputs. The
+    /// established token-major join materializes the same rectangle through
+    /// one strided `concatenated` copy per block; this kernel moves the same
+    /// words to the same positions in a single pass whose threads read and
+    /// write whole head rows. Pure data movement: every output element is
+    /// the bit pattern of exactly one input element, no arithmetic. Refuses
+    /// (nil) anything but a uniform prompt-plane block set, and the caller
+    /// keeps the established join for everything it refuses.
+    /// Kill switch: `DARKBLOOM_CBV2_PREFILL_JOIN_KERNEL=0`.
+    static let joinKernelEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PREFILL_JOIN_KERNEL"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Upper bound on the number of query blocks one join dispatch binds
+    /// (Metal binds each block as its own buffer argument).
+    private static let maxJoinKernelBlocks = 30
+
+    nonisolated(unsafe) private static var joinKernels: [Int: MLXFast.MLXFastKernel] = [:]
+    private static let joinKernelLock = NSLock()
+
+    /// The join kernel for `blockCount` query blocks, built once per count.
+    /// Thread (lane, head, batch*token) copies one 16-byte segment of one
+    /// head row from the block that owns the token into the token-major
+    /// rectangle `[B, L, H, D]`.
+    private static func joinKernel(blockCount: Int) -> MLXFast.MLXFastKernel {
+        joinKernelLock.lock()
+        defer { joinKernelLock.unlock() }
+        if let hit = joinKernels[blockCount] { return hit }
+        let inputNames = (0 ..< blockCount).map { "in\($0)" }
+        let cases = (0 ..< blockCount)
+            .map { "                case \($0): src = in\($0); break;" }
+            .joined(separator: "\n")
+        let source = """
+            const uint lanes = uint(D) / 8u;
+            const uint L_ = uint(L);
+            const uint H_ = uint(H);
+            const uint BS_ = uint(BS);
+            const uint D_ = uint(D);
+            const uint dv = thread_position_in_grid.x;
+            const uint h = thread_position_in_grid.y;
+            const uint bt = thread_position_in_grid.z;
+            if (dv >= lanes || h >= H_ || bt >= uint(B) * L_) {
+                return;
+            }
+            const uint b = bt / L_;
+            const uint t = bt - b * L_;
+            const uint blk = t / BS_;
+            const uint tt = t - blk * BS_;
+            const device T* src;
+            switch (blk) {
+            \(cases)
+                default: return;
+            }
+            const device uint4* s =
+                (const device uint4*)(src + (((b * H_ + h) * BS_ + tt) * D_)) + dv;
+            device uint4* o =
+                (device uint4*)(out + (((b * L_ + t) * H_ + h) * D_)) + dv;
+            *o = *s;
+            """
+        let kernel = MLXFast.metalKernel(
+            name: "cbv2_prefill_join_v1_nb\(blockCount)",
+            inputNames: inputNames,
+            outputNames: ["out"],
+            source: source,
+            header: "#include <metal_stdlib>\nusing namespace metal;\n")
+        joinKernels[blockCount] = kernel
+        return kernel
+    }
+
+    /// The token-major rectangle `[B, L, H, D]` of `blocks` (each
+    /// `[B, H, count, D]`, in token order), or nil when the set is not one
+    /// this kernel handles: fewer than two blocks, more than
+    /// `maxJoinKernelBlocks`, unequal block lengths, a head dim that is not
+    /// a multiple of eight, a mismatched shape or dtype, or an element width
+    /// other than 16 bits.
+    private static func joinTokenMajor(_ blocks: [MLXArray]) -> MLXArray? {
+        guard joinKernelEnabled, blocks.count >= 2, blocks.count <= maxJoinKernelBlocks
+        else { return nil }
+        let head = blocks[0]
+        guard head.ndim == 4, head.dtype == .bfloat16 || head.dtype == .float16
+        else { return nil }
+        let (B, H, BS, D) = (head.dim(0), head.dim(1), head.dim(2), head.dim(3))
+        guard B >= 1, H >= 1, BS >= 1, D >= 8, D % 8 == 0 else { return nil }
+        for block in blocks {
+            guard block.ndim == 4, block.dtype == head.dtype,
+                block.dim(0) == B, block.dim(1) == H,
+                block.dim(2) == BS, block.dim(3) == D
+            else { return nil }
+        }
+        let L = BS * blocks.count
+        let lanes = D / 8
+        guard lanes <= 1024, B * L * H * D < (1 << 31) else { return nil }
+        var headsPerGroup = 1
+        for candidate in [16, 8, 4, 2] where H % candidate == 0 && lanes * candidate <= 1024 {
+            headsPerGroup = candidate
+            break
+        }
+        let joined = joinKernel(blockCount: blocks.count)(
+            blocks.map { $0 as any ScalarOrArray },
+            template: [
+                ("T", head.dtype), ("L", L), ("BS", BS), ("H", H), ("D", D), ("B", B),
+            ],
+            grid: (lanes, H, B * L),
+            threadGroup: (lanes, headsPerGroup, 1),
+            outputShapes: [[B, L, H, D]],
+            outputDTypes: [head.dtype]
+        )[0]
+        CBv2EngageMark.once("prefill-join-kernel")
+        return joined
+    }
 
     /// ATT-008 opt-in switch: batch-wide FULL-attention decode over pooled
     /// KV (`DARKBLOOM_GEMMA4_BATCHED_FULL_ATTENTION=1` enables it).
@@ -537,7 +666,8 @@ enum CBv2AttentionV1 {
             kind: kind, queries: queries,
             cachedKeys: cachedKeys, cachedValues: cachedValues,
             window: window(of: kind), scale: scale,
-            sinks: effectiveSinks, softcap: softcap, spanContexts: spanContexts)
+            sinks: effectiveSinks, softcap: softcap, spanContexts: spanContexts,
+            newKeys: keys, newValues: values)
         {
             return batched
         }
@@ -572,11 +702,38 @@ enum CBv2AttentionV1 {
     /// prefix reuse or continuation offsets), a mismatched head count/head dim
     /// /dtype, any bound span context, or a restack that would exceed
     /// ``packedBatchKVBudgetBytes``.
+    ///
+    /// PREFILL-PACKED-KV-ALIAS. `newKeys`/`newValues` are the caller's
+    /// ALREADY-BATCHED `[B, kvHeads, n, headDim]` rectangles for the chunk the
+    /// per-row `update` calls just committed (nil on the borrow path, which
+    /// commits nothing). When every row's returned view spans exactly `n`
+    /// tokens, every row was fresh, and the restack below rebuilds a
+    /// byte-identical copy of those rectangles:
+    ///   * both contiguous backends return `history ++ chunk` — the windowed
+    ///     ring returns the chunk tensor ITSELF when `historyCount == 0`
+    ///     (`kParts == [newKeys]`), and the full buffer returns
+    ///     `storage[..., ..<offset, :]`, which after a fresh append holds
+    ///     exactly the chunk's bytes;
+    ///   * `kL == n` forces `historyCount == 0` on every row (returned length
+    ///     is always `history + n`), so `concatenated(cachedKeys, axis: 0)`
+    ///     reassembles the row slices of `newKeys` in row order — `newKeys`.
+    /// Attending the original rectangles therefore feeds the SAME bytes to
+    /// the same kernels and deletes the restack's full K+V round trip — at
+    /// the ranked 8 x 1024 seed geometry, ~134 MB of copy traffic per sliding
+    /// layer on the critical path (attention cannot start before the copy).
+    /// `contiguous()` pins the layout contract: a row-contiguous rectangle
+    /// (every fused QKV-norm kernel output) shares its buffer at zero cost,
+    /// and anything else (a transposed-view fallback producer) materializes
+    /// ONE copy — the exact cost of the restack this replaces — so no
+    /// downstream q-block GEMM ever sees a layout the restacked path would
+    /// not have produced. Kill switch:
+    /// `DARKBLOOM_CBV2_PREFILL_PACKED_KV_ALIAS=0`.
     private static func batchedPackedAttention(
         kind: CBv2LayerKind, queries: MLXArray,
         cachedKeys: [MLXArray], cachedValues: [MLXArray],
         window: Int?, scale: Float, sinks: MLXArray?, softcap: Float?,
-        spanContexts: [CBv2SpanChunkContext?]?
+        spanContexts: [CBv2SpanChunkContext?]?,
+        newKeys: MLXArray? = nil, newValues: MLXArray? = nil
     ) -> MLXArray? {
         guard packedBatchKVBudgetBytes > 0 else { return nil }
         guard spanContexts?.allSatisfy({ $0 == nil }) ?? true else { return nil }
@@ -601,6 +758,33 @@ enum CBv2AttentionV1 {
         let restackedBytes =
             (headKeys.nbytes + headValues.nbytes) * cachedKeys.count
         guard restackedBytes <= packedBatchKVBudgetBytes else { return nil }
+
+        // PREFILL-PACKED-KV-ALIAS: every-row-fresh admission (see the doc
+        // comment above). Anything short of the exact identity — a committed
+        // history on any row (`kL > n`), a batch/head/dim/dtype mismatch, or
+        // no rectangles at all (borrow path) — falls through to the
+        // established restack.
+        if packedKVAliasEnabled,
+            let newKeys, let newValues,
+            newKeys.ndim == 4, newValues.ndim == 4,
+            newKeys.dim(2) == kL, newValues.dim(2) == kL,
+            newKeys.dim(0) == cachedKeys.count,
+            newValues.dim(0) == cachedKeys.count,
+            newKeys.dim(1) == headKeys.dim(1),
+            newKeys.dim(3) == headKeys.dim(3),
+            newValues.dim(1) == headValues.dim(1),
+            newValues.dim(3) == headValues.dim(3),
+            newKeys.dtype == headKeys.dtype,
+            newValues.dtype == headValues.dtype
+        {
+            CBv2EngageMark.once("prefill-packedkv-alias")
+            return attendCommittedRow(
+                kind: kind, queries: queries,
+                cachedKeys: contiguous(newKeys),
+                cachedValues: contiguous(newValues),
+                window: window, scale: scale, sinks: sinks, softcap: softcap,
+                spanContext: nil)
+        }
 
         return attendCommittedRow(
             kind: kind, queries: queries,
@@ -1209,6 +1393,14 @@ enum CBv2AttentionV1 {
             offset += count
         }
         if outputs.count == 1 { return outputs[0] }
+        // PREFILL-JOIN-KERNEL: the token-major rectangle in one dispatch.
+        // Same prompt-plane guard as the join below; the returned view keeps
+        // this function's `[B, H, L, D]` contract exactly as that join does.
+        if blockSize > 8, newTokenCount > 8,
+            let joined = joinTokenMajor(outputs)
+        {
+            return joined.transposed(0, 2, 1, 3)
+        }
         // PREFILL-TOKENMAJOR-JOIN. The established head-major join is
         // immediately transposed and reshaped by Gemma4Attention, forcing a
         // second full pass over the prompt attention output. Permuting each

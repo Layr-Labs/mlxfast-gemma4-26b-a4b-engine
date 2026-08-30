@@ -6,6 +6,22 @@ import Testing
 @Suite("Gemma 4 MTP verifier route")
 struct Gemma4MTPVerifierRouteTests {
     @Test
+    func singlePromptShapesAreExplicitAndCannotAliasB8() throws {
+        for columns in 2...4 {
+            let b1 = CBv2Gemma4MTPVerifierShape(batch: 1, columns: columns)
+            let b8 = CBv2Gemma4MTPVerifierShape(batch: 8, columns: columns)
+            #expect(CBv2Gemma4MTPVerifierRoute.production.supports(b1))
+            #expect(b1 != b8)
+        }
+        #expect(!CBv2Gemma4MTPVerifierRoute.production.supports(
+            .init(batch: 1, columns: 1)))
+        #expect(!CBv2Gemma4MTPVerifierRoute.production.supports(
+            .init(batch: 1, columns: 5)))
+        #expect(!CBv2Gemma4MTPVerifierRoute.production.supports(
+            .init(batch: 2, columns: 2)))
+    }
+
+    @Test
     func installedTrunkUsesPreboundScaledEmbedding() throws {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

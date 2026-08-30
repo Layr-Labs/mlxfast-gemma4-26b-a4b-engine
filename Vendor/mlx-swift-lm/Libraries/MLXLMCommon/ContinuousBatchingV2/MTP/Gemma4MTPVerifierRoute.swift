@@ -21,6 +21,16 @@ public enum CBv2Gemma4MTPVerifierAttentionStrategy: Sendable, Equatable {
     case serializedDecode
 }
 
+public struct CBv2Gemma4MTPVerifierShape: Sendable, Hashable {
+    public let batch: Int
+    public let columns: Int
+
+    public init(batch: Int, columns: Int) {
+        self.batch = batch
+        self.columns = columns
+    }
+}
+
 /// Fixed route for the only certified physical widths, C2 through C4.
 public struct CBv2Gemma4MTPVerifierRoute: Sendable {
     public static let production = Self(
@@ -84,5 +94,11 @@ public struct CBv2Gemma4MTPVerifierRoute: Sendable {
             (2...4).contains(columns)
         else { return nil }
         return .ks2Tile2
+    }
+}
+
+public extension CBv2Gemma4MTPVerifierRoute {
+    func supports(_ shape: CBv2Gemma4MTPVerifierShape) -> Bool {
+        shape.batch == 1 && (2...4).contains(shape.columns)
     }
 }

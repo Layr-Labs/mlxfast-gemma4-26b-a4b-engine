@@ -3,6 +3,7 @@
 //  mlx-swift-lm
 //
 //  Port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/gemma4_text.py
+//  Yukon controlled redraw 1/3: executable-equivalent frontier sample; documentation only.
 
 import Foundation
 import MLX

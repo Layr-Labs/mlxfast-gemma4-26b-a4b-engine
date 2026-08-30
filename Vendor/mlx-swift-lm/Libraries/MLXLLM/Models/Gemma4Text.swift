@@ -113,17 +113,23 @@ private func gemma4TruthyFlag(_ raw: String?) -> Bool {
 /// later layers. This changes only when already-built work is queued; the
 /// operations and results are unchanged. Single-token decode is excluded.
 ///
-/// The 18-layer default leaves twelve layers of the 30-layer 26B model for
-/// useful CPU/GPU overlap. `DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL=0` restores
-/// one final submission; another positive value tunes the layer interval.
+/// The 18-layer compatibility value remains available for explicit interval
+/// experiments. With no environment override, production submits one earlier
+/// boundary after layer 12, leaving eighteen layers of host graph construction
+/// to overlap without a second fragmentation point at layer 24.
+/// `DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL=0` restores one final submission;
+/// another positive value selects the legacy repeating interval.
 @inline(__always)
 internal func resolveGemma4PrefillChunkEvalLayers(_ raw: String?) -> Int {
     guard let raw, let value = Int(raw) else { return 18 }
     return max(0, value)
 }
 
+private let gemma4PrefillChunkEvalOverride =
+    ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL"]
+
 private let gemma4PrefillChunkEvalLayers = resolveGemma4PrefillChunkEvalLayers(
-    ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL"])
+    gemma4PrefillChunkEvalOverride)
 
 @inline(__always)
 internal func gemma4ShouldSubmitPrefillChunkEval(
@@ -135,6 +141,27 @@ internal func gemma4ShouldSubmitPrefillChunkEval(
 ) -> Bool {
     schedulePrefill && isCBv2 && interval > 0 && inputLength > 1
         && layerNumber.isMultiple(of: interval)
+}
+
+/// The ranked environment sets no override. Queue one completed prompt prefix
+/// after layer 12; unlike a repeating interval of 12, do not submit again at
+/// layer 24 when only six layers remain to overlap.
+@inline(__always)
+private func gemma4ShouldSubmitProductionPrefillEval(
+    schedulePrefill: Bool,
+    isCBv2: Bool,
+    inputLength: Int,
+    layerNumber: Int
+) -> Bool {
+    if gemma4PrefillChunkEvalOverride != nil {
+        return gemma4ShouldSubmitPrefillChunkEval(
+            schedulePrefill: schedulePrefill,
+            isCBv2: isCBv2,
+            inputLength: inputLength,
+            layerNumber: layerNumber,
+            interval: gemma4PrefillChunkEvalLayers)
+    }
+    return schedulePrefill && isCBv2 && inputLength > 1 && layerNumber == 12
 }
 
 /// CBv2 consumes only the final prompt position, so the LAST decoder layer
@@ -3881,12 +3908,11 @@ public class Gemma4TextModelInner: Module {
             }
 
             let layerNumber = idx + 1
-            if gemma4ShouldSubmitPrefillChunkEval(
+            if gemma4ShouldSubmitProductionPrefillEval(
                 schedulePrefill: schedulePrefill,
                 isCBv2: isCBv2,
                 inputLength: inputLength,
-                layerNumber: layerNumber,
-                interval: gemma4PrefillChunkEvalLayers)
+                layerNumber: layerNumber)
             {
                 asyncEval(h)
                 CBv2StepProfiler.recordEvent("v2.gemma4.prefill.chunk_eval")

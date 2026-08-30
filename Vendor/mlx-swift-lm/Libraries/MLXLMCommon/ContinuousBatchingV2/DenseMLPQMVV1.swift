@@ -103,14 +103,6 @@ public enum CBv2DenseMLPQMVV1 {
     /// whose exact B8/L1/K2816 gate also pins the table geometry.
     public struct ActivationSums {
         fileprivate let values: MLXArray
-
-        /// ZIP-ROUTER-001 ordering handle. Read-only view of the table's own
-        /// output array so a caller can name this dispatch as an
-        /// `MLX.depends` edge when it interleaves the dense chain with an
-        /// independent chain. `Depends` emits no dispatch and its output
-        /// aliases its input's buffer, so handing the array out cannot change
-        /// what any kernel reads or writes.
-        public var dependencyHandle: MLXArray { values }
     }
 
     /// The affine-8 helper below is the current promoted

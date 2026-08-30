@@ -110,6 +110,17 @@ enum CBv2AttentionV1 {
         return value << 20
     }()
 
+    /// A fresh packed prompt already supplies the complete attention K/V
+    /// rectangle. Reuse that rectangle after committing every row instead of
+    /// concatenating the same bytes back out of the per-row cache views.
+    /// `0` restores the established restack for every packed prompt.
+    static let freshPackedKVEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PREFILL_FRESH_KV"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// Join prompt attention blocks directly into the token-major layout that
     /// the following output projection consumes. The returned value remains a
     /// head-major view, so callers keep the same typed interface while their
@@ -515,6 +526,18 @@ enum CBv2AttentionV1 {
             }
         }
 
+        // This proof is taken BEFORE any row advances. Both concrete cache
+        // implementations return exactly the new chunk when retainedCount is
+        // zero: full rows have no visible prefix, and sliding rows prepend
+        // zero history even when the chunk itself exceeds their window. A
+        // custom/frozen-replay cache makes no such promise. Narrow rectangles
+        // keep the existing path, independently of the MTP guard above.
+        let reuseFreshPackedKV = freshPackedKVEnabled && L > 8
+            && rows.allSatisfy {
+                ($0 is CBv2FullSequenceKV || $0 is CBv2WindowedSequenceKV)
+                    && $0.retainedCount == 0
+            }
+
         // Commit every row's K/V FIRST, in row order. `update` appends to that
         // row's own ring and hands back that row's own view; it reads nothing
         // from any other row and nothing from the attention that used to sit
@@ -537,7 +560,8 @@ enum CBv2AttentionV1 {
             kind: kind, queries: queries,
             cachedKeys: cachedKeys, cachedValues: cachedValues,
             window: window(of: kind), scale: scale,
-            sinks: effectiveSinks, softcap: softcap, spanContexts: spanContexts)
+            sinks: effectiveSinks, softcap: softcap, spanContexts: spanContexts,
+            freshChunkKV: reuseFreshPackedKV ? (keys, values) : nil)
         {
             return batched
         }
@@ -576,7 +600,8 @@ enum CBv2AttentionV1 {
         kind: CBv2LayerKind, queries: MLXArray,
         cachedKeys: [MLXArray], cachedValues: [MLXArray],
         window: Int?, scale: Float, sinks: MLXArray?, softcap: Float?,
-        spanContexts: [CBv2SpanChunkContext?]?
+        spanContexts: [CBv2SpanChunkContext?]?,
+        freshChunkKV: (keys: MLXArray, values: MLXArray)? = nil
     ) -> MLXArray? {
         guard packedBatchKVBudgetBytes > 0 else { return nil }
         guard spanContexts?.allSatisfy({ $0 == nil }) ?? true else { return nil }
@@ -602,10 +627,37 @@ enum CBv2AttentionV1 {
             (headKeys.nbytes + headValues.nbytes) * cachedKeys.count
         guard restackedBytes <= packedBatchKVBudgetBytes else { return nil }
 
+        let packedKeys: MLXArray
+        let packedValues: MLXArray
+        if let freshChunkKV,
+            kL == queries.dim(2),
+            freshChunkKV.keys.shape
+                == [cachedKeys.count, headKeys.dim(1), kL, headKeys.dim(3)],
+            freshChunkKV.values.shape
+                == [cachedValues.count, headValues.dim(1), kL, headValues.dim(3)],
+            freshChunkKV.keys.dtype == headKeys.dtype,
+            freshChunkKV.values.dtype == headValues.dtype
+        {
+            // Preserve the restack's row-contiguous layout. `contiguous` is
+            // graph-only and shares storage when the producer already wrote
+            // head-major K/V (Gemma's packed-prefill norm/RoPE path); other
+            // layouts still receive a bit-copy before the same attention
+            // kernels. Never inspect lazy-array strides on the host.
+            //
+            // Cache commits above are deliberately unchanged. The engine
+            // evaluates their inner state with the prompt outputs, so a K/V
+            // write cannot disappear when attention bypasses its copy.
+            packedKeys = freshChunkKV.keys.contiguous()
+            packedValues = freshChunkKV.values.contiguous()
+            CBv2EngageMark.once("prefill-fresh-kv")
+        } else {
+            packedKeys = concatenated(cachedKeys, axis: 0)
+            packedValues = concatenated(cachedValues, axis: 0)
+        }
+
         return attendCommittedRow(
             kind: kind, queries: queries,
-            cachedKeys: concatenated(cachedKeys, axis: 0),
-            cachedValues: concatenated(cachedValues, axis: 0),
+            cachedKeys: packedKeys, cachedValues: packedValues,
             window: window, scale: scale, sinks: sinks, softcap: softcap,
             spanContext: nil)
     }

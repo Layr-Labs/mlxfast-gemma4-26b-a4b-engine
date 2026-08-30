@@ -272,11 +272,7 @@ public enum Gemma4PrefillGlueV1 {
 
     // MARK: - branch tail (5 dispatches -> 1)
 
-    private static let tailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_tail_2816_v1",
-        inputNames: ["h1", "h2", "w1", "w2", "w3", "res2"],
-        outputNames: ["out"],
-        source: """
+    private static let tailSource = """
             threadgroup float local_sums_a[32];
             threadgroup float local_sums_b[32];
             threadgroup float local_inv2[2];
@@ -319,7 +315,13 @@ public enum Gemma4PrefillGlueV1 {
                 const T normed = static_cast<T>(w3[j] * static_cast<T>(tv[i] * inv_t));
                 out[base + i] = res2[base + i] + normed;
             }
-            """,
+            """
+
+    private static let tailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_prefill_glue_tail_2816_v1",
+        inputNames: ["h1", "h2", "w1", "w2", "w3", "res2"],
+        outputNames: ["out"],
+        source: tailSource,
         header: kernelHeader,
         ensureRowContiguous: true
     )
@@ -359,11 +361,7 @@ public enum Gemma4PrefillGlueV1 {
     /// The threadgroup already holds the finished row in registers when it
     /// stores `out`, so both cost one extra in-kernel reduction rather than a
     /// re-read of the row plus two launches.
-    private static let tailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_tail_chain_2816_v1",
-        inputNames: ["h1", "h2", "w1", "w2", "w3", "res2", "s", "wn"],
-        outputNames: ["out", "normed"],
-        source: """
+    private static let tailChainSource = """
             threadgroup float local_sums_a[32];
             threadgroup float local_sums_b[32];
             threadgroup float local_inv2[2];
@@ -422,7 +420,13 @@ public enum Gemma4PrefillGlueV1 {
                 const uint j = lid * GLUE_NREADS + i;
                 normed[base + i] = wn[j] * static_cast<T>(ov[i] * inv_n);
             }
-            """,
+            """
+
+    private static let tailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_prefill_glue_tail_chain_2816_v1",
+        inputNames: ["h1", "h2", "w1", "w2", "w3", "res2", "s", "wn"],
+        outputNames: ["out", "normed"],
+        source: tailChainSource,
         header: kernelHeader,
         ensureRowContiguous: true
     )
@@ -452,6 +456,104 @@ public enum Gemma4PrefillGlueV1 {
             outputShapes: [h1.shape, h1.shape],
             outputDTypes: [h1.dtype, h1.dtype]
         )
+        return (outs[0], outs[1])
+    }
+
+    // MARK: - sorted expert combine + branch tail
+
+    /// Substitute only the expert-row load. Both tail variants retain their
+    /// original RMS trees, BF16 boundaries, residual and chaining arithmetic.
+    private static func sortedExpertTailSource(_ source: String) -> String {
+        let locals = "float av[GLUE_NREADS];"
+        let read = "static_cast<float>(h2[base + i])"
+        precondition(source.components(separatedBy: locals).count == 2)
+        precondition(source.components(separatedBy: read).count == 2)
+        return source.replacingOccurrences(
+            of: locals,
+            with: SwitchGLUSortedWeightedOutput.metalReductionSource + "\n" + locals
+        ).replacingOccurrences(of: read, with: "static_cast<float>(expertv[i])")
+    }
+
+    private static let sortedExpertTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_prefill_sorted_expert_tail_2816_v1",
+        inputNames: [
+            "h1", "sorted_outputs", "inverse_order", "expert_weights",
+            "w1", "w2", "w3", "res2",
+        ],
+        outputNames: ["out"],
+        source: sortedExpertTailSource(tailSource),
+        header: kernelHeader,
+        ensureRowContiguous: true
+    )
+
+    private static let sortedExpertTailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_prefill_sorted_expert_tail_chain_2816_v1",
+        inputNames: [
+            "h1", "sorted_outputs", "inverse_order", "expert_weights",
+            "w1", "w2", "w3", "res2", "s", "wn",
+        ],
+        outputNames: ["out", "normed"],
+        source: sortedExpertTailSource(tailChainSource),
+        header: kernelHeader,
+        ensureRowContiguous: true
+    )
+
+    /// The carrier comes from the existing sorted-reduction admission. A
+    /// mismatched tail leaves it untouched for its ordinary materializer.
+    public static func branchTail(
+        h1: MLXArray, h2: SwitchGLUSortedWeightedOutput,
+        w1: MLXArray, w2: MLXArray, w3: MLXArray,
+        residual2: MLXArray, eps epsIn: Float
+    ) -> MLXArray? {
+        guard let rows = planeRows(h1, weight: w1, eps: epsIn),
+            h2.rows == rows,
+            residual2.shape == h1.shape, residual2.dtype == h1.dtype,
+            w2.shape == w1.shape, w2.dtype == w1.dtype,
+            w3.shape == w1.shape, w3.dtype == w1.dtype
+        else { return nil }
+
+        let out = sortedExpertTailKernel(
+            [h1, h2.sortedOutputs, h2.inverseOrder, h2.weights, w1, w2, w3, residual2],
+            template: [("T", h1.dtype)],
+            grid: (threadsPerRow, rows, 1),
+            threadGroup: (threadsPerRow, 1, 1),
+            outputShapes: [h1.shape],
+            outputDTypes: [h1.dtype]
+        )[0]
+        h2.recordFusedConsumption()
+        CBv2EngageMark.once("expert-tail-prefill")
+        return out
+    }
+
+    public static func branchTailChained(
+        h1: MLXArray, h2: SwitchGLUSortedWeightedOutput,
+        w1: MLXArray, w2: MLXArray, w3: MLXArray,
+        residual2: MLXArray, layerScalar: MLXArray, nextInputNormWeight: MLXArray,
+        eps epsIn: Float
+    ) -> (out: MLXArray, normedNext: MLXArray)? {
+        guard let rows = planeRows(h1, weight: w1, eps: epsIn),
+            h2.rows == rows,
+            residual2.shape == h1.shape, residual2.dtype == h1.dtype,
+            w2.shape == w1.shape, w2.dtype == w1.dtype,
+            w3.shape == w1.shape, w3.dtype == w1.dtype,
+            layerScalar.size == 1, layerScalar.dtype == h1.dtype,
+            nextInputNormWeight.shape == w1.shape,
+            nextInputNormWeight.dtype == w1.dtype
+        else { return nil }
+
+        let outs = sortedExpertTailChainKernel(
+            [
+                h1, h2.sortedOutputs, h2.inverseOrder, h2.weights,
+                w1, w2, w3, residual2, layerScalar, nextInputNormWeight,
+            ],
+            template: [("T", h1.dtype)],
+            grid: (threadsPerRow, rows, 1),
+            threadGroup: (threadsPerRow, 1, 1),
+            outputShapes: [h1.shape, h1.shape],
+            outputDTypes: [h1.dtype, h1.dtype]
+        )
+        h2.recordFusedConsumption()
+        CBv2EngageMark.once("expert-tail-prefill-chain")
         return (outs[0], outs[1])
     }
 

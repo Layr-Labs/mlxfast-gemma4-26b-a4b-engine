@@ -177,6 +177,85 @@ public func weightedExpertUnsort(
     )[0]
 }
 
+/// One forward's sorted expert rows, retained until their layer-tail consumer
+/// decides whether to combine them in registers or use the original reduction.
+/// Only SwitchGLU's existing production admission can construct this carrier.
+public struct SwitchGLUSortedWeightedOutput {
+    public let sortedOutputs: MLXArray
+    public let inverseOrder: MLXArray
+    public let weights: MLXArray
+    public let rows: Int
+
+    fileprivate init(
+        sortedOutputs: MLXArray, inverseOrder: MLXArray, weights: MLXArray
+    ) {
+        precondition(
+            sortedOutputs.ndim == 2 && sortedOutputs.dim(1) == 2816
+                && sortedOutputs.dtype == .bfloat16
+                && inverseOrder.ndim == 1 && inverseOrder.dtype == .uint32
+                && weights.ndim == 2 && weights.dim(1) == 8 && weights.size >= 64
+                && weights.dtype == .bfloat16
+                && sortedOutputs.dim(0) == weights.size
+                && inverseOrder.size == weights.size)
+        self.sortedOutputs = sortedOutputs
+        self.inverseOrder = inverseOrder
+        self.weights = weights
+        self.rows = weights.dim(0)
+    }
+
+    fileprivate func materialized() -> MLXArray {
+        weightedExpertUnsort(
+            sortedOutputs: sortedOutputs, inverseOrder: inverseOrder, weights: weights)
+    }
+
+    /// Call only after a fused consumer has accepted the carrier and emitted
+    /// its graph. A rejected consumer leaves counting to materialized().
+    public func recordFusedConsumption() {
+        weightedExpertUnsortProbe.recordEffective()
+    }
+
+    /// The original per-feature BF16 product and slot-ordered BF16 sum. Tail
+    /// kernels own four adjacent features per thread and reuse these rounded
+    /// values for both the RMS reduction and its subsequent weight multiply.
+    public static let metalReductionSource = """
+        T expertv[4] = {T(0), T(0), T(0), T(0)};
+        const uint assignment_base = row * 8u;
+        for (uint slot = 0; slot < 8u; ++slot) {
+            const uint assignment = assignment_base + slot;
+            const uint sorted_row = (uint)inverse_order[assignment];
+            const size_t expert_base = size_t(sorted_row) * 2816 + lid * 4;
+            const float expert_weight = (float)expert_weights[assignment];
+            for (int i = 0; i < 4; ++i) {
+                const T weighted = (T)(
+                    (float)sorted_outputs[expert_base + i] * expert_weight);
+                expertv[i] = expertv[i] + weighted;
+            }
+        }
+        """
+}
+
+/// Transient result of one expert projection. The fallback is already
+/// projected too: materializing this value never executes the experts again.
+public struct SwitchGLUWeightedOutput {
+    public let sorted: SwitchGLUSortedWeightedOutput?
+    private let reduced: MLXArray?
+
+    fileprivate init(reduced: MLXArray) {
+        self.sorted = nil
+        self.reduced = reduced
+    }
+
+    fileprivate init(sorted: SwitchGLUSortedWeightedOutput) {
+        self.sorted = sorted
+        self.reduced = nil
+    }
+
+    public func materialized() -> MLXArray {
+        if let reduced { return reduced }
+        return sorted!.materialized()
+    }
+}
+
 
 // MARK: - Compiled activation fusions (vMLX / osaurus-main port)
 
@@ -1295,6 +1374,47 @@ public class SwitchGLU: Module {
             sortedOutputs: MLX.squeezed(projected.output, axis: -2),
             inverseOrder: inverseOrder,
             weights: weights)
+    }
+
+    /// Preserve the same projection and reduction admission while allowing a
+    /// layer-tail consumer to avoid writing and rereading the combined rows.
+    public func prepareWeightedOutput(
+        _ x: MLXArray,
+        _ indices: MLXArray,
+        weights: MLXArray,
+        fuseSortedReduction: Bool,
+        isProductionPrefill: Bool = true
+    ) -> SwitchGLUWeightedOutput {
+        // At B=8 decode there are exactly 64 assignments (8 rows x top-k 8),
+        // which is the sorting threshold and the minimum geometry accepted by
+        // weightedExpertUnsort.  Keep the decode gate exact so MTP rectangles
+        // and smaller serving cohorts remain on their established reduction.
+        let isEightRowDecode =
+            !isProductionPrefill && x.dim(0) == 8 && indices.size == 64
+        guard fuseSortedReduction && (isProductionPrefill || isEightRowDecode),
+            supportsWeightedExpertUnsort(x, indices, weights: weights)
+        else {
+            return SwitchGLUWeightedOutput(
+                reduced: weightedExpertSum(callAsFunction(x, indices), weights))
+        }
+
+        let projected = projectExperts(x, indices)
+        guard projected.sorted,
+            let inverseOrder = projected.inverseOrder,
+            projected.output.ndim == 3,
+            projected.output.dim(-2) == 1,
+            projected.output.dim(-1) == 2816,
+            projected.output.dtype == .bfloat16
+        else {
+            return SwitchGLUWeightedOutput(
+                reduced: legacyWeightedReduction(projected, indices: indices, weights: weights))
+        }
+
+        let sorted = SwitchGLUSortedWeightedOutput(
+            sortedOutputs: MLX.squeezed(projected.output, axis: -2),
+            inverseOrder: inverseOrder,
+            weights: weights)
+        return SwitchGLUWeightedOutput(sorted: sorted)
     }
 }
 

@@ -277,6 +277,15 @@ private let gemma4PrefillTailMinChunk: Int = {
     return max(2, value)
 }()
 
+/// Keep the full prefill expert combine inside its following layer tail.
+/// Decode and the narrowed single-row prefill retain their existing kernels.
+private let gemma4PrefillExpertTailEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_PREFILL_EXPERT_TAIL"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// Final-layer last-query prefill: project and cache the whole chunk's K/V
 /// but compute Q and attention for the frontier row alone. Requires the tail
 /// narrowing above (exactly one retained row) and a cache that can commit
@@ -2879,6 +2888,24 @@ private class Gemma4Experts: Module {
             isProductionPrefill: isExpertPrefill)
         return y.reshaped(B, S, H)
     }
+
+    /// Multi-row production prefill only; the caller owns this transient
+    /// result until its tail accepts it or materializes the ordinary result.
+    func prepareWeightedOutput(
+        _ x: MLXArray,
+        topKIndices: MLXArray,
+        topKWeights: MLXArray,
+        isExpertPrefill: Bool
+    ) -> SwitchGLUWeightedOutput {
+        let (B, S, H) = (x.dim(0), x.dim(1), x.dim(2))
+        let K = topKIndices.dim(-1)
+        return switchGLU.prepareWeightedOutput(
+            x.reshaped(B * S, H),
+            topKIndices.reshaped(B * S, K),
+            weights: topKWeights.reshaped(B * S, K),
+            fuseSortedReduction: fuseWeightedUnsort,
+            isProductionPrefill: isExpertPrefill)
+    }
 }
 
 // MARK: - MLP
@@ -3371,7 +3398,8 @@ public class Gemma4DecoderLayer: Module {
         {
             // Dense + sparse branches in parallel, summed into one residual.
             let h1Raw: MLXArray
-            let h2Raw: MLXArray
+            let h2Raw: MLXArray?
+            var deferredExperts: SwitchGLUWeightedOutput? = nil
             // ZIP-ROUTER-001: emit the router chain and the dense chain
             // interleaved so the encoder pairs them into shared barrier
             // stages. Returns nil for every geometry but the pinned B=8
@@ -3413,11 +3441,20 @@ public class Gemma4DecoderLayer: Module {
                     eps: config.rmsNormEps)
                 {
                     h1Raw = mlp(n1)
-                    h2Raw = experts(
-                        n2,
-                        topKIndices: topKIndices,
-                        topKWeights: topKWeights,
-                        isExpertPrefill: isExpertPrefill)
+                    if gemma4PrefillExpertTailEnabled, isExpertPrefill, out.dim(1) > 1 {
+                        deferredExperts = experts.prepareWeightedOutput(
+                            n2,
+                            topKIndices: topKIndices,
+                            topKWeights: topKWeights,
+                            isExpertPrefill: isExpertPrefill)
+                        h2Raw = nil
+                    } else {
+                        h2Raw = experts(
+                            n2,
+                            topKIndices: topKIndices,
+                            topKWeights: topKWeights,
+                            isExpertPrefill: isExpertPrefill)
+                    }
                 } else {
                     h1Raw = mlp(preFeedforwardLayernorm(out))
                     h2Raw = experts(
@@ -3432,38 +3469,11 @@ public class Gemma4DecoderLayer: Module {
             // tail and the layer-scalar multiply (PLE absent on this model).
             let canFoldScalar =
                 perLayerInputGate == nil || activePerLayerInput == nil
-            if canFoldScalar, let chain = glueChain,
-                let nextWeight = nextInputLayernormWeight,
-                let chained = Gemma4FusedLayerGlue.tailChained(
-                    mlpOut: h1Raw, expertOut: h2Raw, residual: residual2,
-                    w1: postFeedforwardLayernorm1.weight,
-                    w2: postFeedforwardLayernorm2.weight,
-                    w3: postFeedforwardLayernorm.weight,
-                    layerScalar: layerScalar,
-                    nextInputNormWeight: nextWeight,
-                    eps: config.rmsNormEps)
-            {
-                out = chained.out
-                chain.pending = (source: chained.out, normed: chained.normedNext)
-                tailApplied = true
-                scalarFolded = true
-            } else if canFoldScalar,
-                let fusedTail = Gemma4FusedLayerGlue.tail(
-                    mlpOut: h1Raw, expertOut: h2Raw, residual: residual2,
-                    w1: postFeedforwardLayernorm1.weight,
-                    w2: postFeedforwardLayernorm2.weight,
-                    w3: postFeedforwardLayernorm.weight,
-                    layerScalar: layerScalar,
-                    eps: config.rmsNormEps)
-            {
-                out = fusedTail
-                tailApplied = true
-                scalarFolded = true
-            } else if canFoldScalar, let chain = glueChain,
+            if let sorted = deferredExperts?.sorted,
+                canFoldScalar, let chain = glueChain,
                 let nextWeight = nextInputLayernormWeight,
                 let chained = Gemma4PrefillGlueV1.branchTailChained(
-                    h1: h1Raw,
-                    h2: h2Raw,
+                    h1: h1Raw, h2: sorted,
                     w1: postFeedforwardLayernorm1.weight,
                     w2: postFeedforwardLayernorm2.weight,
                     w3: postFeedforwardLayernorm.weight,
@@ -3476,21 +3486,81 @@ public class Gemma4DecoderLayer: Module {
                 chain.pending = (source: chained.out, normed: chained.normedNext)
                 tailApplied = true
                 scalarFolded = true
-            } else if let fusedTail = Gemma4PrefillGlueV1.branchTail(
-                h1: h1Raw,
-                h2: h2Raw,
-                w1: postFeedforwardLayernorm1.weight,
-                w2: postFeedforwardLayernorm2.weight,
-                w3: postFeedforwardLayernorm.weight,
-                residual2: residual2,
-                eps: config.rmsNormEps)
+            } else if let sorted = deferredExperts?.sorted,
+                let fusedTail = Gemma4PrefillGlueV1.branchTail(
+                    h1: h1Raw, h2: sorted,
+                    w1: postFeedforwardLayernorm1.weight,
+                    w2: postFeedforwardLayernorm2.weight,
+                    w3: postFeedforwardLayernorm.weight,
+                    residual2: residual2,
+                    eps: config.rmsNormEps)
             {
                 out = fusedTail
                 tailApplied = true
             } else {
-                let h1 = postFeedforwardLayernorm1(h1Raw)
-                let h2 = postFeedforwardLayernorm2(h2Raw)
-                out = h1 + h2
+                // Either the original branch produced h2 already, or this is
+                // the sole materialization of the already-projected carrier.
+                let h2Raw = h2Raw ?? deferredExperts!.materialized().reshaped(h1Raw.shape)
+                if canFoldScalar, let chain = glueChain,
+                    let nextWeight = nextInputLayernormWeight,
+                    let chained = Gemma4FusedLayerGlue.tailChained(
+                        mlpOut: h1Raw, expertOut: h2Raw, residual: residual2,
+                        w1: postFeedforwardLayernorm1.weight,
+                        w2: postFeedforwardLayernorm2.weight,
+                        w3: postFeedforwardLayernorm.weight,
+                        layerScalar: layerScalar,
+                        nextInputNormWeight: nextWeight,
+                        eps: config.rmsNormEps)
+                {
+                    out = chained.out
+                    chain.pending = (source: chained.out, normed: chained.normedNext)
+                    tailApplied = true
+                    scalarFolded = true
+                } else if canFoldScalar,
+                    let fusedTail = Gemma4FusedLayerGlue.tail(
+                        mlpOut: h1Raw, expertOut: h2Raw, residual: residual2,
+                        w1: postFeedforwardLayernorm1.weight,
+                        w2: postFeedforwardLayernorm2.weight,
+                        w3: postFeedforwardLayernorm.weight,
+                        layerScalar: layerScalar,
+                        eps: config.rmsNormEps)
+                {
+                    out = fusedTail
+                    tailApplied = true
+                    scalarFolded = true
+                } else if canFoldScalar, let chain = glueChain,
+                    let nextWeight = nextInputLayernormWeight,
+                    let chained = Gemma4PrefillGlueV1.branchTailChained(
+                        h1: h1Raw,
+                        h2: h2Raw,
+                        w1: postFeedforwardLayernorm1.weight,
+                        w2: postFeedforwardLayernorm2.weight,
+                        w3: postFeedforwardLayernorm.weight,
+                        residual2: residual2,
+                        layerScalar: layerScalar,
+                        nextInputNormWeight: nextWeight,
+                        eps: config.rmsNormEps)
+                {
+                    out = chained.out
+                    chain.pending = (source: chained.out, normed: chained.normedNext)
+                    tailApplied = true
+                    scalarFolded = true
+                } else if let fusedTail = Gemma4PrefillGlueV1.branchTail(
+                    h1: h1Raw,
+                    h2: h2Raw,
+                    w1: postFeedforwardLayernorm1.weight,
+                    w2: postFeedforwardLayernorm2.weight,
+                    w3: postFeedforwardLayernorm.weight,
+                    residual2: residual2,
+                    eps: config.rmsNormEps)
+                {
+                    out = fusedTail
+                    tailApplied = true
+                } else {
+                    let h1 = postFeedforwardLayernorm1(h1Raw)
+                    let h2 = postFeedforwardLayernorm2(h2Raw)
+                    out = h1 + h2
+                }
             }
         } else {
             out = preFeedforwardLayernorm(out)

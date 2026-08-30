@@ -42,6 +42,22 @@ struct MTPVerificationStrategySealTests {
         }
     }
 
+    @Test
+    func productionMTPRequestBoundaryRefusesPhysicalBatchAboveOne() throws {
+        #expect(throws: Never.self) {
+            try Gemma4Runtime.requireCertifiedMTPPhysicalBatch(1)
+        }
+        do {
+            try Gemma4Runtime.requireCertifiedMTPPhysicalBatch(2)
+            Issue.record("production Gemma MTP accepted uncertified physical B2")
+        } catch {
+            let message = String(describing: error)
+            #expect(message.contains("physical batch 1"))
+            #expect(message.contains("got 2"))
+            #expect(message.contains("before engine construction"))
+        }
+    }
+
     // MARK: - Shared fixture (mirrors RuntimeWorkerMTPRoundExecutionTests)
 
     private let vocabSize = 64
@@ -51,11 +67,12 @@ struct MTPVerificationStrategySealTests {
     /// live in (port-notes 5.3).
     private let slidingWindow = 12
 
-    /// Exact-by-construction phase fixture. Its logits are a table lookup on
-    /// each input token, so `[1, C]` and C independent `[1, 1]` calls return
-    /// literally the same stored Float values. Dummy full/sliding attention
-    /// still advances real CBv2 caches, allowing complete MTP round and
-    /// rollback accounting to run through the production engine seam.
+    /// Cache-sensitive exactness fixture. A dominant token table fixes the
+    /// greedy stream, while a small full/sliding attention term derived from
+    /// token-valued K/V makes every raw logit row depend on committed cache
+    /// contents. The serial-query rectangular attention contract therefore
+    /// remains bit-exact to independent `[1, 1]` calls, while stale rollback
+    /// state becomes directly observable in subsequent logits.
     private final class ExactCycleTarget: CBv2MTPSteppableModel {
         static let vocabularySize = 64
         private static let headDimension = 16
@@ -90,7 +107,7 @@ struct MTPVerificationStrategySealTests {
         func forward(
             tokens: MLXArray, caches: [CBv2AttendingLayerCache]
         ) -> MLXArray {
-            exactForward(tokens: tokens, caches: caches, record: false).logits
+            exactForward(tokens: tokens, caches: caches, record: true).logits
         }
 
         func forwardWithHidden(
@@ -110,22 +127,30 @@ struct MTPVerificationStrategySealTests {
         ) -> (logits: MLXArray, lastHidden: MLXArray) {
             let batch = tokens.dim(0)
             let columns = tokens.dim(1)
-            let qkv = MLXArray.zeros(
-                [batch, 1, columns, Self.headDimension], dtype: .float32)
-            var cacheDependency = MLXArray.zeros([1], dtype: .float32)
+            // Token-derived K/V makes every later logit row depend on the
+            // actual committed full/sliding cache contents. A rollback that
+            // leaves even one provisional token behind changes subsequent
+            // attention and therefore breaks the bit-exact logit comparison.
+            let qkv = broadcast(
+                tokens.asType(.float32).reshaped([batch, 1, columns, 1])
+                    / Float(Self.vocabularySize),
+                to: [batch, 1, columns, Self.headDimension])
+            var cacheDependency = MLXArray.zeros(
+                [batch, columns, 1], dtype: .float32)
             for cache in caches {
-                cacheDependency = cacheDependency + cache.updateAndAttend(
+                let attended = cache.updateAndAttend(
                     queries: qkv, keys: qkv, values: qkv,
-                    scale: 0.25, sinks: nil).sum()
+                    scale: 0.25, sinks: nil)
+                cacheDependency = cacheDependency
+                    + attended.sum(axis: -1).squeezed(axis: 1)
+                        .expandedDimensions(axis: -1)
             }
             let next = (tokens + 1) % Self.vocabularySize
-            // The zero-valued dependency is intentional: it keeps the dummy
-            // attention/cache write graph live without changing a table bit.
-            let logits = take(table, next, axis: 0) + cacheDependency * 0
+            let logits = take(table, next, axis: 0) + cacheDependency * 0.001
             let hidden =
                 MLXArray.zeros(
                     [batch, columns, Self.hiddenDimension], dtype: .float32)
-                + cacheDependency * 0
+                + cacheDependency * 0.001
             if record {
                 recordLock.lock()
                 recordedVerificationLogits.append(logits + 0)
@@ -138,11 +163,17 @@ struct MTPVerificationStrategySealTests {
         /// Serial produces C singleton calls while rectangular produces one
         /// C-column call; this normalization compares their actual values.
         func verificationLogitRows() -> [[Float]] {
+            recordedLogitCalls().flatMap { $0 }
+        }
+
+        /// Preserve call grouping so committed verifier prefixes can be
+        /// compared to the independent plain-AR one-call-per-token oracle.
+        func recordedLogitCalls() -> [[[Float]]] {
             recordLock.lock()
             let arrays = recordedVerificationLogits
             recordLock.unlock()
             eval(arrays)
-            return arrays.flatMap { array in
+            return arrays.map { array in
                 let values = array.reshaped([-1]).asArray(Float.self)
                 return stride(
                     from: 0, to: values.count, by: Self.vocabularySize
@@ -279,6 +310,7 @@ struct MTPVerificationStrategySealTests {
         let result: RuntimeWorkerFreeRunResult
         let metrics: CBv2MTPMetrics
         let logitRows: [[Float]]
+        let logitCalls: [[[Float]]]
 
         /// The target's authoritative argmax for every verify column.
         var targetArgmaxes: [[Int]] { metrics.roundAudits.map(\.targetTokens) }
@@ -286,6 +318,28 @@ struct MTPVerificationStrategySealTests {
             guard let last = metrics.roundAudits.last else { return [] }
             return [last.tokensCountAfter, last.numComputedAfter]
         }
+
+        /// Logit rows that actually authored committed output tokens. The
+        /// first call's last row emits the prompt bonus. Every later call is
+        /// paired with the engine's committed width for that delta; rejected
+        /// speculative suffix rows are deliberately excluded.
+        var committedLogitRows: [[Float]] {
+            guard let promptCall = logitCalls.first,
+                let promptBonus = promptCall.last
+            else { return [] }
+            var rows = [promptBonus]
+            for (call, committed) in zip(
+                logitCalls.dropFirst(), result.acceptanceLengths)
+            {
+                rows.append(contentsOf: call.prefix(committed))
+            }
+            return rows
+        }
+    }
+
+    private struct PlainExactRun {
+        let stream: [Int]
+        let committedLogitRows: [[Float]]
     }
 
     private func makeExactEngine(
@@ -320,13 +374,14 @@ struct MTPVerificationStrategySealTests {
         prompt: [Int],
         baseline: [Int],
         n: Int,
-        maxTokens: Int
+        maxTokens: Int,
+        wrong: @escaping (Int, Int) -> Bool = { _, _ in false }
     ) throws -> StrategyRun {
         let target = ExactCycleTarget()
         let drafter = ScriptedDrafter(
             script: baseline, promptLength: prompt.count,
             vocabSize: ExactCycleTarget.vocabularySize,
-            target: target, wrong: { _, _ in false })
+            target: target, wrong: wrong)
         var config = try Gemma4MTPEnvelope.resolveConfig(depth: depth)
         config.enabled = true
         config.maxSpeculativeBatch = 1
@@ -342,7 +397,30 @@ struct MTPVerificationStrategySealTests {
         let metrics = try #require(engine.mtpMetricsSnapshot())
         return StrategyRun(
             seedToken: session.seedToken, result: result, metrics: metrics,
-            logitRows: target.verificationLogitRows())
+            logitRows: target.verificationLogitRows(),
+            logitCalls: target.recordedLogitCalls())
+    }
+
+    private func runPlainExactAR(
+        prompt: [Int], n: Int, maxTokens: Int
+    ) throws -> PlainExactRun {
+        let target = ExactCycleTarget()
+        let engine = makeExactEngine(
+            target: target, promptLength: prompt.count,
+            drafter: nil, config: CBv2MTPConfig())
+        let session = try RuntimeWorkerFreeRunSession(
+            engine: engine, mode: .serial, seedTokens: prompt,
+            maxTokens: maxTokens, stopTokens: [])
+        let result = try session.run(targetN: n)
+        let calls = target.recordedLogitCalls()
+        let promptBonus = try #require(calls.first?.last)
+        var committedRows = [promptBonus]
+        for (call, committed) in zip(calls.dropFirst(), result.acceptanceLengths) {
+            committedRows.append(contentsOf: call.prefix(committed))
+        }
+        return PlainExactRun(
+            stream: [session.seedToken] + result.tokens,
+            committedLogitRows: committedRows)
     }
 
     /// Run every production depth once through the serial verifier and once
@@ -432,7 +510,7 @@ struct MTPVerificationStrategySealTests {
             let target = try makeTarget(seed: 0x5EED_0001)
             let prompt = promptTokens(length: 14, seed: 11)
             let n = 96
-            let maxTokens = n + 8
+            let maxTokens = n + 1
 
             let baseline = try serialReference(
                 target: target, prompt: prompt, n: n, maxTokens: maxTokens)
@@ -471,6 +549,34 @@ struct MTPVerificationStrategySealTests {
                 "pattern \(name): max committed width \(maxWidth), expected \(expectedMaxWidth)")
             #expect(result.draftedTotal >= result.acceptedTotal, "pattern \(name)")
             #expect(result.draftedTotal > 0, "pattern \(name)")
+
+            // Bit-exact serial-vs-rectangular evidence with logits that are a
+            // function of token-derived full/sliding KV contents. Partial,
+            // zero, and mixed acceptance force rollback; stale provisional
+            // cache state changes a subsequent authoritative logit bit.
+            let exactPrompt = promptTokens(length: 14, seed: 11)
+            let plainExact = try runPlainExactAR(
+                prompt: exactPrompt, n: n, maxTokens: maxTokens)
+            let exactBaseline = plainExact.stream
+            let exactSerial = try runStrategy(
+                .serialTarget, depth: 2, prompt: exactPrompt,
+                baseline: exactBaseline, n: n, maxTokens: maxTokens, wrong: wrong)
+            let exactRectangular = try runStrategy(
+                .rectangular, depth: 2, prompt: exactPrompt,
+                baseline: exactBaseline, n: n, maxTokens: maxTokens, wrong: wrong)
+            #expect(
+                exactSerial.logitRows == exactRectangular.logitRows,
+                "pattern \(name): cache-dependent verifier logits diverged after rollback")
+            #expect(
+                exactSerial.result.tokens == exactRectangular.result.tokens,
+                "pattern \(name): committed streams diverged after rollback")
+            #expect(
+                [exactRectangular.seedToken] + exactRectangular.result.tokens
+                    == plainExact.stream,
+                "pattern \(name): rectangular stream diverged from plain AR")
+            #expect(
+                exactRectangular.committedLogitRows == plainExact.committedLogitRows,
+                "pattern \(name): cache-dependent committed logits diverged from plain AR")
         }
     }
 }

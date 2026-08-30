@@ -158,6 +158,14 @@ struct CBv2MTPSeedCostLedger {
 /// Engine-side MTP state: drafter binding, carries, plan marks, metrics.
 final class CBv2MTPRoundDriver {
 
+    /// Installed once with the engine. The certified rectangular closure has
+    /// no eligibility branch or fallback: cache capability was proven before
+    /// this driver could be constructed. Generic automatic behavior remains
+    /// a distinct closure for non-certified integrations and test fixtures.
+    typealias TargetVerifier = (
+        EngineLoopV2, [MLXArray], [CBv2MTPRowWork], CBv2MTPRoundDriver
+    ) -> (argmax: MLXArray, hidden: MLXArray, cacheInnerState: [MLXArray])
+
     /// PARTICIPANT DRAFT-DEPTH LEVER (editable). The maximum MTP draft depth this
     /// submission's adaptive controller uses per decode round. This is a CEILING,
     /// not a fixed depth. The controller selects a depth from 0 to this ceiling
@@ -187,6 +195,7 @@ final class CBv2MTPRoundDriver {
     /// through `forwardWithHidden`).
     let model: any CBv2MTPSteppableModel
     let captureLayers: CBv2MTPCaptureLayers
+    let targetVerifier: TargetVerifier
     private let depthController: CBv2MTPDepthController
 
     // Engine-thread confined.
@@ -217,6 +226,25 @@ final class CBv2MTPRoundDriver {
         self.drafter = drafter
         self.model = model
         self.captureLayers = captureLayers
+        switch config.verificationMode {
+        case .serialTarget:
+            self.targetVerifier = { loop, columns, rows, mtp in
+                loop.mtpBuildSerialTargetVerification(
+                    columns: columns, rows: rows, driver: mtp)
+            }
+        case .rectangular:
+            // `build` refuses this mode unless the provider exposed its
+            // prevalidated, prebound all-cache controller.
+            self.targetVerifier = { loop, columns, rows, mtp in
+                loop.mtpBuildCertifiedRectangularVerification(
+                    columns: columns, rows: rows, driver: mtp)
+            }
+        case .automatic:
+            self.targetVerifier = { loop, columns, rows, mtp in
+                loop.mtpBuildGenericAutomaticVerification(
+                    columns: columns, rows: rows, driver: mtp)
+            }
+        }
         // The adaptive controller's CEILING: the trusted envelope cap
         // (`config.maxDraftTokens`), further bounded by the participant's
         // `submissionDraftDepth`. `fixedDepth` stays `config.fixedDraftTokens`
@@ -233,7 +261,8 @@ final class CBv2MTPRoundDriver {
     /// `DARKBLOOM_CBV2_MTP` kill switch), no drafter, or a model that cannot
     /// drive rounds. nil ⇒ the engine is byte-identical to MTP-less builds.
     static func build(
-        model: CBv2SteppableModel, drafter: (any CBv2MTPDrafter)?, config: CBv2MTPConfig
+        model: CBv2SteppableModel, drafter: (any CBv2MTPDrafter)?, config: CBv2MTPConfig,
+        cacheProvider: CBv2LayerCacheProvider? = nil
     ) -> CBv2MTPRoundDriver? {
         guard config.effectiveEnabled, let drafter else { return nil }
         guard let mtpModel = model as? (any CBv2MTPSteppableModel),
@@ -243,8 +272,12 @@ final class CBv2MTPRoundDriver {
             let drafterTarget = drafter.mtpTargetIdentity,
             modelTarget == drafterTarget
         else { return nil }
+        guard config.verificationMode != .rectangular
+                || cacheProvider?.supportsCertifiedMTPRectangularVerification == true
+        else { return nil }
         return CBv2MTPRoundDriver(
-            config: config, drafter: drafter, model: mtpModel, captureLayers: captureLayers)
+            config: config, drafter: drafter, model: mtpModel,
+            captureLayers: captureLayers)
     }
 
     // MARK: Plan-scoped marks

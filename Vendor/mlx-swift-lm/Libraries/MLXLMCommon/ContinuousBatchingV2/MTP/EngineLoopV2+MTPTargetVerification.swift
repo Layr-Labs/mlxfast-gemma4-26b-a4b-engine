@@ -1,98 +1,84 @@
 // EngineLoopV2+MTPTargetVerification.swift
 //
-// Target-authoritative scoring strategies for one known MTP draft chain.
+// Construction-bound target-authoritative scoring strategies for one known
+// MTP draft chain.
 
 import MLX
 
 extension EngineLoopV2 {
 
-    /// Serial mode is the chip-independent authority path: every column
-    /// executes the same `[B, 1]` eager forward used by ordinary decode,
-    /// while one surrounding speculative KV transaction defers commit until
-    /// the accept walk. Rectangular mode is an explicit optimized strategy.
-    ///
-    /// **Serial is an oracle, not a performance mode.** Production ALWAYS
-    /// selects rectangular: `CBv2MTPRoundDriver.maximumAutomaticDepth`
-    /// pre-clamps depth so `(1 + k) * B <= maxAutomaticRectangularTokens`
-    /// always holds, so the `.automatic` arm below can never pick serial,
-    /// and `MTPAutomaticVerificationPolicy` returns 8 on M3/M4/M5 and 4 on
-    /// M1/M2 — never 0. Serial has never executed in the shipping provider.
-    /// It is also strictly slower than MTP-off: `1 + k` target forwards emit
-    /// at most `1 + k` tokens where plain decode emits one per forward.
-    /// Degrading to it is a SAFETY NET, never a plan.
-    func mtpBuildTargetVerification(
+    /// Explicit serial oracle. This is bound only for `.serialTarget`; it is
+    /// never the recovery path of the certified rectangular production lane.
+    func mtpBuildSerialTargetVerification(
         columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver
     ) -> (argmax: MLXArray, hidden: MLXArray, cacheInnerState: [MLXArray]) {
         precondition(!columns.isEmpty, "CBv2 MTP: target verification requires a seed column")
         let caches = eagerCaches(rowStates: rows.map { kvStates[$0.rec.id]! })
-        let argmax: MLXArray
-        let hidden: MLXArray
+        mtp.recordVerificationStrategy(rectangular: false)
 
-        var useRectangular = switch mtp.config.verificationMode {
-        case .serialTarget: false
-        case .rectangular: true
-        case .automatic:
-            columns.count * columns[0].dim(0) <= mtp.config.maxAutomaticRectangularTokens
+        var argmaxColumns: [MLXArray] = []
+        var hiddenColumns: [MLXArray] = []
+        argmaxColumns.reserveCapacity(columns.count)
+        hiddenColumns.reserveCapacity(columns.count)
+        for column in columns {
+            precondition(column.dim(1) == 1, "CBv2 MTP: serial target column must have L=1")
+            let output = mtp.model.forwardWithHidden(tokens: column, caches: caches)
+            let columnArgmax = argMax(output.logits, axis: -1).asType(.int32)
+            // Building several eager decode calls in one lazy graph can let
+            // mutable KV buffers observe a later version. Complete each
+            // canonical target step before constructing the next.
+            eval([columnArgmax, output.lastHidden] + eagerCacheInnerState(caches))
+            argmaxColumns.append(columnArgmax)
+            hiddenColumns.append(output.lastHidden)
         }
+        return (
+            concatenated(argmaxColumns, axis: 1),
+            concatenated(hiddenColumns, axis: 1),
+            eagerCacheInnerState(caches))
+    }
 
-        // Rectangular verification obliges every layer cache in the bank to
-        // serialise its attention one query position at a time for the
-        // duration of the round. That capability is the opt-in marker
-        // `CBv2MTPRectangularSerializing` (Paged/PagedSeamContract.swift),
-        // NOT a concrete type: `CBv2LayerCache` conforms by extension, and a
-        // paged bank conforms only once `PagedLayerCache.updateAndAttend`
-        // grows the per-column loop (WS-3.4).
-        //
-        // This was `as? CBv2LayerCache` behind a `preconditionFailure`.
-        // `CBv2LayerCache` is `final` and `PagedLayerCache` is a SIBLING
-        // conformer of `CBv2AttendingLayerCache`, never a subclass, so that
-        // cast could not succeed for a paged bank — and `preconditionFailure`
-        // is a `fatalError`: daemon death, every co-resident model's
-        // in-flight requests lost, and not one line of telemetry. A bank that
-        // cannot serialise MUST degrade to the serial oracle above and MUST
-        // NOT trap (PagedSeamContract: "Callers MUST degrade to serial
-        // verification for a cache that does not conform, and MUST NOT trap").
-        var serializingCaches: [CBv2MTPRectangularSerializing] = []
-        if useRectangular {
-            serializingCaches = caches.compactMap { $0 as? CBv2MTPRectangularSerializing }
-            if serializingCaches.count != caches.count {
-                mtp.recordControllerFallback("rectangular_cache_unsupported")
-                useRectangular = false
-            }
+    /// Certified explicit rectangular lane. Engine construction has already
+    /// proven and captured an all-cache controller, and the driver's callable
+    /// is bound directly to this entrypoint. There is no eligibility check,
+    /// allocation, fallback, or fallback accounting in this path.
+    func mtpBuildCertifiedRectangularVerification(
+        columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver
+    ) -> (argmax: MLXArray, hidden: MLXArray, cacheInnerState: [MLXArray]) {
+        precondition(!columns.isEmpty, "CBv2 MTP: target verification requires a seed column")
+        let caches = eagerCaches(rowStates: rows.map { kvStates[$0.rec.id]! })
+        mtp.recordVerificationStrategy(rectangular: true)
+        cacheProvider.setCertifiedMTPRectangularVerification(true)
+        defer { cacheProvider.setCertifiedMTPRectangularVerification(false) }
+        let tokens = concatenated(columns, axis: 1)
+        let output = mtp.model.forwardRectangularVerificationWithHidden(
+            tokens: tokens, caches: caches)
+        return (
+            argMax(output.logits, axis: -1).asType(.int32),
+            output.lastHidden,
+            eagerCacheInnerState(caches))
+    }
+
+    /// Legacy/generic automatic integration lane. Its work envelope changes
+    /// with the planned row count, so it retains runtime strategy selection
+    /// and safe serial degradation. Production Gemma never binds this lane:
+    /// its sealed B1 configs use explicit `.rectangular` verification.
+    func mtpBuildGenericAutomaticVerification(
+        columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver
+    ) -> (argmax: MLXArray, hidden: MLXArray, cacheInnerState: [MLXArray]) {
+        precondition(!columns.isEmpty, "CBv2 MTP: target verification requires a seed column")
+        let rectangularWithinEnvelope =
+            columns.count * columns[0].dim(0)
+            <= mtp.config.maxAutomaticRectangularTokens
+        if rectangularWithinEnvelope,
+            cacheProvider.supportsCertifiedMTPRectangularVerification
+        {
+            return mtpBuildCertifiedRectangularVerification(
+                columns: columns, rows: rows, driver: mtp)
         }
-        mtp.recordVerificationStrategy(rectangular: useRectangular)
-
-        if !useRectangular {
-            var argmaxColumns: [MLXArray] = []
-            var hiddenColumns: [MLXArray] = []
-            argmaxColumns.reserveCapacity(columns.count)
-            hiddenColumns.reserveCapacity(columns.count)
-            for column in columns {
-                precondition(column.dim(1) == 1, "CBv2 MTP: serial target column must have L=1")
-                let output = mtp.model.forwardWithHidden(tokens: column, caches: caches)
-                let columnArgmax = argMax(output.logits, axis: -1).asType(.int32)
-                // Building several eager decode calls in one lazy graph can
-                // let mutable KV buffers observe a later version. Complete
-                // each canonical target step before constructing the next.
-                eval([columnArgmax, output.lastHidden] + eagerCacheInnerState(caches))
-                argmaxColumns.append(columnArgmax)
-                hiddenColumns.append(output.lastHidden)
-            }
-            argmax = concatenated(argmaxColumns, axis: 1)
-            hidden = concatenated(hiddenColumns, axis: 1)
-
-        } else {
-            for cache in serializingCaches { cache.mtpSerializesRectangularAttention = true }
-            defer {
-                for cache in serializingCaches { cache.mtpSerializesRectangularAttention = false }
-            }
-            let tokens = concatenated(columns, axis: 1)
-            let output = mtp.model.forwardRectangularVerificationWithHidden(
-                tokens: tokens, caches: caches)
-            argmax = argMax(output.logits, axis: -1).asType(.int32)
-            hidden = output.lastHidden
+        if rectangularWithinEnvelope {
+            mtp.recordControllerFallback("rectangular_cache_unsupported")
         }
-
-        return (argmax, hidden, eagerCacheInnerState(caches))
+        return mtpBuildSerialTargetVerification(
+            columns: columns, rows: rows, driver: mtp)
     }
 }

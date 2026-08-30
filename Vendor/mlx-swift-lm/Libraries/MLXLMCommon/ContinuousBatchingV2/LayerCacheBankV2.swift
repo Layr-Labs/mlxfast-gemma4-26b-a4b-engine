@@ -98,6 +98,9 @@ public protocol CBv2KVSourceChunkRetaining: AnyObject {
 public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionInvalidating {
 
     private let caches: [any CBv2AttendingLayerCache]
+    /// All-or-nothing rectangular controller captured once at installation.
+    /// nil means this bank remains eligible only for the generic verifier.
+    private let certifiedMTPRectangularCaches: [any CBv2MTPRectangularSerializing]?
     private var boundRowIdentity: [ObjectIdentifier] = []
     private var hasBound = false
     /// Canonical owning layer for an all-contiguous bank's shared position
@@ -109,6 +112,9 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
     /// `PagedKVBackend.makeLayerCaches(attentionSoftcap:)`.
     public init(caches: [any CBv2AttendingLayerCache]) {
         self.caches = caches
+        let rectangular = caches.compactMap { $0 as? CBv2MTPRectangularSerializing }
+        self.certifiedMTPRectangularCaches =
+            rectangular.count == caches.count ? rectangular : nil
         let contiguous = caches.compactMap { $0 as? CBv2LayerCache }
         if contiguous.count == caches.count,
             // Advance at the last owning layer so every earlier layer still
@@ -129,6 +135,20 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
         for cache in caches {
             guard let retaining = cache as? CBv2KVSourceChunkRetaining else { continue }
             retaining.setRetainsChunkForBorrowers(borrowedSources.contains(cache.layerIndex))
+        }
+    }
+
+    public var supportsCertifiedMTPRectangularVerification: Bool {
+        certifiedMTPRectangularCaches != nil
+    }
+
+    public func setCertifiedMTPRectangularVerification(_ enabled: Bool) {
+        // Engine construction binds the explicit rectangular verifier only
+        // when this controller exists. This is an invariant assertion, not a
+        // hot-path eligibility check or a fallback route.
+        let caches = certifiedMTPRectangularCaches!
+        for cache in caches {
+            cache.mtpSerializesRectangularAttention = enabled
         }
     }
 

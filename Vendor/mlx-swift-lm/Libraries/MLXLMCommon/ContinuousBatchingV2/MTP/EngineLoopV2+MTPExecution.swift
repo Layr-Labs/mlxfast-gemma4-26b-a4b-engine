@@ -287,8 +287,7 @@ extension EngineLoopV2 {
             for sequence in metadata.storageRows { sequence.beginSpeculativeWrite() }
         }
         let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
-        let target = mtpBuildTargetVerification(
-            columns: targetColumns, rows: verifyRows, driver: mtp)
+        let target = mtp.targetVerifier(self, targetColumns, verifyRows, mtp)
         cacheInnerState.append(contentsOf: target.cacheInnerState)
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(

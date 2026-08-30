@@ -216,7 +216,8 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         let mtpDriver: CBv2MTPRoundDriver?
         if samplerSupportsMTP {
             mtpDriver = CBv2MTPRoundDriver.build(
-                model: model, drafter: mtpDrafter, config: mtpConfig)
+                model: model, drafter: mtpDrafter, config: mtpConfig,
+                cacheProvider: cacheProvider)
         } else {
             mtpDriver = nil
         }
@@ -232,6 +233,11 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         } else if !samplerSupportsMTP {
             mtpInactiveReason =
                 "sampler \(type(of: sampler)) is not proven argmax-equivalent"
+        } else if mtpConfig.verificationMode == .rectangular,
+            !cacheProvider.supportsCertifiedMTPRectangularVerification
+        {
+            mtpInactiveReason =
+                "explicit rectangular verification lacks a construction-certified cache provider"
         } else {
             mtpInactiveReason =
                 "model/drafter pair cannot prove matching MTP target identity or capture layers"

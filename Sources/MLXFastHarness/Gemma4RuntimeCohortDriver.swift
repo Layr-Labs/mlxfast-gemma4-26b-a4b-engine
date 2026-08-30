@@ -6,11 +6,11 @@ import MLXLLM
 import MLXLMCommon
 import MLXSpeculative
 
-// v1.2 BATCHED (cohort) free-run driver — the engine half of the batch-8
-// cohort measurement (batch-8 brief §4.1, D3/D4/D6). Carries BOTH the SERIAL
-// (target-only) and MTP round-execution paths (`runSerial` / `runMTP`
-// below); one spec, resolved once at `free_decode_begin`, selects which the
-// following `free_decode_run` drains.
+// Closed-cohort free-run driver. Serial requests retain the general B1...B8
+// scheduler surface. Production Gemma exact MTP is deliberately narrower:
+// physical B1 only, with installed C2...C4 verifier entrypoints. A public MTP
+// cohort wider than one is refused before engine construction; the generic
+// multi-row round helpers remain solely for explicit engine-level fixtures.
 //
 // The cohort runs through the vendored ContinuousBatchingV2 engine
 // (`EngineV2` + `SchedulerV2`), not through the worker's single-stream
@@ -36,12 +36,10 @@ import MLXSpeculative
 // vendored revision). If the model cannot produce CBv2 caches, the phase
 // REFUSES; it never falls back to another backend.
 //
-// The one cohort `spec` resolves to `serial` or `mtp` (2026-08-23: MTP round
-// execution landed behind the #56 decoder-neutral seam) — `serial` builds a
-// plain target-only `EngineV2`; `mtp` binds the SAME assistant-head drafter
-// the single-stream leg uses (`Gemma4A4BAssistantHead.swift`) via
-// `makeCohortEngine`'s `mtpDrafter`/`mtpConfig` parameters. Anything else
-// (a spec that resolves to neither) is refused rather than clamped.
+// The one cohort `spec` resolves to `serial` or `mtp`. `serial` builds a plain
+// target-only `EngineV2`; `mtp` first enforces physical B1, then binds the
+// assistant-head drafter and certified direct verifier. Anything else is
+// refused rather than clamped or relabeled.
 //
 // Measurement lives in benchd: nothing here times anything. The driver
 // returns raw committed tokens and the cohort AUDIT counters; benchd owns
@@ -526,42 +524,14 @@ extension Gemma4Runtime {
     ///     every stream's whole (equal-length) seed, so no stream enters
     ///     decode while another still prefills.
     ///
-    /// No MTP drafter is bound (round execution not yet wired — see this
-    /// file's cohort-begin guard and RuntimeWorkerGenericDispatch.swift's
-    /// `.mtp` route), so the engine runs plain target-only decode.
-    ///
-    /// THE BASIC 16-32-WIDE VERIFICATION KERNEL, for the follow-up that wires
-    /// this: when `EngineV2.init(mtpDrafter:mtpConfig:)` is given a bound
-    /// `Gemma4CBv2MTPDrafter` and a `Gemma4MTPEnvelope.resolveConfig(depth:)`
-    /// config (MTPEnvelope.swift), rectangular verification requires NO new
-    /// Metal kernel here — it is already shipped in the vendored fork.
-    /// `Vendor/mlx-swift-lm/.../Paged/PagedSeamContract.swift` declares
-    /// `CBv2MTPRectangularSerializing` and `CBv2LayerCache` (this cohort's
-    /// contiguous layer cache, per port-notes §5's pin) already conforms,
-    /// declaration-only, because the contiguous cache already owns the
-    /// stored flag. Setting `mtpSerializesRectangularAttention = true` for a
-    /// round forces every attention call in `.../ContinuousBatchingV2/
-    /// AttentionV1.swift` (`attendSerialQueries`) to compute one query
-    /// position at a time — so each of the `1+k` verify columns is
-    /// bit-identical to that column run as a standalone `L==1` decode BY
-    /// CONSTRUCTION, and only the weight-bound model body batches across
-    /// columns (`EngineLoopV2+MTPTargetVerification.swift`,
-    /// `mtpBuildTargetVerification`). `Gemma4MTPEnvelope.maxAutomaticRectangularTokens`
-    /// (32) admits exactly this track's B=8 x (1+k) envelope for k=1...3 —
-    /// rectangular widths 16, 24, 32 — and the vendored `.automatic`
-    /// verification mode degrades to the serial `L==1` oracle (never traps)
-    /// for any cache that does not conform, so a paged backend or a future
-    /// wider request is safe by construction, not by convention.
-    ///
-    /// A participant wanting a REAL wide kernel — genuine batched
-    /// multi-query attention across the verify columns instead of
-    /// per-column serialization — would replace the `.rectangular` arm's
-    /// attention dispatch inside `attendSerialQueries` (or provide a second
-    /// `CBv2MTPRectangularSerializing` conformer with a batched kernel
-    /// behind the flag) while leaving the `CBv2MTPRoundDriver` control flow,
-    /// the KV staged-transaction write path (`CBv2SequenceKV.
-    /// beginSpeculativeWrite`/`commitSpeculativeWrite`, port-notes trap 3.3),
-    /// and this envelope's declared/sealed/refused pins untouched.
+    /// A nil drafter builds the unchanged serial engine. A production Gemma
+    /// MTP drafter is legal only at physical B1 and arrives with the sealed
+    /// explicit-rectangular config. `CBv2LayerCacheBank` validates and binds
+    /// its contiguous cache controller once during construction; the round
+    /// driver then invokes the certified rectangular entrypoint directly.
+    /// Unsupported production widths fail before engine construction and
+    /// never degrade to serial under an MTP label. Generic `.automatic`
+    /// configs remain available only to explicit engine-level fixtures.
     static func makeCohortEngine(
         model: Gemma4TextModel,
         batchSize: Int,
@@ -570,6 +540,9 @@ extension Gemma4Runtime {
         mtpDrafter: (any CBv2MTPDrafter)? = nil,
         mtpConfig: CBv2MTPConfig = CBv2MTPConfig()
     ) throws -> EngineV2 {
+        if mtpDrafter != nil, mtpConfig.verificationMode == .rectangular {
+            try requireCertifiedMTPPhysicalBatch(batchSize)
+        }
         let layerKinds = model.cbv2LayerKinds
         // CONTIGUOUS pin: CBv2LayerCache is the contiguous per-layer cache.
         // `newCacheV2` throws (refuses) if the model cannot serve CBv2 — the
@@ -586,9 +559,8 @@ extension Gemma4Runtime {
         // `mtpDrafter` is nil for the plain (target-only) cohort/single-stream
         // engine — EngineV2 runs byte-identical plain decode in that case
         // (`mtpDriver` stays nil at construction). A non-nil drafter binds
-        // the REAL round loop, per this file's own header note on the basic
-        // 16-32-wide verification kernel: no new Metal code, the vendored
-        // `CBv2MTPRoundDriver` + rectangular-serialized attention do the work.
+        // the real B1/C2...C4 round loop. The vendored driver invokes the
+        // construction-certified rectangular cache controller directly.
         return EngineV2(
             model: CBv2SteppableLanguageModelAdapter(model),
             layerKinds: layerKinds,
@@ -604,6 +576,17 @@ extension Gemma4Runtime {
                 enablePrefixCache: false),
             mtpDrafter: mtpDrafter,
             mtpConfig: mtpConfig)
+    }
+
+    /// Production Gemma installs exact verifier entrypoints only for B1/C2,
+    /// B1/C3, and B1/C4. Refuse any wider production MTP request before model
+    /// lookup, allocator reset, cache allocation, or engine construction.
+    static func requireCertifiedMTPPhysicalBatch(_ batchSize: Int) throws {
+        guard batchSize == 1 else {
+            throw MLXFastError.invalidInput(
+                "production Gemma exact MTP is certified only for physical batch 1; "
+                    + "got \(batchSize), refusing before engine construction")
+        }
     }
 
     /// Fail-closed check for a just-constructed MTP-bound engine: this
@@ -645,6 +628,9 @@ extension Gemma4Runtime {
         dflashDrafter: DFlashDraftModel? = nil,
         state: inout RuntimeWorkerState
     ) throws -> RuntimeWorkerResponse {
+        if effectiveSpec?.mode == RuntimeWorkerDecodeRoute.mtp.rawValue {
+            try requireCertifiedMTPPhysicalBatch(cohort.batchSize)
+        }
         // Speculative round EXECUTION for the batched cohort. A resolved
         // `mtp` spec — an assistant head loaded + envelope pins set
         // (`RuntimeWorkerSpecRegistry` / `Gemma4MTPEnvelope`) — binds the
@@ -710,8 +696,8 @@ extension Gemma4Runtime {
         }
         try resetRuntimeWorkerAllocatorForPhaseStart()
         let model = try weightCache.requireLibraryModel()
-        // The mtp arm binds through the pinned CBv2 envelope
-        // (`.serialTarget` verification, depth clamped to `maxDraftTokens`).
+        // The MTP arm binds through the pinned B1 explicit-rectangular CBv2
+        // envelope, with depth clamped to the installed C2...C4 table.
         let mtpConfig =
             isSpeculative
             ? try Gemma4MTPEnvelope.resolveConfig(

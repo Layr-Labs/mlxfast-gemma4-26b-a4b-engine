@@ -250,9 +250,10 @@ public enum CBv2PagedRingGeometry {
 /// failed the storage-eligibility gate first and no round was ever built,
 /// which made removing that gate a latent process abort.
 ///
-/// Both halves have since landed: the verifier `compactMap`s this marker and
-/// degrades to the serial oracle when any cache in the bank does not conform,
-/// and `PagedLayerCache` conforms.
+/// Both halves have since landed: the cache bank captures an all-or-nothing
+/// controller at construction, and `PagedLayerCache` conforms. Explicit
+/// rectangular lanes refuse construction without that controller; only the
+/// separate generic `.automatic` lane may degrade to the serial oracle.
 ///
 /// **Contract.** Setting the flag to `true` obliges the cache to attend one
 /// query position at a time for the duration of the round, so that each
@@ -262,8 +263,9 @@ public enum CBv2PagedRingGeometry {
 /// the weight-bound model body across the `1 + k` columns. A paged conformer is
 /// therefore a column loop over the existing decode dispatch, not a new kernel.
 ///
-/// Callers MUST degrade to serial verification for a cache that does not
-/// conform, and MUST NOT trap.
+/// Generic automatic callers MUST degrade to serial verification for a cache
+/// that does not conform. Certified explicit-rectangular callers MUST fail at
+/// construction and therefore never reach this protocol without a controller.
 protocol CBv2MTPRectangularSerializing: AnyObject {
     /// While `true`, attention is computed one query position at a time.
     /// Set for the duration of a rectangular verification round and cleared

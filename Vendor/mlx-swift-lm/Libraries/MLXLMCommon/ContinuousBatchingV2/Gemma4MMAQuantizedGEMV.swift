@@ -78,13 +78,6 @@ import MLXFast
 /// QMV in isolation. Only the tied vocab plane is meant to enter.
 public enum Gemma4MMAQuantizedGEMV {
 
-    /// Exact affine activation sums emitted by the final RMSNorm producer.
-    /// The initializer stays private so callers cannot fabricate a table that
-    /// merely has the right shape.
-    public struct ActivationSums {
-        fileprivate let values: MLXArray
-    }
-
     /// Rows the accumulator tile carries --- the ranked cohort's batch.
     private static let mRows = 8
     /// Output columns one simdgroup owns (one 8x8 tile).
@@ -161,45 +154,12 @@ public enum Gemma4MMAQuantizedGEMV {
         case "15": return 15
         case "16": return 16
         case "26": return 26
+        case "27": return 27
         default: return defaultVersion
         }
     }()
 
-    private static let defaultVersion = 26
-
-    /// Whether the selected tied-head implementation consumes the exact
-    /// per-row/per-group activation sums. The final RMSNorm uses this to avoid
-    /// producing a sidecar when the head is disabled or a legacy formulation
-    /// was explicitly selected.
-    public static var consumesActivationSums: Bool {
-        guard enabled else { return false }
-        switch version {
-        case 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 26:
-            return true
-        default:
-            return false
-        }
-    }
-
-    /// Adopt a producer-emitted table only for the exact ranked head input.
-    /// The table layout is `[row * (K / 64) + group]`, identical to
-    /// `xSumKernel`.
-    public static func activationSums(
-        produced values: MLXArray, for x: MLXArray
-    ) -> ActivationSums? {
-        guard consumesActivationSums,
-            x.dtype == .bfloat16,
-            x.ndim == 3,
-            x.dim(0) == mRows,
-            x.dim(1) == 1,
-            x.dim(2) == 2816,
-            x.size == mRows * 2816,
-            values.dtype == .float32,
-            values.ndim == 1,
-            values.size == mRows * (2816 / 64)
-        else { return nil }
-        return ActivationSums(values: values)
-    }
+    private static let defaultVersion = 27
 
     /// Kernel source. `T` is the activation/scale dtype, `K` the contraction
     /// length, `N` the output width; all three arrive as template constants so
@@ -1091,7 +1051,7 @@ public enum Gemma4MMAQuantizedGEMV {
     /// tile. At N=262144 that repeats the same 352 sums in 8,192 threadgroups.
     /// This prepass writes those exact FP32 sums once.
     private static let xSumKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_xsum_m8_v5",
+        name: "gemma4_mma_affine4_xsum_m8_v6",
         inputNames: ["x"],
         outputNames: ["xSums"],
         source: """
@@ -1104,6 +1064,7 @@ public enum Gemma4MMAQuantizedGEMV {
             const device T* xp =
                 x + (cell / N_GROUPS) * K + (cell % N_GROUPS) * GROUP;
             float s = 0.0f;
+            #pragma unroll
             for (uint c = 0; c < GROUP / 8; ++c) {
                 const uint i = c * 8;
                 s += xp[i + 0] + xp[i + 1] + xp[i + 2] + xp[i + 3];
@@ -2522,6 +2483,52 @@ public enum Gemma4MMAQuantizedGEMV {
         ensureRowContiguous: true
     )
 
+    // MARK: - Version 27 --- compile-time affine-block trip
+
+    /// Version 13 bound the inner affine-block trip to
+    /// `min(8u, N_GROUPS - biasBlock)`, a runtime value even though `GROUP` is
+    /// 64 and `K` arrives as a template, so `N_GROUPS` is 44. That stops the
+    /// compiler unrolling both the six-block walk and the eight-group body.
+    /// Iterate `gg < 8`, skip the four-group tail with `continue`, and unroll
+    /// both compile-time loops. Accumulation order is unchanged: the tail
+    /// still runs groups 40..43 and skips 44..47.
+    private static let sourceV27: String = {
+        var result = sourceV26
+
+        func replaceOnce(_ old: String, with new: String) {
+            let count = result.components(separatedBy: old).count
+            precondition(count == 2, "sourceV27 replacement count \(count): \(old)")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+
+        replaceOnce(
+            """
+            for (uint biasBlock = 0; biasBlock < N_GROUPS; biasBlock += 8) {
+                const uint blockGroups = min(8u, N_GROUPS - biasBlock);
+                for (uint gg = 0; gg < blockGroups; ++gg) {
+                    const uint g = biasBlock + gg;
+            """,
+            with: """
+            #pragma unroll
+            for (uint biasBlock = 0; biasBlock < N_GROUPS; biasBlock += 8) {
+                #pragma unroll
+                for (uint gg = 0; gg < 8; ++gg) {
+                    if (biasBlock + gg >= N_GROUPS) continue;
+                    const uint g = biasBlock + gg;
+            """
+        )
+        return result
+    }()
+
+    private static let kernelV27: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["out"],
+        source: sourceV27,
+        header: "#include <metal_simdgroup_matrix>\n",
+        ensureRowContiguous: true
+    )
+
     /// Tied-head GEMV, or `nil` when any gate above fails.
     ///
     /// - Parameters:
@@ -2536,8 +2543,7 @@ public enum Gemma4MMAQuantizedGEMV {
         scales: MLXArray,
         biases: MLXArray?,
         groupSize: Int,
-        bits: Int,
-        activationSums: ActivationSums? = nil
+        bits: Int
     ) -> MLXArray? {
         guard enabled else { return nil }
         guard let biases else { return nil }
@@ -2557,7 +2563,7 @@ public enum Gemma4MMAQuantizedGEMV {
         guard k > 0, x.size == mRows * k else { return nil }
 
         let n = w.dim(0)
-        let selectedColsPerThreadgroup = version == 16 || version == 26
+        let selectedColsPerThreadgroup = version == 16 || version == 26 || version == 27
             ? colsPerThreadgroup * 4
             : (version == 15 ? colsPerThreadgroup * 2 : colsPerThreadgroup)
         guard n >= minOutputWidth, n % selectedColsPerThreadgroup == 0 else { return nil }
@@ -2571,28 +2577,20 @@ public enum Gemma4MMAQuantizedGEMV {
         let selected: MLXFast.MLXFastKernel
         let inputs: [MLXArray]
         switch version {
-        case 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 26:
+        case 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 26, 27:
             let sumCells = mRows * (k / groupSize)
-            let xSums: MLXArray
-            if let activationSums,
-                activationSums.values.dtype == .float32,
-                activationSums.values.ndim == 1,
-                activationSums.values.size == sumCells
-            {
-                xSums = activationSums.values
-            } else {
-                let sumThreads = 128
-                let sumThreadgroups = (sumCells + sumThreads - 1) / sumThreads
-                xSums = xSumKernel(
-                    [flatX],
-                    template: [("T", x.dtype), ("K", k)],
-                    grid: (sumThreadgroups * sumThreads, 1, 1),
-                    threadGroup: (sumThreads, 1, 1),
-                    outputShapes: [[sumCells]],
-                    outputDTypes: [.float32]
-                )[0]
-            }
+            let sumThreads = 128
+            let sumThreadgroups = (sumCells + sumThreads - 1) / sumThreads
+            let xSums = xSumKernel(
+                [flatX],
+                template: [("T", x.dtype), ("K", k)],
+                grid: (sumThreadgroups * sumThreads, 1, 1),
+                threadGroup: (sumThreads, 1, 1),
+                outputShapes: [[sumCells]],
+                outputDTypes: [.float32]
+            )[0]
             switch version {
+            case 27: selected = kernelV27
             case 26: selected = kernelV26
             case 16: selected = kernelV16
             case 15: selected = kernelV15

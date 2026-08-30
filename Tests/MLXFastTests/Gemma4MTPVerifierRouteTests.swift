@@ -6,6 +6,40 @@ import Testing
 @Suite("Gemma 4 MTP verifier route")
 struct Gemma4MTPVerifierRouteTests {
     @Test
+    func installedTrunkUsesPreboundScaledEmbedding() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourceURL = repositoryRoot.appendingPathComponent(
+            "Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Gemma4Text.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+
+        let trunkStart = try #require(source.range(of: "    private func forwardTrunk("))
+        let pleStart = try #require(source.range(
+            of: "        // Compute per-layer inputs (PLE)",
+            range: trunkStart.upperBound..<source.endIndex))
+        let trunkEntry = String(source[trunkStart.lowerBound..<pleStart.lowerBound])
+        let verifierEmbedding = try #require(trunkEntry.range(
+            of: "h = verifier.bindings.scaledEmbedding(inputs)"))
+        let ordinaryFusedEmbedding = try #require(trunkEntry.range(
+            of: "Gemma4FusedScaledEmbedding.apply"))
+        #expect(verifierEmbedding.upperBound < ordinaryFusedEmbedding.lowerBound)
+
+        let bindingsStart = try #require(source.range(
+            of: "private struct Gemma4MTPVerifierModelBindings"))
+        let contextStart = try #require(source.range(
+            of: "public struct Gemma4MTPVerifierContext",
+            range: bindingsStart.upperBound..<source.endIndex))
+        let bindings = String(source[bindingsStart.lowerBound..<contextStart.lowerBound])
+        #expect(bindings.contains("let scaledEmbedding: (MLXArray) -> MLXArray"))
+        #expect(source.contains(
+            "let scaledEmbedding: (MLXArray) -> MLXArray = { tokens in"))
+        #expect(source.contains("embedding(tokens) * verifierEmbedScale"))
+        #expect(source.contains("scaledEmbedding: scaledEmbedding"))
+    }
+
+    @Test
     func installedAttentionPathBypassesFailableQKVHelpers() throws {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

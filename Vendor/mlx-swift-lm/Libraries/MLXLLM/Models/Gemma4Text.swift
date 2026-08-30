@@ -4377,7 +4377,9 @@ public class Gemma4TextModelInner: Module {
         // own lookup; token ids still feed the per-layer embeddings (PLE)
         // below. nil keeps the text path byte-identical.
         var h: MLXArray
-        if let inputEmbedding {
+        if let verifier {
+            h = verifier.bindings.scaledEmbedding(inputs)
+        } else if let inputEmbedding {
             h = inputEmbedding.ndim == 2 ? inputEmbedding.expandedDimensions(axis: 0) : inputEmbedding
         } else {
             if let fused = Gemma4FusedScaledEmbedding.apply(
@@ -4923,6 +4925,7 @@ public struct Gemma4MTPVerifierLayerBindings {
 }
 
 private struct Gemma4MTPVerifierModelBindings {
+    let scaledEmbedding: (MLXArray) -> MLXArray
     let layers: [Gemma4MTPVerifierLayerBindings]
     let tiedHead: (MLXArray) -> MLXArray
 }
@@ -5073,6 +5076,10 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 "tied language-model head")
         }
 
+        let verifierEmbedScale = model.embedScale
+        let scaledEmbedding: (MLXArray) -> MLXArray = { tokens in
+            embedding(tokens) * verifierEmbedScale
+        }
         var contexts: [Int: Gemma4MTPVerifierContext] = [:]
         for columns in 2...4 {
             let layers = try model.layers.map {
@@ -5100,6 +5107,7 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             contexts[columns] = Gemma4MTPVerifierContext(
                 columns: columns, route: route,
                 bindings: Gemma4MTPVerifierModelBindings(
+                    scaledEmbedding: scaledEmbedding,
                     layers: layers, tiedHead: head))
         }
         installedMTPVerifierContexts = contexts

@@ -368,7 +368,7 @@ extension Gemma4Runtime {
             guard let promptTokens = request.promptTokens, let steps = request.steps else {
                 throw MLXFastError.invalidInput("runtime worker correctness request missing prompt_tokens or steps")
             }
-            _ = try weightCache.requireLibraryModelAtDrainFencedBoundary()
+            _ = try weightCache.requireLibraryModel()
             try resetRuntimeWorkerAllocatorForPhaseStart()
             let tokens = try generateGreedyCached(
                 promptTokens: promptTokens,
@@ -388,7 +388,7 @@ extension Gemma4Runtime {
             guard let promptTokens = request.promptTokens else {
                 throw MLXFastError.invalidInput("runtime worker teacher-forced correctness request missing prompt_tokens")
             }
-            let model = try weightCache.requireLibraryModelAtDrainFencedBoundary()
+            let model = try weightCache.requireLibraryModel()
             try resetRuntimeWorkerAllocatorForPhaseStart()
             let cache = model.newCache(parameters: nil)
             let logits = try gemma4Logits(
@@ -458,7 +458,7 @@ extension Gemma4Runtime {
             guard let promptTokens = request.promptTokens else {
                 throw MLXFastError.invalidInput("runtime worker prefill request missing prompt_tokens")
             }
-            let model = try weightCache.requireLibraryModelAtDrainFencedBoundary()
+            let model = try weightCache.requireLibraryModel()
             try resetRuntimeWorkerAllocatorForPhaseStart()
             let cache = model.newCache(parameters: nil)
             let logits = try gemma4Logits(
@@ -480,7 +480,7 @@ extension Gemma4Runtime {
             guard let seedTokens = request.seedTokens else {
                 throw MLXFastError.invalidInput("runtime worker decode_begin request missing seed_tokens")
             }
-            let model = try weightCache.requireLibraryModelAtDrainFencedBoundary()
+            let model = try weightCache.requireLibraryModel()
             try resetRuntimeWorkerAllocatorForPhaseStart()
             // Exactly one whole-prompt (seed) forward runs here, with NO preceding
             // warmup pass. The decode measurement deliberately charges this seed

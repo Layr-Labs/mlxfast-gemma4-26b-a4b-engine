@@ -235,7 +235,47 @@ struct RuntimeWorkerPhaseCloseOrderingTests {
     }
 
     @Test
-    func scoredStepCasesDoNotFenceOrTouchTheDrainRegistry() throws {
+    func weightCacheFencesDrainsBeforeAnyStartupOrModelWork() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Sources/MLXFastModel/Gemma4A4BRuntimeWeights.swift"),
+            encoding: .utf8)
+        let initStart = try #require(source.range(
+            of: "    public init(loader: Gemma4A4BWeightLoader, config: Gemma4A4BConfig) {"))
+        let accessorStart = try #require(source.range(
+            of: "    public func requireLibraryModel() throws -> Gemma4TextModel {",
+            range: initStart.upperBound..<source.endIndex))
+        let initializer = source[initStart.lowerBound..<accessorStart.lowerBound]
+
+        let fence = try #require(initializer.range(
+            of: "guard CBv2DetachedDrainRegistry.joinAll(timeout: 5) else {"))
+        let failedModel = try #require(initializer.range(of: "libraryModel = nil"))
+        let failedError = try #require(initializer.range(
+            of: "loadError = MLXFastError.invalidInput("))
+        let earlyReturn = try #require(initializer.range(
+            of: "return",
+            range: failedError.upperBound..<initializer.endIndex))
+        let environment = try #require(initializer.range(
+            of: "let startupEnvironment = ProcessInfo.processInfo.environment"))
+        let load = try #require(initializer.range(
+            of: "let model = try Self.loadLibraryModel("))
+        let warm = try #require(initializer.range(
+            of: "Self.warmLibraryModel(model, config: config)"))
+
+        #expect(fence.lowerBound < failedModel.lowerBound)
+        #expect(failedModel.lowerBound < failedError.lowerBound)
+        #expect(failedError.lowerBound < earlyReturn.lowerBound)
+        #expect(earlyReturn.lowerBound < environment.lowerBound)
+        #expect(environment.lowerBound < load.lowerBound)
+        #expect(load.lowerBound < warm.lowerBound)
+    }
+
+    @Test
+    func everyTimedWorkerVerbUsesOnlyTheLockFreeModelAccessor() throws {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -246,9 +286,17 @@ struct RuntimeWorkerPhaseCloseOrderingTests {
             encoding: .utf8)
 
         for (kind, nextKind) in [
+            ("correctness", "correctness_begin"),
+            ("correctness_begin", "correctness_step"),
             ("correctness_step", "prefill"),
+            ("prefill", "decode_begin"),
+            ("decode_begin", "decode_step"),
             ("decode_step", "free_decode_begin"),
+            ("free_decode_begin", "free_decode_run"),
             ("free_decode_run", "record_reference_begin"),
+            ("record_reference_begin", "record_reference_run"),
+            ("record_reference_run", "cohort_reference_replay"),
+            ("cohort_reference_replay", "phase_diagnostics"),
         ] {
             let start = try #require(source.range(of: "        case \"\(kind)\":"))
             let end = try #require(source.range(
@@ -264,14 +312,18 @@ struct RuntimeWorkerPhaseCloseOrderingTests {
             contentsOf: repositoryRoot.appendingPathComponent(
                 "Sources/MLXFastTrustedHarness/Gemma4RuntimeWorker.swift"),
             encoding: .utf8)
-        for (kind, terminator) in [
-            ("correctness_step", "        case \"prefill\":"),
-            ("decode_step", "        default:"),
+        for (kind, nextKind) in [
+            ("correctness", "correctness_begin"),
+            ("correctness_begin", "correctness_step"),
+            ("correctness_step", "prefill"),
+            ("prefill", "decode_begin"),
+            ("decode_begin", "decode_step"),
+            ("decode_step", "phase_diagnostics"),
         ] {
             let start = try #require(trustedSource.range(
                 of: "        case \"\(kind)\":"))
             let end = try #require(trustedSource.range(
-                of: terminator,
+                of: "        case \"\(nextKind)\":",
                 range: start.upperBound..<trustedSource.endIndex))
             let body = trustedSource[start.lowerBound..<end.lowerBound]
             #expect(!body.contains("requireLibraryModelAtDrainFencedBoundary"))
@@ -281,7 +333,7 @@ struct RuntimeWorkerPhaseCloseOrderingTests {
     }
 
     @Test
-    func freeDecodeBeginFencesOnceAndPassesTheSameModelIntoEitherEngine() throws {
+    func freeDecodeBeginUsesOneLockFreeModelForEitherEngine() throws {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -297,8 +349,9 @@ struct RuntimeWorkerPhaseCloseOrderingTests {
             range: beginStart.upperBound..<workerSource.endIndex))
         let begin = String(workerSource[beginStart.lowerBound..<beginEnd.lowerBound])
 
+        #expect(!begin.contains("requireLibraryModelAtDrainFencedBoundary"))
         #expect(begin.components(
-            separatedBy: "requireLibraryModelAtDrainFencedBoundary()").count == 2)
+            separatedBy: "requireLibraryModel()").count == 2)
         #expect(begin.contains("currentTarget: freeDecodeModel"))
         #expect(begin.components(separatedBy: "model: freeDecodeModel").count == 3)
 

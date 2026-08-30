@@ -97,6 +97,17 @@ public final class Gemma4A4BRuntimeWeightCache {
         self.loader = loader
         self.config = config
 
+        // This is the earliest construction boundary: refuse before startup
+        // memory policy, model loading, warm-engine construction, or any GPU
+        // work if an earlier CBv2 engine did not retire naturally.
+        guard CBv2DetachedDrainRegistry.joinAll(timeout: 5) else {
+            libraryModel = nil
+            loadError = MLXFastError.invalidInput(
+                "Gemma library model initialization cannot proceed before all "
+                    + "CBv2 drains retire naturally")
+            return
+        }
+
         let startupEnvironment = ProcessInfo.processInfo.environment
         if config.numHiddenLayers >= 16,
            RuntimeStartupMemoryPolicy.gemma4MTPFullProfileCommandBufferGateIsOpen(

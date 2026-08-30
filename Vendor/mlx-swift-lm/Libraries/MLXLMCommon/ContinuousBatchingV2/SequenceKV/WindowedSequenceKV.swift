@@ -503,9 +503,12 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
 
     private func allocateIfNeeded(keyTemplate: MLXArray, valueTemplate: MLXArray) {
         guard keys == nil else { return }
-        keys = MLXArray.zeros(
-            [1, kvHeads, window, keyTemplate.dim(3)], dtype: keyTemplate.dtype)
-        values = MLXArray.zeros(
-            [1, kvHeads, window, valueTemplate.dim(3)], dtype: valueTemplate.dtype)
+        // Uninitialized allocation: every reader of this ring is bounded to
+        // written slots (see KVStorageAllocV1.swift), so the zeros fill the
+        // previous allocation paid was never observed.
+        keys = CBv2KVStorageAllocV1.storage(
+            shape: [1, kvHeads, window, keyTemplate.dim(3)], dtype: keyTemplate.dtype)
+        values = CBv2KVStorageAllocV1.storage(
+            shape: [1, kvHeads, window, valueTemplate.dim(3)], dtype: valueTemplate.dtype)
     }
 }

@@ -1108,13 +1108,20 @@ extension Gemma4Runtime {
                 recordingSession.shutdownBlocking()
                 state.recordingSession = nil
             }
-            // Engine shutdown drains its serial queue, but it is not a Metal
-            // completion fence. CBv2 submits through MLX's process-global GPU
-            // stream, so retire that stream before snapshotting allocator state
-            // or clearing free buffers. Otherwise a late command-buffer
-            // retirement can repopulate cacheMemory after clearCache(), which
-            // violates the exact-zero phase barrier even though the session is
-            // already gone.
+            // shutdownBlocking() waits for EngineV2.shutdown(), whose default
+            // fast-ack mode registers the real loop drain in this process-wide
+            // registry and returns. Join that work first; synchronizing Metal
+            // while a detached drain can still submit or release KV would race
+            // the very work this phase barrier is meant to retire.
+            guard CBv2DetachedDrainRegistry.joinAll(timeout: 15) else {
+                throw MLXFastError.invalidInput(
+                    "runtime worker phase close timed out waiting for detached CBv2 drains")
+            }
+            // CBv2 submits through MLX's process-global GPU stream. Once no
+            // engine drain can enqueue more work, retire that stream before
+            // snapshotting allocator state or clearing free buffers. Otherwise
+            // a late command-buffer retirement can repopulate cacheMemory after
+            // clearCache(), violating the exact-zero phase barrier.
             Stream.gpu.synchronize()
             let peakRamGB = peakResidentMemoryGB()
             let stats = expertStats(from: weightCache)

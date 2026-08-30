@@ -758,6 +758,29 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         return ActivationSums(values: values)
     }
 
+    /// Adopts an exact producer-emitted table for the same pinned decode
+    /// geometry as `activationSums(for:)`. The layer-glue producer writes the
+    /// table while its BF16 dense input is still resident in registers, using
+    /// the identical four-value accumulation order as the standalone kernel.
+    public static func activationSums(
+        produced values: MLXArray, for x: MLXArray
+    ) -> ActivationSums? {
+        let blocks = 2816 / kBlock
+        guard enabled,
+            activationSumsEnabled,
+            x.dtype == .bfloat16,
+            x.ndim == 3,
+            x.dim(0) == batch,
+            x.dim(1) == sequence,
+            x.dim(2) == 2816,
+            x.size == batch * sequence * 2816,
+            values.dtype == .float32,
+            values.ndim == 1,
+            values.size == blocks * simdWidth * batch
+        else { return nil }
+        return ActivationSums(values: values)
+    }
+
     /// Returns `nil` unless every production pin holds. The caller then invokes
     /// the original QuantizedLinear unchanged.
     public static func matmul(

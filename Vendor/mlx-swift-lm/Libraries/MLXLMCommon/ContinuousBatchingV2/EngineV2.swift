@@ -653,8 +653,8 @@ public enum CBv2EngageMark {
     }
 }
 
-/// Fence for fast-ack engine shutdowns: every detached drain registers here,
-/// and a later phase can block (bounded) until all previously started drains
+/// Fence for engine shutdowns: every drain task registers here, and a later
+/// phase can block (bounded) until all previously started drains
 /// have finished before it constructs a new engine or measures anything.
 /// A watchdog escape is deliberately retained and makes every later join fail
 /// closed: the task completed, but the engine did not retire. `joinAll` is safe
@@ -676,12 +676,14 @@ private final class CBv2DrainJoinOutcomes: @unchecked Sendable {
     }
 }
 
-public enum CBv2DetachedDrainRegistry {
-    private static let lock = NSLock()
-    private static let joinLock = NSLock()
-    nonisolated(unsafe) private static var drains: [Task<CBv2DrainRetirement, Never>] = []
+final class CBv2DetachedDrainStorage: @unchecked Sendable {
+    private let joinLock = NSLock()
+    private let lock = NSLock()
+    private var drains: [Task<CBv2DrainRetirement, Never>] = []
 
-    static func register(_ task: Task<CBv2DrainRetirement, Never>) {
+    func register(_ task: Task<CBv2DrainRetirement, Never>) {
+        joinLock.lock()
+        defer { joinLock.unlock() }
         lock.lock()
         drains.append(task)
         lock.unlock()
@@ -690,16 +692,20 @@ public enum CBv2DetachedDrainRegistry {
     /// Wait (at most `timeout` seconds) for every registered drain to
     /// complete, then drop the snapshotted prefix only when every task reports
     /// natural retirement. A deadline or watchdog escape leaves that prefix
-    /// registered so every later phase continues to fail closed. Registrations
-    /// may append during the wait; serialized joiners can remove only the exact
-    /// prefix they snapshotted and awaited.
+    /// registered so every later phase continues to fail closed. Registration
+    /// and join share `joinLock`: a registration linearizes either before the
+    /// snapshot or after the joined prefix has been resolved and removed.
     @discardableResult
-    public static func joinAll(timeout: TimeInterval = 5) -> Bool {
+    func joinAll(
+        timeout: TimeInterval = 5,
+        snapshotObserverForTesting: (() -> Void)? = nil
+    ) -> Bool {
         joinLock.lock()
         defer { joinLock.unlock() }
         lock.lock()
         let pending = drains
         lock.unlock()
+        snapshotObserverForTesting?()
         guard !pending.isEmpty else { return true }
         let done = DispatchSemaphore(value: 0)
         let joined = CBv2DrainJoinOutcomes()
@@ -714,26 +720,26 @@ public enum CBv2DetachedDrainRegistry {
         guard completed else { return false }
         let outcomes = joined.load()
         guard outcomes.allSatisfy({ $0 == .natural }) else { return false }
-        // register() only appends and joinLock excludes another remover, so
-        // this is still exactly the prefix snapshotted above even when new
-        // drains registered while it was awaited.
+        // joinLock excludes registrations and another remover, so this is
+        // still exactly the prefix snapshotted above.
         lock.lock()
         drains.removeFirst(pending.count)
         lock.unlock()
         return true
     }
+}
 
-    #if DEBUG
-    /// Test-only cleanup for deliberately injected watchdog escapes.
-    /// Production has no recovery from an unsuccessful retirement result.
-    static func resetForTesting() {
-        joinLock.lock()
-        defer { joinLock.unlock() }
-        lock.lock()
-        drains.removeAll()
-        lock.unlock()
+public enum CBv2DetachedDrainRegistry {
+    private static let storage = CBv2DetachedDrainStorage()
+
+    static func register(_ task: Task<CBv2DrainRetirement, Never>) {
+        storage.register(task)
     }
-    #endif
+
+    @discardableResult
+    public static func joinAll(timeout: TimeInterval = 5) -> Bool {
+        storage.joinAll(timeout: timeout)
+    }
 }
 
 // MARK: - Teacher-forced top-1 scoring (backend parity measurement)

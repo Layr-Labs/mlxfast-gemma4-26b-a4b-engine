@@ -39,6 +39,7 @@ extension Gemma4Runtime {
         let config = try Gemma4A4BConfig.load(from: options.weightsPath)
         let loader = try Gemma4A4BWeightLoader(weightsPath: options.weightsPath)
         let weightCache = Gemma4A4BRuntimeWeightCache(loader: loader, config: config)
+        _ = try weightCache.requireLibraryModelAtDrainFencedBoundary()
         return try generateGreedyCached(
             promptTokens: options.promptTokens,
             steps: options.steps,
@@ -73,6 +74,7 @@ extension Gemma4Runtime {
             let runtimeLoader = try Gemma4A4BWeightLoader(weightsPath: options.weightsPath)
             loader = runtimeLoader
             let weightCache = Gemma4A4BRuntimeWeightCache(loader: runtimeLoader, config: config)
+            _ = try weightCache.requireLibraryModelAtDrainFencedBoundary()
             return runLayeredCorrectness(
                 golden: golden,
                 weightCache: weightCache,

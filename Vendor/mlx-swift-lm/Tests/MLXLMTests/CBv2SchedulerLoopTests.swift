@@ -983,14 +983,12 @@ final class CBv2SchedulerLoopTests: XCTestCase {
         }
     }
 
-    /// Regression: `shutdown()` waits for the drain on the ENGINE queue, so
-    /// a wedged queue (a step blocked inside eval) hung it forever. It is
-    /// now bounded by `shutdownTimeout`: live streams are force-finished
-    /// with `.error` and shutdown returns while the wedged step is still
-    /// blocked.
+    /// Regression: the lifecycle drain waits on the ENGINE queue, so a wedged
+    /// queue (a step blocked inside eval) once hung it forever. It is now
+    /// bounded by `shutdownTimeout`: live streams are force-finished with
+    /// `.error`, and the explicit result says the watchdog escaped rather
+    /// than claiming natural retirement while the step is still blocked.
     func testShutdownTimesOutWhenEngineQueueIsWedged() async throws {
-        CBv2DetachedDrainRegistry.resetForTesting()
-        defer { CBv2DetachedDrainRegistry.resetForTesting() }
         let harness = CBv2SchedHarness(
             loopConfig: CBv2EngineLoopConfig(
                 requestTimeout: 60,
@@ -1006,15 +1004,14 @@ final class CBv2SchedulerLoopTests: XCTestCase {
         try await Task.sleep(nanoseconds: 200_000_000)
 
         let started = Date()
-        await harness.engine.shutdown()
-        let naturallyRetired = CBv2DetachedDrainRegistry.joinAll(timeout: 1)
+        let retirement = await harness.engine.loopForTesting.drain()
         let elapsed = Date().timeIntervalSince(started)
         XCTAssertLessThan(
             elapsed, 2.5,
-            "the registry fence must return at the timeout, not wait out the wedged step")
-        XCTAssertFalse(
-            naturallyRetired,
-            "a watchdog escape must not masquerade as natural loop retirement")
+            "the drain must return at the timeout, not wait out the wedged step")
+        XCTAssertEqual(
+            retirement, .watchdogEscaped,
+            "an internal watchdog timeout is not natural loop retirement")
 
         let collected = await collectedOut
         guard case .error(let message)? = collected.finishReason else {

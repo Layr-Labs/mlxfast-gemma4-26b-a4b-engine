@@ -124,6 +124,7 @@ extension Gemma4Runtime {
             progress("correctness loader start")
             let correctnessLoader = try Gemma4A4BWeightLoader(weightsPath: options.weightsPath)
             let correctnessCache = Gemma4A4BRuntimeWeightCache(loader: correctnessLoader, config: config)
+            _ = try correctnessCache.requireLibraryModelAtDrainFencedBoundary()
             let correctnessStart = DispatchTime.now().uptimeNanoseconds
             progress("correctness start cases=\(golden.totalCorrectnessCaseCount)")
             let correctness = runLayeredCorrectness(
@@ -150,6 +151,7 @@ extension Gemma4Runtime {
 
             let runtimeBenchmarkLoader = try Gemma4A4BWeightLoader(weightsPath: options.weightsPath)
             let benchmarkCache = Gemma4A4BRuntimeWeightCache(loader: runtimeBenchmarkLoader, config: config)
+            _ = try benchmarkCache.requireLibraryModelAtDrainFencedBoundary()
             guard let benchmarkGolden = golden.benchmark else {
                 throw MLXFastError.invalidInput("benchmark golden file must contain a benchmark oracle")
             }

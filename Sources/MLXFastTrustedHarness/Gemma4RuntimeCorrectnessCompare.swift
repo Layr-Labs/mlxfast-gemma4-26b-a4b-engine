@@ -177,6 +177,7 @@ extension Gemma4Runtime {
                 loader: loader,
                 config: config
             )
+            _ = try weightCache.requireLibraryModelAtDrainFencedBoundary()
             return try traceGreedyCached(
                 testCase: selectedCase,
                 step: options.step,

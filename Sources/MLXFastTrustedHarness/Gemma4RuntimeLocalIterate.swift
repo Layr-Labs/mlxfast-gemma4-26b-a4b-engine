@@ -566,7 +566,7 @@ extension Gemma4Runtime {
         let config = try Gemma4A4BConfig.load(from: weightsPath)
         let loader = try Gemma4A4BWeightLoader(weightsPath: weightsPath)
         let weightCache = Gemma4A4BRuntimeWeightCache(loader: loader, config: config)
-        let model = try weightCache.requireLibraryModel()
+        let model = try weightCache.requireLibraryModelAtDrainFencedBoundary()
         guard !testCase.promptTokens.isEmpty else {
             throw MLXFastError.invalidInput("\(modeName) prompt must not be empty")
         }

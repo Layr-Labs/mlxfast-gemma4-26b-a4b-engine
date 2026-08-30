@@ -116,7 +116,7 @@ extension Gemma4Runtime {
         // Package.swift:104-107). This file is the scored worker's target, so a
         // conditional here would compile the gate out of the binary that
         // actually runs.
-        let verifiedTarget = try weightCache.requireLibraryModel()
+        let verifiedTarget = try weightCache.requireLibraryModelAtDrainFencedBoundary()
         try validateLoadedTargetQuantization(
             model: verifiedTarget,
             numHiddenLayers: MLXFastConstants.numHiddenLayers)
@@ -584,6 +584,7 @@ extension Gemma4Runtime {
             guard let promptTokens = request.promptTokens, let steps = request.steps else {
                 throw MLXFastError.invalidInput("runtime worker correctness request missing prompt_tokens or steps")
             }
+            _ = try weightCache.requireLibraryModelAtDrainFencedBoundary()
             try resetRuntimeWorkerAllocatorForPhaseStart()
             let tokens = try generateGreedyCached(
                 promptTokens: promptTokens,
@@ -603,8 +604,8 @@ extension Gemma4Runtime {
             guard let promptTokens = request.promptTokens else {
                 throw MLXFastError.invalidInput("runtime worker teacher-forced correctness request missing prompt_tokens")
             }
+            let model = try weightCache.requireLibraryModelAtDrainFencedBoundary()
             try resetRuntimeWorkerAllocatorForPhaseStart()
-            let model = try weightCache.requireLibraryModel()
             let cache = model.newCache(parameters: nil)
             let logits = try gemma4Logits(
                 inputIDs: inputIDsArray(promptTokens),
@@ -677,8 +678,8 @@ extension Gemma4Runtime {
             guard let promptTokens = request.promptTokens else {
                 throw MLXFastError.invalidInput("runtime worker prefill request missing prompt_tokens")
             }
+            let model = try weightCache.requireLibraryModelAtDrainFencedBoundary()
             try resetRuntimeWorkerAllocatorForPhaseStart()
-            let model = try weightCache.requireLibraryModel()
             let cache = model.newCache(parameters: nil)
             // PRE-MEASURE RE-CHECK. Deliberately AFTER `newCache` -- which is
             // editable model code -- and immediately before the forward, so no
@@ -709,6 +710,7 @@ extension Gemma4Runtime {
             guard let seedTokens = request.seedTokens else {
                 throw MLXFastError.invalidInput("runtime worker decode_begin request missing seed_tokens")
             }
+            let decodeModel = try weightCache.requireLibraryModelAtDrainFencedBoundary()
             try resetRuntimeWorkerAllocatorForPhaseStart()
             // Generic benchd-facing decode window. A `spec` selects the mode and
             // is resolved + echoed as `effective_spec`; an absent spec is the v1
@@ -742,7 +744,6 @@ extension Gemma4Runtime {
             // the instance that is CHECKED is provably the instance that is
             // RUN: `plainSeedForward` receives this exact object, and nothing
             // stands between the two lines.
-            let decodeModel = try weightCache.requireLibraryModel()
             try revalidateTargetForMeasuredWindow(
                 phase: "decode_begin",
                 verifiedTarget: verifiedTarget,
@@ -792,6 +793,8 @@ extension Gemma4Runtime {
             )
 
         case "free_decode_begin":
+            let freeDecodeModel =
+                try weightCache.requireLibraryModelAtDrainFencedBoundary()
             // PRE-MEASURE RE-CHECK, at the TOP of the case and ahead of the
             // cohort branch below, because for the SCORED regime this verb IS
             // the measured prefill window: benchd's `prefill_elapsed_seconds`
@@ -803,7 +806,7 @@ extension Gemma4Runtime {
             try revalidateTargetForMeasuredWindow(
                 phase: "free_decode_begin",
                 verifiedTarget: verifiedTarget,
-                currentTarget: try weightCache.requireLibraryModel(),
+                currentTarget: freeDecodeModel,
                 numHiddenLayers: MLXFastConstants.numHiddenLayers)
             // v1.2 (COHORT): the batched form of the same verb — B seed
             // prefills through the vendored CBv2 engine, all admitted before
@@ -815,7 +818,7 @@ extension Gemma4Runtime {
                     cohort: cohortBegin,
                     effectiveSpec: validated.effectiveSpec,
                     sessionNonce: sessionNonce,
-                    weightCache: weightCache,
+                    model: freeDecodeModel,
                     mtpDrafter: mtpDrafter,
                     dflashDrafter: dflashDrafter,
                     state: &state
@@ -867,7 +870,7 @@ extension Gemma4Runtime {
             let freeSeedToken = try openSingleStreamFreeRunSession(
                 route: freeRoute,
                 seedTokens: seedTokens,
-                model: try weightCache.requireLibraryModel(),
+                model: freeDecodeModel,
                 mtpDrafter: mtpDrafter,
                 dflashDrafter: dflashDrafter,
                 // Route-selected: the mtp block carries mtp's depth, the
@@ -976,11 +979,12 @@ extension Gemma4Runtime {
                 throw MLXFastError.invalidInput(
                     "runtime worker record_reference_begin request missing seed_tokens")
             }
+            let recordModel = try weightCache.requireLibraryModelAtDrainFencedBoundary()
             try resetRuntimeWorkerAllocatorForPhaseStart()
             let recordSeedToken = try openSingleStreamFreeRunSession(
                 route: .serial,
                 seedTokens: recordSeedTokens,
-                model: try weightCache.requireLibraryModel(),
+                model: recordModel,
                 mtpDrafter: nil,
                 requestedDepth: nil,
                 stopTokens: stopTokens,
@@ -1069,9 +1073,10 @@ extension Gemma4Runtime {
                     "runtime worker cohort_reference_replay reached the handler "
                         + "without a validated payload (validation drift)")
             }
+            let replayModel = try weightCache.requireLibraryModelAtDrainFencedBoundary()
             try resetRuntimeWorkerAllocatorForPhaseStart()
             let replayReport = try cohortReferenceReplayReport(
-                model: try weightCache.requireLibraryModel(),
+                model: replayModel,
                 seedsByStream: validatedReplay.seedsByStream,
                 committedByStream: validatedReplay.committedByStream,
                 logitTopK: validatedReplay.logitTopK,

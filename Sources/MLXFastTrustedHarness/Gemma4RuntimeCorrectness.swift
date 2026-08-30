@@ -47,6 +47,7 @@ extension Gemma4Runtime {
                 loader: loader,
                 config: config
             )
+            _ = try weightCache.requireLibraryModelAtDrainFencedBoundary()
             return try generateGreedyCached(
                 promptTokens: options.promptTokens,
                 steps: options.steps,
@@ -95,6 +96,7 @@ extension Gemma4Runtime {
                     loader: runtimeLoader,
                     config: config
                 )
+                _ = try weightCache.requireLibraryModelAtDrainFencedBoundary()
                 return runLayeredCorrectness(
                     golden: golden,
                     weightCache: weightCache,

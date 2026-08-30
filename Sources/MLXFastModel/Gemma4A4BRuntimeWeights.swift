@@ -126,14 +126,6 @@ public final class Gemma4A4BRuntimeWeightCache {
     }
 
     public func requireLibraryModel() throws -> Gemma4TextModel {
-        // Every shutdown mode publishes its drain result. Refuse this
-        // construction boundary unless all prior engines retired naturally;
-        // a deadline or shutdown-watchdog escape may still own GPU/KV work.
-        guard CBv2DetachedDrainRegistry.joinAll(timeout: 5) else {
-            throw MLXFastError.invalidInput(
-                "Gemma library model construction boundary cannot proceed "
-                    + "before all CBv2 drains retire naturally")
-        }
         guard let libraryModel else {
             throw loadError
                 ?? MLXFastError.invalidInput(
@@ -142,9 +134,24 @@ public final class Gemma4A4BRuntimeWeightCache {
         return libraryModel
     }
 
+    /// Checked startup/phase/engine-construction boundary. Keep the ordinary
+    /// resident-model accessor above lock-free: scored decode/correctness steps
+    /// must never enter the process-global detached-drain registry.
+    public func requireLibraryModelAtDrainFencedBoundary() throws -> Gemma4TextModel {
+        // Every shutdown mode publishes its drain result. Refuse this
+        // construction boundary unless all prior engines retired naturally;
+        // a deadline or shutdown-watchdog escape may still own GPU/KV work.
+        guard CBv2DetachedDrainRegistry.joinAll(timeout: 5) else {
+            throw MLXFastError.invalidInput(
+                "Gemma library model construction boundary cannot proceed "
+                    + "before all CBv2 drains retire naturally")
+        }
+        return try requireLibraryModel()
+    }
+
     /// Startup readiness check used by the sandboxed worker.
     public func validateSelectedBackend() throws {
-        let model = try requireLibraryModel()
+        let model = try requireLibraryModelAtDrainFencedBoundary()
         try Gemma4A4BKVBackend.validateContiguous(
             caches: model.newCache(parameters: nil))
     }

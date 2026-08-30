@@ -449,7 +449,7 @@ extension Gemma4Runtime {
         let config = try Gemma4A4BConfig.load(from: options.weightsPath)
         let loader = try Gemma4A4BWeightLoader(weightsPath: options.weightsPath)
         let weightCache = Gemma4A4BRuntimeWeightCache(loader: loader, config: config)
-        let model = try weightCache.requireLibraryModel()
+        let model = try weightCache.requireLibraryModelAtDrainFencedBoundary()
         let tape = try WidthProbeTape.load(path: options.tapePath)
         let result = runWidthProbeCore(
             model: model, tape: tape, steps: options.steps,

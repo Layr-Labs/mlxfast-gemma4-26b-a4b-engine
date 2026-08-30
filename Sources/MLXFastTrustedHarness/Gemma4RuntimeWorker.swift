@@ -85,7 +85,7 @@ extension Gemma4Runtime {
         // tower and runs its constructor-time kernel warmup, all before the
         // protocol hello -- outside every scored window.
         let weightCache = Gemma4A4BRuntimeWeightCache(loader: loader, config: config)
-        _ = try weightCache.requireLibraryModel()
+        _ = try weightCache.requireLibraryModelAtDrainFencedBoundary()
         let decoder = JSONDecoder()
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.withoutEscapingSlashes]
@@ -368,6 +368,7 @@ extension Gemma4Runtime {
             guard let promptTokens = request.promptTokens, let steps = request.steps else {
                 throw MLXFastError.invalidInput("runtime worker correctness request missing prompt_tokens or steps")
             }
+            _ = try weightCache.requireLibraryModelAtDrainFencedBoundary()
             try resetRuntimeWorkerAllocatorForPhaseStart()
             let tokens = try generateGreedyCached(
                 promptTokens: promptTokens,
@@ -387,8 +388,8 @@ extension Gemma4Runtime {
             guard let promptTokens = request.promptTokens else {
                 throw MLXFastError.invalidInput("runtime worker teacher-forced correctness request missing prompt_tokens")
             }
+            let model = try weightCache.requireLibraryModelAtDrainFencedBoundary()
             try resetRuntimeWorkerAllocatorForPhaseStart()
-            let model = try weightCache.requireLibraryModel()
             let cache = model.newCache(parameters: nil)
             let logits = try gemma4Logits(
                 inputIDs: inputIDsArray(promptTokens),
@@ -457,8 +458,8 @@ extension Gemma4Runtime {
             guard let promptTokens = request.promptTokens else {
                 throw MLXFastError.invalidInput("runtime worker prefill request missing prompt_tokens")
             }
+            let model = try weightCache.requireLibraryModelAtDrainFencedBoundary()
             try resetRuntimeWorkerAllocatorForPhaseStart()
-            let model = try weightCache.requireLibraryModel()
             let cache = model.newCache(parameters: nil)
             let logits = try gemma4Logits(
                 inputIDs: inputIDsArray(promptTokens),
@@ -479,6 +480,7 @@ extension Gemma4Runtime {
             guard let seedTokens = request.seedTokens else {
                 throw MLXFastError.invalidInput("runtime worker decode_begin request missing seed_tokens")
             }
+            let model = try weightCache.requireLibraryModelAtDrainFencedBoundary()
             try resetRuntimeWorkerAllocatorForPhaseStart()
             // Exactly one whole-prompt (seed) forward runs here, with NO preceding
             // warmup pass. The decode measurement deliberately charges this seed
@@ -495,7 +497,6 @@ extension Gemma4Runtime {
             // precomputed. Prefill/decode/correctness each run in their own worker
             // process, so no model-owned memo persists across phases; the trusted
             // reset above separately removes allocator free-buffer state.
-            let model = try weightCache.requireLibraryModel()
             let cache = model.newCache(parameters: nil)
             let logits = try gemma4Logits(
                 inputIDs: inputIDsArray(seedTokens),

@@ -27,6 +27,7 @@ extension Gemma4Runtime {
         let config = try Gemma4A4BConfig.load(from: options.weightsPath)
         let loader = try Gemma4A4BWeightLoader(weightsPath: options.weightsPath)
         let weightCache = Gemma4A4BRuntimeWeightCache(loader: loader, config: config)
+        _ = try weightCache.requireLibraryModelAtDrainFencedBoundary()
         return try traceGreedyCached(
             testCase: selectedCase,
             step: options.step,

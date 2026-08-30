@@ -7,53 +7,55 @@ import Testing
 struct CBv2DetachedDrainRegistryTests {
     @Test
     func watchdogEscapeFailsClosedAndRemainsRegistered() {
-        CBv2DetachedDrainRegistry.resetForTesting()
-        defer { CBv2DetachedDrainRegistry.resetForTesting() }
+        let registry = CBv2DetachedDrainStorage()
 
-        CBv2DetachedDrainRegistry.register(Task.detached {
+        registry.register(Task.detached {
             CBv2DrainRetirement.watchdogEscaped
         })
 
-        #expect(!CBv2DetachedDrainRegistry.joinAll(timeout: 1))
+        #expect(!registry.joinAll(timeout: 1))
         #expect(
-            !CBv2DetachedDrainRegistry.joinAll(timeout: 1),
+            !registry.joinAll(timeout: 1),
             "an unsuccessful retirement must remain registered")
     }
 
     @Test
     func naturalRetirementClearsTheJoinedPrefix() {
-        CBv2DetachedDrainRegistry.resetForTesting()
-        defer { CBv2DetachedDrainRegistry.resetForTesting() }
+        let registry = CBv2DetachedDrainStorage()
 
-        CBv2DetachedDrainRegistry.register(Task.detached {
+        registry.register(Task.detached {
+            CBv2DrainRetirement.natural
+        })
+        // Models two idempotent shutdown calls: both registered drain results
+        // must be joined and removed as one natural prefix.
+        registry.register(Task.detached {
             CBv2DrainRetirement.natural
         })
 
-        #expect(CBv2DetachedDrainRegistry.joinAll(timeout: 1))
-        #expect(CBv2DetachedDrainRegistry.joinAll(timeout: 0))
+        #expect(registry.joinAll(timeout: 1))
+        #expect(registry.joinAll(timeout: 0))
     }
 
     @Test
     func deadlineRetainsPendingDrainForALaterFence() {
-        CBv2DetachedDrainRegistry.resetForTesting()
+        let registry = CBv2DetachedDrainStorage()
         let started = DispatchSemaphore(value: 0)
         let release = AsyncStream<Void>.makeStream()
-        CBv2DetachedDrainRegistry.register(Task.detached {
+        registry.register(Task.detached {
             started.signal()
             for await _ in release.stream { break }
             return .natural
         })
         defer {
             release.continuation.finish()
-            _ = CBv2DetachedDrainRegistry.joinAll(timeout: 1)
-            CBv2DetachedDrainRegistry.resetForTesting()
+            _ = registry.joinAll(timeout: 1)
         }
 
         #expect(started.wait(timeout: .now() + 1) == .success)
-        #expect(!CBv2DetachedDrainRegistry.joinAll(timeout: 0.01))
+        #expect(!registry.joinAll(timeout: 0.01))
 
         release.continuation.yield(())
         release.continuation.finish()
-        #expect(CBv2DetachedDrainRegistry.joinAll(timeout: 1))
+        #expect(registry.joinAll(timeout: 1))
     }
 }

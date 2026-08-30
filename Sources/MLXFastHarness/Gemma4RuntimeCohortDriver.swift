@@ -623,7 +623,7 @@ extension Gemma4Runtime {
         cohort: RuntimeWorkerValidatedCohortBegin,
         effectiveSpec: RuntimeWorkerEffectiveSpec?,
         sessionNonce: String,
-        weightCache: Gemma4A4BRuntimeWeightCache,
+        model: Gemma4TextModel,
         mtpDrafter: Gemma4CBv2MTPDrafter?,
         dflashDrafter: DFlashDraftModel? = nil,
         state: inout RuntimeWorkerState
@@ -695,7 +695,6 @@ extension Gemma4Runtime {
                     + "refused \(arm) for a worker with no staged head (wiring bug)")
         }
         try resetRuntimeWorkerAllocatorForPhaseStart()
-        let model = try weightCache.requireLibraryModel()
         // The MTP arm binds through the pinned B1 explicit-rectangular CBv2
         // envelope, with depth clamped to the installed C2...C4 table.
         let mtpConfig =

@@ -793,7 +793,12 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
             engineQueue.async { [self] in
                 guard running else {
-                    waiter.resume(.natural)
+                    // Even an already-stopped loop reports natural retirement
+                    // from a subsequent queue turn, after this request closure
+                    // releases everything it captured.
+                    engineQueue.async {
+                        waiter.resume(.natural)
+                    }
                     return
                 }
                 draining = true
@@ -834,7 +839,10 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     /// Natural shutdown barrier. Donation completion hops back to the engine
     /// queue and calls this, so a drain with no scheduler work wakes promptly
-    /// instead of waiting for another polling step.
+    /// instead of waiting for another polling step. `completeStop()` clears
+    /// `draining` before the sentinel is enqueued, sealing this to one sentinel.
+    /// The subsequent queue turn is the lifetime fence: the closure that
+    /// completed a donation/KV handoff must unwind before `.natural` is visible.
     private func completeDrainIfReady() {
         guard draining, !scheduler.hasWork, inFlight == nil,
             pendingDonationReleaseCount == 0
@@ -842,7 +850,9 @@ public final class EngineLoopV2: @unchecked Sendable {
         completeStop()
         let waiters = drainWaiters
         drainWaiters = []
-        for waiter in waiters { waiter.resume(.natural) }
+        engineQueue.async {
+            for waiter in waiters { waiter.resume(.natural) }
+        }
     }
 
     // MARK: Submission (from EngineV2)

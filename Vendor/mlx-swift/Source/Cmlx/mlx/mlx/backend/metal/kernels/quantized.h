@@ -60,6 +60,7 @@ inline U load_vector(const device T* x, thread U* x_thread) {
   }
 
   else if (bits == 4) {
+    #pragma unroll
     for (int i = 0; i < values_per_thread; i += 4) {
       sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
       x_thread[i] = x[i];
@@ -303,6 +304,7 @@ inline U qdot_affine4_registered(
     U bias,
     U sum) {
   U accum = 0;
+  #pragma unroll
   for (int i = 0; i < (values_per_thread / 4); i++) {
     accum +=
         (x_thread[4 * i] * (w[i] & 0x000f) +
@@ -330,6 +332,7 @@ inline void qdot_affine4_pair(
   U accum0 = 0;
   U accum1 = 0;
   const device uint16_t* ws = (const device uint16_t*)w;
+  #pragma unroll
   for (int i = 0; i < (values_per_thread / 4); i++) {
     const uint16_t packed = ws[i];
     accum0 +=
@@ -732,6 +735,7 @@ struct QuantizedBlockLoader {
 
     T scale = *scales;
     T bias = *biases;
+#pragma unroll
     for (int i = 0; i < n_reads; i++) {
       dequantize<T, pack_factor, bits>(
           src + i * bytes_per_pack, scale, bias, dst + i * pack_factor);
@@ -744,6 +748,7 @@ struct QuantizedBlockLoader {
     }
 
     if (reduction_dim == 1 && bi >= src_tile_dim.x) {
+#pragma unroll
       for (int i = 0; i < n_reads * pack_factor; i++) {
         dst[i] = T(0);
       }
@@ -751,6 +756,7 @@ struct QuantizedBlockLoader {
     }
 
     if (reduction_dim == 0 && bi >= src_tile_dim.y) {
+#pragma unroll
       for (int i = 0; i < n_reads * pack_factor; i++) {
         dst[i] = T(0);
       }
@@ -759,6 +765,7 @@ struct QuantizedBlockLoader {
 
     T scale = *scales;
     T bias = *biases;
+#pragma unroll
     for (int i = 0; i < n_reads; i++) {
       dequantize<T, pack_factor, bits>(
           (device uint8_t*)(src + i * bytes_per_pack),
@@ -987,6 +994,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
   const bool has_pair = first_m + 1 < M;
   thread float2 pair_result[rows_per_simd];
   thread float single_result[rows_per_simd];
+#pragma unroll
   for (int r = 0; r < rows_per_simd; r++) {
     pair_result[r] = 0.0f;
     single_result[r] = 0.0f;
@@ -997,6 +1005,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
     thread float scale_local[rows_per_simd];
     thread float bias_local[rows_per_simd];
 
+    #pragma unroll
     for (int r = 0; r < rows_per_simd; r++) {
       const int row = out_row + r;
       const device uint8_t* wb =
@@ -1004,6 +1013,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
           row * in_vec_size_w + k / 2 + simd_lid * bytes_per_lane;
       const device uint16_t* ws =
           reinterpret_cast<const device uint16_t*>(wb);
+      #pragma unroll
       for (int i = 0; i < 4; i++) {
         packed[r][i] = ws[i];
       }
@@ -1023,12 +1033,14 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
       const device T* xm1 = xm0 + in_vec_size;
       const float sum1 =
           load_vector<T, float, values_per_thread, 4>(xm1, x1);
+      #pragma unroll
       for (int r = 0; r < rows_per_simd; r++) {
         pair_result[r] += qdot_affine4_loaded_pair(
             packed[r], x0, x1, scale_local[r], bias_local[r],
             float2(sum0, sum1));
       }
     } else {
+      #pragma unroll
       for (int r = 0; r < rows_per_simd; r++) {
         single_result[r] += qdot_affine4_loaded<float>(
             packed[r], x0, scale_local[r], bias_local[r], sum0);
@@ -1037,6 +1049,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
   }
 
   if (has_pair) {
+    #pragma unroll
     for (int r = 0; r < rows_per_simd; r++) {
       const float reduced0 = simd_sum(pair_result[r].x);
       const float reduced1 = simd_sum(pair_result[r].y);
@@ -1047,6 +1060,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
       }
     }
   } else {
+    #pragma unroll
     for (int r = 0; r < rows_per_simd; r++) {
       const float reduced = simd_sum(single_result[r]);
       if (simd_lid == 0) {
@@ -1087,6 +1101,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
   const int in_vec_size_g = in_vec_size / 64;
 
   VF acc[rows_per_simd];
+  #pragma unroll
   for (int r = 0; r < rows_per_simd; r++) {
     acc[r] = VF(0.0f);
   }
@@ -1095,11 +1110,13 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
     thread uint16_t packed[rows_per_simd][4];
     thread float scale_local[rows_per_simd];
     thread float bias_local[rows_per_simd];
+    #pragma unroll
     for (int r = 0; r < rows_per_simd; r++) {
       const int row = out_row + r;
       const device uint16_t* ws = reinterpret_cast<const device uint16_t*>(
           reinterpret_cast<const device uint8_t*>(w) + row * in_vec_size_w +
           k / 2 + simd_lid * bytes_per_lane);
+      #pragma unroll
       for (int i = 0; i < 4; i++) {
         packed[r][i] = ws[i];
       }
@@ -1110,11 +1127,14 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
 
     VF sums = VF(0.0f);
     VF partial[rows_per_simd];
+    #pragma unroll
     for (int r = 0; r < rows_per_simd; r++) {
       partial[r] = VF(0.0f);
     }
+    #pragma unroll
     for (int i = 0; i < 4; i++) {
       VF a0, a1, a2, a3;
+      #pragma unroll
       for (int m = 0; m < NA; m++) {
         const device T* xm = x + (first_m + m) * in_vec_size + k +
             simd_lid * values_per_thread + 4 * i;
@@ -1135,6 +1155,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
         a2[m] = xc[2];
         a3[m] = xc[3];
       }
+      #pragma unroll
       for (int r = 0; r < rows_per_simd; r++) {
         if (DIRECT_NIBBLES) {
           partial[r] += (a0 * (packed[r][i] & 0x000f) +
@@ -1149,12 +1170,15 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
         }
       }
     }
+    #pragma unroll
     for (int r = 0; r < rows_per_simd; r++) {
       acc[r] += scale_local[r] * partial[r] + sums * bias_local[r];
     }
   }
 
+  #pragma unroll
   for (int r = 0; r < rows_per_simd; r++) {
+    #pragma unroll
     for (int m = 0; m < NA; m++) {
       const float reduced = simd_sum(acc[r][m]);
       if (simd_lid == 0) {
@@ -1518,6 +1542,7 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
     float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
     float sum1 = load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
 
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* wl = ws + row * in_vec_size_w;
       const device T* sl = scales + row * in_vec_size_g;
@@ -1548,6 +1573,7 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
         load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
     float sum1 =
         load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* wl = ws + row * in_vec_size_w;
       const device T* sl = scales + row * in_vec_size_g;
@@ -1561,6 +1587,7 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
     }
   }
 
+  #pragma unroll
   for (int row = 0; row < results_per_simdgroup; row++) {
     result0[row] = simd_sum(result0[row]);
     result1[row] = simd_sum(result1[row]);
@@ -1648,9 +1675,11 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
 
   int k = 0;
   for (; k <= in_vec_size - block_size; k += block_size) {
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint16_t* wl =
           (const device uint16_t*)(ws + row * in_vec_size_w);
+      #pragma unroll
       for (int i = 0; i < uint16_per_thread; i++) {
         packed[row][i] = wl[i];
       }
@@ -1659,21 +1688,25 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     }
 
     float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x3, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result3[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
@@ -1693,9 +1726,11 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
       0,
       values_per_thread);
   if (remaining > 0) {
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint16_t* wl =
           (const device uint16_t*)(ws + row * in_vec_size_w);
+      #pragma unroll
       for (int i = 0; i < uint16_per_thread; i++) {
         packed[row][i] = wl[i];
       }
@@ -1705,30 +1740,35 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
 
     float sum =
         load_vector_safe<T, float, values_per_thread, 4>(x0, x_thread, remaining);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
         load_vector_safe<T, float, values_per_thread, 4>(x1, x_thread, remaining);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
         load_vector_safe<T, float, values_per_thread, 4>(x2, x_thread, remaining);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
         load_vector_safe<T, float, values_per_thread, 4>(x3, x_thread, remaining);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result3[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
   }
 
+  #pragma unroll
   for (int row = 0; row < results_per_simdgroup; row++) {
     result0[row] = simd_sum(result0[row]);
     result1[row] = simd_sum(result1[row]);
@@ -1797,9 +1837,11 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
 
   int k = 0;
   for (; k <= in_vec_size - block_size; k += block_size) {
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint16_t* wl =
           (const device uint16_t*)(ws + row * in_vec_size_w);
+      #pragma unroll
       for (int i = 0; i < uint16_per_thread; i++) {
         packed[row][i] = wl[i];
       }
@@ -1808,16 +1850,19 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
     }
 
     float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
@@ -1836,9 +1881,11 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
       0,
       values_per_thread);
   if (remaining > 0) {
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint16_t* wl =
           (const device uint16_t*)(ws + row * in_vec_size_w);
+      #pragma unroll
       for (int i = 0; i < uint16_per_thread; i++) {
         packed[row][i] = wl[i];
       }
@@ -1848,24 +1895,28 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
 
     float sum =
         load_vector_safe<T, float, values_per_thread, 4>(x0, x_thread, remaining);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
         load_vector_safe<T, float, values_per_thread, 4>(x1, x_thread, remaining);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
         load_vector_safe<T, float, values_per_thread, 4>(x2, x_thread, remaining);
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
   }
 
+  #pragma unroll
   for (int row = 0; row < results_per_simdgroup; row++) {
     result0[row] = simd_sum(result0[row]);
     result1[row] = simd_sum(result1[row]);
@@ -3709,6 +3760,7 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
 
   thread uint wpf[results_per_simdgroup];
   if (PF) {
+  #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       wpf[row] = *((const device uint*)(ws0 + row * in_vec_size_w));
     }
@@ -3719,16 +3771,19 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
 
     thread uint wcur[results_per_simdgroup];
     if (PF) {
+      #pragma unroll
       for (int row = 0; row < results_per_simdgroup; row++) {
         wcur[row] = wpf[row];
       }
       const int nextblk = (blk + 1 < nblocks) ? (blk + 1) : blk;
       const device uint8_t* wsn = ws0 + nextblk * block_bytes;
+      #pragma unroll
       for (int row = 0; row < results_per_simdgroup; row++) {
         wpf[row] = *((const device uint*)(wsn + row * in_vec_size_w));
       }
     }
 
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device T* sl = scales + row * in_vec_size_g;
       const device T* bl = biases + row * in_vec_size_g;
@@ -3766,6 +3821,7 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
       if (remaining > 0) {
         U sum = load_vector_safe<T, U, values_per_thread, 4>(
             x, x_thread, remaining);
+        #pragma unroll
         for (int row = 0; row < results_per_simdgroup; row++) {
           auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
           const device T* sl = scales + row * in_vec_size_g;
@@ -3780,6 +3836,7 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
     const uint active_tail_lanes = uint(tail_values / values_per_thread);
     if (tail_values % values_per_thread == 0 && simd_lid < active_tail_lanes) {
       U sum = load_vector<T, U, values_per_thread, 4>(x, x_thread);
+      #pragma unroll
       for (int row = 0; row < results_per_simdgroup; row++) {
         const device T* sl = scales + row * in_vec_size_g;
         const device T* bl = biases + row * in_vec_size_g;
@@ -3796,6 +3853,7 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
     }
   }
 
+  #pragma unroll
   for (int row = 0; row < results_per_simdgroup; row++) {
     result[row] = simd_sum(result[row]);
     if (simd_lid == 0) {
@@ -3884,6 +3942,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     const device T* tile_x1 =
         x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
     device T* tile_y1 = y + (assignment + 1) * out_vec_size;
+    #pragma unroll
     for (int t = 0; t < gemma4_down_tile_span; t++) {
       uint3 tile_tid = tid;
       tile_tid.y = tid.y + uint(t);
@@ -3902,6 +3961,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     }
     return;
   }
+  #pragma unroll
   for (int t = 0; t < gemma4_down_tile_span; t++) {
     uint3 tile_tid = tid;
     tile_tid.y = tid.y + uint(t);
@@ -4093,9 +4153,31 @@ template <typename T, int group_size, int bits>
     const device T* single_scales = scales + expert * s_strides[0];
     const device T* single_biases = biases + expert * b_strides[0];
     device T* single_y = y + assignment * (uint)out_vec_size;
-    qmv_impl<T, group_size, bits>(
-        single_w, single_scales, single_biases, single_x, single_y,
-        in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+    if (in_vec_size == 2816 && out_vec_size == 704) {
+      qmv_affine4_g64_singles_impl<T, group_size, bits, 2816, true, true>(
+          single_w,
+          single_scales,
+          single_biases,
+          single_x,
+          single_y,
+          in_vec_size,
+          out_vec_size,
+          tid,
+          simd_gid,
+          simd_lid);
+    } else {
+      qmv_impl<T, group_size, bits>(
+          single_w,
+          single_scales,
+          single_biases,
+          single_x,
+          single_y,
+          in_vec_size,
+          out_vec_size,
+          tid,
+          simd_gid,
+          simd_lid);
+    }
     return;
   }
   uint32_t x_idx;

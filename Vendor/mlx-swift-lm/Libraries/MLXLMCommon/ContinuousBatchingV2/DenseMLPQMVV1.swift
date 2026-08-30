@@ -105,6 +105,15 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Produce the down plane's lane sums inside its existing GeGLU stage.
+    /// The older standalone lane-sum opt-in keeps its own path unchanged.
+    private static let gegluDownSumsEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_GEGLU_DOWN_SUMS"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let batch = 8
     private static let sequence = 1
     private static let groupSize = 64
@@ -129,6 +138,19 @@ public enum CBv2DenseMLPQMVV1 {
         /// aliases its input's buffer, so handing the array out cannot change
         /// what any kernel reads or writes.
         public var dependencyHandle: MLXArray { values }
+    }
+
+    /// One GeGLU invocation's two outputs. Only the producer below can
+    /// construct a carrier; matmul also requires the identical activation
+    /// object. A reshaped or Depends-wrapped array cannot adopt its sums.
+    public struct GeGLUDownInput {
+        public let activation: MLXArray
+        fileprivate let laneSums: MLXArray
+
+        fileprivate init(activation: MLXArray, laneSums: MLXArray) {
+            self.activation = activation
+            self.laneSums = laneSums
+        }
     }
 
     /// The affine-8 helper below is the current promoted
@@ -709,6 +731,129 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         header: mma8DownStaticKHeader,
         ensureRowContiguous: true)
 
+    // The Swift expression first converts every weak scalar to the BF16
+    // operand dtype. Carry the same host Float values, including host sqrt,
+    // then cast inside the producer; no scalar AsType dispatch is introduced.
+    private static let gegluDownCoefficients = MLXArray([
+        Float(0.5), Float(1), sqrt(2 / Float.pi), Float(0.044715),
+    ])
+
+    /// One SIMD group per (g64 group, row pair): 33 * 4 = 132 groups.
+    /// Each lane owns four outputs, so no GeGLU evaluation is duplicated.
+    private static let gegluDownInputKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_geglu_down_lane_sums_bf16_v1",
+        inputNames: ["gate", "up", "coefficients"],
+        outputNames: ["activated", "laneSums"],
+        source: """
+            constexpr uint K = 2112;
+            const uint lane = thread_index_in_simdgroup;
+            const uint g = threadgroup_position_in_grid.y;
+            const uint pair = threadgroup_position_in_grid.z;
+            const uint row = 2 * pair + (lane >> 4);
+            const uint run4 = lane & 15u;
+            const uint base = row * K + 64 * g + 4 * run4;
+            const T c_half = static_cast<T>(coefficients[0]);
+            const T c_one = static_cast<T>(coefficients[1]);
+            const T c_scale = static_cast<T>(coefficients[2]);
+            const T c_cubic = static_cast<T>(coefficients[3]);
+
+            float run_sum = 0.0f;
+            for (uint i = 0; i < 4; ++i) {
+                const T gv = gate[base + i];
+                const T uv = up[base + i];
+                // Match every typed node of gemma4SafeGeluProductShaped,
+                // including the left-associated coefficient*g*g*g chain.
+                const T half_gate = c_half * gv;
+                const T cubic1 = c_cubic * gv;
+                const T cubic2 = cubic1 * gv;
+                const T cubic3 = cubic2 * gv;
+                const T centered = gv + cubic3;
+                const T argument = c_scale * centered;
+                const T curved = metal::precise::tanh(argument);
+                const T shifted = c_one + curved;
+                const T gelu = half_gate * shifted;
+                const T value = gelu * uv;
+                activated[base + i] = value;
+                // Accumulate the final rounded BF16 value, in the original
+                // mma8_runsum8 half-run's ascending four-element order.
+                run_sum += value;
+            }
+
+            // Even lanes form low-half + high-half, exactly mma8_runsum8.
+            // Only even results are consumed; XOR 2,4,8 never crosses into
+            // an odd lane's reversed first addition. They are the original
+            // fm-bit XOR 2,4,16 tree under this pair-major lane mapping.
+            run_sum += simd_shuffle_xor(run_sum, 1u);
+            run_sum += simd_shuffle_xor(run_sum, 2u);
+            run_sum += simd_shuffle_xor(run_sum, 4u);
+            run_sum += simd_shuffle_xor(run_sum, 8u);
+            const float next_row_sum = simd_shuffle_xor(run_sum, 16u);
+            if (lane < 16u && (lane & 1u) == 0u) {
+                const uint fm = lane >> 1;
+                const uint original_lane = ((fm & 3u) << 1)
+                    | ((fm & 4u) << 2) | (pair & 1u) | ((pair & 2u) << 2);
+                ((device float2*)laneSums)[g * 32 + original_lane] =
+                    float2(run_sum, next_row_sum);
+            }
+            """,
+        ensureRowContiguous: true)
+
+    /// Derive only the rs consumer from the current fixed-K body. The
+    /// 17+16 walk, all eight MMAs, affine close and KS=2 combine stay intact.
+    private static let gegluDownSumHeader: String = {
+        var result = mma8DownStaticKHeader
+        func replaceOnce(_ old: String, with new: String) {
+            precondition(result.components(separatedBy: old).count == 2)
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        replaceOnce(
+            "gemma4_qmv_mma8_affine8_g64_down_k2112_impl(",
+            with: "gemma4_qmv_mma8_affine8_g64_down_k2112_geglu_sums_impl(")
+        replaceOnce(
+            """
+                const device T* x,
+                device T* y,
+                const int N,
+            """,
+            with: """
+                const device T* x,
+                const device float2* laneSums,
+                device T* y,
+                const int N,
+            """)
+        replaceOnce(
+            """
+                // Each B lane owns the two 8-runs whose run sums the C lane (fm, fn)
+                // needs; three xor-butterfly steps over the fm lane bits broadcast
+                // RS[g][fn] and RS[g][fn + 1] to all eight lanes of the fn column group.
+                float2 rs = float2(mma8_runsum8<T>(r0), mma8_runsum8<T>(r1));
+                rs += simd_shuffle_xor(rs, 2u);
+                rs += simd_shuffle_xor(rs, 4u);
+                rs += simd_shuffle_xor(rs, 16u);
+            """,
+            with: """
+                // Same lane's tree, emitted with the rounded GeGLU output.
+                const float2 rs = laneSums[g * 32 + simd_lid];
+            """)
+        return result
+    }()
+
+    private static let gegluDownSumQMVKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_mma8_down_k2112_geglu_sums_v1",
+        inputNames: ["x", "w", "scales", "biases", "laneSums"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            gemma4_qmv_mma8_affine8_g64_down_k2112_geglu_sums_impl<T, 2>(
+                w, scales, biases, x, (const device float2*)laneSums, y,
+                w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            """,
+        header: gegluDownSumHeader,
+        ensureRowContiguous: true)
+
     /// One complete SIMD group per g64 group. Keep all lane results rather
     /// than canonicalizing row sums: the consumer reads its own lane's tree.
     private static let mma8DownLaneSumKernel = MLXFast.metalKernel(
@@ -893,6 +1038,45 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
             || (inDim == 2112 && outDim == 2816)
     }
 
+    /// Replaces an admitted dense GeGLU stage with one dispatch producing
+    /// both its BF16 activation and the fixed-K down consumer's lane table.
+    /// Check the complete consumer geometry before building either output.
+    public static func gegluDownInput(
+        gate: MLXArray,
+        up: MLXArray,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode
+    ) -> GeGLUDownInput? {
+        guard enabled, gegluDownSumsEnabled,
+            mma8DownEnabled, mma8DownStaticKEnabled,
+            !mma8DownLaneSumsEnabled,
+            groupSize == Self.groupSize, bits == Self.bits, mode == .affine,
+            gate.dtype == .bfloat16, up.dtype == .bfloat16,
+            gate.shape == [batch, sequence, 2112], up.shape == gate.shape,
+            let biases,
+            weight.dtype == .uint32, weight.shape == [2816, 2112 / 4],
+            scales.dtype == .bfloat16, biases.dtype == .bfloat16,
+            scales.shape == [2816, 2112 / Self.groupSize],
+            biases.shape == scales.shape
+        else { return nil }
+
+        let outputs = gegluDownInputKernel(
+            [gate, up, gegluDownCoefficients],
+            template: [("T", gate.dtype)],
+            grid: (simdWidth, 2112 / Self.groupSize, batch / 2),
+            threadGroup: (simdWidth, 1, 1),
+            outputShapes: [
+                [batch, sequence, 2112], [2112 / Self.groupSize, simdWidth, 2],
+            ],
+            outputDTypes: [.bfloat16, .float32]
+        )
+        return GeGLUDownInput(activation: outputs[0], laneSums: outputs[1])
+    }
+
     /// Builds the shared gate/up table only for the exact dense decode input.
     /// Returning an opaque value prevents callers from fabricating a table with
     /// a plausible shape; all other inputs keep DMLP-001 unchanged.
@@ -951,7 +1135,8 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         groupSize: Int,
         bits: Int,
         mode: QuantizationMode,
-        activationSums: ActivationSums? = nil
+        activationSums: ActivationSums? = nil,
+        gegluDownInput: GeGLUDownInput? = nil
     ) -> MLXArray? {
         guard enabled,
             groupSize == Self.groupSize,
@@ -986,13 +1171,29 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         // the plane is read once per round instead of twice. `liveShape` above
         // already pins the pair, so naming gate/up here also names down.
         //
-        // The MMA close builds its own `rs` with `mma8_runsum8`, so this path
+        // The MMA close requires `mma8_runsum8`'s lane tree, so this path
         // never consumes DMLP-002's xSums table. With the gate/up arm off the
         // table is still built and consumed for the gate/up plane exactly as on
         // the tip -- the fall-through below is the promoted path unchanged.
         let isGateUp = inDim == 2816 && outDim == 2112
         if isGateUp ? mma8GateUpEnabled : mma8DownEnabled {
             let yTiles = outDim / outputsPerGroup
+            if !isGateUp, gegluDownSumsEnabled,
+                mma8DownStaticKEnabled, !mma8DownLaneSumsEnabled,
+                let produced = gegluDownInput, produced.activation === x,
+                produced.laneSums.dtype == .float32,
+                produced.laneSums.shape == [2112 / Self.groupSize, simdWidth, 2]
+            {
+                CBv2EngageMark.once("geglu-down-lane-sums")
+                return gegluDownSumQMVKernel(
+                    [x, weight, scales, biases, produced.laneSums],
+                    template: [("T", x.dtype)],
+                    grid: (simdWidth, yTiles * simdGroups, 1),
+                    threadGroup: (simdWidth, simdGroups, 1),
+                    outputShapes: [[batch, sequence, outDim]],
+                    outputDTypes: [x.dtype]
+                )[0]
+            }
             if !isGateUp && mma8DownLaneSumsEnabled {
                 let groups = inDim / Self.groupSize
                 let laneSums = mma8DownLaneSumKernel(

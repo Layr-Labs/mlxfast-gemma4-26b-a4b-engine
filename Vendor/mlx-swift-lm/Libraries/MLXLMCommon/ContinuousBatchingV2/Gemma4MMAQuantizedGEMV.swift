@@ -136,7 +136,10 @@ public enum Gemma4MMAQuantizedGEMV {
     /// adjacent output tiles, reusing each activation fragment across both and
     /// doubling one threadgroup's output width. Version `16` extends the same
     /// reuse to four output tiles per SIMD group. Version `26` probes one reused
-    /// packed-weight cursor across those tiles. Versions 1...16 are shippable and
+    /// packed-weight cursor across those tiles. Version `27` keeps that cursor
+    /// and replaces the v13 `min(8u, N_GROUPS - biasBlock)` inner trip with a
+    /// compile-time-8 walk plus a four-group tail `continue`, fully unrolling
+    /// the 44-group outer block walk. Versions 1...16 are shippable and
     /// numerically validated; see each version's source for what differs.
     /// Anything unrecognised takes the default.
     private static let version: Int = {
@@ -161,11 +164,12 @@ public enum Gemma4MMAQuantizedGEMV {
         case "15": return 15
         case "16": return 16
         case "26": return 26
+        case "27": return 27
         default: return defaultVersion
         }
     }()
 
-    private static let defaultVersion = 26
+    private static let defaultVersion = 27
 
     /// Whether the selected tied-head implementation consumes the exact
     /// per-row/per-group activation sums. The final RMSNorm uses this to avoid
@@ -174,7 +178,7 @@ public enum Gemma4MMAQuantizedGEMV {
     public static var consumesActivationSums: Bool {
         guard enabled else { return false }
         switch version {
-        case 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 26:
+        case 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 26, 27:
             return true
         default:
             return false
@@ -1091,7 +1095,7 @@ public enum Gemma4MMAQuantizedGEMV {
     /// tile. At N=262144 that repeats the same 352 sums in 8,192 threadgroups.
     /// This prepass writes those exact FP32 sums once.
     private static let xSumKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_xsum_m8_v5",
+        name: "gemma4_mma_affine4_xsum_m8_v27_unroll",
         inputNames: ["x"],
         outputNames: ["xSums"],
         source: """
@@ -1104,6 +1108,7 @@ public enum Gemma4MMAQuantizedGEMV {
             const device T* xp =
                 x + (cell / N_GROUPS) * K + (cell % N_GROUPS) * GROUP;
             float s = 0.0f;
+            #pragma unroll
             for (uint c = 0; c < GROUP / 8; ++c) {
                 const uint i = c * 8;
                 s += xp[i + 0] + xp[i + 1] + xp[i + 2] + xp[i + 3];
@@ -2522,6 +2527,52 @@ public enum Gemma4MMAQuantizedGEMV {
         ensureRowContiguous: true
     )
 
+    // MARK: - Version 27 --- compile-time affine-block inner trip
+
+    /// Version 26 still inherits v13's `min(8u, N_GROUPS - biasBlock)` inner
+    /// bound, a runtime trip count the compiler cannot unroll. K=2816 makes
+    /// N_GROUPS a constexpr 44, so the outer walk is six blocks and the last
+    /// block has four groups. Iterate `gg < 8`, `continue` the four-group
+    /// tail, and fully unroll both loops. The named metallib key changes so a
+    /// stale v26 body cannot keep serving the runtime-bounded trip.
+    private static let sourceV27: String = {
+        var result = sourceV26
+
+        func replaceOnce(_ old: String, with new: String) {
+            let count = result.components(separatedBy: old).count
+            precondition(count == 2, "sourceV27 replacement count \(count): \(old)")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+
+        replaceOnce(
+            """
+            for (uint biasBlock = 0; biasBlock < N_GROUPS; biasBlock += 8) {
+                const uint blockGroups = min(8u, N_GROUPS - biasBlock);
+                for (uint gg = 0; gg < blockGroups; ++gg) {
+                    const uint g = biasBlock + gg;
+            """,
+            with: """
+            #pragma unroll
+            for (uint biasBlock = 0; biasBlock < N_GROUPS; biasBlock += 8) {
+                #pragma unroll
+                for (uint gg = 0; gg < 8; ++gg) {
+                    const uint g = biasBlock + gg;
+                    if (g >= N_GROUPS) continue;
+            """
+        )
+
+        return result
+    }()
+
+    private static let kernelV27: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["out"],
+        source: sourceV27,
+        header: "#include <metal_simdgroup_matrix>\n",
+        ensureRowContiguous: true
+    )
+
     /// Tied-head GEMV, or `nil` when any gate above fails.
     ///
     /// - Parameters:
@@ -2557,7 +2608,7 @@ public enum Gemma4MMAQuantizedGEMV {
         guard k > 0, x.size == mRows * k else { return nil }
 
         let n = w.dim(0)
-        let selectedColsPerThreadgroup = version == 16 || version == 26
+        let selectedColsPerThreadgroup = version == 16 || version == 26 || version == 27
             ? colsPerThreadgroup * 4
             : (version == 15 ? colsPerThreadgroup * 2 : colsPerThreadgroup)
         guard n >= minOutputWidth, n % selectedColsPerThreadgroup == 0 else { return nil }
@@ -2571,7 +2622,7 @@ public enum Gemma4MMAQuantizedGEMV {
         let selected: MLXFast.MLXFastKernel
         let inputs: [MLXArray]
         switch version {
-        case 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 26:
+        case 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 26, 27:
             let sumCells = mRows * (k / groupSize)
             let xSums: MLXArray
             if let activationSums,
@@ -2593,6 +2644,7 @@ public enum Gemma4MMAQuantizedGEMV {
                 )[0]
             }
             switch version {
+            case 27: selected = kernelV27
             case 26: selected = kernelV26
             case 16: selected = kernelV16
             case 15: selected = kernelV15

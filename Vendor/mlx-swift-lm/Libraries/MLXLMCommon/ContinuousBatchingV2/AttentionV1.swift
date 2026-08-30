@@ -73,6 +73,23 @@ enum CBv2AttentionV1 {
         return value << 20
     }()
 
+    /// PREFILL-TOKENMAJOR-JOIN. The q-block loop rejoins its blocks on the
+    /// QUERY axis of a head-major `[B, H, L, D]` rectangle, and the model's
+    /// very next act is to permute that rectangle to `[B, L, H*D]` for
+    /// `o_proj` -- two full passes over the attention output where one
+    /// suffices. Joining the already-permuted blocks on the token axis
+    /// produces the token-major rectangle directly; the head-major array the
+    /// caller is typed to receive is then a pure view of it, and the caller's
+    /// own permute takes that view back to the contiguous buffer, so its
+    /// `reshaped` is free. Kill switch:
+    /// `DARKBLOOM_CBV2_PREFILL_TOKENMAJOR_JOIN=0`.
+    static let tokenMajorJoinEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PREFILL_TOKENMAJOR_JOIN"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// ATT-008 opt-in switch: batch-wide FULL-attention decode over pooled
     /// KV (`DARKBLOOM_GEMMA4_BATCHED_FULL_ATTENTION=1` enables it).
     /// DEFAULT OFF: three counterbalanced local B=8 probe pairs measured the
@@ -1158,7 +1175,39 @@ enum CBv2AttentionV1 {
             }
             offset += count
         }
-        return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
+        if outputs.count == 1 { return outputs[0] }
+        // PREFILL-TOKENMAJOR-JOIN. `concatenated(outputs, axis: 2)` writes a
+        // head-major `[B, H, L, D]` rectangle that `Gemma4Attention` then
+        // permutes to `[B, L, H*D]` -- 2 x 2.2 GB of pure data movement per
+        // prefill step for one join. Permuting each block BEFORE the join
+        // folds both passes into one: element `(b, l, h, d)` of the token-
+        // major join is `outputs[l / blockSize][b, h, l % blockSize, d]`,
+        // which is exactly what the head-major join followed by a permute
+        // produces, so this is the same bytes in the same places -- a
+        // permutation identity, not an arithmetic change.
+        //
+        // The value returned is still `[B, H, L, D]`: a transposed VIEW of the
+        // token-major buffer. Its consumer permutes it straight back, and a
+        // permute of a permute restores the row-contiguous strides, so the
+        // `reshaped` that follows takes `prepare_reshape`'s shared-buffer
+        // branch and the second copy simply disappears. Any consumer that
+        // does need a contiguous head-major array materializes exactly the
+        // copy this branch skipped -- never worse than the join it replaces.
+        //
+        // PROMPT PLANE ONLY. `blockSize <= 8` is the pinned MTP serial-query
+        // path and every narrow verify width; those callers hand their result
+        // to the decode graph, which wants the head-major buffer contiguous
+        // and would materialize the copy this branch skipped -- measured at
+        // +0.5% of the decode wall. `blockSize > 8 && newTokenCount > 8` is
+        // the same predicate the composed prefill SDPA uses, so decode and
+        // MTP stay on the established join by construction.
+        if tokenMajorJoinEnabled, blockSize > 8, newTokenCount > 8, outputs[0].ndim == 4 {
+            CBv2EngageMark.once("prefill-tokenmajor-join")
+            let tokenMajor = concatenated(
+                outputs.map { $0.transposed(0, 2, 1, 3) }, axis: 1)
+            return tokenMajor.transposed(0, 2, 1, 3)
+        }
+        return concatenated(outputs, axis: 2)
     }
 
     /// One query at a time — the pinned MTP serial-verification path.

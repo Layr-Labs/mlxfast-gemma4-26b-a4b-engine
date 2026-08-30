@@ -40,7 +40,6 @@ public enum Gemma4B1MTPQuantizedProjection {
 
         let kernel = bits == 4 ? affine4Kernel : affine8Kernel
         return { x in
-            precondition(x.shape == [1, columns, inDim])
             let flat = x.reshaped([columns, inDim])
             return kernel(
                 [flat, weight, scales, biases],

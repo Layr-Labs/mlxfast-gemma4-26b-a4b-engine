@@ -56,6 +56,31 @@ struct Gemma4MTPVerifierB1ProjectionTests {
         }, axis: 1)
     }
 
+    @Test
+    func installedProjectionDoesNotInspectRuntimeTopology() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourceURL = repositoryRoot.appendingPathComponent(
+            "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/"
+                + "Gemma4B1MTPQuantizedProjection.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        let closureStart = try #require(source.range(of: "        return { x in"))
+        let closureEnd = try #require(source.range(
+            of: "\n        }\n    }\n\n    // Arithmetic provenance:",
+            range: closureStart.upperBound..<source.endIndex))
+        let installedClosure = String(
+            source[closureStart.lowerBound..<closureEnd.lowerBound])
+
+        #expect(!installedClosure.contains("precondition"))
+        #expect(!installedClosure.contains("x.shape"))
+        #expect(!installedClosure.contains("x.ndim"))
+        #expect(!installedClosure.contains("x.dim("))
+        #expect(!installedClosure.contains("x.size"))
+        #expect(!installedClosure.contains("x.dtype"))
+    }
+
     @Test(
         .enabled(if: runtimeEnabled),
         arguments: [2, 3, 4], [4, 8])

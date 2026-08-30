@@ -5601,17 +5601,24 @@ extension Gemma4TextModel: CBv2MTPForwardable {
         return (applyLMHead(postNorm, verifier: nil), preNorm)
     }
 
-    public func cbv2ForwardRectangularVerificationWithHidden(
-        _ tokens: MLXArray, caches: [KVCache]
-    ) -> (logits: MLXArray, lastHidden: MLXArray) {
-        let shape = CBv2Gemma4MTPVerifierShape(
-            batch: tokens.dim(0), columns: tokens.dim(1))
-        guard let verifier = installedMTPVerifierContexts?[shape] else {
-            preconditionFailure(
-                "Gemma 4 MTP verifier has no installed B\(shape.batch)/C\(shape.columns) route")
+    public func cbv2BindRectangularVerificationForward()
+        -> CBv2MTPRectangularVerificationForward
+    {
+        guard let contexts = installedMTPVerifierContexts else {
+            return { [self] tokens, caches in
+                cbv2ForwardWithHidden(tokens, caches: caches)
+            }
         }
-        let (postNorm, preNorm) = model.callCapturingPreNorm(
-            tokens, cache: caches, verifier: verifier)
-        return (applyLMHead(postNorm, verifier: verifier), preNorm)
+        return { [self] tokens, caches in
+            let shape = CBv2Gemma4MTPVerifierShape(
+                batch: tokens.dim(0), columns: tokens.dim(1))
+            guard let verifier = contexts[shape] else {
+                preconditionFailure(
+                    "Gemma 4 MTP verifier has no installed B\(shape.batch)/C\(shape.columns) route")
+            }
+            let (postNorm, preNorm) = model.callCapturingPreNorm(
+                tokens, cache: caches, verifier: verifier)
+            return (applyLMHead(postNorm, verifier: verifier), preNorm)
+        }
     }
 }

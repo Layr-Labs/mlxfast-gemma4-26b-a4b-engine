@@ -204,12 +204,12 @@ struct Gemma4MTPVerifierRouteTests {
 
         let ordinaryStart = try #require(source.range(
             of: "    public func cbv2ForwardWithHidden("))
-        let verifyStart = try #require(source.range(
-            of: "    public func cbv2ForwardRectangularVerificationWithHidden(",
+        let bindStart = try #require(source.range(
+            of: "    public func cbv2BindRectangularVerificationForward()",
             range: ordinaryStart.upperBound..<source.endIndex))
         let ordinary = String(
-            source[ordinaryStart.lowerBound..<verifyStart.lowerBound])
-        let verify = String(source[verifyStart.lowerBound..<source.endIndex])
+            source[ordinaryStart.lowerBound..<bindStart.lowerBound])
+        let binding = String(source[bindStart.lowerBound..<source.endIndex])
 
         // Prompt/prefill, decode seeds, and serial-oracle columns all use the
         // ordinary seam. It must be identical whether the private table is
@@ -219,18 +219,24 @@ struct Gemma4MTPVerifierRouteTests {
         #expect(!ordinary.contains("CBv2Gemma4MTPVerifierShape"))
         #expect(!ordinary.contains("preconditionFailure"))
 
-        // Only the explicitly typed rectangular-verification seam may select
-        // the installed table, and it must exact-key without fallback.
-        #expect(verify.contains(
+        // The adapter calls this binder once at construction. An uninstalled
+        // generic model receives the ordinary rectangular implementation;
+        // an installed production model receives a closure over the immutable
+        // exact table. The measured closure never performs exact-or-stock
+        // eligibility or fallback.
+        #expect(binding.contains(
+            "guard let contexts = installedMTPVerifierContexts else"))
+        #expect(binding.contains(
+            "cbv2ForwardWithHidden(tokens, caches: caches)"))
+        #expect(binding.contains(
             "let shape = CBv2Gemma4MTPVerifierShape("))
-        #expect(verify.contains(
+        #expect(binding.contains(
             "batch: tokens.dim(0), columns: tokens.dim(1)"))
-        #expect(verify.contains(
-            "installedMTPVerifierContexts?[shape]"))
-        #expect(verify.contains(
+        #expect(binding.contains("contexts[shape]"))
+        #expect(binding.contains(
             #"no installed B\(shape.batch)/C\(shape.columns) route"#))
-        #expect(!verify.contains("tokens.dim(0) == 8"))
-        #expect(!verify.contains("tokens.ndim"))
+        #expect(!binding.contains("tokens.dim(0) == 8"))
+        #expect(!binding.contains("tokens.ndim"))
     }
 
     @Test
@@ -253,11 +259,13 @@ struct Gemma4MTPVerifierRouteTests {
             encoding: .utf8)
 
         #expect(contracts.contains(
-            "func cbv2ForwardRectangularVerificationWithHidden("))
+            "func cbv2BindRectangularVerificationForward()"))
         #expect(contracts.contains(
             "func forwardRectangularVerificationWithHidden("))
         #expect(adapter.contains(
-            "forwardable.cbv2ForwardRectangularVerificationWithHidden("))
+            "forwardable.cbv2BindRectangularVerificationForward()"))
+        #expect(adapter.contains(
+            "mtpRectangularVerificationForward(tokens, asKVCaches(caches))"))
 
         let serialStart = try #require(verification.range(of: "if !useRectangular"))
         let rectangularStart = try #require(verification.range(

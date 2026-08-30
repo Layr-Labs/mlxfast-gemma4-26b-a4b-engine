@@ -31,9 +31,21 @@ private let cbv2CompactDecodeRootMarksArmed =
 public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
 
     private let model: any LanguageModel
+    private let mtpRectangularVerificationForward:
+        CBv2MTPRectangularVerificationForward
 
     public init(_ model: any LanguageModel) {
         self.model = model
+        if let forwardable = model as? any CBv2MTPForwardable {
+            mtpRectangularVerificationForward =
+                forwardable.cbv2BindRectangularVerificationForward()
+        } else {
+            mtpRectangularVerificationForward = { _, _ in
+                preconditionFailure(
+                    "CBv2 MTP: \(type(of: model)) is not CBv2MTPForwardable — "
+                        + "engine gating failed")
+            }
+        }
     }
 
     public func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
@@ -213,11 +225,6 @@ extension CBv2SteppableLanguageModelAdapter: CBv2MTPSteppableModel {
     public func forwardRectangularVerificationWithHidden(
         tokens: MLXArray, caches: [CBv2AttendingLayerCache]
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
-        guard let forwardable = model as? CBv2MTPForwardable else {
-            preconditionFailure(
-                "CBv2 MTP: \(type(of: model)) is not CBv2MTPForwardable — engine gating failed")
-        }
-        return forwardable.cbv2ForwardRectangularVerificationWithHidden(
-            tokens, caches: asKVCaches(caches))
+        mtpRectangularVerificationForward(tokens, asKVCaches(caches))
     }
 }

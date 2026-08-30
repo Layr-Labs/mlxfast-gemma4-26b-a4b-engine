@@ -50,6 +50,10 @@ public struct CBv2MTPCaptureLayers: Sendable, Equatable {
 /// Model-level surface for `LanguageModel` conformers reached through
 /// `CBv2SteppableLanguageModelAdapter` (Gemma4TextModel conforms): the
 /// KVCache-shaped twin of the `CBv2MTPSteppableModel` requirements.
+public typealias CBv2MTPRectangularVerificationForward = (
+    _ tokens: MLXArray, _ caches: [KVCache]
+) -> (logits: MLXArray, lastHidden: MLXArray)
+
 public protocol CBv2MTPForwardable: AnyObject {
     /// nil when this model cannot drive MTP (no capture layers).
     var cbv2MTPCaptureLayers: CBv2MTPCaptureLayers? { get }
@@ -59,12 +63,12 @@ public protocol CBv2MTPForwardable: AnyObject {
     /// plain forward on the logits side.
     func cbv2ForwardWithHidden(_ tokens: MLXArray, caches: [KVCache])
         -> (logits: MLXArray, lastHidden: MLXArray)
-    /// Explicit target-verification phase seam. The MTP target-verification
-    /// loop calls this only after it has selected rectangular verification;
-    /// prompt/prefill, seed decode, and serial-oracle columns never call it.
-    func cbv2ForwardRectangularVerificationWithHidden(
-        _ tokens: MLXArray, caches: [KVCache]
-    ) -> (logits: MLXArray, lastHidden: MLXArray)
+    /// Bind the target-verification phase once when the steppable adapter is
+    /// constructed. Generic models retain their ordinary rectangular forward;
+    /// an installed exact lane returns its fixed route directly. The measured
+    /// round never performs exact-or-stock eligibility or fallback.
+    func cbv2BindRectangularVerificationForward()
+        -> CBv2MTPRectangularVerificationForward
 }
 
 /// Steppable models that can drive MTP rounds. Additive refinement of

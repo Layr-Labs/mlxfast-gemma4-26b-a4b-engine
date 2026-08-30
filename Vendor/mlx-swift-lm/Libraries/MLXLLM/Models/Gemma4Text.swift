@@ -146,27 +146,53 @@ private let gemma4LongPrefillChunkEvalLayers: Int = {
 private let gemma4BlockedQueryPrefillThreshold = 128
 
 @inline(__always)
+private func gemma4PrefillChunkEvalIsLongRegime(
+    configured: Int, inputLength: Int
+) -> Bool {
+    configured == 18
+        && gemma4LongPrefillChunkEvalLayers > 0
+        && gemma4LongPrefillChunkEvalLayers < configured
+        && inputLength > gemma4BlockedQueryPrefillThreshold
+}
+
+@inline(__always)
 private func gemma4EffectivePrefillChunkEvalLayers(
     configured: Int, inputLength: Int
 ) -> Int {
-    guard configured == 18,
-        gemma4LongPrefillChunkEvalLayers > 0,
-        gemma4LongPrefillChunkEvalLayers < configured,
-        inputLength > gemma4BlockedQueryPrefillThreshold
+    guard gemma4PrefillChunkEvalIsLongRegime(
+        configured: configured, inputLength: inputLength)
     else { return configured }
     return gemma4LongPrefillChunkEvalLayers
 }
 
+/// PREFILL-CHUNK-EVAL-EARLY-ONLY-019. `29e889d`'s decode-ladder bisection
+/// (see `gemma4ShouldSubmitDecodeAsyncEvalLadder` above) measured that on
+/// this engine only the EARLIEST submitted boundary captures host/device
+/// overlap; later evenly-spaced boundaries in that sweep only fragmented the
+/// command buffer. That question was never asked of the prefill chunk-eval
+/// cadence (`29e889d`'s own note, section 13). `firstBoundaryOnly` answers it
+/// for prefill: instead of every multiple of `interval` (the long/narrow
+/// regime's shipped default submits at layers 6, 12, 18 and 24), submit only
+/// the first one (layer 6) and drop the other three. This changes only WHEN
+/// an already-built graph frontier still built by this loop is submitted for
+/// async evaluation; it adds no operation, operand, dtype, shape or
+/// accumulation-order change, so tokens are identical to the unmodified
+/// cadence by construction. Default `false` preserves every existing
+/// caller's behavior verbatim, including `CBv2ModelTests.swift`'s pinned
+/// interval-cadence expectations, which this editable surface cannot touch.
 @inline(__always)
 internal func gemma4ShouldSubmitPrefillChunkEval(
     schedulePrefill: Bool,
     isCBv2: Bool,
     inputLength: Int,
     layerNumber: Int,
-    interval: Int
+    interval: Int,
+    firstBoundaryOnly: Bool = false
 ) -> Bool {
-    schedulePrefill && isCBv2 && interval > 0 && inputLength > 1
-        && layerNumber.isMultiple(of: interval)
+    guard schedulePrefill, isCBv2, interval > 0, inputLength > 1,
+        layerNumber.isMultiple(of: interval)
+    else { return false }
+    return !firstBoundaryOnly || layerNumber == interval
 }
 
 /// CBv2 consumes only the final prompt position, so the LAST decoder layer
@@ -4241,12 +4267,21 @@ public class Gemma4TextModelInner: Module {
             }
 
             let layerNumber = idx + 1
+            // PREFILL-CHUNK-EVAL-EARLY-ONLY-019: the long/narrow specialized
+            // cadence (DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL_LONG, default on)
+            // now submits only its first boundary (layer 6) instead of all
+            // four (6/12/18/24). Every other regime (kill switch set to 0,
+            // or a custom DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL value) keeps
+            // the shipped interval cadence exactly as before this line.
             if gemma4ShouldSubmitPrefillChunkEval(
                 schedulePrefill: schedulePrefill,
                 isCBv2: isCBv2,
                 inputLength: inputLength,
                 layerNumber: layerNumber,
                 interval: gemma4EffectivePrefillChunkEvalLayers(
+                    configured: gemma4PrefillChunkEvalLayers,
+                    inputLength: inputLength),
+                firstBoundaryOnly: gemma4PrefillChunkEvalIsLongRegime(
                     configured: gemma4PrefillChunkEvalLayers,
                     inputLength: inputLength))
             {

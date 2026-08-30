@@ -732,6 +732,27 @@ struct QuantizedBlockLoader {
 
     T scale = *scales;
     T bias = *biases;
+    if (bits == 4 && n_reads == 4) {
+      const uint32_t packed_w = *reinterpret_cast<const device uint32_t*>(src);
+      const T s0 = scale;
+      const T s1 = scale / static_cast<T>(16.0f);
+      const uint32_t b0 = packed_w & 0x000000FF;
+      const uint32_t b1 = (packed_w >> 8) & 0x000000FF;
+      const uint32_t b2 = (packed_w >> 16) & 0x000000FF;
+      const uint32_t b3 = packed_w >> 24;
+
+      threadgroup T* dst_p = dst;
+      dst_p[0] = s0 * static_cast<T>(b0 & 0x0F) + bias;
+      dst_p[1] = s1 * static_cast<T>(b0 & 0xF0) + bias;
+      dst_p[2] = s0 * static_cast<T>(b1 & 0x0F) + bias;
+      dst_p[3] = s1 * static_cast<T>(b1 & 0xF0) + bias;
+      dst_p[4] = s0 * static_cast<T>(b2 & 0x0F) + bias;
+      dst_p[5] = s1 * static_cast<T>(b2 & 0xF0) + bias;
+      dst_p[6] = s0 * static_cast<T>(b3 & 0x0F) + bias;
+      dst_p[7] = s1 * static_cast<T>(b3 & 0xF0) + bias;
+      return;
+    }
+
     for (int i = 0; i < n_reads; i++) {
       dequantize<T, pack_factor, bits>(
           src + i * bytes_per_pack, scale, bias, dst + i * pack_factor);
@@ -759,6 +780,27 @@ struct QuantizedBlockLoader {
 
     T scale = *scales;
     T bias = *biases;
+    if (bits == 4 && n_reads == 4) {
+      const uint32_t packed_w = *reinterpret_cast<const device uint32_t*>(src);
+      const T s0 = scale;
+      const T s1 = scale / static_cast<T>(16.0f);
+      const uint32_t b0 = packed_w & 0x000000FF;
+      const uint32_t b1 = (packed_w >> 8) & 0x000000FF;
+      const uint32_t b2 = (packed_w >> 16) & 0x000000FF;
+      const uint32_t b3 = packed_w >> 24;
+
+      threadgroup T* dst_p = dst;
+      dst_p[0] = s0 * static_cast<T>(b0 & 0x0F) + bias;
+      dst_p[1] = s1 * static_cast<T>(b0 & 0xF0) + bias;
+      dst_p[2] = s0 * static_cast<T>(b1 & 0x0F) + bias;
+      dst_p[3] = s1 * static_cast<T>(b1 & 0xF0) + bias;
+      dst_p[4] = s0 * static_cast<T>(b2 & 0x0F) + bias;
+      dst_p[5] = s1 * static_cast<T>(b2 & 0xF0) + bias;
+      dst_p[6] = s0 * static_cast<T>(b3 & 0x0F) + bias;
+      dst_p[7] = s1 * static_cast<T>(b3 & 0xF0) + bias;
+      return;
+    }
+
     for (int i = 0; i < n_reads; i++) {
       dequantize<T, pack_factor, bits>(
           (device uint8_t*)(src + i * bytes_per_pack),
@@ -4074,6 +4116,18 @@ template <typename T, int group_size, int bits>
     const device T* single_scales = scales + expert * s_strides[0];
     const device T* single_biases = biases + expert * b_strides[0];
     device T* single_y = y + assignment * (uint)out_vec_size;
+    if (in_vec_size == 2816) {
+      qmv_affine4_g64_singles_impl<T, group_size, bits, 2816, true, false>(
+          single_w, single_scales, single_biases, single_x, single_y,
+          in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+      return;
+    }
+    if (in_vec_size == 704) {
+      qmv_affine4_g64_singles_impl<T, group_size, bits, 704, true, false>(
+          single_w, single_scales, single_biases, single_x, single_y,
+          in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+      return;
+    }
     qmv_impl<T, group_size, bits>(
         single_w, single_scales, single_biases, single_x, single_y,
         in_vec_size, out_vec_size, tid, simd_gid, simd_lid);

@@ -52,21 +52,19 @@ enum CBv2AttentionV1 {
         return value
     }()
 
-    /// Query-block width used when a prompt pass is already on the blocked
-    /// path and the layer's heads are wide (head dim 256 or 512). Wide heads
-    /// do not enter the fused SDPA path, so a blocked prompt pass materializes
-    /// one score rectangle per block; a narrower block holds a smaller
-    /// rectangle. Only the grouping of the query rows changes: every row's
-    /// softmax reduction still runs over the whole key axis, in the same
-    /// order, so the produced values are unchanged.
+    /// Optional explicit query-block width for wide-head prompt attention.
+    /// When unset, the production shapes select 256 rows for D=256 and 128
+    /// for D=512. The cheaper single-dispatch join shifts the D=256 optimum
+    /// upward: fewer attention launches and joins now outweigh the additional
+    /// masked triangle inside a 256-row block. D=512 remains balanced at 128.
     ///
     /// `0` disables the specialization (the block width falls back to
     /// `queryBlockSize`), which is the kill switch.
-    static let wideHeadQueryBlockSize: Int = {
+    static let wideHeadQueryBlockSizeOverride: Int? = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_ATTN_QUERY_BLOCK_WIDE"],
             let value = Int(raw), value >= 0
-        else { return 64 }
+        else { return nil }
         return value
     }()
 
@@ -81,12 +79,12 @@ enum CBv2AttentionV1 {
         kind: CBv2LayerKind, queryLength: Int
     ) -> Int {
         guard queryBlockSize == 128,
-            wideHeadQueryBlockSize > 0,
-            wideHeadQueryBlockSize < queryBlockSize,
             queryLength > queryBlockSize,
             kind.headDim == 256 || kind.headDim == 512
         else { return queryBlockSize }
-        return wideHeadQueryBlockSize
+        let selected = wideHeadQueryBlockSizeOverride
+            ?? (kind.headDim == 256 ? 256 : 128)
+        return selected > 0 ? selected : queryBlockSize
     }
 
     /// Ceiling, in MiB, on the K+V a PACKED prefill may restack on the batch
@@ -148,7 +146,7 @@ enum CBv2AttentionV1 {
     static let joinKernelEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_PREFILL_JOIN_KERNEL"]
-        else { return false }
+        else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
@@ -160,9 +158,10 @@ enum CBv2AttentionV1 {
     private static let joinKernelLock = NSLock()
 
     /// The join kernel for `blockCount` query blocks, built once per count.
-    /// Thread (lane, head, batch*token) copies one 16-byte segment of one
-    /// head row from the block that owns the token into the token-major
-    /// rectangle `[B, L, H, D]`.
+    /// A flat, capped grid streams the token-major rectangle without launching
+    /// one threadgroup per `(batch*token, head)`. D=256 threads copy one
+    /// aligned 16-byte vector; D=512 threads copy one aligned 32-byte vector.
+    /// Adjacent threads remain coalesced in both planes.
     private static func joinKernel(blockCount: Int) -> MLXFast.MLXFastKernel {
         joinKernelLock.lock()
         defer { joinKernelLock.unlock() }
@@ -172,34 +171,44 @@ enum CBv2AttentionV1 {
             .map { "                case \($0): src = in\($0); break;" }
             .joined(separator: "\n")
         let source = """
-            const uint lanes = uint(D) / 8u;
+            const uint segment_values = (WIDE != 0) ? 16u : 8u;
+            const uint lanes = uint(D) / segment_values;
             const uint L_ = uint(L);
             const uint H_ = uint(H);
             const uint BS_ = uint(BS);
             const uint D_ = uint(D);
-            const uint dv = thread_position_in_grid.x;
-            const uint h = thread_position_in_grid.y;
-            const uint bt = thread_position_in_grid.z;
-            if (dv >= lanes || h >= H_ || bt >= uint(B) * L_) {
-                return;
+            const uint total = uint(B) * L_ * H_ * lanes;
+            for (uint item = thread_position_in_grid.x;
+                item < total; item += threads_per_grid.x) {
+                const uint dv = item % lanes;
+                const uint q = item / lanes;
+                const uint h = q % H_;
+                const uint bt = q / H_;
+                const uint b = bt / L_;
+                const uint t = bt - b * L_;
+                const uint blk = t / BS_;
+                const uint tt = t - blk * BS_;
+                const device T* src;
+                switch (blk) {
+                \(cases)
+                    default: continue;
+                }
+                const size_t source_base =
+                    size_t(((b * H_ + h) * BS_ + tt) * D_);
+                const size_t output_segment = size_t((bt * H_ + h) * lanes + dv);
+                if constexpr (WIDE != 0) {
+                    const device ulong4* s =
+                        (const device ulong4*)(src + source_base) + dv;
+                    ((device ulong4*)out)[output_segment] = *s;
+                } else {
+                    const device uint4* s =
+                        (const device uint4*)(src + source_base) + dv;
+                    ((device uint4*)out)[output_segment] = *s;
+                }
             }
-            const uint b = bt / L_;
-            const uint t = bt - b * L_;
-            const uint blk = t / BS_;
-            const uint tt = t - blk * BS_;
-            const device T* src;
-            switch (blk) {
-            \(cases)
-                default: return;
-            }
-            const device uint4* s =
-                (const device uint4*)(src + (((b * H_ + h) * BS_ + tt) * D_)) + dv;
-            device uint4* o =
-                (device uint4*)(out + (((b * L_ + t) * H_ + h) * D_)) + dv;
-            *o = *s;
             """
         let kernel = MLXFast.metalKernel(
-            name: "cbv2_prefill_join_v1_nb\(blockCount)",
+            name: "cbv2_prefill_join_wide_vector_v4_nb\(blockCount)",
             inputNames: inputNames,
             outputNames: ["out"],
             source: source,
@@ -229,20 +238,20 @@ enum CBv2AttentionV1 {
             else { return nil }
         }
         let L = BS * blocks.count
-        let lanes = D / 8
+        let wide = D >= 512
+        let lanes = D / (wide ? 16 : 8)
         guard lanes <= 1024, B * L * H * D < (1 << 31) else { return nil }
-        var headsPerGroup = 1
-        for candidate in [8, 4, 2] where H % candidate == 0 && lanes * candidate <= 1024 {
-            headsPerGroup = candidate
-            break
-        }
+        let totalSegments = B * L * H * lanes
+        let threadGroupCap = D >= 512 ? 512 : 1024
+        let threadGroups = min(threadGroupCap, (totalSegments + 255) / 256)
         let joined = joinKernel(blockCount: blocks.count)(
             blocks.map { $0 as any ScalarOrArray },
             template: [
                 ("T", head.dtype), ("L", L), ("BS", BS), ("H", H), ("D", D), ("B", B),
+                ("WIDE", wide ? 1 : 0),
             ],
-            grid: (lanes, H, B * L),
-            threadGroup: (lanes, headsPerGroup, 1),
+            grid: (threadGroups * 256, 1, 1),
+            threadGroup: (256, 1, 1),
             outputShapes: [[B, L, H, D]],
             outputDTypes: [head.dtype]
         )[0]

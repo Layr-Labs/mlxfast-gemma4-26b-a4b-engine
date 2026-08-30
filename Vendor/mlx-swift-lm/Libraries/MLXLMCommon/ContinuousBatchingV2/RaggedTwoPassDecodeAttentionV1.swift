@@ -22,6 +22,16 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Pass B's softmax merge coefficients are identical for all 32 output
+    /// SIMD groups. Compute them once by default. The switch keeps the exact
+    /// pre-optimization kernel available for differential checks and rollout.
+    private static let sharedPassBMergeEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PASS_B_SHARED_MERGE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let batch = 8
     private static let queryHeads = 16
     private static let kvHeads = 8
@@ -387,11 +397,18 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         ensureRowContiguous: true
     )
 
-    private static let passBKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_2pass_b_direct_bf16_d256_b\(blocks)_v3",
-        inputNames: ["partials", "sums", "maxs"],
-        outputNames: ["out"],
-        source: """
+    private static let passBKernel = makePassBKernel(
+        sharedMerge: sharedPassBMergeEnabled)
+
+    private static func makePassBKernel(
+        sharedMerge: Bool
+    ) -> MLXFast.MLXFastKernel {
+        MLXFast.metalKernel(
+            name: "cbv2_ragged8_sdpa_2pass_b_direct_bf16_d256_b\(blocks)_\(sharedMerge ? "shared_v4" : "v3")",
+            inputNames: ["partials", "sums", "maxs"],
+            outputNames: ["out"],
+            source: """
+            #define CBV2_SHARED_PASS_B_MERGE \(sharedMerge ? 1 : 0)
             constexpr int simd_width = 32;
             constexpr int values_per_lane = D / simd_width;
             // One lane per partition column, so a partition narrower than a
@@ -405,6 +422,14 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             const int output_group = int(simdgroup_index_in_threadgroup);
             const int block_lane = int(thread_index_in_simdgroup);
 
+            #if CBV2_SHARED_PASS_B_MERGE
+            // All 32 output SIMD groups merge the same partition columns. SIMD
+            // zero follows the old per-SIMD max, sum and factor order exactly,
+            // then publishes fp32 values for the unchanged vector merges.
+            threadgroup float merge_factors[BLOCKS];
+            threadgroup float merge_sum_exp[1];
+            #endif
+
             partials += batch_head * BLOCKS * D
                 + output_group * values_per_lane;
             sums += batch_head * BLOCKS;
@@ -415,6 +440,37 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             for (int element = 0; element < values_per_lane; ++element) {
                 accumulator[element] = 0.0f;
             }
+
+            #if CBV2_SHARED_PASS_B_MERGE
+            if (output_group == 0) {
+                float sum_exp_score = 0.0f;
+                float max_score = -3.402823466e+38F;
+                for (int round = 0; round < rounds; ++round) {
+                    const int column = block_lane + simd_width * round;
+                    if (column < BLOCKS) {
+                        max_score = max(max_score, maxs[column]);
+                    }
+                }
+                max_score = simd_max(max_score);
+
+                for (int round = 0; round < rounds; ++round) {
+                    const int column = block_lane + simd_width * round;
+                    if (column < BLOCKS) {
+                        const float factor = fast::exp(maxs[column] - max_score);
+                        merge_factors[column] = factor;
+                        sum_exp_score += factor * sums[column];
+                    }
+                }
+                sum_exp_score = simd_sum(sum_exp_score);
+                if (block_lane == 0) {
+                    merge_sum_exp[0] = sum_exp_score;
+                }
+            }
+            // Every thread reaches the only barrier. It makes the factors and
+            // denominator visible before any output SIMD starts its merge.
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float sum_exp_score = merge_sum_exp[0];
+            #else
             float sum_exp_score = 0.0f;
             float max_score = -3.402823466e+38F;
             for (int round = 0; round < rounds; ++round) {
@@ -433,11 +489,16 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 }
             }
             sum_exp_score = simd_sum(sum_exp_score);
+            #endif
 
             for (int round = 0; round < rounds; ++round) {
                 const int column = block_lane + simd_width * round;
                 if (column < BLOCKS) {
+                    #if CBV2_SHARED_PASS_B_MERGE
+                    const float factor = merge_factors[column];
+                    #else
                     const float factor = fast::exp(maxs[column] - max_score);
+                    #endif
                     for (int element = 0; element < values_per_lane; ++element) {
                         accumulator[element] +=
                             factor * float(partials[column * D + element]);
@@ -454,9 +515,10 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                             : reduced / sum_exp_score);
                 }
             }
-        """,
-        ensureRowContiguous: true
-    )
+            """,
+            ensureRowContiguous: true
+        )
+    }
 
     static func attend(
         queries: MLXArray,

@@ -112,25 +112,37 @@ public func resetWeightedExpertUnsortStats() {
 /// permutation and writes `[tokens, hidden]` directly, avoiding that full
 /// `[tokens, topK, hidden]` intermediate.
 private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "weighted_expert_unsort",
+    name: "weighted_expert_unsort_v3",
     inputNames: ["sorted_outputs", "inverse_order", "weights"],
     outputNames: ["output"],
     source: """
-        uint feature = thread_position_in_grid.x;
-        uint token = thread_position_in_grid.y;
+        constexpr uint reads = 8;
+        const uint feature_base = thread_position_in_grid.x * reads;
+        const uint token = thread_position_in_grid.y;
+        if (feature_base >= 2816) return;
 
-        T accumulator = (T)0;
-        const uint assignment_base = token * (uint)K;
-        for (uint slot = 0; slot < (uint)K; ++slot) {
+        float w[8];
+        uint sorted_rows[8];
+        const uint assignment_base = token * 8;
+        for (uint slot = 0; slot < 8; ++slot) {
             const uint assignment = assignment_base + slot;
-            const uint sorted_row = (uint)inverse_order[assignment];
-            // Preserve the legacy bfloat16 multiply-then-reduce rounding.
-            const T weighted = (T)(
-                (float)sorted_outputs[sorted_row * threads_per_grid.x + feature]
-                * (float)weights[assignment]);
-            accumulator = accumulator + weighted;
+            w[slot] = (float)weights[assignment];
+            sorted_rows[slot] = (uint)inverse_order[assignment];
         }
-        output[token * threads_per_grid.x + feature] = accumulator;
+
+        T accum[reads] = {(T)0, (T)0, (T)0, (T)0, (T)0, (T)0, (T)0, (T)0};
+        for (uint slot = 0; slot < 8; ++slot) {
+            const float weight = w[slot];
+            const device T* src = sorted_outputs + sorted_rows[slot] * 2816 + feature_base;
+            for (uint i = 0; i < reads; ++i) {
+                const T weighted = (T)((float)src[i] * weight);
+                accum[i] = accum[i] + weighted;
+            }
+        }
+        device T* dst = output + token * 2816 + feature_base;
+        for (uint i = 0; i < reads; ++i) {
+            dst[i] = accum[i];
+        }
     """,
     ensureRowContiguous: true
 )
@@ -170,7 +182,7 @@ public func weightedExpertUnsort(
             ("T", sortedOutputs.dtype),
             ("K", 8),
         ],
-        grid: (2816, tokens, 1),
+        grid: (2816 / 8, tokens, 1),
         threadGroup: (64, 4, 1),
         outputShapes: [[tokens, 2816]],
         outputDTypes: [.bfloat16]
@@ -342,92 +354,6 @@ private func geGLUProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
 }
 // MARK: - ROUTE-SIMD-RANK-64: exact decode route table
 
-/// Stable rank sort for the exact B=8/top-K=8 decode plane. One SIMDgroup
-/// loads the 64 keys once (two keys per lane), broadcasts them to every lane,
-/// and directly emits the three routing products consumed downstream.
-private let routeSimdRank64Kernel: MLXFast.MLXFastKernel =
-    MLXFast.metalKernel(
-        name: "mlx_lm_route_simd_rank_scatter_m8_u32_n64_v1",
-        inputNames: ["indices"],
-        outputNames: ["row_order", "sorted_keys", "inverse_order"],
-        source: """
-            const uint assignment = thread_position_in_grid.x;
-            const uint lane = thread_index_in_simdgroup;
-            const uint key = (uint)indices[assignment];
-            const uint key_low = (uint)indices[lane];
-            const uint key_high = (uint)indices[32u + lane];
-            uint rank = 0;
-            for (uint source = 0; source < 32; ++source) {
-                const uint other_low = simd_broadcast(key_low, ushort(source));
-                rank += (other_low < key)
-                    || (other_low == key && source < assignment);
-                const uint other_high = simd_broadcast(key_high, ushort(source));
-                const uint high_assignment = 32u + source;
-                rank += (other_high < key)
-                    || (other_high == key && high_assignment < assignment);
-            }
-            row_order[rank] = assignment / 8;
-            sorted_keys[rank] = key;
-            inverse_order[assignment] = rank;
-        """,
-        ensureRowContiguous: true
-    )
-
-/// EXPERT-PREFIX-BOUNDS-001 carrier for the exact decode route table. The
-/// gathered-QMV host ABI has no spare buffer, so each sorted rhs-index word
-/// carries its expert plus the within-run bounds that the gather kernel needs:
-///
-///   bits  0...7   expert id
-///   bits  8...13  assignments before this one in its expert run
-///   bits 14...19  assignments remaining in the run, including this one, minus 1
-///   bits 20...30  zero
-///   bit      31   prefix-bounds-valid tag
-///
-/// The tag makes every other producer fail closed to the incumbent raw-index
-/// path. The exact Gemma projection gate below also excludes linear biases,
-/// whose generic `bias[indices]` lookup must continue to receive raw indices.
-private let routeSimdRank64PrefixBoundsKernel: MLXFast.MLXFastKernel =
-    MLXFast.metalKernel(
-        name: "mlx_lm_route_simd_rank_bounds_scatter_m8_u32_n64_v1",
-        inputNames: ["indices"],
-        outputNames: ["row_order", "sorted_keys", "inverse_order"],
-        source: """
-            const uint assignment = thread_position_in_grid.x;
-            const uint lane = thread_index_in_simdgroup;
-            const uint key = (uint)indices[assignment];
-            const uint key_low = (uint)indices[lane];
-            const uint key_high = (uint)indices[32u + lane];
-            uint rank = 0;
-            uint run_offset = 0;
-            uint run_length = 0;
-            for (uint source = 0; source < 32; ++source) {
-                const uint other_low = simd_broadcast(key_low, ushort(source));
-                rank += (other_low < key)
-                    || (other_low == key && source < assignment);
-                run_offset += other_low == key && source < assignment;
-                run_length += other_low == key;
-                const uint other_high = simd_broadcast(key_high, ushort(source));
-                const uint high_assignment = 32u + source;
-                rank += (other_high < key)
-                    || (other_high == key && high_assignment < assignment);
-                run_offset += other_high == key && high_assignment < assignment;
-                run_length += other_high == key;
-            }
-            const uint run_remaining = run_length - run_offset;
-            row_order[rank] = assignment / 8;
-            sorted_keys[rank] = 0x80000000u | key
-                | (run_offset << 8) | ((run_remaining - 1) << 14);
-            inverse_order[assignment] = rank;
-        """,
-        ensureRowContiguous: true
-    )
-
-private let routeSimdRank64Enabled: Bool = {
-    guard let raw = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_ROUTE_SIMD_RANK"]
-    else { return true }
-    return !["0", "false", "no", "off"].contains(raw.lowercased())
-}()
 
 // MARK: - ROUTE-CSORT-64: fused counting-sort route table (donor port)
 
@@ -463,13 +389,6 @@ private let routeSimdRank64Enabled: Bool = {
 private let routeCountingSort64Enabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_ROUTE_COUNTING_SORT"]
-    else { return true }
-    return !["0", "false", "no", "off"].contains(raw.lowercased())
-}()
-
-private let expertPrefixBoundsEnabled: Bool = {
-    guard let raw = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_GEMMA4_EXPERT_PREFIX_BOUNDS"]
     else { return true }
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
@@ -550,75 +469,8 @@ private let routeFusedScatterKernelT64: MLXFast.MLXFastKernel = {
     )
 }()
 
-/// Counting-sort twin that emits the tagged per-assignment bounds word while
-/// it already owns the exact stable run offsets. This adds no dispatch and no
-/// route-table load: `total`, the expert base, and `off` are live sort state.
-private let routeFusedScatterPrefixBoundsKernelT64: MLXFast.MLXFastKernel = {
-    let m = routeFusedScatterTopK
-    return MLXFast.metalKernel(
-        name: "mlx_lm_route_csort_bounds_scatter_fused_m\(m)_u32_t64_v1",
-        inputNames: ["keys"],
-        outputNames: ["row_order", "sorted_keys", "inverse_order"],
-        source: """
-            constexpr uint TILE = \(routeSortTile64);
-            constexpr uint M = \(m);
-            uint t = threadgroup_position_in_grid.x;
-            uint k = thread_position_in_threadgroup.x;
-            uint simd_id = k / 32;
-            uint lane = k % 32;
-            uint n = keys_shape[0];
-            threadgroup atomic_uint tg_total[256];
-            threadgroup atomic_uint tg_before[256];
-            atomic_store_explicit(&tg_total[k], 0u, memory_order_relaxed);
-            atomic_store_explicit(&tg_before[k], 0u, memory_order_relaxed);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            uint before_limit = t * TILE;
-            uint idx = k;
-            for (; idx < before_limit; idx += 256) {
-                uint key = keys[idx];
-                atomic_fetch_add_explicit(
-                    &tg_total[key], 1u, memory_order_relaxed);
-                atomic_fetch_add_explicit(
-                    &tg_before[key], 1u, memory_order_relaxed);
-            }
-            for (; idx < n; idx += 256) {
-                atomic_fetch_add_explicit(
-                    &tg_total[keys[idx]], 1u, memory_order_relaxed);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            uint total = atomic_load_explicit(&tg_total[k], memory_order_relaxed);
-            uint lane_excl = simd_prefix_exclusive_sum(total);
-            threadgroup uint simd_totals[8];
-            if (lane == 31) {
-                simd_totals[simd_id] = lane_excl + total;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            uint simd_base = 0;
-            for (uint s = 0; s < simd_id; ++s) {
-                simd_base += simd_totals[s];
-            }
-            const uint expert_base = simd_base + lane_excl;
-            uint off = expert_base
-                + atomic_load_explicit(&tg_before[k], memory_order_relaxed);
-            for (uint i = 0; i < TILE; ++i) {
-                uint idx = t * TILE + i;
-                if (keys[idx] == k) {
-                    const uint run_offset = off - expert_base;
-                    const uint run_remaining = total - run_offset;
-                    row_order[off] = idx / M;
-                    sorted_keys[off] = 0x80000000u | k
-                        | (run_offset << 8) | ((run_remaining - 1) << 14);
-                    inverse_order[idx] = off;
-                    ++off;
-                }
-            }
-            """,
-        ensureRowContiguous: false
-    )
-}()
-
 private func routeCountingSortFusedT64(
-    _ indices: MLXArray, m: Int, expertPrefixBounds: Bool = false
+    _ indices: MLXArray, m: Int
 ) -> (rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray)? {
     let n = indices.size
     guard routeCountingSort64Enabled,
@@ -628,13 +480,7 @@ private func routeCountingSortFusedT64(
     else { return nil }
     CBv2EngageMark.once("route-csort64")
     let tiles = n / routeSortTile64
-    let emitExpertPrefixBounds = expertPrefixBounds && n == routeSortTile64
-    if emitExpertPrefixBounds {
-        CBv2EngageMark.once("expert-prefix-bounds")
-    }
-    let kernel = emitExpertPrefixBounds
-        ? routeFusedScatterPrefixBoundsKernelT64 : routeFusedScatterKernelT64
-    let outputs = kernel(
+    let outputs = routeFusedScatterKernelT64(
         [indices],
         grid: (tiles * 256, 1, 1),
         threadGroup: (256, 1, 1),
@@ -916,26 +762,8 @@ public func gatherSort(
 /// its 256-entry counter table covers every key. The default (`Int.max`)
 /// fails closed onto the established `argSort` chain.
 public func gatherSortIndices(
-    indices: MLXArray, numExperts: Int = Int.max,
-    expertPrefixBounds: Bool = false
+    indices: MLXArray, numExperts: Int = Int.max
 ) -> (MLXArray, MLXArray, MLXArray) {
-    if routeSimdRank64Enabled,
-        indices.ndim == 2, indices.shape == [8, 8], indices.dtype == .uint32
-    {
-        if expertPrefixBounds {
-            CBv2EngageMark.once("expert-prefix-bounds")
-        }
-        let kernel = expertPrefixBounds
-            ? routeSimdRank64PrefixBoundsKernel : routeSimdRank64Kernel
-        let outputs = kernel(
-            [indices],
-            grid: (64, 1, 1),
-            threadGroup: (64, 1, 1),
-            outputShapes: [[64], [64], [64]],
-            outputDTypes: [.uint32, .uint32, .uint32]
-        )
-        return (outputs[0], outputs[1], outputs[2])
-    }
     let m = indices.dim(-1)
     let indices = indices.flattened()
     routeCsortShapeLog.note {
@@ -951,9 +779,7 @@ public func gatherSortIndices(
         }
         // ROUTE-CSORT-64: one fused dispatch with byte-identical outputs
         // (default ON; see routeCountingSort64Enabled above).
-        if let fused = routeCountingSortFusedT64(
-            indices, m: m, expertPrefixBounds: expertPrefixBounds)
-        {
+        if let fused = routeCountingSortFusedT64(indices, m: m) {
             return (fused.rowOrder, fused.sortedKeys, fused.inverseOrder)
         }
     }
@@ -1096,10 +922,6 @@ public class SwitchGLU: Module {
         let useLhsIndices =
             indices.size == 64 && indices.ndim == 2 && indices.shape == [8, 8]
             && x.ndim == 2 && x.shape == [8, inputDims]
-        let useExpertPrefixBounds =
-            expertPrefixBoundsEnabled && useLhsIndices
-            && indices.dtype == .uint32 && x.dtype == .bfloat16
-            && expertPrefixBoundsProjectionsEligible
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
         let doSort = indices.size >= 64
 
@@ -1110,8 +932,7 @@ public class SwitchGLU: Module {
             if useLhsIndices {
                 x = x.flattened(start: 0, end: -3)
                 (lhsIndices, idx, inverseOrder) = gatherSortIndices(
-                    indices: indices, numExperts: numExperts,
-                    expertPrefixBounds: useExpertPrefixBounds)
+                    indices: indices, numExperts: numExperts)
             } else {
                 (x, idx, inverseOrder) = gatherSort(
                     x: x, indices: indices, numExperts: numExperts)
@@ -1146,65 +967,6 @@ public class SwitchGLU: Module {
 
         x = downProj(activated, idx, sortedIndices: doSort)
         return (x, doSort ? inverseOrder : nil, doSort)
-    }
-
-    /// Cached eligibility: the projection tensors are bound at load time and
-    /// the tag consumers defensively decode tagged words even on fallback
-    /// paths, so evaluating the geometry once per module (not per forward,
-    /// where its ~15 shape/dtype bridge reads per layer-round are measurable
-    /// host cost) is safe.
-    private lazy var expertPrefixBoundsProjectionsEligible: Bool =
-        supportsExpertPrefixBoundsProjections()
-
-    /// Exact production geometry whose three quantized gathers understand the
-    /// tagged rhs-index carrier. Every other SwitchGLU, quantization, bias, or
-    /// projection shape retains raw expert indices and the incumbent kernels.
-    private func supportsExpertPrefixBoundsProjections() -> Bool {
-        guard inputDims == 2816, hiddenDims == 704, numExperts == 128,
-            gateUpProj == nil,
-            let gate = gateProj as? QuantizedSwitchLinear,
-            let up = upProj as? QuantizedSwitchLinear,
-            let down = downProj as? QuantizedSwitchLinear
-        else { return false }
-
-        guard gate.inputDims == 2816 && gate.outputDims == 704
-            && gate.numExperts == 128
-            && gate.groupSize == 64 && gate.bits == 4
-            && gate.mode == .affine && gate.bias == nil
-            && up.inputDims == 2816 && up.outputDims == 704
-            && up.numExperts == 128
-            && up.groupSize == 64 && up.bits == 4
-            && up.mode == .affine && up.bias == nil
-        else { return false }
-
-        guard down.inputDims == 704 && down.outputDims == 2816
-            && down.numExperts == 128
-            && down.groupSize == 64 && down.bits == 4
-            && down.mode == .affine && down.bias == nil
-        else { return false }
-
-        guard let gateBiases = gate.biases, let upBiases = up.biases,
-            let downBiases = down.biases,
-            gate.weight.shape == [128, 704, 352]
-                && gate.scales.shape == [128, 704, 44]
-                && gateBiases.shape == [128, 704, 44]
-                && up.weight.shape == [128, 704, 352]
-                && up.scales.shape == [128, 704, 44]
-                && upBiases.shape == [128, 704, 44]
-                && down.weight.shape == [128, 2816, 88]
-                && down.scales.shape == [128, 2816, 11]
-                && downBiases.shape == [128, 2816, 11]
-        else { return false }
-
-        return gate.weight.dtype == .uint32
-            && gate.scales.dtype == .bfloat16
-            && gateBiases.dtype == .bfloat16
-            && up.weight.dtype == .uint32
-            && up.scales.dtype == .bfloat16
-            && upBiases.dtype == .bfloat16
-            && down.weight.dtype == .uint32
-            && down.scales.dtype == .bfloat16
-            && downBiases.dtype == .bfloat16
     }
 
     private func legacyWeightedReduction(

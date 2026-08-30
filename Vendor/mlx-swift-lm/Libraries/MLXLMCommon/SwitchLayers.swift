@@ -380,7 +380,8 @@ private let routeSimdRank64Kernel: MLXFast.MLXFastKernel =
 ///   bits  0...7   expert id
 ///   bits  8...13  assignments before this one in its expert run
 ///   bits 14...19  assignments remaining in the run, including this one, minus 1
-///   bits 20...30  zero
+///   bit      20   Gemma4 gather-QMV compile-time-K enable
+///   bits 21...30  zero
 ///   bit      31   prefix-bounds-valid tag
 ///
 /// The tag makes every other producer fail closed to the incumbent raw-index
@@ -414,9 +415,11 @@ private let routeSimdRank64PrefixBoundsKernel: MLXFast.MLXFastKernel =
                 run_length += other_high == key;
             }
             const uint run_remaining = run_length - run_offset;
+            constexpr uint gather_kfix_tag = GATHER_KFIX ? 0x00100000u : 0u;
             row_order[rank] = assignment / 8;
             sorted_keys[rank] = 0x80000000u | key
-                | (run_offset << 8) | ((run_remaining - 1) << 14);
+                | (run_offset << 8) | ((run_remaining - 1) << 14)
+                | gather_kfix_tag;
             inverse_order[assignment] = rank;
         """,
         ensureRowContiguous: true
@@ -470,6 +473,13 @@ private let routeCountingSort64Enabled: Bool = {
 private let expertPrefixBoundsEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_GEMMA4_EXPERT_PREFIX_BOUNDS"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+private let gemma4GatherKfixEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_GATHER_KFIX"]
     else { return true }
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
@@ -605,9 +615,12 @@ private let routeFusedScatterPrefixBoundsKernelT64: MLXFast.MLXFastKernel = {
                 if (keys[idx] == k) {
                     const uint run_offset = off - expert_base;
                     const uint run_remaining = total - run_offset;
+                    constexpr uint gather_kfix_tag =
+                        GATHER_KFIX ? 0x00100000u : 0u;
                     row_order[off] = idx / M;
                     sorted_keys[off] = 0x80000000u | k
-                        | (run_offset << 8) | ((run_remaining - 1) << 14);
+                        | (run_offset << 8) | ((run_remaining - 1) << 14)
+                        | gather_kfix_tag;
                     inverse_order[idx] = off;
                     ++off;
                 }
@@ -618,7 +631,8 @@ private let routeFusedScatterPrefixBoundsKernelT64: MLXFast.MLXFastKernel = {
 }()
 
 private func routeCountingSortFusedT64(
-    _ indices: MLXArray, m: Int, expertPrefixBounds: Bool = false
+    _ indices: MLXArray, m: Int, expertPrefixBounds: Bool = false,
+    gatherKfix: Bool = false
 ) -> (rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray)? {
     let n = indices.size
     guard routeCountingSort64Enabled,
@@ -631,11 +645,15 @@ private func routeCountingSortFusedT64(
     let emitExpertPrefixBounds = expertPrefixBounds && n == routeSortTile64
     if emitExpertPrefixBounds {
         CBv2EngageMark.once("expert-prefix-bounds")
+        if gatherKfix {
+            CBv2EngageMark.once("gather-kfix")
+        }
     }
     let kernel = emitExpertPrefixBounds
         ? routeFusedScatterPrefixBoundsKernelT64 : routeFusedScatterKernelT64
     let outputs = kernel(
         [indices],
+        template: emitExpertPrefixBounds ? [("GATHER_KFIX", gatherKfix)] : nil,
         grid: (tiles * 256, 1, 1),
         threadGroup: (256, 1, 1),
         outputShapes: [[n], [n], [n]],
@@ -917,18 +935,22 @@ public func gatherSort(
 /// fails closed onto the established `argSort` chain.
 public func gatherSortIndices(
     indices: MLXArray, numExperts: Int = Int.max,
-    expertPrefixBounds: Bool = false
+    expertPrefixBounds: Bool = false, gatherKfix: Bool = false
 ) -> (MLXArray, MLXArray, MLXArray) {
     if routeSimdRank64Enabled,
         indices.ndim == 2, indices.shape == [8, 8], indices.dtype == .uint32
     {
         if expertPrefixBounds {
             CBv2EngageMark.once("expert-prefix-bounds")
+            if gatherKfix {
+                CBv2EngageMark.once("gather-kfix")
+            }
         }
         let kernel = expertPrefixBounds
             ? routeSimdRank64PrefixBoundsKernel : routeSimdRank64Kernel
         let outputs = kernel(
             [indices],
+            template: expertPrefixBounds ? [("GATHER_KFIX", gatherKfix)] : nil,
             grid: (64, 1, 1),
             threadGroup: (64, 1, 1),
             outputShapes: [[64], [64], [64]],
@@ -952,7 +974,8 @@ public func gatherSortIndices(
         // ROUTE-CSORT-64: one fused dispatch with byte-identical outputs
         // (default ON; see routeCountingSort64Enabled above).
         if let fused = routeCountingSortFusedT64(
-            indices, m: m, expertPrefixBounds: expertPrefixBounds)
+            indices, m: m, expertPrefixBounds: expertPrefixBounds,
+            gatherKfix: gatherKfix)
         {
             return (fused.rowOrder, fused.sortedKeys, fused.inverseOrder)
         }
@@ -1100,6 +1123,7 @@ public class SwitchGLU: Module {
             expertPrefixBoundsEnabled && useLhsIndices
             && indices.dtype == .uint32 && x.dtype == .bfloat16
             && expertPrefixBoundsProjectionsEligible
+        let useGatherKfix = gemma4GatherKfixEnabled && useExpertPrefixBounds
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
         let doSort = indices.size >= 64
 
@@ -1111,7 +1135,8 @@ public class SwitchGLU: Module {
                 x = x.flattened(start: 0, end: -3)
                 (lhsIndices, idx, inverseOrder) = gatherSortIndices(
                     indices: indices, numExperts: numExperts,
-                    expertPrefixBounds: useExpertPrefixBounds)
+                    expertPrefixBounds: useExpertPrefixBounds,
+                    gatherKfix: useGatherKfix)
             } else {
                 (x, idx, inverseOrder) = gatherSort(
                     x: x, indices: indices, numExperts: numExperts)

@@ -1285,14 +1285,14 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_m(
   }
 }
 
-template <typename T, int group_size, int bits>
+template <typename T, int group_size, int bits, int KFIX = 0>
 METAL_FUNC void qmv_impl(
     const device uint32_t* w,
     const device T* scales,
     const device T* biases,
     const device T* x,
     device T* y,
-    const constant int& in_vec_size,
+    const constant int& in_vec_size_rt,
     const constant int& out_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -1306,6 +1306,8 @@ METAL_FUNC void qmv_impl(
   constexpr int values_per_thread = pack_factor * packs_per_thread;
   constexpr int block_size = values_per_thread * SIMD_SIZE;
   constexpr int scale_step_per_thread = group_size / values_per_thread;
+
+  const int in_vec_size = (KFIX > 0) ? KFIX : in_vec_size_rt;
 
   const device uint8_t* ws = (const device uint8_t*)w;
 
@@ -3853,6 +3855,8 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   const uint assignment = tid.z;
   const uint32_t route_word = rhs_indices[assignment * rhs_stride];
   const bool expert_prefix_bounds = (route_word & 0x80000000u) != 0u;
+  const bool gather_kfix =
+      expert_prefix_bounds && (route_word & 0x00100000u) != 0u;
   const uint32_t expert =
       expert_prefix_bounds ? (route_word & 0xffu) : route_word;
   uint run_offset = 0;
@@ -3905,17 +3909,31 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   for (int t = 0; t < gemma4_down_tile_span; t++) {
     uint3 tile_tid = tid;
     tile_tid.y = tid.y + uint(t);
-    qmv_impl<T, group_size, bits>(
-        tile_w,
-        tile_scales,
-        tile_biases,
-        tile_x0,
-        tile_y0,
-        in_vec_size,
-        out_vec_size,
-        tile_tid,
-        simd_gid,
-        simd_lid);
+    if (gather_kfix) {
+      qmv_impl<T, group_size, bits, 704>(
+          tile_w,
+          tile_scales,
+          tile_biases,
+          tile_x0,
+          tile_y0,
+          in_vec_size,
+          out_vec_size,
+          tile_tid,
+          simd_gid,
+          simd_lid);
+    } else {
+      qmv_impl<T, group_size, bits>(
+          tile_w,
+          tile_scales,
+          tile_biases,
+          tile_x0,
+          tile_y0,
+          in_vec_size,
+          out_vec_size,
+          tile_tid,
+          simd_gid,
+          simd_lid);
+    }
   }
 }
 
@@ -3983,6 +4001,8 @@ template <typename T, int group_size, int bits>
     const uint32_t route_word =
         rhs_indices[assignment * (uint)rhs_strides[0]];
     const bool expert_prefix_bounds = (route_word & 0x80000000u) != 0u;
+    const bool gather_kfix =
+        expert_prefix_bounds && (route_word & 0x00100000u) != 0u;
     const uint32_t expert =
         expert_prefix_bounds ? (route_word & 0xffu) : route_word;
     uint run_offset = 0;
@@ -4093,9 +4113,19 @@ template <typename T, int group_size, int bits>
     const device T* single_scales = scales + expert * s_strides[0];
     const device T* single_biases = biases + expert * b_strides[0];
     device T* single_y = y + assignment * (uint)out_vec_size;
-    qmv_impl<T, group_size, bits>(
-        single_w, single_scales, single_biases, single_x, single_y,
-        in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+    if (gather_kfix && in_vec_size == 2816) {
+      qmv_impl<T, group_size, bits, 2816>(
+          single_w, single_scales, single_biases, single_x, single_y,
+          in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+    } else if (gather_kfix && in_vec_size == 704) {
+      qmv_impl<T, group_size, bits, 704>(
+          single_w, single_scales, single_biases, single_x, single_y,
+          in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+    } else {
+      qmv_impl<T, group_size, bits>(
+          single_w, single_scales, single_biases, single_x, single_y,
+          in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+    }
     return;
   }
   uint32_t x_idx;

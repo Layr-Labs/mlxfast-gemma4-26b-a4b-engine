@@ -25,6 +25,7 @@ template <typename T, typename U, typename Op, int N = WorkPerThread<T>::n>
       out[index + i] = static_cast<U>(Op()(in[index + i]));
     }
   } else {
+    #pragma unroll
     for (int i = 0; i < N; ++i) {
       out[index + i] = static_cast<U>(Op()(in[index + i]));
     }
@@ -44,6 +45,7 @@ template <typename T, typename U, typename Op, int N = WorkPerThread<T>::n>
       out[offset + i] = static_cast<U>(Op()(in[offset + i]));
     }
   } else {
+    #pragma unroll
     for (int i = 0; i < N; ++i) {
       out[offset + i] = static_cast<U>(Op()(in[offset + i]));
     }

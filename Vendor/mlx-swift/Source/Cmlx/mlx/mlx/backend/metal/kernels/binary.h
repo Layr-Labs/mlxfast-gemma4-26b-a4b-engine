@@ -22,6 +22,7 @@ template <typename T, typename U, typename Op, int N = WorkPerThread<T>::n>
       c[index + i] = Op()(a[0], b[index + i]);
     }
   } else {
+    #pragma unroll
     for (int i = 0; i < N; ++i) {
       c[index + i] = Op()(a[0], b[index + i]);
     }
@@ -41,6 +42,7 @@ template <typename T, typename U, typename Op, int N = WorkPerThread<T>::n>
       c[index + i] = Op()(a[index + i], b[0]);
     }
   } else {
+    #pragma unroll
     for (int i = 0; i < N; ++i) {
       c[index + i] = Op()(a[index + i], b[0]);
     }
@@ -60,6 +62,7 @@ template <typename T, typename U, typename Op, int N = WorkPerThread<T>::n>
       c[index + i] = Op()(a[index + i], b[index + i]);
     }
   } else {
+    #pragma unroll
     for (int i = 0; i < N; ++i) {
       c[index + i] = Op()(a[index + i], b[index + i]);
     }
@@ -80,6 +83,7 @@ template <typename T, typename U, typename Op, int N = WorkPerThread<T>::n>
       c[offset + i] = Op()(a[0], b[offset + i]);
     }
   } else {
+    #pragma unroll
     for (int i = 0; i < N; ++i) {
       c[offset + i] = Op()(a[0], b[offset + i]);
     }
@@ -100,6 +104,7 @@ template <typename T, typename U, typename Op, int N = WorkPerThread<T>::n>
       c[offset + i] = Op()(a[offset + i], b[0]);
     }
   } else {
+    #pragma unroll
     for (int i = 0; i < N; ++i) {
       c[offset + i] = Op()(a[offset + i], b[0]);
     }
@@ -120,6 +125,7 @@ template <typename T, typename U, typename Op, int N = WorkPerThread<T>::n>
       c[offset + i] = Op()(a[offset + i], b[offset + i]);
     }
   } else {
+    #pragma unroll
     for (int i = 0; i < N; ++i) {
       c[offset + i] = Op()(a[offset + i], b[offset + i]);
     }

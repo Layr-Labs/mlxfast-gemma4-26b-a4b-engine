@@ -149,6 +149,7 @@ struct BlockMergeSort {
     short a_idx = 0;
     short b_idx = 0;
 
+    MLX_MTL_LOOP_UNROLL
     for (int i = 0; i < N_PER_THREAD; ++i) {
       auto a = (a_idx < A_sz) ? As[a_idx] : ValT(CompareOp::init);
       auto b = (b_idx < B_sz) ? Bs[b_idx] : ValT(CompareOp::init);
@@ -179,6 +180,7 @@ struct BlockMergeSort {
     // Load from shared memory
     thread ValT thread_vals[N_PER_THREAD];
     thread IdxT thread_idxs[N_PER_THREAD];
+    MLX_MTL_LOOP_UNROLL
     for (int i = 0; i < N_PER_THREAD; ++i) {
       thread_vals[i] = tgp_vals[idx + i];
       if (ARG_SORT) {
@@ -192,10 +194,12 @@ struct BlockMergeSort {
     }
 
     // Do merges using threadgroup memory
+    MLX_MTL_LOOP_UNROLL
     for (int merge_threads = 2; merge_threads <= BLOCK_THREADS;
          merge_threads *= 2) {
       // Update threadgroup memory
       threadgroup_barrier(mem_flags::mem_threadgroup);
+      MLX_MTL_LOOP_UNROLL
       for (int i = 0; i < N_PER_THREAD; ++i) {
         tgp_vals[idx + i] = thread_vals[i];
         if (ARG_SORT) {
@@ -247,6 +251,7 @@ struct BlockMergeSort {
 
     // Write out to shared memory
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    MLX_MTL_LOOP_UNROLL
     for (int i = 0; i < N_PER_THREAD; ++i) {
       tgp_vals[idx + i] = thread_vals[i];
       if (ARG_SORT) {
@@ -676,6 +681,7 @@ mb_block_merge(
   // Load from global memory
   thread ValT thread_vals[N_PER_THREAD];
   thread IdxT thread_idxs[N_PER_THREAD];
+  MLX_MTL_LOOP_UNROLL
   for (int i = 0; i < N_PER_THREAD; i++) {
     int idx = BLOCK_THREADS * i + lid.x;
     if (idx < (A_sz + B_sz)) {
@@ -693,6 +699,7 @@ mb_block_merge(
   threadgroup ValT tgp_vals[sort_kernel::N_PER_BLOCK];
   threadgroup IdxT tgp_idxs[sort_kernel::N_PER_BLOCK];
   threadgroup_barrier(mem_flags::mem_threadgroup);
+  MLX_MTL_LOOP_UNROLL
   for (int i = 0; i < N_PER_THREAD; i++) {
     int idx = BLOCK_THREADS * i + lid.x;
     tgp_vals[idx] = thread_vals[i];
@@ -725,6 +732,7 @@ mb_block_merge(
       thread_idxs);
 
   threadgroup_barrier(mem_flags::mem_threadgroup);
+  MLX_MTL_LOOP_UNROLL
   for (int i = 0; i < N_PER_THREAD; ++i) {
     int idx = lid.x * N_PER_THREAD;
     tgp_vals[idx + i] = thread_vals[i];

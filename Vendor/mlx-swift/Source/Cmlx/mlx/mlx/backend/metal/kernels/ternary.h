@@ -21,6 +21,7 @@ template <
       d[index + i] = Op()(a[index + i], b[bidx], c[cidx]);
     }
   } else {
+    #pragma unroll
     for (int i = 0; i < N; ++i) {
       auto bidx = BSCALAR ? 0 : index + i;
       auto cidx = CSCALAR ? 0 : index + i;
@@ -51,6 +52,7 @@ template <
       d[offset + i] = Op()(a[offset + i], b[bidx], c[cidx]);
     }
   } else {
+    #pragma unroll
     for (int i = 0; i < N; ++i) {
       auto bidx = BSCALAR ? 0 : offset + i;
       auto cidx = CSCALAR ? 0 : offset + i;

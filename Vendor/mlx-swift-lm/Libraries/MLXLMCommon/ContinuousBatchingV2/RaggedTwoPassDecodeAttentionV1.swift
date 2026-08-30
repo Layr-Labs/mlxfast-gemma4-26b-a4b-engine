@@ -134,6 +134,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
 
             thread float q[values_per_lane];
             thread float accumulator[values_per_lane];
+            #pragma unroll
             for (int element = 0; element < values_per_lane; ++element) {
                 q[element] = 1.0f * float(query[element]);
                 accumulator[element] = 0.0f;
@@ -143,6 +144,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             float sum_exp_score = 0.0f;
             for (int token = block; token < N; token += BLOCKS) {
                 float score = 0.0f;
+                #pragma unroll
                 for (int element = 0; element < values_per_lane; ++element) {
                     score += q[element] * float(keys[element]);
                 }
@@ -153,6 +155,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 const float score_factor = fast::exp(score - new_max);
                 max_score = new_max;
                 sum_exp_score = sum_exp_score * old_factor + score_factor;
+                #pragma unroll
                 for (int element = 0; element < values_per_lane; ++element) {
                     accumulator[element] = accumulator[element] * old_factor
                         + score_factor * float(values[element]);
@@ -166,6 +169,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 sum_out[0] = sum_exp_score;
                 max_out[0] = max_score;
             }
+            #pragma unroll
             for (int element = 0; element < values_per_lane; ++element) {
                 partial[element] = T(accumulator[element]);
             }
@@ -221,6 +225,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
 
             thread float q[values_per_lane];
             thread float accumulator[values_per_lane];
+            #pragma unroll
             for (int element = 0; element < values_per_lane; ++element) {
                 q[element] = 1.0f * float(query[element]);
                 accumulator[element] = 0.0f;
@@ -232,6 +237,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 const device T* k = keys + slot * D;
                 const device T* v = values + slot * D;
                 float score = 0.0f;
+                #pragma unroll
                 for (int element = 0; element < values_per_lane; ++element) {
                     score += q[element] * float(k[element]);
                 }
@@ -242,6 +248,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 const float score_factor = fast::exp(score - new_max);
                 max_score = new_max;
                 sum_exp_score = sum_exp_score * old_factor + score_factor;
+                #pragma unroll
                 for (int element = 0; element < values_per_lane; ++element) {
                     accumulator[element] = accumulator[element] * old_factor
                         + score_factor * float(v[element]);
@@ -254,6 +261,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 sum_out[0] = sum_exp_score;
                 max_out[0] = max_score;
             }
+            #pragma unroll
             for (int element = 0; element < values_per_lane; ++element) {
                 partial[element] = T(accumulator[element]);
             }
@@ -328,6 +336,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             if (block == 0 && query_head_in_group == 0) {
                 device T* write_key = const_cast<device T*>(keys) + write_slot * D;
                 device T* write_value = const_cast<device T*>(values) + write_slot * D;
+                #pragma unroll
                 for (int element = 0; element < values_per_lane; ++element) {
                     write_key[element] = new_key[element];
                     write_value[element] = new_value[element];
@@ -345,6 +354,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
 
             thread float q[values_per_lane];
             thread float accumulator[values_per_lane];
+            #pragma unroll
             for (int element = 0; element < values_per_lane; ++element) {
                 q[element] = 1.0f * float(query[element]);
                 accumulator[element] = 0.0f;
@@ -358,6 +368,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 const device T* k = current ? new_key : keys + slot * D;
                 const device T* v = current ? new_value : values + slot * D;
                 float score = 0.0f;
+                #pragma unroll
                 for (int element = 0; element < values_per_lane; ++element) {
                     score += q[element] * float(k[element]);
                 }
@@ -368,6 +379,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 const float score_factor = fast::exp(score - new_max);
                 max_score = new_max;
                 sum_exp_score = sum_exp_score * old_factor + score_factor;
+                #pragma unroll
                 for (int element = 0; element < values_per_lane; ++element) {
                     accumulator[element] = accumulator[element] * old_factor
                         + score_factor * float(v[element]);
@@ -380,6 +392,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 sum_out[0] = sum_exp_score;
                 max_out[0] = max_score;
             }
+            #pragma unroll
             for (int element = 0; element < values_per_lane; ++element) {
                 partial[element] = T(accumulator[element]);
             }
@@ -412,11 +425,13 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             out += batch_head * D + output_group * values_per_lane;
 
             thread float accumulator[values_per_lane];
+            #pragma unroll
             for (int element = 0; element < values_per_lane; ++element) {
                 accumulator[element] = 0.0f;
             }
             float sum_exp_score = 0.0f;
             float max_score = -3.402823466e+38F;
+            #pragma unroll
             for (int round = 0; round < rounds; ++round) {
                 const int column = block_lane + simd_width * round;
                 if (column < BLOCKS) {
@@ -425,6 +440,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             }
             max_score = simd_max(max_score);
 
+            #pragma unroll
             for (int round = 0; round < rounds; ++round) {
                 const int column = block_lane + simd_width * round;
                 if (column < BLOCKS) {
@@ -434,10 +450,12 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             }
             sum_exp_score = simd_sum(sum_exp_score);
 
+            #pragma unroll
             for (int round = 0; round < rounds; ++round) {
                 const int column = block_lane + simd_width * round;
                 if (column < BLOCKS) {
                     const float factor = fast::exp(maxs[column] - max_score);
+                    #pragma unroll
                     for (int element = 0; element < values_per_lane; ++element) {
                         accumulator[element] +=
                             factor * float(partials[column * D + element]);
@@ -445,6 +463,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 }
             }
 
+            #pragma unroll
             for (int element = 0; element < values_per_lane; ++element) {
                 const float reduced = simd_sum(accumulator[element]);
                 if (block_lane == 0) {

@@ -25,6 +25,7 @@ template <typename T, typename U, int N = WorkPerThread<U>::n>
       dst[index + i] = static_cast<U>(src[0]);
     }
   } else {
+    #pragma unroll
     for (int i = 0; i < N; ++i) {
       dst[index + i] = static_cast<U>(src[0]);
     }
@@ -43,6 +44,7 @@ template <typename T, typename U, int N = WorkPerThread<U>::n>
       dst[index + i] = static_cast<U>(src[index + i]);
     }
   } else {
+    #pragma unroll
     for (int i = 0; i < N; ++i) {
       dst[index + i] = static_cast<U>(src[index + i]);
     }
@@ -62,6 +64,7 @@ template <typename T, typename U, int N = WorkPerThread<U>::n>
       dst[offset + i] = static_cast<U>(src[0]);
     }
   } else {
+    #pragma unroll
     for (int i = 0; i < N; ++i) {
       dst[offset + i] = static_cast<U>(src[0]);
     }
@@ -81,6 +84,7 @@ template <typename T, typename U, int N = WorkPerThread<U>::n>
       dst[offset + i] = static_cast<U>(src[offset + i]);
     }
   } else {
+    #pragma unroll
     for (int i = 0; i < N; ++i) {
       dst[offset + i] = static_cast<U>(src[offset + i]);
     }

@@ -28,6 +28,7 @@ struct ArgMin {
   template <int N>
   IndexValPair<U>
   reduce_many(IndexValPair<U> best, thread U* vals, uint32_t offset) {
+    #pragma unroll
     for (int i = 0; i < N; i++) {
       if (vals[i] < best.val) {
         best.val = vals[i];
@@ -54,6 +55,7 @@ struct ArgMax {
   template <int N>
   IndexValPair<U>
   reduce_many(IndexValPair<U> best, thread U* vals, uint32_t offset) {
+    #pragma unroll
     for (int i = 0; i < N; i++) {
       if (vals[i] > best.val) {
         best.val = vals[i];
@@ -120,6 +122,7 @@ template <typename T, typename Op, int N_READS = 4>
     uint32_t offset = current_index;
     const device T* current_in = in + in_idx + current_index * axis_stride;
     T vals[N_READS];
+    #pragma unroll
     for (int i = 0; i < N_READS; i++) {
       vals[i] = (current_index < axis_size) ? *current_in : T(Op::init);
       current_index++;

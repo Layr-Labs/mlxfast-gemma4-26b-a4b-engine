@@ -196,6 +196,7 @@ public final class Gemma4A4BRuntimeWeightCache {
             verify: [.all]
         )
         eval(model)
+        try model.installCBv2MTPVerifier()
         return model
     }
 

@@ -75,6 +75,33 @@ struct TargetQuantizationBindTests {
     private let hiddenSize = 32
     private let vocabSize = 32
 
+    @Test
+    func runtimeLoaderInstallsVerifierOnlyAfterStrictUpdateAndEvaluation() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourceURL = repositoryRoot.appendingPathComponent(
+            "Sources/MLXFastModel/Gemma4A4BRuntimeWeights.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        let update = try #require(source.range(of: "try model.update("))
+        let verifyAll = try #require(
+            source.range(of: "verify: [.all]", range: update.lowerBound..<source.endIndex))
+        let evaluated = try #require(
+            source.range(of: "eval(model)", range: verifyAll.lowerBound..<source.endIndex))
+        let install = try #require(
+            source.range(
+                of: "try model.installCBv2MTPVerifier()",
+                range: evaluated.lowerBound..<source.endIndex))
+        let returned = try #require(
+            source.range(of: "return model", range: install.lowerBound..<source.endIndex))
+
+        #expect(update.lowerBound < verifyAll.lowerBound)
+        #expect(verifyAll.lowerBound < evaluated.lowerBound)
+        #expect(evaluated.lowerBound < install.lowerBound)
+        #expect(install.lowerBound < returned.lowerBound)
+    }
+
     // MARK: - Fixtures
 
     /// The pins the fixture is checked against.

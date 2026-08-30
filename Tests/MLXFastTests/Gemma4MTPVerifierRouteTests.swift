@@ -1,8 +1,128 @@
 @testable import MLXLMCommon
+@testable import MLXLLM
 import Testing
 
 @Suite("Gemma 4 MTP verifier route")
 struct Gemma4MTPVerifierRouteTests {
+    @Test
+    func exactProductionConstructionFixtureInstallsEveryFixedWidthEntrypoint() throws {
+        let fixture = Gemma4MTPVerifierConstructionFixture.production
+        let installed = try fixture.install()
+
+        #expect(fixture.topology.vocabularySize == 262_144)
+        #expect(installed.columns == [2, 3, 4])
+        for columns in 2...4 {
+            #expect(
+                installed.entrypointCount(columns: columns)
+                    == Gemma4MTPVerifierConstructionFixture.production
+                        .requiredEntrypointCount(columns: columns))
+        }
+    }
+
+    @Test
+    func constructionRefusesEveryPinnedTopologyMismatchAndUntiedHead() {
+        let incompatible: [(String, Gemma4MTPVerifierConstructionFixture)] = [
+            ("hidden size", .production.replacingTopology(hiddenSize: 2_815)),
+            ("layer count", .production.replacingTopology(layerCount: 29)),
+            ("expert count", .production.replacingTopology(expertCount: 127)),
+            ("top-k", .production.replacingTopology(topK: 7)),
+            ("untied head", .production.replacingTiedHead(false)),
+        ]
+
+        for (component, fixture) in incompatible {
+            do {
+                _ = try fixture.install()
+                Issue.record("construction accepted incompatible \(component)")
+            } catch let error as Gemma4MTPVerifierInstallationError {
+                #expect(error.description.contains(component))
+            } catch {
+                Issue.record("unexpected error for \(component): \(error)")
+            }
+        }
+    }
+
+    @Test
+    func constructionRefusesWrongQuantizationStorageAndMissingAffineBiases() {
+        let component = "layer 0 q projection"
+        let incompatible: [(String, Gemma4MTPVerifierConstructionFixture)] = [
+            ("group size", .production.replacingQuantization(
+                component: component, groupSize: 32)),
+            ("bits", .production.replacingQuantization(
+                component: component, bits: 8)),
+            ("mode", .production.replacingQuantization(
+                component: component, mode: .mxfp4)),
+            ("weight dtype", .production.replacingQuantization(
+                component: component, weightDType: .float16)),
+            ("scale dtype", .production.replacingQuantization(
+                component: component, scaleDType: .float32)),
+            ("bias dtype", .production.replacingQuantization(
+                component: component, biasDType: .float32)),
+            ("affine biases", .production.replacingQuantization(
+                component: component, hasAffineBiases: false)),
+            ("layout", .production.replacingQuantization(
+                component: component, layout: "transposed")),
+        ]
+
+        for (reason, fixture) in incompatible {
+            do {
+                _ = try fixture.install()
+                Issue.record("construction accepted wrong \(reason)")
+            } catch let error as Gemma4MTPVerifierInstallationError {
+                #expect(error.description.contains(component))
+            } catch {
+                Issue.record("unexpected error for \(reason): \(error)")
+            }
+        }
+    }
+
+    @Test
+    func constructionRefusesEveryMissingProjectionBinding() {
+        let components = [
+            "layer 0 q projection",
+            "layer 0 k projection",
+            "layer 0 v projection",
+            "layer 0 attention output projection",
+            "layer 0 dense gate projection",
+            "layer 0 dense up projection",
+            "layer 0 dense down projection",
+            "layer 0 router projection",
+            "layer 0 expert projection",
+            "tied language-model head",
+        ]
+
+        for component in components {
+            let fixture = Gemma4MTPVerifierConstructionFixture.production
+                .removingBinding(component: component, columns: 3)
+            do {
+                _ = try fixture.install()
+                Issue.record("construction accepted missing \(component) binding")
+            } catch let error as Gemma4MTPVerifierInstallationError {
+                #expect(error.description.contains(component))
+            } catch {
+                Issue.record("unexpected error for \(component): \(error)")
+            }
+        }
+    }
+
+    @Test
+    func constructionRefusesUnsupportedRouteAndHeadVersions() {
+        let incompatible: [(String, Gemma4MTPVerifierConstructionFixture)] = [
+            ("route version", .production.replacingRouteVersion(2)),
+            ("head version", .production.replacingHeadVersion(13)),
+        ]
+
+        for (component, fixture) in incompatible {
+            do {
+                _ = try fixture.install()
+                Issue.record("construction accepted unsupported \(component)")
+            } catch let error as Gemma4MTPVerifierInstallationError {
+                #expect(error.description.contains(component))
+            } catch {
+                Issue.record("unexpected error for \(component): \(error)")
+            }
+        }
+    }
+
     @Test
     func projectionStrategiesContainNoStockOrGenericFallback() {
         let route = CBv2Gemma4MTPVerifierRoute.testing(

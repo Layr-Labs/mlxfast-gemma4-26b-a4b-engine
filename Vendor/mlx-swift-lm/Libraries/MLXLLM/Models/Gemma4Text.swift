@@ -2082,7 +2082,18 @@ private class Gemma4Attention: Module {
         var k: MLXArray
         var v: MLXArray
         var appliedRope = false
-        if let normalized = gemma4FusedQKVNorm(
+        if verifier != nil {
+            // The installed rectangular verifier route cannot satisfy any of
+            // the decode- or prefill-only fused QKV shapes below. Execute the
+            // exact ordinary normalization, transpose, and RoPE chain
+            // directly instead of probing three helpers that must reject it.
+            queries = qNorm(queryRaw).transposed(0, 2, 1, 3)
+            k = kNorm(kRaw).transposed(0, 2, 1, 3)
+            v = vNorm(vRaw).transposed(0, 2, 1, 3)
+            queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: queryPositionOffset)
+            k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
+            appliedRope = true
+        } else if let normalized = gemma4FusedQKVNorm(
             q: queryRaw, k: kRaw, v: vRaw,
             qWeight: qNorm.weight, kWeight: kNorm.weight, eps: config.rmsNormEps,
             keyValueShared: vProj == nil, positionOffsets: capturedOffsets,

@@ -6,6 +6,42 @@ import Testing
 @Suite("Gemma 4 MTP verifier route")
 struct Gemma4MTPVerifierRouteTests {
     @Test
+    func installedAttentionPathBypassesFailableQKVHelpers() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourceURL = repositoryRoot.appendingPathComponent(
+            "Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Gemma4Text.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+
+        let forwardStart = try #require(source.range(of: "    private func forwardV2("))
+        let forwardEnd = try #require(source.range(
+            of: "// MARK: - MoE (26B-A4B)",
+            range: forwardStart.upperBound..<source.endIndex))
+        let forward = String(source[forwardStart.lowerBound..<forwardEnd.lowerBound])
+        let normalizationStart = try #require(
+            forward.range(of: "        var appliedRope = false"))
+        let firstFailableHelper = try #require(forward.range(
+            of: "gemma4FusedQKVNorm(",
+            range: normalizationStart.upperBound..<forward.endIndex))
+        let directRoute = try #require(forward.range(
+            of: "        if verifier != nil {",
+            range: normalizationStart.upperBound..<firstFailableHelper.lowerBound))
+        let direct = String(
+            forward[directRoute.lowerBound..<firstFailableHelper.lowerBound])
+
+        #expect(direct.contains("queries = qNorm(queryRaw).transposed(0, 2, 1, 3)"))
+        #expect(direct.contains("k = kNorm(kRaw).transposed(0, 2, 1, 3)"))
+        #expect(direct.contains("v = vNorm(vRaw).transposed(0, 2, 1, 3)"))
+        #expect(direct.contains(
+            "queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: queryPositionOffset)"))
+        #expect(direct.contains(
+            "k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)"))
+        #expect(!direct.contains("gemma4FusedQKVNorm"))
+    }
+
+    @Test
     func installedLayerPathHasNoFailableDecodeHelperFallbacks() throws {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

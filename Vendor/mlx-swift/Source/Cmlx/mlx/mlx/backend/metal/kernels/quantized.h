@@ -889,6 +889,7 @@ METAL_FUNC void qmv_fast_impl(
   for (int k = 0; k < in_vec_size; k += block_size) {
     U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
 
+#pragma clang loop unroll(full)
     for (int row = 0; row < results_per_simdgroup; row++) {
       auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
       const device T* sl = scales + row * in_vec_size_g;
@@ -905,6 +906,7 @@ METAL_FUNC void qmv_fast_impl(
     x += block_size;
   }
 
+#pragma clang loop unroll(full)
   for (int row = 0; row < results_per_simdgroup; row++) {
     result[row] = simd_sum(result[row]);
     if (simd_lid == 0) {

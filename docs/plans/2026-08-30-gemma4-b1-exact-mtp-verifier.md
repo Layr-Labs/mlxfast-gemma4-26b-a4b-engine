@@ -39,7 +39,7 @@
 
 **Security flag:** none
 
-- [ ] **Step 1: Verify the isolated branch contract**
+- [x] **Step 1: Verify the isolated branch contract**
 
 Run:
 
@@ -51,7 +51,7 @@ git log -7 --oneline
 
 Expected: clean `bench/gemma4-mtp-depth3-tip`, the ancestry command exits zero, and HEAD includes `8f0365c`.
 
-- [ ] **Step 2: Cherry-pick only the three clean commits**
+- [x] **Step 2: Cherry-pick only the three clean commits**
 
 ```bash
 git cherry-pick 3128eb5 5eea619 764e9eb
@@ -59,7 +59,7 @@ git cherry-pick 3128eb5 5eea619 764e9eb
 
 Expected: three new commits; no content is copied from `mlxfast-gemma4-mtp-tip-qmm` or another dirty worktree.
 
-- [ ] **Step 3: Run the existing fixed-width verifier suites under the real GPU lock**
+- [x] **Step 3: Run the existing fixed-width verifier suites under the real GPU lock**
 
 ```bash
 /opt/homebrew/bin/python3 \

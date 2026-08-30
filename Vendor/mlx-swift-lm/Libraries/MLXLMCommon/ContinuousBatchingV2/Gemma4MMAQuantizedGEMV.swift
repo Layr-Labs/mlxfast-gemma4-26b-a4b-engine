@@ -109,6 +109,16 @@ public enum Gemma4MMAQuantizedGEMV {
         }
     }()
 
+    /// DIRECT-GREEDY-TOP1 kill switch. Unset or 1 = enabled, 0 = disabled.
+    public static let directGreedyTop1Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_DIRECT_GREEDY_TOP1"]
+        else { return true }
+        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "0", "false", "no", "off": return false
+        default: return true
+        }
+    }()
+
     /// Which staging/MMA formulation runs. `DARKBLOOM_GEMMA4_MMA_HEAD_VERSION`
     /// is `1` for the fp32 scale-folded kernel, `2` for the bf16-operand kernel
     /// with a per-group diagonal rescale, and `3` for the bf16-operand kernel
@@ -2522,6 +2532,215 @@ public enum Gemma4MMAQuantizedGEMV {
         ensureRowContiguous: true
     )
 
+    // MARK: - Version 26 Direct Greedy Top-1 --- in-kernel argmax reduction
+
+    /// Folds the greedy top-1 reduction into version 26's accumulator stores.
+    /// Emits per-simdgroup partial winner pairs (bf16 value, uint32 token ID)
+    /// to a compact carrier buffer instead of materializing the full [8, N] logits.
+    private static let sourceV26Top1: String = {
+        var result = sourceV26
+
+        func replaceOnce(_ old: String, with new: String) {
+            let count = result.components(separatedBy: old).count
+            precondition(count == 2, "sourceV26Top1 replacement count \(count): \(old)")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+
+        replaceOnce(
+            """
+            const uint outputN0 = sgN0 + fragmentRow;
+            const uint outputN1 = outputN0 + N_PSG;
+            const uint outputN2 = outputN0 + N_PSG * 2;
+            const uint outputN3 = outputN0 + N_PSG * 3;
+            out[fragmentCol * N + outputN0] = T(acc0.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN0] = T(acc0.thread_elements()[1]);
+            out[fragmentCol * N + outputN1] = T(acc1.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN1] = T(acc1.thread_elements()[1]);
+            out[fragmentCol * N + outputN2] = T(acc2.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN2] = T(acc2.thread_elements()[1]);
+            out[fragmentCol * N + outputN3] = T(acc3.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN3] = T(acc3.thread_elements()[1]);
+            """,
+            with: """
+            const uint id0 = sgN0 + fragmentRow;
+            const uint id1 = id0 + N_PSG;
+            const uint id2 = id0 + N_PSG * 2;
+            const uint id3 = id0 + N_PSG * 3;
+
+            // Batch row 0 (fragmentCol)
+            T v0_0 = T(acc0.thread_elements()[0]);
+            T v1_0 = T(acc1.thread_elements()[0]);
+            T v2_0 = T(acc2.thread_elements()[0]);
+            T v3_0 = T(acc3.thread_elements()[0]);
+
+            float best_val0 = float(v0_0);
+            uint best_id0 = id0;
+            if (float(v1_0) > best_val0) { best_val0 = float(v1_0); best_id0 = id1; }
+            if (float(v2_0) > best_val0) { best_val0 = float(v2_0); best_id0 = id2; }
+            if (float(v3_0) > best_val0) { best_val0 = float(v3_0); best_id0 = id3; }
+
+            // Batch row 1 (fragmentCol + 1)
+            T v0_1 = T(acc0.thread_elements()[1]);
+            T v1_1 = T(acc1.thread_elements()[1]);
+            T v2_1 = T(acc2.thread_elements()[1]);
+            T v3_1 = T(acc3.thread_elements()[1]);
+
+            float best_val1 = float(v0_1);
+            uint best_id1 = id0;
+            if (float(v1_1) > best_val1) { best_val1 = float(v1_1); best_id1 = id1; }
+            if (float(v2_1) > best_val1) { best_val1 = float(v2_1); best_id1 = id2; }
+            if (float(v3_1) > best_val1) { best_val1 = float(v3_1); best_id1 = id3; }
+
+            // SIMD-group XOR reduction over fragmentRow lanes (masks 2, 4, 16)
+            {
+                float other_val0 = simd_shuffle_xor(best_val0, 2);
+                uint other_id0 = simd_shuffle_xor(best_id0, 2);
+                if (other_val0 > best_val0 || (other_val0 == best_val0 && other_id0 < best_id0)) {
+                    best_val0 = other_val0;
+                    best_id0 = other_id0;
+                }
+                float other_val1 = simd_shuffle_xor(best_val1, 2);
+                uint other_id1 = simd_shuffle_xor(best_id1, 2);
+                if (other_val1 > best_val1 || (other_val1 == best_val1 && other_id1 < best_id1)) {
+                    best_val1 = other_val1;
+                    best_id1 = other_id1;
+                }
+            }
+            {
+                float other_val0 = simd_shuffle_xor(best_val0, 4);
+                uint other_id0 = simd_shuffle_xor(best_id0, 4);
+                if (other_val0 > best_val0 || (other_val0 == best_val0 && other_id0 < best_id0)) {
+                    best_val0 = other_val0;
+                    best_id0 = other_id0;
+                }
+                float other_val1 = simd_shuffle_xor(best_val1, 4);
+                uint other_id1 = simd_shuffle_xor(best_id1, 4);
+                if (other_val1 > best_val1 || (other_val1 == best_val1 && other_id1 < best_id1)) {
+                    best_val1 = other_val1;
+                    best_id1 = other_id1;
+                }
+            }
+            {
+                float other_val0 = simd_shuffle_xor(best_val0, 16);
+                uint other_id0 = simd_shuffle_xor(best_id0, 16);
+                if (other_val0 > best_val0 || (other_val0 == best_val0 && other_id0 < best_id0)) {
+                    best_val0 = other_val0;
+                    best_id0 = other_id0;
+                }
+                float other_val1 = simd_shuffle_xor(best_val1, 16);
+                uint other_id1 = simd_shuffle_xor(best_id1, 16);
+                if (other_val1 > best_val1 || (other_val1 == best_val1 && other_id1 < best_id1)) {
+                    best_val1 = other_val1;
+                    best_id1 = other_id1;
+                }
+            }
+
+            // Designated lane writes partial winner for its 2 batch rows
+            if ((lane & 22u) == 0) {
+                const uint partialSlot = tg * N_SG + sg;
+                const uint partialsPerRow = N / 32;
+                device uint2* partialCarrier = reinterpret_cast<device uint2*>(partials);
+                const uint b0 = fragmentCol;
+                const uint b1 = fragmentCol + 1;
+                partialCarrier[b0 * partialsPerRow + partialSlot] = uint2(as_type<uint32_t>(best_val0), best_id0);
+                partialCarrier[b1 * partialsPerRow + partialSlot] = uint2(as_type<uint32_t>(best_val1), best_id1);
+            }
+            """
+        )
+        return result
+    }()
+
+    private static let kernelV26Top1: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_affine4_qmv_m8_v26_weight_cursor_top1",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["partials"],
+        source: sourceV26Top1,
+        header: "#include <metal_simdgroup_matrix>\n#include <metal_simdgroup>\n",
+        ensureRowContiguous: true
+    )
+
+    private static let sourceTop1PartialReduce: String = """
+        constexpr uint THREADS_PER_ROW = 256;
+        const uint b = threadgroup_position_in_grid.x;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint simd_lane_id = thread_index_in_simdgroup;
+        const uint simd_group_id = simdgroup_index_in_threadgroup;
+
+        const uint ELEMENTS_PER_THREAD = PARTIALS_PER_ROW / THREADS_PER_ROW;
+        const device uint2* rowPartials =
+            reinterpret_cast<const device uint2*>(partials) + b * PARTIALS_PER_ROW;
+
+        float best_val = -INFINITY;
+        uint best_id = 0xFFFFFFFFu;
+
+        for (uint i = 0; i < ELEMENTS_PER_THREAD; ++i) {
+            uint idx = lid * ELEMENTS_PER_THREAD + i;
+            uint2 pair = rowPartials[idx];
+            float v = as_type<float>(pair.x);
+            uint id = pair.y;
+            if (v > best_val || (v == best_val && id < best_id)) {
+                best_val = v;
+                best_id = id;
+            }
+        }
+
+        // SIMD reduction within each of the 8 SIMD groups (32 threads each)
+        for (ushort offset = 16; offset > 0; offset /= 2) {
+            float other_val = simd_shuffle_down(best_val, offset);
+            uint other_id = simd_shuffle_down(best_id, offset);
+            if (other_val > best_val || (other_val == best_val && other_id < best_id)) {
+                best_val = other_val;
+                best_id = other_id;
+            }
+        }
+
+        threadgroup float tg_best_val[8];
+        threadgroup uint tg_best_id[8];
+
+        if (simd_lane_id == 0) {
+            tg_best_val[simd_group_id] = best_val;
+            tg_best_id[simd_group_id] = best_id;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group_id == 0) {
+            float val = (simd_lane_id < 8) ? tg_best_val[simd_lane_id] : -INFINITY;
+            uint id = (simd_lane_id < 8) ? tg_best_id[simd_lane_id] : 0xFFFFFFFFu;
+            for (ushort offset = 4; offset > 0; offset /= 2) {
+                float other_val = simd_shuffle_down(val, offset);
+                uint other_id = simd_shuffle_down(id, offset);
+                if (other_val > val || (other_val == val && other_id < id)) {
+                    val = other_val;
+                    id = other_id;
+                }
+            }
+            if (simd_lane_id == 0) {
+                outTokens[b] = int32_t(id);
+            }
+        }
+    """
+
+    private static let kernelTop1PartialReduce: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_top1_partial_reduce",
+        inputNames: ["partials"],
+        outputNames: ["outTokens"],
+        source: sourceTop1PartialReduce,
+        header: "#include <metal_simdgroup>\n",
+        ensureRowContiguous: true
+    )
+
+    public static func partialReduce(partials: MLXArray, partialsPerRow: Int) -> MLXArray {
+        let tokenOutputs = kernelTop1PartialReduce(
+            [partials],
+            template: [("PARTIALS_PER_ROW", partialsPerRow)],
+            grid: (mRows * 256, 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [[mRows]],
+            outputDTypes: [.int32]
+        )
+        return tokenOutputs[0]
+    }
+
     /// Tied-head GEMV, or `nil` when any gate above fails.
     ///
     /// - Parameters:
@@ -2630,5 +2849,125 @@ public enum Gemma4MMAQuantizedGEMV {
             outputDTypes: [x.dtype]
         )
         return outputs[0]
+    }
+
+    /// Fused tied-head GEMV with direct greedy top-1 reduction, or `nil` when any gate fails.
+    ///
+    /// - Parameters:
+    ///   - x: activation, `[8, K]` or `[8, 1, K]`, bf16.
+    ///   - w: packed affine codes, `[N, K * bits / 32]` uint32.
+    ///   - scales: `[N, K / groupSize]`, same dtype as `x`.
+    ///   - biases: `[N, K / groupSize]`, same dtype as `x`.
+    ///   - groupSize: affine group size (64).
+    ///   - bits: quantization bits (4).
+    ///   - activationSums: optional precomputed activation sums.
+    /// - Returns: `[8]` int32 token ids, or `nil`.
+    /// DIRECT-GREEDY-TOP1 admission for the weight-side statics alone: every
+    /// `applyTop1` guard that does not depend on the per-step activation. A
+    /// caller that must not run a model forward before knowing whether the
+    /// fused top-1 head can serve the step checks this FIRST, so the switch
+    /// and every geometry refusal resolve with ZERO forwards taken.
+    /// `applyTop1` remains the final authority on the x-dependent residue.
+    public static func applyTop1AdmitsWeights(
+        w: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int
+    ) -> Bool {
+        guard enabled, directGreedyTop1Enabled else { return false }
+        guard version == 26 else { return false }
+        guard let biases else { return false }
+        guard groupSize == 64, bits == 4 else { return false }
+        guard scales.dtype == .bfloat16, biases.dtype == .bfloat16 else { return false }
+        guard w.dtype == .uint32 else { return false }
+        guard w.ndim == 2, scales.ndim == 2, biases.ndim == 2 else { return false }
+        let n = w.dim(0)
+        let selectedColsPerThreadgroup = colsPerThreadgroup * 4
+        guard n >= minOutputWidth, n % selectedColsPerThreadgroup == 0, (n / 32) % 256 == 0
+        else { return false }
+        let k = w.dim(1) * 32 / bits
+        guard k > 0, k % groupSize == 0, k % 8 == 0 else { return false }
+        guard scales.dim(0) == n, biases.dim(0) == n else { return false }
+        guard scales.dim(1) == k / groupSize, biases.dim(1) == k / groupSize else { return false }
+        return true
+    }
+
+    public static func applyTop1(
+        x: MLXArray,
+        w: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        activationSums: ActivationSums? = nil
+    ) -> MLXArray? {
+        guard enabled, directGreedyTop1Enabled else { return nil }
+        guard version == 26 else { return nil }
+        guard let biases else { return nil }
+        guard groupSize == 64, bits == 4 else { return nil }
+        guard x.dtype == .bfloat16, scales.dtype == .bfloat16, biases.dtype == .bfloat16
+        else { return nil }
+        guard w.dtype == .uint32 else { return nil }
+        guard w.ndim == 2, scales.ndim == 2, biases.ndim == 2 else { return nil }
+
+        // [8, K] or [8, 1, K] ONLY -- the decode cohort's own shape, eight
+        // BATCH rows at one position.
+        guard x.ndim == 2 || (x.ndim == 3 && x.dim(1) == 1) else { return nil }
+        guard x.dim(0) == mRows else { return nil }
+        let k = x.dim(-1)
+        guard k > 0, x.size == mRows * k else { return nil }
+
+        let n = w.dim(0)
+        let selectedColsPerThreadgroup = colsPerThreadgroup * 4
+        guard n >= minOutputWidth, n % selectedColsPerThreadgroup == 0, (n / 32) % 256 == 0 else { return nil }
+        guard k % groupSize == 0, k % 8 == 0 else { return nil }
+        guard w.dim(1) == k * bits / 32 else { return nil }
+        guard scales.dim(0) == n, biases.dim(0) == n else { return nil }
+        guard scales.dim(1) == k / groupSize, biases.dim(1) == k / groupSize else { return nil }
+
+        let flatX = x.reshaped([mRows, k])
+        let threadgroups = n / selectedColsPerThreadgroup
+        let sumCells = mRows * (k / groupSize)
+        let xSums: MLXArray
+        if let activationSums,
+            activationSums.values.dtype == .float32,
+            activationSums.values.ndim == 1,
+            activationSums.values.size == sumCells
+        {
+            xSums = activationSums.values
+        } else {
+            let sumThreads = 128
+            let sumThreadgroups = (sumCells + sumThreads - 1) / sumThreads
+            xSums = xSumKernel(
+                [flatX],
+                template: [("T", x.dtype), ("K", k)],
+                grid: (sumThreadgroups * sumThreads, 1, 1),
+                threadGroup: (sumThreads, 1, 1),
+                outputShapes: [[sumCells]],
+                outputDTypes: [.float32]
+            )[0]
+        }
+
+        let partialsPerRow = n / 32
+        let partialOutputs = kernelV26Top1(
+            [flatX, w, scales, biases, xSums],
+            template: [("T", x.dtype), ("K", k), ("N", n)],
+            grid: (threadgroups * threadsPerThreadgroup, 1, 1),
+            threadGroup: (threadsPerThreadgroup, 1, 1),
+            outputShapes: [[mRows, partialsPerRow, 2]],
+            outputDTypes: [.uint32]
+        )
+
+        let tokenOutputs = kernelTop1PartialReduce(
+            partialOutputs,
+            template: [("PARTIALS_PER_ROW", partialsPerRow)],
+            grid: (mRows * 256, 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [[mRows]],
+            outputDTypes: [.int32]
+        )
+
+        return tokenOutputs[0]
     }
 }

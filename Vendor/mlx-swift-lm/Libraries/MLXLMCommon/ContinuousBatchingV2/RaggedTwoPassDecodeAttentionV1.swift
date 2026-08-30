@@ -1,3 +1,4 @@
+// Box-draw auto-entry c3-1913 on crown 158dd4c (ledger in the note).
 // Box-draw entry #3 on the unmodified crown content. Entry #2 (4198c2b2)
 // drew the fast-serial box — the line's eighth consecutive — and sealed
 // candidate decode ~2.2276, the crown's own content level, as the ledger

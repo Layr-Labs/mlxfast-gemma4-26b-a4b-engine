@@ -84,6 +84,94 @@ struct RuntimeWorkerPhaseCloseOrderingTests {
     }
 
     @Test
+    func everyShutdownModeRegistersItsDrainBeforeAnyOptionalAwait() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let engineSource = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/EngineV2.swift"),
+            encoding: .utf8)
+
+        let shutdownStart = try #require(engineSource.range(
+            of: "    public func shutdown() async {"))
+        let shutdownEnd = try #require(engineSource.range(
+            of: "    /// Always-awaiting variant",
+            range: shutdownStart.upperBound..<engineSource.endIndex))
+        let shutdown = String(
+            engineSource[shutdownStart.lowerBound..<shutdownEnd.lowerBound])
+        let synchronousStart = try #require(engineSource.range(
+            of: "    public func shutdownSynchronously() async {"))
+        let synchronousEnd = try #require(engineSource.range(
+            of: "    /// Resolved once:",
+            range: synchronousStart.upperBound..<engineSource.endIndex))
+        let synchronous = String(
+            engineSource[synchronousStart.lowerBound..<synchronousEnd.lowerBound])
+        let registrationStart = try #require(engineSource.range(
+            of: "    private func registerDrain() -> Task<CBv2DrainRetirement, Never> {"))
+        let registrationEnd = try #require(engineSource.range(
+            of: "\n    }",
+            range: registrationStart.upperBound..<engineSource.endIndex))
+        let registration = String(
+            engineSource[registrationStart.lowerBound..<registrationEnd.upperBound])
+
+        let shutdownBegin = try #require(shutdown.range(
+            of: "beginRejectingSubmissions()"))
+        let shutdownDrain = try #require(shutdown.range(
+            of: "let drain = registerDrain()"))
+        let fastAckBranch = try #require(shutdown.range(
+            of: "if Self.fastAckShutdown"))
+        let optionalAwait = try #require(shutdown.range(
+            of: "_ = await drain.value"))
+        #expect(shutdownBegin.lowerBound < shutdownDrain.lowerBound)
+        #expect(shutdownDrain.lowerBound < fastAckBranch.lowerBound)
+        #expect(fastAckBranch.lowerBound < optionalAwait.lowerBound)
+
+        let synchronousBegin = try #require(synchronous.range(
+            of: "beginRejectingSubmissions()"))
+        let synchronousDrain = try #require(synchronous.range(
+            of: "let drain = registerDrain()"))
+        let synchronousAwait = try #require(synchronous.range(
+            of: "_ = await drain.value"))
+        #expect(synchronousBegin.lowerBound < synchronousDrain.lowerBound)
+        #expect(synchronousDrain.lowerBound < synchronousAwait.lowerBound)
+
+        let taskCreation = try #require(registration.range(
+            of: "let drain = Task.detached"))
+        let taskRegistration = try #require(registration.range(
+            of: "CBv2DetachedDrainRegistry.register(drain)"))
+        let taskReturn = try #require(registration.range(of: "return drain"))
+        #expect(taskCreation.lowerBound < taskRegistration.lowerBound)
+        #expect(taskRegistration.lowerBound < taskReturn.lowerBound)
+    }
+
+    @Test
+    func libraryModelConstructionBoundaryChecksDetachedDrainFence() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Sources/MLXFastModel/Gemma4A4BRuntimeWeights.swift"),
+            encoding: .utf8)
+        let methodStart = try #require(source.range(
+            of: "    public func requireLibraryModel() throws -> Gemma4TextModel {"))
+        let methodEnd = try #require(source.range(
+            of: "    /// Startup readiness check",
+            range: methodStart.upperBound..<source.endIndex))
+        let method = String(source[methodStart.lowerBound..<methodEnd.lowerBound])
+
+        #expect(method.contains(
+            "guard CBv2DetachedDrainRegistry.joinAll(timeout: 5) else {"))
+        #expect(method.contains(
+            "Gemma library model construction boundary cannot proceed "))
+        #expect(method.contains(
+            "+ \"before all CBv2 drains retire naturally\""))
+    }
+
+    @Test
     func detachedDrainRegistryRetainsTimedOutTaskForTheNextFence() throws {
         CBv2DetachedDrainRegistry.resetForTesting()
         let started = DispatchSemaphore(value: 0)

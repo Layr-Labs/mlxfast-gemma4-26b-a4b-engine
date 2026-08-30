@@ -576,26 +576,21 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// later phase a bounded fence before it builds a new engine.
     public func shutdown() async {
         beginRejectingSubmissions()
+        let drain = registerDrain()
         if Self.fastAckShutdown {
-            let loop = self.loop
-            // .userInitiated: a starved lower-priority drain would leave the
-            // engine loop thread alive (and any joiner waiting) through the
-            // caller's next work — measured locally as a real regression.
-            CBv2DetachedDrainRegistry.register(
-                Task.detached(priority: .userInitiated) {
-                    await loop.drain()
-                })
             return
         }
-        _ = await loop.drain()
+        _ = await drain.value
     }
 
-    /// Always-synchronous variant for unscored callers (e.g. the constructor
-    /// warm) that want the engine fully retired before continuing regardless
-    /// of the fast-ack default.
+    /// Always-awaiting variant for unscored callers (e.g. the constructor
+    /// warm). It waits for the same registered, bounded drain regardless of
+    /// the fast-ack default; a later checked registry fence still distinguishes
+    /// natural retirement from a shutdown-watchdog escape.
     public func shutdownSynchronously() async {
         beginRejectingSubmissions()
-        _ = await loop.drain()
+        let drain = registerDrain()
+        _ = await drain.value
     }
 
     /// Resolved once: fast-ack drains are the default; set the variable to
@@ -603,6 +598,21 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     private static let fastAckShutdown: Bool =
         ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_SHUTDOWN_FAST_ACK"]
             .map { !["0", "false", "no", "off"].contains($0.lowercased()) } ?? true
+
+    /// Construct and publish the one drain task used by every shutdown mode.
+    /// Synchronous callers await this same task, but its retirement result
+    /// remains registered for the next checked phase/construction fence.
+    private func registerDrain() -> Task<CBv2DrainRetirement, Never> {
+        let loop = self.loop
+        // .userInitiated: a starved lower-priority drain would leave the
+        // engine loop thread alive (and any joiner waiting) through the
+        // caller's next work — measured locally as a real regression.
+        let drain = Task.detached(priority: .userInitiated) {
+            await loop.drain()
+        }
+        CBv2DetachedDrainRegistry.register(drain)
+        return drain
+    }
 
     /// Synchronous helper: `NSLock` is not async-safe to hold across
     /// suspension points, so the flag flip lives outside the async context.

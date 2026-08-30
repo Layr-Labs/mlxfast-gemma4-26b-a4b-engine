@@ -126,12 +126,14 @@ public final class Gemma4A4BRuntimeWeightCache {
     }
 
     public func requireLibraryModel() throws -> Gemma4TextModel {
-        // Fence for fast-ack engine shutdowns: a previous phase's detached
-        // drain (already GPU-complete in practice — the inter-phase gap is
-        // orders of magnitude longer than a drain) must be fully retired
-        // before this phase builds a new engine on the same allocator.
-        // Normally returns immediately with nothing registered.
-        CBv2DetachedDrainRegistry.joinAll(timeout: 5)
+        // Every shutdown mode publishes its drain result. Refuse this
+        // construction boundary unless all prior engines retired naturally;
+        // a deadline or shutdown-watchdog escape may still own GPU/KV work.
+        guard CBv2DetachedDrainRegistry.joinAll(timeout: 5) else {
+            throw MLXFastError.invalidInput(
+                "Gemma library model construction boundary cannot proceed "
+                    + "before all CBv2 drains retire naturally")
+        }
         guard let libraryModel else {
             throw loadError
                 ?? MLXFastError.invalidInput(

@@ -26,6 +26,13 @@ public protocol CBv2LanguageModelDecodeOutputCoversCacheMutations: AnyObject {}
 private let cbv2CompactDecodeRootMarksArmed =
     ProcessInfo.processInfo.environment["MLXFAST_ENGAGE_MARKS"] != nil
 
+/// COMPACT-ROOTS-RING-FENCE-001 escape hatch: setting
+/// `MLXFAST_KEEP_DECODE_RING_FENCE_ROOTS=1` restores the conservative
+/// per-layer fence root list (the ranked runner sets no environment, so the
+/// compact two-root list is what ships).
+private let cbv2KeepDecodeRingFenceRoots =
+    ProcessInfo.processInfo.environment["MLXFAST_KEEP_DECODE_RING_FENCE_ROOTS"] == "1"
+
 /// `CBv2SteppableModel` over any `LanguageModel` whose forward path
 /// understands `CBv2AttendingLayerCache` (Gemma 4, GPT-OSS, test fixtures).
 public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
@@ -71,8 +78,22 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
         else { return nil }
 
         var roots = [forwardOutput, offsets]
-        roots.reserveCapacity(2 + contiguous.count)
-        roots.append(contentsOf: contiguous.map(\.decodeRingWriteFenceEvaluationRoot))
+        // COMPACT-ROOTS-RING-FENCE-001: the admission gates above already
+        // prove the forward output transitively consumes every owning layer's
+        // attention result — and therefore every multi-output primitive that
+        // performs the in-place ring write — so enumerating each layer's
+        // sibling fence output as another SAME-STEP root adds root traversal,
+        // never execution or ordering. The caches keep retaining every
+        // produced fence and the next step's fused write still consumes its
+        // predecessor, so the cross-step chain is untouched. The offsets root
+        // stays: its lazy successor is not necessarily on the logits path.
+        // MLXFAST_KEEP_DECODE_RING_FENCE_ROOTS=1 restores the conservative
+        // per-layer list for one-binary isolation.
+        if cbv2KeepDecodeRingFenceRoots {
+            roots.reserveCapacity(2 + contiguous.count)
+            roots.append(
+                contentsOf: contiguous.map(\.decodeRingWriteFenceEvaluationRoot))
+        }
         if cbv2CompactDecodeRootMarksArmed {
             CBv2EngageMark.once(
                 "compact-decode-roots rows=\(rowCount) layers=\(contiguous.count) "
@@ -208,5 +229,37 @@ extension CBv2SteppableLanguageModelAdapter: CBv2MTPSteppableModel {
                 "CBv2 MTP: \(type(of: model)) is not CBv2MTPForwardable — engine gating failed")
         }
         return forwardable.cbv2ForwardWithHidden(tokens, caches: asKVCaches(caches))
+    }
+}
+
+// MARK: - Direct Greedy Top-1 Decoding
+
+public protocol CBv2DirectGreedyTop1Forwardable {
+    func cbv2DecodeTop1(inputs: MLXArray, cache: [KVCache]?) -> MLXArray?
+}
+
+public protocol CBv2DirectGreedyTop1SteppableModel: CBv2SteppableModel {
+    var supportsDirectGreedyTop1: Bool { get }
+    func decodeTop1(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> MLXArray?
+}
+
+extension CBv2SteppableLanguageModelAdapter: CBv2DirectGreedyTop1SteppableModel {
+
+    public var supportsDirectGreedyTop1: Bool {
+        Gemma4MMAQuantizedGEMV.directGreedyTop1Enabled && (model is CBv2DirectGreedyTop1Forwardable)
+    }
+
+    public func decodeTop1(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> MLXArray? {
+        // The kill switch is consulted BEFORE any model call: a nil returned
+        // after a forward would send the engine down the incumbent path for a
+        // SECOND forward of the same step, double-appending every KV cache.
+        guard supportsDirectGreedyTop1,
+            let forwardable = model as? CBv2DirectGreedyTop1Forwardable
+        else { return nil }
+        return forwardable.cbv2DecodeTop1(inputs: tokens, cache: asKVCaches(caches))
     }
 }

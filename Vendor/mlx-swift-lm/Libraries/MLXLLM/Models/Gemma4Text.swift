@@ -169,6 +169,84 @@ internal func gemma4ShouldSubmitPrefillChunkEval(
         && layerNumber.isMultiple(of: interval)
 }
 
+/// Front rungs for the scheduled-prefill submission ladder. The decode
+/// ladder's measured result - the early boundaries carry the overlap,
+/// because the device is idle until the first submission while the host is
+/// still building the rest of the stack - applies unchanged to the
+/// scheduled prompt path: the interval cadence above submits nothing
+/// before `layerNumber == interval`, so the device waits out the host
+/// build of the first `interval` layers at the start of every scheduled
+/// prefill step. The front rungs submit the frontier after the first two
+/// decoder layers, in ADDITION to the interval cadence, at the one scored
+/// geometry (CBv2 scheduled prefill, batch 8, multi-token). Rungs are
+/// pure submission policy: they reorder when already-built graphs are
+/// queued, never what is computed, so the emitted stream is bit-identical
+/// by construction - the same argument as the decode ladder.
+///
+/// `DARKBLOOM_GEMMA4_PREFILL_EARLY_LADDER=0` (also `false`/`no`/`off`) is
+/// the attribution and emergency kill switch for the front rungs alone.
+/// `DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL=0` still disables the whole prompt
+/// ladder, front rungs included, so that switch's documented "one final
+/// submission" contract keeps holding.
+@inline(__always)
+internal func resolveGemma4PrefillEarlyLadderEnabled(_ raw: String?) -> Bool {
+    guard let raw else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}
+
+private let gemma4PrefillEarlyLadderEnabled =
+    resolveGemma4PrefillEarlyLadderEnabled(
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_EARLY_LADDER"])
+
+/// LOCAL EXPERIMENT ONLY. `DARKBLOOM_GEMMA4_PREFILL_EARLY_LADDER_SET`
+/// overrides the shipped front-rung list with a comma-separated set of
+/// 1-based layer numbers, so the geometry can be swept on one binary
+/// instead of one rebuild per candidate. The ranked runner sets no
+/// environment, so an unset variable keeps the shipped switch below
+/// verbatim and this is inert in a submission. An empty value means "no
+/// front rungs", which is distinct from unset.
+private let gemma4PrefillEarlyLadderSet: Set<Int>? = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_PREFILL_EARLY_LADDER_SET"]
+    else { return nil }
+    return Set(raw.split(separator: ",").compactMap { Int($0.trimmingCharacters(
+        in: .whitespaces)) })
+}()
+
+/// Pure, fail-closed policy for the prefill front rungs. `layerNumber` is
+/// 1-based (the trunk's `idx + 1`), so the shipped pair {1, 2} names the
+/// boundaries after decoder layers 0 and 1 - the same physical boundaries
+/// as the promoted decode pair. One rung would already keep the device fed
+/// (a prompt-rectangle layer far outlasts the host build of the remaining
+/// stack); the second rung mirrors the decode pair at negligible cost and
+/// covers small scheduled chunks, whose per-layer device time shrinks
+/// toward the decode regime where the pair is the measured optimum.
+@inline(__always)
+internal func gemma4ShouldSubmitPrefillEarlyLadder(
+    enabled: Bool,
+    schedulePrefill: Bool,
+    isCBv2: Bool,
+    batchSize: Int,
+    inputLength: Int,
+    layerNumber: Int,
+    interval: Int
+) -> Bool {
+    guard enabled, isCBv2, schedulePrefill, batchSize == 8, inputLength > 1,
+        interval > 0
+    else { return false }
+
+    if let set = gemma4PrefillEarlyLadderSet {
+        return set.contains(layerNumber)
+    }
+    switch layerNumber {
+    case 1, 2:
+        return true
+    default:
+        return false
+    }
+}
+
 /// CBv2 consumes only the final prompt position, so the LAST decoder layer
 /// can keep full attention and every K/V write while retaining just this
 /// many trailing rows for `o_proj`, the residual, the feed-forward/MoE
@@ -2292,6 +2370,7 @@ private enum Gemma4FusedRouterTop8 {
 /// to the stock `inputLayernorm(x)`.
 public final class Gemma4GlueChainBox {
     var pending: (source: MLXArray, normed: MLXArray)?
+    var finalHead: (source: MLXArray, postNorm: MLXArray, sums: Gemma4MMAQuantizedGEMV.ActivationSums)?
     public init() {}
 }
 
@@ -2621,6 +2700,100 @@ private enum Gemma4FusedLayerGlue {
         return (outs[0], outs[1], sums)
     }
 
+    private static let tailFinalHeadSumsKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_glue_final_tail_head_xsum_2816_bf16_v1",
+        inputNames: ["a", "b", "res", "w1", "w2", "w3", "s", "w_final"],
+        outputNames: ["out", "postNorm", "xSums"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float local_inv[2];
+            threadgroup float local_sums[32];
+            threadgroup float quad_sums[704];
+
+            const uint base = row * 2816 + lid * 4;
+            const uint wbase = lid * 4;
+        \(rmsReduce("a", into: "local_inv[0]"))
+        \(rmsReduce("b", into: "local_inv[1]"))
+            const float inv1 = local_inv[0];
+            const float inv2 = local_inv[1];
+            T sv[4];
+            for (int i = 0; i < 4; i++) {
+                const T h1 = w1[wbase + i] * static_cast<T>((float)a[base + i] * inv1);
+                const T h2 = w2[wbase + i] * static_cast<T>((float)b[base + i] * inv2);
+                sv[i] = h1 + h2;
+            }
+        \(rmsReduce("sv", into: "local_inv[0]").replacingOccurrences(
+            of: "(float)sv[base + i]", with: "(float)sv[i]"))
+            const float inv3 = local_inv[0];
+            const T scalar = s[0];
+            T outv[4];
+            for (int i = 0; i < 4; i++) {
+                const T normed3 = static_cast<T>(
+                    w3[wbase + i] * static_cast<T>((float)sv[i] * inv3));
+                const T summed = res[base + i] + normed3;
+                outv[i] = summed * scalar;
+                out[base + i] = outv[i];
+            }
+        \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
+            of: "(float)outv[base + i]", with: "(float)outv[i]"))
+            const float inv4 = local_inv[0];
+            T postv[4];
+            for (int i = 0; i < 4; i++) {
+                postv[i] = w_final[wbase + i] * static_cast<T>((float)outv[i] * inv4);
+                postNorm[base + i] = postv[i];
+            }
+            quad_sums[lid] = postv[0] + postv[1] + postv[2] + postv[3];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if ((lid % 16) == 0) {
+                float s = 0.0f;
+                for (uint c = 0; c < 8; ++c) {
+                    const uint q = lid + c * 2;
+                    s += quad_sums[q];
+                    s += quad_sums[q + 1];
+                }
+                xSums[row * 44 + lid / 16] = s;
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    static func tailFinalHeadSums(
+        mlpOut: MLXArray, expertOut: MLXArray, residual: MLXArray,
+        w1: MLXArray, w2: MLXArray, w3: MLXArray, layerScalar: MLXArray,
+        finalNormWeight: MLXArray, eps: Float
+    ) -> (out: MLXArray, postNorm: MLXArray, sums: Gemma4MMAQuantizedGEMV.ActivationSums)? {
+        guard Gemma4MMAQuantizedGEMV.consumesActivationSums,
+            admits(mlpOut, weight: w1, eps: eps),
+            expertOut.shape == mlpOut.shape, expertOut.dtype == .bfloat16,
+            residual.shape == mlpOut.shape, residual.dtype == .bfloat16,
+            w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16,
+            w3.ndim == 1, w3.dim(0) == axis, w3.dtype == .bfloat16,
+            layerScalar.size == 1, layerScalar.dtype == .bfloat16,
+            finalNormWeight.ndim == 1, finalNormWeight.dim(0) == axis,
+            finalNormWeight.dtype == .bfloat16
+        else { return nil }
+        CBv2EngageMark.once("glue-tail-final-head-xsum")
+        let outs = tailFinalHeadSumsKernel(
+            [mlpOut, expertOut, residual, w1, w2, w3, layerScalar, finalNormWeight],
+            template: [("T", mlpOut.dtype)],
+            grid: (rows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: [
+                [rows, 1, axis],
+                [rows, 1, axis],
+                [rows * (axis / 64)],
+            ],
+            outputDTypes: [.bfloat16, .bfloat16, .float32]
+        )
+        guard let sums = Gemma4MMAQuantizedGEMV.activationSums(
+            produced: outs[2], for: outs[1])
+        else { return nil }
+        return (outs[0], outs[1], sums)
+    }
+
     /// GLUE-003: tail variant that ALSO emits the NEXT layer's input norm.
     /// The threadgroup already holds the finished output row in registers, so
     /// the next layer's `inputLayernorm(out)` costs one more in-kernel
@@ -2672,6 +2845,209 @@ private enum Gemma4FusedLayerGlue {
         """,
         ensureRowContiguous: true
     )
+
+    /// Build the exact legacy `weightedExpertUnsort` value for the four
+    /// features owned by this tail thread. The value remains in registers and
+    /// feeds the expert RMS directly, deleting only the reduced `[8, 2816]`
+    /// materialization and its standalone dispatch.
+    private static let deferredExpertValuesSource = """
+            T expertv[4];
+            const uint assignment_base = row * 8u;
+            for (int i = 0; i < 4; ++i) {
+                T accumulator = static_cast<T>(0.0f);
+                for (uint slot = 0u; slot < 8u; ++slot) {
+                    const uint assignment = assignment_base + slot;
+                    const uint sorted_row = (uint)inverse[assignment];
+                    const T weighted = static_cast<T>(
+                        (float)sorted[sorted_row * 2816u + wbase + (uint)i]
+                        * (float)route_weights[assignment]);
+                    accumulator = accumulator + weighted;
+                }
+                expertv[i] = accumulator;
+            }
+    """
+
+    private static let deferredTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1",
+        inputNames: [
+            "a", "sorted", "inverse", "route_weights", "res",
+            "w1", "w2", "w3", "s",
+        ],
+        outputNames: ["out"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float local_inv[2];
+            threadgroup float local_sums[32];
+            const uint base = row * 2816 + lid * 4;
+            const uint wbase = lid * 4;
+        \(rmsReduce("a", into: "local_inv[0]"))
+        \(deferredExpertValuesSource)
+        \(rmsReduce("expertv", into: "local_inv[1]").replacingOccurrences(
+            of: "(float)expertv[base + i]", with: "(float)expertv[i]"))
+            const float inv1 = local_inv[0];
+            const float inv2 = local_inv[1];
+            T sv[4];
+            for (int i = 0; i < 4; i++) {
+                const T h1 = w1[wbase + i]
+                    * static_cast<T>((float)a[base + i] * inv1);
+                const T h2 = w2[wbase + i]
+                    * static_cast<T>((float)expertv[i] * inv2);
+                sv[i] = h1 + h2;
+            }
+        \(rmsReduce("sv", into: "local_inv[0]").replacingOccurrences(
+            of: "(float)sv[base + i]", with: "(float)sv[i]"))
+            const float inv3 = local_inv[0];
+            const T scalar = s[0];
+            for (int i = 0; i < 4; i++) {
+                const T normed3 = static_cast<T>(
+                    w3[wbase + i] * static_cast<T>((float)sv[i] * inv3));
+                const T summed = res[base + i] + normed3;
+                out[base + i] = summed * scalar;
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    private static let deferredTailChainKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1",
+            inputNames: [
+                "a", "sorted", "inverse", "route_weights", "res",
+                "w1", "w2", "w3", "s", "wn",
+            ],
+            outputNames: ["out", "normed"],
+            source: """
+                const uint row = threadgroup_position_in_grid.x;
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint simd_lane_id = thread_index_in_simdgroup;
+                const uint simd_group_id = simdgroup_index_in_threadgroup;
+                threadgroup float local_inv[2];
+                threadgroup float local_sums[32];
+                const uint base = row * 2816 + lid * 4;
+                const uint wbase = lid * 4;
+            \(rmsReduce("a", into: "local_inv[0]"))
+            \(deferredExpertValuesSource)
+            \(rmsReduce("expertv", into: "local_inv[1]").replacingOccurrences(
+                of: "(float)expertv[base + i]", with: "(float)expertv[i]"))
+                const float inv1 = local_inv[0];
+                const float inv2 = local_inv[1];
+                T sv[4];
+                for (int i = 0; i < 4; i++) {
+                    const T h1 = w1[wbase + i]
+                        * static_cast<T>((float)a[base + i] * inv1);
+                    const T h2 = w2[wbase + i]
+                        * static_cast<T>((float)expertv[i] * inv2);
+                    sv[i] = h1 + h2;
+                }
+            \(rmsReduce("sv", into: "local_inv[0]").replacingOccurrences(
+                of: "(float)sv[base + i]", with: "(float)sv[i]"))
+                const float inv3 = local_inv[0];
+                const T scalar = s[0];
+                T outv[4];
+                for (int i = 0; i < 4; i++) {
+                    const T normed3 = static_cast<T>(
+                        w3[wbase + i]
+                            * static_cast<T>((float)sv[i] * inv3));
+                    const T summed = res[base + i] + normed3;
+                    outv[i] = summed * scalar;
+                    out[base + i] = outv[i];
+                }
+            \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
+                of: "(float)outv[base + i]", with: "(float)outv[i]"))
+                const float inv4 = local_inv[0];
+                for (int i = 0; i < 4; i++) {
+                    normed[base + i] =
+                        wn[wbase + i]
+                            * static_cast<T>((float)outv[i] * inv4);
+                }
+            """,
+            ensureRowContiguous: true
+        )
+
+    private static func admitsDeferred(
+        _ expertRows: DeferredWeightedExpertRows
+    ) -> Bool {
+        expertRows.sortedOutputs.dtype == .bfloat16
+            && expertRows.sortedOutputs.shape == [64, axis]
+            && expertRows.inverseOrder.dtype == .uint32
+            && expertRows.inverseOrder.ndim == 1
+            && expertRows.inverseOrder.size == 64
+            && expertRows.weights.dtype == .bfloat16
+            && expertRows.weights.shape == [rows, 8]
+    }
+
+    static func tailChainedDeferred(
+        mlpOut: MLXArray,
+        expertRows: DeferredWeightedExpertRows,
+        residual: MLXArray,
+        w1: MLXArray,
+        w2: MLXArray,
+        w3: MLXArray,
+        layerScalar: MLXArray,
+        nextInputNormWeight: MLXArray,
+        eps: Float
+    ) -> (out: MLXArray, normedNext: MLXArray)? {
+        guard admits(mlpOut, weight: w1, eps: eps),
+            admitsDeferred(expertRows),
+            residual.shape == mlpOut.shape,
+            residual.dtype == .bfloat16,
+            w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16,
+            w3.ndim == 1, w3.dim(0) == axis, w3.dtype == .bfloat16,
+            layerScalar.size == 1, layerScalar.dtype == .bfloat16,
+            nextInputNormWeight.ndim == 1,
+            nextInputNormWeight.dim(0) == axis,
+            nextInputNormWeight.dtype == .bfloat16
+        else { return nil }
+        CBv2EngageMark.once("glue-deferred-expert-tail-chain")
+        let outs = deferredTailChainKernel(
+            [
+                mlpOut, expertRows.sortedOutputs, expertRows.inverseOrder,
+                expertRows.weights, residual, w1, w2, w3, layerScalar,
+                nextInputNormWeight,
+            ],
+            template: [("T", mlpOut.dtype)],
+            grid: (rows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: [[rows, 1, axis], [rows, 1, axis]],
+            outputDTypes: [.bfloat16, .bfloat16]
+        )
+        return (outs[0], outs[1])
+    }
+
+    static func tailDeferred(
+        mlpOut: MLXArray,
+        expertRows: DeferredWeightedExpertRows,
+        residual: MLXArray,
+        w1: MLXArray,
+        w2: MLXArray,
+        w3: MLXArray,
+        layerScalar: MLXArray,
+        eps: Float
+    ) -> MLXArray? {
+        guard admits(mlpOut, weight: w1, eps: eps),
+            admitsDeferred(expertRows),
+            residual.shape == mlpOut.shape,
+            residual.dtype == .bfloat16,
+            w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16,
+            w3.ndim == 1, w3.dim(0) == axis, w3.dtype == .bfloat16,
+            layerScalar.size == 1, layerScalar.dtype == .bfloat16
+        else { return nil }
+        CBv2EngageMark.once("glue-deferred-expert-tail")
+        return deferredTailKernel(
+            [
+                mlpOut, expertRows.sortedOutputs, expertRows.inverseOrder,
+                expertRows.weights, residual, w1, w2, w3, layerScalar,
+            ],
+            template: [("T", mlpOut.dtype)],
+            grid: (rows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: [[rows, 1, axis]],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
 
     static func tailChained(
         mlpOut: MLXArray, expertOut: MLXArray, residual: MLXArray,
@@ -2839,6 +3215,11 @@ private class Gemma4Experts: Module {
     @ModuleInfo(key: "switch_glu") var switchGLU: SwitchGLU
     let fuseWeightedUnsort: Bool
 
+    struct Output {
+        let output: MLXArray
+        let unsortCarrier: WeightedExpertUnsortCarrier?
+    }
+
     init(
         _ config: Gemma4TextConfiguration,
         fuseWeightedUnsort: Bool = false
@@ -2863,13 +3244,13 @@ private class Gemma4Experts: Module {
         topKIndices: MLXArray,
         topKWeights: MLXArray,
         isExpertPrefill: Bool
-    ) -> MLXArray {
+    ) -> Output {
         // Flatten [B, S, H] and always enter SwitchGLU's combined API. It
         // selects direct sorted reduction only for the exact production
         // contract; every other case performs the established unsort + sum.
         let (B, S, H) = (x.dim(0), x.dim(1), x.dim(2))
         let K = topKIndices.dim(-1)
-        let y = switchGLU.callAndWeightedReduce(
+        let result = switchGLU.callAndWeightedReduceWithUnsortCarrier(
             x.reshaped(B * S, H),
             topKIndices.reshaped(B * S, K),
             weights: topKWeights.reshaped(B * S, K),
@@ -2877,7 +3258,28 @@ private class Gemma4Experts: Module {
             // Ordinary/direct VLM and CBv2 prompt entry points may engage.
             // Rectangular MTP verification explicitly passes false.
             isProductionPrefill: isExpertPrefill)
-        return y.reshaped(B, S, H)
+        return Output(
+            output: result.output.reshaped(B, S, H),
+            unsortCarrier: result.carrier)
+    }
+
+    /// Decode-only producer for the fused layer-tail consumer. The promoted
+    /// expert projection remains unchanged; only the final inverse-permutation
+    /// and weighted reduction are left lazy for the tail kernel.
+    func deferredWeightedRows(
+        _ x: MLXArray,
+        topKIndices: MLXArray,
+        topKWeights: MLXArray,
+        isExpertPrefill: Bool
+    ) -> DeferredWeightedExpertRows? {
+        let (B, S, H) = (x.dim(0), x.dim(1), x.dim(2))
+        let K = topKIndices.dim(-1)
+        return switchGLU.callAndDeferWeightedReduce(
+            x.reshaped(B * S, H),
+            topKIndices.reshaped(B * S, K),
+            weights: topKWeights.reshaped(B * S, K),
+            fuseSortedReduction: fuseWeightedUnsort,
+            isProductionPrefill: isExpertPrefill)
     }
 }
 
@@ -3113,8 +3515,18 @@ private enum Gemma4ZipRouterV1 {
         let normed = carriedRouterNorm ?? router.zipNorm(out)
 
         // Stage 2: router QMV | dense gate + up.
-        let expertScores = router.zipScores(
-            MLX.depends(input: normed, dependencies: [sums.dependencyHandle]))
+        // TRINORM-002B: when the router norm AND the activation-sums table
+        // were emitted by the SAME prefix dispatch, the fence ordering the
+        // scores input behind the sums handle is a structural identity — both
+        // operands are outputs of one kernel and cannot reorder — and holding
+        // it only blocks buffer donation. It is dropped exactly there; every
+        // other combination keeps the fence. The dense-side fence below is
+        // load-bearing and stays (dropping it measured −5.08% on the box).
+        let scoresIn =
+            (carriedRouterNorm != nil && producerSums != nil)
+            ? normed
+            : MLX.depends(input: normed, dependencies: [sums.dependencyHandle])
+        let expertScores = router.zipScores(scoresIn)
         let denseIn = MLX.depends(input: n1, dependencies: [normed])
         let gate = mlp.zipGate(denseIn, sums)
         let up = mlp.zipUp(denseIn, sums)
@@ -3268,6 +3680,7 @@ public class Gemma4DecoderLayer: Module {
         isExpertPrefill: Bool = false,
         glueChain: Gemma4GlueChainBox? = nil,
         nextInputLayernormWeight: MLXArray? = nil,
+        finalHeadNormWeight: MLXArray? = nil,
         enableAttentionBranchPrefix: Bool = false
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         // Prompt-path narrowing (CBv2 only): attention and every K/V write
@@ -3371,7 +3784,42 @@ public class Gemma4DecoderLayer: Module {
         {
             // Dense + sparse branches in parallel, summed into one residual.
             let h1Raw: MLXArray
-            let h2Raw: MLXArray
+            let expertBranch: (
+                raw: MLXArray?,
+                deferred: DeferredWeightedExpertRows?,
+                unsortCarrier: WeightedExpertUnsortCarrier?
+            )
+            // The deferred carrier has a consumer only when the decode tail
+            // may also fold the layer scalar. PLE geometries select the
+            // complete established expert reduction immediately.
+            let canFoldScalar =
+                perLayerInputGate == nil || activePerLayerInput == nil
+            func projectExpertBranch(
+                _ input: MLXArray,
+                indices: MLXArray,
+                weights: MLXArray
+            ) -> (
+                raw: MLXArray?,
+                deferred: DeferredWeightedExpertRows?,
+                unsortCarrier: WeightedExpertUnsortCarrier?
+            ) {
+                if canFoldScalar,
+                    let deferred = experts.deferredWeightedRows(
+                        input,
+                        topKIndices: indices,
+                        topKWeights: weights,
+                        isExpertPrefill: isExpertPrefill)
+                {
+                    return (nil, deferred, nil)
+                }
+                let result = experts(
+                    input,
+                    topKIndices: indices,
+                    topKWeights: weights,
+                    isExpertPrefill: isExpertPrefill)
+                return (result.output, nil, result.unsortCarrier)
+            }
+
             // ZIP-ROUTER-001: emit the router chain and the dense chain
             // interleaved so the encoder pairs them into shared barrier
             // stages. Returns nil for every geometry but the pinned B=8
@@ -3386,11 +3834,10 @@ public class Gemma4DecoderLayer: Module {
                 prefix: attentionBranchPrefix)
             {
                 h1Raw = zipped.denseOut
-                h2Raw = experts(
+                expertBranch = projectExpertBranch(
                     zipped.expertNorm,
-                    topKIndices: zipped.topKIndices,
-                    topKWeights: zipped.topKWeights,
-                    isExpertPrefill: isExpertPrefill)
+                    indices: zipped.topKIndices,
+                    weights: zipped.topKWeights)
             } else {
                 let (topKIndices, topKWeights) = router(out)
 
@@ -3401,11 +3848,10 @@ public class Gemma4DecoderLayer: Module {
                     eps: config.rmsNormEps)
                 {
                     h1Raw = mlp(n1, activationSums: denseSums)
-                    h2Raw = experts(
+                    expertBranch = projectExpertBranch(
                         n2,
-                        topKIndices: topKIndices,
-                        topKWeights: topKWeights,
-                        isExpertPrefill: isExpertPrefill)
+                        indices: topKIndices,
+                        weights: topKWeights)
                 } else if let (n1, n2) = Gemma4PrefillGlueV1.dualPreNorm(
                     x: out,
                     w1: preFeedforwardLayernorm.weight,
@@ -3413,29 +3859,23 @@ public class Gemma4DecoderLayer: Module {
                     eps: config.rmsNormEps)
                 {
                     h1Raw = mlp(n1)
-                    h2Raw = experts(
+                    expertBranch = projectExpertBranch(
                         n2,
-                        topKIndices: topKIndices,
-                        topKWeights: topKWeights,
-                        isExpertPrefill: isExpertPrefill)
+                        indices: topKIndices,
+                        weights: topKWeights)
                 } else {
                     h1Raw = mlp(preFeedforwardLayernorm(out))
-                    h2Raw = experts(
+                    expertBranch = projectExpertBranch(
                         preFeedforwardLayernorm2(out),
-                        topKIndices: topKIndices,
-                        topKWeights: topKWeights,
-                        isExpertPrefill: isExpertPrefill)
+                        indices: topKIndices,
+                        weights: topKWeights)
                 }
             }
-
-            // The scalar fold is only valid when nothing sits between the
-            // tail and the layer-scalar multiply (PLE absent on this model).
-            let canFoldScalar =
-                perLayerInputGate == nil || activePerLayerInput == nil
-            if canFoldScalar, let chain = glueChain,
+            if canFoldScalar, let deferred = expertBranch.deferred,
+                let chain = glueChain,
                 let nextWeight = nextInputLayernormWeight,
-                let chained = Gemma4FusedLayerGlue.tailChained(
-                    mlpOut: h1Raw, expertOut: h2Raw, residual: residual2,
+                let chained = Gemma4FusedLayerGlue.tailChainedDeferred(
+                    mlpOut: h1Raw, expertRows: deferred, residual: residual2,
                     w1: postFeedforwardLayernorm1.weight,
                     w2: postFeedforwardLayernorm2.weight,
                     w3: postFeedforwardLayernorm.weight,
@@ -3447,9 +3887,9 @@ public class Gemma4DecoderLayer: Module {
                 chain.pending = (source: chained.out, normed: chained.normedNext)
                 tailApplied = true
                 scalarFolded = true
-            } else if canFoldScalar,
-                let fusedTail = Gemma4FusedLayerGlue.tail(
-                    mlpOut: h1Raw, expertOut: h2Raw, residual: residual2,
+            } else if canFoldScalar, let deferred = expertBranch.deferred,
+                let fusedTail = Gemma4FusedLayerGlue.tailDeferred(
+                    mlpOut: h1Raw, expertRows: deferred, residual: residual2,
                     w1: postFeedforwardLayernorm1.weight,
                     w2: postFeedforwardLayernorm2.weight,
                     w3: postFeedforwardLayernorm.weight,
@@ -3459,38 +3899,94 @@ public class Gemma4DecoderLayer: Module {
                 out = fusedTail
                 tailApplied = true
                 scalarFolded = true
-            } else if canFoldScalar, let chain = glueChain,
-                let nextWeight = nextInputLayernormWeight,
-                let chained = Gemma4PrefillGlueV1.branchTailChained(
+            } else {
+                let h2Raw: MLXArray
+                if let raw = expertBranch.raw {
+                    h2Raw = raw
+                } else if let deferred = expertBranch.deferred {
+                    h2Raw = resolveDeferredWeightedExpertRows(deferred)
+                } else {
+                    preconditionFailure("Gemma4 expert branch produced no output")
+                }
+
+                if canFoldScalar, let chain = glueChain,
+                    let nextWeight = nextInputLayernormWeight,
+                    let chained = Gemma4FusedLayerGlue.tailChained(
+                        mlpOut: h1Raw, expertOut: h2Raw, residual: residual2,
+                        w1: postFeedforwardLayernorm1.weight,
+                        w2: postFeedforwardLayernorm2.weight,
+                        w3: postFeedforwardLayernorm.weight,
+                        layerScalar: layerScalar,
+                        nextInputNormWeight: nextWeight,
+                        eps: config.rmsNormEps)
+                {
+                    out = chained.out
+                    chain.pending = (source: chained.out, normed: chained.normedNext)
+                    tailApplied = true
+                    scalarFolded = true
+                } else if canFoldScalar,
+                    let fusedTail = Gemma4FusedLayerGlue.tail(
+                        mlpOut: h1Raw, expertOut: h2Raw, residual: residual2,
+                        w1: postFeedforwardLayernorm1.weight,
+                        w2: postFeedforwardLayernorm2.weight,
+                        w3: postFeedforwardLayernorm.weight,
+                        layerScalar: layerScalar,
+                        eps: config.rmsNormEps)
+                {
+                    out = fusedTail
+                    tailApplied = true
+                    scalarFolded = true
+                } else if canFoldScalar, let chain = glueChain,
+                    let nextWeight = nextInputLayernormWeight,
+                    let expert = expertBranch.unsortCarrier,
+                    let chained = Gemma4PrefillGlueV1.branchTailChainedUnsort(
+                        h1: h1Raw,
+                        expert: expert,
+                        w1: postFeedforwardLayernorm1.weight,
+                        w2: postFeedforwardLayernorm2.weight,
+                        w3: postFeedforwardLayernorm.weight,
+                        residual2: residual2,
+                        layerScalar: layerScalar,
+                        nextInputNormWeight: nextWeight,
+                        eps: config.rmsNormEps)
+                {
+                    out = chained.out
+                    chain.pending = (source: chained.out, normed: chained.normedNext)
+                    tailApplied = true
+                    scalarFolded = true
+                } else if canFoldScalar, let chain = glueChain,
+                    let nextWeight = nextInputLayernormWeight,
+                    let chained = Gemma4PrefillGlueV1.branchTailChained(
+                        h1: h1Raw,
+                        h2: h2Raw,
+                        w1: postFeedforwardLayernorm1.weight,
+                        w2: postFeedforwardLayernorm2.weight,
+                        w3: postFeedforwardLayernorm.weight,
+                        residual2: residual2,
+                        layerScalar: layerScalar,
+                        nextInputNormWeight: nextWeight,
+                        eps: config.rmsNormEps)
+                {
+                    out = chained.out
+                    chain.pending = (source: chained.out, normed: chained.normedNext)
+                    tailApplied = true
+                    scalarFolded = true
+                } else if let fusedTail = Gemma4PrefillGlueV1.branchTail(
                     h1: h1Raw,
                     h2: h2Raw,
                     w1: postFeedforwardLayernorm1.weight,
                     w2: postFeedforwardLayernorm2.weight,
                     w3: postFeedforwardLayernorm.weight,
                     residual2: residual2,
-                    layerScalar: layerScalar,
-                    nextInputNormWeight: nextWeight,
                     eps: config.rmsNormEps)
-            {
-                out = chained.out
-                chain.pending = (source: chained.out, normed: chained.normedNext)
-                tailApplied = true
-                scalarFolded = true
-            } else if let fusedTail = Gemma4PrefillGlueV1.branchTail(
-                h1: h1Raw,
-                h2: h2Raw,
-                w1: postFeedforwardLayernorm1.weight,
-                w2: postFeedforwardLayernorm2.weight,
-                w3: postFeedforwardLayernorm.weight,
-                residual2: residual2,
-                eps: config.rmsNormEps)
-            {
-                out = fusedTail
-                tailApplied = true
-            } else {
-                let h1 = postFeedforwardLayernorm1(h1Raw)
-                let h2 = postFeedforwardLayernorm2(h2Raw)
-                out = h1 + h2
+                {
+                    out = fusedTail
+                    tailApplied = true
+                } else {
+                    let h1 = postFeedforwardLayernorm1(h1Raw)
+                    let h2 = postFeedforwardLayernorm2(h2Raw)
+                    out = h1 + h2
+                }
             }
         } else {
             out = preFeedforwardLayernorm(out)
@@ -4213,6 +4709,8 @@ public class Gemma4TextModelInner: Module {
                 glueChain: glueChain,
                 nextInputLayernormWeight: idx + 1 < layers.count
                     ? layers[idx + 1].inputLayernorm.weight : nil,
+                finalHeadNormWeight: (idx == layers.count - 1 && emitMMAHeadSums)
+                    ? norm.weight : nil,
                 enableAttentionBranchPrefix:
                     isCBv2 && !schedulePrefill
                     && inputBatchSize == 8 && inputLength == 1
@@ -4241,6 +4739,20 @@ public class Gemma4TextModelInner: Module {
             }
 
             let layerNumber = idx + 1
+            if gemma4ShouldSubmitPrefillEarlyLadder(
+                enabled: gemma4PrefillEarlyLadderEnabled,
+                schedulePrefill: schedulePrefill,
+                isCBv2: isCBv2,
+                batchSize: inputBatchSize,
+                inputLength: inputLength,
+                layerNumber: layerNumber,
+                interval: gemma4PrefillChunkEvalLayers)
+            {
+                asyncEval(h)
+                CBv2EngageMark.once("gemma4-b8-prefill-early-ladder")
+                CBv2StepProfiler.recordEvent(
+                    "v2.gemma4.prefill.early_ladder")
+            }
             if gemma4ShouldSubmitPrefillChunkEval(
                 schedulePrefill: schedulePrefill,
                 isCBv2: isCBv2,
@@ -4258,6 +4770,13 @@ public class Gemma4TextModelInner: Module {
         let postNorm: MLXArray
         let mmaHeadSums: Gemma4MMAQuantizedGEMV.ActivationSums?
         if emitMMAHeadSums,
+            let finalHead = glueChain.finalHead,
+            finalHead.source === h
+        {
+            postNorm = finalHead.postNorm
+            mmaHeadSums = finalHead.sums
+            CBv2EngageMark.once("final-tail-head-xsum")
+        } else if emitMMAHeadSums,
             let produced = Gemma4FinalNormMMAHeadSumsV1.apply(
                 h, weight: norm.weight, eps: norm.eps)
         {
@@ -4491,6 +5010,97 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 activationSums: activationSums)
         else { return nil }
         return mma.reshaped(Array(hidden.shape.dropLast()) + [mma.dim(-1)])
+    }
+
+    /// DIRECT-GREEDY-TOP1: in-kernel greedy top-1 reduction for the tied LM head.
+    @inline(__always)
+    private func tiedLMHeadMMATop1(
+        _ hidden: MLXArray,
+        activationSums: Gemma4MMAQuantizedGEMV.ActivationSums? = nil
+    ) -> MLXArray? {
+        guard lmHead == nil,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.mode == .affine,
+            let tokens = Gemma4MMAQuantizedGEMV.applyTop1(
+                x: hidden,
+                w: quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                groupSize: quantized.groupSize,
+                bits: quantized.bits,
+                activationSums: activationSums)
+        else { return nil }
+        return tokens
+    }
+
+    func applyLMHeadTop1(
+        _ hidden: MLXArray,
+        activationSums: Gemma4MMAQuantizedGEMV.ActivationSums? = nil
+    ) -> MLXArray? {
+        guard let tokens = tiedLMHeadMMATop1(
+            hidden, activationSums: activationSums)
+        else { return nil }
+        CBv2EngageMark.once("direct-greedy-top1")
+        return tokens
+    }
+
+    public func cbv2DecodeTop1(
+        inputs: MLXArray, cache: [KVCache]?
+    ) -> MLXArray? {
+        // Admission is decided BEFORE the forward. A nil returned past this
+        // guard would make the engine re-run the incumbent step and forward
+        // the model a second time, double-appending every KV cache (the
+        // FullSequenceKV capacity precondition trips on the next full layer).
+        // Every x-independent `applyTop1` refusal — including the
+        // DARKBLOOM_CBV2_DIRECT_GREEDY_TOP1 kill switch — resolves here with
+        // zero forwards taken.
+        guard lmHead == nil,
+            inputs.ndim == 2,
+            inputs.dim(0) == 8,
+            inputs.dim(1) == 1,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.mode == .affine,
+            quantized.groupSize == 64,
+            quantized.bits == 4,
+            Gemma4MMAQuantizedGEMV.applyTop1AdmitsWeights(
+                w: quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                groupSize: quantized.groupSize,
+                bits: quantized.bits)
+        else { return nil }
+
+        // Past this point exactly ONE forward runs, and the step's answer is
+        // produced from it no matter what: if the fused top-1 head refuses on
+        // an x-dependent condition, the SAME hidden state feeds the incumbent
+        // logits head and a plain argmax (greedy selection is invariant under
+        // the head's monotone final maps), never a second forward.
+        if Gemma4MMAQuantizedGEMV.consumesActivationSums {
+            let produced = model.callWithMMAHeadSums(inputs, cache: cache)
+            if let tokens = applyLMHeadTop1(
+                produced.postNorm, activationSums: produced.activationSums)
+            {
+                return tokens
+            }
+            return cbv2GreedyTokensFromHidden(
+                produced.postNorm, activationSums: produced.activationSums)
+        } else {
+            let hidden = model(inputs, cache: cache)
+            if let tokens = applyLMHeadTop1(hidden) { return tokens }
+            return cbv2GreedyTokensFromHidden(hidden)
+        }
+    }
+
+    /// Single-forward safety net for `cbv2DecodeTop1`: the forward has already
+    /// run, so a late fused-head refusal resolves from the SAME hidden state
+    /// through the incumbent logits head plus argmax.
+    private func cbv2GreedyTokensFromHidden(
+        _ hidden: MLXArray,
+        activationSums: Gemma4MMAQuantizedGEMV.ActivationSums? = nil
+    ) -> MLXArray {
+        let logits = applyLMHead(hidden, activationSums: activationSums)
+        return argMax(logits.reshaped([8, logits.dim(-1)]), axis: -1)
+            .asType(.int32)
     }
 
     /// Apply the LM head (tied embedding or explicit `lm_head`) plus the
@@ -4858,3 +5468,7 @@ extension Gemma4TextModel: CBv2MTPForwardable {
         return (applyLMHead(postNorm), preNorm)
     }
 }
+
+// MARK: - ContinuousBatchingV2 Direct Greedy Top-1 Decoding
+
+extension Gemma4TextModel: CBv2DirectGreedyTop1Forwardable {}

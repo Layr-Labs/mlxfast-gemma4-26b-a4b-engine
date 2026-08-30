@@ -177,6 +177,34 @@ public func weightedExpertUnsort(
     )[0]
 }
 
+/// Exact sorted expert rows whose ordered top-K reduction is intentionally
+/// deferred to a downstream fused consumer.
+///
+/// Keeping this carrier explicit prevents generic callers from mistaking
+/// `[assignments, hidden]` for the already-reduced `[tokens, hidden]` result.
+public struct DeferredWeightedExpertRows {
+    public let sortedOutputs: MLXArray
+    public let inverseOrder: MLXArray
+    public let weights: MLXArray
+
+    init(sortedOutputs: MLXArray, inverseOrder: MLXArray, weights: MLXArray) {
+        self.sortedOutputs = sortedOutputs
+        self.inverseOrder = inverseOrder
+        self.weights = weights
+    }
+}
+
+/// Materialize a deferred carrier through the established reduction. Used only
+/// when a downstream fused consumer declines after the producer was selected.
+public func resolveDeferredWeightedExpertRows(
+    _ rows: DeferredWeightedExpertRows
+) -> MLXArray {
+    weightedExpertUnsort(
+        sortedOutputs: rows.sortedOutputs,
+        inverseOrder: rows.inverseOrder,
+        weights: rows.weights)
+}
+
 
 // MARK: - Compiled activation fusions (vMLX / osaurus-main port)
 
@@ -1252,6 +1280,40 @@ public class SwitchGLU: Module {
                 x: projected.output, invOrder: inverseOrder, shape: indices.shape)
         }
         return MLX.squeezed(projected.output, axis: -2)
+    }
+
+    /// Preserve the promoted gathered down projection and defer only its
+    /// inverse-permutation + weighted top-K reduction to a downstream consumer.
+    ///
+    /// This is decode-only and exact-geometry-only. Returning nil leaves
+    /// ``callAndWeightedReduce`` as the complete established fallback.
+    public func callAndDeferWeightedReduce(
+        _ x: MLXArray,
+        _ indices: MLXArray,
+        weights: MLXArray,
+        fuseSortedReduction: Bool,
+        isProductionPrefill: Bool = true
+    ) -> DeferredWeightedExpertRows? {
+        let isEightRowDecode =
+            !isProductionPrefill && x.dim(0) == 8 && indices.size == 64
+        guard fuseSortedReduction && isEightRowDecode,
+            supportsWeightedExpertUnsort(x, indices, weights: weights)
+        else { return nil }
+
+        let projected = projectExperts(x, indices)
+        guard projected.sorted,
+            let inverseOrder = projected.inverseOrder,
+            projected.output.ndim == 3,
+            projected.output.dim(-2) == 1,
+            projected.output.dim(-1) == 2816,
+            projected.output.dtype == .bfloat16
+        else { return nil }
+
+        weightedExpertUnsortProbe.recordEffective()
+        return DeferredWeightedExpertRows(
+            sortedOutputs: MLX.squeezed(projected.output, axis: -2),
+            inverseOrder: inverseOrder,
+            weights: weights)
     }
 
     /// Always-called expert projection + weighted reduction entry point.

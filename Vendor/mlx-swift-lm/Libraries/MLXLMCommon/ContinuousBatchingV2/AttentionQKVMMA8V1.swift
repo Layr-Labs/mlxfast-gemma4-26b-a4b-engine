@@ -35,6 +35,14 @@ public enum CBv2AttentionQKVMMA8V1 {
     private static let simdGroups = 2
     private static let outputsPerGroup = 8
 
+    /// Exact affine-quantization bias sums for one `[8, 1, 2816]` source.
+    /// Construction stays private to the validated producer factory below;
+    /// consumers additionally require pointer identity with `source`.
+    public struct ActivationSums {
+        fileprivate let source: MLXArray
+        fileprivate let values: MLXArray
+    }
+
     private static let mma8KernelHeader = """
 #include <metal_simdgroup_matrix>
 
@@ -311,6 +319,126 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
     y[(c.fn + 1) * N + nt + c.fm] = static_cast<T>(acc1[t]);
   }
 }
+
+// XSUM-CARRIER-001: identical multi-tile matrix arithmetic, with the affine
+// bias run sums supplied by the upstream normalization producer. The source
+// table stores `[group, batch]`; `c.fn` names the first of this lane's two
+// batch rows. The incumbent body above remains byte-for-byte available as the
+// fail-closed fallback.
+template <typename T, int KS, int TILES>
+METAL_FUNC void qkv_mma8_affine4_g64_mt_xsum(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    const device float* x_sums,
+    device T* y,
+    const int K,
+    const int N,
+    const int n0,
+    threadgroup float2* red,
+    uint simd_gid,
+    uint simd_lid) {
+  const int G = K / 64;
+  const int gh = (G + 1) / 2;
+  const int g_begin = (KS == 2 && simd_gid == 1) ? gh : 0;
+  const int g_end = (KS == 2 && simd_gid == 0) ? gh : G;
+  const mma8_coord c = mma8_lane(simd_lid);
+
+  const device uint8_t* wrow[TILES];
+  const device T* srow[TILES];
+  const device T* brow[TILES];
+  thread float acc0[TILES];
+  thread float acc1[TILES];
+#pragma clang loop unroll(full)
+  for (int t = 0; t < TILES; ++t) {
+    const int nt = n0 + t * 8;
+    wrow[t] = (const device uint8_t*)w + (nt + c.fm) * (K / 2) + 4 * c.fn;
+    srow[t] = scales + (nt + c.fm) * G;
+    brow[t] = biases + (nt + c.fm) * G;
+    acc0[t] = 0.0f;
+    acc1[t] = 0.0f;
+  }
+
+  const device T* x0 = x + c.fn * K + 8 * c.fm;
+  const device T* x1 = x0 + K;
+
+  simdgroup_float8x8 A;
+  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+  for (int g = g_begin; g < g_end; ++g) {
+    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+    float2 rs = float2(0.0f);
+    // c.fm == 0 names lanes 0, 1, 8 and 9, whose c.fn values are
+    // respectively 0, 2, 4 and 6. Those four lanes load all eight batch
+    // sums once; every other output-row lane receives its pair by broadcast.
+    if (c.fm == 0) {
+      rs = float2(
+          x_sums[g * 8 + c.fn],
+          x_sums[g * 8 + c.fn + 1]);
+    }
+    const ushort sum_lane =
+        ushort(c.fn / 2 + (c.fn >= 4 ? 6 : 0));
+    rs.x = simd_broadcast(rs.x, sum_lane);
+    rs.y = simd_broadcast(rs.y, sum_lane);
+
+    MMA8_SETB(B0, x, lo)
+    MMA8_SETB(B1, x, hi)
+    MMA8_SETB(B2, y, lo)
+    MMA8_SETB(B3, y, hi)
+    MMA8_SETB(B4, z, lo)
+    MMA8_SETB(B5, z, hi)
+    MMA8_SETB(B6, w, lo)
+    MMA8_SETB(B7, w, hi)
+
+#pragma clang loop unroll(full)
+    for (int t = 0; t < TILES; ++t) {
+      const uint2 wv = *((const device uint2*)(wrow[t] + 32 * g));
+      const float s = float(srow[t][g]);
+      const float b = float(brow[t][g]);
+
+      simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+      MMA8_STEP(B0, 0)
+      MMA8_STEP(B1, 1)
+      MMA8_STEP(B2, 2)
+      MMA8_STEP(B3, 3)
+      MMA8_STEP(B4, 4)
+      MMA8_STEP(B5, 5)
+      MMA8_STEP(B6, 6)
+      MMA8_STEP(B7, 7)
+
+      acc0[t] += s * C.thread_elements()[0] + rs.x * b;
+      acc1[t] += s * C.thread_elements()[1] + rs.y * b;
+    }
+  }
+
+  if (KS == 2) {
+    if (simd_gid == 1) {
+#pragma clang loop unroll(full)
+      for (int t = 0; t < TILES; ++t) {
+        red[t * 32 + simd_lid] = float2(acc0[t], acc1[t]);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_gid == 1) {
+      return;
+    }
+#pragma clang loop unroll(full)
+    for (int t = 0; t < TILES; ++t) {
+      const float2 other = red[t * 32 + simd_lid];
+      acc0[t] = acc0[t] + other.x;
+      acc1[t] = acc1[t] + other.y;
+    }
+  }
+
+#pragma clang loop unroll(full)
+  for (int t = 0; t < TILES; ++t) {
+    const int nt = n0 + t * 8;
+    y[c.fn * N + nt + c.fm] = static_cast<T>(acc0[t]);
+    y[(c.fn + 1) * N + nt + c.fm] = static_cast<T>(acc1[t]);
+  }
+}
 """
 
     /// MMA-MT-001 arm. Default ON.
@@ -346,6 +474,23 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
         header: mma8KernelHeader,
         ensureRowContiguous: true)
 
+    private static let activationSumMultiTileKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_xsum_v1",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            qkv_mma8_affine4_g64_mt_xsum<T, 2, 2>(
+                w, scales, biases, x, xSums, y,
+                x_shape[x_ndim - 1], w_shape[0], int(tid.y) * 16, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
     private static let mma8Kernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_v1",
         inputNames: ["x", "w", "scales", "biases"],
@@ -368,6 +513,23 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
         width == 1024 || width == 2048 || width == 4096 || width == 8192
     }
 
+    /// Validate an exact producer-emitted table. The layout is one FP32 sum
+    /// per affine-64 group and batch row: `[2816 / 64, 8]`.
+    public static func activationSums(
+        produced values: MLXArray, for source: MLXArray
+    ) -> ActivationSums? {
+        guard source.dtype == .bfloat16,
+            source.ndim == 3,
+            source.dim(0) == batch,
+            source.dim(1) == sequence,
+            source.dim(2) == inputWidth,
+            values.dtype == .float32,
+            values.ndim == 1,
+            values.size == (inputWidth / groupSize) * batch
+        else { return nil }
+        return ActivationSums(source: source, values: values)
+    }
+
     public static func matmul(
         x: MLXArray,
         weight: MLXArray,
@@ -375,7 +537,8 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
         biases: MLXArray?,
         groupSize: Int,
         bits: Int,
-        mode: QuantizationMode
+        mode: QuantizationMode,
+        activationSums: ActivationSums? = nil
     ) -> MLXArray? {
         guard enabled,
             groupSize == Self.groupSize,
@@ -402,6 +565,23 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
         else { return nil }
 
         let yTiles = outputWidth / outputsPerGroup
+        if let activationSums,
+            activationSums.source === x,
+            activationSums.values.dtype == .float32,
+            activationSums.values.ndim == 1,
+            activationSums.values.size == (inputWidth / Self.groupSize) * batch,
+            multiTileEnabled,
+            yTiles % tilesPerGroup == 0
+        {
+            return activationSumMultiTileKernel(
+                [x, weight, scales, biases, activationSums.values],
+                template: [("T", x.dtype)],
+                grid: (simdWidth, (yTiles / tilesPerGroup) * simdGroups, 1),
+                threadGroup: (simdWidth, simdGroups, 1),
+                outputShapes: [[batch, sequence, outputWidth]],
+                outputDTypes: [x.dtype]
+            )[0]
+        }
         if multiTileEnabled, yTiles % tilesPerGroup == 0 {
             return multiTileKernel(
                 [x, weight, scales, biases],

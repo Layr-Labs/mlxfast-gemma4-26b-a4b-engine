@@ -1663,7 +1663,11 @@ private class Gemma4Attention: Module {
     /// matrix-unit tier (same kernel text, grid.x = 1). Any guard failure
     /// keeps the quantized module, which reaches the tier through MLX.
     @inline(__always)
-    private func tierProjection(_ layer: Linear, _ x: MLXArray) -> MLXArray {
+    private func tierProjection(
+        _ layer: Linear,
+        _ x: MLXArray,
+        activationSums: CBv2AttentionQKVMMA8V1.ActivationSums? = nil
+    ) -> MLXArray {
         guard let quantized = layer as? QuantizedLinear,
             quantized.bias == nil,
             let projected = CBv2AttentionQKVMMA8V1.matmul(
@@ -1673,7 +1677,8 @@ private class Gemma4Attention: Module {
                 biases: quantized.biases,
                 groupSize: quantized.groupSize,
                 bits: quantized.bits,
-                mode: quantized.mode)
+                mode: quantized.mode,
+                activationSums: activationSums)
         else { return layer(x) }
         return projected
     }
@@ -1704,7 +1709,8 @@ private class Gemma4Attention: Module {
         positionOffset: Gemma4.PositionOffset? = nil,
         v2SharedSource: (any CBv2AttendingLayerCache)? = nil,
         outputStart: Int = 0,
-        useLastQueryPrefill: Bool = false
+        useLastQueryPrefill: Bool = false,
+        activationSums: CBv2AttentionQKVMMA8V1.ActivationSums? = nil
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         // ContinuousBatchingV2: the layer cache owns both the KV update and
         // the attention computation (no masks, no padding — see
@@ -1714,7 +1720,8 @@ private class Gemma4Attention: Module {
             return forwardV2(
                 x, layerCache: layerCacheV2, source: v2SharedSource,
                 sharedKV: sharedKV, positionOffset: positionOffset,
-                outputStart: outputStart, useLastQueryPrefill: useLastQueryPrefill)
+                outputStart: outputStart, useLastQueryPrefill: useLastQueryPrefill,
+                activationSums: activationSums)
         }
         precondition(
             outputStart == 0 && !useLastQueryPrefill,
@@ -1853,7 +1860,8 @@ private class Gemma4Attention: Module {
         sharedKV: (MLXArray, MLXArray)?,
         positionOffset: Gemma4.PositionOffset?,
         outputStart: Int = 0,
-        useLastQueryPrefill: Bool = false
+        useLastQueryPrefill: Bool = false,
+        activationSums: CBv2AttentionQKVMMA8V1.ActivationSums? = nil
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         let (B, L) = (x.dim(0), x.dim(1))
         precondition(
@@ -1884,7 +1892,9 @@ private class Gemma4Attention: Module {
         // 8 x-groups and the tier returns from 7 of them); every other shape
         // keeps the module's affine_qmv road. Routing Q or K through the older
         // custom helper would silently bypass the winning kernel.
-        let queryRaw = tierProjection(qProj, queryInput).reshaped(
+        let queryRaw = tierProjection(
+            qProj, queryInput, activationSums: activationSums
+        ).reshaped(
             B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
@@ -1947,10 +1957,14 @@ private class Gemma4Attention: Module {
             lastQueryCache == nil
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
-        let kRaw = tierProjection(kProj, x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+        let kRaw = tierProjection(
+            kProj, x, activationSums: activationSums
+        ).reshaped(B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
         if let vProj {
-            vRaw = tierProjection(vProj, x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            vRaw = tierProjection(
+                vProj, x, activationSums: activationSums
+            ).reshaped(B, L, nKvHeads, effectiveHeadDim)
         } else {
             vRaw = kRaw
         }
@@ -2259,7 +2273,11 @@ private enum Gemma4FusedRouterTop8 {
 /// identity on the source array, so any intervening transformation falls back
 /// to the stock `inputLayernorm(x)`.
 public final class Gemma4GlueChainBox {
-    var pending: (source: MLXArray, normed: MLXArray)?
+    var pending: (
+        source: MLXArray,
+        normed: MLXArray,
+        qkvSums: CBv2AttentionQKVMMA8V1.ActivationSums?
+    )?
     public init() {}
 }
 
@@ -2484,9 +2502,9 @@ private enum Gemma4FusedLayerGlue {
     /// of the row. The normed output replicates the stock rms sequence over
     /// the exact stored bf16 output values.
     private static let tailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_chain_2816_bf16_v1",
+        name: "gemma4_glue_tail_chain_qkv_xsum_2816_bf16_v1",
         inputNames: ["a", "b", "res", "w1", "w2", "w3", "s", "wn"],
-        outputNames: ["out", "normed"],
+        outputNames: ["out", "normed", "qkvSums"],
         source: """
             const uint row = threadgroup_position_in_grid.x;
             const uint lid = thread_position_in_threadgroup.x;
@@ -2521,9 +2539,27 @@ private enum Gemma4FusedLayerGlue {
         \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
             of: "(float)outv[base + i]", with: "(float)outv[i]"))
             const float inv4 = local_inv[0];
+            T nextv[4];
             for (int i = 0; i < 4; i++) {
-                normed[base + i] =
+                nextv[i] =
                     wn[wbase + i] * static_cast<T>((float)outv[i] * inv4);
+                normed[base + i] = nextv[i];
+            }
+
+            // XSUM-CARRIER-001. Reproduce the QKV affine kernel's exact
+            // group-of-64 sum tree over the stored BF16 next-layer input.
+            // Each lane owns four values; adjacent lanes form the incumbent
+            // `mma8_runsum4` eight-value chunk, then the same balanced
+            // 2/4/8-chunk tree closes the quantization group.
+            const float sum4 =
+                (float)nextv[0] + (float)nextv[1]
+                + (float)nextv[2] + (float)nextv[3];
+            float qsum = sum4 + simd_shuffle_xor(sum4, 1u);
+            qsum += simd_shuffle_xor(qsum, 2u);
+            qsum += simd_shuffle_xor(qsum, 4u);
+            qsum += simd_shuffle_xor(qsum, 8u);
+            if ((simd_lane_id & 15u) == 0u) {
+                qkvSums[(lid / 16u) * 8u + row] = qsum;
             }
         """,
         ensureRowContiguous: true
@@ -2533,7 +2569,11 @@ private enum Gemma4FusedLayerGlue {
         mlpOut: MLXArray, expertOut: MLXArray, residual: MLXArray,
         w1: MLXArray, w2: MLXArray, w3: MLXArray, layerScalar: MLXArray,
         nextInputNormWeight: MLXArray, eps: Float
-    ) -> (out: MLXArray, normedNext: MLXArray)? {
+    ) -> (
+        out: MLXArray,
+        normedNext: MLXArray,
+        qkvSums: CBv2AttentionQKVMMA8V1.ActivationSums?
+    )? {
         guard admits(mlpOut, weight: w1, eps: eps),
             expertOut.shape == mlpOut.shape, expertOut.dtype == .bfloat16,
             residual.shape == mlpOut.shape, residual.dtype == .bfloat16,
@@ -2550,10 +2590,16 @@ private enum Gemma4FusedLayerGlue {
             template: [("T", mlpOut.dtype)],
             grid: (rows * tgThreads, 1, 1),
             threadGroup: (tgThreads, 1, 1),
-            outputShapes: [[rows, 1, axis], [rows, 1, axis]],
-            outputDTypes: [.bfloat16, .bfloat16]
+            outputShapes: [
+                [rows, 1, axis],
+                [rows, 1, axis],
+                [(axis / 64) * rows],
+            ],
+            outputDTypes: [.bfloat16, .bfloat16, .float32]
         )
-        return (outs[0], outs[1])
+        let qkvSums = CBv2AttentionQKVMMA8V1.activationSums(
+            produced: outs[2], for: outs[1])
+        return (outs[0], outs[1], qkvSums)
     }
 
     static func tail(
@@ -3118,19 +3164,23 @@ public class Gemma4DecoderLayer: Module {
         // produced this layer's input norm. Pointer identity on the source
         // guarantees the normed tensor was computed from exactly this input.
         let h: MLXArray
+        let qkvSums: CBv2AttentionQKVMMA8V1.ActivationSums?
         if let chain = glueChain, let pending = chain.pending,
             pending.source === x
         {
             chain.pending = nil
             h = pending.normed
+            qkvSums = pending.qkvSums
         } else {
             glueChain?.pending = nil
             h = inputLayernorm(x)
+            qkvSums = nil
         }
         let (attnOut, kvPair, attnPositionOffset) = selfAttn(
             h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset,
             v2SharedSource: v2SharedSource, outputStart: outputStart,
-            useLastQueryPrefill: useLastQueryPrefill)
+            useLastQueryPrefill: useLastQueryPrefill,
+            activationSums: qkvSums)
         var out: MLXArray
         if let fusedOut = Gemma4FusedLayerGlue.normResidual(
             x: attnOut, residual: residual,
@@ -3240,7 +3290,10 @@ public class Gemma4DecoderLayer: Module {
                     eps: config.rmsNormEps)
             {
                 out = chained.out
-                chain.pending = (source: chained.out, normed: chained.normedNext)
+                chain.pending = (
+                    source: chained.out,
+                    normed: chained.normedNext,
+                    qkvSums: chained.qkvSums)
                 tailApplied = true
                 scalarFolded = true
             } else if canFoldScalar,
@@ -3269,7 +3322,10 @@ public class Gemma4DecoderLayer: Module {
                     eps: config.rmsNormEps)
             {
                 out = chained.out
-                chain.pending = (source: chained.out, normed: chained.normedNext)
+                chain.pending = (
+                    source: chained.out,
+                    normed: chained.normedNext,
+                    qkvSums: nil)
                 tailApplied = true
                 scalarFolded = true
             } else if let fusedTail = Gemma4PrefillGlueV1.branchTail(

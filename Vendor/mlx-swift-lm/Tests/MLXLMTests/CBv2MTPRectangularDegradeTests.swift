@@ -1,8 +1,11 @@
 // CBv2MTPRectangularDegradeTests.swift
 //
-// WS-3.0: a layer-cache bank that cannot serialise its attention per query
-// column MUST degrade MTP target verification to the serial oracle. It must
-// never trap.
+// Construction-bound rectangular verification behavior for a layer-cache
+// bank that cannot serialise attention per query column:
+//
+//   * explicit `.rectangular` refuses MTP activation at engine construction;
+//   * generic `.automatic` may remain active and degrade each otherwise-
+//     rectangular round to the serial target oracle, with telemetry.
 //
 // `EngineLoopV2+MTPTargetVerification` used to reach the serialisation flag
 // through `as? CBv2LayerCache` behind a `preconditionFailure`. `CBv2LayerCache`
@@ -13,18 +16,17 @@
 // requests lost, and no telemetry. It stayed unreachable only because paged
 // windowed rows failed the speculative-storage gate first (WS-3.3 opens it).
 //
-// The gate is now conformance to `CBv2MTPRectangularSerializing`
-// (`Paged/PagedSeamContract.swift`), matching the affirmative-capability
-// convention already used by `CBv2PackedPrefillCapableCache` and
-// `CBv2MultimodalSpanCapableCache`.
+// The cache bank resolves conformance to `CBv2MTPRectangularSerializing`
+// once at construction (`Paged/PagedSeamContract.swift`). Explicit mode
+// requires that certified controller; automatic mode owns the only runtime
+// serial-degradation route.
 //
 // Every engine test here runs the REAL engine over the tiny random-init
 // Gemma-4 target + assistant drafter used by `CBv2MTPRoundSmokeTests`, on the
-// contiguous backend, in forced `.rectangular` mode. The two arms differ in
-// exactly ONE axis: whether the bank's caches conform to
-// `CBv2MTPRectangularSerializing`. Serial is the correctness oracle, so the
-// degraded arm must stay token-exact with both the rectangular arm and the
-// MTP-off baseline.
+// contiguous backend. The refusal test seals the explicit-mode construction
+// boundary. The automatic-mode test proves the retained generic degradation
+// remains observable and token-exact to a truly plain AR engine. A conforming
+// explicit-mode control proves the certified direct lane still executes.
 
 import Foundation
 import MLX
@@ -131,9 +133,11 @@ struct CBv2MTPRectangularDegradeTests {
     private let hiddenSize = 64
     private let slidingWindow = 16
 
-    /// Telemetry key `mtpBuildTargetVerification` records when it refuses to
-    /// run rectangular over a bank it cannot serialise.
+    /// Generic-automatic telemetry key recorded when the provider cannot
+    /// serve a rectangular round.
     private let degradeReason = "rectangular_cache_unsupported"
+    private let explicitRefusalReason =
+        "explicit rectangular verification lacks a construction-certified cache provider"
 
     // MARK: Fixtures (same shapes as CBv2MTPRoundSmokeTests)
 
@@ -216,7 +220,8 @@ struct CBv2MTPRectangularDegradeTests {
     /// `serializing: false` swaps every cache for the non-conforming
     /// decorator; nothing else about the engine changes.
     private func makeEngine(
-        _ fixture: Fixture, mtp: Bool, serializing: Bool = true
+        _ fixture: Fixture, mtp: Bool, serializing: Bool = true,
+        verificationMode: CBv2MTPVerificationMode = .rectangular
     ) throws -> EngineV2 {
         let kinds = fixture.target.cbv2LayerKinds
         let caches: [any CBv2AttendingLayerCache] =
@@ -241,9 +246,7 @@ struct CBv2MTPRectangularDegradeTests {
             mtpConfig: CBv2MTPConfig(
                 enabled: mtp, maxDraftTokens: 2, maxSpeculativeBatch: 2,
                 fixedDraftTokens: 2,
-                // Forced rectangular: the strategy switch must be overruled
-                // by the conformance check, not by the automatic work cap.
-                verificationMode: .rectangular,
+                verificationMode: verificationMode,
                 maxAutomaticRectangularTokens: 8))
     }
 
@@ -260,29 +263,39 @@ struct CBv2MTPRectangularDegradeTests {
             maxTokens: maxTokens)
     }
 
-    // MARK: - (1) Non-conforming bank degrades instead of aborting
+    // MARK: - (1) Explicit rectangular refuses unsupported construction
 
-    /// The acceptance test for WS-3.0. Against the deleted `as? CBv2LayerCache`
-    /// guard this did not fail — it killed the test process with
-    /// "MTP rectangular verification requires CBv2 layer caches".
-    @Test func nonSerializingBankDegradesToSerialInsteadOfTrapping() async throws {
+    @Test func explicitRectangularNonSerializingBankLeavesMTPInactive() async throws {
+        let fixture = try makeFixture()
+        let engine = try makeEngine(
+            fixture, mtp: true, serializing: false,
+            verificationMode: .rectangular)
+        #expect(engine.mtpInactiveReason == explicitRefusalReason)
+        #expect(engine.mtpMetricsSnapshot() == nil)
+        await engine.shutdown()
+    }
+
+    // MARK: - (2) Generic automatic retains observable serial degradation
+
+    @Test func automaticNonSerializingBankDegradesTokenExactly() async throws {
         let fixture = try makeFixture()
         // Prompt 24 > window 16 with 32 generated tokens, so verify rounds
         // really run and the sliding ring wraps through them.
         let prompt = makePromptTokens(length: 24, seed: 11, vocabSize: vocabSize)
-
         // Same non-conforming bank on BOTH legs, so the only variable is MTP.
         let off = try makeEngine(fixture, mtp: false, serializing: false)
         let baseline = try await run(off, greedyRequest(id: 1, prompt: prompt, maxTokens: 32))
         await off.shutdown()
         #expect(baseline.tokens.count == 32)
 
-        let on = try makeEngine(fixture, mtp: true, serializing: false)
+        let on = try makeEngine(
+            fixture, mtp: true, serializing: false,
+            verificationMode: .automatic)
+        #expect(on.mtpInactiveReason == nil)
         let degraded = try await run(on, greedyRequest(id: 1, prompt: prompt, maxTokens: 32))
         let metrics = try #require(on.mtpMetricsSnapshot())
         await on.shutdown()
 
-        // Liveness: the daemon survived a bank it cannot serialise.
         #expect(degraded.finishReason == .length)
         #expect(metrics.rounds >= 1, "no verify round ran — the degrade path was never exercised")
 
@@ -300,9 +313,9 @@ struct CBv2MTPRectangularDegradeTests {
             "degraded MTP diverged: on=\(degraded.tokens) off=\(baseline.tokens)")
     }
 
-    // MARK: - (2) Control arm: a conforming bank still runs rectangular
+    // MARK: - (3) Control arm: a conforming bank still runs rectangular
 
-    /// Proves the degrade in (1) is caused by non-conformance and nothing
+    /// Proves the degrade in (2) is caused by non-conformance and nothing
     /// else: identical fixture, identical config, conforming caches.
     @Test func serializingBankStillRunsRectangular() async throws {
         let fixture = try makeFixture()
@@ -323,7 +336,7 @@ struct CBv2MTPRectangularDegradeTests {
         #expect(rectangular.tokens == baseline.tokens)
     }
 
-    // MARK: - (3) Why the deleted cast was a daemon abort, not a defensive assert
+    // MARK: - (4) Why the deleted cast was a daemon abort, not a defensive assert
 
     /// `CBv2LayerCache` is `final` and `PagedLayerCache` is a sibling
     /// conformer, so `as? CBv2LayerCache` can NEVER succeed for a paged bank
@@ -350,7 +363,7 @@ struct CBv2MTPRectangularDegradeTests {
         }
     }
 
-    // MARK: - (4) WS-3.5: the round's captures are fenced ahead of its writes
+    // MARK: - (5) WS-3.5: the round's captures are fenced ahead of its writes
 
     private func pagedFixture(
         heads: Int, dim: Int

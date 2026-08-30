@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXFast
 import MLXLLM
 import MLXLMCommon
 import MLXRandom
@@ -20,6 +21,91 @@ import Testing
 
 @Suite("MTPVerificationStrategySeal", .serialized)
 struct MTPVerificationStrategySealTests {
+
+    /// Test-only provider seam: attention behavior is the real contiguous
+    /// cache, but the wrapper deliberately does not advertise the internal
+    /// construction-certified rectangular controller capability.
+    private final class NonSerializingExactLayerCache:
+        CBv2AttendingLayerCache,
+        CBv2LastQueryPrefillLayerCache,
+        CBv2SpanMaskBinding,
+        CBv2MultimodalSpanCapableCache,
+        CBv2PackedPrefillCapableCache,
+        KVCache
+    {
+        private let inner: CBv2LayerCache
+
+        init(layerIndex: Int, kind: CBv2LayerKind) {
+            inner = CBv2LayerCache(layerIndex: layerIndex, kind: kind)
+        }
+
+        var layerIndex: Int { inner.layerIndex }
+        var kind: CBv2LayerKind { inner.kind }
+        var rows: [CBv2SequenceKV] { inner.rows }
+        var positionOffsets: MLXArray { inner.positionOffsets }
+
+        func setRows(_ rows: [CBv2SequenceKV]) { inner.setRows(rows) }
+
+        func updateAndAttend(
+            queries: MLXArray, keys: MLXArray, values: MLXArray,
+            scale: Float, sinks: MLXArray?
+        ) -> MLXArray {
+            inner.updateAndAttend(
+                queries: queries, keys: keys, values: values,
+                scale: scale, sinks: sinks)
+        }
+
+        func attendBorrowing(
+            source: CBv2AttendingLayerCache, queries: MLXArray,
+            scale: Float, sinks: MLXArray?
+        ) -> MLXArray {
+            inner.attendBorrowing(
+                source: source, queries: queries, scale: scale, sinks: sinks)
+        }
+
+        func updateAndAttendLastQuery(
+            queries: MLXArray, keys: MLXArray, values: MLXArray,
+            scale: Float, sinks: MLXArray?
+        ) -> MLXArray {
+            inner.updateAndAttendLastQuery(
+                queries: queries, keys: keys, values: values,
+                scale: scale, sinks: sinks)
+        }
+
+        func bindSpanContext(_ context: CBv2SpanChunkContext?) {
+            inner.bindSpanContext(context)
+        }
+        var honorsSpanMaskContexts: Bool { inner.honorsSpanMaskContexts }
+        var keepsRowsIndependentWhenPacked: Bool {
+            inner.keepsRowsIndependentWhenPacked
+        }
+
+        var offset: Int { inner.offset }
+        var maxSize: Int? { inner.maxSize }
+        func innerState() -> [MLXArray] { inner.innerState() }
+        func update(
+            keys: MLXArray, values: MLXArray
+        ) -> (MLXArray, MLXArray) {
+            inner.update(keys: keys, values: values)
+        }
+        var state: [MLXArray] {
+            get { inner.state }
+            set { inner.state = newValue }
+        }
+        var metaState: [String] {
+            get { inner.metaState }
+            set { inner.metaState = newValue }
+        }
+        var isTrimmable: Bool { inner.isTrimmable }
+        @discardableResult func trim(_ n: Int) -> Int { inner.trim(n) }
+        func makeMask(
+            n: Int, windowSize: Int?, returnArray: Bool
+        ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+            inner.makeMask(
+                n: n, windowSize: windowSize, returnArray: returnArray)
+        }
+        func copy() -> any KVCache { inner.copy() }
+    }
 
     // MARK: - (1) GPU-free: the production seal selects certified B1 rectangles
 
@@ -303,12 +389,13 @@ struct MTPVerificationStrategySealTests {
         return [session.seedTokenByStream[0]] + result.tokensByStream[0]
     }
 
-    // MARK: - (2) MLX-gated: serial and rectangular full rounds are lockstep
+    // MARK: - Shared exact-run helpers
 
     private struct StrategyRun {
         let seedToken: Int
         let result: RuntimeWorkerFreeRunResult
         let metrics: CBv2MTPMetrics
+        let inactiveReason: String?
         let logitRows: [[Float]]
         let logitCalls: [[[Float]]]
 
@@ -328,6 +415,42 @@ struct MTPVerificationStrategySealTests {
                 let promptBonus = promptCall.last
             else { return [] }
             var rows = [promptBonus]
+            if metrics.serialVerificationRounds == metrics.rounds {
+                // The first MTP decode delta is the non-speculative seed step;
+                // it has an acceptance-length entry and a singleton target
+                // call, but no round audit. Consume every such leading delta
+                // before pairing audited rounds with serial verify calls.
+                let leadingDeltaCount =
+                    result.acceptanceLengths.count - metrics.roundAudits.count
+                precondition(
+                    leadingDeltaCount == metrics.seedSteps,
+                    "serial logit calls must reconcile as seed deltas plus audited rounds")
+                // Serial verification records one singleton model call per
+                // verify column, not one C-column call per round. Advance by
+                // the target-authoritative round width while retaining only
+                // the columns whose outputs were committed.
+                var callIndex = 1
+                for committed in result.acceptanceLengths.prefix(leadingDeltaCount) {
+                    guard callIndex < logitCalls.count else { return rows }
+                    rows.append(contentsOf: logitCalls[callIndex].prefix(committed))
+                    callIndex += 1
+                }
+                for (audit, committed) in zip(
+                    metrics.roundAudits,
+                    result.acceptanceLengths.dropFirst(leadingDeltaCount))
+                {
+                    let roundWidth = audit.targetTokens.count
+                    let end = min(callIndex + roundWidth, logitCalls.count)
+                    rows.append(contentsOf:
+                        logitCalls[callIndex ..< end].prefix(committed)
+                            .compactMap(\.first))
+                    callIndex = end
+                }
+                precondition(
+                    callIndex == logitCalls.count,
+                    "serial logit calls must be consumed exactly")
+                return rows
+            }
             for (call, committed) in zip(
                 logitCalls.dropFirst(), result.acceptanceLengths)
             {
@@ -346,11 +469,17 @@ struct MTPVerificationStrategySealTests {
         target: ExactCycleTarget,
         promptLength: Int,
         drafter: (any CBv2MTPDrafter)?,
-        config: CBv2MTPConfig
+        config: CBv2MTPConfig,
+        serializingCaches: Bool = true
     ) -> EngineV2 {
-        let caches = target.layerKinds.enumerated().map {
-            CBv2LayerCache(layerIndex: $0.offset, kind: $0.element)
-        }
+        let caches: [any CBv2AttendingLayerCache] =
+            target.layerKinds.enumerated().map { index, kind in
+                if serializingCaches {
+                    return CBv2LayerCache(layerIndex: index, kind: kind)
+                }
+                return NonSerializingExactLayerCache(
+                    layerIndex: index, kind: kind)
+            }
         return EngineV2(
             model: target,
             layerKinds: target.layerKinds,
@@ -375,6 +504,7 @@ struct MTPVerificationStrategySealTests {
         baseline: [Int],
         n: Int,
         maxTokens: Int,
+        serializingCaches: Bool = true,
         wrong: @escaping (Int, Int) -> Bool = { _, _ in false }
     ) throws -> StrategyRun {
         let target = ExactCycleTarget()
@@ -389,7 +519,8 @@ struct MTPVerificationStrategySealTests {
         config.verificationMode = mode
         let engine = makeExactEngine(
             target: target, promptLength: prompt.count,
-            drafter: drafter, config: config)
+            drafter: drafter, config: config,
+            serializingCaches: serializingCaches)
         try Gemma4Runtime.requireMTPActive(engine)
         let session = try RuntimeWorkerMTPSession(
             engine: engine, seedTokens: prompt, maxTokens: maxTokens, stopTokens: [])
@@ -397,6 +528,7 @@ struct MTPVerificationStrategySealTests {
         let metrics = try #require(engine.mtpMetricsSnapshot())
         return StrategyRun(
             seedToken: session.seedToken, result: result, metrics: metrics,
+            inactiveReason: engine.mtpInactiveReason,
             logitRows: target.verificationLogitRows(),
             logitCalls: target.recordedLogitCalls())
     }
@@ -422,6 +554,63 @@ struct MTPVerificationStrategySealTests {
             stream: [session.seedToken] + result.tokens,
             committedLogitRows: committedRows)
     }
+
+    // MARK: - (2) MLX-gated: explicit refusal and generic degradation split
+
+    @Test
+    func explicitRectangularUnsupportedProviderIsInactiveAtConstruction() async throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
+        let prompt = promptTokens(length: 14, seed: 11)
+        let target = ExactCycleTarget()
+        let drafter = ScriptedDrafter(
+            script: [0], promptLength: prompt.count,
+            vocabSize: ExactCycleTarget.vocabularySize,
+            target: target, wrong: { _, _ in false })
+        let config = try Gemma4MTPEnvelope.resolveConfig(depth: 2)
+        let engine = makeExactEngine(
+            target: target, promptLength: prompt.count,
+            drafter: drafter, config: config,
+            serializingCaches: false)
+
+        #expect(
+            engine.mtpInactiveReason
+                == "explicit rectangular verification lacks a construction-certified cache provider")
+        #expect(engine.mtpMetricsSnapshot() == nil)
+        await engine.shutdown()
+    }
+
+    @Test
+    func automaticUnsupportedProviderDegradesSerialAndMatchesPlainAR() throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
+        let prompt = promptTokens(length: 14, seed: 11)
+        let n = 36
+        let maxTokens = n + 1
+        let plain = try runPlainExactAR(
+            prompt: prompt, n: n, maxTokens: maxTokens)
+        let automatic = try runStrategy(
+            .automatic, depth: 2, prompt: prompt,
+            baseline: plain.stream, n: n, maxTokens: maxTokens,
+            serializingCaches: false)
+
+        #expect(automatic.inactiveReason == nil)
+        #expect(automatic.metrics.rounds > 0)
+        #expect(automatic.metrics.rectangularVerificationRounds == 0)
+        #expect(
+            automatic.metrics.serialVerificationRounds
+                == automatic.metrics.rounds)
+        #expect(
+            automatic.metrics.controllerFallbacks[
+                "rectangular_cache_unsupported", default: 0]
+                == automatic.metrics.serialVerificationRounds)
+        #expect([automatic.seedToken] + automatic.result.tokens == plain.stream)
+        #expect(automatic.committedLogitRows == plain.committedLogitRows)
+    }
+
+    // MARK: - (3) MLX-gated: serial and rectangular full rounds are lockstep
 
     /// Run every production depth once through the serial verifier and once
     /// through explicit rectangular verification. The target, prompt,
@@ -481,7 +670,7 @@ struct MTPVerificationStrategySealTests {
         }
     }
 
-    // MARK: - (3) MLX-gated: acceptance-pattern lockstep (hardening)
+    // MARK: - (4) MLX-gated: acceptance-pattern lockstep (hardening)
 
     /// The structural invariant the divergence hypothesis named, kept as a
     /// permanent regression net: across every acceptance pattern — full

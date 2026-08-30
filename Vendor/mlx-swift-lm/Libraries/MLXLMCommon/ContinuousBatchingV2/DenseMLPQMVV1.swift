@@ -87,6 +87,16 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Same-group packed-weight and metadata reads precede activation work.
+    /// This changes only the down-plane load schedule; `0` selects the
+    /// original MMA8 body. Gate/up never selects this variant.
+    private static let mma8DownEarlyWeightsEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MLP_MMA8_DOWN_EARLY_WEIGHTS"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let batch = 8
     private static let sequence = 1
     private static let groupSize = 64
@@ -628,6 +638,44 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         header: mma8KernelHeader,
         ensureRowContiguous: true)
 
+    /// Derive from the incumbent body without duplicating its arithmetic.
+    /// Only independent reads move: there is no next-group prefetch, changed
+    /// reduction tree, additional memory access, or new synchronization.
+    private static let mma8EarlyWeightsHeader: String = {
+        var result = mma8KernelHeader
+        func replaceOnce(_ old: String, with new: String) {
+            precondition(result.components(separatedBy: old).count == 2)
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        let weightLoads = """
+            const uint4 wv = *((const device uint4*)(wrow + 64 * g));
+            const float s = float(srow[g]);
+            const float b = float(brow[g]);
+        """
+        replaceOnce(weightLoads, with: "")
+        replaceOnce(
+            "  for (int g = g_begin; g < g_end; ++g) {",
+            with: "  for (int g = g_begin; g < g_end; ++g) {\n" + weightLoads)
+        return result
+    }()
+
+    private static let mma8EarlyWeightsKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_early_weights_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            gemma4_qmv_mma8_affine8_g64_impl<T, 2>(
+                w, scales, biases, x, y,
+                x_shape[x_ndim - 1], w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8EarlyWeightsHeader,
+        ensureRowContiguous: true)
+
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_v1",
         inputNames: ["x", "w", "scales", "biases"],
@@ -833,7 +881,9 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         let isGateUp = inDim == 2816 && outDim == 2112
         if isGateUp ? mma8GateUpEnabled : mma8DownEnabled {
             let yTiles = outDim / outputsPerGroup
-            return mma8Kernel(
+            let selectedMMA = !isGateUp && mma8DownEarlyWeightsEnabled
+                ? mma8EarlyWeightsKernel : mma8Kernel
+            return selectedMMA(
                 [x, weight, scales, biases],
                 template: [("T", x.dtype)],
                 grid: (simdWidth, yTiles * simdGroups, 1),

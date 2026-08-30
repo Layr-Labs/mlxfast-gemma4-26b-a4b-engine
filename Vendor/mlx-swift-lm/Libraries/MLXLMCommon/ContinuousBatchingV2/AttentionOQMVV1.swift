@@ -212,23 +212,23 @@ inline float mma8_runsum4(uint4 r) {
 
 #define MMA8_STEP(BB, J) A.thread_elements()[0] = float(extract_bits(wv.x, 4 * (J), 4)); A.thread_elements()[1] = float(extract_bits(wv.y, 4 * (J), 4)); simdgroup_multiply_accumulate(C, A, BB, C);
 
-template <typename T, int KS, int KFIX>
+template <typename T, int KS>
 METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
     const device uint32_t* w,
     const device T* scales,
     const device T* biases,
     const device T* x,
     device T* y,
+    const int K,
     const int N,
     const int n0,
     threadgroup float2* red,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int K = KFIX;
-  constexpr int G = K / 64;
-  constexpr int gh = (G + 1) / 2;
-  constexpr int nGroups = (KS == 2) ? gh : G;
-  const int g0 = (KS == 2 && simd_gid == 1) ? gh : 0;
+  const int G = K / 64;
+  const int gh = (G + 1) / 2;
+  const int g_begin = (KS == 2 && simd_gid == 1) ? gh : 0;
+  const int g_end = (KS == 2 && simd_gid == 0) ? gh : G;
   const mma8_coord c = mma8_lane(simd_lid);
 
   const device uint8_t* wrow =
@@ -243,9 +243,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
   simdgroup_float8x8 A;
   simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
 
-#pragma unroll
-  for (int gi = 0; gi < nGroups; ++gi) {
-    const int g = g0 + gi;
+  for (int g = g_begin; g < g_end; ++g) {
     const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
     const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
 
@@ -299,33 +297,16 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
 }
 """
 
-    private static let mma8KernelK4096 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_unroll_v2",
+    private static let mma8Kernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_v1",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
             const uint3 tid = threadgroup_position_in_grid;
             threadgroup float2 red[32];
-            attention_o_qmv_mma8_affine4_g64_impl<T, 2, 4096>(
+            attention_o_qmv_mma8_affine4_g64_impl<T, 2>(
                 w, scales, biases, x, y,
-                w_shape[0], int(tid.y) * 8, red,
-                simdgroup_index_in_threadgroup,
-                thread_index_in_simdgroup);
-            return;
-            """,
-        header: mma8KernelHeader,
-        ensureRowContiguous: true)
-
-    private static let mma8KernelK8192 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_unroll_v2",
-        inputNames: ["x", "w", "scales", "biases"],
-        outputNames: ["y"],
-        source: """
-            const uint3 tid = threadgroup_position_in_grid;
-            threadgroup float2 red[32];
-            attention_o_qmv_mma8_affine4_g64_impl<T, 2, 8192>(
-                w, scales, biases, x, y,
-                w_shape[0], int(tid.y) * 8, red,
+                x_shape[x_ndim - 1], w_shape[0], int(tid.y) * 8, red,
                 simdgroup_index_in_threadgroup,
                 thread_index_in_simdgroup);
             return;
@@ -392,8 +373,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
             // streamed once per round instead of four times. Grid is in
             // threads: (32, 2, 1) threads per group, N/8 groups along y.
             let yTiles = outputWidth / outputsPerGroup
-            let kernel = inDim == 8192 ? mma8KernelK8192 : mma8KernelK4096
-            return kernel(
+            return mma8Kernel(
                 [x, weight, scales, biases],
                 template: [("T", x.dtype)],
                 grid: (simdWidth, yTiles * simdGroups, 1),

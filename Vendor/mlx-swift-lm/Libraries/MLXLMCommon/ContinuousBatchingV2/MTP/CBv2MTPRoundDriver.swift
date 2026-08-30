@@ -164,14 +164,14 @@ final class CBv2MTPRoundDriver {
     /// each round. A higher value widens the adaptive range. It does not force
     /// speculation. The trusted MTP envelope (`config.maxDraftTokens`, ceiling 3
     /// at batch 8) also bounds it, so the effective cap is
-    /// `min(envelope, submissionDraftDepth)`. Compiled at the envelope.
+    /// `min(envelope, submissionDraftDepth)`. Default 1.
     ///
     /// UNIFORM WITH DFLASH. `DFlashDraftModel.submissionDraftDepth` is the DFlash
     /// counterpart. It has the same name, the same meaning, and the same default
     /// 1. The per-arm behaviour differs. MTP adapts up to this ceiling each round.
     /// DFlash proposes a fixed block of this size, because block diffusion drafts
     /// a whole block at once. The constant you edit is the same on both arms.
-    static let submissionDraftDepth = 3
+    static let submissionDraftDepth = 0
 
     /// The effective adaptive-depth ceiling: the trusted envelope's max, bounded
     /// by the participant's `submissionDraftDepth`. Pure and static so the cap is

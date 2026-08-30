@@ -1518,6 +1518,7 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
     float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
     float sum1 = load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
 
+#pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* wl = ws + row * in_vec_size_w;
       const device T* sl = scales + row * in_vec_size_g;
@@ -1548,6 +1549,7 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
         load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
     float sum1 =
         load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
+#pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* wl = ws + row * in_vec_size_w;
       const device T* sl = scales + row * in_vec_size_g;
@@ -1561,6 +1563,7 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
     }
   }
 
+#pragma unroll
   for (int row = 0; row < results_per_simdgroup; row++) {
     result0[row] = simd_sum(result0[row]);
     result1[row] = simd_sum(result1[row]);

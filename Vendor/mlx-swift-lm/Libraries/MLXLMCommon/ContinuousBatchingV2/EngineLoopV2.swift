@@ -450,25 +450,38 @@ private struct CBv2Handoff<Value>: @unchecked Sendable {
     let value: Value
 }
 
+/// Whether an engine-loop drain actually retired the queue or only escaped
+/// through its bounded watchdog.
+enum CBv2DrainRetirement: Sendable, Equatable {
+    /// The engine queue stopped after all in-flight work and KV releases
+    /// completed. It is safe for a process-level owner to fence the GPU and
+    /// reclaim allocator cache after observing this result.
+    case natural
+    /// The bounded shutdown watchdog released the caller while the engine
+    /// queue may still be executing. This is an escape from waiting, not a
+    /// retirement fence, and must fail closed at process-level phase barriers.
+    case watchdogEscaped
+}
+
 /// Resume-exactly-once wrapper for a drain continuation: the engine queue
 /// (natural drain completion) and the shutdown-timeout timer race to
 /// resume it; whichever wins consumes the continuation, the loser no-ops.
 private final class CBv2DrainWaiter: @unchecked Sendable {
     private let lock = NSLock()
-    private var continuation: CheckedContinuation<Void, Never>?
+    private var continuation: CheckedContinuation<CBv2DrainRetirement, Never>?
 
-    init(_ continuation: CheckedContinuation<Void, Never>) {
+    init(_ continuation: CheckedContinuation<CBv2DrainRetirement, Never>) {
         self.continuation = continuation
     }
 
     /// Resume if not already resumed; returns true when this call won.
     @discardableResult
-    func resume() -> Bool {
+    func resume(_ retirement: CBv2DrainRetirement) -> Bool {
         lock.lock()
         let c = continuation
         continuation = nil
         lock.unlock()
-        c?.resume()
+        c?.resume(returning: retirement)
         return c != nil
     }
 }
@@ -763,22 +776,24 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// it forever. The timeout runs on the watchdog queue; when it wins,
     /// every live stream is force-finished with `.error`, live requests
     /// are marked for cancellation (cleaned up if the loop ever resumes),
-    /// and `drain()` returns — the wedged step may still be executing.
-    func drain() async {
-        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+    /// and `drain()` returns `.watchdogEscaped` — the wedged step may still
+    /// be executing. Only `.natural` is a retirement fence.
+    func drain() async -> CBv2DrainRetirement {
+        await withCheckedContinuation {
+            (c: CheckedContinuation<CBv2DrainRetirement, Never>) in
             let waiter = CBv2DrainWaiter(c)
             watchdogQueue.asyncAfter(deadline: .now() + config.shutdownTimeout) { [weak self] in
                 guard let self else {
-                    waiter.resume()
+                    waiter.resume(.watchdogEscaped)
                     return
                 }
-                if waiter.resume() {
+                if waiter.resume(.watchdogEscaped) {
                     self.forceFinishStreamsOnShutdownTimeout()
                 }
             }
             engineQueue.async { [self] in
                 guard running else {
-                    waiter.resume()
+                    waiter.resume(.natural)
                     return
                 }
                 draining = true
@@ -827,7 +842,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         completeStop()
         let waiters = drainWaiters
         drainWaiters = []
-        for waiter in waiters { waiter.resume() }
+        for waiter in waiters { waiter.resume(.natural) }
     }
 
     // MARK: Submission (from EngineV2)

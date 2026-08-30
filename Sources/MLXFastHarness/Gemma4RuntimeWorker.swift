@@ -1115,7 +1115,7 @@ extension Gemma4Runtime {
             // the very work this phase barrier is meant to retire.
             guard CBv2DetachedDrainRegistry.joinAll(timeout: 15) else {
                 throw MLXFastError.invalidInput(
-                    "runtime worker phase close timed out waiting for detached CBv2 drains")
+                    "runtime worker phase close could not prove natural retirement of detached CBv2 drains")
             }
             // CBv2 submits through MLX's process-global GPU stream. Once no
             // engine drain can enqueue more work, retire that stream before

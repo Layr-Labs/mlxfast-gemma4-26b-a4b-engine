@@ -587,7 +587,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
                 })
             return
         }
-        await loop.drain()
+        _ = await loop.drain()
     }
 
     /// Always-synchronous variant for unscored callers (e.g. the constructor
@@ -595,7 +595,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// of the fast-ack default.
     public func shutdownSynchronously() async {
         beginRejectingSubmissions()
-        await loop.drain()
+        _ = await loop.drain()
     }
 
     /// Resolved once: fast-ack drains are the default; set the variable to
@@ -646,43 +646,84 @@ public enum CBv2EngageMark {
 /// Fence for fast-ack engine shutdowns: every detached drain registers here,
 /// and a later phase can block (bounded) until all previously started drains
 /// have finished before it constructs a new engine or measures anything.
-/// The registry keeps only live tasks; `joinAll` is safe to call from
-/// synchronous, non-async code.
+/// A watchdog escape is deliberately retained and makes every later join fail
+/// closed: the task completed, but the engine did not retire. `joinAll` is safe
+/// to call from synchronous, non-async code and serializes concurrent joiners.
+private final class CBv2DrainJoinOutcomes: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: [CBv2DrainRetirement] = []
+
+    func store(_ outcomes: [CBv2DrainRetirement]) {
+        lock.lock()
+        value = outcomes
+        lock.unlock()
+    }
+
+    func load() -> [CBv2DrainRetirement] {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
 public enum CBv2DetachedDrainRegistry {
     private static let lock = NSLock()
-    nonisolated(unsafe) private static var drains: [Task<Void, Never>] = []
+    private static let joinLock = NSLock()
+    nonisolated(unsafe) private static var drains: [Task<CBv2DrainRetirement, Never>] = []
 
-    static func register(_ task: Task<Void, Never>) {
+    static func register(_ task: Task<CBv2DrainRetirement, Never>) {
         lock.lock()
         drains.append(task)
         lock.unlock()
     }
 
     /// Wait (at most `timeout` seconds) for every registered drain to
-    /// complete, then drop the completed entries. Returns `true` when all
-    /// drains finished inside the deadline. A timeout leaves stragglers
-    /// registered so a later join can fence them again.
+    /// complete, then drop the snapshotted prefix only when every task reports
+    /// natural retirement. A deadline or watchdog escape leaves that prefix
+    /// registered so every later phase continues to fail closed. Registrations
+    /// may append during the wait; serialized joiners can remove only the exact
+    /// prefix they snapshotted and awaited.
     @discardableResult
     public static func joinAll(timeout: TimeInterval = 5) -> Bool {
+        joinLock.lock()
+        defer { joinLock.unlock() }
         lock.lock()
         let pending = drains
         lock.unlock()
         guard !pending.isEmpty else { return true }
         let done = DispatchSemaphore(value: 0)
+        let joined = CBv2DrainJoinOutcomes()
         Task.detached(priority: .userInitiated) {
-            for task in pending { _ = await task.value }
+            var outcomes: [CBv2DrainRetirement] = []
+            outcomes.reserveCapacity(pending.count)
+            for task in pending { outcomes.append(await task.value) }
+            joined.store(outcomes)
             done.signal()
         }
         let completed = done.wait(timeout: .now() + timeout) == .success
-        if completed {
-            // Registration only ever appends, so the joined tasks are
-            // exactly the current prefix of the array.
-            lock.lock()
-            drains.removeFirst(Swift.min(pending.count, drains.count))
-            lock.unlock()
-        }
-        return completed
+        guard completed else { return false }
+        let outcomes = joined.load()
+        guard outcomes.allSatisfy({ $0 == .natural }) else { return false }
+        // register() only appends and joinLock excludes another remover, so
+        // this is still exactly the prefix snapshotted above even when new
+        // drains registered while it was awaited.
+        lock.lock()
+        drains.removeFirst(pending.count)
+        lock.unlock()
+        return true
     }
+
+    #if DEBUG
+    /// Test-only cleanup for deliberately injected watchdog escapes.
+    /// Production has no recovery from an unsuccessful retirement result.
+    static func resetForTesting() {
+        joinLock.lock()
+        defer { joinLock.unlock() }
+        lock.lock()
+        drains.removeAll()
+        lock.unlock()
+    }
+    #endif
 }
 
 // MARK: - Teacher-forced top-1 scoring (backend parity measurement)

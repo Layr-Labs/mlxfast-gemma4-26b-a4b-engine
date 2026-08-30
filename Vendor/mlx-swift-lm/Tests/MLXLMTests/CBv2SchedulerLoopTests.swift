@@ -989,6 +989,8 @@ final class CBv2SchedulerLoopTests: XCTestCase {
     /// with `.error` and shutdown returns while the wedged step is still
     /// blocked.
     func testShutdownTimesOutWhenEngineQueueIsWedged() async throws {
+        CBv2DetachedDrainRegistry.resetForTesting()
+        defer { CBv2DetachedDrainRegistry.resetForTesting() }
         let harness = CBv2SchedHarness(
             loopConfig: CBv2EngineLoopConfig(
                 requestTimeout: 60,
@@ -1005,10 +1007,14 @@ final class CBv2SchedulerLoopTests: XCTestCase {
 
         let started = Date()
         await harness.engine.shutdown()
+        let naturallyRetired = CBv2DetachedDrainRegistry.joinAll(timeout: 1)
         let elapsed = Date().timeIntervalSince(started)
         XCTAssertLessThan(
             elapsed, 2.5,
-            "shutdown must return at the timeout, not wait out the wedged step")
+            "the registry fence must return at the timeout, not wait out the wedged step")
+        XCTAssertFalse(
+            naturallyRetired,
+            "a watchdog escape must not masquerade as natural loop retirement")
 
         let collected = await collectedOut
         guard case .error(let message)? = collected.finishReason else {

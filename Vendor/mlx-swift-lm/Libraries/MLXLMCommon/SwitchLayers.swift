@@ -706,10 +706,34 @@ private let routeCsortPrefillEnabled: Bool = {
 }()
 
 /// Keys per histogram/scatter block.
-private let routeCsortPrefillBlock = 256
-/// Counter-table width; must equal ``routeCountingSortKeyBound`` and the 256
-/// threads per threadgroup the three kernels launch with.
-private let routeCsortPrefillWidth = 256
+/// PREFILL-CSORT-BLOCK-128: halved 256 -> 128. Every offset in the pipeline
+/// is dynamic in `blocks`, and the stable counting-sort rank
+/// (`block_offset[b][key] + in-block rank`) is invariant to how the keys are
+/// partitioned: per-block histograms and counts commute across blocks, and
+/// within a block the stable tie order is index order regardless of thread
+/// decomposition. So the outputs are identical integer buffers for ANY block
+/// width; 128 doubles the histogram/scatter threadgroups for the packed
+/// 8x1024 route table (n=8192: 32 -> 64 blocks) and halves the per-thread
+/// serial rank loop in the scatter kernel. Kill switch
+/// DARKBLOOM_ROUTE_CSORT_PREFILL=0 restores the argSort chain; the block
+/// knob itself is pinned here by design (env-free ship value).
+private let routeCsortPrefillBlock = 64
+/// Counter-table width. CSORT-WIDTH-128: halved 256 -> 128. Production
+/// Gemma4 route tables have `numExperts == 128` exactly, so every real key
+/// is below 128 and the upper half of the old 256-bin table was pure dead
+/// weight: half the histogram atomics' footprint, half the scan's threadgroup
+/// lanes, half the `block_hist`/`block_offset` global traffic, and (because
+/// the threadgroup size equals the width) 128 instead of 256 threads per
+/// histogram/scatter threadgroup — more resident threadgroups per SM. The
+/// keys-per-block stays 128, so each thread's stride loop
+/// (`j = k; j < BLOCK; j += WIDTH`) covers its block with exactly one key
+/// and the stable rank is the same index-order expression as before; the
+/// kernels are written stride-general and remain exact for ANY
+/// WIDTH <= BLOCK. Keys above WIDTH cannot appear: the prefill gate
+/// (`numExperts <= routeCsortPrefillWidth`) fail-closes any model whose
+/// expert count exceeds the table. Kill switch
+/// DARKBLOOM_ROUTE_CSORT_PREFILL=0 restores the argSort chain.
+private let routeCsortPrefillWidth = 128
 /// Largest `n` accepted. Positions, block offsets and grid extents are uint32 /
 /// Int32 on the Metal side; this bound keeps every one of them representable
 /// with room to spare and is ~4000x the largest production route table.
@@ -740,7 +764,7 @@ private final class RouteCsortShapeLog: @unchecked Sendable {
 private let routeCsortShapeLog = RouteCsortShapeLog()
 
 private let routeCsortPrefillHistKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "mlx_lm_route_csort128_hist_v1",
+    name: "mlx_lm_route_csort128_hist_v4",
     inputNames: ["keys"],
     outputNames: ["block_hist"],
     source: """
@@ -752,10 +776,14 @@ private let routeCsortPrefillHistKernel: MLXFast.MLXFastKernel = MLXFast.metalKe
         threadgroup atomic_uint tg_count[WIDTH];
         atomic_store_explicit(&tg_count[k], 0u, memory_order_relaxed);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        uint idx = b * BLOCK + k;
-        if (idx < n) {
-            atomic_fetch_add_explicit(
-                &tg_count[keys[idx]], 1u, memory_order_relaxed);
+        // Stride-general: WIDTH threads cover a BLOCK-wide block in
+        // BLOCK/WIDTH passes (exactly one pass at the shipped 128/128).
+        for (uint j = k; j < BLOCK; j += WIDTH) {
+            uint idx = b * BLOCK + j;
+            if (idx < n) {
+                atomic_fetch_add_explicit(
+                    &tg_count[keys[idx]], 1u, memory_order_relaxed);
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // Integer adds commute, so the table is identical for every
@@ -767,7 +795,7 @@ private let routeCsortPrefillHistKernel: MLXFast.MLXFastKernel = MLXFast.metalKe
 )
 
 private let routeCsortPrefillScanKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "mlx_lm_route_csort128_scan_v1",
+    name: "mlx_lm_route_csort128_scan_v3",
     inputNames: ["block_hist"],
     outputNames: ["block_offset"],
     source: """
@@ -780,9 +808,9 @@ private let routeCsortPrefillScanKernel: MLXFast.MLXFastKernel = MLXFast.metalKe
         for (uint b = 0; b < nblocks; ++b) {
             total += block_hist[b * WIDTH + e];
         }
-        // Global bin base: exclusive prefix over the 256 expert totals.
+        // Global bin base: exclusive prefix over the expert totals.
         uint lane_excl = simd_prefix_exclusive_sum(total);
-        threadgroup uint simd_totals[8];
+        threadgroup uint simd_totals[WIDTH / 32];
         if (lane == 31) {
             simd_totals[simd_id] = lane_excl + total;
         }
@@ -802,7 +830,7 @@ private let routeCsortPrefillScanKernel: MLXFast.MLXFastKernel = MLXFast.metalKe
 )
 
 private let routeCsortPrefillScatterKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "mlx_lm_route_csort128_scatter_v1",
+    name: "mlx_lm_route_csort128_scatter_v4",
     inputNames: ["keys", "block_offset"],
     outputNames: ["row_order", "sorted_keys", "inverse_order"],
     source: """
@@ -811,25 +839,31 @@ private let routeCsortPrefillScatterKernel: MLXFast.MLXFastKernel = MLXFast.meta
         uint b = threadgroup_position_in_grid.x;
         uint k = thread_position_in_threadgroup.x;
         uint n = keys_shape[0];
-        uint idx = b * BLOCK + k;
-        // Tail block: the sentinel is outside the proven key space (keys are
-        // below the 256-wide counter table), so it can never tie a real key.
-        uint key = (idx < n) ? keys[idx] : 0xffffffffu;
         threadgroup uint tg_keys[BLOCK];
-        tg_keys[k] = key;
+        // Stage the whole block first (stride-general over BLOCK/WIDTH
+        // passes). Tail entries take the sentinel, which is outside the
+        // proven key space and can never tie a real key.
+        for (uint j = k; j < BLOCK; j += WIDTH) {
+            uint idx = b * BLOCK + j;
+            tg_keys[j] = (idx < n) ? keys[idx] : 0xffffffffu;
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (idx < n) {
-            // Stable local rank: earlier keys in this block only. Read in
-            // index order from threadgroup memory, so no write position ever
-            // depends on scheduling.
-            uint rank = 0u;
-            for (uint j = 0; j < k; ++j) {
-                rank += (tg_keys[j] == key) ? 1u : 0u;
+        for (uint j = k; j < BLOCK; j += WIDTH) {
+            uint idx = b * BLOCK + j;
+            if (idx < n) {
+                uint key = tg_keys[j];
+                // Stable local rank: earlier indices in this block only.
+                // Read in index order from threadgroup memory, so no write
+                // position ever depends on scheduling.
+                uint rank = 0u;
+                for (uint i = 0; i < j; ++i) {
+                    rank += (tg_keys[i] == key) ? 1u : 0u;
+                }
+                uint pos = block_offset[b * WIDTH + key] + rank;
+                row_order[pos] = idx / (uint)M;
+                sorted_keys[pos] = key;
+                inverse_order[idx] = pos;
             }
-            uint pos = block_offset[b * WIDTH + key] + rank;
-            row_order[pos] = idx / (uint)M;
-            sorted_keys[pos] = key;
-            inverse_order[idx] = pos;
         }
         """,
     ensureRowContiguous: true
@@ -871,6 +905,9 @@ private func routeCountingSortPrefill(
     let outputs = routeCsortPrefillScatterKernel(
         [indices, offsets],
         template: [("M", m)],
+        // One WIDTH-wide threadgroup per block: at WIDTH == BLOCK every
+        // thread touches one key; the stride loop generalizes to smaller
+        // widths without touching past tg_keys[BLOCK].
         grid: (blocks * width, 1, 1),
         threadGroup: (width, 1, 1),
         outputShapes: [[n], [n], [n]],

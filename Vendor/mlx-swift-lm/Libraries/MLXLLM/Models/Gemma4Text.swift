@@ -1,6 +1,7 @@
 //
 //  Gemma4Text.swift
 //  mlx-swift-lm
+//  Yukon controlled redraw 3/3 from 2f319d4: documentation only.
 //
 //  Port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/gemma4_text.py
 

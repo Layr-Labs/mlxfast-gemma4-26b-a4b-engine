@@ -141,6 +141,18 @@ func validateGenericWorkerRequest(
         throw MLXFastError.invalidInput(
             "the generic decode session is poisoned after an earlier failure")
     }
+    // A deferred timed run seals the live engine/session until its one
+    // untimed evidence boundary completes. Fence every other kind here,
+    // before any kind-specific validation can admit a handler that touches
+    // allocator, model, or GPU state. `free_decode_finalize` continues below
+    // so its own wire-shape checks remain authoritative.
+    if context.hasPendingFreeRunFinalize,
+        request.kind != "free_decode_finalize"
+    {
+        throw MLXFastError.invalidInput(
+            "runtime worker request '\(request.kind)' refused while "
+                + "free_decode_finalize is pending")
+    }
     // 2. A `spec` may ride only when this worker advertised the v1.1 surface at
     //    spawn. Gated off, the speculative surface does not exist, so a spec on
     //    ANY kind is a protocol violation — reject rather than silently ignore.
@@ -246,10 +258,6 @@ func validateGenericWorkerRequest(
         return RuntimeWorkerValidatedRequest(effectiveSpec: effective)
 
     case "free_decode_begin":
-        guard !context.hasPendingFreeRunFinalize else {
-            throw MLXFastError.invalidInput(
-                "runtime worker free_decode_begin while a timed run awaits finalize")
-        }
         // v1.2 (COHORT): presence of either cohort field selects the cohort
         // form — validated as such, never silently narrowed to single-stream.
         // The v1.1 branch below is byte-for-byte the pre-cohort behavior.
@@ -269,10 +277,6 @@ func validateGenericWorkerRequest(
                 request.spec, specRegistry: specRegistry))
 
     case "free_decode_run":
-        guard !context.hasPendingFreeRunFinalize else {
-            throw MLXFastError.invalidInput(
-                "runtime worker free_decode_run while a finalize is pending")
-        }
         // v1.2 (COHORT): a present `batch_size` selects the cohort form, which
         // sequences against the batched begin's sealed width instead of the
         // single-stream route. An open cohort phase conversely refuses the
@@ -313,10 +317,6 @@ func validateGenericWorkerRequest(
         return RuntimeWorkerValidatedRequest(freeRunCount: n)
 
     case "free_decode_run_timed":
-        guard !context.hasPendingFreeRunFinalize else {
-            throw MLXFastError.invalidInput(
-                "runtime worker free_decode_run_timed while a finalize is pending")
-        }
         guard request.batchSize == nil, context.cohortBatchSize == nil else {
             throw MLXFastError.invalidInput(
                 "runtime worker free_decode_run_timed is single-stream only")
@@ -395,10 +395,6 @@ func validateGenericWorkerRequest(
             cohortReferenceReplay: try validateCohortReferenceReplay(request))
 
     case "phase_diagnostics":
-        guard !context.hasPendingFreeRunFinalize else {
-            throw MLXFastError.invalidInput(
-                "runtime worker phase_diagnostics before free_decode_finalize")
-        }
         return RuntimeWorkerValidatedRequest()
 
     default:

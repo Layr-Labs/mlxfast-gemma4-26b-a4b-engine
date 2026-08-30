@@ -183,17 +183,42 @@ func deferredFreeRunRequiresExactlyOneUntimedFinalize() throws {
     #expect(rejection(#"{"id":3,"kind":"free_decode_finalize"}"#, context: pending) == nil)
     #expect(
         rejection(
-            #"{"id":4,"kind":"free_decode_run_timed","count":8}"#,
+            #"{"id":4,"kind":"free_decode_finalize","count":1}"#,
             context: pending)
-            == "runtime worker free_decode_run_timed while a finalize is pending")
-    #expect(
-        rejection(
-            #"{"id":5,"kind":"free_decode_begin","seed_tokens":[1]}"#,
-            context: pending)
-            == "runtime worker free_decode_begin while a timed run awaits finalize")
-    #expect(
-        rejection(#"{"id":6,"kind":"phase_diagnostics"}"#, context: pending)
-            == "runtime worker phase_diagnostics before free_decode_finalize")
+            == "runtime worker free_decode_finalize must not carry count")
+}
+
+@Test
+func pendingFinalizeBlocksEveryOtherRecognizedVerbAndUnknownKind() throws {
+    let pending = RuntimeWorkerRequestContext(
+        hasDecodeRoute: true,
+        advertisesSpeculativeProtocol: true,
+        hasPendingFreeRunFinalize: true)
+    let blockedKinds = [
+        "correctness",
+        "correctness_begin",
+        "correctness_step",
+        "prefill",
+        "decode_begin",
+        "decode_step",
+        "free_decode_begin",
+        "free_decode_run",
+        "free_decode_run_timed",
+        "record_reference_begin",
+        "record_reference_run",
+        "cohort_reference_replay",
+        "phase_diagnostics",
+        "representative_unknown_kind",
+    ]
+
+    for (id, kind) in blockedKinds.enumerated() {
+        #expect(
+            rejection(
+                #"{"id":\#(id),"kind":"\#(kind)"}"#,
+                context: pending)
+                == "runtime worker request '\(kind)' refused while "
+                    + "free_decode_finalize is pending")
+    }
 }
 
 // MARK: - Guard 5: a teacher-forced decode_begin is serial-only

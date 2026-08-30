@@ -29,65 +29,19 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     private static let headDim = 256
     private static let sequenceLength = 1024
 
-    /// PARTITION-001: the stock partition count, sized for ONE row.
-    ///
-    /// `sdpa_vector_2pass` picks `blocks` from the architecture letter, the key
-    /// length and `n_simds = GQA * qL` alone
-    /// (`scaled_dot_product_attention.cpp:443-476`). Batch never enters the
-    /// choice, because the stock call it was tuned for dispatches one row: at
-    /// N=1024/GQA=2 it wants 128 threadgroup columns on a `d` part to keep the
-    /// machine busy with `kvHeads * 1 * blocks` threadgroups.
-    ///
-    /// This dispatch is batch-wide. `kvHeads * batch * blocks` threadgroups is
-    /// eight times what the heuristic was solving for, so the stock answer
-    /// over-partitions by 8x and pays for it in the pass-A/pass-B scratch
-    /// round trip, which is `batch * queryHeads * blocks * D` BF16 written and
-    /// read once each per sliding layer.
-    private static let stockBlocks: Int = {
-        switch MLX.GPU.deviceInfo().architecture.last {
-        case "s": return 64
-        case "d": return 128
-        default: return 32
-        }
-    }()
-
-    /// PARTITION-002: the partition this dispatch actually uses.
-    ///
-    /// PARTITION-001 stopped at 32 for a reason that was about the merge
-    /// kernel, not about the machine: pass B indexed its columns with one SIMD
-    /// lane each and looped `BLOCKS / simd_width` times, so a partition below a
-    /// simdgroup silently merged nothing. That loop is now lane-guarded and
-    /// admits any partition that divides the ring, which lets the occupancy
-    /// argument finish.
-    ///
-    /// The stock heuristic's answer is an occupancy target expressed in
-    /// threadgroups: on a `d` part at N=1024 and `n_simds = 2` it asks for
-    /// `kvHeads * 1 * 128 = 1024` of them, because the call it was tuned for
-    /// dispatches one row. This dispatch carries eight rows, so the partition
-    /// that reaches the same target is `128 / 8 = 16`, and the whole span from
-    /// 8 to 16 clears it: at 8 the launch is still 512 threadgroups of two
-    /// simdgroups, and each of those simdgroups keeps a 512-byte K load and a
-    /// 512-byte V load outstanding, so roughly 1 MB is in flight against the
-    /// ~225 KB a 450 GB/s part needs to cover its own DRAM latency.
-    ///
-    /// Everything below the target is scratch that does not have to be written.
-    /// `MLX_SDPA_BLOCKS` keeps its stock meaning and still wins, so a process
-    /// can never run mismatched partitions; `DARKBLOOM_CBV2_2PASS_BLOCKS`
-    /// restores the stock answer (`=0`) or selects any other divisor of the
-    /// ring for bisection.
+    /// Mirrors `sdpa_vector_2pass` at N=1024 and qL=1/GQA=2. Honor the same
+    /// diagnostic override so a process can never run mismatched partitions.
     private static let blocks: Int = {
         if let raw = ProcessInfo.processInfo.environment["MLX_SDPA_BLOCKS"],
             let value = Int(raw), value > 0
         {
             return value
         }
-        if let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_2PASS_BLOCKS"], let value = Int(raw)
-        {
-            return value > 0 && sequenceLength.isMultiple(of: value)
-                ? value : stockBlocks
+        switch MLX.GPU.deviceInfo().architecture.last {
+        case "s": return 64
+        case "d": return 128
+        default: return 32
         }
-        return min(8, stockBlocks)
     }()
 
     private static let passAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
@@ -388,25 +342,19 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     )
 
     private static let passBKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_2pass_b_direct_bf16_d256_b\(blocks)_v3",
+        name: "cbv2_ragged8_sdpa_2pass_b_direct_bf16_d256_b\(blocks)_v2",
         inputNames: ["partials", "sums", "maxs"],
         outputNames: ["out"],
         source: """
             constexpr int simd_width = 32;
             constexpr int values_per_lane = D / simd_width;
-            // One lane per partition column, so a partition narrower than a
-            // simdgroup parks the surplus lanes on the identity of each
-            // reduction rather than dropping columns. At BLOCKS >= simd_width
-            // every lane is live in every round and the guard is the constant
-            // true, which leaves the arithmetic and its order untouched.
-            constexpr int rounds = (BLOCKS + simd_width - 1) / simd_width;
 
             const int batch_head = int(threadgroup_position_in_grid.x);
             const int output_group = int(simdgroup_index_in_threadgroup);
             const int block_lane = int(thread_index_in_simdgroup);
 
             partials += batch_head * BLOCKS * D
-                + output_group * values_per_lane;
+                + block_lane * D + output_group * values_per_lane;
             sums += batch_head * BLOCKS;
             maxs += batch_head * BLOCKS;
             out += batch_head * D + output_group * values_per_lane;
@@ -417,32 +365,29 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             }
             float sum_exp_score = 0.0f;
             float max_score = -3.402823466e+38F;
-            for (int round = 0; round < rounds; ++round) {
-                const int column = block_lane + simd_width * round;
-                if (column < BLOCKS) {
-                    max_score = max(max_score, maxs[column]);
-                }
+            for (int block = 0; block < BLOCKS / simd_width; ++block) {
+                max_score = max(
+                    max_score, maxs[block_lane + simd_width * block]);
             }
             max_score = simd_max(max_score);
 
-            for (int round = 0; round < rounds; ++round) {
-                const int column = block_lane + simd_width * round;
-                if (column < BLOCKS) {
-                    sum_exp_score +=
-                        fast::exp(maxs[column] - max_score) * sums[column];
-                }
+            for (int block = 0; block < BLOCKS / simd_width; ++block) {
+                const float factor = fast::exp(
+                    maxs[block_lane + simd_width * block] - max_score);
+                sum_exp_score +=
+                    factor * sums[block_lane + simd_width * block];
             }
             sum_exp_score = simd_sum(sum_exp_score);
 
-            for (int round = 0; round < rounds; ++round) {
-                const int column = block_lane + simd_width * round;
-                if (column < BLOCKS) {
-                    const float factor = fast::exp(maxs[column] - max_score);
-                    for (int element = 0; element < values_per_lane; ++element) {
-                        accumulator[element] +=
-                            factor * float(partials[column * D + element]);
-                    }
+            for (int block = 0; block < BLOCKS / simd_width; ++block) {
+                const float factor = fast::exp(maxs[block_lane] - max_score);
+                for (int element = 0; element < values_per_lane; ++element) {
+                    accumulator[element] +=
+                        factor * float(partials[element]);
                 }
+                maxs += simd_width;
+                sums += simd_width;
+                partials += simd_width * D;
             }
 
             for (int element = 0; element < values_per_lane; ++element) {
@@ -507,7 +452,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     ) -> (output: MLXArray, nextWriteFence: MLXArray)? {
         guard enabled,
             blocks > 0,
-            sequenceLength.isMultiple(of: blocks),
+            blocks.isMultiple(of: 32),
             scale == 1.0,
             slidingWindowLength == sequenceLength,
             queries.dtype == .bfloat16,
@@ -579,7 +524,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     ) -> MLXArray? {
         guard enabled,
             blocks > 0,
-            sequenceLength.isMultiple(of: blocks),
+            blocks.isMultiple(of: 32),
             scale == 1.0,
             queries.dtype == .bfloat16,
             queries.shape == [batch, queryHeads, 1, headDim],

@@ -53,7 +53,7 @@ struct MTPVerificationStrategySealTests {
     /// the chip-independent `.serialTarget` oracle — the only strategy whose
     /// verify columns are bit-identical to ordinary serial decode BY
     /// CONSTRUCTION — while keeping the speculative apparatus fully armed
-    /// (enabled, adaptive depth, the pinned batch gate). A `.automatic` seal
+    /// (enabled, request-fixed depth, the pinned batch gate). A `.automatic` seal
     /// with a positive rectangular cap is an argmax-exactness claim for the
     /// deployed chip/OS/MLX/model tuple that this engine cannot make (no
     /// certification artifact exists; the 2026-08-25 box run refuted it).
@@ -73,7 +73,7 @@ struct MTPVerificationStrategySealTests {
             // work stays configured exactly as before.
             #expect(config.enabled)
             #expect(config.maxDraftTokens == depth)
-            #expect(config.fixedDraftTokens == nil)
+            #expect(config.fixedDraftTokens == depth)
             #expect(config.maxSpeculativeBatch == 8)
         }
     }

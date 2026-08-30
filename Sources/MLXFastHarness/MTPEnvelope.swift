@@ -226,7 +226,7 @@ enum Gemma4MTPEnvelope {
             enabled: true,
             maxDraftTokens: depth,
             maxSpeculativeBatch: 8,
-            fixedDraftTokens: nil,
+            fixedDraftTokens: depth,
             verificationMode: .serialTarget,
             maxAutomaticRectangularTokens: maxAutomaticRectangularTokens
         )

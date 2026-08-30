@@ -347,6 +347,54 @@ inline void qdot_affine4_pair(
   out1 = scale * accum1 + sum1 * bias;
 }
 
+inline float qdot_affine4_g64_word(
+    uint v,
+    const thread float* x_thread,
+    float scale,
+    float bias,
+    float sum) {
+  const uint lo = v & 0x0000FFFFu;
+  const uint hi = v >> 16;
+  float accum = 0;
+  accum +=
+      (x_thread[0] * float(lo & 0x000fu) + x_thread[1] * float(lo & 0x00f0u) +
+       x_thread[2] * float(lo & 0x0f00u) + x_thread[3] * float(lo & 0xf000u));
+  accum +=
+      (x_thread[4] * float(hi & 0x000fu) + x_thread[5] * float(hi & 0x00f0u) +
+       x_thread[6] * float(hi & 0x0f00u) + x_thread[7] * float(hi & 0xf000u));
+  return scale * accum + sum * bias;
+}
+
+inline void qdot_affine4_pair_word(
+    uint v,
+    const thread float* x0,
+    const thread float* x1,
+    float scale,
+    float bias,
+    float sum0,
+    float sum1,
+    thread float& out0,
+    thread float& out1) {
+  const uint lo = v & 0x0000FFFFu;
+  const uint hi = v >> 16;
+  float accum0 = 0;
+  float accum1 = 0;
+  accum0 +=
+      (x0[0] * float(lo & 0x000fu) + x0[1] * float(lo & 0x00f0u) +
+       x0[2] * float(lo & 0x0f00u) + x0[3] * float(lo & 0xf000u));
+  accum1 +=
+      (x1[0] * float(lo & 0x000fu) + x1[1] * float(lo & 0x00f0u) +
+       x1[2] * float(lo & 0x0f00u) + x1[3] * float(lo & 0xf000u));
+  accum0 +=
+      (x0[4] * float(hi & 0x000fu) + x0[5] * float(hi & 0x00f0u) +
+       x0[6] * float(hi & 0x0f00u) + x0[7] * float(hi & 0xf000u));
+  accum1 +=
+      (x1[4] * float(hi & 0x000fu) + x1[5] * float(hi & 0x00f0u) +
+       x1[6] * float(hi & 0x0f00u) + x1[7] * float(hi & 0xf000u));
+  out0 = scale * accum0 + sum0 * bias;
+  out1 = scale * accum1 + sum1 * bias;
+}
+
 // One affine-8 dot product against a byte weight vector ALREADY held in
 // registers. Byte-for-byte the bits == 8 arm of qdot: same per-element
 // multiply, same accumulation order over i, same `scale * accum + sum * bias`
@@ -732,6 +780,27 @@ struct QuantizedBlockLoader {
 
     T scale = *scales;
     T bias = *biases;
+    if (bits == 4 && n_reads == 4) {
+      const uint32_t packed_w = *reinterpret_cast<const device uint32_t*>(src);
+      const T s0 = scale;
+      const T s1 = scale / static_cast<T>(16.0f);
+      const uint32_t b0 = packed_w & 0x000000FF;
+      const uint32_t b1 = (packed_w >> 8) & 0x000000FF;
+      const uint32_t b2 = (packed_w >> 16) & 0x000000FF;
+      const uint32_t b3 = packed_w >> 24;
+
+      threadgroup T* dst_p = dst;
+      dst_p[0] = s0 * static_cast<T>(b0 & 0x0F) + bias;
+      dst_p[1] = s1 * static_cast<T>(b0 & 0xF0) + bias;
+      dst_p[2] = s0 * static_cast<T>(b1 & 0x0F) + bias;
+      dst_p[3] = s1 * static_cast<T>(b1 & 0xF0) + bias;
+      dst_p[4] = s0 * static_cast<T>(b2 & 0x0F) + bias;
+      dst_p[5] = s1 * static_cast<T>(b2 & 0xF0) + bias;
+      dst_p[6] = s0 * static_cast<T>(b3 & 0x0F) + bias;
+      dst_p[7] = s1 * static_cast<T>(b3 & 0xF0) + bias;
+      return;
+    }
+
     for (int i = 0; i < n_reads; i++) {
       dequantize<T, pack_factor, bits>(
           src + i * bytes_per_pack, scale, bias, dst + i * pack_factor);
@@ -759,6 +828,27 @@ struct QuantizedBlockLoader {
 
     T scale = *scales;
     T bias = *biases;
+    if (bits == 4 && n_reads == 4) {
+      const uint32_t packed_w = *reinterpret_cast<const device uint32_t*>(src);
+      const T s0 = scale;
+      const T s1 = scale / static_cast<T>(16.0f);
+      const uint32_t b0 = packed_w & 0x000000FF;
+      const uint32_t b1 = (packed_w >> 8) & 0x000000FF;
+      const uint32_t b2 = (packed_w >> 16) & 0x000000FF;
+      const uint32_t b3 = packed_w >> 24;
+
+      threadgroup T* dst_p = dst;
+      dst_p[0] = s0 * static_cast<T>(b0 & 0x0F) + bias;
+      dst_p[1] = s1 * static_cast<T>(b0 & 0xF0) + bias;
+      dst_p[2] = s0 * static_cast<T>(b1 & 0x0F) + bias;
+      dst_p[3] = s1 * static_cast<T>(b1 & 0xF0) + bias;
+      dst_p[4] = s0 * static_cast<T>(b2 & 0x0F) + bias;
+      dst_p[5] = s1 * static_cast<T>(b2 & 0xF0) + bias;
+      dst_p[6] = s0 * static_cast<T>(b3 & 0x0F) + bias;
+      dst_p[7] = s1 * static_cast<T>(b3 & 0xF0) + bias;
+      return;
+    }
+
     for (int i = 0; i < n_reads; i++) {
       dequantize<T, pack_factor, bits>(
           (device uint8_t*)(src + i * bytes_per_pack),
@@ -1513,19 +1603,35 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   y0 += out_row;
   y1 += out_row;
 
+  thread uint wpf[results_per_simdgroup];
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    wpf[row] = *((const device uint*)(ws + row * in_vec_size_w));
+  }
+
   int k = 0;
   for (; k <= in_vec_size - block_size; k += block_size) {
     float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
     float sum1 = load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
 
+    thread uint wcur[results_per_simdgroup];
     for (int row = 0; row < results_per_simdgroup; row++) {
-      const device uint8_t* wl = ws + row * in_vec_size_w;
+      wcur[row] = wpf[row];
+    }
+    const int next_k = k + block_size;
+    const device uint8_t* wsn = (next_k <= in_vec_size - block_size)
+        ? (ws + block_size / 2)
+        : ws;
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      wpf[row] = *((const device uint*)(wsn + row * in_vec_size_w));
+    }
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
       const device T* sl = scales + row * in_vec_size_g;
       const device T* bl = biases + row * in_vec_size_g;
       float dot0;
       float dot1;
-      qdot_affine4_pair<float, values_per_thread>(
-          wl, x0_thread, x1_thread, sl[0], bl[0], sum0, sum1, dot0, dot1);
+      qdot_affine4_pair_word(
+          wcur[row], x0_thread, x1_thread, sl[0], bl[0], sum0, sum1, dot0, dot1);
       result0[row] += dot0;
       result1[row] += dot1;
     }
@@ -1549,13 +1655,13 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
     float sum1 =
         load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      const device uint8_t* wl = ws + row * in_vec_size_w;
       const device T* sl = scales + row * in_vec_size_g;
       const device T* bl = biases + row * in_vec_size_g;
+      const uint v = *((const device uint*)(ws + row * in_vec_size_w));
       float dot0;
       float dot1;
-      qdot_affine4_pair<float, values_per_thread>(
-          wl, x0_thread, x1_thread, sl[0], bl[0], sum0, sum1, dot0, dot1);
+      qdot_affine4_pair_word(
+          v, x0_thread, x1_thread, sl[0], bl[0], sum0, sum1, dot0, dot1);
       result0[row] += dot0;
       result1[row] += dot1;
     }
@@ -1616,12 +1722,11 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
   constexpr int values_per_thread = 8;
   constexpr int block_size = values_per_thread * SIMD_SIZE;
   constexpr int bytes_per_thread = 4;
-  constexpr int uint16_per_thread = bytes_per_thread / 2;
   constexpr int scale_step_per_thread = 8;
 
   const device uint8_t* ws = (const device uint8_t*)w;
   thread float x_thread[values_per_thread];
-  thread uint16_t packed[results_per_simdgroup][uint16_per_thread];
+  thread uint packed[results_per_simdgroup];
   thread float scale_local[results_per_simdgroup];
   thread float bias_local[results_per_simdgroup];
   thread float result0[results_per_simdgroup] = {0};
@@ -1649,33 +1754,29 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
   int k = 0;
   for (; k <= in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
-      const device uint16_t* wl =
-          (const device uint16_t*)(ws + row * in_vec_size_w);
-      for (int i = 0; i < uint16_per_thread; i++) {
-        packed[row][i] = wl[i];
-      }
+      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }
 
     float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result0[row] += qdot_affine4_registered<float, values_per_thread>(
+      result0[row] += qdot_affine4_g64_word(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result1[row] += qdot_affine4_registered<float, values_per_thread>(
+      result1[row] += qdot_affine4_g64_word(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result2[row] += qdot_affine4_registered<float, values_per_thread>(
+      result2[row] += qdot_affine4_g64_word(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x3, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result3[row] += qdot_affine4_registered<float, values_per_thread>(
+      result3[row] += qdot_affine4_g64_word(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
 
@@ -1694,11 +1795,7 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
       values_per_thread);
   if (remaining > 0) {
     for (int row = 0; row < results_per_simdgroup; row++) {
-      const device uint16_t* wl =
-          (const device uint16_t*)(ws + row * in_vec_size_w);
-      for (int i = 0; i < uint16_per_thread; i++) {
-        packed[row][i] = wl[i];
-      }
+      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }
@@ -1706,25 +1803,25 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     float sum =
         load_vector_safe<T, float, values_per_thread, 4>(x0, x_thread, remaining);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result0[row] += qdot_affine4_registered<float, values_per_thread>(
+      result0[row] += qdot_affine4_g64_word(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
         load_vector_safe<T, float, values_per_thread, 4>(x1, x_thread, remaining);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result1[row] += qdot_affine4_registered<float, values_per_thread>(
+      result1[row] += qdot_affine4_g64_word(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
         load_vector_safe<T, float, values_per_thread, 4>(x2, x_thread, remaining);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result2[row] += qdot_affine4_registered<float, values_per_thread>(
+      result2[row] += qdot_affine4_g64_word(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
         load_vector_safe<T, float, values_per_thread, 4>(x3, x_thread, remaining);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result3[row] += qdot_affine4_registered<float, values_per_thread>(
+      result3[row] += qdot_affine4_g64_word(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
   }
@@ -1768,12 +1865,11 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
   constexpr int values_per_thread = 8;
   constexpr int block_size = values_per_thread * SIMD_SIZE;
   constexpr int bytes_per_thread = 4;
-  constexpr int uint16_per_thread = bytes_per_thread / 2;
   constexpr int scale_step_per_thread = 8;
 
   const device uint8_t* ws = (const device uint8_t*)w;
   thread float x_thread[values_per_thread];
-  thread uint16_t packed[results_per_simdgroup][uint16_per_thread];
+  thread uint packed[results_per_simdgroup];
   thread float scale_local[results_per_simdgroup];
   thread float bias_local[results_per_simdgroup];
   thread float result0[results_per_simdgroup] = {0};
@@ -1798,28 +1894,24 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
   int k = 0;
   for (; k <= in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
-      const device uint16_t* wl =
-          (const device uint16_t*)(ws + row * in_vec_size_w);
-      for (int i = 0; i < uint16_per_thread; i++) {
-        packed[row][i] = wl[i];
-      }
+      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }
 
     float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result0[row] += qdot_affine4_registered<float, values_per_thread>(
+      result0[row] += qdot_affine4_g64_word(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result1[row] += qdot_affine4_registered<float, values_per_thread>(
+      result1[row] += qdot_affine4_g64_word(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result2[row] += qdot_affine4_registered<float, values_per_thread>(
+      result2[row] += qdot_affine4_g64_word(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
 
@@ -1837,11 +1929,7 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
       values_per_thread);
   if (remaining > 0) {
     for (int row = 0; row < results_per_simdgroup; row++) {
-      const device uint16_t* wl =
-          (const device uint16_t*)(ws + row * in_vec_size_w);
-      for (int i = 0; i < uint16_per_thread; i++) {
-        packed[row][i] = wl[i];
-      }
+      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }
@@ -1849,19 +1937,19 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
     float sum =
         load_vector_safe<T, float, values_per_thread, 4>(x0, x_thread, remaining);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result0[row] += qdot_affine4_registered<float, values_per_thread>(
+      result0[row] += qdot_affine4_g64_word(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
         load_vector_safe<T, float, values_per_thread, 4>(x1, x_thread, remaining);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result1[row] += qdot_affine4_registered<float, values_per_thread>(
+      result1[row] += qdot_affine4_g64_word(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
         load_vector_safe<T, float, values_per_thread, 4>(x2, x_thread, remaining);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result2[row] += qdot_affine4_registered<float, values_per_thread>(
+      result2[row] += qdot_affine4_g64_word(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
   }
@@ -3603,30 +3691,6 @@ template <typename T, int group_size, int bits>
       simd_lid);
 }
 
-// One affine-4 dot product against a packed weight WORD (32 values / 8
-// nibbles) held in registers. Byte-for-byte the bits == 4 /
-// values_per_thread == 8 arm of `qdot`: `ws[0]` is the low half-word and
-// `ws[1]` the high half-word of the same aligned uint, so the four nibble
-// masks, the two 4-term sums, the accumulation order over i and the
-// `scale * accum + sum * bias` close are unchanged. Only the load shape
-// differs -- one 4-byte load instead of two 2-byte loads.
-inline float qdot_affine4_g64_word(
-    uint v,
-    const thread float* x_thread,
-    float scale,
-    float bias,
-    float sum) {
-  const uint lo = v & 0x0000FFFFu;
-  const uint hi = v >> 16;
-  float accum = 0;
-  accum +=
-      (x_thread[0] * float(lo & 0x000fu) + x_thread[1] * float(lo & 0x00f0u) +
-       x_thread[2] * float(lo & 0x0f00u) + x_thread[3] * float(lo & 0xf000u));
-  accum +=
-      (x_thread[4] * float(hi & 0x000fu) + x_thread[5] * float(hi & 0x00f0u) +
-       x_thread[6] * float(hi & 0x0f00u) + x_thread[7] * float(hi & 0xf000u));
-  return scale * accum + sum * bias;
-}
 // EXPERT-SINGLES: the SINGLETON arm of the routed-expert gather QMV.
 // Diverse decode routing (8 streams x top-8 over 128 experts, sorted into
 // 64 assignments) leaves most runs at length ONE, so the RUN-QUAD leader
@@ -4074,6 +4138,18 @@ template <typename T, int group_size, int bits>
     const device T* single_scales = scales + expert * s_strides[0];
     const device T* single_biases = biases + expert * b_strides[0];
     device T* single_y = y + assignment * (uint)out_vec_size;
+    if (in_vec_size == 2816) {
+      qmv_affine4_g64_singles_impl<T, group_size, bits, 2816, true, false>(
+          single_w, single_scales, single_biases, single_x, single_y,
+          in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+      return;
+    }
+    if (in_vec_size == 704) {
+      qmv_affine4_g64_singles_impl<T, group_size, bits, 704, true, false>(
+          single_w, single_scales, single_biases, single_x, single_y,
+          in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+      return;
+    }
     qmv_impl<T, group_size, bits>(
         single_w, single_scales, single_biases, single_x, single_y,
         in_vec_size, out_vec_size, tid, simd_gid, simd_lid);

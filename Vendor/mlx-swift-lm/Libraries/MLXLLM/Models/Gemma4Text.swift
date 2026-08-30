@@ -79,8 +79,20 @@ internal func gemma4ShouldSubmitDecodeAsyncEvalLadder(
     //
     // The empty-set row is the control that matters: this is not "fewer is
     // always better", it is "the early pair carries all of the overlap".
+    //
+    // LADDER-ZIP-EXTEND: the table above was swept on a tree whose MoE layer
+    // emitted the router chain and the dense chain as two separate straight
+    // runs. ZIP-ROUTER-001 now interleaves them and fences the expert branch
+    // behind the dense tail, which adds host-side graph construction per MoE
+    // layer without adding any GPU work. Host build per layer therefore got
+    // more expensive relative to the device queue, so the layer at which the
+    // GPU stops starving moves later and the early run is one layer short of
+    // where it was measured. The {0,1,11,23} row prices the cost of a third
+    // and fourth boundary at zero within the noise floor, so extending the
+    // early run cannot pay the fragmentation penalty the full seven-boundary
+    // cadence pays.
     switch layerIndex {
-    case 0, 1:
+    case 0, 1, 2:
         return true
     default:
         return false

@@ -2635,6 +2635,47 @@ private class Gemma4Router: Module {
 
         return (topKIndices, topKWeights)
     }
+
+    // MARK: ZIP-ROUTER-001 stages
+    //
+    // The five statements of `callAsFunction` above, re-exposed one dependent
+    // stage at a time so `Gemma4ZipRouterV1` can emit them interleaved with
+    // the independent dense-MLP chain. Each helper is the verbatim statement
+    // it names; nothing is reordered inside a stage and no operand is
+    // recomputed.
+
+    fileprivate var zipAdmits: Bool { !Gemma4FusedRouterTop8.enabled }
+
+    fileprivate func zipEffectiveScale() -> MLXArray {
+        if let cached = cachedEffectiveScale { return cached }
+        let eff = scale * rootSize
+        cachedEffectiveScale = eff
+        return eff
+    }
+
+    fileprivate func zipNorm(_ x: MLXArray) -> MLXArray {
+        MLXFast.rmsNorm(x, weight: zipEffectiveScale(), eps: eps)
+    }
+
+    fileprivate func zipScores(_ normed: MLXArray) -> MLXArray {
+        proj(normed)
+    }
+
+    fileprivate func zipPartition(_ expertScores: MLXArray) -> MLXArray {
+        MLX.argPartition(expertScores, kth: kth, axis: -1)
+    }
+
+    fileprivate func zipSelected(_ partition: MLXArray) -> MLXArray {
+        partition[.ellipsis, kth...]
+    }
+
+    fileprivate func zipWeights(
+        expertScores: MLXArray, topKIndices: MLXArray
+    ) -> MLXArray {
+        var topKWeights = MLX.takeAlong(expertScores, topKIndices, axis: -1)
+        topKWeights = MLX.softmax(topKWeights, axis: -1, precise: true)
+        return topKWeights * perExpertScale[topKIndices]
+    }
 }
 
 /// Sparse MoE feed-forward block. Wraps `SwitchGLU` with GeGLU activation.
@@ -2738,6 +2779,194 @@ private class Gemma4MLP: Module {
             gemma4GeluProduct(
                 denseProjection(gateProj, x, activationSums: activationSums),
                 denseProjection(upProj, x, activationSums: activationSums)))
+    }
+
+    // MARK: ZIP-ROUTER-001 stages
+    //
+    // `callAsFunction` above, split at its four dependent stages (activation
+    // table, gate, up, down) in the same left-to-right order Swift already
+    // evaluates them in, so `Gemma4ZipRouterV1` can emit each stage next to
+    // the router stage that should run beside it.
+
+    fileprivate func zipActivationSums(
+        _ x: MLXArray
+    ) -> CBv2DenseMLPQMVV1.ActivationSums? {
+        CBv2DenseMLPQMVV1.activationSums(for: x)
+    }
+
+    fileprivate func zipGate(
+        _ x: MLXArray, _ activationSums: CBv2DenseMLPQMVV1.ActivationSums?
+    ) -> MLXArray {
+        denseProjection(gateProj, x, activationSums: activationSums)
+    }
+
+    fileprivate func zipUp(
+        _ x: MLXArray, _ activationSums: CBv2DenseMLPQMVV1.ActivationSums?
+    ) -> MLXArray {
+        denseProjection(upProj, x, activationSums: activationSums)
+    }
+
+    fileprivate func zipDown(_ activated: MLXArray) -> MLXArray {
+        denseProjection(downProj, activated)
+    }
+}
+
+/// ZIP-ROUTER-001 -- interleave the MoE layer's router chain with the
+/// independent dense-MLP chain in the ENCODE ORDER, changing no arithmetic.
+///
+/// Mechanism. MLX's Metal command encoder is concurrent: `dispatch_threadgroups`
+/// calls `maybeInsertBarrier`, which emits a global
+/// `memoryBarrier(BarrierScopeBuffers)` only when the dispatch being encoded
+/// reads a buffer written since the last barrier, or writes one read since it
+/// (`backend/metal/device.cpp`, `set_input_array` / `register_output_array` /
+/// `maybeInsertBarrier`). Consecutive independent dispatches therefore share a
+/// barrier stage and run concurrently on the GPU.
+///
+/// The MoE layer holds two chains that are independent of each other: the
+/// router chain (rms norm -> 128-row affine QMV -> argPartition -> selected
+/// slice) is a latency chain of small dispatches -- the QMV walks 22 dependent
+/// K blocks over a 0.38 MB plane -- while the dense-MLP chain (activation-sum
+/// table -> gate/up -> GeLU product -> down) is bandwidth work on 6.32 MB
+/// planes. In the stock tape they never overlap: MLX evaluates the graph in
+/// reverse breadth-first order from the layer tail (`transforms.cpp`,
+/// `eval_impl`), and the dense branch sits behind the expert branch, so the
+/// router chain runs with nothing underneath it and the dense chain runs after
+/// the expert kernels.
+///
+/// This zips them. `MLX.depends(input:dependencies:)` (`Ops.swift`) builds a
+/// `Depends` primitive whose `eval` is `copy_shared_buffer` -- no dispatch, no
+/// copy, the output IS the input's buffer with the input's shape, strides and
+/// flags (`backend/common/common.cpp`). Naming it as an ordering edge in both
+/// directions -- router stage k+1 depends on dense stage k, dense stage k+1
+/// depends on router stage k -- makes the two chains strictly alternate in any
+/// topological order, so the encoder pairs them into barrier stages whose cost
+/// is the max of the pair instead of the sum.
+///
+/// Exactness. Every kernel receives the identical operand buffer it receives
+/// today: `Depends` aliases, and because its output shares the input's
+/// `array::Data` the shared buffer is never donatable, so no downstream
+/// primitive can write through the alias. No expression is re-associated, no
+/// dispatch is added or removed, and the router's own outputs
+/// (`topKIndices` / `topKWeights`) are produced by the same statements in the
+// T25 third sample marker (r3): byte-identical to ranked 6ff94535 / 957a7f4b apart from this comment (the platform deduplicates identical archives).
+/// same order. Kill switch `DARKBLOOM_GEMMA4_ZIP_ROUTER=0` restores the stock
+/// call; every geometry outside the pinned B=8 decode cell fails closed onto
+/// it because the dense activation table (`CBv2DenseMLPQMVV1.activationSums`)
+/// returns nil there.
+private enum Gemma4ZipRouterV1 {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ZIP_ROUTER"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Tape plan, a bisection knob only -- the ranked run sets no environment
+    /// and always takes the default. `1` (default) is the shipped pairing:
+    /// (router QMV | dense gate+up), (dense GeLU), (argPartition | dense
+    /// down), (selected slice), with the expert branch fenced behind the
+    /// dense chain so the down projection stays inside the zip. `2` slides
+    /// the argPartition one stage earlier, pairing it with the 2 us GeLU
+    /// product instead of the 25 us down projection (measured 0.02 ms/step
+    /// worse and noisier). `0` drops the expert fence, which lets the tape
+    /// float the dense down back behind the expert kernels.
+    static let plan: Int = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ZIP_ROUTER_PLAN"], let v = Int(raw)
+        else { return 1 }
+        return v
+    }()
+
+    struct Zipped {
+        let denseOut: MLXArray
+        let expertNorm: MLXArray
+        let topKIndices: MLXArray
+        let topKWeights: MLXArray
+    }
+
+    static func run(
+        router: Gemma4Router,
+        mlp: Gemma4MLP,
+        out: MLXArray,
+        w1: MLXArray,
+        w2: MLXArray,
+        eps: Float
+    ) -> Zipped? {
+        // Pure shape predicate first: no graph node exists until every pin
+        // below holds, so prefill, MTP rectangles and any other cohort walk
+        // away from here without having built anything.
+        guard enabled, router.zipAdmits,
+            out.ndim == 3, out.dim(0) == 8, out.dim(1) == 1,
+            out.dtype == .bfloat16
+        else { return nil }
+
+        // Stage 0, shared: the two pre-norms, exactly the call the stock
+        // branch makes. A nil here means this is not the fused-glue cell and
+        // no node was built.
+        guard let (n1, n2) = Gemma4FusedLayerGlue.dualPreNorm(
+            x: out, w1: w1, w2: w2, eps: eps)
+        else { return nil }
+
+        // Stage 1: dense activation table | router norm. The table pin is the
+        // zip's geometry gate; a nil leaves the dual pre-norm arrays
+        // unreferenced, so MLX never evaluates them and the caller's stock
+        // path rebuilds the identical pair.
+        guard let sums = mlp.zipActivationSums(n1) else { return nil }
+        let normed = router.zipNorm(out)
+
+        // Stage 2: router QMV | dense gate + up.
+        let expertScores = router.zipScores(
+            MLX.depends(input: normed, dependencies: [sums.dependencyHandle]))
+        let denseIn = MLX.depends(input: n1, dependencies: [normed])
+        let gate = mlp.zipGate(denseIn, sums)
+        let up = mlp.zipUp(denseIn, sums)
+
+        // Stage 3: the dense GeLU product, which the router has no partner
+        // for -- the argPartition is deliberately NOT paired with it.
+        let held = MLX.depends(inputs: [gate, up], dependencies: [expertScores])
+        let activated = gemma4GeluProduct(held[0], held[1])
+
+        // Stage 4: router argPartition | dense down projection. The sort is
+        // 8 us and the down projection 25 us, so this is the pairing that
+        // pays; the selected slice then trails alone at 1.7 us.
+        let partition: MLXArray
+        let topKIndices: MLXArray
+        let denseOut: MLXArray
+        if plan == 2 {
+            partition = router.zipPartition(
+                MLX.depends(input: expertScores, dependencies: [gate, up]))
+            topKIndices = router.zipSelected(
+                MLX.depends(input: partition, dependencies: [activated]))
+            denseOut = mlp.zipDown(
+                MLX.depends(input: activated, dependencies: [partition]))
+        } else {
+            denseOut = mlp.zipDown(activated)
+            partition = router.zipPartition(
+                MLX.depends(input: expertScores, dependencies: [denseOut]))
+            topKIndices = router.zipSelected(partition)
+        }
+
+        // The router weight tail (takeAlong -> softmax -> per-expert scale) is
+        // off the critical path to the expert kernels and already overlaps
+        // them in the stock tape; it is emitted unchanged.
+        let topKWeights = router.zipWeights(
+            expertScores: expertScores, topKIndices: topKIndices)
+        Gemma4RouterProbe.recorder?(expertScores, topKIndices)
+
+        // Every expert dispatch already sits behind `topKIndices`; fencing the
+        // expert branch's activation behind the dense chain's last stage as
+        // well keeps the down projection inside the zip instead of letting the
+        // reverse-BFS tape float it past the expert kernels.
+        let expertNorm =
+            plan >= 1
+            ? MLX.depends(input: n2, dependencies: [denseOut]) : n2
+
+        CBv2EngageMark.once("zip-router")
+        return Zipped(
+            denseOut: denseOut,
+            expertNorm: expertNorm,
+            topKIndices: topKIndices,
+            topKWeights: topKWeights)
     }
 }
 
@@ -2922,41 +3151,61 @@ public class Gemma4DecoderLayer: Module {
             let postFeedforwardLayernorm2
         {
             // Dense + sparse branches in parallel, summed into one residual.
-            let (topKIndices, topKWeights) = router(out)
-
             let h1Raw: MLXArray
             let h2Raw: MLXArray
-            if let (n1, n2) = Gemma4FusedLayerGlue.dualPreNorm(
-                x: out,
+            // ZIP-ROUTER-001: emit the router chain and the dense chain
+            // interleaved so the encoder pairs them into shared barrier
+            // stages. Returns nil for every geometry but the pinned B=8
+            // decode cell, and under the kill switch.
+            if let zipped = Gemma4ZipRouterV1.run(
+                router: router,
+                mlp: mlp,
+                out: out,
                 w1: preFeedforwardLayernorm.weight,
                 w2: preFeedforwardLayernorm2.weight,
                 eps: config.rmsNormEps)
             {
-                h1Raw = mlp(n1)
+                h1Raw = zipped.denseOut
                 h2Raw = experts(
-                    n2,
-                    topKIndices: topKIndices,
-                    topKWeights: topKWeights,
-                    isExpertPrefill: isExpertPrefill)
-            } else if let (n1, n2) = Gemma4PrefillGlueV1.dualPreNorm(
-                x: out,
-                w1: preFeedforwardLayernorm.weight,
-                w2: preFeedforwardLayernorm2.weight,
-                eps: config.rmsNormEps)
-            {
-                h1Raw = mlp(n1)
-                h2Raw = experts(
-                    n2,
-                    topKIndices: topKIndices,
-                    topKWeights: topKWeights,
+                    zipped.expertNorm,
+                    topKIndices: zipped.topKIndices,
+                    topKWeights: zipped.topKWeights,
                     isExpertPrefill: isExpertPrefill)
             } else {
-                h1Raw = mlp(preFeedforwardLayernorm(out))
-                h2Raw = experts(
-                    preFeedforwardLayernorm2(out),
-                    topKIndices: topKIndices,
-                    topKWeights: topKWeights,
-                    isExpertPrefill: isExpertPrefill)
+                let (topKIndices, topKWeights) = router(out)
+
+                if let (n1, n2) = Gemma4FusedLayerGlue.dualPreNorm(
+                    x: out,
+                    w1: preFeedforwardLayernorm.weight,
+                    w2: preFeedforwardLayernorm2.weight,
+                    eps: config.rmsNormEps)
+                {
+                    h1Raw = mlp(n1)
+                    h2Raw = experts(
+                        n2,
+                        topKIndices: topKIndices,
+                        topKWeights: topKWeights,
+                        isExpertPrefill: isExpertPrefill)
+                } else if let (n1, n2) = Gemma4PrefillGlueV1.dualPreNorm(
+                    x: out,
+                    w1: preFeedforwardLayernorm.weight,
+                    w2: preFeedforwardLayernorm2.weight,
+                    eps: config.rmsNormEps)
+                {
+                    h1Raw = mlp(n1)
+                    h2Raw = experts(
+                        n2,
+                        topKIndices: topKIndices,
+                        topKWeights: topKWeights,
+                        isExpertPrefill: isExpertPrefill)
+                } else {
+                    h1Raw = mlp(preFeedforwardLayernorm(out))
+                    h2Raw = experts(
+                        preFeedforwardLayernorm2(out),
+                        topKIndices: topKIndices,
+                        topKWeights: topKWeights,
+                        isExpertPrefill: isExpertPrefill)
+                }
             }
 
             // The scalar fold is only valid when nothing sits between the

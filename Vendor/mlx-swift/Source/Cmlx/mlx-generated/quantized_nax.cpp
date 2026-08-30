@@ -1622,29 +1622,41 @@ template <
   // Do as many matmuls as necessary
   uint32_t index;
   short offset;
-  uint32_t index_next = indices[y_row];
   short offset_next = 0;
   int n = 0;
   while (n < tgp_bm) {
-    n++;
     offset = offset_next;
-    index = index_next;
-    offset_next = tgp_bm;
-    // gather_qmm_rhs is dispatched only for right-sorted indices. If this
-    // segment's expert matches the tile endpoint, sortedness proves that the
-    // remaining suffix is one segment and the per-row probe can stop here.
-    if (kGatherRhsSortedEndpointElide &&
-        indices[y_row + tgp_bm - 1] == index) {
-      n = tgp_bm;
+    // TAGGED-RHSGATHER consumer (see affine_gather_qmm_rhs): bit31 tags a
+    // self-describing word carrying expert (bits 0..7) and run-remaining
+    // minus 1 (bits 8..31). Raw words keep the sealed forward-equality scan
+    // including the sorted-endpoint elision, byte-for-byte.
+    const uint32_t word = indices[y_row + offset];
+    const bool tagged = (word >> 31) != 0;
+    index = tagged ? (word & 0xFFu) : word;
+    if (tagged) {
+      const uint32_t remaining = ((word >> 8) & 0x7FFFFFu) + 1u; // run field is bits 8..30; bit31 is the tag flag;
+      const int room = (int)(tgp_bm - offset);
+      // offset_next is an absolute row boundary in this loop; without
+      // offset + the tagged branch stores a relative length and jumps
+      // backward for any run shorter than the tile remainder (hang).
+      offset_next =
+          (short)(offset + (remaining < (uint32_t)room ? (int)remaining : room));
     } else {
-      for (; n < tgp_bm; n++) {
-        if (indices[y_row + n] != index) {
-          offset_next = n;
-          index_next = indices[y_row + n];
-          break;
+      offset_next = tgp_bm;
+      n = offset + 1;
+      if (kGatherRhsSortedEndpointElide &&
+          indices[y_row + tgp_bm - 1] == index) {
+        n = tgp_bm;
+      } else {
+        for (; n < tgp_bm; n++) {
+          if (indices[y_row + n] != index) {
+            offset_next = n;
+            break;
+          }
         }
       }
     }
+    n = offset_next;
     threadgroup_barrier(mem_flags::mem_none);
 
     NAXTile<AccumType, TM, TN> Dtile;

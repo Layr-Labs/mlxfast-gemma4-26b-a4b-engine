@@ -3982,6 +3982,17 @@ template <typename T, int group_size, int bits>
           simd_lid);
       return;
     }
+    // Gate/up-only strip walk: keep the current RUN-QUAD election and
+    // helper arithmetic, but let each even y-group serve two adjacent tiles.
+    // N=704 has 88 complete eight-row tiles. Down stays at span one here
+    // even if its independent four-tile arm above is disabled.
+    constexpr bool gemma4_gateup_span2 = true;
+    const int gateup_tile_span =
+        gemma4_gateup_span2 && in_vec_size == 2816 && out_vec_size == 704
+        ? 2 : 1;
+    if ((tid.y & uint(gateup_tile_span - 1)) != 0u) {
+      return;
+    }
     const uint assignment = tid.z;
     const uint32_t route_word =
         rhs_indices[assignment * (uint)rhs_strides[0]];
@@ -4031,59 +4042,71 @@ template <typename T, int group_size, int bits>
       device T* run_y0 = y + assignment * out_vec_size;
       device T* run_y1 = y + (assignment + 1) * out_vec_size;
       if (run_len == 2) {
-        qmv_affine4_g64_pair_impl<T, group_size, bits>(
-            run_w,
-            run_scales,
-            run_biases,
-            run_x0,
-            run_x1,
-            run_y0,
-            run_y1,
-            in_vec_size,
-            tid,
-            simd_gid,
-            simd_lid);
+        for (int t = 0; t < gateup_tile_span; t++) {
+          uint3 tile_tid = tid;
+          tile_tid.y = tid.y + uint(t);
+          qmv_affine4_g64_pair_impl<T, group_size, bits>(
+              run_w,
+              run_scales,
+              run_biases,
+              run_x0,
+              run_x1,
+              run_y0,
+              run_y1,
+              in_vec_size,
+              tile_tid,
+              simd_gid,
+              simd_lid);
+        }
         return;
       }
       const device T* run_x2 = x +
           lhs_indices[(assignment + 2) * (uint)lhs_strides[0]] * x_strides[0];
       device T* run_y2 = y + (assignment + 2) * out_vec_size;
       if (run_len == 3) {
-        qmv_affine4_g64_triple_stream_impl<T, group_size, bits>(
+        for (int t = 0; t < gateup_tile_span; t++) {
+          uint3 tile_tid = tid;
+          tile_tid.y = tid.y + uint(t);
+          qmv_affine4_g64_triple_stream_impl<T, group_size, bits>(
+              run_w,
+              run_scales,
+              run_biases,
+              run_x0,
+              run_x1,
+              run_x2,
+              run_y0,
+              run_y1,
+              run_y2,
+              in_vec_size,
+              tile_tid,
+              simd_gid,
+              simd_lid);
+        }
+        return;
+      }
+      const device T* run_x3 = x +
+          lhs_indices[(assignment + 3) * (uint)lhs_strides[0]] * x_strides[0];
+      device T* run_y3 = y + (assignment + 3) * out_vec_size;
+      for (int t = 0; t < gateup_tile_span; t++) {
+        uint3 tile_tid = tid;
+        tile_tid.y = tid.y + uint(t);
+        qmv_affine4_g64_quad_stream_impl<T, group_size, bits>(
             run_w,
             run_scales,
             run_biases,
             run_x0,
             run_x1,
             run_x2,
+            run_x3,
             run_y0,
             run_y1,
             run_y2,
+            run_y3,
             in_vec_size,
-            tid,
+            tile_tid,
             simd_gid,
             simd_lid);
-        return;
       }
-      const device T* run_x3 = x +
-          lhs_indices[(assignment + 3) * (uint)lhs_strides[0]] * x_strides[0];
-      device T* run_y3 = y + (assignment + 3) * out_vec_size;
-      qmv_affine4_g64_quad_stream_impl<T, group_size, bits>(
-          run_w,
-          run_scales,
-          run_biases,
-          run_x0,
-          run_x1,
-          run_x2,
-          run_x3,
-          run_y0,
-          run_y1,
-          run_y2,
-          run_y3,
-          in_vec_size,
-          tid,
-          simd_gid,
-          simd_lid);
       return;
     }
 
@@ -4096,9 +4119,13 @@ template <typename T, int group_size, int bits>
     const device T* single_scales = scales + expert * s_strides[0];
     const device T* single_biases = biases + expert * b_strides[0];
     device T* single_y = y + assignment * (uint)out_vec_size;
-    qmv_impl<T, group_size, bits>(
-        single_w, single_scales, single_biases, single_x, single_y,
-        in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+    for (int t = 0; t < gateup_tile_span; t++) {
+      uint3 tile_tid = tid;
+      tile_tid.y = tid.y + uint(t);
+      qmv_impl<T, group_size, bits>(
+          single_w, single_scales, single_biases, single_x, single_y,
+          in_vec_size, out_vec_size, tile_tid, simd_gid, simd_lid);
+    }
     return;
   }
   uint32_t x_idx;

@@ -83,7 +83,7 @@ Expected: all clean B8 verifier tests pass; the guard restores `mtplx-flash-next
 
 **Does NOT cover:** B2-B8 promotion, C1, or C5+; those shapes remain outside the B1 performance lane.
 
-- [ ] **Step 1: Write failing route-key tests**
+- [x] **Step 1: Write failing route-key tests**
 
 Add:
 
@@ -105,13 +105,13 @@ func singlePromptShapesAreExplicitAndCannotAliasB8() throws {
 }
 ```
 
-- [ ] **Step 2: Run the test and verify the new type is absent**
+- [x] **Step 2: Run the test and verify the new type is absent**
 
 Run the guarded Swift command from Task 1 with `--filter Gemma4MTPVerifierRouteTests`.
 
 Expected: FAIL because `CBv2Gemma4MTPVerifierShape` and `supports(_:)` do not exist.
 
-- [ ] **Step 3: Add the immutable shape key**
+- [x] **Step 3: Add the immutable shape key**
 
 Implement:
 
@@ -135,11 +135,11 @@ public extension CBv2Gemma4MTPVerifierRoute {
 
 Keep the existing B8 projection-policy methods for their clean tests, but do not let them imply that B8 is promoted by this branch.
 
-- [ ] **Step 4: Run the focused test**
+- [x] **Step 4: Run the focused test**
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/MTP/Gemma4MTPVerifierRoute.swift Tests/MLXFastTests/Gemma4MTPVerifierRouteTests.swift

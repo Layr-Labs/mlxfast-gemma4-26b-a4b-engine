@@ -87,7 +87,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             return value > 0 && sequenceLength.isMultiple(of: value)
                 ? value : stockBlocks
         }
-        return min(8, stockBlocks)
+        return min(4, stockBlocks)
     }()
 
     private static let passAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(

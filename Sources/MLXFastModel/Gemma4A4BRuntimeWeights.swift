@@ -295,6 +295,17 @@ public final class Gemma4A4BRuntimeWeightCache {
         )
         eval(model(prefillTokens, cache: caches))
         eval(model(MLXArray([bosToken], [1, 1]), cache: caches))
+        // KVQ-WARM: compile the quant-mirror pipelines BEFORE the engine
+        // warm below, so its 120s-class deadline never has to absorb a
+        // first-compile of the largest novel kernels this tree adds, and a
+        // fresh ranked worker never first-compiles them inside a measured,
+        // step-watchdogged window.
+        FileHandle.standardError.write(Data("[kvq-warm] begin\n".utf8))
+        let kvqWarmStart = Date()
+        CBv2RaggedTwoPassDecodeAttentionV1.warmQuantPipelines()
+        CBv2WindowedSequenceKV.warmPackPipeline()
+        FileHandle.standardError.write(
+            Data("[kvq-warm] done in \(String(format: "%.2f", Date().timeIntervalSince(kvqWarmStart)))s\n".utf8))
         warmCohortShapes(model, config: config)
         // Retire the warm's own buffers HERE, unscored: the trusted
         // phase-start clearCache runs inside the charged window, so any
@@ -402,7 +413,7 @@ public final class Gemma4A4BRuntimeWeightCache {
                 drained.signal()
             }
             // Deadline so a wedged warm can never wedge worker startup.
-            if drained.wait(timeout: .now() + 120) == .timedOut {
+            if drained.wait(timeout: .now() + 240) == .timedOut {
                 consumer.cancel()
                 for slot in 0..<batch {
                     engine.cancel(CBv2RequestID(UInt64(slot)))

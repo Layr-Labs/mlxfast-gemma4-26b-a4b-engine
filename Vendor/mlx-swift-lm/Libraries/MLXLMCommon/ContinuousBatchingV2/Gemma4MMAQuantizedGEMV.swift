@@ -165,7 +165,17 @@ public enum Gemma4MMAQuantizedGEMV {
         }
     }()
 
-    private static let defaultVersion = 26
+    // MMA-HV15: variance-discrimination cell. Five sealed cells five different
+    // mechanisms (decode cadence −6.62%, unfence −6.59%, CHUNK-12 −6.14%,
+    // QBLOCK-256 −5.29%, HV16 −6.39%) all land decode_gain ~= 2.05 vs the
+    // frontier's 2.12489, and independent accounts (DashiellB −6.42%,
+    // Amal-David −6.12%) show the same −6% class while their siblings land
+    // within −0.5% -- consistent with a bimodal runner-machine state that
+    // swamps single-knob effect. v15 is the reuse-half rung (two adjacent
+    // tiles) of the same ladder: mechanistically adjacent to both shipped v26
+    // and rejected v16, golden-PASS byte-identical locally. Rules below
+    // discriminate machine-state from mechanism-state.
+    private static let defaultVersion = 15
 
     /// Whether the selected tied-head implementation consumes the exact
     /// per-row/per-group activation sums. The final RMSNorm uses this to avoid

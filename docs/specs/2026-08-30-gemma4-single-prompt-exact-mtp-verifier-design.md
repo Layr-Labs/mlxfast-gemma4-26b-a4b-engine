@@ -1,7 +1,7 @@
 # Gemma 4 Single-Prompt Exact MTP Verifier and Performance Chart Design
 
 Date: 2026-08-30  
-Status: revised after B1 applicability audit, awaiting written-spec review
+Status: approved after B1 applicability audit
 Worktree: `mlxfast-gemma4-mtp-depth3-tip`  
 Baseline revision: `dfb5d48257de703e235f54f8cb6bf45b914fe6df`
 

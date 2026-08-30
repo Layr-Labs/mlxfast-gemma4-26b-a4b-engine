@@ -733,6 +733,17 @@ private let routeCsortPrefillEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+/// TAGGED-RHSGATHER producer gate. Default OFF: the csort lane ships the
+/// sealed v1 words and untouched consumers. ON (development/audit only
+/// until the consumer fork is sealed): the prefill route table carries
+/// self-describing tagged words for the exact Gemma production geometry.
+private let routePrefillTagsEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_PREFILL_TAGS"]
+    else { return false }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
+
 /// Keys per histogram/scatter block.
 private let routeCsortPrefillBlock = 256
 /// Counter-table width; must equal ``routeCountingSortKeyBound`` and the 256
@@ -829,6 +840,45 @@ private let routeCsortPrefillScanKernel: MLXFast.MLXFastKernel = MLXFast.metalKe
     ensureRowContiguous: true
 )
 
+/// TAGGED-RHSGATHER producer scan (env-gated, default OFF): identical to
+/// `scan_v1` plus one extra output, `expert_total[e]` — the global run
+/// length per expert, which after a stable sort is exactly that expert's
+/// contiguous run extent. The scatter consults it to emit self-describing
+/// route words; every other geometry keeps the v1 producer untouched.
+private let routeCsortPrefillScanTaggedKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "mlx_lm_route_csort128_scan_tag_v1",
+    inputNames: ["block_hist"],
+    outputNames: ["block_offset", "expert_total"],
+    source: """
+        constexpr uint WIDTH = \(routeCsortPrefillWidth);
+        uint e = thread_position_in_threadgroup.x;
+        uint simd_id = e / 32;
+        uint lane = e % 32;
+        uint nblocks = (uint)block_hist_shape[0];
+        uint total = 0u;
+        for (uint b = 0; b < nblocks; ++b) {
+            total += block_hist[b * WIDTH + e];
+        }
+        uint lane_excl = simd_prefix_exclusive_sum(total);
+        threadgroup uint simd_totals[8];
+        if (lane == 31) {
+            simd_totals[simd_id] = lane_excl + total;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint running = 0u;
+        for (uint s = 0; s < simd_id; ++s) {
+            running += simd_totals[s];
+        }
+        running += lane_excl;
+        for (uint b = 0; b < nblocks; ++b) {
+            block_offset[b * WIDTH + e] = running;
+            running += block_hist[b * WIDTH + e];
+        }
+        expert_total[e] = total;
+        """,
+    ensureRowContiguous: true
+)
+
 private let routeCsortPrefillScatterKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
     name: "mlx_lm_route_csort128_scatter_v1",
     inputNames: ["keys", "block_offset"],
@@ -863,6 +913,58 @@ private let routeCsortPrefillScatterKernel: MLXFast.MLXFastKernel = MLXFast.meta
     ensureRowContiguous: true
 )
 
+/// TAGGED-RHSGATHER producer scatter (env-gated, default OFF). Identical
+/// rank math to `scatter_v1`; the only difference is the carrier written to
+/// `sorted_keys`:
+///
+///   bit 31        prefix-valid tag
+///   bits  0...7   expert id (below WIDTH, proven by the gate)
+///   bits  8...31  global assignments remaining in this expert's run
+///                 INCLUDING this one, minus 1 (24 bits, capacity 16M)
+///
+/// `remaining` comes from the sorted-table geometry itself: `pos -
+/// block_offset[0][key]` is this word's offset within its expert's global
+/// run (block 0's offset row IS the expert's global base), so
+/// `remaining = expert_total[key] - run_offset` is exact. A word whose run
+/// would not fit the 24-bit field emits RAW (bit31 clear) — and consumers
+/// decode per word, so a single overflowing expert never forces the whole
+/// table off the tag lane. Producers without the tag bit keep emitting
+/// exactly the v1 words.
+private let routeCsortPrefillScatterTaggedKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "mlx_lm_route_csort128_scatter_tag_v1",
+    inputNames: ["keys", "block_offset", "expert_total"],
+    outputNames: ["row_order", "sorted_keys", "inverse_order"],
+    source: """
+        constexpr uint BLOCK = \(routeCsortPrefillBlock);
+        constexpr uint WIDTH = \(routeCsortPrefillWidth);
+        uint b = threadgroup_position_in_grid.x;
+        uint k = thread_position_in_threadgroup.x;
+        uint n = keys_shape[0];
+        uint idx = b * BLOCK + k;
+        uint key = (idx < n) ? keys[idx] : 0xffffffffu;
+        threadgroup uint tg_keys[BLOCK];
+        tg_keys[k] = key;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (idx < n) {
+            uint rank = 0u;
+            for (uint j = 0; j < k; ++j) {
+                rank += (tg_keys[j] == key) ? 1u : 0u;
+            }
+            uint pos = block_offset[b * WIDTH + key] + rank;
+            row_order[pos] = idx / (uint)M;
+            uint run_offset = pos - block_offset[key];
+            uint remaining = expert_total[key] - run_offset;
+            if (remaining >= 1u && remaining <= (1u << 23)) {
+                sorted_keys[pos] = 0x80000000u | key | ((remaining - 1u) << 8);
+            } else {
+                sorted_keys[pos] = key;
+            }
+            inverse_order[idx] = pos;
+        }
+        """,
+    ensureRowContiguous: true
+)
+
 /// Exact stable counting sort of a flat uint32 route table. Returns nil (fail
 /// closed onto `argSort`) unless every precondition of the kernels holds.
 private func routeCountingSortPrefill(
@@ -889,6 +991,30 @@ private func routeCountingSortPrefill(
         outputShapes: [[blocks, width]],
         outputDTypes: [.uint32]
     )[0]
+    // Bisect gate (development): tag only the packed 8x1024 prefill plane;
+    // verification/drafter tables (n=65536) stay raw until their consumers
+    // are forked and sealed.
+    if routePrefillTagsEnabled && n == 8192 {
+        // TAGGED-RHSGATHER producer lane (default OFF): scan gains the
+        // expert_total output, scatter emits self-describing words.
+        CBv2EngageMark.once("route-csort-prefill-tags")
+        let tagged = routeCsortPrefillScanTaggedKernel(
+            [hist],
+            grid: (width, 1, 1),
+            threadGroup: (width, 1, 1),
+            outputShapes: [[blocks, width], [width]],
+            outputDTypes: [.uint32, .uint32]
+        )
+        let outputs = routeCsortPrefillScatterTaggedKernel(
+            [indices, tagged[0], tagged[1]],
+            template: [("M", m)],
+            grid: (blocks * width, 1, 1),
+            threadGroup: (width, 1, 1),
+            outputShapes: [[n], [n], [n]],
+            outputDTypes: [.uint32, .uint32, .uint32]
+        )
+        return (outputs[0], outputs[1], outputs[2])
+    }
     let offsets = routeCsortPrefillScanKernel(
         [hist],
         grid: (width, 1, 1),

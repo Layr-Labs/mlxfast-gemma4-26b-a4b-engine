@@ -4470,21 +4470,33 @@ template <
   // Do as many matmuls as necessary
   uint32_t index;
   short offset;
-  uint32_t index_next = indices[y_row];
   short offset_next = 0;
   int n = 0;
   while (n < tgp_bm) {
-    n++;
     offset = offset_next;
-    index = index_next;
-    offset_next = tgp_bm;
-    for (; n < tgp_bm; n++) {
-      if (indices[y_row + n] != index) {
-        offset_next = n;
-        index_next = indices[y_row + n];
-        break;
+    // TAGGED-RHSGATHER consumer: producers may encode each sorted row as
+    //   bit31 tag | bits 0..7 expert | bits 8..31 run-remaining - 1.
+    // Raw words (tag clear, every other producer on the board) keep the
+    // exact forward-equality scan; tagged words carry their own run bound,
+    // which deletes the per-row re-read of the scan loop below.
+    const uint32_t word = indices[y_row + offset];
+    const bool tagged = (word >> 31) != 0;
+    index = tagged ? (word & 0xFFu) : word;
+    if (tagged) {
+      const uint32_t remaining = ((word >> 8) & 0x7FFFFFu) + 1u; // run field is bits 8..30; bit31 is the tag flag;
+      const int room = (int)(tgp_bm - offset);
+      offset_next =
+          (short)(remaining < (uint32_t)room ? (int)remaining : room);
+    } else {
+      offset_next = tgp_bm;
+      for (n = offset + 1; n < tgp_bm; n++) {
+        if (indices[y_row + n] != index) {
+          offset_next = n;
+          break;
+        }
       }
     }
+    n = offset_next;
     threadgroup_barrier(mem_flags::mem_none);
 
     // Prepare threadgroup mma operation

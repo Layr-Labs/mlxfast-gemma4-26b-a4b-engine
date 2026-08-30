@@ -32,6 +32,18 @@ public let weightedExpertSum: @Sendable (MLXArray, MLXArray) -> MLXArray = compi
 ) { outputs, weights in
     (outputs * MLX.expandedDimensions(weights, axis: -1)).sum(axis: -2)
 }
+public struct WeightedExpertUnsortCarrier: @unchecked Sendable {
+    public let sortedOutputs: MLXArray
+    public let inverseOrder: MLXArray
+    public let weights: MLXArray
+
+    public init(sortedOutputs: MLXArray, inverseOrder: MLXArray, weights: MLXArray) {
+        self.sortedOutputs = sortedOutputs
+        self.inverseOrder = inverseOrder
+        self.weights = weights
+    }
+}
+
 /// Effective-selection count for the direct sorted-expert reduction. Benchmark
 /// callers arm this after warmup and snapshot it only after the engine is idle.
 /// The unarmed hot path reads one plain Bool and performs no atomic operation,
@@ -112,25 +124,31 @@ public func resetWeightedExpertUnsortStats() {
 /// permutation and writes `[tokens, hidden]` directly, avoiding that full
 /// `[tokens, topK, hidden]` intermediate.
 private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "weighted_expert_unsort",
+    name: "weighted_expert_unsort_v2",
     inputNames: ["sorted_outputs", "inverse_order", "weights"],
     outputNames: ["output"],
     source: """
-        uint feature = thread_position_in_grid.x;
-        uint token = thread_position_in_grid.y;
+        constexpr uint reads = 4;
+        const uint feature_base = thread_position_in_grid.x * reads;
+        const uint token = thread_position_in_grid.y;
+        if (feature_base >= 2816) return;
 
-        T accumulator = (T)0;
+        T accum[reads] = {(T)0, (T)0, (T)0, (T)0};
         const uint assignment_base = token * (uint)K;
         for (uint slot = 0; slot < (uint)K; ++slot) {
             const uint assignment = assignment_base + slot;
             const uint sorted_row = (uint)inverse_order[assignment];
-            // Preserve the legacy bfloat16 multiply-then-reduce rounding.
-            const T weighted = (T)(
-                (float)sorted_outputs[sorted_row * threads_per_grid.x + feature]
-                * (float)weights[assignment]);
-            accumulator = accumulator + weighted;
+            const float w = (float)weights[assignment];
+            const device T* src = sorted_outputs + sorted_row * 2816 + feature_base;
+            for (uint i = 0; i < reads; ++i) {
+                const T weighted = (T)((float)src[i] * w);
+                accum[i] = accum[i] + weighted;
+            }
         }
-        output[token * threads_per_grid.x + feature] = accumulator;
+        device T* dst = output + token * 2816 + feature_base;
+        for (uint i = 0; i < reads; ++i) {
+            dst[i] = accum[i];
+        }
     """,
     ensureRowContiguous: true
 )
@@ -170,7 +188,7 @@ public func weightedExpertUnsort(
             ("T", sortedOutputs.dtype),
             ("K", 8),
         ],
-        grid: (2816, tokens, 1),
+        grid: (2816 / 4, tokens, 1),
         threadGroup: (64, 4, 1),
         outputShapes: [[tokens, 2816]],
         outputDTypes: [.bfloat16]
@@ -1254,6 +1272,52 @@ public class SwitchGLU: Module {
         return MLX.squeezed(projected.output, axis: -2)
     }
 
+    /// Expert projection + weighted reduction entry point returning both
+    /// the lazy standard output and the optional carrier for fused prefill tail consumers.
+    public func callAndWeightedReduceWithUnsortCarrier(
+        _ x: MLXArray,
+        _ indices: MLXArray,
+        weights: MLXArray,
+        fuseSortedReduction: Bool,
+        isProductionPrefill: Bool = true
+    ) -> (output: MLXArray, carrier: WeightedExpertUnsortCarrier?) {
+        // At B=8 decode there are exactly 64 assignments (8 rows x top-k 8),
+        // which is the sorting threshold and the minimum geometry accepted by
+        // weightedExpertUnsort.  Keep the decode gate exact so MTP rectangles
+        // and smaller serving cohorts remain on their established reduction.
+        let isEightRowDecode =
+            !isProductionPrefill && x.dim(0) == 8 && indices.size == 64
+        guard fuseSortedReduction && (isProductionPrefill || isEightRowDecode),
+            supportsWeightedExpertUnsort(x, indices, weights: weights)
+        else {
+            return (weightedExpertSum(callAsFunction(x, indices), weights), nil)
+        }
+
+        let projected = projectExperts(x, indices)
+        guard projected.sorted,
+            let inverseOrder = projected.inverseOrder,
+            projected.output.ndim == 3,
+            projected.output.dim(-2) == 1,
+            projected.output.dim(-1) == 2816,
+            projected.output.dtype == .bfloat16
+        else {
+            return (legacyWeightedReduction(projected, indices: indices, weights: weights), nil)
+        }
+
+        let sortedOutputs = MLX.squeezed(projected.output, axis: -2)
+        let carrier = isProductionPrefill
+            ? WeightedExpertUnsortCarrier(
+                sortedOutputs: sortedOutputs,
+                inverseOrder: inverseOrder,
+                weights: weights)
+            : nil
+        let output = weightedExpertUnsort(
+            sortedOutputs: sortedOutputs,
+            inverseOrder: inverseOrder,
+            weights: weights)
+        return (output, carrier)
+    }
+
     /// Always-called expert projection + weighted reduction entry point.
     ///
     /// When the experiment is enabled, the exact sorted production Gemma
@@ -1268,33 +1332,13 @@ public class SwitchGLU: Module {
         fuseSortedReduction: Bool,
         isProductionPrefill: Bool = true
     ) -> MLXArray {
-        // At B=8 decode there are exactly 64 assignments (8 rows x top-k 8),
-        // which is the sorting threshold and the minimum geometry accepted by
-        // weightedExpertUnsort.  Keep the decode gate exact so MTP rectangles
-        // and smaller serving cohorts remain on their established reduction.
-        let isEightRowDecode =
-            !isProductionPrefill && x.dim(0) == 8 && indices.size == 64
-        guard fuseSortedReduction && (isProductionPrefill || isEightRowDecode),
-            supportsWeightedExpertUnsort(x, indices, weights: weights)
-        else {
-            return weightedExpertSum(callAsFunction(x, indices), weights)
-        }
-
-        let projected = projectExperts(x, indices)
-        guard projected.sorted,
-            let inverseOrder = projected.inverseOrder,
-            projected.output.ndim == 3,
-            projected.output.dim(-2) == 1,
-            projected.output.dim(-1) == 2816,
-            projected.output.dtype == .bfloat16
-        else {
-            return legacyWeightedReduction(projected, indices: indices, weights: weights)
-        }
-
-        return weightedExpertUnsort(
-            sortedOutputs: MLX.squeezed(projected.output, axis: -2),
-            inverseOrder: inverseOrder,
-            weights: weights)
+        callAndWeightedReduceWithUnsortCarrier(
+            x,
+            indices,
+            weights: weights,
+            fuseSortedReduction: fuseSortedReduction,
+            isProductionPrefill: isProductionPrefill
+        ).output
     }
 }
 

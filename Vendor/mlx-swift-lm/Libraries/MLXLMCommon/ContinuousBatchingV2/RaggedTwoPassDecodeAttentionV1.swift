@@ -280,7 +280,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// this step's fence, so the mutation can never be reordered against a
     /// later read of the same allocation.
     private static let fusedRingPassAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_ringwrite_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v1",
+        name: "cbv2_ragged8_ringwrite_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v2",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -353,10 +353,20 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             uint slot = (ring_start + uint(block)) & ring_mask;
             float max_score = -3.402823466e+38F;
             float sum_exp_score = 0.0f;
-            for (int token = block; token < N; token += BLOCKS) {
-                const bool current = token == N - 1;
-                const device T* k = current ? new_key : keys + slot * D;
-                const device T* v = current ? new_value : values + slot * D;
+            // A block only ever visits tokens congruent to itself modulo
+            // BLOCKS, so the single token that must be served from the input
+            // rather than the ring, `N - 1`, is reachable by exactly one block
+            // and only on that block's final pass. Peeling that pass leaves
+            // the visit order and every value identical while dropping the
+            // compare and the two address selects from every pass that could
+            // never have taken them - which, at the live partition, is 127 of
+            // 128 passes on one block and all 128 on the other seven.
+            constexpr int new_token_block = (N - 1) % BLOCKS;
+            const bool serves_new_token = block == new_token_block;
+            const int ring_end = serves_new_token ? N - 1 : N;
+            for (int token = block; token < ring_end; token += BLOCKS) {
+                const device T* k = keys + slot * D;
+                const device T* v = values + slot * D;
                 float score = 0.0f;
                 for (int element = 0; element < values_per_lane; ++element) {
                     score += q[element] * float(k[element]);
@@ -374,6 +384,25 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 }
 
                 slot = (slot + uint(BLOCKS)) & ring_mask;
+            }
+            if (serves_new_token) {
+                const device T* k = new_key;
+                const device T* v = new_value;
+                float score = 0.0f;
+                for (int element = 0; element < values_per_lane; ++element) {
+                    score += q[element] * float(k[element]);
+                }
+                score = simd_sum(score);
+
+                const float new_max = max(max_score, score);
+                const float old_factor = fast::exp(max_score - new_max);
+                const float score_factor = fast::exp(score - new_max);
+                max_score = new_max;
+                sum_exp_score = sum_exp_score * old_factor + score_factor;
+                for (int element = 0; element < values_per_lane; ++element) {
+                    accumulator[element] = accumulator[element] * old_factor
+                        + score_factor * float(v[element]);
+                }
             }
 
             if (lane == 0) {

@@ -153,6 +153,11 @@ struct CBv2MTPSeedCostLedger {
     var count: Int { byBucket.count }
 }
 
+// NULL-CONTROL MARKER, replicate 2 (this comment is the entire diff of
+// submission "BOX-CONTROL-002"). A byte-identical re-entry of the promoted
+// crown, uploaded only to test whether this account's measured -2.68% deficit
+// on identical code is per-run or persistent. No behavior changes.
+
 // MARK: - Driver
 
 /// Engine-side MTP state: drafter binding, carries, plan marks, metrics.

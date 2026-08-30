@@ -121,6 +121,21 @@ enum CBv2AttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// PREFILL-PACKED-KV-ALIAS: when every cohort row of a packed prefill is
+    /// FRESH (zero committed history — exactly the ranked 8×1024 seed
+    /// geometry), the per-row cache updates return views that are byte-for-
+    /// byte the caller's already-batched K/V rectangles, and the batched-SDPA
+    /// restack (`concatenated(cachedKeys/cachedValues, axis: 0)`) rebuilds a
+    /// copy of tensors the caller already holds. This switch lets the batched
+    /// path read the original rectangles instead, deleting that copy. Any
+    /// non-fresh caller falls through to the restack unchanged.
+    static let prefillPackedKVAliasEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PREFILL_PACKED_KV_ALIAS"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// ATT-008 opt-in switch: batch-wide FULL-attention decode over pooled
     /// KV (`DARKBLOOM_GEMMA4_BATCHED_FULL_ATTENTION=1` enables it).
     /// DEFAULT OFF: three counterbalanced local B=8 probe pairs measured the
@@ -537,7 +552,8 @@ enum CBv2AttentionV1 {
             kind: kind, queries: queries,
             cachedKeys: cachedKeys, cachedValues: cachedValues,
             window: window(of: kind), scale: scale,
-            sinks: effectiveSinks, softcap: softcap, spanContexts: spanContexts)
+            sinks: effectiveSinks, softcap: softcap, spanContexts: spanContexts,
+            incomingKeys: keys, incomingValues: values)
         {
             return batched
         }
@@ -576,7 +592,8 @@ enum CBv2AttentionV1 {
         kind: CBv2LayerKind, queries: MLXArray,
         cachedKeys: [MLXArray], cachedValues: [MLXArray],
         window: Int?, scale: Float, sinks: MLXArray?, softcap: Float?,
-        spanContexts: [CBv2SpanChunkContext?]?
+        spanContexts: [CBv2SpanChunkContext?]?,
+        incomingKeys: MLXArray? = nil, incomingValues: MLXArray? = nil
     ) -> MLXArray? {
         guard packedBatchKVBudgetBytes > 0 else { return nil }
         guard spanContexts?.allSatisfy({ $0 == nil }) ?? true else { return nil }
@@ -601,6 +618,33 @@ enum CBv2AttentionV1 {
         let restackedBytes =
             (headKeys.nbytes + headValues.nbytes) * cachedKeys.count
         guard restackedBytes <= packedBatchKVBudgetBytes else { return nil }
+
+        // PREFILL-PACKED-KV-ALIAS: on a fresh cohort seed every row's returned
+        // view spans exactly the just-appended chunk, so the restack below
+        // reassembles byte-for-byte the incoming batched rectangles. The
+        // token-extent equality IS the freshness proof: a returned view always
+        // spans history + chunk, so `ik.dim(2) == kL` forces zero history on
+        // every row simultaneously. Values and layout are identical by
+        // construction (`contiguous()` on a row-contiguous exactly-sized
+        // producer shares the buffer and launches nothing); any failed
+        // condition falls through to the established restack unchanged.
+        if prefillPackedKVAliasEnabled,
+            let ik = incomingKeys, let iv = incomingValues,
+            ik.ndim == 4, iv.ndim == 4,
+            ik.dim(0) == cachedKeys.count, iv.dim(0) == cachedValues.count,
+            ik.dim(2) == kL, iv.dim(2) == kL,
+            ik.dim(1) == headKeys.dim(1), ik.dim(3) == headKeys.dim(3),
+            iv.dim(1) == headValues.dim(1), iv.dim(3) == headValues.dim(3),
+            ik.dtype == headKeys.dtype, iv.dtype == headValues.dtype
+        {
+            CBv2EngageMark.once("prefill-packedkv-alias")
+            return attendCommittedRow(
+                kind: kind, queries: queries,
+                cachedKeys: contiguous(ik),
+                cachedValues: contiguous(iv),
+                window: window, scale: scale, sinks: sinks, softcap: softcap,
+                spanContext: nil)
+        }
 
         return attendCommittedRow(
             kind: kind, queries: queries,

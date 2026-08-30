@@ -2620,7 +2620,18 @@ private class Gemma4Router: Module {
             cachedEffectiveScale = eff
             effScale = eff
         }
-        let normed = MLXFast.rmsNorm(x, weight: effScale, eps: eps)
+        return route(normed: MLXFast.rmsNorm(x, weight: effScale, eps: eps))
+    }
+
+    /// PREFILL-TRIPLE-PRENORM. `callAsFunction` from the normalised plane
+    /// onward: every statement below used to live in the body above and is
+    /// reached by the same single call, so the two entry points cannot drift.
+    /// The only caller that supplies its own `normed` is the prefill layer
+    /// body, whose fused glue kernel produced it with the identical weight and
+    /// the identical `rms_single_row` sequence.
+    fileprivate func route(
+        normed: MLXArray
+    ) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
         let expertScores = proj(normed)
 
         // ROUTE-001: single-dispatch byte-identical replacement of the chain
@@ -2657,6 +2668,11 @@ private class Gemma4Router: Module {
     // recomputed.
 
     fileprivate var zipAdmits: Bool { !Gemma4FusedRouterTop8.enabled }
+
+    /// The weight the router's own `rmsNorm` applies (`scale * hiddenSize^-0.5`),
+    /// so the prefill glue can produce that norm as a third output of the pass
+    /// it already makes over the same plane.
+    fileprivate func fusedNormWeight() -> MLXArray { zipEffectiveScale() }
 
     fileprivate func zipEffectiveScale() -> MLXArray {
         if let cached = cachedEffectiveScale { return cached }
@@ -3186,6 +3202,26 @@ public class Gemma4DecoderLayer: Module {
                     zipped.expertNorm,
                     topKIndices: zipped.topKIndices,
                     topKWeights: zipped.topKWeights,
+                    isExpertPrefill: isExpertPrefill)
+            } else if let (n1, n2, routerNorm) = Gemma4PrefillGlueV1.triplePreNorm(
+                x: out,
+                w1: preFeedforwardLayernorm.weight,
+                w2: preFeedforwardLayernorm2.weight,
+                w3: router.fusedNormWeight(),
+                eps: config.rmsNormEps)
+            {
+                // PREFILL-TRIPLE-PRENORM: the router's own `rmsNorm` over this
+                // very plane rides the pre-norm pass as a third output, so the
+                // layer makes four passes over `out` instead of five. Prefill
+                // plane only -- `planeRows` refuses the `[8, 1, 2816]` decode
+                // cell, where the ZIP branch above already owns the pairing.
+                CBv2EngageMark.once("prefill-triple-prenorm")
+                let (topKIndices, topKWeights) = router.route(normed: routerNorm)
+                h1Raw = mlp(n1)
+                h2Raw = experts(
+                    n2,
+                    topKIndices: topKIndices,
+                    topKWeights: topKWeights,
                     isExpertPrefill: isExpertPrefill)
             } else {
                 let (topKIndices, topKWeights) = router(out)

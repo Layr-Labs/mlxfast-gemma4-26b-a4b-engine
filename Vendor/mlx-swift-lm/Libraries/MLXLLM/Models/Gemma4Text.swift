@@ -169,6 +169,84 @@ internal func gemma4ShouldSubmitPrefillChunkEval(
         && layerNumber.isMultiple(of: interval)
 }
 
+/// Front rungs for the scheduled-prefill submission ladder. The decode
+/// ladder's measured result - the early boundaries carry the overlap,
+/// because the device is idle until the first submission while the host is
+/// still building the rest of the stack - applies unchanged to the
+/// scheduled prompt path: the interval cadence above submits nothing
+/// before `layerNumber == interval`, so the device waits out the host
+/// build of the first `interval` layers at the start of every scheduled
+/// prefill step. The front rungs submit the frontier after the first two
+/// decoder layers, in ADDITION to the interval cadence, at the one scored
+/// geometry (CBv2 scheduled prefill, batch 8, multi-token). Rungs are
+/// pure submission policy: they reorder when already-built graphs are
+/// queued, never what is computed, so the emitted stream is bit-identical
+/// by construction - the same argument as the decode ladder.
+///
+/// `DARKBLOOM_GEMMA4_PREFILL_EARLY_LADDER=0` (also `false`/`no`/`off`) is
+/// the attribution and emergency kill switch for the front rungs alone.
+/// `DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL=0` still disables the whole prompt
+/// ladder, front rungs included, so that switch's documented "one final
+/// submission" contract keeps holding.
+@inline(__always)
+internal func resolveGemma4PrefillEarlyLadderEnabled(_ raw: String?) -> Bool {
+    guard let raw else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}
+
+private let gemma4PrefillEarlyLadderEnabled =
+    resolveGemma4PrefillEarlyLadderEnabled(
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_EARLY_LADDER"])
+
+/// LOCAL EXPERIMENT ONLY. `DARKBLOOM_GEMMA4_PREFILL_EARLY_LADDER_SET`
+/// overrides the shipped front-rung list with a comma-separated set of
+/// 1-based layer numbers, so the geometry can be swept on one binary
+/// instead of one rebuild per candidate. The ranked runner sets no
+/// environment, so an unset variable keeps the shipped switch below
+/// verbatim and this is inert in a submission. An empty value means "no
+/// front rungs", which is distinct from unset.
+private let gemma4PrefillEarlyLadderSet: Set<Int>? = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_PREFILL_EARLY_LADDER_SET"]
+    else { return nil }
+    return Set(raw.split(separator: ",").compactMap { Int($0.trimmingCharacters(
+        in: .whitespaces)) })
+}()
+
+/// Pure, fail-closed policy for the prefill front rungs. `layerNumber` is
+/// 1-based (the trunk's `idx + 1`), so the shipped pair {1, 2} names the
+/// boundaries after decoder layers 0 and 1 - the same physical boundaries
+/// as the promoted decode pair. One rung would already keep the device fed
+/// (a prompt-rectangle layer far outlasts the host build of the remaining
+/// stack); the second rung mirrors the decode pair at negligible cost and
+/// covers small scheduled chunks, whose per-layer device time shrinks
+/// toward the decode regime where the pair is the measured optimum.
+@inline(__always)
+internal func gemma4ShouldSubmitPrefillEarlyLadder(
+    enabled: Bool,
+    schedulePrefill: Bool,
+    isCBv2: Bool,
+    batchSize: Int,
+    inputLength: Int,
+    layerNumber: Int,
+    interval: Int
+) -> Bool {
+    guard enabled, isCBv2, schedulePrefill, batchSize == 8, inputLength > 1,
+        interval > 0
+    else { return false }
+
+    if let set = gemma4PrefillEarlyLadderSet {
+        return set.contains(layerNumber)
+    }
+    switch layerNumber {
+    case 1, 2:
+        return true
+    default:
+        return false
+    }
+}
+
 /// CBv2 consumes only the final prompt position, so the LAST decoder layer
 /// can keep full attention and every K/V write while retaining just this
 /// many trailing rows for `o_proj`, the residual, the feed-forward/MoE
@@ -2285,6 +2363,191 @@ private enum Gemma4FusedRouterTop8 {
     }
 }
 
+/// ROUTE-EPILOGUE-001: one-dispatch, byte-identical replacement of the FIVE
+/// ops that trail the decode router's `argPartition` -- the `[kth...]`
+/// slice (which MLX materializes with a strided uint32 copy), `takeAlong`,
+/// `softmax(precise)` over K, the `perExpertScale[topKIndices]` gather and
+/// the bfloat16 product -- for the exact B=8 decode geometry.
+///
+/// It differs from the (default-off) `Gemma4FusedRouterTop8` above in one
+/// respect: the selection itself is NOT recomputed. The stock argPartition
+/// merge sort still runs and this kernel READS its output at offset `kth`,
+/// so none of that kernel's O(E^2) predecessor scan is paid.
+///
+/// Exactness. `inds` is a verbatim copy of the uint32 values the stock
+/// slice materializes. `topv` reloads the SAME bfloat16 score words
+/// `takeAlong` would have gathered, and the normalization is the identical
+/// `softmax_single_row<T, float, N_READS=4>` transcription (same lane
+/// layout, same `Limits<float>::min` padding, same `fast::exp`, same
+/// `simd_max`/`simd_sum` reduction order on one 32-thread simdgroup)
+/// followed by the stock bfloat16 multiply against the gathered per-expert
+/// scale, with its single store rounding.
+///
+/// On this crown the scored B=8 decode cell runs the router through
+/// `Gemma4ZipRouterV1`, so the live hook is the zip stage-4 seam
+/// (`zipSelected` + `zipWeights`), not `Gemma4Router.select`.
+///
+/// Fail-closed: any other row count, sequence length, expert count, top-K
+/// or dtype takes the established chain. Kill switch:
+/// `DARKBLOOM_GEMMA4_ROUTER_EPILOGUE=0`.
+private enum Gemma4FusedRouterEpilogue {
+    /// DEFAULT ON; `DARKBLOOM_GEMMA4_ROUTER_EPILOGUE=0` restores the stock
+    /// slice/takeAlong/softmax/gather/multiply chain.
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ROUTER_EPILOGUE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let rows = 8
+    private static let experts = 128
+    private static let selected = 8
+
+    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_router_epilogue_e128_k8_bf16_v1",
+        inputNames: ["part", "scores", "pes"],
+        outputNames: ["inds", "wts"],
+        source: """
+            constexpr int SIMD_SIZE = 32;
+            constexpr int N_READS = 4;
+            constexpr int KTH = E - K;
+
+            const int row = int(threadgroup_position_in_grid.x);
+            const int lid = int(thread_position_in_threadgroup.x);
+
+            threadgroup float topv[K];
+            threadgroup uint topi[K];
+            threadgroup float local_max[SIMD_SIZE];
+            threadgroup float local_normalizer[SIMD_SIZE];
+
+            // The stock `argPartition(kth: E - K)` output is the stable
+            // ascending argsort; its trailing K entries are exactly what the
+            // `[kth...]` slice materializes, in the same order.
+            const device T* srow = scores + row * E;
+            if (lid < K) {
+                const uint e = part[row * E + KTH + lid];
+                topi[lid] = e;
+                topv[lid] = float(srow[e]);
+                inds[row * K + lid] = e;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // softmax_single_row<T, float, N_READS=4> transcription
+            // (softmax.h) at axis_size = K on one 32-thread simdgroup, with
+            // the stock bf16 per-expert-scale multiply fused into the write.
+            const int simd_lane_id = int(thread_index_in_simdgroup);
+            const int simd_group_id = int(simdgroup_index_in_threadgroup);
+
+            float ld[N_READS];
+            const int base = lid * N_READS;
+            if (base + N_READS <= K) {
+                for (int i = 0; i < N_READS; i++) {
+                    ld[i] = topv[base + i];
+                }
+            } else {
+                for (int i = 0; i < N_READS; i++) {
+                    ld[i] = ((base + i) < K) ? topv[base + i] : Limits<float>::min;
+                }
+            }
+            if (simd_group_id == 0) {
+                local_max[simd_lane_id] = Limits<float>::min;
+                local_normalizer[simd_lane_id] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float maxval = Limits<float>::finite_min;
+            for (int i = 0; i < N_READS; i++) {
+                maxval = (maxval < ld[i]) ? ld[i] : maxval;
+            }
+            maxval = simd_max(maxval);
+            if (simd_lane_id == 0) {
+                local_max[simd_group_id] = maxval;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+                maxval = simd_max(local_max[simd_lane_id]);
+                if (simd_lane_id == 0) {
+                    local_max[0] = maxval;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            maxval = local_max[0];
+
+            float normalizer = 0;
+            for (int i = 0; i < N_READS; i++) {
+                float exp_x = fast::exp(ld[i] - maxval);
+                ld[i] = exp_x;
+                normalizer += exp_x;
+            }
+            normalizer = simd_sum(normalizer);
+            if (simd_lane_id == 0) {
+                local_normalizer[simd_group_id] = normalizer;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+                normalizer = simd_sum(local_normalizer[simd_lane_id]);
+                if (simd_lane_id == 0) {
+                    local_normalizer[0] = normalizer;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            normalizer = 1 / local_normalizer[0];
+
+            if (base + N_READS <= K) {
+                for (int i = 0; i < N_READS; i++) {
+                    const T w = T(ld[i] * normalizer);
+                    wts[row * K + base + i] = w * pes[topi[base + i]];
+                }
+            } else {
+                for (int i = 0; i < N_READS; i++) {
+                    if ((base + i) < K) {
+                        const T w = T(ld[i] * normalizer);
+                        wts[row * K + base + i] = w * pes[topi[base + i]];
+                    }
+                }
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    /// `partitioned` is the raw `argPartition(kth:)` output, NOT the slice.
+    static func apply(
+        partitioned: MLXArray, expertScores: MLXArray, perExpertScale: MLXArray,
+        topK: Int, kth: Int
+    ) -> (indices: MLXArray, weights: MLXArray)? {
+        guard enabled,
+            topK == selected,
+            kth == experts - selected,
+            expertScores.ndim == 3,
+            expertScores.dim(0) == rows,
+            expertScores.dim(1) == 1,
+            expertScores.dim(2) == experts,
+            expertScores.dtype == .bfloat16,
+            partitioned.shape == expertScores.shape,
+            partitioned.dtype == .uint32,
+            perExpertScale.ndim == 1,
+            perExpertScale.dim(0) == experts,
+            perExpertScale.dtype == .bfloat16
+        else { return nil }
+        CBv2EngageMark.once("router-epilogue")
+
+        let outputs = kernel(
+            [partitioned, expertScores, perExpertScale],
+            template: [
+                ("T", expertScores.dtype),
+                ("E", experts),
+                ("K", selected),
+            ],
+            grid: (rows * 32, 1, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[rows, 1, selected], [rows, 1, selected]],
+            outputDTypes: [.uint32, .bfloat16]
+        )
+        return (outputs[0], outputs[1])
+    }
+}
+
 /// GLUE-003: one-per-forward chain box. Layer L's fused tail deposits the
 /// (output, next-layer-input-norm) pair; layer L+1 consumes the norm instead
 /// of re-reading and re-normalizing the same tensor — guarded by pointer
@@ -2832,6 +3095,20 @@ private class Gemma4Router: Module {
         topKWeights = MLX.softmax(topKWeights, axis: -1, precise: true)
         return topKWeights * perExpertScale[topKIndices]
     }
+
+    /// ROUTE-EPILOGUE-001 hook for the zipped decode cell: the selected
+    /// slice and the weight tail (takeAlong -> precise softmax -> scale
+    /// gather -> bf16 product) in one dispatch, reading the same
+    /// `argPartition` output the stock chain slices. Nil = geometry not
+    /// admitted or kill switch set; the caller falls back to
+    /// `zipSelected` + `zipWeights`.
+    fileprivate func zipEpilogue(
+        partitioned: MLXArray, expertScores: MLXArray
+    ) -> (indices: MLXArray, weights: MLXArray)? {
+        Gemma4FusedRouterEpilogue.apply(
+            partitioned: partitioned, expertScores: expertScores,
+            perExpertScale: perExpertScale, topK: topK, kth: kth)
+    }
 }
 
 /// Sparse MoE feed-forward block. Wraps `SwitchGLU` with GeGLU activation.
@@ -3130,25 +3407,36 @@ private enum Gemma4ZipRouterV1 {
         let partition: MLXArray
         let topKIndices: MLXArray
         let denseOut: MLXArray
+        let epilogueIn: MLXArray
         if plan == 2 {
             partition = router.zipPartition(
                 MLX.depends(input: expertScores, dependencies: [gate, up]))
-            topKIndices = router.zipSelected(
-                MLX.depends(input: partition, dependencies: [activated]))
+            epilogueIn = MLX.depends(input: partition, dependencies: [activated])
             denseOut = mlp.zipDown(
                 MLX.depends(input: activated, dependencies: [partition]))
         } else {
             denseOut = mlp.zipDown(activated)
             partition = router.zipPartition(
                 MLX.depends(input: expertScores, dependencies: [denseOut]))
-            topKIndices = router.zipSelected(partition)
+            epilogueIn = partition
         }
 
-        // The router weight tail (takeAlong -> softmax -> per-expert scale) is
-        // off the critical path to the expert kernels and already overlaps
-        // them in the stock tape; it is emitted unchanged.
-        let topKWeights = router.zipWeights(
-            expertScores: expertScores, topKIndices: topKIndices)
+        // ROUTE-EPILOGUE-001 (zip hook): the selected slice and the weight
+        // tail (takeAlong -> softmax -> per-expert scale gather -> bf16
+        // product) collapse into one dispatch reading the SAME argPartition
+        // output the stock chain slices. Nil falls back to the stock
+        // five-dispatch chain unchanged.
+        let topKWeights: MLXArray
+        if let fused = router.zipEpilogue(
+            partitioned: epilogueIn, expertScores: expertScores)
+        {
+            topKIndices = fused.indices
+            topKWeights = fused.weights
+        } else {
+            topKIndices = router.zipSelected(epilogueIn)
+            topKWeights = router.zipWeights(
+                expertScores: expertScores, topKIndices: topKIndices)
+        }
         Gemma4RouterProbe.recorder?(expertScores, topKIndices)
 
         // Every expert dispatch already sits behind `topKIndices`; fencing the
@@ -3602,6 +3890,20 @@ enum Gemma4FusedScaledEmbedding {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// EMBED-DECODE-001: also admit the `[B, 1]` decode row. The five
+    /// stock dispatches at the head of the step (gather weight, gather
+    /// scales, gather biases, affine dequantize, scale multiply) sit on the
+    /// naked critical path with nothing in flight to overlap them, unlike
+    /// the router tail. Numerics are unchanged: the SAME kernel, the same
+    /// two rounding boundaries, only the shape gate moves. Kill switch:
+    /// `DARKBLOOM_GEMMA4_SCALED_EMBEDDING_DECODE=0`.
+    static let decodeEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_SCALED_EMBEDDING_DECODE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// This checkpoint's embedding quantization. Anything else fails closed.
     private static let groupSize = 64
     private static let bits = 4
@@ -3659,8 +3961,9 @@ enum Gemma4FusedScaledEmbedding {
         guard enabled,
             tokens.ndim == 2,
             tokens.dtype == .int32,
-            // Prefill rectangle only; [B, 1] decode keeps the stock chain.
-            tokens.dim(1) > 1,
+            // Prefill rectangle always; the [B, 1] decode row only under
+            // EMBED-DECODE-001.
+            tokens.dim(1) > 1 || decodeEnabled,
             let quantized = embedding as? QuantizedEmbedding,
             quantized.mode == .affine,
             quantized.bits == bits,
@@ -4241,6 +4544,20 @@ public class Gemma4TextModelInner: Module {
             }
 
             let layerNumber = idx + 1
+            if gemma4ShouldSubmitPrefillEarlyLadder(
+                enabled: gemma4PrefillEarlyLadderEnabled,
+                schedulePrefill: schedulePrefill,
+                isCBv2: isCBv2,
+                batchSize: inputBatchSize,
+                inputLength: inputLength,
+                layerNumber: layerNumber,
+                interval: gemma4PrefillChunkEvalLayers)
+            {
+                asyncEval(h)
+                CBv2EngageMark.once("gemma4-b8-prefill-early-ladder")
+                CBv2StepProfiler.recordEvent(
+                    "v2.gemma4.prefill.early_ladder")
+            }
             if gemma4ShouldSubmitPrefillChunkEval(
                 schedulePrefill: schedulePrefill,
                 isCBv2: isCBv2,

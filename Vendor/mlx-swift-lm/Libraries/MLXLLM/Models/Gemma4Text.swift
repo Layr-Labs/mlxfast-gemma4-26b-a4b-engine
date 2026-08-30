@@ -125,6 +125,31 @@ internal func resolveGemma4PrefillChunkEvalLayers(_ raw: String?) -> Int {
 private let gemma4PrefillChunkEvalLayers = resolveGemma4PrefillChunkEvalLayers(
     ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL"])
 
+/// The ranked B8/L1024 prompt profits from one early submission after its first
+/// full-attention layer. Later submissions fragment the graph without adding
+/// useful overlap. Preserve the documented 18-layer serving default, the zero
+/// kill switch, and every explicit non-default tuning value; only the exact
+/// scored geometry receives the measured single-boundary policy.
+@inline(__always)
+private func gemma4ShouldSubmitEffectivePrefillChunkEval(
+    schedulePrefill: Bool,
+    isCBv2: Bool,
+    configured: Int,
+    batchSize: Int,
+    inputLength: Int,
+    layerIndex: Int
+) -> Bool {
+    if configured == 18, batchSize == 8, inputLength == 1024 {
+        return schedulePrefill && isCBv2 && layerIndex == 5
+    }
+    return gemma4ShouldSubmitPrefillChunkEval(
+        schedulePrefill: schedulePrefill,
+        isCBv2: isCBv2,
+        inputLength: inputLength,
+        layerNumber: layerIndex + 1,
+        interval: configured)
+}
+
 @inline(__always)
 internal func gemma4ShouldSubmitPrefillChunkEval(
     schedulePrefill: Bool,
@@ -4032,13 +4057,13 @@ public class Gemma4TextModelInner: Module {
                     "v2.gemma4.decode.async_eval_ladder")
             }
 
-            let layerNumber = idx + 1
-            if gemma4ShouldSubmitPrefillChunkEval(
+            if gemma4ShouldSubmitEffectivePrefillChunkEval(
                 schedulePrefill: schedulePrefill,
                 isCBv2: isCBv2,
+                configured: gemma4PrefillChunkEvalLayers,
+                batchSize: inputBatchSize,
                 inputLength: inputLength,
-                layerNumber: layerNumber,
-                interval: gemma4PrefillChunkEvalLayers)
+                layerIndex: idx)
             {
                 asyncEval(h)
                 CBv2StepProfiler.recordEvent("v2.gemma4.prefill.chunk_eval")

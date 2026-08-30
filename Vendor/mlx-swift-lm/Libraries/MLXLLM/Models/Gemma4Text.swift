@@ -169,6 +169,84 @@ internal func gemma4ShouldSubmitPrefillChunkEval(
         && layerNumber.isMultiple(of: interval)
 }
 
+/// Front rungs for the scheduled-prefill submission ladder. The decode
+/// ladder's measured result - the early boundaries carry the overlap,
+/// because the device is idle until the first submission while the host is
+/// still building the rest of the stack - applies unchanged to the
+/// scheduled prompt path: the interval cadence above submits nothing
+/// before `layerNumber == interval`, so the device waits out the host
+/// build of the first `interval` layers at the start of every scheduled
+/// prefill step. The front rungs submit the frontier after the first two
+/// decoder layers, in ADDITION to the interval cadence, at the one scored
+/// geometry (CBv2 scheduled prefill, batch 8, multi-token). Rungs are
+/// pure submission policy: they reorder when already-built graphs are
+/// queued, never what is computed, so the emitted stream is bit-identical
+/// by construction - the same argument as the decode ladder.
+///
+/// `DARKBLOOM_GEMMA4_PREFILL_EARLY_LADDER=0` (also `false`/`no`/`off`) is
+/// the attribution and emergency kill switch for the front rungs alone.
+/// `DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL=0` still disables the whole prompt
+/// ladder, front rungs included, so that switch's documented "one final
+/// submission" contract keeps holding.
+@inline(__always)
+internal func resolveGemma4PrefillEarlyLadderEnabled(_ raw: String?) -> Bool {
+    guard let raw else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}
+
+private let gemma4PrefillEarlyLadderEnabled =
+    resolveGemma4PrefillEarlyLadderEnabled(
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_EARLY_LADDER"])
+
+/// LOCAL EXPERIMENT ONLY. `DARKBLOOM_GEMMA4_PREFILL_EARLY_LADDER_SET`
+/// overrides the shipped front-rung list with a comma-separated set of
+/// 1-based layer numbers, so the geometry can be swept on one binary
+/// instead of one rebuild per candidate. The ranked runner sets no
+/// environment, so an unset variable keeps the shipped switch below
+/// verbatim and this is inert in a submission. An empty value means "no
+/// front rungs", which is distinct from unset.
+private let gemma4PrefillEarlyLadderSet: Set<Int>? = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_PREFILL_EARLY_LADDER_SET"]
+    else { return nil }
+    return Set(raw.split(separator: ",").compactMap { Int($0.trimmingCharacters(
+        in: .whitespaces)) })
+}()
+
+/// Pure, fail-closed policy for the prefill front rungs. `layerNumber` is
+/// 1-based (the trunk's `idx + 1`), so the shipped pair {1, 2} names the
+/// boundaries after decoder layers 0 and 1 - the same physical boundaries
+/// as the promoted decode pair. One rung would already keep the device fed
+/// (a prompt-rectangle layer far outlasts the host build of the remaining
+/// stack); the second rung mirrors the decode pair at negligible cost and
+/// covers small scheduled chunks, whose per-layer device time shrinks
+/// toward the decode regime where the pair is the measured optimum.
+@inline(__always)
+internal func gemma4ShouldSubmitPrefillEarlyLadder(
+    enabled: Bool,
+    schedulePrefill: Bool,
+    isCBv2: Bool,
+    batchSize: Int,
+    inputLength: Int,
+    layerNumber: Int,
+    interval: Int
+) -> Bool {
+    guard enabled, isCBv2, schedulePrefill, batchSize == 8, inputLength > 1,
+        interval > 0
+    else { return false }
+
+    if let set = gemma4PrefillEarlyLadderSet {
+        return set.contains(layerNumber)
+    }
+    switch layerNumber {
+    case 1, 2:
+        return true
+    default:
+        return false
+    }
+}
+
 /// CBv2 consumes only the final prompt position, so the LAST decoder layer
 /// can keep full attention and every K/V write while retaining just this
 /// many trailing rows for `o_proj`, the residual, the feed-forward/MoE
@@ -2285,6 +2363,185 @@ private enum Gemma4FusedRouterTop8 {
     }
 }
 
+/// ROUTER-FINALIZE-001: preserve the stock stable `argPartition` selection,
+/// then finish the exact B=8/top-K=8 router tail and the already-promoted
+/// EXPERT-PREFIX-BOUNDS-001 route table in one dispatch.
+///
+/// This deliberately does not revisit selection: previous whole-router
+/// replacements changed the scheduler balance even when bit exact. The input
+/// indices here are the incumbent selected slice. Eight SIMDgroups reproduce
+/// the stock precise softmax independently, including its lane layout and bf16
+/// rounding before the per-expert-scale multiply. The same dispatch then emits
+/// the stable 64-assignment expert permutation and its tagged run bounds, so
+/// `SwitchGLU` can skip its separate route-table dispatch without changing any
+/// expert projection or reduction.
+fileprivate enum Gemma4RouterFinalizerV1 {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ROUTER_FINALIZE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let rows = 8
+    private static let experts = 128
+    private static let selected = 8
+
+    struct Finalized {
+        let weights: MLXArray
+        let preparedRoutes: PreparedExpertRoutes
+    }
+
+    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_router_finalize_routes_e128_k8_b8_bf16_v1",
+        inputNames: ["scores", "indices", "pes"],
+        outputNames: [
+            "weights", "row_order", "sorted_keys", "inverse_order",
+        ],
+        source: """
+            constexpr uint K = 8;
+            constexpr uint E = 128;
+            constexpr uint N_READS = 4;
+
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint row = simdgroup_index_in_threadgroup;
+            const uint row_base = row * K;
+
+            threadgroup uint route_indices[64];
+            if (lane < K) {
+                route_indices[row_base + lane] =
+                    (uint)indices[row_base + lane];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Exact softmax_single_row<T, float, N_READS=4> lane topology:
+            // lanes 0 and 1 own the eight selected values; every remaining
+            // lane contributes the same Limits<float>::min padding as stock.
+            float ld[N_READS];
+            const uint base = lane * N_READS;
+            if (base + N_READS <= K) {
+                for (uint i = 0; i < N_READS; ++i) {
+                    const uint slot = base + i;
+                    const uint expert = route_indices[row_base + slot];
+                    ld[i] = (float)scores[row * E + expert];
+                }
+            } else {
+                for (uint i = 0; i < N_READS; ++i) {
+                    ld[i] = Limits<float>::min;
+                }
+            }
+
+            float maxval = Limits<float>::finite_min;
+            for (uint i = 0; i < N_READS; ++i) {
+                maxval = (maxval < ld[i]) ? ld[i] : maxval;
+            }
+            maxval = simd_max(maxval);
+
+            float normalizer = 0;
+            for (uint i = 0; i < N_READS; ++i) {
+                const float exp_x = fast::exp(ld[i] - maxval);
+                ld[i] = exp_x;
+                normalizer += exp_x;
+            }
+            normalizer = 1 / simd_sum(normalizer);
+
+            if (base + N_READS <= K) {
+                for (uint i = 0; i < N_READS; ++i) {
+                    const uint slot = base + i;
+                    const uint expert = route_indices[row_base + slot];
+                    const T weight = T(ld[i] * normalizer);
+                    weights[row_base + slot] = weight * pes[expert];
+                }
+            }
+
+            // Stable rank is the count of smaller expert ids plus equal ids
+            // at earlier assignments. This is the incumbent route sorter’s
+            // exact two-key SIMD broadcast topology and tie order. The run
+            // metadata uses the crown's in-band ABI.
+            if (lid < 64) {
+                const uint assignment = lid;
+                const uint key = route_indices[assignment];
+                const uint key_low = route_indices[lane];
+                const uint key_high = route_indices[32u + lane];
+                uint rank = 0;
+                uint run_offset = 0;
+                uint run_length = 0;
+                for (uint source = 0; source < 32; ++source) {
+                    const uint other_low =
+                        simd_broadcast(key_low, ushort(source));
+                    rank += (other_low < key)
+                        || (other_low == key && source < assignment);
+                    run_offset +=
+                        other_low == key && source < assignment;
+                    run_length += other_low == key;
+
+                    const uint other_high =
+                        simd_broadcast(key_high, ushort(source));
+                    const uint high_assignment = 32u + source;
+                    rank += (other_high < key)
+                        || (other_high == key
+                            && high_assignment < assignment);
+                    run_offset +=
+                        other_high == key
+                        && high_assignment < assignment;
+                    run_length += other_high == key;
+                }
+                const uint run_remaining = run_length - run_offset;
+                row_order[rank] = assignment / K;
+                sorted_keys[rank] = 0x80000000u | key
+                    | (run_offset << 8)
+                    | ((run_remaining - 1) << 14);
+                inverse_order[assignment] = rank;
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    static func apply(
+        expertScores: MLXArray,
+        topKIndices: MLXArray,
+        perExpertScale: MLXArray,
+        topK: Int
+    ) -> Finalized? {
+        guard enabled,
+            topK == selected,
+            expertScores.ndim == 3,
+            expertScores.shape == [rows, 1, experts],
+            expertScores.dtype == .bfloat16,
+            topKIndices.ndim == 3,
+            topKIndices.shape == [rows, 1, selected],
+            topKIndices.dtype == .uint32,
+            perExpertScale.ndim == 1,
+            perExpertScale.shape == [experts],
+            perExpertScale.dtype == .bfloat16
+        else { return nil }
+
+        let outputs = kernel(
+            [expertScores, topKIndices, perExpertScale],
+            template: [("T", expertScores.dtype)],
+            grid: (256, 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [
+                [rows, 1, selected], [64], [64], [64],
+            ],
+            outputDTypes: [
+                .bfloat16, .uint32, .uint32, .uint32,
+            ]
+        )
+        let indices = topKIndices.reshaped(rows, selected)
+        let weights = outputs[0]
+        let prepared = PreparedExpertRoutes(
+            indices: indices,
+            weights: weights.reshaped(rows, selected),
+            lhsIndices: outputs[1],
+            sortedIndices: outputs[2],
+            inverseOrder: outputs[3])
+        CBv2EngageMark.once("router-finalize")
+        return Finalized(weights: weights, preparedRoutes: prepared)
+    }
+}
+
 /// GLUE-003: one-per-forward chain box. Layer L's fused tail deposits the
 /// (output, next-layer-input-norm) pair; layer L+1 consumes the norm instead
 /// of re-reading and re-normalizing the same tensor — guarded by pointer
@@ -2755,7 +3012,13 @@ private class Gemma4Router: Module {
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
+    func callAsFunction(
+        _ x: MLXArray
+    ) -> (
+        topKIndices: MLXArray,
+        topKWeights: MLXArray,
+        preparedRoutes: PreparedExpertRoutes?
+    ) {
         let effScale: MLXArray
         if let cached = cachedEffectiveScale {
             effScale = cached
@@ -2774,11 +3037,24 @@ private class Gemma4Router: Module {
             expertScores: expertScores, perExpertScale: perExpertScale, topK: topK)
         {
             Gemma4RouterProbe.recorder?(expertScores, fused.indices)
-            return (fused.indices, fused.weights)
+            return (fused.indices, fused.weights, nil)
         }
 
         var topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
         topKIndices = topKIndices[.ellipsis, kth...]
+
+        if let finalized = Gemma4RouterFinalizerV1.apply(
+            expertScores: expertScores,
+            topKIndices: topKIndices,
+            perExpertScale: perExpertScale,
+            topK: topK)
+        {
+            Gemma4RouterProbe.recorder?(expertScores, topKIndices)
+            return (
+                topKIndices,
+                finalized.weights,
+                finalized.preparedRoutes)
+        }
 
         var topKWeights = MLX.takeAlong(expertScores, topKIndices, axis: -1)
         topKWeights = MLX.softmax(topKWeights, axis: -1, precise: true)
@@ -2789,7 +3065,7 @@ private class Gemma4Router: Module {
         // selection itself, never altering either.
         Gemma4RouterProbe.recorder?(expertScores, topKIndices)
 
-        return (topKIndices, topKWeights)
+        return (topKIndices, topKWeights, nil)
     }
 
     // MARK: ZIP-ROUTER-001 stages
@@ -2832,6 +3108,16 @@ private class Gemma4Router: Module {
         topKWeights = MLX.softmax(topKWeights, axis: -1, precise: true)
         return topKWeights * perExpertScale[topKIndices]
     }
+
+    fileprivate func zipFinalize(
+        expertScores: MLXArray, topKIndices: MLXArray
+    ) -> Gemma4RouterFinalizerV1.Finalized? {
+        Gemma4RouterFinalizerV1.apply(
+            expertScores: expertScores,
+            topKIndices: topKIndices,
+            perExpertScale: perExpertScale,
+            topK: topK)
+    }
 }
 
 /// Sparse MoE feed-forward block. Wraps `SwitchGLU` with GeGLU activation.
@@ -2862,6 +3148,7 @@ private class Gemma4Experts: Module {
         _ x: MLXArray,
         topKIndices: MLXArray,
         topKWeights: MLXArray,
+        preparedRoutes: PreparedExpertRoutes? = nil,
         isExpertPrefill: Bool
     ) -> MLXArray {
         // Flatten [B, S, H] and always enter SwitchGLU's combined API. It
@@ -2869,10 +3156,17 @@ private class Gemma4Experts: Module {
         // contract; every other case performs the established unsort + sum.
         let (B, S, H) = (x.dim(0), x.dim(1), x.dim(2))
         let K = topKIndices.dim(-1)
+        let flatIndices =
+            preparedRoutes?.indices
+            ?? topKIndices.reshaped(B * S, K)
+        let flatWeights =
+            preparedRoutes?.weights
+            ?? topKWeights.reshaped(B * S, K)
         let y = switchGLU.callAndWeightedReduce(
             x.reshaped(B * S, H),
-            topKIndices.reshaped(B * S, K),
-            weights: topKWeights.reshaped(B * S, K),
+            flatIndices,
+            weights: flatWeights,
+            preparedRoutes: preparedRoutes,
             fuseSortedReduction: fuseWeightedUnsort,
             // Ordinary/direct VLM and CBv2 prompt entry points may engage.
             // Rectangular MTP verification explicitly passes false.
@@ -3041,6 +3335,7 @@ private enum Gemma4ZipRouterV1 {
         let expertNorm: MLXArray
         let topKIndices: MLXArray
         let topKWeights: MLXArray
+        let preparedRoutes: PreparedExpertRoutes?
     }
 
     /// PREFIX-001 admission lives beside the ZIP admission so the eager
@@ -3144,11 +3439,21 @@ private enum Gemma4ZipRouterV1 {
             topKIndices = router.zipSelected(partition)
         }
 
-        // The router weight tail (takeAlong -> softmax -> per-expert scale) is
-        // off the critical path to the expert kernels and already overlaps
-        // them in the stock tape; it is emitted unchanged.
-        let topKWeights = router.zipWeights(
+        // ROUTER-FINALIZE-001 keeps this exact selected slice, but joins its
+        // precise weight tail with the route products that the expert branch
+        // otherwise builds in a second dispatch.
+        let topKWeights: MLXArray
+        let preparedRoutes: PreparedExpertRoutes?
+        if let finalized = router.zipFinalize(
             expertScores: expertScores, topKIndices: topKIndices)
+        {
+            topKWeights = finalized.weights
+            preparedRoutes = finalized.preparedRoutes
+        } else {
+            topKWeights = router.zipWeights(
+                expertScores: expertScores, topKIndices: topKIndices)
+            preparedRoutes = nil
+        }
         Gemma4RouterProbe.recorder?(expertScores, topKIndices)
 
         // Every expert dispatch already sits behind `topKIndices`; fencing the
@@ -3164,7 +3469,8 @@ private enum Gemma4ZipRouterV1 {
             denseOut: denseOut,
             expertNorm: expertNorm,
             topKIndices: topKIndices,
-            topKWeights: topKWeights)
+            topKWeights: topKWeights,
+            preparedRoutes: preparedRoutes)
     }
 }
 
@@ -3390,9 +3696,10 @@ public class Gemma4DecoderLayer: Module {
                     zipped.expertNorm,
                     topKIndices: zipped.topKIndices,
                     topKWeights: zipped.topKWeights,
+                    preparedRoutes: zipped.preparedRoutes,
                     isExpertPrefill: isExpertPrefill)
             } else {
-                let (topKIndices, topKWeights) = router(out)
+                let (topKIndices, topKWeights, preparedRoutes) = router(out)
 
                 if let (n1, n2, denseSums) = Gemma4FusedLayerGlue.dualPreNorm(
                     x: out,
@@ -3405,6 +3712,7 @@ public class Gemma4DecoderLayer: Module {
                         n2,
                         topKIndices: topKIndices,
                         topKWeights: topKWeights,
+                        preparedRoutes: preparedRoutes,
                         isExpertPrefill: isExpertPrefill)
                 } else if let (n1, n2) = Gemma4PrefillGlueV1.dualPreNorm(
                     x: out,
@@ -3417,6 +3725,7 @@ public class Gemma4DecoderLayer: Module {
                         n2,
                         topKIndices: topKIndices,
                         topKWeights: topKWeights,
+                        preparedRoutes: preparedRoutes,
                         isExpertPrefill: isExpertPrefill)
                 } else {
                     h1Raw = mlp(preFeedforwardLayernorm(out))
@@ -3424,6 +3733,7 @@ public class Gemma4DecoderLayer: Module {
                         preFeedforwardLayernorm2(out),
                         topKIndices: topKIndices,
                         topKWeights: topKWeights,
+                        preparedRoutes: preparedRoutes,
                         isExpertPrefill: isExpertPrefill)
                 }
             }
@@ -4241,6 +4551,20 @@ public class Gemma4TextModelInner: Module {
             }
 
             let layerNumber = idx + 1
+            if gemma4ShouldSubmitPrefillEarlyLadder(
+                enabled: gemma4PrefillEarlyLadderEnabled,
+                schedulePrefill: schedulePrefill,
+                isCBv2: isCBv2,
+                batchSize: inputBatchSize,
+                inputLength: inputLength,
+                layerNumber: layerNumber,
+                interval: gemma4PrefillChunkEvalLayers)
+            {
+                asyncEval(h)
+                CBv2EngageMark.once("gemma4-b8-prefill-early-ladder")
+                CBv2StepProfiler.recordEvent(
+                    "v2.gemma4.prefill.early_ladder")
+            }
             if gemma4ShouldSubmitPrefillChunkEval(
                 schedulePrefill: schedulePrefill,
                 isCBv2: isCBv2,

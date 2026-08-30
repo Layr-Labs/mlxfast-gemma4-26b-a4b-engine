@@ -32,6 +32,38 @@ public let weightedExpertSum: @Sendable (MLXArray, MLXArray) -> MLXArray = compi
 ) { outputs, weights in
     (outputs * MLX.expandedDimensions(weights, axis: -1)).sum(axis: -2)
 }
+
+/// Exact decode-router products prepared together by a model-specific producer.
+///
+/// `indices` and `weights` retain the established `[tokens, topK]` logical
+/// order. The remaining arrays are the stable expert-sorted products consumed
+/// by `SwitchGLU`: gathered lhs rows, tagged expert/run words, and the inverse
+/// permutation. `SwitchGLU` accepts this carrier only for the pinned Gemma 4
+/// B=8/top-K=8 production contract and only when `indices` is the exact array
+/// passed to the projection call; every other use falls back to its incumbent
+/// route-table producer.
+public struct PreparedExpertRoutes {
+    public let indices: MLXArray
+    public let weights: MLXArray
+    public let lhsIndices: MLXArray
+    public let sortedIndices: MLXArray
+    public let inverseOrder: MLXArray
+
+    public init(
+        indices: MLXArray,
+        weights: MLXArray,
+        lhsIndices: MLXArray,
+        sortedIndices: MLXArray,
+        inverseOrder: MLXArray
+    ) {
+        self.indices = indices
+        self.weights = weights
+        self.lhsIndices = lhsIndices
+        self.sortedIndices = sortedIndices
+        self.inverseOrder = inverseOrder
+    }
+}
+
 /// Effective-selection count for the direct sorted-expert reduction. Benchmark
 /// callers arm this after warmup and snapshot it only after the engine is idle.
 /// The unarmed hot path reads one plain Bool and performs no atomic operation,
@@ -1091,7 +1123,8 @@ public class SwitchGLU: Module {
     }
 
     private func projectExperts(
-        _ x: MLXArray, _ indices: MLXArray
+        _ x: MLXArray, _ indices: MLXArray,
+        preparedRoutes: PreparedExpertRoutes? = nil
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
         let useLhsIndices =
             indices.size == 64 && indices.ndim == 2 && indices.shape == [8, 8]
@@ -1107,7 +1140,27 @@ public class SwitchGLU: Module {
         var inverseOrder = MLXArray()
         var lhsIndices: MLXArray?
         if doSort {
-            if useLhsIndices {
+            let usePreparedRoutes =
+                useExpertPrefixBounds
+                && preparedRoutes?.indices === indices
+                && preparedRoutes?.weights.ndim == 2
+                && preparedRoutes?.weights.shape == [8, 8]
+                && preparedRoutes?.weights.dtype == .bfloat16
+                && preparedRoutes?.lhsIndices.ndim == 1
+                && preparedRoutes?.lhsIndices.shape == [64]
+                && preparedRoutes?.lhsIndices.dtype == .uint32
+                && preparedRoutes?.sortedIndices.ndim == 1
+                && preparedRoutes?.sortedIndices.shape == [64]
+                && preparedRoutes?.sortedIndices.dtype == .uint32
+                && preparedRoutes?.inverseOrder.ndim == 1
+                && preparedRoutes?.inverseOrder.shape == [64]
+                && preparedRoutes?.inverseOrder.dtype == .uint32
+            if usePreparedRoutes, let preparedRoutes {
+                x = x.flattened(start: 0, end: -3)
+                lhsIndices = preparedRoutes.lhsIndices
+                idx = preparedRoutes.sortedIndices
+                inverseOrder = preparedRoutes.inverseOrder
+            } else if useLhsIndices {
                 x = x.flattened(start: 0, end: -3)
                 (lhsIndices, idx, inverseOrder) = gatherSortIndices(
                     indices: indices, numExperts: numExperts,
@@ -1245,8 +1298,12 @@ public class SwitchGLU: Module {
             && indices.size >= 64
     }
 
-    public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
-        var projected = projectExperts(x, indices)
+    public func callAsFunction(
+        _ x: MLXArray, _ indices: MLXArray,
+        preparedRoutes: PreparedExpertRoutes? = nil
+    ) -> MLXArray {
+        var projected = projectExperts(
+            x, indices, preparedRoutes: preparedRoutes)
         if let inverseOrder = projected.inverseOrder {
             projected.output = scatterUnsort(
                 x: projected.output, invOrder: inverseOrder, shape: indices.shape)
@@ -1265,6 +1322,7 @@ public class SwitchGLU: Module {
         _ x: MLXArray,
         _ indices: MLXArray,
         weights: MLXArray,
+        preparedRoutes: PreparedExpertRoutes? = nil,
         fuseSortedReduction: Bool,
         isProductionPrefill: Bool = true
     ) -> MLXArray {
@@ -1277,10 +1335,14 @@ public class SwitchGLU: Module {
         guard fuseSortedReduction && (isProductionPrefill || isEightRowDecode),
             supportsWeightedExpertUnsort(x, indices, weights: weights)
         else {
-            return weightedExpertSum(callAsFunction(x, indices), weights)
+            return weightedExpertSum(
+                callAsFunction(
+                    x, indices, preparedRoutes: preparedRoutes),
+                weights)
         }
 
-        let projected = projectExperts(x, indices)
+        let projected = projectExperts(
+            x, indices, preparedRoutes: preparedRoutes)
         guard projected.sorted,
             let inverseOrder = projected.inverseOrder,
             projected.output.ndim == 3,

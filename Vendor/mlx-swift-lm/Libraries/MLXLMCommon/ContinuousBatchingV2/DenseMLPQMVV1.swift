@@ -96,6 +96,15 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Reuse the scalar gate/up weight fragments across all eight rows.
+    /// This does not opt into the gate/up MMA arithmetic.
+    private static let gateUpOctaStreamEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MLP_GATEUP_OCTA_STREAM"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let batch = 8
     private static let sequence = 1
     private static let groupSize = 64
@@ -390,6 +399,155 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
         }
         return result
     }()
+
+    /// Derive only the appended affine8 quad-stream helper, leaving the
+    /// tied-head prefix intact. Each output keeps its original scalar qdot,
+    /// ascending K loop and final simd_sum; four more rows share the weights.
+    private static let octaStreamKernelHeader: String = {
+        let marker = """
+            template <typename T, const int group_size, const int bits>
+            METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
+            """
+        guard let range = kernelHeader.range(of: marker, options: .backwards) else {
+            preconditionFailure("DMLP-OCTA-016 helper marker is missing")
+        }
+        let prefix = String(kernelHeader[..<range.lowerBound])
+        var body = String(kernelHeader[range.lowerBound...])
+        func replace(_ old: String, with new: String, count: Int = 1) {
+            precondition(body.components(separatedBy: old).count == count + 1)
+            body = body.replacingOccurrences(of: old, with: new)
+        }
+        replace("qmv_affine8_g64_quad_stream_impl(",
+                with: "qmv_affine8_g64_octa_stream_xsum_impl(")
+        replace("    const device T* biases,",
+                with: "    const device T* biases,\n    const device float* x_sums,")
+        replace("    const device T* x3,", with: """
+                const device T* x3,
+                const device T* x4,
+                const device T* x5,
+                const device T* x6,
+                const device T* x7,
+            """)
+        replace("    device T* y3,", with: """
+                device T* y3,
+                device T* y4,
+                device T* y5,
+                device T* y6,
+                device T* y7,
+            """)
+        replace("  thread float result3[results_per_simdgroup] = {0};", with: """
+              thread float result3[results_per_simdgroup] = {0};
+              thread float result4[results_per_simdgroup] = {0};
+              thread float result5[results_per_simdgroup] = {0};
+              thread float result6[results_per_simdgroup] = {0};
+              thread float result7[results_per_simdgroup] = {0};
+            """)
+        replace("  const int in_vec_size_g = in_vec_size / 64;",
+                with: "  const int in_vec_size_g = in_vec_size / 64;\n  const int first_m = int(tid.x) * 8;")
+        replace("  x3 += simd_lid * values_per_thread;", with: """
+              x3 += simd_lid * values_per_thread;
+              x4 += simd_lid * values_per_thread;
+              x5 += simd_lid * values_per_thread;
+              x6 += simd_lid * values_per_thread;
+              x7 += simd_lid * values_per_thread;
+            """)
+        replace("  y3 += out_row;", with: """
+              y3 += out_row;
+              y4 += out_row;
+              y5 += out_row;
+              y6 += out_row;
+              y7 += out_row;
+            """)
+
+        let row3 = """
+                sum = load_vector<T, float, values_per_thread, 8>(x3, x_thread);
+                for (int row = 0; row < results_per_simdgroup; row++) {
+                  result3[row] += qdot_affine8_registered<float, values_per_thread>(
+                      packed[row], x_thread, scale_local[row], bias_local[row], sum);
+                }
+            """
+        var rows = row3
+        for row in 4..<8 {
+            rows += "\n" + row3
+                .replacingOccurrences(of: "x3", with: "x\(row)")
+                .replacingOccurrences(of: "result3", with: "result\(row)")
+        }
+        replace(row3, with: rows, count: 2)
+        replace("    x3 += block_size;", with: """
+                x3 += block_size;
+                x4 += block_size;
+                x5 += block_size;
+                x6 += block_size;
+                x7 += block_size;
+            """)
+        replace("    result3[row] = simd_sum(result3[row]);", with: """
+                result3[row] = simd_sum(result3[row]);
+                result4[row] = simd_sum(result4[row]);
+                result5[row] = simd_sum(result5[row]);
+                result6[row] = simd_sum(result6[row]);
+                result7[row] = simd_sum(result7[row]);
+            """)
+        replace("      y3[row] = static_cast<T>(result3[row]);", with: """
+                  y3[row] = static_cast<T>(result3[row]);
+                  y4[row] = static_cast<T>(result4[row]);
+                  y5[row] = static_cast<T>(result5[row]);
+                  y6[row] = static_cast<T>(result6[row]);
+                  y7[row] = static_cast<T>(result7[row]);
+            """)
+
+        // Same DMLP-002 four-value table lookup, now for all eight rows.
+        // The original no-table helper remains available as a fallback.
+        for row in 0..<8 {
+            let declaration = row == 0 ? "float " : ""
+            let old = "\(declaration)sum = load_vector<T, float, values_per_thread, 8>(x\(row), x_thread);"
+            let new = """
+                octa_load_affine8_values<T, float, values_per_thread>(x\(row), x_thread);
+                \(declaration)sum = x_sums[
+                    ((k / block_size) * SIMD_SIZE + int(simd_lid)) * 8 + first_m + \(row)];
+                """
+            replace(old, with: new, count: 2)
+        }
+        let loader = """
+            template <typename T, typename U, int values_per_thread>
+            inline void octa_load_affine8_values(
+                const device T* x,
+                thread U* x_thread) {
+              for (int i = 0; i < values_per_thread; i++) {
+                x_thread[i] = x[i];
+              }
+            }
+
+            """
+        return prefix + loader + body
+    }()
+
+    private static let octaStreamQMVKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_octa_stream_xsum_v1",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const int K = x_shape[x_ndim - 1];
+            const int N = w_shape[0];
+            const int m = int(tid.x) * 8;
+            if (m >= 8) { return; }
+            qmv_affine8_g64_octa_stream_xsum_impl<T, 64, 8>(
+                w, scales, biases, xSums,
+                x + m * K, x + (m + 1) * K,
+                x + (m + 2) * K, x + (m + 3) * K,
+                x + (m + 4) * K, x + (m + 5) * K,
+                x + (m + 6) * K, x + (m + 7) * K,
+                y + m * N, y + (m + 1) * N,
+                y + (m + 2) * N, y + (m + 3) * N,
+                y + (m + 4) * N, y + (m + 5) * N,
+                y + (m + 6) * N, y + (m + 7) * N,
+                K, tid, simd_gid, simd_lid);
+            return;
+            """,
+        header: octaStreamKernelHeader,
+        ensureRowContiguous: true)
 
     /// MMA-MLP-001. Verbatim transcription of the `kGemma4QmvMma8Affine8`
     /// tier body from `zarar/t6-mma-s2` (quantized.h / quantized.cpp twins,
@@ -959,6 +1117,16 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         let inputs = useActivationSums
             ? [x, weight, scales, biases, activationSums!.values]
             : [x, weight, scales, biases]
+        if useActivationSums && gateUpOctaStreamEnabled {
+            return octaStreamQMVKernel(
+                inputs,
+                template: [("T", x.dtype)],
+                grid: (simdWidth, yGroups * simdGroups, 1),
+                threadGroup: (simdWidth, simdGroups, 1),
+                outputShapes: [[batch, sequence, outDim]],
+                outputDTypes: [x.dtype]
+            )[0]
+        }
         return selected(
             inputs,
             template: [("T", x.dtype)],

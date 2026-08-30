@@ -53,13 +53,24 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
 
     /// The partition this dispatch actually uses.
     ///
-    /// 32 is the floor the pass-B merge admits (`BLOCKS / simd_width >= 1`),
-    /// and at batch 8 it still leaves `kvHeads * batch * 32 = 2048`
-    /// threadgroups, i.e. twice the 1024 the stock heuristic settles for on the
-    /// row-local call it was tuned against. `MLX_SDPA_BLOCKS` keeps its stock
-    /// meaning and still wins, so a process can never run mismatched
-    /// partitions; `DARKBLOOM_CBV2_2PASS_BLOCKS` restores the stock answer
-    /// (`=0`) or any other multiple of 32 for bisection.
+    /// PARTITION-016: 16 is the exact occupancy answer the stock heuristic
+    /// derives for the row-local launch it was tuned against — at batch 8
+    /// this dispatch runs `kvHeads * batch * 16 = 1024` threadgroups, the
+    /// same 1024 the stock heuristic settles for on `kvHeads * 1 * 128`.
+    /// PARTITION-001 halved the inherited over-partitioning once (128 -> 32,
+    /// sealed promoted at +1.07%) and stopped at 32 because the old pass-B
+    /// merge indexed one block per lane in groups of 32 (`BLOCKS /
+    /// simd_width >= 1`). That floor is merge arithmetic, not attention:
+    /// this cell rewrites pass B so lanes 16...31 own nothing and
+    /// contribute zero, and the merge sums the surviving 16 block partials
+    /// exactly as before. Halving the partition again quarters nothing of
+    /// the model traffic but halves the non-model scratch once more:
+    /// `8 * 16 * 16 * 256 * 2B = 1.05 MB` per sliding layer versus 2.10 at
+    /// 32 — ~52 MB per decode step saved, ~0.7% of the step's ~7.6 GB, and
+    /// pass-B partial reads halve with it while pass-A query re-reads stay
+    /// constant per threadgroup. `MLX_SDPA_BLOCKS` keeps its stock meaning
+    /// and still wins; `DARKBLOOM_CBV2_2PASS_BLOCKS` restores the stock
+    /// answer (`=0`) or any 16/32/64/128 for bisection.
     private static let blocks: Int = {
         if let raw = ProcessInfo.processInfo.environment["MLX_SDPA_BLOCKS"],
             let value = Int(raw), value > 0
@@ -69,9 +80,9 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         if let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_2PASS_BLOCKS"], let value = Int(raw)
         {
-            return value > 0 && value.isMultiple(of: 32) ? value : stockBlocks
+            return value > 0 && value.isMultiple(of: 16) ? value : stockBlocks
         }
-        return min(32, stockBlocks)
+        return min(16, stockBlocks)
     }()
 
     private static let passAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
@@ -371,53 +382,55 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         ensureRowContiguous: true
     )
 
+    /// Pass B merge. One lane owns one block; lanes past `BLOCKS - 1` own
+    /// nothing and contribute zero, which lets `BLOCKS` sit anywhere in
+    /// {16, 32} without the 32-lane-group arithmetic the previous version
+    /// needed (`BLOCKS / simd_width` rounds to zero below 32). At
+    /// BLOCKS == 32 every lane owns, the selects fold to plain loads, and
+    /// the merge order is the sealed one, element for element. Loads are
+    /// always clamped to a valid block and the owner flag decides the
+    /// value, so no non-owner ever dereferences past its slice.
     private static let passBKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_2pass_b_direct_bf16_d256_b\(blocks)_v2",
+        name: "cbv2_ragged8_sdpa_2pass_b_direct_bf16_d256_b\(blocks)_v3",
         inputNames: ["partials", "sums", "maxs"],
         outputNames: ["out"],
         source: """
-            constexpr int simd_width = 32;
-            constexpr int values_per_lane = D / simd_width;
+            constexpr int values_per_lane = D / 32;
 
             const int batch_head = int(threadgroup_position_in_grid.x);
             const int output_group = int(simdgroup_index_in_threadgroup);
             const int block_lane = int(thread_index_in_simdgroup);
 
-            partials += batch_head * BLOCKS * D
-                + block_lane * D + output_group * values_per_lane;
+            partials += batch_head * BLOCKS * D + output_group * values_per_lane;
             sums += batch_head * BLOCKS;
             maxs += batch_head * BLOCKS;
             out += batch_head * D + output_group * values_per_lane;
 
+            const bool owns = block_lane < BLOCKS;
+            const int block = owns ? block_lane : 0;
+            const device T* partial = partials + block * D;
+            float m_own = maxs[block];
+            if (!owns) {
+                m_own = -3.402823466e+38F;
+            }
+            const float max_score = simd_max(m_own);
+            const float factor = owns
+                ? fast::exp(maxs[block] - max_score)
+                : 0.0f;
+            float s_own = factor * sums[block];
+            if (!owns) {
+                s_own = 0.0f;
+            }
+            const float sum_exp_score = simd_sum(s_own);
+
             thread float accumulator[values_per_lane];
             for (int element = 0; element < values_per_lane; ++element) {
-                accumulator[element] = 0.0f;
+                accumulator[element] = factor * float(partial[element]);
             }
-            float sum_exp_score = 0.0f;
-            float max_score = -3.402823466e+38F;
-            for (int block = 0; block < BLOCKS / simd_width; ++block) {
-                max_score = max(
-                    max_score, maxs[block_lane + simd_width * block]);
-            }
-            max_score = simd_max(max_score);
-
-            for (int block = 0; block < BLOCKS / simd_width; ++block) {
-                const float factor = fast::exp(
-                    maxs[block_lane + simd_width * block] - max_score);
-                sum_exp_score +=
-                    factor * sums[block_lane + simd_width * block];
-            }
-            sum_exp_score = simd_sum(sum_exp_score);
-
-            for (int block = 0; block < BLOCKS / simd_width; ++block) {
-                const float factor = fast::exp(maxs[block_lane] - max_score);
+            if (!owns) {
                 for (int element = 0; element < values_per_lane; ++element) {
-                    accumulator[element] +=
-                        factor * float(partials[element]);
+                    accumulator[element] = 0.0f;
                 }
-                maxs += simd_width;
-                sums += simd_width;
-                partials += simd_width * D;
             }
 
             for (int element = 0; element < values_per_lane; ++element) {
@@ -482,7 +495,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     ) -> (output: MLXArray, nextWriteFence: MLXArray)? {
         guard enabled,
             blocks > 0,
-            blocks.isMultiple(of: 32),
+            blocks == 16 || blocks == 32,
             scale == 1.0,
             slidingWindowLength == sequenceLength,
             queries.dtype == .bfloat16,
@@ -554,7 +567,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     ) -> MLXArray? {
         guard enabled,
             blocks > 0,
-            blocks.isMultiple(of: 32),
+            blocks == 16 || blocks == 32,
             scale == 1.0,
             queries.dtype == .bfloat16,
             queries.shape == [batch, queryHeads, 1, headDim],

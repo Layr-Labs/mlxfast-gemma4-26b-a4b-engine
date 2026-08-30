@@ -350,13 +350,24 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 accumulator[element] = 0.0f;
             }
 
+            // Logical token N - 1 is the only one served from new_keys, and it
+            // lands on partition column BLOCKS - 1 alone, on that column's
+            // final iteration. Peeling it out keeps the traversal, the strided
+            // partition and the accumulation order byte-for-byte identical and
+            // leaves the ring loop a straight affine walk with no per-token
+            // pointer select on the critical path to the K load.
+            static_assert(N % BLOCKS == 0, "partition must divide the ring");
+            constexpr int iterations = N / BLOCKS;
+            const bool owns_current = block == BLOCKS - 1;
+            const int ring_iterations =
+                owns_current ? iterations - 1 : iterations;
+
             uint slot = (ring_start + uint(block)) & ring_mask;
             float max_score = -3.402823466e+38F;
             float sum_exp_score = 0.0f;
-            for (int token = block; token < N; token += BLOCKS) {
-                const bool current = token == N - 1;
-                const device T* k = current ? new_key : keys + slot * D;
-                const device T* v = current ? new_value : values + slot * D;
+            for (int iteration = 0; iteration < ring_iterations; ++iteration) {
+                const device T* k = keys + slot * D;
+                const device T* v = values + slot * D;
                 float score = 0.0f;
                 for (int element = 0; element < values_per_lane; ++element) {
                     score += q[element] * float(k[element]);
@@ -374,6 +385,23 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 }
 
                 slot = (slot + uint(BLOCKS)) & ring_mask;
+            }
+            if (owns_current) {
+                float score = 0.0f;
+                for (int element = 0; element < values_per_lane; ++element) {
+                    score += q[element] * float(new_key[element]);
+                }
+                score = simd_sum(score);
+
+                const float new_max = max(max_score, score);
+                const float old_factor = fast::exp(max_score - new_max);
+                const float score_factor = fast::exp(score - new_max);
+                max_score = new_max;
+                sum_exp_score = sum_exp_score * old_factor + score_factor;
+                for (int element = 0; element < values_per_lane; ++element) {
+                    accumulator[element] = accumulator[element] * old_factor
+                        + score_factor * float(new_value[element]);
+                }
             }
 
             if (lane == 0) {
@@ -417,19 +445,27 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             }
             float sum_exp_score = 0.0f;
             float max_score = -3.402823466e+38F;
+            // This lane's own column maxima, read once. A surplus lane holds
+            // the identity of the max reduction, which is what the guard used
+            // to supply, so the reduced value is unchanged and every later
+            // round can index this array without re-reading device memory.
+            thread float column_max[rounds];
             for (int round = 0; round < rounds; ++round) {
                 const int column = block_lane + simd_width * round;
-                if (column < BLOCKS) {
-                    max_score = max(max_score, maxs[column]);
-                }
+                column_max[round] =
+                    column < BLOCKS ? maxs[column] : -3.402823466e+38F;
+                max_score = max(max_score, column_max[round]);
             }
             max_score = simd_max(max_score);
 
+            // The rescale factor is the same expression the accumulate loop
+            // used to recompute, so it is computed once and kept.
+            thread float factor[rounds];
             for (int round = 0; round < rounds; ++round) {
                 const int column = block_lane + simd_width * round;
+                factor[round] = fast::exp(column_max[round] - max_score);
                 if (column < BLOCKS) {
-                    sum_exp_score +=
-                        fast::exp(maxs[column] - max_score) * sums[column];
+                    sum_exp_score += factor[round] * sums[column];
                 }
             }
             sum_exp_score = simd_sum(sum_exp_score);
@@ -437,10 +473,9 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             for (int round = 0; round < rounds; ++round) {
                 const int column = block_lane + simd_width * round;
                 if (column < BLOCKS) {
-                    const float factor = fast::exp(maxs[column] - max_score);
                     for (int element = 0; element < values_per_lane; ++element) {
                         accumulator[element] +=
-                            factor * float(partials[column * D + element]);
+                            factor[round] * float(partials[column * D + element]);
                     }
                 }
             }

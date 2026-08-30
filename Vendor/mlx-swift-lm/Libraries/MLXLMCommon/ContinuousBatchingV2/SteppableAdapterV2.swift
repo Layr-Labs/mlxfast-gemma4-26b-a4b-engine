@@ -20,6 +20,15 @@ import MLX
 /// a cache type alone.
 public protocol CBv2LanguageModelDecodeOutputCoversCacheMutations: AnyObject {}
 
+/// Model-level direct greedy decode hook. Implementations may return nil for
+/// any unsupported shape/configuration, in which case the engine retains the
+/// ordinary full-logits forward and sampler path.
+public protocol CBv2LanguageModelDirectGreedyForwardable: AnyObject {
+    func cbv2DirectGreedyTokens(
+        _ inputs: MLXArray, cache: [KVCache]?
+    ) -> MLXArray?
+}
+
 /// Local engagement diagnostic for the decode-root compaction, armed only by
 /// `MLXFAST_ENGAGE_MARKS` (the ranked runner sets no environment). Reading one
 /// static Bool keeps the disarmed path allocation-free.
@@ -90,6 +99,15 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
             }
             return kv
         }
+    }
+}
+
+extension CBv2SteppableLanguageModelAdapter: CBv2DirectGreedySteppableModel {
+    public func directGreedyTokens(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> MLXArray? {
+        (model as? any CBv2LanguageModelDirectGreedyForwardable)?
+            .cbv2DirectGreedyTokens(tokens, cache: asKVCaches(caches))
     }
 }
 

@@ -181,6 +181,13 @@ public enum Gemma4MMAQuantizedGEMV {
         }
     }
 
+    /// Cheap host-side admission for the version-26 direct top-1 sibling.
+    /// Callers use this before building the trunk so unsupported versions
+    /// fail closed without constructing a forward that would be discarded.
+    public static var supportsDirectTop1: Bool {
+        enabled && version == 26
+    }
+
     /// Adopt a producer-emitted table only for the exact ranked head input.
     /// The table layout is `[row * (K / 64) + group]`, identical to
     /// `xSumKernel`.
@@ -2521,6 +2528,263 @@ public enum Gemma4MMAQuantizedGEMV {
         header: "#include <metal_simdgroup_matrix>\n",
         ensureRowContiguous: true
     )
+
+    // MARK: - Version 26 direct greedy top-1
+
+    /// Order-only sibling of version 26. Every arithmetic statement through
+    /// the final accumulator is inherited verbatim. Instead of writing the
+    /// 8xN rounded BF16 logits, each SIMD group compares those same rounded
+    /// values across its 32 vocabulary columns and emits one `(value, id)`
+    /// pair per batch row. A tiny second dispatch reduces the 4 * (N / 128)
+    /// pairs per row with the ordinary argmax tie rule (lowest token id).
+    private static let sourceV26Top1: String = {
+        var result = sourceV26
+        let old = """
+            const uint outputN0 = sgN0 + fragmentRow;
+            const uint outputN1 = outputN0 + N_PSG;
+            const uint outputN2 = outputN0 + N_PSG * 2;
+            const uint outputN3 = outputN0 + N_PSG * 3;
+            out[fragmentCol * N + outputN0] = T(acc0.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN0] = T(acc0.thread_elements()[1]);
+            out[fragmentCol * N + outputN1] = T(acc1.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN1] = T(acc1.thread_elements()[1]);
+            out[fragmentCol * N + outputN2] = T(acc2.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN2] = T(acc2.thread_elements()[1]);
+            out[fragmentCol * N + outputN3] = T(acc3.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN3] = T(acc3.thread_elements()[1]);
+            """
+        let new = """
+            const uint outputN0 = sgN0 + fragmentRow;
+            const uint outputN1 = outputN0 + N_PSG;
+            const uint outputN2 = outputN0 + N_PSG * 2;
+            const uint outputN3 = outputN0 + N_PSG * 3;
+
+            // Compare the exact values version 26 would have stored. The cast
+            // to T is the incumbent output-rounding boundary.
+            float best0 = float(T(acc0.thread_elements()[0]));
+            uint bestId0 = outputN0;
+            float candidate0 = float(T(acc1.thread_elements()[0]));
+            if (candidate0 > best0 || (candidate0 == best0 && outputN1 < bestId0)) {
+                best0 = candidate0;
+                bestId0 = outputN1;
+            }
+            candidate0 = float(T(acc2.thread_elements()[0]));
+            if (candidate0 > best0 || (candidate0 == best0 && outputN2 < bestId0)) {
+                best0 = candidate0;
+                bestId0 = outputN2;
+            }
+            candidate0 = float(T(acc3.thread_elements()[0]));
+            if (candidate0 > best0 || (candidate0 == best0 && outputN3 < bestId0)) {
+                best0 = candidate0;
+                bestId0 = outputN3;
+            }
+
+            float best1 = float(T(acc0.thread_elements()[1]));
+            uint bestId1 = outputN0;
+            float candidate1 = float(T(acc1.thread_elements()[1]));
+            if (candidate1 > best1 || (candidate1 == best1 && outputN1 < bestId1)) {
+                best1 = candidate1;
+                bestId1 = outputN1;
+            }
+            candidate1 = float(T(acc2.thread_elements()[1]));
+            if (candidate1 > best1 || (candidate1 == best1 && outputN2 < bestId1)) {
+                best1 = candidate1;
+                bestId1 = outputN2;
+            }
+            candidate1 = float(T(acc3.thread_elements()[1]));
+            if (candidate1 > best1 || (candidate1 == best1 && outputN3 < bestId1)) {
+                best1 = candidate1;
+                bestId1 = outputN3;
+            }
+
+            // Bits 1, 2 and 4 of the SIMD lane enumerate fragmentRow while
+            // bits 0 and 3 select fragmentCol. XOR 2/4/16 therefore reduces
+            // the eight output rows belonging to one batch-row pair without
+            // crossing into another pair.
+            float peer0 = simd_shuffle_xor(best0, 2u);
+            uint peerId0 = simd_shuffle_xor(bestId0, 2u);
+            if (peer0 > best0 || (peer0 == best0 && peerId0 < bestId0)) {
+                best0 = peer0;
+                bestId0 = peerId0;
+            }
+            float peer1 = simd_shuffle_xor(best1, 2u);
+            uint peerId1 = simd_shuffle_xor(bestId1, 2u);
+            if (peer1 > best1 || (peer1 == best1 && peerId1 < bestId1)) {
+                best1 = peer1;
+                bestId1 = peerId1;
+            }
+
+            peer0 = simd_shuffle_xor(best0, 4u);
+            peerId0 = simd_shuffle_xor(bestId0, 4u);
+            if (peer0 > best0 || (peer0 == best0 && peerId0 < bestId0)) {
+                best0 = peer0;
+                bestId0 = peerId0;
+            }
+            peer1 = simd_shuffle_xor(best1, 4u);
+            peerId1 = simd_shuffle_xor(bestId1, 4u);
+            if (peer1 > best1 || (peer1 == best1 && peerId1 < bestId1)) {
+                best1 = peer1;
+                bestId1 = peerId1;
+            }
+
+            peer0 = simd_shuffle_xor(best0, 16u);
+            peerId0 = simd_shuffle_xor(bestId0, 16u);
+            if (peer0 > best0 || (peer0 == best0 && peerId0 < bestId0)) {
+                best0 = peer0;
+                bestId0 = peerId0;
+            }
+            peer1 = simd_shuffle_xor(best1, 16u);
+            peerId1 = simd_shuffle_xor(bestId1, 16u);
+            if (peer1 > best1 || (peer1 == best1 && peerId1 < bestId1)) {
+                best1 = peer1;
+                bestId1 = peerId1;
+            }
+
+            if (fragmentRow == 0) {
+                const uint partialBase = (tg * N_SG + sg) * M_ROWS;
+                partialValues[partialBase + fragmentCol] = T(best0);
+                partialIndices[partialBase + fragmentCol] = bestId0;
+                partialValues[partialBase + fragmentCol + 1] = T(best1);
+                partialIndices[partialBase + fragmentCol + 1] = bestId1;
+            }
+            """
+        precondition(
+            result.components(separatedBy: old).count == 2,
+            "sourceV26Top1 output replacement drift")
+        result = result.replacingOccurrences(of: old, with: new)
+        return result
+    }()
+
+    private static let kernelV26Top1: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_affine4_qmv_m8_v26_direct_top1",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["partialValues", "partialIndices"],
+        source: sourceV26Top1,
+        header: "#include <metal_simdgroup_matrix>\n",
+        ensureRowContiguous: true
+    )
+
+    private static let top1ReduceKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_affine4_qmv_m8_top1_reduce_v1",
+        inputNames: ["partialValues", "partialIndices"],
+        outputNames: ["tokens"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint simd = simdgroup_index_in_threadgroup;
+            threadgroup float simdValues[8];
+            threadgroup uint simdIndices[8];
+
+            float best = -INFINITY;
+            uint bestId = 0xFFFFFFFFu;
+            for (uint i = lid; i < PARTIALS; i += 256) {
+                const uint cell = i * 8 + row;
+                const float value = float(partialValues[cell]);
+                const uint token = partialIndices[cell];
+                if (value > best || (value == best && token < bestId)) {
+                    best = value;
+                    bestId = token;
+                }
+            }
+
+            for (ushort delta = 16; delta >= 1; delta >>= 1) {
+                const float peer = simd_shuffle_down(best, delta);
+                const uint peerId = simd_shuffle_down(bestId, delta);
+                if (lane + delta < 32
+                    && (peer > best || (peer == best && peerId < bestId))) {
+                    best = peer;
+                    bestId = peerId;
+                }
+            }
+            if (lane == 0) {
+                simdValues[simd] = best;
+                simdIndices[simd] = bestId;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (simd == 0) {
+                best = lane < 8 ? simdValues[lane] : -INFINITY;
+                bestId = lane < 8 ? simdIndices[lane] : 0xFFFFFFFFu;
+                for (ushort delta = 16; delta >= 1; delta >>= 1) {
+                    const float peer = simd_shuffle_down(best, delta);
+                    const uint peerId = simd_shuffle_down(bestId, delta);
+                    if (lane + delta < 32
+                        && (peer > best || (peer == best && peerId < bestId))) {
+                        best = peer;
+                        bestId = peerId;
+                    }
+                }
+                if (lane == 0) {
+                    tokens[row] = int(bestId);
+                }
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    /// Direct greedy token ids for the exact version-26 ranked head geometry.
+    /// Returns nil for every other configuration so the caller can retain the
+    /// established full-logits path.
+    public static func applyTop1(
+        x: MLXArray,
+        w: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        activationSums: ActivationSums?
+    ) -> MLXArray? {
+        guard enabled, version == 26, let biases, let activationSums else { return nil }
+        guard groupSize == 64, bits == 4 else { return nil }
+        guard x.dtype == .bfloat16, scales.dtype == .bfloat16,
+            biases.dtype == .bfloat16, w.dtype == .uint32
+        else { return nil }
+        guard w.ndim == 2, scales.ndim == 2, biases.ndim == 2 else { return nil }
+        guard x.ndim == 2 || (x.ndim == 3 && x.dim(1) == 1) else { return nil }
+        guard x.dim(0) == mRows else { return nil }
+
+        let k = x.dim(-1)
+        guard k > 0, x.size == mRows * k else { return nil }
+        let n = w.dim(0)
+        let columnsPerThreadgroup = colsPerThreadgroup * 4
+        guard n >= minOutputWidth, n % columnsPerThreadgroup == 0 else { return nil }
+        guard k % groupSize == 0, k % 8 == 0 else { return nil }
+        guard w.dim(1) == k * bits / 32 else { return nil }
+        guard scales.dim(0) == n, biases.dim(0) == n else { return nil }
+        guard scales.dim(1) == k / groupSize, biases.dim(1) == k / groupSize
+        else { return nil }
+
+        let sumCells = mRows * (k / groupSize)
+        guard activationSums.values.dtype == .float32,
+            activationSums.values.ndim == 1,
+            activationSums.values.size == sumCells
+        else { return nil }
+
+        let flatX = x.reshaped([mRows, k])
+        let threadgroups = n / columnsPerThreadgroup
+        let partialsPerRow = threadgroups * simdgroupsPerThreadgroup
+        let partialCells = partialsPerRow * mRows
+        let partials = kernelV26Top1(
+            [flatX, w, scales, biases, activationSums.values],
+            template: [("T", x.dtype), ("K", k), ("N", n)],
+            grid: (threadgroups * threadsPerThreadgroup, 1, 1),
+            threadGroup: (threadsPerThreadgroup, 1, 1),
+            outputShapes: [
+                [partialCells],
+                [partialCells],
+            ],
+            outputDTypes: [x.dtype, .uint32]
+        )
+        return top1ReduceKernel(
+            partials,
+            template: [("T", x.dtype), ("PARTIALS", partialsPerRow)],
+            grid: (mRows * 256, 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [[mRows]],
+            outputDTypes: [.int32]
+        )[0]
+    }
 
     /// Tied-head GEMV, or `nil` when any gate above fails.
     ///

@@ -169,6 +169,84 @@ internal func gemma4ShouldSubmitPrefillChunkEval(
         && layerNumber.isMultiple(of: interval)
 }
 
+/// Front rungs for the scheduled-prefill submission ladder. The decode
+/// ladder's measured result - the early boundaries carry the overlap,
+/// because the device is idle until the first submission while the host is
+/// still building the rest of the stack - applies unchanged to the
+/// scheduled prompt path: the interval cadence above submits nothing
+/// before `layerNumber == interval`, so the device waits out the host
+/// build of the first `interval` layers at the start of every scheduled
+/// prefill step. The front rungs submit the frontier after the first two
+/// decoder layers, in ADDITION to the interval cadence, at the one scored
+/// geometry (CBv2 scheduled prefill, batch 8, multi-token). Rungs are
+/// pure submission policy: they reorder when already-built graphs are
+/// queued, never what is computed, so the emitted stream is bit-identical
+/// by construction - the same argument as the decode ladder.
+///
+/// `DARKBLOOM_GEMMA4_PREFILL_EARLY_LADDER=0` (also `false`/`no`/`off`) is
+/// the attribution and emergency kill switch for the front rungs alone.
+/// `DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL=0` still disables the whole prompt
+/// ladder, front rungs included, so that switch's documented "one final
+/// submission" contract keeps holding.
+@inline(__always)
+internal func resolveGemma4PrefillEarlyLadderEnabled(_ raw: String?) -> Bool {
+    guard let raw else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}
+
+private let gemma4PrefillEarlyLadderEnabled =
+    resolveGemma4PrefillEarlyLadderEnabled(
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_EARLY_LADDER"])
+
+/// LOCAL EXPERIMENT ONLY. `DARKBLOOM_GEMMA4_PREFILL_EARLY_LADDER_SET`
+/// overrides the shipped front-rung list with a comma-separated set of
+/// 1-based layer numbers, so the geometry can be swept on one binary
+/// instead of one rebuild per candidate. The ranked runner sets no
+/// environment, so an unset variable keeps the shipped switch below
+/// verbatim and this is inert in a submission. An empty value means "no
+/// front rungs", which is distinct from unset.
+private let gemma4PrefillEarlyLadderSet: Set<Int>? = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_PREFILL_EARLY_LADDER_SET"]
+    else { return nil }
+    return Set(raw.split(separator: ",").compactMap { Int($0.trimmingCharacters(
+        in: .whitespaces)) })
+}()
+
+/// Pure, fail-closed policy for the prefill front rungs. `layerNumber` is
+/// 1-based (the trunk's `idx + 1`), so the shipped pair {1, 2} names the
+/// boundaries after decoder layers 0 and 1 - the same physical boundaries
+/// as the promoted decode pair. One rung would already keep the device fed
+/// (a prompt-rectangle layer far outlasts the host build of the remaining
+/// stack); the second rung mirrors the decode pair at negligible cost and
+/// covers small scheduled chunks, whose per-layer device time shrinks
+/// toward the decode regime where the pair is the measured optimum.
+@inline(__always)
+internal func gemma4ShouldSubmitPrefillEarlyLadder(
+    enabled: Bool,
+    schedulePrefill: Bool,
+    isCBv2: Bool,
+    batchSize: Int,
+    inputLength: Int,
+    layerNumber: Int,
+    interval: Int
+) -> Bool {
+    guard enabled, isCBv2, schedulePrefill, batchSize == 8, inputLength > 1,
+        interval > 0
+    else { return false }
+
+    if let set = gemma4PrefillEarlyLadderSet {
+        return set.contains(layerNumber)
+    }
+    switch layerNumber {
+    case 1, 2:
+        return true
+    default:
+        return false
+    }
+}
+
 /// CBv2 consumes only the final prompt position, so the LAST decoder layer
 /// can keep full attention and every K/V write while retaining just this
 /// many trailing rows for `o_proj`, the residual, the feed-forward/MoE
@@ -4241,6 +4319,20 @@ public class Gemma4TextModelInner: Module {
             }
 
             let layerNumber = idx + 1
+            if gemma4ShouldSubmitPrefillEarlyLadder(
+                enabled: gemma4PrefillEarlyLadderEnabled,
+                schedulePrefill: schedulePrefill,
+                isCBv2: isCBv2,
+                batchSize: inputBatchSize,
+                inputLength: inputLength,
+                layerNumber: layerNumber,
+                interval: gemma4PrefillChunkEvalLayers)
+            {
+                asyncEval(h)
+                CBv2EngageMark.once("gemma4-b8-prefill-early-ladder")
+                CBv2StepProfiler.recordEvent(
+                    "v2.gemma4.prefill.early_ladder")
+            }
             if gemma4ShouldSubmitPrefillChunkEval(
                 schedulePrefill: schedulePrefill,
                 isCBv2: isCBv2,

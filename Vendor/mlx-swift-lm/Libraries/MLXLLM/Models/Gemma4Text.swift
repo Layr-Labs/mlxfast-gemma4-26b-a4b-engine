@@ -2908,7 +2908,8 @@ private class Gemma4MLP: Module {
     private func denseProjection(
         _ layer: Linear,
         _ x: MLXArray,
-        activationSums: CBv2DenseMLPQMVV1.ActivationSums? = nil
+        activationSums: CBv2DenseMLPQMVV1.ActivationSums? = nil,
+        gegluDownInput: CBv2DenseMLPQMVV1.GeGLUDownInput? = nil
     ) -> MLXArray {
         guard let quantized = layer as? QuantizedLinear,
             quantized.bias == nil,
@@ -2920,7 +2921,8 @@ private class Gemma4MLP: Module {
                 groupSize: quantized.groupSize,
                 bits: quantized.bits,
                 mode: quantized.mode,
-                activationSums: activationSums)
+                activationSums: activationSums,
+                gegluDownInput: gegluDownInput)
         else { return layer(x) }
         return tight
     }
@@ -2965,8 +2967,31 @@ private class Gemma4MLP: Module {
         denseProjection(upProj, x, activationSums: activationSums)
     }
 
-    fileprivate func zipDown(_ activated: MLXArray) -> MLXArray {
-        denseProjection(downProj, activated)
+    fileprivate func zipGeGLUDownInput(
+        _ gate: MLXArray, _ up: MLXArray
+    ) -> CBv2DenseMLPQMVV1.GeGLUDownInput? {
+        // Replace only the incumbent single-dispatch shaped GeGLU path.
+        // The producer independently checks the exact down-plane geometry.
+        guard gemma4CompiledDecodeSupported,
+            geluFusionClaimsPinnedDecode(gate, up),
+            let quantized = downProj as? QuantizedLinear,
+            quantized.bias == nil
+        else { return nil }
+        return CBv2DenseMLPQMVV1.gegluDownInput(
+            gate: gate, up: up,
+            weight: quantized.weight,
+            scales: quantized.scales,
+            biases: quantized.biases,
+            groupSize: quantized.groupSize,
+            bits: quantized.bits,
+            mode: quantized.mode)
+    }
+
+    fileprivate func zipDown(
+        _ activated: MLXArray,
+        gegluDownInput: CBv2DenseMLPQMVV1.GeGLUDownInput? = nil
+    ) -> MLXArray {
+        denseProjection(downProj, activated, gegluDownInput: gegluDownInput)
     }
 }
 
@@ -3122,7 +3147,11 @@ private enum Gemma4ZipRouterV1 {
         // Stage 3: the dense GeLU product, which the router has no partner
         // for -- the argPartition is deliberately NOT paired with it.
         let held = MLX.depends(inputs: [gate, up], dependencies: [expertScores])
-        let activated = gemma4GeluProduct(held[0], held[1])
+        // Only the default ZIP plan carries the table: plan 2 wraps the
+        // activation in another Depends node before down, changing identity.
+        // Keep all opt-in plans on their established producer and consumer.
+        let produced = plan == 1 ? mlp.zipGeGLUDownInput(held[0], held[1]) : nil
+        let activated = produced?.activation ?? gemma4GeluProduct(held[0], held[1])
 
         // Stage 4: router argPartition | dense down projection. The sort is
         // 8 us and the down projection 25 us, so this is the pairing that
@@ -3138,7 +3167,7 @@ private enum Gemma4ZipRouterV1 {
             denseOut = mlp.zipDown(
                 MLX.depends(input: activated, dependencies: [partition]))
         } else {
-            denseOut = mlp.zipDown(activated)
+            denseOut = mlp.zipDown(activated, gegluDownInput: produced)
             partition = router.zipPartition(
                 MLX.depends(input: expertScores, dependencies: [denseOut]))
             topKIndices = router.zipSelected(partition)

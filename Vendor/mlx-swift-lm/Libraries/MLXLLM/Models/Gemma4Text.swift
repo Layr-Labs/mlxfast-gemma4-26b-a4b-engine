@@ -80,7 +80,7 @@ internal func gemma4ShouldSubmitDecodeAsyncEvalLadder(
     // The empty-set row is the control that matters: this is not "fewer is
     // always better", it is "the early pair carries all of the overlap".
     switch layerIndex {
-    case 1, 3: // SPAN-{1,3}@406e37a: gap-pattern cell of the mapped window
+    case 1, 3, 5: // SPAN3-{1,3,5}@f9696c9: span-density probe on OUR crown
         return true
     default:
         return false

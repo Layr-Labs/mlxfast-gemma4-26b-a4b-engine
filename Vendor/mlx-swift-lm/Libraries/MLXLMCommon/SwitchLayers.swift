@@ -979,6 +979,15 @@ public enum SwitchGLUWeightedReductionProfile: Sendable {
     case gemma4ProductionGeGLU
 }
 
+/// Inputs retained from the direct sorted expert reduction so a downstream
+/// prefill kernel can consume the sorted rows without materializing the
+/// intermediate `[tokens, hidden]` reduction.
+public struct WeightedExpertUnsortCarrier {
+    let sortedOutputs: MLXArray
+    let inverseOrder: MLXArray
+    let weights: MLXArray
+}
+
 public class SwitchGLU: Module {
     @ModuleInfo(key: "gate_proj") var gateProj: SwitchLinear?
     @ModuleInfo(key: "up_proj") var upProj: SwitchLinear?
@@ -1268,16 +1277,34 @@ public class SwitchGLU: Module {
         fuseSortedReduction: Bool,
         isProductionPrefill: Bool = true
     ) -> MLXArray {
+        callAndWeightedReduceWithUnsortCarrier(
+            x,
+            indices,
+            weights: weights,
+            fuseSortedReduction: fuseSortedReduction,
+            isProductionPrefill: isProductionPrefill
+        ).output
+    }
+
+    /// The direct reduction plus its already-sorted inputs. Generic and decode
+    /// paths return no carrier and preserve the established output graph.
+    public func callAndWeightedReduceWithUnsortCarrier(
+        _ x: MLXArray,
+        _ indices: MLXArray,
+        weights: MLXArray,
+        fuseSortedReduction: Bool,
+        isProductionPrefill: Bool = true
+    ) -> (output: MLXArray, carrier: WeightedExpertUnsortCarrier?) {
         // At B=8 decode there are exactly 64 assignments (8 rows x top-k 8),
         // which is the sorting threshold and the minimum geometry accepted by
-        // weightedExpertUnsort.  Keep the decode gate exact so MTP rectangles
+        // weightedExpertUnsort. Keep the decode gate exact so MTP rectangles
         // and smaller serving cohorts remain on their established reduction.
         let isEightRowDecode =
             !isProductionPrefill && x.dim(0) == 8 && indices.size == 64
         guard fuseSortedReduction && (isProductionPrefill || isEightRowDecode),
             supportsWeightedExpertUnsort(x, indices, weights: weights)
         else {
-            return weightedExpertSum(callAsFunction(x, indices), weights)
+            return (weightedExpertSum(callAsFunction(x, indices), weights), nil)
         }
 
         let projected = projectExperts(x, indices)
@@ -1288,13 +1315,25 @@ public class SwitchGLU: Module {
             projected.output.dim(-1) == 2816,
             projected.output.dtype == .bfloat16
         else {
-            return legacyWeightedReduction(projected, indices: indices, weights: weights)
+            return (
+                legacyWeightedReduction(projected, indices: indices, weights: weights),
+                nil
+            )
         }
 
-        return weightedExpertUnsort(
-            sortedOutputs: MLX.squeezed(projected.output, axis: -2),
+        let sortedOutputs = MLX.squeezed(projected.output, axis: -2)
+        let output = weightedExpertUnsort(
+            sortedOutputs: sortedOutputs,
             inverseOrder: inverseOrder,
             weights: weights)
+        let carrier =
+            isProductionPrefill
+            ? WeightedExpertUnsortCarrier(
+                sortedOutputs: sortedOutputs,
+                inverseOrder: inverseOrder,
+                weights: weights)
+            : nil
+        return (output, carrier)
     }
 }
 

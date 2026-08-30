@@ -52,21 +52,19 @@ enum CBv2AttentionV1 {
         return value
     }()
 
-    /// Query-block width used when a prompt pass is already on the blocked
-    /// path and the layer's heads are wide (head dim 256 or 512). Wide heads
-    /// do not enter the fused SDPA path, so a blocked prompt pass materializes
-    /// one score rectangle per block; a narrower block holds a smaller
-    /// rectangle. Only the grouping of the query rows changes: every row's
-    /// softmax reduction still runs over the whole key axis, in the same
-    /// order, so the produced values are unchanged.
+    /// Optional explicit query-block width for wide-head prompt attention.
+    /// When unset, the production shapes select 256 rows for D=256 and 128
+    /// for D=512. Fewer D=256 attention launches outweigh the additional
+    /// masked triangle inside a 256-row block, while D=512 remains balanced
+    /// at the ordinary 128-row width.
     ///
     /// `0` disables the specialization (the block width falls back to
     /// `queryBlockSize`), which is the kill switch.
-    static let wideHeadQueryBlockSize: Int = {
+    static let wideHeadQueryBlockSizeOverride: Int? = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_ATTN_QUERY_BLOCK_WIDE"],
             let value = Int(raw), value >= 0
-        else { return 64 }
+        else { return nil }
         return value
     }()
 
@@ -81,12 +79,12 @@ enum CBv2AttentionV1 {
         kind: CBv2LayerKind, queryLength: Int
     ) -> Int {
         guard queryBlockSize == 128,
-            wideHeadQueryBlockSize > 0,
-            wideHeadQueryBlockSize < queryBlockSize,
             queryLength > queryBlockSize,
             kind.headDim == 256 || kind.headDim == 512
         else { return queryBlockSize }
-        return wideHeadQueryBlockSize
+        let selected = wideHeadQueryBlockSizeOverride
+            ?? (kind.headDim == 256 ? 256 : 128)
+        return selected > 0 ? selected : queryBlockSize
     }
 
     /// Ceiling, in MiB, on the K+V a PACKED prefill may restack on the batch

@@ -1144,7 +1144,15 @@ public class SwitchGLU: Module {
             activated = activation(xGate) * xUp
         }
 
-        x = downProj(activated, idx, sortedIndices: doSort)
+        if doSort,
+            let down = downProj as? QuantizedSwitchLinear,
+            let tightDown = CBv2ExpertDownTightGridV1.apply(
+                x: activated, rhsIndices: idx, projection: down)
+        {
+            x = tightDown
+        } else {
+            x = downProj(activated, idx, sortedIndices: doSort)
+        }
         return (x, doSort ? inverseOrder : nil, doSort)
     }
 

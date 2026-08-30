@@ -76,7 +76,7 @@ struct TargetQuantizationBindTests {
     private let vocabSize = 32
 
     @Test
-    func runtimeLoaderInstallsVerifierOnlyAfterStrictUpdateAndEvaluation() throws {
+    func runtimeLoaderInstallsVerifierAfterStrictUpdateBeforeEvaluation() throws {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -87,19 +87,19 @@ struct TargetQuantizationBindTests {
         let update = try #require(source.range(of: "try model.update("))
         let verifyAll = try #require(
             source.range(of: "verify: [.all]", range: update.lowerBound..<source.endIndex))
-        let evaluated = try #require(
-            source.range(of: "eval(model)", range: verifyAll.lowerBound..<source.endIndex))
         let install = try #require(
             source.range(
                 of: "try model.installCBv2MTPVerifier()",
-                range: evaluated.lowerBound..<source.endIndex))
+                range: verifyAll.lowerBound..<source.endIndex))
+        let evaluated = try #require(
+            source.range(of: "eval(model)", range: install.lowerBound..<source.endIndex))
         let returned = try #require(
-            source.range(of: "return model", range: install.lowerBound..<source.endIndex))
+            source.range(of: "return model", range: evaluated.lowerBound..<source.endIndex))
 
         #expect(update.lowerBound < verifyAll.lowerBound)
-        #expect(verifyAll.lowerBound < evaluated.lowerBound)
-        #expect(evaluated.lowerBound < install.lowerBound)
-        #expect(install.lowerBound < returned.lowerBound)
+        #expect(verifyAll.lowerBound < install.lowerBound)
+        #expect(install.lowerBound < evaluated.lowerBound)
+        #expect(evaluated.lowerBound < returned.lowerBound)
     }
 
     // MARK: - Fixtures

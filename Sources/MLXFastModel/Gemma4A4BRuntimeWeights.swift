@@ -149,7 +149,7 @@ public final class Gemma4A4BRuntimeWeightCache {
 
     /// Preserve the proven load sequence:
     /// shard load -> prefix strip -> sanitize -> per-path affine quantize ->
-    /// strict parameter update -> eval.
+    /// strict parameter update -> exact B1 verifier install -> eval.
     private static func loadLibraryModel(
         denseStore: DenseTensorStore,
         config: Gemma4A4BConfig
@@ -195,8 +195,8 @@ public final class Gemma4A4BRuntimeWeightCache {
             parameters: ModuleParameters.unflattened(sanitized),
             verify: [.all]
         )
-        eval(model)
         try model.installCBv2MTPVerifier()
+        eval(model)
         return model
     }
 

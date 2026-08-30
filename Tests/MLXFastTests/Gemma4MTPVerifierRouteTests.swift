@@ -140,15 +140,80 @@ struct Gemma4MTPVerifierRouteTests {
     func exactProductionConstructionFixtureInstallsEveryFixedWidthEntrypoint() throws {
         let fixture = Gemma4MTPVerifierConstructionFixture.production
         let installed = try fixture.install()
+        let shapes = (2...4).map {
+            CBv2Gemma4MTPVerifierShape(batch: 1, columns: $0)
+        }
 
         #expect(fixture.topology.vocabularySize == 262_144)
-        #expect(installed.columns == [2, 3, 4])
-        for columns in 2...4 {
+        #expect(fixture.topology.requiredProjectionEntrypoints == 266)
+        #expect(installed.shapes == shapes)
+        #expect(fixture.cbv2MTPVerifierInstalled)
+        for shape in shapes {
             #expect(
-                installed.entrypointCount(columns: columns)
-                    == Gemma4MTPVerifierConstructionFixture.production
-                        .requiredEntrypointCount(columns: columns))
+                installed.entrypointCount(shape: shape)
+                    == fixture.topology.requiredProjectionEntrypoints)
+            #expect(installed.context(
+                batch: shape.batch, columns: shape.columns) != nil)
         }
+        #expect(installed.context(batch: 8, columns: 2) == nil)
+    }
+
+    @Test
+    func oneMissingB1ProjectionLeavesNoPartiallyPublishedContexts() {
+        let fixture = Gemma4MTPVerifierConstructionFixture.production
+            .removingBinding(
+                component: "layer 0 q projection",
+                shape: .init(batch: 1, columns: 3))
+
+        do {
+            _ = try fixture.install()
+            Issue.record("construction accepted a missing B1 projection")
+        } catch let error as Gemma4MTPVerifierInstallationError {
+            #expect(error.description.contains("layer 0 q projection"))
+            #expect(!fixture.cbv2MTPVerifierInstalled)
+            #expect(fixture.installedShapeCount == 0)
+        } catch {
+            Issue.record("unexpected installation error: \(error)")
+        }
+    }
+
+    @Test
+    func modelInstallationAndForwardBoundaryUseExactPhysicalShapeKeys() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourceURL = repositoryRoot.appendingPathComponent(
+            "Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Gemma4Text.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+
+        #expect(source.contains(
+            "private var installedMTPVerifierContexts: "
+                + "[CBv2Gemma4MTPVerifierShape: Gemma4MTPVerifierContext]?"))
+        #expect(source.contains(
+            "public func cbv2MTPVerifierContext(\n"
+                + "        batch: Int, columns: Int"))
+        #expect(source.contains("let shapes = (2...4).map"))
+        #expect(source.contains("batch: 1, columns: $0"))
+        #expect(source.contains("CBv2AttentionQKVMMA8V1.bindB1Verifier("))
+        #expect(source.contains("CBv2AttentionOQMVV1.bindB1Verifier("))
+        #expect(source.contains("CBv2DenseMLPQMVV1.bindB1Verifier("))
+        #expect(source.contains("CBv2Gemma4MTPRouterProjection.bindB1Verifier("))
+        #expect(source.contains("CBv2Gemma4MTPExpertProjection.bindB1Verifier("))
+        #expect(source.contains("Gemma4MMAQuantizedGEMV.bindB1Verifier("))
+
+        let forwardStart = try #require(source.range(
+            of: "    public func cbv2ForwardWithHidden("))
+        let forward = String(source[forwardStart.lowerBound..<source.endIndex])
+        #expect(forward.contains(
+            "let shape = CBv2Gemma4MTPVerifierShape("))
+        #expect(forward.contains(
+            "batch: tokens.dim(0), columns: tokens.dim(1)"))
+        #expect(forward.contains(
+            "installedMTPVerifierContexts?[shape]"))
+        #expect(forward.contains(
+            #"no installed B\(shape.batch)/C\(shape.columns) route"#))
+        #expect(!forward.contains("tokens.dim(0) == 8"))
     }
 
     @Test

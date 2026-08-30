@@ -96,6 +96,35 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    private static let geluDownLaneSumsEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_GELU_DOWN_LANE_SUMS"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Fuses the two exact DMLP-002 gate/up planes, their BF16 GELU product
+    /// and the promoted down-lane producer. Feature-off restores those four
+    /// incumbent stages without changing their switches or arithmetic.
+    private static let fusedGateUpGeluEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_FUSED_GATEUP_GELU"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    public static var fusedGateUpGeluProducerEnabled: Bool {
+        enabled && downLaneSumsProducerEnabled && fusedGateUpGeluEnabled
+    }
+
+    /// Lets the dense GELU producer fail closed before it creates a custom
+    /// graph. Its own kill switch restores the incumbent compiled GELU plus
+    /// the accepted standalone lane producer; the broader lane-sum switch
+    /// still restores the pre-promotion MMA8 body.
+    public static var downLaneSumsProducerEnabled: Bool {
+        enabled && mma8DownLaneSumsEnabled && geluDownLaneSumsEnabled
+    }
+
     private static let batch = 8
     private static let sequence = 1
     private static let groupSize = 64
@@ -120,6 +149,19 @@ public enum CBv2DenseMLPQMVV1 {
         /// aliases its input's buffer, so handing the array out cannot change
         /// what any kernel reads or writes.
         public var dependencyHandle: MLXArray { values }
+    }
+
+    /// GELU-DOWN-LANE-SUMS-001: an opaque copy of the promoted down-plane
+    /// lane table emitted by the dense GELU-product producer. The table keeps
+    /// the accepted `(g, mma lane, row pair)` float2 layout, so the promoted
+    /// consumer remains byte-for-byte unchanged.
+    public struct DownLaneSums {
+        fileprivate let values: MLXArray
+    }
+
+    public struct FusedGateUpGelu {
+        public let values: MLXArray
+        public let downLaneSums: DownLaneSums
     }
 
     /// The affine-8 helper below is the current promoted
@@ -390,6 +432,279 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
         }
         return result
     }()
+
+    /// DMLP-FUSED-GU-001 keeps the promoted DMLP-002 dot-product order, but
+    /// walks the shared activation registers once for gate and up, rounds both
+    /// projection results to BF16 at their incumbent boundary, then performs
+    /// the incumbent BF16 GELU product before either intermediate is stored.
+    /// The same close emits the exact promoted down-plane lane table.
+    private static let fusedGateUpGeluHeader = kernelHeader + """
+
+template <typename T>
+inline T gemma4_exact_gelu_product(T gate, T up) {
+  T cubic = static_cast<T>(0.044715f) * gate;
+  cubic = cubic * gate;
+  cubic = cubic * gate;
+  const T inner = gate + cubic;
+  const T scaled = static_cast<T>(0.7978845238685608f) * inner;
+  const T curved = metal::precise::tanh(scaled);
+  const T one_plus = static_cast<T>(1.0f) + curved;
+  const T half_gate = static_cast<T>(0.5f) * gate;
+  const T activated = half_gate * one_plus;
+  return activated * up;
+}
+
+inline uint gemma4_mma8_inverse_lane(uint fm, uint row_pair) {
+  return ((fm & 3u) << 1)
+      | (row_pair & 1u)
+      | ((row_pair & 2u) << 2)
+      | ((fm & 4u) << 2);
+}
+
+template <typename T, const int group_size, const int bits>
+METAL_FUNC void qmv_affine8_g64_dual_plane_gelu_xsum_impl(
+    const device uint32_t* gate_w,
+    const device T* gate_scales,
+    const device T* gate_biases,
+    const device uint32_t* up_w,
+    const device T* up_scales,
+    const device T* up_biases,
+    const device T* x0,
+    const device T* x1,
+    const device T* x2,
+    const device T* x3,
+    device T* y0,
+    device T* y1,
+    device T* y2,
+    device T* y3,
+    device float2* lane_sums,
+    threadgroup T* products,
+    const int in_vec_size,
+    const int out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 4;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 16;
+
+  const device uint8_t* gate_ws = (const device uint8_t*)gate_w;
+  const device uint8_t* up_ws = (const device uint8_t*)up_w;
+  thread float x_thread[values_per_thread];
+  thread uint8_t gate_packed[results_per_simdgroup][bytes_per_thread];
+  thread uint8_t up_packed[results_per_simdgroup][bytes_per_thread];
+  thread float gate_scale[results_per_simdgroup];
+  thread float gate_bias[results_per_simdgroup];
+  thread float up_scale[results_per_simdgroup];
+  thread float up_bias[results_per_simdgroup];
+  thread float gate0[results_per_simdgroup] = {0};
+  thread float gate1[results_per_simdgroup] = {0};
+  thread float gate2[results_per_simdgroup] = {0};
+  thread float gate3[results_per_simdgroup] = {0};
+  thread float up0[results_per_simdgroup] = {0};
+  thread float up1[results_per_simdgroup] = {0};
+  thread float up2[results_per_simdgroup] = {0};
+  thread float up3[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup)
+      + simd_gid * results_per_simdgroup;
+  gate_ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  up_ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  gate_scales += out_row * in_vec_size_g
+      + simd_lid / scale_step_per_thread;
+  gate_biases += out_row * in_vec_size_g
+      + simd_lid / scale_step_per_thread;
+  up_scales += out_row * in_vec_size_g
+      + simd_lid / scale_step_per_thread;
+  up_biases += out_row * in_vec_size_g
+      + simd_lid / scale_step_per_thread;
+  x0 += simd_lid * values_per_thread;
+  x1 += simd_lid * values_per_thread;
+  x2 += simd_lid * values_per_thread;
+  x3 += simd_lid * values_per_thread;
+  y0 += out_row;
+  y1 += out_row;
+  y2 += out_row;
+  y3 += out_row;
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    for (int row = 0; row < results_per_simdgroup; ++row) {
+      const device uint8_t* gate_wl =
+          gate_ws + row * in_vec_size_w;
+      const device uint8_t* up_wl =
+          up_ws + row * in_vec_size_w;
+      for (int i = 0; i < bytes_per_thread; ++i) {
+        gate_packed[row][i] = gate_wl[i];
+        up_packed[row][i] = up_wl[i];
+      }
+      gate_scale[row] = gate_scales[row * in_vec_size_g];
+      gate_bias[row] = gate_biases[row * in_vec_size_g];
+      up_scale[row] = up_scales[row * in_vec_size_g];
+      up_bias[row] = up_biases[row * in_vec_size_g];
+    }
+
+    float sum =
+        load_vector<T, float, values_per_thread, 8>(x0, x_thread);
+    for (int row = 0; row < results_per_simdgroup; ++row) {
+      gate0[row] += qdot_affine8_registered<float, values_per_thread>(
+          gate_packed[row], x_thread,
+          gate_scale[row], gate_bias[row], sum);
+      up0[row] += qdot_affine8_registered<float, values_per_thread>(
+          up_packed[row], x_thread,
+          up_scale[row], up_bias[row], sum);
+    }
+
+    sum = load_vector<T, float, values_per_thread, 8>(x1, x_thread);
+    for (int row = 0; row < results_per_simdgroup; ++row) {
+      gate1[row] += qdot_affine8_registered<float, values_per_thread>(
+          gate_packed[row], x_thread,
+          gate_scale[row], gate_bias[row], sum);
+      up1[row] += qdot_affine8_registered<float, values_per_thread>(
+          up_packed[row], x_thread,
+          up_scale[row], up_bias[row], sum);
+    }
+
+    sum = load_vector<T, float, values_per_thread, 8>(x2, x_thread);
+    for (int row = 0; row < results_per_simdgroup; ++row) {
+      gate2[row] += qdot_affine8_registered<float, values_per_thread>(
+          gate_packed[row], x_thread,
+          gate_scale[row], gate_bias[row], sum);
+      up2[row] += qdot_affine8_registered<float, values_per_thread>(
+          up_packed[row], x_thread,
+          up_scale[row], up_bias[row], sum);
+    }
+
+    sum = load_vector<T, float, values_per_thread, 8>(x3, x_thread);
+    for (int row = 0; row < results_per_simdgroup; ++row) {
+      gate3[row] += qdot_affine8_registered<float, values_per_thread>(
+          gate_packed[row], x_thread,
+          gate_scale[row], gate_bias[row], sum);
+      up3[row] += qdot_affine8_registered<float, values_per_thread>(
+          up_packed[row], x_thread,
+          up_scale[row], up_bias[row], sum);
+    }
+
+    gate_ws += block_size;
+    up_ws += block_size;
+    gate_scales += block_size / 64;
+    gate_biases += block_size / 64;
+    up_scales += block_size / 64;
+    up_biases += block_size / 64;
+    x0 += block_size;
+    x1 += block_size;
+    x2 += block_size;
+    x3 += block_size;
+  }
+
+  for (int row = 0; row < results_per_simdgroup; ++row) {
+    gate0[row] = simd_sum(gate0[row]);
+    gate1[row] = simd_sum(gate1[row]);
+    gate2[row] = simd_sum(gate2[row]);
+    gate3[row] = simd_sum(gate3[row]);
+    up0[row] = simd_sum(up0[row]);
+    up1[row] = simd_sum(up1[row]);
+    up2[row] = simd_sum(up2[row]);
+    up3[row] = simd_sum(up3[row]);
+    if (simd_lid == 0) {
+      const int local_out = int(simd_gid) * results_per_simdgroup + row;
+      const T p0 = gemma4_exact_gelu_product(
+          static_cast<T>(gate0[row]), static_cast<T>(up0[row]));
+      const T p1 = gemma4_exact_gelu_product(
+          static_cast<T>(gate1[row]), static_cast<T>(up1[row]));
+      const T p2 = gemma4_exact_gelu_product(
+          static_cast<T>(gate2[row]), static_cast<T>(up2[row]));
+      const T p3 = gemma4_exact_gelu_product(
+          static_cast<T>(gate3[row]), static_cast<T>(up3[row]));
+      y0[row] = p0;
+      y1[row] = p1;
+      y2[row] = p2;
+      y3[row] = p3;
+      products[local_out] = p0;
+      products[8 + local_out] = p1;
+      products[16 + local_out] = p2;
+      products[24 + local_out] = p3;
+    }
+  }
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0 && simd_lid < 2) {
+    const uint local_pair = simd_lid;
+    const uint row0 = local_pair * 2;
+    const uint row1 = row0 + 1;
+    float a0 = 0.0f;
+    a0 += float(products[row0 * 8 + 0]);
+    a0 += float(products[row0 * 8 + 1]);
+    a0 += float(products[row0 * 8 + 2]);
+    a0 += float(products[row0 * 8 + 3]);
+    float a1 = 0.0f;
+    a1 += float(products[row0 * 8 + 4]);
+    a1 += float(products[row0 * 8 + 5]);
+    a1 += float(products[row0 * 8 + 6]);
+    a1 += float(products[row0 * 8 + 7]);
+    float b0 = 0.0f;
+    b0 += float(products[row1 * 8 + 0]);
+    b0 += float(products[row1 * 8 + 1]);
+    b0 += float(products[row1 * 8 + 2]);
+    b0 += float(products[row1 * 8 + 3]);
+    float b1 = 0.0f;
+    b1 += float(products[row1 * 8 + 4]);
+    b1 += float(products[row1 * 8 + 5]);
+    b1 += float(products[row1 * 8 + 6]);
+    b1 += float(products[row1 * 8 + 7]);
+
+    const uint group = uint(tid.y) >> 3;
+    const uint fm = uint(tid.y) & 7u;
+    const uint row_pair = uint(tid.x) * 2 + local_pair;
+    const uint lane = gemma4_mma8_inverse_lane(fm, row_pair);
+    lane_sums[group * 32 + lane] = float2(a0 + a1, b0 + b1);
+  }
+}
+"""
+
+    private static let fusedGateUpGeluKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_dual_plane_gelu_xsum_v1",
+        inputNames: [
+            "x",
+            "gateWeight", "gateScales", "gateBiases",
+            "upWeight", "upScales", "upBiases",
+        ],
+        outputNames: ["y", "laneSums"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            const int in_vec_size = x_shape[x_ndim - 1];
+            const int out_vec_size = gateWeight_shape[0];
+            const int first_m = int(tid.x) * 4;
+            if (first_m >= 8) {
+                return;
+            }
+            threadgroup T products[32];
+            qmv_affine8_g64_dual_plane_gelu_xsum_impl<T, 64, 8>(
+                gateWeight, gateScales, gateBiases,
+                upWeight, upScales, upBiases,
+                x + first_m * in_vec_size,
+                x + (first_m + 1) * in_vec_size,
+                x + (first_m + 2) * in_vec_size,
+                x + (first_m + 3) * in_vec_size,
+                y + first_m * out_vec_size,
+                y + (first_m + 1) * out_vec_size,
+                y + (first_m + 2) * out_vec_size,
+                y + (first_m + 3) * out_vec_size,
+                (device float2*)laneSums,
+                products,
+                in_vec_size,
+                out_vec_size,
+                tid,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: fusedGateUpGeluHeader,
+        ensureRowContiguous: true)
 
     /// MMA-MLP-001. Verbatim transcription of the `kGemma4QmvMma8Affine8`
     /// tier body from `zarar/t6-mma-s2` (quantized.h / quantized.cpp twins,
@@ -869,6 +1184,101 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         return ActivationSums(values: values)
     }
 
+    /// Fuses only the exact two affine-8 dense gate/up modules. Both planes
+    /// retain DMLP-002's per-result accumulation and SIMD reduction order;
+    /// their results are explicitly rounded to BF16 before the GELU product.
+    public static func fusedGateUpGelu(
+        x: MLXArray,
+        gateWeight: MLXArray,
+        gateScales: MLXArray,
+        gateBiases: MLXArray?,
+        gateGroupSize: Int,
+        gateBits: Int,
+        gateMode: QuantizationMode,
+        upWeight: MLXArray,
+        upScales: MLXArray,
+        upBiases: MLXArray?,
+        upGroupSize: Int,
+        upBits: Int,
+        upMode: QuantizationMode
+    ) -> FusedGateUpGelu? {
+        let inDim = 2816
+        let outDim = 2112
+        let groups = outDim / groupSize
+        guard enabled,
+            fusedGateUpGeluProducerEnabled,
+            downLaneSumsProducerEnabled,
+            gateGroupSize == groupSize,
+            upGroupSize == groupSize,
+            gateBits == bits,
+            upBits == bits,
+            gateMode == .affine,
+            upMode == .affine,
+            let gateBiases,
+            let upBiases,
+            x.dtype == .bfloat16,
+            x.shape == [batch, sequence, inDim],
+            gateWeight.dtype == .uint32,
+            gateWeight.shape == [outDim, inDim * bits / 32],
+            upWeight.dtype == gateWeight.dtype,
+            upWeight.shape == gateWeight.shape,
+            gateScales.dtype == x.dtype,
+            gateScales.shape == [outDim, inDim / groupSize],
+            gateBiases.dtype == x.dtype,
+            gateBiases.shape == gateScales.shape,
+            upScales.dtype == x.dtype,
+            upScales.shape == gateScales.shape,
+            upBiases.dtype == x.dtype,
+            upBiases.shape == gateScales.shape
+        else { return nil }
+
+        let outputs = fusedGateUpGeluKernel(
+            [
+                x,
+                gateWeight, gateScales, gateBiases,
+                upWeight, upScales, upBiases,
+            ],
+            template: [("T", x.dtype)],
+            grid: (
+                (batch / rowsPerGroup) * simdWidth,
+                (outDim / outputsPerGroup) * simdGroups,
+                1
+            ),
+            threadGroup: (simdWidth, simdGroups, 1),
+            outputShapes: [
+                [batch, sequence, outDim],
+                [groups, simdWidth, 2],
+            ],
+            outputDTypes: [x.dtype, .float32]
+        )
+        CBv2EngageMark.once("fused-gateup-gelu")
+        return FusedGateUpGelu(
+            values: outputs[0],
+            downLaneSums: DownLaneSums(values: outputs[1]))
+    }
+
+    /// Adopts a GELU-product-emitted copy of the promoted down-plane table.
+    /// Its opaque initializer and exact output/input guards prevent a caller
+    /// from pairing an arbitrary float buffer with the MMA8 consumer.
+    public static func downLaneSums(
+        produced values: MLXArray, for x: MLXArray
+    ) -> DownLaneSums? {
+        let groups = 2112 / Self.groupSize
+        guard enabled,
+            mma8DownLaneSumsEnabled,
+            x.dtype == .bfloat16,
+            x.ndim == 3,
+            x.dim(0) == batch,
+            x.dim(1) == sequence,
+            x.dim(2) == 2112,
+            x.size == batch * sequence * 2112,
+            values.dtype == .float32,
+            values.ndim == 3,
+            values.shape == [groups, simdWidth, 2]
+        else { return nil }
+        return DownLaneSums(values: values)
+    }
+
     /// Returns `nil` unless every production pin holds. The caller then invokes
     /// the original QuantizedLinear unchanged.
     public static func matmul(
@@ -879,7 +1289,8 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         groupSize: Int,
         bits: Int,
         mode: QuantizationMode,
-        activationSums: ActivationSums? = nil
+        activationSums: ActivationSums? = nil,
+        downLaneSums producedDownLaneSums: DownLaneSums? = nil
     ) -> MLXArray? {
         guard enabled,
             groupSize == Self.groupSize,
@@ -923,14 +1334,16 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
             let yTiles = outDim / outputsPerGroup
             if !isGateUp && mma8DownLaneSumsEnabled {
                 let groups = inDim / Self.groupSize
-                let laneSums = mma8DownLaneSumKernel(
-                    [x],
-                    template: [("T", x.dtype)],
-                    grid: (simdWidth, groups, 1),
-                    threadGroup: (simdWidth, 1, 1),
-                    outputShapes: [[groups, simdWidth, 2]],
-                    outputDTypes: [.float32]
-                )[0]
+                let laneSums =
+                    producedDownLaneSums?.values
+                    ?? mma8DownLaneSumKernel(
+                        [x],
+                        template: [("T", x.dtype)],
+                        grid: (simdWidth, groups, 1),
+                        threadGroup: (simdWidth, 1, 1),
+                        outputShapes: [[groups, simdWidth, 2]],
+                        outputDTypes: [.float32]
+                    )[0]
                 return mma8DownLaneSumQMVKernel(
                     [x, weight, scales, biases, laneSums],
                     template: [("T", x.dtype)],

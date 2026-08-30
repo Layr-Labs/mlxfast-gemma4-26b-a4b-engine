@@ -138,3 +138,21 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
         constraintSampler.failure(for: id)
     }
 }
+
+// MARK: - LGH-001 logitsless greedy head
+
+extension CBv2DefaultSampler: CBv2FusedGreedySampler {
+    public func admitsFusedGreedy(
+        params: [CBv2SamplingParams], hasTokenConstraints: Bool
+    ) -> Bool {
+        !hasTokenConstraints && CBv2OrderOnlyLogits.orderOnly(params)
+    }
+
+    public func noteFusedGreedySample() {
+        // The skipped sampler call did not commit penalty/RNG state. Force the
+        // next ordinary call to rebuild from confirmed history plus its pending
+        // token, exactly as the existing membership-change path does.
+        configuredIDs = []
+        pendingStepLogprobs = nil
+    }
+}

@@ -1534,27 +1534,60 @@ public final class EngineLoopV2: @unchecked Sendable {
 
         let inputs = lazyTokens.reshaped([ids.count, 1])
         let forwardStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-        // SOFTCAP-SKIP: declare order-only consumption for this graph build.
-        let (last, cacheInnerState) = CBv2OrderOnlyLogits.withOrderOnly(params) {
-            decodeLogits(rowStates: rowStates, tokens: inputs)  // [B, vocab]
+        // LGH-001: only the chained B=8 order-only step may bypass logits.
+        // Constraints are rejected here again even though chain admission also
+        // rejects them; this branch must remain correct if chain policy moves.
+        let hasTokenConstraints = ids.contains {
+            scheduler.record(for: $0)?.request.tokenConstraint != nil
         }
-        if CBv2StepProfiler.enabled {
-            CBv2StepProfiler.record(
-                "v2.forward.build", seconds: CFAbsoluteTimeGetCurrent() - forwardStart)
-        }
-        // `pendingSampledTokens` = the fed lazy tokens: each row has exactly
-        // one launched-but-unconfirmed sample here (the chain invariant).
-        let samplerStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-        let sampled = sampler.sample(
-            logits: last, params: params, requestIDs: ids, stepIndex: stepCount,
-            pendingSampledTokens: lazyTokens,
-            rowContext: { [scheduler] in
-                ids.map { Self.samplerRow(scheduler.record(for: $0)!) }
-            })
-        let stepLogprobs = sampler.takeStepLogprobs()
-        if CBv2StepProfiler.enabled {
-            CBv2StepProfiler.record(
-                "v2.sampler.build", seconds: CFAbsoluteTimeGetCurrent() - samplerStart)
+        let sampled: MLXArray
+        let cacheInnerState: [MLXArray]
+        let stepLogprobs: CBv2StepLogprobs?
+        if let fusedSampler = sampler as? CBv2FusedGreedySampler,
+            let fusedModel = model as? CBv2ArgmaxDecodeSteppableModel,
+            fusedSampler.admitsFusedGreedy(
+                params: params, hasTokenConstraints: hasTokenConstraints),
+            fusedModel.admitsArgmaxDecode(tokens: inputs)
+        {
+            // Keep the order-only flag around the fused graph so any fallback
+            // through applyLMHead still skips the strictly-increasing softcap.
+            let (tokens, roots) = CBv2OrderOnlyLogits.withOrderOnly(params) {
+                let caches = eagerCaches(rowStates: rowStates)
+                let tokens = fusedModel.decodeArgmax(tokens: inputs, caches: caches)
+                return (tokens, eagerDecodeEvaluationRoots(caches, logitsRoot: tokens))
+            }
+            sampled = tokens
+            cacheInnerState = roots
+            stepLogprobs = nil
+            fusedSampler.noteFusedGreedySample()
+            if CBv2StepProfiler.enabled {
+                CBv2StepProfiler.record(
+                    "v2.forward.build", seconds: CFAbsoluteTimeGetCurrent() - forwardStart)
+            }
+        } else {
+            // SOFTCAP-SKIP: declare order-only consumption for this graph build.
+            let (last, innerState) = CBv2OrderOnlyLogits.withOrderOnly(params) {
+                decodeLogits(rowStates: rowStates, tokens: inputs)  // [B, vocab]
+            }
+            cacheInnerState = innerState
+            if CBv2StepProfiler.enabled {
+                CBv2StepProfiler.record(
+                    "v2.forward.build", seconds: CFAbsoluteTimeGetCurrent() - forwardStart)
+            }
+            // `pendingSampledTokens` = the fed lazy tokens: each row has exactly
+            // one launched-but-unconfirmed sample here (the chain invariant).
+            let samplerStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+            sampled = sampler.sample(
+                logits: last, params: params, requestIDs: ids, stepIndex: stepCount,
+                pendingSampledTokens: lazyTokens,
+                rowContext: { [scheduler] in
+                    ids.map { Self.samplerRow(scheduler.record(for: $0)!) }
+                })
+            stepLogprobs = sampler.takeStepLogprobs()
+            if CBv2StepProfiler.enabled {
+                CBv2StepProfiler.record(
+                    "v2.sampler.build", seconds: CFAbsoluteTimeGetCurrent() - samplerStart)
+            }
         }
         scheduler.markPendingSamples(ids: ids)
         var toEval = [sampled]

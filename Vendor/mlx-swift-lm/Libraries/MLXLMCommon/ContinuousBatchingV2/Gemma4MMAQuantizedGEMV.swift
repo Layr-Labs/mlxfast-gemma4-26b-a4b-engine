@@ -2631,4 +2631,230 @@ public enum Gemma4MMAQuantizedGEMV {
         )
         return outputs[0]
     }
+
+    // MARK: - LGH-001 exact v26 top-1 reduction
+
+    /// Production default ON. `DARKBLOOM_GEMMA4_LOGITSLESS_HEAD=0` restores the
+    /// stock logits plane plus separate argMax.
+    private static let logitslessEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_LOGITSLESS_HEAD"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }()
+
+    /// Version 26 with only its final vocabulary store replaced. The v26
+    /// packed-weight cursor and every load/MMA operation remain unchanged.
+    /// Each accumulator is first stored through the contracted matrix API to
+    /// threadgroup float storage, then converted to T before comparison. That
+    /// conversion is the same float-to-BF16 rounding as the removed T output
+    /// store. No inference depends on thread_elements lane ownership.
+    private static let sourceV26Argmax: String = {
+        var result = sourceV26
+
+        func replaceOnce(_ old: String, with new: String) {
+            let count = result.components(separatedBy: old).count
+            precondition(count == 2, "sourceV26Argmax replacement count \(count): \(old)")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+
+        replaceOnce(
+            """
+            const uint tg = threadgroup_position_in_grid.x;
+            """,
+            with: """
+            const uint tg = threadgroup_position_in_grid.x;
+            threadgroup float argTiles[N_SG][4][M_ROWS * N_PSG];
+            """
+        )
+        replaceOnce(
+            """
+            const uint outputN0 = sgN0 + fragmentRow;
+            const uint outputN1 = outputN0 + N_PSG;
+            const uint outputN2 = outputN0 + N_PSG * 2;
+            const uint outputN3 = outputN0 + N_PSG * 3;
+            out[fragmentCol * N + outputN0] = T(acc0.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN0] = T(acc0.thread_elements()[1]);
+            out[fragmentCol * N + outputN1] = T(acc1.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN1] = T(acc1.thread_elements()[1]);
+            out[fragmentCol * N + outputN2] = T(acc2.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN2] = T(acc2.thread_elements()[1]);
+            out[fragmentCol * N + outputN3] = T(acc3.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN3] = T(acc3.thread_elements()[1]);
+            """,
+            with: """
+            constexpr uint TILES = uint(N) / (N_SG * N_PSG * 4);
+            simdgroup_store(acc0, argTiles[sg][0], N_PSG);
+            simdgroup_store(acc1, argTiles[sg][1], N_PSG);
+            simdgroup_store(acc2, argTiles[sg][2], N_PSG);
+            simdgroup_store(acc3, argTiles[sg][3], N_PSG);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (lid < M_ROWS) {
+                // Stock BF16 ArgMax starts at (-inf, index 0), ignores NaNs,
+                // and resolves equal values to the lowest global index.
+                float rv = -INFINITY;
+                uint ri = n0;
+                for (uint owner = 0; owner < N_SG; ++owner) {
+                    for (uint tile = 0; tile < 4; ++tile) {
+                        for (uint c = 0; c < N_PSG; ++c) {
+                            const uint oi = n0 + owner * (N_PSG * 4)
+                                + tile * N_PSG + c;
+                            // v26 multiplies a vocabulary-row tile by an
+                            // activation-column tile. Contracted row-major
+                            // storage is therefore [vocabLocal][batchRow].
+                            const float ov = float(T(
+                                argTiles[owner][tile][c * M_ROWS + lid]));
+                            if (ov > rv || (ov == rv && oi < ri)) {
+                                rv = ov;
+                                ri = oi;
+                            }
+                        }
+                    }
+                }
+                pv[lid * TILES + tg] = rv;
+                pi[lid * TILES + tg] = ri;
+            }
+            """
+        )
+        precondition(!result.contains("out["), "sourceV26Argmax still stores logits")
+        return result
+    }()
+
+    private static let kernelV26Argmax: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_affine4_qmv_m8_v26_argmax_safe_store",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["pv", "pi"],
+        source: sourceV26Argmax,
+        header: "#include <metal_simdgroup_matrix>\n",
+        ensureRowContiguous: true
+    )
+
+    /// Second-stage fold of the 2,048 threadgroup records for each row. Its
+    /// comparison is byte-for-byte the stock ArgMax value/index ordering.
+    private static let argmaxReduceKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_head_argmax_reduce_v26_safe_store",
+        inputNames: ["pv", "pi"],
+        outputNames: ["tokens"],
+        source: """
+            const uint m = threadgroup_position_in_grid.x;
+            const uint lane = thread_index_in_simdgroup;
+            float rv = -INFINITY;
+            uint ri = 0;
+            for (uint i = lane; i < uint(NT); i += 32) {
+                const float ov = pv[m * uint(NT) + i];
+                const uint oi = pi[m * uint(NT) + i];
+                if (ov > rv || (ov == rv && oi < ri)) {
+                    rv = ov;
+                    ri = oi;
+                }
+            }
+            for (ushort delta = 16; delta > 0; delta >>= 1) {
+                const float ov = simd_shuffle_down(rv, delta);
+                const uint oi = simd_shuffle_down(ri, delta);
+                if (ov > rv || (ov == rv && oi < ri)) {
+                    rv = ov;
+                    ri = oi;
+                }
+            }
+            if (lane == 0) {
+                tokens[m] = int32_t(ri);
+            }
+            """,
+        ensureRowContiguous: true
+    )
+
+    /// Pure host admission predicate for the exact ranked head rectangle.
+    public static func admitsArgmax(
+        x shape: [Int],
+        xDType: DType,
+        w: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int
+    ) -> Bool {
+        guard logitslessEnabled, enabled, version == 26 else { return false }
+        guard let biases else { return false }
+        guard groupSize == 64, bits == 4 else { return false }
+        guard xDType == .bfloat16,
+            scales.dtype == .bfloat16,
+            biases.dtype == .bfloat16,
+            w.dtype == .uint32
+        else { return false }
+        guard shape == [mRows, 2816] || shape == [mRows, 1, 2816] else { return false }
+        guard w.shape == [262_144, 352] else { return false }
+        guard scales.shape == [262_144, 44], biases.shape == [262_144, 44]
+        else { return false }
+        return true
+    }
+
+    /// Returns the exact raw-BF16 v26 head argmax, or nil outside the pins.
+    public static func applyArgmax(
+        x: MLXArray,
+        w: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        activationSums: ActivationSums? = nil
+    ) -> MLXArray? {
+        guard admitsArgmax(
+            x: x.shape,
+            xDType: x.dtype,
+            w: w,
+            scales: scales,
+            biases: biases,
+            groupSize: groupSize,
+            bits: bits),
+            let biases
+        else { return nil }
+
+        let k = x.dim(-1)
+        let n = w.dim(0)
+        let flatX = x.reshaped([mRows, k])
+        let columnsPerThreadgroup = colsPerThreadgroup * 4
+        let threadgroups = n / columnsPerThreadgroup
+
+        let sumCells = mRows * (k / groupSize)
+        let xSums: MLXArray
+        if let activationSums,
+            activationSums.values.dtype == .float32,
+            activationSums.values.ndim == 1,
+            activationSums.values.size == sumCells
+        {
+            xSums = activationSums.values
+        } else {
+            let sumThreads = 128
+            let sumThreadgroups = (sumCells + sumThreads - 1) / sumThreads
+            xSums = xSumKernel(
+                [flatX],
+                template: [("T", x.dtype), ("K", k)],
+                grid: (sumThreadgroups * sumThreads, 1, 1),
+                threadGroup: (sumThreads, 1, 1),
+                outputShapes: [[sumCells]],
+                outputDTypes: [.float32]
+            )[0]
+        }
+
+        CBv2EngageMark.once("logitsless-greedy-head-v26-safe-store")
+        let partials = kernelV26Argmax(
+            [flatX, w, scales, biases, xSums],
+            template: [("T", x.dtype), ("K", k), ("N", n)],
+            grid: (threadgroups * threadsPerThreadgroup, 1, 1),
+            threadGroup: (threadsPerThreadgroup, 1, 1),
+            outputShapes: [[mRows * threadgroups], [mRows * threadgroups]],
+            outputDTypes: [.float32, .uint32]
+        )
+
+        return argmaxReduceKernel(
+            [partials[0], partials[1]],
+            template: [("NT", threadgroups)],
+            grid: (mRows * 32, 1, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[mRows]],
+            outputDTypes: [.int32]
+        )[0]
+    }
 }

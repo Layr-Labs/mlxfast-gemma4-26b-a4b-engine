@@ -210,3 +210,21 @@ extension CBv2SteppableLanguageModelAdapter: CBv2MTPSteppableModel {
         return forwardable.cbv2ForwardWithHidden(tokens, caches: asKVCaches(caches))
     }
 }
+
+// MARK: - LGH-001 logitsless greedy head
+
+extension CBv2SteppableLanguageModelAdapter: CBv2ArgmaxDecodeSteppableModel {
+    public func admitsArgmaxDecode(tokens: MLXArray) -> Bool {
+        (model as? CBv2ArgmaxDecodeForwardable)?.cbv2AdmitsArgmaxDecode(tokens) ?? false
+    }
+
+    public func decodeArgmax(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> MLXArray {
+        guard let forwardable = model as? CBv2ArgmaxDecodeForwardable else {
+            preconditionFailure(
+                "CBv2 argmax decode reached a model without the admitted capability")
+        }
+        return forwardable.cbv2DecodeArgmax(tokens, caches: asKVCaches(caches))
+    }
+}

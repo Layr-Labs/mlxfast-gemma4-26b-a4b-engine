@@ -4858,3 +4858,51 @@ extension Gemma4TextModel: CBv2MTPForwardable {
         return (applyLMHead(postNorm), preNorm)
     }
 }
+
+// MARK: - LGH-001 logitsless greedy head
+
+extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
+    public func cbv2AdmitsArgmaxDecode(_ tokens: MLXArray) -> Bool {
+        guard tokens.shape == [8, 1],
+            config.hiddenSize == 2816,
+            config.vocabSize == 262_144,
+            lmHead == nil,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.mode == .affine
+        else { return false }
+
+        return Gemma4MMAQuantizedGEMV.admitsArgmax(
+            x: [8, 1, config.hiddenSize],
+            xDType: .bfloat16,
+            w: quantized.weight,
+            scales: quantized.scales,
+            biases: quantized.biases,
+            groupSize: quantized.groupSize,
+            bits: quantized.bits)
+    }
+
+    public func cbv2DecodeArgmax(_ tokens: MLXArray, caches: [KVCache]) -> MLXArray {
+        guard lmHead == nil,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.mode == .affine
+        else {
+            return applyLMHead(model(tokens, cache: caches)).argMax(axis: -1).asType(.int32)
+                .reshaped([8])
+        }
+        let produced = model.callWithMMAHeadSums(tokens, cache: caches)
+        if let fused = Gemma4MMAQuantizedGEMV.applyArgmax(
+            x: produced.postNorm,
+            w: quantized.weight,
+            scales: quantized.scales,
+            biases: quantized.biases,
+            groupSize: quantized.groupSize,
+            bits: quantized.bits,
+            activationSums: produced.activationSums)
+        {
+            return fused
+        }
+        return applyLMHead(
+            produced.postNorm, activationSums: produced.activationSums
+        ).argMax(axis: -1).asType(.int32).reshaped([8])
+    }
+}

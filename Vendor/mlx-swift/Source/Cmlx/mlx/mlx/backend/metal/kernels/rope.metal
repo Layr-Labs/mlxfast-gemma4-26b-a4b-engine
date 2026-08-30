@@ -129,6 +129,7 @@ void rope_impl(
     in_index_1 += pos.x * IdxT(strides[2]);
     in_index_2 = in_index_1 + grid.x * IdxT(strides[2]);
   }
+  #pragma clang loop unroll(full)
   for (int i = 0; i < N && head_idx + i < n_head; ++i) {
     // Read and write the output
     float x1 = static_cast<float>(in[in_index_1]);

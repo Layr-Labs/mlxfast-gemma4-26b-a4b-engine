@@ -1100,6 +1100,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
   const int in_vec_size_g = in_vec_size / 64;
 
   VF acc[rows_per_simd];
+  #pragma unroll
   for (int r = 0; r < rows_per_simd; r++) {
     acc[r] = VF(0.0f);
   }
@@ -1108,11 +1109,13 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
     thread uint16_t packed[rows_per_simd][4];
     thread float scale_local[rows_per_simd];
     thread float bias_local[rows_per_simd];
+    #pragma unroll
     for (int r = 0; r < rows_per_simd; r++) {
       const int row = out_row + r;
       const device uint16_t* ws = reinterpret_cast<const device uint16_t*>(
           reinterpret_cast<const device uint8_t*>(w) + row * in_vec_size_w +
           k / 2 + simd_lid * bytes_per_lane);
+      #pragma unroll
       for (int i = 0; i < 4; i++) {
         packed[r][i] = ws[i];
       }
@@ -1123,11 +1126,14 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
 
     VF sums = VF(0.0f);
     VF partial[rows_per_simd];
+    #pragma unroll
     for (int r = 0; r < rows_per_simd; r++) {
       partial[r] = VF(0.0f);
     }
+    #pragma unroll
     for (int i = 0; i < 4; i++) {
       VF a0, a1, a2, a3;
+      #pragma unroll
       for (int m = 0; m < NA; m++) {
         const device T* xm = x + (first_m + m) * in_vec_size + k +
             simd_lid * values_per_thread + 4 * i;
@@ -1148,6 +1154,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
         a2[m] = xc[2];
         a3[m] = xc[3];
       }
+      #pragma unroll
       for (int r = 0; r < rows_per_simd; r++) {
         if (DIRECT_NIBBLES) {
           partial[r] += (a0 * (packed[r][i] & 0x000f) +
@@ -1162,12 +1169,15 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
         }
       }
     }
+    #pragma unroll
     for (int r = 0; r < rows_per_simd; r++) {
       acc[r] += scale_local[r] * partial[r] + sums * bias_local[r];
     }
   }
 
+  #pragma unroll
   for (int r = 0; r < rows_per_simd; r++) {
+    #pragma unroll
     for (int m = 0; m < NA; m++) {
       const float reduced = simd_sum(acc[r][m]);
       if (simd_lid == 0) {

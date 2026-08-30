@@ -620,6 +620,39 @@ METAL_FUNC void qkv_mma8_affine4_g64_verify(
         )[0]
     }
 
+    /// Construction-time binding for the exact physical-B1 verifier path.
+    /// All topology and quantization invariants are resolved here; the
+    /// returned fixed-shape entrypoint dispatches the shared projection
+    /// directly with no enabled-path eligibility branch or fallback.
+    public static func bindB1Verifier(
+        columns: Int,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode
+    ) -> ((MLXArray) -> MLXArray)? {
+        guard enabled, supportsVerifierColumns(columns),
+            groupSize == Self.groupSize, bits == Self.bits, mode == .affine,
+            let biases,
+            scales.dtype == .bfloat16, biases.dtype == .bfloat16,
+            weight.dtype == .uint32,
+            weight.ndim == 2, weight.dim(1) == inputWidth * Self.bits / 32
+        else { return nil }
+
+        let outputWidth = weight.dim(0)
+        guard liveOutputWidth(outputWidth),
+            scales.shape == [outputWidth, inputWidth / Self.groupSize],
+            biases.shape == scales.shape
+        else { return nil }
+
+        return Gemma4B1MTPQuantizedProjection.bind(
+            columns: columns, inDim: inputWidth, outDim: outputWidth,
+            weight: weight, scales: scales, biases: biases,
+            groupSize: groupSize, bits: bits)
+    }
+
     /// Bind immutable verifier weights once at model installation. The
     /// returned fixed-shape entrypoint contains no eligibility branch or
     /// stock fallback. Its C2/C3/C4 physical width is captured here.

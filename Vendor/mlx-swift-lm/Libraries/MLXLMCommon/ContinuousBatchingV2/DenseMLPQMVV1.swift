@@ -1345,6 +1345,37 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_verify_impl(
         }
     }
 
+    /// Construction-time binding for exact physical-B1 gate/up and down
+    /// verifier projections. Eligibility is settled once here; the returned
+    /// closure dispatches the shared affine-8 projection directly.
+    public static func bindB1Verifier(
+        columns: Int,
+        inDim: Int,
+        outDim: Int,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode
+    ) -> ((MLXArray) -> MLXArray)? {
+        guard enabled, supportsVerifierColumns(columns),
+            groupSize == Self.groupSize, bits == Self.bits, mode == .affine,
+            let biases,
+            scales.dtype == .bfloat16, biases.dtype == .bfloat16,
+            weight.dtype == .uint32, weight.ndim == 2,
+            liveShape(inDim: inDim, outDim: outDim),
+            weight.shape == [outDim, inDim * Self.bits / 32],
+            scales.shape == [outDim, inDim / Self.groupSize],
+            biases.shape == scales.shape
+        else { return nil }
+
+        return Gemma4B1MTPQuantizedProjection.bind(
+            columns: columns, inDim: inDim, outDim: outDim,
+            weight: weight, scales: scales, biases: biases,
+            groupSize: groupSize, bits: bits)
+    }
+
     /// Construction-time binding for the pinned gate/up and down verifier
     /// planes. Gate/up retains the affine-8 quad-stream tree and refuses a
     /// combined binding when the independently reduced MMA8 arm is active;

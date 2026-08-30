@@ -16,6 +16,59 @@ struct Gemma4MTPVerifierQKVKernelTests {
         return Double(parts.seconds) + Double(parts.attoseconds) / 1e18
     }
 
+    private func expectExactBF16Storage(
+        _ candidate: MLXArray, _ reference: MLXArray
+    ) {
+        eval(candidate, reference)
+        #expect(candidate.dtype == .bfloat16)
+        #expect(reference.dtype == .bfloat16)
+        #expect(candidate.shape == reference.shape)
+        #expect(
+            candidate.asData(access: .copy).data
+                == reference.asData(access: .copy).data)
+    }
+
+    @Test(.enabled(if: runtimeEnabled))
+    func b1VerifierQKVIsBitExactToIndependentB1Columns() throws {
+        let k = 2816
+        for n in [1024, 2048, 4096, 8192] {
+            let weightValues: [UInt32] = (0..<(n * k / 8)).map { index in
+                UInt32(truncatingIfNeeded: index &* 2_654_435_761 &+ 71)
+            }
+            let scaleValues: [Float] = (0..<(n * k / 64)).map { index in
+                Float(128 + (index * 13) % 61) / 128.0
+            }
+            let biasValues: [Float] = (0..<(n * k / 64)).map { index in
+                Float((index * 5) % 29 - 14) / 128.0
+            }
+            let weight = MLXArray(weightValues).reshaped([n, k / 8])
+            let scales = MLXArray(scaleValues).reshaped([n, k / 64]).asType(.bfloat16)
+            let biases = MLXArray(biasValues).reshaped([n, k / 64]).asType(.bfloat16)
+
+            for columns in 2...4 {
+                let xValues: [Float] = (0..<(columns * k)).map { index in
+                    Float((index * 31 + columns * 11) % 263 - 131) / 128.0
+                }
+                let x = MLXArray(xValues).reshaped([1, columns, k]).asType(.bfloat16)
+                let bound = try #require(CBv2AttentionQKVMMA8V1.bindB1Verifier(
+                    columns: columns, weight: weight, scales: scales, biases: biases,
+                    groupSize: 64, bits: 4, mode: .affine))
+                let candidate = bound(x)
+                let reference = concatenated(
+                    (0..<columns).map { column in
+                        quantizedMM(
+                            x[0..., column..<(column + 1), 0...], weight,
+                            scales: scales, biases: biases, transpose: true,
+                            groupSize: 64, bits: 4, mode: .affine)
+                    },
+                    axis: 1)
+
+                #expect(candidate.shape == [1, columns, n])
+                expectExactBF16Storage(candidate, reference)
+            }
+        }
+    }
+
     @Test(.enabled(if: runtimeEnabled))
     func verifierQKVIsBitExactToIndependentB8Columns() throws {
         let k = 2816

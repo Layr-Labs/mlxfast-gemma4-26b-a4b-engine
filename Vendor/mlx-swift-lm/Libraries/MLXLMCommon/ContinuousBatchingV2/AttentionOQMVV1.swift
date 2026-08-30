@@ -516,6 +516,37 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_verify(
         )[0]
     }
 
+    /// Construction-time binding for physical-B1 verifier columns. The
+    /// returned closure is the exact shared projection itself, not a checked
+    /// wrapper around the ordinary attention-output path.
+    public static func bindB1Verifier(
+        columns: Int,
+        inDim: Int,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode
+    ) -> ((MLXArray) -> MLXArray)? {
+        guard enabled, supportsVerifierColumns(columns),
+            groupSize == Self.groupSize, bits == Self.bits, mode == .affine,
+            let biases,
+            scales.dtype == .bfloat16, biases.dtype == .bfloat16,
+            weight.dtype == .uint32,
+            weight.ndim == 2,
+            liveInputWidth(inDim),
+            weight.shape == [outputWidth, inDim * Self.bits / 32],
+            scales.shape == [outputWidth, inDim / Self.groupSize],
+            biases.shape == scales.shape
+        else { return nil }
+
+        return Gemma4B1MTPQuantizedProjection.bind(
+            columns: columns, inDim: inDim, outDim: outputWidth,
+            weight: weight, scales: scales, biases: biases,
+            groupSize: groupSize, bits: bits)
+    }
+
     /// Construction-time binding for the two live verifier o_proj planes.
     public static func bindVerifier(
         columns: Int,

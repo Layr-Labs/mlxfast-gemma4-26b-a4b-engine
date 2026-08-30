@@ -2851,6 +2851,38 @@ public enum Gemma4MMAQuantizedGEMV {
             outputShape: [mRows, columns, outDim])
     }
 
+    /// Bind the exact physical-B1 tied-head verifier after resolving the
+    /// artifact topology and quantization contract once. The installed
+    /// entrypoint dispatches the shared affine-4 projection directly.
+    public static func bindB1Verifier(
+        columns: Int,
+        inDim k: Int,
+        outDim n: Int,
+        w: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode
+    ) -> ((MLXArray) -> MLXArray)? {
+        guard enabled, supportsVerifierColumns(columns), mode == .affine,
+            let biases,
+            groupSize == 64, bits == 4,
+            scales.dtype == .bfloat16, biases.dtype == .bfloat16,
+            w.dtype == .uint32,
+            w.ndim == 2, scales.ndim == 2, biases.ndim == 2,
+            k > 0, k.isMultiple(of: groupSize), k.isMultiple(of: 8),
+            n >= minOutputWidth,
+            w.shape == [n, k * bits / 32],
+            scales.shape == [n, k / groupSize], biases.shape == scales.shape
+        else { return nil }
+
+        return Gemma4B1MTPQuantizedProjection.bind(
+            columns: columns, inDim: k, outDim: n,
+            weight: w, scales: scales, biases: biases,
+            groupSize: groupSize, bits: bits)
+    }
+
     /// Bind the exact verifier head after construction-time topology and
     /// quantization validation. The returned entrypoint has no fallback.
     public static func bindVerifier(

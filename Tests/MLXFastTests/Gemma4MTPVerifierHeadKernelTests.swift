@@ -48,6 +48,48 @@ struct Gemma4MTPVerifierHeadKernelTests {
         return Double(parts.seconds) + Double(parts.attoseconds) / 1e18
     }
 
+    private func expectExactBF16Storage(
+        _ candidate: MLXArray, _ reference: MLXArray
+    ) {
+        eval(candidate, reference)
+        #expect(candidate.dtype == .bfloat16)
+        #expect(reference.dtype == .bfloat16)
+        #expect(candidate.shape == reference.shape)
+        #expect(
+            candidate.asData(access: .copy).data
+                == reference.asData(access: .copy).data)
+    }
+
+    @Test(.enabled(if: runtimeEnabled))
+    func b1VerifierHeadAtArtifactWidthIsBitExactToIndependentB1Columns() throws {
+        let k = 2816
+        let n = 262_144
+        let (weight, scales, biases) = deterministicHeadWeights(k: k, n: n)
+
+        for columns in 2...4 {
+            let xValues: [Float] = (0..<(columns * k)).map { index in
+                Float((index * 29 + columns * 7) % 257 - 128) / 128.0
+            }
+            let x = MLXArray(xValues).reshaped([1, columns, k]).asType(.bfloat16)
+            let bound = try #require(Gemma4MMAQuantizedGEMV.bindB1Verifier(
+                columns: columns, inDim: k, outDim: n,
+                w: weight, scales: scales, biases: biases,
+                groupSize: 64, bits: 4, mode: .affine))
+            let candidate = bound(x)
+            let reference = concatenated(
+                (0..<columns).map { column in
+                    quantizedMM(
+                        x[0..., column..<(column + 1), 0...], weight,
+                        scales: scales, biases: biases, transpose: true,
+                        groupSize: 64, bits: 4, mode: .affine)
+                },
+                axis: 1)
+
+            #expect(candidate.shape == [1, columns, n])
+            expectExactBF16Storage(candidate, reference)
+        }
+    }
+
     @Test
     func verifierHeadSupportsOnlyB8DepthOneThroughThree() {
         #expect(Gemma4MMAQuantizedGEMV.supportsVerifierShape(batch: 8, columns: 2))

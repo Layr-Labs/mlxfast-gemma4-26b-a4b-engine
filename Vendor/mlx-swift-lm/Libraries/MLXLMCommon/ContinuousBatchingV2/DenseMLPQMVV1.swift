@@ -105,6 +105,23 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// GATE/UP-only compile-time K walk, DMLP-STATIC-K-018's technique
+    /// applied to the plane `018` never touched. Gate/up's pinned K = 2816
+    /// divides `block_size` (128) exactly (2816 / 128 = 22), so unlike the
+    /// down plane's odd 33-group split, no tail-lane guard, no dead-slot
+    /// masking and no group-count rounding is needed: the runtime tail
+    /// branch already never fires at this shape, this only lets the
+    /// compiler know it. `DARKBLOOM_GEMMA4_MLP_GATEUP_STATIC_K=0` restores
+    /// the incumbent runtime-K `kernel` / `activationSumQMVKernel` pair byte
+    /// for byte. Independent of `mma8GateUpEnabled`: when that opt-in MMA8
+    /// arm is engaged, this switch is simply not consulted.
+    private static let gateUpStaticKEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MLP_GATEUP_STATIC_K"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let batch = 8
     private static let sequence = 1
     private static let groupSize = 64
@@ -887,6 +904,243 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         ensureRowContiguous: true
     )
 
+    /// DMLP-STATIC-K-018's technique, mirrored onto the gate/up plane's
+    /// always-live tight kernel (`kernel` / `activationSumQMVKernel` below,
+    /// `qmv_affine8_g64_quad_stream_impl`'s own body). Gate/up's pinned
+    /// `K = 2816` divides `block_size` (`values_per_thread * SIMD_SIZE` =
+    /// `4 * 32` = 128) exactly -- `2816 / 128 = 22`, remainder zero -- so
+    /// unlike the down plane's odd 33-group split, no tail-lane guard, no
+    /// dead-slot masking and no group-count rounding is needed. The runtime
+    /// `in_vec_size` parameter becomes the compile-time constant `2816`;
+    /// the k-loop, the dequantize loads, `qdot_affine8_registered`'s
+    /// accumulation, the `simd_sum` reduction and the store are untouched
+    /// text. The existing tail-lane branch is also left untouched, byte for
+    /// byte, rather than deleted: with `in_vec_size` now a `constexpr`,
+    /// `active_tail_lanes` is the compile-time constant
+    /// `uint((2816 - 2816) / 4) = 0`, so `simd_lid < active_tail_lanes` is
+    /// unconditionally false for every thread and the branch already
+    /// executes zero iterations, at compile time exactly as it already did
+    /// at runtime. This candidate lets the compiler know a fact that was
+    /// already true; it does not change which fact is true.
+    ///
+    /// `DARKBLOOM_GEMMA4_MLP_GATEUP_STATIC_K=0` restores the incumbent
+    /// runtime-K `kernel` / `activationSumQMVKernel` pair byte for byte.
+    private static let gateUpStaticKHeader: String = {
+        var result = kernelHeader
+        func replaceOnce(_ old: String, with new: String) {
+            precondition(result.components(separatedBy: old).count == 2)
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        replaceOnce(
+            """
+            METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
+                const device uint32_t* w,
+                const device T* scales,
+                const device T* biases,
+                const device T* x0,
+                const device T* x1,
+                const device T* x2,
+                const device T* x3,
+                device T* y0,
+                device T* y1,
+                device T* y2,
+                device T* y3,
+                const int in_vec_size,
+                uint3 tid [[threadgroup_position_in_grid]],
+                uint simd_gid [[simdgroup_index_in_threadgroup]],
+                uint simd_lid [[thread_index_in_simdgroup]]) {
+              constexpr int num_simdgroups = 2;
+            """,
+            with: """
+            METAL_FUNC void qmv_affine8_g64_quad_stream_gateup_k2816_impl(
+                const device uint32_t* w,
+                const device T* scales,
+                const device T* biases,
+                const device T* x0,
+                const device T* x1,
+                const device T* x2,
+                const device T* x3,
+                device T* y0,
+                device T* y1,
+                device T* y2,
+                device T* y3,
+                uint3 tid [[threadgroup_position_in_grid]],
+                uint simd_gid [[simdgroup_index_in_threadgroup]],
+                uint simd_lid [[thread_index_in_simdgroup]]) {
+              constexpr int in_vec_size = 2816;
+              constexpr int num_simdgroups = 2;
+            """)
+        return result
+    }()
+
+    private static let gateUpStaticKKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_gateup_k2816_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+
+            const int in_vec_size = x_shape[x_ndim - 1];
+            const int out_vec_size = w_shape[0];
+            const int first_m = int(tid.x) * 4;
+            if (first_m >= 8) {
+                return;
+            }
+            qmv_affine8_g64_quad_stream_gateup_k2816_impl<T, 64, 8>(
+                w,
+                scales,
+                biases,
+                x + first_m * in_vec_size,
+                x + (first_m + 1) * in_vec_size,
+                x + (first_m + 2) * in_vec_size,
+                x + (first_m + 3) * in_vec_size,
+                y + first_m * out_vec_size,
+                y + (first_m + 1) * out_vec_size,
+                y + (first_m + 2) * out_vec_size,
+                y + (first_m + 3) * out_vec_size,
+                tid,
+                simd_gid,
+                simd_lid);
+            return;
+            """,
+        header: gateUpStaticKHeader,
+        ensureRowContiguous: true
+    )
+
+    /// DMLP-002's own xsum transform, reapplied to `gateUpStaticKHeader`
+    /// instead of the incumbent `kernelHeader`, so the activation-sum table
+    /// consumer gets the same compile-time-K treatment as the plain kernel
+    /// above. Structurally identical to `activationSumKernelHeader` above:
+    /// the same three `replaceLast` edits, the same four `loads`
+    /// substitutions, applied to the already-renamed function.
+    private static let gateUpStaticKXsumHeader: String = {
+        var result = gateUpStaticKHeader
+
+        func replaceLast(_ old: String, with new: String) {
+            guard let range = result.range(of: old, options: .backwards) else {
+                preconditionFailure("gate/up static-K xsum transform marker is missing")
+            }
+            result.replaceSubrange(range, with: new)
+        }
+
+        replaceLast(
+            """
+            template <typename T, const int group_size, const int bits>
+            METAL_FUNC void qmv_affine8_g64_quad_stream_gateup_k2816_impl(
+            """,
+            with: """
+            template <typename T, typename U, int values_per_thread>
+            inline void load_affine8_values_gateup_k2816(
+                const device T* x,
+                thread U* x_thread) {
+              for (int i = 0; i < values_per_thread; i++) {
+                x_thread[i] = x[i];
+              }
+            }
+
+            template <typename T, const int group_size, const int bits>
+            METAL_FUNC void qmv_affine8_g64_quad_stream_gateup_k2816_xsum_impl(
+            """
+        )
+        replaceLast(
+            """
+                const device T* biases,
+                const device T* x0,
+            """,
+            with: """
+                const device T* biases,
+                const device float* x_sums,
+                const device T* x0,
+            """
+        )
+        replaceLast(
+            """
+              const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+                  simd_gid * results_per_simdgroup;
+            """,
+            with: """
+              const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+                  simd_gid * results_per_simdgroup;
+              const int first_m = int(tid.x) * 4;
+            """
+        )
+
+        let loads: [(String, String)] = [
+            (
+                "float sum = load_vector<T, float, values_per_thread, 8>(x0, x_thread);",
+                """
+                load_affine8_values_gateup_k2816<T, float, values_per_thread>(x0, x_thread);
+                float sum = x_sums[
+                    ((k / block_size) * SIMD_SIZE + int(simd_lid)) * 8 + first_m];
+                """),
+            (
+                "sum = load_vector<T, float, values_per_thread, 8>(x1, x_thread);",
+                """
+                load_affine8_values_gateup_k2816<T, float, values_per_thread>(x1, x_thread);
+                sum = x_sums[
+                    ((k / block_size) * SIMD_SIZE + int(simd_lid)) * 8 + first_m + 1];
+                """),
+            (
+                "sum = load_vector<T, float, values_per_thread, 8>(x2, x_thread);",
+                """
+                load_affine8_values_gateup_k2816<T, float, values_per_thread>(x2, x_thread);
+                sum = x_sums[
+                    ((k / block_size) * SIMD_SIZE + int(simd_lid)) * 8 + first_m + 2];
+                """),
+            (
+                "sum = load_vector<T, float, values_per_thread, 8>(x3, x_thread);",
+                """
+                load_affine8_values_gateup_k2816<T, float, values_per_thread>(x3, x_thread);
+                sum = x_sums[
+                    ((k / block_size) * SIMD_SIZE + int(simd_lid)) * 8 + first_m + 3];
+                """),
+        ]
+        for (old, new) in loads {
+            precondition(result.components(separatedBy: old).count == 3)
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        return result
+    }()
+
+    private static let gateUpStaticKXsumKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_gateup_k2816_xsum_v1",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+
+            const int in_vec_size = x_shape[x_ndim - 1];
+            const int out_vec_size = w_shape[0];
+            const int first_m = int(tid.x) * 4;
+            if (first_m >= 8) {
+                return;
+            }
+            qmv_affine8_g64_quad_stream_gateup_k2816_xsum_impl<T, 64, 8>(
+                w,
+                scales,
+                biases,
+                xSums,
+                x + first_m * in_vec_size,
+                x + (first_m + 1) * in_vec_size,
+                x + (first_m + 2) * in_vec_size,
+                x + (first_m + 3) * in_vec_size,
+                y + first_m * out_vec_size,
+                y + (first_m + 1) * out_vec_size,
+                y + (first_m + 2) * out_vec_size,
+                y + (first_m + 3) * out_vec_size,
+                tid,
+                simd_gid,
+                simd_lid);
+            return;
+            """,
+        header: gateUpStaticKXsumHeader,
+        ensureRowContiguous: true
+    )
+
     @inline(__always)
     private static func liveShape(inDim: Int, outDim: Int) -> Bool {
         (inDim == 2816 && outDim == 2112)
@@ -1029,7 +1283,12 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         let useActivationSums = activationSums != nil
             && inDim == 2816
             && outDim == 2112
-        let selected = useActivationSums ? activationSumQMVKernel : kernel
+        let selected: MLXFast.MLXFastKernel
+        if isGateUp && gateUpStaticKEnabled {
+            selected = useActivationSums ? gateUpStaticKXsumKernel : gateUpStaticKKernel
+        } else {
+            selected = useActivationSums ? activationSumQMVKernel : kernel
+        }
         let inputs = useActivationSums
             ? [x, weight, scales, biases, activationSums!.values]
             : [x, weight, scales, biases]

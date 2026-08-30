@@ -387,8 +387,17 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         ensureRowContiguous: true
     )
 
+    /// MERGE-DEPTH-001: how many contiguous lanes of the merge simdgroup can
+    /// hold a live partition column. The lanes above it carry the identity of
+    /// every reduction in the body, so a butterfly bounded here folds the same
+    /// tree the full-width one does and stops before the identity rounds.
+    private static let mergeLanes: Int = {
+        let capped = min(blocks, 32)
+        return capped > 0 && (capped & (capped - 1)) == 0 ? capped : 32
+    }()
+
     private static let passBKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_2pass_b_direct_bf16_d256_b\(blocks)_v3",
+        name: "cbv2_ragged8_sdpa_2pass_b_direct_bf16_d256_b\(blocks)_v5",
         inputNames: ["partials", "sums", "maxs"],
         outputNames: ["out"],
         source: """
@@ -415,29 +424,50 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             for (int element = 0; element < values_per_lane; ++element) {
                 accumulator[element] = 0.0f;
             }
+            // A lane's column summaries are invariant across all three walks
+            // below, and its rescale factor is invariant across the last two.
+            // Holding them keeps the same values while dropping two reloads of
+            // `maxs`, one of `sums`, and one `fast::exp` per column. The dead
+            // lanes take the identity of each reduction through a select, as
+            // they did through the skipped body: `-FLT_MAX` folds away under
+            // `max`, and `fast::exp` of a large negative is `+0.0f`, so the
+            // `+0.0f * +0.0f` they add to a total that started at `+0.0f`
+            // leaves it `+0.0f`.
+            thread float lane_max[rounds];
+            thread float lane_sum[rounds];
+            thread float lane_factor[rounds];
             float sum_exp_score = 0.0f;
             float max_score = -3.402823466e+38F;
             for (int round = 0; round < rounds; ++round) {
                 const int column = block_lane + simd_width * round;
-                if (column < BLOCKS) {
-                    max_score = max(max_score, maxs[column]);
-                }
+                const bool live = column < BLOCKS;
+                lane_max[round] = live ? maxs[column] : -3.402823466e+38F;
+                lane_sum[round] = live ? sums[column] : 0.0f;
+                max_score = max(max_score, lane_max[round]);
             }
-            max_score = simd_max(max_score);
+            // Live columns occupy lanes [0, LANES) and the rest hold the
+            // identity, so strides 1..LANES/2 complete the live tree and the
+            // strides above them only fold `-FLT_MAX`, which `max` discards.
+            for (int stride = 1; stride < LANES; stride <<= 1) {
+                max_score = max(max_score, simd_shuffle_xor(max_score, ushort(stride)));
+            }
+
+            for (int round = 0; round < rounds; ++round) {
+                lane_factor[round] = fast::exp(lane_max[round] - max_score);
+                sum_exp_score += lane_factor[round] * lane_sum[round];
+            }
+            // Same bound. The dead lanes hold `+0.0f`, and `x + 0.0f == x`
+            // for every `x` other than `-0.0f`. `sum_exp_score` starts at
+            // `+0.0f` and only ever sits on the left of a `+=`, and IEEE 754
+            // gives `(+0.0) + (-0.0) = +0.0`, so it is never `-0.0f`.
+            for (int stride = 1; stride < LANES; stride <<= 1) {
+                sum_exp_score += simd_shuffle_xor(sum_exp_score, ushort(stride));
+            }
 
             for (int round = 0; round < rounds; ++round) {
                 const int column = block_lane + simd_width * round;
                 if (column < BLOCKS) {
-                    sum_exp_score +=
-                        fast::exp(maxs[column] - max_score) * sums[column];
-                }
-            }
-            sum_exp_score = simd_sum(sum_exp_score);
-
-            for (int round = 0; round < rounds; ++round) {
-                const int column = block_lane + simd_width * round;
-                if (column < BLOCKS) {
-                    const float factor = fast::exp(maxs[column] - max_score);
+                    const float factor = lane_factor[round];
                     for (int element = 0; element < values_per_lane; ++element) {
                         accumulator[element] +=
                             factor * float(partials[column * D + element]);
@@ -446,7 +476,10 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             }
 
             for (int element = 0; element < values_per_lane; ++element) {
-                const float reduced = simd_sum(accumulator[element]);
+                float reduced = accumulator[element];
+                for (int stride = 1; stride < LANES; stride <<= 1) {
+                    reduced += simd_shuffle_xor(reduced, ushort(stride));
+                }
                 if (block_lane == 0) {
                     out[element] = T(
                         sum_exp_score == 0.0f
@@ -560,6 +593,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 ("T", queries.dtype),
                 ("D", headDim),
                 ("BLOCKS", blocks),
+                ("LANES", mergeLanes),
             ],
             grid: (batch * queryHeads * 1024, 1, 1),
             threadGroup: (1024, 1, 1),
@@ -621,6 +655,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 ("T", queries.dtype),
                 ("D", headDim),
                 ("BLOCKS", blocks),
+                ("LANES", mergeLanes),
             ],
             grid: (batch * queryHeads * 1024, 1, 1),
             threadGroup: (1024, 1, 1),

@@ -44,11 +44,19 @@ enum CBv2AttentionV1 {
     /// launch overhead of 32. `0` disables blocking entirely (one call for the
     /// whole chunk — the pre-2026-07 behavior), which is the kill switch if
     /// this is ever implicated in a numerics or latency regression.
+    // QBLOCK-256: halvee the prefill dispatch sets (1024-token prompt: 8
+    // blocks -> 4) and halvee the token-major join's operand count. The
+    // board's three consecutive schedule-churn losses this evening
+    // ({1,3} −6.62%, unfence −6.59%, CHUNK-12 −6.14%) all ADDED eval
+    // boundaries; this is the only unpriced cell that REMOVES them.
+    // Golden-PASS byte-identical at 256 twice on 1024_256 and once on
+    // 1024_1024 locally before packaging; ship diff compile-verified from
+    // a clean tree. Kill switch DARKBLOOM_CBV2_ATTN_QUERY_BLOCK=128.
     static let queryBlockSize: Int = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_ATTN_QUERY_BLOCK"],
             let value = Int(raw), value >= 0
-        else { return 128 }
+        else { return 256 }
         return value
     }()
 

@@ -11,6 +11,7 @@
 
 import Foundation
 import MLX
+import MLXFast
 
 /// `CBv2SequenceKV` for sliding-window attention.
 ///
@@ -73,6 +74,54 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     private var keys: MLXArray?
     private var values: MLXArray?
 
+    /// KVQ-001: 8-bit affine mirror of the ring, maintained ALONGSIDE the
+    /// bf16 ring (which stays the source of truth for every logical view,
+    /// borrow, staging and rollback path). Only the B=8 full-ring decode
+    /// pass-A kernels read it; halving their K/V bytes is the entire point.
+    ///
+    /// Layout: `[2, kvHeads, window, headDim + 4]` uint8 — plane 0 keys,
+    /// plane 1 values; per (plane, head, slot) the first `headDim` bytes are
+    /// the affine-quantized values and the trailing 4 bytes are the fp16
+    /// (scale, bias) pair for that slot, so one buffer per row carries
+    /// everything a kernel needs (Metal's 31-buffer limit rules out separate
+    /// scale arrays at batch 8).
+    ///
+    /// Consistency: the mirror mirrors the bf16 ring slot-for-slot and is
+    /// written at exactly the writes that mutate the ring (`writeRing`,
+    /// `writeDecodeToken`, and the fused in-kernel store). Rollback moves
+    /// counters only — both buffers keep the same bytes — so validity is
+    /// tracked by the same `oldestValidPosition`/`absoluteOffset` pair and
+    /// the mirror needs no bookkeeping of its own.
+    private var quantMirror: MLXArray?
+
+    /// `MLX_KV_QUANT=0` disables the quantized-ring read path wholesale
+    /// (mirror never allocated, kernels take the established bf16 road).
+    /// Default ON. `MLX_` prefix: the worker env sanitizer only passes
+    /// that namespace through.
+    static let quantEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_KV_QUANT"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// `MLX_KV_QUANT_SIM=1` (default OFF, local only): after every ring
+    /// write, overwrite the bf16 slot with its quantize→dequantize round
+    /// trip, so the SINGLE-STREAM fallback path — the one a local
+    /// `--local-iterate` golden run exercises — sees exactly the values the
+    /// quantized kernels would reconstruct at B = 8. That turns the local
+    /// teacher-forced golden into a real end-to-end drift measurement for
+    /// this mechanism. Never set on the ranked box.
+    static let quantSimulate: Bool = {
+        ["1", "true", "yes", "on"].contains(
+            (ProcessInfo.processInfo.environment["MLX_KV_QUANT_SIM"] ?? "")
+                .lowercased())
+    }()
+
+    private var quantEligible: Bool {
+        Self.quantEnabled && headDim == 256 && window > 0
+            && (window & (window - 1)) == 0
+    }
+
     /// Step-scoped PRE-EVICTION views captured by the most recent MULTI-token
     /// `update()` (`retainedHistory ++ chunk`, up to `window - 1 + n` entries).
     /// KV-borrowing layers (Gemma-4 cross-layer sharing) attend these instead
@@ -114,8 +163,12 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     public var byteCount: Int {
         // Staged tensors are physically held until commit (bounded: one
         // 1+k-token chunk per in-flight MTP round).
+        // KVQ-001: the packed 8-bit mirror is real resident memory and must
+        // be visible to the engine's capacity accounting (the original
+        // KVQ-001 revision omitted it, under-counting ~850 MB at B=8).
         (keys?.nbytes ?? 0) + (values?.nbytes ?? 0)
             + (staged.map { $0.keys.nbytes + $0.values.nbytes } ?? 0)
+            + (quantMirror?.nbytes ?? 0)
     }
 
     public func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
@@ -166,8 +219,8 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         let firstWritten = absoluteOffset + n - writeCount
         let kTail = writeCount == n ? newKeys : newKeys[.ellipsis, (n - writeCount)..., 0...]
         let vTail = writeCount == n ? newValues : newValues[.ellipsis, (n - writeCount)..., 0...]
-        writeRing(keys!, tokens: kTail, firstPosition: firstWritten)
-        writeRing(values!, tokens: vTail, firstPosition: firstWritten)
+        writeRing(keys!, tokens: kTail, firstPosition: firstWritten, mirrorPlane: 0)
+        writeRing(values!, tokens: vTail, firstPosition: firstWritten, mirrorPlane: 1)
 
         absoluteOffset += n
         oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
@@ -185,6 +238,17 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     var decodeRingView: (keys: MLXArray, values: MLXArray, start: Int)? {
         guard staged == nil, let keys, let values, retainedCount == window else { return nil }
         return (keys, values, oldestValidPosition % window)
+    }
+
+    /// KVQ-001: the packed 8-bit mirror for the same full-ring decode step
+    /// `decodeRingView` describes, or nil when the quantized road is off.
+    /// The same allocation serves the before-write (fused) step: the fused
+    /// quantized kernel stores the new token's mirror bytes itself, exactly
+    /// as it stores the bf16 ones.
+    var decodeRingQuantView: MLXArray? {
+        guard staged == nil, quantMirror != nil, retainedCount == window
+        else { return nil }
+        return quantMirror
     }
 
     /// The ring view a fused decode step should attend: the SAME allocations
@@ -299,10 +363,10 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             let skip = confirmed - writeCount
             writeRing(
                 keys!, tokens: staged.keys[.ellipsis, skip ..< confirmed, 0...],
-                firstPosition: absoluteOffset - writeCount)
+                firstPosition: absoluteOffset - writeCount, mirrorPlane: 0)
             writeRing(
                 values!, tokens: staged.values[.ellipsis, skip ..< confirmed, 0...],
-                firstPosition: absoluteOffset - writeCount)
+                firstPosition: absoluteOffset - writeCount, mirrorPlane: 1)
         }
         oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
         // Step-scoped views die at finalize (the plain paths replace them on
@@ -444,15 +508,15 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     }
 
     func cbv2InnerState() -> [MLXArray] {
-        [keys, values].compactMap { $0 }
+        [keys, values, quantMirror].compactMap { $0 }
     }
 
     // MARK: - Ring geometry
 
     private func writeDecodeToken(keys newKeys: MLXArray, values newValues: MLXArray) {
         borrowableChunkViews = nil
-        writeRing(keys!, tokens: newKeys, firstPosition: absoluteOffset)
-        writeRing(values!, tokens: newValues, firstPosition: absoluteOffset)
+        writeRing(keys!, tokens: newKeys, firstPosition: absoluteOffset, mirrorPlane: 0)
+        writeRing(values!, tokens: newValues, firstPosition: absoluteOffset, mirrorPlane: 1)
         absoluteOffset += 1
         oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
     }
@@ -488,9 +552,24 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
 
     /// Write `tokens` (≤ window of them) into their modular slots, splitting
     /// at the wrap point when needed (at most two slice assignments).
-    private func writeRing(_ buffer: MLXArray, tokens: MLXArray, firstPosition: Int) {
+    ///
+    /// `mirrorPlane` (0 = keys, 1 = values) additionally keeps the KVQ-001
+    /// mirror in step when the quantized road is on, and — under
+    /// `MLX_KV_QUANT_SIM` — replaces the bf16 payload with its
+    /// quantize→dequantize round trip so the single-stream fallback sees the
+    /// mirror's numerics.
+    private func writeRing(
+        _ buffer: MLXArray, tokens: MLXArray, firstPosition: Int, mirrorPlane: Int? = nil
+    ) {
+        var tokens = tokens
         let n = tokens.dim(2)
         precondition(n <= window, "writeRing: more tokens than slots")
+        if let plane = mirrorPlane, quantMirror != nil {
+            writeMirror(plane: plane, tokens: tokens, firstPosition: firstPosition)
+            if Self.quantSimulate {
+                tokens = Self.quantRoundTrip(tokens)
+            }
+        }
         let start = firstPosition % window
         if start + n <= window {
             buffer[.ellipsis, start ..< (start + n), 0...] = tokens
@@ -501,11 +580,168 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         }
     }
 
+    // MARK: - KVQ-001 quantized mirror
+
+    /// fp16-rounded per-(head, token) affine parameters for `x`
+    /// (`[..., headDim]` over the last axis). The fp16 rounding is applied
+    /// BEFORE quantization so the host packer, the fused kernel's writer and
+    /// the sim round trip all reconstruct with the identical (scale, bias)
+    /// the mirror actually stores.
+    private static func quantParams(_ f: MLXArray) -> (scale: MLXArray, bias: MLXArray) {
+        let mn = f.min(axis: -1, keepDims: true)
+        let mx = f.max(axis: -1, keepDims: true)
+        let scale = maximum((mx - mn) / 255, MLXArray(Float(1e-6)))
+            .asType(.float16).asType(.float32)
+        let bias = mn.asType(.float16).asType(.float32)
+        return (scale, bias)
+    }
+
+    /// `[1, kvHeads, n, headDim]` bf16 → packed mirror rows
+    /// `[kvHeads, n, headDim + 4]` uint8 (values ++ fp16 scale ++ fp16 bias).
+    private static func quantPack(_ x: MLXArray) -> MLXArray {
+        let f = x[0].asType(.float32)
+        let (scale, bias) = quantParams(f)
+        let q = clip(round((f - bias) / scale), min: 0, max: 255).asType(.uint8)
+        let sBytes = scale.asType(.float16).view(dtype: .uint8)
+        let bBytes = bias.asType(.float16).view(dtype: .uint8)
+        return concatenated([q, sBytes, bBytes], axis: -1)
+    }
+
+    /// KVQ-GPUPACK: `MLX_KV_QUANT_GPUPACK=0` routes mirror packing back
+    /// through the host expression above. Default ON: one kernel dispatch
+    /// replaces the ~8-op MLX expression per (plane, chunk) write, which is
+    /// the whole prefill cost of the mirror.
+    static let gpuPackEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_KV_QUANT_GPUPACK"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// `MLX_KV_QUANT_PACK_CHECK=1` (local only): compute BOTH packers on
+    /// every write and fail loudly on any byte mismatch. The GPU packer is
+    /// only legitimate while it reproduces the host packer bit for bit.
+    static let gpuPackCheck: Bool = {
+        ["1", "true", "yes", "on"].contains(
+            (ProcessInfo.processInfo.environment["MLX_KV_QUANT_PACK_CHECK"] ?? "")
+                .lowercased())
+    }()
+
+    /// One threadgroup (32 lanes) per (head, token) row: simd min/max over
+    /// the 256 payload values, the SAME fp16-rounded (scale, bias) the host
+    /// packer stores (`metal::rint` matches MLX `round`), quantized bytes
+    /// plus the fp16 tail written at the identical offsets.
+    private static let quantPackKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_kvq8_pack_d256_v2",
+        inputNames: ["x"],
+        outputNames: ["packed"],
+        source: """
+            constexpr int D = 256;
+            constexpr int simd_width = 32;
+            constexpr int row_stride = D + 4;
+
+            const int row = int(threadgroup_position_in_grid.x);
+            const int lane = int(thread_position_in_threadgroup.x);
+            const device T* xr = x + row * D;
+
+            float vmin = 3.402823466e+38F;
+            float vmax = -3.402823466e+38F;
+            for (int i = lane; i < D; i += simd_width) {
+                const float v = float(xr[i]);
+                vmin = min(vmin, v);
+                vmax = max(vmax, v);
+            }
+            vmin = simd_min(vmin);
+            vmax = simd_max(vmax);
+
+            const half hs = half(max((vmax - vmin) / 255.0f, 1e-6f));
+            const half hb = half(vmin);
+            const float s = float(hs);
+            const float b = float(hb);
+
+            device uint8_t* out = packed + row * row_stride;
+            for (int i = lane; i < D; i += simd_width) {
+                const float q = metal::rint((float(xr[i]) - b) / s);
+                out[i] = uint8_t(clamp(q, 0.0f, 255.0f));
+            }
+            if (lane == 0) {
+                const ushort su = as_type<ushort>(hs);
+                const ushort bu = as_type<ushort>(hb);
+                out[D + 0] = uint8_t(su & 0xff);
+                out[D + 1] = uint8_t(su >> 8);
+                out[D + 2] = uint8_t(bu & 0xff);
+                out[D + 3] = uint8_t(bu >> 8);
+            }
+        """
+    )
+
+    /// `[1, kvHeads, n, headDim]` -> packed `[kvHeads, n, headDim + 4]`
+    /// uint8, byte-identical to `quantPack`.
+    private static func quantPackGPU(_ x: MLXArray) -> MLXArray {
+        let kvHeads = x.dim(1)
+        let n = x.dim(2)
+        let rows = kvHeads * n
+        return quantPackKernel(
+            [x],
+            template: [("T", x.dtype)],
+            grid: (rows * 32, 1, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[kvHeads, n, x.dim(3) + 4]],
+            outputDTypes: [.uint8]
+        )[0]
+    }
+
+    /// The bf16 values the mirror reconstructs for `x` — the sim harness's
+    /// stand-in for the quantized kernels' dequantized reads.
+    static func quantRoundTrip(_ x: MLXArray) -> MLXArray {
+        let f = x.asType(.float32)
+        let (scale, bias) = quantParams(f)
+        let q = clip(round((f - bias) / scale), min: 0, max: 255)
+        return (q * scale + bias).asType(x.dtype)
+    }
+
+    private func writeMirror(plane: Int, tokens: MLXArray, firstPosition: Int) {
+        guard let quantMirror else { return }
+        let packedFlat: MLXArray
+        if Self.gpuPackCheck {
+            let gpu = Self.quantPackGPU(tokens)
+            let host = Self.quantPack(tokens)
+            let mismatches = (gpu .!= host).sum().item(Int.self)
+            if mismatches != 0 {
+                FileHandle.standardError.write(
+                    "[kvq-gpupack] BYTE MISMATCH: \(mismatches) bytes differ\n"
+                        .data(using: .utf8)!)
+            }
+            packedFlat = host
+        } else if Self.gpuPackEnabled {
+            packedFlat = Self.quantPackGPU(tokens)
+        } else {
+            packedFlat = Self.quantPack(tokens)
+        }
+        let packed = packedFlat.expandedDimensions(axis: 0)
+        let n = tokens.dim(2)
+        let start = firstPosition % window
+        if start + n <= window {
+            quantMirror[plane ..< (plane + 1), 0..., start ..< (start + n), 0...] = packed
+        } else {
+            let first = window - start
+            quantMirror[plane ..< (plane + 1), 0..., start ..< window, 0...] =
+                packed[.ellipsis, ..<first, 0...]
+            quantMirror[plane ..< (plane + 1), 0..., 0 ..< (n - first), 0...] =
+                packed[.ellipsis, first..., 0...]
+        }
+    }
+
     private func allocateIfNeeded(keyTemplate: MLXArray, valueTemplate: MLXArray) {
         guard keys == nil else { return }
         keys = MLXArray.zeros(
             [1, kvHeads, window, keyTemplate.dim(3)], dtype: keyTemplate.dtype)
         values = MLXArray.zeros(
             [1, kvHeads, window, valueTemplate.dim(3)], dtype: valueTemplate.dtype)
+        if quantEligible, keyTemplate.dtype == .bfloat16,
+            keyTemplate.dim(3) == headDim, valueTemplate.dim(3) == headDim
+        {
+            quantMirror = MLXArray.zeros(
+                [2, kvHeads, window, headDim + 4], dtype: .uint8)
+        }
     }
 }

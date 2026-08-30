@@ -280,7 +280,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// this step's fence, so the mutation can never be reordered against a
     /// later read of the same allocation.
     private static let fusedRingPassAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_ringwrite_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v1",
+        name: "cbv2_ragged8_ringwrite_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v2",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -293,6 +293,17 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             constexpr int values_per_lane = D / simd_width;
             static_assert((N & (N - 1)) == 0, "ring length must be a power of two");
             constexpr uint ring_mask = uint(N - 1);
+            // WIDEN-001: every K/V slice this lane touches starts at
+            // `lane * values_per_lane` elements inside a slot that is itself a
+            // whole multiple of D, so the byte offset is a multiple of
+            // `values_per_lane * sizeof(T)` = 16 and a 4-wide vector load is
+            // always aligned. Stating the width instead of leaving eight
+            // 2-byte accesses for the compiler to re-prove is what turns the
+            // per-token slice into two loads.
+            typedef vec<T, 4> T4;
+            static_assert(values_per_lane % 4 == 0,
+                "lane slice must be a whole number of 4-wide vectors");
+            constexpr int vectors_per_lane = values_per_lane / 4;
 
             const int kv_head = int(threadgroup_position_in_grid.x);
             const int batch_index = int(threadgroup_position_in_grid.y);
@@ -355,11 +366,18 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             float sum_exp_score = 0.0f;
             for (int token = block; token < N; token += BLOCKS) {
                 const bool current = token == N - 1;
-                const device T* k = current ? new_key : keys + slot * D;
-                const device T* v = current ? new_value : values + slot * D;
+                const device T4* k = (const device T4*)(
+                    current ? new_key : keys + slot * D);
+                const device T4* v = (const device T4*)(
+                    current ? new_value : values + slot * D);
                 float score = 0.0f;
-                for (int element = 0; element < values_per_lane; ++element) {
-                    score += q[element] * float(k[element]);
+                for (int word = 0; word < vectors_per_lane; ++word) {
+                    const T4 lane_key = k[word];
+                    const int element = 4 * word;
+                    score += q[element + 0] * float(lane_key.x);
+                    score += q[element + 1] * float(lane_key.y);
+                    score += q[element + 2] * float(lane_key.z);
+                    score += q[element + 3] * float(lane_key.w);
                 }
                 score = simd_sum(score);
 
@@ -368,9 +386,17 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 const float score_factor = fast::exp(score - new_max);
                 max_score = new_max;
                 sum_exp_score = sum_exp_score * old_factor + score_factor;
-                for (int element = 0; element < values_per_lane; ++element) {
-                    accumulator[element] = accumulator[element] * old_factor
-                        + score_factor * float(v[element]);
+                for (int word = 0; word < vectors_per_lane; ++word) {
+                    const T4 lane_value = v[word];
+                    const int element = 4 * word;
+                    accumulator[element + 0] = accumulator[element + 0] * old_factor
+                        + score_factor * float(lane_value.x);
+                    accumulator[element + 1] = accumulator[element + 1] * old_factor
+                        + score_factor * float(lane_value.y);
+                    accumulator[element + 2] = accumulator[element + 2] * old_factor
+                        + score_factor * float(lane_value.z);
+                    accumulator[element + 3] = accumulator[element + 3] * old_factor
+                        + score_factor * float(lane_value.w);
                 }
 
                 slot = (slot + uint(BLOCKS)) & ring_mask;
@@ -380,8 +406,14 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 sum_out[0] = sum_exp_score;
                 max_out[0] = max_score;
             }
-            for (int element = 0; element < values_per_lane; ++element) {
-                partial[element] = T(accumulator[element]);
+            device T4* partial_words = (device T4*)partial;
+            for (int word = 0; word < vectors_per_lane; ++word) {
+                const int element = 4 * word;
+                partial_words[word] = T4(
+                    T(accumulator[element + 0]),
+                    T(accumulator[element + 1]),
+                    T(accumulator[element + 2]),
+                    T(accumulator[element + 3]));
             }
         """,
         ensureRowContiguous: true

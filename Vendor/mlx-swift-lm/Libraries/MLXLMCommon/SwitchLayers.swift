@@ -112,25 +112,42 @@ public func resetWeightedExpertUnsortStats() {
 /// permutation and writes `[tokens, hidden]` directly, avoiding that full
 /// `[tokens, topK, hidden]` intermediate.
 private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "weighted_expert_unsort",
+    name: "weighted_expert_unsort_v2_tg_k8",
     inputNames: ["sorted_outputs", "inverse_order", "weights"],
     outputNames: ["output"],
     source: """
-        uint feature = thread_position_in_grid.x;
-        uint token = thread_position_in_grid.y;
+        threadgroup uint staged_inverse[4][K];
+        threadgroup T staged_weights[4][K];
+
+        const uint feature = thread_position_in_grid.x;
+        const uint token = thread_position_in_grid.y;
+        const uint local_feature = thread_position_in_threadgroup.x;
+        const uint local_token = thread_position_in_threadgroup.y;
+        const uint hidden = threads_per_grid.x;
+
+        // The four y lanes in a (64, 4) group cover four tokens. For each
+        // token, only the first K x lanes need to fetch its slot metadata;
+        // every feature lane then reuses that metadata from threadgroup
+        // memory instead of reloading it for every hidden feature.
+        if (local_feature < (uint)K) {
+            const uint assignment = token * (uint)K + local_feature;
+            staged_inverse[local_token][local_feature] =
+                (uint)inverse_order[assignment];
+            staged_weights[local_token][local_feature] = weights[assignment];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         T accumulator = (T)0;
-        const uint assignment_base = token * (uint)K;
+        #pragma unroll
         for (uint slot = 0; slot < (uint)K; ++slot) {
-            const uint assignment = assignment_base + slot;
-            const uint sorted_row = (uint)inverse_order[assignment];
+            const uint sorted_row = staged_inverse[local_token][slot];
             // Preserve the legacy bfloat16 multiply-then-reduce rounding.
             const T weighted = (T)(
-                (float)sorted_outputs[sorted_row * threads_per_grid.x + feature]
-                * (float)weights[assignment]);
+                (float)sorted_outputs[sorted_row * hidden + feature]
+                * (float)staged_weights[local_token][slot]);
             accumulator = accumulator + weighted;
         }
-        output[token * threads_per_grid.x + feature] = accumulator;
+        output[token * hidden + feature] = accumulator;
     """,
     ensureRowContiguous: true
 )

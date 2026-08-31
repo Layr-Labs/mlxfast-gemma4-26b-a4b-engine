@@ -1715,6 +1715,14 @@ public final class EngineLoopV2: @unchecked Sendable {
                         spanContexts: spanContexts,
                         caches: caches,
                         requirement: requirement)
+                } else if group.samples {
+                    output = CBv2OrderOnlyLogits.withOrderOnly(
+                        group.rows.map(\.rec.request.sampling)
+                    ) {
+                        prefillOutput(
+                            tokens: inputs, inputEmbeddings: nil, caches: caches,
+                            requirement: requirement)
+                    }
                 } else {
                     output = prefillOutput(
                         tokens: inputs, inputEmbeddings: nil, caches: caches,
@@ -1776,6 +1784,12 @@ public final class EngineLoopV2: @unchecked Sendable {
                     tokens: inputs, start: row.start, count: row.count,
                     multimodal: multimodal, spanContext: spanContext, caches: caches,
                     requirement: requirement)
+            } else if row.samples {
+                output = CBv2OrderOnlyLogits.withOrderOnly([rec.request.sampling]) {
+                    prefillOutput(
+                        tokens: inputs, inputEmbeddings: nil, caches: caches,
+                        requirement: requirement)
+                }
             } else {
                 output = prefillOutput(
                     tokens: inputs, inputEmbeddings: nil, caches: caches,

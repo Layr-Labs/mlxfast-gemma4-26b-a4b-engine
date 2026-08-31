@@ -1331,10 +1331,12 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const device T* in =
                 scores + size_t(gid) * axis_size + lid * 4;
             if (lid * 4 + 4 <= axis_size) {
+                #pragma clang loop unroll(full)
                 for (int i = 0; i < 4; i++) {
                     ld[i] = static_cast<float>(in[i]);
                 }
             } else {
+                #pragma clang loop unroll(full)
                 for (int i = 0; i < 4; i++) {
                     ld[i] = ((lid * 4 + i) < axis_size)
                         ? static_cast<float>(in[i]) : -INFINITY;
@@ -1347,6 +1349,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             float maxval = -3.402823466e+38F;
+            #pragma clang loop unroll(full)
             for (int i = 0; i < 4; i++) {
                 maxval = (maxval < ld[i]) ? ld[i] : maxval;
             }
@@ -1365,6 +1368,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             maxval = local_max[0];
 
             float normalizer = 0.0f;
+            #pragma clang loop unroll(full)
             for (int i = 0; i < 4; i++) {
                 float exp_x = fast::exp(ld[i] - maxval);
                 ld[i] = exp_x;
@@ -1387,10 +1391,12 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             device T* out_row =
                 probs + size_t(gid) * axis_size + lid * 4;
             if (lid * 4 + 4 <= axis_size) {
+                #pragma clang loop unroll(full)
                 for (int i = 0; i < 4; i++) {
                     out_row[i] = static_cast<T>(ld[i] * normalizer);
                 }
             } else {
+                #pragma clang loop unroll(full)
                 for (int i = 0; i < 4; i++) {
                     if ((lid * 4 + i) < axis_size) {
                         out_row[i] = static_cast<T>(ld[i] * normalizer);
@@ -1469,6 +1475,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 }
                 #pragma clang loop unroll(full)
                 for (int tm = 0; tm < 4; ++tm) {
+                    #pragma clang loop unroll(full)
                     for (int tn = 0; tn < 4; ++tn) {
                         inter[tn] = value_plane[
                             size_t(bm + tm) * D + out_col + tn];
@@ -1476,6 +1483,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
                         float vc = v_coeff[h][tm];
+                        #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
                             result[h][tn] += vc * inter[tn];
                         }

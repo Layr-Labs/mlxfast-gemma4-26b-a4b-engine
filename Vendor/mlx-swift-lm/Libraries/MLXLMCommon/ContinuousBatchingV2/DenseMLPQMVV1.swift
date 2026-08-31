@@ -803,6 +803,66 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         header: mma8DownLaneSumHeader,
         ensureRowContiguous: true)
 
+    private static let mma8DownStaticKLaneSumHeader: String = {
+        var result = mma8DownLaneSumHeader
+        func replaceOnce(_ old: String, with new: String) {
+            precondition(result.components(separatedBy: old).count == 2)
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        replaceOnce(
+            "gemma4_qmv_mma8_affine8_g64_lane_sums_impl(",
+            with: "gemma4_qmv_mma8_affine8_g64_down_k2112_lane_sums_impl(")
+        replaceOnce(
+            """
+                device T* y,
+                const int K,
+                const int N,
+            """,
+            with: """
+                device T* y,
+                const int N,
+            """)
+        replaceOnce(
+            """
+              const int G = K / 64;
+              const int gh = (G + 1) / 2;
+              const int g_begin = (KS == 2 && simd_gid == 1) ? gh : 0;
+              const int g_end = (KS == 2 && simd_gid == 0) ? gh : G;
+            """,
+            with: """
+              constexpr int K = 2112;
+              constexpr int G = K / 64;
+              constexpr int gh = (G + 1) / 2;
+              constexpr int nGroups = (KS == 2) ? gh : G;
+              const int g0 = (KS == 2 && simd_gid == 1) ? gh : 0;
+            """)
+        replaceOnce(
+            "  for (int g = g_begin; g < g_end; ++g) {",
+            with: """
+              #pragma unroll
+              for (int gi = 0; gi < nGroups; ++gi) {
+                const int g = g0 + gi;
+                if (g >= G) continue;
+            """)
+        return result
+    }()
+
+    private static let mma8DownStaticKLaneSumQMVKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_lane_sums_unroll_v1",
+        inputNames: ["x", "w", "scales", "biases", "laneSums"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            gemma4_qmv_mma8_affine8_g64_down_k2112_lane_sums_impl<T, 2>(
+                w, scales, biases, x, (const device float2*)laneSums, y,
+                w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            """,
+        header: mma8DownStaticKLaneSumHeader,
+        ensureRowContiguous: true)
+
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_v2_unroll",
         inputNames: ["x", "w", "scales", "biases"],
@@ -1019,7 +1079,10 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
                     outputShapes: [[groups, simdWidth, 2]],
                     outputDTypes: [.float32]
                 )[0]
-                return mma8DownLaneSumQMVKernel(
+                let selectedMMA = mma8DownStaticKEnabled
+                    ? mma8DownStaticKLaneSumQMVKernel
+                    : mma8DownLaneSumQMVKernel
+                return selectedMMA(
                     [x, weight, scales, biases, laneSums],
                     template: [("T", x.dtype)],
                     grid: (simdWidth, yTiles * simdGroups, 1),

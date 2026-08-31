@@ -306,6 +306,19 @@ public enum Gemma4PrefillGlueV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// PRENORM-SCATTER-TGMETA-K8. The production sorted-plane producer has
+    /// exactly eight destinations per token row. Its 704 threads otherwise
+    /// reload the same eight inverse positions independently. The staged twin
+    /// below reads those positions once per threadgroup. This switch is
+    /// independent of PRENORM-GATHER so the byte-identical v1 kernel remains
+    /// available for attribution and emergency rollback.
+    private static let prenormScatterTGMetaK8Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_PRENORM_TGMETA_K8"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// `dualPreNorm` with its second output removed: the same reduction, the
     /// same `w * T(x * inv)` store, one weight.
     private static let preNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
@@ -394,6 +407,69 @@ public enum Gemma4PrefillGlueV1 {
         ensureRowContiguous: true
     )
 
+    /// K=8 production twin of `preNormScatterKernel`.
+    ///
+    /// Every thread in v1 reads the same eight inverse positions for its row.
+    /// Here the unique one-dimensional thread ids 0...7 publish one position
+    /// each to 32 bytes of threadgroup storage before every thread enters
+    /// `glue_inv_rms`. The helper's first barrier is unconditional, carries
+    /// `mem_threadgroup`, and is reached by all 704 threads after these writes.
+    /// Every `sortedPositions` read is after the helper returns, so that
+    /// existing barrier is the publication fence; no fourth barrier is added.
+    private static let preNormScatterTGMetaK8Kernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_prefill_glue_prenorm_scatter_2816_tgmeta_k8_v2",
+            inputNames: ["x", "w", "inverse"],
+            outputNames: ["out"],
+            source: """
+                threadgroup float local_sums[32];
+                threadgroup float local_inv[1];
+                threadgroup uint sortedPositions[8];
+
+                const uint row = threadgroup_position_in_grid.y;
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint simd_lane_id = thread_index_in_simdgroup;
+                const uint simd_group_id = simdgroup_index_in_threadgroup;
+
+                const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+                const size_t assignment_base = size_t(row) * 8;
+
+                // `lid` is unique across this one-dimensional 704-thread
+                // group. Exactly eight threads write exactly eight slots.
+                if (lid < 8) {
+                    sortedPositions[lid] = inverse[assignment_base + lid];
+                }
+
+                float xv[GLUE_NREADS];
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    xv[i] = static_cast<float>(x[base + i]);
+                }
+
+                // Its first unconditional mem_threadgroup barrier publishes
+                // sortedPositions before any post-helper read below.
+                const float inv = glue_inv_rms(
+                    xv, local_sums, local_inv,
+                    simd_lane_id, simd_group_id, GLUE_EPS);
+
+                T normed[GLUE_NREADS];
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    const uint j = lid * GLUE_NREADS + i;
+                    const T scaled = static_cast<T>(xv[i] * inv);
+                    normed[i] = w[j] * scaled;
+                }
+
+                for (int k = 0; k < 8; k++) {
+                    const size_t pos = size_t(sortedPositions[k]);
+                    const size_t obase = pos * GLUE_AXIS + lid * GLUE_NREADS;
+                    for (int i = 0; i < GLUE_NREADS; i++) {
+                        out[obase + i] = normed[i];
+                    }
+                }
+                """,
+            header: kernelHeader,
+            ensureRowContiguous: true
+        )
+
     /// `rmsNorm(x, weight)` alone. Returns `nil` off the prefill plane or with
     /// the arm switched off.
     public static func preNorm(
@@ -431,6 +507,17 @@ public enum Gemma4PrefillGlueV1 {
         else { return nil }
 
         CBv2EngageMark.once("prefill-prenorm-gather")
+        if prenormScatterTGMetaK8Enabled, topK == 8 {
+            CBv2EngageMark.once("prefill-prenorm-scatter-tgmeta-k8")
+            return preNormScatterTGMetaK8Kernel(
+                [x, weight, inverseOrder],
+                template: [("T", x.dtype)],
+                grid: (threadsPerRow, rows, 1),
+                threadGroup: (threadsPerRow, 1, 1),
+                outputShapes: [[rows * topK, 1, axis]],
+                outputDTypes: [x.dtype]
+            )[0]
+        }
         return preNormScatterKernel(
             [x, weight, inverseOrder],
             template: [("T", x.dtype), ("K", topK)],

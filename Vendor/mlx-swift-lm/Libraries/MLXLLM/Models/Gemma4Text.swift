@@ -80,7 +80,7 @@ internal func gemma4ShouldSubmitDecodeAsyncEvalLadder(
     // The empty-set row is the control that matters: this is not "fewer is
     // always better", it is "the early pair carries all of the overlap".
     switch layerIndex {
-    case 0, 1:
+    case 1:
         return true
     default:
         return false
@@ -5178,7 +5178,44 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
             sanitized[k] = v
         }
+        fuseExpertGateUpStorage(&sanitized)
         return sanitized
+    }
+
+    /// GATEUP-FUSE-PREFILL: make the concatenated gate|up right-hand side the
+    /// primary storage of every routed-expert layer at load. The layer's
+    /// `gate_proj` / `up_proj` weight, scales and biases become zero-copy row
+    /// slices of that storage (see ``SwitchGateUpFusedStorage``), so the bound
+    /// split parameters read the identical bytes with no second copy, and the
+    /// sorted prefill plane dispatches one gather over the whole storage.
+    /// Layers or checkpoints outside the exact production geometry, and the
+    /// arm's off-state, leave the loaded split arrays untouched.
+    private func fuseExpertGateUpStorage(_ sanitized: inout [String: MLXArray]) {
+        guard switchGateUpFusePrefillEnabled else { return }
+        let gateWeightSuffix = ".experts.switch_glu.gate_proj.weight"
+        for key in sanitized.keys where key.hasSuffix(gateWeightSuffix) {
+            let base = String(key.dropLast(gateWeightSuffix.count))
+            guard let layerIdx = extractLayerIdx(from: key),
+                layerIdx < model.layers.count,
+                let experts = model.layers[layerIdx].experts,
+                let gateWeight = sanitized["\(base).experts.switch_glu.gate_proj.weight"],
+                let gateScales = sanitized["\(base).experts.switch_glu.gate_proj.scales"],
+                let gateBiases = sanitized["\(base).experts.switch_glu.gate_proj.biases"],
+                let upWeight = sanitized["\(base).experts.switch_glu.up_proj.weight"],
+                let upScales = sanitized["\(base).experts.switch_glu.up_proj.scales"],
+                let upBiases = sanitized["\(base).experts.switch_glu.up_proj.biases"],
+                let storage = SwitchGateUpFusedStorage(
+                    gateWeight: gateWeight, gateScales: gateScales, gateBiases: gateBiases,
+                    upWeight: upWeight, upScales: upScales, upBiases: upBiases)
+            else { continue }
+            sanitized["\(base).experts.switch_glu.gate_proj.weight"] = storage.gateWeight
+            sanitized["\(base).experts.switch_glu.gate_proj.scales"] = storage.gateScales
+            sanitized["\(base).experts.switch_glu.gate_proj.biases"] = storage.gateBiases
+            sanitized["\(base).experts.switch_glu.up_proj.weight"] = storage.upWeight
+            sanitized["\(base).experts.switch_glu.up_proj.scales"] = storage.upScales
+            sanitized["\(base).experts.switch_glu.up_proj.biases"] = storage.upBiases
+            experts.switchGLU.bindFusedGateUpStorage(storage)
+        }
     }
 
     public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
@@ -5376,3 +5413,6 @@ extension Gemma4TextModel: CBv2MTPForwardable {
         return (applyLMHead(postNorm), preNorm)
     }
 }
+
+// Ranked resample marker 6: this archive is a further ranked sample of the tree carried
+// by the preceding ranked submission of this content apart from any rotation item declared in its note.

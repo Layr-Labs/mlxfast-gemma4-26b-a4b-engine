@@ -997,6 +997,116 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
     return x
 }
 
+// MARK: - GATEUP-FUSE-PREFILL: one gathered gate|up GEMM on the sorted prefill plane
+
+/// GATEUP-FUSE-PREFILL. On the sorted routed-expert prefill plane the gate and
+/// up projections are two `gather_qmm_rhs` dispatches (N = 704 each) over the
+/// same gathered activations `[rows * topK, 1, 2816]` and the same sorted
+/// expert keys; the activations (369 MB for the packed 8 x 1024 cohort) are
+/// therefore streamed from DRAM twice per layer. This arm issues ONE
+/// `gather_qmm_rhs` over a concatenated right-hand side (N = 1408: the gate
+/// columns followed by the up columns) and hands the shaped GeGLU the two
+/// column halves as strided views, so the activations are read once and one
+/// dispatch per layer disappears.
+///
+/// Storage. The concatenated `[experts, 1408, packed-in]` weight and its
+/// `[experts, 1408, groups]` scales and biases are the PRIMARY per-layer
+/// storage, built once at load (``SwitchGateUpFusedStorage``, bound from the
+/// model's sanitize pass). The module's `gate_proj` / `up_proj` parameters
+/// become zero-copy slices of that storage: rows `0..<704` and `704..<1408`
+/// of the output axis, each a contiguous `[704, packed-in]` matrix per
+/// expert with an expert stride of 1408 rows. The gathered decode and
+/// verification kernels address experts through the batch strides they are
+/// handed and require only the per-expert matrix to be contiguous, so they
+/// read the identical bytes through the views without a copy. Net resident
+/// weight memory therefore equals the split layout's exactly; nothing is
+/// duplicated.
+///
+/// Exactness: every output column of the gathered quantized GEMM owns an
+/// independent K-chain -- the tile pipeline (bm/bn/bk, K-step order, per-group
+/// affine dequant `scale * nibble + bias`) is fixed by (K, group size, bits)
+/// and never by N -- and the concatenated weight, scales and biases are a pure
+/// copy of the split ones along the output axis. 1408 keeps every alignment
+/// predicate (32 and 64) that 704 satisfies, so the same pipeline is
+/// selected. The consumer receives the identical gate / up bytes through views
+/// with the identical shapes it saw before.
+///
+/// Routing. The fused right-hand side is dispatched exactly where the host
+/// would select the sorted right-hand-side kernel: a sorted plane without
+/// left-hand indices of at least `max(16, 4 * experts)` rows (512 here). The
+/// eight-row decode cohort carries left-hand indices and never qualifies;
+/// smaller sorted rectangles (speculative verification) keep the split views
+/// and their gathered vector kernels. The `gate_up_proj` module slot is
+/// deliberately NOT populated: the direct sorted reduction requires it to be
+/// nil, so the storage lives in a private, reflection-inert member.
+///
+/// Kill switch: `DARKBLOOM_GEMMA4_PREFILL_GATEUP_FUSE` set to
+/// `0`/`false`/`no`/`off` leaves the split arrays as loaded and restores the
+/// two split gathers. Engage mark: `prefill-gateup-fuse`.
+public let switchGateUpFusePrefillEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_PREFILL_GATEUP_FUSE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// The concatenated `[gate ; up]` affine 4-bit right-hand side of one expert
+/// layer plus the two zero-copy views the split projections are bound to. A
+/// plain final class (not a `Module`, not an `MLXArray` tuple) so the module
+/// reflection that enumerates parameters treats it as an opaque value: it is
+/// never a parameter in its own right, never quantized again, never saved and
+/// never updated. Built once at load, retained for the life of the layer.
+public final class SwitchGateUpFusedStorage {
+    public let weight: MLXArray
+    public let scales: MLXArray
+    public let biases: MLXArray
+    public let gateWeight: MLXArray
+    public let gateScales: MLXArray
+    public let gateBiases: MLXArray
+    public let upWeight: MLXArray
+    public let upScales: MLXArray
+    public let upBiases: MLXArray
+    public let hiddenDims: Int
+
+    /// Exact production geometry only: two packed affine 4-bit / group-64
+    /// planes of 2816 -> 704 over 128 experts, `[128, 704, 352]` uint32 with
+    /// `[128, 704, 44]` bfloat16 scales and biases. Any other pair returns nil
+    /// and leaves the split storage exactly as loaded.
+    public init?(
+        gateWeight: MLXArray, gateScales: MLXArray, gateBiases: MLXArray,
+        upWeight: MLXArray, upScales: MLXArray, upBiases: MLXArray
+    ) {
+        guard gateWeight.shape == [128, 704, 352]
+            && gateScales.shape == [128, 704, 44]
+            && gateBiases.shape == [128, 704, 44]
+            && upWeight.shape == [128, 704, 352]
+            && upScales.shape == [128, 704, 44]
+            && upBiases.shape == [128, 704, 44]
+            && gateWeight.dtype == .uint32 && upWeight.dtype == .uint32
+            && gateScales.dtype == .bfloat16 && upScales.dtype == .bfloat16
+            && gateBiases.dtype == .bfloat16 && upBiases.dtype == .bfloat16
+        else { return nil }
+        let n = 704
+        // Output axis (axis 1 of [experts, out, packed-in]): gate rows
+        // 0..<704 followed by up rows 704..<1408, for weight, scales and
+        // biases alike. Pure copies of the loaded planes; the split
+        // parameters below are slices sharing this storage, not copies.
+        let weight = concatenated([gateWeight, upWeight], axis: 1)
+        let scales = concatenated([gateScales, upScales], axis: 1)
+        let biases = concatenated([gateBiases, upBiases], axis: 1)
+        self.weight = weight
+        self.scales = scales
+        self.biases = biases
+        self.gateWeight = weight[0..., ..<n]
+        self.gateScales = scales[0..., ..<n]
+        self.gateBiases = biases[0..., ..<n]
+        self.upWeight = weight[0..., n...]
+        self.upScales = scales[0..., n...]
+        self.upBiases = biases[0..., n...]
+        self.hiddenDims = n
+    }
+}
+
 // MARK: - SwitchGLU
 
 /// Semantic profile required by the exact Gemma direct-reduction experiment.
@@ -1041,6 +1151,21 @@ public class SwitchGLU: Module {
     /// equivalent fast path — it can never change results.
     let isSiluActivation: Bool
     let isGeluActivation: Bool
+
+    /// GATEUP-FUSE-PREFILL: the primary gate|up storage bound at load (nil
+    /// when the layer is not the exact production geometry or the arm is
+    /// off), and its once-resolved dispatch contract.
+    private var fusedGateUpStorage: SwitchGateUpFusedStorage?
+    private var fusedGateUpResolved = false
+    private var fusedGateUpContract: (groupSize: Int, bits: Int, mode: QuantizationMode)?
+
+    /// Bind the concatenated gate|up storage whose slices the split
+    /// projections were (or will be) loaded with. Load-time only.
+    public func bindFusedGateUpStorage(_ storage: SwitchGateUpFusedStorage) {
+        fusedGateUpStorage = storage
+        fusedGateUpResolved = false
+        fusedGateUpContract = nil
+    }
 
     /// Default SiLU GLU path -- uses the compiled fused (silu * up) kernel.
     public init(
@@ -1127,6 +1252,39 @@ public class SwitchGLU: Module {
         super.init()
     }
 
+    /// GATEUP-FUSE-PREFILL: resolve (once) the quantization contract the
+    /// fused storage is dispatched with. It is read from the bound split
+    /// projections, which must be the exact production contract; anything
+    /// else resolves to nil once and the split views are used forever after.
+    private func fusedGateUpDispatch()
+        -> (storage: SwitchGateUpFusedStorage, groupSize: Int, bits: Int, mode: QuantizationMode)?
+    {
+        guard let storage = fusedGateUpStorage else { return nil }
+        if !fusedGateUpResolved {
+            fusedGateUpResolved = true
+            if gateUpProj == nil, hiddenDims == storage.hiddenDims,
+                let gate = gateProj as? QuantizedSwitchLinear,
+                let up = upProj as? QuantizedSwitchLinear,
+                gate.groupSize == 64 && gate.bits == 4
+                    && gate.mode == .affine && gate.bias == nil
+                    && up.groupSize == 64 && up.bits == 4
+                    && up.mode == .affine && up.bias == nil,
+                gate.weight.shape == [128, 704, 352]
+                    && up.weight.shape == [128, 704, 352]
+                    && storage.weight.shape == [128, 1408, 352]
+                    && storage.scales.shape == [128, 1408, 44]
+                    && storage.biases.shape == [128, 1408, 44]
+                    && storage.weight.dtype == .uint32
+                    && storage.scales.dtype == .bfloat16
+                    && storage.biases.dtype == .bfloat16
+            {
+                fusedGateUpContract = (gate.groupSize, gate.bits, gate.mode)
+            }
+        }
+        guard let contract = fusedGateUpContract else { return nil }
+        return (storage, contract.groupSize, contract.bits, contract.mode)
+    }
+
     private func projectExperts(
         _ x: MLXArray, _ indices: MLXArray
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
@@ -1166,8 +1324,38 @@ public class SwitchGLU: Module {
             guard let gateProj, let upProj else {
                 preconditionFailure("SwitchGLU requires gate_up_proj or gate_proj/up_proj")
             }
-            xUp = upProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
-            xGate = gateProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
+            // GATEUP-FUSE-PREFILL: the sorted right-hand-side plane (the
+            // production prefill) reads its gathered activations once through
+            // one gather over the concatenated gate|up storage. Same kernel
+            // pipeline, same per-column K-chains; the halves are views. The
+            // admission mirrors the host's sorted right-hand-side selection
+            // exactly, so the split views never meet that kernel.
+            if doSort, !useLhsIndices, lhsIndices == nil,
+                x.ndim == 3, x.dim(-2) == 1, x.dim(-1) == inputDims,
+                x.dim(0) >= 16, x.dim(0) / numExperts >= 4,
+                x.dtype == .bfloat16,
+                let fused = fusedGateUpDispatch()
+            {
+                CBv2EngageMark.once("prefill-gateup-fuse")
+                let xGateUp = MLX.gatherQuantizedMM(
+                    x,
+                    fused.storage.weight,
+                    scales: fused.storage.scales,
+                    biases: fused.storage.biases,
+                    lhsIndices: nil,
+                    rhsIndices: idx,
+                    transpose: true,
+                    groupSize: fused.groupSize,
+                    bits: fused.bits,
+                    mode: fused.mode,
+                    sortedIndices: true
+                )
+                xGate = xGateUp[.ellipsis, ..<hiddenDims]
+                xUp = xGateUp[.ellipsis, hiddenDims...]
+            } else {
+                xUp = upProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
+                xGate = gateProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
+            }
         }
 
         let activated: MLXArray

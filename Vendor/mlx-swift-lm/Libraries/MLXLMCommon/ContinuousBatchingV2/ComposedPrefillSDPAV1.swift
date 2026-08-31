@@ -134,6 +134,14 @@ enum CBv2ComposedPrefillSDPAV1 {
     /// where it does not. Same purity argument -- a read-only constant that is
     /// a pure function of the two block lengths, eight distinct values per
     /// 1024-token chunk -- and the same bounded table.
+    ///
+    /// PREFILL-CAUSAL-CLOAD-ELIDE. The backing store has one inert padding
+    /// column and the returned view excludes it. Therefore the logical bias is
+    /// still exactly `[L, kL]`, but its row stride is `kL + 1`. The fused Steel
+    /// GEMM recognizes that otherwise-impossible stride only under the exact
+    /// ranked composed-prefill signature and synthesizes these same two bf16
+    /// values from output coordinates instead of loading C. Every generic
+    /// addMM signature keeps reading the view normally.
     nonisolated(unsafe) private static var maskBiasCache: [Int: MLXArray] = [:]
 
     private static func causalMaskBias(L: Int, kL: Int) -> MLXArray {
@@ -144,11 +152,14 @@ enum CBv2ComposedPrefillSDPAV1 {
             return hit
         }
         maskCacheLock.unlock()
-        let bias = MLX.where(
-            causalMask(L: L, kL: kL),
+        let qIndices = MLXArray(Int32(kL - L) ..< Int32(kL)).expandedDimensions(axis: 1)
+        let paddedKIndices = MLXArray(Int32(0) ..< Int32(kL + 1)).expandedDimensions(axis: 0)
+        let storage = MLX.where(
+            qIndices .>= paddedKIndices,
             bfloat16NegativeZeroScalar,
             bfloat16LowestScalar)
-        eval(bias)
+        eval(storage)
+        let bias = storage[.ellipsis, 0 ..< kL]
         maskCacheLock.lock()
         if maskBiasCache.count >= maxCachedMasks {
             maskBiasCache.removeAll(keepingCapacity: true)

@@ -412,6 +412,24 @@ inline U qdot_affine8_registered(
   return scale * accum + sum * bias;
 }
 
+// The same four products, accumulated in the same order into an accumulator
+// opened at zero, over the same four bytes taken from one packed word. The
+// byte at the lowest address is the low byte of the word.
+template <typename U, int values_per_thread>
+inline U qdot_affine8_registered_word(
+    uint packed_word,
+    const thread U* x_thread,
+    U scale,
+    U bias,
+    U sum) {
+  U accum = 0;
+  accum += x_thread[0] * U(packed_word & 0xffu);
+  accum += x_thread[1] * U((packed_word >> 8) & 0xffu);
+  accum += x_thread[2] * U((packed_word >> 16) & 0xffu);
+  accum += x_thread[3] * U(packed_word >> 24);
+  return scale * accum + sum * bias;
+}
+
 // Two independent affine-8 dot products over one byte weight vector. Keep the
 // per-row scalar accumulation order of qdot while sharing each weight load.
 template <typename U, int values_per_thread>
@@ -2048,7 +2066,7 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
 
   const device uint8_t* ws = (const device uint8_t*)w;
   thread float x_thread[values_per_thread];
-  thread uint8_t packed[results_per_simdgroup][bytes_per_thread];
+  thread uint packed[results_per_simdgroup];
   thread float scale_local[results_per_simdgroup];
   thread float bias_local[results_per_simdgroup];
   thread float result0[results_per_simdgroup] = {0};
@@ -2076,32 +2094,29 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
   int k = 0;
   for (; k <= in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
-      const device uint8_t* wl = ws + row * in_vec_size_w;
-      for (int i = 0; i < bytes_per_thread; i++) {
-        packed[row][i] = wl[i];
-      }
+      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }
 
     float sum = load_vector<T, float, values_per_thread, 8>(x0, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result0[row] += qdot_affine8_registered<float, values_per_thread>(
+      result0[row] += qdot_affine8_registered_word<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 8>(x1, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result1[row] += qdot_affine8_registered<float, values_per_thread>(
+      result1[row] += qdot_affine8_registered_word<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 8>(x2, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result2[row] += qdot_affine8_registered<float, values_per_thread>(
+      result2[row] += qdot_affine8_registered_word<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 8>(x3, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result3[row] += qdot_affine8_registered<float, values_per_thread>(
+      result3[row] += qdot_affine8_registered_word<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
 
@@ -2122,32 +2137,29 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
       uint((in_vec_size - k) / values_per_thread);
   if (simd_lid < active_tail_lanes) {
     for (int row = 0; row < results_per_simdgroup; row++) {
-      const device uint8_t* wl = ws + row * in_vec_size_w;
-      for (int i = 0; i < bytes_per_thread; i++) {
-        packed[row][i] = wl[i];
-      }
+      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }
 
     float sum = load_vector<T, float, values_per_thread, 8>(x0, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result0[row] += qdot_affine8_registered<float, values_per_thread>(
+      result0[row] += qdot_affine8_registered_word<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 8>(x1, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result1[row] += qdot_affine8_registered<float, values_per_thread>(
+      result1[row] += qdot_affine8_registered_word<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 8>(x2, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result2[row] += qdot_affine8_registered<float, values_per_thread>(
+      result2[row] += qdot_affine8_registered_word<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 8>(x3, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result3[row] += qdot_affine8_registered<float, values_per_thread>(
+      result3[row] += qdot_affine8_registered_word<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
   }
@@ -3928,7 +3940,9 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   for (int t = 0; t < gemma4_down_tile_span; t++) {
     uint3 tile_tid = tid;
     tile_tid.y = tid.y + uint(t);
-    qmv_impl<T, group_size, bits>(
+    // This walker is entered only at in_vec_size == 704, so the extent is
+    // folded here the way the singleton path folds 2816.
+    qmv_affine4_g64_singles_impl<T, group_size, bits, 704, false, false>(
         tile_w,
         tile_scales,
         tile_biases,
@@ -4122,7 +4136,11 @@ template <typename T, int group_size, int bits>
           single_w, single_scales, single_biases, single_x, single_y,
           in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
     } else {
-      qmv_impl<T, group_size, bits>(
+      // The gemma4 pair geometry admits only 2816 and 704, so this arm is
+      // the 704 down plane and its extent is a compile-time constant here
+      // exactly as 2816 is above.
+      qmv_affine4_g64_singles_impl<
+          T, group_size, bits, 704, false, false>(
           single_w, single_scales, single_biases, single_x, single_y,
           in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
     }

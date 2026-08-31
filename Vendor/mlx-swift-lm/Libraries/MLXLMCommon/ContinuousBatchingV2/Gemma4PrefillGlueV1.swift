@@ -441,6 +441,110 @@ public enum Gemma4PrefillGlueV1 {
         )[0]
     }
 
+    /// DUAL-PRENORM-SCATTER. The expert prefill plane runs `preNorm(x, w1)`
+    /// for the dense branch and `preNormScatter(x, w2, inverseOrder)` for the
+    /// sorted expert plane back to back: the residual `x` is read twice and
+    /// its `rms_single_row` reduction is evaluated twice per layer, while
+    /// `inv` depends on `x` alone. This kernel reads `x` once, reduces once,
+    /// and writes both outputs in one dispatch. Every stored bit is the bit
+    /// the split kernels store: `dense[base + i]` holds the exact expression
+    /// `preNorm` stores under `w1`, and the scattered `plane` rows hold the
+    /// exact expression `preNormScatter` stores under `w2` — one `T`-rounded
+    /// `scaled` per element feeds both weight products, as in the split
+    /// kernels, where the same rounding happens per output.
+    ///
+    /// Kill switch: `DARKBLOOM_GEMMA4_PREFILL_DUAL_PRENORM_SCATTER` set to
+    /// `0`/`false`/`no`/`off` leaves the call site on the split kernels.
+    /// Engage mark: `prefill-dual-prenorm-scatter`.
+    public static let dualPrenormScatterEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_DUAL_PRENORM_SCATTER"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let dualPreNormScatterKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_prefill_glue_dual_prenorm_scatter_2816_v1",
+            inputNames: ["x", "w1", "w2", "inverse"],
+            outputNames: ["dense", "plane"],
+            source: """
+                threadgroup float local_sums[32];
+                threadgroup float local_inv[1];
+
+                const uint row = threadgroup_position_in_grid.y;
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint simd_lane_id = thread_index_in_simdgroup;
+                const uint simd_group_id = simdgroup_index_in_threadgroup;
+
+                const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+
+                float xv[GLUE_NREADS];
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    xv[i] = static_cast<float>(x[base + i]);
+                }
+
+                const float inv = glue_inv_rms(
+                    xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
+
+                T scaled[GLUE_NREADS];
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    scaled[i] = static_cast<T>(xv[i] * inv);
+                }
+
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    const uint j = lid * GLUE_NREADS + i;
+                    dense[base + i] = w1[j] * scaled[i];
+                }
+
+                T normed[GLUE_NREADS];
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    const uint j = lid * GLUE_NREADS + i;
+                    normed[i] = w2[j] * scaled[i];
+                }
+
+                const size_t assignment_base = size_t(row) * K;
+                for (int k = 0; k < K; k++) {
+                    const size_t pos = size_t(inverse[assignment_base + k]);
+                    const size_t obase = pos * GLUE_AXIS + lid * GLUE_NREADS;
+                    for (int i = 0; i < GLUE_NREADS; i++) {
+                        plane[obase + i] = normed[i];
+                    }
+                }
+                """,
+            header: kernelHeader,
+            ensureRowContiguous: true
+        )
+
+    /// `preNorm(x, w1)` and `preNormScatter(x, w2, inverseOrder)` in one
+    /// dispatch. Returns nil off the prefill plane, with the arm switched
+    /// off, or for an inverse order that is not exactly one `uint32` per
+    /// assignment; the call site then uses the split kernels.
+    public static func dualPreNormScatter(
+        x: MLXArray, weight: MLXArray, expertWeight: MLXArray,
+        inverseOrder: MLXArray, topK: Int, eps epsIn: Float
+    ) -> (dense: MLXArray, plane: MLXArray)? {
+        guard prenormGatherEnabled, dualPrenormScatterEnabled,
+            let rows = planeRows(x, weight: weight, eps: epsIn),
+            planeRows(x, weight: expertWeight, eps: epsIn) == rows,
+            topK >= 1,
+            inverseOrder.ndim == 1,
+            inverseOrder.dtype == .uint32,
+            inverseOrder.dim(0) == rows * topK
+        else { return nil }
+
+        CBv2EngageMark.once("prefill-dual-prenorm-scatter")
+        let outputs = dualPreNormScatterKernel(
+            [x, weight, expertWeight, inverseOrder],
+            template: [("T", x.dtype), ("K", topK)],
+            grid: (threadsPerRow, rows, 1),
+            threadGroup: (threadsPerRow, 1, 1),
+            outputShapes: [x.shape, [rows * topK, 1, axis]],
+            outputDTypes: [x.dtype, x.dtype]
+        )
+        return (dense: outputs[0], plane: outputs[1])
+    }
+
     // MARK: - branch tail (5 dispatches -> 1)
 
     private static let tailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(

@@ -3897,22 +3897,46 @@ public class Gemma4DecoderLayer: Module {
                     // leave the prefill plane. `n2` is that un-sorted norm as
                     // a lazy fallback: it is dispatched only if SwitchGLU
                     // declines the producer, and never otherwise.
+                    //
+                    // DUAL-PRENORM-SCATTER: the producer below fuses the
+                    // dense-branch norm and the sorted expert plane into one
+                    // dispatch over ONE read and ONE reduction of the
+                    // residual row; the dense output it returns feeds the
+                    // dense branch, and `n1` joins `n2` as a lazy fallback
+                    // that is dispatched only where the fused producer
+                    // declines — the same laziness `n2` already relied on.
+                    // The expert branch is built first because the fused
+                    // dense output exists only after the sort's inverse
+                    // order reaches the producer.
                     let expertNormWeight = preFeedforwardLayernorm2.weight
                     let expertTopK = topKIndices.dim(-1)
                     let normEps = config.rmsNormEps
-                    h1Raw = mlp(n1)
+                    let denseNormWeight = preFeedforwardLayernorm.weight
+                    var fusedDense: MLXArray? = nil
                     expertBranch = projectExpertBranch(
                         n2,
                         indices: topKIndices,
                         weights: topKWeights,
                         sortedPlane: { inverseOrder in
-                            Gemma4PrefillGlueV1.preNormScatter(
+                            if let pair = Gemma4PrefillGlueV1.dualPreNormScatter(
+                                x: out,
+                                weight: denseNormWeight,
+                                expertWeight: expertNormWeight,
+                                inverseOrder: inverseOrder,
+                                topK: expertTopK,
+                                eps: normEps)
+                            {
+                                fusedDense = pair.dense
+                                return pair.plane
+                            }
+                            return Gemma4PrefillGlueV1.preNormScatter(
                                 x: out,
                                 weight: expertNormWeight,
                                 inverseOrder: inverseOrder,
                                 topK: expertTopK,
                                 eps: normEps)
                         })
+                    h1Raw = mlp(fusedDense ?? n1)
                 } else if let (n1, n2) = Gemma4PrefillGlueV1.dualPreNorm(
                     x: out,
                     w1: preFeedforwardLayernorm.weight,

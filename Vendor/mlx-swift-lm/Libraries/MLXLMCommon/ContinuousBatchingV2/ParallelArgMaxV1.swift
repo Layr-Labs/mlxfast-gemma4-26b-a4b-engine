@@ -167,13 +167,18 @@ enum CBv2ParallelArgMaxV1 {
         // Metal-capable host. These checks inspect host metadata only.
         guard metalAvailable else { return nil }
         let stream = StreamOrDevice.default
-        var device = mlx_device_new()
-        defer { _ = mlx_device_free(device) }
-        var deviceType = MLX_CPU
-        guard mlx_stream_get_device(&device, stream.ctx) == 0,
-            mlx_device_get_type(&deviceType, device) == 0,
-            deviceType == MLX_GPU
-        else { return nil }
+        if stream.stream !== Stream.gpu {
+            // Ranked decode uses MLX's process-global GPU stream. Only custom
+            // task streams need the general device query, which preserves the
+            // GPU fast path and CPU fallback for those uncommon callers.
+            var device = mlx_device_new()
+            defer { _ = mlx_device_free(device) }
+            var deviceType = MLX_CPU
+            guard mlx_stream_get_device(&device, stream.ctx) == 0,
+                mlx_device_get_type(&deviceType, device) == 0,
+                deviceType == MLX_GPU
+            else { return nil }
+        }
 
         let tiles = vocab / tileSize
         let partial = tileKernel(

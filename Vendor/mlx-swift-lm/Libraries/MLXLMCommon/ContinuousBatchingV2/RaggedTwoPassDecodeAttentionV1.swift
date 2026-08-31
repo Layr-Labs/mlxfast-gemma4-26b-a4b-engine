@@ -608,7 +608,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     static let gqaPairedPassAVec4Enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_DECODE_PAIRED_PASSA_VEC4"]
-        else { return true }
+        else { return false }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 

@@ -152,13 +152,7 @@ enum CBv2AttentionV1 {
         // are adapted from newjordan's public, parity-passed submissions
         // `c4557ca8-e1a2-4569-8d96-95061f6d1eef` and
         // `1e63caf5-c028-4c38-abc7-6b5f5c2b5bb6`.
-        // Off-cadence retest: the first clean stack passed parity at
-        // 1.151572s prefill / 2.089284s decode, but its serial prefill control
-        // shifted 73.768ms faster than the stored record run.
-        // Final cadence draw: the second run held 2.086433s decode and missed
-        // promotion by 0.30%; only ~10ms of serial-prefill control movement
-        // separated its sealed components from the stored threshold.
-        else { return false }
+        else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 

@@ -58,6 +58,7 @@ enum CBv2ParallelArgMaxV1 {
         }
 
         inline CBv2ArgMaxPairV1 cbv2_argmax_simd_v1(CBv2ArgMaxPairV1 best) {
+            #pragma unroll
             for (uint offset = 16; offset > 0; offset >>= 1) {
                 CBv2ArgMaxPairV1 neighbor = {
                     simd_shuffle_down(best.index, offset),
@@ -70,7 +71,7 @@ enum CBv2ParallelArgMaxV1 {
         """
 
     private static let tileKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_parallel_argmax_tiles_v1",
+        name: "cbv2_parallel_argmax_tiles_v2",
         inputNames: ["logits"],
         outputNames: ["tile_values", "tile_indices"],
         source: """
@@ -84,6 +85,7 @@ enum CBv2ParallelArgMaxV1 {
 
             CBv2ArgMaxPairV1 best = {0u, Limits<float>::min};
             for (uint offset = lid * 4; offset < TILE_SIZE; offset += 256 * 4) {
+                #pragma unroll
                 for (uint i = 0; i < 4; ++i) {
                     const uint index = tile_base + offset + i;
                     const float value = float(logits[row_base + index]);
@@ -123,13 +125,14 @@ enum CBv2ParallelArgMaxV1 {
     )
 
     private static let finalKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_parallel_argmax_finalize_v1",
+        name: "cbv2_parallel_argmax_finalize_v2",
         inputNames: ["tile_values", "tile_indices"],
         outputNames: ["tokens"],
         source: """
             const uint row = threadgroup_position_in_grid.y;
             const uint lane = thread_index_in_simdgroup;
             CBv2ArgMaxPairV1 best = {0u, Limits<float>::min};
+            #pragma unroll
             for (uint tile = lane; tile < TILES; tile += 32) {
                 const uint index = row * TILES + tile;
                 CBv2ArgMaxPairV1 current = {

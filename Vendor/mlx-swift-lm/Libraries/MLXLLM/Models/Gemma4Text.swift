@@ -3250,6 +3250,9 @@ private class Gemma4Experts: Module {
     struct Output {
         let output: MLXArray
         let unsortCarrier: WeightedExpertUnsortCarrier?
+        /// Present only on the SKIP-EAGER-UNSORT prefill path, where `output`
+        /// is an unread placeholder. Rebuilds the identical eager reduction.
+        let lazyOutput: (() -> MLXArray)?
     }
 
     init(
@@ -3276,7 +3279,8 @@ private class Gemma4Experts: Module {
         topKIndices: MLXArray,
         topKWeights: MLXArray,
         isExpertPrefill: Bool,
-        sortedPlane: SwitchSortedPlaneProducer? = nil
+        sortedPlane: SwitchSortedPlaneProducer? = nil,
+        deferEagerUnsort: Bool = false
     ) -> Output {
         // Flatten [B, S, H] and always enter SwitchGLU's combined API. It
         // selects direct sorted reduction only for the exact production
@@ -3292,10 +3296,25 @@ private class Gemma4Experts: Module {
             // Rectangular MTP verification explicitly passes false.
             isProductionPrefill: isExpertPrefill,
             // PRENORM-GATHER: the prefill producer of the sorted plane.
-            sortedPlane: sortedPlane)
+            sortedPlane: sortedPlane,
+            // SKIP-EAGER-UNSORT: prefill-only lazy reduction; the caller
+            // rebuilds the identical eager output if every tail declines.
+            deferEagerUnsort: deferEagerUnsort && isExpertPrefill)
+        // SKIP-EAGER-UNSORT: on the prefill carrier path the `output` member
+        // is a placeholder that no caller may read; the real reduction is
+        // rebuilt from the carrier only if every fused-tail path declines.
+        let deferred = deferEagerUnsort && isExpertPrefill && result.carrier != nil
+        let output = deferred
+            ? result.output.reshaped(B, S, H)
+            : result.output.reshaped(B, S, H)
         return Output(
-            output: result.output.reshaped(B, S, H),
-            unsortCarrier: result.carrier)
+            output: output,
+            unsortCarrier: result.carrier,
+            lazyOutput: deferred
+                ? { [carrier = result.carrier!] in
+                    carrier.eagerOutput().reshaped(B, S, H)
+                }
+                : nil)
     }
 
     /// Decode-only producer for the fused layer-tail consumer. The promoted
@@ -3812,7 +3831,8 @@ public class Gemma4DecoderLayer: Module {
             let expertBranch: (
                 raw: MLXArray?,
                 deferred: DeferredWeightedExpertRows?,
-                unsortCarrier: WeightedExpertUnsortCarrier?
+                unsortCarrier: WeightedExpertUnsortCarrier?,
+                lazyOutput: (() -> MLXArray)?
             )
             // The deferred carrier has a consumer only when the decode tail
             // may also fold the layer scalar. PLE geometries select the
@@ -3828,6 +3848,7 @@ public class Gemma4DecoderLayer: Module {
                 raw: MLXArray?,
                 deferred: DeferredWeightedExpertRows?,
                 unsortCarrier: WeightedExpertUnsortCarrier?
+             , lazyOutput: (() -> MLXArray)?
             ) {
                 if canFoldScalar,
                     let deferred = experts.deferredWeightedRows(
@@ -3836,15 +3857,16 @@ public class Gemma4DecoderLayer: Module {
                         topKWeights: weights,
                         isExpertPrefill: isExpertPrefill)
                 {
-                    return (nil, deferred, nil)
+                    return (nil, deferred, nil, nil)
                 }
                 let result = experts(
                     input,
                     topKIndices: indices,
                     topKWeights: weights,
                     isExpertPrefill: isExpertPrefill,
-                    sortedPlane: sortedPlane)
-                return (result.output, nil, result.unsortCarrier)
+                    sortedPlane: sortedPlane,
+                    deferEagerUnsort: true)
+                return (nil, nil, result.unsortCarrier, result.lazyOutput)
             }
 
             // ZIP-ROUTER-001: emit the router chain and the dense chain
@@ -3960,6 +3982,41 @@ public class Gemma4DecoderLayer: Module {
                 out = fusedTail
                 tailApplied = true
                 scalarFolded = true
+                } else if let lazy = expertBranch.lazyOutput {
+                    // SKIP-EAGER-UNSORT fell through: every fused-tail path
+                    // declined, so rebuild the eager reduction once, here.
+                    let h2Raw = lazy()
+                    if canFoldScalar, let chain = glueChain,
+                        let nextWeight = nextInputLayernormWeight,
+                        let chained = Gemma4FusedLayerGlue.tailChained(
+                            mlpOut: h1Raw, expertOut: h2Raw, residual: residual2,
+                            w1: postFeedforwardLayernorm1.weight,
+                            w2: postFeedforwardLayernorm2.weight,
+                            w3: postFeedforwardLayernorm.weight,
+                            layerScalar: layerScalar,
+                            nextInputNormWeight: nextWeight,
+                            eps: config.rmsNormEps)
+                    {
+                        out = chained.out
+                        chain.pending = (source: chained.out, normed: chained.normedNext)
+                        tailApplied = true
+                        scalarFolded = true
+                    } else if canFoldScalar,
+                        let fusedTail = Gemma4FusedLayerGlue.tail(
+                            mlpOut: h1Raw, expertOut: h2Raw, residual: residual2,
+                            w1: postFeedforwardLayernorm1.weight,
+                            w2: postFeedforwardLayernorm2.weight,
+                            w3: postFeedforwardLayernorm.weight,
+                            layerScalar: layerScalar,
+                            eps: config.rmsNormEps)
+                    {
+                        out = fusedTail
+                        tailApplied = true
+                        scalarFolded = true
+                    } else {
+                        preconditionFailure(
+                            "Gemma4 SKIP-EAGER-UNSORT tail declined on prefill plane")
+                    }
             } else {
                 let h2Raw: MLXArray
                 if let raw = expertBranch.raw {
@@ -5453,5 +5510,76 @@ extension Gemma4TextModel: CBv2MTPForwardable {
     }
 }
 
-// Ranked resample marker 2: this archive is a further ranked sample of the tree carried
-// by the preceding ranked submission of this content apart from any rotation item declared in its note.
+// MARK: - LGH-001 --- logitsless greedy head
+
+/// Cross-check every fused token against the logits the stock chain would have
+/// produced. Costs a host sync per step, so it is a diagnostic, never a mode
+/// the benchmark runs in.
+private let gemma4LogitslessHeadVerify: Bool = gemma4TruthyFlag(
+    ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_LOGITSLESS_HEAD_VERIFY"])
+
+/// The tied head can answer the chained decode step with token ids alone.
+///
+/// The values the fused kernel compares are the bf16 the MMA head would have
+/// stored, and the final softcap `tanh(x / c) * c` is strictly increasing for
+/// every `c >= 0`, so the fused top-1 is the stock argmax including its
+/// first-index-wins tie rule. See `Gemma4MMAQuantizedGEMV.applyArgmax`.
+extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
+
+    public func cbv2AdmitsArgmaxDecode(_ tokens: MLXArray) -> Bool {
+        guard tokens.ndim == 2, tokens.dim(1) == 1 else { return false }
+        guard config.finalLogitSoftcapping >= 0 else { return false }
+        guard lmHead == nil,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.mode == .affine
+        else { return false }
+        return Gemma4MMAQuantizedGEMV.admitsArgmax(
+            x: [tokens.dim(0), 1, config.hiddenSize],
+            xDType: .bfloat16,
+            w: quantized.weight,
+            scales: quantized.scales,
+            biases: quantized.biases,
+            groupSize: quantized.groupSize,
+            bits: quantized.bits)
+    }
+
+    public func cbv2DecodeArgmax(_ tokens: MLXArray, caches: [KVCache]) -> MLXArray {
+        let hidden = model(tokens, cache: caches)
+        let rows = tokens.dim(0)
+        guard lmHead == nil,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.mode == .affine,
+            let fused = Gemma4MMAQuantizedGEMV.applyArgmax(
+                x: hidden,
+                w: quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                groupSize: quantized.groupSize,
+                bits: quantized.bits)
+        else {
+            return applyLMHead(hidden).argMax(axis: -1).asType(.int32).reshaped([rows])
+        }
+        CBv2EngageMark.once("logitsless-greedy-head")
+        if gemma4LogitslessHeadVerify {
+            let stock = applyLMHead(hidden).argMax(axis: -1).asType(.int32).reshaped([rows])
+            let disagreements = sum(notEqual(fused, stock)).item(Int.self)
+            // The one place the fused comparison could diverge is a softcap
+            // that maps two DISTINCT stored bf16 logits onto one float; that
+            // needs |logit| in the hundreds, so the observed peak is the
+            // margin. Reported alongside every verified step.
+            let raw = Gemma4MMAQuantizedGEMV.apply(
+                x: hidden, w: quantized.weight, scales: quantized.scales,
+                biases: quantized.biases, groupSize: quantized.groupSize,
+                bits: quantized.bits)!
+            let peak = max(abs(raw.asType(.float32))).item(Float.self)
+            let report =
+                "[lgh] verify mismatch=\(disagreements) max_abs_logit=\(peak)"
+                + (disagreements == 0
+                    ? "\n"
+                    : " fused=\(fused.asArray(Int32.self)) "
+                        + "stock=\(stock.asArray(Int32.self))\n")
+            FileHandle.standardError.write(Data(report.utf8))
+        }
+        return fused
+    }
+}

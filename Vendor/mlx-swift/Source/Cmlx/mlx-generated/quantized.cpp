@@ -3827,6 +3827,124 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
   }
 }
 
+// DOWNWORD: the pairless arm of the K = 704 routed-expert DOWN gather is the
+// last hot affine4 / g64 body still emitting the bits == 4 arm of `qdot`
+// verbatim, which reads a lane's eight packed nibbles as TWO adjacent
+// `uint16_t` device loads. Every other hot arm of this expert path already
+// folds that pair into ONE aligned 4-byte load: `qdot_affine4_pair` for the
+// two-assignment pair, `qdot_affine4_registered_word` for the triple and quad
+// streams, and `qdot_affine4_g64_word` for the K = 2816 singleton.
+//
+// This body is `qmv_impl`'s complete-tile branch with the affine4 / g64
+// constants hardcoded exactly as `qmv_affine4_g64_pair_impl` hardcodes them,
+// and with the two `qdot` calls replaced by `qdot_affine4_g64_word` over the
+// same bytes. The lane -> K mapping, the per-block `load_vector` transform,
+// the per-row accumulator, the four nibble masks, the 4 + 4 grouping, the
+// `scale * accum + sum * bias` close, the `simd_sum` and the store are all
+// unchanged, so every output element keeps the add sequence the stock arm
+// produces for it. Only the WIDTH of the weight load changes.
+//
+// The packed row base is uint32-aligned at every step this arm takes:
+// in_vec_size_w = K / 2 = 352 is a multiple of four, the lane offset is
+// simd_lid * 4, the block stride is 128 and the row stride is 352, so
+// `ws[0]` / `ws[1]` are always the low / high half-words of one aligned word.
+// `qdot_affine4_pair` already relies on that same arithmetic at this same
+// call site for the paired run positions.
+//
+// K stays a RUNTIME bound on purpose. The earlier attempt on this arm routed
+// it through `qmv_affine4_g64_singles_impl` with KFIX = 704, which folds the
+// K bound to a compile-time constant and lets the three-iteration K loop
+// unroll whole; that candidate lost 0.72% of decode. Here the loop bound is
+// still `in_vec_size` and nothing else about the arm moves.
+template <typename T, const int group_size, const int bits>
+METAL_FUNC void qmv_affine4_g64_solo_word_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 8;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 8;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+
+  typedef float U;
+  thread U x_thread[values_per_thread];
+  thread U result[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+  const int used_out_row = min(out_vec_size - results_per_simdgroup, out_row);
+  if (out_row >= out_vec_size) {
+    return;
+  }
+
+  ws += used_out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  scales += used_out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += used_out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x += tid.x * in_vec_size + simd_lid * values_per_thread;
+  y += tid.x * out_vec_size + used_out_row;
+
+  int k = 0;
+  for (; k <= in_vec_size - block_size; k += block_size) {
+    U sum = load_vector<T, U, values_per_thread, 4>(x, x_thread);
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      const device T* sl = scales + row * in_vec_size_g;
+      const device T* bl = biases + row * in_vec_size_g;
+
+      U s = sl[0];
+      U b = bl[0];
+      result[row] += qdot_affine4_g64_word(
+          *((const device uint*)wl), x_thread, s, b, sum);
+    }
+
+    ws += block_size / 2;
+    scales += block_size / 64;
+    biases += block_size / 64;
+    x += block_size;
+  }
+
+  // Same whole-packet tail the pair impl takes at this call site: K = 704
+  // leaves 192 values = 24 complete eight-value lane packets, so no active
+  // lane needs the generic dynamic safe-tail loops.
+  const uint active_tail_lanes =
+      uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
+    U sum = load_vector<T, U, values_per_thread, 4>(x, x_thread);
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      const device T* sl = scales + row * in_vec_size_g;
+      const device T* bl = biases + row * in_vec_size_g;
+
+      U s = sl[0];
+      U b = bl[0];
+      result[row] += qdot_affine4_g64_word(
+          *((const device uint*)wl), x_thread, s, b, sum);
+    }
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result[row] = simd_sum(result[row]);
+    if (simd_lid == 0) {
+      y[row] = static_cast<T>(result[row]);
+    }
+  }
+}
+
 // KERN-DOWN-TILE: y-tile coarsening for the K = 704 expert down gather
 // (the only pair-geometry plane at that K; out_vec_size = 2816). The
 // frozen host launches grid (1, N/8 = 352, 64), so every 64-thread group
@@ -3836,8 +3954,8 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
 // unique bytes at 479-589 GB/s. Here only every span-th y-group survives
 // (the rest return before the scan); the survivor elects ONCE and then
 // walks its span consecutive 8-row y-tiles serially through the verbatim
-// pair impl -- or, for a pairless run position, the verbatim stock
-// qmv_impl -- with tid.y rewritten to the tile index (a strip-walk
+// pair impl -- or, for a pairless run position, the same body with its
+// weight load widened -- with tid.y rewritten to the tile index (a strip-walk
 // pattern). Tile u is served by survivor (u / span) * span
 // at loop step u % span and by no other group, so every output row keeps
 // the IDENTICAL qdot sequence, accumulator, simd_sum and store the
@@ -3928,7 +4046,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   for (int t = 0; t < gemma4_down_tile_span; t++) {
     uint3 tile_tid = tid;
     tile_tid.y = tid.y + uint(t);
-    qmv_impl<T, group_size, bits>(
+    qmv_affine4_g64_solo_word_impl<T, group_size, bits>(
         tile_w,
         tile_scales,
         tile_biases,

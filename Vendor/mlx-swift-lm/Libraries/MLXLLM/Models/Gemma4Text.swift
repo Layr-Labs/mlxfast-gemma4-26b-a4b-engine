@@ -2300,7 +2300,7 @@ private enum Gemma4RouterFinalistsV1 {
     }()
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_router_finalists32_stable_bf16_v1",
+        name: "gemma4_router_finalists32_stable_bf16_v2",
         inputNames: ["scores"],
         outputNames: ["indices"],
         source: """
@@ -2315,7 +2315,9 @@ private enum Gemma4RouterFinalistsV1 {
                 | expert;
             threadgroup uint finalists[32];
 
+            #pragma clang loop unroll(full)
             for (uint width = 2u; width <= 32u; width <<= 1) {
+                #pragma clang loop unroll(full)
                 for (uint stride = width >> 1; stride > 0u; stride >>= 1) {
                     const uint other = simd_shuffle_xor(item, ushort(stride));
                     const bool otherBefore = gemma4_finalists_before(other, item);
@@ -2333,7 +2335,9 @@ private enum Gemma4RouterFinalistsV1 {
 
             if (group == 0u) {
                 item = finalists[lane];
+                #pragma clang loop unroll(full)
                 for (uint width = 2u; width <= 32u; width <<= 1) {
+                    #pragma clang loop unroll(full)
                     for (uint stride = width >> 1; stride > 0u; stride >>= 1) {
                         const uint other = simd_shuffle_xor(item, ushort(stride));
                         const bool otherBefore = gemma4_finalists_before(other, item);

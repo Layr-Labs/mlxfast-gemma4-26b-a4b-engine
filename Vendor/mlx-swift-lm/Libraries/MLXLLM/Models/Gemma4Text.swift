@@ -2470,6 +2470,48 @@ private enum Gemma4FusedLayerGlue {
         """
     }
 
+    /// One eight-byte load of the four contiguous features a thread owns from
+    /// a `[rows, axis]` buffer. `axis / 4` is 704 with no remainder and `base`
+    /// is always a multiple of four elements, so the access is aligned and the
+    /// bytes are exactly those the four scalar reads returned.
+    private static func rowVec4(_ src: String, into dst: String) -> String {
+        """
+            T \(dst)[4];
+            {
+                const vec<T, 4> \(dst)_q =
+                    ((const device vec<T, 4>*)\(src))[row * 704u + lid];
+                \(dst)[0] = \(dst)_q.x;
+                \(dst)[1] = \(dst)_q.y;
+                \(dst)[2] = \(dst)_q.z;
+                \(dst)[3] = \(dst)_q.w;
+            }
+        """
+    }
+
+    /// The same load for a length-`axis` weight vector, which every row shares
+    /// and which is indexed by `wbase` rather than `base`.
+    private static func weightVec4(_ src: String, into dst: String) -> String {
+        """
+            T \(dst)[4];
+            {
+                const vec<T, 4> \(dst)_q =
+                    ((const device vec<T, 4>*)\(src))[lid];
+                \(dst)[0] = \(dst)_q.x;
+                \(dst)[1] = \(dst)_q.y;
+                \(dst)[2] = \(dst)_q.z;
+                \(dst)[3] = \(dst)_q.w;
+            }
+        """
+    }
+
+    /// The matching store back into a `[rows, axis]` buffer.
+    private static func rowStoreVec4(_ dst: String, from src: String) -> String {
+        """
+            ((device vec<T, 4>*)\(dst))[row * 704u + lid] =
+                vec<T, 4>(\(src)[0], \(src)[1], \(src)[2], \(src)[3]);
+        """
+    }
+
     /// Same independent trees as prefill's glue_inv_rms2: four ordered
     /// squares per input, the original SIMD and cross-SIMD sums, then precise
     /// rsqrt. Share three barriers instead of running two three-barrier
@@ -2870,23 +2912,40 @@ private enum Gemma4FusedLayerGlue {
     /// materialization and its standalone dispatch.
     private static let deferredExpertValuesSource = """
             T expertv[4];
-            const uint assignment_base = row * 8u;
-            for (int i = 0; i < 4; ++i) {
-                T accumulator = static_cast<T>(0.0f);
+            {
+                // `inverse` and `route_weights` are indexed by the row and the
+                // slot alone, so the slot walk sits above the feature walk and
+                // each pair is read once per thread instead of once per
+                // feature. The four features a thread owns are adjacent and
+                // eight-byte aligned, so the sorted row arrives in one vector
+                // load. Slot order and the per-slot bfloat16 rounding of the
+                // running sum are unchanged.
+                const uint assignment_base = row * 8u;
+                const device vec<T, 4>* sorted4 =
+                    (const device vec<T, 4>*)sorted;
+                vec<T, 4> accumulator = vec<T, 4>(
+                    static_cast<T>(0.0f), static_cast<T>(0.0f),
+                    static_cast<T>(0.0f), static_cast<T>(0.0f));
                 for (uint slot = 0u; slot < 8u; ++slot) {
                     const uint assignment = assignment_base + slot;
                     const uint sorted_row = (uint)inverse[assignment];
-                    const T weighted = static_cast<T>(
-                        (float)sorted[sorted_row * 2816u + wbase + (uint)i]
-                        * (float)route_weights[assignment]);
-                    accumulator = accumulator + weighted;
+                    const float route = (float)route_weights[assignment];
+                    const vec<T, 4> sv4 = sorted4[sorted_row * 704u + lid];
+                    accumulator = accumulator + vec<T, 4>(
+                        static_cast<T>((float)sv4.x * route),
+                        static_cast<T>((float)sv4.y * route),
+                        static_cast<T>((float)sv4.z * route),
+                        static_cast<T>((float)sv4.w * route));
                 }
-                expertv[i] = accumulator;
+                expertv[0] = accumulator.x;
+                expertv[1] = accumulator.y;
+                expertv[2] = accumulator.z;
+                expertv[3] = accumulator.w;
             }
     """
 
     private static let deferredTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1",
+        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v3",
         inputNames: [
             "a", "sorted", "inverse", "route_weights", "res",
             "w1", "w2", "w3", "s",
@@ -2901,17 +2960,21 @@ private enum Gemma4FusedLayerGlue {
             threadgroup float local_sums[32];
             const uint base = row * 2816 + lid * 4;
             const uint wbase = lid * 4;
-        \(rmsReduce("a", into: "local_inv[0]"))
+        \(rowVec4("a", into: "av"))
+        \(rmsReduce("av", into: "local_inv[0]").replacingOccurrences(
+            of: "(float)av[base + i]", with: "(float)av[i]"))
         \(deferredExpertValuesSource)
         \(rmsReduce("expertv", into: "local_inv[1]").replacingOccurrences(
             of: "(float)expertv[base + i]", with: "(float)expertv[i]"))
             const float inv1 = local_inv[0];
             const float inv2 = local_inv[1];
+        \(weightVec4("w1", into: "w1v"))
+        \(weightVec4("w2", into: "w2v"))
             T sv[4];
             for (int i = 0; i < 4; i++) {
-                const T h1 = w1[wbase + i]
-                    * static_cast<T>((float)a[base + i] * inv1);
-                const T h2 = w2[wbase + i]
+                const T h1 = w1v[i]
+                    * static_cast<T>((float)av[i] * inv1);
+                const T h2 = w2v[i]
                     * static_cast<T>((float)expertv[i] * inv2);
                 sv[i] = h1 + h2;
             }
@@ -2919,19 +2982,23 @@ private enum Gemma4FusedLayerGlue {
             of: "(float)sv[base + i]", with: "(float)sv[i]"))
             const float inv3 = local_inv[0];
             const T scalar = s[0];
+        \(weightVec4("w3", into: "w3v"))
+        \(rowVec4("res", into: "resv"))
+            T outv[4];
             for (int i = 0; i < 4; i++) {
                 const T normed3 = static_cast<T>(
-                    w3[wbase + i] * static_cast<T>((float)sv[i] * inv3));
-                const T summed = res[base + i] + normed3;
-                out[base + i] = summed * scalar;
+                    w3v[i] * static_cast<T>((float)sv[i] * inv3));
+                const T summed = resv[i] + normed3;
+                outv[i] = summed * scalar;
             }
+        \(rowStoreVec4("out", from: "outv"))
         """,
         ensureRowContiguous: true
     )
 
     private static let deferredTailChainKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1",
+            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v3",
             inputNames: [
                 "a", "sorted", "inverse", "route_weights", "res",
                 "w1", "w2", "w3", "s", "wn",
@@ -2946,17 +3013,21 @@ private enum Gemma4FusedLayerGlue {
                 threadgroup float local_sums[32];
                 const uint base = row * 2816 + lid * 4;
                 const uint wbase = lid * 4;
-            \(rmsReduce("a", into: "local_inv[0]"))
+            \(rowVec4("a", into: "av"))
+            \(rmsReduce("av", into: "local_inv[0]").replacingOccurrences(
+                of: "(float)av[base + i]", with: "(float)av[i]"))
             \(deferredExpertValuesSource)
             \(rmsReduce("expertv", into: "local_inv[1]").replacingOccurrences(
                 of: "(float)expertv[base + i]", with: "(float)expertv[i]"))
                 const float inv1 = local_inv[0];
                 const float inv2 = local_inv[1];
+            \(weightVec4("w1", into: "w1v"))
+            \(weightVec4("w2", into: "w2v"))
                 T sv[4];
                 for (int i = 0; i < 4; i++) {
-                    const T h1 = w1[wbase + i]
-                        * static_cast<T>((float)a[base + i] * inv1);
-                    const T h2 = w2[wbase + i]
+                    const T h1 = w1v[i]
+                        * static_cast<T>((float)av[i] * inv1);
+                    const T h2 = w2v[i]
                         * static_cast<T>((float)expertv[i] * inv2);
                     sv[i] = h1 + h2;
                 }
@@ -2964,23 +3035,27 @@ private enum Gemma4FusedLayerGlue {
                 of: "(float)sv[base + i]", with: "(float)sv[i]"))
                 const float inv3 = local_inv[0];
                 const T scalar = s[0];
+            \(weightVec4("w3", into: "w3v"))
+            \(rowVec4("res", into: "resv"))
                 T outv[4];
                 for (int i = 0; i < 4; i++) {
                     const T normed3 = static_cast<T>(
-                        w3[wbase + i]
+                        w3v[i]
                             * static_cast<T>((float)sv[i] * inv3));
-                    const T summed = res[base + i] + normed3;
+                    const T summed = resv[i] + normed3;
                     outv[i] = summed * scalar;
-                    out[base + i] = outv[i];
                 }
+            \(rowStoreVec4("out", from: "outv"))
             \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
                 of: "(float)outv[base + i]", with: "(float)outv[i]"))
                 const float inv4 = local_inv[0];
+            \(weightVec4("wn", into: "wnv"))
+                T nv[4];
                 for (int i = 0; i < 4; i++) {
-                    normed[base + i] =
-                        wn[wbase + i]
-                            * static_cast<T>((float)outv[i] * inv4);
+                    nv[i] = wnv[i]
+                        * static_cast<T>((float)outv[i] * inv4);
                 }
+            \(rowStoreVec4("normed", from: "nv"))
             """,
             ensureRowContiguous: true
         )

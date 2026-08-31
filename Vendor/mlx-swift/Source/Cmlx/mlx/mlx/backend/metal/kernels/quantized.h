@@ -1797,9 +1797,11 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
 
   int k = 0;
   for (; k <= in_vec_size - block_size; k += block_size) {
+    #pragma clang loop unroll(full)
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint16_t* wl =
           (const device uint16_t*)(ws + row * in_vec_size_w);
+      #pragma clang loop unroll(full)
       for (int i = 0; i < uint16_per_thread; i++) {
         packed[row][i] = wl[i];
       }
@@ -1808,16 +1810,19 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
     }
 
     float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
+    #pragma clang loop unroll(full)
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
+    #pragma clang loop unroll(full)
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
+    #pragma clang loop unroll(full)
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
@@ -1836,9 +1841,11 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
       0,
       values_per_thread);
   if (remaining > 0) {
+    #pragma clang loop unroll(full)
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint16_t* wl =
           (const device uint16_t*)(ws + row * in_vec_size_w);
+      #pragma clang loop unroll(full)
       for (int i = 0; i < uint16_per_thread; i++) {
         packed[row][i] = wl[i];
       }
@@ -1848,24 +1855,28 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
 
     float sum =
         load_vector_safe<T, float, values_per_thread, 4>(x0, x_thread, remaining);
+    #pragma clang loop unroll(full)
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
         load_vector_safe<T, float, values_per_thread, 4>(x1, x_thread, remaining);
+    #pragma clang loop unroll(full)
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
         load_vector_safe<T, float, values_per_thread, 4>(x2, x_thread, remaining);
+    #pragma clang loop unroll(full)
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
   }
 
+  #pragma clang loop unroll(full)
   for (int row = 0; row < results_per_simdgroup; row++) {
     result0[row] = simd_sum(result0[row]);
     result1[row] = simd_sum(result1[row]);

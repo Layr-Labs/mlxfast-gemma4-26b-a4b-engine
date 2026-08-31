@@ -1534,6 +1534,39 @@ public final class EngineLoopV2: @unchecked Sendable {
 
         let inputs = lazyTokens.reshaped([ids.count, 1])
         let forwardStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        let isPureGreedy = ids.count == 8
+            && CBv2OrderOnlyLogits.orderOnly(params)
+            && ids.allSatisfy({ scheduler.record(for: $0)?.request.tokenConstraint == nil })
+        let caches = eagerCaches(rowStates: rowStates)
+        if isPureGreedy,
+           let top1Model = model as? CBv2DirectGreedyTop1SteppableModel,
+           let directTokens = top1Model.decodeTop1(tokens: inputs, caches: caches)
+        {
+            if CBv2StepProfiler.enabled {
+                CBv2StepProfiler.record(
+                    "v2.forward.build", seconds: CFAbsoluteTimeGetCurrent() - forwardStart)
+            }
+            let sampled = directTokens
+            scheduler.markPendingSamples(ids: ids)
+            var toEval = [sampled]
+            let cacheRoots = eagerDecodeEvaluationRoots(caches, logitsRoot: sampled)
+            if !cacheRoots.isEmpty {
+                toEval.append(contentsOf: cacheRoots)
+                offsetChainEvalSteps += 1
+            }
+            let evalStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+            asyncEval(toEval)
+            if CBv2StepProfiler.enabled {
+                let now = CFAbsoluteTimeGetCurrent()
+                CBv2StepProfiler.record("v2.asyncEval.submit", seconds: now - evalStart)
+                CBv2StepProfiler.record("v2.launch.total", seconds: now - buildStart)
+            }
+            let step = CBv2InFlightStep(
+                participants: Set(ids), sampledRows: ids, sampledTokens: sampled, evalTargets: [],
+                wallStartedNanos: wallStartedNanos)
+            return step
+        }
+
         // SOFTCAP-SKIP: declare order-only consumption for this graph build.
         let (last, cacheInnerState) = CBv2OrderOnlyLogits.withOrderOnly(params) {
             decodeLogits(rowStates: rowStates, tokens: inputs)  // [B, vocab]
@@ -1616,6 +1649,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             work.append(
                 RowWork(rec: rec, start: start, count: n, samples: samples, isDecode: isDecode))
         }
+
         guard !work.isEmpty else { return nil }
 
         // Lazy offset/KV chains of every eager cache touched this step; ride
@@ -1630,23 +1664,38 @@ public final class EngineLoopV2: @unchecked Sendable {
         if !decodeRows.isEmpty {
             let inputs = MLXArray(decodeRows.map { Int32($0.rec.tokens[$0.start]) })
                 .reshaped([decodeRows.count, 1])
-            // SOFTCAP-SKIP: same declaration on the mixed-step decode rows.
-            let (last, decodeInnerState) = CBv2OrderOnlyLogits.withOrderOnly(
-                decodeRows.map(\.rec.request.sampling)
-            ) {
-                decodeLogits(
-                    rowStates: decodeRows.map { kvStates[$0.rec.id]! }, tokens: inputs)
-            }
-            cacheInnerState.append(contentsOf: decodeInnerState)
-            decodeSampled = sampler.sample(
-                logits: last,
-                params: decodeRows.map(\.rec.request.sampling),
-                requestIDs: decodeRows.map(\.rec.id),
-                stepIndex: stepCount,
-                pendingSampledTokens: nil,  // finalize preceded: all confirmed
-                rowContext: { decodeRows.map { Self.samplerRow($0.rec) } })
-            if let stepLogprobs = sampler.takeStepLogprobs() {
-                logprobSegments.append(stepLogprobs)
+            let decodeParams = decodeRows.map(\.rec.request.sampling)
+            let isPureGreedy = decodeRows.count == 8
+                && CBv2OrderOnlyLogits.orderOnly(decodeParams)
+                && decodeRows.allSatisfy({ $0.rec.request.tokenConstraint == nil })
+            let decodeRowStates = decodeRows.map { kvStates[$0.rec.id]! }
+            let decodeCaches = eagerCaches(rowStates: decodeRowStates)
+            if isPureGreedy,
+               let top1Model = model as? CBv2DirectGreedyTop1SteppableModel,
+               let directTokens = top1Model.decodeTop1(tokens: inputs, caches: decodeCaches)
+            {
+                decodeSampled = directTokens
+                let cacheRoots = eagerDecodeEvaluationRoots(decodeCaches, logitsRoot: directTokens)
+                if !cacheRoots.isEmpty { cacheInnerState.append(contentsOf: cacheRoots) }
+            } else {
+                // SOFTCAP-SKIP: same declaration on the mixed-step decode rows.
+                let (last, decodeInnerState) = CBv2OrderOnlyLogits.withOrderOnly(
+                    decodeParams
+                ) {
+                    decodeLogits(
+                        rowStates: decodeRowStates, tokens: inputs)
+                }
+                cacheInnerState.append(contentsOf: decodeInnerState)
+                decodeSampled = sampler.sample(
+                    logits: last,
+                    params: decodeParams,
+                    requestIDs: decodeRows.map(\.rec.id),
+                    stepIndex: stepCount,
+                    pendingSampledTokens: nil,  // finalize preceded: all confirmed
+                    rowContext: { decodeRows.map { Self.samplerRow($0.rec) } })
+                if let stepLogprobs = sampler.takeStepLogprobs() {
+                    logprobSegments.append(stepLogprobs)
+                }
             }
         }
 

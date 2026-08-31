@@ -105,6 +105,22 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Share each x-side K-group build across two adjacent down-projection
+    /// output tiles. The body pins K = 2112 the way the static-K kernel does,
+    /// so it engages only while that switch is on; explicit false here
+    /// restores the promoted single-tile body.
+    private static let mma8DownMultiTileEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MLP_MMA8_DOWN_MULTITILE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespaces).lowercased())
+    }()
+
+    /// Mirrors the `TILES` argument and the `tid.y * 16` tile stride baked into
+    /// the multi-tile kernel source; the two only ever move together.
+    private static let mma8DownTilesPerGroup = 2
+
     private static let batch = 8
     private static let sequence = 1
     private static let groupSize = 64
@@ -724,6 +740,138 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         header: mma8DownStaticKHeader,
         ensureRowContiguous: true)
 
+    private static let mma8DownMultiTileHeader = mma8KernelHeader + """
+
+template <typename T, int KS, int TILES, int KFIX>
+METAL_FUNC void gemma4_qmv_mma8_affine8_g64_down_mt(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int N,
+    const int n0,
+    threadgroup float2* red,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int K = KFIX;
+  constexpr int G = K / 64;
+  constexpr int gh = (G + 1) / 2;
+  constexpr int nGroups = (KS == 2) ? gh : G;
+  const int g0 = (KS == 2 && simd_gid == 1) ? gh : 0;
+  const mma8_coord c = mma8_lane(simd_lid);
+
+  const device uint8_t* wrow[TILES];
+  const device T* srow[TILES];
+  const device T* brow[TILES];
+#pragma clang loop unroll(full)
+  for (int t = 0; t < TILES; ++t) {
+    const int nt = n0 + t * 8;
+    wrow[t] = (const device uint8_t*)w + (nt + c.fm) * K + 8 * c.fn;
+    srow[t] = scales + (nt + c.fm) * G;
+    brow[t] = biases + (nt + c.fm) * G;
+  }
+  const device T* x0 = x + c.fn * K + 8 * c.fm;
+  const device T* x1 = x0 + K;
+
+  thread float acc0[TILES];
+  thread float acc1[TILES];
+#pragma clang loop unroll(full)
+  for (int t = 0; t < TILES; ++t) {
+    acc0[t] = 0.0f;
+    acc1[t] = 0.0f;
+  }
+
+  simdgroup_float8x8 A;
+  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+#pragma clang loop unroll_count(4)
+  for (int gi = 0; gi < nGroups; ++gi) {
+    const int g = g0 + gi;
+    if (g >= G) continue;
+    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+
+    float2 rs = float2(mma8_runsum8<T>(r0), mma8_runsum8<T>(r1));
+    rs += simd_shuffle_xor(rs, 2u);
+    rs += simd_shuffle_xor(rs, 4u);
+    rs += simd_shuffle_xor(rs, 16u);
+
+    MMA8_SETB(B0, x, lo)
+    MMA8_SETB(B1, x, hi)
+    MMA8_SETB(B2, y, lo)
+    MMA8_SETB(B3, y, hi)
+    MMA8_SETB(B4, z, lo)
+    MMA8_SETB(B5, z, hi)
+    MMA8_SETB(B6, w, lo)
+    MMA8_SETB(B7, w, hi)
+
+#pragma clang loop unroll(full)
+    for (int t = 0; t < TILES; ++t) {
+      const uint4 wv = *((const device uint4*)(wrow[t] + 64 * g));
+      const float s = float(srow[t][g]);
+      const float b = float(brow[t][g]);
+
+      simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+      MMA8_STEP8(B0, x, z, 0)
+      MMA8_STEP8(B1, x, z, 8)
+      MMA8_STEP8(B2, x, z, 16)
+      MMA8_STEP8(B3, x, z, 24)
+      MMA8_STEP8(B4, y, w, 0)
+      MMA8_STEP8(B5, y, w, 8)
+      MMA8_STEP8(B6, y, w, 16)
+      MMA8_STEP8(B7, y, w, 24)
+
+      acc0[t] += s * C.thread_elements()[0] + rs.x * b;
+      acc1[t] += s * C.thread_elements()[1] + rs.y * b;
+    }
+  }
+
+  if (KS == 2) {
+    if (simd_gid == 1) {
+#pragma clang loop unroll(full)
+      for (int t = 0; t < TILES; ++t) {
+        red[t * 32 + simd_lid] = float2(acc0[t], acc1[t]);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_gid == 1) {
+      return;
+    }
+#pragma clang loop unroll(full)
+    for (int t = 0; t < TILES; ++t) {
+      const float2 other = red[t * 32 + simd_lid];
+      acc0[t] = acc0[t] + other.x;
+      acc1[t] = acc1[t] + other.y;
+    }
+  }
+
+#pragma clang loop unroll(full)
+  for (int t = 0; t < TILES; ++t) {
+    const int nt = n0 + t * 8;
+    y[c.fn * N + nt + c.fm] = static_cast<T>(acc0[t]);
+    y[(c.fn + 1) * N + nt + c.fm] = static_cast<T>(acc1[t]);
+  }
+}
+"""
+
+    private static let mma8DownMultiTileKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_mt2_k2112_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            gemma4_qmv_mma8_affine8_g64_down_mt<T, 2, 2, 2112>(
+                w, scales, biases, x, y,
+                w_shape[0], int(tid.y) * 16, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8DownMultiTileHeader,
+        ensureRowContiguous: true)
+
     /// One complete SIMD group per g64 group. Keep all lane results rather
     /// than canonicalizing row sums: the consumer reads its own lane's tree.
     private static let mma8DownLaneSumKernel = MLXFast.metalKernel(
@@ -1023,6 +1171,20 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
                     [x, weight, scales, biases, laneSums],
                     template: [("T", x.dtype)],
                     grid: (simdWidth, yTiles * simdGroups, 1),
+                    threadGroup: (simdWidth, simdGroups, 1),
+                    outputShapes: [[batch, sequence, outDim]],
+                    outputDTypes: [x.dtype]
+                )[0]
+            }
+            if !isGateUp, mma8DownStaticKEnabled,
+                mma8DownMultiTileEnabled,
+                yTiles % mma8DownTilesPerGroup == 0 {
+                CBv2EngageMark.once("dense-mlp-mma8-down-multitile")
+                let tileGroups = yTiles / mma8DownTilesPerGroup
+                return mma8DownMultiTileKernel(
+                    [x, weight, scales, biases],
+                    template: [("T", x.dtype)],
+                    grid: (simdWidth, tileGroups * simdGroups, 1),
                     threadGroup: (simdWidth, simdGroups, 1),
                     outputShapes: [[batch, sequence, outDim]],
                     outputDTypes: [x.dtype]

@@ -146,16 +146,18 @@ public enum CBv2DenseMLPQMVV1 {
 
 template <typename U, int values_per_thread>
 inline U qdot_affine8_registered(
-    const thread uint8_t* w,
+    uint w,
     const thread U* x_thread,
     U scale,
     U bias,
     U sum) {
-  U accum = 0;
-  #pragma unroll
-  for (int i = 0; i < values_per_thread; i++) {
-    accum += x_thread[i] * w[i];
-  }
+  static_assert(
+      values_per_thread == 4, "Word load expects four 8-bit values");
+  U accum =
+      (x_thread[0] * (w & 0xffu) +
+       x_thread[1] * ((w >> 8) & 0xffu) +
+       x_thread[2] * ((w >> 16) & 0xffu) +
+       x_thread[3] * (w >> 24));
   return scale * accum + sum * bias;
 }
 
@@ -185,7 +187,11 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
 
   const device uint8_t* ws = (const device uint8_t*)w;
   thread float x_thread[values_per_thread];
-  thread uint8_t packed[results_per_simdgroup][bytes_per_thread];
+  // One aligned 4-byte load per row replaces four 1-byte loads: both live
+  // K values (2816 and 2112) are multiples of 64, so the row stride, the
+  // block advance (128) and the lane offset (simd_lid * 4) are all multiples
+  // of 4 over the uint32 weight base.
+  thread uint packed[results_per_simdgroup];
   thread float scale_local[results_per_simdgroup];
   thread float bias_local[results_per_simdgroup];
   thread float result0[results_per_simdgroup] = {0};
@@ -214,11 +220,8 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
   for (; k <= in_vec_size - block_size; k += block_size) {
     #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
-      const device uint8_t* wl = ws + row * in_vec_size_w;
-      #pragma unroll
-      for (int i = 0; i < bytes_per_thread; i++) {
-        packed[row][i] = wl[i];
-      }
+      packed[row] = *reinterpret_cast<const device uint*>(
+          ws + row * in_vec_size_w);
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }
@@ -262,11 +265,8 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
   if (simd_lid < active_tail_lanes) {
     #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
-      const device uint8_t* wl = ws + row * in_vec_size_w;
-      #pragma unroll
-      for (int i = 0; i < bytes_per_thread; i++) {
-        packed[row][i] = wl[i];
-      }
+      packed[row] = *reinterpret_cast<const device uint*>(
+          ws + row * in_vec_size_w);
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }

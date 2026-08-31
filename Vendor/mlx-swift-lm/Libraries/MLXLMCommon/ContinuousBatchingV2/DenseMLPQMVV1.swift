@@ -87,12 +87,14 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    /// Reuse each down-plane lane's exact affine bias sum across output
-    /// tiles. Disabling this restores the original per-tile MMA8 reduction.
+    /// DMLP-DOWN-XSUM-019 reuses each down-plane lane's exact affine bias sum
+    /// across every output tile. The dedicated sum pass removes the repeated
+    /// per-tile widening and butterfly work; disabling this restores the
+    /// original per-tile MMA8 reduction.
     private static let mma8DownLaneSumsEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_MLP_MMA8_DOWN_LANE_SUMS"]
-        else { return false }
+        else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 

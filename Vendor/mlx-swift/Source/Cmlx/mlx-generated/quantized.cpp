@@ -327,8 +327,8 @@ inline U qdot_affine4_registered(
 }
 
 // Consume the same two adjacent packed uint16 values through one aligned
-// 32-bit device load. The low and high halves retain the original arithmetic
-// order while halving the explicit weight-load instructions.
+// 32-bit device load. Keep the incumbent two-step accumulator schedule while
+// halving the explicit weight-load instructions.
 template <typename U, int values_per_thread>
 inline U qdot_affine4_registered_word(
     uint packed_word,
@@ -337,18 +337,15 @@ inline U qdot_affine4_registered_word(
     U bias,
     U sum) {
   static_assert(values_per_thread == 8, "Word load expects eight 4-bit values");
-  const uint packed0 = packed_word & 0xffffu;
-  const uint packed1 = packed_word >> 16;
-  U accum =
-      (x_thread[0] * (packed0 & 0x000f) +
-       x_thread[1] * (packed0 & 0x00f0) +
-       x_thread[2] * (packed0 & 0x0f00) +
-       x_thread[3] * (packed0 & 0xf000));
-  accum +=
-      (x_thread[4] * (packed1 & 0x000f) +
-       x_thread[5] * (packed1 & 0x00f0) +
-       x_thread[6] * (packed1 & 0x0f00) +
-       x_thread[7] * (packed1 & 0xf000));
+  U accum = 0;
+  for (int i = 0; i < (values_per_thread / 4); i++) {
+    const uint packed = (packed_word >> (16 * i)) & 0xffffu;
+    accum +=
+        (x_thread[4 * i] * (packed & 0x000f) +
+         x_thread[4 * i + 1] * (packed & 0x00f0) +
+         x_thread[4 * i + 2] * (packed & 0x0f00) +
+         x_thread[4 * i + 3] * (packed & 0xf000));
+  }
   return scale * accum + sum * bias;
 }
 
@@ -366,30 +363,23 @@ inline void qdot_affine4_pair(
     U sum1,
     thread U& out0,
     thread U& out1) {
+  U accum0 = 0;
+  U accum1 = 0;
   static_assert(values_per_thread == 8, "Word load expects eight 4-bit values");
   const uint packedWord = *((const device uint*)w);
-  const uint packed0 = packedWord & 0xffffu;
-  const uint packed1 = packedWord >> 16;
-  U accum0 =
-      (x0[0] * (packed0 & 0x000f) +
-       x0[1] * (packed0 & 0x00f0) +
-       x0[2] * (packed0 & 0x0f00) +
-       x0[3] * (packed0 & 0xf000));
-  U accum1 =
-      (x1[0] * (packed0 & 0x000f) +
-       x1[1] * (packed0 & 0x00f0) +
-       x1[2] * (packed0 & 0x0f00) +
-       x1[3] * (packed0 & 0xf000));
-  accum0 +=
-      (x0[4] * (packed1 & 0x000f) +
-       x0[5] * (packed1 & 0x00f0) +
-       x0[6] * (packed1 & 0x0f00) +
-       x0[7] * (packed1 & 0xf000));
-  accum1 +=
-      (x1[4] * (packed1 & 0x000f) +
-       x1[5] * (packed1 & 0x00f0) +
-       x1[6] * (packed1 & 0x0f00) +
-       x1[7] * (packed1 & 0xf000));
+  for (int i = 0; i < (values_per_thread / 4); i++) {
+    const uint packed = (packedWord >> (16 * i)) & 0xffffu;
+    accum0 +=
+        (x0[4 * i] * (packed & 0x000f) +
+         x0[4 * i + 1] * (packed & 0x00f0) +
+         x0[4 * i + 2] * (packed & 0x0f00) +
+         x0[4 * i + 3] * (packed & 0xf000));
+    accum1 +=
+        (x1[4 * i] * (packed & 0x000f) +
+         x1[4 * i + 1] * (packed & 0x00f0) +
+         x1[4 * i + 2] * (packed & 0x0f00) +
+         x1[4 * i + 3] * (packed & 0xf000));
+  }
   out0 = scale * accum0 + sum0 * bias;
   out1 = scale * accum1 + sum1 * bias;
 }

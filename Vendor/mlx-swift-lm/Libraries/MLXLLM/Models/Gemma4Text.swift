@@ -4219,6 +4219,162 @@ enum Gemma4FusedScaledEmbedding {
     }
 }
 
+// MARK: - DECODE-EMB-RMS-001: fused decode embedding + layer-0 input norm
+
+private let gemma4DecodeEmbeddingRMSEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DECODE_EMBED_RMS"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// The ranked decode rectangle previously used the untouched quantized
+/// embedding chain and then a separate layer-0 RMSNorm. This producer keeps
+/// the incumbent BF16 boundaries and the exact `rms_single_row<T, 4>`
+/// reduction tree, but emits both values in one dispatch: `scaled` remains the
+/// layer-0 residual while `normed` is handed to the layer through GLUE-003.
+private enum Gemma4FusedDecodeEmbeddingRMSV1 {
+    private static let rows = 8
+    private static let axis = 2816
+    private static let vocabulary = 262_144
+    private static let groupSize = 64
+    private static let bits = 4
+    private static let valuesPerThread = 4
+    private static let threadgroupSize = axis / valuesPerThread
+    private static let packedValuesPerWord = 8
+    private static let eps: Float = 1e-6
+
+    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_decode_embedding_rms_affine4_g64_2816_b8_v2",
+        inputNames: ["tokens", "w", "scales", "biases", "embed_scale", "norm_w"],
+        outputNames: ["scaled", "normed"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float local_inv[1];
+            threadgroup float local_sums[32];
+
+            const uint base = row * 2816u + lid * 4u;
+            const uint packed_col = lid >> 1;
+            const uint code_base = (lid & 1u) * 4u;
+            // All lanes in a SIMD group address the same token. Load it once
+            // and retain the exact integer value through a SIMD shuffle.
+            const int raw_token_lane =
+                simd_lane_id == 0 ? tokens[row] : 0;
+            const int raw_token = simd_shuffle(raw_token_lane, ushort(0));
+            const int token = raw_token < 0 ? raw_token + 262144 : raw_token;
+            const size_t token_base = size_t(token) * 352u;
+            // Two neighboring lanes consume the two four-nibble halves of
+            // one packed word. Only the even lane performs the global load.
+            const uint packed_lane = (simd_lane_id & 1u) == 0u
+                ? w[token_base + packed_col] : 0u;
+            const uint packed = simd_shuffle(
+                packed_lane, ushort(simd_lane_id & 0x1eu));
+            const size_t group_index = size_t(token) * 44u + size_t(packed_col >> 3);
+            // Sixteen lanes share one affine group. Shuffle the native BF16
+            // payload so arithmetic and rounding remain byte-identical.
+            const T zero = static_cast<T>(0.0f);
+            const T scale_lane = (simd_lane_id & 15u) == 0u
+                ? scales[group_index] : zero;
+            const T bias_lane = (simd_lane_id & 15u) == 0u
+                ? biases[group_index] : zero;
+            const ushort group_lane = ushort(simd_lane_id & 16u);
+            const T scale = simd_shuffle(scale_lane, group_lane);
+            const T bias = simd_shuffle(bias_lane, group_lane);
+            const T es = embed_scale;
+
+            // These two named T values preserve the stock dequantize-store
+            // and scalar-multiply-store rounding boundaries before RMSNorm.
+            T xv[4];
+            float acc = 0.0f;
+            for (uint i = 0; i < 4u; ++i) {
+                const uint8_t d =
+                    (packed >> (4u * (code_base + i))) & 0x0fu;
+                const T dequantized = scale * d + bias;
+                xv[i] = dequantized * es;
+                scaled[base + i] = xv[i];
+                const float xi = xv[i];
+                acc += xi * xi;
+            }
+
+            // Byte-for-byte arithmetic order of rms_single_row<T, 4> for
+            // axis 2816: the same per-thread four squares, SIMD reduction,
+            // 32-slot cross-SIMD reduction, and precise reciprocal sqrt.
+            acc = simd_sum(acc);
+            if (simd_group_id == 0) local_sums[simd_lane_id] = 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_lane_id == 0) local_sums[simd_group_id] = acc;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+                acc = simd_sum(local_sums[simd_lane_id]);
+                if (simd_lane_id == 0) {
+                    local_inv[0] =
+                        metal::precise::rsqrt(acc / 2816.0f + 1e-06f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            #pragma clang loop unroll(full)
+            for (uint i = 0; i < 4u; ++i) {
+                normed[base + i] = norm_w[lid * 4u + i]
+                    * static_cast<T>((float)xv[i] * local_inv[0]);
+            }
+            """,
+        ensureRowContiguous: true
+    )
+
+    static func apply(
+        tokens: MLXArray,
+        embedding: Embedding,
+        embedScale: Float,
+        inputNormWeight: MLXArray,
+        inputNormEps: Float
+    ) -> (scaled: MLXArray, normed: MLXArray)? {
+        guard gemma4DecodeEmbeddingRMSEnabled,
+            tokens.dtype == .int32,
+            tokens.ndim == 2,
+            tokens.dim(0) == rows,
+            tokens.dim(1) == 1,
+            tokens.size == rows,
+            inputNormEps == eps,
+            inputNormWeight.dtype == .bfloat16,
+            inputNormWeight.ndim == 1,
+            inputNormWeight.dim(0) == axis,
+            let quantized = embedding as? QuantizedEmbedding,
+            quantized.mode == .affine,
+            quantized.bits == bits,
+            quantized.groupSize == groupSize,
+            let biases = quantized.biases
+        else { return nil }
+
+        let weight = quantized.weight
+        let scales = quantized.scales
+        guard weight.dtype == .uint32,
+            weight.shape == [vocabulary, axis / packedValuesPerWord],
+            scales.dtype == .bfloat16,
+            scales.shape == [vocabulary, axis / groupSize],
+            biases.dtype == .bfloat16,
+            biases.shape == scales.shape
+        else { return nil }
+
+        let outputs = kernel(
+            [
+                tokens, weight, scales, biases,
+                embedScale.asMLXArray(dtype: .bfloat16), inputNormWeight,
+            ],
+            template: [("T", DType.bfloat16)],
+            grid: (rows * threadgroupSize, 1, 1),
+            threadGroup: (threadgroupSize, 1, 1),
+            outputShapes: [[rows, 1, axis], [rows, 1, axis]],
+            outputDTypes: [.bfloat16, .bfloat16]
+        )
+        CBv2EngageMark.once("decode-embed-rms")
+        return (outputs[0], outputs[1])
+    }
+}
+
 // MARK: - Text Model
 
 /// FINAL-NORM-XSum. The ranked tied head consumes one exact affine activation
@@ -4561,10 +4717,29 @@ public class Gemma4TextModelInner: Module {
         // own lookup; token ids still feed the per-layer embeddings (PLE)
         // below. nil keeps the text path byte-identical.
         var h: MLXArray
+        var fusedDecodeInputNorm: MLXArray? = nil
         if let inputEmbedding {
             h = inputEmbedding.ndim == 2 ? inputEmbedding.expandedDimensions(axis: 0) : inputEmbedding
         } else {
-            if let fused = Gemma4FusedScaledEmbedding.apply(
+            let fusedDecode: (scaled: MLXArray, normed: MLXArray)?
+            if gemma4DecodeEmbeddingRMSEnabled,
+                !schedulePrefill,
+                hiddenSizePerLayerInput == 0,
+                cache?.contains(where: { $0 is any CBv2AttendingLayerCache }) == true,
+                let firstLayer = layers.first
+            {
+                fusedDecode = Gemma4FusedDecodeEmbeddingRMSV1.apply(
+                    tokens: inputs, embedding: embedTokens,
+                    embedScale: embedScale,
+                    inputNormWeight: firstLayer.inputLayernorm.weight,
+                    inputNormEps: firstLayer.inputLayernorm.eps)
+            } else {
+                fusedDecode = nil
+            }
+            if let fused = fusedDecode {
+                h = fused.scaled
+                fusedDecodeInputNorm = fused.normed
+            } else if let fused = Gemma4FusedScaledEmbedding.apply(
                 tokens: inputs, embedding: embedTokens, embedScale: embedScale,
                 hiddenSize: config.hiddenSize)
             {
@@ -4682,6 +4857,9 @@ public class Gemma4TextModelInner: Module {
         // GLUE-003: one chain box per forward; layer L's fused tail hands
         // layer L+1 its input norm through it.
         let glueChain = Gemma4GlueChainBox()
+        if let fusedDecodeInputNorm {
+            glueChain.pending = (source: h, normed: fusedDecodeInputNorm)
+        }
         for (idx, layer) in layers.enumerated() {
             let prevIdx = previousKvs[idx]
             let sharedKV = intermediates[prevIdx].kv

@@ -286,7 +286,6 @@ public final class SchedulerV2 {
     public func plan() -> CBv2StepPlan {
         var budget = config.maxBatchedTokensPerStep
         var assignments: [(id: CBv2RequestID, numTokens: Int)] = []
-        var assignmentIndex: [CBv2RequestID: Int] = [:]
         var preemptions: [CBv2RequestID] = []
         var speculationFallbacks: [CBv2RequestID: CBv2SpeculationFallback] = [:]
         var stopScheduling = false
@@ -320,7 +319,7 @@ public final class SchedulerV2 {
         // 0. Starved block-sized chunk from the previous step: first claim on
         // this step's full budget (see `deferredBlockRequestID`). One-shot —
         // re-armed below if the row starves again.
-        var deferredAdmittedID: CBv2RequestID? = nil
+        var deferredAdmitted: (id: CBv2RequestID, numTokens: Int)? = nil
         var deferredRunningID: CBv2RequestID? = nil
         if let deferredID = deferredBlockRequestID {
             deferredBlockRequestID = nil
@@ -333,18 +332,18 @@ public final class SchedulerV2 {
                 // — the marker itself is consumed here (one-shot).
                 deferredRunningID = deferredID
             } else if let wIdx = waiting.firstIndex(where: { $0.id == deferredID }) {
-                deferredAdmittedID = admitDeferredBlockRow(
-                    at: wIdx, budget: &budget,
-                    assignments: &assignments, assignmentIndex: &assignmentIndex)
+                deferredAdmitted = admitDeferredBlockRow(
+                    at: wIdx, budget: &budget, assignments: &assignments)
             }
         }
+        let deferredAdmittedID = deferredAdmitted?.id
         // The deferred block row is EXEMPT from the quota (it must keep its
         // first claim on the full budget or the block starvation guard is
         // defeated), but its tokens are prefill and are charged to the quota
         // so the rest of the step stays bounded. This is the one path that
         // can overshoot the cap, and only for multimodal block chunks.
-        if let admitted = deferredAdmittedID, let aIdx = assignmentIndex[admitted] {
-            prefillTokensAssigned += assignments[aIdx].numTokens
+        if let deferredAdmitted {
+            prefillTokensAssigned += deferredAdmitted.numTokens
         }
 
         // 1. RUNNING first, in order.
@@ -463,8 +462,7 @@ public final class SchedulerV2 {
                     }
                     if victim === rec {
                         preempt(
-                            victim, assignments: &assignments,
-                            assignmentIndex: &assignmentIndex, budget: &budget)
+                            victim, assignments: &assignments, budget: &budget)
                         preemptions.append(victim.id)
                         stopScheduling = true  // victim == requester ⇒ stop
                         break
@@ -473,8 +471,7 @@ public final class SchedulerV2 {
                         idx -= 1
                     }
                     preempt(
-                        victim, assignments: &assignments,
-                        assignmentIndex: &assignmentIndex, budget: &budget)
+                        victim, assignments: &assignments, budget: &budget)
                     preemptions.append(victim.id)
                 }
             }
@@ -483,7 +480,6 @@ public final class SchedulerV2 {
             rec.numComputedTokens += n  // optimistic advance
             budget -= n
             if isPrefillRow { prefillTokensAssigned += n }
-            assignmentIndex[rec.id] = assignments.count
             assignments.append((id: rec.id, numTokens: n))
             idx += 1
         }
@@ -558,12 +554,17 @@ public final class SchedulerV2 {
                 rec.numComputedTokens += chunk
                 budget -= chunk
                 prefillTokensAssigned += chunk
-                assignmentIndex[rec.id] = assignments.count
                 assignments.append((id: rec.id, numTokens: chunk))
                 running.append(rec)
             }
         }
 
+        if preemptions.isEmpty {
+            return CBv2StepPlan(
+                assignments: assignments,
+                preemptions: preemptions,
+                speculationFallbacks: speculationFallbacks)
+        }
         return CBv2StepPlan(
             assignments: assignments.filter { $0.numTokens > 0 },
             preemptions: preemptions,
@@ -575,14 +576,15 @@ public final class SchedulerV2 {
     /// once per step for the single deferred row: with the full step budget
     /// available its block is guaranteed to fit (submit validates every
     /// block against a full budget). Same eligibility rules as the regular
-    /// admission path; no preemption on its behalf. Returns the admitted id
-    /// (so the running pass skips it — one assignment per row per plan), or
-    /// nil when the row is not currently admissible.
+    /// admission path; no preemption on its behalf. Returns the admitted
+    /// assignment: its id lets the running pass skip it (one assignment per
+    /// row per plan), and its token count lets the mixed-step quota charge it
+    /// without maintaining an eager assignment-index dictionary for every
+    /// plan. Returns nil when the row is not currently admissible.
     private func admitDeferredBlockRow(
         at wIdx: Int, budget: inout Int,
-        assignments: inout [(id: CBv2RequestID, numTokens: Int)],
-        assignmentIndex: inout [CBv2RequestID: Int]
-    ) -> CBv2RequestID? {
+        assignments: inout [(id: CBv2RequestID, numTokens: Int)]
+    ) -> (id: CBv2RequestID, numTokens: Int)? {
         let rec = waiting[wIdx]
         guard !rec.isPaused, !rec.cancelRequested, rec.pendingSamples == 0,
             running.count < config.maxConcurrentRequests
@@ -613,10 +615,9 @@ public final class SchedulerV2 {
         rec.status = .running
         rec.numComputedTokens += chunk
         budget -= chunk
-        assignmentIndex[rec.id] = assignments.count
         assignments.append((id: rec.id, numTokens: chunk))
         running.append(rec)
-        return rec.id
+        return (id: rec.id, numTokens: chunk)
     }
 
     /// Undo the optimistic advance of an UNEXECUTED plan (failure/rejection
@@ -766,12 +767,12 @@ public final class SchedulerV2 {
     private func preempt(
         _ victim: CBv2ScheduledRequest,
         assignments: inout [(id: CBv2RequestID, numTokens: Int)],
-        assignmentIndex: inout [CBv2RequestID: Int],
         budget: inout Int
     ) {
         // Refund an assignment the victim received earlier in this same plan
-        // (vLLM scheduler.py:550-567).
-        if let aIdx = assignmentIndex.removeValue(forKey: victim.id) {
+        // (vLLM scheduler.py:550-567). Preemption is the rare path, so derive
+        // its lookup here instead of hashing every successful assignment.
+        if let aIdx = assignments.firstIndex(where: { $0.id == victim.id }) {
             budget += assignments[aIdx].numTokens
             assignments[aIdx].numTokens = 0  // filtered out on return
         }

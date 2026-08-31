@@ -3342,11 +3342,24 @@ private class Gemma4MLP: Module {
     private func denseProjection(
         _ layer: Linear,
         _ x: MLXArray,
-        activationSums: CBv2DenseMLPQMVV1.ActivationSums? = nil
+        activationSums: CBv2DenseMLPQMVV1.ActivationSums? = nil,
+        validatedInput: CBv2DenseMLPQMVV1.ValidatedInput? = nil
     ) -> MLXArray {
-        guard let quantized = layer as? QuantizedLinear,
-            quantized.bias == nil,
-            let tight = CBv2DenseMLPQMVV1.matmul(
+        guard let quantized = layer as? QuantizedLinear, quantized.bias == nil else {
+            return layer(x)
+        }
+        let tight = if let validatedInput {
+            CBv2DenseMLPQMVV1.matmul(
+                input: validatedInput,
+                weight: quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                groupSize: quantized.groupSize,
+                bits: quantized.bits,
+                mode: quantized.mode,
+                activationSums: activationSums)
+        } else {
+            CBv2DenseMLPQMVV1.matmul(
                 x: x,
                 weight: quantized.weight,
                 scales: quantized.scales,
@@ -3355,8 +3368,8 @@ private class Gemma4MLP: Module {
                 bits: quantized.bits,
                 mode: quantized.mode,
                 activationSums: activationSums)
-        else { return layer(x) }
-        return tight
+        }
+        return tight ?? layer(x)
     }
 
     func callAsFunction(
@@ -3366,12 +3379,18 @@ private class Gemma4MLP: Module {
         // DMLP-002: one exact activation-sum prepass feeds both fallback
         // projections. If either projection is not the pinned affine8 cell,
         // the candidate arrays remain unevaluated and stock takes over.
-        let activationSums = producerSums ?? CBv2DenseMLPQMVV1.activationSums(for: x)
+        let validatedInput = CBv2DenseMLPQMVV1.validatedInput(x)
+        let activationSums = producerSums
+            ?? validatedInput.flatMap { CBv2DenseMLPQMVV1.activationSums(for: $0) }
         return denseProjection(
             downProj,
             gemma4GeluProduct(
-                denseProjection(gateProj, x, activationSums: activationSums),
-                denseProjection(upProj, x, activationSums: activationSums)))
+                denseProjection(
+                    gateProj, x, activationSums: activationSums,
+                    validatedInput: validatedInput),
+                denseProjection(
+                    upProj, x, activationSums: activationSums,
+                    validatedInput: validatedInput)))
     }
 
     // MARK: ZIP-ROUTER-001 stages
@@ -3388,15 +3407,21 @@ private class Gemma4MLP: Module {
     }
 
     fileprivate func zipGate(
-        _ x: MLXArray, _ activationSums: CBv2DenseMLPQMVV1.ActivationSums?
+        _ x: MLXArray, _ activationSums: CBv2DenseMLPQMVV1.ActivationSums?,
+        validatedInput: CBv2DenseMLPQMVV1.ValidatedInput
     ) -> MLXArray {
-        denseProjection(gateProj, x, activationSums: activationSums)
+        denseProjection(
+            gateProj, x, activationSums: activationSums,
+            validatedInput: validatedInput)
     }
 
     fileprivate func zipUp(
-        _ x: MLXArray, _ activationSums: CBv2DenseMLPQMVV1.ActivationSums?
+        _ x: MLXArray, _ activationSums: CBv2DenseMLPQMVV1.ActivationSums?,
+        validatedInput: CBv2DenseMLPQMVV1.ValidatedInput
     ) -> MLXArray {
-        denseProjection(upProj, x, activationSums: activationSums)
+        denseProjection(
+            upProj, x, activationSums: activationSums,
+            validatedInput: validatedInput)
     }
 
     fileprivate func zipDown(_ activated: MLXArray) -> MLXArray {
@@ -3551,8 +3576,13 @@ private enum Gemma4ZipRouterV1 {
         let expertScores = router.zipScores(
             MLX.depends(input: normed, dependencies: [sums.dependencyHandle]))
         let denseIn = MLX.depends(input: n1, dependencies: [normed])
-        let gate = mlp.zipGate(denseIn, sums)
-        let up = mlp.zipUp(denseIn, sums)
+        guard let validatedDenseIn = CBv2DenseMLPQMVV1.validatedInput(denseIn) else {
+            return nil
+        }
+        let gate = mlp.zipGate(
+            denseIn, sums, validatedInput: validatedDenseIn)
+        let up = mlp.zipUp(
+            denseIn, sums, validatedInput: validatedDenseIn)
 
         // Stage 3: the dense GeLU product, which the router has no partner
         // for -- the argPartition is deliberately NOT paired with it.

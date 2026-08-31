@@ -131,6 +131,15 @@ public enum CBv2DenseMLPQMVV1 {
         public var dependencyHandle: MLXArray { values }
     }
 
+    /// An exact dense-decode activation whose MLX metadata has already been
+    /// checked. The initializer is private so model glue can share one set of
+    /// Swift/C shape queries across gate and up without weakening fail-closed
+    /// admission for public callers.
+    public struct ValidatedInput {
+        fileprivate let values: MLXArray
+        fileprivate let inDim: Int
+    }
+
     /// The affine-8 helper below is the current promoted
     /// `qmv_affine8_g64_quad_stream_impl` body. It reuses the exact
     /// `load_vector` definition and Metal constants already carried by the
@@ -909,23 +918,38 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
             || (inDim == 2112 && outDim == 2816)
     }
 
+    /// Validate the shared portion of dense QMV admission once. Gate and up
+    /// consume the same activation, so repeating these MLX metadata calls for
+    /// both projections is pure host work.
+    public static func validatedInput(_ x: MLXArray) -> ValidatedInput? {
+        guard enabled,
+            x.dtype == .bfloat16,
+            x.ndim == 3,
+            x.dim(0) == batch,
+            x.dim(1) == sequence
+        else { return nil }
+        let inDim = x.dim(2)
+        guard (inDim == 2816 || inDim == 2112),
+            x.size == batch * sequence * inDim
+        else { return nil }
+        return ValidatedInput(values: x, inDim: inDim)
+    }
+
     /// Builds the shared gate/up table only for the exact dense decode input.
     /// Returning an opaque value prevents callers from fabricating a table with
     /// a plausible shape; all other inputs keep DMLP-001 unchanged.
     public static func activationSums(for x: MLXArray) -> ActivationSums? {
-        guard enabled,
-            activationSumsEnabled,
-            x.dtype == .bfloat16,
-            x.ndim == 3,
-            x.dim(0) == batch,
-            x.dim(1) == sequence,
-            x.dim(2) == 2816,
-            x.size == batch * sequence * 2816
-        else { return nil }
+        guard let input = validatedInput(x) else { return nil }
+        return activationSums(for: input)
+    }
+
+    /// Build the gate/up activation table from an already admitted input.
+    public static func activationSums(for input: ValidatedInput) -> ActivationSums? {
+        guard activationSumsEnabled, input.inDim == 2816 else { return nil }
         let blocks = 2816 / kBlock
         let values = activationSumKernel(
-            [x],
-            template: [("T", x.dtype)],
+            [input.values],
+            template: [("T", DType.bfloat16)],
             grid: (simdWidth, blocks, batch),
             threadGroup: (simdWidth, 1, 1),
             outputShapes: [[blocks * simdWidth * batch]],
@@ -969,21 +993,42 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         mode: QuantizationMode,
         activationSums: ActivationSums? = nil
     ) -> MLXArray? {
-        guard enabled,
+        guard let input = validatedInput(x) else { return nil }
+        return matmul(
+            input: input,
+            weight: weight,
+            scales: scales,
+            biases: biases,
+            groupSize: groupSize,
+            bits: bits,
+            mode: mode,
+            activationSums: activationSums)
+    }
+
+    /// QMV from a previously admitted activation. Static projection metadata
+    /// remains checked independently for gate, up, and down.
+    public static func matmul(
+        input: ValidatedInput,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode,
+        activationSums: ActivationSums? = nil
+    ) -> MLXArray? {
+        let x = input.values
+        let inDim = input.inDim
+        guard
             groupSize == Self.groupSize,
             bits == Self.bits,
             mode == .affine,
             let biases,
-            x.dtype == .bfloat16,
             scales.dtype == x.dtype,
             biases.dtype == x.dtype,
-            weight.dtype == .uint32,
-            x.ndim == 3,
-            x.dim(0) == batch,
-            x.dim(1) == sequence
+            weight.dtype == .uint32
         else { return nil }
 
-        let inDim = x.dim(2)
         guard weight.ndim == 2 else { return nil }
         let outDim = weight.dim(0)
         guard liveShape(inDim: inDim, outDim: outDim),

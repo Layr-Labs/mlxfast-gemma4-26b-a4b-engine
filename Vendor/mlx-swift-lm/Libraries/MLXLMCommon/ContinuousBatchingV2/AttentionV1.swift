@@ -469,45 +469,34 @@ enum CBv2AttentionV1 {
                 cachedKeyRows.reserveCapacity(B)
                 cachedValueRows.reserveCapacity(B)
                 let ringRows = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
-                if ringRows.count == B && ringRows.allSatisfy({ $0.decodeRingView != nil }) {
-                    // WRITE-016: fold this step's one-token ring write into
-                    // ring pass A. The separate `decodeRingWrite` below is a
-                    // `SliceUpdate` over a 4 MiB allocation the direct-ring
-                    // attention graph still retains, so it cannot generally
-                    // donate: 4 KiB of new K/V costs a full-ring copy, 25
-                    // sliding layers x 8 rows x K/V per forward. The fused
-                    // pass A stores the same bytes into the same evicted slot
-                    // in place and serves logical token 1023 from the new K/V
-                    // arrays, so no block reads the slot it writes and the
-                    // accumulation order is unchanged. Refused (and skipped
-                    // entirely, write included) unless the storage-owning
-                    // layer has no K/V borrower that must keep observing the
-                    // pre-write allocation.
-                    if fusedRingWriteEnabled, allowFusedRingWrite,
-                        let decodeRingWriteFence
-                    {
-                        let preWrite = ringRows.compactMap { $0.decodeRingViewBeforeWrite }
-                        if preWrite.count == B,
-                            let fused = CBv2RaggedTwoPassDecodeAttentionV1
-                                .attendRingWriting(
-                                    queries: queries,
-                                    newKeys: keys, newValues: values,
-                                    keys: preWrite.map(\.keys),
-                                    values: preWrite.map(\.values),
-                                    starts: preWrite.map(\.start),
-                                    previousWriteFence: decodeRingWriteFence.value,
-                                    scale: scale,
-                                    slidingWindowLength: ringRows[0].window)
-                        {
-                            for row in ringRows {
-                                row.advanceDecodeRingAfterFusedWrite()
-                            }
-                            decodeRingWriteFence.value = fused.nextWriteFence
-                            CBv2EngageMark.once("write016")
-                            return fused.output
-                        }
+                // WRITE-016: fold this step's one-token ring write into
+                // ring pass A. `decodeRingViewBeforeWrite` has the same
+                // full-ring admission as `decodeRingView`; on the successful
+                // fused path it is therefore both the proof and the payload.
+                // Build its three argument planes in one pass, and defer the
+                // post-write view proof below to fallback only.
+                if ringRows.count == B, fusedRingWriteEnabled, allowFusedRingWrite,
+                    let decodeRingWriteFence,
+                    let preWrite = decodeRingViewsBeforeWrite(ringRows),
+                    let fused = CBv2RaggedTwoPassDecodeAttentionV1.attendRingWriting(
+                        queries: queries,
+                        newKeys: keys, newValues: values,
+                        keys: preWrite.keys,
+                        values: preWrite.values,
+                        starts: preWrite.starts,
+                        previousWriteFence: decodeRingWriteFence.value,
+                        scale: scale,
+                        slidingWindowLength: ringRows[0].window)
+                {
+                    for row in ringRows {
+                        row.advanceDecodeRingAfterFusedWrite()
                     }
+                    decodeRingWriteFence.value = fused.nextWriteFence
+                    CBv2EngageMark.once("write016")
+                    return fused.output
+                }
 
+                if ringRows.count == B && ringRows.allSatisfy({ $0.decodeRingView != nil }) {
                     for (index, row) in ringRows.enumerated() {
                         row.decodeRingWrite(
                             keys: keys[index ..< (index + 1)],
@@ -1281,6 +1270,27 @@ enum CBv2AttentionV1 {
             return false
         }
         return window == 1024
+    }
+
+    /// The full-ring views consumed by WRITE-016 before its in-place store.
+    /// A nil row fails closed before incomplete arrays reach the kernel.
+    @inline(__always)
+    private static func decodeRingViewsBeforeWrite(
+        _ rows: [CBv2WindowedSequenceKV]
+    ) -> (keys: [MLXArray], values: [MLXArray], starts: [Int])? {
+        var keys: [MLXArray] = []
+        var values: [MLXArray] = []
+        var starts: [Int] = []
+        keys.reserveCapacity(rows.count)
+        values.reserveCapacity(rows.count)
+        starts.reserveCapacity(rows.count)
+        for row in rows {
+            guard let view = row.decodeRingViewBeforeWrite else { return nil }
+            keys.append(view.keys)
+            values.append(view.values)
+            starts.append(view.start)
+        }
+        return (keys, values, starts)
     }
 
     private static func window(of kind: CBv2LayerKind) -> Int? {

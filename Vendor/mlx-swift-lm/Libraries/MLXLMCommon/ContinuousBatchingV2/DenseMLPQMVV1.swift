@@ -186,6 +186,7 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
   const device uint8_t* ws = (const device uint8_t*)w;
   thread float x_thread[values_per_thread];
   thread uint8_t packed[results_per_simdgroup][bytes_per_thread];
+  thread uint8_t packed_next[results_per_simdgroup][bytes_per_thread];
   thread float scale_local[results_per_simdgroup];
   thread float bias_local[results_per_simdgroup];
   thread float result0[results_per_simdgroup] = {0};
@@ -210,14 +211,38 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
   y2 += out_row;
   y3 += out_row;
 
+  // DMLP-GATEUP-CARRY-020: the weight-operand register carry, on the gate/up
+  // plane. Every packed byte's address is a function of the block index alone,
+  // so one block's codes stay resident while the next block's are read a whole
+  // iteration ahead of their use. `la` is zero on the last trip of the main
+  // loop, which re-reads the block just consumed rather than stepping past the
+  // final K block; `ws` itself still advances exactly as before, so the tail
+  // block below reads what it always read. Scales and biases keep their
+  // original loads: carrying them too would cost eight more registers on a
+  // kernel that already holds four accumulator sets.
   int k = 0;
-  for (; k <= in_vec_size - block_size; k += block_size) {
+  if (in_vec_size >= block_size) {
     #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* wl = ws + row * in_vec_size_w;
       #pragma unroll
       for (int i = 0; i < bytes_per_thread; i++) {
-        packed[row][i] = wl[i];
+        packed_next[row][i] = wl[i];
+      }
+    }
+  }
+  for (; k <= in_vec_size - block_size; k += block_size) {
+    const int la = (k + 2 * block_size <= in_vec_size) ? block_size : 0;
+    #pragma unroll
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      #pragma unroll
+      for (int i = 0; i < bytes_per_thread; i++) {
+        packed[row][i] = packed_next[row][i];
+      }
+      #pragma unroll
+      for (int i = 0; i < bytes_per_thread; i++) {
+        packed_next[row][i] = wl[la + i];
       }
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
@@ -705,11 +730,49 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
                 const int g = g0 + gi;
                 if (g >= G) continue;
             """)
+        // DMLP-DOWN-CARRY-019: the weight-operand register carry the frontier
+        // applied to the two attention matrix-unit tiers, on the dense down
+        // plane. Every address here is a function of the group index alone, so
+        // one group's codes, scale and bias stay resident in registers while
+        // the next group's are read a whole iteration ahead of their use.
+        // `g_next` is clamped to the last valid group, so the final look-ahead
+        // re-reads a group already read and its value is discarded.
+        //
+        // The read stays at the statement it already occupied. Moving it to the
+        // top of the body instead perturbs the close's floating-point
+        // contraction and stops the output being bit-identical; keeping it here
+        // leaves the emitted arithmetic word for word what the tip emits.
+        replaceOnce(
+            """
+              simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+            """,
+            with: """
+              simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+              uint4 wv_next = *((const device uint4*)(wrow + 64 * g0));
+              T s_next = srow[g0];
+              T b_next = brow[g0];
+            """)
+        replaceOnce(
+            """
+                const uint4 wv = *((const device uint4*)(wrow + 64 * g));
+                const float s = float(srow[g]);
+                const float b = float(brow[g]);
+            """,
+            with: """
+                const uint4 wv = wv_next;
+                const float s = float(s_next);
+                const float b = float(b_next);
+                const int g_next = min(g + 1, G - 1);
+                wv_next = *((const device uint4*)(wrow + 64 * g_next));
+                s_next = srow[g_next];
+                b_next = brow[g_next];
+            """)
         return result
     }()
 
     private static let mma8DownStaticKKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_unroll_v1",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_carry_v2",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -804,7 +867,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         ensureRowContiguous: true)
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_v2_unroll",
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_carry_v3",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -866,7 +929,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     )
 
     private static let activationSumQMVKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_v2_unroll",
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_carry_v3",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["y"],
         source: """

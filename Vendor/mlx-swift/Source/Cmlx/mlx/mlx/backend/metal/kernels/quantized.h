@@ -928,6 +928,7 @@ inline U qdot_affine4_loaded(
     U bias,
     U sum) {
   U accum = 0;
+  #pragma unroll
   for (int i = 0; i < 4; i++) {
     accum +=
         (x_thread[4 * i] * (ws[i] & 0x000f) +
@@ -946,6 +947,7 @@ inline float2 qdot_affine4_loaded_pair(
     float bias,
     float2 sum) {
   float2 accum = 0;
+  #pragma unroll
   for (int i = 0; i < 4; i++) {
     accum +=
         (float2(x0[4 * i], x1[4 * i]) * (ws[i] & 0x000f) +
@@ -987,6 +989,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
   const bool has_pair = first_m + 1 < M;
   thread float2 pair_result[rows_per_simd];
   thread float single_result[rows_per_simd];
+  #pragma unroll
   for (int r = 0; r < rows_per_simd; r++) {
     pair_result[r] = 0.0f;
     single_result[r] = 0.0f;
@@ -997,6 +1000,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
     thread float scale_local[rows_per_simd];
     thread float bias_local[rows_per_simd];
 
+    #pragma unroll
     for (int r = 0; r < rows_per_simd; r++) {
       const int row = out_row + r;
       const device uint8_t* wb =
@@ -1004,6 +1008,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
           row * in_vec_size_w + k / 2 + simd_lid * bytes_per_lane;
       const device uint16_t* ws =
           reinterpret_cast<const device uint16_t*>(wb);
+      #pragma unroll
       for (int i = 0; i < 4; i++) {
         packed[r][i] = ws[i];
       }
@@ -1023,12 +1028,14 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
       const device T* xm1 = xm0 + in_vec_size;
       const float sum1 =
           load_vector<T, float, values_per_thread, 4>(xm1, x1);
+      #pragma unroll
       for (int r = 0; r < rows_per_simd; r++) {
         pair_result[r] += qdot_affine4_loaded_pair(
             packed[r], x0, x1, scale_local[r], bias_local[r],
             float2(sum0, sum1));
       }
     } else {
+      #pragma unroll
       for (int r = 0; r < rows_per_simd; r++) {
         single_result[r] += qdot_affine4_loaded<float>(
             packed[r], x0, scale_local[r], bias_local[r], sum0);
@@ -1037,6 +1044,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
   }
 
   if (has_pair) {
+    #pragma unroll
     for (int r = 0; r < rows_per_simd; r++) {
       const float reduced0 = simd_sum(pair_result[r].x);
       const float reduced1 = simd_sum(pair_result[r].y);
@@ -1047,6 +1055,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
       }
     }
   } else {
+    #pragma unroll
     for (int r = 0; r < rows_per_simd; r++) {
       const float reduced = simd_sum(single_result[r]);
       if (simd_lid == 0) {
@@ -1087,6 +1096,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
   const int in_vec_size_g = in_vec_size / 64;
 
   VF acc[rows_per_simd];
+  #pragma unroll
   for (int r = 0; r < rows_per_simd; r++) {
     acc[r] = VF(0.0f);
   }
@@ -1095,11 +1105,13 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
     thread uint16_t packed[rows_per_simd][4];
     thread float scale_local[rows_per_simd];
     thread float bias_local[rows_per_simd];
+    #pragma unroll
     for (int r = 0; r < rows_per_simd; r++) {
       const int row = out_row + r;
       const device uint16_t* ws = reinterpret_cast<const device uint16_t*>(
           reinterpret_cast<const device uint8_t*>(w) + row * in_vec_size_w +
           k / 2 + simd_lid * bytes_per_lane);
+      #pragma unroll
       for (int i = 0; i < 4; i++) {
         packed[r][i] = ws[i];
       }
@@ -1110,11 +1122,14 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
 
     VF sums = VF(0.0f);
     VF partial[rows_per_simd];
+    #pragma unroll
     for (int r = 0; r < rows_per_simd; r++) {
       partial[r] = VF(0.0f);
     }
+    #pragma unroll
     for (int i = 0; i < 4; i++) {
       VF a0, a1, a2, a3;
+      #pragma unroll
       for (int m = 0; m < NA; m++) {
         const device T* xm = x + (first_m + m) * in_vec_size + k +
             simd_lid * values_per_thread + 4 * i;
@@ -1135,6 +1150,7 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
         a2[m] = xc[2];
         a3[m] = xc[3];
       }
+      #pragma unroll
       for (int r = 0; r < rows_per_simd; r++) {
         if (DIRECT_NIBBLES) {
           partial[r] += (a0 * (packed[r][i] & 0x000f) +
@@ -1149,12 +1165,15 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
         }
       }
     }
+    #pragma unroll
     for (int r = 0; r < rows_per_simd; r++) {
       acc[r] += scale_local[r] * partial[r] + sums * bias_local[r];
     }
   }
 
+  #pragma unroll
   for (int r = 0; r < rows_per_simd; r++) {
+    #pragma unroll
     for (int m = 0; m < NA; m++) {
       const float reduced = simd_sum(acc[r][m]);
       if (simd_lid == 0) {

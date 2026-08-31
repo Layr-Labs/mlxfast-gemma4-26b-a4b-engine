@@ -3870,9 +3870,6 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     uint simd_gid,
     uint simd_lid) {
   constexpr int gemma4_down_tile_span = 4; // sweep alternate: 2
-  if (tid.y % uint(gemma4_down_tile_span) != 0u) {
-    return;
-  }
   const uint assignment = tid.z;
   const uint32_t route_word = rhs_indices[assignment * rhs_stride];
   const bool expert_prefix_bounds = (route_word & 0x80000000u) != 0u;
@@ -3904,6 +3901,18 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
       : assignment + 1 < 64 &&
           rhs_indices[(assignment + 1) * rhs_stride] == expert;
   if (has_pair) {
+    // SOLOUNWALK: the span gate is a PAIR-arm gate. Only the paired arm reuses
+    // anything across the span (one activation load feeding two output tiles),
+    // so only the paired arm has a reason to fold four tiles into one
+    // threadgroup. Gating before the route decode also gated the pairless arm,
+    // which reuses nothing: it just ran the same `qmv_impl` four times with
+    // tid.y, tid.y + 1, tid.y + 2, tid.y + 3 that four separate threadgroups
+    // would have run anyway, at four times the live state and a quarter of the
+    // grid. Moving the gate here leaves the paired walk byte-for-byte as it was
+    // and hands the pairless arm back to the grid.
+    if (tid.y % uint(gemma4_down_tile_span) != 0u) {
+      return;
+    }
     const device T* tile_x1 =
         x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
     device T* tile_y1 = y + (assignment + 1) * out_vec_size;
@@ -3925,21 +3934,20 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     }
     return;
   }
-  for (int t = 0; t < gemma4_down_tile_span; t++) {
-    uint3 tile_tid = tid;
-    tile_tid.y = tid.y + uint(t);
-    qmv_impl<T, group_size, bits>(
-        tile_w,
-        tile_scales,
-        tile_biases,
-        tile_x0,
-        tile_y0,
-        in_vec_size,
-        out_vec_size,
-        tile_tid,
-        simd_gid,
-        simd_lid);
-  }
+  // One tile per threadgroup, the tid this threadgroup was launched with.
+  // Same callee, same arguments, same derived out_row as the walked form
+  // produced for this tid.y; only the thread that runs it changes.
+  qmv_impl<T, group_size, bits>(
+      tile_w,
+      tile_scales,
+      tile_biases,
+      tile_x0,
+      tile_y0,
+      in_vec_size,
+      out_vec_size,
+      tid,
+      simd_gid,
+      simd_lid);
 }
 
 template <typename T, int group_size, int bits>

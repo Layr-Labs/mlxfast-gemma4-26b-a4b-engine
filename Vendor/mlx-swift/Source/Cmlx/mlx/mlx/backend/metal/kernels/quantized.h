@@ -339,6 +339,41 @@ inline U qdot_affine4_registered_word(
   return scale * accum + sum * bias;
 }
 
+template <typename U, int values_per_thread>
+inline U qdot_affine4_registered_word_loop(
+    uint packed_word,
+    const thread U* x_thread,
+    U scale,
+    U bias,
+    U sum) {
+  static_assert(values_per_thread == 8, "Word load expects eight 4-bit values");
+  U accum = 0;
+  for (int i = 0; i < (values_per_thread / 4); i++) {
+    const uint packed = (packed_word >> (16 * i)) & 0xffffu;
+    accum +=
+        (x_thread[4 * i] * (packed & 0x000f) +
+         x_thread[4 * i + 1] * (packed & 0x00f0) +
+         x_thread[4 * i + 2] * (packed & 0x0f00) +
+         x_thread[4 * i + 3] * (packed & 0xf000));
+  }
+  return scale * accum + sum * bias;
+}
+
+template <bool loop_schedule, typename U, int values_per_thread>
+inline U qdot_affine4_registered_word_scheduled(
+    uint packed_word,
+    const thread U* x_thread,
+    U scale,
+    U bias,
+    U sum) {
+  if (loop_schedule) {
+    return qdot_affine4_registered_word_loop<U, values_per_thread>(
+        packed_word, x_thread, scale, bias, sum);
+  }
+  return qdot_affine4_registered_word<U, values_per_thread>(
+      packed_word, x_thread, scale, bias, sum);
+}
+
 // Two independent affine-4 dot products over one packed weight vector. Each
 // accumulator retains the scalar qdot operation order; only the packed weight
 // load is shared between adjacent assignments routed to the same expert.
@@ -1628,7 +1663,11 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
 // `qdot_affine4_registered` is the bits == 4 arm of `qdot` verbatim. Only the
 // LOADS are shared, so every output element's add sequence is identical to
 // stock qmv_impl.
-template <typename T, const int group_size, const int bits>
+template <
+    typename T,
+    const int group_size,
+    const int bits,
+    bool loop_word_schedule = false>
 METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1690,22 +1729,26 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
 
     float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
+      result0[row] += qdot_affine4_registered_word_scheduled<
+          loop_word_schedule, float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result1[row] += qdot_affine4_registered_word<float, values_per_thread>(
+      result1[row] += qdot_affine4_registered_word_scheduled<
+          loop_word_schedule, float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result2[row] += qdot_affine4_registered_word<float, values_per_thread>(
+      result2[row] += qdot_affine4_registered_word_scheduled<
+          loop_word_schedule, float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x3, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result3[row] += qdot_affine4_registered_word<float, values_per_thread>(
+      result3[row] += qdot_affine4_registered_word_scheduled<
+          loop_word_schedule, float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
 
@@ -1733,25 +1776,29 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     float sum =
         load_vector_safe<T, float, values_per_thread, 4>(x0, x_thread, remaining);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
+      result0[row] += qdot_affine4_registered_word_scheduled<
+          loop_word_schedule, float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
         load_vector_safe<T, float, values_per_thread, 4>(x1, x_thread, remaining);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result1[row] += qdot_affine4_registered_word<float, values_per_thread>(
+      result1[row] += qdot_affine4_registered_word_scheduled<
+          loop_word_schedule, float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
         load_vector_safe<T, float, values_per_thread, 4>(x2, x_thread, remaining);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result2[row] += qdot_affine4_registered_word<float, values_per_thread>(
+      result2[row] += qdot_affine4_registered_word_scheduled<
+          loop_word_schedule, float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
         load_vector_safe<T, float, values_per_thread, 4>(x3, x_thread, remaining);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result3[row] += qdot_affine4_registered_word<float, values_per_thread>(
+      result3[row] += qdot_affine4_registered_word_scheduled<
+          loop_word_schedule, float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
   }
@@ -1832,17 +1879,20 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
 
     float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
+      result0[row] += qdot_affine4_registered_word_loop<
+          float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result1[row] += qdot_affine4_registered_word<float, values_per_thread>(
+      result1[row] += qdot_affine4_registered_word_loop<
+          float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result2[row] += qdot_affine4_registered_word<float, values_per_thread>(
+      result2[row] += qdot_affine4_registered_word_loop<
+          float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
 
@@ -1869,19 +1919,22 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
     float sum =
         load_vector_safe<T, float, values_per_thread, 4>(x0, x_thread, remaining);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
+      result0[row] += qdot_affine4_registered_word_loop<
+          float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
         load_vector_safe<T, float, values_per_thread, 4>(x1, x_thread, remaining);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result1[row] += qdot_affine4_registered_word<float, values_per_thread>(
+      result1[row] += qdot_affine4_registered_word_loop<
+          float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
         load_vector_safe<T, float, values_per_thread, 4>(x2, x_thread, remaining);
     for (int row = 0; row < results_per_simdgroup; row++) {
-      result2[row] += qdot_affine4_registered_word<float, values_per_thread>(
+      result2[row] += qdot_affine4_registered_word_loop<
+          float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
   }
@@ -4085,7 +4138,7 @@ template <typename T, int group_size, int bits>
       const device T* run_x3 = x +
           lhs_indices[(assignment + 3) * (uint)lhs_strides[0]] * x_strides[0];
       device T* run_y3 = y + (assignment + 3) * out_vec_size;
-      qmv_affine4_g64_quad_stream_impl<T, group_size, bits>(
+      qmv_affine4_g64_quad_stream_impl<T, group_size, bits, true>(
           run_w,
           run_scales,
           run_biases,

@@ -102,8 +102,29 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
         // stock 50 MiB MLX default. overwrite=0 left that in place and the
         // 512 MiB post-wire budget never landed. overwrite=1 makes the
         // promoted Laguna M5-Max command-buffer profile actually apply.
-        setenv("MLX_MAX_MB_PER_BUFFER", "512", 1)
-        setenv("MLX_MAX_OPS_PER_BUFFER", "50", 1)
+        // CMDBUF-400 (2026-08-31). Releve de 50 a 400 sur receipt mesure.
+        // `asyncEval` encode le step entier sur le thread appelant et MLX
+        // bloque au-dela de 10 command buffers en vol; a 50 ops/buffer le step
+        // B=8 en emet ~30 contre cette fenetre de 10, donc il paie de la
+        // contre-pression hote. ABBA entrelace GPU libre, 8 runs par bras:
+        // p50 13.607 ms a 50 contre 13.549 a 200, Mann-Whitney U=3 (sommes de
+        // rangs 97 vs 39, attendu 68) => p < 0.05. Le balayage 200/400/800 est
+        // un PLATEAU (13.569 / 13.550 / 13.583), conforme a l'explication par
+        // la fenetre de blocage; 400 est au milieu du plateau avec la
+        // dispersion la plus serree (0.16%). Vaut ~-0.43% decode = +0.32%
+        // composite. Pur ordonnancement: aucune operation flottante ajoutee,
+        // retiree ni reordonnee, donc la presomption box sur les nouveaux
+        // chemins flottants ne s'y applique pas.
+        //
+        // ECHAPPATOIRE DE MESURE (par defaut inerte). Le force-set ci-dessous
+        // utilise overwrite=1, donc un operateur qui balaie la variable depuis
+        // le shell parent etait ECRASE en silence et mesurait deux bras
+        // identiques. Avec MLXFAST_ALLOW_CMDBUF_OVERRIDE=1 une valeur
+        // explicitement exportee est respectee.
+        let allowOverride = environment["MLXFAST_ALLOW_CMDBUF_OVERRIDE"]
+            .map { ["1", "true", "yes", "on"].contains($0.lowercased()) } ?? false
+        setenv("MLX_MAX_MB_PER_BUFFER", "512", allowOverride && environment["MLX_MAX_MB_PER_BUFFER"] != nil ? 0 : 1)
+        setenv("MLX_MAX_OPS_PER_BUFFER", "400", allowOverride && environment["MLX_MAX_OPS_PER_BUFFER"] != nil ? 0 : 1)
     }
 
     public static func resolve(

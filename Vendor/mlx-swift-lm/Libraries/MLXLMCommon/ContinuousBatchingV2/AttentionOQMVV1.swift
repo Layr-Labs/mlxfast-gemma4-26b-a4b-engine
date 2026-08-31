@@ -32,6 +32,13 @@ public enum CBv2AttentionOQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    public static let laneSumsEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ATTN_O_LANE_SUMS"]
+        else { return false }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let batch = 8
     private static let sequence = 1
     private static let outputWidth = 2816
@@ -333,6 +340,95 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
         header: mma8KernelHeader,
         ensureRowContiguous: true)
 
+    /// Precomputed run-sum reduction for attention o_proj.
+    private static let attentionOLaneSumKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_attention_o_mma8_lane_sums_v1",
+        inputNames: ["x"],
+        outputNames: ["laneSums"],
+        source: """
+            const uint lane = thread_index_in_simdgroup;
+            const int g = int(threadgroup_position_in_grid.y);
+            const int K = x_shape[x_ndim - 1];
+            const mma8_coord c = mma8_lane(lane);
+            const device T* x0 = x + c.fn * K + 8 * c.fm;
+            const device T* x1 = x0 + K;
+            const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+            const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+            float2 rs = float2(mma8_runsum4<T>(r0), mma8_runsum4<T>(r1));
+            rs += simd_shuffle_xor(rs, 2u);
+            rs += simd_shuffle_xor(rs, 4u);
+            rs += simd_shuffle_xor(rs, 16u);
+            ((device float2*)laneSums)[g * 32 + lane] = rs;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
+    private static let mma8LaneSumHeader: String = {
+        var result = mma8KernelHeader
+        func replaceOnce(_ old: String, with new: String) {
+            precondition(result.components(separatedBy: old).count == 2)
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        replaceOnce(
+            "attention_o_qmv_mma8_affine4_g64_impl(",
+            with: "attention_o_qmv_mma8_affine4_g64_lane_sums_impl(")
+        replaceOnce(
+            """
+                const device T* x,
+                device T* y,
+            """,
+            with: """
+                const device T* x,
+                const device float2* laneSums,
+                device T* y,
+            """)
+        replaceOnce(
+            """
+                float2 rs = float2(mma8_runsum4<T>(r0), mma8_runsum4<T>(r1));
+                rs += simd_shuffle_xor(rs, 2u);
+                rs += simd_shuffle_xor(rs, 4u);
+                rs += simd_shuffle_xor(rs, 16u);
+            """,
+            with: """
+                const float2 rs = laneSums[g * 32 + simd_lid];
+            """)
+        return result
+    }()
+
+    private static let mma8LaneSumKernelK4096 = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_lane_sums_unroll_v1",
+        inputNames: ["x", "w", "scales", "biases", "laneSums"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            attention_o_qmv_mma8_affine4_g64_lane_sums_impl<T, 2, 4096>(
+                w, scales, biases, x, (const device float2*)laneSums, y,
+                w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8LaneSumHeader,
+        ensureRowContiguous: true)
+
+    private static let mma8LaneSumKernelK8192 = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_lane_sums_unroll_v1",
+        inputNames: ["x", "w", "scales", "biases", "laneSums"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            attention_o_qmv_mma8_affine4_g64_lane_sums_impl<T, 2, 8192>(
+                w, scales, biases, x, (const device float2*)laneSums, y,
+                w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8LaneSumHeader,
+        ensureRowContiguous: true)
+
     private static let qmvKernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_affine4_g64_tight_v1",
         inputNames: ["x", "w", "scales", "biases"],
@@ -392,6 +488,26 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
             // streamed once per round instead of four times. Grid is in
             // threads: (32, 2, 1) threads per group, N/8 groups along y.
             let yTiles = outputWidth / outputsPerGroup
+            if laneSumsEnabled {
+                let groups = inDim / Self.groupSize
+                let laneSums = attentionOLaneSumKernel(
+                    [x],
+                    template: [("T", x.dtype)],
+                    grid: (simdWidth, groups, 1),
+                    threadGroup: (simdWidth, 1, 1),
+                    outputShapes: [[groups, simdWidth, 2]],
+                    outputDTypes: [.float32]
+                )[0]
+                let kernel = inDim == 8192 ? mma8LaneSumKernelK8192 : mma8LaneSumKernelK4096
+                return kernel(
+                    [x, weight, scales, biases, laneSums],
+                    template: [("T", x.dtype)],
+                    grid: (simdWidth, yTiles * simdGroups, 1),
+                    threadGroup: (simdWidth, simdGroups, 1),
+                    outputShapes: [[batch, sequence, outputWidth]],
+                    outputDTypes: [x.dtype]
+                )[0]
+            }
             let kernel = inDim == 8192 ? mma8KernelK8192 : mma8KernelK4096
             return kernel(
                 [x, weight, scales, biases],

@@ -108,6 +108,16 @@ public enum Gemma4MMAQuantizedGEMV {
         default: return true
         }
     }()
+    /// Share each packed weight word across the four lanes that own one
+    /// output-row fragment. The v27 scalar-word fallback remains available
+    /// through `DARKBLOOM_GEMMA4_MMA_HEAD_WEIGHT_BROADCAST=0`.
+    private static let weightBroadcastEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MMA_HEAD_WEIGHT_BROADCAST"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }()
 
     /// Which staging/MMA formulation runs. `DARKBLOOM_GEMMA4_MMA_HEAD_VERSION`
     /// is `1` for the fp32 scale-folded kernel, `2` for the bf16-operand kernel
@@ -2573,6 +2583,105 @@ public enum Gemma4MMAQuantizedGEMV {
         ensureRowContiguous: true
     )
 
+    // MARK: - Version 28 --- SIMD-shared packed words
+
+    /// Each four-lane output-row fragment used to fetch the same eight packed
+    /// words independently. Give each lane one word from the low half and one
+    /// from the high half, then broadcast the selected word when the eight
+    /// code slices consume it. The uint values and the nibble extraction stay
+    /// unchanged; only redundant device-load issue is removed.
+    private static let sourceV28: String = {
+        var result = sourceV27
+
+        func replaceOnce(_ old: String, with new: String) {
+            let count = result.components(separatedBy: old).count
+            precondition(count == 2, "sourceV28 replacement count \(count): \(old)")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+
+        replaceOnce(
+            """
+                const uint packedWord0 =
+                    (sgN0 + fragmentRow) * W_ROW_U32 + g * (GROUP / 8);
+                const uint packedTileStride = N_PSG * W_ROW_U32;
+                const device uint4* packedGroup =
+                    reinterpret_cast<const device uint4*>(w + packedWord0);
+                const uint4 packedLo0 = packedGroup[0];
+                const uint4 packedHi0 = packedGroup[1];
+                packedGroup = reinterpret_cast<const device uint4*>(
+                    w + packedWord0 + packedTileStride);
+                const uint4 packedLo1 = packedGroup[0];
+                const uint4 packedHi1 = packedGroup[1];
+                packedGroup = reinterpret_cast<const device uint4*>(
+                    w + packedWord0 + packedTileStride * 2);
+                const uint4 packedLo2 = packedGroup[0];
+                const uint4 packedHi2 = packedGroup[1];
+                packedGroup = reinterpret_cast<const device uint4*>(
+                    w + packedWord0 + packedTileStride * 3);
+                const uint4 packedLo3 = packedGroup[0];
+                const uint4 packedHi3 = packedGroup[1];
+            """,
+            with: """
+                const uint packedWord0 =
+                    (sgN0 + fragmentRow) * W_ROW_U32 + g * (GROUP / 8);
+                const uint packedTileStride = N_PSG * W_ROW_U32;
+                const uint packedWordIndex = fragmentCol >> 1u;
+                const uint packedRowLane =
+                    ((fragmentRow & 3u) << 1u) + ((fragmentRow & 4u) << 2u);
+                const device uint32_t* packedRow0 =
+                    w + packedWord0;
+                const uint packedLo0 = packedRow0[packedWordIndex];
+                const uint packedHi0 = packedRow0[4 + packedWordIndex];
+                const device uint32_t* packedRow1 =
+                    w + packedWord0 + packedTileStride;
+                const uint packedLo1 = packedRow1[packedWordIndex];
+                const uint packedHi1 = packedRow1[4 + packedWordIndex];
+                const device uint32_t* packedRow2 =
+                    w + packedWord0 + packedTileStride * 2;
+                const uint packedLo2 = packedRow2[packedWordIndex];
+                const uint packedHi2 = packedRow2[4 + packedWordIndex];
+                const device uint32_t* packedRow3 =
+                    w + packedWord0 + packedTileStride * 3;
+                const uint packedLo3 = packedRow3[packedWordIndex];
+                const uint packedHi3 = packedRow3[4 + packedWordIndex];
+            """
+        )
+        replaceOnce(
+            """
+                    const uint packed0 = t < 4 ? packedLo0[t] : packedHi0[t - 4];
+                    const uint packed1 = t < 4 ? packedLo1[t] : packedHi1[t - 4];
+                    const uint packed2 = t < 4 ? packedLo2[t] : packedHi2[t - 4];
+                    const uint packed3 = t < 4 ? packedLo3[t] : packedHi3[t - 4];
+            """,
+            with: """
+                    const ushort packedSourceLane = ushort(
+                        packedRowLane + (t & 1u) + ((t & 2u) << 2u));
+                    const uint packed0 = t < 4
+                        ? simd_broadcast(packedLo0, packedSourceLane)
+                        : simd_broadcast(packedHi0, packedSourceLane);
+                    const uint packed1 = t < 4
+                        ? simd_broadcast(packedLo1, packedSourceLane)
+                        : simd_broadcast(packedHi1, packedSourceLane);
+                    const uint packed2 = t < 4
+                        ? simd_broadcast(packedLo2, packedSourceLane)
+                        : simd_broadcast(packedHi2, packedSourceLane);
+                    const uint packed3 = t < 4
+                        ? simd_broadcast(packedLo3, packedSourceLane)
+                        : simd_broadcast(packedHi3, packedSourceLane);
+            """
+        )
+        return result
+    }()
+
+    private static let kernelV28: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_affine4_qmv_m8_v28_weight_broadcast",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["out"],
+        source: sourceV28,
+        header: "#include <metal_simdgroup_matrix>\n",
+        ensureRowContiguous: true
+    )
+
     /// Tied-head GEMV, or `nil` when any gate above fails.
     ///
     /// - Parameters:
@@ -2644,7 +2753,7 @@ public enum Gemma4MMAQuantizedGEMV {
                 )[0]
             }
             switch version {
-            case 27: selected = kernelV27
+            case 27: selected = weightBroadcastEnabled ? kernelV28 : kernelV27
             case 26: selected = kernelV26
             case 16: selected = kernelV16
             case 15: selected = kernelV15
@@ -2658,6 +2767,9 @@ public enum Gemma4MMAQuantizedGEMV {
             case 7: selected = kernelV7
             case 6: selected = kernelV6
             default: selected = kernelV5
+            }
+            if version == 27 && weightBroadcastEnabled {
+                CBv2EngageMark.once("gemma4-mma-head-weight-broadcast")
             }
             inputs = [flatX, w, scales, biases, xSums]
         case 4:

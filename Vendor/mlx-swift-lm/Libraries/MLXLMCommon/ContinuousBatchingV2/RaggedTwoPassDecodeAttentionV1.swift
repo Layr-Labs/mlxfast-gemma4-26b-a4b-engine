@@ -616,7 +616,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         MLXFast.metalKernel(
             name:
                 "cbv2_ragged8_ringwrite_sdpa_2pass_a_gqapair_vec4_bf16_d256_g2"
-                + "_b\(blocks)_v1",
+                + "_b\(blocks)_exphalf_v2",
             inputNames: [
                 "queries",
                 "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -737,14 +737,23 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     score_lo = simd_sum(score_lo);
                     score_hi = simd_sum(score_hi);
 
-                    const float new_max_lo = max(max_lo, score_lo);
-                    const float new_max_hi = max(max_hi, score_hi);
-                    const float old_factor_lo = fast::exp(max_lo - new_max_lo);
-                    const float old_factor_hi = fast::exp(max_hi - new_max_hi);
-                    const float score_factor_lo = fast::exp(score_lo - new_max_lo);
-                    const float score_factor_hi = fast::exp(score_hi - new_max_hi);
-                    max_lo = new_max_lo;
-                    max_hi = new_max_hi;
+                    // EXPHALF-001: `new_max` is `max(old_max, score)`, so one
+                    // of `old_max - new_max` and `score - new_max` is exactly
+                    // zero every token and the other is `-|score - old_max|`.
+                    // `fast::exp` of a zero is exactly `1.0f`, so one of the two
+                    // exponentials per head is a known constant. Compute the
+                    // single non-trivial one and place it with a select on
+                    // which side moved.
+                    const bool score_leads_lo = score_lo > max_lo;
+                    const bool score_leads_hi = score_hi > max_hi;
+                    const float shrink_lo = fast::exp(-fabs(score_lo - max_lo));
+                    const float shrink_hi = fast::exp(-fabs(score_hi - max_hi));
+                    const float old_factor_lo = score_leads_lo ? shrink_lo : 1.0f;
+                    const float old_factor_hi = score_leads_hi ? shrink_hi : 1.0f;
+                    const float score_factor_lo = score_leads_lo ? 1.0f : shrink_lo;
+                    const float score_factor_hi = score_leads_hi ? 1.0f : shrink_hi;
+                    max_lo = max(max_lo, score_lo);
+                    max_hi = max(max_hi, score_hi);
                     sum_lo = sum_lo * old_factor_lo + score_factor_lo;
                     sum_hi = sum_hi * old_factor_hi + score_factor_hi;
                     #pragma clang loop unroll(full)

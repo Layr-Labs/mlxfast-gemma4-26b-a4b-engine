@@ -3922,6 +3922,124 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   }
 }
 
+// KERN-GATEUP-TILE: span-two y strip-walk for the K=2816, N=704 expert
+// gate/up planes.  This is the incumbent RUN-QUAD election lifted outside the
+// y loop: route-word decoding, run boundaries and the selected single/pair/
+// triple/quad implementation are unchanged; each survivor simply invokes that
+// same implementation for two consecutive original tid.y values.
+template <typename T, int group_size, int bits>
+METAL_FUNC void gather_qmv_gemma4_gateup_tile(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    const device uint32_t* lhs_indices,
+    const device uint32_t* rhs_indices,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const uint lhs_stride,
+    const uint rhs_stride,
+    const int64_t x_stride,
+    const int64_t w_stride,
+    const int64_t s_stride,
+    const int64_t b_stride,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int tile_span = 2;
+  if (tid.y % uint(tile_span) != 0u) {
+    return;
+  }
+  const uint assignment = tid.z;
+  const uint32_t route_word = rhs_indices[assignment * rhs_stride];
+  const bool prefix_bounds = (route_word & 0x80000000u) != 0u;
+  const uint32_t expert = prefix_bounds ? (route_word & 0xffu) : route_word;
+  uint run_offset = 0;
+  if (prefix_bounds) {
+    run_offset = (route_word >> 8) & 0x3fu;
+  } else {
+    for (uint prior = assignment; prior > 0; --prior) {
+      if (rhs_indices[(prior - 1) * rhs_stride] != expert) {
+        break;
+      }
+      run_offset++;
+    }
+  }
+  if ((run_offset & 3u) != 0u) {
+    return;
+  }
+  uint run_len = 1;
+  if (prefix_bounds) {
+    run_len = min(4u, ((route_word >> 14) & 0x3fu) + 1u);
+  } else {
+    while (run_len < 4u && assignment + run_len < 64u &&
+           rhs_indices[(assignment + run_len) * rhs_stride] == expert) {
+      run_len++;
+    }
+  }
+
+  const device uint32_t* run_w = w + expert * w_stride;
+  const device T* run_scales = scales + expert * s_stride;
+  const device T* run_biases = biases + expert * b_stride;
+  const device T* run_x0 =
+      x + lhs_indices[assignment * lhs_stride] * x_stride;
+  device T* run_y0 = y + assignment * out_vec_size;
+
+  if (run_len == 1u) {
+    for (int t = 0; t < tile_span; ++t) {
+      uint3 tile_tid = tid;
+      tile_tid.y = tid.y + uint(t);
+      qmv_impl<T, group_size, bits>(
+          run_w, run_scales, run_biases, run_x0, run_y0,
+          in_vec_size, out_vec_size, tile_tid, simd_gid, simd_lid);
+    }
+    return;
+  }
+
+  const device T* run_x1 =
+      x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
+  device T* run_y1 = y + (assignment + 1) * out_vec_size;
+  if (run_len == 2u) {
+    for (int t = 0; t < tile_span; ++t) {
+      uint3 tile_tid = tid;
+      tile_tid.y = tid.y + uint(t);
+      qmv_affine4_g64_pair_impl<T, group_size, bits>(
+          run_w, run_scales, run_biases, run_x0, run_x1, run_y0, run_y1,
+          in_vec_size, tile_tid, simd_gid, simd_lid);
+    }
+    return;
+  }
+
+  const device T* run_x2 =
+      x + lhs_indices[(assignment + 2) * lhs_stride] * x_stride;
+  device T* run_y2 = y + (assignment + 2) * out_vec_size;
+  if (run_len == 3u) {
+    for (int t = 0; t < tile_span; ++t) {
+      uint3 tile_tid = tid;
+      tile_tid.y = tid.y + uint(t);
+      qmv_affine4_g64_triple_stream_impl<T, group_size, bits>(
+          run_w, run_scales, run_biases,
+          run_x0, run_x1, run_x2, run_y0, run_y1, run_y2,
+          in_vec_size, tile_tid, simd_gid, simd_lid);
+    }
+    return;
+  }
+
+  const device T* run_x3 =
+      x + lhs_indices[(assignment + 3) * lhs_stride] * x_stride;
+  device T* run_y3 = y + (assignment + 3) * out_vec_size;
+  for (int t = 0; t < tile_span; ++t) {
+    uint3 tile_tid = tid;
+    tile_tid.y = tid.y + uint(t);
+    qmv_affine4_g64_quad_stream_impl<T, group_size, bits>(
+        run_w, run_scales, run_biases,
+        run_x0, run_x1, run_x2, run_x3,
+        run_y0, run_y1, run_y2, run_y3,
+        in_vec_size, tile_tid, simd_gid, simd_lid);
+  }
+}
+
 template <typename T, int group_size, int bits>
 [[kernel]] void affine_gather_qmv(
     const device uint32_t* w [[buffer(0)]],
@@ -3955,6 +4073,16 @@ template <typename T, int group_size, int bits>
       ((in_vec_size == 2816 && out_vec_size == 704) ||
        (in_vec_size == 704 && out_vec_size == 2816));
   if (gemma4_pair_geometry) {
+    constexpr bool gemma4_gateup_tile = true;
+    if (gemma4_gateup_tile && in_vec_size == 2816 && out_vec_size == 704) {
+      gather_qmv_gemma4_gateup_tile<T, group_size, bits>(
+          w, scales, biases, x, lhs_indices, rhs_indices, y,
+          in_vec_size, out_vec_size,
+          (uint)lhs_strides[0], (uint)rhs_strides[0],
+          x_strides[0], w_strides[0], s_strides[0], b_strides[0],
+          tid, simd_gid, simd_lid);
+      return;
+    }
     // KERN-DOWN-TILE gate (strip-walk pattern): compile-time flip; ON
     // here -- the K = 704 down plane takes the y-tile-coarsened arm above.
     // Flip to false to return every plane to the incumbent per-y-group

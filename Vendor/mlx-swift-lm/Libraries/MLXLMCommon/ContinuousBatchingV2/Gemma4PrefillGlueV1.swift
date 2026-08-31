@@ -219,6 +219,87 @@ public enum Gemma4PrefillGlueV1 {
         )[0]
     }
 
+    // MARK: - PLE norm + residual + layer scalar (3 dispatches -> 1)
+
+    private static let pleResidualScaleEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PLE_RESIDUAL_SCALE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let normResidualScaleKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_glue_norm_residual_scale_2816_bf16_v1",
+            inputNames: ["x", "w", "res", "s"],
+            outputNames: ["out"],
+            source: """
+                threadgroup float local_sums[32];
+                threadgroup float local_inv[1];
+
+                const uint row = threadgroup_position_in_grid.y;
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint simd_lane_id = thread_index_in_simdgroup;
+                const uint simd_group_id = simdgroup_index_in_threadgroup;
+                const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+
+                float xv[GLUE_NREADS];
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    xv[i] = static_cast<float>(x[base + i]);
+                }
+                const float inv = glue_inv_rms(
+                    xv, local_sums, local_inv,
+                    simd_lane_id, simd_group_id, GLUE_EPS);
+                const T scalar = s[0];
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    const uint j = lid * GLUE_NREADS + i;
+                    const T normed = static_cast<T>(
+                        w[j] * static_cast<T>(xv[i] * inv));
+                    // Stock materializes both the norm output and residual
+                    // sum as BF16 before the terminal scalar multiply.
+                    const T summed = res[base + i] + normed;
+                    out[base + i] = summed * scalar;
+                }
+                """,
+            header: kernelHeader,
+            ensureRowContiguous: true)
+
+    /// Exact production B=8 PLE tail:
+    /// `(residual + rmsNorm(x, weight)) * layerScalar`.
+    public static func normResidualScale(
+        x: MLXArray,
+        weight: MLXArray,
+        residual: MLXArray,
+        layerScalar: MLXArray,
+        eps epsIn: Float
+    ) -> MLXArray? {
+        guard pleResidualScaleEnabled,
+            epsIn == eps,
+            x.dtype == .bfloat16,
+            x.ndim == 3,
+            x.dim(0) == 8,
+            x.dim(1) >= 1,
+            x.dim(2) == axis,
+            weight.dtype == x.dtype,
+            weight.ndim == 1,
+            weight.dim(0) == axis,
+            residual.shape == x.shape,
+            residual.dtype == x.dtype,
+            layerScalar.dtype == x.dtype,
+            layerScalar.size == 1
+        else { return nil }
+
+        let rows = x.dim(0) * x.dim(1)
+        return normResidualScaleKernel(
+            [x, weight, residual, layerScalar],
+            template: [("T", x.dtype)],
+            grid: (threadsPerRow, rows, 1),
+            threadGroup: (threadsPerRow, 1, 1),
+            outputShapes: [x.shape],
+            outputDTypes: [x.dtype]
+        )[0]
+    }
+
     // MARK: - dual pre-norm (2 dispatches -> 1)
 
     private static let dualPreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(

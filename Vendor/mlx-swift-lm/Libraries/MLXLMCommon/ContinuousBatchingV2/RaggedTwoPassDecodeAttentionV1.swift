@@ -255,6 +255,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
 
             thread float q[values_per_lane];
             thread float accumulator[values_per_lane];
+            #pragma clang loop unroll(full)
             for (int element = 0; element < values_per_lane; ++element) {
                 q[element] = 1.0f * float(query[element]);
                 accumulator[element] = 0.0f;
@@ -266,6 +267,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 const device T* k = keys + slot * D;
                 const device T* v = values + slot * D;
                 float score = 0.0f;
+                #pragma clang loop unroll(full)
                 for (int element = 0; element < values_per_lane; ++element) {
                     score += q[element] * float(k[element]);
                 }
@@ -276,6 +278,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 const float score_factor = fast::exp(score - new_max);
                 max_score = new_max;
                 sum_exp_score = sum_exp_score * old_factor + score_factor;
+                #pragma clang loop unroll(full)
                 for (int element = 0; element < values_per_lane; ++element) {
                     accumulator[element] = accumulator[element] * old_factor
                         + score_factor * float(v[element]);
@@ -288,6 +291,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 sum_out[0] = sum_exp_score;
                 max_out[0] = max_score;
             }
+            #pragma clang loop unroll(full)
             for (int element = 0; element < values_per_lane; ++element) {
                 partial[element] = T(accumulator[element]);
             }

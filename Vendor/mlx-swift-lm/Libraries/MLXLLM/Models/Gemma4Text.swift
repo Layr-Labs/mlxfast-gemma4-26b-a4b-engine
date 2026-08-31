@@ -5453,5 +5453,76 @@ extension Gemma4TextModel: CBv2MTPForwardable {
     }
 }
 
-// Ranked resample marker 2: this archive is a further ranked sample of the tree carried
-// by the preceding ranked submission of this content apart from any rotation item declared in its note.
+// MARK: - LGH-001 --- logitsless greedy head
+
+/// Cross-check every fused token against the logits the stock chain would have
+/// produced. Costs a host sync per step, so it is a diagnostic, never a mode
+/// the benchmark runs in.
+private let gemma4LogitslessHeadVerify: Bool = gemma4TruthyFlag(
+    ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_LOGITSLESS_HEAD_VERIFY"])
+
+/// The tied head can answer the chained decode step with token ids alone.
+///
+/// The values the fused kernel compares are the bf16 the MMA head would have
+/// stored, and the final softcap `tanh(x / c) * c` is strictly increasing for
+/// every `c >= 0`, so the fused top-1 is the stock argmax including its
+/// first-index-wins tie rule. See `Gemma4MMAQuantizedGEMV.applyArgmax`.
+extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
+
+    public func cbv2AdmitsArgmaxDecode(_ tokens: MLXArray) -> Bool {
+        guard tokens.ndim == 2, tokens.dim(1) == 1 else { return false }
+        guard config.finalLogitSoftcapping >= 0 else { return false }
+        guard lmHead == nil,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.mode == .affine
+        else { return false }
+        return Gemma4MMAQuantizedGEMV.admitsArgmax(
+            x: [tokens.dim(0), 1, config.hiddenSize],
+            xDType: .bfloat16,
+            w: quantized.weight,
+            scales: quantized.scales,
+            biases: quantized.biases,
+            groupSize: quantized.groupSize,
+            bits: quantized.bits)
+    }
+
+    public func cbv2DecodeArgmax(_ tokens: MLXArray, caches: [KVCache]) -> MLXArray {
+        let hidden = model(tokens, cache: caches)
+        let rows = tokens.dim(0)
+        guard lmHead == nil,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.mode == .affine,
+            let fused = Gemma4MMAQuantizedGEMV.applyArgmax(
+                x: hidden,
+                w: quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                groupSize: quantized.groupSize,
+                bits: quantized.bits)
+        else {
+            return applyLMHead(hidden).argMax(axis: -1).asType(.int32).reshaped([rows])
+        }
+        CBv2EngageMark.once("logitsless-greedy-head")
+        if gemma4LogitslessHeadVerify {
+            let stock = applyLMHead(hidden).argMax(axis: -1).asType(.int32).reshaped([rows])
+            let disagreements = sum(notEqual(fused, stock)).item(Int.self)
+            // The one place the fused comparison could diverge is a softcap
+            // that maps two DISTINCT stored bf16 logits onto one float; that
+            // needs |logit| in the hundreds, so the observed peak is the
+            // margin. Reported alongside every verified step.
+            let raw = Gemma4MMAQuantizedGEMV.apply(
+                x: hidden, w: quantized.weight, scales: quantized.scales,
+                biases: quantized.biases, groupSize: quantized.groupSize,
+                bits: quantized.bits)!
+            let peak = max(abs(raw.asType(.float32))).item(Float.self)
+            let report =
+                "[lgh] verify mismatch=\(disagreements) max_abs_logit=\(peak)"
+                + (disagreements == 0
+                    ? "\n"
+                    : " fused=\(fused.asArray(Int32.self)) "
+                        + "stock=\(stock.asArray(Int32.self))\n")
+            FileHandle.standardError.write(Data(report.utf8))
+        }
+        return fused
+    }
+}

@@ -84,9 +84,11 @@ enum CBv2ParallelArgMaxV1 {
 
             CBv2ArgMaxPairV1 best = {0u, Limits<float>::min};
             for (uint offset = lid * 4; offset < TILE_SIZE; offset += 256 * 4) {
+                const vec<T, 4> vals = *reinterpret_cast<const device vec<T, 4>*>(logits + row_base + tile_base + offset);
+                #pragma clang loop unroll(full)
                 for (uint i = 0; i < 4; ++i) {
                     const uint index = tile_base + offset + i;
-                    const float value = float(logits[row_base + index]);
+                    const float value = float(vals[i]);
                     // Classify NaNs by bits so fast-math cannot discard the
                     // stock rule that an unordered comparison never wins.
                     const bool is_nan =

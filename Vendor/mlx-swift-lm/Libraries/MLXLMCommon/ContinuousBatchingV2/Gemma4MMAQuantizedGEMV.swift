@@ -109,6 +109,17 @@ public enum Gemma4MMAQuantizedGEMV {
         }
     }()
 
+    /// HEAD-TILE-ARGMAX-SG kill switch. Unset or 1 = enabled, 0 = disabled.
+    public static let directGreedyTop1Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_DIRECT_GREEDY_TOP1"]
+        else { return true }
+        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "0", "false", "no", "off": return false
+        default: return true
+        }
+    }()
+
     /// Which staging/MMA formulation runs. `DARKBLOOM_GEMMA4_MMA_HEAD_VERSION`
     /// is `1` for the fp32 scale-folded kernel, `2` for the bf16-operand kernel
     /// with a per-group diagonal rescale, and `3` for the bf16-operand kernel
@@ -2573,6 +2584,185 @@ public enum Gemma4MMAQuantizedGEMV {
         ensureRowContiguous: true
     )
 
+    // MARK: - HEAD-TILE-ARGMAX-SG --- register-local direct top-1
+
+    /// Promoted argmax semantics: exclude NaNs, prefer the greater value,
+    /// break exact ties toward the smaller vocabulary index, and retain the
+    /// index-zero/-infinity sentinel when no candidate wins.
+    private static let argmaxPairHeader = """
+        struct CBv2ArgMaxPairV1 {
+            uint index;
+            float value;
+        };
+
+        inline CBv2ArgMaxPairV1 cbv2_argmax_choose_v1(
+            CBv2ArgMaxPairV1 best, CBv2ArgMaxPairV1 current) {
+            if (best.value < current.value ||
+                (best.value == current.value && best.index > current.index)) {
+                return current;
+            }
+            return best;
+        }
+
+        inline bool cbv2_argmax_is_nan_v1(float value) {
+            return (as_type<uint>(value) & 0x7fffffffu) > 0x7f800000u;
+        }
+
+        inline CBv2ArgMaxPairV1 cbv2_argmax_xor_v1(
+            CBv2ArgMaxPairV1 best, uint mask) {
+            CBv2ArgMaxPairV1 neighbor = {
+                simd_shuffle_xor(best.index, ushort(mask)),
+                simd_shuffle_xor(best.value, ushort(mask)),
+            };
+            return cbv2_argmax_choose_v1(best, neighbor);
+        }
+
+        inline CBv2ArgMaxPairV1 cbv2_argmax_simd_v1(CBv2ArgMaxPairV1 best) {
+            for (uint offset = 16; offset > 0; offset >>= 1) {
+                CBv2ArgMaxPairV1 neighbor = {
+                    simd_shuffle_down(best.index, ushort(offset)),
+                    simd_shuffle_down(best.value, ushort(offset)),
+                };
+                best = cbv2_argmax_choose_v1(best, neighbor);
+            }
+            return best;
+        }
+        """
+
+    /// The v27 arithmetic and BF16 output rounding are unchanged. Instead of
+    /// storing [8, N] logits, each lane first selects across its four output
+    /// fragments, then XOR masks 2/4/16 reduce the three lane bits that encode
+    /// `fragmentRow`. The four fragmentRow-zero lanes own two batch rows each.
+    private static let sourceV27Top1SG: String = {
+        var result = sourceV27
+
+        func replaceOnce(_ old: String, with new: String) {
+            let count = result.components(separatedBy: old).count
+            precondition(count == 2, "sourceV27Top1SG replacement count \(count): \(old)")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+
+        replaceOnce(
+            """
+            const uint outputN0 = sgN0 + fragmentRow;
+            const uint outputN1 = outputN0 + N_PSG;
+            const uint outputN2 = outputN0 + N_PSG * 2;
+            const uint outputN3 = outputN0 + N_PSG * 3;
+            out[fragmentCol * N + outputN0] = T(acc0.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN0] = T(acc0.thread_elements()[1]);
+            out[fragmentCol * N + outputN1] = T(acc1.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN1] = T(acc1.thread_elements()[1]);
+            out[fragmentCol * N + outputN2] = T(acc2.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN2] = T(acc2.thread_elements()[1]);
+            out[fragmentCol * N + outputN3] = T(acc3.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN3] = T(acc3.thread_elements()[1]);
+            """,
+            with: """
+            const uint outputN0 = sgN0 + fragmentRow;
+            const uint outputN1 = outputN0 + N_PSG;
+            const uint outputN2 = outputN0 + N_PSG * 2;
+            const uint outputN3 = outputN0 + N_PSG * 3;
+
+            CBv2ArgMaxPairV1 best0 = {0u, Limits<float>::min};
+            CBv2ArgMaxPairV1 best1 = {0u, Limits<float>::min};
+            float value0 = float(T(acc0.thread_elements()[0]));
+            float value1 = float(T(acc0.thread_elements()[1]));
+            if (!cbv2_argmax_is_nan_v1(value0)) {
+                CBv2ArgMaxPairV1 current = {outputN0, value0};
+                best0 = cbv2_argmax_choose_v1(best0, current);
+            }
+            if (!cbv2_argmax_is_nan_v1(value1)) {
+                CBv2ArgMaxPairV1 current = {outputN0, value1};
+                best1 = cbv2_argmax_choose_v1(best1, current);
+            }
+
+            value0 = float(T(acc1.thread_elements()[0]));
+            value1 = float(T(acc1.thread_elements()[1]));
+            if (!cbv2_argmax_is_nan_v1(value0)) {
+                CBv2ArgMaxPairV1 current = {outputN1, value0};
+                best0 = cbv2_argmax_choose_v1(best0, current);
+            }
+            if (!cbv2_argmax_is_nan_v1(value1)) {
+                CBv2ArgMaxPairV1 current = {outputN1, value1};
+                best1 = cbv2_argmax_choose_v1(best1, current);
+            }
+
+            value0 = float(T(acc2.thread_elements()[0]));
+            value1 = float(T(acc2.thread_elements()[1]));
+            if (!cbv2_argmax_is_nan_v1(value0)) {
+                CBv2ArgMaxPairV1 current = {outputN2, value0};
+                best0 = cbv2_argmax_choose_v1(best0, current);
+            }
+            if (!cbv2_argmax_is_nan_v1(value1)) {
+                CBv2ArgMaxPairV1 current = {outputN2, value1};
+                best1 = cbv2_argmax_choose_v1(best1, current);
+            }
+
+            value0 = float(T(acc3.thread_elements()[0]));
+            value1 = float(T(acc3.thread_elements()[1]));
+            if (!cbv2_argmax_is_nan_v1(value0)) {
+                CBv2ArgMaxPairV1 current = {outputN3, value0};
+                best0 = cbv2_argmax_choose_v1(best0, current);
+            }
+            if (!cbv2_argmax_is_nan_v1(value1)) {
+                CBv2ArgMaxPairV1 current = {outputN3, value1};
+                best1 = cbv2_argmax_choose_v1(best1, current);
+            }
+
+            best0 = cbv2_argmax_xor_v1(best0, 2u);
+            best0 = cbv2_argmax_xor_v1(best0, 4u);
+            best0 = cbv2_argmax_xor_v1(best0, 16u);
+            best1 = cbv2_argmax_xor_v1(best1, 2u);
+            best1 = cbv2_argmax_xor_v1(best1, 4u);
+            best1 = cbv2_argmax_xor_v1(best1, 16u);
+
+            if (fragmentRow == 0u) {
+                const uint partial = tg * N_SG + sg;
+                partial_values[fragmentCol * TILES + partial] = best0.value;
+                partial_indices[fragmentCol * TILES + partial] = best0.index;
+                partial_values[(fragmentCol + 1) * TILES + partial] = best1.value;
+                partial_indices[(fragmentCol + 1) * TILES + partial] = best1.index;
+            }
+            """
+        )
+        return result
+    }()
+
+    private static let kernelV27Top1SG: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_affine4_qmv_m8_v27_sg_argmax_v2",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["partial_values", "partial_indices"],
+        source: sourceV27Top1SG,
+        header: "#include <metal_simdgroup_matrix>\n#include <metal_simdgroup>\n"
+            + argmaxPairHeader,
+        ensureRowContiguous: true
+    )
+
+    /// Byte-equivalent promoted finalizer over the compact [8, N/32] carrier.
+    private static let kernelHeadSGFinalize: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_head_sg_argmax_finalize_v1",
+        inputNames: ["partial_values", "partial_indices"],
+        outputNames: ["tokens"],
+        source: """
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lane = thread_index_in_simdgroup;
+            CBv2ArgMaxPairV1 best = {0u, Limits<float>::min};
+            for (uint tile = lane; tile < TILES; tile += 32) {
+                const uint offset = row * TILES + tile;
+                CBv2ArgMaxPairV1 current = {
+                    partial_indices[offset], partial_values[offset],
+                };
+                best = cbv2_argmax_choose_v1(best, current);
+            }
+            best = cbv2_argmax_simd_v1(best);
+            if (lane == 0) {
+                tokens[row] = int(best.index);
+            }
+            """,
+        header: "#include <metal_simdgroup>\n" + argmaxPairHeader,
+        ensureRowContiguous: true
+    )
+
     /// Tied-head GEMV, or `nil` when any gate above fails.
     ///
     /// - Parameters:
@@ -2682,5 +2872,106 @@ public enum Gemma4MMAQuantizedGEMV {
             outputDTypes: [x.dtype]
         )
         return outputs[0]
+    }
+
+    /// Weight-only admission checked before a model forward. Restricting the
+    /// fused path to v27 prevents an explicit legacy head-version selection
+    /// from silently running different arithmetic.
+    public static func applyTop1AdmitsWeights(
+        w: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int
+    ) -> Bool {
+        guard enabled, directGreedyTop1Enabled, version == 27 else { return false }
+        guard let biases else { return false }
+        guard groupSize == 64, bits == 4 else { return false }
+        guard scales.dtype == .bfloat16, biases.dtype == .bfloat16 else { return false }
+        guard w.dtype == .uint32 else { return false }
+        guard w.ndim == 2, scales.ndim == 2, biases.ndim == 2 else { return false }
+
+        let n = w.dim(0)
+        let selectedColsPerThreadgroup = colsPerThreadgroup * 4
+        guard n >= minOutputWidth, n % selectedColsPerThreadgroup == 0 else { return false }
+        let k = w.dim(1) * 32 / bits
+        guard k > 0, k % groupSize == 0, k % 8 == 0 else { return false }
+        guard scales.dim(0) == n, biases.dim(0) == n else { return false }
+        guard scales.dim(1) == k / groupSize, biases.dim(1) == k / groupSize else {
+            return false
+        }
+        return true
+    }
+
+    /// v27 tied-head GEMV with direct greedy top-1 reduction. Returns `[8]`
+    /// int32 token IDs, or nil so the caller can use incumbent full logits.
+    public static func applyTop1(
+        x: MLXArray,
+        w: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        activationSums: ActivationSums? = nil
+    ) -> MLXArray? {
+        guard applyTop1AdmitsWeights(
+            w: w, scales: scales, biases: biases,
+            groupSize: groupSize, bits: bits)
+        else { return nil }
+        guard let biases else { return nil }
+        guard x.dtype == .bfloat16 else { return nil }
+        guard x.ndim == 2 || (x.ndim == 3 && x.dim(1) == 1) else { return nil }
+        guard x.dim(0) == mRows else { return nil }
+        let k = x.dim(-1)
+        guard k > 0, x.size == mRows * k else { return nil }
+
+        let n = w.dim(0)
+        let selectedColsPerThreadgroup = colsPerThreadgroup * 4
+        guard k % groupSize == 0, k % 8 == 0 else { return nil }
+        guard w.dim(1) == k * bits / 32 else { return nil }
+
+        let flatX = x.reshaped([mRows, k])
+        let threadgroups = n / selectedColsPerThreadgroup
+        let sumCells = mRows * (k / groupSize)
+        let xSums: MLXArray
+        if let activationSums,
+            activationSums.values.dtype == .float32,
+            activationSums.values.ndim == 1,
+            activationSums.values.size == sumCells
+        {
+            xSums = activationSums.values
+        } else {
+            let sumThreads = 128
+            let sumThreadgroups = (sumCells + sumThreads - 1) / sumThreads
+            xSums = xSumKernel(
+                [flatX],
+                template: [("T", x.dtype), ("K", k)],
+                grid: (sumThreadgroups * sumThreads, 1, 1),
+                threadGroup: (sumThreads, 1, 1),
+                outputShapes: [[sumCells]],
+                outputDTypes: [.float32]
+            )[0]
+        }
+
+        // Four simdgroups per 128-column threadgroup, so the compact carrier
+        // has N / 32 partials per row. Every element has exactly one writer.
+        let tiles = threadgroups * simdgroupsPerThreadgroup
+        let partials = kernelV27Top1SG(
+            [flatX, w, scales, biases, xSums],
+            template: [("T", x.dtype), ("K", k), ("N", n), ("TILES", tiles)],
+            grid: (threadgroups * threadsPerThreadgroup, 1, 1),
+            threadGroup: (threadsPerThreadgroup, 1, 1),
+            outputShapes: [[mRows, tiles], [mRows, tiles]],
+            outputDTypes: [.float32, .uint32]
+        )
+
+        return kernelHeadSGFinalize(
+            partials,
+            template: [("TILES", tiles)],
+            grid: (32, mRows, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[mRows]],
+            outputDTypes: [.int32]
+        )[0]
     }
 }

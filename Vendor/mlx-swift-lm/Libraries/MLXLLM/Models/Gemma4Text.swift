@@ -5011,6 +5011,88 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         return mma.reshaped(Array(hidden.shape.dropLast()) + [mma.dim(-1)])
     }
 
+    /// DIRECT-GREEDY-TOP1: in-kernel greedy top-1 reduction for the tied LM head.
+    @inline(__always)
+    private func tiedLMHeadMMATop1(
+        _ hidden: MLXArray,
+        activationSums: Gemma4MMAQuantizedGEMV.ActivationSums? = nil
+    ) -> MLXArray? {
+        guard lmHead == nil,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.mode == .affine,
+            let tokens = Gemma4MMAQuantizedGEMV.applyTop1(
+                x: hidden,
+                w: quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                groupSize: quantized.groupSize,
+                bits: quantized.bits,
+                activationSums: activationSums)
+        else { return nil }
+        return tokens
+    }
+
+    func applyLMHeadTop1(
+        _ hidden: MLXArray,
+        activationSums: Gemma4MMAQuantizedGEMV.ActivationSums? = nil
+    ) -> MLXArray? {
+        guard let tokens = tiedLMHeadMMATop1(
+            hidden, activationSums: activationSums)
+        else { return nil }
+        CBv2EngageMark.once("direct-greedy-top1")
+        return tokens
+    }
+
+    public func cbv2DecodeTop1(
+        inputs: MLXArray, cache: [KVCache]?
+    ) -> MLXArray? {
+        // Admission is decided before the forward. A nil returned after this
+        // guard would make the engine re-run the incumbent step and append
+        // every KV cache twice.
+        guard lmHead == nil,
+            inputs.ndim == 2,
+            inputs.dim(0) == 8,
+            inputs.dim(1) == 1,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.mode == .affine,
+            quantized.groupSize == 64,
+            quantized.bits == 4,
+            Gemma4MMAQuantizedGEMV.applyTop1AdmitsWeights(
+                w: quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                groupSize: quantized.groupSize,
+                bits: quantized.bits)
+        else { return nil }
+
+        // Past admission exactly one forward runs. Any x-dependent refusal
+        // resolves from the same hidden state through the incumbent head.
+        if Gemma4MMAQuantizedGEMV.consumesActivationSums {
+            let produced = model.callWithMMAHeadSums(inputs, cache: cache)
+            if let tokens = applyLMHeadTop1(
+                produced.postNorm, activationSums: produced.activationSums)
+            {
+                return tokens
+            }
+            return cbv2GreedyTokensFromHidden(
+                produced.postNorm, activationSums: produced.activationSums)
+        } else {
+            let hidden = model(inputs, cache: cache)
+            if let tokens = applyLMHeadTop1(hidden) { return tokens }
+            return cbv2GreedyTokensFromHidden(hidden)
+        }
+    }
+
+    /// Single-forward safety net for `cbv2DecodeTop1`.
+    private func cbv2GreedyTokensFromHidden(
+        _ hidden: MLXArray,
+        activationSums: Gemma4MMAQuantizedGEMV.ActivationSums? = nil
+    ) -> MLXArray {
+        let logits = applyLMHead(hidden, activationSums: activationSums)
+        return argMax(logits.reshaped([8, logits.dim(-1)]), axis: -1)
+            .asType(.int32)
+    }
+
     /// Apply the LM head (tied embedding or explicit `lm_head`) plus the
     /// configured final-logit softcap. Pure function of the post-norm hidden.
     /// LMH-001: tight-grid dispatch for the tied lm_head ordinary QMV.
@@ -5376,3 +5458,7 @@ extension Gemma4TextModel: CBv2MTPForwardable {
         return (applyLMHead(postNorm), preNorm)
     }
 }
+
+// MARK: - ContinuousBatchingV2 Direct Greedy Top-1 Decoding
+
+extension Gemma4TextModel: CBv2DirectGreedyTop1Forwardable {}

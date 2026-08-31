@@ -2425,7 +2425,7 @@ private enum Gemma4RouteGlueFoldV1 {
     }
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_route_finalists_rank_gluefold_v1",
+        name: "gemma4_route_finalists_rank_gluefold_rank_unroll_v2",
         inputNames: ["scores"],
         outputNames: ["indices", "row_order", "sorted_keys", "inverse_order"],
         source: """
@@ -2489,6 +2489,7 @@ private enum Gemma4RouteGlueFoldV1 {
                 const uint key_low = sel[lane];
                 const uint key_high = sel[32u + lane];
                 uint rank = 0;
+                #pragma unroll
                 for (uint source = 0; source < 32; ++source) {
                     const uint other_low = simd_broadcast(key_low, ushort(source));
                     rank += (other_low < key)

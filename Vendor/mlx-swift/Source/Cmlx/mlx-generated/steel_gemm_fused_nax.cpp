@@ -85,6 +85,38 @@ void gemm_epilogue(
   });
 }
 
+template <class NAXTile_t>
+void gemm_prefill_causal_bias_epilogue(
+    thread NAXTile_t& Dtile,
+    const constant GEMMParams* params,
+    const int row0,
+    const int col0) {
+  using V = typename NAXTile_t::elem_type;
+  using CFrag = typename NAXTile_t::NAXFrag_t;
+
+  constexpr short TM = NAXTile_t::kTileRows;
+  constexpr short TN = NAXTile_t::kTileCols;
+  constexpr short kElemsPerFrag = NAXTile_t::kElemsPerFrag;
+
+  const_for_loop<0, TM, 1>([&](auto mm) {
+    const_for_loop<0, TN, 1>([&](auto nn) {
+      thread auto& delems = Dtile.template frag_at<mm, nn>();
+
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < kElemsPerFrag; i++) {
+        const short2 sc = CFrag::get_coord(i);
+        const int row =
+            row0 + mm.value * CFrag::kFragRows + int(sc.y);
+        const int col =
+            col0 + nn.value * CFrag::kFragCols + int(sc.x);
+        const bool masked = col > (params->N - params->M) + row;
+        delems[i] += static_cast<V>(as_type<float>(
+            masked ? 0xFF7F0000u : 0x80000000u));
+      }
+    });
+  });
+}
+
 // clang-format off
 template <
     typename T,
@@ -115,6 +147,33 @@ template <
   // Exit early if out of bounds
   if (params->tiles_n <= tid_x || params->tiles_m <= tid_y) {
     return;
+  }
+
+  // The composed Gemma prefill path marks its causal addMM bias with the
+  // otherwise-impossible row stride N + 1. Refuse every other shape, layout,
+  // dtype, epilogue, and GQA batch signature before eliding C loads.
+  bool synthesize_prefill_causal_bias = false;
+  if constexpr (
+      metal::is_same_v<T, bfloat16_t> && !transpose_a && transpose_b) {
+    if (use_out_source && !do_axpby && has_batch && align_M && align_N &&
+        params->M == 128 && params->N >= 128 && params->N <= 1024 &&
+        params->N % 128 == 0 && (params->K == 256 || params->K == 512) &&
+        params->lda == params->K && params->ldb == params->K &&
+        params->ldd == params->N && addmm_params->ldc == params->N + 1 &&
+        addmm_params->fdc == 1 && params->batch_ndim == 2) {
+      const constant auto* A_bstrides = batch_strides;
+      const constant auto* B_bstrides = A_bstrides + 2;
+      const constant auto* C_bstrides = B_bstrides + 2;
+      const bool gqa_shape =
+          (batch_shape[0] == 64 && batch_shape[1] == 2) ||
+          (batch_shape[0] == 16 && batch_shape[1] == 8);
+      synthesize_prefill_causal_bias =
+          gqa_shape && A_bstrides[1] == int64_t(1024) * params->K &&
+          A_bstrides[0] == int64_t(batch_shape[1]) * A_bstrides[1] &&
+          B_bstrides[1] == 0 &&
+          B_bstrides[0] == int64_t(params->N) * params->K &&
+          C_bstrides[0] == 0 && C_bstrides[1] == 0;
+    }
   }
 
   // Adjust for batch
@@ -214,8 +273,20 @@ template <
             sgp_sm,
             sgp_sn);
         if (use_out_source) {
-          gemm_epilogue<kAlignedM.value, kAlignedN.value>(
-              Dtile, C, params, addmm_params, sgp_sm, sgp_sn);
+          if constexpr (
+              metal::is_same_v<T, bfloat16_t> &&
+              !transpose_a && transpose_b) {
+            if (synthesize_prefill_causal_bias) {
+              gemm_prefill_causal_bias_epilogue(
+                  Dtile, params, c_row + tm, c_col + tn);
+            } else {
+              gemm_epilogue<kAlignedM.value, kAlignedN.value>(
+                  Dtile, C, params, addmm_params, sgp_sm, sgp_sn);
+            }
+          } else {
+            gemm_epilogue<kAlignedM.value, kAlignedN.value>(
+                Dtile, C, params, addmm_params, sgp_sm, sgp_sn);
+          }
         }
         if constexpr (kAlignedM && kAlignedN) {
           Dtile.store(D, int(params->ldd));

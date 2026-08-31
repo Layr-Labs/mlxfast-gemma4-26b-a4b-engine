@@ -2382,6 +2382,172 @@ private enum Gemma4RouterFinalistsV1 {
     }
 }
 
+/// GLUE-FOLD (G2): merge the two ADJACENT single-threadgroup route glue
+/// stages of the pinned B=8 decode cell into one dispatch. On the incumbent
+/// chain the router scores feed `gemma4_router_finalists32_stable_bf16_v1`
+/// (top-8 selection, one 128-thread group per row) and its `[8, 8]` output
+/// then feeds the strictly-serial `mlx_lm_route_simd_rank_scatter_m8_u32_n64`
+/// launch inside `SwitchGLU.projectExperts` (the sorted route table). Both are
+/// launch-drain stages on the layer's DEPENDENT chain: the expert gathers
+/// cannot start until the rank scatter has drained. This kernel runs the
+/// identical selection network and the identical rank scatter back to back in
+/// ONE 1024-thread threadgroup (8 rows x 128 threads; the 64 selected keys
+/// are staged through threadgroup memory instead of a device round trip), so
+/// one whole dispatch and its barrier stage leave the dependent chain in every
+/// MoE layer of every decode step (x30/step).
+///
+/// Exactness by construction: every operation in both phases is integer or
+/// raw-bit work -- the comparator reads the unchanged BF16 score bits as a
+/// packed word exactly like the incumbent finalists kernel, the selection
+/// bitonic and the rank loop are copied verbatim (only the threadgroup-memory
+/// indexing gains a `row` offset), and no floating-point value is produced,
+/// re-associated or re-rounded anywhere. There is no accumulation and no
+/// reduction-tree change to reason about: outputs are bit-identical to the
+/// incumbent pair of kernels for every input. The staged `sel` array holds
+/// exactly the values the incumbent chain would have written to the `[8, 8]`
+/// indices buffer, and phase 2 reads them at the same flattened positions.
+///
+/// Fail-closed: any geometry other than the pinned decode cell, a disabled
+/// finalists stage, plan != 1, or the kill switch selects the incumbent
+/// two-dispatch chain unchanged. `DARKBLOOM_GEMMA4_GLUE_FOLD=0` is the kill
+/// switch (off = exact incumbent chain). Engage mark: `glue-fold`.
+private enum Gemma4RouteGlueFoldV1 {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_GLUE_FOLD"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    struct Fold {
+        let indices: MLXArray
+        let table: SwitchRouteTable
+    }
+
+    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_route_finalists_rank_gluefold_v1",
+        inputNames: ["scores"],
+        outputNames: ["indices", "row_order", "sorted_keys", "inverse_order"],
+        source: """
+            const uint tid = thread_position_in_threadgroup.x;
+            const uint row = tid / 128u;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint group = sg % 4u;
+            const uint expert = group * 32u + lane;
+            // Phase 1 -- the incumbent finalists32 selection, verbatim, with
+            // the per-row threadgroup slices offset by `row`. Pack the
+            // unchanged BF16 bits and the original expert index; comparisons
+            // retain native BF16 LessThan semantics.
+            uint item = (uint(bfloat16_to_uint16(scores[row * 128u + expert])) << 7)
+                | expert;
+            threadgroup uint finalists[256];
+            threadgroup uint sel[64];
+
+            for (uint width = 2u; width <= 32u; width <<= 1) {
+                for (uint stride = width >> 1; stride > 0u; stride >>= 1) {
+                    const uint other = simd_shuffle_xor(item, ushort(stride));
+                    const bool otherBefore = gemma4_finalists_before(other, item);
+                    const bool takeMinimum = ((lane & width) == 0u)
+                        == ((lane & stride) == 0u);
+                    if (takeMinimum ? otherBefore : !otherBefore) item = other;
+                }
+            }
+
+            if (lane >= 24u) {
+                finalists[row * 32u + group * 8u + lane - 24u] = item;
+            }
+            // All thirty-two complete SIMD groups participate in this barrier.
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (group == 0u) {
+                item = finalists[row * 32u + lane];
+                for (uint width = 2u; width <= 32u; width <<= 1) {
+                    for (uint stride = width >> 1; stride > 0u; stride >>= 1) {
+                        const uint other = simd_shuffle_xor(item, ushort(stride));
+                        const bool otherBefore = gemma4_finalists_before(other, item);
+                        const bool takeMinimum = ((lane & width) == 0u)
+                            == ((lane & stride) == 0u);
+                        if (takeMinimum ? otherBefore : !otherBefore) item = other;
+                    }
+                }
+                if (lane >= 24u) {
+                    const uint selected = item & 127u;
+                    indices[row * 8u + lane - 24u] = selected;
+                    sel[row * 8u + lane - 24u] = selected;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Phase 2 -- the incumbent simd-rank scatter, verbatim, over the
+            // staged 64 keys. Threads 0..63 are exactly the two complete
+            // SIMD groups the standalone kernel launched; `assignment` and
+            // `lane` reproduce its coordinates.
+            if (tid < 64u) {
+                const uint assignment = tid;
+                const uint key = sel[assignment];
+                const uint key_low = sel[lane];
+                const uint key_high = sel[32u + lane];
+                uint rank = 0;
+                for (uint source = 0; source < 32; ++source) {
+                    const uint other_low = simd_broadcast(key_low, ushort(source));
+                    rank += (other_low < key)
+                        || (other_low == key && source < assignment);
+                    const uint other_high = simd_broadcast(key_high, ushort(source));
+                    const uint high_assignment = 32u + source;
+                    rank += (other_high < key)
+                        || (other_high == key && high_assignment < assignment);
+                }
+                row_order[rank] = assignment / 8;
+                sorted_keys[rank] = key;
+                inverse_order[assignment] = rank;
+            }
+        """,
+        header: """
+            inline bool gemma4_finalists_before(uint a, uint b) {
+                const bfloat16_t av = uint16_to_bfloat16(uint16_t(a >> 7));
+                const bfloat16_t bv = uint16_to_bfloat16(uint16_t(b >> 7));
+                const bool an = metal::isnan(av);
+                const bool bn = metal::isnan(bv);
+                bool ab;
+                bool ba;
+                if (an | bn) {
+                    ab = (!an) & bn;
+                    ba = (!bn) & an;
+                } else {
+                    ab = av < bv;
+                    ba = bv < av;
+                }
+                return ab || (!ba && (a & 127u) < (b & 127u));
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    static func apply(_ scores: MLXArray, topK: Int, kth: Int) -> Fold? {
+        guard enabled, Gemma4RouterFinalistsV1.enabled,
+            topK == 8, kth == 120,
+            scores.ndim == 3, scores.dim(0) == 8,
+            scores.dim(1) == 1, scores.dim(2) == 128,
+            scores.dtype == .bfloat16
+        else { return nil }
+        CBv2EngageMark.once("glue-fold")
+        let outs = kernel(
+            [scores],
+            grid: (1024, 1, 1),
+            threadGroup: (1024, 1, 1),
+            outputShapes: [[8, 1, 8], [64], [64], [64]],
+            outputDTypes: [.uint32, .uint32, .uint32, .uint32]
+        )
+        return Fold(
+            indices: outs[0],
+            table: SwitchRouteTable(
+                rowOrder: outs[1],
+                sortedKeys: outs[2],
+                inverseOrder: outs[3]))
+    }
+}
+
 /// GLUE-003: one-per-forward chain box. Layer L's fused tail deposits the
 /// (output, next-layer-input-norm) pair; layer L+1 consumes the norm instead
 /// of re-reading and re-normalizing the same tensor — guarded by pointer
@@ -3305,7 +3471,8 @@ private class Gemma4Experts: Module {
         _ x: MLXArray,
         topKIndices: MLXArray,
         topKWeights: MLXArray,
-        isExpertPrefill: Bool
+        isExpertPrefill: Bool,
+        routeTable: SwitchRouteTable? = nil
     ) -> DeferredWeightedExpertRows? {
         let (B, S, H) = (x.dim(0), x.dim(1), x.dim(2))
         let K = topKIndices.dim(-1)
@@ -3314,7 +3481,8 @@ private class Gemma4Experts: Module {
             topKIndices.reshaped(B * S, K),
             weights: topKWeights.reshaped(B * S, K),
             fuseSortedReduction: fuseWeightedUnsort,
-            isProductionPrefill: isExpertPrefill)
+            isProductionPrefill: isExpertPrefill,
+            routeTable: routeTable)
     }
 }
 
@@ -3479,6 +3647,9 @@ private enum Gemma4ZipRouterV1 {
         let expertNorm: MLXArray
         let topKIndices: MLXArray
         let topKWeights: MLXArray
+        /// GLUE-FOLD: the route table emitted beside the top-8 selection, or
+        /// nil when the incumbent two-dispatch chain produced the indices.
+        let routeTable: SwitchRouteTable?
     }
 
     /// PREFIX-001 admission lives beside the ZIP admission so the eager
@@ -3565,11 +3736,11 @@ private enum Gemma4ZipRouterV1 {
         // Stage 4: router argPartition | dense down projection. The sort is
         // 8 us and the down projection 25 us, so this is the pairing that
         // pays; the selected slice then trails alone at 1.7 us.
-        let partition: MLXArray
         let topKIndices: MLXArray
         let denseOut: MLXArray
+        var routeTable: SwitchRouteTable? = nil
         if plan == 2 {
-            partition = router.zipPartition(
+            let partition = router.zipPartition(
                 MLX.depends(input: expertScores, dependencies: [gate, up]))
             topKIndices = router.zipSelected(
                 MLX.depends(input: partition, dependencies: [activated]))
@@ -3577,9 +3748,23 @@ private enum Gemma4ZipRouterV1 {
                 MLX.depends(input: activated, dependencies: [partition]))
         } else {
             denseOut = mlp.zipDown(activated)
-            partition = router.zipPartition(
-                MLX.depends(input: expertScores, dependencies: [denseOut]))
-            topKIndices = router.zipSelected(partition)
+            // GLUE-FOLD: one dispatch emits the top-8 selection AND the
+            // sorted route table, so the standalone rank-scatter launch
+            // leaves the dependent chain. The fold consumes the identical
+            // fenced scores node the incumbent partition consumed, keeping
+            // the tape's ordering edges unchanged. Fail-closed onto the
+            // incumbent finalists + slice pair.
+            if let fold = Gemma4RouteGlueFoldV1.apply(
+                MLX.depends(input: expertScores, dependencies: [denseOut]),
+                topK: router.topK, kth: router.kth)
+            {
+                topKIndices = fold.indices
+                routeTable = fold.table
+            } else {
+                let partition = router.zipPartition(
+                    MLX.depends(input: expertScores, dependencies: [denseOut]))
+                topKIndices = router.zipSelected(partition)
+            }
         }
 
         // The router weight tail (takeAlong -> softmax -> per-expert scale) is
@@ -3602,7 +3787,8 @@ private enum Gemma4ZipRouterV1 {
             denseOut: denseOut,
             expertNorm: expertNorm,
             topKIndices: topKIndices,
-            topKWeights: topKWeights)
+            topKWeights: topKWeights,
+            routeTable: routeTable)
     }
 }
 
@@ -3823,7 +4009,8 @@ public class Gemma4DecoderLayer: Module {
                 _ input: MLXArray,
                 indices: MLXArray,
                 weights: MLXArray,
-                sortedPlane: SwitchSortedPlaneProducer? = nil
+                sortedPlane: SwitchSortedPlaneProducer? = nil,
+                routeTable: SwitchRouteTable? = nil
             ) -> (
                 raw: MLXArray?,
                 deferred: DeferredWeightedExpertRows?,
@@ -3834,7 +4021,8 @@ public class Gemma4DecoderLayer: Module {
                         input,
                         topKIndices: indices,
                         topKWeights: weights,
-                        isExpertPrefill: isExpertPrefill)
+                        isExpertPrefill: isExpertPrefill,
+                        routeTable: routeTable)
                 {
                     return (nil, deferred, nil)
                 }
@@ -3864,7 +4052,8 @@ public class Gemma4DecoderLayer: Module {
                 expertBranch = projectExpertBranch(
                     zipped.expertNorm,
                     indices: zipped.topKIndices,
-                    weights: zipped.topKWeights)
+                    weights: zipped.topKWeights,
+                    routeTable: zipped.routeTable)
             } else {
                 let (topKIndices, topKWeights) = router(out)
 
@@ -5452,6 +5641,9 @@ extension Gemma4TextModel: CBv2MTPForwardable {
         return (applyLMHead(postNorm), preNorm)
     }
 }
+
+// Ranked resample marker 2: this archive is a further ranked sample of the tree carried
+// by the preceding ranked submission of this content apart from any rotation item declared in its note.
 
 // Ranked resample marker 2: this archive is a further ranked sample of the tree carried
 // by the preceding ranked submission of this content apart from any rotation item declared in its note.

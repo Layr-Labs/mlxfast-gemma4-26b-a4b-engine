@@ -70,6 +70,33 @@ template <
     return;
   }
 
+  // The composed Gemma prefill path marks its causal addMM bias with the
+  // otherwise-impossible row stride N + 1. Refuse every other shape, layout,
+  // dtype, epilogue, and GQA batch signature before eliding C loads.
+  bool synthesize_prefill_causal_bias = false;
+  if constexpr (
+      metal::is_same_v<T, bfloat16_t> && !transpose_a && transpose_b) {
+    if (use_out_source && !do_axpby && has_batch && align_M && align_N &&
+        params->M == 128 && params->N >= 128 && params->N <= 1024 &&
+        params->N % 128 == 0 && (params->K == 256 || params->K == 512) &&
+        params->lda == params->K && params->ldb == params->K &&
+        params->ldd == params->N && addmm_params->ldc == params->N + 1 &&
+        addmm_params->fdc == 1 && params->batch_ndim == 2) {
+      const constant auto* A_bstrides = batch_strides;
+      const constant auto* B_bstrides = A_bstrides + 2;
+      const constant auto* C_bstrides = B_bstrides + 2;
+      const bool gqa_shape =
+          (batch_shape[0] == 64 && batch_shape[1] == 2) ||
+          (batch_shape[0] == 16 && batch_shape[1] == 8);
+      synthesize_prefill_causal_bias =
+          gqa_shape && A_bstrides[1] == int64_t(1024) * params->K &&
+          A_bstrides[0] == int64_t(batch_shape[1]) * A_bstrides[1] &&
+          B_bstrides[1] == 0 &&
+          B_bstrides[0] == int64_t(params->N) * params->K &&
+          C_bstrides[0] == 0 && C_bstrides[1] == 0;
+    }
+  }
+
   // Adjust for batch
   if (has_batch) {
     const constant auto* A_bstrides = batch_strides;
@@ -191,7 +218,40 @@ template <
 
     // Do epilogue
     if (use_out_source) {
-      if (do_axpby) {
+      if constexpr (
+          metal::is_same_v<T, bfloat16_t> && !transpose_a && transpose_b) {
+        if (synthesize_prefill_causal_bias) {
+          // Preserve the established add epilogue exactly: unmasked scores
+          // add bf16 negative zero widened to fp32, while masked scores add
+          // bf16's finite minimum widened to fp32.
+          STEEL_PRAGMA_UNROLL
+          for (short i = 0; i < mma_t::TM; i++) {
+            STEEL_PRAGMA_UNROLL
+            for (short j = 0; j < mma_t::TN; j++) {
+              thread auto& accum = mma_op.Ctile.frag_at(i, j);
+              const int row =
+                  c_row + mma_op.sm + i * mma_t::TM_stride;
+              const int col =
+                  c_col + mma_op.sn + j * mma_t::TN_stride;
+              STEEL_PRAGMA_UNROLL
+              for (short k = 0;
+                   k < decltype(mma_op.Ctile)::kElemsPerFrag;
+                   k++) {
+                const bool masked =
+                    col + k > (params->N - params->M) + row;
+                accum[k] += as_type<float>(
+                    masked ? 0xFF7F0000u : 0x80000000u);
+              }
+            }
+          }
+        } else if (do_axpby) {
+          mma_op.apply_epilogue(
+              C, addmm_params->ldc, addmm_params->fdc, epilogue_op_axpby);
+        } else {
+          mma_op.apply_epilogue(
+              C, addmm_params->ldc, addmm_params->fdc, epilogue_op_add);
+        }
+      } else if (do_axpby) {
         mma_op.apply_epilogue(
             C, addmm_params->ldc, addmm_params->fdc, epilogue_op_axpby);
       } else {

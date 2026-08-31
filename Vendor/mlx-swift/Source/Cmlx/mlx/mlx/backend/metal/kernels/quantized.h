@@ -3922,10 +3922,40 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     }
     return;
   }
+  // DOWNSINGLE: the pairless position of the K = 704 down gather is the
+  // singleton arm of the same routed-expert plane that the K = 2816 gate/up
+  // gather already hands to `qmv_affine4_g64_singles_impl`. That impl was
+  // written for BOTH affine K values -- its tail comment names this one
+  // ("down_proj K = 704 leaves 192 = 24") and its `tail_values %
+  // values_per_thread == 0` arm is the path 704 takes -- but only the 2816
+  // dispatch was ever wired up, and the down plane reaches this tile walker
+  // before that dispatch is even in scope. So the busiest arm of the down
+  // plane still emits two uint16 weight loads per (row, K-block) where
+  // gate/up emits one aligned uint32.
+  //
+  // WVEC on, PF off: the configuration the gate/up singleton site uses.
+  // KFIX = 704 is the value this whole arm is already gated on
+  // (`gemma4_down_tile && in_vec_size == 704`), so nblocks, in_vec_size_w,
+  // in_vec_size_g and the tail split all constant-fold.
+  //
+  // Bit-exact against the `qmv_impl` it replaces. With WVEC the only body
+  // difference is `qdot<U, 8, 4>(wl, ...)` becoming
+  // `qdot_affine4_g64_word(*(const device uint*)wl, ...)`, and those agree
+  // term for term: `lo` is `ws[0]` and `hi` is `ws[1]` of the same aligned
+  // word, the four nibble masks, the two 4-term groupings, the `accum`
+  // start and the `scale * accum + sum * bias` close are unchanged. The
+  // word is 4-byte aligned at every site here because `w` is a uint32_t
+  // allocation, in_vec_size_w = 352, the lane offset is simd_lid * 4 and
+  // the block stride is 128. Everything else already matches qmv_impl's
+  // out_vec_size >= 8 arm line for line: same used_out_row clamp, same
+  // two-block K loop, same `active_tail_lanes` fast tail over the 192
+  // remainder, same per-row accumulator, same simd_sum and store. Register
+  // footprint is identical (x_thread[8] + result[4]); PF = false deletes
+  // the prefetch buffers at compile time.
   for (int t = 0; t < gemma4_down_tile_span; t++) {
     uint3 tile_tid = tid;
     tile_tid.y = tid.y + uint(t);
-    qmv_impl<T, group_size, bits>(
+    qmv_affine4_g64_singles_impl<T, group_size, bits, 704, true, false>(
         tile_w,
         tile_scales,
         tile_biases,

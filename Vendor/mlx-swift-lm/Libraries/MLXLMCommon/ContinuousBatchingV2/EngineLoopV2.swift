@@ -57,6 +57,27 @@ internal func resolveCBv2CompactDecodeRootsEnabled(_ raw: String?) -> Bool {
 private let cbv2CompactDecodeRootsEnabled = resolveCBv2CompactDecodeRootsEnabled(
     ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_COMPACT_DECODE_ROOTS"])
 
+/// Explicit attribution and rollback switch for the greedy prompt-frontier
+/// softcap bypass. Unset is enabled; an explicit false value restores the
+/// current crown's softcapped prefill logits.
+internal let cbv2PrefillSoftcapSkipEnabled: Bool =
+    ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_PREFILL_SOFTCAP_SKIP"]
+        .map { !["0", "false", "no", "off"].contains($0.lowercased()) } ?? true
+
+/// SOFTCAP-SKIP at the prompt frontier: brackets one chunk's graph build with
+/// the order-only declaration and records engagement exactly once. An empty
+/// `params` array disqualifies a disabled, non-sampling, or capture-observed
+/// chunk; `orderOnly` separately rejects value-sensitive sampling parameters.
+@inline(__always)
+internal func cbv2WithPrefillOrderOnly<T>(
+    _ params: [CBv2SamplingParams], _ build: () -> T
+) -> T {
+    if CBv2OrderOnlyLogits.orderOnly(params) {
+        CBv2EngageMark.once("prefill-order-only-softcap-skip")
+    }
+    return CBv2OrderOnlyLogits.withOrderOnly(params, build)
+}
+
 /// Builds per-layer batch-facing cache views for a set of rows
 /// (`rowStates[b][layer]`, row order == batch row order). WS-A's
 /// `LayerCacheV2` conforms; see CONTRACT-ISSUES-B-scheduler.md §1.
@@ -1706,26 +1727,32 @@ public final class EngineLoopV2: @unchecked Sendable {
                     multimodalByID[$0.rec.id]?.chunkContext(
                         start: $0.start, count: $0.count)
                 }
-                let output: MLXArray
-                if spanContexts.contains(where: { $0 != nil }) {
-                    output = packedMultimodalChunksForward(
-                        tokens: inputs,
-                        starts: group.rows.map(\.start),
-                        multimodal: group.rows.map { multimodalByID[$0.rec.id] },
-                        spanContexts: spanContexts,
-                        caches: caches,
-                        requirement: requirement)
-                } else {
-                    output = prefillOutput(
-                        tokens: inputs, inputEmbeddings: nil, caches: caches,
-                        requirement: requirement)
+                let capture = group.samples ? prefillFrontierCapture() : nil
+                // SOFTCAP-SKIP: empty params disqualify this chunk.
+                let orderOnlyParams =
+                    cbv2PrefillSoftcapSkipEnabled && group.samples && capture == nil
+                    ? group.rows.map(\.rec.request.sampling) : []
+                let output: MLXArray = cbv2WithPrefillOrderOnly(orderOnlyParams) {
+                    if spanContexts.contains(where: { $0 != nil }) {
+                        return packedMultimodalChunksForward(
+                            tokens: inputs,
+                            starts: group.rows.map(\.start),
+                            multimodal: group.rows.map { multimodalByID[$0.rec.id] },
+                            spanContexts: spanContexts,
+                            caches: caches,
+                            requirement: requirement)
+                    } else {
+                        return prefillOutput(
+                            tokens: inputs, inputEmbeddings: nil, caches: caches,
+                            requirement: requirement)
+                    }
                 }
                 cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
 
                 if group.samples {
                     // Parity seam: the frontier logits, as this backend
                     // computed them, BEFORE the sampler touches them.
-                    if let capture = prefillFrontierCapture() {
+                    if let capture {
                         for (index, row) in group.rows.enumerated() {
                             capture(row.rec.id, output[index])
                         }
@@ -1764,26 +1791,33 @@ public final class EngineLoopV2: @unchecked Sendable {
             let caches = eagerCaches(rowStates: [kvStates[rec.id]!])
             let requirement: CBv2PrefillRequirement =
                 row.samples ? .lastPositionLogits : .evaluationOnly
-            let output: MLXArray
-            if let multimodal = multimodalByID[rec.id],
-                let spanContext = multimodal.chunkContext(start: row.start, count: row.count)
-            {
-                // Vision chunk (contains image spans): the NEW pinned path —
-                // spliced input embeddings + span attention masks. Chunks of
-                // the SAME request without spans fall through to the
-                // untouched text path (pure function of has-spans).
-                output = multimodalChunkForward(
-                    tokens: inputs, start: row.start, count: row.count,
-                    multimodal: multimodal, spanContext: spanContext, caches: caches,
-                    requirement: requirement)
-            } else {
-                output = prefillOutput(
-                    tokens: inputs, inputEmbeddings: nil, caches: caches,
-                    requirement: requirement)
+            let capture = row.samples ? prefillFrontierCapture() : nil
+            // SOFTCAP-SKIP: empty params disqualify this chunk.
+            let orderOnlyParams =
+                cbv2PrefillSoftcapSkipEnabled && row.samples && capture == nil
+                ? [rec.request.sampling] : []
+            let output: MLXArray = cbv2WithPrefillOrderOnly(orderOnlyParams) {
+                if let multimodal = multimodalByID[rec.id],
+                    let spanContext = multimodal.chunkContext(
+                        start: row.start, count: row.count)
+                {
+                    // Vision chunk (contains image spans): the NEW pinned path —
+                    // spliced input embeddings + span attention masks. Chunks of
+                    // the SAME request without spans fall through to the
+                    // untouched text path (pure function of has-spans).
+                    return multimodalChunkForward(
+                        tokens: inputs, start: row.start, count: row.count,
+                        multimodal: multimodal, spanContext: spanContext, caches: caches,
+                        requirement: requirement)
+                } else {
+                    return prefillOutput(
+                        tokens: inputs, inputEmbeddings: nil, caches: caches,
+                        requirement: requirement)
+                }
             }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             if row.samples {
-                if let capture = prefillFrontierCapture() {
+                if let capture {
                     capture(rec.id, output[0])
                 }
                 prefillSampled[rec.id] = sampler.sample(

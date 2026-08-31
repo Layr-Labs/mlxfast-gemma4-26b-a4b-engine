@@ -84,6 +84,37 @@ extension EngineLoopV2 {
         return work
     }
 
+    func mtpBuildPrefillFrontier(
+        _ row: CBv2MTPRowWork
+    ) -> (output: MLXArray, caches: [CBv2AttendingLayerCache]) {
+        let rec = row.rec
+        let slice = rec.tokens[row.start ..< row.start + row.count]
+        let inputs = MLXArray(slice.map(Int32.init)).reshaped([1, row.count])
+        let caches = eagerCaches(rowStates: [kvStates[rec.id]!])
+        let requirement: CBv2PrefillRequirement =
+            row.samples ? .lastPositionLogits : .evaluationOnly
+        let capture = row.samples ? prefillFrontierCapture() : nil
+        // SOFTCAP-SKIP: empty params disqualify this chunk.
+        let orderOnlyParams =
+            cbv2PrefillSoftcapSkipEnabled && row.samples && capture == nil
+            ? [rec.request.sampling] : []
+        let output: MLXArray = cbv2WithPrefillOrderOnly(orderOnlyParams) {
+            if let multimodal = multimodalByID[rec.id],
+                let spanContext = multimodal.chunkContext(start: row.start, count: row.count)
+            {
+                return multimodalChunkForward(
+                    tokens: inputs, start: row.start, count: row.count,
+                    multimodal: multimodal, spanContext: spanContext, caches: caches,
+                    requirement: requirement)
+            } else {
+                return prefillOutput(
+                    tokens: inputs, inputEmbeddings: nil, caches: caches,
+                    requirement: requirement)
+            }
+        }
+        return (output, caches)
+    }
+
     func mtpBuildRoundGraph(
         _ work: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver
     ) -> CBv2MTPGraphBuild {
@@ -123,24 +154,7 @@ extension EngineLoopV2 {
         var prefillEvalTargets: [MLXArray] = []
         for row in work where !row.isDecode && row.carry == nil {
             let rec = row.rec
-            let slice = rec.tokens[row.start ..< row.start + row.count]
-            let inputs = MLXArray(slice.map(Int32.init)).reshaped([1, row.count])
-            let caches = eagerCaches(rowStates: [kvStates[rec.id]!])
-            let requirement: CBv2PrefillRequirement =
-                row.samples ? .lastPositionLogits : .evaluationOnly
-            let output: MLXArray
-            if let multimodal = multimodalByID[rec.id],
-                let spanContext = multimodal.chunkContext(start: row.start, count: row.count)
-            {
-                output = multimodalChunkForward(
-                    tokens: inputs, start: row.start, count: row.count,
-                    multimodal: multimodal, spanContext: spanContext, caches: caches,
-                    requirement: requirement)
-            } else {
-                output = prefillOutput(
-                    tokens: inputs, inputEmbeddings: nil, caches: caches,
-                    requirement: requirement)
-            }
+            let (output, caches) = mtpBuildPrefillFrontier(row)
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             if row.samples {
                 prefillSampled[rec.id] = sampler.sample(

@@ -314,7 +314,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// this step's fence, so the mutation can never be reordered against a
     /// later read of the same allocation.
     private static let fusedRingPassAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_ringwrite_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v1",
+        name: "cbv2_ragged8_ringwrite_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v2",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -402,9 +402,24 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 const float score_factor = fast::exp(score - new_max);
                 max_score = new_max;
                 sum_exp_score = sum_exp_score * old_factor + score_factor;
-                for (int element = 0; element < values_per_lane; ++element) {
-                    accumulator[element] = accumulator[element] * old_factor
-                        + score_factor * float(v[element]);
+                // OLDFACTOR-SKIP-002: `score` is a `simd_sum`, so the running
+                // maximum is simdgroup-uniform and this test never diverges
+                // within a simdgroup. The maximum only moves on a new high
+                // score, so on the common iteration `old_factor` is exactly
+                // 1.0f and the accumulator multiplies it drives are the
+                // identity. Each arm is the incumbent expression with the
+                // literal substituted, so the rounding is unchanged.
+                const bool rescale = old_factor != 1.0f;
+                if (rescale) {
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        accumulator[element] = accumulator[element] * old_factor
+                            + score_factor * float(v[element]);
+                    }
+                } else {
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        accumulator[element] = accumulator[element] * 1.0f
+                            + score_factor * float(v[element]);
+                    }
                 }
 
                 slot = (slot + uint(BLOCKS)) & ring_mask;
@@ -459,7 +474,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         MLXFast.metalKernel(
             name:
                 "cbv2_ragged8_ringwrite_sdpa_2pass_a_gqapair_bf16_d256_g2"
-                + "_b\(blocks)_v1",
+                + "_b\(blocks)_v2",
             inputNames: [
                 "queries",
                 "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -561,12 +576,31 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     max_hi = new_max_hi;
                     sum_lo = sum_lo * old_factor_lo + score_factor_lo;
                     sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                    // OLDFACTOR-SKIP-002: both maxima are carried on `simd_sum`
+                    // results, so these tests are simdgroup-uniform and never
+                    // diverge. On the common iteration the maximum has not
+                    // moved, `old_factor` is exactly 1.0f, and the multiplies
+                    // it drives are the identity. Each arm is the incumbent
+                    // expression with the literal substituted, so the rounding
+                    // is unchanged.
+                    const bool rescale_lo = old_factor_lo != 1.0f;
+                    const bool rescale_hi = old_factor_hi != 1.0f;
                     for (int element = 0; element < values_per_lane; ++element) {
                         const float value_element = float(v[element]);
-                        acc_lo[element] = acc_lo[element] * old_factor_lo
-                            + score_factor_lo * value_element;
-                        acc_hi[element] = acc_hi[element] * old_factor_hi
-                            + score_factor_hi * value_element;
+                        if (rescale_lo) {
+                            acc_lo[element] = acc_lo[element] * old_factor_lo
+                                + score_factor_lo * value_element;
+                        } else {
+                            acc_lo[element] = acc_lo[element] * 1.0f
+                                + score_factor_lo * value_element;
+                        }
+                        if (rescale_hi) {
+                            acc_hi[element] = acc_hi[element] * old_factor_hi
+                                + score_factor_hi * value_element;
+                        } else {
+                            acc_hi[element] = acc_hi[element] * 1.0f
+                                + score_factor_hi * value_element;
+                        }
                     }
 
                     slot = (slot + uint(BLOCKS)) & ring_mask;
@@ -616,7 +650,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         MLXFast.metalKernel(
             name:
                 "cbv2_ragged8_ringwrite_sdpa_2pass_a_gqapair_vec4_bf16_d256_g2"
-                + "_b\(blocks)_v1",
+                + "_b\(blocks)_v2",
             inputNames: [
                 "queries",
                 "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -747,17 +781,50 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     max_hi = new_max_hi;
                     sum_lo = sum_lo * old_factor_lo + score_factor_lo;
                     sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                    // OLDFACTOR-SKIP-001: the two running maxima are carried on
+                    // `simd_sum` results, so they are simdgroup-uniform and
+                    // these two tests never diverge within a simdgroup. A
+                    // maximum only moves on a new high score, which past the
+                    // first few tokens of a 1024-slot ring is rare, so on the
+                    // overwhelmingly common iteration `old_factor` is exactly
+                    // 1.0f and the sixteen accumulator multiplies it drives are
+                    // the identity. Each arm below is the incumbent expression
+                    // with the literal substituted for the factor, so the
+                    // rounding is whatever the incumbent already did.
+                    const bool rescale_lo = old_factor_lo != 1.0f;
+                    const bool rescale_hi = old_factor_hi != 1.0f;
                     #pragma clang loop unroll(full)
                     for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
                         const T4 value_vector = v[chunk];
-                        #pragma clang loop unroll(full)
-                        for (int j = 0; j < 4; ++j) {
-                            const int element = chunk * 4 + j;
-                            const float value_element = float(value_vector[j]);
-                            acc_lo[element] = acc_lo[element] * old_factor_lo
-                                + score_factor_lo * value_element;
-                            acc_hi[element] = acc_hi[element] * old_factor_hi
-                                + score_factor_hi * value_element;
+                        if (rescale_lo) {
+                            #pragma clang loop unroll(full)
+                            for (int j = 0; j < 4; ++j) {
+                                const int element = chunk * 4 + j;
+                                acc_lo[element] = acc_lo[element] * old_factor_lo
+                                    + score_factor_lo * float(value_vector[j]);
+                            }
+                        } else {
+                            #pragma clang loop unroll(full)
+                            for (int j = 0; j < 4; ++j) {
+                                const int element = chunk * 4 + j;
+                                acc_lo[element] = acc_lo[element] * 1.0f
+                                    + score_factor_lo * float(value_vector[j]);
+                            }
+                        }
+                        if (rescale_hi) {
+                            #pragma clang loop unroll(full)
+                            for (int j = 0; j < 4; ++j) {
+                                const int element = chunk * 4 + j;
+                                acc_hi[element] = acc_hi[element] * old_factor_hi
+                                    + score_factor_hi * float(value_vector[j]);
+                            }
+                        } else {
+                            #pragma clang loop unroll(full)
+                            for (int j = 0; j < 4; ++j) {
+                                const int element = chunk * 4 + j;
+                                acc_hi[element] = acc_hi[element] * 1.0f
+                                    + score_factor_hi * float(value_vector[j]);
+                            }
                         }
                     }
 

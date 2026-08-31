@@ -902,7 +902,7 @@ private let gemma4QKVNormRopeEnabled: Bool = {
 }()
 
 private let gemma4QKVNormKernel = MLXFast.metalKernel(
-    name: "gemma4_b8_qkv_rms_norm_rope_v2",
+    name: "gemma4_b8_qkv_rms_norm_rope_v3",
     inputNames: [
         "q", "k", "v", "q_weight", "k_weight",
         "position_offsets", "rope_log2_base", "rope_freqs",
@@ -967,6 +967,7 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < reads; ++i) {
             const uint element = lid * reads + i;
             const T normalized = T(float(input[i]) * inverse_rms);
@@ -1033,7 +1034,7 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
 /// threadgroup, and each row keeps its own 64 threads and its own two
 /// simdgroups, so the reduction tree is the stock one row for row.
 private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
-    name: "gemma4_qkv_rms_norm_head_major_v2",
+    name: "gemma4_qkv_rms_norm_head_major_v3",
     inputNames: [
         "q", "k", "q_weight", "k_weight",
         "position_offsets", "rope_freqs",
@@ -1117,6 +1118,7 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
 
         if (row >= TOTAL_ROWS) return;
         const float inverse_rms = inv_rms[slot];
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < reads; ++i) {
             const T normalized = T(float(input[i]) * inverse_rms);
             if (APPLY_ROPE) {
@@ -1233,7 +1235,7 @@ private func gemma4FusedQKVNormHeadMajor(
 /// staging boundary. Structure extends the head-major twin; rotation is a
 /// line-for-line transcription of rope.metal's base path.
 private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
-    name: "gemma4_qkv_rms_norm_head_major_sliding_v1",
+    name: "gemma4_qkv_rms_norm_head_major_sliding_v2",
     inputNames: [
         "q", "k", "v", "q_weight", "k_weight",
         "position_offsets", "rope_log2_base",
@@ -1319,6 +1321,7 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
 
         if (row >= TOTAL_ROWS) return;
         const float inverse_rms = inv_rms[slot];
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < reads; ++i) {
             const T normalized = T(float(input[i]) * inverse_rms);
             if (APPLY_ROPE && weighted) {

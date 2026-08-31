@@ -2300,7 +2300,7 @@ private enum Gemma4RouterFinalistsV1 {
     }()
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_router_finalists32_stable_bf16_v1",
+        name: "gemma4_router_finalists32_bits_v2",
         inputNames: ["scores"],
         outputNames: ["indices"],
         source: """
@@ -2347,18 +2347,27 @@ private enum Gemma4RouterFinalistsV1 {
         """,
         header: """
             inline bool gemma4_finalists_before(uint a, uint b) {
-                const bfloat16_t av = uint16_to_bfloat16(uint16_t(a >> 7));
-                const bfloat16_t bv = uint16_to_bfloat16(uint16_t(b >> 7));
-                const bool an = metal::isnan(av);
-                const bool bn = metal::isnan(bv);
+                const uint aBits = a >> 7;
+                const uint bBits = b >> 7;
+                const bool aNaN = (aBits & 0x7F80u) == 0x7F80u
+                    && (aBits & 0x007Fu) != 0u;
+                const bool bNaN = (bBits & 0x7F80u) == 0x7F80u
+                    && (bBits & 0x007Fu) != 0u;
                 bool ab;
                 bool ba;
-                if (an | bn) {
-                    ab = (!an) & bn;
-                    ba = (!bn) & an;
+                if (aNaN | bNaN) {
+                    ab = (!aNaN) & bNaN;
+                    ba = (!bNaN) & aNaN;
                 } else {
-                    ab = av < bv;
-                    ba = bv < av;
+                    // Normalize both signed zeros before the IEEE order map.
+                    const uint aNorm = (aBits & 0x7FFFu) == 0u ? 0u : aBits;
+                    const uint bNorm = (bBits & 0x7FFFu) == 0u ? 0u : bBits;
+                    const uint aOrder = (aNorm & 0x8000u) != 0u
+                        ? ((~aNorm) & 0xFFFFu) : (aNorm ^ 0x8000u);
+                    const uint bOrder = (bNorm & 0x8000u) != 0u
+                        ? ((~bNorm) & 0xFFFFu) : (bNorm ^ 0x8000u);
+                    ab = aOrder < bOrder;
+                    ba = bOrder < aOrder;
                 }
                 return ab || (!ba && (a & 127u) < (b & 127u));
             }

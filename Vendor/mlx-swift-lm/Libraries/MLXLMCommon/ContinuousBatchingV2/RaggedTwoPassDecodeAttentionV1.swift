@@ -90,6 +90,19 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         return min(8, stockBlocks)
     }()
 
+    /// UNIFORM-RING-START-001 kill switch. The scored B=8 serial cohort is
+    /// rectangular and advances in lockstep, so its eight post-write ring
+    /// starts are equal. When that host-side proof succeeds, pass A binds one
+    /// UInt32 instead of eight: MLX places arrays with fewer than eight values
+    /// in Metal's constant address space. `=0` keeps the exact eight-element
+    /// device array and specializes the index to `batch_index` for same-binary A/B.
+    private static let uniformRingStartEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_DECODE_UNIFORM_RING_START"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// Attribution: COMBINE-PACK-001 and COMBINE-HOIST-001 below are adapted
     /// from samfenwick's public Yukon submission
     /// `0ca873cb-d1b3-43e0-b75d-88d49c206812` (`3dcce32`). That sealed run
@@ -314,7 +327,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// this step's fence, so the mutation can never be reordered against a
     /// later read of the same allocation.
     private static let fusedRingPassAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_ringwrite_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v1",
+        name: "cbv2_ragged8_ringwrite_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v2",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -357,7 +370,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
             const device T* new_value = new_values
                 + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
-            const uint ring_start = starts[batch_index];
+            const uint ring_start = starts[UNIFORM_START ? 0 : batch_index];
             const uint write_slot = (ring_start + ring_mask) & ring_mask;
             if (block == 0 && query_head_in_group == 0) {
                 device T* write_key = const_cast<device T*>(keys) + write_slot * D;
@@ -459,7 +472,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         MLXFast.metalKernel(
             name:
                 "cbv2_ragged8_ringwrite_sdpa_2pass_a_gqapair_bf16_d256_g2"
-                + "_b\(blocks)_v1",
+                + "_b\(blocks)_v2",
             inputNames: [
                 "queries",
                 "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -502,7 +515,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
                 const device T* new_value = new_values
                     + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
-                const uint ring_start = starts[batch_index];
+                const uint ring_start = starts[UNIFORM_START ? 0 : batch_index];
                 const uint write_slot = (ring_start + ring_mask) & ring_mask;
                 if (block == 0) {
                     device T* write_key = const_cast<device T*>(keys) + write_slot * D;
@@ -616,7 +629,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         MLXFast.metalKernel(
             name:
                 "cbv2_ragged8_ringwrite_sdpa_2pass_a_gqapair_vec4_bf16_d256_g2"
-                + "_b\(blocks)_v1",
+                + "_b\(blocks)_v2",
             inputNames: [
                 "queries",
                 "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -662,7 +675,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
                 const device T* new_value = new_values
                     + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
-                const uint ring_start = starts[batch_index];
+                const uint ring_start = starts[UNIFORM_START ? 0 : batch_index];
                 const uint write_slot = (ring_start + ring_mask) & ring_mask;
                 if (block == 0) {
                     device T4* write_key = reinterpret_cast<device T4*>(
@@ -950,6 +963,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             newValues.shape == newKeys.shape,
             previousWriteFence.dtype == .int32,
             previousWriteFence.shape == [1],
+            batch > 0,
             keys.count == batch,
             values.count == batch,
             starts.count == batch,
@@ -966,7 +980,15 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             else { return nil }
         }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let uniformStart = uniformRingStartEnabled
+            && starts.dropFirst().allSatisfy { $0 == starts[0] }
+        if uniformStart {
+            CBv2EngageMark.once("decode-uniform-ring-start")
+        }
+        let startValues = uniformStart
+            ? [UInt32(starts[0])]
+            : starts.map(UInt32.init)
+        let startArray = MLXArray(startValues, [startValues.count])
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let paired = gqaPairedPassAEnabled && gqa == 2
@@ -989,6 +1011,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 ("GQA", gqa),
                 ("KV_HEADS", kvHeads),
                 ("BLOCKS", blocks),
+                ("UNIFORM_START", uniformStart),
             ],
             grid: paired
                 ? (kvHeads * 32, batch, blocks)

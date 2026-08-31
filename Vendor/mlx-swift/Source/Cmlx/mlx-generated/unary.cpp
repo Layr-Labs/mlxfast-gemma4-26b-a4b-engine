@@ -20,12 +20,9 @@ template <typename T, typename U, typename Op, int N = WorkPerThread<T>::n>
     constant uint& size,
     uint index [[thread_position_in_grid]]) {
   index *= N;
-  if (N > 1 && index + N > size) {
-    for (int i = 0; index + i < size; ++i) {
-      out[index + i] = static_cast<U>(Op()(in[index + i]));
-    }
-  } else {
-    for (int i = 0; i < N; ++i) {
+  #pragma unroll
+  for (int i = 0; i < N; ++i) {
+    if (index + i < size) {
       out[index + i] = static_cast<U>(Op()(in[index + i]));
     }
   }
@@ -39,12 +36,9 @@ template <typename T, typename U, typename Op, int N = WorkPerThread<T>::n>
     uint2 index [[thread_position_in_grid]],
     uint2 grid_dim [[threads_per_grid]]) {
   int64_t offset = N * (index.x + grid_dim.x * int64_t(index.y));
-  if (N > 1 && offset + N > size) {
-    for (int i = 0; offset + i < size; ++i) {
-      out[offset + i] = static_cast<U>(Op()(in[offset + i]));
-    }
-  } else {
-    for (int i = 0; i < N; ++i) {
+  #pragma unroll
+  for (int i = 0; i < N; ++i) {
+    if (offset + i < size) {
       out[offset + i] = static_cast<U>(Op()(in[offset + i]));
     }
   }
@@ -69,9 +63,12 @@ template <
   auto xshape = in_shape[ndim - 1];
   IdxT xstride = in_strides[ndim - 1];
   IdxT out_idx = N * index.x + xshape * (index.y + IdxT(grid_dim.y) * index.z);
-  for (int i = 0; i < N && (int(N * index.x) + i) < xshape; ++i) {
-    out[out_idx++] = static_cast<U>(Op()(in[idx]));
-    idx += xstride;
+  #pragma unroll
+  for (int i = 0; i < N; ++i) {
+    if ((int(N * index.x) + i) < xshape) {
+      out[out_idx++] = static_cast<U>(Op()(in[idx]));
+      idx += xstride;
+    }
   }
 }
 

@@ -587,7 +587,18 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
   simdgroup_float8x8 A;
   simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
 
+  // QREG-001: keep the affine scalars and dequantized weight words for
+  // iteration g+1 resident while iteration g computes. The addresses are
+  // functions of the group index alone; `g_next` is clamped to the walk's
+  // last group. Identical arithmetic, identical accumulation order.
+  uint4 wv_next = *((const device uint4*)(wrow + 64 * g_begin));
+  float s_next = float(srow[g_begin]);
+  float b_next = float(brow[g_begin]);
+
   for (int g = g_begin; g < g_end; ++g) {
+    const uint4 wv = wv_next;
+    const float s = s_next;
+    const float b = b_next;
     const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
     const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
 
@@ -608,9 +619,13 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     MMA8_SETB(B6, w, lo)
     MMA8_SETB(B7, w, hi)
 
-    const uint4 wv = *((const device uint4*)(wrow + 64 * g));
-    const float s = float(srow[g]);
-    const float b = float(brow[g]);
+    // Keep the look-ahead at the incumbent load site. Moving it to the top
+    // of the loop changes Metal's contraction choice for the affine close on
+    // some toolchains, despite preserving the source-level expression.
+    const int g_next = (g + 1 < g_end) ? g + 1 : g_end - 1;
+    wv_next = *((const device uint4*)(wrow + 64 * g_next));
+    s_next = float(srow[g_next]);
+    b_next = float(brow[g_next]);
 
     simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
     MMA8_STEP8(B0, x, z, 0)
@@ -645,7 +660,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
 """
 
     private static let mma8Kernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_v1",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_qreg_v2",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -709,7 +724,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     }()
 
     private static let mma8DownStaticKKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_unroll_v1",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_unroll_qreg_v2",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """

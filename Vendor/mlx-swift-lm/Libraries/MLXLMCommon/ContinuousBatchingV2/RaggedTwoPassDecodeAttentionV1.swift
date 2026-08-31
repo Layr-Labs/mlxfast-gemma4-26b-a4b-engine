@@ -791,6 +791,213 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             ensureRowContiguous: true
         )
 
+    /// QUAD-STAGED-PASSA-001: the paired vec4 pass A stages four ring rows.
+    ///
+    /// The paired vec4 kernel still walks ONE ring row per loop iteration,
+    /// so each row's K and V loads sit behind the previous iteration's
+    /// online-softmax chain in the scheduler. This twin stages the four
+    /// subsequent rows' K/V vector pointers up front — the loads are
+    /// independent of the accumulator state, so the compiler can put all
+    /// eight 16-byte lane loads in flight before the first rescale — and
+    /// then applies the eight online-softmax updates (two heads x four rows)
+    /// strictly in token order. Per head the sequence of `max`/`exp`/rescale
+    /// operations, their operands, and their order are exactly the paired
+    /// vec4 kernel's, so `partials`, `sums`, `maxs`, and the fence land on
+    /// the same bytes.
+    ///
+    /// Evidence (isolated harness, M3 Ultra, alternating-order A/B, 60 rounds
+    /// x 3 runs, against the paired vec4 kernel): incumbent 362.6-364.6 us
+    /// vs staged 330.7-336.3 us median = +8.4-9.9%, FNV-1a over (partials,
+    /// sums, maxs, fence) identical (`1073493fda16d31e`). Admitted only when
+    /// `sequenceLength / blocks` is a multiple of four; every partition the
+    /// default and the bisection knobs select at N=1024 satisfies this, and
+    /// anything narrower keeps the paired vec4 body below.
+    ///
+    /// Kill switch: `DARKBLOOM_CBV2_DECODE_PAIRED_PASSA_VEC4=0` falls back to
+    /// the scalar paired kernel, which stays in the file untouched.
+    private static let fusedRingPassAPairedVec4QuadKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name:
+                "cbv2_ragged8_ringwrite_sdpa_2pass_a_gqapair_vec4_quad_bf16"
+                + "_d256_g2_b\(blocks)_v1",
+            inputNames: [
+                "queries",
+                "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+                "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+                "starts", "new_keys", "new_values", "write_fence",
+            ],
+            outputNames: ["partials", "sums", "maxs", "fence"],
+            source: """
+                constexpr int simd_width = 32;
+                constexpr int values_per_lane = D / simd_width;
+                constexpr int vectors_per_lane = values_per_lane / 4;
+                static_assert((N & (N - 1)) == 0, "ring length must be a power of two");
+                static_assert(GQA == 2, "this kernel pairs exactly two query heads");
+                static_assert(values_per_lane % 4 == 0, "lane run must be a multiple of four");
+                static_assert((N % (4 * BLOCKS)) == 0, "quad staging needs four rows per group");
+                constexpr uint ring_mask = uint(N - 1);
+                typedef vec<T, 4> T4;
+
+                const int kv_head = int(threadgroup_position_in_grid.x);
+                const int batch_index = int(threadgroup_position_in_grid.y);
+                const int block = int(threadgroup_position_in_grid.z);
+                const int query_head = GQA * kv_head;
+                const int batch_head = batch_index * 16 + query_head;
+                const int lane = int(thread_index_in_simdgroup);
+
+                const device T* keys = k0;
+                const device T* values = v0;
+                switch (batch_index) {
+                    case 1: keys = k1; values = v1; break;
+                    case 2: keys = k2; values = v2; break;
+                    case 3: keys = k3; values = v3; break;
+                    case 4: keys = k4; values = v4; break;
+                    case 5: keys = k5; values = v5; break;
+                    case 6: keys = k6; values = v6; break;
+                    case 7: keys = k7; values = v7; break;
+                    default: break;
+                }
+
+                const device T* query =
+                    queries + batch_head * D + lane * values_per_lane;
+                keys += kv_head * N * D + lane * values_per_lane;
+                values += kv_head * N * D + lane * values_per_lane;
+                const device T* new_key = new_keys
+                    + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
+                const device T* new_value = new_values
+                    + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
+                const uint ring_start = starts[batch_index];
+                const uint write_slot = (ring_start + ring_mask) & ring_mask;
+                if (block == 0) {
+                    device T* write_key = const_cast<device T*>(keys) + write_slot * D;
+                    device T* write_value = const_cast<device T*>(values) + write_slot * D;
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        write_key[element] = new_key[element];
+                        write_value[element] = new_value[element];
+                    }
+                }
+                if (batch_index == 0 && kv_head == 0 && block == 0 && lane == 0) {
+                    fence[0] = write_fence[0] + 1;
+                }
+
+                device T* partial = partials
+                    + batch_head * BLOCKS * D + block * D + lane * values_per_lane;
+                device float* sum_out = sums + batch_head * BLOCKS + block;
+                device float* max_out = maxs + batch_head * BLOCKS + block;
+
+                thread float q_lo[values_per_lane];
+                thread float q_hi[values_per_lane];
+                thread float acc_lo[values_per_lane];
+                thread float acc_hi[values_per_lane];
+                {
+                    const device T4* query_lo = reinterpret_cast<const device T4*>(query);
+                    const device T4* query_hi =
+                        reinterpret_cast<const device T4*>(query + D);
+                    #pragma clang loop unroll(full)
+                    for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
+                        const T4 lo_vector = query_lo[chunk];
+                        const T4 hi_vector = query_hi[chunk];
+                        #pragma clang loop unroll(full)
+                        for (int j = 0; j < 4; ++j) {
+                            q_lo[chunk * 4 + j] = 1.0f * float(lo_vector[j]);
+                            q_hi[chunk * 4 + j] = 1.0f * float(hi_vector[j]);
+                            acc_lo[chunk * 4 + j] = 0.0f;
+                            acc_hi[chunk * 4 + j] = 0.0f;
+                        }
+                    }
+                }
+
+                uint slot = (ring_start + uint(block)) & ring_mask;
+                float max_lo = -3.402823466e+38F;
+                float max_hi = -3.402823466e+38F;
+                float sum_lo = 0.0f;
+                float sum_hi = 0.0f;
+                for (int token = block; token < N; token += 4 * BLOCKS) {
+                    const device T4* staged_k[4];
+                    const device T4* staged_v[4];
+                    uint next_slot = slot;
+                    for (int step = 0; step < 4; ++step) {
+                        const int step_token = token + step * BLOCKS;
+                        const bool current = step_token == N - 1;
+                        staged_k[step] = reinterpret_cast<const device T4*>(
+                            current ? new_key : keys + next_slot * D);
+                        staged_v[step] = reinterpret_cast<const device T4*>(
+                            current ? new_value : values + next_slot * D);
+                        next_slot = (next_slot + uint(BLOCKS)) & ring_mask;
+                    }
+                    for (int step = 0; step < 4; ++step) {
+                        const device T4* k = staged_k[step];
+                        const device T4* v = staged_v[step];
+                        float score_lo = 0.0f;
+                        float score_hi = 0.0f;
+                        #pragma clang loop unroll(full)
+                        for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
+                            const T4 key_vector = k[chunk];
+                            #pragma clang loop unroll(full)
+                            for (int j = 0; j < 4; ++j) {
+                                const float key_element = float(key_vector[j]);
+                                score_lo += q_lo[chunk * 4 + j] * key_element;
+                                score_hi += q_hi[chunk * 4 + j] * key_element;
+                            }
+                        }
+                        score_lo = simd_sum(score_lo);
+                        score_hi = simd_sum(score_hi);
+
+                        const float new_max_lo = max(max_lo, score_lo);
+                        const float new_max_hi = max(max_hi, score_hi);
+                        const float old_factor_lo = fast::exp(max_lo - new_max_lo);
+                        const float old_factor_hi = fast::exp(max_hi - new_max_hi);
+                        const float score_factor_lo = fast::exp(score_lo - new_max_lo);
+                        const float score_factor_hi = fast::exp(score_hi - new_max_hi);
+                        max_lo = new_max_lo;
+                        max_hi = new_max_hi;
+                        sum_lo = sum_lo * old_factor_lo + score_factor_lo;
+                        sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                        #pragma clang loop unroll(full)
+                        for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
+                            const T4 value_vector = v[chunk];
+                            #pragma clang loop unroll(full)
+                            for (int j = 0; j < 4; ++j) {
+                                const int element = chunk * 4 + j;
+                                const float value_element = float(value_vector[j]);
+                                acc_lo[element] = acc_lo[element] * old_factor_lo
+                                    + score_factor_lo * value_element;
+                                acc_hi[element] = acc_hi[element] * old_factor_hi
+                                    + score_factor_hi * value_element;
+                            }
+                        }
+                    }
+
+                    slot = (slot + uint(4 * BLOCKS)) & ring_mask;
+                }
+
+                if (lane == 0) {
+                    sum_out[0] = sum_lo;
+                    max_out[0] = max_lo;
+                    sum_out[BLOCKS] = sum_hi;
+                    max_out[BLOCKS] = max_hi;
+                }
+                {
+                    device T4* partial_lo = reinterpret_cast<device T4*>(partial);
+                    device T4* partial_hi =
+                        reinterpret_cast<device T4*>(partial + BLOCKS * D);
+                    #pragma clang loop unroll(full)
+                    for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
+                        T4 lo_vector;
+                        T4 hi_vector;
+                        #pragma clang loop unroll(full)
+                        for (int j = 0; j < 4; ++j) {
+                            lo_vector[j] = T(acc_lo[chunk * 4 + j]);
+                            hi_vector[j] = T(acc_hi[chunk * 4 + j]);
+                        }
+                        partial_lo[chunk] = lo_vector;
+                        partial_hi[chunk] = hi_vector;
+                    }
+                }
+            """,
+            ensureRowContiguous: true
+        )
+
     private static let passBKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name:
             "cbv2_ragged8_sdpa_2pass_b_direct_bf16_d256_b\(blocks)"
@@ -971,14 +1178,24 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         let summaryShape = [batch, queryHeads, 1, blocks]
         let paired = gqaPairedPassAEnabled && gqa == 2
         let vectorized = paired && gqaPairedPassAVec4Enabled && headDim % 4 == 0
+        // QUAD-STAGED-PASSA-001: the staged twin takes over exactly when the
+        // ring's per-block token count divides into four-row groups; any
+        // narrower partition keeps the paired vec4 body below.
+        let quadStaged =
+            vectorized && sequenceLength / blocks % 4 == 0
         if paired {
             CBv2EngageMark.once("decode-gqa-paired-passa")
         }
         if vectorized {
             CBv2EngageMark.once("decode-gqa-paired-passa-vec4")
         }
+        if quadStaged {
+            CBv2EngageMark.once("decode-gqa-paired-passa-vec4-quad")
+        }
         let pairedKernel =
-            vectorized ? fusedRingPassAPairedVec4Kernel : fusedRingPassAPairedKernel
+            quadStaged
+            ? fusedRingPassAPairedVec4QuadKernel
+            : vectorized ? fusedRingPassAPairedVec4Kernel : fusedRingPassAPairedKernel
         let passA = (paired ? pairedKernel : fusedRingPassAKernel)(
             [queries] + keys + values
                 + [startArray, newKeys, newValues, previousWriteFence],

@@ -997,6 +997,111 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
     return x
 }
 
+// MARK: - GATEUP-FUSE-PREFILL: one gathered gate|up GEMM on the sorted prefill plane
+
+/// GATEUP-FUSE-PREFILL. On the sorted routed-expert prefill plane the gate and
+/// up projections are two `gather_qmm_rhs` dispatches (N = 704 each) over the
+/// same gathered activations `[rows * topK, 1, 2816]` and the same sorted
+/// expert keys; the activations (369 MB for the packed 8 x 1024 cohort) are
+/// therefore streamed from DRAM twice per layer. This arm issues ONE
+/// `gather_qmm_rhs` over a concatenated right-hand side (N = 1408: the gate
+/// columns followed by the up columns) and hands the shaped GeGLU the two
+/// column halves as strided views, so the activations are read once and one
+/// dispatch per layer disappears.
+///
+/// Exactness: every output column of the gathered quantized GEMM owns an
+/// independent K-chain -- the tile pipeline (bm/bn/bk, K-step order, per-group
+/// affine dequant `scale * nibble + bias`) is fixed by (K, group size, bits)
+/// and never by N -- and the concatenated weight, scales and biases are a pure
+/// copy of the split ones along the output axis. 1408 keeps every alignment
+/// predicate (32 and 64) that 704 satisfies, so the same pipeline is
+/// selected. The consumer receives the identical gate / up bytes through views
+/// with the identical shapes it saw before.
+///
+/// Prefill-only: the fused right-hand side is consulted solely from the
+/// production prefill reduction entry, and only for the sorted, lhs-index-free
+/// plane of at least ``prefillGateUpFuseMinSortedRows`` sorted rows. Decode,
+/// rectangular verification and every generic SwitchGLU keep the split
+/// projections and their kernels. The `gate_up_proj` module slot is
+/// deliberately NOT populated: the direct sorted reduction requires it to be
+/// nil, so the fused right-hand side lives in a private, reflection-inert
+/// member built once per layer on first use (a permanent +272 MiB per layer
+/// resident copy of the two 4-bit planes; the split planes stay for decode).
+///
+/// Kill switch: `DARKBLOOM_GEMMA4_PREFILL_GATEUP_FUSE` set to
+/// `0`/`false`/`no`/`off` restores the two split gathers. Engage mark:
+/// `prefill-gateup-fuse`.
+private let prefillGateUpFuseEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_PREFILL_GATEUP_FUSE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// Smallest sorted plane (`rows * topK`) admitted to the fused gather. The
+/// packed production prefill sorts 65,536 rows; a 1,024-row chunk sorts 8,192.
+/// Every speculative verification rectangle sorts at most 2,048 rows and the
+/// eight-row decode cohort never sorts its activations at all, so nothing
+/// outside prefill reaches this floor.
+private let prefillGateUpFuseMinSortedRows = 8192
+
+/// The concatenated `[gate ; up]` affine 4-bit right-hand side of one expert
+/// layer. A plain final class (not a `Module`, not an `MLXArray` tuple) so the
+/// module reflection that enumerates parameters treats it as an opaque value:
+/// it is never a parameter, never quantized again, never saved and never
+/// updated. Built once, evaluated once, retained for the life of the layer.
+private final class PrefillGateUpFusedRHS {
+    let weight: MLXArray
+    let scales: MLXArray
+    let biases: MLXArray
+    let groupSize: Int
+    let bits: Int
+    let mode: QuantizationMode
+
+    /// Exact production geometry only: two affine 4-bit / group-64 gathers of
+    /// 2816 -> 704 over 128 experts, without a dense bias, whose packed
+    /// weight, scales and biases carry the shapes the sorted prefill plane
+    /// dispatches today. Any other pair returns nil and keeps the split path.
+    init?(gate: QuantizedSwitchLinear, up: QuantizedSwitchLinear) {
+        guard gate.inputDims == 2816 && gate.outputDims == 704
+            && gate.numExperts == 128
+            && gate.groupSize == 64 && gate.bits == 4
+            && gate.mode == .affine && gate.bias == nil
+            && up.inputDims == 2816 && up.outputDims == 704
+            && up.numExperts == 128
+            && up.groupSize == 64 && up.bits == 4
+            && up.mode == .affine && up.bias == nil,
+            let gateBiases = gate.biases, let upBiases = up.biases,
+            gate.weight.shape == [128, 704, 352]
+                && gate.scales.shape == [128, 704, 44]
+                && gateBiases.shape == [128, 704, 44]
+                && up.weight.shape == [128, 704, 352]
+                && up.scales.shape == [128, 704, 44]
+                && upBiases.shape == [128, 704, 44],
+            gate.weight.dtype == .uint32
+                && gate.scales.dtype == .bfloat16
+                && gateBiases.dtype == .bfloat16
+                && up.weight.dtype == .uint32
+                && up.scales.dtype == .bfloat16
+                && upBiases.dtype == .bfloat16
+        else { return nil }
+        // Output axis (axis 1 of [experts, out, packed-in]): gate columns
+        // 0..<704 followed by up columns 704..<1408, for weight, scales and
+        // biases alike. Pure copies; evaluated here so the first prefill
+        // forward never carries the concatenation.
+        let weight = concatenated([gate.weight, up.weight], axis: 1)
+        let scales = concatenated([gate.scales, up.scales], axis: 1)
+        let biases = concatenated([gateBiases, upBiases], axis: 1)
+        eval(weight, scales, biases)
+        self.weight = weight
+        self.scales = scales
+        self.biases = biases
+        self.groupSize = gate.groupSize
+        self.bits = gate.bits
+        self.mode = gate.mode
+    }
+}
+
 // MARK: - SwitchGLU
 
 /// Semantic profile required by the exact Gemma direct-reduction experiment.
@@ -1041,6 +1146,12 @@ public class SwitchGLU: Module {
     /// equivalent fast path — it can never change results.
     let isSiluActivation: Bool
     let isGeluActivation: Bool
+
+    /// GATEUP-FUSE-PREFILL: the concatenated gate|up right-hand side for the
+    /// sorted prefill plane, resolved once per layer on first prefill use
+    /// (nil when the layer is not the exact production geometry).
+    private var prefillGateUpFused: PrefillGateUpFusedRHS?
+    private var prefillGateUpFusedResolved = false
 
     /// Default SiLU GLU path -- uses the compiled fused (silu * up) kernel.
     public init(
@@ -1127,8 +1238,25 @@ public class SwitchGLU: Module {
         super.init()
     }
 
+    /// GATEUP-FUSE-PREFILL: build (once) and return the fused right-hand side.
+    /// Off the exact production geometry this resolves to nil once and the
+    /// split projections are used forever after.
+    private func prefillGateUpFusedRHS() -> PrefillGateUpFusedRHS? {
+        if !prefillGateUpFusedResolved {
+            prefillGateUpFusedResolved = true
+            if gateUpProj == nil,
+                let gate = gateProj as? QuantizedSwitchLinear,
+                let up = upProj as? QuantizedSwitchLinear
+            {
+                prefillGateUpFused = PrefillGateUpFusedRHS(gate: gate, up: up)
+            }
+        }
+        return prefillGateUpFused
+    }
+
     private func projectExperts(
-        _ x: MLXArray, _ indices: MLXArray
+        _ x: MLXArray, _ indices: MLXArray,
+        prefillGateUpFuse: Bool = false
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
         let useLhsIndices =
             indices.size == 64 && indices.ndim == 2 && indices.shape == [8, 8]
@@ -1166,8 +1294,37 @@ public class SwitchGLU: Module {
             guard let gateProj, let upProj else {
                 preconditionFailure("SwitchGLU requires gate_up_proj or gate_proj/up_proj")
             }
-            xUp = upProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
-            xGate = gateProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
+            // GATEUP-FUSE-PREFILL: the sorted production prefill plane reads
+            // its gathered activations once through one gather over the
+            // concatenated gate|up right-hand side. Same kernel pipeline,
+            // same per-column K-chains; the two halves are strided views.
+            if prefillGateUpFuse, prefillGateUpFuseEnabled,
+                doSort, !useLhsIndices, lhsIndices == nil,
+                x.ndim == 3, x.dim(0) >= prefillGateUpFuseMinSortedRows,
+                x.dim(-2) == 1, x.dim(-1) == inputDims,
+                x.dtype == .bfloat16,
+                let fused = prefillGateUpFusedRHS()
+            {
+                CBv2EngageMark.once("prefill-gateup-fuse")
+                let xGateUp = MLX.gatherQuantizedMM(
+                    x,
+                    fused.weight,
+                    scales: fused.scales,
+                    biases: fused.biases,
+                    lhsIndices: nil,
+                    rhsIndices: idx,
+                    transpose: true,
+                    groupSize: fused.groupSize,
+                    bits: fused.bits,
+                    mode: fused.mode,
+                    sortedIndices: true
+                )
+                xGate = xGateUp[.ellipsis, ..<hiddenDims]
+                xUp = xGateUp[.ellipsis, hiddenDims...]
+            } else {
+                xUp = upProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
+                xGate = gateProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
+            }
         }
 
         let activated: MLXArray
@@ -1369,7 +1526,10 @@ public class SwitchGLU: Module {
             return (weightedExpertSum(callAsFunction(x, indices), weights), nil)
         }
 
-        let projected = projectExperts(x, indices)
+        // GATEUP-FUSE-PREFILL rides only the production prefill reduction;
+        // the eight-row decode cohort keeps its split gate / up gathers.
+        let projected = projectExperts(
+            x, indices, prefillGateUpFuse: isProductionPrefill)
         guard projected.sorted,
             let inverseOrder = projected.inverseOrder,
             projected.output.ndim == 3,

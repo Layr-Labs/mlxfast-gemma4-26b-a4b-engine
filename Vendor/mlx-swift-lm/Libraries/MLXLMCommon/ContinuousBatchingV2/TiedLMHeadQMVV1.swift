@@ -45,19 +45,6 @@
 // the prior parity receipts on this track used, and the local runtime parity
 // test pins it bitwise.) Only the grid differs from the stock road.
 //
-// LMH-002 (this submission). The header's short walks whose trip counts are
-// already compile-time constants -- the affine-4 registered dot's lane walk
-// (values_per_thread / 4), load_vector's fixed-count value walk, the
-// four-row cohort walks (results_per_simdgroup), the packed uint16 walk
-// (uint16_per_thread), and the final four-row SIMD reduction -- now carry
-// `#pragma clang loop unroll(full)`. The K traversal is NOT annotated: its
-// trip count comes from the live input shape. No address, predicate,
-// accumulation order, or arithmetic expression is changed, so the bitwise
-// parity this file pins is unaffected; only loop-control codegen differs.
-// The kernel name is versioned to `..._unroll_v3` so the named MLX kernel
-// cache cannot satisfy the new request with the previously compiled body.
-// Mechanism inherited from fkiene's promoted `22154b54` (DenseMLPQMVV1).
-//
 // `DARKBLOOM_CBV2_TIED_LMHEAD_QMV=0` restores the stock path inside the same
 // executable.
 
@@ -99,7 +86,6 @@ inline U load_vector(const device T* x, thread U* x_thread) {
   U sum = 0;
 
   if (bits == 2) {
-    #pragma clang loop unroll(full)
     for (int i = 0; i < values_per_thread; i += 4) {
       sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
       x_thread[i] = x[i];
@@ -110,7 +96,6 @@ inline U load_vector(const device T* x, thread U* x_thread) {
   }
 
   else if (bits == 3) {
-    #pragma clang loop unroll(full)
     for (int i = 0; i < values_per_thread; i += 8) {
       sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
           x[i + 6] + x[i + 7];
@@ -126,7 +111,6 @@ inline U load_vector(const device T* x, thread U* x_thread) {
   }
 
   else if (bits == 4) {
-    #pragma clang loop unroll(full)
     for (int i = 0; i < values_per_thread; i += 4) {
       sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
       x_thread[i] = x[i];
@@ -137,7 +121,6 @@ inline U load_vector(const device T* x, thread U* x_thread) {
   }
 
   else if (bits == 5) {
-    #pragma clang loop unroll(full)
     for (int i = 0; i < values_per_thread; i += 8) {
       sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
           x[i + 6] + x[i + 7];
@@ -153,7 +136,6 @@ inline U load_vector(const device T* x, thread U* x_thread) {
   }
 
   else if (bits == 6) {
-    #pragma clang loop unroll(full)
     for (int i = 0; i < values_per_thread; i += 4) {
       sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
       x_thread[i] = x[i];
@@ -164,7 +146,6 @@ inline U load_vector(const device T* x, thread U* x_thread) {
   }
 
   else if (bits == 8) {
-    #pragma clang loop unroll(full)
     for (int i = 0; i < values_per_thread; i++) {
       sum += x[i];
       x_thread[i] = x[i];
@@ -266,7 +247,6 @@ inline U qdot_affine4_registered(
     U bias,
     U sum) {
   U accum = 0;
-  #pragma clang loop unroll(full)
   for (int i = 0; i < (values_per_thread / 4); i++) {
     accum +=
         (x_thread[4 * i] * (w[i] & 0x000f) +
@@ -331,11 +311,9 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
 
   int k = 0;
   for (; k < in_vec_size - block_size; k += block_size) {
-    #pragma clang loop unroll(full)
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint16_t* wl =
           (const device uint16_t*)(ws + row * in_vec_size_w);
-      #pragma clang loop unroll(full)
       for (int i = 0; i < uint16_per_thread; i++) {
         packed[row][i] = wl[i];
       }
@@ -344,25 +322,21 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     }
 
     float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
-    #pragma clang loop unroll(full)
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
-    #pragma clang loop unroll(full)
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
-    #pragma clang loop unroll(full)
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x3, x_thread);
-    #pragma clang loop unroll(full)
     for (int row = 0; row < results_per_simdgroup; row++) {
       result3[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
@@ -382,11 +356,9 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
       0,
       values_per_thread);
   if (remaining > 0) {
-    #pragma clang loop unroll(full)
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint16_t* wl =
           (const device uint16_t*)(ws + row * in_vec_size_w);
-      #pragma clang loop unroll(full)
       for (int i = 0; i < uint16_per_thread; i++) {
         packed[row][i] = wl[i];
       }
@@ -396,35 +368,30 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
 
     float sum =
         load_vector_safe<T, float, values_per_thread, 4>(x0, x_thread, remaining);
-    #pragma clang loop unroll(full)
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
         load_vector_safe<T, float, values_per_thread, 4>(x1, x_thread, remaining);
-    #pragma clang loop unroll(full)
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
         load_vector_safe<T, float, values_per_thread, 4>(x2, x_thread, remaining);
-    #pragma clang loop unroll(full)
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum =
         load_vector_safe<T, float, values_per_thread, 4>(x3, x_thread, remaining);
-    #pragma clang loop unroll(full)
     for (int row = 0; row < results_per_simdgroup; row++) {
       result3[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
   }
 
-  #pragma clang loop unroll(full)
   for (int row = 0; row < results_per_simdgroup; row++) {
     result0[row] = simd_sum(result0[row]);
     result1[row] = simd_sum(result1[row]);
@@ -441,7 +408,48 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
 """
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_tied_lmhead_qmv_affine4_g64_quad_stream_unroll_v3",
+        name: "cbv2_b8_tied_lmhead_qmv_affine4_g64_quad_stream_v2",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+
+            const int in_vec_size = K;
+            const int out_vec_size = OUTN;
+
+            const int first_m = int(tid.x) * 4;
+            if (first_m >= 8) {
+                return;
+            }
+            qmv_affine4_g64_quad_stream_impl<T, 64, 4>(
+                w,
+                scales,
+                biases,
+                x + first_m * in_vec_size,
+                x + (first_m + 1) * in_vec_size,
+                x + (first_m + 2) * in_vec_size,
+                x + (first_m + 3) * in_vec_size,
+                y + first_m * out_vec_size,
+                y + (first_m + 1) * out_vec_size,
+                y + (first_m + 2) * out_vec_size,
+                y + (first_m + 3) * out_vec_size,
+                in_vec_size,
+                tid,
+                simd_gid,
+                simd_lid);
+            return;
+            """,
+        header: kernelHeader,
+        ensureRowContiguous: true
+    )
+    /// ROUTER-QMV-001: the same exact quad-stream body serves the small
+    /// Gemma router projection under a separate cache key. The output plane
+    /// is only 128 columns, so it needs its own name even though the source
+    /// and wrapper are identical to the tied-head kernel.
+    private static let routerKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_router_qmv_affine4_g64_quad_stream_v1",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -515,7 +523,11 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
 
         let xGroups = batch / rowsPerGroup
         let yGroups = outDim / outputsPerGroup
-        return kernel(
+        // The Gemma router's 128-column plane gets a distinct cache key so
+        // its K/OUTN specialization cannot collide with the tied vocabulary
+        // specialization while sharing the exact same helper source.
+        let selected = outDim == 128 ? routerKernel : kernel
+        return selected(
             [x, weight, scales, biases],
             template: [
                 ("T", x.dtype),

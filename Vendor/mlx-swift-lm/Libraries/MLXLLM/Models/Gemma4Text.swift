@@ -3150,6 +3150,30 @@ private class Gemma4Router: Module {
         self._perExpertScale.wrappedValue = MLXArray.ones([numExperts])
         super.init()
     }
+    /// ROUTER-QMV-001: the batch-eight decode router is the small affine-4/g64
+    /// QMV that the stock host deliberately leaves on its pair tier because
+    /// its output plane is below the wide-N threshold. Reuse the exact
+    /// register-streamed four-row body used by the tied-head specialization,
+    /// but keep every non-matching quantization or shape on `Linear`.
+    private func project(_ x: MLXArray) -> MLXArray {
+        guard let quantized = proj as? QuantizedLinear,
+            quantized.bias == nil,
+            quantized.mode == .affine,
+            quantized.groupSize == 64,
+            quantized.bits == 4,
+            let projected = CBv2TiedLMHeadQMVV1.matmul(
+                x: x,
+                weight: quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                inDim: x.dim(-1),
+                outDim: kth + topK)
+        else {
+            return proj(x)
+        }
+        return projected
+    }
+
 
     func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
         let effScale: MLXArray
@@ -3161,7 +3185,7 @@ private class Gemma4Router: Module {
             effScale = eff
         }
         let normed = MLXFast.rmsNorm(x, weight: effScale, eps: eps)
-        let expertScores = proj(normed)
+        let expertScores = project(normed)
 
         // ROUTE-001: single-dispatch byte-identical replacement of the chain
         // below for the B=8 decode geometry. Every other geometry, dtype, or
@@ -3208,7 +3232,7 @@ private class Gemma4Router: Module {
     }
 
     fileprivate func zipScores(_ normed: MLXArray) -> MLXArray {
-        proj(normed)
+        project(normed)
     }
 
     fileprivate func zipPartition(_ expertScores: MLXArray) -> MLXArray {

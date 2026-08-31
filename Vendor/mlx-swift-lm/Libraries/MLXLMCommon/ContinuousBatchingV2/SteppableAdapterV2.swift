@@ -25,6 +25,16 @@ public protocol CBv2LanguageModelDecodeOutputCoversCacheMutations: AnyObject {}
 /// static Bool keeps the disarmed path allocation-free.
 private let cbv2CompactDecodeRootMarksArmed =
     ProcessInfo.processInfo.environment["MLXFAST_ENGAGE_MARKS"] != nil
+/// Shared-KV decode-root compaction has its own attribution boundary because
+/// shared cache objects own neither rows nor ring writes. The default keeps the
+/// optimized route; an explicit off value restores full cache-inner-state
+/// evaluation for this decomposition only.
+private let cbv2CompactSharedDecodeRootsEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_CBV2_COMPACT_SHARED_DECODE_ROOTS"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
 
 /// `CBv2SteppableModel` over any `LanguageModel` whose forward path
 /// understands `CBv2AttendingLayerCache` (Gemma 4, GPT-OSS, test fixtures).
@@ -40,11 +50,12 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
         return model(tokens, cache: asKVCaches(caches))
     }
 
-    /// Initial fail-closed decode compaction: only an affirming model over an
-    /// all-owning, all-contiguous bank with one shared position state. The
-    /// output root forces every K/V mutation; the post-forward position root
-    /// collapses the next-step offset chain; per-layer fences conservatively
-    /// retain explicit ordering for fused in-place sliding-ring writes.
+    /// Initial fail-closed decode compaction: an affirming model over an
+    /// all-contiguous bank with one shared position state. Storage-owning
+    /// layers keep explicit ring-write fences; KV-shared layers own no rows
+    /// or ring writes and therefore contribute no fence root. The output root
+    /// forces every K/V mutation; the position root collapses the next-step
+    /// offset chain.
     public func compactDecodeEvaluationRoots(
         forwardOutput: MLXArray, caches: [CBv2AttendingLayerCache]
     ) -> [MLXArray]? {
@@ -52,28 +63,46 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
             return nil
         }
         let contiguous = caches.compactMap { $0 as? CBv2LayerCache }
+        let hasShared = contiguous.contains {
+            $0.kind.sharesKVWithLayer != nil
+        }
         guard !contiguous.isEmpty,
             contiguous.count == caches.count,
-            contiguous.allSatisfy({ $0.kind.sharesKVWithLayer == nil }),
-            let rowCount = contiguous.first?.rows.count,
-            rowCount > 0,
-            contiguous.allSatisfy({ $0.rows.count == rowCount }),
+            !hasShared || cbv2CompactSharedDecodeRootsEnabled,
             contiguous.allSatisfy({ cache in
-                cache.rows.allSatisfy {
-                    $0 is any CBv2DecodeRootCompactionCapableSequenceKV
-                }
+                cache.kind.sharesKVWithLayer == nil || cache.rows.isEmpty
             }),
-            let stateIdentity = contiguous[0].unifiedPositionStateIdentity,
-            let offsets = contiguous[0].unifiedPositionOffsets,
-            contiguous.dropFirst().allSatisfy({
+            let canonical = contiguous.first(where: {
+                $0.kind.sharesKVWithLayer == nil
+            }),
+            canonical.rows.count > 0,
+            contiguous.allSatisfy({ cache in
+                cache.kind.sharesKVWithLayer != nil
+                    || cache.rows.count == canonical.rows.count
+            }),
+            contiguous.allSatisfy({ cache in
+                cache.kind.sharesKVWithLayer != nil
+                    || cache.rows.allSatisfy {
+                        $0 is any CBv2DecodeRootCompactionCapableSequenceKV
+                    }
+            }),
+            let stateIdentity = canonical.unifiedPositionStateIdentity,
+            let offsets = canonical.unifiedPositionOffsets,
+            contiguous.allSatisfy({
                 $0.unifiedPositionStateIdentity == stateIdentity
             })
         else { return nil }
 
+        let rowCount = canonical.rows.count
         var roots = [forwardOutput, offsets]
         roots.reserveCapacity(2 + contiguous.count)
-        roots.append(contentsOf: contiguous.map(\.decodeRingWriteFenceEvaluationRoot))
+        for cache in contiguous where cache.kind.sharesKVWithLayer == nil {
+            roots.append(cache.decodeRingWriteFenceEvaluationRoot)
+        }
         if cbv2CompactDecodeRootMarksArmed {
+            if hasShared {
+                CBv2EngageMark.once("compact-decode-roots-shared")
+            }
             CBv2EngageMark.once(
                 "compact-decode-roots rows=\(rowCount) layers=\(contiguous.count) "
                     + "roots=\(roots.count)")

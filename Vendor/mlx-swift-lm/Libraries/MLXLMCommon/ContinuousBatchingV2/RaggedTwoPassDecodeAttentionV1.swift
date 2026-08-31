@@ -616,7 +616,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         MLXFast.metalKernel(
             name:
                 "cbv2_ragged8_ringwrite_sdpa_2pass_a_gqapair_vec4_bf16_d256_g2"
-                + "_b\(blocks)_v1",
+                + "_b\(blocks)_qreg_v3",
             inputNames: [
                 "queries",
                 "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -688,8 +688,15 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 device float* sum_out = sums + batch_head * BLOCKS + block;
                 device float* max_out = maxs + batch_head * BLOCKS + block;
 
-                thread float q_lo[values_per_lane];
-                thread float q_hi[values_per_lane];
+                // QREG-001: the query run stays in its loaded T4 form and is
+                // widened to float at the point of use. `float(x)` on a
+                // bfloat16 is exact and `1.0f * float(x)` is `float(x)`, so the
+                // multiplicand each FMA sees is the same word this kernel used
+                // when it kept the run pre-widened. It halves the query's share
+                // of the live set: sixteen float registers become eight of
+                // packed bfloat16.
+                thread T4 q_lo[vectors_per_lane];
+                thread T4 q_hi[vectors_per_lane];
                 thread float acc_lo[values_per_lane];
                 thread float acc_hi[values_per_lane];
                 {
@@ -699,12 +706,10 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         reinterpret_cast<const device T4*>(query + D);
                     #pragma clang loop unroll(full)
                     for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
-                        const T4 lo_vector = query_lo[chunk];
-                        const T4 hi_vector = query_hi[chunk];
+                        q_lo[chunk] = query_lo[chunk];
+                        q_hi[chunk] = query_hi[chunk];
                         #pragma clang loop unroll(full)
                         for (int j = 0; j < 4; ++j) {
-                            q_lo[chunk * 4 + j] = 1.0f * float(lo_vector[j]);
-                            q_hi[chunk * 4 + j] = 1.0f * float(hi_vector[j]);
                             acc_lo[chunk * 4 + j] = 0.0f;
                             acc_hi[chunk * 4 + j] = 0.0f;
                         }
@@ -727,11 +732,13 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     #pragma clang loop unroll(full)
                     for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
                         const T4 key_vector = k[chunk];
+                        const T4 q_lo_vector = q_lo[chunk];
+                        const T4 q_hi_vector = q_hi[chunk];
                         #pragma clang loop unroll(full)
                         for (int j = 0; j < 4; ++j) {
                             const float key_element = float(key_vector[j]);
-                            score_lo += q_lo[chunk * 4 + j] * key_element;
-                            score_hi += q_hi[chunk * 4 + j] * key_element;
+                            score_lo += float(q_lo_vector[j]) * key_element;
+                            score_hi += float(q_hi_vector[j]) * key_element;
                         }
                     }
                     score_lo = simd_sum(score_lo);
@@ -747,17 +754,50 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     max_hi = new_max_hi;
                     sum_lo = sum_lo * old_factor_lo + score_factor_lo;
                     sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                    // OLDFACTOR-SKIP-001: the two running maxima are carried on
+                    // `simd_sum` results, so they are simdgroup-uniform and
+                    // these two tests never diverge within a simdgroup. A
+                    // maximum only moves on a new high score, which past the
+                    // first few tokens of a 1024-slot ring is rare, so on the
+                    // overwhelmingly common iteration `old_factor` is exactly
+                    // 1.0f and the sixteen accumulator multiplies it drives are
+                    // the identity. Each arm below is the incumbent expression
+                    // with the literal substituted for the factor, so the
+                    // rounding is whatever the incumbent already did.
+                    const bool rescale_lo = old_factor_lo != 1.0f;
+                    const bool rescale_hi = old_factor_hi != 1.0f;
                     #pragma clang loop unroll(full)
                     for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
                         const T4 value_vector = v[chunk];
-                        #pragma clang loop unroll(full)
-                        for (int j = 0; j < 4; ++j) {
-                            const int element = chunk * 4 + j;
-                            const float value_element = float(value_vector[j]);
-                            acc_lo[element] = acc_lo[element] * old_factor_lo
-                                + score_factor_lo * value_element;
-                            acc_hi[element] = acc_hi[element] * old_factor_hi
-                                + score_factor_hi * value_element;
+                        if (rescale_lo) {
+                            #pragma clang loop unroll(full)
+                            for (int j = 0; j < 4; ++j) {
+                                const int element = chunk * 4 + j;
+                                acc_lo[element] = acc_lo[element] * old_factor_lo
+                                    + score_factor_lo * float(value_vector[j]);
+                            }
+                        } else {
+                            #pragma clang loop unroll(full)
+                            for (int j = 0; j < 4; ++j) {
+                                const int element = chunk * 4 + j;
+                                acc_lo[element] = acc_lo[element] * 1.0f
+                                    + score_factor_lo * float(value_vector[j]);
+                            }
+                        }
+                        if (rescale_hi) {
+                            #pragma clang loop unroll(full)
+                            for (int j = 0; j < 4; ++j) {
+                                const int element = chunk * 4 + j;
+                                acc_hi[element] = acc_hi[element] * old_factor_hi
+                                    + score_factor_hi * float(value_vector[j]);
+                            }
+                        } else {
+                            #pragma clang loop unroll(full)
+                            for (int j = 0; j < 4; ++j) {
+                                const int element = chunk * 4 + j;
+                                acc_hi[element] = acc_hi[element] * 1.0f
+                                    + score_factor_hi * float(value_vector[j]);
+                            }
                         }
                     }
 

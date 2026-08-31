@@ -2389,6 +2389,7 @@ private enum Gemma4RouterFinalistsV1 {
 /// to the stock `inputLayernorm(x)`.
 public final class Gemma4GlueChainBox {
     var pending: (source: MLXArray, normed: MLXArray)?
+    var finalHead: (source: MLXArray, postNorm: MLXArray, sums: Gemma4MMAQuantizedGEMV.ActivationSums)?
     public init() {}
 }
 
@@ -2528,6 +2529,37 @@ private enum Gemma4FusedLayerGlue {
         replaceOnce(
             "const T h2 = w2[wbase + i] * static_cast<T>((float)b[base + i] * inv2);",
             with: "const T h2 = w2[wbase + i] * static_cast<T>(bv[i] * inv2);")
+        return result
+    }
+
+    /// The deferred variant of `pairedRmsSource`: the second operand is the
+    /// register-resident `expertv` built by `deferredExpertValuesSource`
+    /// instead of a device array, so its loads become register reads.
+    private static let pairedRmsDeferredSource = pairedRmsSource
+        .replacingOccurrences(
+            of: "bv[i] = (float)b[base + i];",
+            with: "bv[i] = (float)expertv[i];")
+
+    /// Derive the deferred tail variants from the complete incumbent deferred
+    /// sources. The expert resolution already sits between the two serial
+    /// reductions, so pairing needs no code motion: the input RMS block is
+    /// deleted and the expert RMS block becomes the shared three-barrier
+    /// paired reduction. Each sum keeps its own four ordered squares, SIMD
+    /// tree, and precise rsqrt; only the two later reloads switch to the
+    /// widened register values the paired pass already holds.
+    private static func pairedRmsDeferredTailSource(_ source: String) -> String {
+        var result = source
+        func replaceOnce(_ old: String, with new: String) {
+            precondition(result.components(separatedBy: old).count == 2)
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        replaceOnce(rmsReduce("a", into: "local_inv[0]"), with: "")
+        replaceOnce(
+            rmsReduce("expertv", into: "local_inv[1]").replacingOccurrences(
+                of: "(float)expertv[base + i]", with: "(float)expertv[i]"),
+            with: pairedRmsDeferredSource)
+        replaceOnce("(float)a[base + i] * inv1", with: "av[i] * inv1")
+        replaceOnce("(float)expertv[i] * inv2", with: "bv[i] * inv2")
         return result
     }
 
@@ -2872,27 +2904,30 @@ private enum Gemma4FusedLayerGlue {
             T expertv[4];
             const uint assignment_base = row * 8u;
             for (int i = 0; i < 4; ++i) {
-                T accumulator = static_cast<T>(0.0f);
-                for (uint slot = 0u; slot < 8u; ++slot) {
-                    const uint assignment = assignment_base + slot;
-                    const uint sorted_row = (uint)inverse[assignment];
+                expertv[i] = static_cast<T>(0.0f);
+            }
+            for (uint slot = 0u; slot < 8u; ++slot) {
+                const uint assignment = assignment_base + slot;
+                const uint sorted_base =
+                    (uint)inverse[assignment] * 2816u + wbase;
+                const T route_weight = route_weights[assignment];
+                for (int i = 0; i < 4; ++i) {
                     const T weighted = static_cast<T>(
-                        (float)sorted[sorted_row * 2816u + wbase + (uint)i]
-                        * (float)route_weights[assignment]);
-                    accumulator = accumulator + weighted;
+                        (float)sorted[sorted_base + (uint)i]
+                        * (float)route_weight);
+                    expertv[i] = expertv[i] + weighted;
                 }
-                expertv[i] = accumulator;
             }
     """
 
     private static let deferredTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1",
+        name: "gemma4_glue_deferred_expert_tail_paired_rms_2816_bf16_v2",
         inputNames: [
             "a", "sorted", "inverse", "route_weights", "res",
             "w1", "w2", "w3", "s",
         ],
         outputNames: ["out"],
-        source: """
+        source: pairedRmsDeferredTailSource("""
             const uint row = threadgroup_position_in_grid.x;
             const uint lid = thread_position_in_threadgroup.x;
             const uint simd_lane_id = thread_index_in_simdgroup;
@@ -2925,19 +2960,19 @@ private enum Gemma4FusedLayerGlue {
                 const T summed = res[base + i] + normed3;
                 out[base + i] = summed * scalar;
             }
-        """,
+        """),
         ensureRowContiguous: true
     )
 
     private static let deferredTailChainKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1",
+            name: "gemma4_glue_deferred_expert_tail_chain_paired_rms_2816_bf16_v2",
             inputNames: [
                 "a", "sorted", "inverse", "route_weights", "res",
                 "w1", "w2", "w3", "s", "wn",
             ],
             outputNames: ["out", "normed"],
-            source: """
+            source: pairedRmsDeferredTailSource("""
                 const uint row = threadgroup_position_in_grid.x;
                 const uint lid = thread_position_in_threadgroup.x;
                 const uint simd_lane_id = thread_index_in_simdgroup;
@@ -2981,7 +3016,7 @@ private enum Gemma4FusedLayerGlue {
                         wn[wbase + i]
                             * static_cast<T>((float)outv[i] * inv4);
                 }
-            """,
+            """),
             ensureRowContiguous: true
         )
 
@@ -2995,6 +3030,222 @@ private enum Gemma4FusedLayerGlue {
             && expertRows.inverseOrder.size == 64
             && expertRows.weights.dtype == .bfloat16
             && expertRows.weights.shape == [rows, 8]
+    }
+
+    /// TAILHEAD-012 (materialized): layer-29 tail folded into the FINAL model
+    /// RMSNorm and the tied-head activation-sums table. Byte-order-identical
+    /// to the incumbent tail + Gemma4FinalNormMMAHeadSumsV1 pair.
+    private static let tailFinalHeadSumsKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_glue_final_tail_head_xsum_2816_bf16_v1",
+        inputNames: ["a", "b", "res", "w1", "w2", "w3", "s", "w_final"],
+        outputNames: ["out", "postNorm", "xSums"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float local_inv[2];
+            threadgroup float local_sums[32];
+            threadgroup float quad_sums[704];
+
+            const uint base = row * 2816 + lid * 4;
+            const uint wbase = lid * 4;
+        \(rmsReduce("a", into: "local_inv[0]"))
+        \(rmsReduce("b", into: "local_inv[1]"))
+            const float inv1 = local_inv[0];
+            const float inv2 = local_inv[1];
+            T sv[4];
+            for (int i = 0; i < 4; i++) {
+                const T h1 = w1[wbase + i] * static_cast<T>((float)a[base + i] * inv1);
+                const T h2 = w2[wbase + i] * static_cast<T>((float)b[base + i] * inv2);
+                sv[i] = h1 + h2;
+            }
+        \(rmsReduce("sv", into: "local_inv[0]").replacingOccurrences(
+            of: "(float)sv[base + i]", with: "(float)sv[i]"))
+            const float inv3 = local_inv[0];
+            const T scalar = s[0];
+            T outv[4];
+            for (int i = 0; i < 4; i++) {
+                const T normed3 = static_cast<T>(
+                    w3[wbase + i] * static_cast<T>((float)sv[i] * inv3));
+                const T summed = res[base + i] + normed3;
+                outv[i] = summed * scalar;
+                out[base + i] = outv[i];
+            }
+        \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
+            of: "(float)outv[base + i]", with: "(float)outv[i]"))
+            const float inv4 = local_inv[0];
+            T postv[4];
+            for (int i = 0; i < 4; i++) {
+                postv[i] = w_final[wbase + i] * static_cast<T>((float)outv[i] * inv4);
+                postNorm[base + i] = postv[i];
+            }
+            quad_sums[lid] = postv[0] + postv[1] + postv[2] + postv[3];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if ((lid % 16) == 0) {
+                float s2 = 0.0f;
+                for (uint c = 0; c < 8; ++c) {
+                    const uint q = lid + c * 2;
+                    s2 += quad_sums[q];
+                    s2 += quad_sums[q + 1];
+                }
+                xSums[row * 44 + lid / 16] = s2;
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    static func tailFinalHeadSums(
+        mlpOut: MLXArray, expertOut: MLXArray, residual: MLXArray,
+        w1: MLXArray, w2: MLXArray, w3: MLXArray, layerScalar: MLXArray,
+        finalNormWeight: MLXArray, eps: Float
+    ) -> (out: MLXArray, postNorm: MLXArray, sums: Gemma4MMAQuantizedGEMV.ActivationSums)? {
+        guard Gemma4MMAQuantizedGEMV.consumesActivationSums,
+            admits(mlpOut, weight: w1, eps: eps),
+            expertOut.shape == mlpOut.shape, expertOut.dtype == .bfloat16,
+            residual.shape == mlpOut.shape, residual.dtype == .bfloat16,
+            w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16,
+            w3.ndim == 1, w3.dim(0) == axis, w3.dtype == .bfloat16,
+            layerScalar.size == 1, layerScalar.dtype == .bfloat16,
+            finalNormWeight.ndim == 1, finalNormWeight.dim(0) == axis,
+            finalNormWeight.dtype == .bfloat16
+        else { return nil }
+        CBv2EngageMark.once("glue-tail-final-head-xsum")
+        let outs = tailFinalHeadSumsKernel(
+            [mlpOut, expertOut, residual, w1, w2, w3, layerScalar, finalNormWeight],
+            template: [("T", mlpOut.dtype)],
+            grid: (rows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: [
+                [rows, 1, axis],
+                [rows, 1, axis],
+                [rows * (axis / 64)],
+            ],
+            outputDTypes: [.bfloat16, .bfloat16, .float32]
+        )
+        guard let sums = Gemma4MMAQuantizedGEMV.activationSums(
+            produced: outs[2], for: outs[1])
+        else { return nil }
+        return (outs[0], outs[1], sums)
+    }
+
+    // Controlled rerun r3 of the validated seven-mechanism r6 source: its
+    // first two draws measured composite -1.30% and -1.55% with decode
+    // within 0.14-0.27% of the crown's promoted figure; this comment
+    // changes no executable code and exists to receive an independent
+    // paired-runner assignment.
+    /// TAILHEAD-DEFERRED: the deferred-expert-rows front of
+    /// `deferredTailChainKernel` composed with the final-norm + head-sums
+    /// back of `tailFinalHeadSumsKernel` — layer 29's expert unsort, dual
+    /// post-FF norms, residual, layerScalar, FINAL model RMSNorm, and the
+    /// tied-head activation-sums table in ONE dispatch on the deferred path.
+    private static let deferredFinalTailHeadKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_glue_deferred_final_tail_head_xsum_paired_rms_2816_bf16_v2",
+            inputNames: [
+                "a", "sorted", "inverse", "route_weights", "res",
+                "w1", "w2", "w3", "s", "w_final",
+            ],
+            outputNames: ["out", "postNorm", "xSums"],
+            source: pairedRmsDeferredTailSource("""
+                const uint row = threadgroup_position_in_grid.x;
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint simd_lane_id = thread_index_in_simdgroup;
+                const uint simd_group_id = simdgroup_index_in_threadgroup;
+                threadgroup float local_inv[2];
+                threadgroup float local_sums[32];
+                threadgroup float quad_sums[704];
+                const uint base = row * 2816 + lid * 4;
+                const uint wbase = lid * 4;
+            \(rmsReduce("a", into: "local_inv[0]"))
+            \(deferredExpertValuesSource)
+            \(rmsReduce("expertv", into: "local_inv[1]").replacingOccurrences(
+                of: "(float)expertv[base + i]", with: "(float)expertv[i]"))
+                const float inv1 = local_inv[0];
+                const float inv2 = local_inv[1];
+                T sv[4];
+                for (int i = 0; i < 4; i++) {
+                    const T h1 = w1[wbase + i]
+                        * static_cast<T>((float)a[base + i] * inv1);
+                    const T h2 = w2[wbase + i]
+                        * static_cast<T>((float)expertv[i] * inv2);
+                    sv[i] = h1 + h2;
+                }
+            \(rmsReduce("sv", into: "local_inv[0]").replacingOccurrences(
+                of: "(float)sv[base + i]", with: "(float)sv[i]"))
+                const float inv3 = local_inv[0];
+                const T scalar = s[0];
+                T outv[4];
+                for (int i = 0; i < 4; i++) {
+                    const T normed3 = static_cast<T>(
+                        w3[wbase + i]
+                            * static_cast<T>((float)sv[i] * inv3));
+                    const T summed = res[base + i] + normed3;
+                    outv[i] = summed * scalar;
+                    out[base + i] = outv[i];
+                }
+            \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
+                of: "(float)outv[base + i]", with: "(float)outv[i]"))
+                const float inv4 = local_inv[0];
+                T postv[4];
+                for (int i = 0; i < 4; i++) {
+                    postv[i] = w_final[wbase + i]
+                        * static_cast<T>((float)outv[i] * inv4);
+                    postNorm[base + i] = postv[i];
+                }
+                quad_sums[lid] = postv[0] + postv[1] + postv[2] + postv[3];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if ((lid % 16) == 0) {
+                    float s2 = 0.0f;
+                    for (uint c = 0; c < 8; ++c) {
+                        const uint q = lid + c * 2;
+                        s2 += quad_sums[q];
+                        s2 += quad_sums[q + 1];
+                    }
+                    xSums[row * 44 + lid / 16] = s2;
+                }
+            """),
+            ensureRowContiguous: true
+        )
+
+    static func tailFinalHeadSumsDeferred(
+        mlpOut: MLXArray,
+        expertRows: DeferredWeightedExpertRows,
+        residual: MLXArray,
+        w1: MLXArray, w2: MLXArray, w3: MLXArray, layerScalar: MLXArray,
+        finalNormWeight: MLXArray, eps: Float
+    ) -> (out: MLXArray, postNorm: MLXArray, sums: Gemma4MMAQuantizedGEMV.ActivationSums)? {
+        guard Gemma4MMAQuantizedGEMV.consumesActivationSums,
+            admits(mlpOut, weight: w1, eps: eps),
+            admitsDeferred(expertRows),
+            residual.shape == mlpOut.shape, residual.dtype == .bfloat16,
+            w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16,
+            w3.ndim == 1, w3.dim(0) == axis, w3.dtype == .bfloat16,
+            layerScalar.size == 1, layerScalar.dtype == .bfloat16,
+            finalNormWeight.ndim == 1, finalNormWeight.dim(0) == axis,
+            finalNormWeight.dtype == .bfloat16
+        else { return nil }
+        CBv2EngageMark.once("glue-deferred-final-tail-head-xsum")
+        let outs = deferredFinalTailHeadKernel(
+            [
+                mlpOut, expertRows.sortedOutputs, expertRows.inverseOrder,
+                expertRows.weights, residual, w1, w2, w3, layerScalar,
+                finalNormWeight,
+            ],
+            template: [("T", mlpOut.dtype)],
+            grid: (rows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: [
+                [rows, 1, axis],
+                [rows, 1, axis],
+                [rows * (axis / 64)],
+            ],
+            outputDTypes: [.bfloat16, .bfloat16, .float32]
+        )
+        guard let sums = Gemma4MMAQuantizedGEMV.activationSums(
+            produced: outs[2], for: outs[1])
+        else { return nil }
+        return (outs[0], outs[1], sums)
     }
 
     static func tailChainedDeferred(
@@ -3548,8 +3799,17 @@ private enum Gemma4ZipRouterV1 {
         let normed = carriedRouterNorm ?? router.zipNorm(out)
 
         // Stage 2: router QMV | dense gate + up.
-        let expertScores = router.zipScores(
-            MLX.depends(input: normed, dependencies: [sums.dependencyHandle]))
+        // TRINORM-002B: when the router norm AND the activation-sums table
+        // were emitted by the SAME prefix dispatch, the fence ordering the
+        // scores input behind the sums handle is a structural identity — both
+        // operands are outputs of one kernel and cannot reorder. Dropped
+        // exactly there; every other combination keeps the fence. The dense-
+        // side fence below is load-bearing and stays.
+        let scoresIn =
+            (carriedRouterNorm != nil && producerSums != nil)
+            ? normed
+            : MLX.depends(input: normed, dependencies: [sums.dependencyHandle])
+        let expertScores = router.zipScores(scoresIn)
         let denseIn = MLX.depends(input: n1, dependencies: [normed])
         let gate = mlp.zipGate(denseIn, sums)
         let up = mlp.zipUp(denseIn, sums)
@@ -3703,6 +3963,7 @@ public class Gemma4DecoderLayer: Module {
         isExpertPrefill: Bool = false,
         glueChain: Gemma4GlueChainBox? = nil,
         nextInputLayernormWeight: MLXArray? = nil,
+        finalHeadNormWeight: MLXArray? = nil,
         enableAttentionBranchPrefix: Bool = false
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         // Prompt-path narrowing (CBv2 only): attention and every K/V write
@@ -3910,6 +4171,24 @@ public class Gemma4DecoderLayer: Module {
                 tailApplied = true
                 scalarFolded = true
             } else if canFoldScalar, let deferred = expertBranch.deferred,
+                let chain = glueChain,
+                let finalWeight = finalHeadNormWeight,
+                let finalHead = Gemma4FusedLayerGlue.tailFinalHeadSumsDeferred(
+                    mlpOut: h1Raw, expertRows: deferred, residual: residual2,
+                    w1: postFeedforwardLayernorm1.weight,
+                    w2: postFeedforwardLayernorm2.weight,
+                    w3: postFeedforwardLayernorm.weight,
+                    layerScalar: layerScalar,
+                    finalNormWeight: finalWeight,
+                    eps: config.rmsNormEps)
+            {
+                out = finalHead.out
+                chain.finalHead = (
+                    source: finalHead.out, postNorm: finalHead.postNorm,
+                    sums: finalHead.sums)
+                tailApplied = true
+                scalarFolded = true
+            } else if canFoldScalar, let deferred = expertBranch.deferred,
                 let fusedTail = Gemma4FusedLayerGlue.tailDeferred(
                     mlpOut: h1Raw, expertRows: deferred, residual: residual2,
                     w1: postFeedforwardLayernorm1.weight,
@@ -3944,6 +4223,23 @@ public class Gemma4DecoderLayer: Module {
                 {
                     out = chained.out
                     chain.pending = (source: chained.out, normed: chained.normedNext)
+                    tailApplied = true
+                    scalarFolded = true
+                } else if canFoldScalar, let chain = glueChain,
+                    let finalWeight = finalHeadNormWeight,
+                    let finalHead = Gemma4FusedLayerGlue.tailFinalHeadSums(
+                        mlpOut: h1Raw, expertOut: h2Raw, residual: residual2,
+                        w1: postFeedforwardLayernorm1.weight,
+                        w2: postFeedforwardLayernorm2.weight,
+                        w3: postFeedforwardLayernorm.weight,
+                        layerScalar: layerScalar,
+                        finalNormWeight: finalWeight,
+                        eps: config.rmsNormEps)
+                {
+                    out = finalHead.out
+                    chain.finalHead = (
+                        source: finalHead.out, postNorm: finalHead.postNorm,
+                        sums: finalHead.sums)
                     tailApplied = true
                     scalarFolded = true
                 } else if canFoldScalar,
@@ -4731,6 +5027,8 @@ public class Gemma4TextModelInner: Module {
                 glueChain: glueChain,
                 nextInputLayernormWeight: idx + 1 < layers.count
                     ? layers[idx + 1].inputLayernorm.weight : nil,
+                finalHeadNormWeight: (idx == layers.count - 1 && emitMMAHeadSums)
+                    ? norm.weight : nil,
                 enableAttentionBranchPrefix:
                     isCBv2 && !schedulePrefill
                     && inputBatchSize == 8 && inputLength == 1
@@ -4776,6 +5074,13 @@ public class Gemma4TextModelInner: Module {
         let postNorm: MLXArray
         let mmaHeadSums: Gemma4MMAQuantizedGEMV.ActivationSums?
         if emitMMAHeadSums,
+            let finalHead = glueChain.finalHead,
+            finalHead.source === h
+        {
+            postNorm = finalHead.postNorm
+            mmaHeadSums = finalHead.sums
+            CBv2EngageMark.once("final-tail-head-xsum")
+        } else if emitMMAHeadSums,
             let produced = Gemma4FinalNormMMAHeadSumsV1.apply(
                 h, weight: norm.weight, eps: norm.eps)
         {
@@ -5009,6 +5314,97 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 activationSums: activationSums)
         else { return nil }
         return mma.reshaped(Array(hidden.shape.dropLast()) + [mma.dim(-1)])
+    }
+
+    /// DIRECT-GREEDY-TOP1: in-kernel greedy top-1 reduction for the tied LM head.
+    @inline(__always)
+    private func tiedLMHeadMMATop1(
+        _ hidden: MLXArray,
+        activationSums: Gemma4MMAQuantizedGEMV.ActivationSums? = nil
+    ) -> MLXArray? {
+        guard lmHead == nil,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.mode == .affine,
+            let tokens = Gemma4MMAQuantizedGEMV.applyTop1(
+                x: hidden,
+                w: quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                groupSize: quantized.groupSize,
+                bits: quantized.bits,
+                activationSums: activationSums)
+        else { return nil }
+        return tokens
+    }
+
+    func applyLMHeadTop1(
+        _ hidden: MLXArray,
+        activationSums: Gemma4MMAQuantizedGEMV.ActivationSums? = nil
+    ) -> MLXArray? {
+        guard let tokens = tiedLMHeadMMATop1(
+            hidden, activationSums: activationSums)
+        else { return nil }
+        CBv2EngageMark.once("direct-greedy-top1")
+        return tokens
+    }
+
+    public func cbv2DecodeTop1(
+        inputs: MLXArray, cache: [KVCache]?
+    ) -> MLXArray? {
+        // Admission is decided BEFORE the forward. A nil returned past this
+        // guard would make the engine re-run the incumbent step and forward
+        // the model a second time, double-appending every KV cache (the
+        // FullSequenceKV capacity precondition trips on the next full layer).
+        // Every x-independent `applyTop1` refusal — including the
+        // DARKBLOOM_CBV2_DIRECT_GREEDY_TOP1 kill switch — resolves here with
+        // zero forwards taken.
+        guard lmHead == nil,
+            inputs.ndim == 2,
+            inputs.dim(0) == 8,
+            inputs.dim(1) == 1,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.mode == .affine,
+            quantized.groupSize == 64,
+            quantized.bits == 4,
+            Gemma4MMAQuantizedGEMV.applyTop1AdmitsWeights(
+                w: quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                groupSize: quantized.groupSize,
+                bits: quantized.bits)
+        else { return nil }
+
+        // Past this point exactly ONE forward runs, and the step's answer is
+        // produced from it no matter what: if the fused top-1 head refuses on
+        // an x-dependent condition, the SAME hidden state feeds the incumbent
+        // logits head and a plain argmax (greedy selection is invariant under
+        // the head's monotone final maps), never a second forward.
+        if Gemma4MMAQuantizedGEMV.consumesActivationSums {
+            let produced = model.callWithMMAHeadSums(inputs, cache: cache)
+            if let tokens = applyLMHeadTop1(
+                produced.postNorm, activationSums: produced.activationSums)
+            {
+                return tokens
+            }
+            return cbv2GreedyTokensFromHidden(
+                produced.postNorm, activationSums: produced.activationSums)
+        } else {
+            let hidden = model(inputs, cache: cache)
+            if let tokens = applyLMHeadTop1(hidden) { return tokens }
+            return cbv2GreedyTokensFromHidden(hidden)
+        }
+    }
+
+    /// Single-forward safety net for `cbv2DecodeTop1`: the forward has already
+    /// run, so a late fused-head refusal resolves from the SAME hidden state
+    /// through the incumbent logits head plus argmax.
+    private func cbv2GreedyTokensFromHidden(
+        _ hidden: MLXArray,
+        activationSums: Gemma4MMAQuantizedGEMV.ActivationSums? = nil
+    ) -> MLXArray {
+        let logits = applyLMHead(hidden, activationSums: activationSums)
+        return argMax(logits.reshaped([8, logits.dim(-1)]), axis: -1)
+            .asType(.int32)
     }
 
     /// Apply the LM head (tied embedding or explicit `lm_head`) plus the
@@ -5376,3 +5772,8 @@ extension Gemma4TextModel: CBv2MTPForwardable {
         return (applyLMHead(postNorm), preNorm)
     }
 }
+
+// MARK: - ContinuousBatchingV2 Direct Greedy Top-1 Decoding
+
+extension Gemma4TextModel: CBv2DirectGreedyTop1Forwardable {}
+

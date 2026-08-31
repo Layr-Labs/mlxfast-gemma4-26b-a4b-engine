@@ -1183,6 +1183,68 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     private static let minKeyLength = 4
     private static let maxKeyLength = 4095
 
+    /// The AV path reads four adjacent BF16 values from each V row at a time.
+    /// `out_col` is always a multiple of four in the admitted D=512 geometry,
+    /// so a `vec<T, 4>` load covers the same bytes as the four scalar loads
+    /// without changing the per-element multiply or accumulation order.
+    ///
+    /// Kill switch: `DARKBLOOM_GEMMA4_D512_AV_VEC4=0` restores the scalar
+    /// loads. Default ON.
+    private static let avVec4Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_AV_VEC4"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static func markAVVec4() {
+        guard avVec4Enabled else { return }
+        CBv2EngageMark.once("d512-av-vec4")
+    }
+
+    private static let avValueLoad: String = {
+        guard avVec4Enabled else {
+            return """
+                        for (int tn = 0; tn < 4; ++tn) {
+                            inter[tn] = value_plane[
+                                size_t(bm + tm) * D + out_col + tn];
+                        }
+            """
+        }
+        return """
+                        const device T4* value_ptr = reinterpret_cast<const device T4*>(
+                            value_plane + size_t(bm + tm) * D + out_col);
+                        const T4 value_vector = value_ptr[0];
+                        for (int tn = 0; tn < 4; ++tn) {
+                            inter[tn] = value_vector[tn];
+                        }
+        """
+    }()
+
+    private static let avFusedValueLoad: String = {
+        guard avVec4Enabled else {
+            return """
+                        for (int tn = 0; tn < 4; ++tn) {
+                            inter[tn] = is_new_token
+                                ? new_value_plane[out_col + tn]
+                                : value_plane[
+                                      size_t(bm + tm) * D + out_col + tn];
+                        }
+            """
+        }
+        return """
+                        const device T4* value_ptr = is_new_token
+                            ? reinterpret_cast<const device T4*>(
+                                  new_value_plane + out_col)
+                            : reinterpret_cast<const device T4*>(
+                                  value_plane + size_t(bm + tm) * D + out_col);
+                        const T4 value_vector = value_ptr[0];
+                        for (int tn = 0; tn < 4; ++tn) {
+                            inter[tn] = value_vector[tn];
+                        }
+        """
+    }()
+
     /// Dispatch 1 — QKᵀ. Grid: (row, kv head, chunk of 4 virtual gemv
     /// threadgroups = 64 score rows) × 128 threads (4 simdgroups — exactly
     /// the stock gemv threadgroup shape). Each simdgroup replays the stock
@@ -1424,7 +1486,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// butterfly for all 8 heads of the GQA group at once (shared V tile
     /// loads). params as dispatch 1.
     private static let avKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_v1",
+        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_v2_vec4",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -1434,6 +1496,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         source: """
             constexpr int D = 512;
             constexpr int GQA = 8;
+            typedef vec<T, 4> T4;
 
             const int key_length = int(params[0]);
 
@@ -1486,10 +1549,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 }
                 #pragma clang loop unroll(full)
                 for (int tm = 0; tm < 4; ++tm) {
-                    for (int tn = 0; tn < 4; ++tn) {
-                        inter[tn] = value_plane[
-                            size_t(bm + tm) * D + out_col + tn];
-                    }
+                    \(avValueLoad)
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
                         float vc = v_coeff[h][tm];
@@ -1508,10 +1568,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                             prob_rows[size_t(h) * key_length + bm + tm]);
                     }
                     #pragma clang loop unroll(full)
-                    for (int tn = 0; tn < 4; ++tn) {
-                        inter[tn] = value_plane[
-                            size_t(bm + tm) * D + out_col + tn];
-                    }
+                    \(avValueLoad)
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
                         #pragma clang loop unroll(full)
@@ -1753,7 +1810,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// `new_values` rather than the cache slot the fused QK dispatch wrote,
     /// so this kernel has no read-after-in-place-write hazard at all.
     private static let fusedAvKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_v2",
+        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_v3_vec4",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -1763,6 +1820,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         source: """
             constexpr int D = 512;
             constexpr int GQA = 8;
+            typedef vec<T, 4> T4;
 
             const int key_length = int(params[0]);
 
@@ -1820,10 +1878,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 if (bm + 4 <= key_length - 1) {
                 #pragma clang loop unroll(full)
                 for (int tm = 0; tm < 4; ++tm) {
-                    for (int tn = 0; tn < 4; ++tn) {
-                        inter[tn] = value_plane[
-                            size_t(bm + tm) * D + out_col + tn];
-                    }
+                    \(avValueLoad)
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
                         float vc = v_coeff[h][tm];
@@ -1836,12 +1891,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 #pragma clang loop unroll(full)
                 for (int tm = 0; tm < 4; ++tm) {
                     const bool is_new_token = bm + tm == key_length - 1;
-                    for (int tn = 0; tn < 4; ++tn) {
-                        inter[tn] = is_new_token
-                            ? new_value_plane[out_col + tn]
-                            : value_plane[
-                                  size_t(bm + tm) * D + out_col + tn];
-                    }
+                    \(avFusedValueLoad)
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
                         float vc = v_coeff[h][tm];
@@ -1862,12 +1912,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     }
                     const bool is_new_token = bm + tm == key_length - 1;
                     #pragma clang loop unroll(full)
-                    for (int tn = 0; tn < 4; ++tn) {
-                        inter[tn] = is_new_token
-                            ? new_value_plane[out_col + tn]
-                            : value_plane[
-                                  size_t(bm + tm) * D + out_col + tn];
-                    }
+                        \(avFusedValueLoad)
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
                         #pragma clang loop unroll(full)
@@ -2083,6 +2128,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             outputShapes: [scratchShape],
             outputDTypes: [.bfloat16]
         )[0]
+        markAVVec4()
 
         let output = avKernel(
             [probs] + valueBuffers + [paramsArray],
@@ -2204,6 +2250,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             outputShapes: [scratchShape],
             outputDTypes: [.bfloat16]
         )[0]
+        markAVVec4()
 
         let output = fusedAvKernel(
             [probs] + valueBuffers + [paramsArray, values],
@@ -2321,6 +2368,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             outputShapes: [scratchShape],
             outputDTypes: [.bfloat16]
         )[0]
+        markAVVec4()
 
         return avKernel(
             [probs] + valueBuffers + [paramsArray],

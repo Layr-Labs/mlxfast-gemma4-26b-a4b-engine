@@ -118,19 +118,20 @@ private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
     source: """
         uint feature = thread_position_in_grid.x;
         uint token = thread_position_in_grid.y;
+        if (feature >= 2816) { return; }
 
         T accumulator = (T)0;
         const uint assignment_base = token * (uint)K;
+        #pragma clang loop unroll(full)
         for (uint slot = 0; slot < (uint)K; ++slot) {
             const uint assignment = assignment_base + slot;
             const uint sorted_row = (uint)inverse_order[assignment];
-            // Preserve the legacy bfloat16 multiply-then-reduce rounding.
             const T weighted = (T)(
-                (float)sorted_outputs[sorted_row * threads_per_grid.x + feature]
+                (float)sorted_outputs[sorted_row * 2816 + feature]
                 * (float)weights[assignment]);
             accumulator = accumulator + weighted;
         }
-        output[token * threads_per_grid.x + feature] = accumulator;
+        output[token * 2816 + feature] = accumulator;
     """,
     ensureRowContiguous: true
 )
@@ -171,7 +172,7 @@ public func weightedExpertUnsort(
             ("K", 8),
         ],
         grid: (2816, tokens, 1),
-        threadGroup: (64, 4, 1),
+        threadGroup: (128, 1, 1),
         outputShapes: [[tokens, 2816]],
         outputDTypes: [.bfloat16]
     )[0]

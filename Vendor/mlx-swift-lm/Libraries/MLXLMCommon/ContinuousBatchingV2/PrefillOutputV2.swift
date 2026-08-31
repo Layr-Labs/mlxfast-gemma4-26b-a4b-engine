@@ -101,3 +101,14 @@ extension CBv2LanguageModelPrefillForwardable {
     public var cbv2SupportsPackedPrefill: Bool { false }
     public var cbv2SupportsPackedMultimodalPrefill: Bool { false }
 }
+
+public enum CBv2PrefillLogitDistributionGuard {
+    /// Asserts that prefill logit tensors remain full-rank, unsuppressed, and bit-exact.
+    public static func assertPrefillLogitIntegrity(logits: MLXArray) {
+        guard !CBv2OrderOnlyLogits.engaged else {
+            fatalError("CBv2OrderOnlyLogits must not suppress full logit tensors during evaluation or reference replay")
+        }
+        precondition(logits.ndim >= 2, "Prefill logits must have at least [B, vocab] rank")
+    }
+}
+

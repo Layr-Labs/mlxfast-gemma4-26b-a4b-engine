@@ -202,6 +202,152 @@ enum CBv2ComposedPrefillSDPAV1 {
         return queries.reshaped([B, nKVHeads, nRepeats, queries.dim(2), queryDim])
     }
 
+    /// Single-pass FlashAttention-2 online softmax kernel for Apple Silicon.
+    /// Fuses QK^T dot product, causal mask, online softmax normalization,
+    /// and P*V value accumulation into an 8-warp block-cooperative kernel,
+    /// completely eliminating all intermediate DRAM score materializations and
+    /// sharing K/V loads across queries in threadgroup SRAM.
+    static let flashAttentionEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PREFILL_FLASH_ATTN"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let flashAttentionKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_fused_prefill_flash_sdpa_v3",
+        inputNames: ["queries", "keys", "values"],
+        outputNames: ["output"],
+        source: """
+            constexpr int simd_width = 32;
+            constexpr int num_warps = 8;
+            constexpr int values_per_lane = D / simd_width;
+            constexpr int vecs_per_lane = values_per_lane / 4;
+            constexpr float neg_infinity = -3.402823466e+38F;
+
+            typedef vec<T, 4> T4;
+            typedef vec<float, 4> float4;
+
+            const int q_row_base = int(threadgroup_position_in_grid.y) * num_warps;
+            const int local_y = int(thread_position_in_threadgroup.y);
+            const int lane = int(thread_position_in_threadgroup.x);
+            const int local_id = local_y * simd_width + lane;
+
+            const int q_row = q_row_base + local_y;
+            const bool valid_q = (q_row < L);
+
+            const int batch_head = int(threadgroup_position_in_grid.z);
+            const int q_head = batch_head % N_Q_HEADS;
+            const int batch_idx = batch_head / N_Q_HEADS;
+            const int kv_head = q_head / GQA;
+
+            const int q_abs_pos = (KL - L) + q_row;
+            const int q_head_stride = L * D;
+            const int k_head_stride = KL * D;
+            const int v_head_stride = KL * D;
+            const int o_head_stride = L * D;
+
+            float4 q_reg[vecs_per_lane];
+            if (valid_q) {
+                const device T* q_lane = queries
+                    + batch_idx * (N_Q_HEADS * q_head_stride)
+                    + q_head * q_head_stride
+                    + q_row * D + lane * values_per_lane;
+                #pragma clang loop unroll(full)
+                for (int e = 0; e < vecs_per_lane; ++e) {
+                    const device T4* q_vec = (const device T4*)(q_lane + e * 4);
+                    T4 val = *q_vec;
+                    q_reg[e] = {float(val[0]), float(val[1]), float(val[2]), float(val[3])};
+                }
+            }
+
+            float4 O_acc[vecs_per_lane];
+            #pragma clang loop unroll(full)
+            for (int e = 0; e < vecs_per_lane; ++e) {
+                O_acc[e] = {0.0f, 0.0f, 0.0f, 0.0f};
+            }
+            float max_score = neg_infinity;
+            float sum_exp = 0.0f;
+
+            const int k_end = valid_q ? (q_abs_pos + 1) : 0;
+
+            const int max_q_row = min(L - 1, q_row_base + num_warps - 1);
+            const int max_q_abs_pos = (KL - L) + max_q_row;
+            const int group_k_end = max_q_abs_pos + 1;
+
+            const device T* k_base = keys + batch_idx * (N_KV_HEADS * k_head_stride) + kv_head * k_head_stride;
+            const device T* v_base = values + batch_idx * (N_KV_HEADS * v_head_stride) + kv_head * v_head_stride;
+
+            threadgroup T4 k_shared[128];
+            threadgroup T4 v_shared[128];
+
+            const int num_vecs = D / 4;
+
+            for (int k_idx = 0; k_idx < group_k_end; ++k_idx) {
+                for (int i = local_id; i < num_vecs; i += num_warps * simd_width) {
+                    const device T4* k_vec_ptr = (const device T4*)(k_base + k_idx * D + i * 4);
+                    const device T4* v_vec_ptr = (const device T4*)(v_base + k_idx * D + i * 4);
+                    k_shared[i] = *k_vec_ptr;
+                    v_shared[i] = *v_vec_ptr;
+                }
+                
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                if (valid_q && k_idx < k_end) {
+                    float dot_val = 0.0f;
+                    #pragma clang loop unroll(full)
+                    for (int e = 0; e < vecs_per_lane; ++e) {
+                        int shared_idx = lane * vecs_per_lane + e;
+                        T4 k_val = k_shared[shared_idx];
+                        float4 k_f4 = {float(k_val[0]), float(k_val[1]), float(k_val[2]), float(k_val[3])};
+                        dot_val += q_reg[e][0] * k_f4[0] + q_reg[e][1] * k_f4[1] + q_reg[e][2] * k_f4[2] + q_reg[e][3] * k_f4[3];
+                    }
+                    dot_val = simd_sum(dot_val);
+
+                    const float new_max = max(max_score, dot_val);
+                    const float alpha = (max_score == neg_infinity) ? 0.0f : fast::exp(max_score - new_max);
+                    const float score_factor = fast::exp(dot_val - new_max);
+                    max_score = new_max;
+                    sum_exp = sum_exp * alpha + score_factor;
+
+                    #pragma clang loop unroll(full)
+                    for (int e = 0; e < vecs_per_lane; ++e) {
+                        int shared_idx = lane * vecs_per_lane + e;
+                        T4 v_val = v_shared[shared_idx];
+                        float4 v_f4 = {float(v_val[0]), float(v_val[1]), float(v_val[2]), float(v_val[3])};
+                        O_acc[e][0] = O_acc[e][0] * alpha + score_factor * v_f4[0];
+                        O_acc[e][1] = O_acc[e][1] * alpha + score_factor * v_f4[1];
+                        O_acc[e][2] = O_acc[e][2] * alpha + score_factor * v_f4[2];
+                        O_acc[e][3] = O_acc[e][3] * alpha + score_factor * v_f4[3];
+                    }
+                }
+                
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            if (valid_q) {
+                const float inv_sum = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;
+                device T* out_lane = output
+                    + batch_idx * (N_Q_HEADS * o_head_stride)
+                    + q_head * o_head_stride
+                    + q_row * D + lane * values_per_lane;
+                
+                #pragma clang loop unroll(full)
+                for (int e = 0; e < vecs_per_lane; ++e) {
+                    device T4* out_vec = (device T4*)(out_lane + e * 4);
+                    T4 val = {
+                        T(O_acc[e][0] * inv_sum),
+                        T(O_acc[e][1] * inv_sum),
+                        T(O_acc[e][2] * inv_sum),
+                        T(O_acc[e][3] * inv_sum)
+                    };
+                    *out_vec = val;
+                }
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
     /// The fast.cpp SDPA fallback, minus the identity query scale.
     /// Returns nil when this call is not provably that graph.
     /// `queryPlaneSlice` is this block's view of `queryPlane(...)` when the
@@ -226,7 +372,7 @@ enum CBv2ComposedPrefillSDPAV1 {
         let valueDim = values.dim(3)
         guard queries.dim(2) == L, keys.dim(2) == kL, values.dim(2) == kL else { return nil }
         guard keys.dim(0) == B, values.dim(0) == B else { return nil }
-        guard keys.dim(3) == queryDim else { return nil }
+        guard keys.dim(3) == queryDim, valueDim == queryDim else { return nil }
         guard !mlxHasFusedKernel(queryDim: queryDim, valueDim: valueDim, L: L) else { return nil }
         // Symbolic `.causal` only: an array mask (kL > window) keeps the
         // stock call, whose fallback reshapes the broadcast mask.
@@ -238,14 +384,31 @@ enum CBv2ComposedPrefillSDPAV1 {
         }
         let nRepeats = nQHeads / nKVHeads
 
+        if flashAttentionEnabled, (queryDim == 256 || queryDim == 512) {
+            CBv2EngageMark.once("prefill-flash-sdpa")
+            let numGroupsY = (L + 7) / 8
+            return flashAttentionKernel(
+                [queries, keys, values],
+                template: [
+                    ("T", queries.dtype),
+                    ("D", queryDim),
+                    ("GQA", nRepeats),
+                    ("N_Q_HEADS", nQHeads),
+                    ("N_KV_HEADS", nKVHeads),
+                    ("L", L),
+                    ("KL", kL),
+                ],
+                grid: (32, numGroupsY * 8, B * nQHeads),
+                threadGroup: (32, 8, 1),
+                outputShapes: [[B, nQHeads, L, queryDim]],
+                outputDTypes: [queries.dtype]
+            )[0]
+        }
+
         var q = queries
         var k = keys
         var v = values
         if nRepeats > 1 {
-            // STRICT: without the hoisted plane the GQA split would have to
-            // `reshape` a strided q-block, which copies -- trading the deleted
-            // identity multiply for a copy of the same size instead of
-            // deleting it. Refuse rather than break even.
             guard let plane = queryPlaneSlice,
                 plane.ndim == 5, plane.dim(0) == B, plane.dim(1) == nKVHeads,
                 plane.dim(2) == nRepeats, plane.dim(3) == L, plane.dim(4) == queryDim,
@@ -257,23 +420,6 @@ enum CBv2ComposedPrefillSDPAV1 {
         }
 
         CBv2EngageMark.once("prefill-sdpa-compose")
-        // PREFILL-MASK-FUSE: the causal mask is applied by the QK^T GEMM's
-        // OWN epilogue instead of by a second full pass over the score
-        // rectangle. `steel_gemm_fused`'s `use_out_source` epilogue is
-        // `TransformAdd::apply(acc, C) = float(acc) + float(C)` evaluated on
-        // the fp32 accumulator BEFORE the single bfloat16 store, so:
-        //   * unmasked (bias -0.0): `acc + (-0.0) == acc` for every fp32
-        //     value, signed zeros included, and the store rounds exactly as
-        //     the plain matmul's `TransformNone` store does;
-        //   * masked (bias 0xFF7F = -3.3895e38): ulp(3.39e38) is 2^104, so
-        //     `acc + bias` rounds to `bias` for any score with |acc| < 2^103
-        //     -- every attention score this model produces by many orders of
-        //     magnitude -- and the store yields exactly 0xFF7F, the same word
-        //     `where(mask, scores, finfo(bf16).min)` writes.
-        // `c` rides the GEMM as a broadcast (batch strides 0, ldc = kL): MLX
-        // passes its strides straight through to the kernel, so nothing is
-        // materialized and the [L, kL] bias is read once per output tile out
-        // of cache instead of the whole rectangle being read and rewritten.
         var scores: MLXArray
         if maskFuseEnabled {
             CBv2EngageMark.once("prefill-mask-fuse")

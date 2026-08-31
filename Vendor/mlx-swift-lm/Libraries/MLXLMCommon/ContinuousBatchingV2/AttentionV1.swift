@@ -515,10 +515,18 @@ enum CBv2AttentionV1 {
                         }
                     }
 
+                    let packedMirrorBatch = portQuantActive
+                        ? CBv2WindowedSequenceKV.quantPackPairBatchGPUIfEligible(
+                            keys: keys, values: values)
+                        : nil
                     for (index, row) in ringRows.enumerated() {
+                        let packedMirror = packedMirrorBatch.map {
+                            $0[index].squeezed(axis: 0)
+                        }
                         row.decodeRingWrite(
                             keys: keys[index ..< (index + 1)],
-                            values: values[index ..< (index + 1)])
+                            values: values[index ..< (index + 1)],
+                            packedMirror: packedMirror)
                     }
                     let views = ringRows.compactMap { $0.decodeRingView }
                     // KVQ-PORT: the ring write above is the promoted stock

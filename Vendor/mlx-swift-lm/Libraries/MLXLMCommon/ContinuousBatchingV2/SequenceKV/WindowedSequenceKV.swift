@@ -229,10 +229,13 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         return (returnedKeys, returnedValues)
     }
 
-    func decodeRingWrite(keys newKeys: MLXArray, values newValues: MLXArray) {
+    func decodeRingWrite(
+        keys newKeys: MLXArray, values newValues: MLXArray,
+        packedMirror: MLXArray? = nil
+    ) {
         precondition(staged == nil && newKeys.dim(2) == 1 && newValues.dim(2) == 1)
         allocateIfNeeded(keyTemplate: newKeys, valueTemplate: newValues)
-        writeDecodeToken(keys: newKeys, values: newValues)
+        writeDecodeToken(keys: newKeys, values: newValues, packedMirror: packedMirror)
     }
 
     var decodeRingView: (keys: MLXArray, values: MLXArray, start: Int)? {
@@ -520,12 +523,16 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
 
     // MARK: - Ring geometry
 
-    private func writeDecodeToken(keys newKeys: MLXArray, values newValues: MLXArray) {
+    private func writeDecodeToken(
+        keys newKeys: MLXArray, values newValues: MLXArray,
+        packedMirror: MLXArray? = nil
+    ) {
         borrowableChunkViews = nil
         // KVQ-PAIRWRITE: when both mirror planes go out together the ring
         // writes carry no mirror plane of their own.
         let paired = writePairedMirror(
-            keys: newKeys, values: newValues, firstPosition: absoluteOffset)
+            keys: newKeys, values: newValues, firstPosition: absoluteOffset,
+            packed: packedMirror)
         writeRing(
             keys!, tokens: newKeys, firstPosition: absoluteOffset,
             mirrorPlane: paired ? nil : 0)
@@ -712,7 +719,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// its text, and a Swift-hosted kernel that changes text without
     /// changing name serves a stale cached body.
     private static let quantPackPairKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_kvq8_pack_pair_d256_v1",
+        name: "cbv2_kvq8_pack_pair_d256_batch_v2",
         inputNames: ["xk", "xv"],
         outputNames: ["packed_w"],
         source: """
@@ -723,7 +730,13 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             device uint8_t* packed = (device uint8_t*)packed_w;
             const int row = int(threadgroup_position_in_grid.x);
             const int lane = int(thread_position_in_threadgroup.x);
-            const device T* xr = row < HEADS ? xk + row * D : xv + (row - HEADS) * D;
+            const int rows_per_batch = 2 * HEADS;
+            const int batch_index = row / rows_per_batch;
+            const int local_row = row - batch_index * rows_per_batch;
+            const bool value_plane = local_row >= HEADS;
+            const int head = value_plane ? local_row - HEADS : local_row;
+            const int source_row = batch_index * HEADS + head;
+            const device T* xr = (value_plane ? xv : xk) + source_row * D;
 
             float vmin = 3.402823466e+38F;
             float vmax = -3.402823466e+38F;
@@ -1375,16 +1388,34 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
     /// `[1, H, 1, D]` keys and values -> `[2, H, 1, (D + 4) / 4]` uint32,
     /// row for row what `quantPackGPU` produces for each plane separately.
     static func quantPackPairGPU(keys: MLXArray, values: MLXArray) -> MLXArray {
+        let batch = keys.dim(0)
         let heads = keys.dim(1)
         let headDim = keys.dim(3)
+        let outputShape = batch == 1
+            ? [2, heads, 1, (headDim + 4) / 4]
+            : [batch, 2, heads, 1, (headDim + 4) / 4]
         return quantPackPairKernel(
             [keys, values],
             template: [("T", keys.dtype), ("HEADS", heads)],
-            grid: (2 * heads * 32, 1, 1),
+            grid: (batch * 2 * heads * 32, 1, 1),
             threadGroup: (32, 1, 1),
-            outputShapes: [[2, heads, 1, (headDim + 4) / 4]],
+            outputShapes: [outputShape],
             outputDTypes: [.uint32]
         )[0]
+    }
+
+    /// Pack all eight decode rows in one dispatch. Each row still owns its
+    /// mirror allocation and consumes one zero-copy slice of this result.
+    static func quantPackPairBatchGPUIfEligible(
+        keys: MLXArray, values: MLXArray
+    ) -> MLXArray? {
+        guard pairedMirrorWriteEnabled, gpuPackEnabled,
+            !gpuPackCheck, !quantSimulate,
+            keys.dtype == values.dtype,
+            keys.shape == [8, 8, 1, 256],
+            values.shape == keys.shape
+        else { return nil }
+        return quantPackPairGPU(keys: keys, values: values)
     }
 
     /// KVQ-PAIRWRITE. Maintaining the mirror plane by plane builds TWO
@@ -1400,7 +1431,8 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
     /// false — leaving the per-plane road to run untouched — whenever a
     /// precondition does not hold.
     private func writePairedMirror(
-        keys newKeys: MLXArray, values newValues: MLXArray, firstPosition: Int
+        keys newKeys: MLXArray, values newValues: MLXArray, firstPosition: Int,
+        packed prepacked: MLXArray? = nil
     ) -> Bool {
         guard Self.pairedMirrorWriteEnabled,
             let quantMirror,
@@ -1410,7 +1442,15 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
             newKeys.shape == [1, kvHeads, 1, headDim],
             newValues.shape == [1, kvHeads, 1, headDim]
         else { return false }
-        let packed = Self.quantPackPairGPU(keys: newKeys, values: newValues)
+        let packed: MLXArray
+        if let prepacked {
+            guard prepacked.dtype == .uint32,
+                prepacked.shape == [2, kvHeads, 1, (headDim + 4) / 4]
+            else { return false }
+            packed = prepacked
+        } else {
+            packed = Self.quantPackPairGPU(keys: newKeys, values: newValues)
+        }
         let slot = firstPosition % window
         quantMirror[0..., 0..., slot ..< (slot + 1), 0...] = packed
         return true

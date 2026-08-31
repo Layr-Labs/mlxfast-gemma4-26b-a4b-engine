@@ -135,7 +135,7 @@ template <
   // Store result
   dispatch_bool(align_M || !is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(align_N || !is_unaligned_sn, [&](auto kAlignedN) {
-      if constexpr (kAlignedM && kAlignedN) {
+      if constexpr (kAlignedM.value && kAlignedN.value) {
         Dtile.store(C, int(params->ldc));
       } else {
         Dtile.store_safe(C, int(params->ldc), short2(sgp_sn, sgp_sm));

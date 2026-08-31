@@ -1,5 +1,4 @@
-// LMH-001v2: tight-grid dispatch for the tied lm_head ordinary QMV at batch
-// eight, carrying the promoted quad-STREAM body verbatim.
+// LMH-OCTO-001: one pass over the tied lm_head weight matrix instead of two.
 //
 // The vendored MLX host launches ordinary QMV as
 //
@@ -8,55 +7,61 @@
 //     compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 //
 // (`backend/metal/quantized.cpp`), so the x extent of the grid is the cohort
-// row count, eight. The promoted wide-N tier in `quantized.h`
-// (`qmv_affine4_g64_quad_stream_impl`) claims four cohort rows per threadgroup
-// and returns from the rest:
+// row count, eight, and each x-group re-reads the same weight rows for its own
+// cohort row. The stock body reads the matrix EIGHT times per decode step.
+// The promoted quad-STREAM body in `quantized.h` claims four cohort rows per
+// threadgroup and returns from the rest, which cuts that to TWO passes; this
+// file's tight-grid dispatch (josusanmartin's LMH-001, submission `2de922a4`,
+// official receipt +0.216% composite / +0.383% decode on the `3ab9bd4` parent)
+// stops launching the six groups that only hit the early return, but the two
+// surviving x-groups still stream the whole matrix each.
 //
-//     const int first_m = int(tid.x) * 4;
-//     if (first_m >= 8) { return; }
+// On the tied lm_head that second pass is the largest single read in the
+// decode step. N = 262144 rows of K = 2816 affine-4 weights is 352 MiB of
+// packed words plus 44 MiB of group scales and biases; at two passes the
+// kernel pulls 792 MiB to produce 2.1 M logits, an arithmetic intensity of
+// about a third of an operation per byte. It is the most bandwidth-skewed op
+// in the tower.
 //
-// Two x-groups do the work; six are launched and retire immediately. On the
-// tied lm_head that is the largest grid of the decode step -- N = 262144 gives
-// N / 8 = 32768 y-groups, so 8 * 32768 = 262144 threadgroups are launched and
-// 196608 of them exist only to hit that early return.
+// THIS CHANGE. The body becomes an octo-stream: `results_per_simdgroup` drops
+// from four to two and the cohort loop widens from four rows to all eight, so
+// one simdgroup holds two output rows' packed words and drives every cohort
+// row against them before moving to the next K block. The grid's x extent
+// becomes one. Each weight word, each group scale and each group bias is then
+// fetched exactly once per decode step rather than twice, and the resident
+// working set per thread goes DOWN: `result` is still sixteen floats (eight
+// streams by two rows, where it was four by four), while `packed` halves from
+// [4][2] to [2][2] and `scale_local`/`bias_local` halve from four entries to
+// two. Nothing is spent to buy the saving.
 //
-// The host grid is not editable. This file instead dispatches the same
-// computation from a custom kernel whose own grid has x extent two, so only
-// the groups that were already doing the work are launched. `first_m` is kept
-// as `tid.x * 4`, so with tid.x in {0, 1} the two surviving groups claim rows
-// 0-3 and 4-7 exactly as before: the same threadgroup does the same rows with
-// the same pointers.
+// What it costs is the query side. `load_vector` now runs eight times per K
+// block instead of four, because each of the eight cohort rows must be widened
+// and run-summed against the two resident weight rows. That input rectangle is
+// eight rows of 2816 bfloat16, 45 KiB in total, and every threadgroup reads
+// the same 45 KiB, so those loads come out of cache rather than DRAM. The
+// multiply-accumulate count is unchanged: sixteen `qdot_affine4_registered`
+// calls per block either way, because the product of streams and rows is
+// sixteen in both shapes.
 //
-// LINEAGE. The tight-grid dispatch is josusanmartin's LMH-001 (submission
-// `2de922a4`; its isolated ancestor holds an official box receipt of +0.216%
-// composite / +0.383% decode on the `3ab9bd4` parent, fidelity passed). That
-// original embedded the then-promoted register-resident quad body. The current
-// promoted tier is the register-STREAMED quad (`49e4becd`), measured faster
-// than the retired quad on the box precisely because only one row of x is
-// live at a time; shipping the old body at two groups would trade the grid
-// saving back for the slower body. The header below therefore carries the
-// PROMOTED helpers VERBATIM from `quantized.h` -- `load_vector`,
-// `load_vector_safe`, `qdot_affine4_registered`, and
-// `qmv_affine4_g64_quad_stream_impl` -- and the kernel body reproduces the
-// stock `[[kernel]] affine_qmv` wide-N call block, so the compiler sees the
-// same code shape the JIT library compiles and makes the same contraction
-// decisions. (A hand-inlined expansion of the same arithmetic measured 1-4
-// ulp off the library kernel under this compiler; verbatim inclusion is what
-// the prior parity receipts on this track used, and the local runtime parity
-// test pins it bitwise.) Only the grid differs from the stock road.
+// EXACTNESS. Every output element is still produced by the same arithmetic in
+// the same order. `load_vector` sees the same eight bfloat16 words at the same
+// addresses; `qdot_affine4_registered` sees the same packed word, the same
+// pre-scaled query values, the same scale, bias and run sum; the K traversal
+// visits the same blocks in the same ascending order into the same float
+// accumulator; the same `simd_sum` reduces it; the same bfloat16 conversion
+// stores it. Only the assignment of (output row, cohort row) pairs to
+// threadgroups changes, and no accumulator is shared between pairs. The kernel
+// name is versioned to `..._octo_stream_v4` so the named MLX kernel cache
+// cannot answer the new request with the previously compiled quad body.
 //
-// LMH-002 (this submission). The header's short walks whose trip counts are
-// already compile-time constants -- the affine-4 registered dot's lane walk
-// (values_per_thread / 4), load_vector's fixed-count value walk, the
-// four-row cohort walks (results_per_simdgroup), the packed uint16 walk
-// (uint16_per_thread), and the final four-row SIMD reduction -- now carry
-// `#pragma clang loop unroll(full)`. The K traversal is NOT annotated: its
-// trip count comes from the live input shape. No address, predicate,
-// accumulation order, or arithmetic expression is changed, so the bitwise
-// parity this file pins is unaffected; only loop-control codegen differs.
-// The kernel name is versioned to `..._unroll_v3` so the named MLX kernel
-// cache cannot satisfy the new request with the previously compiled body.
-// Mechanism inherited from fkiene's promoted `22154b54` (DenseMLPQMVV1).
+// LINEAGE. The header below still carries the PROMOTED helpers VERBATIM from
+// `quantized.h` -- `load_vector`, `load_vector_safe` and
+// `qdot_affine4_registered`, each with the `#pragma clang loop unroll(full)`
+// annotations on their compile-time walks that `df8d0ef` promoted at +1.11%.
+// A hand-inlined expansion of the same arithmetic measured 1-4 ulp off the
+// library kernel under this compiler; verbatim inclusion is what the prior
+// parity receipts on this track used, and the local runtime parity test pins
+// it bitwise.
 //
 // `DARKBLOOM_CBV2_TIED_LMHEAD_QMV=0` restores the stock path inside the same
 // executable.
@@ -77,10 +82,10 @@ public enum CBv2TiedLMHeadQMVV1 {
     private static let batch = 8
     private static let groupSize = 64
     private static let bits = 4
-    private static let rowsPerGroup = 4
     private static let simdWidth = 32
     private static let simdGroups = 2
-    private static let outputsPerGroup = 8
+    /// `num_simdgroups * results_per_simdgroup` in the octo body.
+    private static let outputsPerGroup = 4
     /// `values_per_thread * SIMD` in the kernel; the tail block needs one more.
     private static let values_per_thread_block = 256
 
@@ -278,24 +283,20 @@ inline U qdot_affine4_registered(
 }
 
 template <typename T, const int group_size, const int bits>
-METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
+METAL_FUNC void qmv_affine4_g64_octo_stream_impl(
     const device uint32_t* w,
     const device T* scales,
     const device T* biases,
-    const device T* x0,
-    const device T* x1,
-    const device T* x2,
-    const device T* x3,
-    device T* y0,
-    device T* y1,
-    device T* y2,
-    device T* y3,
+    const device T* x,
+    device T* y,
     const int in_vec_size,
+    const int out_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   constexpr int num_simdgroups = 2;
-  constexpr int results_per_simdgroup = 4;
+  constexpr int results_per_simdgroup = 2;
+  constexpr int streams = 8;
   constexpr int values_per_thread = 8;
   constexpr int block_size = values_per_thread * SIMD_SIZE;
   constexpr int bytes_per_thread = 4;
@@ -307,10 +308,7 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
   thread uint16_t packed[results_per_simdgroup][uint16_per_thread];
   thread float scale_local[results_per_simdgroup];
   thread float bias_local[results_per_simdgroup];
-  thread float result0[results_per_simdgroup] = {0};
-  thread float result1[results_per_simdgroup] = {0};
-  thread float result2[results_per_simdgroup] = {0};
-  thread float result3[results_per_simdgroup] = {0};
+  thread float result[streams][results_per_simdgroup] = {0};
 
   const int in_vec_size_w = in_vec_size / 2;
   const int in_vec_size_g = in_vec_size / 64;
@@ -320,14 +318,8 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
   ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
   scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
   biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
-  x0 += simd_lid * values_per_thread;
-  x1 += simd_lid * values_per_thread;
-  x2 += simd_lid * values_per_thread;
-  x3 += simd_lid * values_per_thread;
-  y0 += out_row;
-  y1 += out_row;
-  y2 += out_row;
-  y3 += out_row;
+  x += simd_lid * values_per_thread;
+  y += out_row;
 
   int k = 0;
   for (; k < in_vec_size - block_size; k += block_size) {
@@ -343,38 +335,21 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
       bias_local[row] = biases[row * in_vec_size_g];
     }
 
-    float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
     #pragma clang loop unroll(full)
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result0[row] += qdot_affine4_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
-    }
-    sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
-    #pragma clang loop unroll(full)
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result1[row] += qdot_affine4_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
-    }
-    sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
-    #pragma clang loop unroll(full)
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result2[row] += qdot_affine4_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
-    }
-    sum = load_vector<T, float, values_per_thread, 4>(x3, x_thread);
-    #pragma clang loop unroll(full)
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result3[row] += qdot_affine4_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    for (int m = 0; m < streams; m++) {
+      const float sum = load_vector<T, float, values_per_thread, 4>(
+          x + m * in_vec_size, x_thread);
+      #pragma clang loop unroll(full)
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        result[m][row] += qdot_affine4_registered<float, values_per_thread>(
+            packed[row], x_thread, scale_local[row], bias_local[row], sum);
+      }
     }
 
     ws += block_size / 2;
     scales += block_size / 64;
     biases += block_size / 64;
-    x0 += block_size;
-    x1 += block_size;
-    x2 += block_size;
-    x3 += block_size;
+    x += block_size;
   }
 
   const int remaining = clamp(
@@ -394,54 +369,36 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
       bias_local[row] = biases[row * in_vec_size_g];
     }
 
-    float sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x0, x_thread, remaining);
     #pragma clang loop unroll(full)
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result0[row] += qdot_affine4_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
-    }
-    sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x1, x_thread, remaining);
-    #pragma clang loop unroll(full)
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result1[row] += qdot_affine4_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
-    }
-    sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x2, x_thread, remaining);
-    #pragma clang loop unroll(full)
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result2[row] += qdot_affine4_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
-    }
-    sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x3, x_thread, remaining);
-    #pragma clang loop unroll(full)
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      result3[row] += qdot_affine4_registered<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    for (int m = 0; m < streams; m++) {
+      const float sum = load_vector_safe<T, float, values_per_thread, 4>(
+          x + m * in_vec_size, x_thread, remaining);
+      #pragma clang loop unroll(full)
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        result[m][row] += qdot_affine4_registered<float, values_per_thread>(
+            packed[row], x_thread, scale_local[row], bias_local[row], sum);
+      }
     }
   }
 
   #pragma clang loop unroll(full)
   for (int row = 0; row < results_per_simdgroup; row++) {
-    result0[row] = simd_sum(result0[row]);
-    result1[row] = simd_sum(result1[row]);
-    result2[row] = simd_sum(result2[row]);
-    result3[row] = simd_sum(result3[row]);
+    #pragma clang loop unroll(full)
+    for (int m = 0; m < streams; m++) {
+      result[m][row] = simd_sum(result[m][row]);
+    }
     if (simd_lid == 0) {
-      y0[row] = static_cast<T>(result0[row]);
-      y1[row] = static_cast<T>(result1[row]);
-      y2[row] = static_cast<T>(result2[row]);
-      y3[row] = static_cast<T>(result3[row]);
+      #pragma clang loop unroll(full)
+      for (int m = 0; m < streams; m++) {
+        y[m * out_vec_size + row] = static_cast<T>(result[m][row]);
+      }
     }
   }
 }
 """
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_tied_lmhead_qmv_affine4_g64_quad_stream_unroll_v3",
+        name: "cbv2_b8_tied_lmhead_qmv_affine4_g64_octo_stream_v4",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -452,23 +409,14 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
             const int in_vec_size = K;
             const int out_vec_size = OUTN;
 
-            const int first_m = int(tid.x) * 4;
-            if (first_m >= 8) {
-                return;
-            }
-            qmv_affine4_g64_quad_stream_impl<T, 64, 4>(
+            qmv_affine4_g64_octo_stream_impl<T, 64, 4>(
                 w,
                 scales,
                 biases,
-                x + first_m * in_vec_size,
-                x + (first_m + 1) * in_vec_size,
-                x + (first_m + 2) * in_vec_size,
-                x + (first_m + 3) * in_vec_size,
-                y + first_m * out_vec_size,
-                y + (first_m + 1) * out_vec_size,
-                y + (first_m + 2) * out_vec_size,
-                y + (first_m + 3) * out_vec_size,
+                x,
+                y,
                 in_vec_size,
+                out_vec_size,
                 tid,
                 simd_gid,
                 simd_lid);
@@ -513,7 +461,6 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
             biases.shape == scales.shape
         else { return nil }
 
-        let xGroups = batch / rowsPerGroup
         let yGroups = outDim / outputsPerGroup
         return kernel(
             [x, weight, scales, biases],
@@ -522,7 +469,7 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
                 ("K", inDim),
                 ("OUTN", outDim),
             ],
-            grid: (xGroups * simdWidth, yGroups * simdGroups, 1),
+            grid: (simdWidth, yGroups * simdGroups, 1),
             threadGroup: (simdWidth, simdGroups, 1),
             outputShapes: [[batch, 1, outDim]],
             outputDTypes: [x.dtype]

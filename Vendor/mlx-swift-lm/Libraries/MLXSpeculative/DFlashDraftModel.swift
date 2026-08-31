@@ -338,14 +338,14 @@ public final class DFlashDraftModel: Module, @unchecked Sendable {
     /// round. `gemma4DFlashMaxDepth` clamps it to the drafter ceiling
     /// (`recommendedBlockSize - 1`) and the engine ceiling
     /// (`experimentalDFlashMaxBlockSize - 1`, which is 15). A value above a
-    /// ceiling clamps to the ceiling. The engine does not refuse it. Default 1.
+    /// ceiling. The engine does not refuse it. Default 15.
     ///
     /// UNIFORM WITH MTP. `CBv2MTPRoundDriver.submissionDraftDepth` is the MTP
-    /// counterpart. It has the same name, the same meaning, and the same default
-    /// 1. The per-arm behaviour differs. MTP adapts up to its ceiling each round.
-    /// DFlash proposes a fixed block of this size. The constant you edit is the
-    /// same on both arms.
-    public static let submissionDraftDepth = 1
+    /// counterpart. It has the same name and meaning, but each arm's compiled
+    /// ceiling is independent. MTP adapts up to its ceiling each round. DFlash
+    /// proposes a fixed block of this size. The constant applies to the selected
+    /// arm.
+    public static let submissionDraftDepth = 15
 
     /// The pure DFlash depth clamp. A requested draft depth, bounded by the
     /// drafter ceiling and the engine ceiling, floored at 1. A value above a

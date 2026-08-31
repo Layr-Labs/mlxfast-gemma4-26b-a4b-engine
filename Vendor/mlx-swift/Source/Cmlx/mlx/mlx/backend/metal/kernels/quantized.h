@@ -60,6 +60,7 @@ inline U load_vector(const device T* x, thread U* x_thread) {
   }
 
   else if (bits == 4) {
+    #pragma clang loop unroll(full)
     for (int i = 0; i < values_per_thread; i += 4) {
       sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
       x_thread[i] = x[i];
@@ -1518,6 +1519,7 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
     float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
     float sum1 = load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
 
+    #pragma clang loop unroll(full)
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* wl = ws + row * in_vec_size_w;
       const device T* sl = scales + row * in_vec_size_g;
@@ -1548,6 +1550,7 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
         load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
     float sum1 =
         load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
+    #pragma clang loop unroll(full)
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* wl = ws + row * in_vec_size_w;
       const device T* sl = scales + row * in_vec_size_g;
@@ -1561,6 +1564,7 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
     }
   }
 
+  #pragma clang loop unroll(full)
   for (int row = 0; row < results_per_simdgroup; row++) {
     result0[row] = simd_sum(result0[row]);
     result1[row] = simd_sum(result1[row]);
@@ -3884,6 +3888,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     const device T* tile_x1 =
         x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
     device T* tile_y1 = y + (assignment + 1) * out_vec_size;
+    #pragma clang loop unroll(full)
     for (int t = 0; t < gemma4_down_tile_span; t++) {
       uint3 tile_tid = tid;
       tile_tid.y = tid.y + uint(t);
@@ -3902,6 +3907,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     }
     return;
   }
+  #pragma clang loop unroll(full)
   for (int t = 0; t < gemma4_down_tile_span; t++) {
     uint3 tile_tid = tid;
     tile_tid.y = tid.y + uint(t);

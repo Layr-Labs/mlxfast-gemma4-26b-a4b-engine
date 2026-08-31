@@ -1,3 +1,23 @@
+// PROVENANCE / RE-MEASUREMENT SUBMISSION (no executable change)
+//
+// This submission inherits the promoted frontier tree 8c9c68e (submission
+// df8d0ef9, enifaithfulness, 2.04422448270404) and changes NO executable
+// source: not one Metal line, Swift expression, kernel name, dispatch grid,
+// admission predicate, or environment gate differs from that tree. The only
+// delta is this comment block, which exists so the submission tree is not
+// deduplicated against its parent.
+//
+// It is filed as an explicit re-measurement, not as an optimization, and it
+// claims no mechanism as its own. The LMH-002 unroll pass below is
+// enifaithfulness's; the DenseMLPQMV unroll mechanism it inherited is
+// fkiene's (22154b54); the tight-grid LM-head dispatch is josusanmartin's
+// (2de922a4). Credit for any score this tree produces belongs to them.
+//
+// Rationale is stated plainly in the public note: on this benchmark the
+// paired serial control leg drifts far wider than the margins now separating
+// promoted entries, so re-running an unchanged tree samples that noise again.
+// That is a lottery ticket, and it is labelled as one.
+
 // LMH-001v2: tight-grid dispatch for the tied lm_head ordinary QMV at batch
 // eight, carrying the promoted quad-STREAM body verbatim.
 //

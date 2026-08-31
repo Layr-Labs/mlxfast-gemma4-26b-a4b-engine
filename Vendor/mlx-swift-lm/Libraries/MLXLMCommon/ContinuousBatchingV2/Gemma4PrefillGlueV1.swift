@@ -166,7 +166,7 @@ public enum Gemma4PrefillGlueV1 {
     // MARK: - norm + residual (2 dispatches -> 1)
 
     private static let normResidualKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_norm_residual_2816_v1",
+        name: "gemma4_prefill_glue_norm_residual_2816_vec4_v2",
         inputNames: ["x", "w", "res"],
         outputNames: ["out"],
         source: """
@@ -180,21 +180,29 @@ public enum Gemma4PrefillGlueV1 {
 
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
 
+            const uint wbase = lid * GLUE_NREADS;
+            const vec<T, GLUE_NREADS> x_vec =
+                *reinterpret_cast<const device vec<T, GLUE_NREADS>*>(x + base);
             float xv[GLUE_NREADS];
             for (int i = 0; i < GLUE_NREADS; i++) {
-                xv[i] = static_cast<float>(x[base + i]);
+                xv[i] = static_cast<float>(x_vec[i]);
             }
 
             const float inv = glue_inv_rms(
                 xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
 
+            const vec<T, GLUE_NREADS> w_vec =
+                *reinterpret_cast<const device vec<T, GLUE_NREADS>*>(w + wbase);
+            const vec<T, GLUE_NREADS> res_vec =
+                *reinterpret_cast<const device vec<T, GLUE_NREADS>*>(res + base);
+            vec<T, GLUE_NREADS> out_vec;
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
                 // The stock pair stores `w * T(x*inv)` to bf16, then reads it
                 // back for the add. Round in the same place.
-                const T normed = static_cast<T>(w[j] * static_cast<T>(xv[i] * inv));
-                out[base + i] = res[base + i] + normed;
+                const T normed = static_cast<T>(w_vec[i] * static_cast<T>(xv[i] * inv));
+                out_vec[i] = res_vec[i] + normed;
             }
+            *reinterpret_cast<device vec<T, GLUE_NREADS>*>(out + base) = out_vec;
             """,
         header: kernelHeader,
         ensureRowContiguous: true
@@ -222,7 +230,7 @@ public enum Gemma4PrefillGlueV1 {
     // MARK: - dual pre-norm (2 dispatches -> 1)
 
     private static let dualPreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_dual_prenorm_2816_v1",
+        name: "gemma4_prefill_glue_dual_prenorm_2816_vec4_v2",
         inputNames: ["x", "w1", "w2"],
         outputNames: ["out1", "out2"],
         source: """
@@ -236,9 +244,12 @@ public enum Gemma4PrefillGlueV1 {
 
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
 
+            const uint wbase = lid * GLUE_NREADS;
+            const vec<T, GLUE_NREADS> x_vec =
+                *reinterpret_cast<const device vec<T, GLUE_NREADS>*>(x + base);
             float xv[GLUE_NREADS];
             for (int i = 0; i < GLUE_NREADS; i++) {
-                xv[i] = static_cast<float>(x[base + i]);
+                xv[i] = static_cast<float>(x_vec[i]);
             }
 
             // One sum-of-squares serves both weights: the two stock kernels
@@ -246,12 +257,19 @@ public enum Gemma4PrefillGlueV1 {
             const float inv = glue_inv_rms(
                 xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
 
+            const vec<T, GLUE_NREADS> w1_vec =
+                *reinterpret_cast<const device vec<T, GLUE_NREADS>*>(w1 + wbase);
+            const vec<T, GLUE_NREADS> w2_vec =
+                *reinterpret_cast<const device vec<T, GLUE_NREADS>*>(w2 + wbase);
+            vec<T, GLUE_NREADS> out1_vec;
+            vec<T, GLUE_NREADS> out2_vec;
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
                 const T scaled = static_cast<T>(xv[i] * inv);
-                out1[base + i] = w1[j] * scaled;
-                out2[base + i] = w2[j] * scaled;
+                out1_vec[i] = w1_vec[i] * scaled;
+                out2_vec[i] = w2_vec[i] * scaled;
             }
+            *reinterpret_cast<device vec<T, GLUE_NREADS>*>(out1 + base) = out1_vec;
+            *reinterpret_cast<device vec<T, GLUE_NREADS>*>(out2 + base) = out2_vec;
             """,
         header: kernelHeader,
         ensureRowContiguous: true
@@ -444,7 +462,7 @@ public enum Gemma4PrefillGlueV1 {
     // MARK: - branch tail (5 dispatches -> 1)
 
     private static let tailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_tail_2816_v1",
+        name: "gemma4_prefill_glue_tail_2816_vec4_v2",
         inputNames: ["h1", "h2", "w1", "w2", "w3", "res2"],
         outputNames: ["out"],
         source: """
@@ -459,11 +477,16 @@ public enum Gemma4PrefillGlueV1 {
 
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
 
+            const uint wbase = lid * GLUE_NREADS;
+            const vec<T, GLUE_NREADS> h1_vec =
+                *reinterpret_cast<const device vec<T, GLUE_NREADS>*>(h1 + base);
+            const vec<T, GLUE_NREADS> h2_vec =
+                *reinterpret_cast<const device vec<T, GLUE_NREADS>*>(h2 + base);
             float av[GLUE_NREADS];
             float bv[GLUE_NREADS];
             for (int i = 0; i < GLUE_NREADS; i++) {
-                av[i] = static_cast<float>(h1[base + i]);
-                bv[i] = static_cast<float>(h2[base + i]);
+                av[i] = static_cast<float>(h1_vec[i]);
+                bv[i] = static_cast<float>(h2_vec[i]);
             }
 
             float inv_a = 0;
@@ -474,22 +497,30 @@ public enum Gemma4PrefillGlueV1 {
 
             // The branch sum stays in registers. The stock graph writes it to
             // bf16 between the norms and the final norm, so round it here.
+            const vec<T, GLUE_NREADS> w1_vec =
+                *reinterpret_cast<const device vec<T, GLUE_NREADS>*>(w1 + wbase);
+            const vec<T, GLUE_NREADS> w2_vec =
+                *reinterpret_cast<const device vec<T, GLUE_NREADS>*>(w2 + wbase);
             float tv[GLUE_NREADS];
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
-                const T n1 = static_cast<T>(w1[j] * static_cast<T>(av[i] * inv_a));
-                const T n2 = static_cast<T>(w2[j] * static_cast<T>(bv[i] * inv_b));
+                const T n1 = static_cast<T>(w1_vec[i] * static_cast<T>(av[i] * inv_a));
+                const T n2 = static_cast<T>(w2_vec[i] * static_cast<T>(bv[i] * inv_b));
                 tv[i] = static_cast<float>(static_cast<T>(n1 + n2));
             }
 
             const float inv_t = glue_inv_rms(
                 tv, local_sums_a, local_inv2, simd_lane_id, simd_group_id, GLUE_EPS);
 
+            const vec<T, GLUE_NREADS> w3_vec =
+                *reinterpret_cast<const device vec<T, GLUE_NREADS>*>(w3 + wbase);
+            const vec<T, GLUE_NREADS> res2_vec =
+                *reinterpret_cast<const device vec<T, GLUE_NREADS>*>(res2 + base);
+            vec<T, GLUE_NREADS> out_vec;
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
-                const T normed = static_cast<T>(w3[j] * static_cast<T>(tv[i] * inv_t));
-                out[base + i] = res2[base + i] + normed;
+                const T normed = static_cast<T>(w3_vec[i] * static_cast<T>(tv[i] * inv_t));
+                out_vec[i] = res2_vec[i] + normed;
             }
+            *reinterpret_cast<device vec<T, GLUE_NREADS>*>(out + base) = out_vec;
             """,
         header: kernelHeader,
         ensureRowContiguous: true
@@ -531,7 +562,7 @@ public enum Gemma4PrefillGlueV1 {
     /// stores `out`, so both cost one extra in-kernel reduction rather than a
     /// re-read of the row plus two launches.
     private static let tailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_tail_chain_2816_v1",
+        name: "gemma4_prefill_glue_tail_chain_2816_vec4_v2",
         inputNames: ["h1", "h2", "w1", "w2", "w3", "res2", "s", "wn"],
         outputNames: ["out", "normed"],
         source: """
@@ -546,11 +577,16 @@ public enum Gemma4PrefillGlueV1 {
 
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
 
+            const uint wbase = lid * GLUE_NREADS;
+            const vec<T, GLUE_NREADS> h1_vec =
+                *reinterpret_cast<const device vec<T, GLUE_NREADS>*>(h1 + base);
+            const vec<T, GLUE_NREADS> h2_vec =
+                *reinterpret_cast<const device vec<T, GLUE_NREADS>*>(h2 + base);
             float av[GLUE_NREADS];
             float bv[GLUE_NREADS];
             for (int i = 0; i < GLUE_NREADS; i++) {
-                av[i] = static_cast<float>(h1[base + i]);
-                bv[i] = static_cast<float>(h2[base + i]);
+                av[i] = static_cast<float>(h1_vec[i]);
+                bv[i] = static_cast<float>(h2_vec[i]);
             }
 
             float inv_a = 0;
@@ -559,11 +595,14 @@ public enum Gemma4PrefillGlueV1 {
                 av, bv, local_sums_a, local_sums_b, local_inv2,
                 simd_lane_id, simd_group_id, GLUE_EPS, inv_a, inv_b);
 
+            const vec<T, GLUE_NREADS> w1_vec =
+                *reinterpret_cast<const device vec<T, GLUE_NREADS>*>(w1 + wbase);
+            const vec<T, GLUE_NREADS> w2_vec =
+                *reinterpret_cast<const device vec<T, GLUE_NREADS>*>(w2 + wbase);
             float tv[GLUE_NREADS];
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
-                const T n1 = static_cast<T>(w1[j] * static_cast<T>(av[i] * inv_a));
-                const T n2 = static_cast<T>(w2[j] * static_cast<T>(bv[i] * inv_b));
+                const T n1 = static_cast<T>(w1_vec[i] * static_cast<T>(av[i] * inv_a));
+                const T n2 = static_cast<T>(w2_vec[i] * static_cast<T>(bv[i] * inv_b));
                 tv[i] = static_cast<float>(static_cast<T>(n1 + n2));
             }
 
@@ -574,25 +613,33 @@ public enum Gemma4PrefillGlueV1 {
             // multiply reads it back and stores again. Both roundings are
             // explicit here, so `out` is the same array either way.
             const T scalar = s[0];
+            const vec<T, GLUE_NREADS> w3_vec =
+                *reinterpret_cast<const device vec<T, GLUE_NREADS>*>(w3 + wbase);
+            const vec<T, GLUE_NREADS> res2_vec =
+                *reinterpret_cast<const device vec<T, GLUE_NREADS>*>(res2 + base);
+            vec<T, GLUE_NREADS> out_vec;
             float ov[GLUE_NREADS];
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
-                const T normed3 = static_cast<T>(w3[j] * static_cast<T>(tv[i] * inv_t));
-                const T summed = static_cast<T>(res2[base + i] + normed3);
+                const T normed3 = static_cast<T>(w3_vec[i] * static_cast<T>(tv[i] * inv_t));
+                const T summed = static_cast<T>(res2_vec[i] + normed3);
                 const T scaled = static_cast<T>(summed * scalar);
-                out[base + i] = scaled;
+                out_vec[i] = scaled;
                 ov[i] = static_cast<float>(scaled);
             }
+            *reinterpret_cast<device vec<T, GLUE_NREADS>*>(out + base) = out_vec;
 
             // The next layer's input norm, over exactly the bf16 values just
             // stored to `out`.
             const float inv_n = glue_inv_rms(
                 ov, local_sums_a, local_inv2, simd_lane_id, simd_group_id, GLUE_EPS);
 
+            const vec<T, GLUE_NREADS> wn_vec =
+                *reinterpret_cast<const device vec<T, GLUE_NREADS>*>(wn + wbase);
+            vec<T, GLUE_NREADS> normed_vec;
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
-                normed[base + i] = wn[j] * static_cast<T>(ov[i] * inv_n);
+                normed_vec[i] = wn_vec[i] * static_cast<T>(ov[i] * inv_n);
             }
+            *reinterpret_cast<device vec<T, GLUE_NREADS>*>(normed + base) = normed_vec;
             """,
         header: kernelHeader,
         ensureRowContiguous: true
@@ -632,7 +679,7 @@ public enum Gemma4PrefillGlueV1 {
     /// same `[tokens, hidden]` expert result. Produce each reduced expert value
     /// in the tail thread that consumes it, removing the intermediate tensor.
     private static let expertTailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_expert_unsort_tail_chain_2816_v1",
+        name: "gemma4_prefill_expert_unsort_tail_chain_2816_vec4_v2",
         inputNames: [
             "sorted", "inverse_order", "route_weights", "h1",
             "w1", "w2", "w3", "res2", "s", "wn",
@@ -650,21 +697,35 @@ public enum Gemma4PrefillGlueV1 {
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
             const uint assignment_base = row * 8;
 
+            const uint wbase = lid * GLUE_NREADS;
+            const vec<T, GLUE_NREADS> h1_vec =
+                *reinterpret_cast<const device vec<T, GLUE_NREADS>*>(h1 + base);
             float av[GLUE_NREADS];
             float bv[GLUE_NREADS];
+            T acc[GLUE_NREADS];
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint feature = lid * GLUE_NREADS + i;
-                av[i] = static_cast<float>(h1[base + i]);
-                T accumulator = (T)0;
-                for (uint slot = 0; slot < 8; ++slot) {
-                    const uint assignment = assignment_base + slot;
-                    const uint sorted_row = (uint)inverse_order[assignment];
+                av[i] = static_cast<float>(h1_vec[i]);
+                acc[i] = (T)0;
+            }
+            // Slot-major: one vec4 sorted-row load per slot, routing weight
+            // and inverse-order index read once per slot. Each feature's
+            // accumulator still consumes slots 0..7 in the original order,
+            // so per-feature bf16 addition sequences are unchanged.
+            for (uint slot = 0; slot < 8; ++slot) {
+                const uint assignment = assignment_base + slot;
+                const uint sorted_row = (uint)inverse_order[assignment];
+                const T route_weight = route_weights[assignment];
+                const vec<T, GLUE_NREADS> sorted_vec =
+                    *reinterpret_cast<const device vec<T, GLUE_NREADS>*>(
+                        sorted + size_t(sorted_row) * GLUE_AXIS + wbase);
+                for (int i = 0; i < GLUE_NREADS; i++) {
                     const T weighted = (T)(
-                        (float)sorted[size_t(sorted_row) * GLUE_AXIS + feature]
-                        * (float)route_weights[assignment]);
-                    accumulator = accumulator + weighted;
+                        (float)sorted_vec[i] * (float)route_weight);
+                    acc[i] = acc[i] + weighted;
                 }
-                bv[i] = static_cast<float>(accumulator);
+            }
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                bv[i] = static_cast<float>(acc[i]);
             }
 
             float inv_a = 0;
@@ -673,13 +734,16 @@ public enum Gemma4PrefillGlueV1 {
                 av, bv, local_sums_a, local_sums_b, local_inv2,
                 simd_lane_id, simd_group_id, GLUE_EPS, inv_a, inv_b);
 
+            const vec<T, GLUE_NREADS> w1_vec =
+                *reinterpret_cast<const device vec<T, GLUE_NREADS>*>(w1 + wbase);
+            const vec<T, GLUE_NREADS> w2_vec =
+                *reinterpret_cast<const device vec<T, GLUE_NREADS>*>(w2 + wbase);
             float tv[GLUE_NREADS];
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
                 const T n1 = static_cast<T>(
-                    w1[j] * static_cast<T>(av[i] * inv_a));
+                    w1_vec[i] * static_cast<T>(av[i] * inv_a));
                 const T n2 = static_cast<T>(
-                    w2[j] * static_cast<T>(bv[i] * inv_b));
+                    w2_vec[i] * static_cast<T>(bv[i] * inv_b));
                 tv[i] = static_cast<float>(static_cast<T>(n1 + n2));
             }
 
@@ -688,26 +752,34 @@ public enum Gemma4PrefillGlueV1 {
                 simd_lane_id, simd_group_id, GLUE_EPS);
 
             const T scalar = s[0];
+            const vec<T, GLUE_NREADS> w3_vec =
+                *reinterpret_cast<const device vec<T, GLUE_NREADS>*>(w3 + wbase);
+            const vec<T, GLUE_NREADS> res2_vec =
+                *reinterpret_cast<const device vec<T, GLUE_NREADS>*>(res2 + base);
+            vec<T, GLUE_NREADS> out_vec;
             float ov[GLUE_NREADS];
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
                 const T normed3 = static_cast<T>(
-                    w3[j] * static_cast<T>(tv[i] * inv_t));
-                const T summed = static_cast<T>(res2[base + i] + normed3);
+                    w3_vec[i] * static_cast<T>(tv[i] * inv_t));
+                const T summed = static_cast<T>(res2_vec[i] + normed3);
                 const T scaled = static_cast<T>(summed * scalar);
-                out[base + i] = scaled;
+                out_vec[i] = scaled;
                 ov[i] = static_cast<float>(scaled);
             }
+            *reinterpret_cast<device vec<T, GLUE_NREADS>*>(out + base) = out_vec;
 
             const float inv_n = glue_inv_rms(
                 ov, local_sums_a, local_inv2,
                 simd_lane_id, simd_group_id, GLUE_EPS);
 
+            const vec<T, GLUE_NREADS> wn_vec =
+                *reinterpret_cast<const device vec<T, GLUE_NREADS>*>(wn + wbase);
+            vec<T, GLUE_NREADS> normed_vec;
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
-                normed[base + i] =
-                    wn[j] * static_cast<T>(ov[i] * inv_n);
+                normed_vec[i] =
+                    wn_vec[i] * static_cast<T>(ov[i] * inv_n);
             }
+            *reinterpret_cast<device vec<T, GLUE_NREADS>*>(normed + base) = normed_vec;
         """,
         header: kernelHeader,
         ensureRowContiguous: true

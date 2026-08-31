@@ -616,7 +616,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         MLXFast.metalKernel(
             name:
                 "cbv2_ragged8_ringwrite_sdpa_2pass_a_gqapair_vec4_bf16_d256_g2"
-                + "_b\(blocks)_v1",
+                + "_b\(blocks)_vr_v2",
             inputNames: [
                 "queries",
                 "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -722,11 +722,18 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         current ? new_key : keys + slot * D);
                     const device T4* v = reinterpret_cast<const device T4*>(
                         current ? new_value : values + slot * D);
+                    // The slot's V run is read in the same walk as its K
+                    // run and held in registers until the accumulator update
+                    // below. `v[chunk]` returns the identical word the
+                    // update read in place, and the score walk, the
+                    // reduction and the update keep their order.
+                    thread T4 value_vectors[vectors_per_lane];
                     float score_lo = 0.0f;
                     float score_hi = 0.0f;
                     #pragma clang loop unroll(full)
                     for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
                         const T4 key_vector = k[chunk];
+                        value_vectors[chunk] = v[chunk];
                         #pragma clang loop unroll(full)
                         for (int j = 0; j < 4; ++j) {
                             const float key_element = float(key_vector[j]);
@@ -749,7 +756,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     sum_hi = sum_hi * old_factor_hi + score_factor_hi;
                     #pragma clang loop unroll(full)
                     for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
-                        const T4 value_vector = v[chunk];
+                        const T4 value_vector = value_vectors[chunk];
                         #pragma clang loop unroll(full)
                         for (int j = 0; j < 4; ++j) {
                             const int element = chunk * 4 + j;

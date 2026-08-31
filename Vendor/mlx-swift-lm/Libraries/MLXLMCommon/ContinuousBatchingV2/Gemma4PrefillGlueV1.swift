@@ -277,6 +277,170 @@ public enum Gemma4PrefillGlueV1 {
         return (outs[0], outs[1])
     }
 
+    // MARK: - PRENORM-GATHER: the expert pre-norm emits the sorted plane
+
+    /// PRENORM-GATHER. On the prefill plane the routed-expert branch consumed
+    /// its pre-norm through a standalone sorted gather: `dualPreNorm` wrote
+    /// the expert-normed rows to device memory, the counting sort produced
+    /// the row order, and one gather dispatch read every token row once per
+    /// assignment (top-k rows each, in expert order, so with no locality) and
+    /// wrote the `[rows * topK, 1, 2816]` plane the gathered projections
+    /// consume. The un-sorted expert norm had no other reader. This arm
+    /// deletes it: `preNorm` emits the dense-branch norm alone, and
+    /// `preNormScatter` reads each residual row exactly once, reduces it with
+    /// the identical `rms_single_row` tree, and writes the expert-normed row
+    /// straight to its `topK` sorted positions, which the counting sort's
+    /// inverse order names. Same values, same dtype, same positions as the
+    /// gathered plane: `plane[inverseOrder[t * topK + k]] = normed(t)` is
+    /// exactly `normed[rowOrder]` because the inverse order is the inverse
+    /// permutation of the row order, and the inverse order is a permutation,
+    /// so every plane row is written exactly once.
+    ///
+    /// Kill switch: `DARKBLOOM_GEMMA4_PREFILL_PRENORM_GATHER` set to
+    /// `0`/`false`/`no`/`off` restores `dualPreNorm` and the standalone
+    /// gather. Engage mark: `prefill-prenorm-gather`.
+    public static let prenormGatherEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_PRENORM_GATHER"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// `dualPreNorm` with its second output removed: the same reduction, the
+    /// same `w * T(x * inv)` store, one weight.
+    private static let preNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_prefill_glue_prenorm_2816_v1",
+        inputNames: ["x", "w"],
+        outputNames: ["out"],
+        source: """
+            threadgroup float local_sums[32];
+            threadgroup float local_inv[1];
+
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+
+            const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+
+            float xv[GLUE_NREADS];
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                xv[i] = static_cast<float>(x[base + i]);
+            }
+
+            const float inv = glue_inv_rms(
+                xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
+
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                const uint j = lid * GLUE_NREADS + i;
+                const T scaled = static_cast<T>(xv[i] * inv);
+                out[base + i] = w[j] * scaled;
+            }
+            """,
+        header: kernelHeader,
+        ensureRowContiguous: true
+    )
+
+    /// `dualPreNorm`'s second output written straight into expert-sorted
+    /// order. One threadgroup per token row, as before; the row's normed
+    /// values are computed once into registers and stored to each of the
+    /// row's K sorted positions.
+    private static let preNormScatterKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_prefill_glue_prenorm_scatter_2816_v1",
+        inputNames: ["x", "w", "inverse"],
+        outputNames: ["out"],
+        source: """
+            threadgroup float local_sums[32];
+            threadgroup float local_inv[1];
+
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+
+            const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+
+            float xv[GLUE_NREADS];
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                xv[i] = static_cast<float>(x[base + i]);
+            }
+
+            const float inv = glue_inv_rms(
+                xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
+
+            // The stored value is the identical expression `dualPreNorm`
+            // stores for its second output; it is rounded to T here, once,
+            // and copied verbatim to every sorted position.
+            T normed[GLUE_NREADS];
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                const uint j = lid * GLUE_NREADS + i;
+                const T scaled = static_cast<T>(xv[i] * inv);
+                normed[i] = w[j] * scaled;
+            }
+
+            // Assignment t * K + k of this row owns sorted position
+            // inverse[t * K + k]. The inverse order is a permutation of the
+            // plane rows, so every plane row is written exactly once.
+            const size_t assignment_base = size_t(row) * K;
+            for (int k = 0; k < K; k++) {
+                const size_t pos = size_t(inverse[assignment_base + k]);
+                const size_t obase = pos * GLUE_AXIS + lid * GLUE_NREADS;
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    out[obase + i] = normed[i];
+                }
+            }
+            """,
+        header: kernelHeader,
+        ensureRowContiguous: true
+    )
+
+    /// `rmsNorm(x, weight)` alone. Returns `nil` off the prefill plane or with
+    /// the arm switched off.
+    public static func preNorm(
+        x: MLXArray, weight: MLXArray, eps epsIn: Float
+    ) -> MLXArray? {
+        guard prenormGatherEnabled,
+            let rows = planeRows(x, weight: weight, eps: epsIn)
+        else { return nil }
+
+        return preNormKernel(
+            [x, weight],
+            template: [("T", x.dtype)],
+            grid: (threadsPerRow, rows, 1),
+            threadGroup: (threadsPerRow, 1, 1),
+            outputShapes: [x.shape],
+            outputDTypes: [x.dtype]
+        )[0]
+    }
+
+    /// `rmsNorm(x, weight)` written straight into expert-sorted order: row
+    /// `inverseOrder[t * topK + k]` of the returned `[rows * topK, 1, 2816]`
+    /// plane is the normed row `t`. Returns `nil` off the prefill plane, with
+    /// the arm switched off, or for an inverse order that is not exactly one
+    /// `uint32` per assignment.
+    public static func preNormScatter(
+        x: MLXArray, weight: MLXArray, inverseOrder: MLXArray, topK: Int,
+        eps epsIn: Float
+    ) -> MLXArray? {
+        guard prenormGatherEnabled,
+            let rows = planeRows(x, weight: weight, eps: epsIn),
+            topK >= 1,
+            inverseOrder.ndim == 1,
+            inverseOrder.dtype == .uint32,
+            inverseOrder.dim(0) == rows * topK
+        else { return nil }
+
+        CBv2EngageMark.once("prefill-prenorm-gather")
+        return preNormScatterKernel(
+            [x, weight, inverseOrder],
+            template: [("T", x.dtype), ("K", topK)],
+            grid: (threadsPerRow, rows, 1),
+            threadGroup: (threadsPerRow, 1, 1),
+            outputShapes: [[rows * topK, 1, axis]],
+            outputDTypes: [x.dtype]
+        )[0]
+    }
+
     // MARK: - branch tail (5 dispatches -> 1)
 
     private static let tailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(

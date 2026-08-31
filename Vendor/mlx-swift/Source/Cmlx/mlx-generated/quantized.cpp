@@ -1,7 +1,12 @@
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+
 namespace mlx::core::metal {
 
 const char* quantized() {
-  return R"preamble(
+  static const std::string source = [] {
+    std::string value = R"preamble(
 // Copyright © 2025 Apple Inc.
 
 // Auto generated source for mlx/backend/metal/kernels/quantized.h
@@ -3712,6 +3717,7 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
 
   thread uint wpf[results_per_simdgroup];
   if (PF) {
+#pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       wpf[row] = *((const device uint*)(ws0 + row * in_vec_size_w));
     }
@@ -3722,16 +3728,19 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
 
     thread uint wcur[results_per_simdgroup];
     if (PF) {
+#pragma unroll
       for (int row = 0; row < results_per_simdgroup; row++) {
         wcur[row] = wpf[row];
       }
       const int nextblk = (blk + 1 < nblocks) ? (blk + 1) : blk;
       const device uint8_t* wsn = ws0 + nextblk * block_bytes;
+#pragma unroll
       for (int row = 0; row < results_per_simdgroup; row++) {
         wpf[row] = *((const device uint*)(wsn + row * in_vec_size_w));
       }
     }
 
+#pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device T* sl = scales + row * in_vec_size_g;
       const device T* bl = biases + row * in_vec_size_g;
@@ -3769,6 +3778,7 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
       if (remaining > 0) {
         U sum = load_vector_safe<T, U, values_per_thread, 4>(
             x, x_thread, remaining);
+#pragma unroll
         for (int row = 0; row < results_per_simdgroup; row++) {
           auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
           const device T* sl = scales + row * in_vec_size_g;
@@ -3783,6 +3793,7 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
     const uint active_tail_lanes = uint(tail_values / values_per_thread);
     if (tail_values % values_per_thread == 0 && simd_lid < active_tail_lanes) {
       U sum = load_vector<T, U, values_per_thread, 4>(x, x_thread);
+#pragma unroll
       for (int row = 0; row < results_per_simdgroup; row++) {
         const device T* sl = scales + row * in_vec_size_g;
         const device T* bl = biases + row * in_vec_size_g;
@@ -3799,6 +3810,7 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
     }
   }
 
+#pragma unroll
   for (int row = 0; row < results_per_simdgroup; row++) {
     result[row] = simd_sum(result[row]);
     if (simd_lid == 0) {
@@ -4096,7 +4108,7 @@ template <typename T, int group_size, int bits>
     const device T* single_scales = scales + expert * s_strides[0];
     const device T* single_biases = biases + expert * b_strides[0];
     device T* single_y = y + assignment * (uint)out_vec_size;
-    qmv_impl<T, group_size, bits>(
+    qmv_affine4_g64_singles_impl<T, group_size, bits, 2816, true, false>(
         single_w, single_scales, single_biases, single_x, single_y,
         in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
     return;
@@ -4746,6 +4758,47 @@ template <typename T, const int group_size, const int bits>
 
 ///////////////////////////////////////////////////////////////////////////////
 )preamble";
+
+    const char* raw = std::getenv("DARKBLOOM_MLX_SINGLETON_QMV_2816");
+    const std::string option = raw == nullptr ? "" : raw;
+    const bool enabled =
+        option != "0" && option != "false" && option != "FALSE" &&
+        option != "off" && option != "OFF" && option != "no" &&
+        option != "NO";
+    if (enabled) {
+      std::fprintf(stderr, "[engage] singleton-qmv-2816\n");
+      return value;
+    }
+
+    const auto replace_all = [](std::string& text,
+                                const std::string& from,
+                                const std::string& to) {
+      size_t count = 0;
+      size_t pos = 0;
+      while ((pos = text.find(from, pos)) != std::string::npos) {
+        text.replace(pos, from.size(), to);
+        pos += to.size();
+        ++count;
+      }
+      return count;
+    };
+
+    const size_t pragma_count = replace_all(value, "\n#pragma unroll\n", "\n");
+    const size_t call_count = replace_all(
+        value,
+        "qmv_affine4_g64_singles_impl<T, group_size, bits, 2816, true, false>(",
+        "qmv_impl<T, group_size, bits>(");
+    if (pragma_count != 7 || call_count != 1) {
+      std::fprintf(
+          stderr,
+          "singleton-qmv-2816 OFF rewrite mismatch: pragmas=%zu call=%zu\n",
+          pragma_count,
+          call_count);
+      std::abort();
+    }
+    return value;
+  }();
+  return source.c_str();
 }
 
 } // namespace mlx::core::metal

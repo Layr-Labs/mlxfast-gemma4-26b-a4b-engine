@@ -375,7 +375,7 @@ private func geGLUProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
 /// and directly emits the three routing products consumed downstream.
 private let routeSimdRank64Kernel: MLXFast.MLXFastKernel =
     MLXFast.metalKernel(
-        name: "mlx_lm_route_simd_rank_scatter_m8_u32_n64_v1",
+        name: "mlx_lm_route_simd_rank_scatter_m8_u32_n64_v2",
         inputNames: ["indices"],
         outputNames: ["row_order", "sorted_keys", "inverse_order"],
         source: """
@@ -385,6 +385,7 @@ private let routeSimdRank64Kernel: MLXFast.MLXFastKernel =
             const uint key_low = (uint)indices[lane];
             const uint key_high = (uint)indices[32u + lane];
             uint rank = 0;
+            #pragma clang loop unroll(full)
             for (uint source = 0; source < 32; ++source) {
                 const uint other_low = simd_broadcast(key_low, ushort(source));
                 rank += (other_low < key)

@@ -1180,6 +1180,7 @@ private func gemma4FusedQKVNormHeadMajor(
     ropeParameters: Gemma4QKVRopeParameters, applyRope: Bool
 ) -> (q: MLXArray, k: MLXArray, v: MLXArray, appliedRope: Bool)? {
     guard gemma4QKVNormPrefillEnabled, keyValueShared, eps == 1.0e-6,
+        ropeParameters.usesFrequencies,
         positionOffsets.dtype == .int32,
         positionOffsets.size == q.dim(0),
         ropeParameters.frequencies.dtype == .float32,
@@ -1298,6 +1299,7 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
 
         float sum = 0.0f;
         if (row < TOTAL_ROWS) {
+            #pragma clang loop unroll(full)
             for (uint i = 0; i < reads; ++i) {
                 const float value = float(input[i]);
                 sum += value * value;
@@ -1319,6 +1321,7 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
 
         if (row >= TOTAL_ROWS) return;
         const float inverse_rms = inv_rms[slot];
+        #pragma clang loop unroll(full)
         for (uint i = 0; i < reads; ++i) {
             const T normalized = T(float(input[i]) * inverse_rms);
             if (APPLY_ROPE && weighted) {
@@ -1339,6 +1342,7 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
             const uint b = local_row / (l_count * h_count);
             const float L =
                 static_cast<float>(row_position[slot] + position_offsets[b]);
+            #pragma clang loop unroll(full)
             for (uint i = 0; i < reads; ++i) {
                 const uint pair = lid * reads + i;
                 const float d = static_cast<float>(pair) / static_cast<float>(D / 2);

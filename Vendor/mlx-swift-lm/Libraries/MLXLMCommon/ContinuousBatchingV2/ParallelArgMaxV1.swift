@@ -84,6 +84,7 @@ enum CBv2ParallelArgMaxV1 {
 
             CBv2ArgMaxPairV1 best = {0u, Limits<float>::min};
             for (uint offset = lid * 4; offset < TILE_SIZE; offset += 256 * 4) {
+                #pragma clang loop unroll(full)
                 for (uint i = 0; i < 4; ++i) {
                     const uint index = tile_base + offset + i;
                     const float value = float(logits[row_base + index]);

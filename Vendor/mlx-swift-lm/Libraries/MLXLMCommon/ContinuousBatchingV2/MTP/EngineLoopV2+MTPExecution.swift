@@ -100,7 +100,11 @@ extension EngineLoopV2 {
             let inputs = MLXArray(decodeRows.map { Int32($0.rec.tokens[$0.start]) })
                 .reshaped([decodeRows.count, 1])
             let caches = eagerCaches(rowStates: decodeRows.map { kvStates[$0.rec.id]! })
-            let (logits, hidden) = mtp.model.forwardWithHidden(tokens: inputs, caches: caches)
+            let (logits, hidden) = CBv2OrderOnlyLogits.withOrderOnly(
+                decodeRows.map(\.rec.request.sampling)
+            ) {
+                mtp.model.forwardWithHidden(tokens: inputs, caches: caches)
+            }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             decodeSampled = sampler.sample(
                 logits: logits[0..., -1, 0...],
@@ -129,17 +133,22 @@ extension EngineLoopV2 {
             let requirement: CBv2PrefillRequirement =
                 row.samples ? .lastPositionLogits : .evaluationOnly
             let output: MLXArray
+            let eligibleParams = row.samples ? [rec.request.sampling] : []
             if let multimodal = multimodalByID[rec.id],
                 let spanContext = multimodal.chunkContext(start: row.start, count: row.count)
             {
-                output = multimodalChunkForward(
-                    tokens: inputs, start: row.start, count: row.count,
-                    multimodal: multimodal, spanContext: spanContext, caches: caches,
-                    requirement: requirement)
+                output = CBv2OrderOnlyLogits.withOrderOnly(eligibleParams) {
+                    multimodalChunkForward(
+                        tokens: inputs, start: row.start, count: row.count,
+                        multimodal: multimodal, spanContext: spanContext, caches: caches,
+                        requirement: requirement)
+                }
             } else {
-                output = prefillOutput(
-                    tokens: inputs, inputEmbeddings: nil, caches: caches,
-                    requirement: requirement)
+                output = CBv2OrderOnlyLogits.withOrderOnly(eligibleParams) {
+                    prefillOutput(
+                        tokens: inputs, inputEmbeddings: nil, caches: caches,
+                        requirement: requirement)
+                }
             }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             if row.samples {

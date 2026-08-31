@@ -129,6 +129,26 @@ enum CBv2ComposedPrefillSDPAV1 {
         return mask
     }
 
+    /// CAUSAL-CLOAD (concept receipt: solver i34-9, submission d0ccbe3c).
+    /// When enabled, the cached bias is built over `kL + 1` key columns and
+    /// the array handed to `addMM` is the leading-`kL`-column view of that
+    /// storage. The logical operand is unchanged — still exactly `[L, kL]`,
+    /// still bfloat16 negative zero where a score is admitted and the lowest
+    /// finite bfloat16 where it is masked — only its row stride changes,
+    /// from `kL` to `kL + 1`. That stride is the signature the fused Steel
+    /// GEMM recognizes to SYNTHESIZE this operand in its epilogue instead of
+    /// loading it; any kernel branch that does not synthesize still loads
+    /// correct values through the same stride. The padding column is filled
+    /// by the same comparison rule as every other column and never read.
+    /// Kill switch: `DARKBLOOM_CBV2_PREFILL_MASK_SYNTH=0` (unpadded bias,
+    /// stride kL — the kernel signature then never fires).
+    static let maskSynthEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PREFILL_MASK_SYNTH"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// Causal mask BIAS, memoized on `(L, kL)` exactly like the boolean mask:
     /// `-0.0` where the mask admits the key, `finfo(bfloat16).min` (0xFF7F)
     /// where it does not. Same purity argument -- a read-only constant that is
@@ -144,10 +164,29 @@ enum CBv2ComposedPrefillSDPAV1 {
             return hit
         }
         maskCacheLock.unlock()
-        let bias = MLX.where(
-            causalMask(L: L, kL: kL),
-            bfloat16NegativeZeroScalar,
-            bfloat16LowestScalar)
+        let bias: MLXArray
+        if maskSynthEnabled {
+            // Padded storage, sliced view: the comparison is expressed
+            // directly over query and key index vectors (not the shared
+            // boolean-mask helper) so the inert padding column is produced
+            // by the same rule as every real column.
+            let qIndices = MLXArray(Int32(kL - L) ..< Int32(kL))
+                .expandedDimensions(axis: 1)
+            let kIndices = MLXArray(Int32(0) ..< Int32(kL + 1))
+                .expandedDimensions(axis: 0)
+            let padded = MLX.where(
+                qIndices .>= kIndices,
+                bfloat16NegativeZeroScalar,
+                bfloat16LowestScalar)
+            eval(padded)
+            bias = padded[0..., 0 ..< kL]
+            CBv2EngageMark.once("prefill-mask-synth-bias")
+        } else {
+            bias = MLX.where(
+                causalMask(L: L, kL: kL),
+                bfloat16NegativeZeroScalar,
+                bfloat16LowestScalar)
+        }
         eval(bias)
         maskCacheLock.lock()
         if maskBiasCache.count >= maxCachedMasks {

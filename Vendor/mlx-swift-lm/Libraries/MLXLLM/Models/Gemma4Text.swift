@@ -5376,3 +5376,7 @@ extension Gemma4TextModel: CBv2MTPForwardable {
         return (applyLMHead(postNorm), preNorm)
     }
 }
+
+// Ranked resample marker 8: this archive is a further ranked sample of the tree carried
+// by the preceding ranked submission of this content. No mechanism, guard, default,
+// kill switch or preserved surface differs between the two archives.

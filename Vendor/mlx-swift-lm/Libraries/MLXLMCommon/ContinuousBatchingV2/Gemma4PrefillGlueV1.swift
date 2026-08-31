@@ -468,7 +468,7 @@ public enum Gemma4PrefillGlueV1 {
     /// same `[tokens, hidden]` expert result. Produce each reduced expert value
     /// in the tail thread that consumes it, removing the intermediate tensor.
     private static let expertTailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_expert_unsort_tail_chain_2816_v1",
+        name: "gemma4_prefill_expert_unsort_tail_chain_2816_v2",
         inputNames: [
             "sorted", "inverse_order", "route_weights", "h1",
             "w1", "w2", "w3", "res2", "s", "wn",
@@ -486,22 +486,40 @@ public enum Gemma4PrefillGlueV1 {
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
             const uint assignment_base = row * 8;
 
+            static_assert(
+                GLUE_NREADS == 4, "the vector expert gather owns four features");
+
             float av[GLUE_NREADS];
             float bv[GLUE_NREADS];
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint feature = lid * GLUE_NREADS + i;
                 av[i] = static_cast<float>(h1[base + i]);
-                T accumulator = (T)0;
-                for (uint slot = 0; slot < 8; ++slot) {
-                    const uint assignment = assignment_base + slot;
-                    const uint sorted_row = (uint)inverse_order[assignment];
-                    const T weighted = (T)(
-                        (float)sorted[size_t(sorted_row) * GLUE_AXIS + feature]
-                        * (float)route_weights[assignment]);
-                    accumulator = accumulator + weighted;
-                }
-                bv[i] = static_cast<float>(accumulator);
             }
+
+            // `inverse_order` and `route_weights` are indexed by the row and the
+            // slot alone, so the slot walk sits above the feature walk and each
+            // pair is read once per thread rather than once per feature. The
+            // four features a thread owns are adjacent and eight-byte aligned,
+            // so the sorted row arrives in one vector load. Slot order and the
+            // per-slot bfloat16 rounding of the running sum are unchanged.
+            const device vec<T, 4>* sorted4 = (const device vec<T, 4>*)sorted;
+            vec<T, 4> accumulator = vec<T, 4>((T)0, (T)0, (T)0, (T)0);
+            for (uint slot = 0; slot < 8; ++slot) {
+                const uint assignment = assignment_base + slot;
+                const uint sorted_row = (uint)inverse_order[assignment];
+                const float route = (float)route_weights[assignment];
+                const vec<T, 4> sv =
+                    sorted4[size_t(sorted_row) * (GLUE_AXIS / GLUE_NREADS) + lid];
+                const vec<T, 4> weighted = vec<T, 4>(
+                    (T)((float)sv.x * route),
+                    (T)((float)sv.y * route),
+                    (T)((float)sv.z * route),
+                    (T)((float)sv.w * route));
+                accumulator = accumulator + weighted;
+            }
+            bv[0] = static_cast<float>(accumulator.x);
+            bv[1] = static_cast<float>(accumulator.y);
+            bv[2] = static_cast<float>(accumulator.z);
+            bv[3] = static_cast<float>(accumulator.w);
 
             float inv_a = 0;
             float inv_b = 0;

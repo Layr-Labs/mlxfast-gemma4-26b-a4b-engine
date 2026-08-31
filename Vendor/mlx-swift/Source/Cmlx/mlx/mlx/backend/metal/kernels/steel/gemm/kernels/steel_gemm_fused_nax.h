@@ -38,8 +38,8 @@ void gemm_epilogue(
 
   const_for_loop<0, TM, 1>([&](auto mm) {
     const_for_loop<0, TN, 1>([&](auto nn) {
-      auto m = mm * Int<CFrag::kFragRows>{};
-      auto n = nn * Int<CFrag::kFragCols>{};
+      auto m = Int<decltype(mm)::value * CFrag::kFragRows>{};
+      auto n = Int<decltype(nn)::value * CFrag::kFragCols>{};
 
       cfrag_t celems;
 
@@ -204,7 +204,7 @@ template <
           gemm_epilogue<kAlignedM.value, kAlignedN.value>(
               Dtile, C, params, addmm_params, sgp_sm, sgp_sn);
         }
-        if constexpr (kAlignedM && kAlignedN) {
+        if constexpr (kAlignedM.value && kAlignedN.value) {
           Dtile.store(D, int(params->ldd));
         } else {
           Dtile.store_safe(D, int(params->ldd), short2(sgp_sn, sgp_sm));

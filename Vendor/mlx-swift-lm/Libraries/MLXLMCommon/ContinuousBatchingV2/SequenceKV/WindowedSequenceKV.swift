@@ -614,12 +614,36 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// `[1, kvHeads, n, headDim]` bf16 → packed mirror rows
     /// `[kvHeads, n, headDim + 4]` uint8 (values ++ fp16 scale ++ fp16 bias).
     private static func quantPack(_ x: MLXArray) -> MLXArray {
+        // KVQ4 host twin of `cbv2_kvq4g64_pack_d256_v1`: 4-bit values in
+        // groups of 64, one fp16 (scale, bias) pair per group, packed eight
+        // nibbles to a word and four group words after the payload.
         let f = x[0].asType(.float32)
-        let (scale, bias) = quantParams(f)
-        let q = clip(round((f - bias) / scale), min: 0, max: 255).asType(.uint8)
-        let sBytes = scale.asType(.float16).view(dtype: .uint8)
-        let bBytes = bias.asType(.float16).view(dtype: .uint8)
-        return concatenated([q, sBytes, bBytes], axis: -1)
+        let heads = f.dim(0), n = f.dim(1), d = f.dim(2)
+        let groups = d / 64
+        let grouped = f.reshaped([heads, n, groups, 64])
+        let mn = grouped.min(axis: -1, keepDims: true)
+        let mx = grouped.max(axis: -1, keepDims: true)
+        let scale = maximum((mx - mn) / 15, MLXArray(Float(1e-6)))
+            .asType(.float16).asType(.float32)
+        let bias = mn.asType(.float16).asType(.float32)
+        let q = clip(round((grouped - bias) / scale), min: 0, max: 15)
+            .asType(.uint32)
+            .reshaped([heads, n, d / 8, 8])
+        var payload = MLXArray.zeros([heads, n, d / 8], dtype: .uint32)
+        for i in 0 ..< 8 {
+            payload = payload + (q[.ellipsis, i] << MLXArray(Int32(4 * i)))
+        }
+        // The tail word is the fp16 pair laid out little-endian: scale in
+        // the low half, bias in the high half. Concatenating the two fp16
+        // values and viewing the pair as one uint32 reproduces exactly the
+        // bytes the kernel writes, without any per-half bit arithmetic.
+        let pair = concatenated(
+            [scale.asType(.float16), bias.asType(.float16)], axis: -1)
+        let tail = pair.view(dtype: .uint32).reshaped([heads, n, groups])
+        // The shift operands promote the accumulator to int64; the mirror is
+        // a uint32 buffer, so narrow before the concat or the row silently
+        // doubles in width.
+        return concatenated([payload.asType(.uint32), tail], axis: -1)
     }
 
     /// KVQ-GPUPACK: `MLX_KV_QUANT_GPUPACK=0` routes mirror packing back
@@ -656,46 +680,50 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// packer stores (`metal::rint` matches MLX `round`), quantized bytes
     /// plus the fp16 tail written at the identical offsets.
     private static let quantPackKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_kvq8_pack_d256_v3u",
+        name: "cbv2_kvq4g64_pack_d256_v1",
         inputNames: ["x"],
         outputNames: ["packed_w"],
         source: """
             constexpr int D = 256;
             constexpr int simd_width = 32;
-            constexpr int row_stride = D + 4;
+            constexpr int per_lane = D / simd_width;      // 8 values
+            constexpr int group_size = 64;
+            constexpr int payload_words = D / 8;          // 32 (8 nibbles each)
 
-            device uint8_t* packed = (device uint8_t*)packed_w;
             const int row = int(threadgroup_position_in_grid.x);
             const int lane = int(thread_position_in_threadgroup.x);
             const device T* xr = x + row * D;
+            device uint32_t* out = packed_w + row * (payload_words + D / group_size);
 
+            // A lane owns 8 consecutive elements, so it lies wholly inside one
+            // 64-element group; the eight lanes of a group are contiguous and
+            // aligned, so an xor butterfly over 1,2,4 reduces exactly them.
             float vmin = 3.402823466e+38F;
             float vmax = -3.402823466e+38F;
-            for (int i = lane; i < D; i += simd_width) {
-                const float v = float(xr[i]);
+            for (int i = 0; i < per_lane; ++i) {
+                const float v = float(xr[lane * per_lane + i]);
                 vmin = min(vmin, v);
                 vmax = max(vmax, v);
             }
-            vmin = simd_min(vmin);
-            vmax = simd_max(vmax);
+            for (uint m = 1; m < 8; m <<= 1) {
+                vmin = min(vmin, simd_shuffle_xor(vmin, m));
+                vmax = max(vmax, simd_shuffle_xor(vmax, m));
+            }
 
-            const half hs = half(max((vmax - vmin) / 255.0f, 1e-6f));
+            const half hs = half(max((vmax - vmin) / 15.0f, 1e-6f));
             const half hb = half(vmin);
             const float s = float(hs);
             const float b = float(hb);
 
-            device uint8_t* out = packed + row * row_stride;
-            for (int i = lane; i < D; i += simd_width) {
-                const float q = metal::rint((float(xr[i]) - b) / s);
-                out[i] = uint8_t(clamp(q, 0.0f, 255.0f));
+            uint32_t word = 0u;
+            for (int i = 0; i < per_lane; ++i) {
+                const float q = metal::rint((float(xr[lane * per_lane + i]) - b) / s);
+                word |= uint32_t(clamp(q, 0.0f, 15.0f)) << (4 * i);
             }
-            if (lane == 0) {
-                const ushort su = as_type<ushort>(hs);
-                const ushort bu = as_type<ushort>(hb);
-                out[D + 0] = uint8_t(su & 0xff);
-                out[D + 1] = uint8_t(su >> 8);
-                out[D + 2] = uint8_t(bu & 0xff);
-                out[D + 3] = uint8_t(bu >> 8);
+            out[lane] = word;
+            if (lane % 8 == 0) {
+                out[payload_words + lane / 8] =
+                    uint32_t(as_type<ushort>(hs)) | (uint32_t(as_type<ushort>(hb)) << 16);
             }
         """
     )
@@ -712,46 +740,50 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// its text, and a Swift-hosted kernel that changes text without
     /// changing name serves a stale cached body.
     private static let quantPackPairKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_kvq8_pack_pair_d256_v1",
-        inputNames: ["xk", "xv"],
+        name: "cbv2_kvq4g64_pack_pair_d256_v1",
+        inputNames: ["keys", "values"],
         outputNames: ["packed_w"],
         source: """
             constexpr int D = 256;
             constexpr int simd_width = 32;
-            constexpr int row_stride = D + 4;
+            constexpr int per_lane = D / simd_width;      // 8 values
+            constexpr int group_size = 64;
+            constexpr int payload_words = D / 8;          // 32
+            constexpr int row_words = payload_words + D / group_size;
 
-            device uint8_t* packed = (device uint8_t*)packed_w;
             const int row = int(threadgroup_position_in_grid.x);
+            const int plane = row / HEADS;
+            const int head = row % HEADS;
             const int lane = int(thread_position_in_threadgroup.x);
-            const device T* xr = row < HEADS ? xk + row * D : xv + (row - HEADS) * D;
+            const device T* src = (plane == 0 ? keys : values) + head * D;
+            device uint32_t* out = packed_w + row * row_words;
 
             float vmin = 3.402823466e+38F;
             float vmax = -3.402823466e+38F;
-            for (int i = lane; i < D; i += simd_width) {
-                const float v = float(xr[i]);
+            for (int i = 0; i < per_lane; ++i) {
+                const float v = float(src[lane * per_lane + i]);
                 vmin = min(vmin, v);
                 vmax = max(vmax, v);
             }
-            vmin = simd_min(vmin);
-            vmax = simd_max(vmax);
+            for (uint m = 1; m < 8; m <<= 1) {
+                vmin = min(vmin, simd_shuffle_xor(vmin, m));
+                vmax = max(vmax, simd_shuffle_xor(vmax, m));
+            }
 
-            const half hs = half(max((vmax - vmin) / 255.0f, 1e-6f));
+            const half hs = half(max((vmax - vmin) / 15.0f, 1e-6f));
             const half hb = half(vmin);
             const float s = float(hs);
             const float b = float(hb);
 
-            device uint8_t* out = packed + row * row_stride;
-            for (int i = lane; i < D; i += simd_width) {
-                const float q = metal::rint((float(xr[i]) - b) / s);
-                out[i] = uint8_t(clamp(q, 0.0f, 255.0f));
+            uint32_t word = 0u;
+            for (int i = 0; i < per_lane; ++i) {
+                const float q = metal::rint((float(src[lane * per_lane + i]) - b) / s);
+                word |= uint32_t(clamp(q, 0.0f, 15.0f)) << (4 * i);
             }
-            if (lane == 0) {
-                const ushort su = as_type<ushort>(hs);
-                const ushort bu = as_type<ushort>(hb);
-                out[D + 0] = uint8_t(su & 0xff);
-                out[D + 1] = uint8_t(su >> 8);
-                out[D + 2] = uint8_t(bu & 0xff);
-                out[D + 3] = uint8_t(bu >> 8);
+            out[lane] = word;
+            if (lane % 8 == 0) {
+                out[payload_words + lane / 8] =
+                    uint32_t(as_type<ushort>(hs)) | (uint32_t(as_type<ushort>(hb)) << 16);
             }
         """
     )
@@ -782,9 +814,12 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     ///
     /// `MLX_KV_QUANT_DIAG=0` disables the probe.
     static let diagEnabled: Bool = {
+        // KVQ4: the diagnostic ladder is finished and these probes still speak
+        // the 8-bit layout, so they default OFF here; one of them writes the
+        // live mirror and would corrupt 4-bit rows.
         guard let raw = ProcessInfo.processInfo.environment["MLX_KV_QUANT_DIAG"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
+        else { return false }
+        return ["1", "true", "yes", "on"].contains(raw.lowercased())
     }()
 
     private static let diagBlocks = 256
@@ -796,6 +831,10 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     private static let diagStride = 64
     nonisolated(unsafe) private static var diagCounter = 0
     private static let diagLock = NSLock()
+    static let selfTestArmed: Bool = ["1","true","yes","on"].contains(
+        (ProcessInfo.processInfo.environment["MLX_KVQ4_SELFTEST"] ?? "").lowercased())
+    nonisolated(unsafe) private static var shapeLogged = false
+    nonisolated(unsafe) private static var mirrorChecked = false
     nonisolated(unsafe) private static var diagDispatched = false
     nonisolated(unsafe) private static var diagRejected = false
 
@@ -1224,7 +1263,7 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
         let made = (
             mirrors: (0 ..< 8).map { _ in
                 MLXArray.zeros(
-                    [2, kvHeads, window, (headDim + 4) / 4], dtype: .uint32)
+                    [2, kvHeads, window, headDim / 8 + headDim / 64], dtype: .uint32)
             },
             keys: (0 ..< 8).map { _ in
                 MLXArray.zeros([1, kvHeads, window, headDim], dtype: .bfloat16)
@@ -1312,16 +1351,22 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
 
     /// `MLX_KV_QUANT_DIAG_FUSED=0` disables the second probe.
     static let diagFusedEnabled: Bool = {
+        // KVQ4: the diagnostic ladder is finished and these probes still speak
+        // the 8-bit layout, so they default OFF here; one of them writes the
+        // live mirror and would corrupt 4-bit rows.
         guard let raw = ProcessInfo.processInfo.environment["MLX_KV_QUANT_DIAG_FUSED"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
+        else { return false }
+        return ["1", "true", "yes", "on"].contains(raw.lowercased())
     }()
 
     /// `MLX_KV_QUANT_DIAG_LIVE=0` sends the fused write back to scratch.
     static let diagLiveWrite: Bool = {
+        // KVQ4: the diagnostic ladder is finished and these probes still speak
+        // the 8-bit layout, so they default OFF here; one of them writes the
+        // live mirror and would corrupt 4-bit rows.
         guard let raw = ProcessInfo.processInfo.environment["MLX_KV_QUANT_DIAG_LIVE"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
+        else { return false }
+        return ["1", "true", "yes", "on"].contains(raw.lowercased())
     }()
 
     nonisolated(unsafe) private static var diagFusedDispatched = false
@@ -1338,7 +1383,54 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
 
     /// KVQ-WARM: compile the pack pipeline at constructor time (see
     /// `CBv2RaggedTwoPassDecodeAttentionV1.warmQuantPipelines`).
+    /// KVQ4 self-test (`MLX_KVQ4_SELFTEST=1`): pack a known ramp with the GPU
+    /// packer, unpack it on the host with the reader's own arithmetic, and
+    /// report the reconstruction error. Packer/reader mutual parity cannot
+    /// catch a shared layout misunderstanding; this can.
+    public static func selfTestKVQ4() {
+        guard ["1", "true", "yes", "on"].contains(
+            (ProcessInfo.processInfo.environment["MLX_KVQ4_SELFTEST"] ?? "").lowercased())
+        else { return }
+        let d = 256
+        let ramp = ((MLXArray(0 ..< Int32(d)).asType(.float32) - 128.0) / 37.0)
+            .reshaped([1, 1, 1, d]).asType(.bfloat16)
+        let packed = quantPackGPU(ramp)                  // [1, 1, 36] uint32
+        let words = packed.reshaped([36])
+        // Reader arithmetic: value(e) = nibble(words[e/8], e%8) * s(e/64) + b(e/64)
+        var recon = [Float](repeating: 0, count: d)
+        let host = words.asArray(UInt32.self)
+        for e in 0 ..< d {
+            let word = host[e / 8]
+            let nib = Float((word >> UInt32(4 * (e % 8))) & 0xF)
+            let tail = host[32 + e / 64]
+            let s = Float(Float16(bitPattern: UInt16(tail & 0xffff)))
+            let b = Float(Float16(bitPattern: UInt16(tail >> 16)))
+            recon[e] = nib * s + b
+        }
+        let orig = ramp.reshaped([d]).asType(.float32).asArray(Float.self)
+        var maxErr: Float = 0
+        for e in 0 ..< d { maxErr = Swift.max(maxErr, abs(recon[e] - orig[e])) }
+        FileHandle.standardError.write(Data(
+            "[kvq4-selftest] max abs err \(maxErr) orig[0..3]=\(orig[0..<4]) recon[0..3]=\(recon[0..<4])\n".utf8))
+
+        // Now drive the REAL read kernel over a mirror whose every slot holds
+        // this ramp, with a one-hot query selecting element 0. The expected
+        // score for every token is then recon[0].
+        let rows = 8 * 1024
+        let tiled = broadcast(packed.reshaped([1, 1, 36]), to: [8, 1024, 36])
+        let mirror = concatenated([tiled, tiled], axis: 0)
+            .reshaped([2, 8, 1024, 36])
+        var oneHot = [Float](repeating: 0, count: 8 * 16 * 256)
+        for h in 0 ..< (8 * 16) { oneHot[h * 256] = 1.0 }
+        let q = MLXArray(oneHot, [8, 16, 1, 256]).asType(.bfloat16)
+        _ = rows
+        CBv2RaggedTwoPassDecodeAttentionV1.selfTestReadKernel(mirror: mirror, queries: q)
+        FileHandle.standardError.write(Data(
+            "[kvq4-kernel] expected score per token = recon[0] = \(recon[0])\n".utf8))
+    }
+
     public static func warmPackPipeline() {
+        selfTestKVQ4()
         guard quantEnabled, gpuPackEnabled else { return }
         let dummy = MLXArray.zeros([1, 8, 1, 256], dtype: .float16)
         eval(quantPackGPU(dummy))
@@ -1358,7 +1450,7 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
             template: [("T", x.dtype)],
             grid: (rows * 32, 1, 1),
             threadGroup: (32, 1, 1),
-            outputShapes: [[kvHeads, n, (x.dim(3) + 4) / 4]],
+            outputShapes: [[kvHeads, n, x.dim(3) / 8 + x.dim(3) / 64]],
             outputDTypes: [.uint32]
         )[0]
     }
@@ -1366,13 +1458,22 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
     /// The bf16 values the mirror reconstructs for `x` — the sim harness's
     /// stand-in for the quantized kernels' dequantized reads.
     static func quantRoundTrip(_ x: MLXArray) -> MLXArray {
+        // KVQ4: the sim harness must speak the same 4-bit group-64 contract
+        // the kernels do, or the local golden measures the wrong mechanism.
         let f = x.asType(.float32)
-        let (scale, bias) = quantParams(f)
-        let q = clip(round((f - bias) / scale), min: 0, max: 255)
-        return (q * scale + bias).asType(x.dtype)
+        let d = f.dim(-1)
+        let lead = Array(f.shape.dropLast())
+        let grouped = f.reshaped(lead + [d / 64, 64])
+        let mn = grouped.min(axis: -1, keepDims: true)
+        let mx = grouped.max(axis: -1, keepDims: true)
+        let scale = maximum((mx - mn) / 15, MLXArray(Float(1e-6)))
+            .asType(.float16).asType(.float32)
+        let bias = mn.asType(.float16).asType(.float32)
+        let q = clip(round((grouped - bias) / scale), min: 0, max: 15)
+        return (q * scale + bias).reshaped(f.shape).asType(x.dtype)
     }
 
-    /// `[1, H, 1, D]` keys and values -> `[2, H, 1, (D + 4) / 4]` uint32,
+    /// `[1, H, 1, D]` keys and values -> `[2, H, 1, D/8 + D/64]` uint32,
     /// row for row what `quantPackGPU` produces for each plane separately.
     static func quantPackPairGPU(keys: MLXArray, values: MLXArray) -> MLXArray {
         let heads = keys.dim(1)
@@ -1382,7 +1483,7 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
             template: [("T", keys.dtype), ("HEADS", heads)],
             grid: (2 * heads * 32, 1, 1),
             threadGroup: (32, 1, 1),
-            outputShapes: [[2, heads, 1, (headDim + 4) / 4]],
+            outputShapes: [[2, heads, 1, headDim / 8 + headDim / 64]],
             outputDTypes: [.uint32]
         )[0]
     }
@@ -1421,22 +1522,47 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
         let packedFlat: MLXArray
         if Self.gpuPackCheck {
             let gpu = Self.quantPackGPU(tokens)
-            let host = Self.quantPack(tokens).view(dtype: .uint32)
+            // Both packers already emit uint32 words in the KVQ4 layout, so
+            // the comparison is direct; an extra `view` here reinterpreted
+            // one side and produced a shape mismatch instead of a check.
+            let host = Self.quantPack(tokens)
             let mismatches = (gpu .!= host).sum().item(Int.self)
             if mismatches != 0 {
                 FileHandle.standardError.write(
                     "[kvq-gpupack] BYTE MISMATCH: \(mismatches) bytes differ\n"
                         .data(using: .utf8)!)
             }
-            packedFlat = host
+            packedFlat = host.view(dtype: .uint8)
         } else if Self.gpuPackEnabled {
             packedFlat = Self.quantPackGPU(tokens).view(dtype: .uint8)
         } else {
-            packedFlat = Self.quantPack(tokens)
+            packedFlat = Self.quantPack(tokens).view(dtype: .uint8)
         }
         let packed = packedFlat.view(dtype: .uint32).expandedDimensions(axis: 0)
         let n = tokens.dim(2)
         let start = firstPosition % window
+        // KVQ4 in-situ check: read the row we are about to store back through
+        // the reader's arithmetic and compare with the source token.
+        if Self.selfTestArmed {
+            Self.diagLock.lock()
+            let fresh = !Self.mirrorChecked
+            Self.mirrorChecked = true
+            Self.diagLock.unlock()
+            if fresh {
+                let row = packed[0, 0, 0].asArray(UInt32.self)
+                let src = tokens[0, 0, 0].asType(.float32).asArray(Float.self)
+                var maxErr: Float = 0
+                for e in 0 ..< min(256, src.count) {
+                    let nib = Float((row[e / 8] >> UInt32(4 * (e % 8))) & 0xF)
+                    let tail = row[32 + e / 64]
+                    let s = Float(Float16(bitPattern: UInt16(tail & 0xffff)))
+                    let b = Float(Float16(bitPattern: UInt16(tail >> 16)))
+                    maxErr = Swift.max(maxErr, abs(nib * s + b - src[e]))
+                }
+                FileHandle.standardError.write(Data(
+                    "[kvq4-insitu] plane=\(plane) n=\(n) rowWords=\(row.count) maxErr=\(maxErr) src[0..3]=\(src[0..<4])\n".utf8))
+            }
+        }
         if start + n <= window {
             quantMirror[plane ..< (plane + 1), 0..., start ..< (start + n), 0...] = packed
         } else {
@@ -1460,8 +1586,9 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
             // KVQ-U32: the mirror is allocated and BOUND as uint32 words
             // (row = (headDim + 4) / 4 of them). Kernel bodies cast down to
             // uint8_t* internally; byte layout is unchanged.
+            Self.selfTestKVQ4()
             quantMirror = MLXArray.zeros(
-                [2, kvHeads, window, (headDim + 4) / 4], dtype: .uint32)
+                [2, kvHeads, window, headDim / 8 + headDim / 64], dtype: .uint32)
         }
     }
 }

@@ -72,6 +72,14 @@ public enum CBv2TiedLMHeadQMVV1 {
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
+    /// One 32-bit transaction replaces the two 16-bit packed-weight reads in
+    /// each affine-4 lane. The opt-out preserves the promoted stream kernel.
+    private static let packedWeightWordEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_TIED_LMHEAD_PACKED_WEIGHT"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
 
     /// Pinned to the ruled decode cohort and this checkpoint's tower.
     private static let batch = 8
@@ -277,7 +285,8 @@ inline U qdot_affine4_registered(
   return scale * accum + sum * bias;
 }
 
-template <typename T, const int group_size, const int bits>
+template <typename T, const int group_size, const int bits,
+          const bool vector_weight_word = false>
 METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -335,9 +344,15 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint16_t* wl =
           (const device uint16_t*)(ws + row * in_vec_size_w);
-      #pragma clang loop unroll(full)
-      for (int i = 0; i < uint16_per_thread; i++) {
-        packed[row][i] = wl[i];
+      if (vector_weight_word) {
+        const uint32_t word = *((const device uint32_t*)wl);
+        packed[row][0] = static_cast<uint16_t>(word & 0xffffu);
+        packed[row][1] = static_cast<uint16_t>(word >> 16);
+      } else {
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < uint16_per_thread; i++) {
+          packed[row][i] = wl[i];
+        }
       }
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
@@ -386,9 +401,15 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint16_t* wl =
           (const device uint16_t*)(ws + row * in_vec_size_w);
-      #pragma clang loop unroll(full)
-      for (int i = 0; i < uint16_per_thread; i++) {
-        packed[row][i] = wl[i];
+      if (vector_weight_word) {
+        const uint32_t word = *((const device uint32_t*)wl);
+        packed[row][0] = static_cast<uint16_t>(word & 0xffffu);
+        packed[row][1] = static_cast<uint16_t>(word >> 16);
+      } else {
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < uint16_per_thread; i++) {
+          packed[row][i] = wl[i];
+        }
       }
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
@@ -456,7 +477,44 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
             if (first_m >= 8) {
                 return;
             }
-            qmv_affine4_g64_quad_stream_impl<T, 64, 4>(
+            qmv_affine4_g64_quad_stream_impl<T, 64, 4, false>(
+                w,
+                scales,
+                biases,
+                x + first_m * in_vec_size,
+                x + (first_m + 1) * in_vec_size,
+                x + (first_m + 2) * in_vec_size,
+                x + (first_m + 3) * in_vec_size,
+                y + first_m * out_vec_size,
+                y + (first_m + 1) * out_vec_size,
+                y + (first_m + 2) * out_vec_size,
+                y + (first_m + 3) * out_vec_size,
+                in_vec_size,
+                tid,
+                simd_gid,
+                simd_lid);
+            return;
+            """,
+        header: kernelHeader,
+        ensureRowContiguous: true
+    )
+    private static let packedWeightKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_tied_lmhead_qmv_affine4_g64_quad_stream_weight_word_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+
+            const int in_vec_size = K;
+            const int out_vec_size = OUTN;
+
+            const int first_m = int(tid.x) * 4;
+            if (first_m >= 8) {
+                return;
+            }
+            qmv_affine4_g64_quad_stream_impl<T, 64, 4, true>(
                 w,
                 scales,
                 biases,
@@ -515,7 +573,14 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
 
         let xGroups = batch / rowsPerGroup
         let yGroups = outDim / outputsPerGroup
-        return kernel(
+        let selectedKernel: MLXFast.MLXFastKernel
+        if packedWeightWordEnabled {
+            CBv2EngageMark.once("tied-lmhead-packed-weight-word")
+            selectedKernel = packedWeightKernel
+        } else {
+            selectedKernel = kernel
+        }
+        return selectedKernel(
             [x, weight, scales, biases],
             template: [
                 ("T", x.dtype),

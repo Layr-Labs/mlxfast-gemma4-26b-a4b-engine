@@ -210,3 +210,36 @@ extension CBv2SteppableLanguageModelAdapter: CBv2MTPSteppableModel {
         return forwardable.cbv2ForwardWithHidden(tokens, caches: asKVCaches(caches))
     }
 }
+
+// MARK: - Direct Greedy Top-1 Decoding
+
+public protocol CBv2DirectGreedyTop1Forwardable {
+    func cbv2DecodeTop1(inputs: MLXArray, cache: [KVCache]?) -> MLXArray?
+}
+
+public protocol CBv2DirectGreedyTop1SteppableModel: CBv2SteppableModel {
+    var supportsDirectGreedyTop1: Bool { get }
+    func decodeTop1(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> MLXArray?
+}
+
+extension CBv2SteppableLanguageModelAdapter: CBv2DirectGreedyTop1SteppableModel {
+
+    public var supportsDirectGreedyTop1: Bool {
+        Gemma4MMAQuantizedGEMV.directGreedyTop1Enabled && (model is CBv2DirectGreedyTop1Forwardable)
+    }
+
+    public func decodeTop1(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> MLXArray? {
+        // The kill switch is consulted BEFORE any model call: a nil returned
+        // after a forward would send the engine down the incumbent path for a
+        // SECOND forward of the same step, double-appending every KV cache.
+        guard supportsDirectGreedyTop1,
+            let forwardable = model as? CBv2DirectGreedyTop1Forwardable
+        else { return nil }
+        return forwardable.cbv2DecodeTop1(inputs: tokens, cache: asKVCaches(caches))
+    }
+}
+

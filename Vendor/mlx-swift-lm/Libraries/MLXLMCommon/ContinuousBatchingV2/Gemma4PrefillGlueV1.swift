@@ -468,7 +468,7 @@ public enum Gemma4PrefillGlueV1 {
     /// same `[tokens, hidden]` expert result. Produce each reduced expert value
     /// in the tail thread that consumes it, removing the intermediate tensor.
     private static let expertTailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_expert_unsort_tail_chain_2816_v1",
+        name: "gemma4_prefill_expert_unsort_tail_chain_2816_v3",
         inputNames: [
             "sorted", "inverse_order", "route_weights", "h1",
             "w1", "w2", "w3", "res2", "s", "wn",
@@ -483,25 +483,57 @@ public enum Gemma4PrefillGlueV1 {
             const uint lid = thread_position_in_threadgroup.x;
             const uint simd_lane_id = thread_index_in_simdgroup;
             const uint simd_group_id = simdgroup_index_in_threadgroup;
-            const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
             const uint assignment_base = row * 8;
+
+            static_assert(
+                GLUE_NREADS == 4, "the vector expert gather owns four features");
+
+            // `GLUE_AXIS / GLUE_NREADS` is 704 with no remainder and both
+            // `row * GLUE_AXIS + lid * GLUE_NREADS` and `lid * GLUE_NREADS`
+            // are whole multiples of four elements, so every four-feature
+            // packet this thread owns is one eight-byte aligned vector.
+            // `ensureRowContiguous` makes each buffer start an allocation
+            // base, so the vector index of the row element is
+            // `row * 704 + lid` and of a length-axis weight vector is `lid`.
+            // Same bytes, same order, one load instead of four.
+            const size_t row_vec =
+                size_t(row) * (GLUE_AXIS / GLUE_NREADS) + lid;
 
             float av[GLUE_NREADS];
             float bv[GLUE_NREADS];
-            for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint feature = lid * GLUE_NREADS + i;
-                av[i] = static_cast<float>(h1[base + i]);
-                T accumulator = (T)0;
-                for (uint slot = 0; slot < 8; ++slot) {
-                    const uint assignment = assignment_base + slot;
-                    const uint sorted_row = (uint)inverse_order[assignment];
-                    const T weighted = (T)(
-                        (float)sorted[size_t(sorted_row) * GLUE_AXIS + feature]
-                        * (float)route_weights[assignment]);
-                    accumulator = accumulator + weighted;
-                }
-                bv[i] = static_cast<float>(accumulator);
+            {
+                const vec<T, 4> h1v = ((const device vec<T, 4>*)h1)[row_vec];
+                av[0] = static_cast<float>(h1v.x);
+                av[1] = static_cast<float>(h1v.y);
+                av[2] = static_cast<float>(h1v.z);
+                av[3] = static_cast<float>(h1v.w);
             }
+
+            // `inverse_order` and `route_weights` are indexed by the row and the
+            // slot alone, so the slot walk sits above the feature walk and each
+            // pair is read once per thread rather than once per feature. The
+            // four features a thread owns are adjacent and eight-byte aligned,
+            // so the sorted row arrives in one vector load. Slot order and the
+            // per-slot bfloat16 rounding of the running sum are unchanged.
+            const device vec<T, 4>* sorted4 = (const device vec<T, 4>*)sorted;
+            vec<T, 4> accumulator = vec<T, 4>((T)0, (T)0, (T)0, (T)0);
+            for (uint slot = 0; slot < 8; ++slot) {
+                const uint assignment = assignment_base + slot;
+                const uint sorted_row = (uint)inverse_order[assignment];
+                const float route = (float)route_weights[assignment];
+                const vec<T, 4> sv =
+                    sorted4[size_t(sorted_row) * (GLUE_AXIS / GLUE_NREADS) + lid];
+                const vec<T, 4> weighted = vec<T, 4>(
+                    (T)((float)sv.x * route),
+                    (T)((float)sv.y * route),
+                    (T)((float)sv.z * route),
+                    (T)((float)sv.w * route));
+                accumulator = accumulator + weighted;
+            }
+            bv[0] = static_cast<float>(accumulator.x);
+            bv[1] = static_cast<float>(accumulator.y);
+            bv[2] = static_cast<float>(accumulator.z);
+            bv[3] = static_cast<float>(accumulator.w);
 
             float inv_a = 0;
             float inv_b = 0;
@@ -509,13 +541,17 @@ public enum Gemma4PrefillGlueV1 {
                 av, bv, local_sums_a, local_sums_b, local_inv2,
                 simd_lane_id, simd_group_id, GLUE_EPS, inv_a, inv_b);
 
+            const vec<T, 4> w1v = ((const device vec<T, 4>*)w1)[lid];
+            const vec<T, 4> w2v = ((const device vec<T, 4>*)w2)[lid];
+            const T w1e[GLUE_NREADS] = { w1v.x, w1v.y, w1v.z, w1v.w };
+            const T w2e[GLUE_NREADS] = { w2v.x, w2v.y, w2v.z, w2v.w };
+
             float tv[GLUE_NREADS];
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
                 const T n1 = static_cast<T>(
-                    w1[j] * static_cast<T>(av[i] * inv_a));
+                    w1e[i] * static_cast<T>(av[i] * inv_a));
                 const T n2 = static_cast<T>(
-                    w2[j] * static_cast<T>(bv[i] * inv_b));
+                    w2e[i] * static_cast<T>(bv[i] * inv_b));
                 tv[i] = static_cast<float>(static_cast<T>(n1 + n2));
             }
 
@@ -524,26 +560,36 @@ public enum Gemma4PrefillGlueV1 {
                 simd_lane_id, simd_group_id, GLUE_EPS);
 
             const T scalar = s[0];
+            const vec<T, 4> w3v = ((const device vec<T, 4>*)w3)[lid];
+            const vec<T, 4> resv = ((const device vec<T, 4>*)res2)[row_vec];
+            const T w3e[GLUE_NREADS] = { w3v.x, w3v.y, w3v.z, w3v.w };
+            const T rese[GLUE_NREADS] = { resv.x, resv.y, resv.z, resv.w };
+
+            T outv[GLUE_NREADS];
             float ov[GLUE_NREADS];
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
                 const T normed3 = static_cast<T>(
-                    w3[j] * static_cast<T>(tv[i] * inv_t));
-                const T summed = static_cast<T>(res2[base + i] + normed3);
+                    w3e[i] * static_cast<T>(tv[i] * inv_t));
+                const T summed = static_cast<T>(rese[i] + normed3);
                 const T scaled = static_cast<T>(summed * scalar);
-                out[base + i] = scaled;
+                outv[i] = scaled;
                 ov[i] = static_cast<float>(scaled);
             }
+            ((device vec<T, 4>*)out)[row_vec] =
+                vec<T, 4>(outv[0], outv[1], outv[2], outv[3]);
 
             const float inv_n = glue_inv_rms(
                 ov, local_sums_a, local_inv2,
                 simd_lane_id, simd_group_id, GLUE_EPS);
 
+            const vec<T, 4> wnv = ((const device vec<T, 4>*)wn)[lid];
+            const T wne[GLUE_NREADS] = { wnv.x, wnv.y, wnv.z, wnv.w };
+            T nv[GLUE_NREADS];
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
-                normed[base + i] =
-                    wn[j] * static_cast<T>(ov[i] * inv_n);
+                nv[i] = wne[i] * static_cast<T>(ov[i] * inv_n);
             }
+            ((device vec<T, 4>*)normed)[row_vec] =
+                vec<T, 4>(nv[0], nv[1], nv[2], nv[3]);
         """,
         header: kernelHeader,
         ensureRowContiguous: true

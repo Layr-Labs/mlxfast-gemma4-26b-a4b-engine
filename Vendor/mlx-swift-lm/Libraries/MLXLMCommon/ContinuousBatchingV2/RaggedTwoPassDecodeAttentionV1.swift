@@ -616,7 +616,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         MLXFast.metalKernel(
             name:
                 "cbv2_ragged8_ringwrite_sdpa_2pass_a_gqapair_vec4_bf16_d256_g2"
-                + "_b\(blocks)_v1",
+                + "_b\(blocks)_v3",
             inputNames: [
                 "queries",
                 "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -737,27 +737,73 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     score_lo = simd_sum(score_lo);
                     score_hi = simd_sum(score_hi);
 
-                    const float new_max_lo = max(max_lo, score_lo);
-                    const float new_max_hi = max(max_hi, score_hi);
-                    const float old_factor_lo = fast::exp(max_lo - new_max_lo);
-                    const float old_factor_hi = fast::exp(max_hi - new_max_hi);
+                    // EXPSKIP-001: every score here is a finite `simd_sum` of
+                    // bfloat16 products, so `max(a, b)` and the strict-greater
+                    // ternary select the same word. On a token that does not
+                    // raise the running maximum the difference handed to the
+                    // rescale exponential is exactly zero, and `fast::exp(0.0f)`
+                    // returns exactly `1.0f` on this target — probed on device,
+                    // both words are 0x3F800000. So the literal stands in for a
+                    // transcendental that was already returning it, twice per
+                    // token.
+                    const bool moved_lo = score_lo > max_lo;
+                    const bool moved_hi = score_hi > max_hi;
+                    const float new_max_lo = moved_lo ? score_lo : max_lo;
+                    const float new_max_hi = moved_hi ? score_hi : max_hi;
+                    const float old_factor_lo =
+                        moved_lo ? fast::exp(max_lo - new_max_lo) : 1.0f;
+                    const float old_factor_hi =
+                        moved_hi ? fast::exp(max_hi - new_max_hi) : 1.0f;
                     const float score_factor_lo = fast::exp(score_lo - new_max_lo);
                     const float score_factor_hi = fast::exp(score_hi - new_max_hi);
                     max_lo = new_max_lo;
                     max_hi = new_max_hi;
                     sum_lo = sum_lo * old_factor_lo + score_factor_lo;
                     sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                    // OLDFACTOR-SKIP-001: the two running maxima are carried on
+                    // `simd_sum` results, so they are simdgroup-uniform and
+                    // these two tests never diverge within a simdgroup. A
+                    // maximum only moves on a new high score, which past the
+                    // first few tokens of a 1024-slot ring is rare, so on the
+                    // overwhelmingly common iteration `old_factor` is exactly
+                    // 1.0f and the sixteen accumulator multiplies it drives are
+                    // the identity. Each arm below is the incumbent expression
+                    // with the literal substituted for the factor, so the
+                    // rounding is whatever the incumbent already did.
+                    const bool rescale_lo = moved_lo;
+                    const bool rescale_hi = moved_hi;
                     #pragma clang loop unroll(full)
                     for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
                         const T4 value_vector = v[chunk];
-                        #pragma clang loop unroll(full)
-                        for (int j = 0; j < 4; ++j) {
-                            const int element = chunk * 4 + j;
-                            const float value_element = float(value_vector[j]);
-                            acc_lo[element] = acc_lo[element] * old_factor_lo
-                                + score_factor_lo * value_element;
-                            acc_hi[element] = acc_hi[element] * old_factor_hi
-                                + score_factor_hi * value_element;
+                        if (rescale_lo) {
+                            #pragma clang loop unroll(full)
+                            for (int j = 0; j < 4; ++j) {
+                                const int element = chunk * 4 + j;
+                                acc_lo[element] = acc_lo[element] * old_factor_lo
+                                    + score_factor_lo * float(value_vector[j]);
+                            }
+                        } else {
+                            #pragma clang loop unroll(full)
+                            for (int j = 0; j < 4; ++j) {
+                                const int element = chunk * 4 + j;
+                                acc_lo[element] = acc_lo[element] * 1.0f
+                                    + score_factor_lo * float(value_vector[j]);
+                            }
+                        }
+                        if (rescale_hi) {
+                            #pragma clang loop unroll(full)
+                            for (int j = 0; j < 4; ++j) {
+                                const int element = chunk * 4 + j;
+                                acc_hi[element] = acc_hi[element] * old_factor_hi
+                                    + score_factor_hi * float(value_vector[j]);
+                            }
+                        } else {
+                            #pragma clang loop unroll(full)
+                            for (int j = 0; j < 4; ++j) {
+                                const int element = chunk * 4 + j;
+                                acc_hi[element] = acc_hi[element] * 1.0f
+                                    + score_factor_hi * float(value_vector[j]);
+                            }
                         }
                     }
 

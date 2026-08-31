@@ -59,6 +59,15 @@ protocol CBv2InnerStateProviding {
     func cbv2InnerState() -> [MLXArray]
 }
 
+/// Owner-maintained view of one full-sequence row's private K/V allocation.
+/// This avoids rebuilding an array and querying MLX metadata in every D=512
+/// decode admission check.
+struct CBv2FullPrivateStorage {
+    let keys: MLXArray
+    let values: MLXArray
+    let capacity: Int
+}
+
 /// ATT-008: shared batch-wide K/V storage for a lockstep decode cohort of
 /// full-attention rows.
 ///
@@ -206,6 +215,16 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
     private var values: MLXArray?
     private var capacity: Int
 
+    private struct PrivateStorageSignature {
+        let keyDType: DType
+        let valueDType: DType
+        let keyHeadDim: Int
+        let valueHeadDim: Int
+        var capacity: Int
+    }
+
+    private var privateStorageSignature: PrivateStorageSignature?
+
     /// ATT-008 cohort pooling (nil until `cohortPool(binding:)` migrates this
     /// row). While bound, `keys`/`values` are nil and the pool's row
     /// `cohortIndex` is the storage.
@@ -348,6 +367,31 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
         return [keys, values].compactMap { $0 }
     }
 
+    /// Resolve private storage using metadata maintained by this storage owner.
+    /// Any stale, pooled, undersized, or geometry-mismatched state fails closed.
+    @inline(__always)
+    func writing22PrivateStorage(
+        requiredCapacity: Int, dtype: DType,
+        kvHeads expectedKVHeads: Int, headDim expectedHeadDim: Int
+    ) -> CBv2FullPrivateStorage? {
+        guard cohortPool == nil,
+            let keys, let values,
+            let signature = privateStorageSignature,
+            requiredCapacity >= 0,
+            requiredCapacity <= capacity,
+            signature.capacity == capacity,
+            kvHeads == expectedKVHeads,
+            headDim == expectedHeadDim,
+            signature.keyDType == dtype,
+            signature.valueDType == dtype,
+            signature.keyHeadDim == expectedHeadDim,
+            signature.valueHeadDim == expectedHeadDim
+        else { return nil }
+
+        return CBv2FullPrivateStorage(
+            keys: keys, values: values, capacity: capacity)
+    }
+
     // MARK: - ATT-008 cohort pooling
 
     /// Resolve (or form) the shared decode pool for `rows`, or nil when the
@@ -407,6 +451,7 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
             row.cohortIndex = index
             row.keys = nil
             row.values = nil
+            row.privateStorageSignature = nil
         }
         return pool
     }
@@ -416,10 +461,20 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
     private func ensureCapacity(_ needed: Int, keyTemplate: MLXArray, valueTemplate: MLXArray) {
         if keys == nil {
             capacity = min(maxLength, max(capacity, needed))
+            let keyHeadDim = keyTemplate.dim(3)
+            let valueHeadDim = valueTemplate.dim(3)
+            let keyDType = keyTemplate.dtype
+            let valueDType = valueTemplate.dtype
             keys = MLXArray.zeros(
-                [1, kvHeads, capacity, keyTemplate.dim(3)], dtype: keyTemplate.dtype)
+                [1, kvHeads, capacity, keyHeadDim], dtype: keyDType)
             values = MLXArray.zeros(
-                [1, kvHeads, capacity, valueTemplate.dim(3)], dtype: valueTemplate.dtype)
+                [1, kvHeads, capacity, valueHeadDim], dtype: valueDType)
+            privateStorageSignature = PrivateStorageSignature(
+                keyDType: keyDType,
+                valueDType: valueDType,
+                keyHeadDim: keyHeadDim,
+                valueHeadDim: valueHeadDim,
+                capacity: capacity)
             return
         }
         guard needed > capacity else { return }
@@ -435,5 +490,6 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
             [values!, MLXArray.zeros([1, kvHeads, growth, values!.dim(3)], dtype: values!.dtype)],
             axis: 2)
         capacity = newCapacity
+        privateStorageSignature?.capacity = newCapacity
     }
 }

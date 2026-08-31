@@ -2014,21 +2014,13 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
         params.reserveCapacity(batch + 2)
         for row in fullRows {
-            let state = row.cbv2InnerState()
-            guard state.count == 2,
-                state[0].dtype == .bfloat16,
-                state[1].dtype == .bfloat16,
-                state[0].ndim == 4,
-                state[0].dim(0) == 1,
-                state[0].dim(1) == kvHeads,
-                state[0].dim(3) == headDim,
-                state[1].shape == state[0].shape,
-                state[1].dtype == state[0].dtype,
-                state[0].dim(2) >= keyLength
+            guard let storage = row.writing22PrivateStorage(
+                requiredCapacity: keyLength, dtype: .bfloat16,
+                kvHeads: kvHeads, headDim: headDim)
             else { return nil }
-            keyBuffers.append(state[0])
-            valueBuffers.append(state[1])
-            params.append(UInt32(state[0].dim(2)))
+            keyBuffers.append(storage.keys)
+            valueBuffers.append(storage.values)
+            params.append(UInt32(storage.capacity))
         }
         let paramsArray = MLXArray(params)
 

@@ -3275,8 +3275,7 @@ private class Gemma4Experts: Module {
         _ x: MLXArray,
         topKIndices: MLXArray,
         topKWeights: MLXArray,
-        isExpertPrefill: Bool,
-        sortedPlane: SwitchSortedPlaneProducer? = nil
+        isExpertPrefill: Bool
     ) -> Output {
         // Flatten [B, S, H] and always enter SwitchGLU's combined API. It
         // selects direct sorted reduction only for the exact production
@@ -3290,9 +3289,7 @@ private class Gemma4Experts: Module {
             fuseSortedReduction: fuseWeightedUnsort,
             // Ordinary/direct VLM and CBv2 prompt entry points may engage.
             // Rectangular MTP verification explicitly passes false.
-            isProductionPrefill: isExpertPrefill,
-            // PRENORM-GATHER: the prefill producer of the sorted plane.
-            sortedPlane: sortedPlane)
+            isProductionPrefill: isExpertPrefill)
         return Output(
             output: result.output.reshaped(B, S, H),
             unsortCarrier: result.carrier)
@@ -3822,8 +3819,7 @@ public class Gemma4DecoderLayer: Module {
             func projectExpertBranch(
                 _ input: MLXArray,
                 indices: MLXArray,
-                weights: MLXArray,
-                sortedPlane: SwitchSortedPlaneProducer? = nil
+                weights: MLXArray
             ) -> (
                 raw: MLXArray?,
                 deferred: DeferredWeightedExpertRows?,
@@ -3842,8 +3838,7 @@ public class Gemma4DecoderLayer: Module {
                     input,
                     topKIndices: indices,
                     topKWeights: weights,
-                    isExpertPrefill: isExpertPrefill,
-                    sortedPlane: sortedPlane)
+                    isExpertPrefill: isExpertPrefill)
                 return (result.output, nil, result.unsortCarrier)
             }
 
@@ -3879,40 +3874,6 @@ public class Gemma4DecoderLayer: Module {
                         n2,
                         indices: topKIndices,
                         weights: topKWeights)
-                } else if isExpertPrefill,
-                    Gemma4PrefillGlueV1.prenormGatherEnabled,
-                    let n1 = Gemma4PrefillGlueV1.preNorm(
-                        x: out,
-                        weight: preFeedforwardLayernorm.weight,
-                        eps: config.rmsNormEps),
-                    let n2 = Gemma4PrefillGlueV1.preNorm(
-                        x: out,
-                        weight: preFeedforwardLayernorm2.weight,
-                        eps: config.rmsNormEps)
-                {
-                    // PRENORM-GATHER: the expert pre-norm is written straight
-                    // into expert-sorted order by the producer below, from
-                    // the residual and the sort's inverse order, so the
-                    // un-sorted expert norm and the standalone gather of it
-                    // leave the prefill plane. `n2` is that un-sorted norm as
-                    // a lazy fallback: it is dispatched only if SwitchGLU
-                    // declines the producer, and never otherwise.
-                    let expertNormWeight = preFeedforwardLayernorm2.weight
-                    let expertTopK = topKIndices.dim(-1)
-                    let normEps = config.rmsNormEps
-                    h1Raw = mlp(n1)
-                    expertBranch = projectExpertBranch(
-                        n2,
-                        indices: topKIndices,
-                        weights: topKWeights,
-                        sortedPlane: { inverseOrder in
-                            Gemma4PrefillGlueV1.preNormScatter(
-                                x: out,
-                                weight: expertNormWeight,
-                                inverseOrder: inverseOrder,
-                                topK: expertTopK,
-                                eps: normEps)
-                        })
                 } else if let (n1, n2) = Gemma4PrefillGlueV1.dualPreNorm(
                     x: out,
                     w1: preFeedforwardLayernorm.weight,
@@ -5217,44 +5178,7 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
             sanitized[k] = v
         }
-        fuseExpertGateUpStorage(&sanitized)
         return sanitized
-    }
-
-    /// GATEUP-FUSE-PREFILL: make the concatenated gate|up right-hand side the
-    /// primary storage of every routed-expert layer at load. The layer's
-    /// `gate_proj` / `up_proj` weight, scales and biases become zero-copy row
-    /// slices of that storage (see ``SwitchGateUpFusedStorage``), so the bound
-    /// split parameters read the identical bytes with no second copy, and the
-    /// sorted prefill plane dispatches one gather over the whole storage.
-    /// Layers or checkpoints outside the exact production geometry, and the
-    /// arm's off-state, leave the loaded split arrays untouched.
-    private func fuseExpertGateUpStorage(_ sanitized: inout [String: MLXArray]) {
-        guard switchGateUpFusePrefillEnabled else { return }
-        let gateWeightSuffix = ".experts.switch_glu.gate_proj.weight"
-        for key in sanitized.keys where key.hasSuffix(gateWeightSuffix) {
-            let base = String(key.dropLast(gateWeightSuffix.count))
-            guard let layerIdx = extractLayerIdx(from: key),
-                layerIdx < model.layers.count,
-                let experts = model.layers[layerIdx].experts,
-                let gateWeight = sanitized["\(base).experts.switch_glu.gate_proj.weight"],
-                let gateScales = sanitized["\(base).experts.switch_glu.gate_proj.scales"],
-                let gateBiases = sanitized["\(base).experts.switch_glu.gate_proj.biases"],
-                let upWeight = sanitized["\(base).experts.switch_glu.up_proj.weight"],
-                let upScales = sanitized["\(base).experts.switch_glu.up_proj.scales"],
-                let upBiases = sanitized["\(base).experts.switch_glu.up_proj.biases"],
-                let storage = SwitchGateUpFusedStorage(
-                    gateWeight: gateWeight, gateScales: gateScales, gateBiases: gateBiases,
-                    upWeight: upWeight, upScales: upScales, upBiases: upBiases)
-            else { continue }
-            sanitized["\(base).experts.switch_glu.gate_proj.weight"] = storage.gateWeight
-            sanitized["\(base).experts.switch_glu.gate_proj.scales"] = storage.gateScales
-            sanitized["\(base).experts.switch_glu.gate_proj.biases"] = storage.gateBiases
-            sanitized["\(base).experts.switch_glu.up_proj.weight"] = storage.upWeight
-            sanitized["\(base).experts.switch_glu.up_proj.scales"] = storage.upScales
-            sanitized["\(base).experts.switch_glu.up_proj.biases"] = storage.upBiases
-            experts.switchGLU.bindFusedGateUpStorage(storage)
-        }
     }
 
     public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
@@ -5452,6 +5376,3 @@ extension Gemma4TextModel: CBv2MTPForwardable {
         return (applyLMHead(postNorm), preNorm)
     }
 }
-
-// Ranked resample marker 2: this archive is a further ranked sample of the tree carried
-// by the preceding ranked submission of this content apart from any rotation item declared in its note.

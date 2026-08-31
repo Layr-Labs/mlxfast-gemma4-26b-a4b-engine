@@ -214,11 +214,17 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
   for (; k <= in_vec_size - block_size; k += block_size) {
     #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
-      const device uint8_t* wl = ws + row * in_vec_size_w;
-      #pragma unroll
-      for (int i = 0; i < bytes_per_thread; i++) {
-        packed[row][i] = wl[i];
-      }
+      // One aligned 4-byte load, unpacked into the incumbent byte cache: both
+      // live K values (2816 and 2112) are multiples of 64, so the row stride,
+      // the block advance (128) and the lane offset (simd_lid * 4) are all
+      // multiples of 4 over the uint32 base. Register layout and every
+      // consumer stay uint8, a byte-identical relabeling of the same bytes.
+      const uint wv = *reinterpret_cast<const device uint*>(
+          ws + row * in_vec_size_w);
+      packed[row][0] = uint8_t(wv & 0xffu);
+      packed[row][1] = uint8_t((wv >> 8) & 0xffu);
+      packed[row][2] = uint8_t((wv >> 16) & 0xffu);
+      packed[row][3] = uint8_t(wv >> 24);
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }
@@ -262,11 +268,17 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
   if (simd_lid < active_tail_lanes) {
     #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
-      const device uint8_t* wl = ws + row * in_vec_size_w;
-      #pragma unroll
-      for (int i = 0; i < bytes_per_thread; i++) {
-        packed[row][i] = wl[i];
-      }
+      // One aligned 4-byte load, unpacked into the incumbent byte cache: both
+      // live K values (2816 and 2112) are multiples of 64, so the row stride,
+      // the block advance (128) and the lane offset (simd_lid * 4) are all
+      // multiples of 4 over the uint32 base. Register layout and every
+      // consumer stay uint8, a byte-identical relabeling of the same bytes.
+      const uint wv = *reinterpret_cast<const device uint*>(
+          ws + row * in_vec_size_w);
+      packed[row][0] = uint8_t(wv & 0xffu);
+      packed[row][1] = uint8_t((wv >> 8) & 0xffu);
+      packed[row][2] = uint8_t((wv >> 16) & 0xffu);
+      packed[row][3] = uint8_t(wv >> 24);
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }

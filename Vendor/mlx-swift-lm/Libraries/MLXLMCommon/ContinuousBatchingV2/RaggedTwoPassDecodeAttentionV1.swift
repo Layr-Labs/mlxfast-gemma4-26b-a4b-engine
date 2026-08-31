@@ -15,6 +15,11 @@ import MLX
 import MLXFast
 
 enum CBv2RaggedTwoPassDecodeAttentionV1 {
+    struct Output {
+        let values: MLXArray
+        let projectionActivationSums: MLXArray
+    }
+
     private static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_RAGGED_TWO_PASS_ATTENTION"]
@@ -27,6 +32,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     private static let kvHeads = 8
     private static let gqa = 2
     private static let headDim = 256
+    private static let activationGroupSize = 64
     private static let sequenceLength = 1024
 
     /// PARTITION-001: the stock partition count, sized for ONE row.
@@ -796,7 +802,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             "cbv2_ragged8_sdpa_2pass_b_direct_bf16_d256_b\(blocks)"
             + "_c\(combineColumns)_v5",
         inputNames: ["partials", "sums", "maxs"],
-        outputNames: ["out"],
+        outputNames: ["out", "xSums"],
         source: """
             constexpr int simd_width = 32;
             constexpr int values_per_lane = D / simd_width;
@@ -821,8 +827,12 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             sums += batch_head * BLOCKS;
             maxs += batch_head * BLOCKS;
             out += batch_head * D + output_group * values_per_lane;
+            xSums += batch_head * (D / 64);
+
+            threadgroup float output_group_sums[simd_width];
 
             thread float accumulator[values_per_lane];
+            thread T emitted[values_per_lane];
             for (int element = 0; element < values_per_lane; ++element) {
                 accumulator[element] = 0.0f;
             }
@@ -880,11 +890,40 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     reduced += simd_shuffle_xor(reduced, ushort(stride));
                 }
                 if (block_lane == 0) {
-                    out[element] = T(
+                    emitted[element] = T(
                         sum_exp_score == 0.0f
                             ? reduced
                             : reduced / sum_exp_score);
+                    out[element] = emitted[element];
                 }
+            }
+
+            // O-SUM-FUSE-001: pass B already owns the final BF16 activation
+            // bytes consumed by the affine4 output projection. Form the same
+            // eight-value partials and 64-value tree as the MMA projection's
+            // `mma8_runsum4` + xor(2,4,16), once per row/group here, instead
+            // of repeating it in every output tile.
+            if (block_lane == 0) {
+                float partial_sum = 0.0f;
+                partial_sum += float(emitted[0]) + float(emitted[1])
+                    + float(emitted[2]) + float(emitted[3]);
+                partial_sum += float(emitted[4]) + float(emitted[5])
+                    + float(emitted[6]) + float(emitted[7]);
+                output_group_sums[output_group] = partial_sum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (simdgroup_index_in_threadgroup == 0 && lane < D / 64) {
+                const int base = lane * 8;
+                const float sum01 = output_group_sums[base]
+                    + output_group_sums[base + 1];
+                const float sum23 = output_group_sums[base + 2]
+                    + output_group_sums[base + 3];
+                const float sum45 = output_group_sums[base + 4]
+                    + output_group_sums[base + 5];
+                const float sum67 = output_group_sums[base + 6]
+                    + output_group_sums[base + 7];
+                xSums[lane] = (sum01 + sum23) + (sum45 + sum67);
             }
         """,
         ensureRowContiguous: true
@@ -895,7 +934,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         keys: [MLXArray],
         values: [MLXArray],
         scale: Float
-    ) -> MLXArray? {
+    ) -> Output? {
         attend(
             passAKernel: passAKernel, queries: queries, keys: keys, values: values,
             extraInputs: [], scale: scale)
@@ -908,7 +947,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         starts: [Int],
         scale: Float,
         slidingWindowLength: Int
-    ) -> MLXArray? {
+    ) -> Output? {
         guard slidingWindowLength == sequenceLength,
             starts.count == batch,
             starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength })
@@ -936,7 +975,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         previousWriteFence: MLXArray,
         scale: Float,
         slidingWindowLength: Int
-    ) -> (output: MLXArray, nextWriteFence: MLXArray)? {
+    ) -> (output: MLXArray, projectionActivationSums: MLXArray, nextWriteFence: MLXArray)? {
         guard enabled,
             blocks > 0,
             sequenceLength.isMultiple(of: blocks),
@@ -998,7 +1037,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             outputDTypes: [.bfloat16, .float32, .float32, .int32]
         )
 
-        let output = passBKernel(
+        let passB = passBKernel(
             Array(passA.prefix(3)),
             template: [
                 ("T", queries.dtype),
@@ -1008,10 +1047,13 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             ],
             grid: (batch * queryHeads * combineThreads, 1, 1),
             threadGroup: (combineThreads, 1, 1),
-            outputShapes: [[batch, queryHeads, 1, headDim]],
-            outputDTypes: [.bfloat16]
-        )[0]
-        return (output, passA[3])
+            outputShapes: [
+                [batch, queryHeads, 1, headDim],
+                [batch, queryHeads, headDim / activationGroupSize],
+            ],
+            outputDTypes: [.bfloat16, .float32]
+        )
+        return (passB[0], passB[1], passA[3])
     }
 
     private static func attend(
@@ -1021,7 +1063,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         values: [MLXArray],
         extraInputs: [MLXArray],
         scale: Float
-    ) -> MLXArray? {
+    ) -> Output? {
         guard enabled,
             blocks > 0,
             sequenceLength.isMultiple(of: blocks),
@@ -1060,7 +1102,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             outputDTypes: [.bfloat16, .float32, .float32]
         )
 
-        return passBKernel(
+        let passB = passBKernel(
             passA,
             template: [
                 ("T", queries.dtype),
@@ -1070,9 +1112,13 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             ],
             grid: (batch * queryHeads * combineThreads, 1, 1),
             threadGroup: (combineThreads, 1, 1),
-            outputShapes: [[batch, queryHeads, 1, headDim]],
-            outputDTypes: [.bfloat16]
-        )[0]
+            outputShapes: [
+                [batch, queryHeads, 1, headDim],
+                [batch, queryHeads, headDim / activationGroupSize],
+            ],
+            outputDTypes: [.bfloat16, .float32]
+        )
+        return Output(values: passB[0], projectionActivationSums: passB[1])
     }
 }
 

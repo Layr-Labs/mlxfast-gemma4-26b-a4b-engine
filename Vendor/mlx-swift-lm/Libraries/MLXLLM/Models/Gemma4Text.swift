@@ -1713,7 +1713,9 @@ private class Gemma4Attention: Module {
     /// Exact B8/L1 attention output projection. Sliding/full K widths select
     /// the tight affine4 fast-QMV replica; every other path keeps the layer.
     @inline(__always)
-    private func outputProjection(_ x: MLXArray) -> MLXArray {
+    private func outputProjection(
+        _ x: MLXArray, activationSums: MLXArray? = nil
+    ) -> MLXArray {
         guard let quantized = oProj as? QuantizedLinear,
             quantized.bias == nil,
             let projected = CBv2AttentionOQMVV1.matmul(
@@ -1723,7 +1725,8 @@ private class Gemma4Attention: Module {
                 biases: quantized.biases,
                 groupSize: quantized.groupSize,
                 bits: quantized.bits,
-                mode: quantized.mode)
+                mode: quantized.mode,
+                activationSums: activationSums)
         else { return oProj(x) }
         return projected
     }
@@ -1940,6 +1943,9 @@ private class Gemma4Attention: Module {
                 outputDType == .float16 ? queries.asType(.float32) : queries
             let attention = layerCache.attendBorrowing(
                 source: source, queries: attentionQueries, scale: scale, sinks: nil)
+            let projectionActivationSums =
+                (layerCache as? CBv2OutputProjectionActivationSumsProviding)?
+                .outputProjectionActivationSums
             var output = attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
             if outputStart > 0 {
                 output = output[0..., outputStart..., 0...]
@@ -1947,7 +1953,11 @@ private class Gemma4Attention: Module {
             if output.dtype != outputDType {
                 output = output.asType(outputDType)
             }
-            return (outputProjection(output), sharedKV, positionOffset)
+            return (
+                outputProjection(
+                    output,
+                    activationSums: projectionActivationSums?.reshaped(B, -1)),
+                sharedKV, positionOffset)
         }
 
         guard let kProj, let kNorm, let vNorm else {
@@ -2041,6 +2051,9 @@ private class Gemma4Attention: Module {
             attention = layerCache.updateAndAttend(
                 queries: attentionQueries, keys: k, values: v, scale: scale, sinks: nil)
         }
+        let projectionActivationSums =
+            (layerCache as? CBv2OutputProjectionActivationSumsProviding)?
+            .outputProjectionActivationSums
 
         var output = attention.transposed(0, 2, 1, 3).reshaped(B, queryLength, -1)
         if lastQueryCache == nil && outputStart > 0 {
@@ -2049,7 +2062,11 @@ private class Gemma4Attention: Module {
         if output.dtype != outputDType {
             output = output.asType(outputDType)
         }
-        return (outputProjection(output), (k, v), captured)
+        return (
+            outputProjection(
+                output,
+                activationSums: projectionActivationSums?.reshaped(B, -1)),
+            (k, v), captured)
     }
 }
 

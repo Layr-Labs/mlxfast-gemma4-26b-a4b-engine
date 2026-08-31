@@ -534,6 +534,13 @@ public protocol CBv2AttendingLayerCache: AnyObject {
     ) -> MLXArray
 }
 
+/// Optional producer sidecar for projections whose affine correction needs
+/// exact sums of the attention output's 64-value groups. Backends that do not
+/// fuse those sums simply do not conform, and the projection recomputes them.
+public protocol CBv2OutputProjectionActivationSumsProviding: AnyObject {
+    var outputProjectionActivationSums: MLXArray? { get }
+}
+
 // MARK: - Scheduler plan (vLLM-V1 style: no phases)
 
 public enum CBv2RequestStatus: Sendable, Equatable {

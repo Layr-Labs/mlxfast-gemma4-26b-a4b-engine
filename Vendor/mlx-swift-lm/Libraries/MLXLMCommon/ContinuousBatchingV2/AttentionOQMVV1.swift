@@ -32,6 +32,13 @@ public enum CBv2AttentionOQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    private static let fusedActivationSumsEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ATTN_O_FUSED_SUMS"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let batch = 8
     private static let sequence = 1
     private static let outputWidth = 2816
@@ -333,6 +340,57 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
         header: mma8KernelHeader,
         ensureRowContiguous: true)
 
+    private static let mma8ActivationSumHeader: String = {
+        var result = mma8KernelHeader
+        func replaceOnce(_ old: String, with new: String) {
+            precondition(result.components(separatedBy: old).count == 2)
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        replaceOnce(
+            "attention_o_qmv_mma8_affine4_g64_impl(",
+            with: "attention_o_qmv_mma8_affine4_g64_fused_sums_impl(")
+        replaceOnce(
+            """
+                const device T* x,
+                device T* y,
+            """,
+            with: """
+                const device T* x,
+                const device float* xSums,
+                device T* y,
+            """)
+        replaceOnce(
+            """
+                float2 rs = float2(mma8_runsum4<T>(r0), mma8_runsum4<T>(r1));
+                rs += simd_shuffle_xor(rs, 2u);
+                rs += simd_shuffle_xor(rs, 4u);
+                rs += simd_shuffle_xor(rs, 16u);
+            """,
+            with: """
+                const float2 rs = float2(
+                    xSums[c.fn * G + g],
+                    xSums[(c.fn + 1) * G + g]);
+            """)
+        return result
+    }()
+
+    private static let mma8KernelK4096FusedSums = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_fused_sums_v1",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            attention_o_qmv_mma8_affine4_g64_fused_sums_impl<T, 2, 4096>(
+                w, scales, biases, x, xSums, y,
+                w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8ActivationSumHeader,
+        ensureRowContiguous: true)
+
     private static let qmvKernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_affine4_g64_tight_v1",
         inputNames: ["x", "w", "scales", "biases"],
@@ -361,7 +419,8 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
         biases: MLXArray?,
         groupSize: Int,
         bits: Int,
-        mode: QuantizationMode
+        mode: QuantizationMode,
+        activationSums: MLXArray? = nil
     ) -> MLXArray? {
         guard enabled,
             groupSize == Self.groupSize,
@@ -392,6 +451,19 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
             // streamed once per round instead of four times. Grid is in
             // threads: (32, 2, 1) threads per group, N/8 groups along y.
             let yTiles = outputWidth / outputsPerGroup
+            if fusedActivationSumsEnabled, inDim == 4096, let activationSums,
+                activationSums.dtype == .float32,
+                activationSums.shape == [batch, inDim / Self.groupSize]
+            {
+                return mma8KernelK4096FusedSums(
+                    [x, weight, scales, biases, activationSums],
+                    template: [("T", x.dtype)],
+                    grid: (simdWidth, yTiles * simdGroups, 1),
+                    threadGroup: (simdWidth, simdGroups, 1),
+                    outputShapes: [[batch, sequence, outputWidth]],
+                    outputDTypes: [x.dtype]
+                )[0]
+            }
             let kernel = inDim == 8192 ? mma8KernelK8192 : mma8KernelK4096
             return kernel(
                 [x, weight, scales, biases],

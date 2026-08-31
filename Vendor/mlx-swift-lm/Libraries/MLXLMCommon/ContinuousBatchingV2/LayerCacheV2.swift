@@ -46,7 +46,9 @@ final class CBv2DecodeRingWriteFence {
 }
 
 /// Per-layer, batch-facing cache + attention dispatcher for the v2 engine.
-public final class CBv2LayerCache: CBv2AttendingLayerCache {
+public final class CBv2LayerCache:
+    CBv2AttendingLayerCache, CBv2OutputProjectionActivationSumsProviding
+{
 
     public let layerIndex: Int
     public let kind: CBv2LayerKind
@@ -55,6 +57,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     /// Empty for KV-shared layers (`kind.sharesKVWithLayer != nil`), which
     /// own no storage and borrow via `attendBorrowing`.
     public private(set) var rows: [CBv2SequenceKV]
+
+    public private(set) var outputProjectionActivationSums: MLXArray?
 
     /// Per-row absolute RoPE offsets `[B]` (int32, device array).
     ///
@@ -188,6 +192,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         precondition(
             kind.sharesKVWithLayer == nil,
             "CBv2LayerCache: KV-shared layer \(layerIndex) must use attendBorrowing")
+        outputProjectionActivationSums = nil
         let output = CBv2AttentionV1.updateAndAttend(
             rows: rows, kind: kind,
             queries: queries, keys: keys, values: values,
@@ -195,7 +200,10 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             spanContexts: boundSpanContexts,
             serializeQueries: mtpSerializesRectangularAttention,
             decodeRingWriteFence: decodeRingWriteFence,
-            allowFusedRingWrite: !retainsChunkForBorrowers)
+            allowFusedRingWrite: !retainsChunkForBorrowers,
+            projectionActivationSums: { [self] sums in
+                outputProjectionActivationSums = sums
+            })
         // Advance offsets ON-DEVICE. A unified bank elects exactly one owning
         // cache; Gemma snapshots the shared pre-step value before this call.
         if advancesPositionOffsets {
@@ -218,6 +226,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         precondition(
             !mtpSerializesRectangularAttention,
             "CBv2LayerCache: last-query prefill is never part of an MTP verify round")
+        outputProjectionActivationSums = nil
         let output = CBv2AttentionV1.updateAndAttendLastQuery(
             rows: rows, kind: kind,
             queries: queries, keys: keys, values: values,
@@ -239,6 +248,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             kind.sharesKVWithLayer == source.layerIndex,
             "CBv2LayerCache: layer \(layerIndex) shares KV with \(kind.sharesKVWithLayer!), not \(source.layerIndex)"
         )
+        outputProjectionActivationSums = nil
         return CBv2AttentionV1.attendBorrowing(
             sourceRows: source.rows, sourceKind: source.kind, kind: kind,
             queries: queries, scale: scale, sinks: sinks, softcap: attentionSoftcap,

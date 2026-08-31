@@ -423,7 +423,8 @@ enum CBv2AttentionV1 {
         spanContexts: [CBv2SpanChunkContext?]? = nil,
         serializeQueries: Bool = false,
         decodeRingWriteFence: CBv2DecodeRingWriteFence? = nil,
-        allowFusedRingWrite: Bool = false
+        allowFusedRingWrite: Bool = false,
+        projectionActivationSums: ((MLXArray) -> Void)? = nil
     ) -> MLXArray {
         let B = queries.dim(0)
         let L = queries.dim(2)
@@ -503,6 +504,7 @@ enum CBv2AttentionV1 {
                                 row.advanceDecodeRingAfterFusedWrite()
                             }
                             decodeRingWriteFence.value = fused.nextWriteFence
+                            projectionActivationSums?(fused.projectionActivationSums)
                             CBv2EngageMark.once("write016")
                             return fused.output
                         }
@@ -520,7 +522,8 @@ enum CBv2AttentionV1 {
                             values: views.map(\.values), starts: views.map(\.start),
                             scale: scale, slidingWindowLength: ringRows[0].window)
                     {
-                        return output
+                        projectionActivationSums?(output.projectionActivationSums)
+                        return output.values
                     }
                     for row in ringRows {
                         let view = row.snapshot()
@@ -540,7 +543,8 @@ enum CBv2AttentionV1 {
                     queries: queries, keys: cachedKeyRows, values: cachedValueRows,
                     scale: scale)
                 {
-                    return output
+                    projectionActivationSums?(output.projectionActivationSums)
+                    return output.values
                 }
 
                 // Before every row's sliding ring reaches 1024 entries, retain
@@ -1088,7 +1092,7 @@ enum CBv2AttentionV1 {
                 queries: queries, keys: cachedKeyRows, values: cachedValueRows,
                 scale: scale)
             {
-                return output
+                return output.values
             }
 
             var outputs: [MLXArray] = []

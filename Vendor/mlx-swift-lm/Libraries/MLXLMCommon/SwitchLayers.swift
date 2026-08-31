@@ -112,22 +112,36 @@ public func resetWeightedExpertUnsortStats() {
 /// permutation and writes `[tokens, hidden]` directly, avoiding that full
 /// `[tokens, topK, hidden]` intermediate.
 private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "weighted_expert_unsort",
+    name: "weighted_expert_unsort_v2",
     inputNames: ["sorted_outputs", "inverse_order", "weights"],
     outputNames: ["output"],
     source: """
-        uint feature = thread_position_in_grid.x;
-        uint token = thread_position_in_grid.y;
+        constexpr uint top_k = uint(K);
+        static_assert(K == 8, "Gemma 4 weighted unsort requires top-K 8");
+
+        const uint feature = thread_position_in_grid.x;
+        const uint token = thread_position_in_grid.y;
+        const uint local_feature = thread_position_in_threadgroup.x;
+        const uint local_token = thread_position_in_threadgroup.y;
+
+        threadgroup uint staged_inverse[4][K];
+        threadgroup float staged_weights[4][K];
+        if (local_feature < top_k) {
+            const uint assignment = token * top_k + local_feature;
+            staged_inverse[local_token][local_feature] =
+                (uint)inverse_order[assignment];
+            staged_weights[local_token][local_feature] =
+                (float)weights[assignment];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         T accumulator = (T)0;
-        const uint assignment_base = token * (uint)K;
-        for (uint slot = 0; slot < (uint)K; ++slot) {
-            const uint assignment = assignment_base + slot;
-            const uint sorted_row = (uint)inverse_order[assignment];
-            // Preserve the legacy bfloat16 multiply-then-reduce rounding.
+        #pragma clang loop unroll(full)
+        for (uint slot = 0; slot < top_k; ++slot) {
+            const uint sorted_row = staged_inverse[local_token][slot];
             const T weighted = (T)(
                 (float)sorted_outputs[sorted_row * threads_per_grid.x + feature]
-                * (float)weights[assignment]);
+                * staged_weights[local_token][slot]);
             accumulator = accumulator + weighted;
         }
         output[token * threads_per_grid.x + feature] = accumulator;

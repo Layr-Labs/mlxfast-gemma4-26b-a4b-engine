@@ -954,39 +954,76 @@ METAL_FUNC void qmv_fast_impl(
 // inputs; unused host groups return without reading weights. load_vector, the
 // qdot expression, K accumulation order, and simd_sum remain identical to
 // qmv_fast_impl for every output element.
+// Word form: the caller now hands the same eight packed bytes as two aligned
+// uints. Each 16-bit half is exactly the uint16 the loop form read (little
+// endian), the four nibble masks and the accumulation order over i are
+// unchanged, and the halves are written explicitly so no variable 16 * i
+// shift is left to the compiler.
 template <typename U>
 inline U qdot_affine4_loaded(
-    const thread uint16_t* ws,
+    const thread uint* ws,
     const thread U* x_thread,
     U scale,
     U bias,
     U sum) {
-  U accum = 0;
-  for (int i = 0; i < 4; i++) {
-    accum +=
-        (x_thread[4 * i] * (ws[i] & 0x000f) +
-         x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
-         x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
-         x_thread[4 * i + 3] * (ws[i] & 0xf000));
-  }
+  const uint p0 = ws[0] & 0xffffu;
+  const uint p1 = ws[0] >> 16;
+  const uint p2 = ws[1] & 0xffffu;
+  const uint p3 = ws[1] >> 16;
+  U accum =
+      (x_thread[0] * (p0 & 0x000f) +
+       x_thread[1] * (p0 & 0x00f0) +
+       x_thread[2] * (p0 & 0x0f00) +
+       x_thread[3] * (p0 & 0xf000));
+  accum +=
+      (x_thread[4] * (p1 & 0x000f) +
+       x_thread[5] * (p1 & 0x00f0) +
+       x_thread[6] * (p1 & 0x0f00) +
+       x_thread[7] * (p1 & 0xf000));
+  accum +=
+      (x_thread[8] * (p2 & 0x000f) +
+       x_thread[9] * (p2 & 0x00f0) +
+       x_thread[10] * (p2 & 0x0f00) +
+       x_thread[11] * (p2 & 0xf000));
+  accum +=
+      (x_thread[12] * (p3 & 0x000f) +
+       x_thread[13] * (p3 & 0x00f0) +
+       x_thread[14] * (p3 & 0x0f00) +
+       x_thread[15] * (p3 & 0xf000));
   return scale * accum + sum * bias;
 }
 
 inline float2 qdot_affine4_loaded_pair(
-    const thread uint16_t* ws,
+    const thread uint* ws,
     const thread float* x0,
     const thread float* x1,
     float scale,
     float bias,
     float2 sum) {
-  float2 accum = 0;
-  for (int i = 0; i < 4; i++) {
-    accum +=
-        (float2(x0[4 * i], x1[4 * i]) * (ws[i] & 0x000f) +
-         float2(x0[4 * i + 1], x1[4 * i + 1]) * (ws[i] & 0x00f0) +
-         float2(x0[4 * i + 2], x1[4 * i + 2]) * (ws[i] & 0x0f00) +
-         float2(x0[4 * i + 3], x1[4 * i + 3]) * (ws[i] & 0xf000));
-  }
+  const uint p0 = ws[0] & 0xffffu;
+  const uint p1 = ws[0] >> 16;
+  const uint p2 = ws[1] & 0xffffu;
+  const uint p3 = ws[1] >> 16;
+  float2 accum =
+      (float2(x0[0], x1[0]) * (p0 & 0x000f) +
+       float2(x0[1], x1[1]) * (p0 & 0x00f0) +
+       float2(x0[2], x1[2]) * (p0 & 0x0f00) +
+       float2(x0[3], x1[3]) * (p0 & 0xf000));
+  accum +=
+      (float2(x0[4], x1[4]) * (p1 & 0x000f) +
+       float2(x0[5], x1[5]) * (p1 & 0x00f0) +
+       float2(x0[6], x1[6]) * (p1 & 0x0f00) +
+       float2(x0[7], x1[7]) * (p1 & 0xf000));
+  accum +=
+      (float2(x0[8], x1[8]) * (p2 & 0x000f) +
+       float2(x0[9], x1[9]) * (p2 & 0x00f0) +
+       float2(x0[10], x1[10]) * (p2 & 0x0f00) +
+       float2(x0[11], x1[11]) * (p2 & 0xf000));
+  accum +=
+      (float2(x0[12], x1[12]) * (p3 & 0x000f) +
+       float2(x0[13], x1[13]) * (p3 & 0x00f0) +
+       float2(x0[14], x1[14]) * (p3 & 0x0f00) +
+       float2(x0[15], x1[15]) * (p3 & 0xf000));
   return scale * accum + sum * bias;
 }
 
@@ -1027,7 +1064,11 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
   }
 
   for (int k = 0; k < in_vec_size; k += block_size) {
-    thread uint16_t packed[rows_per_simd][4];
+    // Two aligned 4-byte loads per row replace four 2-byte loads. This fast
+    // path only dispatches with in_vec_size a multiple of block_size, so the
+    // row stride in_vec_size_w, the block offset k / 2 and the lane offset
+    // simd_lid * bytes_per_lane are all multiples of 4 over the uint32 base.
+    thread uint packed[rows_per_simd][2];
     thread float scale_local[rows_per_simd];
     thread float bias_local[rows_per_simd];
 
@@ -1036,11 +1077,10 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64(
       const device uint8_t* wb =
           reinterpret_cast<const device uint8_t*>(w) +
           row * in_vec_size_w + k / 2 + simd_lid * bytes_per_lane;
-      const device uint16_t* ws =
-          reinterpret_cast<const device uint16_t*>(wb);
-      for (int i = 0; i < 4; i++) {
-        packed[r][i] = ws[i];
-      }
+      const device uint* wu =
+          reinterpret_cast<const device uint*>(wb);
+      packed[r][0] = wu[0];
+      packed[r][1] = wu[1];
       const int group_index =
           row * in_vec_size_g + k / 64 + simd_lid / 4;
       scale_local[r] = scales[group_index];
@@ -1131,12 +1171,18 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_wide(
     thread float bias_local[rows_per_simd];
     for (int r = 0; r < rows_per_simd; r++) {
       const int row = out_row + r;
-      const device uint16_t* ws = reinterpret_cast<const device uint16_t*>(
+      // Same two-aligned-uint load shape as the pair kernel above; the
+      // register layout and every consumer stay uint16, so the unpack is a
+      // byte-identical relabeling of the same loaded bytes.
+      const device uint* wu = reinterpret_cast<const device uint*>(
           reinterpret_cast<const device uint8_t*>(w) + row * in_vec_size_w +
           k / 2 + simd_lid * bytes_per_lane);
-      for (int i = 0; i < 4; i++) {
-        packed[r][i] = ws[i];
-      }
+      const uint w0 = wu[0];
+      const uint w1 = wu[1];
+      packed[r][0] = uint16_t(w0 & 0xffffu);
+      packed[r][1] = uint16_t(w0 >> 16);
+      packed[r][2] = uint16_t(w1 & 0xffffu);
+      packed[r][3] = uint16_t(w1 >> 16);
       const int group_index = row * in_vec_size_g + k / 64 + simd_lid / 4;
       scale_local[r] = scales[group_index];
       bias_local[r] = biases[group_index];

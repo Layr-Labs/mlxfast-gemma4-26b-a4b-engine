@@ -112,25 +112,31 @@ public func resetWeightedExpertUnsortStats() {
 /// permutation and writes `[tokens, hidden]` directly, avoiding that full
 /// `[tokens, topK, hidden]` intermediate.
 private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "weighted_expert_unsort",
+    name: "weighted_expert_unsort_vec4_v2",
     inputNames: ["sorted_outputs", "inverse_order", "weights"],
     outputNames: ["output"],
     source: """
-        uint feature = thread_position_in_grid.x;
+        uint feature_vec = thread_position_in_grid.x;
         uint token = thread_position_in_grid.y;
+        if (feature_vec >= 704) { return; }
 
-        T accumulator = (T)0;
+        vec<T, 4> accumulator = vec<T, 4>(0);
         const uint assignment_base = token * (uint)K;
+        const device vec<T, 4>* in_vec = (const device vec<T, 4>*)sorted_outputs;
+        device vec<T, 4>* out_vec = (device vec<T, 4>*)output;
+
+        #pragma clang loop unroll(full)
         for (uint slot = 0; slot < (uint)K; ++slot) {
             const uint assignment = assignment_base + slot;
             const uint sorted_row = (uint)inverse_order[assignment];
-            // Preserve the legacy bfloat16 multiply-then-reduce rounding.
-            const T weighted = (T)(
-                (float)sorted_outputs[sorted_row * threads_per_grid.x + feature]
-                * (float)weights[assignment]);
-            accumulator = accumulator + weighted;
+            const float w = (float)weights[assignment];
+            const vec<T, 4> in_val = in_vec[sorted_row * 704 + feature_vec];
+            accumulator[0] += (T)((float)in_val[0] * w);
+            accumulator[1] += (T)((float)in_val[1] * w);
+            accumulator[2] += (T)((float)in_val[2] * w);
+            accumulator[3] += (T)((float)in_val[3] * w);
         }
-        output[token * threads_per_grid.x + feature] = accumulator;
+        out_vec[token * 704 + feature_vec] = accumulator;
     """,
     ensureRowContiguous: true
 )
@@ -170,7 +176,7 @@ public func weightedExpertUnsort(
             ("T", sortedOutputs.dtype),
             ("K", 8),
         ],
-        grid: (2816, tokens, 1),
+        grid: (704, tokens, 1),
         threadGroup: (64, 4, 1),
         outputShapes: [[tokens, 2816]],
         outputDTypes: [.bfloat16]
@@ -556,6 +562,7 @@ private let routeFusedScatterKernelT64: MLXFast.MLXFastKernel = {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             uint simd_base = 0;
+            #pragma clang loop unroll(full)
             for (uint s = 0; s < simd_id; ++s) {
                 simd_base += simd_totals[s];
             }
@@ -564,6 +571,7 @@ private let routeFusedScatterKernelT64: MLXFast.MLXFastKernel = {
                 atomic_load_explicit(&tg_before[k], memory_order_relaxed);
             // Walk this tile's slice in input order: stability by
             // construction, exactly the stock scatter's write order.
+            #pragma clang loop unroll(4)
             for (uint i = 0; i < TILE; ++i) {
                 uint idx = t * TILE + i;
                 if (keys[idx] == k) {
@@ -622,12 +630,14 @@ private let routeFusedScatterPrefixBoundsKernelT64: MLXFast.MLXFastKernel = {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             uint simd_base = 0;
+            #pragma clang loop unroll(full)
             for (uint s = 0; s < simd_id; ++s) {
                 simd_base += simd_totals[s];
             }
             const uint expert_base = simd_base + lane_excl;
             uint off = expert_base
                 + atomic_load_explicit(&tg_before[k], memory_order_relaxed);
+            #pragma clang loop unroll(4)
             for (uint i = 0; i < TILE; ++i) {
                 uint idx = t * TILE + i;
                 if (keys[idx] == k) {

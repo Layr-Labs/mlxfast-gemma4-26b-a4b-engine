@@ -2285,6 +2285,173 @@ private enum Gemma4FusedRouterTop8 {
     }
 }
 
+/// ROUTER-WEIGHT-TAIL: one dispatch for the router's weight tail at the pinned
+/// B=8 decode geometry.
+///
+/// The stock tail is `takeAlong(expertScores, topKIndices, axis: -1)` ->
+/// `softmax(axis: -1, precise: true)` -> `perExpertScale[topKIndices]` ->
+/// elementwise multiply, which the encoder sees as an index build, two
+/// gathers, a softmax and a multiply. This kernel performs the same four
+/// operations for one cohort row per threadgroup.
+///
+/// The softmax body is the transcription of
+/// `softmax_single_row<T, float, N_READS = 4>` (softmax.h) that
+/// `Gemma4FusedRouterTop8` already carries: the same lane layout, the same
+/// `Limits<float>::min` padding for lanes past the axis, the same
+/// `fast::exp`, and the same `simd_max` / `simd_sum` reduction order on one
+/// 32-thread simdgroup at `axis_size = K`. The gathered score is the same
+/// BF16 word `takeAlong` returns, and the close is the same BF16 multiply
+/// against the same gathered per-expert scale.
+///
+/// Fail-closed: any other row count, sequence length, expert count, top-K or
+/// dtype returns nil and the established operation chain runs unchanged.
+/// `DARKBLOOM_GEMMA4_ROUTER_WEIGHT_TAIL=0` restores it inside the same
+/// executable.
+private enum Gemma4RouterWeightTailV1 {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ROUTER_WEIGHT_TAIL"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let rows = 8
+    private static let experts = 128
+    private static let selected = 8
+
+    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_router_weight_tail_e128_k8_bf16_v1",
+        inputNames: ["scores", "inds", "pes"],
+        outputNames: ["wts"],
+        source: """
+            constexpr int N_READS = 4;
+
+            const int row = int(threadgroup_position_in_grid.x);
+            const int lid = int(thread_position_in_threadgroup.x);
+
+            threadgroup float topv[K];
+            threadgroup uint topi[K];
+            threadgroup float local_max[32];
+            threadgroup float local_normalizer[32];
+
+            if (lid < K) {
+                const uint e = inds[row * K + lid];
+                topi[lid] = e;
+                topv[lid] = float(scores[row * E + e]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const int simd_lane_id = int(thread_index_in_simdgroup);
+            const int simd_group_id = int(simdgroup_index_in_threadgroup);
+
+            float ld[N_READS];
+            const int base = lid * N_READS;
+            if (base + N_READS <= K) {
+                for (int i = 0; i < N_READS; i++) {
+                    ld[i] = topv[base + i];
+                }
+            } else {
+                for (int i = 0; i < N_READS; i++) {
+                    ld[i] = ((base + i) < K) ? topv[base + i] : Limits<float>::min;
+                }
+            }
+            if (simd_group_id == 0) {
+                local_max[simd_lane_id] = Limits<float>::min;
+                local_normalizer[simd_lane_id] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float maxval = Limits<float>::finite_min;
+            for (int i = 0; i < N_READS; i++) {
+                maxval = (maxval < ld[i]) ? ld[i] : maxval;
+            }
+            maxval = simd_max(maxval);
+            if (simd_lane_id == 0) {
+                local_max[simd_group_id] = maxval;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+                maxval = simd_max(local_max[simd_lane_id]);
+                if (simd_lane_id == 0) {
+                    local_max[0] = maxval;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            maxval = local_max[0];
+
+            float normalizer = 0;
+            for (int i = 0; i < N_READS; i++) {
+                float exp_x = fast::exp(ld[i] - maxval);
+                ld[i] = exp_x;
+                normalizer += exp_x;
+            }
+            normalizer = simd_sum(normalizer);
+            if (simd_lane_id == 0) {
+                local_normalizer[simd_group_id] = normalizer;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+                normalizer = simd_sum(local_normalizer[simd_lane_id]);
+                if (simd_lane_id == 0) {
+                    local_normalizer[0] = normalizer;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            normalizer = 1 / local_normalizer[0];
+
+            if (base + N_READS <= K) {
+                for (int i = 0; i < N_READS; i++) {
+                    const T w = T(ld[i] * normalizer);
+                    wts[row * K + base + i] = w * pes[topi[base + i]];
+                }
+            } else {
+                for (int i = 0; i < N_READS; i++) {
+                    if ((base + i) < K) {
+                        const T w = T(ld[i] * normalizer);
+                        wts[row * K + base + i] = w * pes[topi[base + i]];
+                    }
+                }
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    static func apply(
+        expertScores: MLXArray, topKIndices: MLXArray, perExpertScale: MLXArray,
+        topK: Int
+    ) -> MLXArray? {
+        guard enabled,
+            topK == selected,
+            expertScores.ndim == 3,
+            expertScores.dim(0) == rows,
+            expertScores.dim(1) == 1,
+            expertScores.dim(2) == experts,
+            expertScores.dtype == .bfloat16,
+            topKIndices.ndim == 3,
+            topKIndices.dim(0) == rows,
+            topKIndices.dim(1) == 1,
+            topKIndices.dim(2) == selected,
+            topKIndices.dtype == .uint32,
+            perExpertScale.ndim == 1,
+            perExpertScale.dim(0) == experts,
+            perExpertScale.dtype == .bfloat16
+        else { return nil }
+        CBv2EngageMark.once("router-weight-tail")
+        return kernel(
+            [expertScores, topKIndices, perExpertScale],
+            template: [
+                ("T", expertScores.dtype),
+                ("E", experts),
+                ("K", selected),
+            ],
+            grid: (rows * 32, 1, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[rows, 1, selected]],
+            outputDTypes: [expertScores.dtype]
+        )[0]
+    }
+}
+
 /// ROUTER-FINALISTS-017: selection only, within the existing ZIP stage.
 /// Keep the stable ascending argsort tail: each 32-entry subset retains its
 /// largest eight, then one SIMD group sorts the 32 survivors. A discarded
@@ -3236,6 +3403,12 @@ private class Gemma4Router: Module {
     fileprivate func zipWeights(
         expertScores: MLXArray, topKIndices: MLXArray
     ) -> MLXArray {
+        if let fused = Gemma4RouterWeightTailV1.apply(
+            expertScores: expertScores, topKIndices: topKIndices,
+            perExpertScale: perExpertScale, topK: topK)
+        {
+            return fused
+        }
         var topKWeights = MLX.takeAlong(expertScores, topKIndices, axis: -1)
         topKWeights = MLX.softmax(topKWeights, axis: -1, precise: true)
         return topKWeights * perExpertScale[topKIndices]

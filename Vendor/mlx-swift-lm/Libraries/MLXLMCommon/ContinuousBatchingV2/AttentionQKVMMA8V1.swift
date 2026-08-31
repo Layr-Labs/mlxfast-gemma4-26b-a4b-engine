@@ -248,9 +248,46 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
   simdgroup_float8x8 A;
   simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
 
+  // The per-group weight operands are carried in registers: group g0's
+  // packed word, scale and bias are read before the walk, and each trip
+  // reads the next group's while the current group's stay resident. The
+  // addresses are functions of the group index alone, so the value each
+  // trip consumes is the value the in-place read produced. The uniform
+  // final-trip guard avoids issuing a redundant read whose value cannot be
+  // consumed after the loop.
+  uint2 wv_next[TILES];
+  T s_next[TILES];
+  T b_next[TILES];
+#pragma clang loop unroll(full)
+  for (int t = 0; t < TILES; ++t) {
+    wv_next[t] = *((const device uint2*)(wrow[t] + 32 * g0));
+    s_next[t] = srow[t][g0];
+    b_next[t] = brow[t][g0];
+  }
+
 #pragma unroll
   for (int gi = 0; gi < nGroups; ++gi) {
     const int g = g0 + gi;
+
+    uint2 wv_cur[TILES];
+    float s_cur[TILES];
+    float b_cur[TILES];
+#pragma clang loop unroll(full)
+    for (int t = 0; t < TILES; ++t) {
+      wv_cur[t] = wv_next[t];
+      s_cur[t] = float(s_next[t]);
+      b_cur[t] = float(b_next[t]);
+    }
+    if (gi + 1 < nGroups) {
+      const int g_next = g + 1;
+#pragma clang loop unroll(full)
+      for (int t = 0; t < TILES; ++t) {
+        wv_next[t] = *((const device uint2*)(wrow[t] + 32 * g_next));
+        s_next[t] = srow[t][g_next];
+        b_next[t] = brow[t][g_next];
+      }
+    }
+
     const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
     const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
 
@@ -270,9 +307,9 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
 
 #pragma clang loop unroll(full)
     for (int t = 0; t < TILES; ++t) {
-      const uint2 wv = *((const device uint2*)(wrow[t] + 32 * g));
-      const float s = float(srow[t][g]);
-      const float b = float(brow[t][g]);
+      const uint2 wv = wv_cur[t];
+      const float s = s_cur[t];
+      const float b = b_cur[t];
 
       simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
       MMA8_STEP(B0, 0)
@@ -334,7 +371,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
     private static let tilesPerGroup = 2
 
     private static let multiTileKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_unroll_v2",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry_guard_v4",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """

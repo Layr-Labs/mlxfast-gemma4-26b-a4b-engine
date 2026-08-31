@@ -1706,19 +1706,25 @@ public final class EngineLoopV2: @unchecked Sendable {
                     multimodalByID[$0.rec.id]?.chunkContext(
                         start: $0.start, count: $0.count)
                 }
-                let output: MLXArray
-                if spanContexts.contains(where: { $0 != nil }) {
-                    output = packedMultimodalChunksForward(
-                        tokens: inputs,
-                        starts: group.rows.map(\.start),
-                        multimodal: group.rows.map { multimodalByID[$0.rec.id] },
-                        spanContexts: spanContexts,
-                        caches: caches,
-                        requirement: requirement)
-                } else {
-                    output = prefillOutput(
-                        tokens: inputs, inputEmbeddings: nil, caches: caches,
-                        requirement: requirement)
+                if group.samples {
+                    CBv2EngageMark.once("prefill-order-only-softcap-skip")
+                }
+                let output: MLXArray = CBv2OrderOnlyLogits.withOrderOnly(
+                    group.samples ? group.rows.map(\.rec.request.sampling) : []
+                ) {
+                    if spanContexts.contains(where: { $0 != nil }) {
+                        return packedMultimodalChunksForward(
+                            tokens: inputs,
+                            starts: group.rows.map(\.start),
+                            multimodal: group.rows.map { multimodalByID[$0.rec.id] },
+                            spanContexts: spanContexts,
+                            caches: caches,
+                            requirement: requirement)
+                    } else {
+                        return prefillOutput(
+                            tokens: inputs, inputEmbeddings: nil, caches: caches,
+                            requirement: requirement)
+                    }
                 }
                 cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
 
@@ -1764,22 +1770,25 @@ public final class EngineLoopV2: @unchecked Sendable {
             let caches = eagerCaches(rowStates: [kvStates[rec.id]!])
             let requirement: CBv2PrefillRequirement =
                 row.samples ? .lastPositionLogits : .evaluationOnly
-            let output: MLXArray
-            if let multimodal = multimodalByID[rec.id],
-                let spanContext = multimodal.chunkContext(start: row.start, count: row.count)
-            {
-                // Vision chunk (contains image spans): the NEW pinned path —
-                // spliced input embeddings + span attention masks. Chunks of
-                // the SAME request without spans fall through to the
-                // untouched text path (pure function of has-spans).
-                output = multimodalChunkForward(
-                    tokens: inputs, start: row.start, count: row.count,
-                    multimodal: multimodal, spanContext: spanContext, caches: caches,
-                    requirement: requirement)
-            } else {
-                output = prefillOutput(
-                    tokens: inputs, inputEmbeddings: nil, caches: caches,
-                    requirement: requirement)
+            let output: MLXArray = CBv2OrderOnlyLogits.withOrderOnly(
+                row.samples ? [rec.request.sampling] : []
+            ) {
+                if let multimodal = multimodalByID[rec.id],
+                    let spanContext = multimodal.chunkContext(start: row.start, count: row.count)
+                {
+                    // Vision chunk (contains image spans): the NEW pinned path —
+                    // spliced input embeddings + span attention masks. Chunks of
+                    // the SAME request without spans fall through to the
+                    // untouched text path (pure function of has-spans).
+                    return multimodalChunkForward(
+                        tokens: inputs, start: row.start, count: row.count,
+                        multimodal: multimodal, spanContext: spanContext, caches: caches,
+                        requirement: requirement)
+                } else {
+                    return prefillOutput(
+                        tokens: inputs, inputEmbeddings: nil, caches: caches,
+                        requirement: requirement)
+                }
             }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             if row.samples {

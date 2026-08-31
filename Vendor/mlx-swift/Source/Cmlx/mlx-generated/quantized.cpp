@@ -2076,10 +2076,18 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
   int k = 0;
   for (; k <= in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
+      // `wl` is four-byte aligned on every iteration: `w` is a uint32_t
+      // allocation, in_vec_size_w is g64-aligned, simd_lid * 4 and the
+      // block_size advance are both multiples of four.  One word load
+      // replaces four dependent byte loads; the bytes are unpacked
+      // little-endian, which is the order the same address range already
+      // reads back in.
       const device uint8_t* wl = ws + row * in_vec_size_w;
-      for (int i = 0; i < bytes_per_thread; i++) {
-        packed[row][i] = wl[i];
-      }
+      const uint wword = *(const device uint*)wl;
+      packed[row][0] = uint8_t(wword & 0xffu);
+      packed[row][1] = uint8_t((wword >> 8) & 0xffu);
+      packed[row][2] = uint8_t((wword >> 16) & 0xffu);
+      packed[row][3] = uint8_t(wword >> 24);
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }
@@ -2122,10 +2130,14 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
       uint((in_vec_size - k) / values_per_thread);
   if (simd_lid < active_tail_lanes) {
     for (int row = 0; row < results_per_simdgroup; row++) {
+      // Same alignment argument as the main loop, and the word covers exactly
+      // the four bytes the scalar loads covered, so the reach is unchanged.
       const device uint8_t* wl = ws + row * in_vec_size_w;
-      for (int i = 0; i < bytes_per_thread; i++) {
-        packed[row][i] = wl[i];
-      }
+      const uint wword = *(const device uint*)wl;
+      packed[row][0] = uint8_t(wword & 0xffu);
+      packed[row][1] = uint8_t((wword >> 8) & 0xffu);
+      packed[row][2] = uint8_t((wword >> 16) & 0xffu);
+      packed[row][3] = uint8_t(wword >> 24);
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }

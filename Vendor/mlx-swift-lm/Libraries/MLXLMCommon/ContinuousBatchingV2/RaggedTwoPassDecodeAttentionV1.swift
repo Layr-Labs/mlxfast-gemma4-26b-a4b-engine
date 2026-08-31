@@ -960,8 +960,8 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// the stock gemv threadgroup shape). Each simdgroup replays the stock
     /// GEMVKernel<bf16,4,1,1,32,4,4> lane→column mapping and tail shift for
     /// TM=4 score rows, for all 8 heads of the GQA group at once.
-    /// params: [0]=kL, [1]=K (=D, runtime like the stock buffer-passed
-    /// sizes), [2+row]=that row's KV buffer capacity.
+    /// params: [0]=kL, [1]=the fixed D (=512, retained for the shared
+    /// parameter layout), [2+row]=that row's KV buffer capacity.
     /// WRITE-022 (samfenwick's db4ef5e, re-implemented with credit): the
     /// stock QK source as a shared constant so the plain and fenced kernel
     /// objects are STRUCTURALLY identical — the fenced one differs only by an
@@ -974,7 +974,6 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             constexpr int GQA = 8;
 
             const int key_length = int(params[0]);
-            const int in_vec_size = int(params[1]);
 
             const int n_chunks = (key_length + 63) / 64;
             const int z = int(threadgroup_position_in_grid.z);
@@ -1008,7 +1007,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int virtual_groups = (key_length + 15) / 16;
             const int vtg_lo = chunk * 4;
             const int vtg_hi = min(vtg_lo + 4, virtual_groups);
-            const int n_iter = in_vec_size / 128;
+            constexpr int n_iter = D / 128;
 
             for (int vtg = vtg_lo; vtg < vtg_hi; ++vtg) {
                 int out_row = vtg * 16 + sg * 4;
@@ -1021,6 +1020,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 T inter[4];
                 float v_coeff[GQA][4];
                 int bn = lane * 4;
+                #pragma clang loop unroll(full)
                 for (int i = 0; i < n_iter; ++i) {
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
@@ -1075,7 +1075,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         """
 
     private static let qkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_qk_bf16_g8_v1",
+        name: "cbv2_ragged8_sdpa_d512_qk_bf16_g8_v2",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -1087,7 +1087,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     )
 
     private static let qkFencedKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_qk_fenced_bf16_g8_v1",
+        name: "cbv2_ragged8_sdpa_d512_qk_fenced_bf16_g8_v2",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -1342,7 +1342,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// served from `new_keys` during scoring, never from the slot being
     /// written, so no read races the store.
     private static let fusedQkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_qk_bf16_g8_v2",
+        name: "cbv2_ragged8_writesdpa_d512_qk_bf16_g8_v3",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -1355,7 +1355,6 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             constexpr int GQA = 8;
 
             const int key_length = int(params[0]);
-            const int in_vec_size = int(params[1]);
 
             const int n_chunks = (key_length + 63) / 64;
             const int z = int(threadgroup_position_in_grid.z);
@@ -1407,7 +1406,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int virtual_groups = (key_length + 15) / 16;
             const int vtg_lo = chunk * 4;
             const int vtg_hi = min(vtg_lo + 4, virtual_groups);
-            const int n_iter = in_vec_size / 128;
+            constexpr int n_iter = D / 128;
 
             for (int vtg = vtg_lo; vtg < vtg_hi; ++vtg) {
                 int out_row = vtg * 16 + sg * 4;
@@ -1425,6 +1424,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 T inter[4];
                 float v_coeff[GQA][4];
                 int bn = lane * 4;
+                #pragma clang loop unroll(full)
                 for (int i = 0; i < n_iter; ++i) {
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {

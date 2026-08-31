@@ -727,6 +727,16 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         // neighbours, and a second copy of them would cost registers for no
         // stream. `g` is monotone here and the loop count is a constant, so the
         // hand-off is register renaming in a fully unrolled body, not a copy.
+        //
+        // DMLP-DOWN-CARRY3-023: the codes go THREE groups deep. Depth two paid
+        // more than depth one did on this plane, which says the stall this
+        // hides is longer than two groups of work rather than nearly covered.
+        // The plane's per-group code load is a full sixteen bytes per lane,
+        // twice what the 4-bit attention tiers pull, so it has proportionally
+        // more latency to cover; its unrolled body is also only seventeen trips
+        // long, short enough that three uint4 in flight is four registers of
+        // growth rather than a spill. The scale and the bias still stay one
+        // group ahead for the same reason as before.
         replaceOnce(
             """
               simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
@@ -737,6 +747,8 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
               uint4 wv_next = *((const device uint4*)(wrow + 64 * g0));
               uint4 wv_next2 =
                   *((const device uint4*)(wrow + 64 * min(g0 + 1, G - 1)));
+              uint4 wv_next3 =
+                  *((const device uint4*)(wrow + 64 * min(g0 + 2, G - 1)));
               T s_next = srow[g0];
               T b_next = brow[g0];
             """)
@@ -752,7 +764,8 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
                 const float b = float(b_next);
                 const int g_next = min(g + 1, G - 1);
                 wv_next = wv_next2;
-                wv_next2 = *((const device uint4*)(wrow + 64 * min(g + 2, G - 1)));
+                wv_next2 = wv_next3;
+                wv_next3 = *((const device uint4*)(wrow + 64 * min(g + 3, G - 1)));
                 s_next = srow[g_next];
                 b_next = brow[g_next];
             """)
@@ -760,7 +773,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     }()
 
     private static let mma8DownStaticKKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_carry2_v3",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_carry3_v4",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """

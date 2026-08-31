@@ -242,14 +242,18 @@ extension EngineLoopV2 {
             )
             let fullSnapshot = fullRow.snapshot()
             let slidingSnapshot = slidingRow.snapshot()
+            let fullLength = fullRow.retainedCount
+            let slidingLength = slidingRow.retainedCount
             captures.append(
                 CBv2MTPRowCapture(
                     fullKeys: fullSnapshot.keys,
                     fullValues: fullSnapshot.values,
                     slidingKeys: slidingSnapshot.keys,
                     slidingValues: slidingSnapshot.values,
-                    slidingStart: slidingRow.absoluteOffset - slidingRow.retainedCount,
-                    anchor: fullRow.absoluteOffset))
+                    slidingStart: slidingRow.absoluteOffset - slidingLength,
+                    anchor: fullRow.absoluteOffset,
+                    fullLength: fullLength,
+                    slidingLength: slidingLength))
             captured.append((fullRow, fullSnapshot.keys, fullSnapshot.values))
             captured.append((slidingRow, slidingSnapshot.keys, slidingSnapshot.values))
             rowMetadata.append(

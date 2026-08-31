@@ -97,6 +97,11 @@ public struct CBv2MTPRowCapture {
     /// temporal order. Window-limited by storage eviction.
     public var slidingKeys: MLXArray
     public var slidingValues: MLXArray
+    /// Logical temporal widths captured alongside the views. The engine
+    /// already owns these host integers as `retainedCount`; carrying them
+    /// avoids rediscovering array shape metadata in the B-wide drafter path.
+    public var fullLength: Int
+    public var slidingLength: Int
     /// Absolute position of the FIRST retained sliding entry (the sliding
     /// KV covers positions [slidingStart, anchor)). The full capture always
     /// starts at 0.
@@ -108,12 +113,15 @@ public struct CBv2MTPRowCapture {
     public init(
         fullKeys: MLXArray, fullValues: MLXArray,
         slidingKeys: MLXArray, slidingValues: MLXArray,
-        slidingStart: Int, anchor: Int
+        slidingStart: Int, anchor: Int,
+        fullLength: Int? = nil, slidingLength: Int? = nil
     ) {
         self.fullKeys = fullKeys
         self.fullValues = fullValues
         self.slidingKeys = slidingKeys
         self.slidingValues = slidingValues
+        self.fullLength = fullLength ?? fullKeys.dim(2)
+        self.slidingLength = slidingLength ?? slidingKeys.dim(2)
         self.slidingStart = slidingStart
         self.anchor = anchor
     }

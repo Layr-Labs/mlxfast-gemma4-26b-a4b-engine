@@ -138,8 +138,8 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         if rows.count == 1 {
             let row = rows[0]
             let slidingMask = Self.slidingMask(
-                rows: rows, tMax: row.slidingKeys.dim(2), window: slidingWindow,
-                dtype: row.slidingKeys.dtype)
+                rows: rows, tMax: row.slidingLength, window: slidingWindow,
+                dtype: row.slidingKeys.dtype, lengths: [row.slidingLength])
             return Prepared(
                 sharedKV: Gemma4SharedKV(
                     fullAttention: (row.fullKeys, row.fullValues),
@@ -151,13 +151,37 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
                 ropeTable: ropeTable)
         }
 
-        let (fullKV, fullMask) = Self.padAndMask(
-            keys: rows.map(\.fullKeys), values: rows.map(\.fullValues))
-        let (slidingKV, slidingMask) = Self.padAndMask(
-            keys: rows.map(\.slidingKeys), values: rows.map(\.slidingValues))
+        // Gather arrays and their engine-owned logical widths in one pass.
+        // The same widths govern key/value padding and both sliding masks;
+        // no array shape query is needed on the B-wide hot path.
+        var fullKeys: [MLXArray] = []
+        var fullValues: [MLXArray] = []
+        var fullLengths: [Int] = []
+        var slidingKeys: [MLXArray] = []
+        var slidingValues: [MLXArray] = []
+        var slidingLengths: [Int] = []
+        fullKeys.reserveCapacity(rows.count)
+        fullValues.reserveCapacity(rows.count)
+        fullLengths.reserveCapacity(rows.count)
+        slidingKeys.reserveCapacity(rows.count)
+        slidingValues.reserveCapacity(rows.count)
+        slidingLengths.reserveCapacity(rows.count)
+        for row in rows {
+            fullKeys.append(row.fullKeys)
+            fullValues.append(row.fullValues)
+            fullLengths.append(row.fullLength)
+            slidingKeys.append(row.slidingKeys)
+            slidingValues.append(row.slidingValues)
+            slidingLengths.append(row.slidingLength)
+        }
+
+        let (fullKV, fullMask, _) = Self.padAndMask(
+            keys: fullKeys, values: fullValues, lengths: fullLengths)
+        let (slidingKV, slidingMask, slidingTMax) = Self.padAndMask(
+            keys: slidingKeys, values: slidingValues, lengths: slidingLengths)
         let absoluteSlidingMask = Self.slidingMask(
-            rows: rows, tMax: slidingKV.0.dim(2), window: slidingWindow,
-            dtype: slidingKV.0.dtype)
+            rows: rows, tMax: slidingTMax, window: slidingWindow,
+            dtype: slidingKV.0.dtype, lengths: slidingLengths)
         return Prepared(
             sharedKV: Gemma4SharedKV(fullAttention: fullKV, slidingAttention: slidingKV),
             masks: Gemma4DrafterMasks(
@@ -211,22 +235,26 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
     /// `[B, kvHeads, Tmax, headDim]` and build the additive padding mask
     /// `[B, 1, 1, Tmax]` — 0 for valid entries, `-inf` for the padded tail
     /// (`Gemma4DrafterMaskBuilder`'s convention). All lengths are host ints
-    /// from array metadata; the tensors stay lazy.
+    /// carried by the capture contract; the tensors stay lazy.
     private static func padAndMask(
-        keys: [MLXArray], values: [MLXArray]
-    ) -> (kv: (MLXArray, MLXArray), mask: MLXArray) {
-        let lengths = keys.map { $0.dim(2) }
+        keys: [MLXArray], values: [MLXArray], lengths: [Int]
+    ) -> (kv: (MLXArray, MLXArray), mask: MLXArray, tMax: Int) {
+        precondition(
+            keys.count == values.count && lengths.count == keys.count,
+            "Gemma4CBv2MTPDrafter: capture metadata count mismatch")
         let tMax = lengths.max() ?? 0
         precondition(tMax > 0, "Gemma4CBv2MTPDrafter: empty KV capture")
 
-        let padded = (padStack(keys, to: tMax), padStack(values, to: tMax))
+        let padded = (
+            padStack(keys, lengths: lengths, to: tMax),
+            padStack(values, lengths: lengths, to: tMax))
 
         let positions = MLXArray(Int32(0) ..< Int32(tMax)).reshaped([1, 1, 1, tMax])
         let valid = positions .< MLXArray(lengths.map { Int32($0) }).reshaped([-1, 1, 1, 1])
         let dtype = keys[0].dtype
         let zero = MLXArray(0.0).asType(dtype)
         let negInf = MLXArray(-Float.infinity).asType(dtype)
-        return (padded, MLX.where(valid, zero, negInf))
+        return (padded, MLX.where(valid, zero, negInf), tMax)
     }
 
     /// Additive `[B, 1, 1, Tmax]` mask for CBv2 sliding captures. Returns nil
@@ -234,9 +262,13 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
     /// and no padding exists. Internal so the absolute boundary is pinned by
     /// weight-free tests without exposing it as product API.
     static func slidingMask(
-        rows: [CBv2MTPRowCapture], tMax: Int, window: Int, dtype: DType
+        rows: [CBv2MTPRowCapture], tMax: Int, window: Int, dtype: DType,
+        lengths knownLengths: [Int]? = nil
     ) -> MLXArray? {
-        let lengths = rows.map { $0.slidingKeys.dim(2) }
+        let lengths = knownLengths ?? rows.map { $0.slidingKeys.dim(2) }
+        precondition(
+            lengths.count == rows.count,
+            "Gemma4CBv2MTPDrafter: sliding metadata count mismatch")
         let needsMask = rows.enumerated().contains { index, row in
             lengths[index] < tMax || row.slidingStart <= row.anchor - window
         }
@@ -255,14 +287,17 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         return MLX.where(valid, zero, negInf)
     }
 
-    private static func padStack(_ rows: [MLXArray], to tMax: Int) -> MLXArray {
-        if rows.allSatisfy({ $0.dim(2) == tMax }) {
+    private static func padStack(
+        _ rows: [MLXArray], lengths: [Int], to tMax: Int
+    ) -> MLXArray {
+        if lengths.allSatisfy({ $0 == tMax }) {
             return concatenated(rows, axis: 0)
         }
+        let firstShape = rows[0].shape
         let out = MLXArray.zeros(
-            [rows.count, rows[0].dim(1), tMax, rows[0].dim(3)], dtype: rows[0].dtype)
+            [rows.count, firstShape[1], tMax, firstShape[3]], dtype: rows[0].dtype)
         for (i, row) in rows.enumerated() {
-            out[i ..< (i + 1), 0..., 0 ..< row.dim(2), 0...] = row
+            out[i ..< (i + 1), 0..., 0 ..< lengths[i], 0...] = row
         }
         return out
     }

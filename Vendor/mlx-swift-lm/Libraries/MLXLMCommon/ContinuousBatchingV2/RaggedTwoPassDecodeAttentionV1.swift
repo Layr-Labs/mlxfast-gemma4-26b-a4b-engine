@@ -14,6 +14,10 @@ import Foundation
 import MLX
 import MLXFast
 
+/// Local-only engagement evidence; the ranked runner does not set this flag.
+private let cbv2D512StoreHostMetadataMarksArmed =
+    ProcessInfo.processInfo.environment["MLXFAST_ENGAGE_MARKS"] != nil
+
 enum CBv2RaggedTwoPassDecodeAttentionV1 {
     private static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
@@ -2013,22 +2017,39 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         valueBuffers.reserveCapacity(batch)
         var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
         params.reserveCapacity(batch + 2)
-        for row in fullRows {
-            let state = row.cbv2InnerState()
-            guard state.count == 2,
-                state[0].dtype == .bfloat16,
-                state[1].dtype == .bfloat16,
-                state[0].ndim == 4,
-                state[0].dim(0) == 1,
-                state[0].dim(1) == kvHeads,
-                state[0].dim(3) == headDim,
-                state[1].shape == state[0].shape,
-                state[1].dtype == state[0].dtype,
-                state[0].dim(2) >= keyLength
-            else { return nil }
-            keyBuffers.append(state[0])
-            valueBuffers.append(state[1])
-            params.append(UInt32(state[0].dim(2)))
+        if cbv2D512StoreHostMetadataEnabled {
+            if cbv2D512StoreHostMetadataMarksArmed {
+                CBv2EngageMark.once("write022-hostmeta")
+            }
+            for row in fullRows {
+                guard let storage = row.writing22PrivateStorage(
+                    requiredCapacity: keyLength, dtype: .bfloat16,
+                    kvHeads: kvHeads, headDim: headDim)
+                else { return nil }
+                keyBuffers.append(storage.keys)
+                valueBuffers.append(storage.values)
+                params.append(UInt32(storage.capacity))
+            }
+        } else {
+            // Incumbent WRITE-022 admission path, retained byte-for-byte for
+            // process-level OFF/ON attribution.
+            for row in fullRows {
+                let state = row.cbv2InnerState()
+                guard state.count == 2,
+                    state[0].dtype == .bfloat16,
+                    state[1].dtype == .bfloat16,
+                    state[0].ndim == 4,
+                    state[0].dim(0) == 1,
+                    state[0].dim(1) == kvHeads,
+                    state[0].dim(3) == headDim,
+                    state[1].shape == state[0].shape,
+                    state[1].dtype == state[0].dtype,
+                    state[0].dim(2) >= keyLength
+                else { return nil }
+                keyBuffers.append(state[0])
+                valueBuffers.append(state[1])
+                params.append(UInt32(state[0].dim(2)))
+            }
         }
         let paramsArray = MLXArray(params)
 

@@ -313,9 +313,10 @@ inline U qdot_affine4_registered(
   return scale * accum + sum * bias;
 }
 
-// Consume the same two adjacent packed uint16 values through one aligned
-// 32-bit device load. The low and high halves retain the original arithmetic
-// order while halving the explicit weight-load instructions.
+// Same affine-4 dot product as qdot_affine4_registered, with the two adjacent
+// packed uint16 values supplied by one aligned uint device load.  The low and
+// high halves are consumed in the original i = 0, 1 order, so the two
+// four-term expressions and the accumulator chain are unchanged.
 template <typename U, int values_per_thread>
 inline U qdot_affine4_registered_word(
     uint packed_word,
@@ -324,18 +325,15 @@ inline U qdot_affine4_registered_word(
     U bias,
     U sum) {
   static_assert(values_per_thread == 8, "Word load expects eight 4-bit values");
-  const uint packed0 = packed_word & 0xffffu;
-  const uint packed1 = packed_word >> 16;
-  U accum =
-      (x_thread[0] * (packed0 & 0x000f) +
-       x_thread[1] * (packed0 & 0x00f0) +
-       x_thread[2] * (packed0 & 0x0f00) +
-       x_thread[3] * (packed0 & 0xf000));
-  accum +=
-      (x_thread[4] * (packed1 & 0x000f) +
-       x_thread[5] * (packed1 & 0x00f0) +
-       x_thread[6] * (packed1 & 0x0f00) +
-       x_thread[7] * (packed1 & 0xf000));
+  U accum = 0;
+  for (int i = 0; i < (values_per_thread / 4); i++) {
+    const uint packed = (packed_word >> (16 * i)) & 0xffffu;
+    accum +=
+        (x_thread[4 * i] * (packed & 0x000f) +
+         x_thread[4 * i + 1] * (packed & 0x00f0) +
+         x_thread[4 * i + 2] * (packed & 0x0f00) +
+         x_thread[4 * i + 3] * (packed & 0xf000));
+  }
   return scale * accum + sum * bias;
 }
 
@@ -353,30 +351,23 @@ inline void qdot_affine4_pair(
     U sum1,
     thread U& out0,
     thread U& out1) {
+  U accum0 = 0;
+  U accum1 = 0;
   static_assert(values_per_thread == 8, "Word load expects eight 4-bit values");
-  const uint packedWord = *((const device uint*)w);
-  const uint packed0 = packedWord & 0xffffu;
-  const uint packed1 = packedWord >> 16;
-  U accum0 =
-      (x0[0] * (packed0 & 0x000f) +
-       x0[1] * (packed0 & 0x00f0) +
-       x0[2] * (packed0 & 0x0f00) +
-       x0[3] * (packed0 & 0xf000));
-  U accum1 =
-      (x1[0] * (packed0 & 0x000f) +
-       x1[1] * (packed0 & 0x00f0) +
-       x1[2] * (packed0 & 0x0f00) +
-       x1[3] * (packed0 & 0xf000));
-  accum0 +=
-      (x0[4] * (packed1 & 0x000f) +
-       x0[5] * (packed1 & 0x00f0) +
-       x0[6] * (packed1 & 0x0f00) +
-       x0[7] * (packed1 & 0xf000));
-  accum1 +=
-      (x1[4] * (packed1 & 0x000f) +
-       x1[5] * (packed1 & 0x00f0) +
-       x1[6] * (packed1 & 0x0f00) +
-       x1[7] * (packed1 & 0xf000));
+  const uint packed_word = *((const device uint*)w);
+  for (int i = 0; i < (values_per_thread / 4); i++) {
+    const uint packed = (packed_word >> (16 * i)) & 0xffffu;
+    accum0 +=
+        (x0[4 * i] * (packed & 0x000f) +
+         x0[4 * i + 1] * (packed & 0x00f0) +
+         x0[4 * i + 2] * (packed & 0x0f00) +
+         x0[4 * i + 3] * (packed & 0xf000));
+    accum1 +=
+        (x1[4 * i] * (packed & 0x000f) +
+         x1[4 * i + 1] * (packed & 0x00f0) +
+         x1[4 * i + 2] * (packed & 0x0f00) +
+         x1[4 * i + 3] * (packed & 0xf000));
+  }
   out0 = scale * accum0 + sum0 * bias;
   out1 = scale * accum1 + sum1 * bias;
 }
@@ -1625,9 +1616,10 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
 //
 // Exactness is unchanged and argued the same way: each (output row, input row)
 // pair keeps its own accumulator, its own K-loop order, and its own simd_sum;
-// `qdot_affine4_registered` is the bits == 4 arm of `qdot` verbatim. Only the
-// LOADS are shared, so every output element's add sequence is identical to
-// stock qmv_impl.
+// `qdot_affine4_registered_word` is the bits == 4 arm of `qdot` verbatim,
+// consuming the same two half-words from one aligned word load. Only the LOADS
+// are shared, so every output element's add sequence is identical to stock
+// qmv_impl.
 template <typename T, const int group_size, const int bits>
 METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     const device uint32_t* w,
@@ -1682,8 +1674,9 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
   int k = 0;
   for (; k <= in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
-      packed[row] =
-          *((const device uint*)(ws + row * in_vec_size_w));
+      const device uint* wl =
+          (const device uint*)(ws + row * in_vec_size_w);
+      packed[row] = wl[0];
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }
@@ -1724,8 +1717,9 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
       values_per_thread);
   if (remaining > 0) {
     for (int row = 0; row < results_per_simdgroup; row++) {
-      packed[row] =
-          *((const device uint*)(ws + row * in_vec_size_w));
+      const device uint* wl =
+          (const device uint*)(ws + row * in_vec_size_w);
+      packed[row] = wl[0];
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }
@@ -1773,8 +1767,8 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
 // Three-row weight-stream sharing: qmv_affine4_g64_quad_stream_impl with the
 // fourth input row deleted, for same-expert gather runs of exactly three. The
 // register discipline (one live x buffer), K-loop order, per-(output, input)
-// accumulators, and qdot_affine4_registered arithmetic are the quad's own, so
-// every output element's add sequence remains identical to stock qmv_impl.
+// accumulators, and qdot_affine4_registered_word arithmetic are the quad's own,
+// so every output element's add sequence remains identical to stock qmv_impl.
 template <typename T, const int group_size, const int bits>
 METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
     const device uint32_t* w,
@@ -1824,8 +1818,9 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
   int k = 0;
   for (; k <= in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
-      packed[row] =
-          *((const device uint*)(ws + row * in_vec_size_w));
+      const device uint* wl =
+          (const device uint*)(ws + row * in_vec_size_w);
+      packed[row] = wl[0];
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }
@@ -1860,8 +1855,9 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
       values_per_thread);
   if (remaining > 0) {
     for (int row = 0; row < results_per_simdgroup; row++) {
-      packed[row] =
-          *((const device uint*)(ws + row * in_vec_size_w));
+      const device uint* wl =
+          (const device uint*)(ws + row * in_vec_size_w);
+      packed[row] = wl[0];
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }
@@ -3729,6 +3725,7 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
 
   thread uint wpf[results_per_simdgroup];
   if (PF) {
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       wpf[row] = *((const device uint*)(ws0 + row * in_vec_size_w));
     }
@@ -3739,16 +3736,19 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
 
     thread uint wcur[results_per_simdgroup];
     if (PF) {
+      #pragma unroll
       for (int row = 0; row < results_per_simdgroup; row++) {
         wcur[row] = wpf[row];
       }
       const int nextblk = (blk + 1 < nblocks) ? (blk + 1) : blk;
       const device uint8_t* wsn = ws0 + nextblk * block_bytes;
+      #pragma unroll
       for (int row = 0; row < results_per_simdgroup; row++) {
         wpf[row] = *((const device uint*)(wsn + row * in_vec_size_w));
       }
     }
 
+    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device T* sl = scales + row * in_vec_size_g;
       const device T* bl = biases + row * in_vec_size_g;
@@ -3786,6 +3786,7 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
       if (remaining > 0) {
         U sum = load_vector_safe<T, U, values_per_thread, 4>(
             x, x_thread, remaining);
+        #pragma unroll
         for (int row = 0; row < results_per_simdgroup; row++) {
           auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
           const device T* sl = scales + row * in_vec_size_g;
@@ -3800,6 +3801,7 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
     const uint active_tail_lanes = uint(tail_values / values_per_thread);
     if (tail_values % values_per_thread == 0 && simd_lid < active_tail_lanes) {
       U sum = load_vector<T, U, values_per_thread, 4>(x, x_thread);
+      #pragma unroll
       for (int row = 0; row < results_per_simdgroup; row++) {
         const device T* sl = scales + row * in_vec_size_g;
         const device T* bl = biases + row * in_vec_size_g;
@@ -3816,6 +3818,7 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
     }
   }
 
+  #pragma unroll
   for (int row = 0; row < results_per_simdgroup; row++) {
     result[row] = simd_sum(result[row]);
     if (simd_lid == 0) {
@@ -3904,6 +3907,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     const device T* tile_x1 =
         x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
     device T* tile_y1 = y + (assignment + 1) * out_vec_size;
+    #pragma unroll
     for (int t = 0; t < gemma4_down_tile_span; t++) {
       uint3 tile_tid = tid;
       tile_tid.y = tid.y + uint(t);
@@ -3922,6 +3926,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     }
     return;
   }
+  #pragma unroll
   for (int t = 0; t < gemma4_down_tile_span; t++) {
     uint3 tile_tid = tid;
     tile_tid.y = tid.y + uint(t);

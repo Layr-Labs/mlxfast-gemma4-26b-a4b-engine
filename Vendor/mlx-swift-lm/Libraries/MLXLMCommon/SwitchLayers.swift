@@ -112,7 +112,7 @@ public func resetWeightedExpertUnsortStats() {
 /// permutation and writes `[tokens, hidden]` directly, avoiding that full
 /// `[tokens, topK, hidden]` intermediate.
 private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "weighted_expert_unsort",
+    name: "weighted_expert_unsort_unroll_v1",
     inputNames: ["sorted_outputs", "inverse_order", "weights"],
     outputNames: ["output"],
     source: """
@@ -121,6 +121,7 @@ private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
 
         T accumulator = (T)0;
         const uint assignment_base = token * (uint)K;
+        #pragma clang loop unroll(full)
         for (uint slot = 0; slot < (uint)K; ++slot) {
             const uint assignment = assignment_base + slot;
             const uint sorted_row = (uint)inverse_order[assignment];
@@ -556,6 +557,7 @@ private let routeFusedScatterKernelT64: MLXFast.MLXFastKernel = {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             uint simd_base = 0;
+            #pragma clang loop unroll(full)
             for (uint s = 0; s < simd_id; ++s) {
                 simd_base += simd_totals[s];
             }
@@ -564,6 +566,7 @@ private let routeFusedScatterKernelT64: MLXFast.MLXFastKernel = {
                 atomic_load_explicit(&tg_before[k], memory_order_relaxed);
             // Walk this tile's slice in input order: stability by
             // construction, exactly the stock scatter's write order.
+            #pragma clang loop unroll(4)
             for (uint i = 0; i < TILE; ++i) {
                 uint idx = t * TILE + i;
                 if (keys[idx] == k) {
@@ -622,12 +625,14 @@ private let routeFusedScatterPrefixBoundsKernelT64: MLXFast.MLXFastKernel = {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             uint simd_base = 0;
+            #pragma clang loop unroll(full)
             for (uint s = 0; s < simd_id; ++s) {
                 simd_base += simd_totals[s];
             }
             const uint expert_base = simd_base + lane_excl;
             uint off = expert_base
                 + atomic_load_explicit(&tg_before[k], memory_order_relaxed);
+            #pragma clang loop unroll(4)
             for (uint i = 0; i < TILE; ++i) {
                 uint idx = t * TILE + i;
                 if (keys[idx] == k) {

@@ -283,7 +283,7 @@ enum CBv2ComposedPrefillSDPAV1 {
             scores = MLX.where(causalMask(L: L, kL: kL), scores, bfloat16LowestScalar)
         }
 
-        scores = MLX.softmax(scores, axis: -1, precise: true)
+        scores = MLX.softmax(scores, axis: -1, precise: false)
         var output = matmul(scores, v)
         if nRepeats > 1 {
             output = output.reshaped([B, nQHeads, L, valueDim])

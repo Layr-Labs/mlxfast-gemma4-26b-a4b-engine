@@ -255,6 +255,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
 
             thread float q[values_per_lane];
             thread float accumulator[values_per_lane];
+            #pragma clang loop unroll(full)
             for (int element = 0; element < values_per_lane; ++element) {
                 q[element] = 1.0f * float(query[element]);
                 accumulator[element] = 0.0f;
@@ -266,6 +267,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 const device T* k = keys + slot * D;
                 const device T* v = values + slot * D;
                 float score = 0.0f;
+                #pragma clang loop unroll(full)
                 for (int element = 0; element < values_per_lane; ++element) {
                     score += q[element] * float(k[element]);
                 }
@@ -276,6 +278,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 const float score_factor = fast::exp(score - new_max);
                 max_score = new_max;
                 sum_exp_score = sum_exp_score * old_factor + score_factor;
+                #pragma clang loop unroll(full)
                 for (int element = 0; element < values_per_lane; ++element) {
                     accumulator[element] = accumulator[element] * old_factor
                         + score_factor * float(v[element]);
@@ -288,6 +291,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 sum_out[0] = sum_exp_score;
                 max_out[0] = max_score;
             }
+            #pragma clang loop unroll(full)
             for (int element = 0; element < values_per_lane; ++element) {
                 partial[element] = T(accumulator[element]);
             }
@@ -459,7 +463,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         MLXFast.metalKernel(
             name:
                 "cbv2_ragged8_ringwrite_sdpa_2pass_a_gqapair_bf16_d256_g2"
-                + "_b\(blocks)_vr_qreg_v3",
+                + "_b\(blocks)_v1",
             inputNames: [
                 "queries",
                 "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -688,8 +692,8 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 device float* sum_out = sums + batch_head * BLOCKS + block;
                 device float* max_out = maxs + batch_head * BLOCKS + block;
 
-                thread T4 q_lo_vectors[vectors_per_lane];
-                thread T4 q_hi_vectors[vectors_per_lane];
+                thread float q_lo[values_per_lane];
+                thread float q_hi[values_per_lane];
                 thread float acc_lo[values_per_lane];
                 thread float acc_hi[values_per_lane];
                 {
@@ -699,10 +703,12 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         reinterpret_cast<const device T4*>(query + D);
                     #pragma clang loop unroll(full)
                     for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
-                        q_lo_vectors[chunk] = query_lo[chunk];
-                        q_hi_vectors[chunk] = query_hi[chunk];
+                        const T4 lo_vector = query_lo[chunk];
+                        const T4 hi_vector = query_hi[chunk];
                         #pragma clang loop unroll(full)
                         for (int j = 0; j < 4; ++j) {
+                            q_lo[chunk * 4 + j] = 1.0f * float(lo_vector[j]);
+                            q_hi[chunk * 4 + j] = 1.0f * float(hi_vector[j]);
                             acc_lo[chunk * 4 + j] = 0.0f;
                             acc_hi[chunk * 4 + j] = 0.0f;
                         }
@@ -722,18 +728,14 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         current ? new_value : values + slot * D);
                     float score_lo = 0.0f;
                     float score_hi = 0.0f;
-                    thread T4 value_vectors[vectors_per_lane];
                     #pragma clang loop unroll(full)
                     for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
                         const T4 key_vector = k[chunk];
-                        const T4 q_lo_vector = q_lo_vectors[chunk];
-                        const T4 q_hi_vector = q_hi_vectors[chunk];
-                        value_vectors[chunk] = v[chunk];
                         #pragma clang loop unroll(full)
                         for (int j = 0; j < 4; ++j) {
                             const float key_element = float(key_vector[j]);
-                            score_lo += float(q_lo_vector[j]) * key_element;
-                            score_hi += float(q_hi_vector[j]) * key_element;
+                            score_lo += q_lo[chunk * 4 + j] * key_element;
+                            score_hi += q_hi[chunk * 4 + j] * key_element;
                         }
                     }
                     score_lo = simd_sum(score_lo);
@@ -751,7 +753,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     sum_hi = sum_hi * old_factor_hi + score_factor_hi;
                     #pragma clang loop unroll(full)
                     for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
-                        const T4 value_vector = value_vectors[chunk];
+                        const T4 value_vector = v[chunk];
                         #pragma clang loop unroll(full)
                         for (int j = 0; j < 4; ++j) {
                             const int element = chunk * 4 + j;
@@ -796,15 +798,12 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     private static let passBKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name:
             "cbv2_ragged8_sdpa_2pass_b_direct_bf16_d256_b\(blocks)"
-            + "_c\(combineColumns)_vec4_v6",
+            + "_c\(combineColumns)_v5",
         inputNames: ["partials", "sums", "maxs"],
         outputNames: ["out"],
         source: """
-            typedef vec<T, 4> T4;
             constexpr int simd_width = 32;
             constexpr int values_per_lane = D / simd_width;
-            constexpr int vectors_per_lane = values_per_lane / 4;
-            static_assert(values_per_lane % 4 == 0, "lane run is four-wide");
             // COMBINE-PACK-001: a lane owns one partition column of one output
             // group, and a simdgroup carries `sets` output groups side by
             // side. COLS is min(BLOCKS, simd_width) rounded to a power of two,
@@ -828,6 +827,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             out += batch_head * D + output_group * values_per_lane;
 
             thread float accumulator[values_per_lane];
+            #pragma clang loop unroll(full)
             for (int element = 0; element < values_per_lane; ++element) {
                 accumulator[element] = 0.0f;
             }
@@ -843,6 +843,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             thread float lane_factor[rounds];
             float sum_exp_score = 0.0f;
             float max_score = -3.402823466e+38F;
+            #pragma clang loop unroll(full)
             for (int round = 0; round < rounds; ++round) {
                 const int column = block_lane + COLS * round;
                 const bool live = column < BLOCKS;
@@ -855,44 +856,39 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             // bounded at COLS never leaves the set. It is the same tree the
             // full-width reduction ran over the live columns, with the rounds
             // that only folded in the identity dropped.
+            #pragma clang loop unroll(full)
             for (int stride = 1; stride < COLS; stride <<= 1) {
                 max_score =
                     max(max_score, simd_shuffle_xor(max_score, ushort(stride)));
             }
 
+            #pragma clang loop unroll(full)
             for (int round = 0; round < rounds; ++round) {
                 lane_factor[round] = fast::exp(lane_max[round] - max_score);
                 sum_exp_score += lane_factor[round] * lane_sum[round];
             }
+            #pragma clang loop unroll(full)
             for (int stride = 1; stride < COLS; stride <<= 1) {
                 sum_exp_score += simd_shuffle_xor(sum_exp_score, ushort(stride));
             }
 
-            // A lane's run of the column is contiguous, so it is read as
-            // four-wide vectors of the same element type. Each component is
-            // widened where it is multiplied, so every product and every
-            // accumulator update is the one the element walk performed.
+            #pragma clang loop unroll(full)
             for (int round = 0; round < rounds; ++round) {
                 const int column = block_lane + COLS * round;
                 if (column < BLOCKS) {
                     const float factor = lane_factor[round];
-                    const device T4* partial_vectors =
-                        reinterpret_cast<const device T4*>(
-                            partials + column * D);
                     #pragma clang loop unroll(full)
-                    for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
-                        const T4 partial_vector = partial_vectors[chunk];
-                        #pragma clang loop unroll(full)
-                        for (int j = 0; j < 4; ++j) {
-                            accumulator[chunk * 4 + j] +=
-                                factor * float(partial_vector[j]);
-                        }
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        accumulator[element] +=
+                            factor * float(partials[column * D + element]);
                     }
                 }
             }
 
+            #pragma clang loop unroll(full)
             for (int element = 0; element < values_per_lane; ++element) {
                 float reduced = accumulator[element];
+                #pragma clang loop unroll(full)
                 for (int stride = 1; stride < COLS; stride <<= 1) {
                     reduced += simd_shuffle_xor(reduced, ushort(stride));
                 }

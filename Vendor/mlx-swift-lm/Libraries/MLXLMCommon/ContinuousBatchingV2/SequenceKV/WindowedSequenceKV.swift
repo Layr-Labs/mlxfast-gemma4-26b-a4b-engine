@@ -104,6 +104,32 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// KVQ-FUSE kill switch: `MLX_KV_QUANT_FUSE=0` stands the fused
+    /// mirror-writing pass A down and restores the promoted separate-write
+    /// road (per-row `decodeRingWrite` + `attendRingQuant`) byte-for-byte.
+    /// Default ON.
+    static let quantFuseEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_KV_QUANT_FUSE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// KVQ-FUSE: true once a fused quantized decode step has advanced this
+    /// row WITHOUT writing the bf16 ring. From that step on the bf16 ring
+    /// holds stale bytes for every decode-written slot and only the mirror
+    /// is authoritative. Nothing on the B=8 quantized decode road reads the
+    /// bf16 ring, and the paths that would (chunk updates, snapshots,
+    /// borrow views, speculative staging) cannot occur mid-request on this
+    /// track (single prefill then pure decode, no KV-shared borrowers on
+    /// this checkpoint, MTP target-only). They fail loudly below rather
+    /// than read a stale ring.
+    private var bf16RingStale = false
+
+    /// KVQ-FUSE: whether this row's bf16 ring is stale (see above). The
+    /// attention dispatcher consults this so a bf16 read road can never
+    /// silently engage on a row only the mirror is authoritative for.
+    var bf16RingIsStale: Bool { bf16RingStale }
+
     /// `MLX_KV_QUANT_SIM=1` (default OFF, local only): after every ring
     /// write, overwrite the bf16 slot with its quantize→dequantize round
     /// trip, so the SINGLE-STREAM fallback path — the one a local
@@ -187,6 +213,10 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         precondition(
             staged == nil,
             "CBv2WindowedSequenceKV: plain update with a staged speculative write pending — commit first"
+        )
+        precondition(
+            !bf16RingStale,
+            "CBv2WindowedSequenceKV: update() after a fused quantized decode step — the bf16 ring is stale (KVQ-FUSE)"
         )
 
         allocateIfNeeded(keyTemplate: newKeys, valueTemplate: newValues)
@@ -283,6 +313,22 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         // 47dae0ea, which scored 1.96373951131358 with it dispatching. Only
         // the write half is still unproven, so only probe 2 runs here.
         diagnosticFusedDispatch()
+        absoluteOffset += 1
+        oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
+    }
+
+    /// Bookkeeping half of a fused QUANTIZED decode step (KVQ-FUSE). The
+    /// fused pass A already stored this step's mirror bytes in place; the
+    /// bf16 ring was deliberately NOT written, so mark it stale and advance
+    /// exactly the counters `writeDecodeToken` would. No probe dispatch:
+    /// the diagnostics answered their question and would only re-dispatch a
+    /// full-geometry pass A into the timed window.
+    func advanceDecodeRingAfterFusedQuantWrite() {
+        precondition(
+            staged == nil && keys != nil && retainedCount == window,
+            "CBv2WindowedSequenceKV: fused quant ring advance outside a full-ring decode step")
+        borrowableChunkViews = nil
+        bf16RingStale = true
         absoluteOffset += 1
         oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
     }
@@ -414,6 +460,10 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     }
 
     public func snapshot() -> (keys: MLXArray, values: MLXArray, offset: Int) {
+        precondition(
+            !bf16RingStale,
+            "CBv2WindowedSequenceKV: snapshot() after a fused quantized decode step — the bf16 ring is stale (KVQ-FUSE)"
+        )
         if let staged {
             return stagedSnapshot(staged)
         }

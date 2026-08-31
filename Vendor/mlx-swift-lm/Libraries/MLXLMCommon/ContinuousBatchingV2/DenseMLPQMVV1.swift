@@ -105,6 +105,16 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// DMLP-UNROLLFULL-001. Turns the affine-8 quad-stream body's fourteen
+    /// `#pragma unroll` HINTS into `#pragma clang loop unroll(full)`
+    /// DIRECTIVES. Setting this to 0 restores the hinted body byte for byte.
+    private static let unrollFullEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MLP_UNROLL_FULL"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let batch = 8
     private static let sequence = 1
     private static let groupSize = 64
@@ -414,6 +424,65 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
         }
         return result
     }()
+
+    /// DMLP-UNROLLFULL-001. Derives a body in which every `#pragma unroll` in
+    /// the affine-8 section is `#pragma clang loop unroll(full)` instead.
+    ///
+    /// In clang the two are NOT the same thing. Bare `#pragma unroll` is
+    /// `unroll(enable)`: a hint the unroller is free to decline, and it does
+    /// decline when its own cost model dislikes the register pressure.
+    /// `unroll(full)` is a directive, and on a loop whose trip count is a
+    /// compile-time constant it forces the loop away entirely. That is the
+    /// whole of the change; the loop bodies are text-for-text what they were.
+    ///
+    /// Every loop it lands on has a constant trip count of four:
+    /// `results_per_simdgroup` (the four output rows a simdgroup owns),
+    /// `bytes_per_thread` (the four packed weight bytes a lane stages),
+    /// `values_per_thread` (the four activations a lane holds), and the final
+    /// four-row `simd_sum` close. So each one is a directive the compiler can
+    /// always satisfy, and none of them is the K traversal -- `k` still walks
+    /// a runtime `in_vec_size` in a rolled loop, exactly as before.
+    ///
+    /// Bitwise exact by construction. Unrolling a loop with a constant trip
+    /// count replays the same statements over the same indices in the same
+    /// order; no operand, no accumulation order and no rounding step moves.
+    /// The four `result*[row] +=` chains still accumulate in ascending K.
+    ///
+    /// Scoped to the affine-8 section deliberately. The tied-head prefix that
+    /// this header is built on already carries its own annotations from the
+    /// commit that put them there, and rewriting them here would make this
+    /// change unreadable against that one.
+    private static func unrollFullHeader(
+        _ source: String, implName: String
+    ) -> String {
+        let marker = """
+            template <typename U, int values_per_thread>
+            inline U qdot_affine8_registered(
+            """
+        guard let start = source.range(of: marker) else {
+            preconditionFailure("DMLP-UNROLLFULL-001 section marker is missing")
+        }
+        let prefix = String(source[source.startIndex ..< start.lowerBound])
+        var body = String(source[start.lowerBound...])
+        // Fourteen in the DMLP-001 body plus one in DMLP-002's
+        // `load_affine8_values`; assert rather than silently under-apply.
+        let hints = body.components(separatedBy: "#pragma unroll\n").count - 1
+        precondition(hints == 14 || hints == 15)
+        body = body.replacingOccurrences(
+            of: "#pragma unroll\n", with: "#pragma clang loop unroll(full)\n")
+        let signature = "METAL_FUNC void \(implName)("
+        precondition(body.components(separatedBy: signature).count == 2)
+        body = body.replacingOccurrences(
+            of: signature, with: "METAL_FUNC void \(implName)_uf(")
+        return prefix + body
+    }
+
+    private static let unrollFullKernelHeader: String = unrollFullHeader(
+        kernelHeader, implName: "qmv_affine8_g64_quad_stream_impl")
+
+    private static let unrollFullActivationSumKernelHeader: String = unrollFullHeader(
+        activationSumKernelHeader,
+        implName: "qmv_affine8_g64_quad_stream_xsum_impl")
 
     /// MMA-MLP-001. Verbatim transcription of the `kGemma4QmvMma8Affine8`
     /// tier body from `zarar/t6-mma-s2` (quantized.h / quantized.cpp twins,
@@ -903,6 +972,86 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         ensureRowContiguous: true
     )
 
+    /// DMLP-UNROLLFULL-001: the two kernels above over the directive body.
+    /// Launch arguments, grid, threadgroup and argument order are unchanged.
+    /// The names carry a fresh version so no pipeline cache can serve the
+    /// hinted body under the directive one.
+    private static let unrollFullKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_v3_unrollfull",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+
+            const int in_vec_size = x_shape[x_ndim - 1];
+            const int out_vec_size = w_shape[0];
+            const int first_m = int(tid.x) * 4;
+            if (first_m >= 8) {
+                return;
+            }
+            qmv_affine8_g64_quad_stream_impl_uf<T, 64, 8>(
+                w,
+                scales,
+                biases,
+                x + first_m * in_vec_size,
+                x + (first_m + 1) * in_vec_size,
+                x + (first_m + 2) * in_vec_size,
+                x + (first_m + 3) * in_vec_size,
+                y + first_m * out_vec_size,
+                y + (first_m + 1) * out_vec_size,
+                y + (first_m + 2) * out_vec_size,
+                y + (first_m + 3) * out_vec_size,
+                in_vec_size,
+                tid,
+                simd_gid,
+                simd_lid);
+            return;
+            """,
+        header: unrollFullKernelHeader,
+        ensureRowContiguous: true
+    )
+
+    private static let unrollFullActivationSumQMVKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_v3_unrollfull",
+            inputNames: ["x", "w", "scales", "biases", "xSums"],
+            outputNames: ["y"],
+            source: """
+                const uint3 tid = threadgroup_position_in_grid;
+                const uint simd_gid = simdgroup_index_in_threadgroup;
+                const uint simd_lid = thread_index_in_simdgroup;
+
+                const int in_vec_size = x_shape[x_ndim - 1];
+                const int out_vec_size = w_shape[0];
+                const int first_m = int(tid.x) * 4;
+                if (first_m >= 8) {
+                    return;
+                }
+                qmv_affine8_g64_quad_stream_xsum_impl_uf<T, 64, 8>(
+                    w,
+                    scales,
+                    biases,
+                    xSums,
+                    x + first_m * in_vec_size,
+                    x + (first_m + 1) * in_vec_size,
+                    x + (first_m + 2) * in_vec_size,
+                    x + (first_m + 3) * in_vec_size,
+                    y + first_m * out_vec_size,
+                    y + (first_m + 1) * out_vec_size,
+                    y + (first_m + 2) * out_vec_size,
+                    y + (first_m + 3) * out_vec_size,
+                    in_vec_size,
+                    tid,
+                    simd_gid,
+                    simd_lid);
+                return;
+                """,
+            header: unrollFullActivationSumKernelHeader,
+            ensureRowContiguous: true
+        )
+
     @inline(__always)
     private static func liveShape(inDim: Int, outDim: Int) -> Bool {
         (inDim == 2816 && outDim == 2112)
@@ -1045,7 +1194,17 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         let useActivationSums = activationSums != nil
             && inDim == 2816
             && outDim == 2112
-        let selected = useActivationSums ? activationSumQMVKernel : kernel
+        // DMLP-UNROLLFULL-001: same body, `unroll(full)` where the tip only
+        // hinted. Shape-independent -- it annotates constant-trip loops that
+        // exist at every geometry this dispatch admits, so it needs no shape
+        // guard of its own beyond the ones already applied above.
+        let selected: MLXFast.MLXFastKernel
+        if unrollFullEnabled {
+            selected = useActivationSums
+                ? unrollFullActivationSumQMVKernel : unrollFullKernel
+        } else {
+            selected = useActivationSums ? activationSumQMVKernel : kernel
+        }
         let inputs = useActivationSums
             ? [x, weight, scales, biases, activationSums!.values]
             : [x, weight, scales, biases]

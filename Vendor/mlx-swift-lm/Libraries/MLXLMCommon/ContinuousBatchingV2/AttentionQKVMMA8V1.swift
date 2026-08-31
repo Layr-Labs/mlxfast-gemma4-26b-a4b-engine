@@ -255,12 +255,29 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
   // trip consumes is the value the in-place read produced. The clamp on
   // `g_next` keeps the last trip inside the simdgroup's group range; the
   // value it re-reads is discarded at loop exit.
+  //
+  // QKV-CARRY2-023: the codes go TWO groups deep, the frontier's depth on
+  // the dense down plane (DMLP-DOWN-CARRY2-021) and the attention o tier.
+  // One trip of this body is eight matrix-unit steps per tile and a
+  // three-step shuffle chain, well short of a device load's latency, so a
+  // single group of look-ahead leaves the second half of that latency
+  // uncovered. The scale and the bias stay one group ahead: they are two
+  // bytes each against the codes' eight, they sit in the same cache lines
+  // as their neighbours, and a second copy of them would cost registers
+  // for no additional stream. `gi` is monotone and `nGroups` is a
+  // compile-time constant under full unroll, so the hand-off is register
+  // renaming, not an emitted copy. Every read stays at the statement it
+  // already occupied; the consumed (wv, s, b) sequence per group is
+  // unchanged, so the emitted arithmetic is word for word the tip's.
   uint2 wv_next[TILES];
+  uint2 wv_next2[TILES];
   T s_next[TILES];
   T b_next[TILES];
 #pragma clang loop unroll(full)
   for (int t = 0; t < TILES; ++t) {
     wv_next[t] = *((const device uint2*)(wrow[t] + 32 * g0));
+    wv_next2[t] =
+        *((const device uint2*)(wrow[t] + 32 * (g0 + min(1, nGroups - 1))));
     s_next[t] = srow[t][g0];
     b_next[t] = brow[t][g0];
   }
@@ -281,7 +298,9 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
     const int g_next = g0 + min(gi + 1, nGroups - 1);
 #pragma clang loop unroll(full)
     for (int t = 0; t < TILES; ++t) {
-      wv_next[t] = *((const device uint2*)(wrow[t] + 32 * g_next));
+      wv_next[t] = wv_next2[t];
+      wv_next2[t] = *((const device uint2*)(
+          wrow[t] + 32 * (g0 + min(gi + 2, nGroups - 1))));
       s_next[t] = srow[t][g_next];
       b_next[t] = brow[t][g_next];
     }
@@ -369,7 +388,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
     private static let tilesPerGroup = 2
 
     private static let multiTileKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry_v3",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_v4",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """

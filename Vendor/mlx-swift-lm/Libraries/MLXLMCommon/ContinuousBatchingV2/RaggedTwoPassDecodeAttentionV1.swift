@@ -1152,6 +1152,18 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// D512-UNIFORM-PARAMS-001 kill switch. WRITE-022's scored lockstep
+    /// cohort gives every private full-KV row the same backing capacity. When
+    /// that host-side proof succeeds, pack `[kL, D, capacity]` so MLX binds the
+    /// three UInt32 values in Metal constant address space. `=0` retains the
+    /// exact ten-value `[kL, D, capacity0 ... capacity7]` device array.
+    private static let uniformParamsEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_UNIFORM_PARAMS"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let batch = 8
     private static let queryHeads = 16
     private static let kvHeads = 2
@@ -1172,7 +1184,8 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// GEMVKernel<bf16,4,1,1,32,4,4> lane→column mapping and tail shift for
     /// TM=4 score rows, for all 8 heads of the GQA group at once.
     /// params: [0]=kL, [1]=K (=D, runtime like the stock buffer-passed
-    /// sizes), [2+row]=that row's KV buffer capacity.
+    /// sizes), and either [2]=the proved-uniform row capacity or
+    /// [2+row]=that row's KV buffer capacity.
     /// WRITE-022 (samfenwick's db4ef5e, re-implemented with credit): the
     /// stock QK source as a shared constant so the plain and fenced kernel
     /// objects are STRUCTURALLY identical — the fenced one differs only by an
@@ -1196,7 +1209,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int sg = int(simdgroup_index_in_threadgroup);
             const int lane = int(thread_index_in_simdgroup);
 
-            const int row_capacity = int(params[2 + row]);
+            const int row_capacity = int(params[UNIFORM_CAPACITY ? 2 : 2 + row]);
 
             const device T* key_plane = k0;
             switch (row) {
@@ -1286,7 +1299,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         """
 
     private static let qkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_qk_bf16_g8_v1",
+        name: "cbv2_ragged8_sdpa_d512_qk_bf16_g8_v2",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -1298,7 +1311,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     )
 
     private static let qkFencedKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_qk_fenced_bf16_g8_v1",
+        name: "cbv2_ragged8_sdpa_d512_qk_fenced_bf16_g8_v2",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -1407,7 +1420,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// butterfly for all 8 heads of the GQA group at once (shared V tile
     /// loads). params as dispatch 1.
     private static let avKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_v1",
+        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_v2",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -1428,7 +1441,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int sg = int(simdgroup_index_in_threadgroup);
             const int lane = int(thread_index_in_simdgroup);
 
-            const int row_capacity = int(params[2 + row]);
+            const int row_capacity = int(params[UNIFORM_CAPACITY ? 2 : 2 + row]);
 
             const device T* value_plane = v0;
             switch (row) {
@@ -1905,7 +1918,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// barrier (BarrierScopeBuffers, encoder-wide) orders every buffer write
     /// this dispatch issued before the fenced QK reads them.
     private static let ringStoreKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_d512_ringstore_bf16_v1",
+        name: "cbv2_ragged8_d512_ringstore_bf16_v2",
         inputNames: [
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -1919,7 +1932,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int kv_head = z % 2;
             const int lane = int(thread_position_in_threadgroup.x);
             const int key_length = int(params[0]);
-            const int row_capacity = int(params[2 + row]);
+            const int row_capacity = int(params[UNIFORM_CAPACITY ? 2 : 2 + row]);
 
             const device T* key_plane = k0;
             const device T* value_plane = v0;
@@ -2009,10 +2022,10 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
 
         var keyBuffers: [MLXArray] = []
         var valueBuffers: [MLXArray] = []
+        var capacities: [UInt32] = []
         keyBuffers.reserveCapacity(batch)
         valueBuffers.reserveCapacity(batch)
-        var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
-        params.reserveCapacity(batch + 2)
+        capacities.reserveCapacity(batch)
         for row in fullRows {
             let state = row.cbv2InnerState()
             guard state.count == 2,
@@ -2028,19 +2041,36 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             else { return nil }
             keyBuffers.append(state[0])
             valueBuffers.append(state[1])
-            params.append(UInt32(state[0].dim(2)))
+            capacities.append(UInt32(state[0].dim(2)))
+        }
+        let uniformCapacity = uniformParamsEnabled
+            && capacities.count == batch
+            && capacities.dropFirst().allSatisfy { $0 == capacities[0] }
+        if uniformCapacity {
+            CBv2EngageMark.once("d512-uniform-params")
+        }
+        var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
+        params.reserveCapacity(uniformCapacity ? 3 : batch + 2)
+        if uniformCapacity {
+            params.append(capacities[0])
+        } else {
+            params.append(contentsOf: capacities)
         }
         let paramsArray = MLXArray(params)
 
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)
         ]
+        let capacityTemplate: [(String, any KernelTemplateArg)] = [
+            ("T", queries.dtype),
+            ("UNIFORM_CAPACITY", uniformCapacity),
+        ]
         let scratchShape = [batch, queryHeads, 1, keyLength]
 
         let storeFence = ringStoreKernel(
             keyBuffers + valueBuffers
                 + [paramsArray, keys, values, previousWriteFence],
-            template: template,
+            template: capacityTemplate,
             grid: (128, 1, batch * kvHeads),
             threadGroup: (128, 1, 1),
             outputShapes: [[1]],
@@ -2050,7 +2080,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let chunks = (keyLength + 63) / 64
         let scores = qkFencedKernel(
             [queries] + keyBuffers + [paramsArray, storeFence],
-            template: template,
+            template: capacityTemplate,
             grid: (32, 4, batch * kvHeads * chunks),
             threadGroup: (32, 4, 1),
             outputShapes: [scratchShape],
@@ -2069,7 +2099,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
 
         let output = avKernel(
             [probs] + valueBuffers + [paramsArray],
-            template: template,
+            template: capacityTemplate,
             grid: (32, 4, batch * kvHeads * 8),
             threadGroup: (32, 4, 1),
             outputShapes: [[batch, queryHeads, 1, headDim]],
@@ -2282,12 +2312,16 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)
         ]
+        let capacityTemplate: [(String, any KernelTemplateArg)] = [
+            ("T", queries.dtype),
+            ("UNIFORM_CAPACITY", false),
+        ]
         let scratchShape = [batch, queryHeads, 1, keyLength]
 
         let chunks = (keyLength + 63) / 64
         let scores = qkKernel(
             [queries] + keyBuffers + [paramsArray],
-            template: template,
+            template: capacityTemplate,
             grid: (32, 4, batch * kvHeads * chunks),
             threadGroup: (32, 4, 1),
             outputShapes: [scratchShape],
@@ -2307,7 +2341,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
 
         return avKernel(
             [probs] + valueBuffers + [paramsArray],
-            template: template,
+            template: capacityTemplate,
             grid: (32, 4, batch * kvHeads * 8),
             threadGroup: (32, 4, 1),
             outputShapes: [[batch, queryHeads, 1, headDim]],

@@ -248,9 +248,55 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
   simdgroup_float8x8 A;
   simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
 
+  // QKV-PF: the K-group weight stream is prefetched one group ahead.
+  //
+  // A group's packed `uint2`, its scale and its bias are addressed by `g`
+  // alone and depend on nothing computed in the body. The incumbent issues
+  // those loads INSIDE the tile loop, immediately before the eight
+  // `simdgroup_multiply_accumulate` steps that consume them, so a lane holds
+  // at most TILES packed words in flight and every group pays a fresh load
+  // latency behind the previous group's matrix chain. Holding one group
+  // resident and issuing the next group's loads at the TOP of the body keeps
+  // two groups of the plane outstanding across the whole walk.
+  //
+  // Bit-exactness: the loads move, the arithmetic does not. A load hoisted
+  // one group earlier returns the identical word, and the fragment build,
+  // the eight matrix steps and the
+  // `acc += s * C.thread_elements()[i] + rs[i] * b` close run in the
+  // identical order over the identical ascending `g` range, per tile.
+  uint2 wv_next[TILES];
+  T s_next[TILES];
+  T b_next[TILES];
+#pragma clang loop unroll(full)
+  for (int t = 0; t < TILES; ++t) {
+    wv_next[t] = *((const device uint2*)(wrow[t] + 32 * g0));
+    s_next[t] = srow[t][g0];
+    b_next[t] = brow[t][g0];
+  }
+
 #pragma unroll
   for (int gi = 0; gi < nGroups; ++gi) {
     const int g = g0 + gi;
+
+    uint2 wv_cur[TILES];
+    float s_cur[TILES];
+    float b_cur[TILES];
+#pragma clang loop unroll(full)
+    for (int t = 0; t < TILES; ++t) {
+      wv_cur[t] = wv_next[t];
+      s_cur[t] = float(s_next[t]);
+      b_cur[t] = float(b_next[t]);
+    }
+    // Clamped so the final trip re-reads its own group rather than stepping
+    // past the plane; that value is discarded.
+    const int g_next = g0 + min(gi + 1, nGroups - 1);
+#pragma clang loop unroll(full)
+    for (int t = 0; t < TILES; ++t) {
+      wv_next[t] = *((const device uint2*)(wrow[t] + 32 * g_next));
+      s_next[t] = srow[t][g_next];
+      b_next[t] = brow[t][g_next];
+    }
+
     const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
     const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
 
@@ -270,9 +316,9 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
 
 #pragma clang loop unroll(full)
     for (int t = 0; t < TILES; ++t) {
-      const uint2 wv = *((const device uint2*)(wrow[t] + 32 * g));
-      const float s = float(srow[t][g]);
-      const float b = float(brow[t][g]);
+      const uint2 wv = wv_cur[t];
+      const float s = s_cur[t];
+      const float b = b_cur[t];
 
       simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
       MMA8_STEP(B0, 0)
@@ -334,7 +380,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
     private static let tilesPerGroup = 2
 
     private static let multiTileKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_unroll_v2",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_pf_v3",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """

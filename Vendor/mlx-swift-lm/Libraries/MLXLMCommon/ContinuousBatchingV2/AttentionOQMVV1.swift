@@ -243,9 +243,26 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
   simdgroup_float8x8 A;
   simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
 
+  // OPROJ-PF: the same one-group-ahead weight-stream prefetch the Q/K/V tier
+  // carries (see AttentionQKVMMA8V1). One group's packed word, scale and
+  // bias stay resident while the next group's are issued at the top of the
+  // body, so two groups of the plane are outstanding per lane instead of
+  // one. Addresses depend on `g` alone; the operands, their order and the
+  // accumulator close are unchanged.
+  uint2 wv_next = *((const device uint2*)(wrow + 32 * g0));
+  T s_next = srow[g0];
+  T b_next = brow[g0];
+
 #pragma unroll
   for (int gi = 0; gi < nGroups; ++gi) {
     const int g = g0 + gi;
+    const uint2 wv = wv_next;
+    const float s = float(s_next);
+    const float b = float(b_next);
+    const int g_next = g0 + min(gi + 1, nGroups - 1);
+    wv_next = *((const device uint2*)(wrow + 32 * g_next));
+    s_next = srow[g_next];
+    b_next = brow[g_next];
     const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
     const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
 
@@ -262,10 +279,6 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
     MMA8_SETB(B5, z, hi)
     MMA8_SETB(B6, w, lo)
     MMA8_SETB(B7, w, hi)
-
-    const uint2 wv = *((const device uint2*)(wrow + 32 * g));
-    const float s = float(srow[g]);
-    const float b = float(brow[g]);
 
     simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
     MMA8_STEP(B0, 0)
@@ -300,7 +313,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
 """
 
     private static let mma8KernelK4096 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_unroll_v2",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_pf_v3",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -317,7 +330,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
         ensureRowContiguous: true)
 
     private static let mma8KernelK8192 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_unroll_v2",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_pf_v3",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """

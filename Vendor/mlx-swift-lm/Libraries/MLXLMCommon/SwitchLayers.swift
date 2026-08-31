@@ -373,9 +373,11 @@ private func geGLUProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
 /// Stable rank sort for the exact B=8/top-K=8 decode plane. One SIMDgroup
 /// loads the 64 keys once (two keys per lane), broadcasts them to every lane,
 /// and directly emits the three routing products consumed downstream.
-private let routeSimdRank64Kernel: MLXFast.MLXFastKernel =
+private func makeRouteSimdRank64Kernel(runScanSimdLeader: Bool) -> MLXFast.MLXFastKernel {
     MLXFast.metalKernel(
-        name: "mlx_lm_route_simd_rank_scatter_m8_u32_n64_v1",
+        name: runScanSimdLeader
+            ? "mlx_lm_route_simd_rank_scatter_m8_u32_n64_runscan_v1"
+            : "mlx_lm_route_simd_rank_scatter_m8_u32_n64_v1",
         inputNames: ["indices"],
         outputNames: ["row_order", "sorted_keys", "inverse_order"],
         source: """
@@ -395,11 +397,17 @@ private let routeSimdRank64Kernel: MLXFast.MLXFastKernel =
                     || (other_high == key && high_assignment < assignment);
             }
             row_order[rank] = assignment / 8;
-            sorted_keys[rank] = key;
+            sorted_keys[rank] = \(runScanSimdLeader ? "0x40000000u | key" : "key");
             inverse_order[assignment] = rank;
         """,
         ensureRowContiguous: true
     )
+}
+
+private let routeSimdRank64Kernel = makeRouteSimdRank64Kernel(
+    runScanSimdLeader: false)
+private let routeSimdRank64RunScanKernel = makeRouteSimdRank64Kernel(
+    runScanSimdLeader: true)
 
 /// EXPERT-PREFIX-BOUNDS-001 carrier for the exact decode route table. The
 /// gathered-QMV host ABI has no spare buffer, so each sorted rhs-index word
@@ -453,6 +461,13 @@ private let routeSimdRank64PrefixBoundsKernel: MLXFast.MLXFastKernel =
 private let routeSimdRank64Enabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_ROUTE_SIMD_RANK"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+private let gatherRunScanSimdLeaderEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GATHER_RUNSCAN_SIMDLEADER"]
     else { return true }
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
@@ -945,16 +960,20 @@ public func gatherSort(
 /// fails closed onto the established `argSort` chain.
 public func gatherSortIndices(
     indices: MLXArray, numExperts: Int = Int.max,
-    expertPrefixBounds: Bool = false
+    expertPrefixBounds: Bool = false, runScanSimdLeader: Bool = false
 ) -> (MLXArray, MLXArray, MLXArray) {
     if routeSimdRank64Enabled,
         indices.ndim == 2, indices.shape == [8, 8], indices.dtype == .uint32
     {
         if expertPrefixBounds {
             CBv2EngageMark.once("expert-prefix-bounds")
+        } else if runScanSimdLeader {
+            CBv2EngageMark.once("gather-runscan-simdleader")
         }
         let kernel = expertPrefixBounds
-            ? routeSimdRank64PrefixBoundsKernel : routeSimdRank64Kernel
+            ? routeSimdRank64PrefixBoundsKernel
+            : runScanSimdLeader
+                ? routeSimdRank64RunScanKernel : routeSimdRank64Kernel
         let outputs = kernel(
             [indices],
             grid: (64, 1, 1),
@@ -1137,6 +1156,10 @@ public class SwitchGLU: Module {
             expertPrefixBoundsEnabled && useLhsIndices
             && indices.dtype == .uint32 && x.dtype == .bfloat16
             && expertPrefixBoundsProjectionsEligible
+        let useRunScanSimdLeader =
+            gatherRunScanSimdLeaderEnabled && !useExpertPrefixBounds
+            && useLhsIndices && indices.dtype == .uint32 && x.dtype == .bfloat16
+            && expertPrefixBoundsProjectionsEligible
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
         let doSort = indices.size >= 64
 
@@ -1148,7 +1171,8 @@ public class SwitchGLU: Module {
                 x = x.flattened(start: 0, end: -3)
                 (lhsIndices, idx, inverseOrder) = gatherSortIndices(
                     indices: indices, numExperts: numExperts,
-                    expertPrefixBounds: useExpertPrefixBounds)
+                    expertPrefixBounds: useExpertPrefixBounds,
+                    runScanSimdLeader: useRunScanSimdLeader)
             } else {
                 (x, idx, inverseOrder) = gatherSort(
                     x: x, indices: indices, numExperts: numExperts)

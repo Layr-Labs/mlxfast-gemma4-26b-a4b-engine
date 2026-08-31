@@ -3856,16 +3856,27 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   const uint assignment = tid.z;
   const uint32_t route_word = rhs_indices[assignment * rhs_stride];
   const bool expert_prefix_bounds = (route_word & 0x80000000u) != 0u;
+  const bool runscan_simdleader = (route_word & 0x40000000u) != 0u;
   const uint32_t expert =
-      expert_prefix_bounds ? (route_word & 0xffu) : route_word;
+      (expert_prefix_bounds || runscan_simdleader) ? (route_word & 0xffu)
+                                                   : route_word;
   uint run_offset = 0;
   if (expert_prefix_bounds) {
     run_offset = (route_word >> 8) & 0x3fu;
+  } else if (runscan_simdleader) {
+    uint leader_offset = 0;
+    if (simd_lid == 0) {
+      for (uint prior = assignment; prior > 0; --prior) {
+        if ((rhs_indices[(prior - 1) * rhs_stride] & 0xffu) != expert) {
+          break;
+        }
+        leader_offset++;
+      }
+    }
+    run_offset = simd_broadcast(leader_offset, ushort(0));
   } else {
     for (uint prior = assignment; prior > 0; --prior) {
-      if (rhs_indices[(prior - 1) * rhs_stride] != expert) {
-        break;
-      }
+      if (rhs_indices[(prior - 1) * rhs_stride] != expert) break;
       run_offset++;
     }
   }
@@ -3879,10 +3890,20 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   const device T* tile_x0 =
       x + lhs_indices[assignment * lhs_stride] * x_stride;
   device T* tile_y0 = y + assignment * out_vec_size;
-  const bool has_pair = expert_prefix_bounds
-      ? (((route_word >> 14) & 0x3fu) + 1u) > 1u
-      : assignment + 1 < 64 &&
-          rhs_indices[(assignment + 1) * rhs_stride] == expert;
+  bool has_pair = false;
+  if (expert_prefix_bounds) {
+    has_pair = (((route_word >> 14) & 0x3fu) + 1u) > 1u;
+  } else if (runscan_simdleader) {
+    uint leader_has_pair = 0;
+    if (simd_lid == 0) {
+      leader_has_pair = assignment + 1 < 64 &&
+          (rhs_indices[(assignment + 1) * rhs_stride] & 0xffu) == expert;
+    }
+    has_pair = simd_broadcast(leader_has_pair, ushort(0)) != 0;
+  } else {
+    has_pair = assignment + 1 < 64 &&
+        rhs_indices[(assignment + 1) * rhs_stride] == expert;
+  }
   if (has_pair) {
     const device T* tile_x1 =
         x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
@@ -3986,16 +4007,28 @@ template <typename T, int group_size, int bits>
     const uint32_t route_word =
         rhs_indices[assignment * (uint)rhs_strides[0]];
     const bool expert_prefix_bounds = (route_word & 0x80000000u) != 0u;
+    const bool runscan_simdleader = (route_word & 0x40000000u) != 0u;
     const uint32_t expert =
-        expert_prefix_bounds ? (route_word & 0xffu) : route_word;
+        (expert_prefix_bounds || runscan_simdleader) ? (route_word & 0xffu)
+                                                     : route_word;
     uint run_offset = 0;
     if (expert_prefix_bounds) {
       run_offset = (route_word >> 8) & 0x3fu;
+    } else if (runscan_simdleader) {
+      uint leader_offset = 0;
+      if (simd_lid == 0) {
+        for (uint prior = assignment; prior > 0; --prior) {
+          if ((rhs_indices[(prior - 1) * (uint)rhs_strides[0]] & 0xffu) !=
+              expert) {
+            break;
+          }
+          leader_offset++;
+        }
+      }
+      run_offset = simd_broadcast(leader_offset, ushort(0));
     } else {
       for (uint prior = assignment; prior > 0; --prior) {
-        if (rhs_indices[(prior - 1) * (uint)rhs_strides[0]] != expert) {
-          break;
-        }
+        if (rhs_indices[(prior - 1) * (uint)rhs_strides[0]] != expert) break;
         run_offset++;
       }
     }
@@ -4013,12 +4046,20 @@ template <typename T, int group_size, int bits>
     uint run_len = 1;
     if (expert_prefix_bounds) {
       run_len = min(4u, ((route_word >> 14) & 0x3fu) + 1u);
+    } else if (runscan_simdleader) {
+      uint leader_len = 1;
+      if (simd_lid == 0) {
+        while (leader_len < 4 && assignment + leader_len < 64 &&
+               (rhs_indices[(assignment + leader_len) *
+                            (uint)rhs_strides[0]] & 0xffu) == expert) {
+          leader_len++;
+        }
+      }
+      run_len = simd_broadcast(leader_len, ushort(0));
     } else {
       while (run_len < 4 && assignment + run_len < 64 &&
              rhs_indices[(assignment + run_len) * (uint)rhs_strides[0]] ==
-                 expert) {
-        run_len++;
-      }
+                 expert) run_len++;
     }
     if (run_len > 1) {
       const device uint32_t* run_w = w + expert * w_strides[0];

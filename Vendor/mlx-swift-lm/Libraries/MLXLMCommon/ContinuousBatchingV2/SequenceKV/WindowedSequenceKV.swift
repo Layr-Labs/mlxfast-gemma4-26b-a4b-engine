@@ -144,6 +144,31 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// at `commitSpeculativeWrite()`. At most one transaction per row.
     private var staged: (keys: MLXArray, values: MLXArray, basePosition: Int)?
 
+    /// KVQ-WRITEBEHIND: decode tokens whose bf16 ring slot assignment has not
+    /// been constructed yet, in position order starting at
+    /// `pendingRingFirstPosition`. Only the quantized decode road defers, and
+    /// only when the paired mirror write has already carried this token's
+    /// mirror bytes, so the mirror is never behind. Every reader of the bf16
+    /// ring flushes first, which makes the deferral invisible.
+    private var pendingRingKeys: [MLXArray] = []
+    private var pendingRingValues: [MLXArray] = []
+    private var pendingRingFirstPosition = 0
+
+    /// The run length the deferral is allowed to reach. A run of `L` tokens
+    /// costs one full-ring slice assignment plus one `L`-token concatenation
+    /// instead of `L` full-ring assignments, so the per-token bf16 ring cost
+    /// falls by a factor of about `L`. Must stay well under `window`: a run
+    /// longer than the window would write one slot twice in a single flush.
+    static let pendingRingRunLimit = 32
+
+    /// `MLX_KV_RING_WRITEBEHIND=0` returns the bf16 ring to one slice
+    /// assignment per decode token per plane. Default ON.
+    static let ringWriteBehindEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_KV_RING_WRITEBEHIND"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// - Parameters:
     ///   - window: sliding window in tokens (> 0).
     ///   - initialOffset: absolute position this sequence starts at. Non-zero
@@ -169,9 +194,14 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         (keys?.nbytes ?? 0) + (values?.nbytes ?? 0)
             + (staged.map { $0.keys.nbytes + $0.values.nbytes } ?? 0)
             + (quantMirror?.nbytes ?? 0)
+            // KVQ-WRITEBEHIND: a bounded run of one-token tensors, resident
+            // until the run flushes.
+            + pendingRingKeys.reduce(0) { $0 + $1.nbytes }
+            + pendingRingValues.reduce(0) { $0 + $1.nbytes }
     }
 
     public func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
+        flushPendingRingWrites()
         let n = newKeys.dim(2)
         precondition(newKeys.dim(0) == 1 && newValues.dim(0) == 1,
             "CBv2WindowedSequenceKV holds ONE sequence; got batch \(newKeys.dim(0))")
@@ -229,13 +259,31 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         return (returnedKeys, returnedValues)
     }
 
-    func decodeRingWrite(keys newKeys: MLXArray, values newValues: MLXArray) {
+    /// `deferRingCopy` is the caller's statement that the bf16 ring is not an
+    /// input to this step's attention, which is true exactly when the
+    /// quantized mirror road is the one that will run. It is a request, not a
+    /// promise: the write behind declines whenever its own preconditions do
+    /// not hold, and any read flushes it out before observing the ring.
+    func decodeRingWrite(
+        keys newKeys: MLXArray, values newValues: MLXArray, deferRingCopy: Bool = false
+    ) {
         precondition(staged == nil && newKeys.dim(2) == 1 && newValues.dim(2) == 1)
         allocateIfNeeded(keyTemplate: newKeys, valueTemplate: newValues)
-        writeDecodeToken(keys: newKeys, values: newValues)
+        writeDecodeToken(keys: newKeys, values: newValues, deferRingCopy: deferRingCopy)
+    }
+
+    /// KVQ-WRITEBEHIND: the ring start `decodeRingView` reports, and the same
+    /// availability predicate, without handing out the bf16 buffers. The
+    /// quantized road needs the start and the mirror only, so asking through
+    /// this accessor leaves a deferred run deferred.
+    var decodeRingSlot: Int? {
+        guard staged == nil, keys != nil, values != nil, retainedCount == window
+        else { return nil }
+        return oldestValidPosition % window
     }
 
     var decodeRingView: (keys: MLXArray, values: MLXArray, start: Int)? {
+        flushPendingRingWrites()
         guard staged == nil, let keys, let values, retainedCount == window else { return nil }
         return (keys, values, oldestValidPosition % window)
     }
@@ -262,6 +310,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// lands in is `absoluteOffset % window`, i.e. `(start + window - 1) %
     /// window` — the slot the returned start has just stepped past.
     var decodeRingViewBeforeWrite: (keys: MLXArray, values: MLXArray, start: Int)? {
+        flushPendingRingWrites()
         guard staged == nil, let keys, let values, retainedCount == window else { return nil }
         return (keys, values, (oldestValidPosition + 1) % window)
     }
@@ -272,6 +321,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// `SliceUpdate`. Precondition mirrors `decodeRingViewBeforeWrite`, which
     /// the caller must have consulted for the very same step.
     func advanceDecodeRingAfterFusedWrite() {
+        flushPendingRingWrites()
         precondition(
             staged == nil && keys != nil && retainedCount == window,
             "CBv2WindowedSequenceKV: fused ring advance outside a full-ring decode step")
@@ -355,6 +405,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     }
 
     public func commitSpeculativeWrite() {
+        flushPendingRingWrites()
         speculativeWriteArmed = false
         guard let staged else { return }
         self.staged = nil
@@ -414,6 +465,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     }
 
     public func snapshot() -> (keys: MLXArray, values: MLXArray, offset: Int) {
+        flushPendingRingWrites()
         if let staged {
             return stagedSnapshot(staged)
         }
@@ -486,6 +538,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     }
 
     public func rollback(_ n: Int) {
+        flushPendingRingWrites()
         precondition(n >= 0, "CBv2WindowedSequenceKV.rollback: negative n")
         if let staged {
             // Pure counter move: the staged tokens were never written to
@@ -520,20 +573,64 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
 
     // MARK: - Ring geometry
 
-    private func writeDecodeToken(keys newKeys: MLXArray, values newValues: MLXArray) {
+    private func writeDecodeToken(
+        keys newKeys: MLXArray, values newValues: MLXArray, deferRingCopy: Bool = false
+    ) {
         borrowableChunkViews = nil
         // KVQ-PAIRWRITE: when both mirror planes go out together the ring
         // writes carry no mirror plane of their own.
         let paired = writePairedMirror(
             keys: newKeys, values: newValues, firstPosition: absoluteOffset)
-        writeRing(
-            keys!, tokens: newKeys, firstPosition: absoluteOffset,
-            mirrorPlane: paired ? nil : 0)
-        writeRing(
-            values!, tokens: newValues, firstPosition: absoluteOffset,
-            mirrorPlane: paired ? nil : 1)
+        // KVQ-WRITEBEHIND: the mirror is already current for this token, so
+        // the ring copy can join a run. Deferral needs the paired write to
+        // have happened, because an unpaired token still owes the mirror its
+        // bytes and `writeRing` is what delivers them.
+        if paired, deferRingCopy, Self.ringWriteBehindEnabled,
+            pendingRingKeys.count < Self.pendingRingRunLimit,
+            pendingRingKeys.isEmpty
+                || pendingRingFirstPosition + pendingRingKeys.count == absoluteOffset
+        {
+            if pendingRingKeys.isEmpty { pendingRingFirstPosition = absoluteOffset }
+            pendingRingKeys.append(newKeys)
+            pendingRingValues.append(newValues)
+        } else {
+            flushPendingRingWrites()
+            writeRing(
+                keys!, tokens: newKeys, firstPosition: absoluteOffset,
+                mirrorPlane: paired ? nil : 0)
+            writeRing(
+                values!, tokens: newValues, firstPosition: absoluteOffset,
+                mirrorPlane: paired ? nil : 1)
+        }
         absoluteOffset += 1
         oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
+    }
+
+    /// KVQ-WRITEBEHIND: construct the deferred run's ring slice assignments.
+    ///
+    /// The run is `pendingRingKeys.count` consecutive one-token writes
+    /// starting at `pendingRingFirstPosition`, and the run limit is far below
+    /// `window`, so every token in it owns a distinct slot and the batched
+    /// write lands byte for byte what the per-token writes would have landed.
+    /// The mirror planes went out with the tokens themselves, so this pass
+    /// carries no mirror plane.
+    private func flushPendingRingWrites() {
+        guard !pendingRingKeys.isEmpty, let keys, let values else {
+            pendingRingKeys.removeAll(keepingCapacity: true)
+            pendingRingValues.removeAll(keepingCapacity: true)
+            return
+        }
+        let runKeys =
+            pendingRingKeys.count == 1
+            ? pendingRingKeys[0] : concatenated(pendingRingKeys, axis: 2)
+        let runValues =
+            pendingRingValues.count == 1
+            ? pendingRingValues[0] : concatenated(pendingRingValues, axis: 2)
+        let first = pendingRingFirstPosition
+        pendingRingKeys.removeAll(keepingCapacity: true)
+        pendingRingValues.removeAll(keepingCapacity: true)
+        writeRing(keys, tokens: runKeys, firstPosition: first, mirrorPlane: nil)
+        writeRing(values, tokens: runValues, firstPosition: first, mirrorPlane: nil)
     }
 
     /// Views covering absolute positions `[from, to)` in temporal order:

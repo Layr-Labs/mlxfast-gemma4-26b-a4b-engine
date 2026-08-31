@@ -469,7 +469,11 @@ enum CBv2AttentionV1 {
                 cachedKeyRows.reserveCapacity(B)
                 cachedValueRows.reserveCapacity(B)
                 let ringRows = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
-                if ringRows.count == B && ringRows.allSatisfy({ $0.decodeRingView != nil }) {
+                // KVQ-WRITEBEHIND: the availability question is a counter
+                // question, so ask it through `decodeRingSlot`. Asking through
+                // `decodeRingView` would hand out the bf16 buffers and force
+                // any deferred ring run out on every single step.
+                if ringRows.count == B && ringRows.allSatisfy({ $0.decodeRingSlot != nil }) {
                     // WRITE-016: fold this step's one-token ring write into
                     // ring pass A. The separate `decodeRingWrite` below is a
                     // `SliceUpdate` over a 4 MiB allocation the direct-ring
@@ -516,26 +520,34 @@ enum CBv2AttentionV1 {
                     }
 
                     for (index, row) in ringRows.enumerated() {
+                        // KVQ-WRITEBEHIND: when the mirror road is the one
+                        // that reads, the bf16 ring is not an input to this
+                        // step's attention, so its slice assignment can join a
+                        // bounded run instead of copying the whole ring for
+                        // one token. Any reader of the ring flushes the run
+                        // first, including the fallbacks a few lines below.
                         row.decodeRingWrite(
                             keys: keys[index ..< (index + 1)],
-                            values: values[index ..< (index + 1)])
+                            values: values[index ..< (index + 1)],
+                            deferRingCopy: portQuantActive)
                     }
-                    let views = ringRows.compactMap { $0.decodeRingView }
                     // KVQ-PORT: the ring write above is the promoted stock
                     // mechanism's; only the READ moves to the 8-bit mirror,
                     // and its pass A is consumed by pass B exactly as the
                     // bf16 road consumes it. All-or-nothing: unless every
                     // row exposes a mirror the established road runs.
+                    let slots = ringRows.compactMap { $0.decodeRingSlot }
                     let portMirrors = ringRows.compactMap { $0.decodeRingQuantView }
-                    if views.count == B, portMirrors.count == B,
+                    if slots.count == B, portMirrors.count == B,
                         let quantOutput = CBv2RaggedTwoPassDecodeAttentionV1
                             .attendRingQuant(
                                 queries: queries, mirrors: portMirrors,
-                                starts: views.map(\.start), scale: scale,
+                                starts: slots, scale: scale,
                                 slidingWindowLength: ringRows[0].window)
                     {
                         return quantOutput
                     }
+                    let views = ringRows.compactMap { $0.decodeRingView }
                     if views.count == B,
                         let output = CBv2RaggedTwoPassDecodeAttentionV1.attendRing(
                             queries: queries, keys: views.map(\.keys),

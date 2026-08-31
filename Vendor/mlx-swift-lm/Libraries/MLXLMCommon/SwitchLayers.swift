@@ -1080,6 +1080,125 @@ public let switchGateUpFusePrefillEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+/// GATEUP-FUSE-DECODE. The scored cohort's decode leg is the OTHER consumer of
+/// the same concatenated gate|up storage this file already builds at load for
+/// the prefill arm, and it is the leg the composite weights at 0.75.
+///
+/// At B=8 the routed plane is 64 sorted assignments of one row each, so the
+/// host takes the `gather_qmv` branch of `GatherQMM::eval_gpu`: `M == 1` and
+/// `B / E == 64 / 128 == 0 < 4` rule out the sorted right-hand-side GEMM, and
+/// `M < vector_limit` rules out `gather_qmm`.
+///
+/// That last test is the only selector the fused N touches, and it is NOT
+/// N-blind: `vector_limit = get_qmv_batch_limit(K, N, d)` reads N and the
+/// device architecture string. It is invariant here for two independent
+/// reasons, neither of which is a property of one machine. First, D = K =
+/// 2816 misses the `D <= 2048 && O <= 2048` bucket whatever O is, and both
+/// O = 704 and O = 1408 satisfy `D <= 4096 && O <= 4096`, so the split and
+/// fused arms land in the same bucket of the same branch on any given chip.
+/// Second, the smallest value any branch of that function can return is 6, so
+/// `M == 1 < vector_limit` holds on every Apple GPU generation this fork
+/// compiles for, with or without this change.
+///
+/// `gather_qmv` then launches `grid = (M, ceil(N / 8), B)` with 8 output rows
+/// per threadgroup. Gate and up are two such launches at `N = 704`, i.e.
+/// 88 + 88 = 176 threadgroups. One launch over the concatenated `N = 1408`
+/// right-hand side is 176 threadgroups of the identical shape reading the
+/// identical weight, scale and bias bytes for the identical expert — the work
+/// is conserved exactly and one dispatch per routed layer per decode step
+/// disappears.
+///
+/// Mechanism, stated so it can be attacked: not host encode cost. A B=8
+/// routed layer is bandwidth-shaped, and a saved encode is small against the
+/// weight stream. What the fused arm buys is weight-stream locality — one
+/// contiguous ~2 MB pass over an expert's `[1408, 352]` block plus its scales
+/// and biases, instead of two ~1 MB passes over the two halves separated by a
+/// whole kernel; and with ~52 distinct experts among the 64 sorted
+/// assignments, adjacent duplicates get a second chance at a warm block. The
+/// removed dispatch is a real but secondary saving.
+///
+/// Exactness. `gather_qmv` gives every output row its own simdgroup-local
+/// K-chain: `values_per_thread`, `block_size`, the `qdot` expression, the
+/// K-step order and the final `simd_sum` are fixed by (K, group size, bits)
+/// and by nothing on the N axis. `out_vec_size` only bounds `tid.y` and the
+/// row guard. Rows `0..<704` of the concatenated matrix are a byte copy of the
+/// gate plane and rows `704..<1408` of the up plane, and the fused storage is
+/// already the PRIMARY allocation whose slices the split projections are bound
+/// to — so this arm reads the very same bytes the split arm reads, in the same
+/// order, and the two halves come back as views with the shapes the shaped
+/// GeGLU already consumed. Bit-identical by construction, not by measurement.
+///
+/// Also unchanged: the kernel variant. In this vendored fork `gather_qmv`
+/// selects with `bool fast = N % bn == 0 && K % 512 == 0` (bn = 8). Both
+/// N = 704 and N = 1408 pass the N term; K = 2816 fails the K term on both
+/// arms (2816 % 512 == 256), so both take the non-fast `gather_qmv`. Upstream
+/// `main` has since generalised the K term to
+/// `K % qmv_fast_k_alignment(bits) == 0`, which is 512 at bits = 4 — same
+/// predicate, same outcome — so the conclusion survives a later rebase. No new
+/// kernel is compiled and no shape leaves the envelope the prefill arm already
+/// validated.
+///
+/// The consumer, which is where a fused output can quietly give the saving
+/// back. Both halves leave this arm as strided views of the fused
+/// `[64, 1, 1408]` output and are consumed by `geGLUProduct`, which at the
+/// pinned decode rectangle routes to `compiledGeGLUShaped`: a `compile()`d
+/// graph, i.e. MLX's `Compiled` primitive, NOT an `MLXFast.metalKernel`. That
+/// distinction is the answer. The `ensureRowContiguous` default that would
+/// copy both inputs is a parameter of `MLXFast.metalKernel` and has no
+/// counterpart on the compile path. `Compiled::eval_gpu` instead calls
+/// `compiled_collapse_contiguous_dims`, whose `compiled_check_contiguity`
+/// sees two non-scalar inputs that are not row-contiguous, returns
+/// `contiguous = false`, and selects the `..._strided_` kernel with a
+/// per-input stride vector. One dispatch either way, no copy inserted, so the
+/// dispatch count is strictly one lower per routed layer.
+///
+/// What the strided arm does cost, as a debit rather than a footnote: the
+/// contiguous variant processes several elements per thread
+/// (`get_work_per_thread`) while the strided `ndim <= 3` variant processes
+/// one, and the non-contiguous branch of `compiled_allocate_outputs` can only
+/// donate a row-contiguous input, so the GeGLU output becomes a fresh
+/// 64 x 704 bfloat16 allocation (~90 KB per routed layer per step, served
+/// from MLX's buffer cache) where the split arm could donate. Both terms are
+/// index arithmetic and pool churn over a 45,056-element plane moving ~270 KB
+/// across its three buffers, i.e. a launch-bound kernel — small, but not zero,
+/// and the reason the predicted floor is neutral minus an epsilon rather than
+/// plain neutral.
+///
+/// No new compiler-cache entry either: `CompilerCache::find` matches on input
+/// shapes, dtypes and constants, never on strides or contiguity. The shaped
+/// GeGLU trace the decode plane already uses is reused unchanged, so the
+/// linear scan that `shapedGeluPrefillShapeCap` exists to bound does not grow.
+///
+/// Kill switch: `DARKBLOOM_GEMMA4_DECODE_GATEUP_FUSE` set to
+/// `0`/`false`/`no`/`off` restores the two split gathers on the decode leg
+/// while leaving the prefill arm's dispatch untouched. The two arms' dispatch
+/// switches are independent; the load-time bind is not. With EITHER arm on,
+/// the fused storage becomes the primary allocation and both split
+/// projections are rebound to views of it, so decode-on/prefill-off still
+/// changes what the prefill leg's split gathers point at. Benign for the
+/// reason given above — same bytes at the same addresses, admitted without a
+/// copy by `ensure_row_contiguous_matrix` — but it is a coupling, not an
+/// independence.
+///
+/// Engage mark: `decode-gateup-fuse`. A guard that declines silently (a
+/// non-bfloat16 run, an unresolved contract) would be indistinguishable from
+/// a neutral measurement, so the fall-through emits
+/// `decode-gateup-fuse-declined-<reason>` under `MLXFAST_ENGAGE_MARKS`. A run
+/// showing neither mark never reached the routed decode cohort at all.
+/// Local mirror of the engage-mark arming flag. `CBv2EngageMark` owns the
+/// stderr sink but does not expose whether it is armed, and `EngineV2.swift`
+/// is not an editable path. Computing a decline reason is only worth doing
+/// when marks are armed; unarmed, the fall-through reads one static `Bool`.
+private let engageMarksArmed: Bool =
+    ProcessInfo.processInfo.environment["MLXFAST_ENGAGE_MARKS"] != nil
+
+public let switchGateUpFuseDecodeEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DECODE_GATEUP_FUSE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// The concatenated `[gate ; up]` affine 4-bit right-hand side of one expert
 /// layer plus the two zero-copy views the split projections are bound to. A
 /// plain final class (not a `Module`, not an `MLXArray` tuple) so the module
@@ -1282,6 +1401,18 @@ public class SwitchGLU: Module {
         super.init()
     }
 
+    /// GATEUP-FUSE-DECODE: why the decode arm declined, for the engage mark
+    /// only. Evaluated exclusively under `MLXFAST_ENGAGE_MARKS`.
+    private func decodeGateUpFuseDeclineReason(_ x: MLXArray) -> String {
+        if !switchGateUpFuseDecodeEnabled { return "switch-off" }
+        if x.dtype != .bfloat16 { return "dtype" }
+        if !(x.ndim == 3 && x.dim(-2) == 1 && x.dim(-1) == inputDims) {
+            return "shape"
+        }
+        if fusedGateUpDispatch() == nil { return "contract" }
+        return "unknown"
+    }
+
     /// GATEUP-FUSE-PREFILL: resolve (once) the quantization contract the
     /// fused storage is dispatched with. It is read from the bound split
     /// projections, which must be the exact production contract; anything
@@ -1398,7 +1529,39 @@ public class SwitchGLU: Module {
                 )
                 xGate = xGateUp[.ellipsis, ..<hiddenDims]
                 xUp = xGateUp[.ellipsis, hiddenDims...]
+            } else if switchGateUpFuseDecodeEnabled, doSort, useLhsIndices,
+                let lhs = lhsIndices,
+                x.ndim == 3, x.dim(-2) == 1, x.dim(-1) == inputDims,
+                x.dtype == .bfloat16,
+                let fused = fusedGateUpDispatch()
+            {
+                // GATEUP-FUSE-DECODE: the B=8 routed cohort. Same
+                // `gather_qmv` branch, same 176 threadgroups, same expert
+                // bytes; one dispatch instead of two.
+                CBv2EngageMark.once("decode-gateup-fuse")
+                let xGateUp = MLX.gatherQuantizedMM(
+                    x,
+                    fused.storage.weight,
+                    scales: fused.storage.scales,
+                    biases: fused.storage.biases,
+                    lhsIndices: lhs,
+                    rhsIndices: idx,
+                    transpose: true,
+                    groupSize: fused.groupSize,
+                    bits: fused.bits,
+                    mode: fused.mode,
+                    sortedIndices: doSort
+                )
+                xGate = xGateUp[.ellipsis, ..<hiddenDims]
+                xUp = xGateUp[.ellipsis, hiddenDims...]
             } else {
+                // GATEUP-FUSE-DECODE diagnosability: on the routed decode
+                // cohort a declined guard must not read as a neutral result.
+                if engageMarksArmed, doSort, useLhsIndices {
+                    CBv2EngageMark.once(
+                        "decode-gateup-fuse-declined-"
+                            + decodeGateUpFuseDeclineReason(x))
+                }
                 xUp = upProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
                 xGate = gateProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
             }

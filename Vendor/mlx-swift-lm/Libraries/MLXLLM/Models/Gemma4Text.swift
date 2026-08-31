@@ -5230,7 +5230,17 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     /// Layers or checkpoints outside the exact production geometry, and the
     /// arm's off-state, leave the loaded split arrays untouched.
     private func fuseExpertGateUpStorage(_ sanitized: inout [String: MLXArray]) {
-        guard switchGateUpFusePrefillEnabled else { return }
+        // GATEUP-FUSE-DECODE binds the same storage, so either arm being on
+        // is enough to build it; each arm keeps its own dispatch kill switch.
+        // The dispatch switches are independent, this bind is not: with either
+        // arm on, the fused array is the primary allocation and BOTH split
+        // projections are rebound to views of it, so the other arm's split
+        // gathers read the fused allocation too. Benign — `[:, 0:704, :]` and
+        // `[:, 704:1408, :]` keep `stride(-2) == shape(-1) == 352` and
+        // `stride(-1) == 1`, which is all `ensure_row_contiguous_matrix`
+        // checks, so no copy is inserted and the addresses are unchanged.
+        guard switchGateUpFusePrefillEnabled || switchGateUpFuseDecodeEnabled
+        else { return }
         let gateWeightSuffix = ".experts.switch_glu.gate_proj.weight"
         for key in sanitized.keys where key.hasSuffix(gateWeightSuffix) {
             let base = String(key.dropLast(gateWeightSuffix.count))

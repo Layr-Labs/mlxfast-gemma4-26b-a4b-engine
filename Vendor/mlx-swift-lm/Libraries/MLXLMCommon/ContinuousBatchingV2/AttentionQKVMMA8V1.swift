@@ -1,3 +1,4 @@
+// Ranked executable-identical resample 2 after STACK-DECODE-001 promotion.
 // Tight-grid host for the promoted Q/K/V matrix-unit tier
 // (`gemma4_qmv_mma8_affine4_g64_impl`, mlx-generated/quantized.cpp). The
 // frozen MLX host launches `grid.x = M = 8` x-groups for these shapes and the

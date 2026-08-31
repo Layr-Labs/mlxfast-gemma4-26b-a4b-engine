@@ -112,7 +112,7 @@ public func resetWeightedExpertUnsortStats() {
 /// permutation and writes `[tokens, hidden]` directly, avoiding that full
 /// `[tokens, topK, hidden]` intermediate.
 private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "weighted_expert_unsort",
+    name: "weighted_expert_unsort_unroll_v1",
     inputNames: ["sorted_outputs", "inverse_order", "weights"],
     outputNames: ["output"],
     source: """
@@ -121,6 +121,7 @@ private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
 
         T accumulator = (T)0;
         const uint assignment_base = token * (uint)K;
+        #pragma clang loop unroll(full)
         for (uint slot = 0; slot < (uint)K; ++slot) {
             const uint assignment = assignment_base + slot;
             const uint sorted_row = (uint)inverse_order[assignment];

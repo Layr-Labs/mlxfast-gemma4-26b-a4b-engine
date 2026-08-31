@@ -756,11 +756,63 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
                 s_next = srow[g_next];
                 b_next = brow[g_next];
             """)
+        // DMLP-DOWN-BFILL-024: sink each B operand's fill to the step that
+        // consumes it. The eight fills used to run as a block, so all eight
+        // `simdgroup_float8x8` operands, sixteen registers, were live across the
+        // whole matrix-unit run. Interleaved, only one is live at a time. `r0`
+        // and `r1` stay live to the last fill instead of dying at the block, so
+        // the trade is eight registers held longer against fourteen freed.
+        //
+        // The step order, the accumulator, and every device read are untouched.
+        // `C` is a serial dependence across all eight steps, so nothing that was
+        // running in parallel stops doing so: the fills only have to stay one
+        // step ahead of the multiply that reads them.
+        replaceOnce(
+            """
+                MMA8_SETB(B0, x, lo)
+                MMA8_SETB(B1, x, hi)
+                MMA8_SETB(B2, y, lo)
+                MMA8_SETB(B3, y, hi)
+                MMA8_SETB(B4, z, lo)
+                MMA8_SETB(B5, z, hi)
+                MMA8_SETB(B6, w, lo)
+                MMA8_SETB(B7, w, hi)
+            """,
+            with: "    // B operand fills are interleaved into the steps below.")
+        replaceOnce(
+            """
+                MMA8_STEP8(B0, x, z, 0)
+                MMA8_STEP8(B1, x, z, 8)
+                MMA8_STEP8(B2, x, z, 16)
+                MMA8_STEP8(B3, x, z, 24)
+                MMA8_STEP8(B4, y, w, 0)
+                MMA8_STEP8(B5, y, w, 8)
+                MMA8_STEP8(B6, y, w, 16)
+                MMA8_STEP8(B7, y, w, 24)
+            """,
+            with: """
+                MMA8_SETB(B0, x, lo)
+                MMA8_STEP8(B0, x, z, 0)
+                MMA8_SETB(B1, x, hi)
+                MMA8_STEP8(B1, x, z, 8)
+                MMA8_SETB(B2, y, lo)
+                MMA8_STEP8(B2, x, z, 16)
+                MMA8_SETB(B3, y, hi)
+                MMA8_STEP8(B3, x, z, 24)
+                MMA8_SETB(B4, z, lo)
+                MMA8_STEP8(B4, y, w, 0)
+                MMA8_SETB(B5, z, hi)
+                MMA8_STEP8(B5, y, w, 8)
+                MMA8_SETB(B6, w, lo)
+                MMA8_STEP8(B6, y, w, 16)
+                MMA8_SETB(B7, w, hi)
+                MMA8_STEP8(B7, y, w, 24)
+            """)
         return result
     }()
 
     private static let mma8DownStaticKKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_carry2_v3",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_carry2_bfill_v5",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """

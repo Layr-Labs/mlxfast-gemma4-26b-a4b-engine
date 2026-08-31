@@ -10,6 +10,16 @@
 import Foundation
 import MLX
 
+/// WRITE022-HOSTMETA-001: use owner-maintained private-storage metadata during
+/// D=512 admission. Keep this process-level switch beside the owner so OFF
+/// also preserves the incumbent allocation/growth path.
+let cbv2D512StoreHostMetadataEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_D512_STORE_HOSTMETA"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// Counters for the v2 core runtime's own host-interaction points.
 ///
 /// The engine step loop must never force a host sync (`.item()`, `asArray`,
@@ -57,6 +67,19 @@ public enum CBv2CoreInstrumentation {
 /// unconsumed lazy chain may grow O(steps) — DAR-325).
 protocol CBv2InnerStateProviding {
     func cbv2InnerState() -> [MLXArray]
+}
+
+/// Lightweight view of one full-sequence row's private K/V allocation.
+///
+/// `CBv2FullSequenceKV` is the sole authority that creates, grows, or releases
+/// these arrays. Callers can therefore use its host-maintained signature
+/// instead of asking MLX for the same dtype/shape metadata on every decode
+/// step. This value deliberately carries the arrays themselves plus only the
+/// runtime scalar the D=512 kernels need.
+struct CBv2FullPrivateStorage {
+    let keys: MLXArray
+    let values: MLXArray
+    let capacity: Int
 }
 
 /// ATT-008: shared batch-wide K/V storage for a lockstep decode cohort of
@@ -206,6 +229,22 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
     private var values: MLXArray?
     private var capacity: Int
 
+    /// Owner-authoritative metadata for `keys` and `values`. When present,
+    /// their shapes are exactly
+    /// `[1, kvHeads, capacity, keyHeadDim/valueHeadDim]`; no operation exposed
+    /// by this type can change an allocation's rank, shape, or dtype in place.
+    /// Initial allocation creates the signature, doubling updates its capacity,
+    /// rollback leaves it untouched, and pooling clears it with the arrays.
+    private struct PrivateStorageSignature {
+        let keyDType: DType
+        let valueDType: DType
+        let keyHeadDim: Int
+        let valueHeadDim: Int
+        var capacity: Int
+    }
+
+    private var privateStorageSignature: PrivateStorageSignature?
+
     /// ATT-008 cohort pooling (nil until `cohortPool(binding:)` migrates this
     /// row). While bound, `keys`/`values` are nil and the pool's row
     /// `cohortIndex` is the storage.
@@ -348,6 +387,34 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
         return [keys, values].compactMap { $0 }
     }
 
+    /// Resolve private storage for the WRITE-022 D=512 dispatch without
+    /// allocating a two-element state array or crossing into MLX for backing
+    /// array metadata. Every rejection is side-effect free. In particular,
+    /// unallocated and pooled rows, geometry/dtype mismatches, a stale owner
+    /// signature, and an append that would require growth all fail closed.
+    @inline(__always)
+    func writing22PrivateStorage(
+        requiredCapacity: Int, dtype: DType,
+        kvHeads expectedKVHeads: Int, headDim expectedHeadDim: Int
+    ) -> CBv2FullPrivateStorage? {
+        guard cohortPool == nil,
+            let keys, let values,
+            let signature = privateStorageSignature,
+            requiredCapacity >= 0,
+            requiredCapacity <= capacity,
+            signature.capacity == capacity,
+            kvHeads == expectedKVHeads,
+            headDim == expectedHeadDim,
+            signature.keyDType == dtype,
+            signature.valueDType == dtype,
+            signature.keyHeadDim == expectedHeadDim,
+            signature.valueHeadDim == expectedHeadDim
+        else { return nil }
+
+        return CBv2FullPrivateStorage(
+            keys: keys, values: values, capacity: capacity)
+    }
+
     // MARK: - ATT-008 cohort pooling
 
     /// Resolve (or form) the shared decode pool for `rows`, or nil when the
@@ -407,6 +474,9 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
             row.cohortIndex = index
             row.keys = nil
             row.values = nil
+            if cbv2D512StoreHostMetadataEnabled {
+                row.privateStorageSignature = nil
+            }
         }
         return pool
     }
@@ -416,10 +486,28 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
     private func ensureCapacity(_ needed: Int, keyTemplate: MLXArray, valueTemplate: MLXArray) {
         if keys == nil {
             capacity = min(maxLength, max(capacity, needed))
-            keys = MLXArray.zeros(
-                [1, kvHeads, capacity, keyTemplate.dim(3)], dtype: keyTemplate.dtype)
-            values = MLXArray.zeros(
-                [1, kvHeads, capacity, valueTemplate.dim(3)], dtype: valueTemplate.dtype)
+            if cbv2D512StoreHostMetadataEnabled {
+                let keyHeadDim = keyTemplate.dim(3)
+                let valueHeadDim = valueTemplate.dim(3)
+                let keyDType = keyTemplate.dtype
+                let valueDType = valueTemplate.dtype
+                keys = MLXArray.zeros(
+                    [1, kvHeads, capacity, keyHeadDim], dtype: keyDType)
+                values = MLXArray.zeros(
+                    [1, kvHeads, capacity, valueHeadDim], dtype: valueDType)
+                privateStorageSignature = PrivateStorageSignature(
+                    keyDType: keyDType,
+                    valueDType: valueDType,
+                    keyHeadDim: keyHeadDim,
+                    valueHeadDim: valueHeadDim,
+                    capacity: capacity)
+            } else {
+                // Incumbent allocation path, retained byte-for-byte for OFF.
+                keys = MLXArray.zeros(
+                    [1, kvHeads, capacity, keyTemplate.dim(3)], dtype: keyTemplate.dtype)
+                values = MLXArray.zeros(
+                    [1, kvHeads, capacity, valueTemplate.dim(3)], dtype: valueTemplate.dtype)
+            }
             return
         }
         guard needed > capacity else { return }
@@ -435,5 +523,8 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
             [values!, MLXArray.zeros([1, kvHeads, growth, values!.dim(3)], dtype: values!.dtype)],
             axis: 2)
         capacity = newCapacity
+        if cbv2D512StoreHostMetadataEnabled {
+            privateStorageSignature?.capacity = newCapacity
+        }
     }
 }

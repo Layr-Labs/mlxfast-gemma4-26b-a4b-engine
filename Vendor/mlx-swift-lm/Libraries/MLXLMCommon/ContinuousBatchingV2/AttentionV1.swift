@@ -27,6 +27,14 @@ enum CBv2AttentionV1 {
     /// `0`/`false`/`no`/`off` restores the established `decodeRingWrite` +
     /// `attendRing` pair, which also stays the fallback for every input the
     /// fused path refuses.
+    /// `MLX_KV_QUANT_FW=0` returns the quantized road to the promoted
+    /// separate-write shape that took the crown.
+    static let fusedQuantWriteEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_KV_QUANT_FW"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let fusedRingWriteEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_FUSED_RING_WRITE"]
@@ -490,6 +498,36 @@ enum CBv2AttentionV1 {
                     // is unavailable (kill switch, or any row without one).
                     let portQuantActive = CBv2WindowedSequenceKV.quantEnabled
                         && ringRows.allSatisfy { $0.decodeRingQuantView != nil }
+                    // KVQ-FW: the quantized road now has its own fused write,
+                    // so it no longer has to concede the write to the separate
+                    // road. Tried first; on any refusal the promoted quantized
+                    // separate road below still runs, and below that the stock
+                    // bf16 pair.
+                    if portQuantActive, fusedQuantWriteEnabled, fusedRingWriteEnabled,
+                        allowFusedRingWrite, let decodeRingWriteFence
+                    {
+                        let preWrite = ringRows.compactMap { $0.decodeRingViewBeforeWrite }
+                        let preMirrors = ringRows.compactMap { $0.decodeRingQuantView }
+                        if preWrite.count == B, preMirrors.count == B,
+                            let fused = CBv2RaggedTwoPassDecodeAttentionV1
+                                .attendRingQuantWriting(
+                                    queries: queries,
+                                    newKeys: keys, newValues: values,
+                                    keys: preWrite.map(\.keys),
+                                    values: preWrite.map(\.values),
+                                    mirrors: preMirrors,
+                                    starts: preWrite.map(\.start),
+                                    previousWriteFence: decodeRingWriteFence.value,
+                                    scale: scale,
+                                    slidingWindowLength: ringRows[0].window)
+                        {
+                            for row in ringRows {
+                                row.advanceDecodeRingAfterFusedWrite()
+                            }
+                            decodeRingWriteFence.value = fused.nextWriteFence
+                            return fused.output
+                        }
+                    }
                     if !portQuantActive, fusedRingWriteEnabled, allowFusedRingWrite,
                         let decodeRingWriteFence
                     {

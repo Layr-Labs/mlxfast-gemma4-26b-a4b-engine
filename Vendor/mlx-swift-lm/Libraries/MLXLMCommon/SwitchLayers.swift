@@ -112,7 +112,7 @@ public func resetWeightedExpertUnsortStats() {
 /// permutation and writes `[tokens, hidden]` directly, avoiding that full
 /// `[tokens, topK, hidden]` intermediate.
 private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "weighted_expert_unsort",
+    name: "weighted_expert_unsort_unroll_v2",
     inputNames: ["sorted_outputs", "inverse_order", "weights"],
     outputNames: ["output"],
     source: """
@@ -121,6 +121,7 @@ private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
 
         T accumulator = (T)0;
         const uint assignment_base = token * (uint)K;
+        #pragma clang loop unroll(full)
         for (uint slot = 0; slot < (uint)K; ++slot) {
             const uint assignment = assignment_base + slot;
             const uint sorted_row = (uint)inverse_order[assignment];
@@ -375,7 +376,7 @@ private func geGLUProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
 /// and directly emits the three routing products consumed downstream.
 private let routeSimdRank64Kernel: MLXFast.MLXFastKernel =
     MLXFast.metalKernel(
-        name: "mlx_lm_route_simd_rank_scatter_m8_u32_n64_v1",
+        name: "mlx_lm_route_simd_rank_scatter_m8_u32_n64_unroll_v2",
         inputNames: ["indices"],
         outputNames: ["row_order", "sorted_keys", "inverse_order"],
         source: """
@@ -385,6 +386,7 @@ private let routeSimdRank64Kernel: MLXFast.MLXFastKernel =
             const uint key_low = (uint)indices[lane];
             const uint key_high = (uint)indices[32u + lane];
             uint rank = 0;
+            #pragma clang loop unroll(full)
             for (uint source = 0; source < 32; ++source) {
                 const uint other_low = simd_broadcast(key_low, ushort(source));
                 rank += (other_low < key)
@@ -416,7 +418,7 @@ private let routeSimdRank64Kernel: MLXFast.MLXFastKernel =
 /// whose generic `bias[indices]` lookup must continue to receive raw indices.
 private let routeSimdRank64PrefixBoundsKernel: MLXFast.MLXFastKernel =
     MLXFast.metalKernel(
-        name: "mlx_lm_route_simd_rank_bounds_scatter_m8_u32_n64_v1",
+        name: "mlx_lm_route_simd_rank_bounds_scatter_m8_u32_n64_unroll_v2",
         inputNames: ["indices"],
         outputNames: ["row_order", "sorted_keys", "inverse_order"],
         source: """
@@ -428,6 +430,7 @@ private let routeSimdRank64PrefixBoundsKernel: MLXFast.MLXFastKernel =
             uint rank = 0;
             uint run_offset = 0;
             uint run_length = 0;
+            #pragma clang loop unroll(full)
             for (uint source = 0; source < 32; ++source) {
                 const uint other_low = simd_broadcast(key_low, ushort(source));
                 rank += (other_low < key)

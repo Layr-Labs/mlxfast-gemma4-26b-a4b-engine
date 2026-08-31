@@ -3942,6 +3942,58 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   }
 }
 
+// GATEUPTILE: the K = 704 down plane runs its y tiles through a span walker
+// (`gather_qmv_gemma4_down_tile`), so one threadgroup produces several
+// consecutive output tiles of the same assignment from one resident activation
+// vector. The K = 2816 gate/up plane has no such walker: it elects a run tier
+// and then hands every y tile of a singleton assignment to its own
+// threadgroup, each of which pulls the whole 2816-element activation vector
+// again. That vector is 5632 bytes, four times the down plane's, and it is the
+// one operand every tile of an assignment shares. This walker gives the gate/up
+// singleton arm the same treatment at span 2: one threadgroup, two consecutive
+// output tiles, one activation residency.
+//
+// Span 2 rather than 4. out_vec_size is 704 here, so the plane has 88 y tiles
+// per assignment against the down plane's 352, and folding by 4 would leave 22
+// leaders per assignment where the down plane's winning span leaves 88. Span 2
+// leaves 44 and halves the activation re-reads.
+//
+// 88 is even, so a leader at even tid.y always has its follower in range and no
+// tile is written twice. The callee, its arguments and the out_row it derives
+// from tid.y are unchanged; only the thread that runs each tile moves.
+template <typename T, int group_size, int bits>
+METAL_FUNC void gather_qmv_gemma4_gateup_tile_single(
+    const device uint32_t* single_w,
+    const device T* single_scales,
+    const device T* single_biases,
+    const device T* single_x,
+    device T* single_y,
+    const int in_vec_size,
+    const int out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int gemma4_gateup_tile_span = 2; // sweep alternate: 1
+  if (tid.y % uint(gemma4_gateup_tile_span) != 0u) {
+    return;
+  }
+  for (int t = 0; t < gemma4_gateup_tile_span; t++) {
+    uint3 tile_tid = tid;
+    tile_tid.y = tid.y + uint(t);
+    qmv_affine4_g64_singles_impl<T, group_size, bits, 2816, true, false>(
+        single_w,
+        single_scales,
+        single_biases,
+        single_x,
+        single_y,
+        in_vec_size,
+        out_vec_size,
+        tile_tid,
+        simd_gid,
+        simd_lid);
+  }
+}
+
 template <typename T, int group_size, int bits>
 [[kernel]] void affine_gather_qmv(
     const device uint32_t* w [[buffer(0)]],
@@ -4117,8 +4169,7 @@ template <typename T, int group_size, int bits>
     const device T* single_biases = biases + expert * b_strides[0];
     device T* single_y = y + assignment * (uint)out_vec_size;
     if (in_vec_size == 2816) {
-      qmv_affine4_g64_singles_impl<
-          T, group_size, bits, 2816, true, false>(
+      gather_qmv_gemma4_gateup_tile_single<T, group_size, bits>(
           single_w, single_scales, single_biases, single_x, single_y,
           in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
     } else {

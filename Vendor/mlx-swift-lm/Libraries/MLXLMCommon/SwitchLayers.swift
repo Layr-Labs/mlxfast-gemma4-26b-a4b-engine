@@ -112,25 +112,38 @@ public func resetWeightedExpertUnsortStats() {
 /// permutation and writes `[tokens, hidden]` directly, avoiding that full
 /// `[tokens, topK, hidden]` intermediate.
 private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "weighted_expert_unsort",
+    name: "weighted_expert_unsort_vec4_v2",
     inputNames: ["sorted_outputs", "inverse_order", "weights"],
     outputNames: ["output"],
     source: """
-        uint feature = thread_position_in_grid.x;
+        typedef vec<T, 4> T4;
+        // One lane owns four consecutive features instead of one, so the
+        // grid is a quarter as wide and each row read and the store are one
+        // four-wide vector. The hidden extent is `threads_per_grid.x * 4`,
+        // which is the extent the one-feature form read as
+        // `threads_per_grid.x`.
+        uint quad = thread_position_in_grid.x;
         uint token = thread_position_in_grid.y;
+        const uint hidden = threads_per_grid.x * 4u;
 
-        T accumulator = (T)0;
+        T4 accumulator = T4((T)0);
         const uint assignment_base = token * (uint)K;
         for (uint slot = 0; slot < (uint)K; ++slot) {
             const uint assignment = assignment_base + slot;
             const uint sorted_row = (uint)inverse_order[assignment];
+            const device T4* row = reinterpret_cast<const device T4*>(
+                sorted_outputs + sorted_row * hidden);
+            const T4 source = row[quad];
+            const float weight = (float)weights[assignment];
             // Preserve the legacy bfloat16 multiply-then-reduce rounding.
-            const T weighted = (T)(
-                (float)sorted_outputs[sorted_row * threads_per_grid.x + feature]
-                * (float)weights[assignment]);
-            accumulator = accumulator + weighted;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < 4; ++j) {
+                const T weighted = (T)((float)source[j] * weight);
+                accumulator[j] = accumulator[j] + weighted;
+            }
         }
-        output[token * threads_per_grid.x + feature] = accumulator;
+        reinterpret_cast<device T4*>(output + token * hidden)[quad] =
+            accumulator;
     """,
     ensureRowContiguous: true
 )
@@ -170,7 +183,7 @@ public func weightedExpertUnsort(
             ("T", sortedOutputs.dtype),
             ("K", 8),
         ],
-        grid: (2816, tokens, 1),
+        grid: (704, tokens, 1),
         threadGroup: (64, 4, 1),
         outputShapes: [[tokens, 2816]],
         outputDTypes: [.bfloat16]
@@ -907,26 +920,6 @@ private func routeCountingSortPrefill(
     return (outputs[0], outputs[1], outputs[2])
 }
 
-/// GLUE-FOLD carrier: the exact decode route table (`row_order`,
-/// `sorted_keys`, `inverse_order`, each `[64]` uint32) computed upstream by a
-/// producer that already holds the router scores, so `projectExperts` never
-/// issues its standalone route-table dispatch. The arrays must be exactly what
-/// `gatherSortIndices` would have produced for the same `[8, 8]` indices --
-/// raw (untagged) sorted expert keys included -- and any shape, dtype or
-/// switch-state mismatch declines the carrier and re-issues the incumbent
-/// chain unchanged.
-public struct SwitchRouteTable {
-    public let rowOrder: MLXArray
-    public let sortedKeys: MLXArray
-    public let inverseOrder: MLXArray
-
-    public init(rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray) {
-        self.rowOrder = rowOrder
-        self.sortedKeys = sortedKeys
-        self.inverseOrder = inverseOrder
-    }
-}
-
 /// `numExperts` is the exclusive upper bound of the index key space. Callers
 /// that know it (SwitchGLU) pass it so PREFILL-CSORT-128 can prove its 256-entry
 /// counter table covers every key; the default (`Int.max`) fails closed onto the
@@ -1337,8 +1330,7 @@ public class SwitchGLU: Module {
 
     private func projectExperts(
         _ x: MLXArray, _ indices: MLXArray,
-        sortedPlane: SwitchSortedPlaneProducer? = nil,
-        routeTable: SwitchRouteTable? = nil
+        sortedPlane: SwitchSortedPlaneProducer? = nil
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
         let useLhsIndices =
             indices.size == 64 && indices.ndim == 2 && indices.shape == [8, 8]
@@ -1356,32 +1348,9 @@ public class SwitchGLU: Module {
         if doSort {
             if useLhsIndices {
                 x = x.flattened(start: 0, end: -3)
-                // GLUE-FOLD: an upstream producer already emitted the exact
-                // route table beside the top-8 selection; consume it and the
-                // standalone `mlx_lm_route_simd_rank_scatter` dispatch never
-                // enters the chain. Any mismatch -- including the raw-key
-                // contract (prefix-bounds tagging wants tagged keys) or a
-                // disabled incumbent rank path -- re-issues the incumbent
-                // chain, which produces byte-identical arrays.
-                if let table = routeTable,
-                    !useExpertPrefixBounds,
-                    routeSimdRank64Enabled,
-                    numExperts == 128,
-                    table.rowOrder.dtype == .uint32,
-                    table.rowOrder.ndim == 1, table.rowOrder.size == 64,
-                    table.sortedKeys.dtype == .uint32,
-                    table.sortedKeys.ndim == 1, table.sortedKeys.size == 64,
-                    table.inverseOrder.dtype == .uint32,
-                    table.inverseOrder.ndim == 1, table.inverseOrder.size == 64
-                {
-                    (lhsIndices, idx, inverseOrder) = (
-                        table.rowOrder, table.sortedKeys, table.inverseOrder
-                    )
-                } else {
-                    (lhsIndices, idx, inverseOrder) = gatherSortIndices(
-                        indices: indices, numExperts: numExperts,
-                        expertPrefixBounds: useExpertPrefixBounds)
-                }
+                (lhsIndices, idx, inverseOrder) = gatherSortIndices(
+                    indices: indices, numExperts: numExperts,
+                    expertPrefixBounds: useExpertPrefixBounds)
             } else if let sortedPlane {
                 // PRENORM-GATHER: the producer writes the sorted plane from
                 // the inverse order; `x` is only read if it declines.
@@ -1582,8 +1551,7 @@ public class SwitchGLU: Module {
         _ indices: MLXArray,
         weights: MLXArray,
         fuseSortedReduction: Bool,
-        isProductionPrefill: Bool = true,
-        routeTable: SwitchRouteTable? = nil
+        isProductionPrefill: Bool = true
     ) -> DeferredWeightedExpertRows? {
         let isEightRowDecode =
             !isProductionPrefill && x.dim(0) == 8 && indices.size == 64
@@ -1591,7 +1559,7 @@ public class SwitchGLU: Module {
             supportsWeightedExpertUnsort(x, indices, weights: weights)
         else { return nil }
 
-        let projected = projectExperts(x, indices, routeTable: routeTable)
+        let projected = projectExperts(x, indices)
         guard projected.sorted,
             let inverseOrder = projected.inverseOrder,
             projected.output.ndim == 3,

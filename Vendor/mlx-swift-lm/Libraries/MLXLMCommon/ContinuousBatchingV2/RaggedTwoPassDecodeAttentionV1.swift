@@ -918,6 +918,182 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             extraInputs: [], scale: scale)
     }
 
+    private static let portQuantReadKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_ring_2pass_a_q8_d256_g2_port_b\(blocks)_v1",
+        inputNames: [
+            "queries",
+            "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7", "starts",
+        ],
+        outputNames: ["partials", "sums", "maxs"],
+        source: """
+            constexpr int simd_width = 32;
+            constexpr int values_per_lane = D / simd_width;
+            constexpr int row_stride = D + 4;
+
+            const int kv_head = int(threadgroup_position_in_grid.x);
+            const int batch_index = int(threadgroup_position_in_grid.y);
+            const int block = int(threadgroup_position_in_grid.z);
+            const int query_head_in_group = int(thread_position_in_threadgroup.y);
+            const int query_head = GQA * kv_head + query_head_in_group;
+            const int batch_head = batch_index * 16 + query_head;
+            const int lane = int(thread_index_in_simdgroup);
+
+            constexpr int row_words = row_stride / 4;
+            const device uint32_t* mirror_w = m0;
+            switch (batch_index) {
+                case 1: mirror_w = m1; break;
+                case 2: mirror_w = m2; break;
+                case 3: mirror_w = m3; break;
+                case 4: mirror_w = m4; break;
+                case 5: mirror_w = m5; break;
+                case 6: mirror_w = m6; break;
+                case 7: mirror_w = m7; break;
+                default: break;
+            }
+            const uint start = starts[batch_index];
+
+            const device T* query =
+                queries + batch_head * D + lane * values_per_lane;
+            int slot = int((start + block) % N);
+            device T* partial = partials
+                + batch_head * BLOCKS * D + block * D + lane * values_per_lane;
+            device float* sum_out = sums + batch_head * BLOCKS + block;
+            device float* max_out = maxs + batch_head * BLOCKS + block;
+
+            thread float q[values_per_lane];
+            thread float accumulator[values_per_lane];
+            for (int element = 0; element < values_per_lane; ++element) {
+                q[element] = 1.0f * float(query[element]);
+                accumulator[element] = 0.0f;
+            }
+
+            float max_score = -3.402823466e+38F;
+            float sum_exp_score = 0.0f;
+            for (int token = block; token < N; token += BLOCKS) {
+                const device uint32_t* krow_w =
+                    mirror_w + (kv_head * N + slot) * row_words;
+                const device uint32_t* vrow_w =
+                    mirror_w + ((KV_HEADS + kv_head) * N + slot) * row_words;
+                const uint32_t ktw = krow_w[D / 4];
+                const uint32_t vtw = vrow_w[D / 4];
+                const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
+                const float kb = float(as_type<half>(ushort(ktw >> 16)));
+                const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
+                const float vb = float(as_type<half>(ushort(vtw >> 16)));
+                const uint32_t kw0 = krow_w[lane * 2];
+                const uint32_t kw1 = krow_w[lane * 2 + 1];
+                const uint32_t vw0 = vrow_w[lane * 2];
+                const uint32_t vw1 = vrow_w[lane * 2 + 1];
+                float score = 0.0f;
+                for (int element = 0; element < 4; ++element) {
+                    score += q[element]
+                        * fma(float((kw0 >> (8 * element)) & 0xffu), ks, kb);
+                }
+                for (int element = 0; element < 4; ++element) {
+                    score += q[4 + element]
+                        * fma(float((kw1 >> (8 * element)) & 0xffu), ks, kb);
+                }
+                score = simd_sum(score);
+
+                const float new_max = max(max_score, score);
+                const float old_factor = fast::exp(max_score - new_max);
+                const float score_factor = fast::exp(score - new_max);
+                max_score = new_max;
+                sum_exp_score = sum_exp_score * old_factor + score_factor;
+                for (int element = 0; element < 4; ++element) {
+                    accumulator[element] = accumulator[element] * old_factor
+                        + score_factor
+                            * fma(float((vw0 >> (8 * element)) & 0xffu), vs, vb);
+                    accumulator[4 + element] = accumulator[4 + element] * old_factor
+                        + score_factor
+                            * fma(float((vw1 >> (8 * element)) & 0xffu), vs, vb);
+                }
+
+                slot += BLOCKS;
+                if (slot >= N) slot -= N;
+            }
+
+            if (lane == 0) {
+                sum_out[0] = sum_exp_score;
+                max_out[0] = max_score;
+            }
+            for (int element = 0; element < values_per_lane; ++element) {
+                partial[element] = T(accumulator[element]);
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    /// KVQ-PORT: `attendRing` reading the packed 8-bit mirror instead of the
+    /// bf16 ring, with the result CONSUMED by pass B exactly as the stock
+    /// road consumes it. This is the separate-write road only: the promoted
+    /// stock mechanism still owns the ring write, so no fused kernel, no
+    /// bf16 companion and no participant-authored fence are involved.
+    ///
+    /// Three diagnostic submissions established what this is allowed to
+    /// assume. `47dae0ea` (1.9637) proved the read kernel dispatches and
+    /// completes on the ranked box; `e14279c9` (2.0147) proved the fused
+    /// writer and its companion do too; `3f7e5b55` (2.0122) proved writing
+    /// in place into a live, graph-referenced mirror is fine there. All
+    /// three discarded their output. What none of them exercised is pass B
+    /// consuming a quantized pass A, which is what this does.
+    static func attendRingQuant(
+        queries: MLXArray,
+        mirrors: [MLXArray],
+        starts: [Int],
+        scale: Float,
+        slidingWindowLength: Int
+    ) -> MLXArray? {
+        guard CBv2WindowedSequenceKV.quantEnabled,
+            slidingWindowLength == sequenceLength,
+            starts.count == batch,
+            starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength }),
+            enabled, blocks > 0, sequenceLength.isMultiple(of: blocks),
+            scale == 1.0,
+            queries.dtype == .bfloat16,
+            queries.shape == [batch, queryHeads, 1, headDim],
+            headDim == 256, kvHeads == 8,
+            mirrors.count == batch,
+            mirrors.allSatisfy({
+                $0.dtype == .uint32
+                    && $0.shape == [2, kvHeads, sequenceLength, (headDim + 4) / 4]
+            })
+        else { return nil }
+
+        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let partialShape = [batch, queryHeads, 1, blocks, headDim]
+        let summaryShape = [batch, queryHeads, 1, blocks]
+        let passA = portQuantReadKernel(
+            [queries] + mirrors + [startArray],
+            template: [
+                ("T", queries.dtype),
+                ("D", headDim),
+                ("N", sequenceLength),
+                ("GQA", gqa),
+                ("KV_HEADS", kvHeads),
+                ("BLOCKS", blocks),
+            ],
+            grid: (kvHeads * 32, batch * gqa, blocks),
+            threadGroup: (32, gqa, 1),
+            outputShapes: [partialShape, summaryShape, summaryShape],
+            outputDTypes: [.bfloat16, .float32, .float32]
+        )
+        CBv2EngageMark.once("kvq8port")
+        return passBKernel(
+            passA,
+            template: [
+                ("T", queries.dtype),
+                ("D", headDim),
+                ("BLOCKS", blocks),
+                ("COLS", combineColumns),
+            ],
+            grid: (batch * queryHeads * combineThreads, 1, 1),
+            threadGroup: (combineThreads, 1, 1),
+            outputShapes: [[batch, queryHeads, 1, headDim]],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
+
     static func attendRing(
         queries: MLXArray,
         keys: [MLXArray],

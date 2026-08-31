@@ -483,7 +483,14 @@ enum CBv2AttentionV1 {
                     // entirely, write included) unless the storage-owning
                     // layer has no K/V borrower that must keep observing the
                     // pre-write allocation.
-                    if fusedRingWriteEnabled, allowFusedRingWrite,
+                    // KVQ-PORT: the fused road owns the write AND the read.
+                    // This revision moves only the read to the mirror, so the
+                    // fused road must stand down for the quant path to be
+                    // reachable at all. It is restored the moment the mirror
+                    // is unavailable (kill switch, or any row without one).
+                    let portQuantActive = CBv2WindowedSequenceKV.quantEnabled
+                        && ringRows.allSatisfy { $0.decodeRingQuantView != nil }
+                    if !portQuantActive, fusedRingWriteEnabled, allowFusedRingWrite,
                         let decodeRingWriteFence
                     {
                         let preWrite = ringRows.compactMap { $0.decodeRingViewBeforeWrite }
@@ -514,6 +521,21 @@ enum CBv2AttentionV1 {
                             values: values[index ..< (index + 1)])
                     }
                     let views = ringRows.compactMap { $0.decodeRingView }
+                    // KVQ-PORT: the ring write above is the promoted stock
+                    // mechanism's; only the READ moves to the 8-bit mirror,
+                    // and its pass A is consumed by pass B exactly as the
+                    // bf16 road consumes it. All-or-nothing: unless every
+                    // row exposes a mirror the established road runs.
+                    let portMirrors = ringRows.compactMap { $0.decodeRingQuantView }
+                    if views.count == B, portMirrors.count == B,
+                        let quantOutput = CBv2RaggedTwoPassDecodeAttentionV1
+                            .attendRingQuant(
+                                queries: queries, mirrors: portMirrors,
+                                starts: views.map(\.start), scale: scale,
+                                slidingWindowLength: ringRows[0].window)
+                    {
+                        return quantOutput
+                    }
                     if views.count == B,
                         let output = CBv2RaggedTwoPassDecodeAttentionV1.attendRing(
                             queries: queries, keys: views.map(\.keys),

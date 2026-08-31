@@ -289,6 +289,15 @@ private let gemma4PrefillLastQueryEnabled: Bool = {
     return gemma4TruthyFlag(raw)
 }()
 
+/// The scored B=8/L=1 decode path can never select a prefill-only last-query
+/// specialization. Skip constructing that policy call's three eager arguments
+/// in every decoder layer. Default ON; `0`/`false`/`no`/`off` restores the
+/// incumbent call in the same binary.
+private let gemma4DecodeLastQueryPolicySkipEnabled =
+    resolveGemma4DecodeAsyncEvalLadderEnabled(
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_DECODE_LASTQ_POLICY_SKIP"])
+
 /// The final layer must own a full-attention, non-shared cache for
 /// last-query prefill to be equivalent. Sliding windows give each query a
 /// different visible span, and a KV-shared final layer writes nothing.
@@ -1430,20 +1439,28 @@ private func gemma4FusedQKVNorm(
         positionOffsets.dtype == .int32, positionOffsets.shape == [8],
         ropeParameters.log2Base.dtype == .float32, ropeParameters.log2Base.size == 1,
         ropeParameters.frequencies.dtype == .float32,
-        q.ndim == 4, k.ndim == 4, v.ndim == 4,
-        q.dim(0) == 8, q.dim(1) == 1, q.dim(2) == 16,
-        k.dim(0) == 8, k.dim(1) == 1, v.shape == k.shape,
-        q.dim(3) == k.dim(3),
-        (q.dim(3) == 256 && k.dim(2) == 8) || (q.dim(3) == 512 && k.dim(2) == 2),
-        qWeight.shape == [q.dim(3)], kWeight.shape == [q.dim(3)],
-        !keyValueShared || v.shape == k.shape,
-        !ropeParameters.usesFrequencies
-            || ropeParameters.frequencies.size == q.dim(3) / 2
+        q.ndim == 4, k.ndim == 4, v.ndim == 4
     else { return nil }
 
+    // MLX metadata queries cross the Swift/C boundary. Cache the geometry once
+    // after rank admission; fixed-B8 decode invokes this admission per layer.
     let dimension = q.dim(3)
+    let keyValueHeads = k.dim(2)
+    let keyValueShape = k.shape
+    let valueShape = v.shape
+
+    guard
+        q.dim(0) == 8, q.dim(1) == 1, q.dim(2) == 16,
+        k.dim(0) == 8, k.dim(1) == 1, valueShape == keyValueShape,
+        dimension == k.dim(3),
+        (dimension == 256 && keyValueHeads == 8) || (dimension == 512 && keyValueHeads == 2),
+        qWeight.shape == [dimension], kWeight.shape == [dimension],
+        !ropeParameters.usesFrequencies
+            || ropeParameters.frequencies.size == dimension / 2
+    else { return nil }
+
     let qRows = 8 * 16
-    let kRows = 8 * k.dim(2)
+    let kRows = 8 * keyValueHeads
     let threads = dimension / 4
     let fusedRope = gemma4QKVNormRopeEnabled && applyRope
     let normRows = qRows + kRows + (keyValueShared ? 0 : kRows)
@@ -1452,14 +1469,14 @@ private func gemma4FusedQKVNorm(
          ropeParameters.log2Base, ropeParameters.frequencies],
         template: [
             ("T", q.dtype), ("D", dimension), ("Q_ROWS", qRows), ("K_ROWS", kRows),
-            ("Q_HEADS", 16), ("K_HEADS", k.dim(2)),
+            ("Q_HEADS", 16), ("K_HEADS", keyValueHeads),
             ("KEY_VALUE_SHARED", keyValueShared), ("APPLY_ROPE", fusedRope),
             ("USE_FREQS", ropeParameters.usesFrequencies),
         ],
         grid: (normRows * threads, 1, 1), threadGroup: (threads, 1, 1),
         outputShapes: fusedRope
-            ? [[8, 16, 1, dimension], [8, k.dim(2), 1, dimension], v.shape]
-            : [q.shape, k.shape, v.shape],
+            ? [[8, 16, 1, dimension], [8, keyValueHeads, 1, dimension], valueShape]
+            : [q.shape, keyValueShape, valueShape],
         outputDTypes: [q.dtype, k.dtype, v.dtype]
     )
     if fusedRope { CBv2EngageMark.once("qkv-norm-rope") }
@@ -1581,7 +1598,11 @@ private func gemma4AttentionFallback(
     // and corrupt EVERY row of the batch. Map NaN -> 0 so a fully-masked query
     // contributes nothing. This matches `MLXFast.scaledDotProductAttention`,
     // which this manual fallback replaces for the batched (ragged) path.
-    probs = MLX.where(probs .!= probs, MLXArray(Float(0)), probs)
+    // Maskless softmax has no fully-masked row, so avoid constructing the
+    // compare-and-select graph in that case.
+    if mask != nil {
+        probs = MLX.where(probs .!= probs, MLXArray(Float(0)), probs)
+    }
     scores = probs.asType(scores.dtype)
     var output = matmul(scores, v)
     if repeats > 1 {
@@ -1908,7 +1929,9 @@ private class Gemma4Attention: Module {
         }
 
         let queryInput = lastQueryCache == nil ? x : x[0..., outputStart..., 0...]
-        let queryLength = queryInput.dim(1)
+        // Ordinary decode already read L above; only the narrowed last-query
+        // prefill slice needs a fresh metadata lookup for its query length.
+        let queryLength = lastQueryCache == nil ? L : queryInput.dim(1)
 
         // Keep Q/K/V on the promoted matrix-unit tier's arithmetic. At the
         // exact B=8/L=1 decode shapes the tight-grid host re-dispatches the
@@ -3280,7 +3303,8 @@ private class Gemma4Experts: Module {
         // Flatten [B, S, H] and always enter SwitchGLU's combined API. It
         // selects direct sorted reduction only for the exact production
         // contract; every other case performs the established unsort + sum.
-        let (B, S, H) = (x.dim(0), x.dim(1), x.dim(2))
+        let xShape = x.shape
+        let (B, S, H) = (xShape[0], xShape[1], xShape[2])
         let K = topKIndices.dim(-1)
         let result = switchGLU.callAndWeightedReduceWithUnsortCarrier(
             x.reshaped(B * S, H),
@@ -3304,7 +3328,8 @@ private class Gemma4Experts: Module {
         topKWeights: MLXArray,
         isExpertPrefill: Bool
     ) -> DeferredWeightedExpertRows? {
-        let (B, S, H) = (x.dim(0), x.dim(1), x.dim(2))
+        let xShape = x.shape
+        let (B, S, H) = (xShape[0], xShape[1], xShape[2])
         let K = topKIndices.dim(-1)
         return switchGLU.callAndDeferWeightedReduce(
             x.reshaped(B * S, H),
@@ -3342,11 +3367,24 @@ private class Gemma4MLP: Module {
     private func denseProjection(
         _ layer: Linear,
         _ x: MLXArray,
-        activationSums: CBv2DenseMLPQMVV1.ActivationSums? = nil
+        activationSums: CBv2DenseMLPQMVV1.ActivationSums? = nil,
+        validatedInput: CBv2DenseMLPQMVV1.ValidatedInput? = nil
     ) -> MLXArray {
-        guard let quantized = layer as? QuantizedLinear,
-            quantized.bias == nil,
-            let tight = CBv2DenseMLPQMVV1.matmul(
+        guard let quantized = layer as? QuantizedLinear, quantized.bias == nil else {
+            return layer(x)
+        }
+        let tight = if let validatedInput {
+            CBv2DenseMLPQMVV1.matmul(
+                input: validatedInput,
+                weight: quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                groupSize: quantized.groupSize,
+                bits: quantized.bits,
+                mode: quantized.mode,
+                activationSums: activationSums)
+        } else {
+            CBv2DenseMLPQMVV1.matmul(
                 x: x,
                 weight: quantized.weight,
                 scales: quantized.scales,
@@ -3355,8 +3393,8 @@ private class Gemma4MLP: Module {
                 bits: quantized.bits,
                 mode: quantized.mode,
                 activationSums: activationSums)
-        else { return layer(x) }
-        return tight
+        }
+        return tight ?? layer(x)
     }
 
     func callAsFunction(
@@ -3366,12 +3404,18 @@ private class Gemma4MLP: Module {
         // DMLP-002: one exact activation-sum prepass feeds both fallback
         // projections. If either projection is not the pinned affine8 cell,
         // the candidate arrays remain unevaluated and stock takes over.
-        let activationSums = producerSums ?? CBv2DenseMLPQMVV1.activationSums(for: x)
+        let validatedInput = CBv2DenseMLPQMVV1.validatedInput(x)
+        let activationSums = producerSums
+            ?? validatedInput.flatMap { CBv2DenseMLPQMVV1.activationSums(for: $0) }
         return denseProjection(
             downProj,
             gemma4GeluProduct(
-                denseProjection(gateProj, x, activationSums: activationSums),
-                denseProjection(upProj, x, activationSums: activationSums)))
+                denseProjection(
+                    gateProj, x, activationSums: activationSums,
+                    validatedInput: validatedInput),
+                denseProjection(
+                    upProj, x, activationSums: activationSums,
+                    validatedInput: validatedInput)))
     }
 
     // MARK: ZIP-ROUTER-001 stages
@@ -3388,15 +3432,21 @@ private class Gemma4MLP: Module {
     }
 
     fileprivate func zipGate(
-        _ x: MLXArray, _ activationSums: CBv2DenseMLPQMVV1.ActivationSums?
+        _ x: MLXArray, _ activationSums: CBv2DenseMLPQMVV1.ActivationSums?,
+        validatedInput: CBv2DenseMLPQMVV1.ValidatedInput
     ) -> MLXArray {
-        denseProjection(gateProj, x, activationSums: activationSums)
+        denseProjection(
+            gateProj, x, activationSums: activationSums,
+            validatedInput: validatedInput)
     }
 
     fileprivate func zipUp(
-        _ x: MLXArray, _ activationSums: CBv2DenseMLPQMVV1.ActivationSums?
+        _ x: MLXArray, _ activationSums: CBv2DenseMLPQMVV1.ActivationSums?,
+        validatedInput: CBv2DenseMLPQMVV1.ValidatedInput
     ) -> MLXArray {
-        denseProjection(upProj, x, activationSums: activationSums)
+        denseProjection(
+            upProj, x, activationSums: activationSums,
+            validatedInput: validatedInput)
     }
 
     fileprivate func zipDown(_ activated: MLXArray) -> MLXArray {
@@ -3551,13 +3601,21 @@ private enum Gemma4ZipRouterV1 {
         let expertScores = router.zipScores(
             MLX.depends(input: normed, dependencies: [sums.dependencyHandle]))
         let denseIn = MLX.depends(input: n1, dependencies: [normed])
-        let gate = mlp.zipGate(denseIn, sums)
-        let up = mlp.zipUp(denseIn, sums)
+        guard let validatedDenseIn = CBv2DenseMLPQMVV1.validatedInput(denseIn) else {
+            return nil
+        }
+        let gate = mlp.zipGate(
+            denseIn, sums, validatedInput: validatedDenseIn)
+        let up = mlp.zipUp(
+            denseIn, sums, validatedInput: validatedDenseIn)
 
         // Stage 3: the dense GeLU product, which the router has no partner
         // for -- the argPartition is deliberately NOT paired with it.
-        let held = MLX.depends(inputs: [gate, up], dependencies: [expertScores])
-        let activated = gemma4GeluProduct(held[0], held[1])
+        // The activation already waits for both operands, so only one input
+        // needs to carry the router ordering edge. Holding `gate` preserves the
+        // expertScores barrier while avoiding a second Depends output alias.
+        let heldGate = MLX.depends(input: gate, dependencies: [expertScores])
+        let activated = gemma4GeluProduct(heldGate, up)
 
         // Stage 4: router argPartition | dense down projection. The sort is
         // 8 us and the down projection 25 us, so this is the pairing that
@@ -4550,8 +4608,8 @@ public class Gemma4TextModelInner: Module {
         mmaHeadSums: Gemma4MMAQuantizedGEMV.ActivationSums?
     ) {
         // Shape queries cross the Swift/C boundary. Cache the two immutable
-        // input dimensions once rather than paying for them at every ladder
-        // policy check while the host is building the decode graph.
+        // input dimensions once rather than paying for them throughout the
+        // decoder-layer loop while the host is building the decode graph.
         let inputBatchSize = inputs.dim(0)
         let inputLength = inputs.dim(1)
 
@@ -4624,6 +4682,14 @@ public class Gemma4TextModelInner: Module {
         // no padding and no shared frontier to mask). In v2 mode every layer
         // (including KV-shared ones) has a cache object.
         let isCBv2 = fullCache.contains { ($0 as? (any CBv2AttendingLayerCache)) != nil }
+        let skipDecodeLastQueryPolicy =
+            gemma4DecodeLastQueryPolicySkipEnabled
+            && isCBv2 && !schedulePrefill
+            && inputBatchSize == 8 && inputLength == 1
+            && gemma4SupportsProductionExpertTopology(config)
+        if skipDecodeLastQueryPolicy {
+            CBv2EngageMark.once("gemma4-b8-lastq-policy-skip")
+        }
         // All-contiguous banks expose one position chain. Snapshot it before
         // the first layer advances the chain, then reuse that same lazy array
         // for every Q/K RoPE call in this forward.
@@ -4682,10 +4748,42 @@ public class Gemma4TextModelInner: Module {
         // GLUE-003: one chain box per forward; layer L's fused tail hands
         // layer L+1 its input norm through it.
         let glueChain = Gemma4GlueChainBox()
+        // Function arguments are evaluated before the prefill-only predicate,
+        // so computing this inside the loop repeated its host-side policy work
+        // on every decoder layer, including single-token decode. Decode cannot
+        // submit prefill chunk evaluations; use zero as the dormant interval.
+        let effectivePrefillChunkEvalLayers = schedulePrefill
+            ? gemma4EffectivePrefillChunkEvalLayers(
+                configured: gemma4PrefillChunkEvalLayers,
+                inputLength: inputLength)
+            : 0
+        // PREFIX-001 admission is invariant for the whole forward. Resolve it
+        // once rather than rebuilding the same fixed-B8 predicate in every
+        // decoder-layer invocation.
+        let enableDecodeAttentionBranchPrefix =
+            isCBv2 && !schedulePrefill
+            && inputBatchSize == 8 && inputLength == 1
+            && !capturePreNorm && dFlashHiddenCapture == nil
+        // Expert-prefill eligibility is invariant across decoder layers.
+        // Resolve it once rather than repeating the policy helper in the loop.
+        let useWeightedExpertUnsort = gemma4AllowsWeightedExpertUnsort(
+            schedulePrefill: schedulePrefill)
+        // The layer array is immutable during a forward pass.  Resolve its
+        // terminal index once rather than reloading count in every layer.
+        let finalLayerIndex = layers.count - 1
+
         for (idx, layer) in layers.enumerated() {
             let prevIdx = previousKvs[idx]
-            let sharedKV = intermediates[prevIdx].kv
-            let sharedPositionOffset = intermediates[prevIdx].positionOffset
+            // The current cache feeds both last-query capability selection and
+            // the layer call. Bind it once to avoid a second checked array
+            // subscript on every decoder layer.
+            let layerCache = fullCache[idx]
+            // Load the routed producer tuple once.  Both fields come from the
+            // same immutable per-layer snapshot, so this preserves routing
+            // while avoiding a second checked Array subscript in every layer.
+            let sharedIntermediate = intermediates[prevIdx]
+            let sharedKV = sharedIntermediate.kv
+            let sharedPositionOffset = sharedIntermediate.positionOffset
 
             // CBv2: KV-shared layers attend by borrowing the SOURCE layer's
             // cache object (attendBorrowing) instead of consuming raw K/V
@@ -4695,27 +4793,37 @@ public class Gemma4TextModelInner: Module {
                 isCBv2 && prevIdx != idx
                 ? fullCache[prevIdx] as? (any CBv2AttendingLayerCache) : nil
 
-            let mask = maskByType[layer.layerType]
+            // CBv2 never populates maskByType (legacy path only), so the
+            // scored decode path skips the per-layer dictionary lookup on an
+            // empty table entirely.
+            let mask = isCBv2 ? nil : maskByType[layer.layerType]
             // Prompt-path specializations, final layer only. Every earlier
             // layer runs the full chunk unchanged because later positions'
             // K/V depend on it.
             let isFinalPromptLayer =
                 schedulePrefill && isCBv2 && idx == layers.count - 1
-                && h.dim(0) > 0 && h.dim(1) >= gemma4PrefillTailMinChunk
+                && inputBatchSize > 0 && inputLength >= gemma4PrefillTailMinChunk
             let outputTailRows: Int? =
                 isFinalPromptLayer && gemma4PrefillTailRows > 0
-                ? min(gemma4PrefillTailRows, h.dim(1)) : nil
-            let useLastQueryPrefill = gemma4UseLastQueryPrefill(
-                config,
-                layerIdx: idx,
-                batchSize: h.dim(0),
-                sequenceLength: h.dim(1),
-                outputTailRows: outputTailRows,
-                hasCapableCache: fullCache[idx] is any CBv2LastQueryPrefillLayerCache)
+                ? min(gemma4PrefillTailRows, inputLength) : nil
+            let useLastQueryPrefill: Bool
+            if skipDecodeLastQueryPolicy {
+                useLastQueryPrefill = false
+            } else {
+                // Exact incumbent policy call, including eager shape queries
+                // and cache-capability cast, for prefill and every fallback.
+                useLastQueryPrefill = gemma4UseLastQueryPrefill(
+                    config,
+                    layerIdx: idx,
+                    batchSize: inputBatchSize,
+                    sequenceLength: inputLength,
+                    outputTailRows: outputTailRows,
+                    hasCapableCache: layerCache is any CBv2LastQueryPrefillLayerCache)
+            }
             let (out, kvPair, positionOffset) = layer(
                 h,
                 mask: mask,
-                cache: fullCache[idx],
+                cache: layerCache,
                 perLayerInput: perLayerInputs[idx],
                 sharedKV: sharedKV,
                 positionOffset: unifiedCBv2PositionOffset ?? sharedPositionOffset,
@@ -4726,15 +4834,11 @@ public class Gemma4TextModelInner: Module {
                 // Ordinary direct forwards keep the established reduction;
                 // enabling it there regressed the raw-prefill control without
                 // affecting the serving path selected by the benchmark.
-                isExpertPrefill: gemma4AllowsWeightedExpertUnsort(
-                    schedulePrefill: schedulePrefill),
+                isExpertPrefill: useWeightedExpertUnsort,
                 glueChain: glueChain,
-                nextInputLayernormWeight: idx + 1 < layers.count
+                nextInputLayernormWeight: idx < finalLayerIndex
                     ? layers[idx + 1].inputLayernorm.weight : nil,
-                enableAttentionBranchPrefix:
-                    isCBv2 && !schedulePrefill
-                    && inputBatchSize == 8 && inputLength == 1
-                    && !capturePreNorm && dFlashHiddenCapture == nil
+                enableAttentionBranchPrefix: enableDecodeAttentionBranchPrefix
             )
             h = out
             intermediates[idx] = (kvPair, positionOffset)
@@ -4744,8 +4848,9 @@ public class Gemma4TextModelInner: Module {
             // `layer` returns the recombined dense+sparse result. Submitting
             // only here starts the completed prefix early without serializing
             // those independent per-layer branches or changing any math.
-            if gemma4ShouldSubmitDecodeAsyncEvalLadder(
-                enabled: gemma4DecodeAsyncEvalLadderEnabled,
+            if gemma4DecodeAsyncEvalLadderEnabled
+                && gemma4ShouldSubmitDecodeAsyncEvalLadder(
+                    enabled: true,
                 schedulePrefill: schedulePrefill,
                 isCBv2: isCBv2,
                 batchSize: inputBatchSize,
@@ -4759,14 +4864,13 @@ public class Gemma4TextModelInner: Module {
             }
 
             let layerNumber = idx + 1
-            if gemma4ShouldSubmitPrefillChunkEval(
-                schedulePrefill: schedulePrefill,
-                isCBv2: isCBv2,
-                inputLength: inputLength,
-                layerNumber: layerNumber,
-                interval: gemma4EffectivePrefillChunkEvalLayers(
-                    configured: gemma4PrefillChunkEvalLayers,
-                    inputLength: inputLength))
+            if schedulePrefill
+                && gemma4ShouldSubmitPrefillChunkEval(
+                    schedulePrefill: schedulePrefill,
+                    isCBv2: isCBv2,
+                    inputLength: inputLength,
+                    layerNumber: layerNumber,
+                    interval: effectivePrefillChunkEvalLayers)
             {
                 asyncEval(h)
                 CBv2StepProfiler.recordEvent("v2.gemma4.prefill.chunk_eval")
@@ -4953,9 +5057,7 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         if lmHead == nil,
-            inputs.ndim == 2,
-            inputs.dim(0) == 8,
-            inputs.dim(1) == 1,
+            inputs.shape == [8, 1],
             let quantized = model.embedTokens as? QuantizedEmbedding,
             quantized.mode == .affine,
             quantized.groupSize == 64,

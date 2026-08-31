@@ -616,7 +616,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         MLXFast.metalKernel(
             name:
                 "cbv2_ragged8_ringwrite_sdpa_2pass_a_gqapair_vec4_bf16_d256_g2"
-                + "_b\(blocks)_v1",
+                + "_b\(blocks)_vr_v2",
             inputNames: [
                 "queries",
                 "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -722,11 +722,18 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         current ? new_key : keys + slot * D);
                     const device T4* v = reinterpret_cast<const device T4*>(
                         current ? new_value : values + slot * D);
+                    // The slot's V run is read in the same walk as its K
+                    // run and held in registers until the accumulator update
+                    // below. `v[chunk]` returns the identical word the
+                    // update read in place, and the score walk, the
+                    // reduction and the update keep their order.
+                    thread T4 value_vectors[vectors_per_lane];
                     float score_lo = 0.0f;
                     float score_hi = 0.0f;
                     #pragma clang loop unroll(full)
                     for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
                         const T4 key_vector = k[chunk];
+                        value_vectors[chunk] = v[chunk];
                         #pragma clang loop unroll(full)
                         for (int j = 0; j < 4; ++j) {
                             const float key_element = float(key_vector[j]);
@@ -749,7 +756,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     sum_hi = sum_hi * old_factor_hi + score_factor_hi;
                     #pragma clang loop unroll(full)
                     for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
-                        const T4 value_vector = v[chunk];
+                        const T4 value_vector = value_vectors[chunk];
                         #pragma clang loop unroll(full)
                         for (int j = 0; j < 4; ++j) {
                             const int element = chunk * 4 + j;
@@ -2243,17 +2250,18 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             fullRows.allSatisfy({ $0.absoluteOffset == offset }),
             fullRows.allSatisfy({ keyLength <= $0.maxLength })
         else { return nil }
+        // The buffer facts this admission needs — unpooled private storage,
+        // both buffers present, bfloat16, `kvHeads` and `headDim` as
+        // declared — are owned by the storage and recorded there where the
+        // buffers are created, grown or released
+        // (`CBv2FullSequenceKV.cbv2FullBufferState`). Reading the recorded
+        // signature replaces re-deriving the same facts from the arrays on
+        // every full-attention layer of every round. A row whose signature
+        // does not match returns nil and this whole path falls back, exactly
+        // as a failed field check did.
         for row in fullRows {
-            let state = row.cbv2InnerState()
-            guard state.count == 2,
-                state[0].dtype == .bfloat16,
-                state[1].dtype == .bfloat16,
-                state[0].ndim == 4,
-                state[0].dim(0) == 1,
-                state[0].dim(1) == kvHeads,
-                state[0].dim(3) == headDim,
-                state[1].shape == state[0].shape,
-                state[1].dtype == state[0].dtype
+            guard row.cbv2FullBufferState(
+                dtype: .bfloat16, kvHeads: kvHeads, headDim: headDim) != nil
             else { return nil }
         }
 
@@ -2272,10 +2280,22 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             _ = row.update(
                 keys: keys[index ..< (index + 1)],
                 values: values[index ..< (index + 1)])
-            let state = row.cbv2InnerState()
-            keyBuffers.append(state[0])
-            valueBuffers.append(state[1])
-            params.append(UInt32(state[0].dim(2)))
+            // `update` can grow the buffers, and the storage re-records the
+            // signature when it does, so the post-append capacity comes back
+            // with the buffers. The `cbv2InnerState` arm stays as the
+            // fallback for a row the signature does not describe.
+            if let state = row.cbv2FullBufferState(
+                dtype: .bfloat16, kvHeads: kvHeads, headDim: headDim)
+            {
+                keyBuffers.append(state.keys)
+                valueBuffers.append(state.values)
+                params.append(UInt32(state.capacity))
+            } else {
+                let state = row.cbv2InnerState()
+                keyBuffers.append(state[0])
+                valueBuffers.append(state[1])
+                params.append(UInt32(state[0].dim(2)))
+            }
         }
         let paramsArray = MLXArray(params)
 

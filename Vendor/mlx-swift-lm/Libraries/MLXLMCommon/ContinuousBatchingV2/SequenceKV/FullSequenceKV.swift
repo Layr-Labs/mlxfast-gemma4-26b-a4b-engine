@@ -212,6 +212,37 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
     private(set) var cohortPool: CBv2FullDecodeCohortPool?
     private(set) var cohortIndex: Int = -1
 
+    /// What the private K/V buffers currently are, recorded by the storage
+    /// owner where they are created, grown, or released. `nil` means there
+    /// is no private buffer pair to describe (never allocated, or migrated
+    /// into a pool).
+    struct BufferSignature {
+        let dtype: DType
+        let kvHeads: Int
+        let headDim: Int
+        let capacity: Int
+    }
+    private var bufferSignature: BufferSignature?
+
+    /// The private K/V buffers and their capacity, returned only when this
+    /// row is unpooled, both buffers exist, and the recorded signature
+    /// matches the caller's declared geometry and dtype. Any mismatch
+    /// returns nil and the caller keeps its established path.
+    func cbv2FullBufferState(
+        dtype expectedDType: DType, kvHeads expectedKVHeads: Int,
+        headDim expectedHeadDim: Int
+    ) -> (keys: MLXArray, values: MLXArray, capacity: Int)? {
+        guard cohortPool == nil,
+            let signature = bufferSignature,
+            signature.dtype == expectedDType,
+            signature.kvHeads == expectedKVHeads,
+            signature.headDim == expectedHeadDim,
+            let keys,
+            let values
+        else { return nil }
+        return (keys, values, signature.capacity)
+    }
+
     /// - Parameters:
     ///   - promptLength: expected prompt length, used to size the initial
     ///     allocation (`promptLength + 256`, capped at `maxLength`).
@@ -407,6 +438,7 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
             row.cohortIndex = index
             row.keys = nil
             row.values = nil
+            row.bufferSignature = nil
         }
         return pool
     }
@@ -420,6 +452,9 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
                 [1, kvHeads, capacity, keyTemplate.dim(3)], dtype: keyTemplate.dtype)
             values = MLXArray.zeros(
                 [1, kvHeads, capacity, valueTemplate.dim(3)], dtype: valueTemplate.dtype)
+            bufferSignature = BufferSignature(
+                dtype: keyTemplate.dtype, kvHeads: kvHeads,
+                headDim: keyTemplate.dim(3), capacity: capacity)
             return
         }
         guard needed > capacity else { return }
@@ -435,5 +470,8 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
             [values!, MLXArray.zeros([1, kvHeads, growth, values!.dim(3)], dtype: values!.dtype)],
             axis: 2)
         capacity = newCapacity
+        bufferSignature = BufferSignature(
+            dtype: keys!.dtype, kvHeads: kvHeads, headDim: keys!.dim(3),
+            capacity: capacity)
     }
 }

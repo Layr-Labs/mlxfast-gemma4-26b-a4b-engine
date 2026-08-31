@@ -189,6 +189,18 @@ public final class Gemma4A4BRuntimeWeightCache {
             expectedNames: Set(denseStore.tensorNames))
 
         let sanitized = model.sanitize(weights: weights)
+        // GATEUP-FUSE-PREFILL: `sanitize()`'s routed-expert branch
+        // (Gemma4Text.swift) concatenates each MoE layer's split gate/up
+        // planes into one storage and replaces `sanitized`'s gate_proj/
+        // up_proj entries with zero-copy slices of it, so this dictionary
+        // is the only remaining reference to the pre-concatenation raw
+        // planes. Dropping it now -- rather than after `eval(model)` below
+        // -- lets that eval retire each layer's raw planes as soon as that
+        // layer's concatenation evaluates, instead of holding every
+        // layer's raw planes resident for the whole graph evaluation.
+        // Harmless when the fuse never engages: `weights` is not read again
+        // after this point regardless.
+        weights = [:]
         try quantizeWithPerPathWidths(
             model: model, sanitized: sanitized, config: config)
         try model.update(

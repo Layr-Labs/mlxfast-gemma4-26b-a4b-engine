@@ -1016,6 +1016,35 @@ public struct WeightedExpertUnsortCarrier {
     let weights: MLXArray
 }
 
+/// GATEUP-FUSE-PREFILL kill switch. Unset (default) or any value other than
+/// `0`/`false`/`no`/`off` (case-insensitively) selects the fused sorted
+/// prefill gate|up gathered quantized matmul this file and
+/// `Gemma4Text.swift`'s routed-expert sanitize branch implement together;
+/// any of those values restores the incumbent split gate/up dispatch and
+/// leaves the split gate/up arrays exactly as loaded. `public` because
+/// `Gemma4Text.swift` -- a different module -- reads it too, to decide
+/// whether its sanitize pass builds the fused storage at all.
+public let gemma4PrefillGateUpFuseEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_PREFILL_GATEUP_FUSE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// The concatenated gate|up right-hand side GATEUP-FUSE-PREFILL installs on
+/// a routed-expert `SwitchGLU` at load time: `weight`/`scales`/`biases` with
+/// the gate columns in rows `0..<hiddenDims` and the up columns in rows
+/// `hiddenDims..<(2 * hiddenDims)`, per expert. Built once by
+/// `Gemma4Text.swift`'s sanitize pass by concatenating the checkpoint's
+/// already-loaded gate and up planes along their output axis; the layer's
+/// `gate_proj`/`up_proj` parameters are bound to zero-copy slices of these
+/// same arrays, so this storage duplicates no weight memory.
+private struct PrefillFusedGateUpStorage {
+    let weight: MLXArray
+    let scales: MLXArray
+    let biases: MLXArray?
+}
+
 public class SwitchGLU: Module {
     @ModuleInfo(key: "gate_proj") var gateProj: SwitchLinear?
     @ModuleInfo(key: "up_proj") var upProj: SwitchLinear?
@@ -1127,6 +1156,28 @@ public class SwitchGLU: Module {
         super.init()
     }
 
+    /// GATEUP-FUSE-PREFILL storage, installed at most once by the load-time
+    /// sanitize pass. A plain stored property -- never `@ModuleInfo` -- so
+    /// it is reflection-inert: `Module`'s parameter tree, quantization and
+    /// save/update machinery never sees it, never re-quantizes it and never
+    /// duplicates it into a checkpoint. `nil` on every layer this feature
+    /// does not apply to (including every non-Gemma-4-26B-A4B `SwitchGLU`
+    /// sharing this file), which keeps the incumbent split `gateProj`/
+    /// `upProj` dispatch as the permanent fallback.
+    private var prefillFusedGateUp: PrefillFusedGateUpStorage?
+
+    /// Install the fused gate|up storage this layer's load-time sanitize
+    /// pass built. `Gemma4Text.swift` calls this directly on the exact
+    /// production routed-expert layers, before quantization and parameter
+    /// binding run; every other layer never calls it and `projectExperts`
+    /// keeps the split dispatch.
+    public func installPrefillFusedGateUpStorage(
+        weight: MLXArray, scales: MLXArray, biases: MLXArray?
+    ) {
+        prefillFusedGateUp = PrefillFusedGateUpStorage(
+            weight: weight, scales: scales, biases: biases)
+    }
+
     private func projectExperts(
         _ x: MLXArray, _ indices: MLXArray
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
@@ -1157,7 +1208,30 @@ public class SwitchGLU: Module {
 
         let xGate: MLXArray
         let xUp: MLXArray
-        if let gateUpProj {
+        if prefillGateUpFuseEligible, let fused = prefillFusedGateUp,
+            lhsIndices == nil, doSort,
+            x.dtype == .bfloat16, idx.dtype == .uint32,
+            idx.size >= Swift.max(16, 4 * numExperts)
+        {
+            // GATEUP-FUSE-PREFILL: the sorted prefill plane (no lhs
+            // indices; at least the host's own `gather_qmm_rhs` kernel
+            // threshold of `max(16, 4 * numExperts)` assignments, which the
+            // eight-row decode cohort and every rectangular verification
+            // width fall under) issues one gathered quantized matmul
+            // against the concatenated gate|up storage instead of two. The
+            // GeGLU consumer below reads the two halves as views of that
+            // one result -- byte-identical to the split dispatch, because
+            // the concatenated weight/scales/biases are a pure copy of the
+            // split ones along the output axis and every output column
+            // still owns its own independent input-axis reduction.
+            CBv2EngageMark.once("prefill-gateup-fuse")
+            let xGateUp = MLX.gatherQuantizedMM(
+                x, fused.weight, scales: fused.scales, biases: fused.biases,
+                lhsIndices: nil, rhsIndices: idx, transpose: true,
+                groupSize: 64, bits: 4, mode: .affine, sortedIndices: true)
+            xGate = xGateUp[.ellipsis, ..<hiddenDims]
+            xUp = xGateUp[.ellipsis, hiddenDims...]
+        } else if let gateUpProj {
             let xGateUp = gateUpProj(
                 x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
             xGate = xGateUp[.ellipsis, ..<hiddenDims]
@@ -1242,6 +1316,45 @@ public class SwitchGLU: Module {
             && down.weight.dtype == .uint32
             && down.scales.dtype == .bfloat16
             && downBiases.dtype == .bfloat16
+    }
+
+    /// Cached GATEUP-FUSE-PREFILL eligibility, evaluated once per module for
+    /// the same reason ``expertPrefixBoundsProjectionsEligible`` is: the
+    /// shape/dtype bridge reads are measurable host cost on the hot path,
+    /// and the installed storage and its `gate_proj`/`up_proj` slices never
+    /// change after load.
+    private lazy var prefillGateUpFuseEligible: Bool =
+        supportsPrefillGateUpFuse()
+
+    /// Exact production geometry the fused storage was built for. Every
+    /// other `SwitchGLU` -- including one whose sanitize pass never called
+    /// ``installPrefillFusedGateUpStorage(weight:scales:biases:)`` -- keeps
+    /// the incumbent split `gateProj`/`upProj` dispatch, because
+    /// `prefillFusedGateUp` stays `nil` and this returns `false` on the
+    /// very first guard.
+    private func supportsPrefillGateUpFuse() -> Bool {
+        guard let fused = prefillFusedGateUp,
+            inputDims == 2816, hiddenDims == 704, numExperts == 128,
+            gateUpProj == nil,
+            let gate = gateProj as? QuantizedSwitchLinear,
+            let up = upProj as? QuantizedSwitchLinear,
+            gate.bias == nil, up.bias == nil,
+            gate.groupSize == 64, gate.bits == 4, gate.mode == .affine,
+            up.groupSize == 64, up.bits == 4, up.mode == .affine
+        else { return false }
+
+        guard fused.weight.dtype == .uint32,
+            fused.scales.dtype == .bfloat16,
+            fused.weight.shape == [128, 1408, 352],
+            fused.scales.shape == [128, 1408, 44]
+        else { return false }
+
+        guard let fusedBiases = fused.biases,
+            fusedBiases.dtype == .bfloat16,
+            fusedBiases.shape == [128, 1408, 44]
+        else { return false }
+
+        return true
     }
 
     private func legacyWeightedReduction(

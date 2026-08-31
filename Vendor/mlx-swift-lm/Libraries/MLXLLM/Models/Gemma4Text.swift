@@ -41,6 +41,16 @@ private let gemma4DecodeAsyncEvalLadderEnabled =
     resolveGemma4DecodeAsyncEvalLadderEnabled(
         ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_DECODE_ASYNC_EVAL_LADDER"])
+/// The final decoder boundary is submitted separately so the host can build
+/// its last layer while the completed prefix is already on the device.
+/// `DARKBLOOM_GEMMA4_DECODE_ASYNC_EVAL_TAIL=0` removes only this tail
+/// submission; the earlier ladder remains independently attributable.
+private let gemma4DecodeAsyncEvalLadderTailEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DECODE_ASYNC_EVAL_TAIL"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
 
 /// Pure, fail-closed policy for the Gemma 4 decode submission ladder.
 ///
@@ -82,6 +92,8 @@ internal func gemma4ShouldSubmitDecodeAsyncEvalLadder(
     switch layerIndex {
     case 0, 1:
         return true
+    case 29:
+        return gemma4DecodeAsyncEvalLadderTailEnabled
     default:
         return false
     }
@@ -4233,6 +4245,19 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
     private static let valuesPerThread = 4
     private static let threadgroupSize = axis / valuesPerThread
     private static let eps: Float = 1e-6
+    /// The x-sum leaders normally exchange 704 partials through threadgroup
+    /// memory. SIMD groups already contain each 16-value affine group, so this
+    /// route gathers those partials with shuffles and keeps the stock scalar
+    /// addition order. Set `DARKBLOOM_GEMMA4_FINAL_NORM_XSUM_SIMD=0` to retain
+    /// the threadgroup-memory implementation.
+    private static let simdXsumEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_FINAL_NORM_XSUM_SIMD"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }()
+
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_final_rmsnorm_mma_xsum_2816_bf16_v1",
@@ -4302,6 +4327,64 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
             """,
         ensureRowContiguous: true
     )
+    private static let sourceV2: String = {
+        var result = source
+
+        func replaceOnce(_ old: String, with new: String) {
+            precondition(result.components(separatedBy: old).count == 2)
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+
+        replaceOnce(
+            "threadgroup float quad_sums[704];\n",
+            with: ""
+        )
+        replaceOnce(
+            """
+            quad_sums[lid] = outv[0] + outv[1] + outv[2] + outv[3];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            """,
+            with: """
+            const float quad_sum = outv[0] + outv[1] + outv[2] + outv[3];
+            """
+        )
+        replaceOnce(
+            """
+            if ((lid % 16) == 0) {
+                float s = 0.0f;
+                for (uint c = 0; c < 8; ++c) {
+                    const uint q = lid + c * 2;
+                    s += quad_sums[q];
+                    s += quad_sums[q + 1];
+                }
+                xSums[row * 44 + lid / 16] = s;
+            }
+            """,
+            with: """
+            float s = 0.0f;
+            for (uint c = 0; c < 8; ++c) {
+                const uint source_lane =
+                    (simd_lane_id & 16u) + c * 2;
+                s += simd_shuffle(quad_sum, ushort(source_lane));
+                s += simd_shuffle(
+                    quad_sum, ushort(source_lane + 1));
+            }
+            if ((simd_lane_id & 15u) == 0u) {
+                xSums[row * 44 + lid / 16] = s;
+            }
+            """
+        )
+        return result
+    }()
+
+    private static let kernelV2: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_final_rmsnorm_mma_xsum_2816_bf16_v2_simd_shuffle",
+        inputNames: ["x", "w"],
+        outputNames: ["out", "xSums"],
+        source: sourceV2,
+        ensureRowContiguous: true
+    )
+
 
     static func apply(
         _ x: MLXArray, weight: MLXArray, eps: Float
@@ -4319,7 +4402,8 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
             weight.dim(0) == axis
         else { return nil }
 
-        let outputs = kernel(
+        let selectedKernel = simdXsumEnabled ? kernelV2 : kernel
+        let outputs = selectedKernel(
             [x, weight],
             template: [("T", x.dtype)],
             grid: (rows * threadgroupSize, 1, 1),
@@ -4330,7 +4414,10 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
         guard let sums = Gemma4MMAQuantizedGEMV.activationSums(
             produced: outputs[1], for: outputs[0])
         else { return nil }
-        CBv2EngageMark.once("final-norm-mma-xsum")
+        CBv2EngageMark.once(
+            simdXsumEnabled
+                ? "final-norm-mma-xsum-simd"
+                : "final-norm-mma-xsum")
         return (outputs[0], sums)
     }
 }
@@ -4753,6 +4840,9 @@ public class Gemma4TextModelInner: Module {
                 layerIndex: idx)
             {
                 asyncEval(h)
+                if layerIndex == 29 {
+                    CBv2EngageMark.once("gemma4-b8-decode-async-ladder-tail")
+                }
                 CBv2EngageMark.once("gemma4-b8-decode-async-ladder")
                 CBv2StepProfiler.recordEvent(
                     "v2.gemma4.decode.async_eval_ladder")

@@ -1531,6 +1531,304 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         ensureRowContiguous: true
     )
 
+    /// D512-KVEC4-001: the QK and AV dispatches read their K-plane / V-plane
+    /// tiles four elements at a time instead of one.
+    ///
+    /// The transcribed stock gemv body loads each 4-element run of a K tile
+    /// (and the AV body each 4-element run of a V tile) as four scalar BF16
+    /// loads — the one load pattern in the decode hot path still narrower
+    /// than VEC4-PASSA-001's starting point on the ring. Every one of those
+    /// runs is 8 contiguous bytes at an 8-byte-aligned address: the K/V
+    /// planes are the rows' whole backing allocations (buffer offset zero),
+    /// and each address is `plane + kv_head*capacity*D + row*D + bn` (QK,
+    /// `bn = lane*4 + i*128`) or `plane + (bm+tm)*D + out_col` (AV,
+    /// `out_col` a multiple of 4) — every term a multiple of 4 BF16
+    /// elements. Issuing each run as one `vec<T, 4>` load asks the same
+    /// bytes of the same cache line in one quarter of the instructions,
+    /// the exact lever `ee77bc4` measured at +1.37% of ranked decode on the
+    /// ring kernel (flat local null there too).
+    ///
+    /// Query and probability reads are NOT touched: their base offsets ride
+    /// upstream views (`queries`) or a runtime `key_length` stride
+    /// (`probs`), so their alignment is not provable, and they are the
+    /// cached small tensors besides. Loads move, adds do not: `inter[]`
+    /// still holds T values consumed by the identical mixed-precision FMA
+    /// chain in the identical order, so every score row and every output
+    /// element keeps its exact add sequence.
+    ///
+    /// Kill switch: `DARKBLOOM_GEMMA4_D512_VEC4_LOADS=0` restores the
+    /// scalar-load kernels, which stay in the file untouched.
+    static let d512Vec4LoadsEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_VEC4_LOADS"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// `qkSource` with the K-tile run loads vectorized (D512-KVEC4-001).
+    /// Shared by the plain and fenced kernel objects exactly like
+    /// `qkSource`, so the WRITE-022 structural-identity property is kept.
+    private static let qkSourceKVec4: String = """
+            constexpr int D = 512;
+            constexpr int GQA = 8;
+            typedef vec<T, 4> T4;
+
+            const int key_length = int(params[0]);
+            const int in_vec_size = int(params[1]);
+
+            const int n_chunks = (key_length + 63) / 64;
+            const int z = int(threadgroup_position_in_grid.z);
+            const int chunk = z % n_chunks;
+            const int row_kv = z / n_chunks;
+            const int row = row_kv / 2;
+            const int kv_head = row_kv % 2;
+            const int sg = int(simdgroup_index_in_threadgroup);
+            const int lane = int(thread_index_in_simdgroup);
+
+            const int row_capacity = int(params[2 + row]);
+
+            const device T* key_plane = k0;
+            switch (row) {
+                case 1: key_plane = k1; break;
+                case 2: key_plane = k2; break;
+                case 3: key_plane = k3; break;
+                case 4: key_plane = k4; break;
+                case 5: key_plane = k5; break;
+                case 6: key_plane = k6; break;
+                case 7: key_plane = k7; break;
+                default: break;
+            }
+            key_plane += size_t(kv_head) * size_t(row_capacity) * D;
+
+            const device T* query =
+                queries + size_t(row * 16 + kv_head * GQA) * D;
+            device T* score_rows =
+                scores + size_t(row * 16 + kv_head * GQA) * key_length;
+
+            const int virtual_groups = (key_length + 15) / 16;
+            const int vtg_lo = chunk * 4;
+            const int vtg_hi = min(vtg_lo + 4, virtual_groups);
+            const int n_iter = in_vec_size / 128;
+
+            for (int vtg = vtg_lo; vtg < vtg_hi; ++vtg) {
+                int out_row = vtg * 16 + sg * 4;
+                if (out_row >= key_length) continue;
+                out_row = out_row + 4 <= key_length
+                    ? out_row : key_length - 4;
+
+                const device T* mat = key_plane + size_t(out_row) * D;
+                float result[GQA][4] = {{0.0f}};
+                T inter[4];
+                float v_coeff[GQA][4];
+                int bn = lane * 4;
+                for (int i = 0; i < n_iter; ++i) {
+                    #pragma clang loop unroll(full)
+                    for (int h = 0; h < GQA; ++h) {
+                        #pragma clang loop unroll(full)
+                        for (int tn = 0; tn < 4; ++tn) {
+                            v_coeff[h][tn] = static_cast<float>(
+                                query[h * D + bn + tn]);
+                        }
+                    }
+                    int mat_offset = 0;
+                    #pragma clang loop unroll(full)
+                    for (int tm = 0; tm < 4; ++tm) {
+                        const T4 key_run = *reinterpret_cast<
+                            const device T4*>(mat + mat_offset + bn);
+                        #pragma clang loop unroll(full)
+                        for (int tn = 0; tn < 4; ++tn) {
+                            inter[tn] = key_run[tn];
+                        }
+                        #pragma clang loop unroll(full)
+                        for (int h = 0; h < GQA; ++h) {
+                            #pragma clang loop unroll(full)
+                            for (int tn = 0; tn < 4; ++tn) {
+                                result[h][tm] +=
+                                    inter[tn] * v_coeff[h][tn];
+                            }
+                        }
+                        mat_offset += D;
+                    }
+                    bn += 128;
+                }
+                #pragma clang loop unroll(full)
+                for (int h = 0; h < GQA; ++h) {
+                    #pragma clang loop unroll(full)
+                    for (int tm = 0; tm < 4; ++tm) {
+                        #pragma clang loop unroll(full)
+                        for (ushort delta = 16; delta >= 1; delta >>= 1) {
+                            result[h][tm] +=
+                                simd_shuffle_down(result[h][tm], delta);
+                        }
+                    }
+                }
+                if (lane == 0) {
+                    #pragma clang loop unroll(full)
+                    for (int h = 0; h < GQA; ++h) {
+                        #pragma clang loop unroll(full)
+                        for (int tm = 0; tm < 4; ++tm) {
+                            score_rows[
+                                size_t(h) * key_length + out_row + tm] =
+                                static_cast<T>(result[h][tm]);
+                        }
+                    }
+                }
+            }
+        """
+
+    private static let qkKVec4Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_qk_kvec4_bf16_g8_v1",
+        inputNames: [
+            "queries",
+            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+            "params",
+        ],
+        outputNames: ["scores"],
+        source: qkSourceKVec4,
+        ensureRowContiguous: true
+    )
+
+    private static let qkFencedKVec4Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_qk_kvec4_fenced_bf16_g8_v1",
+        inputNames: [
+            "queries",
+            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+            "params", "store_fence",
+        ],
+        outputNames: ["scores"],
+        source: qkSourceKVec4,
+        ensureRowContiguous: true
+    )
+
+    /// `avKernel` with the V-tile run loads vectorized (D512-KVEC4-001).
+    private static let avVVec4Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_av_vvec4_bf16_g8_v1",
+        inputNames: [
+            "probs",
+            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+            "params",
+        ],
+        outputNames: ["out"],
+        source: """
+            constexpr int D = 512;
+            constexpr int GQA = 8;
+            typedef vec<T, 4> T4;
+
+            const int key_length = int(params[0]);
+
+            const int z = int(threadgroup_position_in_grid.z);
+            const int tile = z % 8;
+            const int row_kv = z / 8;
+            const int row = row_kv / 2;
+            const int kv_head = row_kv % 2;
+            const int sg = int(simdgroup_index_in_threadgroup);
+            const int lane = int(thread_index_in_simdgroup);
+
+            const int row_capacity = int(params[2 + row]);
+
+            const device T* value_plane = v0;
+            switch (row) {
+                case 1: value_plane = v1; break;
+                case 2: value_plane = v2; break;
+                case 3: value_plane = v3; break;
+                case 4: value_plane = v4; break;
+                case 5: value_plane = v5; break;
+                case 6: value_plane = v6; break;
+                case 7: value_plane = v7; break;
+                default: break;
+            }
+            value_plane += size_t(kv_head) * size_t(row_capacity) * D;
+
+            const device T* prob_rows =
+                probs + size_t(row * 16 + kv_head * GQA) * key_length;
+
+            const int thrM = lane / 4;
+            const int thrN = lane % 4;
+            int bm = thrM * 4;
+            const int out_col = tile * 64 + (4 * sg + thrN) * 4;
+
+            float result[GQA][4] = {{0.0f}};
+            T inter[4];
+            float v_coeff[GQA][4];
+            const int n_iter = key_length / 32;
+            const int leftover = key_length - n_iter * 32;
+
+            for (int i = 0; i < n_iter; ++i) {
+                threadgroup_barrier(mem_flags::mem_none);
+                #pragma clang loop unroll(full)
+                for (int h = 0; h < GQA; ++h) {
+                    #pragma clang loop unroll(full)
+                    for (int tm = 0; tm < 4; ++tm) {
+                        v_coeff[h][tm] = static_cast<float>(
+                            prob_rows[size_t(h) * key_length + bm + tm]);
+                    }
+                }
+                #pragma clang loop unroll(full)
+                for (int tm = 0; tm < 4; ++tm) {
+                    const T4 value_run = *reinterpret_cast<const device T4*>(
+                        value_plane + size_t(bm + tm) * D + out_col);
+                    for (int tn = 0; tn < 4; ++tn) {
+                        inter[tn] = value_run[tn];
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int h = 0; h < GQA; ++h) {
+                        float vc = v_coeff[h][tm];
+                        for (int tn = 0; tn < 4; ++tn) {
+                            result[h][tn] += vc * inter[tn];
+                        }
+                    }
+                }
+                bm += 32;
+            }
+            if (leftover > 0) {
+                for (int tm = 0; tm < 4 && bm + tm < key_length; ++tm) {
+                    #pragma clang loop unroll(full)
+                    for (int h = 0; h < GQA; ++h) {
+                        v_coeff[h][tm] = static_cast<float>(
+                            prob_rows[size_t(h) * key_length + bm + tm]);
+                    }
+                    const T4 value_run = *reinterpret_cast<const device T4*>(
+                        value_plane + size_t(bm + tm) * D + out_col);
+                    #pragma clang loop unroll(full)
+                    for (int tn = 0; tn < 4; ++tn) {
+                        inter[tn] = value_run[tn];
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int h = 0; h < GQA; ++h) {
+                        #pragma clang loop unroll(full)
+                        for (int tn = 0; tn < 4; ++tn) {
+                            result[h][tn] += v_coeff[h][tm] * inter[tn];
+                        }
+                    }
+                }
+            }
+            #pragma clang loop unroll(full)
+            for (int h = 0; h < GQA; ++h) {
+                #pragma clang loop unroll(full)
+                for (int tn = 0; tn < 4; ++tn) {
+                    #pragma clang loop unroll(full)
+                    for (ushort delta = 4; delta >= 1; delta >>= 1) {
+                        result[h][tn] +=
+                            simd_shuffle_down(result[h][tn], 4 * delta);
+                    }
+                }
+            }
+            if (thrM == 0) {
+                #pragma clang loop unroll(full)
+                for (int h = 0; h < GQA; ++h) {
+                    device T* out_ptr = out
+                        + size_t(row * 16 + kv_head * GQA + h) * D
+                        + out_col;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        out_ptr[j] = static_cast<T>(result[h][j]);
+                    }
+                }
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
     // ATTRIBUTION. Everything in this WRITE-016-D512 section, and the
     // matching hunks in AttentionV1.swift and SequenceKV/FullSequenceKV.swift,
     // is taken VERBATIM from public ranked submission
@@ -2047,8 +2345,11 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             outputDTypes: [.int32]
         )[0]
 
+        if d512Vec4LoadsEnabled {
+            CBv2EngageMark.once("d512-kvec4-loads")
+        }
         let chunks = (keyLength + 63) / 64
-        let scores = qkFencedKernel(
+        let scores = (d512Vec4LoadsEnabled ? qkFencedKVec4Kernel : qkFencedKernel)(
             [queries] + keyBuffers + [paramsArray, storeFence],
             template: template,
             grid: (32, 4, batch * kvHeads * chunks),
@@ -2067,7 +2368,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             outputDTypes: [.bfloat16]
         )[0]
 
-        let output = avKernel(
+        let output = (d512Vec4LoadsEnabled ? avVVec4Kernel : avKernel)(
             [probs] + valueBuffers + [paramsArray],
             template: template,
             grid: (32, 4, batch * kvHeads * 8),
@@ -2285,7 +2586,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let scratchShape = [batch, queryHeads, 1, keyLength]
 
         let chunks = (keyLength + 63) / 64
-        let scores = qkKernel(
+        let scores = (d512Vec4LoadsEnabled ? qkKVec4Kernel : qkKernel)(
             [queries] + keyBuffers + [paramsArray],
             template: template,
             grid: (32, 4, batch * kvHeads * chunks),
@@ -2305,7 +2606,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             outputDTypes: [.bfloat16]
         )[0]
 
-        return avKernel(
+        return (d512Vec4LoadsEnabled ? avVVec4Kernel : avKernel)(
             [probs] + valueBuffers + [paramsArray],
             template: template,
             grid: (32, 4, batch * kvHeads * 8),

@@ -1033,7 +1033,7 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
 /// threadgroup, and each row keeps its own 64 threads and its own two
 /// simdgroups, so the reduction tree is the stock one row for row.
 private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
-    name: "gemma4_qkv_rms_norm_head_major_v2",
+    name: "gemma4_qkv_rms_norm_head_major_position_broadcast_v3",
     inputNames: [
         "q", "k", "q_weight", "k_weight",
         "position_offsets", "rope_freqs",
@@ -1067,7 +1067,18 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
                 const uint rem = row - b * (LQ * HQ);
                 const uint l = rem / HQ;
                 const uint h = rem - l * HQ;
-                row_position[slot] = l;
+                if (POSITION_BROADCAST) {
+                    // One lane publishes the token's complete RoPE position.
+                    // The existing post-normalization barrier below makes it
+                    // visible before any lane consumes the value.
+                    if (APPLY_ROPE && lid == 0) {
+                        row_position[slot] = l + position_offsets[b];
+                    }
+                } else {
+                    // Exact promoted fallback: every lane writes the token
+                    // offset and reloads the batch offset at consumption.
+                    row_position[slot] = l;
+                }
                 input = q + (size_t)row * D;
                 output = q_out + (((size_t)b * HQ + h) * LQ + l) * D;
             } else {
@@ -1077,7 +1088,13 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
                 const uint rem = krow - b * (LK * HK);
                 const uint l = rem / HK;
                 const uint h = rem - l * HK;
-                row_position[slot] = l;
+                if (POSITION_BROADCAST) {
+                    if (APPLY_ROPE && lid == 0) {
+                        row_position[slot] = l + position_offsets[b];
+                    }
+                } else {
+                    row_position[slot] = l;
+                }
                 const size_t off = (((size_t)b * HK + h) * LK + l) * D;
                 input = k + (size_t)krow * D;
                 weight = k_weight;
@@ -1141,8 +1158,9 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
             const uint b = row < Q_ROWS
                 ? row / (LQ * HQ)
                 : (row - Q_ROWS) / (LK * HK);
-            const float L =
-                static_cast<float>(row_position[slot] + position_offsets[b]);
+            const float L = POSITION_BROADCAST
+                ? static_cast<float>(row_position[slot])
+                : static_cast<float>(row_position[slot] + position_offsets[b]);
             for (uint i = 0; i < reads; ++i) {
                 const uint pair = lid * reads + i;
                 const float inv_freq = 1.0f / rope_freqs[pair];
@@ -1164,6 +1182,20 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
 private let gemma4QKVNormPrefillEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_GEMMA4_QKV_NORM_PREFILL"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// QKV-POSITION-BROADCAST-PREFILL: each prompt row has one RoPE position,
+/// but the promoted kernels make all 64/128 threads write the row-local token
+/// offset and make every active rotation thread reload the same batch offset.
+/// One lane now publishes their integer sum through the threadgroup scratch
+/// that already exists. The promoted norm-to-RoPE barrier is the publication
+/// fence. `DARKBLOOM_GEMMA4_QKV_NORM_PREFILL_POSITION_BROADCAST=0` restores
+/// the literal promoted write/read expressions inside the same JIT source.
+private let gemma4QKVNormPrefillPositionBroadcastEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_QKV_NORM_PREFILL_POSITION_BROADCAST"]
     else { return true }
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
@@ -1214,6 +1246,7 @@ private func gemma4FusedQKVNormHeadMajor(
             ("TOTAL_ROWS", rows), ("RPT", rowsPerGroup),
             ("LQ", lq), ("HQ", hq), ("LK", lk), ("HK", hk),
             ("APPLY_ROPE", fusedRope),
+            ("POSITION_BROADCAST", gemma4QKVNormPrefillPositionBroadcastEnabled),
         ],
         grid: (groups * rowsPerGroup * rowThreads, 1, 1),
         threadGroup: (rowsPerGroup * rowThreads, 1, 1),
@@ -1223,7 +1256,12 @@ private func gemma4FusedQKVNormHeadMajor(
         ],
         outputDTypes: [q.dtype, q.dtype, q.dtype]
     )
-    if fusedRope { CBv2EngageMark.once("qkv-norm-rope-prefill") }
+    if fusedRope {
+        CBv2EngageMark.once("qkv-norm-rope-prefill")
+        if gemma4QKVNormPrefillPositionBroadcastEnabled {
+            CBv2EngageMark.once("qkv-norm-rope-prefill-position-broadcast")
+        }
+    }
     return (outputs[0], outputs[1], outputs[2], fusedRope)
 }
 
@@ -1233,7 +1271,7 @@ private func gemma4FusedQKVNormHeadMajor(
 /// staging boundary. Structure extends the head-major twin; rotation is a
 /// line-for-line transcription of rope.metal's base path.
 private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
-    name: "gemma4_qkv_rms_norm_head_major_sliding_v1",
+    name: "gemma4_qkv_rms_norm_head_major_sliding_position_broadcast_v2",
     inputNames: [
         "q", "k", "v", "q_weight", "k_weight",
         "position_offsets", "rope_log2_base",
@@ -1281,7 +1319,16 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
             const uint rem = local_row - b * (l_count * h_count);
             const uint l = rem / h_count;
             const uint h = rem - l * h_count;
-            row_position[slot] = l;
+            if (POSITION_BROADCAST) {
+                // V rows never consume RoPE position scratch. For Q/K, one
+                // lane publishes the complete position before the unchanged
+                // post-normalization barrier.
+                if (APPLY_ROPE && weighted && lid == 0) {
+                    row_position[slot] = l + position_offsets[b];
+                }
+            } else {
+                row_position[slot] = l;
+            }
             output += (((size_t)b * h_count + h) * l_count + l) * D;
         }
 
@@ -1337,8 +1384,9 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
             const uint h_count = row < Q_ROWS ? HQ : HK;
             const uint l_count = row < Q_ROWS ? LQ : LK;
             const uint b = local_row / (l_count * h_count);
-            const float L =
-                static_cast<float>(row_position[slot] + position_offsets[b]);
+            const float L = POSITION_BROADCAST
+                ? static_cast<float>(row_position[slot])
+                : static_cast<float>(row_position[slot] + position_offsets[b]);
             for (uint i = 0; i < reads; ++i) {
                 const uint pair = lid * reads + i;
                 const float d = static_cast<float>(pair) / static_cast<float>(D / 2);
@@ -1405,6 +1453,7 @@ private func gemma4FusedQKVNormHeadMajorSliding(
             ("K_ROWS", kRows), ("TOTAL_ROWS", rows), ("RPT", rowsPerGroup),
             ("LQ", lq), ("HQ", hq), ("LK", lk), ("HK", hk),
             ("APPLY_ROPE", fusedRope),
+            ("POSITION_BROADCAST", gemma4QKVNormPrefillPositionBroadcastEnabled),
         ],
         grid: (groups * rowsPerGroup * rowThreads, 1, 1),
         threadGroup: (rowsPerGroup * rowThreads, 1, 1),
@@ -1414,7 +1463,12 @@ private func gemma4FusedQKVNormHeadMajorSliding(
         ],
         outputDTypes: [q.dtype, q.dtype, q.dtype]
     )
-    if fusedRope { CBv2EngageMark.once("qkv-norm-rope-prefill-sliding") }
+    if fusedRope {
+        CBv2EngageMark.once("qkv-norm-rope-prefill-sliding")
+        if gemma4QKVNormPrefillPositionBroadcastEnabled {
+            CBv2EngageMark.once("qkv-norm-rope-prefill-position-broadcast")
+        }
+    }
     return (outputs[0], outputs[1], outputs[2], fusedRope)
 }
 

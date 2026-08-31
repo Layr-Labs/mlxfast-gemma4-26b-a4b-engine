@@ -2438,6 +2438,16 @@ private enum Gemma4FusedLayerGlue {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Load the four contiguous expert features for one assignment as a
+    /// single aligned vector. The scalar body remains available as the
+    /// process-level fallback for attribution and rollback.
+    private static let deferredExpertVectorEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_DEFERRED_EXPERT_VEC4"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let rows = 8
     private static let axis = 2816
     private static let eps: Float = 1e-6
@@ -2885,8 +2895,39 @@ private enum Gemma4FusedLayerGlue {
             }
     """
 
+    /// The decode deferred expert reduction owns four adjacent hidden
+    /// features per lane. Read those four values once per assignment and
+    /// reuse the route weight for all four independent, ordered accumulators.
+    private static let deferredExpertValuesVectorSource = """
+            typedef vec<T, 4> T4;
+            T expertv[4];
+            expertv[0] = static_cast<T>(0.0f);
+            expertv[1] = static_cast<T>(0.0f);
+            expertv[2] = static_cast<T>(0.0f);
+            expertv[3] = static_cast<T>(0.0f);
+            const uint assignment_base = row * 8u;
+            #pragma clang loop unroll(full)
+            for (uint slot = 0u; slot < 8u; ++slot) {
+                const uint assignment = assignment_base + slot;
+                const uint sorted_row = (uint)inverse[assignment];
+                const device T4* sorted_vector =
+                    reinterpret_cast<const device T4*>(
+                        sorted + sorted_row * 2816u + wbase);
+                const T4 sorted_values = sorted_vector[0];
+                const T route_weight = route_weights[assignment];
+                expertv[0] = expertv[0] + static_cast<T>(
+                    (float)sorted_values[0] * (float)route_weight);
+                expertv[1] = expertv[1] + static_cast<T>(
+                    (float)sorted_values[1] * (float)route_weight);
+                expertv[2] = expertv[2] + static_cast<T>(
+                    (float)sorted_values[2] * (float)route_weight);
+                expertv[3] = expertv[3] + static_cast<T>(
+                    (float)sorted_values[3] * (float)route_weight);
+            }
+    """
+
     private static let deferredTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1",
+        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v2",
         inputNames: [
             "a", "sorted", "inverse", "route_weights", "res",
             "w1", "w2", "w3", "s",
@@ -2902,7 +2943,8 @@ private enum Gemma4FusedLayerGlue {
             const uint base = row * 2816 + lid * 4;
             const uint wbase = lid * 4;
         \(rmsReduce("a", into: "local_inv[0]"))
-        \(deferredExpertValuesSource)
+        \(deferredExpertVectorEnabled
+            ? deferredExpertValuesVectorSource : deferredExpertValuesSource)
         \(rmsReduce("expertv", into: "local_inv[1]").replacingOccurrences(
             of: "(float)expertv[base + i]", with: "(float)expertv[i]"))
             const float inv1 = local_inv[0];
@@ -2931,7 +2973,7 @@ private enum Gemma4FusedLayerGlue {
 
     private static let deferredTailChainKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1",
+            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v2",
             inputNames: [
                 "a", "sorted", "inverse", "route_weights", "res",
                 "w1", "w2", "w3", "s", "wn",
@@ -2947,7 +2989,8 @@ private enum Gemma4FusedLayerGlue {
                 const uint base = row * 2816 + lid * 4;
                 const uint wbase = lid * 4;
             \(rmsReduce("a", into: "local_inv[0]"))
-            \(deferredExpertValuesSource)
+            \(deferredExpertVectorEnabled
+                ? deferredExpertValuesVectorSource : deferredExpertValuesSource)
             \(rmsReduce("expertv", into: "local_inv[1]").replacingOccurrences(
                 of: "(float)expertv[base + i]", with: "(float)expertv[i]"))
                 const float inv1 = local_inv[0];
@@ -3020,6 +3063,9 @@ private enum Gemma4FusedLayerGlue {
             nextInputNormWeight.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-deferred-expert-tail-chain")
+        if deferredExpertVectorEnabled {
+            CBv2EngageMark.once("glue-deferred-expert-vector")
+        }
         let outs = deferredTailChainKernel(
             [
                 mlpOut, expertRows.sortedOutputs, expertRows.inverseOrder,
@@ -3054,6 +3100,9 @@ private enum Gemma4FusedLayerGlue {
             layerScalar.size == 1, layerScalar.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-deferred-expert-tail")
+        if deferredExpertVectorEnabled {
+            CBv2EngageMark.once("glue-deferred-expert-vector")
+        }
         return deferredTailKernel(
             [
                 mlpOut, expertRows.sortedOutputs, expertRows.inverseOrder,

@@ -401,6 +401,56 @@ private let routeSimdRank64Kernel: MLXFast.MLXFastKernel =
         ensureRowContiguous: true
     )
 
+/// ROUTE-SIMD-RANK-PAIR-001: one SIMDgroup computes both assignment halves.
+///
+/// The incumbent launch has 64 threads, so its two SIMDgroups each load and
+/// broadcast the same 64-key route table before ranking only one half. This
+/// variant keeps one lane responsible for assignment `lane` and
+/// `32 + lane`; the two rank walks share the two broadcasts and the loaded
+/// keys, while each stable comparison still uses its original flat
+/// assignment index. It therefore emits the same stable permutation with one
+/// SIMDgroup and half the duplicated route-table traffic.
+///
+/// Kill switch: `DARKBLOOM_ROUTE_SIMD_RANK_PAIR=0` selects the incumbent
+/// two-SIMDgroup kernel. Engage mark: `route-simd-rank-paired`.
+private let routeSimdRank64PairedKernel: MLXFast.MLXFastKernel =
+    MLXFast.metalKernel(
+        name: "mlx_lm_route_simd_rank_scatter_m8_u32_n64_pair_v1",
+        inputNames: ["indices"],
+        outputNames: ["row_order", "sorted_keys", "inverse_order"],
+        source: """
+            const uint lane = thread_index_in_simdgroup;
+            const uint low_assignment = lane;
+            const uint high_assignment = 32u + lane;
+            const uint low_key = (uint)indices[low_assignment];
+            const uint high_key = (uint)indices[high_assignment];
+            const uint key_low = (uint)indices[lane];
+            const uint key_high = (uint)indices[32u + lane];
+            uint low_rank = 0;
+            uint high_rank = 0;
+            for (uint source = 0; source < 32; ++source) {
+                const uint other_low = simd_broadcast(key_low, ushort(source));
+                low_rank += (other_low < low_key)
+                    || (other_low == low_key && source < low_assignment);
+                high_rank += (other_low < high_key)
+                    || (other_low == high_key && source < high_assignment);
+                const uint other_high = simd_broadcast(key_high, ushort(source));
+                const uint high_source = 32u + source;
+                low_rank += (other_high < low_key)
+                    || (other_high == low_key && high_source < low_assignment);
+                high_rank += (other_high < high_key)
+                    || (other_high == high_key && high_source < high_assignment);
+            }
+            row_order[low_rank] = low_assignment / 8;
+            sorted_keys[low_rank] = low_key;
+            inverse_order[low_assignment] = low_rank;
+            row_order[high_rank] = high_assignment / 8;
+            sorted_keys[high_rank] = high_key;
+            inverse_order[high_assignment] = high_rank;
+        """,
+        ensureRowContiguous: true
+    )
+
 /// EXPERT-PREFIX-BOUNDS-001 carrier for the exact decode route table. The
 /// gathered-QMV host ABI has no spare buffer, so each sorted rhs-index word
 /// carries its expert plus the within-run bounds that the gather kernel needs:
@@ -456,6 +506,15 @@ private let routeSimdRank64Enabled: Bool = {
     else { return true }
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
+/// The paired ranker is the default decode geometry; disabling it keeps the
+/// original two-SIMDgroup implementation for bisecting.
+private let routeSimdRank64PairedEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_ROUTE_SIMD_RANK_PAIR"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 
 // MARK: - ROUTE-CSORT-64: fused counting-sort route table (donor port)
 
@@ -983,12 +1042,18 @@ public func gatherSortIndices(
         if expertPrefixBounds {
             CBv2EngageMark.once("expert-prefix-bounds")
         }
+        let paired = routeSimdRank64PairedEnabled && !expertPrefixBounds
+        if paired {
+            CBv2EngageMark.once("route-simd-rank-paired")
+        }
         let kernel = expertPrefixBounds
-            ? routeSimdRank64PrefixBoundsKernel : routeSimdRank64Kernel
+            ? routeSimdRank64PrefixBoundsKernel
+            : (paired ? routeSimdRank64PairedKernel : routeSimdRank64Kernel)
+        let threads = paired ? 32 : 64
         let outputs = kernel(
             [indices],
-            grid: (64, 1, 1),
-            threadGroup: (64, 1, 1),
+            grid: (threads, 1, 1),
+            threadGroup: (threads, 1, 1),
             outputShapes: [[64], [64], [64]],
             outputDTypes: [.uint32, .uint32, .uint32]
         )

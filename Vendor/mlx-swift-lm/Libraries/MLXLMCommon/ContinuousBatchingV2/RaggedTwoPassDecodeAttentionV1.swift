@@ -87,7 +87,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             return value > 0 && sequenceLength.isMultiple(of: value)
                 ? value : stockBlocks
         }
-        return min(8, stockBlocks)
+        return min(4, stockBlocks)
     }()
 
     /// Attribution: COMBINE-PACK-001 and COMBINE-HOIST-001 below are adapted

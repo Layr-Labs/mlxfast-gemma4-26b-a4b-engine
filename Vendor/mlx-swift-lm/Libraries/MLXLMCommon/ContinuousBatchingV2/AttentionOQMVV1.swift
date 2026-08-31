@@ -247,6 +247,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
   // resident while the next group's are read. Addresses are functions of the
   // group index alone and `g_next` is clamped to the simdgroup's last group.
   uint2 wv_next = *((const device uint2*)(wrow + 32 * g0));
+  uint2 wv_next2 = *((const device uint2*)(wrow + 32 * (g0 + min(1, nGroups - 1))));
   T s_next = srow[g0];
   T b_next = brow[g0];
 
@@ -257,7 +258,9 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
     const float s = float(s_next);
     const float b = float(b_next);
     const int g_next = g0 + min(gi + 1, nGroups - 1);
-    wv_next = *((const device uint2*)(wrow + 32 * g_next));
+    const int g_next2 = g0 + min(gi + 2, nGroups - 1);
+    wv_next = wv_next2;
+    wv_next2 = *((const device uint2*)(wrow + 32 * g_next2));
     s_next = srow[g_next];
     b_next = brow[g_next];
     const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
@@ -310,7 +313,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
 """
 
     private static let mma8KernelK4096 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry_v3",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry2_v1",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -327,7 +330,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
         ensureRowContiguous: true)
 
     private static let mma8KernelK8192 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_carry_v3",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_carry2_v1",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """

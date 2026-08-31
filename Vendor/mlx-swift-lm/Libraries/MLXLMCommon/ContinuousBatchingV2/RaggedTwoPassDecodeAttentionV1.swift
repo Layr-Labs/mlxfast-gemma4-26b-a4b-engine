@@ -1202,7 +1202,10 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             constexpr int GQA = 8;
 
             const int key_length = int(params[0]);
-            const int in_vec_size = int(params[1]);
+            // Frozen: every dispatch passes params[1] == D (the kernels'
+            // own head width); constexpr control lets the 4-trip QK outer
+            // loop unroll.
+            constexpr int in_vec_size = D;
 
             const int n_chunks = (key_length + 63) / 64;
             const int z = int(threadgroup_position_in_grid.z);
@@ -1236,7 +1239,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int virtual_groups = (key_length + 15) / 16;
             const int vtg_lo = chunk * 4;
             const int vtg_hi = min(vtg_lo + 4, virtual_groups);
-            const int n_iter = in_vec_size / 128;
+            constexpr int n_iter = in_vec_size / 128;
 
             for (int vtg = vtg_lo; vtg < vtg_hi; ++vtg) {
                 int out_row = vtg * 16 + sg * 4;
@@ -1261,9 +1264,16 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     int mat_offset = 0;
                     #pragma clang loop unroll(full)
                     for (int tm = 0; tm < 4; ++tm) {
+                        // D512-VEC4 (concept receipt: solver fkiene,
+                        // submission 2275db7): the four adjacent reads are
+                        // one aligned vec<T, 4> transaction; components are
+                        // consumed in the incumbent order.
+                        const vec<T, 4> inter_vec =
+                            *reinterpret_cast<const device vec<T, 4>*>(
+                                mat + mat_offset + bn);
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
-                            inter[tn] = mat[mat_offset + bn + tn];
+                            inter[tn] = inter_vec[tn];
                         }
                         #pragma clang loop unroll(full)
                         for (int h = 0; h < GQA; ++h) {
@@ -1303,7 +1313,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         """
 
     private static let qkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_qk_bf16_g8_v1",
+        name: "cbv2_ragged8_sdpa_d512_qk_bf16_g8_static_invec_vec4_v3",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -1315,7 +1325,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     )
 
     private static let qkFencedKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_qk_fenced_bf16_g8_v1",
+        name: "cbv2_ragged8_sdpa_d512_qk_fenced_bf16_g8_static_invec_vec4_v3",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -1424,7 +1434,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// butterfly for all 8 heads of the GQA group at once (shared V tile
     /// loads). params as dispatch 1.
     private static let avKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_v1",
+        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_vec4_v2",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -1486,9 +1496,12 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 }
                 #pragma clang loop unroll(full)
                 for (int tm = 0; tm < 4; ++tm) {
+                    const vec<T, 4> inter_vec =
+                        *reinterpret_cast<const device vec<T, 4>*>(
+                            value_plane + size_t(bm + tm) * D + out_col);
+                    #pragma clang loop unroll(full)
                     for (int tn = 0; tn < 4; ++tn) {
-                        inter[tn] = value_plane[
-                            size_t(bm + tm) * D + out_col + tn];
+                        inter[tn] = inter_vec[tn];
                     }
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
@@ -1507,10 +1520,14 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                         v_coeff[h][tm] = static_cast<float>(
                             prob_rows[size_t(h) * key_length + bm + tm]);
                     }
-                    #pragma clang loop unroll(full)
-                    for (int tn = 0; tn < 4; ++tn) {
-                        inter[tn] = value_plane[
-                            size_t(bm + tm) * D + out_col + tn];
+                    {
+                        const vec<T, 4> inter_vec =
+                            *reinterpret_cast<const device vec<T, 4>*>(
+                                value_plane + size_t(bm + tm) * D + out_col);
+                        #pragma clang loop unroll(full)
+                        for (int tn = 0; tn < 4; ++tn) {
+                            inter[tn] = inter_vec[tn];
+                        }
                     }
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
@@ -1570,7 +1587,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// served from `new_keys` during scoring, never from the slot being
     /// written, so no read races the store.
     private static let fusedQkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_qk_bf16_g8_v2",
+        name: "cbv2_ragged8_writesdpa_d512_qk_bf16_g8_static_invec_vec4_v4",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -1583,7 +1600,10 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             constexpr int GQA = 8;
 
             const int key_length = int(params[0]);
-            const int in_vec_size = int(params[1]);
+            // Frozen: every dispatch passes params[1] == D (the kernels'
+            // own head width); constexpr control lets the 4-trip QK outer
+            // loop unroll.
+            constexpr int in_vec_size = D;
 
             const int n_chunks = (key_length + 63) / 64;
             const int z = int(threadgroup_position_in_grid.z);
@@ -1635,7 +1655,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int virtual_groups = (key_length + 15) / 16;
             const int vtg_lo = chunk * 4;
             const int vtg_hi = min(vtg_lo + 4, virtual_groups);
-            const int n_iter = in_vec_size / 128;
+            constexpr int n_iter = in_vec_size / 128;
 
             for (int vtg = vtg_lo; vtg < vtg_hi; ++vtg) {
                 int out_row = vtg * 16 + sg * 4;
@@ -1666,9 +1686,16 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     if (!tile_has_new_token) {
                     #pragma clang loop unroll(full)
                     for (int tm = 0; tm < 4; ++tm) {
+                        // D512-VEC4 (concept receipt: solver fkiene,
+                        // submission 2275db7): the four adjacent reads are
+                        // one aligned vec<T, 4> transaction; components are
+                        // consumed in the incumbent order.
+                        const vec<T, 4> inter_vec =
+                            *reinterpret_cast<const device vec<T, 4>*>(
+                                mat + mat_offset + bn);
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
-                            inter[tn] = mat[mat_offset + bn + tn];
+                            inter[tn] = inter_vec[tn];
                         }
                         #pragma clang loop unroll(full)
                         for (int h = 0; h < GQA; ++h) {
@@ -1753,7 +1780,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// `new_values` rather than the cache slot the fused QK dispatch wrote,
     /// so this kernel has no read-after-in-place-write hazard at all.
     private static let fusedAvKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_v2",
+        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_vec4_v3",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -1820,9 +1847,12 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 if (bm + 4 <= key_length - 1) {
                 #pragma clang loop unroll(full)
                 for (int tm = 0; tm < 4; ++tm) {
+                    const vec<T, 4> inter_vec =
+                        *reinterpret_cast<const device vec<T, 4>*>(
+                            value_plane + size_t(bm + tm) * D + out_col);
+                    #pragma clang loop unroll(full)
                     for (int tn = 0; tn < 4; ++tn) {
-                        inter[tn] = value_plane[
-                            size_t(bm + tm) * D + out_col + tn];
+                        inter[tn] = inter_vec[tn];
                     }
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
@@ -1836,11 +1866,15 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 #pragma clang loop unroll(full)
                 for (int tm = 0; tm < 4; ++tm) {
                     const bool is_new_token = bm + tm == key_length - 1;
+                    const device T* row_src = is_new_token
+                        ? new_value_plane
+                        : value_plane + size_t(bm + tm) * D;
+                    const vec<T, 4> inter_vec =
+                        *reinterpret_cast<const device vec<T, 4>*>(
+                            row_src + out_col);
+                    #pragma clang loop unroll(full)
                     for (int tn = 0; tn < 4; ++tn) {
-                        inter[tn] = is_new_token
-                            ? new_value_plane[out_col + tn]
-                            : value_plane[
-                                  size_t(bm + tm) * D + out_col + tn];
+                        inter[tn] = inter_vec[tn];
                     }
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
@@ -1861,12 +1895,17 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                             prob_rows[size_t(h) * key_length + bm + tm]);
                     }
                     const bool is_new_token = bm + tm == key_length - 1;
+                    // The row's source plane is uniform across the four
+                    // components, so the branch selects one aligned vec.
+                    const device T* row_src = is_new_token
+                        ? new_value_plane
+                        : value_plane + size_t(bm + tm) * D;
+                    const vec<T, 4> inter_vec =
+                        *reinterpret_cast<const device vec<T, 4>*>(
+                            row_src + out_col);
                     #pragma clang loop unroll(full)
                     for (int tn = 0; tn < 4; ++tn) {
-                        inter[tn] = is_new_token
-                            ? new_value_plane[out_col + tn]
-                            : value_plane[
-                                  size_t(bm + tm) * D + out_col + tn];
+                        inter[tn] = inter_vec[tn];
                     }
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {

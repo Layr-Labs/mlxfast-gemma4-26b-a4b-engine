@@ -109,6 +109,16 @@ public enum Gemma4MMAQuantizedGEMV {
         }
     }()
 
+    /// DIRECT-GREEDY-TOP1 kill switch. Unset or 1 = enabled, 0 = disabled.
+    public static let directGreedyTop1Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_DIRECT_GREEDY_TOP1"]
+        else { return true }
+        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "0", "false", "no", "off": return false
+        default: return true
+        }
+    }()
+
     /// Which staging/MMA formulation runs. `DARKBLOOM_GEMMA4_MMA_HEAD_VERSION`
     /// is `1` for the fp32 scale-folded kernel, `2` for the bf16-operand kernel
     /// with a per-group diagonal rescale, and `3` for the bf16-operand kernel
@@ -2573,14 +2583,161 @@ public enum Gemma4MMAQuantizedGEMV {
         ensureRowContiguous: true
     )
 
-    /// Tied-head GEMV, or `nil` when any gate above fails.
-    ///
-    /// - Parameters:
-    ///   - x: activation, `[8, K]` or anything that flattens to it, bf16.
-    ///   - w: packed affine codes, `[N, K * bits / 32]` uint32.
-    ///   - scales: `[N, K / groupSize]`, same dtype as `x`.
-    ///   - biases: `[N, K / groupSize]`, same dtype as `x`.
-    /// - Returns: `[8, N]` in `x`'s dtype, or `nil`.
+    // MARK: - Direct Greedy Top-1 --- in-kernel argmax reduction (v27 base)
+
+    /// Folds the greedy top-1 reduction into the v27 kernel's accumulator
+    /// stores (inheriting the compile-time unrolled block walk). Emits
+    /// per-simdgroup partial winner pairs (bf16 value, uint32 token ID)
+    /// to a compact carrier buffer instead of materializing the full [8, N] logits.
+    private static let sourceV26Top1: String = {
+        var result = sourceV27
+
+        func replaceOnce(_ old: String, with new: String) {
+            let count = result.components(separatedBy: old).count
+            precondition(count == 2, "sourceV26Top1 replacement count \(count): \(old)")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+
+        replaceOnce(
+            """
+            const uint outputN0 = sgN0 + fragmentRow;
+            const uint outputN1 = outputN0 + N_PSG;
+            const uint outputN2 = outputN0 + N_PSG * 2;
+            const uint outputN3 = outputN0 + N_PSG * 3;
+            out[fragmentCol * N + outputN0] = T(acc0.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN0] = T(acc0.thread_elements()[1]);
+            out[fragmentCol * N + outputN1] = T(acc1.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN1] = T(acc1.thread_elements()[1]);
+            out[fragmentCol * N + outputN2] = T(acc2.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN2] = T(acc2.thread_elements()[1]);
+            out[fragmentCol * N + outputN3] = T(acc3.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN3] = T(acc3.thread_elements()[1]);
+            """,
+            with: """
+            const uint outputN0 = sgN0 + fragmentRow;
+            const uint outputN1 = outputN0 + N_PSG;
+            const uint outputN2 = outputN0 + N_PSG * 2;
+            const uint outputN3 = outputN0 + N_PSG * 3;
+            // HEAD-TILE-ARGMAX: the incumbent stores land in a threadgroup
+            // tile buffer instead of device logits; the tile is then reduced
+            // with the promoted parallel-argmax semantics (strictly greater,
+            // NaN excluded by bit test, smaller-index ties) whose choose() is
+            // associative and commutative, so ANY reduction shape yields the
+            // identical (value, index) pair. One writer per (row, tile).
+            threadgroup T tile_buf[8 * 128];
+            const uint tgTileBase = uint(threadgroup_position_in_grid.x) * 128u;
+            const uint c0 = outputN0 - tgTileBase;
+            const uint c1 = outputN1 - tgTileBase;
+            const uint c2 = outputN2 - tgTileBase;
+            const uint c3 = outputN3 - tgTileBase;
+            if (c0 < 128u) {
+                tile_buf[fragmentCol * 128u + c0] = T(acc0.thread_elements()[0]);
+                tile_buf[(fragmentCol + 1) * 128u + c0] = T(acc0.thread_elements()[1]);
+            }
+            if (c1 < 128u) {
+                tile_buf[fragmentCol * 128u + c1] = T(acc1.thread_elements()[0]);
+                tile_buf[(fragmentCol + 1) * 128u + c1] = T(acc1.thread_elements()[1]);
+            }
+            if (c2 < 128u) {
+                tile_buf[fragmentCol * 128u + c2] = T(acc2.thread_elements()[0]);
+                tile_buf[(fragmentCol + 1) * 128u + c2] = T(acc2.thread_elements()[1]);
+            }
+            if (c3 < 128u) {
+                tile_buf[fragmentCol * 128u + c3] = T(acc3.thread_elements()[0]);
+                tile_buf[(fragmentCol + 1) * 128u + c3] = T(acc3.thread_elements()[1]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            {
+                const uint lane2 = thread_index_in_simdgroup;
+                const uint sg2 = simdgroup_index_in_threadgroup;
+                const uint tileId = uint(threadgroup_position_in_grid.x);
+                for (uint rr = 0; rr < 2; ++rr) {
+                    const uint rowId = sg2 * 2 + rr;
+                    CBv2ArgMaxPairV1 best = {0u, Limits<float>::min};
+                    for (uint c = lane2; c < 128u; c += 32u) {
+                        const float value = float(tile_buf[rowId * 128u + c]);
+                        const bool is_nan =
+                            (as_type<uint>(value) & 0x7fffffffu) > 0x7f800000u;
+                        const uint index = tgTileBase + c;
+                        if (!is_nan && value > best.value) {
+                            best = {index, value};
+                        }
+                    }
+                    best = cbv2_argmax_simd_v1(best);
+                    if (lane2 == 0) {
+                        tile_values[rowId * TILES + tileId] = best.value;
+                        tile_indices[rowId * TILES + tileId] = best.index;
+                    }
+                }
+            }
+            """
+        )
+        return result
+    }()
+
+    private static let argmaxPairHeader = """
+        struct CBv2ArgMaxPairV1 {
+            uint index;
+            float value;
+        };
+
+        inline CBv2ArgMaxPairV1 cbv2_argmax_choose_v1(
+            CBv2ArgMaxPairV1 best, CBv2ArgMaxPairV1 current) {
+            if (best.value < current.value ||
+                (best.value == current.value && best.index > current.index)) {
+                return current;
+            }
+            return best;
+        }
+
+        inline CBv2ArgMaxPairV1 cbv2_argmax_simd_v1(CBv2ArgMaxPairV1 best) {
+            for (uint offset = 16; offset > 0; offset >>= 1) {
+                CBv2ArgMaxPairV1 neighbor = {
+                    simd_shuffle_down(best.index, offset),
+                    simd_shuffle_down(best.value, offset),
+                };
+                best = cbv2_argmax_choose_v1(best, neighbor);
+            }
+            return best;
+        }
+        """
+
+    private static let kernelV26Top1: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_affine4_qmv_m8_v27_headtile_argmax_v1",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["tile_values", "tile_indices"],
+        source: sourceV26Top1,
+        header: "#include <metal_simdgroup_matrix>\n#include <metal_simdgroup>\n"
+            + argmaxPairHeader,
+        ensureRowContiguous: true
+    )
+
+    /// Byte-duplicate of the promoted `cbv2_parallel_argmax_finalize_v1`
+    /// semantics, consuming head-emitted tile pairs (TILES as template).
+    private static let kernelHeadTileFinalize: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_headtile_argmax_finalize_v1",
+        inputNames: ["tile_values", "tile_indices"],
+        outputNames: ["tokens"],
+        source: """
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lane = thread_index_in_simdgroup;
+            CBv2ArgMaxPairV1 best = {0u, Limits<float>::min};
+            for (uint tile = lane; tile < TILES; tile += 32) {
+                const uint index = row * TILES + tile;
+                CBv2ArgMaxPairV1 current = {
+                    tile_indices[index], tile_values[index],
+                };
+                best = cbv2_argmax_choose_v1(best, current);
+            }
+            best = cbv2_argmax_simd_v1(best);
+            if (lane == 0) {
+                tokens[row] = int(best.index);
+            }
+            """,
+        header: argmaxPairHeader,
+        ensureRowContiguous: true
+    )
+
     public static func apply(
         x: MLXArray,
         w: MLXArray,
@@ -2682,5 +2839,135 @@ public enum Gemma4MMAQuantizedGEMV {
             outputDTypes: [x.dtype]
         )
         return outputs[0]
+    }
+
+    /// Fused tied-head GEMV with direct greedy top-1 reduction, or `nil` when any gate fails.
+    ///
+    /// - Parameters:
+    ///   - x: activation, `[8, K]` or `[8, 1, K]`, bf16.
+    ///   - w: packed affine codes, `[N, K * bits / 32]` uint32.
+    ///   - scales: `[N, K / groupSize]`, same dtype as `x`.
+    ///   - biases: `[N, K / groupSize]`, same dtype as `x`.
+    ///   - groupSize: affine group size (64).
+    ///   - bits: quantization bits (4).
+    ///   - activationSums: optional precomputed activation sums.
+    /// - Returns: `[8]` int32 token ids, or `nil`.
+    /// DIRECT-GREEDY-TOP1 admission for the weight-side statics alone: every
+    /// `applyTop1` guard that does not depend on the per-step activation. A
+    /// caller that must not run a model forward before knowing whether the
+    /// fused top-1 head can serve the step checks this FIRST, so the switch
+    /// and every geometry refusal resolve with ZERO forwards taken.
+    /// `applyTop1` remains the final authority on the x-dependent residue.
+
+    /// Second-stage reduction over head-emitted tile pairs. Internal so the
+    /// GPU tie-semantics tests can drive it with synthetic pairs.
+    public static func finalizeTilePairs(
+        values: MLXArray, indices: MLXArray, tiles: Int, rows: Int
+    ) -> MLXArray {
+        let tokenOutputs = kernelHeadTileFinalize(
+            [values, indices],
+            template: [("TILES", tiles)],
+            grid: (32, rows, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[rows]],
+            outputDTypes: [.int32]
+        )
+        return tokenOutputs[0]
+    }
+
+    public static func applyTop1AdmitsWeights(
+        w: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int
+    ) -> Bool {
+        guard enabled, directGreedyTop1Enabled else { return false }
+        guard version == 26 || version == 27 else { return false }
+        guard let biases else { return false }
+        guard groupSize == 64, bits == 4 else { return false }
+        guard scales.dtype == .bfloat16, biases.dtype == .bfloat16 else { return false }
+        guard w.dtype == .uint32 else { return false }
+        guard w.ndim == 2, scales.ndim == 2, biases.ndim == 2 else { return false }
+        let n = w.dim(0)
+        let selectedColsPerThreadgroup = colsPerThreadgroup * 4
+        guard n >= minOutputWidth, n % selectedColsPerThreadgroup == 0, (n / 32) % 256 == 0
+        else { return false }
+        let k = w.dim(1) * 32 / bits
+        guard k > 0, k % groupSize == 0, k % 8 == 0 else { return false }
+        guard scales.dim(0) == n, biases.dim(0) == n else { return false }
+        guard scales.dim(1) == k / groupSize, biases.dim(1) == k / groupSize else { return false }
+        return true
+    }
+
+    public static func applyTop1(
+        x: MLXArray,
+        w: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        activationSums: ActivationSums? = nil
+    ) -> MLXArray? {
+        guard enabled, directGreedyTop1Enabled else { return nil }
+        guard version == 26 || version == 27 else { return nil }
+        guard let biases else { return nil }
+        guard groupSize == 64, bits == 4 else { return nil }
+        guard x.dtype == .bfloat16, scales.dtype == .bfloat16, biases.dtype == .bfloat16
+        else { return nil }
+        guard w.dtype == .uint32 else { return nil }
+        guard w.ndim == 2, scales.ndim == 2, biases.ndim == 2 else { return nil }
+
+        // [8, K] or [8, 1, K] ONLY -- the decode cohort's own shape, eight
+        // BATCH rows at one position.
+        guard x.ndim == 2 || (x.ndim == 3 && x.dim(1) == 1) else { return nil }
+        guard x.dim(0) == mRows else { return nil }
+        let k = x.dim(-1)
+        guard k > 0, x.size == mRows * k else { return nil }
+
+        let n = w.dim(0)
+        let selectedColsPerThreadgroup = colsPerThreadgroup * 4
+        guard n >= minOutputWidth, n % selectedColsPerThreadgroup == 0 else { return nil }
+        guard k % groupSize == 0, k % 8 == 0 else { return nil }
+        guard w.dim(1) == k * bits / 32 else { return nil }
+        guard scales.dim(0) == n, biases.dim(0) == n else { return nil }
+        guard scales.dim(1) == k / groupSize, biases.dim(1) == k / groupSize else { return nil }
+
+        let flatX = x.reshaped([mRows, k])
+        let threadgroups = n / selectedColsPerThreadgroup
+        let sumCells = mRows * (k / groupSize)
+        let xSums: MLXArray
+        if let activationSums,
+            activationSums.values.dtype == .float32,
+            activationSums.values.ndim == 1,
+            activationSums.values.size == sumCells
+        {
+            xSums = activationSums.values
+        } else {
+            let sumThreads = 128
+            let sumThreadgroups = (sumCells + sumThreads - 1) / sumThreads
+            xSums = xSumKernel(
+                [flatX],
+                template: [("T", x.dtype), ("K", k)],
+                grid: (sumThreadgroups * sumThreads, 1, 1),
+                threadGroup: (sumThreads, 1, 1),
+                outputShapes: [[sumCells]],
+                outputDTypes: [.float32]
+            )[0]
+        }
+
+        let tiles = threadgroups
+        let tilePairs = kernelV26Top1(
+            [flatX, w, scales, biases, xSums],
+            template: [("T", x.dtype), ("K", k), ("N", n), ("TILES", tiles)],
+            grid: (threadgroups * threadsPerThreadgroup, 1, 1),
+            threadGroup: (threadsPerThreadgroup, 1, 1),
+            outputShapes: [[mRows, tiles], [mRows, tiles]],
+            outputDTypes: [.float32, .uint32]
+        )
+
+        return finalizeTilePairs(
+            values: tilePairs[0], indices: tilePairs[1],
+            tiles: tiles, rows: mRows)
     }
 }

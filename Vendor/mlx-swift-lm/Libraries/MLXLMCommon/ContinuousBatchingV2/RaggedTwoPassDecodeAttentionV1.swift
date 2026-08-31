@@ -1326,6 +1326,80 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         ensureRowContiguous: true
     )
 
+    /// D512-LASTCHUNK-WRITE: the final 64-row QK chunk is the only QK
+    /// threadgroup for a (row, KV head) that can read logical cache row kL-1.
+    /// Let that same group publish the new K/V words before entering the
+    /// established, branch-free QK score walk. This preserves WRITE-022's hot
+    /// loop while deleting its standalone store dispatch.
+    private static let qkLastChunkWritingSource: String = {
+        let anchor = """
+                key_plane += size_t(kv_head) * size_t(row_capacity) * D;
+
+                const device T* query =
+            """
+        let replacement = """
+                key_plane += size_t(kv_head) * size_t(row_capacity) * D;
+
+                // `chunk` is uniform for the complete 128-thread group.
+                // Four SIMDgroups use one unique linear index each, so the
+                // group copies each of the 512 K and V words exactly once.
+                if (chunk == n_chunks - 1) {
+                    const device T* value_plane = v0;
+                    switch (row) {
+                        case 1: value_plane = v1; break;
+                        case 2: value_plane = v2; break;
+                        case 3: value_plane = v3; break;
+                        case 4: value_plane = v4; break;
+                        case 5: value_plane = v5; break;
+                        case 6: value_plane = v6; break;
+                        case 7: value_plane = v7; break;
+                        default: break;
+                    }
+                    value_plane += size_t(kv_head) * size_t(row_capacity) * D;
+                    const int linear = sg * 32 + lane;
+                    device T* write_key = const_cast<device T*>(key_plane)
+                        + size_t(key_length - 1) * D + linear * 4;
+                    device T* write_value = const_cast<device T*>(value_plane)
+                        + size_t(key_length - 1) * D + linear * 4;
+                    const device T* src_key = new_keys
+                        + size_t(row * 2 + kv_head) * D + linear * 4;
+                    const device T* src_value = new_values
+                        + size_t(row * 2 + kv_head) * D + linear * 4;
+                    for (int element = 0; element < 4; ++element) {
+                        write_key[element] = src_key[element];
+                        write_value[element] = src_value[element];
+                    }
+                    // This group can now read its new K row through the
+                    // unmodified QK loop. Dispatch completion and the
+                    // existing scores -> softmax -> AV edge publish V.
+                    threadgroup_barrier(mem_flags::mem_device);
+                    if (row == 0 && kv_head == 0 && linear == 0) {
+                        fence[0] = write_fence[0] + 1;
+                    }
+                }
+
+                const device T* query =
+            """
+        // Exactly one insertion site keeps the generated score body
+        // structurally tied to the promoted qkSource.
+        precondition(qkSource.components(separatedBy: anchor).count == 2)
+        return qkSource.replacingOccurrences(of: anchor, with: replacement)
+    }()
+
+    private static let qkLastChunkWritingKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "cbv2_ragged8_sdpa_d512_qk_lastchunk_write_bf16_g8_v1",
+            inputNames: [
+                "queries",
+                "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+                "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+                "params", "new_keys", "new_values", "write_fence",
+            ],
+            outputNames: ["scores", "fence"],
+            source: qkLastChunkWritingSource,
+            ensureRowContiguous: true
+        )
+
     /// Dispatch 2 — softmax. A verbatim transcription of
     /// `softmax_single_row` (block_softmax_precise, AccT=float, N_READS=4)
     /// over the 128 score rows; the CALLER sizes the threadgroup exactly
@@ -1980,6 +2054,15 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// D512-LASTCHUNK-WRITE kill switch. Off restores WRITE-022's current
+    /// standalone ring-store dispatch followed by the fenced, stock QK body.
+    private static let lastChunkWriteEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_LASTCHUNK_WRITE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// WRITE-022: the fused append as its own 32 KiB dispatch placed before
     /// the STOCK three-kernel chain (byte-for-byte dispatch 1-3), fence-
     /// ordered. Removes the same 80 copy-on-write appends as the v2 fold
@@ -2053,26 +2136,44 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             ("T", queries.dtype)
         ]
         let scratchShape = [batch, queryHeads, 1, keyLength]
-
-        let storeFence = ringStoreKernel(
-            keyBuffers + valueBuffers
-                + [paramsArray, keys, values, previousWriteFence],
-            template: template,
-            grid: (128, 1, batch * kvHeads),
-            threadGroup: (128, 1, 1),
-            outputShapes: [[1]],
-            outputDTypes: [.int32]
-        )[0]
-
         let chunks = (keyLength + 63) / 64
-        let scores = qkFencedKernel(
-            [queries] + keyBuffers + [paramsArray, storeFence],
-            template: template,
-            grid: (32, 4, batch * kvHeads * chunks),
-            threadGroup: (32, 4, 1),
-            outputShapes: [scratchShape],
-            outputDTypes: [.bfloat16]
-        )[0]
+
+        let scores: MLXArray
+        let storeFence: MLXArray
+        if lastChunkWriteEnabled {
+            let outputs = qkLastChunkWritingKernel(
+                [queries] + keyBuffers + valueBuffers
+                    + [paramsArray, keys, values, previousWriteFence],
+                template: template,
+                grid: (32, 4, batch * kvHeads * chunks),
+                threadGroup: (32, 4, 1),
+                outputShapes: [scratchShape, [1]],
+                outputDTypes: [.bfloat16, .int32]
+            )
+            scores = outputs[0]
+            storeFence = outputs[1]
+            CBv2EngageMark.once("d512-lastchunk-write")
+        } else {
+            // Exact WRITE-022 fallback: separate store dispatch, then the
+            // untouched fenced QK body.
+            storeFence = ringStoreKernel(
+                keyBuffers + valueBuffers
+                    + [paramsArray, keys, values, previousWriteFence],
+                template: template,
+                grid: (128, 1, batch * kvHeads),
+                threadGroup: (128, 1, 1),
+                outputShapes: [[1]],
+                outputDTypes: [.int32]
+            )[0]
+            scores = qkFencedKernel(
+                [queries] + keyBuffers + [paramsArray, storeFence],
+                template: template,
+                grid: (32, 4, batch * kvHeads * chunks),
+                threadGroup: (32, 4, 1),
+                outputShapes: [scratchShape],
+                outputDTypes: [.bfloat16]
+            )[0]
+        }
 
         let softmaxThreads = ((keyLength + 3) / 4 + 31) / 32 * 32
         let probs = softmaxKernel(

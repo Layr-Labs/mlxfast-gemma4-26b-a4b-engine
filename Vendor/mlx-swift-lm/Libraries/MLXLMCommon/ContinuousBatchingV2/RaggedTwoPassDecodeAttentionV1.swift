@@ -791,6 +791,280 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             ensureRowContiguous: true
         )
 
+    /// VEC8-PASSA-001: the paired pass A issues each lane's K run and V run
+    /// as ONE 16-byte load instead of two 8-byte loads.
+    ///
+    /// A lane owns `D / 32 == 8` contiguous BF16 elements of the head — 16
+    /// bytes. VEC4-PASSA-001 issued that run as two `vec<T, 4>` loads because
+    /// `vec<T, 4>` is the widest bfloat vector Metal names, and the compiler
+    /// cannot merge the pair on its own: a `vec<T, 4>` pointer only asserts
+    /// 8-byte alignment, so the AIR keeps two 8-byte loads. Loading the run
+    /// as one `uint4` asserts the 16-byte alignment the addresses actually
+    /// have and halves the load-issue count again — the exact lever VEC4
+    /// measured at +1.37% of ranked decode (`ee77bc4`, flat local null) one
+    /// step further down.
+    ///
+    /// The alignment is provable for the RING buffers only: they are whole
+    /// `MLXArray.zeros` allocations (buffer offset 0), and every address the
+    /// token loop forms is `base + kv_head*N*D + lane*8 + slot*D` elements —
+    /// every term a multiple of 8 BF16 elements, i.e. 16 bytes. The
+    /// `new_keys`/`new_values` inputs are upstream projection views whose
+    /// buffer offset this kernel cannot prove, so the final token — the only
+    /// one ever served from them — is peeled out of the loop and keeps
+    /// VEC4's `vec<T, 4>` loads and pointer select verbatim. The peel splits
+    /// the incumbent's 128 iterations into 127 ring-only rounds plus one
+    /// tail round over the SAME tokens in the SAME order; every FMA, every
+    /// `simd_sum`, every `fast::exp`, and both accumulation chains are
+    /// character for character VEC4's, so each output element's add sequence
+    /// is unchanged. Loads move, adds do not.
+    ///
+    /// Kill switch: `DARKBLOOM_CBV2_DECODE_PAIRED_PASSA_VEC8=0` falls back
+    /// to the vec4 paired kernel, which stays in the file untouched.
+    static let gqaPairedPassAVec8Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_DECODE_PAIRED_PASSA_VEC8"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let fusedRingPassAPairedVec8Kernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name:
+                "cbv2_ragged8_ringwrite_sdpa_2pass_a_gqapair_vec8_bf16_d256_g2"
+                + "_b\(blocks)_v1",
+            inputNames: [
+                "queries",
+                "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+                "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+                "starts", "new_keys", "new_values", "write_fence",
+            ],
+            outputNames: ["partials", "sums", "maxs", "fence"],
+            source: """
+                constexpr int simd_width = 32;
+                constexpr int values_per_lane = D / simd_width;
+                constexpr int vectors_per_lane = values_per_lane / 4;
+                static_assert((N & (N - 1)) == 0, "ring length must be a power of two");
+                static_assert(GQA == 2, "this kernel pairs exactly two query heads");
+                static_assert(values_per_lane == 8, "one uint4 must cover a lane's K/V run");
+                static_assert(N % BLOCKS == 0, "the peel needs whole rounds");
+                constexpr uint ring_mask = uint(N - 1);
+                typedef vec<T, 4> T4;
+
+                const int kv_head = int(threadgroup_position_in_grid.x);
+                const int batch_index = int(threadgroup_position_in_grid.y);
+                const int block = int(threadgroup_position_in_grid.z);
+                const int query_head = GQA * kv_head;
+                const int batch_head = batch_index * 16 + query_head;
+                const int lane = int(thread_index_in_simdgroup);
+
+                const device T* keys = k0;
+                const device T* values = v0;
+                switch (batch_index) {
+                    case 1: keys = k1; values = v1; break;
+                    case 2: keys = k2; values = v2; break;
+                    case 3: keys = k3; values = v3; break;
+                    case 4: keys = k4; values = v4; break;
+                    case 5: keys = k5; values = v5; break;
+                    case 6: keys = k6; values = v6; break;
+                    case 7: keys = k7; values = v7; break;
+                    default: break;
+                }
+
+                const device T* query =
+                    queries + batch_head * D + lane * values_per_lane;
+                keys += kv_head * N * D + lane * values_per_lane;
+                values += kv_head * N * D + lane * values_per_lane;
+                const device T* new_key = new_keys
+                    + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
+                const device T* new_value = new_values
+                    + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
+                const uint ring_start = starts[batch_index];
+                const uint write_slot = (ring_start + ring_mask) & ring_mask;
+                if (block == 0) {
+                    device T4* write_key = reinterpret_cast<device T4*>(
+                        const_cast<device T*>(keys) + write_slot * D);
+                    device T4* write_value = reinterpret_cast<device T4*>(
+                        const_cast<device T*>(values) + write_slot * D);
+                    const device T4* source_key =
+                        reinterpret_cast<const device T4*>(new_key);
+                    const device T4* source_value =
+                        reinterpret_cast<const device T4*>(new_value);
+                    #pragma clang loop unroll(full)
+                    for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
+                        write_key[chunk] = source_key[chunk];
+                        write_value[chunk] = source_value[chunk];
+                    }
+                }
+                if (batch_index == 0 && kv_head == 0 && block == 0 && lane == 0) {
+                    fence[0] = write_fence[0] + 1;
+                }
+
+                device T* partial = partials
+                    + batch_head * BLOCKS * D + block * D + lane * values_per_lane;
+                device float* sum_out = sums + batch_head * BLOCKS + block;
+                device float* max_out = maxs + batch_head * BLOCKS + block;
+
+                thread float q_lo[values_per_lane];
+                thread float q_hi[values_per_lane];
+                thread float acc_lo[values_per_lane];
+                thread float acc_hi[values_per_lane];
+                {
+                    const device T4* query_lo =
+                        reinterpret_cast<const device T4*>(query);
+                    const device T4* query_hi =
+                        reinterpret_cast<const device T4*>(query + D);
+                    #pragma clang loop unroll(full)
+                    for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
+                        const T4 lo_vector = query_lo[chunk];
+                        const T4 hi_vector = query_hi[chunk];
+                        #pragma clang loop unroll(full)
+                        for (int j = 0; j < 4; ++j) {
+                            q_lo[chunk * 4 + j] = 1.0f * float(lo_vector[j]);
+                            q_hi[chunk * 4 + j] = 1.0f * float(hi_vector[j]);
+                            acc_lo[chunk * 4 + j] = 0.0f;
+                            acc_hi[chunk * 4 + j] = 0.0f;
+                        }
+                    }
+                }
+
+                uint slot = (ring_start + uint(block)) & ring_mask;
+                float max_lo = -3.402823466e+38F;
+                float max_hi = -3.402823466e+38F;
+                float sum_lo = 0.0f;
+                float sum_hi = 0.0f;
+                // Rounds 0..126: every token here is < N - 1, so it is always
+                // served from the ring — the provably 16-byte-aligned side.
+                // One uint4 per K run, one per V run, unpacked into the exact
+                // chunk vectors the vec4 body consumed in the exact order.
+                int token = block;
+                for (; token < N - BLOCKS; token += BLOCKS) {
+                    const uint4 key_raw = *reinterpret_cast<const device uint4*>(
+                        keys + slot * D);
+                    const uint4 value_raw = *reinterpret_cast<const device uint4*>(
+                        values + slot * D);
+                    const T4 key_chunks[2] = {
+                        as_type<T4>(key_raw.xy), as_type<T4>(key_raw.zw)};
+                    const T4 value_chunks[2] = {
+                        as_type<T4>(value_raw.xy), as_type<T4>(value_raw.zw)};
+                    float score_lo = 0.0f;
+                    float score_hi = 0.0f;
+                    #pragma clang loop unroll(full)
+                    for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
+                        const T4 key_vector = key_chunks[chunk];
+                        #pragma clang loop unroll(full)
+                        for (int j = 0; j < 4; ++j) {
+                            const float key_element = float(key_vector[j]);
+                            score_lo += q_lo[chunk * 4 + j] * key_element;
+                            score_hi += q_hi[chunk * 4 + j] * key_element;
+                        }
+                    }
+                    score_lo = simd_sum(score_lo);
+                    score_hi = simd_sum(score_hi);
+
+                    const float new_max_lo = max(max_lo, score_lo);
+                    const float new_max_hi = max(max_hi, score_hi);
+                    const float old_factor_lo = fast::exp(max_lo - new_max_lo);
+                    const float old_factor_hi = fast::exp(max_hi - new_max_hi);
+                    const float score_factor_lo = fast::exp(score_lo - new_max_lo);
+                    const float score_factor_hi = fast::exp(score_hi - new_max_hi);
+                    max_lo = new_max_lo;
+                    max_hi = new_max_hi;
+                    sum_lo = sum_lo * old_factor_lo + score_factor_lo;
+                    sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                    #pragma clang loop unroll(full)
+                    for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
+                        const T4 value_vector = value_chunks[chunk];
+                        #pragma clang loop unroll(full)
+                        for (int j = 0; j < 4; ++j) {
+                            const int element = chunk * 4 + j;
+                            const float value_element = float(value_vector[j]);
+                            acc_lo[element] = acc_lo[element] * old_factor_lo
+                                + score_factor_lo * value_element;
+                            acc_hi[element] = acc_hi[element] * old_factor_hi
+                                + score_factor_hi * value_element;
+                        }
+                    }
+
+                    slot = (slot + uint(BLOCKS)) & ring_mask;
+                }
+                // Round 127, token == block + N - BLOCKS: the only round that
+                // can hold logical token N - 1, served from new_keys /
+                // new_values whose alignment is not provable — so this round
+                // is character for character the vec4 body, T4 loads and
+                // pointer select included.
+                {
+                    const bool current = token == N - 1;
+                    const device T4* k = reinterpret_cast<const device T4*>(
+                        current ? new_key : keys + slot * D);
+                    const device T4* v = reinterpret_cast<const device T4*>(
+                        current ? new_value : values + slot * D);
+                    float score_lo = 0.0f;
+                    float score_hi = 0.0f;
+                    #pragma clang loop unroll(full)
+                    for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
+                        const T4 key_vector = k[chunk];
+                        #pragma clang loop unroll(full)
+                        for (int j = 0; j < 4; ++j) {
+                            const float key_element = float(key_vector[j]);
+                            score_lo += q_lo[chunk * 4 + j] * key_element;
+                            score_hi += q_hi[chunk * 4 + j] * key_element;
+                        }
+                    }
+                    score_lo = simd_sum(score_lo);
+                    score_hi = simd_sum(score_hi);
+
+                    const float new_max_lo = max(max_lo, score_lo);
+                    const float new_max_hi = max(max_hi, score_hi);
+                    const float old_factor_lo = fast::exp(max_lo - new_max_lo);
+                    const float old_factor_hi = fast::exp(max_hi - new_max_hi);
+                    const float score_factor_lo = fast::exp(score_lo - new_max_lo);
+                    const float score_factor_hi = fast::exp(score_hi - new_max_hi);
+                    max_lo = new_max_lo;
+                    max_hi = new_max_hi;
+                    sum_lo = sum_lo * old_factor_lo + score_factor_lo;
+                    sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                    #pragma clang loop unroll(full)
+                    for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
+                        const T4 value_vector = v[chunk];
+                        #pragma clang loop unroll(full)
+                        for (int j = 0; j < 4; ++j) {
+                            const int element = chunk * 4 + j;
+                            const float value_element = float(value_vector[j]);
+                            acc_lo[element] = acc_lo[element] * old_factor_lo
+                                + score_factor_lo * value_element;
+                            acc_hi[element] = acc_hi[element] * old_factor_hi
+                                + score_factor_hi * value_element;
+                        }
+                    }
+                }
+
+                if (lane == 0) {
+                    sum_out[0] = sum_lo;
+                    max_out[0] = max_lo;
+                    sum_out[BLOCKS] = sum_hi;
+                    max_out[BLOCKS] = max_hi;
+                }
+                {
+                    device T4* partial_lo = reinterpret_cast<device T4*>(partial);
+                    device T4* partial_hi =
+                        reinterpret_cast<device T4*>(partial + BLOCKS * D);
+                    #pragma clang loop unroll(full)
+                    for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
+                        T4 lo_vector;
+                        T4 hi_vector;
+                        #pragma clang loop unroll(full)
+                        for (int j = 0; j < 4; ++j) {
+                            lo_vector[j] = T(acc_lo[chunk * 4 + j]);
+                            hi_vector[j] = T(acc_hi[chunk * 4 + j]);
+                        }
+                        partial_lo[chunk] = lo_vector;
+                        partial_hi[chunk] = hi_vector;
+                    }
+                }
+            """,
+            ensureRowContiguous: true
+        )
+
     private static let passBKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name:
             "cbv2_ragged8_sdpa_2pass_b_direct_bf16_d256_b\(blocks)"
@@ -971,14 +1245,20 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         let summaryShape = [batch, queryHeads, 1, blocks]
         let paired = gqaPairedPassAEnabled && gqa == 2
         let vectorized = paired && gqaPairedPassAVec4Enabled && headDim % 4 == 0
+        let wide = vectorized && gqaPairedPassAVec8Enabled && headDim == 256
         if paired {
             CBv2EngageMark.once("decode-gqa-paired-passa")
         }
         if vectorized {
             CBv2EngageMark.once("decode-gqa-paired-passa-vec4")
         }
+        if wide {
+            CBv2EngageMark.once("decode-gqa-paired-passa-vec8")
+        }
         let pairedKernel =
-            vectorized ? fusedRingPassAPairedVec4Kernel : fusedRingPassAPairedKernel
+            wide
+            ? fusedRingPassAPairedVec8Kernel
+            : vectorized ? fusedRingPassAPairedVec4Kernel : fusedRingPassAPairedKernel
         let passA = (paired ? pairedKernel : fusedRingPassAKernel)(
             [queries] + keys + values
                 + [startArray, newKeys, newValues, previousWriteFence],

@@ -1348,11 +1348,22 @@ auto gemm_loop(
   NAXTile<AccumType, TM, TN> Dtile;
   Dtile.clear();
 
+  // Upstream #3941 (v0.32.1): simdgroups with an empty output extent skip
+  // the K loop and remainder entirely. Simdgroup-uniform, and every
+  // threadgroup_barrier below stays unconditional, so convergence holds.
+  const bool has_output = sgp_sm > 0 && sgp_sn > 0;
+
   int gemm_k_iterations_ = gemm_k_iterations_aligned;
 
   STEEL_PRAGMA_NO_UNROLL
   for (int kk0 = 0; kk0 < gemm_k_iterations_; kk0++) {
     threadgroup_barrier(mem_flags::mem_none);
+
+    if constexpr (!kAlignedM || !kAlignedN) {
+      if (!has_output) {
+        continue;
+      }
+    }
 
     STEEL_PRAGMA_NO_UNROLL
     for (int kk1 = 0; kk1 < BK; kk1 += SK) {
@@ -1397,6 +1408,12 @@ auto gemm_loop(
 
   if constexpr (!kAlignedK) {
     simdgroup_barrier(mem_flags::mem_none);
+
+    if constexpr (!kAlignedM || !kAlignedN) {
+      if (!has_output) {
+        return Dtile;
+      }
+    }
 
     const short rem_bk = K - gemm_k_iterations_ * BK;
 

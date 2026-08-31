@@ -264,6 +264,8 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
     s_next[t] = srow[t][g0];
     b_next[t] = brow[t][g0];
   }
+  uint4 r0_next = *((const device uint4*)(x0 + 64 * g0));
+  uint4 r1_next = *((const device uint4*)(x1 + 64 * g0));
 
 #pragma unroll
   for (int gi = 0; gi < nGroups; ++gi) {
@@ -278,6 +280,9 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
       s_cur[t] = float(s_next[t]);
       b_cur[t] = float(b_next[t]);
     }
+    const uint4 r0 = r0_next;
+    const uint4 r1 = r1_next;
+
     const int g_next = g0 + min(gi + 1, nGroups - 1);
 #pragma clang loop unroll(full)
     for (int t = 0; t < TILES; ++t) {
@@ -285,9 +290,8 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
       s_next[t] = srow[t][g_next];
       b_next[t] = brow[t][g_next];
     }
-
-    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
-    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+    r0_next = *((const device uint4*)(x0 + 64 * g_next));
+    r1_next = *((const device uint4*)(x1 + 64 * g_next));
 
     float2 rs = float2(mma8_runsum4<T>(r0), mma8_runsum4<T>(r1));
     rs += simd_shuffle_xor(rs, 2u);
@@ -369,7 +373,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
     private static let tilesPerGroup = 2
 
     private static let multiTileKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry_v3",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry_v4",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """

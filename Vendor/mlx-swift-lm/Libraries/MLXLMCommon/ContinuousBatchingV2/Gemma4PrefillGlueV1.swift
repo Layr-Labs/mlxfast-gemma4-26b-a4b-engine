@@ -96,6 +96,7 @@ public enum Gemma4PrefillGlueV1 {
             uint simd_group_id,
             float eps) {
           float acc = 0;
+          #pragma clang loop unroll(full)
           for (int i = 0; i < GLUE_NREADS; i++) {
             acc += xv[i] * xv[i];
           }
@@ -133,6 +134,7 @@ public enum Gemma4PrefillGlueV1 {
             thread float& inv_b) {
           float acc_a = 0;
           float acc_b = 0;
+          #pragma clang loop unroll(full)
           for (int i = 0; i < GLUE_NREADS; i++) {
             acc_a += av[i] * av[i];
             acc_b += bv[i] * bv[i];
@@ -181,6 +183,7 @@ public enum Gemma4PrefillGlueV1 {
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
 
             float xv[GLUE_NREADS];
+            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 xv[i] = static_cast<float>(x[base + i]);
             }
@@ -188,6 +191,7 @@ public enum Gemma4PrefillGlueV1 {
             const float inv = glue_inv_rms(
                 xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
 
+            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 // The stock pair stores `w * T(x*inv)` to bf16, then reads it
@@ -237,6 +241,7 @@ public enum Gemma4PrefillGlueV1 {
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
 
             float xv[GLUE_NREADS];
+            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 xv[i] = static_cast<float>(x[base + i]);
             }
@@ -246,6 +251,7 @@ public enum Gemma4PrefillGlueV1 {
             const float inv = glue_inv_rms(
                 xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
 
+            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 const T scaled = static_cast<T>(xv[i] * inv);
@@ -296,7 +302,11 @@ public enum Gemma4PrefillGlueV1 {
     /// permutation of the row order, and the inverse order is a permutation,
     /// so every plane row is written exactly once.
     ///
-    /// Kill switch: `DARKBLOOM_GEMMA4_PREFILL_PRENORM_GATHER` set to
+    /// The un-sorted expert norm was the only other output of `dualPreNorm`, so
+    /// `preNorm` and `preNormScatter` run as two separate dispatches:
+    /// `preNorm` is independent of the sort and starts immediately;
+    /// `preNormScatter` consumes `inverseOrder` and waits on the sort.
+    /// Kill switch: `DARKBLOOM_GEMMA4_PREFILL_PRENORM_GATHER`. Setting it to
     /// `0`/`false`/`no`/`off` restores `dualPreNorm` and the standalone
     /// gather. Engage mark: `prefill-prenorm-gather`.
     public static let prenormGatherEnabled: Bool = {
@@ -324,6 +334,7 @@ public enum Gemma4PrefillGlueV1 {
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
 
             float xv[GLUE_NREADS];
+            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 xv[i] = static_cast<float>(x[base + i]);
             }
@@ -331,6 +342,7 @@ public enum Gemma4PrefillGlueV1 {
             const float inv = glue_inv_rms(
                 xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
 
+            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 const T scaled = static_cast<T>(xv[i] * inv);
@@ -361,6 +373,7 @@ public enum Gemma4PrefillGlueV1 {
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
 
             float xv[GLUE_NREADS];
+            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 xv[i] = static_cast<float>(x[base + i]);
             }
@@ -372,6 +385,7 @@ public enum Gemma4PrefillGlueV1 {
             // stores for its second output; it is rounded to T here, once,
             // and copied verbatim to every sorted position.
             T normed[GLUE_NREADS];
+            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 const T scaled = static_cast<T>(xv[i] * inv);
@@ -385,6 +399,7 @@ public enum Gemma4PrefillGlueV1 {
             for (int k = 0; k < K; k++) {
                 const size_t pos = size_t(inverse[assignment_base + k]);
                 const size_t obase = pos * GLUE_AXIS + lid * GLUE_NREADS;
+                #pragma clang loop unroll(full)
                 for (int i = 0; i < GLUE_NREADS; i++) {
                     out[obase + i] = normed[i];
                 }
@@ -461,6 +476,7 @@ public enum Gemma4PrefillGlueV1 {
 
             float av[GLUE_NREADS];
             float bv[GLUE_NREADS];
+            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 av[i] = static_cast<float>(h1[base + i]);
                 bv[i] = static_cast<float>(h2[base + i]);
@@ -475,6 +491,7 @@ public enum Gemma4PrefillGlueV1 {
             // The branch sum stays in registers. The stock graph writes it to
             // bf16 between the norms and the final norm, so round it here.
             float tv[GLUE_NREADS];
+            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 const T n1 = static_cast<T>(w1[j] * static_cast<T>(av[i] * inv_a));
@@ -485,6 +502,7 @@ public enum Gemma4PrefillGlueV1 {
             const float inv_t = glue_inv_rms(
                 tv, local_sums_a, local_inv2, simd_lane_id, simd_group_id, GLUE_EPS);
 
+            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 const T normed = static_cast<T>(w3[j] * static_cast<T>(tv[i] * inv_t));
@@ -548,6 +566,7 @@ public enum Gemma4PrefillGlueV1 {
 
             float av[GLUE_NREADS];
             float bv[GLUE_NREADS];
+            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 av[i] = static_cast<float>(h1[base + i]);
                 bv[i] = static_cast<float>(h2[base + i]);
@@ -560,6 +579,7 @@ public enum Gemma4PrefillGlueV1 {
                 simd_lane_id, simd_group_id, GLUE_EPS, inv_a, inv_b);
 
             float tv[GLUE_NREADS];
+            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 const T n1 = static_cast<T>(w1[j] * static_cast<T>(av[i] * inv_a));
@@ -575,6 +595,7 @@ public enum Gemma4PrefillGlueV1 {
             // explicit here, so `out` is the same array either way.
             const T scalar = s[0];
             float ov[GLUE_NREADS];
+            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 const T normed3 = static_cast<T>(w3[j] * static_cast<T>(tv[i] * inv_t));
@@ -589,6 +610,7 @@ public enum Gemma4PrefillGlueV1 {
             const float inv_n = glue_inv_rms(
                 ov, local_sums_a, local_inv2, simd_lane_id, simd_group_id, GLUE_EPS);
 
+            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 normed[base + i] = wn[j] * static_cast<T>(ov[i] * inv_n);
@@ -652,10 +674,12 @@ public enum Gemma4PrefillGlueV1 {
 
             float av[GLUE_NREADS];
             float bv[GLUE_NREADS];
+            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint feature = lid * GLUE_NREADS + i;
                 av[i] = static_cast<float>(h1[base + i]);
                 T accumulator = (T)0;
+                #pragma clang loop unroll(full)
                 for (uint slot = 0; slot < 8; ++slot) {
                     const uint assignment = assignment_base + slot;
                     const uint sorted_row = (uint)inverse_order[assignment];
@@ -674,6 +698,7 @@ public enum Gemma4PrefillGlueV1 {
                 simd_lane_id, simd_group_id, GLUE_EPS, inv_a, inv_b);
 
             float tv[GLUE_NREADS];
+            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 const T n1 = static_cast<T>(
@@ -689,6 +714,7 @@ public enum Gemma4PrefillGlueV1 {
 
             const T scalar = s[0];
             float ov[GLUE_NREADS];
+            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 const T normed3 = static_cast<T>(
@@ -703,6 +729,7 @@ public enum Gemma4PrefillGlueV1 {
                 ov, local_sums_a, local_inv2,
                 simd_lane_id, simd_group_id, GLUE_EPS);
 
+            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 normed[base + i] =

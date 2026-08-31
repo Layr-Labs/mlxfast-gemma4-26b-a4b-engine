@@ -249,6 +249,8 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
   uint2 wv_next = *((const device uint2*)(wrow + 32 * g0));
   T s_next = srow[g0];
   T b_next = brow[g0];
+  uint4 r0_next = *((const device uint4*)(x0 + 64 * g0));
+  uint4 r1_next = *((const device uint4*)(x1 + 64 * g0));
 
 #pragma unroll
   for (int gi = 0; gi < nGroups; ++gi) {
@@ -256,12 +258,14 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
     const uint2 wv = wv_next;
     const float s = float(s_next);
     const float b = float(b_next);
+    const uint4 r0 = r0_next;
+    const uint4 r1 = r1_next;
     const int g_next = g0 + min(gi + 1, nGroups - 1);
     wv_next = *((const device uint2*)(wrow + 32 * g_next));
     s_next = srow[g_next];
     b_next = brow[g_next];
-    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
-    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+    r0_next = *((const device uint4*)(x0 + 64 * g_next));
+    r1_next = *((const device uint4*)(x1 + 64 * g_next));
 
     float2 rs = float2(mma8_runsum4<T>(r0), mma8_runsum4<T>(r1));
     rs += simd_shuffle_xor(rs, 2u);
@@ -310,7 +314,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
 """
 
     private static let mma8KernelK4096 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry_v3",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry_v4",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -327,7 +331,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
         ensureRowContiguous: true)
 
     private static let mma8KernelK8192 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_carry_v3",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_carry_v4",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """

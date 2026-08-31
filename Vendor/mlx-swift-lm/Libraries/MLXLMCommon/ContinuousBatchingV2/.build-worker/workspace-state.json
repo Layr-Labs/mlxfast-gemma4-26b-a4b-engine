@@ -1,0 +1,27 @@
+{
+  "object" : {
+    "artifacts" : [
+
+    ],
+    "dependencies" : [
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "mlx-swift",
+          "kind" : "fileSystem",
+          "location" : "/Users/gmh-chief/gemma/mlxfast-gemma4-26b-a4b/Vendor/mlx-swift",
+          "name" : "mlx-swift"
+        },
+        "state" : {
+          "name" : "fileSystem",
+          "path" : "/Users/gmh-chief/gemma/mlxfast-gemma4-26b-a4b/Vendor/mlx-swift"
+        },
+        "subpath" : "mlx-swift"
+      }
+    ],
+    "prebuilts" : [
+
+    ]
+  },
+  "version" : 7
+}

@@ -112,22 +112,34 @@ public func resetWeightedExpertUnsortStats() {
 /// permutation and writes `[tokens, hidden]` directly, avoiding that full
 /// `[tokens, topK, hidden]` intermediate.
 private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "weighted_expert_unsort",
+    name: "weighted_expert_unsort_v2_staged",
     inputNames: ["sorted_outputs", "inverse_order", "weights"],
     outputNames: ["output"],
     source: """
+        constexpr uint rows_per_threadgroup = 4;
         uint feature = thread_position_in_grid.x;
         uint token = thread_position_in_grid.y;
+        uint local_token = thread_position_in_threadgroup.y;
+        uint load_slot = thread_position_in_threadgroup.x;
+
+        threadgroup uint inverse_local[rows_per_threadgroup][K];
+        threadgroup T weights_local[rows_per_threadgroup][K];
+        if (load_slot < (uint)K) {
+            const uint assignment = token * (uint)K + load_slot;
+            inverse_local[local_token][load_slot] =
+                (uint)inverse_order[assignment];
+            weights_local[local_token][load_slot] = weights[assignment];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         T accumulator = (T)0;
-        const uint assignment_base = token * (uint)K;
+        #pragma unroll
         for (uint slot = 0; slot < (uint)K; ++slot) {
-            const uint assignment = assignment_base + slot;
-            const uint sorted_row = (uint)inverse_order[assignment];
+            const uint sorted_row = inverse_local[local_token][slot];
             // Preserve the legacy bfloat16 multiply-then-reduce rounding.
             const T weighted = (T)(
                 (float)sorted_outputs[sorted_row * threads_per_grid.x + feature]
-                * (float)weights[assignment]);
+                * (float)weights_local[local_token][slot]);
             accumulator = accumulator + weighted;
         }
         output[token * threads_per_grid.x + feature] = accumulator;

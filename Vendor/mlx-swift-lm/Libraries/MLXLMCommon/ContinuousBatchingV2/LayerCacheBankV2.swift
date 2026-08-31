@@ -196,6 +196,35 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
     }
 
     public func layerCaches(rowStates: [[CBv2SequenceKV?]]) -> [CBv2AttendingLayerCache] {
+        // The decode loop re-enters this method for every [B, 1] forward
+        // without changing membership. Compare against the retained anchors
+        // in place so the steady state does not allocate a new identity
+        // array just to discover that no rebind is needed. Keep the same
+        // fail-closed anchor check as the allocating path.
+        if hasBound, rowStates.count == boundRowIdentity.count {
+            var unchanged = true
+            for index in rowStates.indices {
+                var anchor: CBv2SequenceKV?
+                for state in rowStates[index] {
+                    if let state {
+                        anchor = state
+                        break
+                    }
+                }
+                guard let anchor else {
+                    preconditionFailure(
+                        "CBv2LayerCacheBank: row owns no storage at any layer")
+                }
+                if ObjectIdentifier(anchor) != boundRowIdentity[index] {
+                    unchanged = false
+                    break
+                }
+            }
+            if unchanged {
+                return caches
+            }
+        }
+
         let identity = rowStates.map { row -> ObjectIdentifier in
             guard let anchor = row.compactMap({ $0 }).first else {
                 preconditionFailure("CBv2LayerCacheBank: row owns no storage at any layer")

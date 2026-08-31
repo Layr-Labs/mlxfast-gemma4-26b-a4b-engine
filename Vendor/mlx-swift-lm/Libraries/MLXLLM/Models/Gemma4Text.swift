@@ -4235,7 +4235,7 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
     private static let eps: Float = 1e-6
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_final_rmsnorm_mma_xsum_2816_bf16_v1",
+        name: "gemma4_final_rmsnorm_mma_xsum_2816_bf16_v2_unroll",
         inputNames: ["x", "w"],
         outputNames: ["out", "xSums"],
         source: """
@@ -4252,6 +4252,7 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
 
             // Exact `rms_single_row<T, 4>` reduction for axis 2816.
             float acc = 0.0f;
+            #pragma clang loop unroll(full)
             for (int i = 0; i < 4; ++i) {
                 const float xi = x[base + i];
                 acc += xi * xi;
@@ -4275,6 +4276,7 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             T outv[4];
+            #pragma clang loop unroll(full)
             for (int i = 0; i < 4; ++i) {
                 // Preserve the stock RMSNorm's BF16 boundary exactly.
                 outv[i] = w[wbase + i]
@@ -4292,6 +4294,7 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
             // group. No SIMD reassociation is introduced.
             if ((lid % 16) == 0) {
                 float s = 0.0f;
+                #pragma clang loop unroll(full)
                 for (uint c = 0; c < 8; ++c) {
                     const uint q = lid + c * 2;
                     s += quad_sums[q];

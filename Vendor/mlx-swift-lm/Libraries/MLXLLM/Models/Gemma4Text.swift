@@ -1014,6 +1014,89 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
     """,
     ensureRowContiguous: true
 )
+private let gemma4SharedQNormRopeKernel = MLXFast.metalKernel(
+    name: "gemma4_shared_q_rms_norm_rope_v1",
+    inputNames: ["q", "q_weight", "position_offsets", "rope_log2_base", "rope_freqs"],
+    outputNames: ["q_out"],
+    source: """
+        constexpr uint reads = 4;
+        const uint row = threadgroup_position_in_grid.x;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint lane = thread_index_in_simdgroup;
+        const uint simd_group = simdgroup_index_in_threadgroup;
+
+        const device T* input = q + row * D + lid * reads;
+        const device T* weight = q_weight + lid * reads;
+        device T* output_row = q_out + row * D;
+
+        float sum = 0.0f;
+        for (uint i = 0; i < reads; ++i) {
+            const float value = float(input[i]);
+            sum += value * value;
+        }
+        sum = simd_sum(sum);
+
+        threadgroup float partials[32];
+        threadgroup float inverse_rms;
+        threadgroup T rounded[D];
+        if (simd_group == 0) partials[lane] = 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) partials[simd_group] = sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            sum = simd_sum(partials[lane]);
+            if (lane == 0) {
+                inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = 0; i < reads; ++i) {
+            const uint element = lid * reads + i;
+            const T normalized = T(float(input[i]) * inverse_rms);
+            rounded[element] = T(weight[i] * normalized);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (lid * reads < D / 2) {
+            const uint batch = row / Q_HEADS;
+            const float L = static_cast<float>(position_offsets[batch]);
+            for (uint i = 0; i < reads; ++i) {
+                const uint pair = lid * reads + i;
+                const float d = static_cast<float>(pair) / static_cast<float>(D / 2);
+                const float inv_freq = USE_FREQS
+                    ? 1.0f / rope_freqs[pair]
+                    : metal::exp2(-d * rope_log2_base[0]);
+                const float theta = L * inv_freq;
+                const float costheta = metal::fast::cos(theta);
+                const float sintheta = metal::fast::sin(theta);
+                const float x1 = static_cast<float>(rounded[pair]);
+                const float x2 = static_cast<float>(rounded[pair + D / 2]);
+                const float rx1 = x1 * costheta - x2 * sintheta;
+                const float rx2 = x1 * sintheta + x2 * costheta;
+                output_row[pair] = static_cast<T>(rx1);
+                output_row[pair + D / 2] = static_cast<T>(rx2);
+            }
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+/// Shared-KV layers still perform a Q RMSNorm and RoPE after borrowing the
+/// source layer's cache. On the ranked B=8/L=1 cell, keep that query-only
+/// path head-major from one dispatch instead of materializing the normalized
+/// row, transposing it, and dispatching RoPE separately.
+///
+/// `DARKBLOOM_GEMMA4_SHARED_Q_NORM_ROPE=0` restores the established two-stage
+/// path. The exact q-only cell is intentionally narrow; prefill, MTP
+/// rectangles, and non-contiguous or non-BF16 inputs fall through unchanged.
+private let gemma4SharedQNormRopeEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_SHARED_Q_NORM_ROPE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 
 /// QKVNORM-PREFILL-001: the prefill twin of `gemma4_b8_qkv_rms_norm_v1`.
 ///
@@ -1465,6 +1548,55 @@ private func gemma4FusedQKVNorm(
     if fusedRope { CBv2EngageMark.once("qkv-norm-rope") }
     return (outputs[0], outputs[1], outputs[2], fusedRope)
 }
+/// Return the head-major query tensor for a shared-KV decode layer. The
+/// position buffer is already the source layer's pre-update snapshot, so the
+/// fused kernel can apply the same per-row RoPE positions as the established
+/// qNorm -> transpose -> RoPE sequence without reading cache state.
+@inline(__always)
+private func gemma4FusedSharedQNormRope(
+    q: MLXArray,
+    qWeight: MLXArray,
+    eps: Float,
+    positionOffset: Gemma4.PositionOffset,
+    ropeParameters: Gemma4QKVRopeParameters
+) -> MLXArray? {
+    guard gemma4SharedQNormRopeEnabled,
+        eps == 1.0e-6,
+        case .batch(let positionOffsets) = positionOffset,
+        positionOffsets.dtype == .int32,
+        positionOffsets.shape == [8],
+        ropeParameters.log2Base.dtype == .float32,
+        ropeParameters.log2Base.size == 1,
+        ropeParameters.frequencies.dtype == .float32,
+        q.dtype == .bfloat16,
+        qWeight.dtype == .bfloat16,
+        q.ndim == 4,
+        q.dim(0) == 8,
+        q.dim(1) == 1,
+        q.dim(2) == 16,
+        (q.dim(3) == 256 || q.dim(3) == 512),
+        qWeight.shape == [q.dim(3)],
+        !ropeParameters.usesFrequencies
+            || ropeParameters.frequencies.size == q.dim(3) / 2
+    else { return nil }
+
+    let dimension = q.dim(3)
+    let threads = dimension / 4
+    let outputs = gemma4SharedQNormRopeKernel(
+        [q, qWeight, positionOffsets, ropeParameters.log2Base, ropeParameters.frequencies],
+        template: [
+            ("T", q.dtype), ("D", dimension), ("Q_HEADS", 16),
+            ("USE_FREQS", ropeParameters.usesFrequencies),
+        ],
+        grid: (8 * 16 * threads, 1, 1),
+        threadGroup: (threads, 1, 1),
+        outputShapes: [[8, 16, 1, dimension]],
+        outputDTypes: [q.dtype]
+    )
+    CBv2EngageMark.once("shared-q-norm-rope-decode")
+    return outputs[0]
+}
+
 
 private class ScaledLinear: Module {
     let weight: MLXArray
@@ -1933,8 +2065,21 @@ private class Gemma4Attention: Module {
                     K/V (threaded by Gemma4TextModelInner)
                     """)
             }
-            var queries = qNorm(queryRaw).transposed(0, 2, 1, 3)
-            queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: positionOffset)
+            let queries: MLXArray
+            if let fused = gemma4FusedSharedQNormRope(
+                q: queryRaw,
+                qWeight: qNorm.weight,
+                eps: config.rmsNormEps,
+                positionOffset: positionOffset,
+                ropeParameters: qkvRopeParameters)
+            {
+                queries = fused
+            } else {
+                var fallback = qNorm(queryRaw).transposed(0, 2, 1, 3)
+                fallback = gemma4ApplyRotaryPosition(
+                    rope, to: fallback, offset: positionOffset)
+                queries = fallback
+            }
             let outputDType = queries.dtype
             let attentionQueries =
                 outputDType == .float16 ? queries.asType(.float32) : queries

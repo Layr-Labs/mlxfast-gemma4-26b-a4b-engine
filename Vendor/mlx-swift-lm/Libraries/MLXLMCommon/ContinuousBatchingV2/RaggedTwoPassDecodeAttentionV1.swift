@@ -255,6 +255,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
 
             thread float q[values_per_lane];
             thread float accumulator[values_per_lane];
+            #pragma clang loop unroll(full)
             for (int element = 0; element < values_per_lane; ++element) {
                 q[element] = 1.0f * float(query[element]);
                 accumulator[element] = 0.0f;
@@ -266,6 +267,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 const device T* k = keys + slot * D;
                 const device T* v = values + slot * D;
                 float score = 0.0f;
+                #pragma clang loop unroll(full)
                 for (int element = 0; element < values_per_lane; ++element) {
                     score += q[element] * float(k[element]);
                 }
@@ -276,6 +278,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 const float score_factor = fast::exp(score - new_max);
                 max_score = new_max;
                 sum_exp_score = sum_exp_score * old_factor + score_factor;
+                #pragma clang loop unroll(full)
                 for (int element = 0; element < values_per_lane; ++element) {
                     accumulator[element] = accumulator[element] * old_factor
                         + score_factor * float(v[element]);
@@ -288,6 +291,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 sum_out[0] = sum_exp_score;
                 max_out[0] = max_score;
             }
+            #pragma clang loop unroll(full)
             for (int element = 0; element < values_per_lane; ++element) {
                 partial[element] = T(accumulator[element]);
             }
@@ -828,6 +832,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             out += batch_head * D + output_group * values_per_lane;
 
             thread float accumulator[values_per_lane];
+            #pragma clang loop unroll(full)
             for (int element = 0; element < values_per_lane; ++element) {
                 accumulator[element] = 0.0f;
             }
@@ -843,6 +848,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             thread float lane_factor[rounds];
             float sum_exp_score = 0.0f;
             float max_score = -3.402823466e+38F;
+            #pragma clang loop unroll(full)
             for (int round = 0; round < rounds; ++round) {
                 const int column = block_lane + COLS * round;
                 const bool live = column < BLOCKS;
@@ -855,23 +861,22 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             // bounded at COLS never leaves the set. It is the same tree the
             // full-width reduction ran over the live columns, with the rounds
             // that only folded in the identity dropped.
+            #pragma clang loop unroll(full)
             for (int stride = 1; stride < COLS; stride <<= 1) {
                 max_score =
                     max(max_score, simd_shuffle_xor(max_score, ushort(stride)));
             }
 
+            #pragma clang loop unroll(full)
             for (int round = 0; round < rounds; ++round) {
                 lane_factor[round] = fast::exp(lane_max[round] - max_score);
                 sum_exp_score += lane_factor[round] * lane_sum[round];
             }
+            #pragma clang loop unroll(full)
             for (int stride = 1; stride < COLS; stride <<= 1) {
                 sum_exp_score += simd_shuffle_xor(sum_exp_score, ushort(stride));
             }
-
-            // A lane's run of the column is contiguous, so it is read as
-            // four-wide vectors of the same element type. Each component is
-            // widened where it is multiplied, so every product and every
-            // accumulator update is the one the element walk performed.
+            #pragma clang loop unroll(full)
             for (int round = 0; round < rounds; ++round) {
                 const int column = block_lane + COLS * round;
                 if (column < BLOCKS) {
@@ -891,8 +896,10 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 }
             }
 
+            #pragma clang loop unroll(full)
             for (int element = 0; element < values_per_lane; ++element) {
                 float reduced = accumulator[element];
+                #pragma clang loop unroll(full)
                 for (int stride = 1; stride < COLS; stride <<= 1) {
                     reduced += simd_shuffle_xor(reduced, ushort(stride));
                 }

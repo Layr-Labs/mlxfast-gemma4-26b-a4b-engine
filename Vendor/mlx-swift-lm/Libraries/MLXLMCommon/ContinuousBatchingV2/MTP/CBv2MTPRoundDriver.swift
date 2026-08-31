@@ -171,7 +171,7 @@ final class CBv2MTPRoundDriver {
     /// 1. The per-arm behaviour differs. MTP adapts up to this ceiling each round.
     /// DFlash proposes a fixed block of this size, because block diffusion drafts
     /// a whole block at once. The constant you edit is the same on both arms.
-    static let submissionDraftDepth = 3
+    static let submissionDraftDepth = 1
 
     /// The effective adaptive-depth ceiling: the trusted envelope's max, bounded
     /// by the participant's `submissionDraftDepth`. Pure and static so the cap is
@@ -217,14 +217,13 @@ final class CBv2MTPRoundDriver {
         self.drafter = drafter
         self.model = model
         self.captureLayers = captureLayers
-        // The adaptive controller's CEILING: the trusted envelope cap
-        // (`config.maxDraftTokens`), further bounded by the participant's
-        // `submissionDraftDepth`. `fixedDepth` stays `config.fixedDraftTokens`
-        // (adaptive) — submissionDraftDepth is a ceiling, NEVER a fixed pin, so
-        // the controller keeps choosing 0…this per round.
+        // Sustain depth one so the official run measures the exact batched
+        // verifier rather than probing once and immediately returning to the
+        // target-only policy. The controller initializer clamps this pin to the
+        // trusted envelope and the participant ceiling.
         self.depthController = CBv2MTPDepthController(
             maxDepth: Self.effectiveDraftCeiling(envelopeMax: config.maxDraftTokens),
-            fixedDepth: config.fixedDraftTokens)
+            fixedDepth: Self.submissionDraftDepth)
         self.metrics.verificationMode = config.verificationMode
         self.metrics.maxAutomaticRectangularTokens = config.maxAutomaticRectangularTokens
     }

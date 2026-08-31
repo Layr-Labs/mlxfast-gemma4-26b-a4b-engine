@@ -46,17 +46,11 @@ final class CBv2MTPDepthController {
     /// PARTICIPANT POLICY LEVER (editable; the participant contract names
     /// this controller as the adaptive policy a submission may change).
     ///
-    /// This submission runs TARGET-ONLY: the controller never selects a
-    /// positive draft depth, so no seed step, no verify step, and no cost
-    /// probe is ever planned. The sealed verification mode for this track is
-    /// `.serialTarget`, where a depth-k round costs 1+k FULL target forwards;
-    /// the adaptive policy therefore converges to depth 0 on its own, but it
-    /// keeps re-proving that at every probe cadence (a seed step plus a
-    /// 1+k verify step) — pure loss on this arm. Pinning the policy at 0
-    /// removes those rounds. Every committed token is still produced by an
-    /// ordinary target decode step, so the emitted stream stays bit-identical
-    /// to serial decode.
-    static let speculationEnabled = false
+    /// Enable speculation for the exact B=8 depth-one verifier. The verifier
+    /// keeps every model-plane call at the ordinary `[8,1]` shape and builds
+    /// both serial columns in one lazy graph, avoiding the rectangular
+    /// numerical path and its M5 near-tie divergence.
+    static let speculationEnabled = true
 
     private struct CostState {
         var samples = 0

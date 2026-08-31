@@ -3925,10 +3925,17 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     }
     return;
   }
+  // KFIX-DOWN: the pairless arm walks its span tiles through the K-fixed
+  // sibling of the same body. WVEC and PF are both OFF, so the emitted loads
+  // and the arithmetic are `qmv_impl`'s own, statement for statement; the only
+  // difference is that K is the literal 704 the gemma4 gate has already
+  // proven, so the block count (2), the tail size (192 = 24 whole lane
+  // packets), `in_vec_size_w` (352) and `in_vec_size_g` (11) constant-fold
+  // instead of being recomputed on each of the span tile passes.
   for (int t = 0; t < gemma4_down_tile_span; t++) {
     uint3 tile_tid = tid;
     tile_tid.y = tid.y + uint(t);
-    qmv_impl<T, group_size, bits>(
+    qmv_affine4_g64_singles_impl<T, group_size, bits, 704, false, false>(
         tile_w,
         tile_scales,
         tile_biases,

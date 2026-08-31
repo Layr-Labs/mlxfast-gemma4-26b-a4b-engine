@@ -246,7 +246,18 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
   // Same register carry as the Q/K/V tier: one group's weight operands stay
   // resident while the next group's are read. Addresses are functions of the
   // group index alone and `g_next` is clamped to the simdgroup's last group.
+  //
+  // ATTNO-CARRY2-022: the codes run two groups ahead. One trip is eight
+  // matrix-unit steps and a three-step shuffle chain, well short of a device
+  // load's latency, so a single group of look-ahead covers only part of the
+  // stall. The scale and the bias stay one group ahead: two bytes each against
+  // the codes' eight, read from the neighbours' cache lines, and a second copy
+  // would spend registers on no additional stream. `gi` is monotone and
+  // `nGroups` is a compile-time 32 or 64 under `#pragma unroll`, so the hand-off
+  // is register renaming, not an emitted copy.
   uint2 wv_next = *((const device uint2*)(wrow + 32 * g0));
+  uint2 wv_next2 =
+      *((const device uint2*)(wrow + 32 * (g0 + min(1, nGroups - 1))));
   T s_next = srow[g0];
   T b_next = brow[g0];
 
@@ -257,7 +268,9 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
     const float s = float(s_next);
     const float b = float(b_next);
     const int g_next = g0 + min(gi + 1, nGroups - 1);
-    wv_next = *((const device uint2*)(wrow + 32 * g_next));
+    wv_next = wv_next2;
+    wv_next2 =
+        *((const device uint2*)(wrow + 32 * (g0 + min(gi + 2, nGroups - 1))));
     s_next = srow[g_next];
     b_next = brow[g_next];
     const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
@@ -310,7 +323,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
 """
 
     private static let mma8KernelK4096 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry_v3",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry2_v4",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -327,7 +340,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
         ensureRowContiguous: true)
 
     private static let mma8KernelK8192 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_carry_v3",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_carry2_v4",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """

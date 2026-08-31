@@ -1707,18 +1707,24 @@ public final class EngineLoopV2: @unchecked Sendable {
                         start: $0.start, count: $0.count)
                 }
                 let output: MLXArray
+                let eligibleParams = (group.samples && prefillFrontierCapture() == nil)
+                    ? group.rows.map(\.rec.request.sampling) : []
                 if spanContexts.contains(where: { $0 != nil }) {
-                    output = packedMultimodalChunksForward(
-                        tokens: inputs,
-                        starts: group.rows.map(\.start),
-                        multimodal: group.rows.map { multimodalByID[$0.rec.id] },
-                        spanContexts: spanContexts,
-                        caches: caches,
-                        requirement: requirement)
+                    output = CBv2OrderOnlyLogits.withOrderOnly(eligibleParams) {
+                        packedMultimodalChunksForward(
+                            tokens: inputs,
+                            starts: group.rows.map(\.start),
+                            multimodal: group.rows.map { multimodalByID[$0.rec.id] },
+                            spanContexts: spanContexts,
+                            caches: caches,
+                            requirement: requirement)
+                    }
                 } else {
-                    output = prefillOutput(
-                        tokens: inputs, inputEmbeddings: nil, caches: caches,
-                        requirement: requirement)
+                    output = CBv2OrderOnlyLogits.withOrderOnly(eligibleParams) {
+                        prefillOutput(
+                            tokens: inputs, inputEmbeddings: nil, caches: caches,
+                            requirement: requirement)
+                    }
                 }
                 cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
 
@@ -1765,6 +1771,8 @@ public final class EngineLoopV2: @unchecked Sendable {
             let requirement: CBv2PrefillRequirement =
                 row.samples ? .lastPositionLogits : .evaluationOnly
             let output: MLXArray
+            let eligibleParams = (row.samples && prefillFrontierCapture() == nil)
+                ? [rec.request.sampling] : []
             if let multimodal = multimodalByID[rec.id],
                 let spanContext = multimodal.chunkContext(start: row.start, count: row.count)
             {
@@ -1772,14 +1780,18 @@ public final class EngineLoopV2: @unchecked Sendable {
                 // spliced input embeddings + span attention masks. Chunks of
                 // the SAME request without spans fall through to the
                 // untouched text path (pure function of has-spans).
-                output = multimodalChunkForward(
-                    tokens: inputs, start: row.start, count: row.count,
-                    multimodal: multimodal, spanContext: spanContext, caches: caches,
-                    requirement: requirement)
+                output = CBv2OrderOnlyLogits.withOrderOnly(eligibleParams) {
+                    multimodalChunkForward(
+                        tokens: inputs, start: row.start, count: row.count,
+                        multimodal: multimodal, spanContext: spanContext, caches: caches,
+                        requirement: requirement)
+                }
             } else {
-                output = prefillOutput(
-                    tokens: inputs, inputEmbeddings: nil, caches: caches,
-                    requirement: requirement)
+                output = CBv2OrderOnlyLogits.withOrderOnly(eligibleParams) {
+                    prefillOutput(
+                        tokens: inputs, inputEmbeddings: nil, caches: caches,
+                        requirement: requirement)
+                }
             }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             if row.samples {

@@ -515,10 +515,26 @@ enum CBv2AttentionV1 {
                         }
                     }
 
+                    // KVQ-COHORTPACK: the rows below each pack their own decode
+                    // token's mirror bytes, so a cohort of B rows issues B pack
+                    // dispatches per sliding layer to quantize what arrived as
+                    // one `[B, kvHeads, 1, headDim]` tensor. Pack the cohort
+                    // once here and hand each row its slice: the kernel is the
+                    // per-row one with the row selector widened, so slice `i`
+                    // is byte for byte what row `i` would have produced. nil
+                    // whenever the cohort form does not apply, and each row
+                    // independently declines a slice whose shape is not its
+                    // mirror slot, so the per-row road stays reachable.
+                    let cohortPacked =
+                        portQuantActive
+                        ? CBv2WindowedSequenceKV.quantPackCohortGPU(
+                            keys: keys, values: values)
+                        : nil
                     for (index, row) in ringRows.enumerated() {
                         row.decodeRingWrite(
                             keys: keys[index ..< (index + 1)],
-                            values: values[index ..< (index + 1)])
+                            values: values[index ..< (index + 1)],
+                            cohortPacked: cohortPacked?[index])
                     }
                     let views = ringRows.compactMap { $0.decodeRingView }
                     // KVQ-PORT: the ring write above is the promoted stock

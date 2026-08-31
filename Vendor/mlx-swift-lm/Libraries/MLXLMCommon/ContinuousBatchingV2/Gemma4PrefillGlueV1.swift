@@ -96,6 +96,7 @@ public enum Gemma4PrefillGlueV1 {
             uint simd_group_id,
             float eps) {
           float acc = 0;
+          #pragma unroll
           for (int i = 0; i < GLUE_NREADS; i++) {
             acc += xv[i] * xv[i];
           }
@@ -166,7 +167,7 @@ public enum Gemma4PrefillGlueV1 {
     // MARK: - norm + residual (2 dispatches -> 1)
 
     private static let normResidualKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_norm_residual_2816_v1",
+        name: "gemma4_prefill_glue_norm_residual_2816_v2",
         inputNames: ["x", "w", "res"],
         outputNames: ["out"],
         source: """
@@ -222,7 +223,7 @@ public enum Gemma4PrefillGlueV1 {
     // MARK: - dual pre-norm (2 dispatches -> 1)
 
     private static let dualPreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_dual_prenorm_2816_v1",
+        name: "gemma4_prefill_glue_dual_prenorm_2816_v2",
         inputNames: ["x", "w1", "w2"],
         outputNames: ["out1", "out2"],
         source: """
@@ -280,7 +281,7 @@ public enum Gemma4PrefillGlueV1 {
     // MARK: - branch tail (5 dispatches -> 1)
 
     private static let tailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_tail_2816_v1",
+        name: "gemma4_prefill_glue_tail_2816_v2",
         inputNames: ["h1", "h2", "w1", "w2", "w3", "res2"],
         outputNames: ["out"],
         source: """
@@ -367,7 +368,7 @@ public enum Gemma4PrefillGlueV1 {
     /// stores `out`, so both cost one extra in-kernel reduction rather than a
     /// re-read of the row plus two launches.
     private static let tailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_tail_chain_2816_v1",
+        name: "gemma4_prefill_glue_tail_chain_2816_v2",
         inputNames: ["h1", "h2", "w1", "w2", "w3", "res2", "s", "wn"],
         outputNames: ["out", "normed"],
         source: """
@@ -468,7 +469,7 @@ public enum Gemma4PrefillGlueV1 {
     /// same `[tokens, hidden]` expert result. Produce each reduced expert value
     /// in the tail thread that consumes it, removing the intermediate tensor.
     private static let expertTailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_expert_unsort_tail_chain_2816_v1",
+        name: "gemma4_prefill_expert_unsort_tail_chain_2816_v2",
         inputNames: [
             "sorted", "inverse_order", "route_weights", "h1",
             "w1", "w2", "w3", "res2", "s", "wn",

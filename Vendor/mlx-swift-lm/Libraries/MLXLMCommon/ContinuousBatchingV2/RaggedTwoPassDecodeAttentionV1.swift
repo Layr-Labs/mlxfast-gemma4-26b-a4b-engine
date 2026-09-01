@@ -1935,7 +1935,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// butterfly for all 8 heads of the GQA group at once (shared V tile
     /// loads). params as dispatch 1.
     private static let avKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_xfold_v3",
+        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_pquad_v4",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -2002,10 +2002,18 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 }
                 #pragma clang loop unroll(full)
                 for (int h = 0; h < GQA; ++h) {
+                    // PQUAD: `bm` depends only on `thrM`, so the four lanes of
+                    // a quad (thrN = 0..3) need the identical four
+                    // probabilities and were each loading all four. Each lane
+                    // now loads the one at its own `thrN` and the quad
+                    // broadcasts, so the per-head probability traffic is one
+                    // device load instead of four. Same four values, same
+                    // order, so the accumulation is unchanged.
+                    const float p_lane = static_cast<float>(
+                        prob_rows[size_t(h) * key_length + bm + thrN]);
                     #pragma clang loop unroll(full)
                     for (int tm = 0; tm < 4; ++tm) {
-                        p_coeff[tm] = static_cast<float>(
-                            prob_rows[size_t(h) * key_length + bm + tm]);
+                        p_coeff[tm] = quad_shuffle(p_lane, ushort(tm));
                     }
                     #pragma clang loop unroll(full)
                     for (int tm = 0; tm < 4; ++tm) {

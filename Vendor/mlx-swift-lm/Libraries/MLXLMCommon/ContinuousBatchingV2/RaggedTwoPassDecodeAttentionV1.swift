@@ -1444,34 +1444,37 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
 
                 const device T* mat = key_plane + size_t(out_row) * D;
                 float result[GQA][4] = {{0.0f}};
-                T inter[4];
-                float v_coeff[GQA][4];
+                // KTILE: the 4x4 key tile is shared by all GQA heads, the
+                // query block is not. Staging the tile costs 16 halves and
+                // frees the 32-float per-head staging array.
+                T k_tile[4][4];
+                float q_coeff[4];
                 int bn = lane * 4;
                 for (int i = 0; i < n_iter; ++i) {
-                    #pragma clang loop unroll(full)
-                    for (int h = 0; h < GQA; ++h) {
-                        #pragma clang loop unroll(full)
-                        for (int tn = 0; tn < 4; ++tn) {
-                            v_coeff[h][tn] = static_cast<float>(
-                                query[h * D + bn + tn]);
-                        }
-                    }
                     int mat_offset = 0;
                     #pragma clang loop unroll(full)
                     for (int tm = 0; tm < 4; ++tm) {
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
-                            inter[tn] = mat[mat_offset + bn + tn];
+                            k_tile[tm][tn] = mat[mat_offset + bn + tn];
+                        }
+                        mat_offset += D;
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int h = 0; h < GQA; ++h) {
+                        #pragma clang loop unroll(full)
+                        for (int tn = 0; tn < 4; ++tn) {
+                            q_coeff[tn] = static_cast<float>(
+                                query[h * D + bn + tn]);
                         }
                         #pragma clang loop unroll(full)
-                        for (int h = 0; h < GQA; ++h) {
+                        for (int tm = 0; tm < 4; ++tm) {
                             #pragma clang loop unroll(full)
                             for (int tn = 0; tn < 4; ++tn) {
                                 result[h][tm] +=
-                                    inter[tn] * v_coeff[h][tn];
+                                    k_tile[tm][tn] * q_coeff[tn];
                             }
                         }
-                        mat_offset += D;
                     }
                     bn += 128;
                 }
@@ -1501,7 +1504,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         """
 
     private static let qkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_qk_bf16_g8_v1",
+        name: "cbv2_ragged8_sdpa_d512_qk_bf16_g8_ktile_v2",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -1513,7 +1516,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     )
 
     private static let qkFencedKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_qk_fenced_bf16_g8_v1",
+        name: "cbv2_ragged8_sdpa_d512_qk_fenced_bf16_g8_ktile_v2",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -1622,7 +1625,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// butterfly for all 8 heads of the GQA group at once (shared V tile
     /// loads). params as dispatch 1.
     private static let avKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_v1",
+        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_vtile_v2",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -1667,32 +1670,35 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int out_col = tile * 64 + (4 * sg + thrN) * 4;
 
             float result[GQA][4] = {{0.0f}};
-            T inter[4];
-            float v_coeff[GQA][4];
+            // VTILE: the 4x4 value tile is shared by all GQA heads, the
+            // probability block is not. Staging the tile costs 16 halves and
+            // frees the 32-float per-head staging array.
+            T v_tile[4][4];
+            float p_coeff[4];
             const int n_iter = key_length / 32;
             const int leftover = key_length - n_iter * 32;
 
             for (int i = 0; i < n_iter; ++i) {
                 threadgroup_barrier(mem_flags::mem_none);
                 #pragma clang loop unroll(full)
-                for (int h = 0; h < GQA; ++h) {
-                    #pragma clang loop unroll(full)
-                    for (int tm = 0; tm < 4; ++tm) {
-                        v_coeff[h][tm] = static_cast<float>(
-                            prob_rows[size_t(h) * key_length + bm + tm]);
+                for (int tm = 0; tm < 4; ++tm) {
+                    for (int tn = 0; tn < 4; ++tn) {
+                        v_tile[tm][tn] = value_plane[
+                            size_t(bm + tm) * D + out_col + tn];
                     }
                 }
                 #pragma clang loop unroll(full)
-                for (int tm = 0; tm < 4; ++tm) {
-                    for (int tn = 0; tn < 4; ++tn) {
-                        inter[tn] = value_plane[
-                            size_t(bm + tm) * D + out_col + tn];
+                for (int h = 0; h < GQA; ++h) {
+                    #pragma clang loop unroll(full)
+                    for (int tm = 0; tm < 4; ++tm) {
+                        p_coeff[tm] = static_cast<float>(
+                            prob_rows[size_t(h) * key_length + bm + tm]);
                     }
                     #pragma clang loop unroll(full)
-                    for (int h = 0; h < GQA; ++h) {
-                        float vc = v_coeff[h][tm];
+                    for (int tm = 0; tm < 4; ++tm) {
+                        float vc = p_coeff[tm];
                         for (int tn = 0; tn < 4; ++tn) {
-                            result[h][tn] += vc * inter[tn];
+                            result[h][tn] += vc * v_tile[tm][tn];
                         }
                     }
                 }
@@ -1701,20 +1707,17 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             if (leftover > 0) {
                 for (int tm = 0; tm < 4 && bm + tm < key_length; ++tm) {
                     #pragma clang loop unroll(full)
-                    for (int h = 0; h < GQA; ++h) {
-                        v_coeff[h][tm] = static_cast<float>(
-                            prob_rows[size_t(h) * key_length + bm + tm]);
-                    }
-                    #pragma clang loop unroll(full)
                     for (int tn = 0; tn < 4; ++tn) {
-                        inter[tn] = value_plane[
+                        v_tile[0][tn] = value_plane[
                             size_t(bm + tm) * D + out_col + tn];
                     }
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
+                        const float pc = static_cast<float>(
+                            prob_rows[size_t(h) * key_length + bm + tm]);
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
-                            result[h][tn] += v_coeff[h][tm] * inter[tn];
+                            result[h][tn] += pc * v_tile[0][tn];
                         }
                     }
                 }
@@ -1768,7 +1771,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// served from `new_keys` during scoring, never from the slot being
     /// written, so no read races the store.
     private static let fusedQkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_qk_bf16_g8_v2",
+        name: "cbv2_ragged8_writesdpa_d512_qk_bf16_g8_ktile_v3",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -1848,33 +1851,21 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 const bool tile_has_new_token =
                     out_row + 4 > key_length - 1;
                 float result[GQA][4] = {{0.0f}};
-                T inter[4];
-                float v_coeff[GQA][4];
+                // KTILE: the 4x4 key tile is shared by all GQA heads, the
+                // query block is not. Staging the tile costs 16 halves and
+                // frees the 32-float per-head staging array. The peel keeps
+                // both arms, it now only decides how the tile is filled.
+                T k_tile[4][4];
+                float q_coeff[4];
                 int bn = lane * 4;
                 for (int i = 0; i < n_iter; ++i) {
-                    #pragma clang loop unroll(full)
-                    for (int h = 0; h < GQA; ++h) {
-                        #pragma clang loop unroll(full)
-                        for (int tn = 0; tn < 4; ++tn) {
-                            v_coeff[h][tn] = static_cast<float>(
-                                query[h * D + bn + tn]);
-                        }
-                    }
                     int mat_offset = 0;
                     if (!tile_has_new_token) {
                     #pragma clang loop unroll(full)
                     for (int tm = 0; tm < 4; ++tm) {
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
-                            inter[tn] = mat[mat_offset + bn + tn];
-                        }
-                        #pragma clang loop unroll(full)
-                        for (int h = 0; h < GQA; ++h) {
-                            #pragma clang loop unroll(full)
-                            for (int tn = 0; tn < 4; ++tn) {
-                                result[h][tm] +=
-                                    inter[tn] * v_coeff[h][tn];
-                            }
+                            k_tile[tm][tn] = mat[mat_offset + bn + tn];
                         }
                         mat_offset += D;
                     }
@@ -1885,20 +1876,28 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                             out_row + tm == key_length - 1;
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
-                            inter[tn] = is_new_token
+                            k_tile[tm][tn] = is_new_token
                                 ? new_key_plane[bn + tn]
                                 : mat[mat_offset + bn + tn];
                         }
+                        mat_offset += D;
+                    }
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int h = 0; h < GQA; ++h) {
                         #pragma clang loop unroll(full)
-                        for (int h = 0; h < GQA; ++h) {
+                        for (int tn = 0; tn < 4; ++tn) {
+                            q_coeff[tn] = static_cast<float>(
+                                query[h * D + bn + tn]);
+                        }
+                        #pragma clang loop unroll(full)
+                        for (int tm = 0; tm < 4; ++tm) {
                             #pragma clang loop unroll(full)
                             for (int tn = 0; tn < 4; ++tn) {
                                 result[h][tm] +=
-                                    inter[tn] * v_coeff[h][tn];
+                                    k_tile[tm][tn] * q_coeff[tn];
                             }
                         }
-                        mat_offset += D;
-                    }
                     }
                     bn += 128;
                 }
@@ -1951,7 +1950,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// `new_values` rather than the cache slot the fused QK dispatch wrote,
     /// so this kernel has no read-after-in-place-write hazard at all.
     private static let fusedAvKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_v2",
+        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_vtile_v3",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -1998,36 +1997,25 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int out_col = tile * 64 + (4 * sg + thrN) * 4;
 
             float result[GQA][4] = {{0.0f}};
-            T inter[4];
-            float v_coeff[GQA][4];
+            // VTILE: the 4x4 value tile is shared by all GQA heads, the
+            // probability block is not. Staging the tile costs 16 halves and
+            // frees the 32-float per-head staging array. The peel keeps both
+            // arms, it now only decides how the tile is filled.
+            T v_tile[4][4];
+            float p_coeff[4];
             const int n_iter = key_length / 32;
             const int leftover = key_length - n_iter * 32;
 
             for (int i = 0; i < n_iter; ++i) {
                 threadgroup_barrier(mem_flags::mem_none);
-                #pragma clang loop unroll(full)
-                for (int h = 0; h < GQA; ++h) {
-                    #pragma clang loop unroll(full)
-                    for (int tm = 0; tm < 4; ++tm) {
-                        v_coeff[h][tm] = static_cast<float>(
-                            prob_rows[size_t(h) * key_length + bm + tm]);
-                    }
-                }
                 // Tile-level peel: only the 4-row tile containing logical
                 // row kL-1 pays the serve-from-input branch.
                 if (bm + 4 <= key_length - 1) {
                 #pragma clang loop unroll(full)
                 for (int tm = 0; tm < 4; ++tm) {
                     for (int tn = 0; tn < 4; ++tn) {
-                        inter[tn] = value_plane[
+                        v_tile[tm][tn] = value_plane[
                             size_t(bm + tm) * D + out_col + tn];
-                    }
-                    #pragma clang loop unroll(full)
-                    for (int h = 0; h < GQA; ++h) {
-                        float vc = v_coeff[h][tm];
-                        for (int tn = 0; tn < 4; ++tn) {
-                            result[h][tn] += vc * inter[tn];
-                        }
                     }
                 }
                 } else {
@@ -2035,42 +2023,47 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 for (int tm = 0; tm < 4; ++tm) {
                     const bool is_new_token = bm + tm == key_length - 1;
                     for (int tn = 0; tn < 4; ++tn) {
-                        inter[tn] = is_new_token
+                        v_tile[tm][tn] = is_new_token
                             ? new_value_plane[out_col + tn]
                             : value_plane[
                                   size_t(bm + tm) * D + out_col + tn];
                     }
+                }
+                }
+                #pragma clang loop unroll(full)
+                for (int h = 0; h < GQA; ++h) {
                     #pragma clang loop unroll(full)
-                    for (int h = 0; h < GQA; ++h) {
-                        float vc = v_coeff[h][tm];
+                    for (int tm = 0; tm < 4; ++tm) {
+                        p_coeff[tm] = static_cast<float>(
+                            prob_rows[size_t(h) * key_length + bm + tm]);
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int tm = 0; tm < 4; ++tm) {
+                        float vc = p_coeff[tm];
                         for (int tn = 0; tn < 4; ++tn) {
-                            result[h][tn] += vc * inter[tn];
+                            result[h][tn] += vc * v_tile[tm][tn];
                         }
                     }
-                }
                 }
                 bm += 32;
             }
             if (leftover > 0) {
                 for (int tm = 0; tm < 4 && bm + tm < key_length; ++tm) {
-                    #pragma clang loop unroll(full)
-                    for (int h = 0; h < GQA; ++h) {
-                        v_coeff[h][tm] = static_cast<float>(
-                            prob_rows[size_t(h) * key_length + bm + tm]);
-                    }
                     const bool is_new_token = bm + tm == key_length - 1;
                     #pragma clang loop unroll(full)
                     for (int tn = 0; tn < 4; ++tn) {
-                        inter[tn] = is_new_token
+                        v_tile[0][tn] = is_new_token
                             ? new_value_plane[out_col + tn]
                             : value_plane[
                                   size_t(bm + tm) * D + out_col + tn];
                     }
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
+                        const float pc = static_cast<float>(
+                            prob_rows[size_t(h) * key_length + bm + tm]);
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
-                            result[h][tn] += v_coeff[h][tm] * inter[tn];
+                            result[h][tn] += pc * v_tile[0][tn];
                         }
                     }
                 }

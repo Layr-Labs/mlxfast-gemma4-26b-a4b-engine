@@ -437,44 +437,58 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
             groupSize == Self.groupSize,
             bits == Self.bits,
             mode == .affine,
-            let biases,
-            x.dtype == .bfloat16,
-            scales.dtype == x.dtype,
-            biases.dtype == x.dtype,
-            weight.dtype == .uint32,
-            x.ndim == 3,
-            x.dim(0) == batch,
-            x.dim(1) == sequence,
-            x.dim(2) == inputWidth,
-            weight.ndim == 2,
-            weight.dim(1) == inputWidth * Self.bits / 32
+            let biases
         else { return nil }
 
-        let outputWidth = weight.dim(0)
-        guard liveOutputWidth(outputWidth),
-            x.size == batch * sequence * inputWidth,
-            scales.shape == [outputWidth, inputWidth / Self.groupSize],
-            biases.shape == scales.shape
+        let xDType = x.dtype
+        let scalesDType = scales.dtype
+        let biasesDType = biases.dtype
+        let weightDType = weight.dtype
+        guard xDType == .bfloat16,
+            scalesDType == xDType,
+            biasesDType == xDType,
+            weightDType == .uint32,
+            x.ndim == 3,
+            weight.ndim == 2
         else { return nil }
+
+        let xShape = x.shape3
+        let weightShape = weight.shape2
+        let outputWidth = weightShape.0
+        guard xShape.0 == batch,
+            xShape.1 == sequence,
+            xShape.2 == inputWidth,
+            weightShape.1 == inputWidth * Self.bits / 32,
+            liveOutputWidth(outputWidth)
+        else { return nil }
+
+        let scalesShape = scales.shape
+        guard scalesShape.count == 2,
+            scalesShape[0] == outputWidth,
+            scalesShape[1] == inputWidth / Self.groupSize
+        else { return nil }
+
+        let biasesShape = biases.shape
+        guard biasesShape == scalesShape else { return nil }
 
         let yTiles = outputWidth / outputsPerGroup
         if multiTileEnabled, yTiles % tilesPerGroup == 0 {
             return multiTileKernel(
                 [x, weight, scales, biases],
-                template: [("T", x.dtype)],
+                template: [("T", xDType)],
                 grid: (simdWidth, (yTiles / tilesPerGroup) * simdGroups, 1),
                 threadGroup: (simdWidth, simdGroups, 1),
                 outputShapes: [[batch, sequence, outputWidth]],
-                outputDTypes: [x.dtype]
+                outputDTypes: [xDType]
             )[0]
         }
         return mma8Kernel(
             [x, weight, scales, biases],
-            template: [("T", x.dtype)],
+            template: [("T", xDType)],
             grid: (simdWidth, yTiles * simdGroups, 1),
             threadGroup: (simdWidth, simdGroups, 1),
             outputShapes: [[batch, sequence, outputWidth]],
-            outputDTypes: [x.dtype]
+            outputDTypes: [xDType]
         )[0]
     }
 }

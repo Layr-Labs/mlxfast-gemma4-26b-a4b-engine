@@ -3771,6 +3771,13 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
   typedef float U;
   thread U x_thread[values_per_thread];
   thread U result[results_per_simdgroup] = {0};
+  // SHOIST: the scale/bias pair for all four rows of a K-block is issued in
+  // the same prologue as the four packed weight words, not one row at a time
+  // inside the dot loop. Removing the equivalent hoist from
+  // qmv_affine4_g64_pair_impl measured 0.20% slower at cohort 8, so the four
+  // extra live register pairs buy more latency cover than they cost.
+  thread U scale_local[results_per_simdgroup];
+  thread U bias_local[results_per_simdgroup];
 
   const int in_vec_size_w = in_vec_size / 2;
   const int in_vec_size_g = in_vec_size / qgroup;
@@ -3812,16 +3819,22 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
       }
     }
 
+    thread uint wblk[results_per_simdgroup];
     for (int row = 0; row < results_per_simdgroup; row++) {
-      const device T* sl = scales + row * in_vec_size_g;
-      const device T* bl = biases + row * in_vec_size_g;
-      U s = sl[0];
-      U b = bl[0];
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+      if (!PF && WVEC) {
+        wblk[row] = *((const device uint*)(ws + row * in_vec_size_w));
+      }
+    }
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const U s = scale_local[row];
+      const U b = bias_local[row];
       if (PF) {
         result[row] += qdot_affine4_g64_word(wcur[row], x_thread, s, b, sum);
       } else if (WVEC) {
-        const uint v = *((const device uint*)(ws + row * in_vec_size_w));
-        result[row] += qdot_affine4_g64_word(v, x_thread, s, b, sum);
+        result[row] += qdot_affine4_g64_word(wblk[row], x_thread, s, b, sum);
       } else {
         auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
         result[row] += qdot<U, values_per_thread, 4>(wl, x_thread, s, b, sum);

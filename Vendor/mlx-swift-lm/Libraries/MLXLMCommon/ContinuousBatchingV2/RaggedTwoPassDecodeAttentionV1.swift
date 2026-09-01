@@ -1026,7 +1026,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// next decode dispatch after this write completes.
     private static let portQuantFusedWriteKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_2pass_a_q4g64_d256_g2_regpack_vec4_carry_pair_b\(blocks)_v5",
+            name: "cbv2_ragged8_sdpa_ringwrite_2pass_a_q4g64_d256_g2_regpack_vec4_carry_pair_regslim_b\(blocks)_v1",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -1086,12 +1086,17 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     float kmax = -3.402823466e+38F;
                     float vmin = 3.402823466e+38F;
                     float vmax = -3.402823466e+38F;
-                    // The lane's own elements, loaded once and held in
-                    // registers: the extrema pass and the quantization pass
-                    // below read the same values, so the second pass reads
-                    // `kv`/`vv` instead of issuing the loads again.
-                    float kv[values_per_lane];
-                    float vv[values_per_lane];
+                    // REGSLIM: this write block runs in ONE of BLOCKS
+                    // threadgroups, but its register footprint is allocated
+                    // for all of them. Holding the lane's sixteen elements
+                    // across the extrema pass and the quantization pass costs
+                    // sixteen live floats on every block to save four vector
+                    // loads on one, so the two passes re-issue the same
+                    // aligned four-wide loads instead. `new_keys`/`new_values`
+                    // are read-only inputs of this dispatch, so the second
+                    // read returns the same words and the quantization
+                    // arithmetic below is unchanged element for element.
+                    //
                     // The lane owns `values_per_lane` contiguous elements
                     // starting at a multiple of that count, so the span is
                     // vector-aligned and the eight scalar loads become two
@@ -1107,12 +1112,12 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         const T4 vq4 = vvec[q];
                         #pragma unroll
                         for (int j = 0; j < 4; ++j) {
-                            kv[q * 4 + j] = float(kq4[j]);
-                            vv[q * 4 + j] = float(vq4[j]);
-                            kmin = min(kmin, kv[q * 4 + j]);
-                            kmax = max(kmax, kv[q * 4 + j]);
-                            vmin = min(vmin, vv[q * 4 + j]);
-                            vmax = max(vmax, vv[q * 4 + j]);
+                            const float ke = float(kq4[j]);
+                            const float ve = float(vq4[j]);
+                            kmin = min(kmin, ke);
+                            kmax = max(kmax, ke);
+                            vmin = min(vmin, ve);
+                            vmax = max(vmax, ve);
                         }
                     }
                     for (uint mask = 1; mask < 8; mask <<= 1) {
@@ -1130,11 +1135,21 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     const float vs = float(vhs);
                     const float vb = float(vhb);
                     #pragma unroll
-                    for (int element = 0; element < values_per_lane; ++element) {
-                        const float kq = metal::rint((kv[element] - kb) / ks);
-                        const float vq = metal::rint((vv[element] - vb) / vs);
-                        kword |= uint32_t(clamp(kq, 0.0f, 15.0f)) << (4 * element);
-                        vword |= uint32_t(clamp(vq, 0.0f, 15.0f)) << (4 * element);
+                    for (int q = 0; q < values_per_lane / 4; ++q) {
+                        const T4 kq4 = kvec[q];
+                        const T4 vq4 = vvec[q];
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            const int element = q * 4 + j;
+                            const float kq =
+                                metal::rint((float(kq4[j]) - kb) / ks);
+                            const float vq =
+                                metal::rint((float(vq4[j]) - vb) / vs);
+                            kword |=
+                                uint32_t(clamp(kq, 0.0f, 15.0f)) << (4 * element);
+                            vword |=
+                                uint32_t(clamp(vq, 0.0f, 15.0f)) << (4 * element);
+                        }
                     }
 
                     {
@@ -1440,6 +1455,125 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         )[0]
         CBv2EngageMark.once("kvq4-fused-live-write")
         return (output, passA[3])
+    }
+
+    /// WRITE-023 store dispatch: one threadgroup per (row, kv head) — 64
+    /// threadgroups of 64 threads — each thread copying 4 contiguous
+    /// elements of K and 4 of V into the row's evicted ring slot through a
+    /// const_cast on the input pointer. 64 KiB total. The fence output is
+    /// the WRITE-016/WRITE-022 pattern: a real graph edge whose inter-kernel
+    /// barrier orders every buffer write this dispatch issued.
+    private static let slidingRingStoreKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sliding_ringstore_bf16_d256_v1",
+        inputNames: [
+            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+            "params", "new_keys", "new_values", "write_fence",
+        ],
+        outputNames: ["fence"],
+        source: """
+            constexpr int D = 256;
+            const int z = int(threadgroup_position_in_grid.z);
+            const int row = z / KV_HEADS;
+            const int kv_head = z % KV_HEADS;
+            const int lane = int(thread_position_in_threadgroup.x);
+            const int window = int(params[0]);
+            const int slot = int(params[1 + row]);
+
+            const device T* key_plane = k0;
+            const device T* value_plane = v0;
+            switch (row) {
+                case 1: key_plane = k1; value_plane = v1; break;
+                case 2: key_plane = k2; value_plane = v2; break;
+                case 3: key_plane = k3; value_plane = v3; break;
+                case 4: key_plane = k4; value_plane = v4; break;
+                case 5: key_plane = k5; value_plane = v5; break;
+                case 6: key_plane = k6; value_plane = v6; break;
+                case 7: key_plane = k7; value_plane = v7; break;
+                default: break;
+            }
+            key_plane += size_t(kv_head) * size_t(window) * D;
+            value_plane += size_t(kv_head) * size_t(window) * D;
+
+            device T* write_key = const_cast<device T*>(key_plane)
+                + size_t(slot) * D + lane * 4;
+            device T* write_value = const_cast<device T*>(value_plane)
+                + size_t(slot) * D + lane * 4;
+            const device T* src_key = new_keys
+                + size_t(row * KV_HEADS + kv_head) * D + lane * 4;
+            const device T* src_value = new_values
+                + size_t(row * KV_HEADS + kv_head) * D + lane * 4;
+            for (int element = 0; element < 4; ++element) {
+                write_key[element] = src_key[element];
+                write_value[element] = src_value[element];
+            }
+            if (z == 0 && lane == 0) {
+                fence[0] = write_fence[0] + 1;
+            }
+        """,
+        ensureRowContiguous: true)
+
+    /// WRITE-023 kill switch: `DARKBLOOM_CBV2_SLIDING_STORE_DISPATCH` set to
+    /// 0/false/no/off restores the per-row BF16 `SliceUpdate` pair.
+    static let slidingStoreDispatchEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_SLIDING_STORE_DISPATCH"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// WRITE-023: deposit this decode step's K/V into every row's bf16 ring
+    /// slot with one fenced in-place dispatch instead of sixteen whole-ring
+    /// `SliceUpdate`s. Returns nil (nothing written, no graph built) whenever
+    /// a predicate fails, so the caller keeps the established write.
+    static func storeSlidingRing(
+        keyRings: [MLXArray],
+        valueRings: [MLXArray],
+        slots: [Int],
+        newKeys: MLXArray,
+        newValues: MLXArray,
+        previousWriteFence: MLXArray,
+        slidingWindowLength: Int
+    ) -> MLXArray? {
+        guard slidingStoreDispatchEnabled,
+            enabled,
+            slidingWindowLength == sequenceLength,
+            headDim == 256, kvHeads == 8,
+            keyRings.count == batch, valueRings.count == batch,
+            slots.count == batch,
+            slots.allSatisfy({ 0 <= $0 && $0 < sequenceLength }),
+            newKeys.dtype == .bfloat16,
+            newKeys.shape == [batch, kvHeads, 1, headDim],
+            newValues.dtype == .bfloat16,
+            newValues.shape == newKeys.shape,
+            previousWriteFence.dtype == .int32,
+            previousWriteFence.shape == [1],
+            keyRings.allSatisfy({
+                $0.dtype == .bfloat16
+                    && $0.shape == [1, kvHeads, sequenceLength, headDim]
+            }),
+            valueRings.allSatisfy({
+                $0.dtype == .bfloat16
+                    && $0.shape == [1, kvHeads, sequenceLength, headDim]
+            })
+        else { return nil }
+
+        var params: [UInt32] = [UInt32(sequenceLength)]
+        params.append(contentsOf: slots.map(UInt32.init))
+        let fence = slidingRingStoreKernel(
+            keyRings + valueRings
+                + [MLXArray(params), newKeys, newValues, previousWriteFence],
+            template: [
+                ("T", newKeys.dtype),
+                ("KV_HEADS", kvHeads),
+            ],
+            grid: (headDim / 4, 1, batch * kvHeads),
+            threadGroup: (headDim / 4, 1, 1),
+            outputShapes: [[1]],
+            outputDTypes: [.int32]
+        )[0]
+        CBv2EngageMark.once("write023-sliding-store")
+        return fence
     }
 
     static func attendRing(

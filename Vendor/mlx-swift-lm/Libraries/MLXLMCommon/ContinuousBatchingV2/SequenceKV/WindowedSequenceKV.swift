@@ -253,6 +253,28 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         return (keys, values, oldestValidPosition % window)
     }
 
+    /// WRITE-023: the live bf16 ring allocations and the physical slot this
+    /// step's token belongs in, offered BEFORE the write happens. The slot is
+    /// `absoluteOffset % window` — exactly where `decodeRingWriteBF16Only`'s
+    /// `writeRing` would land a one-token update.
+    var decodeRingStoreTarget: (keys: MLXArray, values: MLXArray, slot: Int)? {
+        guard staged == nil, let keys, let values, retainedCount == window
+        else { return nil }
+        return (keys, values, absoluteOffset % window)
+    }
+
+    /// Bookkeeping half of WRITE-023. The store dispatch already deposited
+    /// this step's token into the ring allocation, so advance exactly the
+    /// counters `decodeRingWriteBF16Only` would and build no `SliceUpdate`.
+    func advanceDecodeRingAfterBF16Store() {
+        precondition(
+            staged == nil && keys != nil && values != nil && retainedCount == window,
+            "CBv2WindowedSequenceKV: bf16 store advance outside a full-ring decode step")
+        borrowableChunkViews = nil
+        absoluteOffset += 1
+        oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
+    }
+
     /// KVQ-001: the packed 8-bit mirror for the same full-ring decode step
     /// `decodeRingView` describes, or nil when the quantized road is off.
     /// The same allocation serves the before-write (fused) step: the fused

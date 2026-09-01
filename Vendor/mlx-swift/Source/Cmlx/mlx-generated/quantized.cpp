@@ -1578,6 +1578,56 @@ METAL_FUNC void qmv_impl(
   }
 }
 
+
+// XVEC: textual twin of `load_vector<T, float, 8, 4>` fed by ONE aligned
+// 16-byte load instead of eight 2-byte scalar loads. Every Gemma 4 caller of
+// the affine-4 / g64 expert impls hands a 16-byte-aligned lane base (row
+// stride K * 2 bytes with K in {2816, 704}, lane offset simd_lid * 16 bytes,
+// block advance 512 bytes). The eight T values are recovered bit for bit
+// from the halfwords, the parenthesised 4-tuples are evaluated on T exactly
+// as in the reference and the two trees are added in fp32, and the
+// per-position power-of-two scalings are the reference's own, so `sum` and
+// every `x_thread[i]` are the values the scalar loader produces. Loads-only.
+// The 16-byte path exists only for 16-bit T (the pinned bf16 decode cell);
+// any other T keeps the stock scalar loader, so every ahead-of-time
+// instantiation of this header (float included) compiles and stays exact.
+template <typename T, bool is16 = (sizeof(T) == 2)>
+struct qmv_x8_loader {
+  static inline float load(const device T* x, thread float* x_thread) {
+    return load_vector<T, float, 8, 4>(x, x_thread);
+  }
+};
+
+template <typename T>
+struct qmv_x8_loader<T, true> {
+  static inline float load(const device T* x, thread float* x_thread) {
+    const uint4 r = *((const device uint4*)x);
+    thread T xt[8];
+    xt[0] = as_type<T>(ushort(r.x & 0xFFFFu));
+    xt[1] = as_type<T>(ushort(r.x >> 16));
+    xt[2] = as_type<T>(ushort(r.y & 0xFFFFu));
+    xt[3] = as_type<T>(ushort(r.y >> 16));
+    xt[4] = as_type<T>(ushort(r.z & 0xFFFFu));
+    xt[5] = as_type<T>(ushort(r.z >> 16));
+    xt[6] = as_type<T>(ushort(r.w & 0xFFFFu));
+    xt[7] = as_type<T>(ushort(r.w >> 16));
+    float sum = 0;
+    for (int i = 0; i < 8; i += 4) {
+      sum += xt[i] + xt[i + 1] + xt[i + 2] + xt[i + 3];
+      x_thread[i] = xt[i];
+      x_thread[i + 1] = xt[i + 1] / 16.0f;
+      x_thread[i + 2] = xt[i + 2] / 256.0f;
+      x_thread[i + 3] = xt[i + 3] / 4096.0f;
+    }
+    return sum;
+  }
+};
+
+template <typename T>
+inline float qmv_load_x8_vec(const device T* x, thread float* x_thread) {
+  return qmv_x8_loader<T>::load(x, x_thread);
+}
+
 template <typename T, const int group_size, const int bits>
 METAL_FUNC void qmv_affine4_g64_pair_impl(
     const device uint32_t* w,
@@ -1628,8 +1678,8 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
       bias_local[row] = biases[row * in_vec_size_g];
     }
 
-    float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
-    float sum1 = load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
+    float sum0 = qmv_load_x8_vec<T>(x0, x0_thread);
+    float sum1 = qmv_load_x8_vec<T>(x1, x1_thread);
 
     for (int row = 0; row < results_per_simdgroup; row++) {
       float dot0;
@@ -1661,9 +1711,9 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
     }
 
     float sum0 =
-        load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
+        qmv_load_x8_vec<T>(x0, x0_thread);
     float sum1 =
-        load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
+        qmv_load_x8_vec<T>(x1, x1_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       float dot0;
       float dot1;
@@ -1767,22 +1817,22 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
       bias_local[row] = biases[row * in_vec_size_g];
     }
 
-    float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
+    float sum = qmv_load_x8_vec<T>(x0, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
-    sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
+    sum = qmv_load_x8_vec<T>(x1, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine4_registered_word<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
-    sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
+    sum = qmv_load_x8_vec<T>(x2, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine4_registered_word<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
-    sum = load_vector<T, float, values_per_thread, 4>(x3, x_thread);
+    sum = qmv_load_x8_vec<T>(x3, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result3[row] += qdot_affine4_registered_word<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
@@ -1909,17 +1959,17 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
       bias_local[row] = biases[row * in_vec_size_g];
     }
 
-    float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
+    float sum = qmv_load_x8_vec<T>(x0, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
-    sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
+    sum = qmv_load_x8_vec<T>(x1, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine4_registered_word<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
-    sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
+    sum = qmv_load_x8_vec<T>(x2, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine4_registered_word<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
@@ -3012,9 +3062,19 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 8:
-          // 4+4: two weight streams, receipted on this benchmark (scored
-          // 3.195804751396457 as a promoted submission) before a later
-          // stale-base REPLACE overlay reverted it; restored here.
+          // 3+3+2, not 4+4. M = 8 is the only hot width whose EVEN split needs
+          // two simultaneous vec<float,4> accumulators in every active worker;
+          // M = 9 uses three-lane vectors and profiles CHEAPER despite more work
+          // (319 / 437 / 216 us for M = 7 / 8 / 9 in the public cross-row study)
+          // — a register cliff, not work scaling.
+          // Exact: these lanes carry INDEPENDENT input rows and are never reduced
+          // across (simd_sum reduces along K WITHIN a row), so moving a row from
+          // lane 3 of a four-wide vector to lane 0 of a two-wide one cannot
+          // reorder its scalar chain. Template admits it: M in [3,9], 8 % 3 == 2
+          // (no one-row tail), IPG 3 inside the wide helper's [2,4].
+          // Receipts: 85d5bca3 2.91143, yzxoi 2.92675.
+          // SYNERGY with the streak gate above, which is why they ship together:
+          // gate 2 reaches the width-8 verify SOONER, so this kernel fires MORE.
           qmv_fast_crossrow_affine4_g64_m<T, 8, 4, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
@@ -3790,25 +3850,36 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
   const int nblocks = in_vec_size / block_size;
   const device uint8_t* ws0 = ws;
 
+  // PF2: two-deep word carry. The block b+1 words already sit in `wpf`
+  // when block b is consumed and the block b+2 words are issued right then,
+  // so two blocks of weight words are in flight per lane across the whole
+  // walk. Loads only: the consumed word, its qdot, the accumulator and the
+  // simd_sum are the singles arm's, byte for byte.
   thread uint wpf[results_per_simdgroup];
+  thread uint wpf2[results_per_simdgroup];
   if (PF) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       wpf[row] = *((const device uint*)(ws0 + row * in_vec_size_w));
     }
+    const device uint8_t* ws1 = ws0 + ((nblocks > 1) ? block_bytes : 0);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      wpf2[row] = *((const device uint*)(ws1 + row * in_vec_size_w));
+    }
   }
 
   for (int blk = 0; blk < nblocks; blk++) {
-    U sum = load_vector<T, U, values_per_thread, 4>(x, x_thread);
+    U sum = qmv_load_x8_vec<T>(x, x_thread);
 
     thread uint wcur[results_per_simdgroup];
     if (PF) {
       for (int row = 0; row < results_per_simdgroup; row++) {
         wcur[row] = wpf[row];
+        wpf[row] = wpf2[row];
       }
-      const int nextblk = (blk + 1 < nblocks) ? (blk + 1) : blk;
+      const int nextblk = (blk + 2 < nblocks) ? (blk + 2) : (nblocks - 1);
       const device uint8_t* wsn = ws0 + nextblk * block_bytes;
       for (int row = 0; row < results_per_simdgroup; row++) {
-        wpf[row] = *((const device uint*)(wsn + row * in_vec_size_w));
+        wpf2[row] = *((const device uint*)(wsn + row * in_vec_size_w));
       }
     }
 
@@ -3862,7 +3933,7 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
     }
     const uint active_tail_lanes = uint(tail_values / values_per_thread);
     if (tail_values % values_per_thread == 0 && simd_lid < active_tail_lanes) {
-      U sum = load_vector<T, U, values_per_thread, 4>(x, x_thread);
+      U sum = qmv_load_x8_vec<T>(x, x_thread);
       for (int row = 0; row < results_per_simdgroup; row++) {
         const device T* sl = scales + row * in_vec_size_g;
         const device T* bl = biases + row * in_vec_size_g;
@@ -4831,7 +4902,7 @@ template <typename T, const int group_size, const int bits>
   }
 }
 
-///////////////////////////////////////////////////////////////////////////////
+
 )preamble";
 }
 

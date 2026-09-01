@@ -615,6 +615,27 @@ enum CBv2AttentionV1 {
                 return concatenated(outputs, axis: 0)
             }
 
+            // KVQ-D512: the full-attention decode chain reading the packed
+            // 4-bit g64 mirror — the KV-mirror mechanism class (four box
+            // receipts on the sliding lane) applied to the last untouched
+            // KV read stream. Per-row appends stay the established
+            // byte-identical calls (the storage hook lands the mirror
+            // bytes); only the QK and probs·V operand SOURCE changes, with
+            // the stock-transcribed loop structure preserved. Fails closed
+            // to every established road below (kill switches
+            // MLX_KVQ_D512 / MLX_KVQ_D512_READ).
+            if let decodeRingWriteFence, allowFusedRingWrite,
+                let fused = CBv2RaggedComposedD512DecodeAttentionV1
+                .updateAndAttendQuant(
+                    rows: rows, kind: kind,
+                    queries: queries, keys: keys, values: values,
+                    previousWriteFence: decodeRingWriteFence.value,
+                    scale: scale, sinks: effectiveSinks, softcap: softcap)
+            {
+                decodeRingWriteFence.value = fused.nextWriteFence
+                return fused.output
+            }
+
             // WRITE-016-D512: the D512 chain with the new token's K/V stored
             // in place by the QK dispatch (fence-chained like WRITE-016)
             // instead of 16 copy-on-write slice appends. Fails closed to the

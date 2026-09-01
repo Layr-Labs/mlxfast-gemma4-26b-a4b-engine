@@ -2005,6 +2005,521 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         ensureRowContiguous: true
     )
 
+    // MARK: - KVQ-D512: the same three-dispatch chain reading the 4-bit mirror
+
+    /// KVQ-D512 kill switch: `MLX_KVQ_D512_READ=0` keeps the decode reads on
+    /// the bf16 planes. Default ON (the mirror itself is gated by
+    /// `MLX_KVQ_D512` at the storage layer).
+    private static let quantReadEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_KVQ_D512_READ"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Dispatch 1 (q4): the stock-transcribed QK walk with the K loads
+    /// moved to the packed mirror. Loop structure, lane->column mapping,
+    /// tail shift, add order per output: identical to `qkSource`; only the
+    /// operand source changes — a lane's four consecutive elements are one
+    /// half of one payload word, dequantized with that 64-group's fp16
+    /// (scale, bias) tail.
+    private static let qkQ4Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_qk_q4g64_livewrite_g8_v2",
+        inputNames: [
+            "queries",
+            "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
+            "params", "new_keys", "new_values", "write_fence",
+        ],
+        outputNames: ["scores", "fence"],
+        source: """
+            constexpr int D = 512;
+            constexpr int GQA = 8;
+            constexpr int row_words = D / 8 + D / 64;      // 72
+
+            const int key_length = int(params[0]);
+            const int in_vec_size = int(params[1]);
+
+            const int n_chunks = (key_length + 63) / 64;
+            const int z = int(threadgroup_position_in_grid.z);
+            const int chunk = z % n_chunks;
+            const int row_kv = z / n_chunks;
+            const int row = row_kv / 2;
+            const int kv_head = row_kv % 2;
+            const int sg = int(simdgroup_index_in_threadgroup);
+            const int lane = int(thread_index_in_simdgroup);
+
+            const int row_capacity = int(params[2 + row]);
+
+            const device uint32_t* mirror = m0;
+            switch (row) {
+                case 1: mirror = m1; break;
+                case 2: mirror = m2; break;
+                case 3: mirror = m3; break;
+                case 4: mirror = m4; break;
+                case 5: mirror = m5; break;
+                case 6: mirror = m6; break;
+                case 7: mirror = m7; break;
+                default: break;
+            }
+
+            // D512-Q4-LIVE. The last QK chunk owns this (row, KV-head)
+            // slot. Its four simdgroups exactly cover K and V: two groups
+            // of 32 lanes per D512 plane, eight source values per lane.
+            // Groups of eight lanes never cross a simdgroup, so the 1/2/4
+            // xor reduction and packed bytes match the standalone packer.
+            if (chunk == n_chunks - 1) {
+                const bool value_plane = sg >= 2;
+                const int pack_lane = (sg & 1) * 32 + lane;
+                const device T* source = (value_plane ? new_values : new_keys)
+                    + size_t(row * 2 + kv_head) * D;
+                device uint32_t* packed_row =
+                    const_cast<device uint32_t*>(mirror)
+                    + size_t((value_plane ? 2 : 0) + kv_head)
+                        * size_t(row_capacity) * row_words
+                    + size_t(key_length - 1) * row_words;
+
+                float vmin = 3.402823466e+38F;
+                float vmax = -3.402823466e+38F;
+                #pragma clang loop unroll(full)
+                for (int element = 0; element < 8; ++element) {
+                    const float value = float(source[pack_lane * 8 + element]);
+                    vmin = min(vmin, value);
+                    vmax = max(vmax, value);
+                }
+                for (uint mask = 1; mask < 8; mask <<= 1) {
+                    vmin = min(vmin, simd_shuffle_xor(vmin, mask));
+                    vmax = max(vmax, simd_shuffle_xor(vmax, mask));
+                }
+                const half hs = half(max((vmax - vmin) / 15.0f, 1e-6f));
+                const half hb = half(vmin);
+                const float pack_scale = float(hs);
+                const float pack_bias = float(hb);
+                uint32_t packed_word = 0u;
+                #pragma clang loop unroll(full)
+                for (int element = 0; element < 8; ++element) {
+                    const float q = metal::rint(
+                        (float(source[pack_lane * 8 + element]) - pack_bias)
+                            / pack_scale);
+                    packed_word |= uint32_t(clamp(q, 0.0f, 15.0f))
+                        << (4 * element);
+                }
+                packed_row[pack_lane] = packed_word;
+                if ((pack_lane & 7) == 0) {
+                    packed_row[D / 8 + pack_lane / 8] =
+                        uint32_t(as_type<ushort>(hs))
+                        | (uint32_t(as_type<ushort>(hb)) << 16);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_device);
+            // K plane rows for this head: [2, KVH, capacity, row_words],
+            // plane 0.
+            const device uint32_t* key_rows = mirror
+                + size_t(kv_head) * size_t(row_capacity) * row_words;
+
+            const device T* query =
+                queries + size_t(row * 16 + kv_head * GQA) * D;
+            device T* score_rows =
+                scores + size_t(row * 16 + kv_head * GQA) * key_length;
+
+            const int virtual_groups = (key_length + 15) / 16;
+            const int vtg_lo = chunk * 4;
+            const int vtg_hi = min(vtg_lo + 4, virtual_groups);
+            const int n_iter = in_vec_size / 128;
+
+            for (int vtg = vtg_lo; vtg < vtg_hi; ++vtg) {
+                int out_row = vtg * 16 + sg * 4;
+                if (out_row >= key_length) continue;
+                out_row = out_row + 4 <= key_length
+                    ? out_row : key_length - 4;
+
+                const device uint32_t* mat_rows =
+                    key_rows + size_t(out_row) * row_words;
+                float result[GQA][4] = {{0.0f}};
+                float inter[4];
+                float v_coeff[GQA][4];
+                int bn = lane * 4;
+                for (int i = 0; i < n_iter; ++i) {
+                    #pragma clang loop unroll(full)
+                    for (int h = 0; h < GQA; ++h) {
+                        #pragma clang loop unroll(full)
+                        for (int tn = 0; tn < 4; ++tn) {
+                            v_coeff[h][tn] = static_cast<float>(
+                                query[h * D + bn + tn]);
+                        }
+                    }
+                    const int word_index = bn / 8;
+                    const int nibble_base = (bn % 8);
+                    const int group = bn / 64;
+                    int mat_offset = 0;
+                    #pragma clang loop unroll(full)
+                    for (int tm = 0; tm < 4; ++tm) {
+                        const device uint32_t* mrow =
+                            mat_rows + mat_offset;
+                        const uint32_t tail = mrow[D / 8 + group];
+                        const float ks =
+                            float(as_type<half>(ushort(tail & 0xffffu)));
+                        const float kb =
+                            float(as_type<half>(ushort(tail >> 16)));
+                        const uint32_t w = mrow[word_index];
+                        #pragma clang loop unroll(full)
+                        for (int tn = 0; tn < 4; ++tn) {
+                            inter[tn] = fma(
+                                float((w >> (4 * (nibble_base + tn))) & 0xfu),
+                                ks, kb);
+                        }
+                        #pragma clang loop unroll(full)
+                        for (int h = 0; h < GQA; ++h) {
+                            #pragma clang loop unroll(full)
+                            for (int tn = 0; tn < 4; ++tn) {
+                                result[h][tm] +=
+                                    inter[tn] * v_coeff[h][tn];
+                            }
+                        }
+                        mat_offset += row_words;
+                    }
+                    bn += 128;
+                }
+                #pragma clang loop unroll(full)
+                for (int h = 0; h < GQA; ++h) {
+                    #pragma clang loop unroll(full)
+                    for (int tm = 0; tm < 4; ++tm) {
+                        #pragma clang loop unroll(full)
+                        for (ushort delta = 16; delta >= 1; delta >>= 1) {
+                            result[h][tm] +=
+                                simd_shuffle_down(result[h][tm], delta);
+                        }
+                    }
+                }
+                if (lane == 0) {
+                    #pragma clang loop unroll(full)
+                    for (int h = 0; h < GQA; ++h) {
+                        #pragma clang loop unroll(full)
+                        for (int tm = 0; tm < 4; ++tm) {
+                            score_rows[
+                                size_t(h) * key_length + out_row + tm] =
+                                static_cast<T>(result[h][tm]);
+                        }
+                    }
+                }
+            }
+            if (row == 0 && kv_head == 0 && chunk == n_chunks - 1
+                && sg == 0 && lane == 0) {
+                fence[0] = write_fence[0] + 1;
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    /// Dispatch 3 (q4): the stock-transcribed probs·V walk with the V loads
+    /// moved to the packed mirror. A thread's four consecutive output
+    /// columns live in one half payload word of slot `bm + tm`, all inside
+    /// the 64-group `tile`, so one tail read per (slot, tile) serves the
+    /// quad. Row striding, butterfly, add order: identical to the bf16
+    /// kernel.
+    private static let avQ4Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_av_q4g64_g8_v1",
+        inputNames: [
+            "probs",
+            "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
+            "params",
+        ],
+        outputNames: ["out"],
+        source: """
+            constexpr int D = 512;
+            constexpr int GQA = 8;
+            constexpr int KVH = 2;
+            constexpr int row_words = D / 8 + D / 64;      // 72
+
+            const int key_length = int(params[0]);
+
+            const int z = int(threadgroup_position_in_grid.z);
+            const int tile = z % 8;
+            const int row_kv = z / 8;
+            const int row = row_kv / 2;
+            const int kv_head = row_kv % 2;
+            const int sg = int(simdgroup_index_in_threadgroup);
+            const int lane = int(thread_index_in_simdgroup);
+
+            const int row_capacity = int(params[2 + row]);
+
+            const device uint32_t* mirror = m0;
+            switch (row) {
+                case 1: mirror = m1; break;
+                case 2: mirror = m2; break;
+                case 3: mirror = m3; break;
+                case 4: mirror = m4; break;
+                case 5: mirror = m5; break;
+                case 6: mirror = m6; break;
+                case 7: mirror = m7; break;
+                default: break;
+            }
+            // V plane rows for this head: plane 1 of
+            // [2, KVH, capacity, row_words].
+            const device uint32_t* value_rows = mirror
+                + (size_t(KVH) + size_t(kv_head))
+                    * size_t(row_capacity) * row_words;
+
+            const device T* prob_rows =
+                probs + size_t(row * 16 + kv_head * GQA) * key_length;
+
+            const int thrM = lane / 4;
+            const int thrN = lane % 4;
+            int bm = thrM * 4;
+            const int out_col = tile * 64 + (4 * sg + thrN) * 4;
+            const int word_index = out_col / 8;
+            const int nibble_base = out_col % 8;
+            const int group = out_col / 64;
+
+            float result[GQA][4] = {{0.0f}};
+            float inter[4];
+            float v_coeff[GQA][4];
+            const int n_iter = key_length / 32;
+            const int leftover = key_length - n_iter * 32;
+
+            for (int i = 0; i < n_iter; ++i) {
+                threadgroup_barrier(mem_flags::mem_none);
+                #pragma clang loop unroll(full)
+                for (int h = 0; h < GQA; ++h) {
+                    #pragma clang loop unroll(full)
+                    for (int tm = 0; tm < 4; ++tm) {
+                        v_coeff[h][tm] = static_cast<float>(
+                            prob_rows[size_t(h) * key_length + bm + tm]);
+                    }
+                }
+                #pragma clang loop unroll(full)
+                for (int tm = 0; tm < 4; ++tm) {
+                    const device uint32_t* vrow =
+                        value_rows + size_t(bm + tm) * row_words;
+                    const uint32_t tail = vrow[D / 8 + group];
+                    const float vs =
+                        float(as_type<half>(ushort(tail & 0xffffu)));
+                    const float vb =
+                        float(as_type<half>(ushort(tail >> 16)));
+                    const uint32_t w = vrow[word_index];
+                    #pragma clang loop unroll(full)
+                    for (int tn = 0; tn < 4; ++tn) {
+                        inter[tn] = fma(
+                            float((w >> (4 * (nibble_base + tn))) & 0xfu),
+                            vs, vb);
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int h = 0; h < GQA; ++h) {
+                        float vc = v_coeff[h][tm];
+                        for (int tn = 0; tn < 4; ++tn) {
+                            result[h][tn] += vc * inter[tn];
+                        }
+                    }
+                }
+                bm += 32;
+            }
+            if (leftover > 0) {
+                for (int tm = 0; tm < 4 && bm + tm < key_length; ++tm) {
+                    #pragma clang loop unroll(full)
+                    for (int h = 0; h < GQA; ++h) {
+                        v_coeff[h][tm] = static_cast<float>(
+                            prob_rows[size_t(h) * key_length + bm + tm]);
+                    }
+                    const device uint32_t* vrow =
+                        value_rows + size_t(bm + tm) * row_words;
+                    const uint32_t tail = vrow[D / 8 + group];
+                    const float vs =
+                        float(as_type<half>(ushort(tail & 0xffffu)));
+                    const float vb =
+                        float(as_type<half>(ushort(tail >> 16)));
+                    const uint32_t w = vrow[word_index];
+                    #pragma clang loop unroll(full)
+                    for (int tn = 0; tn < 4; ++tn) {
+                        inter[tn] = fma(
+                            float((w >> (4 * (nibble_base + tn))) & 0xfu),
+                            vs, vb);
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int h = 0; h < GQA; ++h) {
+                        #pragma clang loop unroll(full)
+                        for (int tn = 0; tn < 4; ++tn) {
+                            result[h][tn] += v_coeff[h][tm] * inter[tn];
+                        }
+                    }
+                }
+            }
+            #pragma clang loop unroll(full)
+            for (int h = 0; h < GQA; ++h) {
+                #pragma clang loop unroll(full)
+                for (int tn = 0; tn < 4; ++tn) {
+                    #pragma clang loop unroll(full)
+                    for (ushort delta = 4; delta >= 1; delta >>= 1) {
+                        result[h][tn] +=
+                            simd_shuffle_down(result[h][tn], 4 * delta);
+                    }
+                }
+            }
+            if (thrM == 0) {
+                #pragma clang loop unroll(full)
+                for (int h = 0; h < GQA; ++h) {
+                    device T* out_ptr = out
+                        + size_t(row * 16 + kv_head * GQA + h) * D
+                        + out_col;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        out_ptr[j] = static_cast<T>(result[h][j]);
+                    }
+                }
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    /// KVQ-D512-LIVE: retain WRITE-022's in-place BF16 store, then pack the
+    /// fresh K/V into the live q4 mirror inside QK. QK and AV read q4; no
+    /// functional BF16 or mirror SliceUpdate remains in the decode chain.
+    static func updateAndAttendQuant(
+        rows: [CBv2SequenceKV], kind: CBv2LayerKind,
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        previousWriteFence: MLXArray,
+        scale: Float, sinks: MLXArray?, softcap: Float?
+    ) -> (output: MLXArray, nextWriteFence: MLXArray)? {
+        guard enabled, quantReadEnabled, storeDispatchEnabled,
+            rows.count == batch,
+            scale == 1.0,
+            sinks == nil,
+            softcap == nil,
+            !kind.isBidirectional,
+            kind.queryHeads == queryHeads,
+            kind.kvHeads == kvHeads,
+            kind.headDim == headDim,
+            queries.dtype == .bfloat16,
+            keys.dtype == .bfloat16,
+            values.dtype == .bfloat16,
+            previousWriteFence.dtype == .int32,
+            previousWriteFence.shape == [1],
+            queries.shape == [batch, queryHeads, 1, headDim],
+            keys.shape == [batch, kvHeads, 1, headDim],
+            values.shape == keys.shape
+        else { return nil }
+        guard case .full = kind.attention else { return nil }
+        let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
+        guard fullRows.count == batch else { return nil }
+
+        // Refuse before mutating even the first row when mirror storage is
+        // disabled or incomplete. Checking only after `row.update` makes a
+        // failed all-or-nothing admission observable: the established
+        // fallback appends that already-updated row a second time.
+        guard CBv2FullDecodeCohortPool.quantD512Enabled,
+            fullRows.allSatisfy({
+                guard let mirror = $0.quantMirrorView else { return false }
+                return mirror.dtype == .uint32
+                    && mirror.ndim == 4
+                    && mirror.dim(0) == 2
+                    && mirror.dim(1) == kvHeads
+                    && mirror.dim(3) == headDim / 8 + headDim / 64
+            })
+        else { return nil }
+
+        let offset = fullRows[0].absoluteOffset
+        let keyLength = offset + 1
+        guard offset > 0,
+            keyLength >= minKeyLength,
+            keyLength <= maxKeyLength,
+            fullRows.allSatisfy({ $0.cohortPool == nil }),
+            fullRows.allSatisfy({ $0.absoluteOffset == offset }),
+            fullRows.allSatisfy({ keyLength <= $0.maxLength })
+        else { return nil }
+
+        var keyBuffers: [MLXArray] = []
+        var valueBuffers: [MLXArray] = []
+        var mirrors: [MLXArray] = []
+        keyBuffers.reserveCapacity(batch)
+        valueBuffers.reserveCapacity(batch)
+        mirrors.reserveCapacity(batch)
+        var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
+        params.reserveCapacity(batch + 2)
+        for row in fullRows {
+            let state = row.cbv2InnerState()
+            guard state.count == 3,
+                state[0].dtype == .bfloat16,
+                state[1].dtype == .bfloat16,
+                state[0].ndim == 4,
+                state[0].dim(0) == 1,
+                state[0].dim(1) == kvHeads,
+                state[0].dim(2) >= keyLength,
+                state[0].dim(3) == headDim,
+                state[1].shape == state[0].shape,
+                state[2].dtype == .uint32,
+                state[2].ndim == 4,
+                state[2].dim(0) == 2,
+                state[2].dim(1) == kvHeads,
+                state[2].dim(2) == state[0].dim(2),
+                state[2].dim(3) == headDim / 8 + headDim / 64,
+                let mirror = row.quantMirrorView,
+                mirror.dtype == .uint32,
+                mirror.ndim == 4,
+                mirror.dim(0) == 2,
+                mirror.dim(1) == kvHeads,
+                mirror.dim(2) >= keyLength,
+                mirror.dim(3) == headDim / 8 + headDim / 64
+            else { return nil }
+            keyBuffers.append(state[0])
+            valueBuffers.append(state[1])
+            mirrors.append(mirror)
+            params.append(UInt32(state[0].dim(2)))
+        }
+        let paramsArray = MLXArray(params)
+        CBv2EngageMark.once("kvqd512")
+
+        let template: [(String, any KernelTemplateArg)] = [
+            ("T", queries.dtype)
+        ]
+        let scratchShape = [batch, queryHeads, 1, keyLength]
+
+        // Preserve the promoted WRITE-022 BF16 store exactly. Its fence is
+        // consumed by QK, which then performs the q4 live store and publishes
+        // the next inter-step fence.
+        let storeFence = ringStoreKernel(
+            keyBuffers + valueBuffers
+                + [paramsArray, keys, values, previousWriteFence],
+            template: template,
+            grid: (128, 1, batch * kvHeads),
+            threadGroup: (128, 1, 1),
+            outputShapes: [[1]],
+            outputDTypes: [.int32]
+        )[0]
+
+        let chunks = (keyLength + 63) / 64
+        let passQK = qkQ4Kernel(
+            [queries] + mirrors + [paramsArray, keys, values, storeFence],
+            template: template,
+            grid: (32, 4, batch * kvHeads * chunks),
+            threadGroup: (32, 4, 1),
+            outputShapes: [scratchShape, [1]],
+            outputDTypes: [.bfloat16, .int32]
+        )
+        let scores = passQK[0]
+        let nextWriteFence = passQK[1]
+
+        let softmaxThreads = ((keyLength + 3) / 4 + 31) / 32 * 32
+        let probs = softmaxKernel(
+            [scores, paramsArray],
+            template: template,
+            grid: (softmaxThreads * batch * queryHeads, 1, 1),
+            threadGroup: (softmaxThreads, 1, 1),
+            outputShapes: [scratchShape],
+            outputDTypes: [.bfloat16]
+        )[0]
+
+        let output = avQ4Kernel(
+            [probs] + mirrors + [paramsArray],
+            template: template,
+            grid: (32, 4, batch * kvHeads * 8),
+            threadGroup: (32, 4, 1),
+            outputShapes: [[batch, queryHeads, 1, headDim]],
+            outputDTypes: [.bfloat16]
+        )[0]
+        for row in fullRows {
+            row.advanceAfterFusedAppend()
+        }
+        CBv2EngageMark.once("kvqd512-live")
+        return (output, nextWriteFence)
+    }
+
     // ATTRIBUTION. Everything in this WRITE-016-D512 section, and the
     // matching hunks in AttentionV1.swift and SequenceKV/FullSequenceKV.swift,
     // is taken VERBATIM from public ranked submission

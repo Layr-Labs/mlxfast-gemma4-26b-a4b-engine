@@ -102,6 +102,27 @@ final class CBv2FullDecodeCohortPool {
     /// Hard ceiling on growth: the largest `maxLength` of the migrated rows.
     private let capacityLimit: Int
 
+    /// KVQ-D512: packed 4-bit g64 mirror of the pool, layout
+    /// `[rowCount, 2, kvHeads, capacity, headDim/8 + headDim/64]` uint32 —
+    /// plane 0 keys, plane 1 values; per (row, plane, head, slot) the first
+    /// `headDim/8` words hold eight nibbles each and the trailing
+    /// `headDim/64` words hold that slot's per-group fp16 (scale, bias)
+    /// pairs. Maintained at exactly the writes that mutate the pool
+    /// (`rowAppend`, `batchAppend`, growth) plus one full pack at
+    /// migration; the bf16 pool stays the source of truth for every other
+    /// consumer. `MLX_KVQ_D512=0` disables the mirror wholesale.
+    private(set) var quantMirror: MLXArray?
+
+    static let quantD512Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_KVQ_D512"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private var quantEligible: Bool {
+        Self.quantD512Enabled && headDim == 512 && keys.dtype == .bfloat16
+    }
+
     init(
         keys: MLXArray, values: MLXArray, capacity: Int,
         rowCount: Int, kvHeads: Int, headDim: Int, capacityLimit: Int
@@ -113,9 +134,16 @@ final class CBv2FullDecodeCohortPool {
         self.kvHeads = kvHeads
         self.headDim = headDim
         self.capacityLimit = capacityLimit
+        if quantEligible {
+            // One full pack of the migrated bytes; per-slot packing is
+            // position-independent, so slots beyond any row's offset hold
+            // garbage the readers never address (identical contract to the
+            // bf16 pool's uninitialized tail).
+            quantMirror = Self.packPlanes(keys: keys, values: values, headDim: headDim)
+        }
     }
 
-    var nbytes: Int { keys.nbytes + values.nbytes }
+    var nbytes: Int { keys.nbytes + values.nbytes + (quantMirror?.nbytes ?? 0) }
 
     /// One row's append through the pool — the pooled twin of the private
     /// buffer's slice assignment (identical values into identical slots).
@@ -126,6 +154,14 @@ final class CBv2FullDecodeCohortPool {
         ensureCapacity(offset + n)
         keys[index ..< (index + 1), 0..., offset ..< (offset + n), 0...] = newKeys
         values[index ..< (index + 1), 0..., offset ..< (offset + n), 0...] = newValues
+        if let mirror = quantMirror {
+            let packed = Self.packPlanes(
+                keys: newKeys, values: newValues, headDim: headDim)
+            mirror[
+                index ..< (index + 1), 0..., 0..., offset ..< (offset + n), 0...
+            ] = packed
+            quantMirror = mirror
+        }
     }
 
     /// Lockstep decode append: every row writes the SAME slot, so all
@@ -134,6 +170,12 @@ final class CBv2FullDecodeCohortPool {
         ensureCapacity(offset + 1)
         keys[0..., 0..., offset ..< (offset + 1), 0...] = newKeys
         values[0..., 0..., offset ..< (offset + 1), 0...] = newValues
+        if let mirror = quantMirror {
+            let packed = Self.packPlanes(
+                keys: newKeys, values: newValues, headDim: headDim)
+            mirror[0..., 0..., 0..., offset ..< (offset + 1), 0...] = packed
+            quantMirror = mirror
+        }
     }
 
     /// Zero-copy temporal-order views of one row — shape
@@ -167,7 +209,96 @@ final class CBv2FullDecodeCohortPool {
         values = concatenated(
             [values, MLXArray.zeros([rowCount, kvHeads, growth, headDim], dtype: values.dtype)],
             axis: 2)
+        if let mirror = quantMirror {
+            quantMirror = concatenated(
+                [
+                    mirror,
+                    MLXArray.zeros(
+                        [rowCount, 2, kvHeads, growth, headDim / 8 + headDim / 64],
+                        dtype: .uint32),
+                ],
+                axis: 3)
+        }
         capacity = newCapacity
+    }
+
+    // MARK: - KVQ-D512 packing (shared machinery below the class)
+
+    /// `cbv2_kvq4g64_pack_d512_v1`: the promoted D=256 g64 packer's math at
+    /// D=512 — per-64-element-group fp16 (scale, bias) via the 8-lane xor
+    /// butterfly, `/15` scale floor `1e-6`, `rint`/clamp nibbles packed
+    /// eight per word, one tail word per group. 64 lanes per (row, slot):
+    /// each lane owns 8 consecutive elements wholly inside one group, and
+    /// every 8-lane group is aligned inside one simdgroup, so the stride
+    /// 1/2/4 butterfly reduces exactly the group's lanes in both
+    /// simdgroups.
+    fileprivate static let packKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_kvq4g64_pack_d512_v1",
+        inputNames: ["x"],
+        outputNames: ["packed_w"],
+        source: """
+            constexpr int D = 512;
+            constexpr int lanes = 64;
+            constexpr int per_lane = D / lanes;            // 8 values
+            constexpr int payload_words = D / 8;           // 64
+            constexpr int row_words = payload_words + D / 64;
+
+            const int row = int(threadgroup_position_in_grid.x);
+            const int lane = int(thread_position_in_threadgroup.x);
+            const device T* xr = x + row * D;
+            device uint32_t* out = packed_w + row * row_words;
+
+            float vmin = 3.402823466e+38F;
+            float vmax = -3.402823466e+38F;
+            for (int i = 0; i < per_lane; ++i) {
+                const float v = float(xr[lane * per_lane + i]);
+                vmin = min(vmin, v);
+                vmax = max(vmax, v);
+            }
+            for (uint m = 1; m < 8; m <<= 1) {
+                vmin = min(vmin, simd_shuffle_xor(vmin, m));
+                vmax = max(vmax, simd_shuffle_xor(vmax, m));
+            }
+
+            const half hs = half(max((vmax - vmin) / 15.0f, 1e-6f));
+            const half hb = half(vmin);
+            const float s = float(hs);
+            const float b = float(hb);
+
+            uint32_t word = 0u;
+            for (int i = 0; i < per_lane; ++i) {
+                const float q = metal::rint((float(xr[lane * per_lane + i]) - b) / s);
+                word |= uint32_t(clamp(q, 0.0f, 15.0f)) << (4 * i);
+            }
+            out[lane] = word;
+            if (lane % 8 == 0) {
+                out[payload_words + lane / 8] =
+                    uint32_t(as_type<ushort>(hs)) | (uint32_t(as_type<ushort>(hb)) << 16);
+            }
+        """
+    )
+
+    /// `[R, kvHeads, n, D]` K and V → packed `[R, 2, kvHeads, n, row_words]`
+    /// uint32.
+    fileprivate static func packPlanes(
+        keys: MLXArray, values: MLXArray, headDim: Int
+    ) -> MLXArray {
+        let r = keys.dim(0)
+        let h = keys.dim(1)
+        let n = keys.dim(2)
+        let rowWords = headDim / 8 + headDim / 64
+        // Plane-major stack: [R, 2, h, n, D] flattened to rows.
+        let stacked = stacked([keys, values], axis: 1)
+        let rows = r * 2 * h * n
+        let packed = packKernel(
+            [stacked],
+            template: [("T", keys.dtype)],
+            grid: (rows * 64, 1, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [[r, 2, h, n, rowWords]],
+            outputDTypes: [.uint32]
+        )[0]
+        return packed
     }
 }
 
@@ -206,6 +337,20 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
     private var values: MLXArray?
     private var capacity: Int
 
+    /// KVQ-D512: packed 4-bit g64 mirror of the PRIVATE buffers, layout
+    /// `[2, kvHeads, capacity, headDim/8 + headDim/64]` uint32 (plane 0
+    /// keys, plane 1 values) — the private-row twin of the pool mirror
+    /// above, maintained at exactly the private writes (`update` appends
+    /// and the fused-store roads' explicit mirror append) and grown with
+    /// the buffers. bf16 stays the source of truth for every other reader.
+    private var quantMirror: MLXArray?
+
+    /// The mirror and its slot capacity for the batched decode kernels, or
+    /// nil when the quantized road is off or the row is pooled.
+    var quantMirrorView: MLXArray? {
+        cohortPool == nil ? quantMirror : nil
+    }
+
     /// ATT-008 cohort pooling (nil until `cohortPool(binding:)` migrates this
     /// row). While bound, `keys`/`values` are nil and the pool's row
     /// `cohortIndex` is the storage.
@@ -237,6 +382,7 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
             return pool.nbytes / pool.rowCount
         }
         return (keys?.nbytes ?? 0) + (values?.nbytes ?? 0)
+            + (quantMirror?.nbytes ?? 0)
     }
 
     /// WRITE-016-D512: the `update()` bookkeeping advance without the two
@@ -245,6 +391,18 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
     /// capacity >= the new length before the store, so this never needs
     /// `ensureCapacity`; a step that would grow the buffer falls back to the
     /// append path instead.
+    /// KVQ-D512 companion to the fused-store roads: those kernels store the
+    /// token's bf16 K/V in place, so the mirror gets the SAME token packed
+    /// from the same operands here (host pack + one-slot slice, the
+    /// identical bytes `update`'s hook would have landed).
+    func mirrorFusedAppend(keys newKeys: MLXArray, values newValues: MLXArray) {
+        guard let mirror = quantMirror else { return }
+        let packed = CBv2FullDecodeCohortPool.packPlanes(
+            keys: newKeys, values: newValues, headDim: headDim)
+        mirror[0..., 0..., absoluteOffset ..< (absoluteOffset + 1), 0...] = packed[0]
+        quantMirror = mirror
+    }
+
     public func advanceAfterFusedAppend() {
         precondition(
             cohortPool == nil && keys != nil && values != nil,
@@ -282,6 +440,13 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
 
         keys![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newKeys
         values![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newValues
+        if let mirror = quantMirror {
+            let packed = CBv2FullDecodeCohortPool.packPlanes(
+                keys: newKeys, values: newValues, headDim: headDim)
+            mirror[0..., 0..., absoluteOffset ..< (absoluteOffset + n), 0...] =
+                packed[0]
+            quantMirror = mirror
+        }
         absoluteOffset += n
 
         return (
@@ -343,9 +508,9 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
 
     func cbv2InnerState() -> [MLXArray] {
         if let pool = cohortPool {
-            return [pool.keys, pool.values]
+            return [pool.keys, pool.values, pool.quantMirror].compactMap { $0 }
         }
-        return [keys, values].compactMap { $0 }
+        return [keys, values, quantMirror].compactMap { $0 }
     }
 
     // MARK: - ATT-008 cohort pooling
@@ -420,6 +585,14 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
                 [1, kvHeads, capacity, keyTemplate.dim(3)], dtype: keyTemplate.dtype)
             values = MLXArray.zeros(
                 [1, kvHeads, capacity, valueTemplate.dim(3)], dtype: valueTemplate.dtype)
+            if CBv2FullDecodeCohortPool.quantD512Enabled,
+                keyTemplate.dim(3) == 512, headDim == 512,
+                keyTemplate.dtype == .bfloat16
+            {
+                quantMirror = MLXArray.zeros(
+                    [2, kvHeads, capacity, headDim / 8 + headDim / 64],
+                    dtype: .uint32)
+            }
             return
         }
         guard needed > capacity else { return }
@@ -434,6 +607,16 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
         values = concatenated(
             [values!, MLXArray.zeros([1, kvHeads, growth, values!.dim(3)], dtype: values!.dtype)],
             axis: 2)
+        if let mirror = quantMirror {
+            quantMirror = concatenated(
+                [
+                    mirror,
+                    MLXArray.zeros(
+                        [2, kvHeads, growth, headDim / 8 + headDim / 64],
+                        dtype: .uint32),
+                ],
+                axis: 2)
+        }
         capacity = newCapacity
     }
 }

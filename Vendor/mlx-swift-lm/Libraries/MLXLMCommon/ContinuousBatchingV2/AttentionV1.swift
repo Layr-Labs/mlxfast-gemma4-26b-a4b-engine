@@ -490,6 +490,35 @@ enum CBv2AttentionV1 {
                     // is unavailable (kill switch, or any row without one).
                     let portQuantActive = CBv2WindowedSequenceKV.quantEnabled
                         && ringRows.allSatisfy { $0.decodeRingQuantView != nil }
+                    // KVQ-FUSE: the quantized road's own fused form — pass A
+                    // stores this step's mirror bytes in place, so the
+                    // per-row separate writes below (bf16 `SliceUpdate`s,
+                    // host packs, mirror `SliceUpdate`s) are skipped
+                    // entirely. Fence-chained exactly as WRITE-016; fails
+                    // closed to the promoted separate-write road.
+                    if portQuantActive, allowFusedRingWrite,
+                        let decodeRingWriteFence
+                    {
+                        let preWrite = ringRows.compactMap { $0.decodeRingViewBeforeWrite }
+                        let mirrors = ringRows.compactMap { $0.decodeRingQuantView }
+                        if preWrite.count == B, mirrors.count == B,
+                            let fused = CBv2RaggedTwoPassDecodeAttentionV1
+                                .attendRingQuantWriting(
+                                    queries: queries, mirrors: mirrors,
+                                    starts: preWrite.map(\.start),
+                                    newKeys: keys, newValues: values,
+                                    previousWriteFence: decodeRingWriteFence.value,
+                                    scale: scale,
+                                    slidingWindowLength: ringRows[0].window)
+                        {
+                            for row in ringRows {
+                                row.advanceDecodeRingAfterFusedQuantWrite()
+                            }
+                            decodeRingWriteFence.value = fused.nextWriteFence
+                            CBv2EngageMark.once("kvq8fuse")
+                            return fused.output
+                        }
+                    }
                     if !portQuantActive, fusedRingWriteEnabled, allowFusedRingWrite,
                         let decodeRingWriteFence
                     {
@@ -536,6 +565,15 @@ enum CBv2AttentionV1 {
                     {
                         return quantOutput
                     }
+                    // KVQ-FUSE: a row that took a fused quantized step has a
+                    // stale bf16 ring; only mirror-reading roads may serve
+                    // it. The quant road above is geometry-invariant per
+                    // request, so this cannot fire once it has engaged —
+                    // fail loudly rather than attend stale bytes.
+                    precondition(
+                        ringRows.allSatisfy { !$0.bf16RingIsStale },
+                        "CBv2AttentionV1: bf16 ring road reached after a fused quantized decode step (KVQ-FUSE)"
+                    )
                     if views.count == B,
                         let output = CBv2RaggedTwoPassDecodeAttentionV1.attendRing(
                             queries: queries, keys: views.map(\.keys),

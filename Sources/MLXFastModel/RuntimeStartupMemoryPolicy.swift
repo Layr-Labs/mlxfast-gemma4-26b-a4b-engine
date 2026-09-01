@@ -45,7 +45,7 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
     public let clearAllocatorCacheAfterWarmup: Bool
     public let environmentOverrides: [String: String]
 
-    /// The profile gate for the full-profile 512 MiB post-wire command-buffer
+    /// The profile gate for the full-profile 1024 MiB post-wire command-buffer
     /// budget (and the 32 GiB serial-path allocator cap). Returns `true` only
     /// when a machine may install it: at or above the 96 GiB floor, not running
     /// under an explicit low-memory request, and with the benchmark-forwarded
@@ -77,12 +77,20 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
     /// early enough to supply a full-profile default without touching trusted
     /// worker code.
     ///
-    /// The 512 MiB referenced-byte budget is the independently promoted
-    /// post-residency setting from the Laguna M5-Max track. It admits a whole
-    /// model layer per command buffer after the persistent weights have been
-    /// wired, while the stock 50-operation cap remains the outer safety wall.
-    /// Explicit user values win and a benchmark-forwarded kill switch supports
-    /// same-binary controls.
+    /// The referenced-byte budget descends from the independently promoted
+    /// post-residency setting from the Laguna M5-Max track, which was 512 MiB:
+    /// enough to admit a whole model layer per command buffer after the
+    /// persistent weights have been wired. At the ranked Gemma-4 26B-A4B
+    /// geometry one layer's MoE expert bank is on its own about 408 MiB of
+    /// referenced bytes (128 experts x 3 matrices x 2816 x 704, affine 4-bit
+    /// with group-size-64 scales and biases), so 512 MiB admitted that layer
+    /// and then had to cut. 1024 MiB is the next doubling on that same lever
+    /// and lets two adjacent layers share one command buffer. The operation
+    /// cap alongside it stopped being the first constraint to trip once it
+    /// passed 512, so bytes -- not op count -- is what actually decides the
+    /// commit points here. A benchmark-forwarded kill switch supports
+    /// same-binary controls; note that both writes below are `overwrite=1`,
+    /// so an explicit user value does NOT survive the gate being open.
     ///
     /// The gate decision is factored into
     /// `gemma4MTPFullProfileCommandBufferGateIsOpen` so the serial
@@ -100,10 +108,10 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
         ) else { return }
         // Force-set: the ranked worker / parent may already have exported the
         // stock 50 MiB MLX default. overwrite=0 left that in place and the
-        // 512 MiB post-wire budget never landed. overwrite=1 makes the
-        // promoted Laguna M5-Max command-buffer profile actually apply.
-        setenv("MLX_MAX_MB_PER_BUFFER", "512", 1)
-        setenv("MLX_MAX_OPS_PER_BUFFER", "512", 1)
+        // post-wire budget never landed. overwrite=1 makes the promoted
+        // Laguna M5-Max command-buffer profile actually apply.
+        setenv("MLX_MAX_MB_PER_BUFFER", "1024", 1)
+        setenv("MLX_MAX_OPS_PER_BUFFER", "1024", 1)
     }
 
     public static func resolve(
@@ -141,9 +149,10 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
                 cacheLimitBytes: 6 << 30,
                 // Shorter command buffers bound transient in-flight memory on
                 // machines whose allocator cache is also capped to match the
-                // trusted worker's 6 GiB phase-start value. 128 MiB is a
-                // quarter of the full profile's referenced-byte budget. The op
-                // cap is the one asymmetry left after the full profile moved
+                // trusted worker's 6 GiB phase-start value. 128 MiB is an
+                // eighth of the referenced-byte budget the full profile now
+                // force-sets (1024 MiB). The op cap is the one asymmetry left
+                // after the full profile moved
                 // to 512 / 50: 64 here is ABOVE the full profile's 50, so the
                 // low profile is bounded by bytes, not by op count. That is an
                 // open item for whoever owns these budgets -- it is recorded
@@ -186,12 +195,25 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
             // buffers; decode's explicit async-eval groups remain the outer
             // command-buffer boundary, and this referenced-buffer budget
             // governs within them. 512 / 50 is the promoted Laguna M5-Max
-            // post-wire profile -- the same pair
-            // `installGemma4MTPFullProfileCommandBufferDefaults` force-sets
-            // above, so these values now REPORT the ranked environment rather
-            // than contradict it. (They were 320 / 128 until the accepted
+            // post-wire profile. (They were 320 / 128 until the accepted
             // submission 0cd0a6b4-b539-4705-a1c7-cb271c1f9d3b; the prose here
             // still said 320 afterwards, which is what this line fixes.)
+            //
+            // These scalars no longer equal the pair
+            // `installGemma4MTPFullProfileCommandBufferDefaults` force-sets
+            // above (now 1024 / 1024): the op cap diverged first when that
+            // seam was promoted 50 -> 256 -> 512 -> 1024, and the byte budget
+            // diverges here. That divergence is deliberate and recorded rather
+            // than silently repaired, for two reasons. First, `resolve()` and
+            // `apply()` have NO caller left in this tree -- the DFlash worker
+            // that consumed them left with the 2026-08-22 vendored adoption,
+            // and the test pinning that wiring is disabled -- so these scalars
+            // report a profile nothing installs, while the force-set above is
+            // what the ranked box actually runs. Second, they are pinned by
+            // `Tests/MLXFastTests/Model/RuntimeStartupMemoryPolicyTests.swift`,
+            // which is outside `editablePaths`; moving them would redden a
+            // guard this lane cannot edit for no runtime effect. Whoever
+            // restores a caller for `apply()` must reconcile the two.
             maxMegabytesPerCommandBuffer: 512,
             maxOperationsPerCommandBuffer: 50,
             clearAllocatorCacheAfterWarmup: false,

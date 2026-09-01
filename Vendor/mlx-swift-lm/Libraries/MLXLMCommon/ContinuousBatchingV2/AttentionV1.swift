@@ -491,10 +491,23 @@ enum CBv2AttentionV1 {
                                     scale: scale,
                                     slidingWindowLength: ringRows[0].window)
                         {
-                            for (index, row) in ringRows.enumerated() {
-                                row.decodeRingWriteBF16Only(
-                                    keys: keys[index ..< (index + 1)],
-                                    values: values[index ..< (index + 1)])
+                            // Q4-BF16-ELIDE: the fused pass already stored
+                            // the mirror slot and served this step's live
+                            // token from the new K/V arrays; on the
+                            // quant-authoritative road the BF16 SliceUpdates
+                            // are dead graph work, so advance counters only.
+                            // Kill switch restores the incumbent writes.
+                            if CBv2WindowedSequenceKV.q4BF16RingElideEnabled {
+                                CBv2EngageMark.once("kvq4-bf16-elide")
+                                for row in ringRows {
+                                    row.advanceDecodeRingAfterQuantWrite()
+                                }
+                            } else {
+                                for (index, row) in ringRows.enumerated() {
+                                    row.decodeRingWriteBF16Only(
+                                        keys: keys[index ..< (index + 1)],
+                                        values: values[index ..< (index + 1)])
+                                }
                             }
                             // The next pass-A consumes this fence; this
                             // step's pass-B output also consumes pass-A's
@@ -570,7 +583,7 @@ enum CBv2AttentionV1 {
                     {
                         return quantOutput
                     }
-                    if views.count == B,
+                    if views.count == B, !ringRows.contains(where: \.bf16RingStale),
                         let output = CBv2RaggedTwoPassDecodeAttentionV1.attendRing(
                             queries: queries, keys: views.map(\.keys),
                             values: views.map(\.values), starts: views.map(\.start),

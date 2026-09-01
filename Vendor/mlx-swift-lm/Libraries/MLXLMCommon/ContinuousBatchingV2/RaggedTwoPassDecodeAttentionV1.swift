@@ -1678,8 +1678,13 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 float sum_lo = 0.0f;
                 float sum_hi = 0.0f;
                 uint slot = (start + uint(block)) % uint(N);
+                // PFA2: two-token-ahead carry (loads only; per-token arithmetic
+                // and order unchanged). pre = token+BLOCKS, pre2 = token+2*BLOCKS.
                 const bool prefetch_first = block < N - 1;
-                uint next_slot = slot + uint(BLOCKS);
+                uint slot2 = slot + uint(BLOCKS);
+                if (slot2 >= uint(N)) slot2 -= uint(N);
+                const bool prefetch_second = block + BLOCKS < N - 1;
+                uint next_slot = slot2 + uint(BLOCKS);
                 if (next_slot >= uint(N)) next_slot -= uint(N);
                 uint32_t kw_pre = prefetch_first
                     ? mkeys_w[slot * row_words + lane] : 0u;
@@ -1689,6 +1694,14 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     ? mkeys_w[slot * row_words + payload_words + lane / 8] : 0u;
                 uint32_t vtw_pre = prefetch_first
                     ? mvalues_w[slot * row_words + payload_words + lane / 8] : 0u;
+                uint32_t kw_pre2 = prefetch_second
+                    ? mkeys_w[slot2 * row_words + lane] : 0u;
+                uint32_t vw_pre2 = prefetch_second
+                    ? mvalues_w[slot2 * row_words + lane] : 0u;
+                uint32_t ktw_pre2 = prefetch_second
+                    ? mkeys_w[slot2 * row_words + payload_words + lane / 8] : 0u;
+                uint32_t vtw_pre2 = prefetch_second
+                    ? mvalues_w[slot2 * row_words + payload_words + lane / 8] : 0u;
                 for (int token = block; token < N; token += BLOCKS) {
                     const bool current = token == N - 1;
                     const uint32_t kw = current ? kword : kw_pre;
@@ -1701,12 +1714,16 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         ? (uint32_t(as_type<ushort>(vhs))
                             | (uint32_t(as_type<ushort>(vhb)) << 16))
                         : vtw_pre;
-                    if (token + BLOCKS < N - 1) {
-                        kw_pre = mkeys_w[next_slot * row_words + lane];
-                        vw_pre = mvalues_w[next_slot * row_words + lane];
-                        ktw_pre =
+                    kw_pre = kw_pre2;
+                    vw_pre = vw_pre2;
+                    ktw_pre = ktw_pre2;
+                    vtw_pre = vtw_pre2;
+                    if (token + 2 * BLOCKS < N - 1) {
+                        kw_pre2 = mkeys_w[next_slot * row_words + lane];
+                        vw_pre2 = mvalues_w[next_slot * row_words + lane];
+                        ktw_pre2 =
                             mkeys_w[next_slot * row_words + payload_words + lane / 8];
-                        vtw_pre =
+                        vtw_pre2 =
                             mvalues_w[next_slot * row_words + payload_words + lane / 8];
                         next_slot += uint(BLOCKS);
                         if (next_slot >= uint(N)) next_slot -= uint(N);

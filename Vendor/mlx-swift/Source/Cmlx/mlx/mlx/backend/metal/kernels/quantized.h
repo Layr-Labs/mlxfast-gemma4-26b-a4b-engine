@@ -3982,10 +3982,18 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     }
     return;
   }
+  // EXPERT-SINGLES-DOWN: the pairless down tile takes the same loads-only
+  // WVEC singles body the K = 2816 singleton arm already ships (KFIX = 704,
+  // one aligned 4-byte weight load per (row, K-block) instead of two 2-byte
+  // loads; 704 = 2 * 256 + 192 so the 24-lane whole-packet tail is the
+  // `tail_values % 8 == 0` arm). Same lane -> K mapping, same load_vector,
+  // same 4 + 4 qdot grouping, same accumulator, simd_sum and store as the
+  // stock qmv_impl it replaces, so every output element's add sequence is
+  // unchanged.
   for (int t = 0; t < gemma4_down_tile_span; t++) {
     uint3 tile_tid = tid;
     tile_tid.y = tid.y + uint(t);
-    qmv_impl<T, group_size, bits>(
+    qmv_affine4_g64_singles_impl<T, group_size, bits, 704, true, false>(
         tile_w,
         tile_scales,
         tile_biases,
@@ -4179,7 +4187,10 @@ template <typename T, int group_size, int bits>
           single_w, single_scales, single_biases, single_x, single_y,
           in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
     } else {
-      qmv_impl<T, group_size, bits>(
+      // EXPERT-SINGLES-DOWN: K = 704 singleton arm (reached only when the
+      // down-tile flag above is off) takes the same WVEC singles body.
+      qmv_affine4_g64_singles_impl<
+          T, group_size, bits, 704, true, false>(
           single_w, single_scales, single_biases, single_x, single_y,
           in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
     }

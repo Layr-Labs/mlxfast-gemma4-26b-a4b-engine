@@ -176,8 +176,8 @@ METAL_FUNC void qkv_mma8_affine4_g64_impl(
     MMA8_STEP(B6, 6)
     MMA8_STEP(B7, 7)
 
-    acc0 += s * C.thread_elements()[0] + rs.x * b;
-    acc1 += s * C.thread_elements()[1] + rs.y * b;
+    acc0 = fma(s, C.thread_elements()[0], fma(rs.x, b, acc0));
+    acc1 = fma(s, C.thread_elements()[1], fma(rs.y, b, acc1));
   }
 
   if (KS == 2) {
@@ -336,8 +336,8 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
       MMA8_STEP(B6, 6)
       MMA8_STEP(B7, 7)
 
-      acc0[t] += s * C.thread_elements()[0] + rs.x * b;
-      acc1[t] += s * C.thread_elements()[1] + rs.y * b;
+      acc0[t] = fma(s, C.thread_elements()[0], fma(rs.x, b, acc0[t]));
+      acc1[t] = fma(s, C.thread_elements()[1], fma(rs.y, b, acc1[t]));
     }
   }
 
@@ -386,7 +386,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
     private static let tilesPerGroup = 2
 
     private static let multiTileKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_v4",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_v5",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -403,7 +403,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
         ensureRowContiguous: true)
 
     private static let mma8Kernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_carry2_v3",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_carry2_v4",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """

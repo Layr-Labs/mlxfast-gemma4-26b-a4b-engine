@@ -1020,6 +1020,170 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         ensureRowContiguous: true
     )
 
+    /// KVQ-GQAPAIR: GQA-PAIR-001 applied to the quantized mirror read.
+    ///
+    /// The pairing above is on the BF16 fused ring pass A only. The quantized
+    /// read landed as a fresh kernel and kept the incumbent's shape: a GQA
+    /// group is laid across two simdgroups of one threadgroup, one query head
+    /// each, and both simdgroups walk the same block-strided slot sequence of
+    /// the same `(row, kv head)` mirror. Every packed K row and every packed
+    /// V row of the retained window is therefore issued TWICE, and every
+    /// nibble in them is unpacked and dequantized twice, once per simdgroup,
+    /// for the same 144 bytes.
+    ///
+    /// Here one simdgroup serves both query heads. The lane holds both heads'
+    /// queries and both heads' accumulators, loads each payload word and each
+    /// group tail word ONCE, forms each dequantized element ONCE, and feeds
+    /// the two independent online-softmax chains from that one register. The
+    /// two chains never mix: each keeps its own `max`, its own `sum`, its own
+    /// accumulator bank and its own `simd_sum`.
+    ///
+    /// Every expression is character for character the unpaired kernel's with
+    /// the shared load and the shared `fma(nibble, scale, bias)` hoisted into
+    /// a named value. Hoisting a value that both heads already computed
+    /// separately cannot change either head's result: `fma` is one rounded
+    /// operation whichever statement it sits in, and each head's accumulation
+    /// order over `element`, its reduction and its close are unchanged. The
+    /// partition, the traversal order and the BF16 partial store are also
+    /// unchanged; only which thread does the work moves.
+    ///
+    /// Occupancy: the launch keeps its `KV_HEADS * batch * BLOCKS`
+    /// threadgroups and drops from two simdgroups to one, which is the same
+    /// trade the BF16 pairing already makes on this partition.
+    ///
+    /// Kill switch: `MLX_KV_QUANT_GQAPAIR=0` returns the quantized read to one
+    /// simdgroup per query head.
+    static let quantGqaPairedReadEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_KV_QUANT_GQAPAIR"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let portQuantReadPairedKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name:
+                "cbv2_ragged8_sdpa_ring_2pass_a_q4g64_gqapair_d256_g2_port"
+                + "_b\(blocks)_v1",
+            inputNames: [
+                "queries",
+                "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7", "starts",
+            ],
+            outputNames: ["partials", "sums", "maxs"],
+            source: """
+                constexpr int simd_width = 32;
+                constexpr int values_per_lane = D / simd_width;
+                static_assert(GQA == 2, "this kernel pairs exactly two query heads");
+
+                const int kv_head = int(threadgroup_position_in_grid.x);
+                const int batch_index = int(threadgroup_position_in_grid.y);
+                const int block = int(threadgroup_position_in_grid.z);
+                const int query_head = GQA * kv_head;
+                const int batch_head = batch_index * 16 + query_head;
+                const int lane = int(thread_index_in_simdgroup);
+
+                // KVQ4: 4-bit payload in 32 words (8 nibbles each) plus one tail word
+                // per 64-element group holding that group's fp16 (scale, bias).
+                constexpr int row_words = D / 8 + D / 64;
+                const device uint32_t* mirror_w = m0;
+                switch (batch_index) {
+                    case 1: mirror_w = m1; break;
+                    case 2: mirror_w = m2; break;
+                    case 3: mirror_w = m3; break;
+                    case 4: mirror_w = m4; break;
+                    case 5: mirror_w = m5; break;
+                    case 6: mirror_w = m6; break;
+                    case 7: mirror_w = m7; break;
+                    default: break;
+                }
+                const uint start = starts[batch_index];
+
+                const device T* query =
+                    queries + batch_head * D + lane * values_per_lane;
+                int slot = int((start + block) % N);
+                device T* partial = partials
+                    + batch_head * BLOCKS * D + block * D + lane * values_per_lane;
+                device float* sum_out = sums + batch_head * BLOCKS + block;
+                device float* max_out = maxs + batch_head * BLOCKS + block;
+
+                thread float q_lo[values_per_lane];
+                thread float q_hi[values_per_lane];
+                thread float acc_lo[values_per_lane];
+                thread float acc_hi[values_per_lane];
+                for (int element = 0; element < values_per_lane; ++element) {
+                    q_lo[element] = 1.0f * float(query[element]);
+                    q_hi[element] = 1.0f * float(query[D + element]);
+                    acc_lo[element] = 0.0f;
+                    acc_hi[element] = 0.0f;
+                }
+
+                float max_lo = -3.402823466e+38F;
+                float max_hi = -3.402823466e+38F;
+                float sum_lo = 0.0f;
+                float sum_hi = 0.0f;
+                for (int token = block; token < N; token += BLOCKS) {
+                    const device uint32_t* krow_w =
+                        mirror_w + (kv_head * N + slot) * row_words;
+                    const device uint32_t* vrow_w =
+                        mirror_w + ((KV_HEADS + kv_head) * N + slot) * row_words;
+                    // One lane owns 8 consecutive elements, so it sits wholly
+                    // inside one 64-element group: group = (lane * 8) / 64.
+                    const int group = lane / 8;
+                    const uint32_t ktw = krow_w[D / 8 + group];
+                    const uint32_t vtw = vrow_w[D / 8 + group];
+                    const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
+                    const float kb = float(as_type<half>(ushort(ktw >> 16)));
+                    const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
+                    const float vb = float(as_type<half>(ushort(vtw >> 16)));
+                    const uint32_t kw = krow_w[lane];
+                    const uint32_t vw = vrow_w[lane];
+                    float score_lo = 0.0f;
+                    float score_hi = 0.0f;
+                    for (int element = 0; element < 8; ++element) {
+                        const float key_element =
+                            fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
+                        score_lo += q_lo[element] * key_element;
+                        score_hi += q_hi[element] * key_element;
+                    }
+                    score_lo = simd_sum(score_lo);
+                    score_hi = simd_sum(score_hi);
+
+                    const float new_max_lo = max(max_lo, score_lo);
+                    const float new_max_hi = max(max_hi, score_hi);
+                    const float old_factor_lo = fast::exp(max_lo - new_max_lo);
+                    const float old_factor_hi = fast::exp(max_hi - new_max_hi);
+                    const float score_factor_lo = fast::exp(score_lo - new_max_lo);
+                    const float score_factor_hi = fast::exp(score_hi - new_max_hi);
+                    max_lo = new_max_lo;
+                    max_hi = new_max_hi;
+                    sum_lo = sum_lo * old_factor_lo + score_factor_lo;
+                    sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                    for (int element = 0; element < 8; ++element) {
+                        const float value_element =
+                            fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
+                        acc_lo[element] = acc_lo[element] * old_factor_lo
+                            + score_factor_lo * value_element;
+                        acc_hi[element] = acc_hi[element] * old_factor_hi
+                            + score_factor_hi * value_element;
+                    }
+
+                    slot += BLOCKS;
+                    if (slot >= N) slot -= N;
+                }
+
+                if (lane == 0) {
+                    sum_out[0] = sum_lo;
+                    max_out[0] = max_lo;
+                    sum_out[BLOCKS] = sum_hi;
+                    max_out[BLOCKS] = max_hi;
+                }
+                for (int element = 0; element < values_per_lane; ++element) {
+                    partial[element] = T(acc_lo[element]);
+                    partial[BLOCKS * D + element] = T(acc_hi[element]);
+                }
+            """,
+            ensureRowContiguous: true
+        )
+
     /// KVQ-PORT: `attendRing` reading the packed 8-bit mirror instead of the
     /// bf16 ring, with the result CONSUMED by pass B exactly as the stock
     /// road consumes it. This is the separate-write road only: the promoted
@@ -1085,7 +1249,12 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         let startArray = MLXArray(starts.map(UInt32.init), [batch])
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
-        let passA = portQuantReadKernel(
+        // KVQ-GQAPAIR: one simdgroup per GQA group rather than per query head,
+        // so the group's mirror rows are loaded and dequantized once. The
+        // outputs are the same three arrays in the same layout, written by
+        // the same lane 0 and the same lane bank.
+        let paired = quantGqaPairedReadEnabled && gqa == 2
+        let passA = (paired ? portQuantReadPairedKernel : portQuantReadKernel)(
             [queries] + mirrors + [startArray],
             template: [
                 ("T", queries.dtype),
@@ -1095,8 +1264,8 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 ("KV_HEADS", kvHeads),
                 ("BLOCKS", blocks),
             ],
-            grid: (kvHeads * 32, batch * gqa, blocks),
-            threadGroup: (32, gqa, 1),
+            grid: (kvHeads * 32, paired ? batch : batch * gqa, blocks),
+            threadGroup: (32, paired ? 1 : gqa, 1),
             outputShapes: [partialShape, summaryShape, summaryShape],
             outputDTypes: [.bfloat16, .float32, .float32]
         )

@@ -4344,6 +4344,21 @@ enum Gemma4FusedScaledEmbedding {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// EMBED-DECODE: DEFAULT ON for the `[B, 1]` decode column as well. The
+    /// kernel body is unchanged and geometry-agnostic (one thread per packed
+    /// word of one token row), so the decode step takes the same single
+    /// launch instead of the five stock dispatches (`weight[x]`, `scales[x]`,
+    /// `biases[x]`, `affine_dequantize`, `* embedScale`). Values are
+    /// byte-identical by the same two-boundary argument as prefill. Kill
+    /// switch `DARKBLOOM_GEMMA4_SCALED_EMBEDDING_DECODE=0` restores the
+    /// prefill-only gate. Engage mark: `scaled-embedding-decode`.
+    static let decodeEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_SCALED_EMBEDDING_DECODE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// This checkpoint's embedding quantization. Anything else fails closed.
     private static let groupSize = 64
     private static let bits = 4
@@ -4401,8 +4416,9 @@ enum Gemma4FusedScaledEmbedding {
         guard enabled,
             tokens.ndim == 2,
             tokens.dtype == .int32,
-            // Prefill rectangle only; [B, 1] decode keeps the stock chain.
-            tokens.dim(1) > 1,
+            // Prefill rectangle, or the [B, 1] decode column when
+            // EMBED-DECODE is on; otherwise decode keeps the stock chain.
+            tokens.dim(1) > 1 || (decodeEnabled && tokens.dim(1) == 1),
             let quantized = embedding as? QuantizedEmbedding,
             quantized.mode == .affine,
             quantized.bits == bits,
@@ -4429,7 +4445,7 @@ enum Gemma4FusedScaledEmbedding {
         let length = tokens.dim(1)
         let wordsPerRow = weight.dim(1)
 
-        CBv2EngageMark.once("scaled-embedding")
+        CBv2EngageMark.once(length == 1 ? "scaled-embedding-decode" : "scaled-embedding")
         return kernel(
             // `asMLXArray(dtype:)` is the exact conversion the stock
             // `MLXArray * Float` overload performs on the scalar.

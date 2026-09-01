@@ -938,38 +938,6 @@ METAL_FUNC void adjust_matrix_offsets(
   y += tid.z * output_stride;
 }
 
-// DARKBLOOM GEMMA4 NAX QMM-T ROW-STRIP TILING.
-// qmm_t_nax_tgp_impl covers a BM x BN output tile with WM x WN simdgroups.
-// The launch shape is fixed by the host (32, WN, WM) and the host is not
-// editable, so the threadgroup is always 4 simdgroups over a 64 x 64 tile.
-// Stock splits that tile 2 x 2, so each simdgroup owns 32 rows x 32 cols and
-// the two simdgroups that share a row band each fetch the SAME 32 rows of the
-// activation operand from device memory: A is read twice per threadgroup per
-// K step. This constant instead lays the same 4 simdgroups out as 4 row
-// strips of 16 rows x 64 cols. The strips are disjoint in M, so every A
-// fragment is fetched exactly once, and the B operand -- which already lives
-// in threadgroup memory as Ws -- is read wider instead.
-//
-// Nothing about the K loop moves. BK, SK and TK are untouched, the k and kk1
-// loops keep their bounds and their order, and every output element still
-// accumulates over exactly the same k values in exactly the same sequence.
-// Only which simdgroup owns an element, and how the owner's fragments are
-// shaped, change. The MMA op count per threadgroup is invariant as well:
-// stock issues WM*WN * (TM * TN/2 * TK) = 4 * (2 * 1 * 2) = 16 ops per kk1
-// step, the strip layout issues 4 * (1 * 2 * 2) = 16. Both shapes enter the
-// same TN-even branch of tile_matmad_nax, so the per-element fragment
-// accumulation chain is instruction-for-instruction the same.
-//
-// The kernel's template parameters, and therefore every kernel-name string
-// the host builds, are untouched: BM, BN, BK, WM and WN all keep their
-// values and only the interior mapping is re-derived from them.
-//
-// Kill switch: build with -DDARKBLOOM_GEMMA4_NAX_TILING=0 and SGM/SGN fold
-// back to WM/WN, which reproduces the shipped expressions byte for byte.
-#ifndef DARKBLOOM_GEMMA4_NAX_TILING
-#define DARKBLOOM_GEMMA4_NAX_TILING 1
-#endif
-
 template <
     typename T,
     const int group_size,
@@ -1031,29 +999,16 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   // Make the weight loader
   loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
 
-  // Simdgroup grid over the BM x BN tile. Stock is WM x WN; the row-strip
-  // layout stacks the same WM*WN simdgroups in the row direction only, so
-  // no two of them share a row band. See the note on the enable above.
-  constexpr int SGM = (DARKBLOOM_GEMMA4_NAX_TILING != 0) ? (WM * WN) : WM;
-  constexpr int SGN = (DARKBLOOM_GEMMA4_NAX_TILING != 0) ? 1 : WN;
-  static_assert(SGM * SGN == WM * WN, "simdgroup count must be preserved");
-  static_assert(BM % (SGM * 16) == 0, "row strip must be a fragment multiple");
-  static_assert(BN % (SGN * 16) == 0, "col strip must be a fragment multiple");
-
-  constexpr short SM = BM / SGM;
-  constexpr short SN = BN / SGN;
+  constexpr short SM = BM / WM;
+  constexpr short SN = BN / WN;
   constexpr short SK = 32;
 
   constexpr short TM = SM / 16;
   constexpr short TN = SN / 16;
   constexpr short TK = SK / 16;
 
-  // tile_matmad_nax has no branch for an odd TN greater than one; it would
-  // silently emit no MMA at all. Refuse to compile such a layout.
-  static_assert(TN == 1 || TN % 2 == 0, "TN must be 1 or even for NAX MMA");
-
-  const short tm = SM * (simd_gid / SGN);
-  const short tn = SN * (simd_gid % SGN);
+  const short tm = SM * (simd_gid / WN);
+  const short tn = SN * (simd_gid % WN);
 
   constexpr bool transpose_a = false;
   constexpr bool transpose_b = true;
@@ -1570,50 +1525,6 @@ METAL_FUNC void gather_rhs_mma_frag_row(
   }
 }
 
-// DARKBLOOM GEMMA4 NAX GATHER-RHS ROW-STRIP TILING.
-// affine_gather_qmm_rhs_nax covers a BM x BN output tile with WM x WN
-// simdgroups. The launch shape is fixed by the host (32, WN, WM) and the host
-// is not editable, so the threadgroup is always 4 simdgroups over a 64 x 64
-// tile. Stock splits that tile 2 x 2, so each simdgroup owns 32 rows x 32
-// cols and the two simdgroups that share a row band each fetch the SAME 32
-// rows of the activation operand from device memory: A is read twice per
-// threadgroup per K step. This constant instead lays the same 4 simdgroups
-// out as 4 row strips of 16 rows x 64 cols. The strips are disjoint in M, so
-// every A fragment is fetched exactly once, and the B operand -- which
-// already lives in threadgroup memory as Ws -- is read wider instead.
-//
-// Nothing about the K loop moves. BK, SK and TK are untouched, the k, kk1 and
-// k_remain loops keep their bounds and their order, and every output element
-// still accumulates over exactly the same k values in exactly the same
-// sequence. Only which simdgroup owns an element, and how the owner's
-// fragments are shaped, change.
-//
-// COMPOSITION WITH THE SEGMENT ELISION ON THIS KERNEL. The elision is
-// expressed at Dtile.kFragRows (16 row) granularity and stays at exactly that
-// granularity here: stock gives a simdgroup TM = 2 fragment rows of a 32 row
-// band, the strip layout gives TM = 1 fragment row of a 16 row band, and the
-// union over the 4 simdgroups is the same 64 rows either way. The live-band
-// guard fr < seg_hi && fr + kFragRows > seg_lo tests fr and seg_lo/seg_hi in
-// the same tm-relative frame in both layouts, so it decides the same
-// intersection of absolute rows against the same segment. offset and
-// offset_next stay threadgroup uniform, seg_lo/seg_hi stay simdgroup uniform,
-// and gather_rhs_mma_frag_row keeps issuing exactly the TN-even op sequence
-// of the shared helper, so the partial-band path and the full path still
-// agree op for op. Narrowing the band from 32 rows to 16 can only move a band
-// from partial to whole or to empty; it can never make a whole band partial,
-// so the elision's own correctness argument is unweakened.
-//
-// The kernel's template parameters, and therefore every kernel-name string
-// the host builds, are untouched: BM, BN, BK, WM and WN all keep their values
-// and only the interior mapping is re-derived from them.
-//
-// Kill switch: build with -DDARKBLOOM_GEMMA4_NAX_GATHER_TILING=0 and SGM/SGN
-// fold back to WM/WN, reproducing the shipped expressions byte for byte.
-// Independent of the qmm-t family's switch.
-#ifndef DARKBLOOM_GEMMA4_NAX_GATHER_TILING
-#define DARKBLOOM_GEMMA4_NAX_GATHER_TILING 1
-#endif
-
 template <
     typename T,
     int group_size,
@@ -1684,31 +1595,16 @@ template <
   scales += transpose ? y_col_long * K_g : y_col / group_size;
   biases += transpose ? y_col_long * K_g : y_col / group_size;
 
-  // Simdgroup grid over the BM x BN tile. Stock is WM x WN; the row-strip
-  // layout stacks the same WM*WN simdgroups in the row direction only, so no
-  // two of them share a row band. See the note on the enable above, including
-  // why this leaves the segment elision's granularity and guard unchanged.
-  constexpr int SGM =
-      (DARKBLOOM_GEMMA4_NAX_GATHER_TILING != 0) ? (WM * WN) : WM;
-  constexpr int SGN = (DARKBLOOM_GEMMA4_NAX_GATHER_TILING != 0) ? 1 : WN;
-  static_assert(SGM * SGN == WM * WN, "simdgroup count must be preserved");
-  static_assert(BM % (SGM * 16) == 0, "row strip must be a fragment multiple");
-  static_assert(BN % (SGN * 16) == 0, "col strip must be a fragment multiple");
-
-  constexpr short SM = BM / SGM;
-  constexpr short SN = BN / SGN;
+  constexpr short SM = BM / WM;
+  constexpr short SN = BN / WN;
   constexpr short SK = 32;
 
   constexpr short TM = SM / 16;
   constexpr short TN = SN / 16;
   constexpr short TK = SK / 16;
 
-  // gather_rhs_mma_frag_row issues the shared helper's TN-even op sequence and
-  // has no branch for an odd TN; an odd TN would silently emit no arithmetic.
-  static_assert(TN % 2 == 0, "gather segment elision requires an even TN");
-
-  const short tm = SM * (simd_group_id / SGN);
-  const short tn = SN * (simd_group_id % SGN);
+  const short tm = SM * (simd_group_id / WN);
+  const short tn = SN * (simd_group_id % WN);
 
   const short sgp_sm =
       align_M ? SM : min(SM, short(max(0, (M - (y_row + tm)))));

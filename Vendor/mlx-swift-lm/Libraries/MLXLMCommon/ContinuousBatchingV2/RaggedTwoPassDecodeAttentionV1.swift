@@ -1026,7 +1026,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// next decode dispatch after this write completes.
     private static let portQuantFusedWriteKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_2pass_a_q4g64_d256_g2_regpack_vec4_carry_pair_b\(blocks)_v5",
+            name: "cbv2_ragged8_sdpa_ringwrite_2pass_a_q4g64_d256_g2_regpack_vec4_carry_pair_b\(blocks)_v6",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -1172,11 +1172,22 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 thread float q_hi[values_per_lane];
                 thread float acc_lo[values_per_lane];
                 thread float acc_hi[values_per_lane];
-                for (int element = 0; element < values_per_lane; ++element) {
-                    q_lo[element] = float(query[element]);
-                    q_hi[element] = float(query[D + element]);
-                    acc_lo[element] = 0.0f;
-                    acc_hi[element] = 0.0f;
+                using T4 = vec<T, 4>;
+                const device T4* q_lo_vec =
+                    reinterpret_cast<const device T4*>(query);
+                const device T4* q_hi_vec =
+                    reinterpret_cast<const device T4*>(query + D);
+                #pragma unroll
+                for (int q = 0; q < values_per_lane / 4; ++q) {
+                    const T4 ql4 = q_lo_vec[q];
+                    const T4 qh4 = q_hi_vec[q];
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        q_lo[q * 4 + j] = float(ql4[j]);
+                        q_hi[q * 4 + j] = float(qh4[j]);
+                        acc_lo[q * 4 + j] = 0.0f;
+                        acc_hi[q * 4 + j] = 0.0f;
+                    }
                 }
 
                 float max_lo = -3.402823466e+38F;
@@ -1230,6 +1241,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     const float vb = float(as_type<half>(ushort(vtw >> 16)));
                     float score_lo = 0.0f;
                     float score_hi = 0.0f;
+                    #pragma unroll
                     for (int element = 0; element < values_per_lane; ++element) {
                         const float key_element =
                             fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
@@ -1249,6 +1261,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     max_hi = new_max_hi;
                     sum_lo = sum_lo * old_factor_lo + score_factor_lo;
                     sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                    #pragma unroll
                     for (int element = 0; element < values_per_lane; ++element) {
                         const float value_element =
                             fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
@@ -1266,9 +1279,21 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     sum_out[BLOCKS] = sum_hi;
                     max_out[BLOCKS] = max_hi;
                 }
-                for (int element = 0; element < values_per_lane; ++element) {
-                    partial[element] = T(acc_lo[element]);
-                    partial[BLOCKS * D + element] = T(acc_hi[element]);
+                device T4* part_lo_vec =
+                    reinterpret_cast<device T4*>(partial);
+                device T4* part_hi_vec =
+                    reinterpret_cast<device T4*>(partial + BLOCKS * D);
+                #pragma unroll
+                for (int q = 0; q < values_per_lane / 4; ++q) {
+                    T4 plo4;
+                    T4 phi4;
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        plo4[j] = T(acc_lo[q * 4 + j]);
+                        phi4[j] = T(acc_hi[q * 4 + j]);
+                    }
+                    part_lo_vec[q] = plo4;
+                    part_hi_vec[q] = phi4;
                 }
             """,
             ensureRowContiguous: true
@@ -2187,7 +2212,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// served from `new_keys` during scoring, never from the slot being
     /// written, so no read races the store.
     private static let fusedQkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_qk_bf16_g8_ktile_v3",
+        name: "cbv2_ragged8_writesdpa_d512_qk_bf16_g8_ktile_v4",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -2342,15 +2367,19 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             }
 
             if (chunk == 0 && sg == 0) {
-                device T* write_key = const_cast<device T*>(key_plane)
-                    + size_t(key_length - 1) * D + lane * 16;
-                device T* write_value = const_cast<device T*>(value_plane)
-                    + size_t(key_length - 1) * D + lane * 16;
-                const device T* src_key = new_key_plane + lane * 16;
-                const device T* src_value = new_value_plane + lane * 16;
-                for (int element = 0; element < 16; ++element) {
-                    write_key[element] = src_key[element];
-                    write_value[element] = src_value[element];
+                using T4 = vec<T, 4>;
+                device T4* write_kvec = reinterpret_cast<device T4*>(
+                    const_cast<device T*>(key_plane) + size_t(key_length - 1) * D + lane * 16);
+                device T4* write_vvec = reinterpret_cast<device T4*>(
+                    const_cast<device T*>(value_plane) + size_t(key_length - 1) * D + lane * 16);
+                const device T4* src_kvec =
+                    reinterpret_cast<const device T4*>(new_key_plane + lane * 16);
+                const device T4* src_vvec =
+                    reinterpret_cast<const device T4*>(new_value_plane + lane * 16);
+                #pragma clang loop unroll(full)
+                for (int element = 0; element < 4; ++element) {
+                    write_kvec[element] = src_kvec[element];
+                    write_vvec[element] = src_vvec[element];
                 }
             }
             if (z == 0 && sg == 0 && lane == 0) {
@@ -2366,7 +2395,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// `new_values` rather than the cache slot the fused QK dispatch wrote,
     /// so this kernel has no read-after-in-place-write hazard at all.
     private static let fusedAvKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_vtile_v3",
+        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_vtile_v4",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -2429,6 +2458,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 if (bm + 4 <= key_length - 1) {
                 #pragma clang loop unroll(full)
                 for (int tm = 0; tm < 4; ++tm) {
+                    #pragma clang loop unroll(full)
                     for (int tn = 0; tn < 4; ++tn) {
                         v_tile[tm][tn] = value_plane[
                             size_t(bm + tm) * D + out_col + tn];
@@ -2438,6 +2468,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 #pragma clang loop unroll(full)
                 for (int tm = 0; tm < 4; ++tm) {
                     const bool is_new_token = bm + tm == key_length - 1;
+                    #pragma clang loop unroll(full)
                     for (int tn = 0; tn < 4; ++tn) {
                         v_tile[tm][tn] = is_new_token
                             ? new_value_plane[out_col + tn]
@@ -2456,6 +2487,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     #pragma clang loop unroll(full)
                     for (int tm = 0; tm < 4; ++tm) {
                         float vc = p_coeff[tm];
+                        #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
                             result[h][tn] += vc * v_tile[tm][tn];
                         }

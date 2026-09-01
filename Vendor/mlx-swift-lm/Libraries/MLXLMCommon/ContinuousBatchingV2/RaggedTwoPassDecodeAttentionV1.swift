@@ -1721,6 +1721,123 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// orders the standalone K/V store before this dispatch without touching
     /// the unrolled inner loop (the addressing perturbation WRITE-021/v2
     /// paid ~-1.34% decode for).
+    /// D512-QKVEC4 kill switch. `0`/`false`/`no`/`off` restores the scalar
+    /// load runs below, which stay in the file as the fallback body.
+    static let d512QKVec4Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_D512_QK_VEC4"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// The QK inner loop, in the two load widths.
+    ///
+    /// Every scalar load run in the incumbent body walks `bn + tn` for `tn` in
+    /// `[0, 4)`. `bn` is `lane * 4` stepped by 128, `mat` is a plane base plus
+    /// a multiple of `D = 512`, and `query` is a plane base plus a multiple of
+    /// `D`, so every run is four contiguous elements at a four-element-aligned
+    /// address. D512-QKVEC4 issues each run as one `vec<T, 4>` instead of four
+    /// scalar loads: twelve load instructions per iteration instead of
+    /// forty-eight, for the same 128 fused multiply-adds.
+    ///
+    /// The values loaded, the order they are converted in, and the order they
+    /// are accumulated in are all unchanged, so every output word is bit
+    /// identical. No accumulator or staging array changes shape and nothing
+    /// moves into threadgroup memory, so the live register set and the
+    /// threadgroup memory footprint are both unchanged: this buys load-issue
+    /// slots, not arithmetic and not occupancy.
+    private static let qkInnerLoop: String = d512QKVec4Enabled
+        ? """
+                        typedef vec<T, 4> T4;
+                        // KTILE: the 4x4 key tile is shared by all GQA heads,
+                        // the query block is not. Staging the tile costs 16
+                        // halves and frees the 32-float per-head array.
+                        T4 k_tile[4];
+                        float q_coeff[4];
+                        int bn = lane * 4;
+                        for (int i = 0; i < n_iter; ++i) {
+                            int mat_offset = 0;
+                            #pragma clang loop unroll(full)
+                            for (int tm = 0; tm < 4; ++tm) {
+                                k_tile[tm] =
+                                    *reinterpret_cast<const device T4*>(
+                                        mat + mat_offset + bn);
+                                mat_offset += D;
+                            }
+                            #pragma clang loop unroll(full)
+                            for (int h = 0; h < GQA; ++h) {
+                                const T4 q_vec =
+                                    *reinterpret_cast<const device T4*>(
+                                        query + h * D + bn);
+                                #pragma clang loop unroll(full)
+                                for (int tn = 0; tn < 4; ++tn) {
+                                    q_coeff[tn] =
+                                        static_cast<float>(q_vec[tn]);
+                                }
+                                #pragma clang loop unroll(full)
+                                for (int tm = 0; tm < 4; ++tm) {
+                                    #pragma clang loop unroll(full)
+                                    for (int tn = 0; tn < 4; ++tn) {
+                                        result[h * 4 + tm] +=
+                                            k_tile[tm][tn] * q_coeff[tn];
+                                    }
+                                }
+                            }
+                            bn += 128;
+                        }
+            """
+        : """
+                        // KTILE: the 4x4 key tile is shared by all GQA heads,
+                        // the query block is not. Staging the tile costs 16
+                        // halves and frees the 32-float per-head array.
+                        T k_tile[4][4];
+                        float q_coeff[4];
+                        int bn = lane * 4;
+                        for (int i = 0; i < n_iter; ++i) {
+                            int mat_offset = 0;
+                            #pragma clang loop unroll(full)
+                            for (int tm = 0; tm < 4; ++tm) {
+                                #pragma clang loop unroll(full)
+                                for (int tn = 0; tn < 4; ++tn) {
+                                    k_tile[tm][tn] = mat[mat_offset + bn + tn];
+                                }
+                                mat_offset += D;
+                            }
+                            #pragma clang loop unroll(full)
+                            for (int h = 0; h < GQA; ++h) {
+                                #pragma clang loop unroll(full)
+                                for (int tn = 0; tn < 4; ++tn) {
+                                    q_coeff[tn] = static_cast<float>(
+                                        query[h * D + bn + tn]);
+                                }
+                                #pragma clang loop unroll(full)
+                                for (int tm = 0; tm < 4; ++tm) {
+                                    #pragma clang loop unroll(full)
+                                    for (int tn = 0; tn < 4; ++tn) {
+                                        result[h * 4 + tm] +=
+                                            k_tile[tm][tn] * q_coeff[tn];
+                                    }
+                                }
+                            }
+                            bn += 128;
+                        }
+            """
+
+    /// Kernel names carry the load width: an `MLXFast.metalKernel` family is
+    /// compiled from its source string at runtime and cached by NAME, so a
+    /// changed body under an unchanged name would serve a stale pipeline.
+    private static var qkKernelName: String {
+        d512QKVec4Enabled
+            ? "cbv2_ragged8_sdpa_d512_qk_vec4_bf16_g8_xfold_v4"
+            : "cbv2_ragged8_sdpa_d512_qk_bf16_g8_xfold_v3"
+    }
+
+    private static var qkFencedKernelName: String {
+        d512QKVec4Enabled
+            ? "cbv2_ragged8_sdpa_d512_qk_fenced_vec4_bf16_g8_xfold_v4"
+            : "cbv2_ragged8_sdpa_d512_qk_fenced_bf16_g8_xfold_v3"
+    }
+
     private static let qkSource: String = """
             constexpr int D = 512;
             constexpr int GQA = 8;
@@ -1773,40 +1890,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 // so the cross-lane fold below can address the whole set with
                 // compile-time indices.
                 float result[GQA * 4] = {0.0f};
-                // KTILE: the 4x4 key tile is shared by all GQA heads, the
-                // query block is not. Staging the tile costs 16 halves and
-                // frees the 32-float per-head staging array.
-                T k_tile[4][4];
-                float q_coeff[4];
-                int bn = lane * 4;
-                for (int i = 0; i < n_iter; ++i) {
-                    int mat_offset = 0;
-                    #pragma clang loop unroll(full)
-                    for (int tm = 0; tm < 4; ++tm) {
-                        #pragma clang loop unroll(full)
-                        for (int tn = 0; tn < 4; ++tn) {
-                            k_tile[tm][tn] = mat[mat_offset + bn + tn];
-                        }
-                        mat_offset += D;
-                    }
-                    #pragma clang loop unroll(full)
-                    for (int h = 0; h < GQA; ++h) {
-                        #pragma clang loop unroll(full)
-                        for (int tn = 0; tn < 4; ++tn) {
-                            q_coeff[tn] = static_cast<float>(
-                                query[h * D + bn + tn]);
-                        }
-                        #pragma clang loop unroll(full)
-                        for (int tm = 0; tm < 4; ++tm) {
-                            #pragma clang loop unroll(full)
-                            for (int tn = 0; tn < 4; ++tn) {
-                                result[h * 4 + tm] +=
-                                    k_tile[tm][tn] * q_coeff[tn];
-                            }
-                        }
-                    }
-                    bn += 128;
-                }
+        \(qkInnerLoop)
                 // XFOLD: the 32 sums fold across the simdgroup as ONE
                 // butterfly over the whole set rather than 32 independent
                 // shuffle-down chains. Step K halves the set every lane still
@@ -1884,7 +1968,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         """
 
     private static let qkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_qk_bf16_g8_xfold_v3",
+        name: qkKernelName,
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -1896,7 +1980,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     )
 
     private static let qkFencedKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_qk_fenced_bf16_g8_xfold_v3",
+        name: qkFencedKernelName,
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",

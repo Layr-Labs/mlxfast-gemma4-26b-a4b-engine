@@ -1026,7 +1026,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// next decode dispatch after this write completes.
     private static let portQuantFusedWriteKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_2pass_a_q4g64_d256_g2_b\(blocks)_v1",
+            name: "cbv2_ragged8_sdpa_ringwrite_2pass_a_q4g64_d256_g2_regpack_vec4_carry_b\(blocks)_v4",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -1083,13 +1083,34 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     float kmax = -3.402823466e+38F;
                     float vmin = 3.402823466e+38F;
                     float vmax = -3.402823466e+38F;
-                    for (int element = 0; element < values_per_lane; ++element) {
-                        const float kx = float(new_key[element]);
-                        const float vx = float(new_value[element]);
-                        kmin = min(kmin, kx);
-                        kmax = max(kmax, kx);
-                        vmin = min(vmin, vx);
-                        vmax = max(vmax, vx);
+                    // The lane's own elements, loaded once and held in
+                    // registers: the extrema pass and the quantization pass
+                    // below read the same values, so the second pass reads
+                    // `kv`/`vv` instead of issuing the loads again.
+                    float kv[values_per_lane];
+                    float vv[values_per_lane];
+                    // The lane owns `values_per_lane` contiguous elements
+                    // starting at a multiple of that count, so the span is
+                    // vector-aligned and the eight scalar loads become two
+                    // four-wide ones per plane.
+                    using T4 = vec<T, 4>;
+                    const device T4* kvec =
+                        reinterpret_cast<const device T4*>(new_key);
+                    const device T4* vvec =
+                        reinterpret_cast<const device T4*>(new_value);
+                    #pragma unroll
+                    for (int q = 0; q < values_per_lane / 4; ++q) {
+                        const T4 kq4 = kvec[q];
+                        const T4 vq4 = vvec[q];
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            kv[q * 4 + j] = float(kq4[j]);
+                            vv[q * 4 + j] = float(vq4[j]);
+                            kmin = min(kmin, kv[q * 4 + j]);
+                            kmax = max(kmax, kv[q * 4 + j]);
+                            vmin = min(vmin, vv[q * 4 + j]);
+                            vmax = max(vmax, vv[q * 4 + j]);
+                        }
                     }
                     for (uint mask = 1; mask < 8; mask <<= 1) {
                         kmin = min(kmin, simd_shuffle_xor(kmin, mask));
@@ -1105,9 +1126,10 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     const float kb = float(khb);
                     const float vs = float(vhs);
                     const float vb = float(vhb);
+                    #pragma unroll
                     for (int element = 0; element < values_per_lane; ++element) {
-                        const float kq = metal::rint((float(new_key[element]) - kb) / ks);
-                        const float vq = metal::rint((float(new_value[element]) - vb) / vs);
+                        const float kq = metal::rint((kv[element] - kb) / ks);
+                        const float vq = metal::rint((vv[element] - vb) / vs);
                         kword |= uint32_t(clamp(kq, 0.0f, 15.0f)) << (4 * element);
                         vword |= uint32_t(clamp(vq, 0.0f, 15.0f)) << (4 * element);
                     }
@@ -1153,20 +1175,46 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 float max_score = -3.402823466e+38F;
                 float sum_exp_score = 0.0f;
                 uint slot = (start + uint(block)) % uint(N);
+                // The walk holds the next position's packed words while it
+                // works on the current one, so each load is issued a whole
+                // iteration before its value is needed. The prefetch is
+                // suppressed when the next position is the current token,
+                // which is served from `kword`/`vword` and whose slot this
+                // kernel is storing into; every address formed is therefore a
+                // slot the one-stage walk also reads.
+                const bool prefetch_first = block < N - 1;
+                uint next_slot = slot + uint(BLOCKS);
+                if (next_slot >= uint(N)) next_slot -= uint(N);
+                uint32_t kw_pre = prefetch_first
+                    ? mkeys_w[slot * row_words + lane] : 0u;
+                uint32_t vw_pre = prefetch_first
+                    ? mvalues_w[slot * row_words + lane] : 0u;
+                uint32_t ktw_pre = prefetch_first
+                    ? mkeys_w[slot * row_words + payload_words + lane / 8] : 0u;
+                uint32_t vtw_pre = prefetch_first
+                    ? mvalues_w[slot * row_words + payload_words + lane / 8] : 0u;
                 for (int token = block; token < N; token += BLOCKS) {
                     const bool current = token == N - 1;
-                    const uint32_t kw = current
-                        ? kword : mkeys_w[slot * row_words + lane];
-                    const uint32_t vw = current
-                        ? vword : mvalues_w[slot * row_words + lane];
+                    const uint32_t kw = current ? kword : kw_pre;
+                    const uint32_t vw = current ? vword : vw_pre;
                     const uint32_t ktw = current
                         ? (uint32_t(as_type<ushort>(khs))
                             | (uint32_t(as_type<ushort>(khb)) << 16))
-                        : mkeys_w[slot * row_words + payload_words + lane / 8];
+                        : ktw_pre;
                     const uint32_t vtw = current
                         ? (uint32_t(as_type<ushort>(vhs))
                             | (uint32_t(as_type<ushort>(vhb)) << 16))
-                        : mvalues_w[slot * row_words + payload_words + lane / 8];
+                        : vtw_pre;
+                    if (token + BLOCKS < N - 1) {
+                        kw_pre = mkeys_w[next_slot * row_words + lane];
+                        vw_pre = mvalues_w[next_slot * row_words + lane];
+                        ktw_pre =
+                            mkeys_w[next_slot * row_words + payload_words + lane / 8];
+                        vtw_pre =
+                            mvalues_w[next_slot * row_words + payload_words + lane / 8];
+                        next_slot += uint(BLOCKS);
+                        if (next_slot >= uint(N)) next_slot -= uint(N);
+                    }
                     const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
                     const float kb = float(as_type<half>(ushort(ktw >> 16)));
                     const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
@@ -1189,8 +1237,6 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                                 * fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
                     }
 
-                    slot += uint(BLOCKS);
-                    if (slot >= uint(N)) slot -= uint(N);
                 }
 
                 if (lane == 0) {

@@ -1523,7 +1523,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// removes only the global partial write/read and the second dispatch.
     private static let portQuantFusedWriteResidentKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_v1",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_r2",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -1824,19 +1824,20 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         }
                     }
 
-                    for (int element = 0; element < values_per_lane; ++element) {
-                        float reduced = accumulator[element];
-                        for (int stride = 1; stride < COLS; stride <<= 1) {
-                            reduced +=
-                                simd_shuffle_xor(reduced, ushort(stride));
-                        }
-                        if (block_lane == 0) {
-                            head_out[element] = T(
-                                sum_exp_score == 0.0f
-                                    ? reduced
-                                    : reduced / sum_exp_score);
+                    #pragma clang loop unroll(full)
+                    for (int step = 0; (1 << step) < COLS; ++step) {
+                        const ushort stride = ushort(1 << step);
+                        const bool upper = (block_lane & int(stride)) != 0;
+                        const int live = values_per_lane >> step;
+                        #pragma clang loop unroll(full)
+                        for (int slot = 0; slot < live; slot += 2) {
+                            const float keep  = upper ? accumulator[slot + 1] : accumulator[slot];
+                            const float trade = upper ? accumulator[slot]     : accumulator[slot + 1];
+                            accumulator[slot >> 1] = keep + simd_shuffle_xor(trade, stride);
                         }
                     }
+                    head_out[block_lane] = T(
+                        sum_exp_score == 0.0f ? accumulator[0] : accumulator[0] / sum_exp_score);
                 }
             """,
             ensureRowContiguous: true

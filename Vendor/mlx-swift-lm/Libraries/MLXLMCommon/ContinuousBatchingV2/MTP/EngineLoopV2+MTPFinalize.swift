@@ -40,14 +40,13 @@ extension EngineLoopV2 {
             let rec: CBv2ScheduledRequest
             let targets: [Int]
             let accepted: Int
+            let naturalEmitted: Int
         }
 
-        // Resolve each row's natural target-authoritative prefix, then choose
-        // one committed width for the rectangular step. This keeps subsequent
-        // quantized MoE target batches shape-identical across all rows.
+        // Resolve each row's natural target-authoritative prefix with independent
+        // per-row acceptance commit.
         var outcomes: [RowOutcome] = []
         outcomes.reserveCapacity(verify.rows.count)
-        var commonEmitted = targetWidth
 
         for (batchIndex, metadata) in verify.rows.enumerated() {
             let id = metadata.id
@@ -74,14 +73,14 @@ extension EngineLoopV2 {
             }) {
                 naturalEmitted = stopIndex + 1
             }
-            commonEmitted = min(commonEmitted, naturalEmitted)
             outcomes.append(
                 RowOutcome(
                     batchIndex: batchIndex,
                     metadata: metadata,
                     rec: rec,
                     targets: targets,
-                    accepted: accepted))
+                    accepted: accepted,
+                    naturalEmitted: naturalEmitted))
         }
 
         round.finalizedVerifyIDs = Set(outcomes.map { $0.metadata.id })
@@ -90,15 +89,16 @@ extension EngineLoopV2 {
             finalizedVerifyIDs: round.finalizedVerifyIDs)
 
         if !outcomes.isEmpty {
-            let stepAccepted = outcomes.map { min($0.accepted, commonEmitted) }.min() ?? 0
-            let observedDrafts =
-                commonEmitted <= stepAccepted
-                ? commonEmitted : min(k, stepAccepted + 1)
-            mtp.recordStepAcceptance(
-                drafted: k,
-                accepted: stepAccepted,
-                observedDrafts: observedDrafts,
-                decodeRowBucket: mtp.planDecodeRowBucket)
+            for outcome in outcomes {
+                let observedDrafts =
+                    outcome.naturalEmitted <= outcome.accepted
+                    ? outcome.naturalEmitted : min(k, outcome.accepted + 1)
+                mtp.recordStepAcceptance(
+                    drafted: k,
+                    accepted: outcome.accepted,
+                    observedDrafts: observedDrafts,
+                    decodeRowBucket: mtp.planDecodeRowBucket)
+            }
         }
 
         for outcome in outcomes {
@@ -107,7 +107,7 @@ extension EngineLoopV2 {
             let id = metadata.id
             let rec = outcome.rec
             let accepted = outcome.accepted
-            let emitted = Array(outcome.targets.prefix(commonEmitted))
+            let emitted = Array(outcome.targets.prefix(outcome.naturalEmitted))
 
             // Confirm in order with the same stop and length semantics as the
             // ordinary finalize loop.

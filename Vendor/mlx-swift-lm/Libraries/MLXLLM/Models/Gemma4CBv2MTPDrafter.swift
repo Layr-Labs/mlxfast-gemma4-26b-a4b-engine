@@ -194,8 +194,12 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         }
         // Mirror runGemma4MTPGreedyRound: seed = concat(target embedding of
         // the token, carried hidden) along the feature axis.
-        let inputsEmbeds = concatenated(
-            [target.embedTokensForDrafter(tokens), rotatedHidden], axis: -1)
+        let emb = target.embedTokensForDrafter(tokens)
+        let emb3D = emb.ndim == 2 ? emb.reshaped([emb.dim(0), 1, emb.dim(1)]) : emb
+        let hid3D = rotatedHidden.ndim == 2
+            ? rotatedHidden.reshaped([rotatedHidden.dim(0), 1, rotatedHidden.dim(1)])
+            : rotatedHidden
+        let inputsEmbeds = concatenated([emb3D, hid3D], axis: -1)
         let (newHidden, logits) = drafter(
             inputsEmbeds: inputsEmbeds,
             sharedKV: prepared.sharedKV,
@@ -360,31 +364,30 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         let inRange = steps.allSatisfy { $0 >= 0 && $0 < Int32(table.windowAhead) }
         guard inRange else { return hidden }
 
-        let indices = MLXArray(steps, [perRow.count, 1])
+        let indices = MLXArray(steps)
         let cosRows = table.cos[indices]  // [B, halfDim]
         let sinRows = table.sin[indices]  // [B, halfDim]
 
-        // Reshape hidden so the rotary prefix is `[B, L, 1, halfDim, 2]`.
-        let leadShape = Array(hidden.shape.dropLast())
+        let originalShape = hidden.shape
+        let leadShape = Array(originalShape.dropLast())
         let flat = hidden.reshaped(leadShape + [featureDim])
-        let prefixLead = leadShape.dropLast()
-        let prefixShape = Array(prefixLead) + [1, halfDim, 2]
-        let pairs = flat[.ellipsis, 0 ..< rotaryPrefix]
-            .reshaped(Array(prefixShape))
+
+        // Broadcast cos/sin to [B, ..., 1, halfDim] matching leadShape
+        let cosBroadcastShape = [perRow.count] + Array(repeating: 1, count: max(0, leadShape.count - 1)) + [halfDim]
+        let cosB = cosRows.reshaped(cosBroadcastShape)
+        let sinB = sinRows.reshaped(cosBroadcastShape)
+
+        let prefix = flat[.ellipsis, 0 ..< rotaryPrefix]
+        let pairs = prefix.reshaped(leadShape + [halfDim, 2])
         let a = pairs[.ellipsis, 0]  // [.., halfDim]
         let b = pairs[.ellipsis, 1]  // [.., halfDim]
 
-        // Broadcast cos/sin to the query/head axes.
-        let cosBroadcastShape = Array(prefixLead) + [1, halfDim]
-        let sinBroadcastShape = Array(prefixLead) + [1, halfDim]
-        let cosB = cosRows.reshaped(cosBroadcastShape)
-        let sinB = sinRows.reshaped(sinBroadcastShape)
         let aRot = a * cosB - b * sinB
         let bRot = a * sinB + b * cosB
         let rotatedPrefix = MLX.stacked([aRot, bRot], axis: -1)
-            .reshaped(Array(prefixShape))
-            .reshaped(Array(prefixLead) + [rotaryPrefix])
+            .reshaped(leadShape + [rotaryPrefix])
         let tail = flat[.ellipsis, rotaryPrefix ..< featureDim]
-        return MLX.concatenated([rotatedPrefix, tail], axis: -1)
+        let rotatedHidden = MLX.concatenated([rotatedPrefix, tail], axis: -1)
+        return rotatedHidden.reshaped(originalShape)
     }
 }

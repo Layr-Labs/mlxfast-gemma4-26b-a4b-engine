@@ -1024,16 +1024,9 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// token is always consumed from the just-computed packed word, so no
     /// threadgroup races the in-place store. The returned fence orders the
     /// next decode dispatch after this write completes.
-    static let q4GQAPairedEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_DECODE_Q4_GQA_PAIRED"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
     private static let portQuantFusedWriteKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_2pass_a_q4g64_d256_g2_pair_regpack_vec4_carry_b\(blocks)_v5",
+            name: "cbv2_ragged8_sdpa_ringwrite_2pass_a_q4g64_d256_g2_regpack_vec4_carry_pair_b\(blocks)_v5",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -1050,6 +1043,10 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 const int kv_head = int(threadgroup_position_in_grid.x);
                 const int batch_index = int(threadgroup_position_in_grid.y);
                 const int block = int(threadgroup_position_in_grid.z);
+                // GQA-PAIR: one simdgroup serves BOTH query heads of its
+                // group. The packed words, the metadata and the nibble
+                // dequant are read and computed once and feed two independent
+                // online-softmax chains that never mix.
                 const int query_head = GQA * kv_head;
                 const int batch_head = batch_index * 16 + query_head;
                 const int lane = int(thread_index_in_simdgroup);
@@ -1140,21 +1137,23 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         vword |= uint32_t(clamp(vq, 0.0f, 15.0f)) << (4 * element);
                     }
 
-                    device uint32_t* write_key =
-                        const_cast<device uint32_t*>(mkeys_w)
-                        + write_slot * row_words;
-                    device uint32_t* write_value =
-                        const_cast<device uint32_t*>(mvalues_w)
-                        + write_slot * row_words;
-                    write_key[lane] = kword;
-                    write_value[lane] = vword;
-                    if (lane % 8 == 0) {
-                        write_key[payload_words + lane / 8] =
-                            uint32_t(as_type<ushort>(khs))
-                            | (uint32_t(as_type<ushort>(khb)) << 16);
-                        write_value[payload_words + lane / 8] =
-                            uint32_t(as_type<ushort>(vhs))
-                            | (uint32_t(as_type<ushort>(vhb)) << 16);
+                    {
+                        device uint32_t* write_key =
+                            const_cast<device uint32_t*>(mkeys_w)
+                            + write_slot * row_words;
+                        device uint32_t* write_value =
+                            const_cast<device uint32_t*>(mvalues_w)
+                            + write_slot * row_words;
+                        write_key[lane] = kword;
+                        write_value[lane] = vword;
+                        if (lane % 8 == 0) {
+                            write_key[payload_words + lane / 8] =
+                                uint32_t(as_type<ushort>(khs))
+                                | (uint32_t(as_type<ushort>(khb)) << 16);
+                            write_value[payload_words + lane / 8] =
+                                uint32_t(as_type<ushort>(vhs))
+                                | (uint32_t(as_type<ushort>(vhb)) << 16);
+                        }
                     }
                 }
                 if (batch_index == 0 && kv_head == 0
@@ -1162,24 +1161,20 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     fence[0] = write_fence[0] + 1;
                 }
 
-                const device T* query_lo =
+                const device T* query =
                     queries + batch_head * D + lane * values_per_lane;
-                const device T* query_hi = query_lo + D;
-                device T* partial_lo = partials
+                device T* partial = partials
                     + batch_head * BLOCKS * D + block * D + lane * values_per_lane;
-                device T* partial_hi = partial_lo + BLOCKS * D;
-                device float* sum_lo_out = sums + batch_head * BLOCKS + block;
-                device float* sum_hi_out = sum_lo_out + BLOCKS;
-                device float* max_lo_out = maxs + batch_head * BLOCKS + block;
-                device float* max_hi_out = max_lo_out + BLOCKS;
+                device float* sum_out = sums + batch_head * BLOCKS + block;
+                device float* max_out = maxs + batch_head * BLOCKS + block;
 
                 thread float q_lo[values_per_lane];
                 thread float q_hi[values_per_lane];
                 thread float acc_lo[values_per_lane];
                 thread float acc_hi[values_per_lane];
                 for (int element = 0; element < values_per_lane; ++element) {
-                    q_lo[element] = float(query_lo[element]);
-                    q_hi[element] = float(query_hi[element]);
+                    q_lo[element] = float(query[element]);
+                    q_hi[element] = float(query[D + element]);
                     acc_lo[element] = 0.0f;
                     acc_hi[element] = 0.0f;
                 }
@@ -1262,17 +1257,18 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         acc_hi[element] = acc_hi[element] * old_factor_hi
                             + score_factor_hi * value_element;
                     }
+
                 }
 
                 if (lane == 0) {
-                    sum_lo_out[0] = sum_lo;
-                    sum_hi_out[0] = sum_hi;
-                    max_lo_out[0] = max_lo;
-                    max_hi_out[0] = max_hi;
+                    sum_out[0] = sum_lo;
+                    max_out[0] = max_lo;
+                    sum_out[BLOCKS] = sum_hi;
+                    max_out[BLOCKS] = max_hi;
                 }
                 for (int element = 0; element < values_per_lane; ++element) {
-                    partial_lo[element] = T(acc_lo[element]);
-                    partial_hi[element] = T(acc_hi[element]);
+                    partial[element] = T(acc_lo[element]);
+                    partial[BLOCKS * D + element] = T(acc_hi[element]);
                 }
             """,
             ensureRowContiguous: true
@@ -1387,8 +1383,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         scale: Float,
         slidingWindowLength: Int
     ) -> (output: MLXArray, nextWriteFence: MLXArray)? {
-        guard q4GQAPairedEnabled,
-            CBv2WindowedSequenceKV.q4FusedMirrorWriteEnabled,
+        guard CBv2WindowedSequenceKV.q4FusedMirrorWriteEnabled,
             CBv2WindowedSequenceKV.quantEnabled,
             !CBv2WindowedSequenceKV.quantSimulate,
             !CBv2WindowedSequenceKV.gpuPackCheck,

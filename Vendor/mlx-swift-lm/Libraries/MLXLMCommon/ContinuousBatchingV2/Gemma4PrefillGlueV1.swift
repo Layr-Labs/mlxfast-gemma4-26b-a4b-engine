@@ -312,6 +312,21 @@ public enum Gemma4PrefillGlueV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// PRENORM-DUAL-SCATTER. The gather arm still issued two reductions of
+    /// the same residual: dense `preNorm` for `mlp(n1)`, and
+    /// `preNormScatter` for the sorted expert plane. One dispatch now loads
+    /// `x` once, runs the identical `glue_inv_rms` tree once, applies `w1`
+    /// in-place and `w2` into the existing K permutation. Kill switch:
+    /// `DARKBLOOM_GEMMA4_PREFILL_PRENORM_DUAL_SCATTER` set to
+    /// `0`/`false`/`no`/`off` restores the two-kernel pair. Engage mark:
+    /// `prefill-prenorm-dual-scatter-fuse`.
+    public static let prenormDualScatterEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_PRENORM_DUAL_SCATTER"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// `dualPreNorm` with its second output removed: the same reduction, the
     /// same `w * T(x * inv)` store, one weight.
     private static let preNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
@@ -450,6 +465,139 @@ public enum Gemma4PrefillGlueV1 {
             outputShapes: [[rows * topK, 1, axis]],
             outputDTypes: [x.dtype]
         )[0]
+    }
+
+    // MARK: - PRENORM-DUAL-SCATTER: dense pre-norm + expert scatter (2 -> 1)
+
+    /// Unique cache key. Do not reuse `prenorm_scatter` with a second output;
+    /// JIT caches by this name.
+    private static let preNormDualScatterKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_prefill_glue_prenorm_dual_scatter_2816_unroll_v1",
+        inputNames: ["x", "w1", "w2", "inverse"],
+        outputNames: ["out1", "out2"],
+        source: """
+            threadgroup float local_sums[32];
+            threadgroup float local_inv[1];
+
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+
+            const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+
+            float xv[GLUE_NREADS];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                xv[i] = static_cast<float>(x[base + i]);
+            }
+
+            const float inv = glue_inv_rms(
+                xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
+
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                const uint j = lid * GLUE_NREADS + i;
+                const T scaled = static_cast<T>(xv[i] * inv);
+                out1[base + i] = w1[j] * scaled;
+            }
+
+            // The stored value is the identical expression `dualPreNorm`
+            // stores for its second output; it is rounded to T here, once,
+            // and copied verbatim to every sorted position.
+            T normed[GLUE_NREADS];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                const uint j = lid * GLUE_NREADS + i;
+                const T scaled = static_cast<T>(xv[i] * inv);
+                normed[i] = w2[j] * scaled;
+            }
+
+            // Assignment t * K + k of this row owns sorted position
+            // inverse[t * K + k]. The inverse order is a permutation of the
+            // plane rows, so every plane row is written exactly once.
+            const size_t assignment_base = size_t(row) * K;
+            for (int k = 0; k < K; k++) {
+                const size_t pos = size_t(inverse[assignment_base + k]);
+                const size_t obase = pos * GLUE_AXIS + lid * GLUE_NREADS;
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    out2[obase + i] = normed[i];
+                }
+            }
+            """,
+        header: kernelHeader,
+        ensureRowContiguous: true
+    )
+
+    /// `(rmsNorm(x, w1), scatter(rmsNorm(x, w2)))`. Dense `out1` keeps
+    /// `x.shape`; `out2` is the `[rows * topK, 1, 2816]` expert-sorted plane.
+    /// Returns `nil` off the prefill plane, with either arm switched off, or
+    /// for an inverse order that is not exactly one `uint32` per assignment.
+    public static func preNormDualScatter(
+        x: MLXArray, w1: MLXArray, w2: MLXArray, inverseOrder: MLXArray,
+        topK: Int, eps epsIn: Float
+    ) -> (MLXArray, MLXArray)? {
+        guard prenormGatherEnabled, prenormDualScatterEnabled,
+            let rows = planeRows(x, weight: w1, eps: epsIn),
+            w2.shape == w1.shape,
+            w2.dtype == w1.dtype,
+            topK >= 1,
+            inverseOrder.ndim == 1,
+            inverseOrder.dtype == .uint32,
+            inverseOrder.dim(0) == rows * topK
+        else { return nil }
+
+        CBv2EngageMark.once("prefill-prenorm-dual-scatter-fuse")
+        let outs = preNormDualScatterKernel(
+            [x, w1, w2, inverseOrder],
+            template: [("T", x.dtype), ("K", topK)],
+            grid: (threadsPerRow, rows, 1),
+            threadGroup: (threadsPerRow, 1, 1),
+            outputShapes: [x.shape, [rows * topK, 1, axis]],
+            outputDTypes: [x.dtype, x.dtype]
+        )
+        return (outs[0], outs[1])
+    }
+
+    /// Exact-bit probe of both fused outputs against the two incumbent
+    /// kernels at `[8, 32, 2816]`, K=8. `x` varies by row and column;
+    /// `w1` and `w2` are distinct non-uniform vectors. Every payload is a
+    /// dyadic that is exact in bfloat16 (`n/128`, `n/16`, `n/32` with
+    /// `n` in a 7-bit mantissa). A w1/w2 swap or a hidden-index miss
+    /// fails `arrayEqual`. The rotated inverse makes a row permutation
+    /// miss fail on the scatter plane. Returns `nil` if either arm declines.
+    public static func exactBitCompareDualScatter() -> (dense: Bool, scatter: Bool)? {
+        let b = 8
+        let s = 32
+        let k = 8
+        let rows = b * s
+        let nAssign = rows * k
+        var xVals = [Float](repeating: 0, count: rows * axis)
+        for r in 0..<rows {
+            for h in 0..<axis {
+                let n = ((r & 15) << 3) | (h & 7)
+                xVals[r * axis + h] = Float(n + 1) / 128
+            }
+        }
+        let x = MLXArray(xVals).reshaped([b, s, axis]).asType(.bfloat16)
+        let w1 = MLXArray((0..<axis).map { h in Float((h % 16) + 1) / 16 })
+            .asType(.bfloat16)
+        let w2 = MLXArray((0..<axis).map { h in Float((h % 8) + 1) / 32 })
+            .asType(.bfloat16)
+        let inverseOrder = MLXArray(
+            (0..<nAssign).map { UInt32(($0 + 1) % nAssign) })
+        guard let n1 = preNorm(x: x, weight: w1, eps: eps),
+            let scatter = preNormScatter(
+                x: x, weight: w2, inverseOrder: inverseOrder, topK: k, eps: eps),
+            let fused = preNormDualScatter(
+                x: x, w1: w1, w2: w2, inverseOrder: inverseOrder, topK: k, eps: eps)
+        else { return nil }
+        eval(n1, scatter, fused.0, fused.1)
+        return (
+            dense: arrayEqual(n1, fused.0).item(Bool.self),
+            scatter: arrayEqual(scatter, fused.1).item(Bool.self)
+        )
     }
 
     // MARK: - branch tail (5 dispatches -> 1)

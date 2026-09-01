@@ -9,6 +9,7 @@
 
 import Foundation
 import MLX
+import MLXFast
 
 /// Counters for the v2 core runtime's own host-interaction points.
 ///
@@ -206,6 +207,60 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
     private var values: MLXArray?
     private var capacity: Int
 
+    /// KVQ-D512-VAL: 4-bit affine mirror of the VALUE plane only, in groups
+    /// of 64, maintained ALONGSIDE the bf16 buffer (which stays the source of
+    /// truth for every logical view, snapshot, borrow and rollback path).
+    /// Only the B=8 D=512 full-attention decode AV kernel reads it; cutting
+    /// its 1,024-byte rows to 288 is the entire point.
+    ///
+    /// Layout `[kvHeads, capacity, 72]` uint32, slot-for-slot with the bf16
+    /// plane: words 0..<64 hold eight 4-bit values each, words 64..<72 hold
+    /// one fp16 (scale, bias) pair per 64-element group, scale in the low
+    /// half. Same packing the sliding-window mirror uses at D=256.
+    private var valueMirror: MLXArray?
+
+    /// Number of leading tokens whose mirror rows are known to match the
+    /// bf16 plane. Any write that does not also pack leaves this behind
+    /// `absoluteOffset`, and every reader is fail-closed on the difference.
+    private var mirrorValidCount: Int = 0
+
+    /// 64 payload words + 8 group words for D = 512.
+    static let mirrorRowWords = 512 / 8 + 512 / 64
+
+    /// `MLX_KV_D512_VMIRROR=0` never allocates the mirror, so the decode
+    /// chain takes the established bf16 road in the same binary. `MLX_`
+    /// prefix: the worker env sanitizer only passes that namespace through.
+    static let valueMirrorEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_KV_D512_VMIRROR"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// `MLX_KV_D512_VMIRROR_SIM=1` (default OFF, local only): overwrite the
+    /// bf16 value plane with its quantize/dequantize round trip after every
+    /// write, so the SINGLE-STREAM path — the one a local `--local-iterate`
+    /// golden run exercises — sees the values the B=8 quantized AV kernel
+    /// would reconstruct. That turns the local teacher-forced golden into a
+    /// real drift measurement for this mechanism. Never set on the box.
+    static let valueMirrorSimulate: Bool = {
+        ["1", "true", "yes", "on"].contains(
+            (ProcessInfo.processInfo.environment["MLX_KV_D512_VMIRROR_SIM"] ?? "")
+                .lowercased())
+    }()
+
+    private var mirrorEligible: Bool {
+        Self.valueMirrorEnabled && headDim == 512 && cohortPool == nil
+    }
+
+    /// The packed value mirror, or nil when it is not caught up with the
+    /// bf16 plane. Fail-closed: a caller that gets nil must read bf16.
+    var cbv2QuantValuePlane: MLXArray? {
+        guard cohortPool == nil, mirrorValidCount == absoluteOffset,
+            let valueMirror
+        else { return nil }
+        return valueMirror
+    }
+
     /// ATT-008 cohort pooling (nil until `cohortPool(binding:)` migrates this
     /// row). While bound, `keys`/`values` are nil and the pool's row
     /// `cohortIndex` is the storage.
@@ -236,7 +291,10 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
             // truthful after migration.
             return pool.nbytes / pool.rowCount
         }
+        // KVQ-D512-VAL: the mirror is real resident memory and must be
+        // visible to the engine's capacity accounting.
         return (keys?.nbytes ?? 0) + (values?.nbytes ?? 0)
+            + (valueMirror?.nbytes ?? 0)
     }
 
     /// WRITE-016-D512: the `update()` bookkeeping advance without the two
@@ -253,6 +311,23 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
             absoluteOffset + 1 <= maxLength,
             "CBv2FullSequenceKV: fused append past maxLength — admission bug")
         absoluteOffset += 1
+    }
+
+    /// KVQ-D512-VAL twin of `advanceAfterFusedAppend` for the store dispatch
+    /// that ALSO packed the new token's mirror row in the same kernel. The
+    /// caller only reaches here after `cbv2QuantValuePlane` handed it a
+    /// caught-up mirror, so the guard below should never fire; it retires the
+    /// mirror rather than trapping, because a stale mirror only ever needs to
+    /// cost the cohort its quantized road, never the run.
+    public func advanceAfterFusedAppendWithMirror() {
+        let caughtUp = valueMirror != nil && mirrorValidCount == absoluteOffset
+        advanceAfterFusedAppend()
+        if caughtUp {
+            mirrorValidCount = absoluteOffset
+        } else {
+            valueMirror = nil
+            mirrorValidCount = 0
+        }
     }
 
     public func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
@@ -282,6 +357,12 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
 
         keys![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newKeys
         values![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newValues
+        packValueMirror(newValues, at: absoluteOffset, count: n)
+        if Self.valueMirrorSimulate, mirrorEligible, newValues.dim(3) == 512 {
+            Self.noteSimulationOnce()
+            values![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] =
+                Self.simulateValueRoundTrip(newValues)
+        }
         absoluteOffset += n
 
         return (
@@ -339,6 +420,10 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
             n <= absoluteOffset,
             "CBv2FullSequenceKV.rollback(\(n)) exceeds retained \(absoluteOffset)")
         absoluteOffset -= n
+        // The rolled-back mirror slots still hold the rejected token's bytes;
+        // they are structurally unreachable for the same reason the bf16 tail
+        // is, and the next append repacks them.
+        mirrorValidCount = min(mirrorValidCount, absoluteOffset)
     }
 
     func cbv2InnerState() -> [MLXArray] {
@@ -407,6 +492,10 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
             row.cohortIndex = index
             row.keys = nil
             row.values = nil
+            // KVQ-D512-VAL: nothing maintains a mirror through the pool, so
+            // migration retires it and the row rejoins the bf16 road.
+            row.valueMirror = nil
+            row.mirrorValidCount = 0
         }
         return pool
     }
@@ -420,6 +509,11 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
                 [1, kvHeads, capacity, keyTemplate.dim(3)], dtype: keyTemplate.dtype)
             values = MLXArray.zeros(
                 [1, kvHeads, capacity, valueTemplate.dim(3)], dtype: valueTemplate.dtype)
+            if mirrorEligible, valueTemplate.dim(3) == 512 {
+                valueMirror = MLXArray.zeros(
+                    [kvHeads, capacity, Self.mirrorRowWords], dtype: .uint32)
+                mirrorValidCount = 0
+            }
             return
         }
         guard needed > capacity else { return }
@@ -434,6 +528,129 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
         values = concatenated(
             [values!, MLXArray.zeros([1, kvHeads, growth, values!.dim(3)], dtype: values!.dtype)],
             axis: 2)
+        if let mirror = valueMirror {
+            valueMirror = concatenated(
+                [
+                    mirror,
+                    MLXArray.zeros(
+                        [kvHeads, growth, Self.mirrorRowWords], dtype: .uint32),
+                ],
+                axis: 1)
+        }
         capacity = newCapacity
     }
+
+    // MARK: - KVQ-D512-VAL packing
+
+    /// Pack `[1, kvHeads, n, 512]` bf16 values into the mirror slots
+    /// `[offset, offset + n)`. One dispatch per update, whatever `n` is.
+    private func packValueMirror(_ newValues: MLXArray, at offset: Int, count n: Int) {
+        guard valueMirror != nil, newValues.dim(3) == 512,
+            mirrorValidCount == offset
+        else { return }
+        let rows = kvHeads * n
+        let packed = Self.valuePackKernel(
+            [newValues.reshaped([rows, 512])],
+            template: [("T", newValues.dtype)],
+            grid: (64, 1, rows),
+            threadGroup: (64, 1, 1),
+            outputShapes: [[rows, Self.mirrorRowWords]],
+            outputDTypes: [.uint32]
+        )[0]
+        valueMirror![0..., offset ..< (offset + n), 0...] =
+            packed.reshaped([kvHeads, n, Self.mirrorRowWords])
+        mirrorValidCount = offset + n
+    }
+
+    nonisolated(unsafe) private static var simulationLogged = false
+    private static let simulationLogLock = NSLock()
+
+    /// One line to stderr the first time the simulation actually perturbs a
+    /// value plane. A silent probe proves nothing.
+    private static func noteSimulationOnce() {
+        simulationLogLock.lock()
+        let fresh = !simulationLogged
+        simulationLogged = true
+        simulationLogLock.unlock()
+        if fresh {
+            FileHandle.standardError.write(
+                Data("[kvq-d512-val] simulation active\n".utf8))
+        }
+    }
+
+    /// Host expression for the mirror's quantize/dequantize round trip, used
+    /// only by the local simulation flag. It is the same expression the
+    /// packer kernel is verified against, so the values it writes are the
+    /// ones the AV kernel reconstructs, up to the bf16 store.
+    private static func simulateValueRoundTrip(_ x: MLXArray) -> MLXArray {
+        let shape = x.shape
+        let grouped = x.asType(.float32)
+            .reshaped([shape[0], shape[1], shape[2], 8, 64])
+        let mn = grouped.min(axis: -1, keepDims: true)
+        let mx = grouped.max(axis: -1, keepDims: true)
+        let scale = maximum((mx - mn) / 15, MLXArray(Float(1e-6)))
+            .asType(.float16).asType(.float32)
+        let bias = mn.asType(.float16).asType(.float32)
+        let q = clip(round((grouped - bias) / scale), min: 0, max: 15)
+        return (q * scale + bias).reshaped(shape).asType(x.dtype)
+    }
+
+    /// One threadgroup of 64 lanes per (head, token) row. A lane owns eight
+    /// consecutive elements, so it lies wholly inside one 64-element group
+    /// and the eight lanes of a group are contiguous and aligned — an xor
+    /// butterfly over 1, 2, 4 reduces exactly them. The fp16 rounding of
+    /// (scale, bias) happens BEFORE quantization, so the reader reconstructs
+    /// with the identical pair the mirror stores.
+    ///
+    /// This is the D = 512 transcription of the promoted sliding-window
+    /// packer `cbv2_kvq4g64_pack_d256_v1`, deliberately duplicated rather
+    /// than shared: that packer is a live path and re-composing its source
+    /// string would change its text, and a Swift-hosted kernel whose text
+    /// changes without its name serves a stale cached body.
+    private static let valuePackKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_kvq4g64_pack_d512_v1",
+        inputNames: ["x"],
+        outputNames: ["packed_w"],
+        source: """
+            constexpr int D = 512;
+            constexpr int lanes = 64;
+            constexpr int per_lane = D / lanes;           // 8 values
+            constexpr int group_size = 64;
+            constexpr int payload_words = D / 8;          // 64 (8 nibbles each)
+
+            const int row = int(threadgroup_position_in_grid.z);
+            const int lane = int(thread_position_in_threadgroup.x);
+            const device T* xr = x + size_t(row) * D;
+            device uint32_t* out =
+                packed_w + size_t(row) * (payload_words + D / group_size);
+
+            float vmin = 3.402823466e+38F;
+            float vmax = -3.402823466e+38F;
+            for (int i = 0; i < per_lane; ++i) {
+                const float v = float(xr[lane * per_lane + i]);
+                vmin = min(vmin, v);
+                vmax = max(vmax, v);
+            }
+            for (uint m = 1; m < 8; m <<= 1) {
+                vmin = min(vmin, simd_shuffle_xor(vmin, m));
+                vmax = max(vmax, simd_shuffle_xor(vmax, m));
+            }
+
+            const half hs = half(max((vmax - vmin) / 15.0f, 1e-6f));
+            const half hb = half(vmin);
+            const float s = float(hs);
+            const float b = float(hb);
+
+            uint32_t word = 0u;
+            for (int i = 0; i < per_lane; ++i) {
+                const float q = metal::rint((float(xr[lane * per_lane + i]) - b) / s);
+                word |= uint32_t(clamp(q, 0.0f, 15.0f)) << (4 * i);
+            }
+            out[lane] = word;
+            if (lane % 8 == 0) {
+                out[payload_words + lane / 8] =
+                    uint32_t(as_type<ushort>(hs)) | (uint32_t(as_type<ushort>(hb)) << 16);
+            }
+        """
+    )
 }

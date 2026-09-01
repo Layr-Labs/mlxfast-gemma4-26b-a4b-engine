@@ -1191,29 +1191,41 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 // which is served from `kword`/`vword` and whose slot this
                 // kernel is storing into; every address formed is therefore a
                 // slot the one-stage walk also reads.
+                //
+                // The current token is served out of registers rather than
+                // read back from the slot this same kernel is writing. That
+                // used to cost four selects on EVERY iteration of the walk,
+                // to pick between the register copy and the prefetched one,
+                // even though the choice can only go one way once per block.
+                //
+                // Feed the register copy into the prefetch slots instead. The
+                // one-stage walk then reads kw_pre unconditionally and the
+                // selects leave the hot loop entirely, with the loop body
+                // neither duplicated nor peeled: the extra case rides in the
+                // prefetch branch that was already there.
+                //
+                // Same words in the same order into the same arithmetic, so
+                // this is bit-identical, not merely equivalent.
+                const uint32_t kt_cur = uint32_t(as_type<ushort>(khs))
+                    | (uint32_t(as_type<ushort>(khb)) << 16);
+                const uint32_t vt_cur = uint32_t(as_type<ushort>(vhs))
+                    | (uint32_t(as_type<ushort>(vhb)) << 16);
                 const bool prefetch_first = block < N - 1;
                 uint next_slot = slot + uint(BLOCKS);
                 if (next_slot >= uint(N)) next_slot -= uint(N);
                 uint32_t kw_pre = prefetch_first
-                    ? mkeys_w[slot * row_words + lane] : 0u;
+                    ? mkeys_w[slot * row_words + lane] : kword;
                 uint32_t vw_pre = prefetch_first
-                    ? mvalues_w[slot * row_words + lane] : 0u;
+                    ? mvalues_w[slot * row_words + lane] : vword;
                 uint32_t ktw_pre = prefetch_first
-                    ? mkeys_w[slot * row_words + payload_words + lane / 8] : 0u;
+                    ? mkeys_w[slot * row_words + payload_words + lane / 8] : kt_cur;
                 uint32_t vtw_pre = prefetch_first
-                    ? mvalues_w[slot * row_words + payload_words + lane / 8] : 0u;
+                    ? mvalues_w[slot * row_words + payload_words + lane / 8] : vt_cur;
                 for (int token = block; token < N; token += BLOCKS) {
-                    const bool current = token == N - 1;
-                    const uint32_t kw = current ? kword : kw_pre;
-                    const uint32_t vw = current ? vword : vw_pre;
-                    const uint32_t ktw = current
-                        ? (uint32_t(as_type<ushort>(khs))
-                            | (uint32_t(as_type<ushort>(khb)) << 16))
-                        : ktw_pre;
-                    const uint32_t vtw = current
-                        ? (uint32_t(as_type<ushort>(vhs))
-                            | (uint32_t(as_type<ushort>(vhb)) << 16))
-                        : vtw_pre;
+                    const uint32_t kw = kw_pre;
+                    const uint32_t vw = vw_pre;
+                    const uint32_t ktw = ktw_pre;
+                    const uint32_t vtw = vtw_pre;
                     if (token + BLOCKS < N - 1) {
                         kw_pre = mkeys_w[next_slot * row_words + lane];
                         vw_pre = mvalues_w[next_slot * row_words + lane];
@@ -1223,6 +1235,11 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                             mvalues_w[next_slot * row_words + payload_words + lane / 8];
                         next_slot += uint(BLOCKS);
                         if (next_slot >= uint(N)) next_slot -= uint(N);
+                    } else if (token + BLOCKS == N - 1) {
+                        kw_pre = kword;
+                        vw_pre = vword;
+                        ktw_pre = kt_cur;
+                        vtw_pre = vt_cur;
                     }
                     const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
                     const float kb = float(as_type<half>(ushort(ktw >> 16)));

@@ -96,7 +96,6 @@ public enum Gemma4PrefillGlueV1 {
             uint simd_group_id,
             float eps) {
           float acc = 0;
-          #pragma clang loop unroll(full)
           for (int i = 0; i < GLUE_NREADS; i++) {
             acc += xv[i] * xv[i];
           }
@@ -134,7 +133,6 @@ public enum Gemma4PrefillGlueV1 {
             thread float& inv_b) {
           float acc_a = 0;
           float acc_b = 0;
-          #pragma clang loop unroll(full)
           for (int i = 0; i < GLUE_NREADS; i++) {
             acc_a += av[i] * av[i];
             acc_b += bv[i] * bv[i];
@@ -168,7 +166,7 @@ public enum Gemma4PrefillGlueV1 {
     // MARK: - norm + residual (2 dispatches -> 1)
 
     private static let normResidualKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_norm_residual_2816_unroll_v2",
+        name: "gemma4_prefill_glue_norm_residual_2816_v1",
         inputNames: ["x", "w", "res"],
         outputNames: ["out"],
         source: """
@@ -183,7 +181,6 @@ public enum Gemma4PrefillGlueV1 {
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
 
             float xv[GLUE_NREADS];
-            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 xv[i] = static_cast<float>(x[base + i]);
             }
@@ -191,7 +188,6 @@ public enum Gemma4PrefillGlueV1 {
             const float inv = glue_inv_rms(
                 xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
 
-            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 // The stock pair stores `w * T(x*inv)` to bf16, then reads it
@@ -226,7 +222,7 @@ public enum Gemma4PrefillGlueV1 {
     // MARK: - dual pre-norm (2 dispatches -> 1)
 
     private static let dualPreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_dual_prenorm_2816_unroll_v2",
+        name: "gemma4_prefill_glue_dual_prenorm_2816_v1",
         inputNames: ["x", "w1", "w2"],
         outputNames: ["out1", "out2"],
         source: """
@@ -241,7 +237,6 @@ public enum Gemma4PrefillGlueV1 {
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
 
             float xv[GLUE_NREADS];
-            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 xv[i] = static_cast<float>(x[base + i]);
             }
@@ -251,7 +246,6 @@ public enum Gemma4PrefillGlueV1 {
             const float inv = glue_inv_rms(
                 xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
 
-            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 const T scaled = static_cast<T>(xv[i] * inv);
@@ -283,179 +277,10 @@ public enum Gemma4PrefillGlueV1 {
         return (outs[0], outs[1])
     }
 
-    // MARK: - PRENORM-GATHER: the expert pre-norm emits the sorted plane
-
-    /// PRENORM-GATHER. On the prefill plane the routed-expert branch consumed
-    /// its pre-norm through a standalone sorted gather: `dualPreNorm` wrote
-    /// the expert-normed rows to device memory, the counting sort produced
-    /// the row order, and one gather dispatch read every token row once per
-    /// assignment (top-k rows each, in expert order, so with no locality) and
-    /// wrote the `[rows * topK, 1, 2816]` plane the gathered projections
-    /// consume. The un-sorted expert norm had no other reader. This arm
-    /// deletes it: `preNorm` emits the dense-branch norm alone, and
-    /// `preNormScatter` reads each residual row exactly once, reduces it with
-    /// the identical `rms_single_row` tree, and writes the expert-normed row
-    /// straight to its `topK` sorted positions, which the counting sort's
-    /// inverse order names. Same values, same dtype, same positions as the
-    /// gathered plane: `plane[inverseOrder[t * topK + k]] = normed(t)` is
-    /// exactly `normed[rowOrder]` because the inverse order is the inverse
-    /// permutation of the row order, and the inverse order is a permutation,
-    /// so every plane row is written exactly once.
-    ///
-    /// Kill switch: `DARKBLOOM_GEMMA4_PREFILL_PRENORM_GATHER` set to
-    /// `0`/`false`/`no`/`off` restores `dualPreNorm` and the standalone
-    /// gather. Engage mark: `prefill-prenorm-gather`.
-    public static let prenormGatherEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_PREFILL_PRENORM_GATHER"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
-    /// `dualPreNorm` with its second output removed: the same reduction, the
-    /// same `w * T(x * inv)` store, one weight.
-    private static let preNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_prenorm_2816_unroll_v2",
-        inputNames: ["x", "w"],
-        outputNames: ["out"],
-        source: """
-            threadgroup float local_sums[32];
-            threadgroup float local_inv[1];
-
-            const uint row = threadgroup_position_in_grid.y;
-            const uint lid = thread_position_in_threadgroup.x;
-            const uint simd_lane_id = thread_index_in_simdgroup;
-            const uint simd_group_id = simdgroup_index_in_threadgroup;
-
-            const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
-
-            float xv[GLUE_NREADS];
-            #pragma clang loop unroll(full)
-            for (int i = 0; i < GLUE_NREADS; i++) {
-                xv[i] = static_cast<float>(x[base + i]);
-            }
-
-            const float inv = glue_inv_rms(
-                xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
-
-            #pragma clang loop unroll(full)
-            for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
-                const T scaled = static_cast<T>(xv[i] * inv);
-                out[base + i] = w[j] * scaled;
-            }
-            """,
-        header: kernelHeader,
-        ensureRowContiguous: true
-    )
-
-    /// `dualPreNorm`'s second output written straight into expert-sorted
-    /// order. One threadgroup per token row, as before; the row's normed
-    /// values are computed once into registers and stored to each of the
-    /// row's K sorted positions.
-    private static let preNormScatterKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_prenorm_scatter_2816_unroll_v2",
-        inputNames: ["x", "w", "inverse"],
-        outputNames: ["out"],
-        source: """
-            threadgroup float local_sums[32];
-            threadgroup float local_inv[1];
-
-            const uint row = threadgroup_position_in_grid.y;
-            const uint lid = thread_position_in_threadgroup.x;
-            const uint simd_lane_id = thread_index_in_simdgroup;
-            const uint simd_group_id = simdgroup_index_in_threadgroup;
-
-            const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
-
-            float xv[GLUE_NREADS];
-            #pragma clang loop unroll(full)
-            for (int i = 0; i < GLUE_NREADS; i++) {
-                xv[i] = static_cast<float>(x[base + i]);
-            }
-
-            const float inv = glue_inv_rms(
-                xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
-
-            // The stored value is the identical expression `dualPreNorm`
-            // stores for its second output; it is rounded to T here, once,
-            // and copied verbatim to every sorted position.
-            T normed[GLUE_NREADS];
-            #pragma clang loop unroll(full)
-            for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
-                const T scaled = static_cast<T>(xv[i] * inv);
-                normed[i] = w[j] * scaled;
-            }
-
-            // Assignment t * K + k of this row owns sorted position
-            // inverse[t * K + k]. The inverse order is a permutation of the
-            // plane rows, so every plane row is written exactly once.
-            const size_t assignment_base = size_t(row) * K;
-            for (int k = 0; k < K; k++) {
-                const size_t pos = size_t(inverse[assignment_base + k]);
-                const size_t obase = pos * GLUE_AXIS + lid * GLUE_NREADS;
-                #pragma clang loop unroll(full)
-                for (int i = 0; i < GLUE_NREADS; i++) {
-                    out[obase + i] = normed[i];
-                }
-            }
-            """,
-        header: kernelHeader,
-        ensureRowContiguous: true
-    )
-
-    /// `rmsNorm(x, weight)` alone. Returns `nil` off the prefill plane or with
-    /// the arm switched off.
-    public static func preNorm(
-        x: MLXArray, weight: MLXArray, eps epsIn: Float
-    ) -> MLXArray? {
-        guard prenormGatherEnabled,
-            let rows = planeRows(x, weight: weight, eps: epsIn)
-        else { return nil }
-
-        return preNormKernel(
-            [x, weight],
-            template: [("T", x.dtype)],
-            grid: (threadsPerRow, rows, 1),
-            threadGroup: (threadsPerRow, 1, 1),
-            outputShapes: [x.shape],
-            outputDTypes: [x.dtype]
-        )[0]
-    }
-
-    /// `rmsNorm(x, weight)` written straight into expert-sorted order: row
-    /// `inverseOrder[t * topK + k]` of the returned `[rows * topK, 1, 2816]`
-    /// plane is the normed row `t`. Returns `nil` off the prefill plane, with
-    /// the arm switched off, or for an inverse order that is not exactly one
-    /// `uint32` per assignment.
-    public static func preNormScatter(
-        x: MLXArray, weight: MLXArray, inverseOrder: MLXArray, topK: Int,
-        eps epsIn: Float
-    ) -> MLXArray? {
-        guard prenormGatherEnabled,
-            let rows = planeRows(x, weight: weight, eps: epsIn),
-            topK >= 1,
-            inverseOrder.ndim == 1,
-            inverseOrder.dtype == .uint32,
-            inverseOrder.dim(0) == rows * topK
-        else { return nil }
-
-        CBv2EngageMark.once("prefill-prenorm-gather")
-        return preNormScatterKernel(
-            [x, weight, inverseOrder],
-            template: [("T", x.dtype), ("K", topK)],
-            grid: (threadsPerRow, rows, 1),
-            threadGroup: (threadsPerRow, 1, 1),
-            outputShapes: [[rows * topK, 1, axis]],
-            outputDTypes: [x.dtype]
-        )[0]
-    }
-
     // MARK: - branch tail (5 dispatches -> 1)
 
     private static let tailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_tail_2816_unroll_v2",
+        name: "gemma4_prefill_glue_tail_2816_v1",
         inputNames: ["h1", "h2", "w1", "w2", "w3", "res2"],
         outputNames: ["out"],
         source: """
@@ -472,7 +297,6 @@ public enum Gemma4PrefillGlueV1 {
 
             float av[GLUE_NREADS];
             float bv[GLUE_NREADS];
-            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 av[i] = static_cast<float>(h1[base + i]);
                 bv[i] = static_cast<float>(h2[base + i]);
@@ -487,7 +311,6 @@ public enum Gemma4PrefillGlueV1 {
             // The branch sum stays in registers. The stock graph writes it to
             // bf16 between the norms and the final norm, so round it here.
             float tv[GLUE_NREADS];
-            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 const T n1 = static_cast<T>(w1[j] * static_cast<T>(av[i] * inv_a));
@@ -498,7 +321,6 @@ public enum Gemma4PrefillGlueV1 {
             const float inv_t = glue_inv_rms(
                 tv, local_sums_a, local_inv2, simd_lane_id, simd_group_id, GLUE_EPS);
 
-            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 const T normed = static_cast<T>(w3[j] * static_cast<T>(tv[i] * inv_t));
@@ -545,7 +367,7 @@ public enum Gemma4PrefillGlueV1 {
     /// stores `out`, so both cost one extra in-kernel reduction rather than a
     /// re-read of the row plus two launches.
     private static let tailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_tail_chain_2816_unroll_v2",
+        name: "gemma4_prefill_glue_tail_chain_2816_v1",
         inputNames: ["h1", "h2", "w1", "w2", "w3", "res2", "s", "wn"],
         outputNames: ["out", "normed"],
         source: """
@@ -562,7 +384,6 @@ public enum Gemma4PrefillGlueV1 {
 
             float av[GLUE_NREADS];
             float bv[GLUE_NREADS];
-            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 av[i] = static_cast<float>(h1[base + i]);
                 bv[i] = static_cast<float>(h2[base + i]);
@@ -575,7 +396,6 @@ public enum Gemma4PrefillGlueV1 {
                 simd_lane_id, simd_group_id, GLUE_EPS, inv_a, inv_b);
 
             float tv[GLUE_NREADS];
-            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 const T n1 = static_cast<T>(w1[j] * static_cast<T>(av[i] * inv_a));
@@ -591,7 +411,6 @@ public enum Gemma4PrefillGlueV1 {
             // explicit here, so `out` is the same array either way.
             const T scalar = s[0];
             float ov[GLUE_NREADS];
-            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 const T normed3 = static_cast<T>(w3[j] * static_cast<T>(tv[i] * inv_t));
@@ -606,7 +425,6 @@ public enum Gemma4PrefillGlueV1 {
             const float inv_n = glue_inv_rms(
                 ov, local_sums_a, local_inv2, simd_lane_id, simd_group_id, GLUE_EPS);
 
-            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 normed[base + i] = wn[j] * static_cast<T>(ov[i] * inv_n);
@@ -650,7 +468,7 @@ public enum Gemma4PrefillGlueV1 {
     /// same `[tokens, hidden]` expert result. Produce each reduced expert value
     /// in the tail thread that consumes it, removing the intermediate tensor.
     private static let expertTailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_expert_unsort_tail_chain_2816_unroll_v2",
+        name: "gemma4_prefill_expert_unsort_tail_chain_2816_v1",
         inputNames: [
             "sorted", "inverse_order", "route_weights", "h1",
             "w1", "w2", "w3", "res2", "s", "wn",
@@ -670,7 +488,6 @@ public enum Gemma4PrefillGlueV1 {
 
             float av[GLUE_NREADS];
             float bv[GLUE_NREADS];
-            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint feature = lid * GLUE_NREADS + i;
                 av[i] = static_cast<float>(h1[base + i]);
@@ -693,7 +510,6 @@ public enum Gemma4PrefillGlueV1 {
                 simd_lane_id, simd_group_id, GLUE_EPS, inv_a, inv_b);
 
             float tv[GLUE_NREADS];
-            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 const T n1 = static_cast<T>(
@@ -709,7 +525,6 @@ public enum Gemma4PrefillGlueV1 {
 
             const T scalar = s[0];
             float ov[GLUE_NREADS];
-            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 const T normed3 = static_cast<T>(
@@ -724,7 +539,6 @@ public enum Gemma4PrefillGlueV1 {
                 ov, local_sums_a, local_inv2,
                 simd_lane_id, simd_group_id, GLUE_EPS);
 
-            #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
                 const uint j = lid * GLUE_NREADS + i;
                 normed[base + i] =

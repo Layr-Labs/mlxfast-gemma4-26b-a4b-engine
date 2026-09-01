@@ -148,16 +148,6 @@ enum CBv2AttentionV1 {
     static let joinKernelEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_PREFILL_JOIN_KERNEL"]
-        // Attribution: default-on join selection and 16-head grouping below
-        // are adapted from newjordan's public, parity-passed submissions
-        // `c4557ca8-e1a2-4569-8d96-95061f6d1eef` and
-        // `1e63caf5-c028-4c38-abc7-6b5f5c2b5bb6`.
-        // Off-cadence retest: the first clean stack passed parity at
-        // 1.151572s prefill / 2.089284s decode, but its serial prefill control
-        // shifted 73.768ms faster than the stored record run.
-        // Final cadence draw: the second run held 2.086433s decode and missed
-        // promotion by 0.30%; only ~10ms of serial-prefill control movement
-        // separated its sealed components from the stored threshold.
         else { return false }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
@@ -242,8 +232,7 @@ enum CBv2AttentionV1 {
         let lanes = D / 8
         guard lanes <= 1024, B * L * H * D < (1 << 31) else { return nil }
         var headsPerGroup = 1
-        for candidate in [16, 8, 4, 2]
-        where H % candidate == 0 && lanes * candidate <= 1024 {
+        for candidate in [8, 4, 2] where H % candidate == 0 && lanes * candidate <= 1024 {
             headsPerGroup = candidate
             break
         }
@@ -470,53 +459,6 @@ enum CBv2AttentionV1 {
                 cachedValueRows.reserveCapacity(B)
                 let ringRows = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
                 if ringRows.count == B && ringRows.allSatisfy({ $0.decodeRingView != nil }) {
-                    // Q4-LIVE-WRITE: admit all rows before any host state
-                    // mutation. Pass A writes only the live q4 mirror slot;
-                    // the established BF16 SliceUpdates and counters remain
-                    // on their incumbent path below.
-                    if CBv2WindowedSequenceKV.q4FusedMirrorWriteEnabled,
-                        allowFusedRingWrite, let decodeRingWriteFence
-                    {
-                        let preWrite = ringRows.compactMap {
-                            $0.decodeRingQuantViewBeforeWrite
-                        }
-                        if preWrite.count == B,
-                            let fused = CBv2RaggedTwoPassDecodeAttentionV1
-                                .attendRingQuantWriting(
-                                    queries: queries,
-                                    mirrors: preWrite.map(\.mirror),
-                                    starts: preWrite.map(\.start),
-                                    newKeys: keys, newValues: values,
-                                    previousWriteFence: decodeRingWriteFence.value,
-                                    scale: scale,
-                                    slidingWindowLength: ringRows[0].window)
-                        {
-                            // Q4-BF16-ELIDE: the fused pass already stored
-                            // the mirror slot and served this step's live
-                            // token from the new K/V arrays; on the
-                            // quant-authoritative road the BF16 SliceUpdates
-                            // are dead graph work, so advance counters only.
-                            // Kill switch restores the incumbent writes.
-                            if CBv2WindowedSequenceKV.q4BF16RingElideEnabled {
-                                CBv2EngageMark.once("kvq4-bf16-elide")
-                                for row in ringRows {
-                                    row.advanceDecodeRingAfterQuantWrite()
-                                }
-                            } else {
-                                for (index, row) in ringRows.enumerated() {
-                                    row.decodeRingWriteBF16Only(
-                                        keys: keys[index ..< (index + 1)],
-                                        values: values[index ..< (index + 1)])
-                                }
-                            }
-                            // The next pass-A consumes this fence; this
-                            // step's pass-B output also consumes pass-A's
-                            // first three outputs, so the live store remains
-                            // rooted both in observable output and cache state.
-                            decodeRingWriteFence.value = fused.nextWriteFence
-                            return fused.output
-                        }
-                    }
                     // WRITE-016: fold this step's one-token ring write into
                     // ring pass A. The separate `decodeRingWrite` below is a
                     // `SliceUpdate` over a 4 MiB allocation the direct-ring
@@ -530,14 +472,7 @@ enum CBv2AttentionV1 {
                     // entirely, write included) unless the storage-owning
                     // layer has no K/V borrower that must keep observing the
                     // pre-write allocation.
-                    // KVQ-PORT: the fused road owns the write AND the read.
-                    // This revision moves only the read to the mirror, so the
-                    // fused road must stand down for the quant path to be
-                    // reachable at all. It is restored the moment the mirror
-                    // is unavailable (kill switch, or any row without one).
-                    let portQuantActive = CBv2WindowedSequenceKV.quantEnabled
-                        && ringRows.allSatisfy { $0.decodeRingQuantView != nil }
-                    if !portQuantActive, fusedRingWriteEnabled, allowFusedRingWrite,
+                    if fusedRingWriteEnabled, allowFusedRingWrite,
                         let decodeRingWriteFence
                     {
                         let preWrite = ringRows.compactMap { $0.decodeRingViewBeforeWrite }
@@ -568,22 +503,7 @@ enum CBv2AttentionV1 {
                             values: values[index ..< (index + 1)])
                     }
                     let views = ringRows.compactMap { $0.decodeRingView }
-                    // KVQ-PORT: the ring write above is the promoted stock
-                    // mechanism's; only the READ moves to the 8-bit mirror,
-                    // and its pass A is consumed by pass B exactly as the
-                    // bf16 road consumes it. All-or-nothing: unless every
-                    // row exposes a mirror the established road runs.
-                    let portMirrors = ringRows.compactMap { $0.decodeRingQuantView }
-                    if views.count == B, portMirrors.count == B,
-                        let quantOutput = CBv2RaggedTwoPassDecodeAttentionV1
-                            .attendRingQuant(
-                                queries: queries, mirrors: portMirrors,
-                                starts: views.map(\.start), scale: scale,
-                                slidingWindowLength: ringRows[0].window)
-                    {
-                        return quantOutput
-                    }
-                    if views.count == B, !ringRows.contains(where: \.bf16RingStale),
+                    if views.count == B,
                         let output = CBv2RaggedTwoPassDecodeAttentionV1.attendRing(
                             queries: queries, keys: views.map(\.keys),
                             values: views.map(\.values), starts: views.map(\.start),

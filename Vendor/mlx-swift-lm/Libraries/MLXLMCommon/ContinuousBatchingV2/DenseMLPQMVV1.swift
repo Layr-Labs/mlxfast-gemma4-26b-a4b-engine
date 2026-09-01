@@ -105,41 +105,6 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    /// W4-LOAD (engage mark `mlp-w4-load`). The four packed affine-8 codes a
-    /// lane owns for one output row are four CONTIGUOUS bytes at a 4-byte
-    /// aligned address, so they can be fetched as ONE aligned 32-bit load
-    /// instead of four separate 1-byte loads. The codes, their order and every
-    /// arithmetic statement that consumes them are unchanged, so the arm is
-    /// bit-identical to the promoted bodies by construction.
-    ///
-    /// Alignment holds for every address this arm forms. The quad-stream body
-    /// advances `ws` by `out_row * in_vec_size_w + simd_lid * bytes_per_thread`
-    /// once and by `block_size` per K block, and the fetch adds
-    /// `row * in_vec_size_w`, so
-    ///
-    ///     addr - base = (out_row + row) * in_vec_size_w
-    ///                 + bytes_per_thread * simd_lid
-    ///                 + block_size * n
-    ///
-    /// with the body's own constants `bytes_per_thread == 4` and
-    /// `block_size == 128`, both multiples of 4, and `in_vec_size_w == inDim`
-    /// where `liveShape` admits only 2816 (= 4 * 704) and 2112 (= 4 * 528).
-    /// Every term is a multiple of 4. `weight.dtype == .uint32` is required by
-    /// `matmul`, so the buffer base is itself at least 4-byte aligned. The tail
-    /// block forms the same addresses under a lane predicate, which restricts
-    /// WHICH lanes load and never the address. The load reads exactly the bytes
-    /// `wl[0 ..< 4]` the incumbent loop read, so no new byte is touched and the
-    /// bounds are unchanged.
-    ///
-    /// `DARKBLOOM_GEMMA4_MLP_W4_LOAD=0` restores the promoted quad-stream and
-    /// activation-sum bodies byte for byte in the same binary.
-    public static let w4Enabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_MLP_W4_LOAD"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
     private static let batch = 8
     private static let sequence = 1
     private static let groupSize = 64
@@ -187,7 +152,6 @@ inline U qdot_affine8_registered(
     U bias,
     U sum) {
   U accum = 0;
-  #pragma unroll
   for (int i = 0; i < values_per_thread; i++) {
     accum += x_thread[i] * w[i];
   }
@@ -247,10 +211,8 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
 
   int k = 0;
   for (; k <= in_vec_size - block_size; k += block_size) {
-    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* wl = ws + row * in_vec_size_w;
-      #pragma unroll
       for (int i = 0; i < bytes_per_thread; i++) {
         packed[row][i] = wl[i];
       }
@@ -259,25 +221,21 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
     }
 
     float sum = load_vector<T, float, values_per_thread, 8>(x0, x_thread);
-    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine8_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 8>(x1, x_thread);
-    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine8_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 8>(x2, x_thread);
-    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine8_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 8>(x3, x_thread);
-    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result3[row] += qdot_affine8_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
@@ -295,10 +253,8 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
   const uint active_tail_lanes =
       uint((in_vec_size - k) / values_per_thread);
   if (simd_lid < active_tail_lanes) {
-    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* wl = ws + row * in_vec_size_w;
-      #pragma unroll
       for (int i = 0; i < bytes_per_thread; i++) {
         packed[row][i] = wl[i];
       }
@@ -307,32 +263,27 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
     }
 
     float sum = load_vector<T, float, values_per_thread, 8>(x0, x_thread);
-    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine8_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 8>(x1, x_thread);
-    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine8_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 8>(x2, x_thread);
-    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine8_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 8>(x3, x_thread);
-    #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       result3[row] += qdot_affine8_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
   }
 
-  #pragma unroll
   for (int row = 0; row < results_per_simdgroup; row++) {
     result0[row] = simd_sum(result0[row]);
     result1[row] = simd_sum(result1[row]);
@@ -380,7 +331,6 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
             inline void load_affine8_values(
                 const device T* x,
                 thread U* x_thread) {
-              #pragma unroll
               for (int i = 0; i < values_per_thread; i++) {
                 x_thread[i] = x[i];
               }
@@ -634,30 +584,27 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     rs += simd_shuffle_xor(rs, 4u);
     rs += simd_shuffle_xor(rs, 16u);
 
-    // BFILL: each B operand is filled immediately before the step that
-    // consumes it instead of all eight ahead of the run, so one B is live
-    // at a time rather than eight. `r0`/`r1` are not written between here
-    // and the last step, and the accumulation order into `C` is unchanged.
+    MMA8_SETB(B0, x, lo)
+    MMA8_SETB(B1, x, hi)
+    MMA8_SETB(B2, y, lo)
+    MMA8_SETB(B3, y, hi)
+    MMA8_SETB(B4, z, lo)
+    MMA8_SETB(B5, z, hi)
+    MMA8_SETB(B6, w, lo)
+    MMA8_SETB(B7, w, hi)
+
     const uint4 wv = *((const device uint4*)(wrow + 64 * g));
     const float s = float(srow[g]);
     const float b = float(brow[g]);
 
     simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
-    MMA8_SETB(B0, x, lo)
     MMA8_STEP8(B0, x, z, 0)
-    MMA8_SETB(B1, x, hi)
     MMA8_STEP8(B1, x, z, 8)
-    MMA8_SETB(B2, y, lo)
     MMA8_STEP8(B2, x, z, 16)
-    MMA8_SETB(B3, y, hi)
     MMA8_STEP8(B3, x, z, 24)
-    MMA8_SETB(B4, z, lo)
     MMA8_STEP8(B4, y, w, 0)
-    MMA8_SETB(B5, z, hi)
     MMA8_STEP8(B5, y, w, 8)
-    MMA8_SETB(B6, w, lo)
     MMA8_STEP8(B6, y, w, 16)
-    MMA8_SETB(B7, w, hi)
     MMA8_STEP8(B7, y, w, 24)
 
     acc0 += s * C.thread_elements()[0] + rs.x * b;
@@ -743,62 +690,11 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
                 const int g = g0 + gi;
                 if (g >= G) continue;
             """)
-        // DMLP-DOWN-CARRY-019: the weight-operand register carry the frontier
-        // applied to the two attention matrix-unit tiers, on the dense down
-        // plane. Every address here is a function of the group index alone, so
-        // one group's codes, scale and bias stay resident in registers while
-        // the next group's are read a whole iteration ahead of their use.
-        // `g_next` is clamped to the last valid group, so the final look-ahead
-        // re-reads a group already read and its value is discarded.
-        //
-        // The read stays at the statement it already occupied. Moving it to the
-        // top of the body instead perturbs the close's floating-point
-        // contraction and stops the output being bit-identical; keeping it here
-        // leaves the emitted arithmetic word for word what the tip emits.
-        //
-        // DMLP-DOWN-CARRY2-021: the codes go TWO groups deep. One iteration of
-        // this body is eight matrix-unit steps and a three-step shuffle chain,
-        // which is well short of a device load's latency, so a single group of
-        // look-ahead leaves the second half of that latency uncovered. The
-        // scale and the bias stay one group ahead: they are two bytes each
-        // against the codes' sixteen, they sit in the same cache lines as their
-        // neighbours, and a second copy of them would cost registers for no
-        // stream. `g` is monotone here and the loop count is a constant, so the
-        // hand-off is register renaming in a fully unrolled body, not a copy.
-        replaceOnce(
-            """
-              simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
-            """,
-            with: """
-              simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
-
-              uint4 wv_next = *((const device uint4*)(wrow + 64 * g0));
-              uint4 wv_next2 =
-                  *((const device uint4*)(wrow + 64 * min(g0 + 1, G - 1)));
-              T s_next = srow[g0];
-              T b_next = brow[g0];
-            """)
-        replaceOnce(
-            """
-                const uint4 wv = *((const device uint4*)(wrow + 64 * g));
-                const float s = float(srow[g]);
-                const float b = float(brow[g]);
-            """,
-            with: """
-                const uint4 wv = wv_next;
-                const float s = float(s_next);
-                const float b = float(b_next);
-                const int g_next = min(g + 1, G - 1);
-                wv_next = wv_next2;
-                wv_next2 = *((const device uint4*)(wrow + 64 * min(g + 2, G - 1)));
-                s_next = srow[g_next];
-                b_next = brow[g_next];
-            """)
         return result
     }()
 
     private static let mma8DownStaticKKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_carry2_bfill_v4",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_unroll_v1",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -893,7 +789,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         ensureRowContiguous: true)
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_v2_unroll",
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_v1",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -934,7 +830,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     /// followed by four ascending `sum += bf16` operations. Row is the unit-
     /// stride dimension so one table serves both gate and up projections.
     private static let activationSumKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_affine8_xsum_v2_unroll",
+        name: "cbv2_b8_l1_dense_mlp_affine8_xsum_v1",
         inputNames: ["x"],
         outputNames: ["xSums"],
         source: """
@@ -945,7 +841,6 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
             const device T* xp =
                 x + row * in_vec_size + k_block * 128 + lane * 4;
             float sum = 0.0f;
-            #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 sum += xp[i];
             }
@@ -955,7 +850,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     )
 
     private static let activationSumQMVKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_v2_unroll",
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_v1",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["y"],
         source: """
@@ -989,147 +884,6 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
             return;
             """,
         header: activationSumKernelHeader,
-        ensureRowContiguous: true
-    )
-
-    /// The `uchar4` twin of the promoted registered dot product. The
-    /// accumulation text is identical; only the container of the four
-    /// already-loaded weight codes changes, from four separate `thread uint8_t`
-    /// to one `uchar4` that a single 32-bit device load fills.
-    private static let wideDotHelper = """
-
-template <typename U, int values_per_thread>
-inline U qdot_affine8_registered_v4(
-    const thread uchar4 w,
-    const thread U* x_thread,
-    U scale,
-    U bias,
-    U sum) {
-  U accum = 0;
-  #pragma unroll
-  for (int i = 0; i < values_per_thread; i++) {
-    accum += x_thread[i] * w[i];
-  }
-  return scale * accum + sum * bias;
-}
-
-"""
-
-    /// Rewrite a promoted quad-stream header into its W4 twin. Three
-    /// single-purpose substitutions with checked occurrence counts, so any
-    /// future drift in the donor body fails construction instead of silently
-    /// transforming an unintended text.
-    private static func w4Header(_ source: String) -> String {
-        var text = source
-        func replaceExactly(_ old: String, _ new: String, _ count: Int) {
-            precondition(text.components(separatedBy: old).count == count + 1)
-            text = text.replacingOccurrences(of: old, with: new)
-        }
-        replaceExactly(
-            "qdot_affine8_registered<", "qdot_affine8_registered_v4<", 8)
-        replaceExactly(
-            "  thread uint8_t packed[results_per_simdgroup][bytes_per_thread];",
-            "  thread uchar4 packed[results_per_simdgroup];",
-            1)
-        replaceExactly(
-            "      const device uint8_t* wl = ws + row * in_vec_size_w;\n"
-                + "      #pragma unroll\n"
-                + "      for (int i = 0; i < bytes_per_thread; i++) {\n"
-                + "        packed[row][i] = wl[i];\n"
-                + "      }",
-            "      packed[row] =\n"
-                + "          *((const device uchar4*)(ws + row * in_vec_size_w));",
-            2)
-        replaceExactly(
-            "template <typename U, int values_per_thread>\n"
-                + "inline U qdot_affine8_registered(",
-            wideDotHelper
-                + "template <typename U, int values_per_thread>\n"
-                + "inline U qdot_affine8_registered(",
-            1)
-        return text
-    }
-
-    private static let w4KernelHeader: String = w4Header(kernelHeader)
-
-    private static let w4ActivationSumKernelHeader: String =
-        w4Header(activationSumKernelHeader)
-
-    /// The W4 twins. Source text is the promoted kernels' own, character for
-    /// character; only the name and the header differ, so the grid, threadgroup
-    /// shape, dispatch count, operands and bytes moved are all unchanged.
-    private static let w4Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_w4_v1",
-        inputNames: ["x", "w", "scales", "biases"],
-        outputNames: ["y"],
-        source: """
-            const uint3 tid = threadgroup_position_in_grid;
-            const uint simd_gid = simdgroup_index_in_threadgroup;
-            const uint simd_lid = thread_index_in_simdgroup;
-
-            const int in_vec_size = x_shape[x_ndim - 1];
-            const int out_vec_size = w_shape[0];
-            const int first_m = int(tid.x) * 4;
-            if (first_m >= 8) {
-                return;
-            }
-            qmv_affine8_g64_quad_stream_impl<T, 64, 8>(
-                w,
-                scales,
-                biases,
-                x + first_m * in_vec_size,
-                x + (first_m + 1) * in_vec_size,
-                x + (first_m + 2) * in_vec_size,
-                x + (first_m + 3) * in_vec_size,
-                y + first_m * out_vec_size,
-                y + (first_m + 1) * out_vec_size,
-                y + (first_m + 2) * out_vec_size,
-                y + (first_m + 3) * out_vec_size,
-                in_vec_size,
-                tid,
-                simd_gid,
-                simd_lid);
-            return;
-            """,
-        header: w4KernelHeader,
-        ensureRowContiguous: true
-    )
-
-    private static let w4ActivationSumQMVKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_w4_v1",
-        inputNames: ["x", "w", "scales", "biases", "xSums"],
-        outputNames: ["y"],
-        source: """
-            const uint3 tid = threadgroup_position_in_grid;
-            const uint simd_gid = simdgroup_index_in_threadgroup;
-            const uint simd_lid = thread_index_in_simdgroup;
-
-            const int in_vec_size = x_shape[x_ndim - 1];
-            const int out_vec_size = w_shape[0];
-            const int first_m = int(tid.x) * 4;
-            if (first_m >= 8) {
-                return;
-            }
-            qmv_affine8_g64_quad_stream_xsum_impl<T, 64, 8>(
-                w,
-                scales,
-                biases,
-                xSums,
-                x + first_m * in_vec_size,
-                x + (first_m + 1) * in_vec_size,
-                x + (first_m + 2) * in_vec_size,
-                x + (first_m + 3) * in_vec_size,
-                y + first_m * out_vec_size,
-                y + (first_m + 1) * out_vec_size,
-                y + (first_m + 2) * out_vec_size,
-                y + (first_m + 3) * out_vec_size,
-                in_vec_size,
-                tid,
-                simd_gid,
-                simd_lid);
-            return;
-            """,
-        header: w4ActivationSumKernelHeader,
         ensureRowContiguous: true
     )
 
@@ -1275,15 +1029,7 @@ inline U qdot_affine8_registered_v4(
         let useActivationSums = activationSums != nil
             && inDim == 2816
             && outDim == 2112
-        if w4Enabled {
-            CBv2EngageMark.once("mlp-w4-load")
-        }
-        let selected: MLXFast.MLXFastKernel
-        if useActivationSums {
-            selected = w4Enabled ? w4ActivationSumQMVKernel : activationSumQMVKernel
-        } else {
-            selected = w4Enabled ? w4Kernel : kernel
-        }
+        let selected = useActivationSums ? activationSumQMVKernel : kernel
         let inputs = useActivationSums
             ? [x, weight, scales, biases, activationSums!.values]
             : [x, weight, scales, biases]

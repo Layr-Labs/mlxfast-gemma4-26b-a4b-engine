@@ -110,7 +110,6 @@ public final class Gemma4A4BRuntimeWeightCache {
            )
         {
             setenv("MLX_MAX_MB_PER_BUFFER", "512", 1)
-            setenv("MLX_MAX_OPS_PER_BUFFER", "256", 1)
             Memory.cacheLimit = 32 << 30
         }
 
@@ -190,13 +189,6 @@ public final class Gemma4A4BRuntimeWeightCache {
             expectedNames: Set(denseStore.tensorNames))
 
         let sanitized = model.sanitize(weights: weights)
-        // GATEUP-FUSE-PREFILL: the sanitize pass re-binds the routed-expert
-        // gate/up planes as slices of a concatenated storage; the raw loaded
-        // planes are then reachable only through that concatenation, and
-        // dropping this dictionary lets the evaluation below retire each
-        // layer's raw planes as soon as its storage is built instead of
-        // holding every layer's until this function returns.
-        weights.removeAll()
         try quantizeWithPerPathWidths(
             model: model, sanitized: sanitized, config: config)
         try model.update(

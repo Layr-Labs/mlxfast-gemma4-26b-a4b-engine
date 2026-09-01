@@ -134,8 +134,9 @@ template <
       loader_b.src -= k_jump_b;
     }
 
-    // Matrix level aligned never check
+    // MoE gather at B=8: tight K loop unroll for aligned tiles (GEMM gather is the MoE routed-expert path, 8 experts top-2, ~16 gathers per step). Exact mma/ loads.
     if (align_M && align_N) {
+#pragma clang loop unroll(full)
       for (int k = 0; k < gemm_k_iterations; k++) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
 

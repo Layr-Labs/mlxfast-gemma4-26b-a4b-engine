@@ -1,6 +1,7 @@
-// Ranked replication by delordemm1 of the parity-clean resident q4 merge
-// published in submission bc839700. This marker is non-executable; the kernel
-// and host implementation below remain byte-identical to that measured tree.
+// Box-draw entry #3 on the unmodified crown content. Entry #2 (4198c2b2)
+// drew the fast-serial box — the line's eighth consecutive — and sealed
+// candidate decode ~2.2276, the crown's own content level, as the ledger
+// predicts. Submitted off-cadence to decouple from any scheduler phase.
 // RaggedTwoPassDecodeAttentionV1.swift
 //
 // Batch-wide dispatch of MLX's established two-pass vector attention for the
@@ -17,16 +18,6 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     private static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_RAGGED_TWO_PASS_ATTENTION"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
-    /// Keep all eight q4 pass-A partitions resident in one threadgroup and
-    /// transcribe pass B from threadgroup memory. The established two-dispatch
-    /// path remains available as a same-binary control.
-    private static let q4ResidentMergeEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_Q4_RESIDENT_MERGE"]
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
@@ -98,40 +89,6 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         }
         return min(8, stockBlocks)
     }()
-
-    /// Attribution: COMBINE-PACK-001 and COMBINE-HOIST-001 below are adapted
-    /// from samfenwick's public Yukon submission
-    /// `0ca873cb-d1b3-43e0-b75d-88d49c206812` (`3dcce32`). That sealed run
-    /// passed parity and measured the fastest absolute decode window among the
-    /// recent public candidates (2.085229 seconds).
-    /// Off-cadence retest: the first stacked run also passed parity and kept
-    /// 13.871 ms of absolute decode gain, but missed promotion after its paired
-    /// serial prefill control shifted by 25.274 ms versus the record run.
-    ///
-    /// COMBINE-PACK-001: how many partition columns one simdgroup of the merge
-    /// dispatch carries.
-    ///
-    /// The merge indexes a partition column with a lane, so with the partition
-    /// PARTITION-002 settled on it runs eight live lanes and twenty-four dead
-    /// ones in every simdgroup of every threadgroup. Packing `32 / COLS`
-    /// output groups into the one simdgroup fills those lanes instead. It is
-    /// the same reduction over the same columns in the same order, so the
-    /// merge is unchanged arithmetically; only the lane a column lands on and
-    /// the number of threads launched move.
-    ///
-    /// At a partition of a simdgroup or wider this is `32`, `sets` is one and
-    /// the packing is the incumbent one thread per column, so the stock
-    /// partitions and the `DARKBLOOM_CBV2_2PASS_BLOCKS` bisection route keep
-    /// the shape they had.
-    private static let combineColumns: Int = {
-        let capped = min(blocks, 32)
-        return capped > 0 && (capped & (capped - 1)) == 0 ? capped : 32
-    }()
-
-    /// Output groups per simdgroup. `D / values_per_lane` is always 32, so the
-    /// merge needs `32 / combineSets` simdgroups to cover the head.
-    private static let combineSets = 32 / combineColumns
-    private static let combineThreads = (32 / combineSets) * 32
 
     private static let passAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "cbv2_ragged8_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v1",
@@ -430,405 +387,23 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         ensureRowContiguous: true
     )
 
-    /// GQA-PAIR-001: one simdgroup serves BOTH query heads of its GQA group.
-    ///
-    /// The incumbent lays a GQA group across two simdgroups of one threadgroup,
-    /// one query head each. Both simdgroups walk the same block-strided slot
-    /// sequence of the same `(row, kv head)` ring, so every K row and every V
-    /// row of the retained window is issued TWICE, once per simdgroup, for the
-    /// same 512 bytes. The second issue is a cache hit rather than a second
-    /// DRAM read, but it is still a full set of load instructions and a second
-    /// pass through the L1 return path, and the sliding layers stream 67 MB of
-    /// ring per decode step across 25 of the 30 layers.
-    ///
-    /// Here the lane holds both heads' queries and both heads' accumulators,
-    /// loads each K element and each V element ONCE, and feeds the two
-    /// independent online-softmax chains from that one register. The two chains
-    /// never mix: each keeps its own `max`, its own `sum`, its own accumulator
-    /// bank, and its own `simd_sum`, and each expression is character for
-    /// character the incumbent's with the shared load hoisted out. So every
-    /// output element's add sequence is unchanged and the partition, traversal
-    /// order and BF16 partial store are unchanged.
-    ///
-    /// Occupancy: the launch keeps its 512 threadgroups and drops from two
-    /// simdgroups to one, so half as many K/V loads are outstanding. The
-    /// incumbent's own sizing note puts roughly 1 MB in flight against the
-    /// ~225 KB needed to cover DRAM latency on a 450 GB/s part, so halving it
-    /// still clears that bar with margin.
-    ///
-    /// Kill switch: `DARKBLOOM_CBV2_DECODE_GQA_PAIRED_PASSA=0`.
-    static let gqaPairedPassAEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_DECODE_GQA_PAIRED_PASSA"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
-    private static let fusedRingPassAPairedKernel: MLXFast.MLXFastKernel =
-        MLXFast.metalKernel(
-            name:
-                "cbv2_ragged8_ringwrite_sdpa_2pass_a_gqapair_bf16_d256_g2"
-                + "_b\(blocks)_vr_qreg_v3",
-            inputNames: [
-                "queries",
-                "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
-                "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
-                "starts", "new_keys", "new_values", "write_fence",
-            ],
-            outputNames: ["partials", "sums", "maxs", "fence"],
-            source: """
-                constexpr int simd_width = 32;
-                constexpr int values_per_lane = D / simd_width;
-                static_assert((N & (N - 1)) == 0, "ring length must be a power of two");
-                static_assert(GQA == 2, "this kernel pairs exactly two query heads");
-                constexpr uint ring_mask = uint(N - 1);
-
-                const int kv_head = int(threadgroup_position_in_grid.x);
-                const int batch_index = int(threadgroup_position_in_grid.y);
-                const int block = int(threadgroup_position_in_grid.z);
-                const int query_head = GQA * kv_head;
-                const int batch_head = batch_index * 16 + query_head;
-                const int lane = int(thread_index_in_simdgroup);
-
-                const device T* keys = k0;
-                const device T* values = v0;
-                switch (batch_index) {
-                    case 1: keys = k1; values = v1; break;
-                    case 2: keys = k2; values = v2; break;
-                    case 3: keys = k3; values = v3; break;
-                    case 4: keys = k4; values = v4; break;
-                    case 5: keys = k5; values = v5; break;
-                    case 6: keys = k6; values = v6; break;
-                    case 7: keys = k7; values = v7; break;
-                    default: break;
-                }
-
-                const device T* query =
-                    queries + batch_head * D + lane * values_per_lane;
-                keys += kv_head * N * D + lane * values_per_lane;
-                values += kv_head * N * D + lane * values_per_lane;
-                const device T* new_key = new_keys
-                    + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
-                const device T* new_value = new_values
-                    + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
-                const uint ring_start = starts[batch_index];
-                const uint write_slot = (ring_start + ring_mask) & ring_mask;
-                if (block == 0) {
-                    device T* write_key = const_cast<device T*>(keys) + write_slot * D;
-                    device T* write_value = const_cast<device T*>(values) + write_slot * D;
-                    for (int element = 0; element < values_per_lane; ++element) {
-                        write_key[element] = new_key[element];
-                        write_value[element] = new_value[element];
-                    }
-                }
-                if (batch_index == 0 && kv_head == 0 && block == 0 && lane == 0) {
-                    fence[0] = write_fence[0] + 1;
-                }
-
-                device T* partial = partials
-                    + batch_head * BLOCKS * D + block * D + lane * values_per_lane;
-                device float* sum_out = sums + batch_head * BLOCKS + block;
-                device float* max_out = maxs + batch_head * BLOCKS + block;
-
-                thread float q_lo[values_per_lane];
-                thread float q_hi[values_per_lane];
-                thread float acc_lo[values_per_lane];
-                thread float acc_hi[values_per_lane];
-                for (int element = 0; element < values_per_lane; ++element) {
-                    q_lo[element] = 1.0f * float(query[element]);
-                    q_hi[element] = 1.0f * float(query[D + element]);
-                    acc_lo[element] = 0.0f;
-                    acc_hi[element] = 0.0f;
-                }
-
-                uint slot = (ring_start + uint(block)) & ring_mask;
-                float max_lo = -3.402823466e+38F;
-                float max_hi = -3.402823466e+38F;
-                float sum_lo = 0.0f;
-                float sum_hi = 0.0f;
-                for (int token = block; token < N; token += BLOCKS) {
-                    const bool current = token == N - 1;
-                    const device T* k = current ? new_key : keys + slot * D;
-                    const device T* v = current ? new_value : values + slot * D;
-                    float score_lo = 0.0f;
-                    float score_hi = 0.0f;
-                    for (int element = 0; element < values_per_lane; ++element) {
-                        const float key_element = float(k[element]);
-                        score_lo += q_lo[element] * key_element;
-                        score_hi += q_hi[element] * key_element;
-                    }
-                    score_lo = simd_sum(score_lo);
-                    score_hi = simd_sum(score_hi);
-
-                    const float new_max_lo = max(max_lo, score_lo);
-                    const float new_max_hi = max(max_hi, score_hi);
-                    const float old_factor_lo = fast::exp(max_lo - new_max_lo);
-                    const float old_factor_hi = fast::exp(max_hi - new_max_hi);
-                    const float score_factor_lo = fast::exp(score_lo - new_max_lo);
-                    const float score_factor_hi = fast::exp(score_hi - new_max_hi);
-                    max_lo = new_max_lo;
-                    max_hi = new_max_hi;
-                    sum_lo = sum_lo * old_factor_lo + score_factor_lo;
-                    sum_hi = sum_hi * old_factor_hi + score_factor_hi;
-                    for (int element = 0; element < values_per_lane; ++element) {
-                        const float value_element = float(v[element]);
-                        acc_lo[element] = acc_lo[element] * old_factor_lo
-                            + score_factor_lo * value_element;
-                        acc_hi[element] = acc_hi[element] * old_factor_hi
-                            + score_factor_hi * value_element;
-                    }
-
-                    slot = (slot + uint(BLOCKS)) & ring_mask;
-                }
-
-                if (lane == 0) {
-                    sum_out[0] = sum_lo;
-                    max_out[0] = max_lo;
-                    sum_out[BLOCKS] = sum_hi;
-                    max_out[BLOCKS] = max_hi;
-                }
-                for (int element = 0; element < values_per_lane; ++element) {
-                    partial[element] = T(acc_lo[element]);
-                    partial[BLOCKS * D + element] = T(acc_hi[element]);
-                }
-            """,
-            ensureRowContiguous: true
-        )
-
-    /// VEC4-PASSA-001: the paired pass A reads K and V four elements at a
-    /// time instead of one.
-    ///
-    /// A lane owns `D / 32 == 8` contiguous elements of the head, so each
-    /// retained slot costs it eight scalar 2-byte loads for K and eight more
-    /// for V. Every one of those addresses is `lane * 8 + slot * D` plus a
-    /// constant, so the whole run of eight is 16 contiguous bytes at a
-    /// 16-byte-aligned address. Issuing it as two `vec<T, 4>` loads asks the
-    /// same bytes of the same cache line in one quarter of the instructions.
-    ///
-    /// The pairing rider already showed that the ranked part is sensitive to
-    /// load-issue count on this kernel even where the box this was written on
-    /// is not: `ee77bc4` measured a flat local null and returned decode gain
-    /// `2.23188325717` against the `2.20170392058` of the tree it replaced,
-    /// +1.37% of decode. This is the same lever one step further down, and it
-    /// touches nothing but addressing width.
-    ///
-    /// Kill switch: `DARKBLOOM_CBV2_DECODE_PAIRED_PASSA_VEC4=0` falls back to
-    /// the scalar paired kernel, which stays in the file untouched.
-    static let gqaPairedPassAVec4Enabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_DECODE_PAIRED_PASSA_VEC4"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
-    private static let fusedRingPassAPairedVec4Kernel: MLXFast.MLXFastKernel =
-        MLXFast.metalKernel(
-            name:
-                "cbv2_ragged8_ringwrite_sdpa_2pass_a_gqapair_vec4_bf16_d256_g2"
-                + "_b\(blocks)_v1",
-            inputNames: [
-                "queries",
-                "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
-                "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
-                "starts", "new_keys", "new_values", "write_fence",
-            ],
-            outputNames: ["partials", "sums", "maxs", "fence"],
-            source: """
-                constexpr int simd_width = 32;
-                constexpr int values_per_lane = D / simd_width;
-                constexpr int vectors_per_lane = values_per_lane / 4;
-                static_assert((N & (N - 1)) == 0, "ring length must be a power of two");
-                static_assert(GQA == 2, "this kernel pairs exactly two query heads");
-                static_assert(values_per_lane % 4 == 0, "lane run must be a multiple of four");
-                constexpr uint ring_mask = uint(N - 1);
-                typedef vec<T, 4> T4;
-
-                const int kv_head = int(threadgroup_position_in_grid.x);
-                const int batch_index = int(threadgroup_position_in_grid.y);
-                const int block = int(threadgroup_position_in_grid.z);
-                const int query_head = GQA * kv_head;
-                const int batch_head = batch_index * 16 + query_head;
-                const int lane = int(thread_index_in_simdgroup);
-
-                const device T* keys = k0;
-                const device T* values = v0;
-                switch (batch_index) {
-                    case 1: keys = k1; values = v1; break;
-                    case 2: keys = k2; values = v2; break;
-                    case 3: keys = k3; values = v3; break;
-                    case 4: keys = k4; values = v4; break;
-                    case 5: keys = k5; values = v5; break;
-                    case 6: keys = k6; values = v6; break;
-                    case 7: keys = k7; values = v7; break;
-                    default: break;
-                }
-
-                const device T* query =
-                    queries + batch_head * D + lane * values_per_lane;
-                keys += kv_head * N * D + lane * values_per_lane;
-                values += kv_head * N * D + lane * values_per_lane;
-                const device T* new_key = new_keys
-                    + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
-                const device T* new_value = new_values
-                    + (batch_index * KV_HEADS + kv_head) * D + lane * values_per_lane;
-                const uint ring_start = starts[batch_index];
-                const uint write_slot = (ring_start + ring_mask) & ring_mask;
-                if (block == 0) {
-                    device T4* write_key = reinterpret_cast<device T4*>(
-                        const_cast<device T*>(keys) + write_slot * D);
-                    device T4* write_value = reinterpret_cast<device T4*>(
-                        const_cast<device T*>(values) + write_slot * D);
-                    const device T4* source_key =
-                        reinterpret_cast<const device T4*>(new_key);
-                    const device T4* source_value =
-                        reinterpret_cast<const device T4*>(new_value);
-                    #pragma clang loop unroll(full)
-                    for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
-                        write_key[chunk] = source_key[chunk];
-                        write_value[chunk] = source_value[chunk];
-                    }
-                }
-                if (batch_index == 0 && kv_head == 0 && block == 0 && lane == 0) {
-                    fence[0] = write_fence[0] + 1;
-                }
-
-                device T* partial = partials
-                    + batch_head * BLOCKS * D + block * D + lane * values_per_lane;
-                device float* sum_out = sums + batch_head * BLOCKS + block;
-                device float* max_out = maxs + batch_head * BLOCKS + block;
-
-                thread T4 q_lo_vectors[vectors_per_lane];
-                thread T4 q_hi_vectors[vectors_per_lane];
-                thread float acc_lo[values_per_lane];
-                thread float acc_hi[values_per_lane];
-                {
-                    const device T4* query_lo =
-                        reinterpret_cast<const device T4*>(query);
-                    const device T4* query_hi =
-                        reinterpret_cast<const device T4*>(query + D);
-                    #pragma clang loop unroll(full)
-                    for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
-                        q_lo_vectors[chunk] = query_lo[chunk];
-                        q_hi_vectors[chunk] = query_hi[chunk];
-                        #pragma clang loop unroll(full)
-                        for (int j = 0; j < 4; ++j) {
-                            acc_lo[chunk * 4 + j] = 0.0f;
-                            acc_hi[chunk * 4 + j] = 0.0f;
-                        }
-                    }
-                }
-
-                uint slot = (ring_start + uint(block)) & ring_mask;
-                float max_lo = -3.402823466e+38F;
-                float max_hi = -3.402823466e+38F;
-                float sum_lo = 0.0f;
-                float sum_hi = 0.0f;
-                for (int token = block; token < N; token += BLOCKS) {
-                    const bool current = token == N - 1;
-                    const device T4* k = reinterpret_cast<const device T4*>(
-                        current ? new_key : keys + slot * D);
-                    const device T4* v = reinterpret_cast<const device T4*>(
-                        current ? new_value : values + slot * D);
-                    float score_lo = 0.0f;
-                    float score_hi = 0.0f;
-                    thread T4 value_vectors[vectors_per_lane];
-                    #pragma clang loop unroll(full)
-                    for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
-                        const T4 key_vector = k[chunk];
-                        const T4 q_lo_vector = q_lo_vectors[chunk];
-                        const T4 q_hi_vector = q_hi_vectors[chunk];
-                        value_vectors[chunk] = v[chunk];
-                        #pragma clang loop unroll(full)
-                        for (int j = 0; j < 4; ++j) {
-                            const float key_element = float(key_vector[j]);
-                            score_lo += float(q_lo_vector[j]) * key_element;
-                            score_hi += float(q_hi_vector[j]) * key_element;
-                        }
-                    }
-                    score_lo = simd_sum(score_lo);
-                    score_hi = simd_sum(score_hi);
-
-                    const float new_max_lo = max(max_lo, score_lo);
-                    const float new_max_hi = max(max_hi, score_hi);
-                    const float old_factor_lo = fast::exp(max_lo - new_max_lo);
-                    const float old_factor_hi = fast::exp(max_hi - new_max_hi);
-                    const float score_factor_lo = fast::exp(score_lo - new_max_lo);
-                    const float score_factor_hi = fast::exp(score_hi - new_max_hi);
-                    max_lo = new_max_lo;
-                    max_hi = new_max_hi;
-                    sum_lo = sum_lo * old_factor_lo + score_factor_lo;
-                    sum_hi = sum_hi * old_factor_hi + score_factor_hi;
-                    #pragma clang loop unroll(full)
-                    for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
-                        const T4 value_vector = value_vectors[chunk];
-                        #pragma clang loop unroll(full)
-                        for (int j = 0; j < 4; ++j) {
-                            const int element = chunk * 4 + j;
-                            const float value_element = float(value_vector[j]);
-                            acc_lo[element] = acc_lo[element] * old_factor_lo
-                                + score_factor_lo * value_element;
-                            acc_hi[element] = acc_hi[element] * old_factor_hi
-                                + score_factor_hi * value_element;
-                        }
-                    }
-
-                    slot = (slot + uint(BLOCKS)) & ring_mask;
-                }
-
-                if (lane == 0) {
-                    sum_out[0] = sum_lo;
-                    max_out[0] = max_lo;
-                    sum_out[BLOCKS] = sum_hi;
-                    max_out[BLOCKS] = max_hi;
-                }
-                {
-                    device T4* partial_lo = reinterpret_cast<device T4*>(partial);
-                    device T4* partial_hi =
-                        reinterpret_cast<device T4*>(partial + BLOCKS * D);
-                    #pragma clang loop unroll(full)
-                    for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
-                        T4 lo_vector;
-                        T4 hi_vector;
-                        #pragma clang loop unroll(full)
-                        for (int j = 0; j < 4; ++j) {
-                            lo_vector[j] = T(acc_lo[chunk * 4 + j]);
-                            hi_vector[j] = T(acc_hi[chunk * 4 + j]);
-                        }
-                        partial_lo[chunk] = lo_vector;
-                        partial_hi[chunk] = hi_vector;
-                    }
-                }
-            """,
-            ensureRowContiguous: true
-        )
-
     private static let passBKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name:
-            "cbv2_ragged8_sdpa_2pass_b_direct_bf16_d256_b\(blocks)"
-            + "_c\(combineColumns)_vec4_v6",
+        name: "cbv2_ragged8_sdpa_2pass_b_direct_bf16_d256_b\(blocks)_v3",
         inputNames: ["partials", "sums", "maxs"],
         outputNames: ["out"],
         source: """
-            typedef vec<T, 4> T4;
             constexpr int simd_width = 32;
             constexpr int values_per_lane = D / simd_width;
-            constexpr int vectors_per_lane = values_per_lane / 4;
-            static_assert(values_per_lane % 4 == 0, "lane run is four-wide");
-            // COMBINE-PACK-001: a lane owns one partition column of one output
-            // group, and a simdgroup carries `sets` output groups side by
-            // side. COLS is min(BLOCKS, simd_width) rounded to a power of two,
-            // so every lane holds a live column and the surplus-lane guard
-            // below is the constant true whenever the partition fits a
-            // simdgroup. At COLS == simd_width this is the incumbent one
-            // output group per simdgroup, one column per lane.
-            constexpr int sets = simd_width / COLS;
-            constexpr int rounds = (BLOCKS + COLS - 1) / COLS;
+            // One lane per partition column, so a partition narrower than a
+            // simdgroup parks the surplus lanes on the identity of each
+            // reduction rather than dropping columns. At BLOCKS >= simd_width
+            // every lane is live in every round and the guard is the constant
+            // true, which leaves the arithmetic and its order untouched.
+            constexpr int rounds = (BLOCKS + simd_width - 1) / simd_width;
 
             const int batch_head = int(threadgroup_position_in_grid.x);
-            const int lane = int(thread_index_in_simdgroup);
-            const int block_lane = lane % COLS;
-            const int output_group =
-                int(simdgroup_index_in_threadgroup) * sets + lane / COLS;
+            const int output_group = int(simdgroup_index_in_threadgroup);
+            const int block_lane = int(thread_index_in_simdgroup);
 
             partials += batch_head * BLOCKS * D
                 + output_group * values_per_lane;
@@ -840,71 +415,38 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             for (int element = 0; element < values_per_lane; ++element) {
                 accumulator[element] = 0.0f;
             }
-            // COMBINE-HOIST-001: a lane's column summaries are invariant
-            // across the three passes below, and its rescale factor is
-            // invariant across the last two. The incumbent re-read `maxs`
-            // three times and `sums` once, and evaluated the same
-            // `fast::exp` twice per column. Each is kept in a register
-            // instead. `rounds` is a compile-time constant, so these are
-            // named registers rather than an indexed stack array.
-            thread float lane_max[rounds];
-            thread float lane_sum[rounds];
-            thread float lane_factor[rounds];
             float sum_exp_score = 0.0f;
             float max_score = -3.402823466e+38F;
             for (int round = 0; round < rounds; ++round) {
-                const int column = block_lane + COLS * round;
-                const bool live = column < BLOCKS;
-                lane_max[round] = live ? maxs[column] : -3.402823466e+38F;
-                lane_sum[round] = live ? sums[column] : 0.0f;
-                max_score = max(max_score, lane_max[round]);
-            }
-            // The columns of one output group sit on the contiguous lane run
-            // [set * COLS, set * COLS + COLS), so an ascending xor butterfly
-            // bounded at COLS never leaves the set. It is the same tree the
-            // full-width reduction ran over the live columns, with the rounds
-            // that only folded in the identity dropped.
-            for (int stride = 1; stride < COLS; stride <<= 1) {
-                max_score =
-                    max(max_score, simd_shuffle_xor(max_score, ushort(stride)));
-            }
-
-            for (int round = 0; round < rounds; ++round) {
-                lane_factor[round] = fast::exp(lane_max[round] - max_score);
-                sum_exp_score += lane_factor[round] * lane_sum[round];
-            }
-            for (int stride = 1; stride < COLS; stride <<= 1) {
-                sum_exp_score += simd_shuffle_xor(sum_exp_score, ushort(stride));
-            }
-
-            // A lane's run of the column is contiguous, so it is read as
-            // four-wide vectors of the same element type. Each component is
-            // widened where it is multiplied, so every product and every
-            // accumulator update is the one the element walk performed.
-            for (int round = 0; round < rounds; ++round) {
-                const int column = block_lane + COLS * round;
+                const int column = block_lane + simd_width * round;
                 if (column < BLOCKS) {
-                    const float factor = lane_factor[round];
-                    const device T4* partial_vectors =
-                        reinterpret_cast<const device T4*>(
-                            partials + column * D);
-                    #pragma clang loop unroll(full)
-                    for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
-                        const T4 partial_vector = partial_vectors[chunk];
-                        #pragma clang loop unroll(full)
-                        for (int j = 0; j < 4; ++j) {
-                            accumulator[chunk * 4 + j] +=
-                                factor * float(partial_vector[j]);
-                        }
+                    max_score = max(max_score, maxs[column]);
+                }
+            }
+            max_score = simd_max(max_score);
+
+            for (int round = 0; round < rounds; ++round) {
+                const int column = block_lane + simd_width * round;
+                if (column < BLOCKS) {
+                    sum_exp_score +=
+                        fast::exp(maxs[column] - max_score) * sums[column];
+                }
+            }
+            sum_exp_score = simd_sum(sum_exp_score);
+
+            for (int round = 0; round < rounds; ++round) {
+                const int column = block_lane + simd_width * round;
+                if (column < BLOCKS) {
+                    const float factor = fast::exp(maxs[column] - max_score);
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        accumulator[element] +=
+                            factor * float(partials[column * D + element]);
                     }
                 }
             }
 
             for (int element = 0; element < values_per_lane; ++element) {
-                float reduced = accumulator[element];
-                for (int stride = 1; stride < COLS; stride <<= 1) {
-                    reduced += simd_shuffle_xor(reduced, ushort(stride));
-                }
+                const float reduced = simd_sum(accumulator[element]);
                 if (block_lane == 0) {
                     out[element] = T(
                         sum_exp_score == 0.0f
@@ -916,238 +458,6 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         ensureRowContiguous: true
     )
 
-    private static let passBFoldKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name:
-            "cbv2_ragged8_sdpa_2pass_b_direct_bf16_d256_b\(blocks)"
-            + "_c\(combineColumns)_vec4_xfold_v1",
-        inputNames: ["partials", "sums", "maxs"],
-        outputNames: ["out"],
-        source: """
-            typedef vec<T, 4> T4;
-            constexpr int simd_width = 32;
-            constexpr int values_per_lane = D / simd_width;
-            constexpr int vectors_per_lane = values_per_lane / 4;
-            static_assert(values_per_lane % 4 == 0, "lane run is four-wide");
-            // COMBINE-PACK-001: a lane owns one partition column of one output
-            // group, and a simdgroup carries `sets` output groups side by
-            // side. COLS is min(BLOCKS, simd_width) rounded to a power of two,
-            // so every lane holds a live column and the surplus-lane guard
-            // below is the constant true whenever the partition fits a
-            // simdgroup. At COLS == simd_width this is the incumbent one
-            // output group per simdgroup, one column per lane.
-            constexpr int sets = simd_width / COLS;
-            constexpr int rounds = (BLOCKS + COLS - 1) / COLS;
-
-            const int batch_head = int(threadgroup_position_in_grid.x);
-            const int lane = int(thread_index_in_simdgroup);
-            const int block_lane = lane % COLS;
-            const int output_group =
-                int(simdgroup_index_in_threadgroup) * sets + lane / COLS;
-
-            partials += batch_head * BLOCKS * D
-                + output_group * values_per_lane;
-            sums += batch_head * BLOCKS;
-            maxs += batch_head * BLOCKS;
-            out += batch_head * D + output_group * values_per_lane;
-
-            thread float accumulator[values_per_lane];
-            for (int element = 0; element < values_per_lane; ++element) {
-                accumulator[element] = 0.0f;
-            }
-            // COMBINE-HOIST-001: a lane's column summaries are invariant
-            // across the three passes below, and its rescale factor is
-            // invariant across the last two. The incumbent re-read `maxs`
-            // three times and `sums` once, and evaluated the same
-            // `fast::exp` twice per column. Each is kept in a register
-            // instead. `rounds` is a compile-time constant, so these are
-            // named registers rather than an indexed stack array.
-            thread float lane_max[rounds];
-            thread float lane_sum[rounds];
-            thread float lane_factor[rounds];
-            float sum_exp_score = 0.0f;
-            float max_score = -3.402823466e+38F;
-            for (int round = 0; round < rounds; ++round) {
-                const int column = block_lane + COLS * round;
-                const bool live = column < BLOCKS;
-                lane_max[round] = live ? maxs[column] : -3.402823466e+38F;
-                lane_sum[round] = live ? sums[column] : 0.0f;
-                max_score = max(max_score, lane_max[round]);
-            }
-            // The columns of one output group sit on the contiguous lane run
-            // [set * COLS, set * COLS + COLS), so an ascending xor butterfly
-            // bounded at COLS never leaves the set. It is the same tree the
-            // full-width reduction ran over the live columns, with the rounds
-            // that only folded in the identity dropped.
-            for (int stride = 1; stride < COLS; stride <<= 1) {
-                max_score =
-                    max(max_score, simd_shuffle_xor(max_score, ushort(stride)));
-            }
-
-            for (int round = 0; round < rounds; ++round) {
-                lane_factor[round] = fast::exp(lane_max[round] - max_score);
-                sum_exp_score += lane_factor[round] * lane_sum[round];
-            }
-            for (int stride = 1; stride < COLS; stride <<= 1) {
-                sum_exp_score += simd_shuffle_xor(sum_exp_score, ushort(stride));
-            }
-
-            // A lane's run of the column is contiguous, so it is read as
-            // four-wide vectors of the same element type. Each component is
-            // widened where it is multiplied, so every product and every
-            // accumulator update is the one the element walk performed.
-            for (int round = 0; round < rounds; ++round) {
-                const int column = block_lane + COLS * round;
-                if (column < BLOCKS) {
-                    const float factor = lane_factor[round];
-                    const device T4* partial_vectors =
-                        reinterpret_cast<const device T4*>(
-                            partials + column * D);
-                    #pragma clang loop unroll(full)
-                    for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
-                        const T4 partial_vector = partial_vectors[chunk];
-                        #pragma clang loop unroll(full)
-                        for (int j = 0; j < 4; ++j) {
-                            accumulator[chunk * 4 + j] +=
-                                factor * float(partial_vector[j]);
-                        }
-                    }
-                }
-            }
-
-            // COMBINE-XFOLD-001: fold the lane run with ONE cross-lane
-            // butterfly instead of `values_per_lane` independent chains, and
-            // let every lane store its own element.
-            //
-            // The incumbent ran one log2(COLS) shuffle chain per element, so
-            // every lane carried every element to the last step, and then the
-            // single lane with `block_lane == 0` issued the whole run of
-            // stores while the other COLS-1 lanes sat in the branch shadow.
-            //
-            // Step k pairs the lanes that differ in bit k of `block_lane`,
-            // exactly as chain step k did. Each lane keeps the half of the
-            // element set whose low index bit equals its own bit k and sends
-            // the half its partner keeps, so `simd_shuffle_xor(upper ? a : b,
-            // stride)` returns the partner's evaluation of that select and
-            // the partner has the opposite `upper`. After the last step a
-            // lane holds, in `fold[j]`, the complete sum for element
-            // `j * COLS + block_lane`.
-            //
-            // Every element's additions therefore still fold lane bit 0
-            // first, then bit 1, and so on in the same ascending order, over
-            // the same values, so each stored element is bit for bit the one
-            // the chains produced. `sum_exp_score` is bitwise equal on every
-            // lane of the set already: its own butterfly gives each lane the
-            // same operands in commuted pairs, and IEEE addition is
-            // commutative.
-            //
-            // Each step is a literal-bound block rather than a loop over a
-            // runtime delta, so the array is addressed with compile-time
-            // indices and cannot be spilled.
-            constexpr bool lane_fold = values_per_lane >= COLS;
-            if (lane_fold) {
-                float fold[values_per_lane];
-                #pragma clang loop unroll(full)
-                for (int element = 0; element < values_per_lane; ++element) {
-                    fold[element] = accumulator[element];
-                }
-                if (COLS > 1) {
-                    const bool upper = (block_lane & 1) != 0;
-                    #pragma clang loop unroll(full)
-                    for (int j = 0; j < values_per_lane / 2; ++j) {
-                        const float a = fold[2 * j];
-                        const float b = fold[2 * j + 1];
-                        fold[j] = (upper ? b : a)
-                            + simd_shuffle_xor(upper ? a : b, ushort(1));
-                    }
-                }
-                if (COLS > 2) {
-                    const bool upper = (block_lane & 2) != 0;
-                    #pragma clang loop unroll(full)
-                    for (int j = 0; j < values_per_lane / 4; ++j) {
-                        const float a = fold[2 * j];
-                        const float b = fold[2 * j + 1];
-                        fold[j] = (upper ? b : a)
-                            + simd_shuffle_xor(upper ? a : b, ushort(2));
-                    }
-                }
-                if (COLS > 4) {
-                    const bool upper = (block_lane & 4) != 0;
-                    #pragma clang loop unroll(full)
-                    for (int j = 0; j < values_per_lane / 8; ++j) {
-                        const float a = fold[2 * j];
-                        const float b = fold[2 * j + 1];
-                        fold[j] = (upper ? b : a)
-                            + simd_shuffle_xor(upper ? a : b, ushort(4));
-                    }
-                }
-                if (COLS > 8) {
-                    const bool upper = (block_lane & 8) != 0;
-                    #pragma clang loop unroll(full)
-                    for (int j = 0; j < values_per_lane / 16; ++j) {
-                        const float a = fold[2 * j];
-                        const float b = fold[2 * j + 1];
-                        fold[j] = (upper ? b : a)
-                            + simd_shuffle_xor(upper ? a : b, ushort(8));
-                    }
-                }
-                if (COLS > 16) {
-                    const bool upper = (block_lane & 16) != 0;
-                    #pragma clang loop unroll(full)
-                    for (int j = 0; j < values_per_lane / 32; ++j) {
-                        const float a = fold[2 * j];
-                        const float b = fold[2 * j + 1];
-                        fold[j] = (upper ? b : a)
-                            + simd_shuffle_xor(upper ? a : b, ushort(16));
-                    }
-                }
-                // The run the lane kept is contiguous across the set, so the
-                // COLS stores of one output group are one coalesced run
-                // instead of a serial run issued by one lane.
-                #pragma clang loop unroll(full)
-                for (int j = 0; j < values_per_lane / COLS; ++j) {
-                    out[j * COLS + block_lane] = T(
-                        sum_exp_score == 0.0f
-                            ? fold[j]
-                            : fold[j] / sum_exp_score);
-                }
-            } else {
-                // A partition wider than the lane run cannot be folded into
-                // the lane index; that shape keeps the incumbent chains.
-                for (int element = 0; element < values_per_lane; ++element) {
-                    float reduced = accumulator[element];
-                    for (int stride = 1; stride < COLS; stride <<= 1) {
-                        reduced += simd_shuffle_xor(reduced, ushort(stride));
-                    }
-                    if (block_lane == 0) {
-                        out[element] = T(
-                            sum_exp_score == 0.0f
-                                ? reduced
-                                : reduced / sum_exp_score);
-                    }
-                }
-            }
-        """,
-        ensureRowContiguous: true
-    )
-
-    /// COMBINE-XFOLD-001 selector. ON by default;
-    /// `DARKBLOOM_GEMMA4_PASSA_COMBFOLD=0` restores the incumbent merge
-    /// kernel byte for byte, including its cached pipeline name.
-    private static let combineFold: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_PASSA_COMBFOLD"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
-    private static var passBActive: MLXFast.MLXFastKernel {
-        if combineFold {
-            CBv2EngageMark.once("passb-xfold")
-            return passBFoldKernel
-        }
-        return passBKernel
-    }
-
     static func attend(
         queries: MLXArray,
         keys: [MLXArray],
@@ -1157,899 +467,6 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         attend(
             passAKernel: passAKernel, queries: queries, keys: keys, values: values,
             extraInputs: [], scale: scale)
-    }
-
-    private static let portQuantReadKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_ring_2pass_a_q4g64_d256_g2_port_b\(blocks)_v1",
-        inputNames: [
-            "queries",
-            "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7", "starts",
-        ],
-        outputNames: ["partials", "sums", "maxs"],
-        source: """
-            constexpr int simd_width = 32;
-            constexpr int values_per_lane = D / simd_width;
-            constexpr int row_stride = D + 4;
-
-            const int kv_head = int(threadgroup_position_in_grid.x);
-            const int batch_index = int(threadgroup_position_in_grid.y);
-            const int block = int(threadgroup_position_in_grid.z);
-            const int query_head_in_group = int(thread_position_in_threadgroup.y);
-            const int query_head = GQA * kv_head + query_head_in_group;
-            const int batch_head = batch_index * 16 + query_head;
-            const int lane = int(thread_index_in_simdgroup);
-
-            // KVQ4: 4-bit payload in 32 words (8 nibbles each) plus one tail word
-            // per 64-element group holding that group's fp16 (scale, bias).
-            constexpr int row_words = D / 8 + D / 64;
-            const device uint32_t* mirror_w = m0;
-            switch (batch_index) {
-                case 1: mirror_w = m1; break;
-                case 2: mirror_w = m2; break;
-                case 3: mirror_w = m3; break;
-                case 4: mirror_w = m4; break;
-                case 5: mirror_w = m5; break;
-                case 6: mirror_w = m6; break;
-                case 7: mirror_w = m7; break;
-                default: break;
-            }
-            const uint start = starts[batch_index];
-
-            const device T* query =
-                queries + batch_head * D + lane * values_per_lane;
-            int slot = int((start + block) % N);
-            device T* partial = partials
-                + batch_head * BLOCKS * D + block * D + lane * values_per_lane;
-            device float* sum_out = sums + batch_head * BLOCKS + block;
-            device float* max_out = maxs + batch_head * BLOCKS + block;
-
-            thread float q[values_per_lane];
-            thread float accumulator[values_per_lane];
-            for (int element = 0; element < values_per_lane; ++element) {
-                q[element] = 1.0f * float(query[element]);
-                accumulator[element] = 0.0f;
-            }
-
-            float max_score = -3.402823466e+38F;
-            float sum_exp_score = 0.0f;
-            for (int token = block; token < N; token += BLOCKS) {
-                const device uint32_t* krow_w =
-                    mirror_w + (kv_head * N + slot) * row_words;
-                const device uint32_t* vrow_w =
-                    mirror_w + ((KV_HEADS + kv_head) * N + slot) * row_words;
-                // One lane owns 8 consecutive elements, so it sits wholly
-                // inside one 64-element group: group = (lane * 8) / 64.
-                const int group = lane / 8;
-                const uint32_t ktw = krow_w[D / 8 + group];
-                const uint32_t vtw = vrow_w[D / 8 + group];
-                const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
-                const float kb = float(as_type<half>(ushort(ktw >> 16)));
-                const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
-                const float vb = float(as_type<half>(ushort(vtw >> 16)));
-                const uint32_t kw = krow_w[lane];
-                const uint32_t vw = vrow_w[lane];
-                float score = 0.0f;
-                for (int element = 0; element < 8; ++element) {
-                    score += q[element]
-                        * fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
-                }
-                score = simd_sum(score);
-
-                const float new_max = max(max_score, score);
-                const float old_factor = fast::exp(max_score - new_max);
-                const float score_factor = fast::exp(score - new_max);
-                max_score = new_max;
-                sum_exp_score = sum_exp_score * old_factor + score_factor;
-                for (int element = 0; element < 8; ++element) {
-                    accumulator[element] = accumulator[element] * old_factor
-                        + score_factor
-                            * fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
-                }
-
-                slot += BLOCKS;
-                if (slot >= N) slot -= N;
-            }
-
-            if (lane == 0) {
-                sum_out[0] = sum_exp_score;
-                max_out[0] = max_score;
-            }
-            for (int element = 0; element < values_per_lane; ++element) {
-                partial[element] = T(accumulator[element]);
-            }
-        """,
-        ensureRowContiguous: true
-    )
-
-    /// Shipped q4g64 pass-A with one live mirror-slot write. The logical new
-    /// token is always consumed from the just-computed packed word, so no
-    /// threadgroup races the in-place store. The returned fence orders the
-    /// next decode dispatch after this write completes.
-    private static let portQuantFusedWriteKernel: MLXFast.MLXFastKernel =
-        MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_2pass_a_q4g64_d256_g2_regpack_vec4_carry_pair_b\(blocks)_v5",
-            inputNames: [
-                "queries",
-                "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
-                "starts", "new_keys", "new_values", "write_fence",
-            ],
-            outputNames: ["partials", "sums", "maxs", "fence"],
-            source: """
-                constexpr int simd_width = 32;
-                constexpr int values_per_lane = D / simd_width;
-                constexpr int payload_words = D / 8;
-                constexpr int row_words = payload_words + D / 64;
-                constexpr int current_block = (N - 1) % BLOCKS;
-
-                const int kv_head = int(threadgroup_position_in_grid.x);
-                const int batch_index = int(threadgroup_position_in_grid.y);
-                const int block = int(threadgroup_position_in_grid.z);
-                // GQA-PAIR: one simdgroup serves BOTH query heads of its
-                // group. The packed words, the metadata and the nibble
-                // dequant are read and computed once and feed two independent
-                // online-softmax chains that never mix.
-                const int query_head = GQA * kv_head;
-                const int batch_head = batch_index * 16 + query_head;
-                const int lane = int(thread_index_in_simdgroup);
-
-                const device uint32_t* mirror_w = m0;
-                switch (batch_index) {
-                    case 1: mirror_w = m1; break;
-                    case 2: mirror_w = m2; break;
-                    case 3: mirror_w = m3; break;
-                    case 4: mirror_w = m4; break;
-                    case 5: mirror_w = m5; break;
-                    case 6: mirror_w = m6; break;
-                    case 7: mirror_w = m7; break;
-                    default: break;
-                }
-                const device uint32_t* mkeys_w =
-                    mirror_w + kv_head * N * row_words;
-                const device uint32_t* mvalues_w =
-                    mirror_w + (KV_HEADS + kv_head) * N * row_words;
-                const device T* new_key = new_keys
-                    + (batch_index * KV_HEADS + kv_head) * D
-                    + lane * values_per_lane;
-                const device T* new_value = new_values
-                    + (batch_index * KV_HEADS + kv_head) * D
-                    + lane * values_per_lane;
-                const uint start = starts[batch_index];
-                const uint write_slot = (start + uint(N - 1)) % uint(N);
-
-                half khs = half(0.0f);
-                half khb = half(0.0f);
-                half vhs = half(0.0f);
-                half vhb = half(0.0f);
-                uint32_t kword = 0u;
-                uint32_t vword = 0u;
-                if (block == current_block) {
-                    float kmin = 3.402823466e+38F;
-                    float kmax = -3.402823466e+38F;
-                    float vmin = 3.402823466e+38F;
-                    float vmax = -3.402823466e+38F;
-                    // The lane's own elements, loaded once and held in
-                    // registers: the extrema pass and the quantization pass
-                    // below read the same values, so the second pass reads
-                    // `kv`/`vv` instead of issuing the loads again.
-                    float kv[values_per_lane];
-                    float vv[values_per_lane];
-                    // The lane owns `values_per_lane` contiguous elements
-                    // starting at a multiple of that count, so the span is
-                    // vector-aligned and the eight scalar loads become two
-                    // four-wide ones per plane.
-                    using T4 = vec<T, 4>;
-                    const device T4* kvec =
-                        reinterpret_cast<const device T4*>(new_key);
-                    const device T4* vvec =
-                        reinterpret_cast<const device T4*>(new_value);
-                    #pragma unroll
-                    for (int q = 0; q < values_per_lane / 4; ++q) {
-                        const T4 kq4 = kvec[q];
-                        const T4 vq4 = vvec[q];
-                        #pragma unroll
-                        for (int j = 0; j < 4; ++j) {
-                            kv[q * 4 + j] = float(kq4[j]);
-                            vv[q * 4 + j] = float(vq4[j]);
-                            kmin = min(kmin, kv[q * 4 + j]);
-                            kmax = max(kmax, kv[q * 4 + j]);
-                            vmin = min(vmin, vv[q * 4 + j]);
-                            vmax = max(vmax, vv[q * 4 + j]);
-                        }
-                    }
-                    for (uint mask = 1; mask < 8; mask <<= 1) {
-                        kmin = min(kmin, simd_shuffle_xor(kmin, mask));
-                        kmax = max(kmax, simd_shuffle_xor(kmax, mask));
-                        vmin = min(vmin, simd_shuffle_xor(vmin, mask));
-                        vmax = max(vmax, simd_shuffle_xor(vmax, mask));
-                    }
-                    khs = half(max((kmax - kmin) / 15.0f, 1e-6f));
-                    khb = half(kmin);
-                    vhs = half(max((vmax - vmin) / 15.0f, 1e-6f));
-                    vhb = half(vmin);
-                    const float ks = float(khs);
-                    const float kb = float(khb);
-                    const float vs = float(vhs);
-                    const float vb = float(vhb);
-                    #pragma unroll
-                    for (int element = 0; element < values_per_lane; ++element) {
-                        const float kq = metal::rint((kv[element] - kb) / ks);
-                        const float vq = metal::rint((vv[element] - vb) / vs);
-                        kword |= uint32_t(clamp(kq, 0.0f, 15.0f)) << (4 * element);
-                        vword |= uint32_t(clamp(vq, 0.0f, 15.0f)) << (4 * element);
-                    }
-
-                    {
-                        device uint32_t* write_key =
-                            const_cast<device uint32_t*>(mkeys_w)
-                            + write_slot * row_words;
-                        device uint32_t* write_value =
-                            const_cast<device uint32_t*>(mvalues_w)
-                            + write_slot * row_words;
-                        write_key[lane] = kword;
-                        write_value[lane] = vword;
-                        if (lane % 8 == 0) {
-                            write_key[payload_words + lane / 8] =
-                                uint32_t(as_type<ushort>(khs))
-                                | (uint32_t(as_type<ushort>(khb)) << 16);
-                            write_value[payload_words + lane / 8] =
-                                uint32_t(as_type<ushort>(vhs))
-                                | (uint32_t(as_type<ushort>(vhb)) << 16);
-                        }
-                    }
-                }
-                if (batch_index == 0 && kv_head == 0
-                    && block == current_block && lane == 0) {
-                    fence[0] = write_fence[0] + 1;
-                }
-
-                const device T* query =
-                    queries + batch_head * D + lane * values_per_lane;
-                device T* partial = partials
-                    + batch_head * BLOCKS * D + block * D + lane * values_per_lane;
-                device float* sum_out = sums + batch_head * BLOCKS + block;
-                device float* max_out = maxs + batch_head * BLOCKS + block;
-
-                thread float q_lo[values_per_lane];
-                thread float q_hi[values_per_lane];
-                thread float acc_lo[values_per_lane];
-                thread float acc_hi[values_per_lane];
-                for (int element = 0; element < values_per_lane; ++element) {
-                    q_lo[element] = float(query[element]);
-                    q_hi[element] = float(query[D + element]);
-                    acc_lo[element] = 0.0f;
-                    acc_hi[element] = 0.0f;
-                }
-
-                float max_lo = -3.402823466e+38F;
-                float max_hi = -3.402823466e+38F;
-                float sum_lo = 0.0f;
-                float sum_hi = 0.0f;
-                uint slot = (start + uint(block)) % uint(N);
-                // The walk holds the next position's packed words while it
-                // works on the current one, so each load is issued a whole
-                // iteration before its value is needed. The prefetch is
-                // suppressed when the next position is the current token,
-                // which is served from `kword`/`vword` and whose slot this
-                // kernel is storing into; every address formed is therefore a
-                // slot the one-stage walk also reads.
-                const bool prefetch_first = block < N - 1;
-                uint next_slot = slot + uint(BLOCKS);
-                if (next_slot >= uint(N)) next_slot -= uint(N);
-                uint32_t kw_pre = prefetch_first
-                    ? mkeys_w[slot * row_words + lane] : 0u;
-                uint32_t vw_pre = prefetch_first
-                    ? mvalues_w[slot * row_words + lane] : 0u;
-                uint32_t ktw_pre = prefetch_first
-                    ? mkeys_w[slot * row_words + payload_words + lane / 8] : 0u;
-                uint32_t vtw_pre = prefetch_first
-                    ? mvalues_w[slot * row_words + payload_words + lane / 8] : 0u;
-                for (int token = block; token < N; token += BLOCKS) {
-                    const bool current = token == N - 1;
-                    const uint32_t kw = current ? kword : kw_pre;
-                    const uint32_t vw = current ? vword : vw_pre;
-                    const uint32_t ktw = current
-                        ? (uint32_t(as_type<ushort>(khs))
-                            | (uint32_t(as_type<ushort>(khb)) << 16))
-                        : ktw_pre;
-                    const uint32_t vtw = current
-                        ? (uint32_t(as_type<ushort>(vhs))
-                            | (uint32_t(as_type<ushort>(vhb)) << 16))
-                        : vtw_pre;
-                    if (token + BLOCKS < N - 1) {
-                        kw_pre = mkeys_w[next_slot * row_words + lane];
-                        vw_pre = mvalues_w[next_slot * row_words + lane];
-                        ktw_pre =
-                            mkeys_w[next_slot * row_words + payload_words + lane / 8];
-                        vtw_pre =
-                            mvalues_w[next_slot * row_words + payload_words + lane / 8];
-                        next_slot += uint(BLOCKS);
-                        if (next_slot >= uint(N)) next_slot -= uint(N);
-                    }
-                    const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
-                    const float kb = float(as_type<half>(ushort(ktw >> 16)));
-                    const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
-                    const float vb = float(as_type<half>(ushort(vtw >> 16)));
-                    float score_lo = 0.0f;
-                    float score_hi = 0.0f;
-                    for (int element = 0; element < values_per_lane; ++element) {
-                        const float key_element =
-                            fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
-                        score_lo += q_lo[element] * key_element;
-                        score_hi += q_hi[element] * key_element;
-                    }
-                    score_lo = simd_sum(score_lo);
-                    score_hi = simd_sum(score_hi);
-
-                    const float new_max_lo = max(max_lo, score_lo);
-                    const float new_max_hi = max(max_hi, score_hi);
-                    const float old_factor_lo = fast::exp(max_lo - new_max_lo);
-                    const float old_factor_hi = fast::exp(max_hi - new_max_hi);
-                    const float score_factor_lo = fast::exp(score_lo - new_max_lo);
-                    const float score_factor_hi = fast::exp(score_hi - new_max_hi);
-                    max_lo = new_max_lo;
-                    max_hi = new_max_hi;
-                    sum_lo = sum_lo * old_factor_lo + score_factor_lo;
-                    sum_hi = sum_hi * old_factor_hi + score_factor_hi;
-                    for (int element = 0; element < values_per_lane; ++element) {
-                        const float value_element =
-                            fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
-                        acc_lo[element] = acc_lo[element] * old_factor_lo
-                            + score_factor_lo * value_element;
-                        acc_hi[element] = acc_hi[element] * old_factor_hi
-                            + score_factor_hi * value_element;
-                    }
-
-                }
-
-                if (lane == 0) {
-                    sum_out[0] = sum_lo;
-                    max_out[0] = max_lo;
-                    sum_out[BLOCKS] = sum_hi;
-                    max_out[BLOCKS] = max_hi;
-                }
-                for (int element = 0; element < values_per_lane; ++element) {
-                    partial[element] = T(acc_lo[element]);
-                    partial[BLOCKS * D + element] = T(acc_hi[element]);
-                }
-            """,
-            ensureRowContiguous: true
-        )
-
-    /// B8-Q4-RESIDENT-001: the eight block SIMD groups that previously ran as
-    /// separate pass-A threadgroups now share one 256-thread threadgroup. Each
-    /// group executes the incumbent block-strided walk and casts both head
-    /// accumulators through BF16 threadgroup storage. After a barrier, the same
-    /// threads execute the incumbent COLS=8 pass-B mapping and xor trees. This
-    /// removes only the global partial write/read and the second dispatch.
-    private static let portQuantFusedWriteResidentKernel: MLXFast.MLXFastKernel =
-        MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_c2",
-            inputNames: [
-                "queries",
-                "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
-                "starts", "new_keys", "new_values", "write_fence",
-            ],
-            outputNames: ["out", "fence"],
-            source: """
-                typedef vec<T, 4> T4;
-                constexpr int simd_width = 32;
-                constexpr int values_per_lane = D / simd_width;
-                constexpr int vectors_per_lane = values_per_lane / 4;
-                constexpr int payload_words = D / 8;
-                constexpr int row_words = payload_words + D / 64;
-                constexpr int current_block = (N - 1) % BLOCKS;
-                constexpr int COLS = BLOCKS;
-                constexpr int sets = simd_width / COLS;
-                constexpr int rounds = (BLOCKS + COLS - 1) / COLS;
-                static_assert(BLOCKS == 8, "resident kernel requires eight blocks");
-                static_assert(GQA == 2, "resident kernel requires GQA two");
-                static_assert(values_per_lane % 4 == 0, "lane run is four-wide");
-
-                const int kv_head = int(threadgroup_position_in_grid.x);
-                const int batch_index = int(threadgroup_position_in_grid.y);
-                const int block = int(simdgroup_index_in_threadgroup);
-                const int query_head = GQA * kv_head;
-                const int batch_head = batch_index * 16 + query_head;
-                const int lane = int(thread_index_in_simdgroup);
-
-                threadgroup T local_partials[GQA * BLOCKS * D];
-                threadgroup float local_sums[GQA * BLOCKS];
-                threadgroup float local_maxs[GQA * BLOCKS];
-
-                const device uint32_t* mirror_w = m0;
-                switch (batch_index) {
-                    case 1: mirror_w = m1; break;
-                    case 2: mirror_w = m2; break;
-                    case 3: mirror_w = m3; break;
-                    case 4: mirror_w = m4; break;
-                    case 5: mirror_w = m5; break;
-                    case 6: mirror_w = m6; break;
-                    case 7: mirror_w = m7; break;
-                    default: break;
-                }
-                const device uint32_t* mkeys_w =
-                    mirror_w + kv_head * N * row_words;
-                const device uint32_t* mvalues_w =
-                    mirror_w + (KV_HEADS + kv_head) * N * row_words;
-                const device T* new_key = new_keys
-                    + (batch_index * KV_HEADS + kv_head) * D
-                    + lane * values_per_lane;
-                const device T* new_value = new_values
-                    + (batch_index * KV_HEADS + kv_head) * D
-                    + lane * values_per_lane;
-                const uint start = starts[batch_index];
-                const uint write_slot = (start + uint(N - 1)) % uint(N);
-
-                half khs = half(0.0f);
-                half khb = half(0.0f);
-                half vhs = half(0.0f);
-                half vhb = half(0.0f);
-                uint32_t kword = 0u;
-                uint32_t vword = 0u;
-                if (block == current_block) {
-                    float kmin = 3.402823466e+38F;
-                    float kmax = -3.402823466e+38F;
-                    float vmin = 3.402823466e+38F;
-                    float vmax = -3.402823466e+38F;
-                    float kv[values_per_lane];
-                    float vv[values_per_lane];
-                    const device T4* kvec =
-                        reinterpret_cast<const device T4*>(new_key);
-                    const device T4* vvec =
-                        reinterpret_cast<const device T4*>(new_value);
-                    #pragma unroll
-                    for (int q = 0; q < values_per_lane / 4; ++q) {
-                        const T4 kq4 = kvec[q];
-                        const T4 vq4 = vvec[q];
-                        #pragma unroll
-                        for (int j = 0; j < 4; ++j) {
-                            kv[q * 4 + j] = float(kq4[j]);
-                            vv[q * 4 + j] = float(vq4[j]);
-                            kmin = min(kmin, kv[q * 4 + j]);
-                            kmax = max(kmax, kv[q * 4 + j]);
-                            vmin = min(vmin, vv[q * 4 + j]);
-                            vmax = max(vmax, vv[q * 4 + j]);
-                        }
-                    }
-                    for (uint mask = 1; mask < 8; mask <<= 1) {
-                        kmin = min(kmin, simd_shuffle_xor(kmin, mask));
-                        kmax = max(kmax, simd_shuffle_xor(kmax, mask));
-                        vmin = min(vmin, simd_shuffle_xor(vmin, mask));
-                        vmax = max(vmax, simd_shuffle_xor(vmax, mask));
-                    }
-                    khs = half(max((kmax - kmin) / 15.0f, 1e-6f));
-                    khb = half(kmin);
-                    vhs = half(max((vmax - vmin) / 15.0f, 1e-6f));
-                    vhb = half(vmin);
-                    const float ks = float(khs);
-                    const float kb = float(khb);
-                    const float vs = float(vhs);
-                    const float vb = float(vhb);
-                    #pragma unroll
-                    for (int element = 0; element < values_per_lane; ++element) {
-                        const float kq = metal::rint((kv[element] - kb) / ks);
-                        const float vq = metal::rint((vv[element] - vb) / vs);
-                        kword |= uint32_t(clamp(kq, 0.0f, 15.0f)) << (4 * element);
-                        vword |= uint32_t(clamp(vq, 0.0f, 15.0f)) << (4 * element);
-                    }
-
-                    device uint32_t* write_key =
-                        const_cast<device uint32_t*>(mkeys_w)
-                        + write_slot * row_words;
-                    device uint32_t* write_value =
-                        const_cast<device uint32_t*>(mvalues_w)
-                        + write_slot * row_words;
-                    write_key[lane] = kword;
-                    write_value[lane] = vword;
-                    if (lane % 8 == 0) {
-                        write_key[payload_words + lane / 8] =
-                            uint32_t(as_type<ushort>(khs))
-                            | (uint32_t(as_type<ushort>(khb)) << 16);
-                        write_value[payload_words + lane / 8] =
-                            uint32_t(as_type<ushort>(vhs))
-                            | (uint32_t(as_type<ushort>(vhb)) << 16);
-                    }
-                }
-                if (batch_index == 0 && kv_head == 0
-                    && block == current_block && lane == 0) {
-                    fence[0] = write_fence[0] + 1;
-                }
-
-                const device T* query =
-                    queries + batch_head * D + lane * values_per_lane;
-                threadgroup T* partial = local_partials
-                    + block * D + lane * values_per_lane;
-                threadgroup float* sum_out = local_sums + block;
-                threadgroup float* max_out = local_maxs + block;
-
-                thread float q_lo[values_per_lane];
-                thread float q_hi[values_per_lane];
-                thread float acc_lo[values_per_lane];
-                thread float acc_hi[values_per_lane];
-                for (int element = 0; element < values_per_lane; ++element) {
-                    q_lo[element] = float(query[element]);
-                    q_hi[element] = float(query[D + element]);
-                    acc_lo[element] = 0.0f;
-                    acc_hi[element] = 0.0f;
-                }
-
-                float max_lo = -3.402823466e+38F;
-                float max_hi = -3.402823466e+38F;
-                float sum_lo = 0.0f;
-                float sum_hi = 0.0f;
-                uint slot = (start + uint(block)) % uint(N);
-                const bool prefetch_first = block < N - 1;
-                uint next_slot = slot + uint(BLOCKS);
-                if (next_slot >= uint(N)) next_slot -= uint(N);
-                uint32_t kw_pre = prefetch_first
-                    ? mkeys_w[slot * row_words + lane] : 0u;
-                uint32_t vw_pre = prefetch_first
-                    ? mvalues_w[slot * row_words + lane] : 0u;
-                uint32_t ktw_pre = prefetch_first
-                    ? mkeys_w[slot * row_words + payload_words + lane / 8] : 0u;
-                uint32_t vtw_pre = prefetch_first
-                    ? mvalues_w[slot * row_words + payload_words + lane / 8] : 0u;
-                for (int token = block; token < N; token += BLOCKS) {
-                    const bool current = token == N - 1;
-                    const uint32_t kw = current ? kword : kw_pre;
-                    const uint32_t vw = current ? vword : vw_pre;
-                    const uint32_t ktw = current
-                        ? (uint32_t(as_type<ushort>(khs))
-                            | (uint32_t(as_type<ushort>(khb)) << 16))
-                        : ktw_pre;
-                    const uint32_t vtw = current
-                        ? (uint32_t(as_type<ushort>(vhs))
-                            | (uint32_t(as_type<ushort>(vhb)) << 16))
-                        : vtw_pre;
-                    if (token + BLOCKS < N - 1) {
-                        kw_pre = mkeys_w[next_slot * row_words + lane];
-                        vw_pre = mvalues_w[next_slot * row_words + lane];
-                        ktw_pre =
-                            mkeys_w[next_slot * row_words + payload_words + lane / 8];
-                        vtw_pre =
-                            mvalues_w[next_slot * row_words + payload_words + lane / 8];
-                        next_slot += uint(BLOCKS);
-                        if (next_slot >= uint(N)) next_slot -= uint(N);
-                    }
-                    const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
-                    const float kb = float(as_type<half>(ushort(ktw >> 16)));
-                    const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
-                    const float vb = float(as_type<half>(ushort(vtw >> 16)));
-                    float score_lo = 0.0f;
-                    float score_hi = 0.0f;
-                    for (int element = 0; element < values_per_lane; ++element) {
-                        const float key_element =
-                            fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
-                        score_lo += q_lo[element] * key_element;
-                        score_hi += q_hi[element] * key_element;
-                    }
-                    score_lo = simd_sum(score_lo);
-                    score_hi = simd_sum(score_hi);
-
-                    const float new_max_lo = max(max_lo, score_lo);
-                    const float new_max_hi = max(max_hi, score_hi);
-                    const float old_factor_lo = fast::exp(max_lo - new_max_lo);
-                    const float old_factor_hi = fast::exp(max_hi - new_max_hi);
-                    const float score_factor_lo = fast::exp(score_lo - new_max_lo);
-                    const float score_factor_hi = fast::exp(score_hi - new_max_hi);
-                    max_lo = new_max_lo;
-                    max_hi = new_max_hi;
-                    sum_lo = sum_lo * old_factor_lo + score_factor_lo;
-                    sum_hi = sum_hi * old_factor_hi + score_factor_hi;
-                    for (int element = 0; element < values_per_lane; ++element) {
-                        const float value_element =
-                            fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
-                        acc_lo[element] = acc_lo[element] * old_factor_lo
-                            + score_factor_lo * value_element;
-                        acc_hi[element] = acc_hi[element] * old_factor_hi
-                            + score_factor_hi * value_element;
-                    }
-                }
-
-                if (lane == 0) {
-                    sum_out[0] = sum_lo;
-                    max_out[0] = max_lo;
-                    sum_out[BLOCKS] = sum_hi;
-                    max_out[BLOCKS] = max_hi;
-                }
-                for (int element = 0; element < values_per_lane; ++element) {
-                    partial[element] = T(acc_lo[element]);
-                    partial[BLOCKS * D + element] = T(acc_hi[element]);
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-
-                const int block_lane = lane % COLS;
-                const int output_group = block * sets + lane / COLS;
-                #pragma clang loop unroll(full)
-                for (int head = 0; head < GQA; ++head) {
-                    const threadgroup T* head_partials = local_partials
-                        + head * BLOCKS * D + output_group * values_per_lane;
-                    const threadgroup float* head_sums =
-                        local_sums + head * BLOCKS;
-                    const threadgroup float* head_maxs =
-                        local_maxs + head * BLOCKS;
-                    device T* head_out = out
-                        + (batch_head + head) * D
-                        + output_group * values_per_lane;
-
-                    thread float accumulator[values_per_lane];
-                    for (int element = 0; element < values_per_lane; ++element) {
-                        accumulator[element] = 0.0f;
-                    }
-                    thread float lane_max[rounds];
-                    thread float lane_sum[rounds];
-                    thread float lane_factor[rounds];
-                    float sum_exp_score = 0.0f;
-                    float max_score = -3.402823466e+38F;
-                    for (int round = 0; round < rounds; ++round) {
-                        const int column = block_lane + COLS * round;
-                        const bool live = column < BLOCKS;
-                        lane_max[round] =
-                            live ? head_maxs[column] : -3.402823466e+38F;
-                        lane_sum[round] = live ? head_sums[column] : 0.0f;
-                        max_score = max(max_score, lane_max[round]);
-                    }
-                    for (int stride = 1; stride < COLS; stride <<= 1) {
-                        max_score = max(
-                            max_score,
-                            simd_shuffle_xor(max_score, ushort(stride)));
-                    }
-
-                    for (int round = 0; round < rounds; ++round) {
-                        lane_factor[round] =
-                            fast::exp(lane_max[round] - max_score);
-                        sum_exp_score += lane_factor[round] * lane_sum[round];
-                    }
-                    for (int stride = 1; stride < COLS; stride <<= 1) {
-                        sum_exp_score +=
-                            simd_shuffle_xor(sum_exp_score, ushort(stride));
-                    }
-
-                    for (int round = 0; round < rounds; ++round) {
-                        const int column = block_lane + COLS * round;
-                        if (column < BLOCKS) {
-                            const float factor = lane_factor[round];
-                            const threadgroup T4* partial_vectors =
-                                reinterpret_cast<const threadgroup T4*>(
-                                    head_partials + column * D);
-                            #pragma clang loop unroll(full)
-                            for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
-                                const T4 partial_vector = partial_vectors[chunk];
-                                #pragma clang loop unroll(full)
-                                for (int j = 0; j < 4; ++j) {
-                                    accumulator[chunk * 4 + j] +=
-                                        factor * float(partial_vector[j]);
-                                }
-                            }
-                        }
-                    }
-
-                    // Each step trades the half of the live slots whose
-                    // element bit matches the partner's column bit and keeps
-                    // the other half, so the live count runs 8, 4, 2, 1 and
-                    // the lane that survives for an element is the one whose
-                    // column index equals it. Every node of the addition tree
-                    // pairs the same two column subtrees the per-element
-                    // butterfly paired.
-                    #pragma clang loop unroll(full)
-                    for (int step = 0; (1 << step) < COLS; ++step) {
-                        const ushort stride = ushort(1 << step);
-                        const bool upper = (block_lane & int(stride)) != 0;
-                        const int live = values_per_lane >> step;
-                        #pragma clang loop unroll(full)
-                        for (int slot = 0; slot < live; slot += 2) {
-                            const float keep = upper
-                                ? accumulator[slot + 1]
-                                : accumulator[slot];
-                            const float trade = upper
-                                ? accumulator[slot]
-                                : accumulator[slot + 1];
-                            accumulator[slot >> 1] =
-                                keep + simd_shuffle_xor(trade, stride);
-                        }
-                    }
-                    head_out[block_lane] = T(
-                        sum_exp_score == 0.0f
-                            ? accumulator[0]
-                            : accumulator[0] / sum_exp_score);
-                }
-            """,
-            ensureRowContiguous: true
-        )
-
-    /// KVQ-PORT: `attendRing` reading the packed 8-bit mirror instead of the
-    /// bf16 ring, with the result CONSUMED by pass B exactly as the stock
-    /// road consumes it. This is the separate-write road only: the promoted
-    /// stock mechanism still owns the ring write, so no fused kernel, no
-    /// bf16 companion and no participant-authored fence are involved.
-    ///
-    /// Three diagnostic submissions established what this is allowed to
-    /// assume. `47dae0ea` (1.9637) proved the read kernel dispatches and
-    /// completes on the ranked box; `e14279c9` (2.0147) proved the fused
-    /// writer and its companion do too; `3f7e5b55` (2.0122) proved writing
-    /// in place into a live, graph-referenced mirror is fine there. All
-    /// three discarded their output. What none of them exercised is pass B
-    /// consuming a quantized pass A, which is what this does.
-    /// KVQ4 kernel self-test: dispatch the real read kernel over a mirror
-    /// whose every slot holds a known ramp, with a one-hot query. Pass A's
-    /// `sums` then equals exp(0)=1 per block only if the dequantized dot
-    /// products are what the host model predicts, so a mismatch localizes
-    /// the fault to the kernel rather than the layout.
-    public static func selfTestReadKernel(mirror: MLXArray, queries: MLXArray) {
-        let startArray = MLXArray(Array(repeating: UInt32(0), count: batch), [batch])
-        let partialShape = [batch, queryHeads, 1, blocks, headDim]
-        let summaryShape = [batch, queryHeads, 1, blocks]
-        let out = portQuantReadKernel(
-            [queries] + Array(repeating: mirror, count: batch) + [startArray],
-            template: [
-                ("T", queries.dtype), ("D", headDim), ("N", sequenceLength),
-                ("GQA", gqa), ("KV_HEADS", kvHeads), ("BLOCKS", blocks),
-            ],
-            grid: (kvHeads * 32, batch * gqa, blocks),
-            threadGroup: (32, gqa, 1),
-            outputShapes: [partialShape, summaryShape, summaryShape],
-            outputDTypes: [.bfloat16, .float32, .float32]
-        )
-        let maxs = out[2].reshaped([-1]).asArray(Float.self)
-        let partial = out[0].reshaped([-1]).asArray(Float.self)
-        FileHandle.standardError.write(Data(
-            "[kvq4-kernel] blocks=\(blocks) maxs[0..3]=\(maxs[0..<4]) partial[0..5]=\(partial[0..<6])\n".utf8))
-    }
-
-    static func attendRingQuant(
-        queries: MLXArray,
-        mirrors: [MLXArray],
-        starts: [Int],
-        scale: Float,
-        slidingWindowLength: Int
-    ) -> MLXArray? {
-        guard CBv2WindowedSequenceKV.quantEnabled,
-            slidingWindowLength == sequenceLength,
-            starts.count == batch,
-            starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength }),
-            enabled, blocks > 0, sequenceLength.isMultiple(of: blocks),
-            scale == 1.0,
-            queries.dtype == .bfloat16,
-            queries.shape == [batch, queryHeads, 1, headDim],
-            headDim == 256, kvHeads == 8,
-            mirrors.count == batch,
-            mirrors.allSatisfy({
-                $0.dtype == .uint32
-                    && $0.shape == [2, kvHeads, sequenceLength, headDim / 8 + headDim / 64]
-            })
-        else { return nil }
-
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
-        let partialShape = [batch, queryHeads, 1, blocks, headDim]
-        let summaryShape = [batch, queryHeads, 1, blocks]
-        let passA = portQuantReadKernel(
-            [queries] + mirrors + [startArray],
-            template: [
-                ("T", queries.dtype),
-                ("D", headDim),
-                ("N", sequenceLength),
-                ("GQA", gqa),
-                ("KV_HEADS", kvHeads),
-                ("BLOCKS", blocks),
-            ],
-            grid: (kvHeads * 32, batch * gqa, blocks),
-            threadGroup: (32, gqa, 1),
-            outputShapes: [partialShape, summaryShape, summaryShape],
-            outputDTypes: [.bfloat16, .float32, .float32]
-        )
-        CBv2EngageMark.once("kvq8port")
-        return passBActive(
-            passA,
-            template: [
-                ("T", queries.dtype),
-                ("D", headDim),
-                ("BLOCKS", blocks),
-                ("COLS", combineColumns),
-            ],
-            grid: (batch * queryHeads * combineThreads, 1, 1),
-            threadGroup: (combineThreads, 1, 1),
-            outputShapes: [[batch, queryHeads, 1, headDim]],
-            outputDTypes: [.bfloat16]
-        )[0]
-    }
-
-    /// Exact B8/D256 q4g64 ring attention which packs this step's new K/V
-    /// into the live mirror from pass A. Pass B consumes the first three
-    /// outputs, while the fourth output is the next step's write fence.
-    static func attendRingQuantWriting(
-        queries: MLXArray,
-        mirrors: [MLXArray],
-        starts: [Int],
-        newKeys: MLXArray,
-        newValues: MLXArray,
-        previousWriteFence: MLXArray,
-        scale: Float,
-        slidingWindowLength: Int
-    ) -> (output: MLXArray, nextWriteFence: MLXArray)? {
-        guard CBv2WindowedSequenceKV.q4FusedMirrorWriteEnabled,
-            CBv2WindowedSequenceKV.quantEnabled,
-            !CBv2WindowedSequenceKV.quantSimulate,
-            !CBv2WindowedSequenceKV.gpuPackCheck,
-            slidingWindowLength == sequenceLength,
-            starts.count == batch,
-            starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength }),
-            enabled, blocks > 0, sequenceLength.isMultiple(of: blocks),
-            scale == 1.0,
-            queries.dtype == .bfloat16,
-            queries.shape == [batch, queryHeads, 1, headDim],
-            newKeys.dtype == .bfloat16,
-            newKeys.shape == [batch, kvHeads, 1, headDim],
-            newValues.dtype == .bfloat16,
-            newValues.shape == newKeys.shape,
-            previousWriteFence.dtype == .int32,
-            previousWriteFence.shape == [1],
-            mirrors.count == batch,
-            mirrors.allSatisfy({
-                $0.dtype == .uint32
-                    && $0.shape == [2, kvHeads, sequenceLength, headDim / 8 + headDim / 64]
-            })
-        else { return nil }
-
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
-        let inputs = [queries] + mirrors
-            + [startArray, newKeys, newValues, previousWriteFence]
-        if q4ResidentMergeEnabled,
-            blocks == 8,
-            combineColumns == 8,
-            combineThreads == 256
-        {
-            let resident = portQuantFusedWriteResidentKernel(
-                inputs,
-                template: [
-                    ("T", queries.dtype),
-                    ("D", headDim),
-                    ("N", sequenceLength),
-                    ("GQA", gqa),
-                    ("KV_HEADS", kvHeads),
-                    ("BLOCKS", blocks),
-                ],
-                grid: (kvHeads * blocks * 32, batch, 1),
-                threadGroup: (blocks * 32, 1, 1),
-                outputShapes: [[batch, queryHeads, 1, headDim], [1]],
-                outputDTypes: [.bfloat16, .int32]
-            )
-            CBv2EngageMark.once("kvq4-fused-live-write")
-            CBv2EngageMark.once("kvq4-resident-merge")
-            return (resident[0], resident[1])
-        }
-
-        let partialShape = [batch, queryHeads, 1, blocks, headDim]
-        let summaryShape = [batch, queryHeads, 1, blocks]
-        let passA = portQuantFusedWriteKernel(
-            inputs,
-            template: [
-                ("T", queries.dtype),
-                ("D", headDim),
-                ("N", sequenceLength),
-                ("GQA", gqa),
-                ("KV_HEADS", kvHeads),
-                ("BLOCKS", blocks),
-            ],
-            grid: (kvHeads * 32, batch, blocks),
-            threadGroup: (32, 1, 1),
-            outputShapes: [partialShape, summaryShape, summaryShape, [1]],
-            outputDTypes: [.bfloat16, .float32, .float32, .int32]
-        )
-        let output = passBActive(
-            Array(passA.prefix(3)),
-            template: [
-                ("T", queries.dtype),
-                ("D", headDim),
-                ("BLOCKS", blocks),
-                ("COLS", combineColumns),
-            ],
-            grid: (batch * queryHeads * combineThreads, 1, 1),
-            threadGroup: (combineThreads, 1, 1),
-            outputShapes: [[batch, queryHeads, 1, headDim]],
-            outputDTypes: [.bfloat16]
-        )[0]
-        CBv2EngageMark.once("kvq4-fused-live-write")
-        return (output, passA[3])
     }
 
     static func attendRing(
@@ -2120,17 +537,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         let startArray = MLXArray(starts.map(UInt32.init), [batch])
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
-        let paired = gqaPairedPassAEnabled && gqa == 2
-        let vectorized = paired && gqaPairedPassAVec4Enabled && headDim % 4 == 0
-        if paired {
-            CBv2EngageMark.once("decode-gqa-paired-passa")
-        }
-        if vectorized {
-            CBv2EngageMark.once("decode-gqa-paired-passa-vec4")
-        }
-        let pairedKernel =
-            vectorized ? fusedRingPassAPairedVec4Kernel : fusedRingPassAPairedKernel
-        let passA = (paired ? pairedKernel : fusedRingPassAKernel)(
+        let passA = fusedRingPassAKernel(
             [queries] + keys + values
                 + [startArray, newKeys, newValues, previousWriteFence],
             template: [
@@ -2141,24 +548,21 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 ("KV_HEADS", kvHeads),
                 ("BLOCKS", blocks),
             ],
-            grid: paired
-                ? (kvHeads * 32, batch, blocks)
-                : (kvHeads * 32, batch * gqa, blocks),
-            threadGroup: paired ? (32, 1, 1) : (32, gqa, 1),
+            grid: (kvHeads * 32, batch * gqa, blocks),
+            threadGroup: (32, gqa, 1),
             outputShapes: [partialShape, summaryShape, summaryShape, [1]],
             outputDTypes: [.bfloat16, .float32, .float32, .int32]
         )
 
-        let output = passBActive(
+        let output = passBKernel(
             Array(passA.prefix(3)),
             template: [
                 ("T", queries.dtype),
                 ("D", headDim),
                 ("BLOCKS", blocks),
-                ("COLS", combineColumns),
             ],
-            grid: (batch * queryHeads * combineThreads, 1, 1),
-            threadGroup: (combineThreads, 1, 1),
+            grid: (batch * queryHeads * 1024, 1, 1),
+            threadGroup: (1024, 1, 1),
             outputShapes: [[batch, queryHeads, 1, headDim]],
             outputDTypes: [.bfloat16]
         )[0]
@@ -2211,16 +615,15 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             outputDTypes: [.bfloat16, .float32, .float32]
         )
 
-        return passBActive(
+        return passBKernel(
             passA,
             template: [
                 ("T", queries.dtype),
                 ("D", headDim),
                 ("BLOCKS", blocks),
-                ("COLS", combineColumns),
             ],
-            grid: (batch * queryHeads * combineThreads, 1, 1),
-            threadGroup: (combineThreads, 1, 1),
+            grid: (batch * queryHeads * 1024, 1, 1),
+            threadGroup: (1024, 1, 1),
             outputShapes: [[batch, queryHeads, 1, headDim]],
             outputDTypes: [.bfloat16]
         )[0]
@@ -2379,122 +782,65 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     ? out_row : key_length - 4;
 
                 const device T* mat = key_plane + size_t(out_row) * D;
-                // XFOLD: one flat accumulator over the same 32 partial sums,
-                // so the cross-lane fold below can address the whole set with
-                // compile-time indices.
-                float result[GQA * 4] = {0.0f};
-                // KTILE: the 4x4 key tile is shared by all GQA heads, the
-                // query block is not. Staging the tile costs 16 halves and
-                // frees the 32-float per-head staging array.
-                T k_tile[4][4];
-                float q_coeff[4];
+                float result[GQA][4] = {{0.0f}};
+                T inter[4];
+                float v_coeff[GQA][4];
                 int bn = lane * 4;
                 for (int i = 0; i < n_iter; ++i) {
+                    #pragma clang loop unroll(full)
+                    for (int h = 0; h < GQA; ++h) {
+                        #pragma clang loop unroll(full)
+                        for (int tn = 0; tn < 4; ++tn) {
+                            v_coeff[h][tn] = static_cast<float>(
+                                query[h * D + bn + tn]);
+                        }
+                    }
                     int mat_offset = 0;
                     #pragma clang loop unroll(full)
                     for (int tm = 0; tm < 4; ++tm) {
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
-                            k_tile[tm][tn] = mat[mat_offset + bn + tn];
+                            inter[tn] = mat[mat_offset + bn + tn];
+                        }
+                        #pragma clang loop unroll(full)
+                        for (int h = 0; h < GQA; ++h) {
+                            #pragma clang loop unroll(full)
+                            for (int tn = 0; tn < 4; ++tn) {
+                                result[h][tm] +=
+                                    inter[tn] * v_coeff[h][tn];
+                            }
                         }
                         mat_offset += D;
                     }
+                    bn += 128;
+                }
+                #pragma clang loop unroll(full)
+                for (int h = 0; h < GQA; ++h) {
+                    #pragma clang loop unroll(full)
+                    for (int tm = 0; tm < 4; ++tm) {
+                        #pragma clang loop unroll(full)
+                        for (ushort delta = 16; delta >= 1; delta >>= 1) {
+                            result[h][tm] +=
+                                simd_shuffle_down(result[h][tm], delta);
+                        }
+                    }
+                }
+                if (lane == 0) {
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
                         #pragma clang loop unroll(full)
-                        for (int tn = 0; tn < 4; ++tn) {
-                            q_coeff[tn] = static_cast<float>(
-                                query[h * D + bn + tn]);
-                        }
-                        #pragma clang loop unroll(full)
                         for (int tm = 0; tm < 4; ++tm) {
-                            #pragma clang loop unroll(full)
-                            for (int tn = 0; tn < 4; ++tn) {
-                                result[h * 4 + tm] +=
-                                    k_tile[tm][tn] * q_coeff[tn];
-                            }
+                            score_rows[
+                                size_t(h) * key_length + out_row + tm] =
+                                static_cast<T>(result[h][tm]);
                         }
                     }
-                    bn += 128;
                 }
-                // XFOLD: the 32 sums fold across the simdgroup as ONE
-                // butterfly over the whole set rather than 32 independent
-                // shuffle-down chains. Step K halves the set every lane still
-                // carries, so the traffic is 16 + 8 + 4 + 2 + 1 = 31 shuffles
-                // instead of 32 * 5 = 160, and the live accumulator collapses
-                // 32 -> 16 -> 8 -> 4 -> 2 -> 1 instead of staying 32 wide for
-                // the whole fold.
-                //
-                // Exactness: step K merges the group holding lane l with the
-                // group holding lane l ^ K, so after k steps every lane's
-                // group is the coset of the same subgroup <16, 8, ...>. The
-                // merge hierarchy is therefore the SAME for every lane and the
-                // same as the shuffle-down form's: 16 pairs {l, l+16}, 8 quads
-                // {l, l+8, l+16, l+24}, and so on. Only the left/right order
-                // at each node varies with the lane, and float addition is
-                // commutative, so every sum is bit-identical. Measured: 0 of
-                // 402,944 fp32 words and 0 of 2,687,232 bf16 words differ,
-                // against a deliberately reassociated control that moves 66%
-                // of the fp32 words.
-                //
-                // Landing: after the five steps bit i of a lane's surviving
-                // value index equals bit i of the lane, so lane l holds the sum
-                // for (h, tm) = (l >> 2, l & 3). Lane 0's run of 32 serialised
-                // stores becomes one store per lane, to 32 distinct addresses.
-                {
-                    const bool hi = (lane & 16) != 0;
-                    #pragma clang loop unroll(full)
-                    for (int j = 0; j < 16; ++j) {
-                        const float a = result[j];
-                        const float b = result[16 + j];
-                        result[j] = (hi ? b : a)
-                            + simd_shuffle_xor(hi ? a : b, ushort(16));
-                    }
-                }
-                {
-                    const bool hi = (lane & 8) != 0;
-                    #pragma clang loop unroll(full)
-                    for (int j = 0; j < 8; ++j) {
-                        const float a = result[j];
-                        const float b = result[8 + j];
-                        result[j] = (hi ? b : a)
-                            + simd_shuffle_xor(hi ? a : b, ushort(8));
-                    }
-                }
-                {
-                    const bool hi = (lane & 4) != 0;
-                    #pragma clang loop unroll(full)
-                    for (int j = 0; j < 4; ++j) {
-                        const float a = result[j];
-                        const float b = result[4 + j];
-                        result[j] = (hi ? b : a)
-                            + simd_shuffle_xor(hi ? a : b, ushort(4));
-                    }
-                }
-                {
-                    const bool hi = (lane & 2) != 0;
-                    #pragma clang loop unroll(full)
-                    for (int j = 0; j < 2; ++j) {
-                        const float a = result[j];
-                        const float b = result[2 + j];
-                        result[j] = (hi ? b : a)
-                            + simd_shuffle_xor(hi ? a : b, ushort(2));
-                    }
-                }
-                {
-                    const bool hi = (lane & 1) != 0;
-                    const float a = result[0];
-                    const float b = result[1];
-                    result[0] = (hi ? b : a)
-                        + simd_shuffle_xor(hi ? a : b, ushort(1));
-                }
-                score_rows[size_t(lane >> 2) * key_length + out_row
-                    + (lane & 3)] = static_cast<T>(result[0]);
             }
         """
 
     private static let qkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_qk_bf16_g8_xfold_v3",
+        name: "cbv2_ragged8_sdpa_d512_qk_bf16_g8_v1",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -2506,7 +852,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     )
 
     private static let qkFencedKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_qk_fenced_bf16_g8_xfold_v3",
+        name: "cbv2_ragged8_sdpa_d512_qk_fenced_bf16_g8_v1",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -2615,7 +961,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// butterfly for all 8 heads of the GQA group at once (shared V tile
     /// loads). params as dispatch 1.
     private static let avKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_xfold_v3",
+        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_v1",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -2659,39 +1005,33 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             int bm = thrM * 4;
             const int out_col = tile * 64 + (4 * sg + thrN) * 4;
 
-            // XFOLD: one flat accumulator over the same 32 partial sums, so
-            // the cross-lane fold below can address the whole set with
-            // compile-time indices.
-            float result[GQA * 4] = {0.0f};
-            // VTILE: the 4x4 value tile is shared by all GQA heads, the
-            // probability block is not. Staging the tile costs 16 halves and
-            // frees the 32-float per-head staging array.
-            T v_tile[4][4];
-            float p_coeff[4];
+            float result[GQA][4] = {{0.0f}};
+            T inter[4];
+            float v_coeff[GQA][4];
             const int n_iter = key_length / 32;
             const int leftover = key_length - n_iter * 32;
 
             for (int i = 0; i < n_iter; ++i) {
                 threadgroup_barrier(mem_flags::mem_none);
                 #pragma clang loop unroll(full)
-                for (int tm = 0; tm < 4; ++tm) {
-                    for (int tn = 0; tn < 4; ++tn) {
-                        v_tile[tm][tn] = value_plane[
-                            size_t(bm + tm) * D + out_col + tn];
-                    }
-                }
-                #pragma clang loop unroll(full)
                 for (int h = 0; h < GQA; ++h) {
                     #pragma clang loop unroll(full)
                     for (int tm = 0; tm < 4; ++tm) {
-                        p_coeff[tm] = static_cast<float>(
+                        v_coeff[h][tm] = static_cast<float>(
                             prob_rows[size_t(h) * key_length + bm + tm]);
                     }
+                }
+                #pragma clang loop unroll(full)
+                for (int tm = 0; tm < 4; ++tm) {
+                    for (int tn = 0; tn < 4; ++tn) {
+                        inter[tn] = value_plane[
+                            size_t(bm + tm) * D + out_col + tn];
+                    }
                     #pragma clang loop unroll(full)
-                    for (int tm = 0; tm < 4; ++tm) {
-                        float vc = p_coeff[tm];
+                    for (int h = 0; h < GQA; ++h) {
+                        float vc = v_coeff[h][tm];
                         for (int tn = 0; tn < 4; ++tn) {
-                            result[h * 4 + tn] += vc * v_tile[tm][tn];
+                            result[h][tn] += vc * inter[tn];
                         }
                     }
                 }
@@ -2700,75 +1040,45 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             if (leftover > 0) {
                 for (int tm = 0; tm < 4 && bm + tm < key_length; ++tm) {
                     #pragma clang loop unroll(full)
+                    for (int h = 0; h < GQA; ++h) {
+                        v_coeff[h][tm] = static_cast<float>(
+                            prob_rows[size_t(h) * key_length + bm + tm]);
+                    }
+                    #pragma clang loop unroll(full)
                     for (int tn = 0; tn < 4; ++tn) {
-                        v_tile[0][tn] = value_plane[
+                        inter[tn] = value_plane[
                             size_t(bm + tm) * D + out_col + tn];
                     }
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
-                        const float pc = static_cast<float>(
-                            prob_rows[size_t(h) * key_length + bm + tm]);
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
-                            result[h * 4 + tn] += pc * v_tile[0][tn];
+                            result[h][tn] += v_coeff[h][tm] * inter[tn];
                         }
                     }
                 }
             }
-            // XFOLD: the 32 sums fold across the eight lanes that share this
-            // thrN as ONE butterfly over the whole set rather than 32
-            // independent shuffle-down chains. The traffic is 16 + 8 + 4 = 28
-            // shuffles instead of 32 * 3 = 96, and the live accumulator
-            // collapses 32 -> 16 -> 8 -> 4 instead of staying 32 wide.
-            //
-            // Exactness: as in the QK fold, step K merges the group holding
-            // lane l with the group holding lane l ^ K, so the merge hierarchy
-            // over the eight thrM lanes is the same coset chain for every lane
-            // and the same one the shuffle-down form built. Only the left and
-            // right order at each node varies, and float addition is
-            // commutative. Measured bit-identical alongside the QK fold.
-            //
-            // Landing: bit i of a lane's surviving head index equals bit i + 2
-            // of the lane, so the lane finishes holding head thrM's four
-            // columns. The eight thrM == 0 lanes' run of 32 stores becomes
-            // four stores on every lane, to the same 32 addresses per thrN.
-            {
-                const bool hi = (lane & 16) != 0;
+            #pragma clang loop unroll(full)
+            for (int h = 0; h < GQA; ++h) {
                 #pragma clang loop unroll(full)
-                for (int j = 0; j < 16; ++j) {
-                    const float a = result[j];
-                    const float b = result[16 + j];
-                    result[j] = (hi ? b : a)
-                        + simd_shuffle_xor(hi ? a : b, ushort(16));
+                for (int tn = 0; tn < 4; ++tn) {
+                    #pragma clang loop unroll(full)
+                    for (ushort delta = 4; delta >= 1; delta >>= 1) {
+                        result[h][tn] +=
+                            simd_shuffle_down(result[h][tn], 4 * delta);
+                    }
                 }
             }
-            {
-                const bool hi = (lane & 8) != 0;
+            if (thrM == 0) {
                 #pragma clang loop unroll(full)
-                for (int j = 0; j < 8; ++j) {
-                    const float a = result[j];
-                    const float b = result[8 + j];
-                    result[j] = (hi ? b : a)
-                        + simd_shuffle_xor(hi ? a : b, ushort(8));
-                }
-            }
-            {
-                const bool hi = (lane & 4) != 0;
-                #pragma clang loop unroll(full)
-                for (int j = 0; j < 4; ++j) {
-                    const float a = result[j];
-                    const float b = result[4 + j];
-                    result[j] = (hi ? b : a)
-                        + simd_shuffle_xor(hi ? a : b, ushort(4));
-                }
-            }
-            {
-                device T* out_ptr = out
-                    + size_t(row * 16 + kv_head * GQA + thrM) * D
-                    + out_col;
-                #pragma clang loop unroll(full)
-                for (int j = 0; j < 4; ++j) {
-                    out_ptr[j] = static_cast<T>(result[j]);
+                for (int h = 0; h < GQA; ++h) {
+                    device T* out_ptr = out
+                        + size_t(row * 16 + kv_head * GQA + h) * D
+                        + out_col;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        out_ptr[j] = static_cast<T>(result[h][j]);
+                    }
                 }
             }
         """,
@@ -2797,7 +1107,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// served from `new_keys` during scoring, never from the slot being
     /// written, so no read races the store.
     private static let fusedQkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_qk_bf16_g8_ktile_v3",
+        name: "cbv2_ragged8_writesdpa_d512_qk_bf16_g8_v2",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -2877,21 +1187,33 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 const bool tile_has_new_token =
                     out_row + 4 > key_length - 1;
                 float result[GQA][4] = {{0.0f}};
-                // KTILE: the 4x4 key tile is shared by all GQA heads, the
-                // query block is not. Staging the tile costs 16 halves and
-                // frees the 32-float per-head staging array. The peel keeps
-                // both arms, it now only decides how the tile is filled.
-                T k_tile[4][4];
-                float q_coeff[4];
+                T inter[4];
+                float v_coeff[GQA][4];
                 int bn = lane * 4;
                 for (int i = 0; i < n_iter; ++i) {
+                    #pragma clang loop unroll(full)
+                    for (int h = 0; h < GQA; ++h) {
+                        #pragma clang loop unroll(full)
+                        for (int tn = 0; tn < 4; ++tn) {
+                            v_coeff[h][tn] = static_cast<float>(
+                                query[h * D + bn + tn]);
+                        }
+                    }
                     int mat_offset = 0;
                     if (!tile_has_new_token) {
                     #pragma clang loop unroll(full)
                     for (int tm = 0; tm < 4; ++tm) {
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
-                            k_tile[tm][tn] = mat[mat_offset + bn + tn];
+                            inter[tn] = mat[mat_offset + bn + tn];
+                        }
+                        #pragma clang loop unroll(full)
+                        for (int h = 0; h < GQA; ++h) {
+                            #pragma clang loop unroll(full)
+                            for (int tn = 0; tn < 4; ++tn) {
+                                result[h][tm] +=
+                                    inter[tn] * v_coeff[h][tn];
+                            }
                         }
                         mat_offset += D;
                     }
@@ -2902,28 +1224,20 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                             out_row + tm == key_length - 1;
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
-                            k_tile[tm][tn] = is_new_token
+                            inter[tn] = is_new_token
                                 ? new_key_plane[bn + tn]
                                 : mat[mat_offset + bn + tn];
                         }
-                        mat_offset += D;
-                    }
-                    }
-                    #pragma clang loop unroll(full)
-                    for (int h = 0; h < GQA; ++h) {
                         #pragma clang loop unroll(full)
-                        for (int tn = 0; tn < 4; ++tn) {
-                            q_coeff[tn] = static_cast<float>(
-                                query[h * D + bn + tn]);
-                        }
-                        #pragma clang loop unroll(full)
-                        for (int tm = 0; tm < 4; ++tm) {
+                        for (int h = 0; h < GQA; ++h) {
                             #pragma clang loop unroll(full)
                             for (int tn = 0; tn < 4; ++tn) {
                                 result[h][tm] +=
-                                    k_tile[tm][tn] * q_coeff[tn];
+                                    inter[tn] * v_coeff[h][tn];
                             }
                         }
+                        mat_offset += D;
+                    }
                     }
                     bn += 128;
                 }
@@ -2976,7 +1290,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// `new_values` rather than the cache slot the fused QK dispatch wrote,
     /// so this kernel has no read-after-in-place-write hazard at all.
     private static let fusedAvKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_vtile_v3",
+        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_v2",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -3023,25 +1337,36 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int out_col = tile * 64 + (4 * sg + thrN) * 4;
 
             float result[GQA][4] = {{0.0f}};
-            // VTILE: the 4x4 value tile is shared by all GQA heads, the
-            // probability block is not. Staging the tile costs 16 halves and
-            // frees the 32-float per-head staging array. The peel keeps both
-            // arms, it now only decides how the tile is filled.
-            T v_tile[4][4];
-            float p_coeff[4];
+            T inter[4];
+            float v_coeff[GQA][4];
             const int n_iter = key_length / 32;
             const int leftover = key_length - n_iter * 32;
 
             for (int i = 0; i < n_iter; ++i) {
                 threadgroup_barrier(mem_flags::mem_none);
+                #pragma clang loop unroll(full)
+                for (int h = 0; h < GQA; ++h) {
+                    #pragma clang loop unroll(full)
+                    for (int tm = 0; tm < 4; ++tm) {
+                        v_coeff[h][tm] = static_cast<float>(
+                            prob_rows[size_t(h) * key_length + bm + tm]);
+                    }
+                }
                 // Tile-level peel: only the 4-row tile containing logical
                 // row kL-1 pays the serve-from-input branch.
                 if (bm + 4 <= key_length - 1) {
                 #pragma clang loop unroll(full)
                 for (int tm = 0; tm < 4; ++tm) {
                     for (int tn = 0; tn < 4; ++tn) {
-                        v_tile[tm][tn] = value_plane[
+                        inter[tn] = value_plane[
                             size_t(bm + tm) * D + out_col + tn];
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int h = 0; h < GQA; ++h) {
+                        float vc = v_coeff[h][tm];
+                        for (int tn = 0; tn < 4; ++tn) {
+                            result[h][tn] += vc * inter[tn];
+                        }
                     }
                 }
                 } else {
@@ -3049,47 +1374,42 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 for (int tm = 0; tm < 4; ++tm) {
                     const bool is_new_token = bm + tm == key_length - 1;
                     for (int tn = 0; tn < 4; ++tn) {
-                        v_tile[tm][tn] = is_new_token
-                            ? new_value_plane[out_col + tn]
-                            : value_plane[
-                                  size_t(bm + tm) * D + out_col + tn];
-                    }
-                }
-                }
-                #pragma clang loop unroll(full)
-                for (int h = 0; h < GQA; ++h) {
-                    #pragma clang loop unroll(full)
-                    for (int tm = 0; tm < 4; ++tm) {
-                        p_coeff[tm] = static_cast<float>(
-                            prob_rows[size_t(h) * key_length + bm + tm]);
-                    }
-                    #pragma clang loop unroll(full)
-                    for (int tm = 0; tm < 4; ++tm) {
-                        float vc = p_coeff[tm];
-                        for (int tn = 0; tn < 4; ++tn) {
-                            result[h][tn] += vc * v_tile[tm][tn];
-                        }
-                    }
-                }
-                bm += 32;
-            }
-            if (leftover > 0) {
-                for (int tm = 0; tm < 4 && bm + tm < key_length; ++tm) {
-                    const bool is_new_token = bm + tm == key_length - 1;
-                    #pragma clang loop unroll(full)
-                    for (int tn = 0; tn < 4; ++tn) {
-                        v_tile[0][tn] = is_new_token
+                        inter[tn] = is_new_token
                             ? new_value_plane[out_col + tn]
                             : value_plane[
                                   size_t(bm + tm) * D + out_col + tn];
                     }
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
-                        const float pc = static_cast<float>(
+                        float vc = v_coeff[h][tm];
+                        for (int tn = 0; tn < 4; ++tn) {
+                            result[h][tn] += vc * inter[tn];
+                        }
+                    }
+                }
+                }
+                bm += 32;
+            }
+            if (leftover > 0) {
+                for (int tm = 0; tm < 4 && bm + tm < key_length; ++tm) {
+                    #pragma clang loop unroll(full)
+                    for (int h = 0; h < GQA; ++h) {
+                        v_coeff[h][tm] = static_cast<float>(
                             prob_rows[size_t(h) * key_length + bm + tm]);
+                    }
+                    const bool is_new_token = bm + tm == key_length - 1;
+                    #pragma clang loop unroll(full)
+                    for (int tn = 0; tn < 4; ++tn) {
+                        inter[tn] = is_new_token
+                            ? new_value_plane[out_col + tn]
+                            : value_plane[
+                                  size_t(bm + tm) * D + out_col + tn];
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int h = 0; h < GQA; ++h) {
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
-                            result[h][tn] += pc * v_tile[0][tn];
+                            result[h][tn] += v_coeff[h][tm] * inter[tn];
                         }
                     }
                 }

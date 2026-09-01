@@ -616,7 +616,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         MLXFast.metalKernel(
             name:
                 "cbv2_ragged8_ringwrite_sdpa_2pass_a_gqapair_vec4_bf16_d256_g2"
-                + "_b\(blocks)_v1",
+                + "_b\(blocks)_qhoist_v2",
             inputNames: [
                 "queries",
                 "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -688,8 +688,8 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 device float* sum_out = sums + batch_head * BLOCKS + block;
                 device float* max_out = maxs + batch_head * BLOCKS + block;
 
-                thread T4 q_lo_vectors[vectors_per_lane];
-                thread T4 q_hi_vectors[vectors_per_lane];
+                thread float q_lo_floats[values_per_lane];
+                thread float q_hi_floats[values_per_lane];
                 thread float acc_lo[values_per_lane];
                 thread float acc_hi[values_per_lane];
                 {
@@ -699,10 +699,12 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         reinterpret_cast<const device T4*>(query + D);
                     #pragma clang loop unroll(full)
                     for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
-                        q_lo_vectors[chunk] = query_lo[chunk];
-                        q_hi_vectors[chunk] = query_hi[chunk];
+                        const T4 ql = query_lo[chunk];
+                        const T4 qh = query_hi[chunk];
                         #pragma clang loop unroll(full)
                         for (int j = 0; j < 4; ++j) {
+                            q_lo_floats[chunk * 4 + j] = float(ql[j]);
+                            q_hi_floats[chunk * 4 + j] = float(qh[j]);
                             acc_lo[chunk * 4 + j] = 0.0f;
                             acc_hi[chunk * 4 + j] = 0.0f;
                         }
@@ -726,14 +728,12 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     #pragma clang loop unroll(full)
                     for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
                         const T4 key_vector = k[chunk];
-                        const T4 q_lo_vector = q_lo_vectors[chunk];
-                        const T4 q_hi_vector = q_hi_vectors[chunk];
                         value_vectors[chunk] = v[chunk];
                         #pragma clang loop unroll(full)
                         for (int j = 0; j < 4; ++j) {
                             const float key_element = float(key_vector[j]);
-                            score_lo += float(q_lo_vector[j]) * key_element;
-                            score_hi += float(q_hi_vector[j]) * key_element;
+                            score_lo += q_lo_floats[chunk * 4 + j] * key_element;
+                            score_hi += q_hi_floats[chunk * 4 + j] * key_element;
                         }
                     }
                     score_lo = simd_sum(score_lo);

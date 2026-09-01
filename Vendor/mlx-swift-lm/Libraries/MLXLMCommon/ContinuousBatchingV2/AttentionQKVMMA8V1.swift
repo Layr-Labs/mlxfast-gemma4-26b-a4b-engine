@@ -157,23 +157,27 @@ METAL_FUNC void qkv_mma8_affine4_g64_impl(
     rs += simd_shuffle_xor(rs, 4u);
     rs += simd_shuffle_xor(rs, 16u);
 
-    MMA8_SETB(B0, x, lo)
-    MMA8_SETB(B1, x, hi)
-    MMA8_SETB(B2, y, lo)
-    MMA8_SETB(B3, y, hi)
-    MMA8_SETB(B4, z, lo)
-    MMA8_SETB(B5, z, hi)
-    MMA8_SETB(B6, w, lo)
-    MMA8_SETB(B7, w, hi)
-
+    // Each operand is filled immediately before the step that reads it, so
+    // one is live at a time instead of eight. `r0`/`r1` are not written
+    // across the run, so every fill yields the value it yielded before and
+    // the accumulation order into `C` is unchanged. The multitile body
+    // below keeps its hoisted fills: there they are shared across tiles.
     simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+    MMA8_SETB(B0, x, lo)
     MMA8_STEP(B0, 0)
+    MMA8_SETB(B1, x, hi)
     MMA8_STEP(B1, 1)
+    MMA8_SETB(B2, y, lo)
     MMA8_STEP(B2, 2)
+    MMA8_SETB(B3, y, hi)
     MMA8_STEP(B3, 3)
+    MMA8_SETB(B4, z, lo)
     MMA8_STEP(B4, 4)
+    MMA8_SETB(B5, z, hi)
     MMA8_STEP(B5, 5)
+    MMA8_SETB(B6, w, lo)
     MMA8_STEP(B6, 6)
+    MMA8_SETB(B7, w, hi)
     MMA8_STEP(B7, 7)
 
     acc0 += s * C.thread_elements()[0] + rs.x * b;

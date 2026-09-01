@@ -919,7 +919,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     }
 
     private static let portQuantReadKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_ring_2pass_a_q4g64_d256_g2_port_b\(blocks)_v1",
+        name: "cbv2_ragged8_sdpa_ring_2pass_a_q4g64_d256_g2_port_pair_carry_b\(blocks)_v3",
         inputNames: [
             "queries",
             "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7", "starts",
@@ -933,8 +933,10 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             const int kv_head = int(threadgroup_position_in_grid.x);
             const int batch_index = int(threadgroup_position_in_grid.y);
             const int block = int(threadgroup_position_in_grid.z);
-            const int query_head_in_group = int(thread_position_in_threadgroup.y);
-            const int query_head = GQA * kv_head + query_head_in_group;
+            // GQA-PAIR: one simdgroup serves BOTH query heads of its group.
+            // Each packed word is loaded once and each nibble dequant is
+            // evaluated once, feeding two chains that never mix.
+            const int query_head = GQA * kv_head;
             const int batch_head = batch_index * 16 + query_head;
             const int lane = int(thread_index_in_simdgroup);
 
@@ -963,46 +965,87 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             device float* max_out = maxs + batch_head * BLOCKS + block;
 
             thread float q[values_per_lane];
-            thread float accumulator[values_per_lane];
+            thread float q_hi[values_per_lane];
+            thread float acc_lo[values_per_lane];
+            thread float acc_hi[values_per_lane];
             for (int element = 0; element < values_per_lane; ++element) {
                 q[element] = 1.0f * float(query[element]);
-                accumulator[element] = 0.0f;
+                q_hi[element] = 1.0f * float(query[D + element]);
+                acc_lo[element] = 0.0f;
+                acc_hi[element] = 0.0f;
             }
 
             float max_score = -3.402823466e+38F;
+            float max_hi = -3.402823466e+38F;
             float sum_exp_score = 0.0f;
+            float sum_hi = 0.0f;
+            // One lane owns 8 consecutive elements, so it sits wholly inside
+            // one 64-element group: group = (lane * 8) / 64.
+            const int group = lane / 8;
+            // The walk holds the next position's four words while it works on
+            // the current one, so each load is issued a whole iteration before
+            // its value is read. `next_slot` is reduced modulo N on every step,
+            // so every address formed is one the one-stage walk also forms.
+            uint next_slot = slot + BLOCKS;
+            if (next_slot >= N) next_slot -= N;
+            const device uint32_t* pre_k =
+                mirror_w + (kv_head * N + slot) * row_words;
+            const device uint32_t* pre_v =
+                mirror_w + ((KV_HEADS + kv_head) * N + slot) * row_words;
+            uint32_t kw_pre = pre_k[lane];
+            uint32_t vw_pre = pre_v[lane];
+            uint32_t ktw_pre = pre_k[D / 8 + group];
+            uint32_t vtw_pre = pre_v[D / 8 + group];
             for (int token = block; token < N; token += BLOCKS) {
-                const device uint32_t* krow_w =
-                    mirror_w + (kv_head * N + slot) * row_words;
-                const device uint32_t* vrow_w =
-                    mirror_w + ((KV_HEADS + kv_head) * N + slot) * row_words;
-                // One lane owns 8 consecutive elements, so it sits wholly
-                // inside one 64-element group: group = (lane * 8) / 64.
-                const int group = lane / 8;
-                const uint32_t ktw = krow_w[D / 8 + group];
-                const uint32_t vtw = vrow_w[D / 8 + group];
+                const uint32_t ktw = ktw_pre;
+                const uint32_t vtw = vtw_pre;
+                const uint32_t kw = kw_pre;
+                const uint32_t vw = vw_pre;
+                {
+                    const device uint32_t* nk =
+                        mirror_w + (kv_head * N + next_slot) * row_words;
+                    const device uint32_t* nv =
+                        mirror_w + ((KV_HEADS + kv_head) * N + next_slot)
+                            * row_words;
+                    kw_pre = nk[lane];
+                    vw_pre = nv[lane];
+                    ktw_pre = nk[D / 8 + group];
+                    vtw_pre = nv[D / 8 + group];
+                    next_slot += BLOCKS;
+                    if (next_slot >= N) next_slot -= N;
+                }
                 const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
                 const float kb = float(as_type<half>(ushort(ktw >> 16)));
                 const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
                 const float vb = float(as_type<half>(ushort(vtw >> 16)));
-                const uint32_t kw = krow_w[lane];
-                const uint32_t vw = vrow_w[lane];
                 float score = 0.0f;
+                float score_hi = 0.0f;
                 for (int element = 0; element < 8; ++element) {
-                    score += q[element]
-                        * fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
+                    const float key_element =
+                        fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
+                    score += q[element] * key_element;
+                    score_hi += q_hi[element] * key_element;
                 }
                 score = simd_sum(score);
+                score_hi = simd_sum(score_hi);
 
                 const float new_max = max(max_score, score);
+                const float new_max_hi = max(max_hi, score_hi);
                 const float old_factor = fast::exp(max_score - new_max);
+                const float old_factor_hi = fast::exp(max_hi - new_max_hi);
                 const float score_factor = fast::exp(score - new_max);
+                const float score_factor_hi = fast::exp(score_hi - new_max_hi);
                 max_score = new_max;
+                max_hi = new_max_hi;
                 sum_exp_score = sum_exp_score * old_factor + score_factor;
+                sum_hi = sum_hi * old_factor_hi + score_factor_hi;
                 for (int element = 0; element < 8; ++element) {
-                    accumulator[element] = accumulator[element] * old_factor
-                        + score_factor
-                            * fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
+                    const float value_element =
+                        fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
+                    acc_lo[element] = acc_lo[element] * old_factor
+                        + score_factor * value_element;
+                    acc_hi[element] = acc_hi[element] * old_factor_hi
+                        + score_factor_hi * value_element;
                 }
 
                 slot += BLOCKS;
@@ -1012,9 +1055,12 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             if (lane == 0) {
                 sum_out[0] = sum_exp_score;
                 max_out[0] = max_score;
+                sum_out[BLOCKS] = sum_hi;
+                max_out[BLOCKS] = max_hi;
             }
             for (int element = 0; element < values_per_lane; ++element) {
-                partial[element] = T(accumulator[element]);
+                partial[element] = T(acc_lo[element]);
+                partial[BLOCKS * D + element] = T(acc_hi[element]);
             }
         """,
         ensureRowContiguous: true
@@ -1302,8 +1348,8 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 ("T", queries.dtype), ("D", headDim), ("N", sequenceLength),
                 ("GQA", gqa), ("KV_HEADS", kvHeads), ("BLOCKS", blocks),
             ],
-            grid: (kvHeads * 32, batch * gqa, blocks),
-            threadGroup: (32, gqa, 1),
+            grid: (kvHeads * 32, batch, blocks),
+            threadGroup: (32, 1, 1),
             outputShapes: [partialShape, summaryShape, summaryShape],
             outputDTypes: [.bfloat16, .float32, .float32]
         )
@@ -1349,8 +1395,8 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 ("KV_HEADS", kvHeads),
                 ("BLOCKS", blocks),
             ],
-            grid: (kvHeads * 32, batch * gqa, blocks),
-            threadGroup: (32, gqa, 1),
+            grid: (kvHeads * 32, batch, blocks),
+            threadGroup: (32, 1, 1),
             outputShapes: [partialShape, summaryShape, summaryShape],
             outputDTypes: [.bfloat16, .float32, .float32]
         )
@@ -1615,6 +1661,125 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             outputDTypes: [.bfloat16]
         )[0]
     }
+
+    /// SLIDE-STORE-001: the sliding road's BF16 ring append as its own small
+    /// dispatch.
+    ///
+    /// On the fused q4 road, attention reads the packed mirror and never the
+    /// BF16 ring, but the host still constructs two functional `writeRing`
+    /// updates per row per layer to keep that ring current. Each is a
+    /// `SliceUpdate` over an allocation the decode graph retains, so 512 bytes
+    /// of new K/V cost a whole-ring copy, twice per row, on every sliding
+    /// layer of every decode step.
+    ///
+    /// This writes the same bytes to the same slot in place, in one dispatch,
+    /// fence-ordered ahead of the pass that reads the ring. It is the sliding
+    /// twin of WRITE-022, which does exactly this for the D512 road, and it is
+    /// deliberately NOT folded into pass A: adding the ring allocations to that
+    /// kernel's bindings is a separate, measured-negative mechanism.
+    private static let slidingRingStoreKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "cbv2_ragged8_sliding_ringstore_bf16_d256_v1",
+            inputNames: [
+                "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+                "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+                "starts", "new_keys", "new_values", "write_fence",
+            ],
+            outputNames: ["fence"],
+            source: """
+                constexpr int D = 256;
+                constexpr int KVH = 8;
+                const int z = int(threadgroup_position_in_grid.z);
+                const int row = z / KVH;
+                const int kv_head = z % KVH;
+                const int lane = int(thread_position_in_threadgroup.x);
+
+                const device T* key_plane = k0;
+                const device T* value_plane = v0;
+                switch (row) {
+                    case 1: key_plane = k1; value_plane = v1; break;
+                    case 2: key_plane = k2; value_plane = v2; break;
+                    case 3: key_plane = k3; value_plane = v3; break;
+                    case 4: key_plane = k4; value_plane = v4; break;
+                    case 5: key_plane = k5; value_plane = v5; break;
+                    case 6: key_plane = k6; value_plane = v6; break;
+                    case 7: key_plane = k7; value_plane = v7; break;
+                    default: break;
+                }
+                key_plane += size_t(kv_head) * size_t(N) * D;
+                value_plane += size_t(kv_head) * size_t(N) * D;
+
+                // The evicted slot the ordinary append replaces, the same one
+                // the mirror store targets.
+                const uint start = starts[row];
+                const uint write_slot = (start + uint(N - 1)) % uint(N);
+
+                device T* write_key = const_cast<device T*>(key_plane)
+                    + size_t(write_slot) * D + lane * 2;
+                device T* write_value = const_cast<device T*>(value_plane)
+                    + size_t(write_slot) * D + lane * 2;
+                const device T* src_key = new_keys
+                    + size_t(row * KVH + kv_head) * D + lane * 2;
+                const device T* src_value = new_values
+                    + size_t(row * KVH + kv_head) * D + lane * 2;
+                for (int element = 0; element < 2; ++element) {
+                    write_key[element] = src_key[element];
+                    write_value[element] = src_value[element];
+                }
+                if (z == 0 && lane == 0) {
+                    fence[0] = write_fence[0] + 1;
+                }
+            """,
+            ensureRowContiguous: true)
+
+    /// `DARKBLOOM_CBV2_SLIDING_STORE_DISPATCH=0` restores the host's two
+    /// functional ring updates per row.
+    static let slidingStoreDispatchEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_SLIDING_STORE_DISPATCH"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Stores this step's K/V into every row's BF16 ring in place and returns
+    /// the fence that orders the store against the reader. `nil` when any
+    /// precondition fails, in which case the caller keeps the host updates.
+    static func storeSlidingRings(
+        keys: [MLXArray], values: [MLXArray], starts: [Int],
+        newKeys: MLXArray, newValues: MLXArray, previousWriteFence: MLXArray
+    ) -> MLXArray? {
+        guard slidingStoreDispatchEnabled, enabled,
+            keys.count == batch, values.count == batch, starts.count == batch,
+            starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength }),
+            newKeys.dtype == .bfloat16,
+            newKeys.shape == [batch, kvHeads, 1, headDim],
+            newValues.dtype == .bfloat16,
+            newValues.shape == newKeys.shape,
+            previousWriteFence.dtype == .int32,
+            previousWriteFence.shape == [1],
+            keys.allSatisfy({
+                $0.dtype == .bfloat16
+                    && $0.shape == [1, kvHeads, sequenceLength, headDim]
+            }),
+            values.allSatisfy({
+                $0.dtype == .bfloat16
+                    && $0.shape == [1, kvHeads, sequenceLength, headDim]
+            })
+        else { return nil }
+        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        return slidingRingStoreKernel(
+            keys + values + [startArray, newKeys, newValues, previousWriteFence],
+            template: [
+                ("T", newKeys.dtype),
+                ("N", sequenceLength),
+            ],
+            grid: (headDim / 2, 1, batch * kvHeads),
+            threadGroup: (headDim / 2, 1, 1),
+            outputShapes: [[1]],
+            outputDTypes: [.int32]
+        )[0]
+    }
+
 }
 
 /// D512-SDPA: batch-wide FULL-attention decode for the exact Gemma 4 decode
@@ -2577,7 +2742,6 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             }
         """,
         ensureRowContiguous: true)
-
     /// WRITE-022 kill switch: `DARKBLOOM_GEMMA4_D512_STORE_DISPATCH=0` falls
     /// back to the v2 fold (and its own switch falls back to the append path).
     private static let storeDispatchEnabled: Bool = {

@@ -208,9 +208,7 @@ inline float mma8_runsum4(uint4 r) {
   return sum;
 }
 
-#define MMA8_SETB(BB, W, HI) BB.thread_elements()[0] = mma8_##HI<T>(r0.W); BB.thread_elements()[1] = mma8_##HI<T>(r1.W);
-
-#define MMA8_STEP(BB, J) A.thread_elements()[0] = float(extract_bits(wv.x, 4 * (J), 4)); A.thread_elements()[1] = float(extract_bits(wv.y, 4 * (J), 4)); simdgroup_multiply_accumulate(C, A, BB, C);
+#define MMA8_SUBSTEP(J, REG, HI) B.thread_elements()[0] = mma8_##HI<T>(r0.REG); B.thread_elements()[1] = mma8_##HI<T>(r1.REG); A.thread_elements()[0] = float(extract_bits(wv.x, 4 * (J), 4)); A.thread_elements()[1] = float(extract_bits(wv.y, 4 * (J), 4)); simdgroup_multiply_accumulate(C, A, B, C);
 
 template <typename T, int KS, int KFIX>
 METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
@@ -241,14 +239,15 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
   float acc0 = 0.0f;
   float acc1 = 0.0f;
   simdgroup_float8x8 A;
-  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+  simdgroup_float8x8 B;
 
-  // Same register carry as the Q/K/V tier: one group's weight operands stay
-  // resident while the next group's are read. Addresses are functions of the
-  // group index alone and `g_next` is clamped to the simdgroup's last group.
   uint2 wv_next = *((const device uint2*)(wrow + 32 * g0));
+  uint2 wv_next2 =
+      *((const device uint2*)(wrow + 32 * (g0 + min(1, nGroups - 1))));
   T s_next = srow[g0];
   T b_next = brow[g0];
+  uint4 r0_next = *((const device uint4*)(x0 + 64 * g0));
+  uint4 r1_next = *((const device uint4*)(x1 + 64 * g0));
 
 #pragma unroll
   for (int gi = 0; gi < nGroups; ++gi) {
@@ -256,36 +255,31 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
     const uint2 wv = wv_next;
     const float s = float(s_next);
     const float b = float(b_next);
+    const uint4 r0 = r0_next;
+    const uint4 r1 = r1_next;
     const int g_next = g0 + min(gi + 1, nGroups - 1);
-    wv_next = *((const device uint2*)(wrow + 32 * g_next));
+    const int g_next2 = g0 + min(gi + 2, nGroups - 1);
+    wv_next = wv_next2;
+    wv_next2 = *((const device uint2*)(wrow + 32 * g_next2));
     s_next = srow[g_next];
     b_next = brow[g_next];
-    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
-    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+    r0_next = *((const device uint4*)(x0 + 64 * g_next));
+    r1_next = *((const device uint4*)(x1 + 64 * g_next));
 
     float2 rs = float2(mma8_runsum4<T>(r0), mma8_runsum4<T>(r1));
     rs += simd_shuffle_xor(rs, 2u);
     rs += simd_shuffle_xor(rs, 4u);
     rs += simd_shuffle_xor(rs, 16u);
 
-    MMA8_SETB(B0, x, lo)
-    MMA8_SETB(B1, x, hi)
-    MMA8_SETB(B2, y, lo)
-    MMA8_SETB(B3, y, hi)
-    MMA8_SETB(B4, z, lo)
-    MMA8_SETB(B5, z, hi)
-    MMA8_SETB(B6, w, lo)
-    MMA8_SETB(B7, w, hi)
-
     simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
-    MMA8_STEP(B0, 0)
-    MMA8_STEP(B1, 1)
-    MMA8_STEP(B2, 2)
-    MMA8_STEP(B3, 3)
-    MMA8_STEP(B4, 4)
-    MMA8_STEP(B5, 5)
-    MMA8_STEP(B6, 6)
-    MMA8_STEP(B7, 7)
+    MMA8_SUBSTEP(0, x, lo)
+    MMA8_SUBSTEP(1, x, hi)
+    MMA8_SUBSTEP(2, y, lo)
+    MMA8_SUBSTEP(3, y, hi)
+    MMA8_SUBSTEP(4, z, lo)
+    MMA8_SUBSTEP(5, z, hi)
+    MMA8_SUBSTEP(6, w, lo)
+    MMA8_SUBSTEP(7, w, hi)
 
     acc0 += s * C.thread_elements()[0] + rs.x * b;
     acc1 += s * C.thread_elements()[1] + rs.y * b;
@@ -310,7 +304,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
 """
 
     private static let mma8KernelK4096 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry_v3",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry_v4",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -327,7 +321,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
         ensureRowContiguous: true)
 
     private static let mma8KernelK8192 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_carry_v3",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_carry_v4",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """

@@ -99,6 +99,12 @@ inline float mma8_runsum4(uint4 r) {
 
 #define MMA8_STEP(BB, J) A.thread_elements()[0] = float(extract_bits(wv.x, 4 * (J), 4)); A.thread_elements()[1] = float(extract_bits(wv.y, 4 * (J), 4)); simdgroup_multiply_accumulate(C, A, BB, C);
 
+#define MMA8_SUBSTEP(J, REG, HI) \
+  B.thread_elements()[0] = mma8_##HI<T>(r0.REG); \
+  B.thread_elements()[1] = mma8_##HI<T>(r1.REG); \
+  A.thread_elements()[0] = float(extract_bits(wv.x, 4 * (J), 4)); \
+  A.thread_elements()[1] = float(extract_bits(wv.y, 4 * (J), 4)); \
+  simdgroup_multiply_accumulate(C, A, B, C);
 template <typename T, int KS, int KFIX>
 METAL_FUNC void qkv_mma8_affine4_g64_impl(
     const device uint32_t* w,
@@ -128,13 +134,15 @@ METAL_FUNC void qkv_mma8_affine4_g64_impl(
   float acc0 = 0.0f;
   float acc1 = 0.0f;
   simdgroup_float8x8 A;
-  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+  simdgroup_float8x8 B;
 
   uint2 wv_next = *((const device uint2*)(wrow + 32 * g0));
   uint2 wv_next2 =
       *((const device uint2*)(wrow + 32 * (g0 + min(1, nGroups - 1))));
   T s_next = srow[g0];
   T b_next = brow[g0];
+  uint4 r0_next = *((const device uint4*)(x0 + 64 * g0));
+  uint4 r1_next = *((const device uint4*)(x1 + 64 * g0));
 
 #pragma unroll
   for (int gi = 0; gi < nGroups; ++gi) {
@@ -142,39 +150,31 @@ METAL_FUNC void qkv_mma8_affine4_g64_impl(
     const uint2 wv = wv_next;
     const float s = float(s_next);
     const float b = float(b_next);
+    const uint4 r0 = r0_next;
+    const uint4 r1 = r1_next;
     const int g_next = g0 + min(gi + 1, nGroups - 1);
     const int g_next2 = g0 + min(gi + 2, nGroups - 1);
     wv_next = wv_next2;
     wv_next2 = *((const device uint2*)(wrow + 32 * g_next2));
     s_next = srow[g_next];
     b_next = brow[g_next];
-
-    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
-    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+    r0_next = *((const device uint4*)(x0 + 64 * g_next));
+    r1_next = *((const device uint4*)(x1 + 64 * g_next));
 
     float2 rs = float2(mma8_runsum4<T>(r0), mma8_runsum4<T>(r1));
     rs += simd_shuffle_xor(rs, 2u);
     rs += simd_shuffle_xor(rs, 4u);
     rs += simd_shuffle_xor(rs, 16u);
 
-    MMA8_SETB(B0, x, lo)
-    MMA8_SETB(B1, x, hi)
-    MMA8_SETB(B2, y, lo)
-    MMA8_SETB(B3, y, hi)
-    MMA8_SETB(B4, z, lo)
-    MMA8_SETB(B5, z, hi)
-    MMA8_SETB(B6, w, lo)
-    MMA8_SETB(B7, w, hi)
-
     simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
-    MMA8_STEP(B0, 0)
-    MMA8_STEP(B1, 1)
-    MMA8_STEP(B2, 2)
-    MMA8_STEP(B3, 3)
-    MMA8_STEP(B4, 4)
-    MMA8_STEP(B5, 5)
-    MMA8_STEP(B6, 6)
-    MMA8_STEP(B7, 7)
+    MMA8_SUBSTEP(0, x, lo)
+    MMA8_SUBSTEP(1, x, hi)
+    MMA8_SUBSTEP(2, y, lo)
+    MMA8_SUBSTEP(3, y, hi)
+    MMA8_SUBSTEP(4, z, lo)
+    MMA8_SUBSTEP(5, z, hi)
+    MMA8_SUBSTEP(6, w, lo)
+    MMA8_SUBSTEP(7, w, hi)
 
     acc0 += s * C.thread_elements()[0] + rs.x * b;
     acc1 += s * C.thread_elements()[1] + rs.y * b;
@@ -258,15 +258,12 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
   const device T* x1 = x0 + K;
 
   simdgroup_float8x8 A;
-  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+  simdgroup_float8x8 B;
 
-  // The per-group weight operands are carried in registers: group g0's
-  // packed word, scale and bias are read before the walk, and each trip
-  // reads the next group's while the current group's stay resident. The
-  // addresses are functions of the group index alone, so the value each
-  // trip consumes is the value the in-place read produced. The clamp on
-  // `g_next` keeps the last trip inside the simdgroup's group range; the
-  // value it re-reads is discarded at loop exit.
+  // The per-group weight and activation operands are carried in registers:
+  // group g0's packed words, scale, bias, and activation vectors are read
+  // before the walk, and each trip reads the next group's while the current
+  // group's stay resident.
   uint2 wv_next[TILES];
   uint2 wv_next2[TILES];
   T s_next[TILES];
@@ -279,6 +276,8 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
     s_next[t] = srow[t][g0];
     b_next[t] = brow[t][g0];
   }
+  uint4 r0_next = *((const device uint4*)(x0 + 64 * g0));
+  uint4 r1_next = *((const device uint4*)(x1 + 64 * g0));
 
 #pragma unroll
   for (int gi = 0; gi < nGroups; ++gi) {
@@ -293,6 +292,8 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
       s_cur[t] = float(s_next[t]);
       b_cur[t] = float(b_next[t]);
     }
+    const uint4 r0 = r0_next;
+    const uint4 r1 = r1_next;
     const int g_next = g0 + min(gi + 1, nGroups - 1);
     const int g_next2 = g0 + min(gi + 2, nGroups - 1);
 #pragma clang loop unroll(full)
@@ -302,23 +303,13 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
       s_next[t] = srow[t][g_next];
       b_next[t] = brow[t][g_next];
     }
-
-    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
-    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+    r0_next = *((const device uint4*)(x0 + 64 * g_next));
+    r1_next = *((const device uint4*)(x1 + 64 * g_next));
 
     float2 rs = float2(mma8_runsum4<T>(r0), mma8_runsum4<T>(r1));
     rs += simd_shuffle_xor(rs, 2u);
     rs += simd_shuffle_xor(rs, 4u);
     rs += simd_shuffle_xor(rs, 16u);
-
-    MMA8_SETB(B0, x, lo)
-    MMA8_SETB(B1, x, hi)
-    MMA8_SETB(B2, y, lo)
-    MMA8_SETB(B3, y, hi)
-    MMA8_SETB(B4, z, lo)
-    MMA8_SETB(B5, z, hi)
-    MMA8_SETB(B6, w, lo)
-    MMA8_SETB(B7, w, hi)
 
 #pragma clang loop unroll(full)
     for (int t = 0; t < TILES; ++t) {
@@ -327,14 +318,14 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
       const float b = b_cur[t];
 
       simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
-      MMA8_STEP(B0, 0)
-      MMA8_STEP(B1, 1)
-      MMA8_STEP(B2, 2)
-      MMA8_STEP(B3, 3)
-      MMA8_STEP(B4, 4)
-      MMA8_STEP(B5, 5)
-      MMA8_STEP(B6, 6)
-      MMA8_STEP(B7, 7)
+      MMA8_SUBSTEP(0, x, lo)
+      MMA8_SUBSTEP(1, x, hi)
+      MMA8_SUBSTEP(2, y, lo)
+      MMA8_SUBSTEP(3, y, hi)
+      MMA8_SUBSTEP(4, z, lo)
+      MMA8_SUBSTEP(5, z, hi)
+      MMA8_SUBSTEP(6, w, lo)
+      MMA8_SUBSTEP(7, w, hi)
 
       acc0[t] += s * C.thread_elements()[0] + rs.x * b;
       acc1[t] += s * C.thread_elements()[1] + rs.y * b;
@@ -386,7 +377,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
     private static let tilesPerGroup = 2
 
     private static let multiTileKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_v4",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_v5",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -403,7 +394,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
         ensureRowContiguous: true)
 
     private static let mma8Kernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_carry2_v3",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_carry2_v4",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """

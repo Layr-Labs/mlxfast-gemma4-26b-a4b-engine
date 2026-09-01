@@ -241,7 +241,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
   float acc0 = 0.0f;
   float acc1 = 0.0f;
   simdgroup_float8x8 A;
-  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+  simdgroup_float8x8 B;
 
   // Same register carry as the Q/K/V tier: one group's weight operands stay
   // resident while the next group's are read. Addresses are functions of the
@@ -268,24 +268,23 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
     rs += simd_shuffle_xor(rs, 4u);
     rs += simd_shuffle_xor(rs, 16u);
 
-    MMA8_SETB(B0, x, lo)
-    MMA8_SETB(B1, x, hi)
-    MMA8_SETB(B2, y, lo)
-    MMA8_SETB(B3, y, hi)
-    MMA8_SETB(B4, z, lo)
-    MMA8_SETB(B5, z, hi)
-    MMA8_SETB(B6, w, lo)
-    MMA8_SETB(B7, w, hi)
-
     simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
-    MMA8_STEP(B0, 0)
-    MMA8_STEP(B1, 1)
-    MMA8_STEP(B2, 2)
-    MMA8_STEP(B3, 3)
-    MMA8_STEP(B4, 4)
-    MMA8_STEP(B5, 5)
-    MMA8_STEP(B6, 6)
-    MMA8_STEP(B7, 7)
+    MMA8_SETB(B, x, lo)
+    MMA8_STEP(B, 0)
+    MMA8_SETB(B, x, hi)
+    MMA8_STEP(B, 1)
+    MMA8_SETB(B, y, lo)
+    MMA8_STEP(B, 2)
+    MMA8_SETB(B, y, hi)
+    MMA8_STEP(B, 3)
+    MMA8_SETB(B, z, lo)
+    MMA8_STEP(B, 4)
+    MMA8_SETB(B, z, hi)
+    MMA8_STEP(B, 5)
+    MMA8_SETB(B, w, lo)
+    MMA8_STEP(B, 6)
+    MMA8_SETB(B, w, hi)
+    MMA8_STEP(B, 7)
 
     acc0 += s * C.thread_elements()[0] + rs.x * b;
     acc1 += s * C.thread_elements()[1] + rs.y * b;

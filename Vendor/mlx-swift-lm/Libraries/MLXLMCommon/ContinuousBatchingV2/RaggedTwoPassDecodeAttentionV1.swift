@@ -3138,8 +3138,10 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// output is the WRITE-016 pattern: a real graph edge whose inter-kernel
     /// barrier (BarrierScopeBuffers, encoder-wide) orders every buffer write
     /// this dispatch issued before the fenced QK reads them.
+    /// WRITE-022-RING-UNROLL-001: explicit full unroll of the fixed four-
+    /// element K/V copy, leaving the 128-thread D/4 mapping unchanged.
     private static let ringStoreKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_d512_ringstore_bf16_v1",
+        name: "cbv2_ragged8_d512_ringstore_bf16_v2",
         inputNames: [
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -3178,6 +3180,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 + size_t(row * 2 + kv_head) * D + lane * 4;
             const device T* src_value = new_values
                 + size_t(row * 2 + kv_head) * D + lane * 4;
+            #pragma clang loop unroll(full)
             for (int element = 0; element < 4; ++element) {
                 write_key[element] = src_key[element];
                 write_value[element] = src_value[element];

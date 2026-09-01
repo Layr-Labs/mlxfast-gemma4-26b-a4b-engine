@@ -1442,6 +1442,125 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         return (output, passA[3])
     }
 
+    /// WRITE-023 store dispatch: one threadgroup per (row, kv head) — 64
+    /// threadgroups of 64 threads — each thread copying 4 contiguous
+    /// elements of K and 4 of V into the row's evicted ring slot through a
+    /// const_cast on the input pointer. 64 KiB total. The fence output is
+    /// the WRITE-016/WRITE-022 pattern: a real graph edge whose inter-kernel
+    /// barrier orders every buffer write this dispatch issued.
+    private static let slidingRingStoreKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sliding_ringstore_bf16_d256_v1",
+        inputNames: [
+            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+            "params", "new_keys", "new_values", "write_fence",
+        ],
+        outputNames: ["fence"],
+        source: """
+            constexpr int D = 256;
+            const int z = int(threadgroup_position_in_grid.z);
+            const int row = z / KV_HEADS;
+            const int kv_head = z % KV_HEADS;
+            const int lane = int(thread_position_in_threadgroup.x);
+            const int window = int(params[0]);
+            const int slot = int(params[1 + row]);
+
+            const device T* key_plane = k0;
+            const device T* value_plane = v0;
+            switch (row) {
+                case 1: key_plane = k1; value_plane = v1; break;
+                case 2: key_plane = k2; value_plane = v2; break;
+                case 3: key_plane = k3; value_plane = v3; break;
+                case 4: key_plane = k4; value_plane = v4; break;
+                case 5: key_plane = k5; value_plane = v5; break;
+                case 6: key_plane = k6; value_plane = v6; break;
+                case 7: key_plane = k7; value_plane = v7; break;
+                default: break;
+            }
+            key_plane += size_t(kv_head) * size_t(window) * D;
+            value_plane += size_t(kv_head) * size_t(window) * D;
+
+            device T* write_key = const_cast<device T*>(key_plane)
+                + size_t(slot) * D + lane * 4;
+            device T* write_value = const_cast<device T*>(value_plane)
+                + size_t(slot) * D + lane * 4;
+            const device T* src_key = new_keys
+                + size_t(row * KV_HEADS + kv_head) * D + lane * 4;
+            const device T* src_value = new_values
+                + size_t(row * KV_HEADS + kv_head) * D + lane * 4;
+            for (int element = 0; element < 4; ++element) {
+                write_key[element] = src_key[element];
+                write_value[element] = src_value[element];
+            }
+            if (z == 0 && lane == 0) {
+                fence[0] = write_fence[0] + 1;
+            }
+        """,
+        ensureRowContiguous: true)
+
+    /// WRITE-023 kill switch: `DARKBLOOM_CBV2_SLIDING_STORE_DISPATCH` set to
+    /// 0/false/no/off restores the per-row BF16 `SliceUpdate` pair.
+    static let slidingStoreDispatchEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_SLIDING_STORE_DISPATCH"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// WRITE-023: deposit this decode step's K/V into every row's bf16 ring
+    /// slot with one fenced in-place dispatch instead of sixteen whole-ring
+    /// `SliceUpdate`s. Returns nil (nothing written, no graph built) whenever
+    /// a predicate fails, so the caller keeps the established write.
+    static func storeSlidingRing(
+        keyRings: [MLXArray],
+        valueRings: [MLXArray],
+        slots: [Int],
+        newKeys: MLXArray,
+        newValues: MLXArray,
+        previousWriteFence: MLXArray,
+        slidingWindowLength: Int
+    ) -> MLXArray? {
+        guard slidingStoreDispatchEnabled,
+            enabled,
+            slidingWindowLength == sequenceLength,
+            headDim == 256, kvHeads == 8,
+            keyRings.count == batch, valueRings.count == batch,
+            slots.count == batch,
+            slots.allSatisfy({ 0 <= $0 && $0 < sequenceLength }),
+            newKeys.dtype == .bfloat16,
+            newKeys.shape == [batch, kvHeads, 1, headDim],
+            newValues.dtype == .bfloat16,
+            newValues.shape == newKeys.shape,
+            previousWriteFence.dtype == .int32,
+            previousWriteFence.shape == [1],
+            keyRings.allSatisfy({
+                $0.dtype == .bfloat16
+                    && $0.shape == [1, kvHeads, sequenceLength, headDim]
+            }),
+            valueRings.allSatisfy({
+                $0.dtype == .bfloat16
+                    && $0.shape == [1, kvHeads, sequenceLength, headDim]
+            })
+        else { return nil }
+
+        var params: [UInt32] = [UInt32(sequenceLength)]
+        params.append(contentsOf: slots.map(UInt32.init))
+        let fence = slidingRingStoreKernel(
+            keyRings + valueRings
+                + [MLXArray(params), newKeys, newValues, previousWriteFence],
+            template: [
+                ("T", newKeys.dtype),
+                ("KV_HEADS", kvHeads),
+            ],
+            grid: (headDim / 4, 1, batch * kvHeads),
+            threadGroup: (headDim / 4, 1, 1),
+            outputShapes: [[1]],
+            outputDTypes: [.int32]
+        )[0]
+        CBv2EngageMark.once("write023-sliding-store")
+        return fence
+    }
+
     static func attendRing(
         queries: MLXArray,
         keys: [MLXArray],

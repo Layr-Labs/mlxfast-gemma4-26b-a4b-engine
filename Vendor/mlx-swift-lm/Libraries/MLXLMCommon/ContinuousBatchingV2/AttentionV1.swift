@@ -491,6 +491,33 @@ enum CBv2AttentionV1 {
                                     scale: scale,
                                     slidingWindowLength: ringRows[0].window)
                         {
+                            // WRITE-023: the sixteen BF16 `SliceUpdate`s this
+                            // branch still leaves behind each rewrite a whole
+                            // 4 MiB ring allocation to deposit 512 bytes. One
+                            // fenced dispatch stores the same bytes into the
+                            // same evicted slots in place. Chained AFTER the
+                            // mirror write so the layer keeps a single fence
+                            // order; refused as a unit, in which case the
+                            // established pair below runs untouched.
+                            let stores = ringRows.compactMap {
+                                $0.decodeRingStoreTarget
+                            }
+                            if stores.count == B,
+                                let storeFence = CBv2RaggedTwoPassDecodeAttentionV1
+                                    .storeSlidingRing(
+                                        keyRings: stores.map(\.keys),
+                                        valueRings: stores.map(\.values),
+                                        slots: stores.map(\.slot),
+                                        newKeys: keys, newValues: values,
+                                        previousWriteFence: fused.nextWriteFence,
+                                        slidingWindowLength: ringRows[0].window)
+                            {
+                                for row in ringRows {
+                                    row.advanceDecodeRingAfterBF16Store()
+                                }
+                                decodeRingWriteFence.value = storeFence
+                                return fused.output
+                            }
                             for (index, row) in ringRows.enumerated() {
                                 row.decodeRingWriteBF16Only(
                                     keys: keys[index ..< (index + 1)],

@@ -1172,9 +1172,13 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 thread float q_hi[values_per_lane];
                 thread float acc_lo[values_per_lane];
                 thread float acc_hi[values_per_lane];
+                float qsum_lo = 0.0f;
+                float qsum_hi = 0.0f;
                 for (int element = 0; element < values_per_lane; ++element) {
                     q_lo[element] = float(query[element]);
                     q_hi[element] = float(query[D + element]);
+                    qsum_lo += q_lo[element];
+                    qsum_hi += q_hi[element];
                     acc_lo[element] = 0.0f;
                     acc_hi[element] = 0.0f;
                 }
@@ -1228,14 +1232,23 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     const float kb = float(as_type<half>(ushort(ktw >> 16)));
                     const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
                     const float vb = float(as_type<half>(ushort(vtw >> 16)));
-                    float score_lo = 0.0f;
-                    float score_hi = 0.0f;
+                    // Take the dot product against the RAW nibbles and apply
+                    // the group's scale and bias once at the end:
+                    //   sum(q * (n * ks + kb)) == ks * sum(q * n) + kb * sum(q)
+                    // sum(q) is a property of the query, so it does not change
+                    // as the walk moves across the window and is hoisted out of
+                    // the loop entirely. What is left per element is one fma
+                    // per query head instead of one dequantising fma shared by
+                    // the pair plus one fma per head.
+                    float qn_lo = 0.0f;
+                    float qn_hi = 0.0f;
                     for (int element = 0; element < values_per_lane; ++element) {
-                        const float key_element =
-                            fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
-                        score_lo += q_lo[element] * key_element;
-                        score_hi += q_hi[element] * key_element;
+                        const float nibble = float((kw >> (4 * element)) & 0xfu);
+                        qn_lo = fma(q_lo[element], nibble, qn_lo);
+                        qn_hi = fma(q_hi[element], nibble, qn_hi);
                     }
+                    float score_lo = fma(ks, qn_lo, kb * qsum_lo);
+                    float score_hi = fma(ks, qn_hi, kb * qsum_hi);
                     score_lo = simd_sum(score_lo);
                     score_hi = simd_sum(score_hi);
 
@@ -1249,6 +1262,12 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     max_hi = new_max_hi;
                     sum_lo = sum_lo * old_factor_lo + score_factor_lo;
                     sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                    // The value side is left exactly as it was. Folding it too
+                    // costs four more live registers in a loop that already
+                    // carries a prefetch pipeline, and the full fold failed
+                    // scoreless on the box while passing every local gate.
+                    // This arm keeps the score-side saving and gives those
+                    // registers back.
                     for (int element = 0; element < values_per_lane; ++element) {
                         const float value_element =
                             fma(float((vw >> (4 * element)) & 0xfu), vs, vb);

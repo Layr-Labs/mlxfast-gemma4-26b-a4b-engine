@@ -1026,7 +1026,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// next decode dispatch after this write completes.
     private static let portQuantFusedWriteKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_2pass_a_q4g64_d256_g2_regpack_vec4_carry_pair_b\(blocks)_v5",
+            name: "cbv2_ragged8_sdpa_ringwrite_2pass_a_q4g64_d256_g2_regpack_vec4_carry_pair_splitfresh_b\(blocks)_v6",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -1191,39 +1191,77 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 // which is served from `kword`/`vword` and whose slot this
                 // kernel is storing into; every address formed is therefore a
                 // slot the one-stage walk also reads.
-                const bool prefetch_first = block < N - 1;
+                const bool owns_fresh_token = block == current_block;
+                const int mirror_limit = owns_fresh_token ? N - 1 : N;
                 uint next_slot = slot + uint(BLOCKS);
                 if (next_slot >= uint(N)) next_slot -= uint(N);
-                uint32_t kw_pre = prefetch_first
-                    ? mkeys_w[slot * row_words + lane] : 0u;
-                uint32_t vw_pre = prefetch_first
-                    ? mvalues_w[slot * row_words + lane] : 0u;
-                uint32_t ktw_pre = prefetch_first
-                    ? mkeys_w[slot * row_words + payload_words + lane / 8] : 0u;
-                uint32_t vtw_pre = prefetch_first
-                    ? mvalues_w[slot * row_words + payload_words + lane / 8] : 0u;
-                for (int token = block; token < N; token += BLOCKS) {
-                    const bool current = token == N - 1;
-                    const uint32_t kw = current ? kword : kw_pre;
-                    const uint32_t vw = current ? vword : vw_pre;
-                    const uint32_t ktw = current
-                        ? (uint32_t(as_type<ushort>(khs))
-                            | (uint32_t(as_type<ushort>(khb)) << 16))
-                        : ktw_pre;
-                    const uint32_t vtw = current
-                        ? (uint32_t(as_type<ushort>(vhs))
-                            | (uint32_t(as_type<ushort>(vhb)) << 16))
-                        : vtw_pre;
-                    if (token + BLOCKS < N - 1) {
-                        kw_pre = mkeys_w[next_slot * row_words + lane];
-                        vw_pre = mvalues_w[next_slot * row_words + lane];
-                        ktw_pre =
-                            mkeys_w[next_slot * row_words + payload_words + lane / 8];
-                        vtw_pre =
-                            mvalues_w[next_slot * row_words + payload_words + lane / 8];
-                        next_slot += uint(BLOCKS);
-                        if (next_slot >= uint(N)) next_slot -= uint(N);
+                if (block < mirror_limit) {
+                    uint32_t kw_pre = mkeys_w[slot * row_words + lane];
+                    uint32_t vw_pre = mvalues_w[slot * row_words + lane];
+                    uint32_t ktw_pre =
+                        mkeys_w[slot * row_words + payload_words + lane / 8];
+                    uint32_t vtw_pre =
+                        mvalues_w[slot * row_words + payload_words + lane / 8];
+                    for (int token = block; token < mirror_limit; token += BLOCKS) {
+                        const uint32_t kw = kw_pre;
+                        const uint32_t vw = vw_pre;
+                        const uint32_t ktw = ktw_pre;
+                        const uint32_t vtw = vtw_pre;
+                        if (token + BLOCKS < mirror_limit) {
+                            kw_pre = mkeys_w[next_slot * row_words + lane];
+                            vw_pre = mvalues_w[next_slot * row_words + lane];
+                            ktw_pre =
+                                mkeys_w[next_slot * row_words + payload_words + lane / 8];
+                            vtw_pre =
+                                mvalues_w[next_slot * row_words + payload_words + lane / 8];
+                            next_slot += uint(BLOCKS);
+                            if (next_slot >= uint(N)) next_slot -= uint(N);
+                        }
+                        const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
+                        const float kb = float(as_type<half>(ushort(ktw >> 16)));
+                        const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
+                        const float vb = float(as_type<half>(ushort(vtw >> 16)));
+                        float score_lo = 0.0f;
+                        float score_hi = 0.0f;
+                        for (int element = 0; element < values_per_lane; ++element) {
+                            const float key_element =
+                                fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
+                            score_lo += q_lo[element] * key_element;
+                            score_hi += q_hi[element] * key_element;
+                        }
+                        score_lo = simd_sum(score_lo);
+                        score_hi = simd_sum(score_hi);
+
+                        const float new_max_lo = max(max_lo, score_lo);
+                        const float new_max_hi = max(max_hi, score_hi);
+                        const float old_factor_lo = fast::exp(max_lo - new_max_lo);
+                        const float old_factor_hi = fast::exp(max_hi - new_max_hi);
+                        const float score_factor_lo = fast::exp(score_lo - new_max_lo);
+                        const float score_factor_hi = fast::exp(score_hi - new_max_hi);
+                        max_lo = new_max_lo;
+                        max_hi = new_max_hi;
+                        sum_lo = sum_lo * old_factor_lo + score_factor_lo;
+                        sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                        for (int element = 0; element < values_per_lane; ++element) {
+                            const float value_element =
+                                fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
+                            acc_lo[element] = acc_lo[element] * old_factor_lo
+                                + score_factor_lo * value_element;
+                            acc_hi[element] = acc_hi[element] * old_factor_hi
+                                + score_factor_hi * value_element;
+                        }
                     }
+                }
+
+                // Only one partition owns logical token N-1. Process that
+                // register-resident row after the mirror-only walk so the hot
+                // loop above pays no per-token fresh-row comparison or four
+                // packed-word selects.
+                if (owns_fresh_token) {
+                    const uint32_t ktw = uint32_t(as_type<ushort>(khs))
+                        | (uint32_t(as_type<ushort>(khb)) << 16);
+                    const uint32_t vtw = uint32_t(as_type<ushort>(vhs))
+                        | (uint32_t(as_type<ushort>(vhb)) << 16);
                     const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
                     const float kb = float(as_type<half>(ushort(ktw >> 16)));
                     const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
@@ -1231,8 +1269,8 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     float score_lo = 0.0f;
                     float score_hi = 0.0f;
                     for (int element = 0; element < values_per_lane; ++element) {
-                        const float key_element =
-                            fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
+                        const float key_element = fma(
+                            float((kword >> (4 * element)) & 0xfu), ks, kb);
                         score_lo += q_lo[element] * key_element;
                         score_hi += q_hi[element] * key_element;
                     }
@@ -1250,14 +1288,13 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     sum_lo = sum_lo * old_factor_lo + score_factor_lo;
                     sum_hi = sum_hi * old_factor_hi + score_factor_hi;
                     for (int element = 0; element < values_per_lane; ++element) {
-                        const float value_element =
-                            fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
+                        const float value_element = fma(
+                            float((vword >> (4 * element)) & 0xfu), vs, vb);
                         acc_lo[element] = acc_lo[element] * old_factor_lo
                             + score_factor_lo * value_element;
                         acc_hi[element] = acc_hi[element] * old_factor_hi
                             + score_factor_hi * value_element;
                     }
-
                 }
 
                 if (lane == 0) {

@@ -290,6 +290,53 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
         )
     }
 
+    // MARK: - CUT-3 batched prefill append
+
+    /// Hand a NEVER-WRITTEN row's freshly allocated storage to the batched
+    /// prefill store kernel (see `CBv2AttentionV1.batchedPrefillKVAppend`).
+    ///
+    /// Performs exactly the allocation the per-row `update` would perform
+    /// (the `ensureCapacity` fresh branch) and nothing else: no slice
+    /// assignment, no offset advance. The caller writes every row's K/V
+    /// rectangle with one in-place kernel dispatch, then confirms with
+    /// ``confirmFreshBatchedPrefillAppend(_:)``. Returns nil — and mutates
+    /// nothing — unless this row is pristine private storage (never written,
+    /// offset 0, unpooled), so a mid-cohort refusal leaves every row on the
+    /// established per-row road.
+    func prepareFreshBatchedPrefillAppend(
+        keys newKeys: MLXArray, values newValues: MLXArray
+    ) -> (keys: MLXArray, values: MLXArray)? {
+        guard cohortPool == nil,
+            absoluteOffset == 0,
+            keys == nil, values == nil,
+            newKeys.dim(0) == 1, newValues.dim(0) == 1,
+            newKeys.dim(1) == kvHeads, newValues.dim(1) == kvHeads,
+            newKeys.dim(2) == newValues.dim(2),
+            newKeys.dim(2) <= maxLength,
+            newKeys.dtype == newValues.dtype
+        else { return nil }
+        ensureCapacity(newKeys.dim(2), keyTemplate: newKeys, valueTemplate: newValues)
+        guard let allocatedKeys = keys, let allocatedValues = values else {
+            return nil
+        }
+        return (allocatedKeys, allocatedValues)
+    }
+
+    /// The bookkeeping half of a batched prefill append: the caller's kernel
+    /// already stored this row's `n` tokens into `[0, n)` of its private
+    /// buffer — the same bytes the per-row slice assignment would have
+    /// written into the same slots — so only the offset advance remains.
+    func confirmFreshBatchedPrefillAppend(_ n: Int) {
+        precondition(
+            cohortPool == nil && keys != nil && values != nil && absoluteOffset == 0,
+            "CBv2FullSequenceKV: batched prefill confirm requires fresh private storage")
+        precondition(
+            absoluteOffset + n <= maxLength,
+            "CBv2FullSequenceKV: append past maxLength (\(absoluteOffset) + \(n) > \(maxLength)) — admission bug"
+        )
+        absoluteOffset = n
+    }
+
     /// Confirm this row's slot of a pool-level `batchAppend` (the batched
     /// decode path commits all rows' K/V in one slice assignment, then bumps
     /// each row's offset here instead of calling `update`).

@@ -218,10 +218,15 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         precondition(
             !mtpSerializesRectangularAttention,
             "CBv2LayerCache: last-query prefill is never part of an MTP verify round")
+        // CUT-3: the layer's write fence + borrower-retention gate let a
+        // fresh uniform cohort commit through the batched store kernel; the
+        // unfenced road stays inside `CBv2AttentionV1` for every refusal.
         let output = CBv2AttentionV1.updateAndAttendLastQuery(
             rows: rows, kind: kind,
             queries: queries, keys: keys, values: values,
-            scale: scale, sinks: sinks, softcap: attentionSoftcap)
+            scale: scale, sinks: sinks, softcap: attentionSoftcap,
+            decodeRingWriteFence: decodeRingWriteFence,
+            allowFusedRingWrite: !retainsChunkForBorrowers)
         if advancesPositionOffsets {
             positionOffsetsState.value = positionOffsetsState.value + Int32(keys.dim(2))
         }

@@ -257,6 +257,60 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         writeDecodeToken(keys: newKeys, values: newValues)
     }
 
+    // MARK: - CUT-3 batched prefill ring append
+
+    /// Hand a NEVER-WRITTEN row's freshly allocated ring (and q4 mirror) to
+    /// the batched prefill store kernel (see
+    /// `CBv2AttentionV1.batchedPrefillKVAppend`).
+    ///
+    /// Performs exactly the allocation `update` would perform
+    /// (`allocateIfNeeded`) and nothing else: no ring writes, no mirror
+    /// writes, no counter movement. Valid only on a pristine row (ring never
+    /// allocated, offset and oldest-valid both 0, no staged transaction) —
+    /// the geometry a fresh cohort's first chunk presents — so a mid-cohort
+    /// refusal leaves every row on the established per-row road.
+    func prepareFreshBatchedPrefillAppend(
+        keys newKeys: MLXArray, values newValues: MLXArray
+    ) -> (keys: MLXArray, values: MLXArray)? {
+        guard !speculativeWriteArmed, staged == nil, !bf16RingStale,
+            !Self.quantSimulate,
+            keys == nil, values == nil,
+            absoluteOffset == 0, oldestValidPosition == 0,
+            newKeys.dim(0) == 1, newValues.dim(0) == 1,
+            newKeys.dim(1) == kvHeads, newValues.dim(1) == kvHeads,
+            newKeys.dim(3) == headDim, newValues.dim(3) == headDim,
+            newKeys.dim(2) == newValues.dim(2),
+            newKeys.dim(2) > 1, newKeys.dim(2) <= window
+        else { return nil }
+        allocateIfNeeded(keyTemplate: newKeys, valueTemplate: newValues)
+        guard let ringKeys = keys, let ringValues = values else { return nil }
+        return (ringKeys, ringValues)
+    }
+
+    /// The bookkeeping half of a batched prefill ring append. The caller's
+    /// kernel already stored this row's chunk into ring slots
+    /// `[0, n)` — the same bytes `writeRing` would have written into the
+    /// same slots (a fresh chunk starts at slot 0 and, with `n <= window`,
+    /// never wraps) — so what remains is exactly `update`'s fresh-chunk
+    /// tail: mirror maintenance on both planes, the counter transition, and
+    /// the returned views. For a fresh row `historyCount == 0`, so the
+    /// returned views ARE the chunk tensors — nothing reads the ring this
+    /// step, which is what makes the in-place store safe.
+    func confirmBatchedPrefillRingAppend(
+        keys newKeys: MLXArray, values newValues: MLXArray
+    ) -> (MLXArray, MLXArray) {
+        precondition(
+            keys != nil && values != nil && !speculativeWriteArmed && staged == nil,
+            "CBv2WindowedSequenceKV: batched prefill confirm outside a prepared fresh append")
+        writeMirror(plane: 0, tokens: newKeys, firstPosition: 0)
+        writeMirror(plane: 1, tokens: newValues, firstPosition: 0)
+        let n = newKeys.dim(2)
+        absoluteOffset += n
+        oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
+        borrowableChunkViews = (newKeys, newValues)
+        return (newKeys, newValues)
+    }
+
     /// Preserve the incumbent BF16 SliceUpdates and counter transition while
     /// the fused q4 attention pass owns only the live mirror-slot write.
     func decodeRingWriteBF16Only(keys newKeys: MLXArray, values newValues: MLXArray) {

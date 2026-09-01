@@ -124,6 +124,22 @@ enum CBv2AttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// CUT-3: batched PREFILL KV append. One fence-chained in-place store
+    /// dispatch (the WRITE-022 pattern, extended from one token to the whole
+    /// chunk rectangle) writes all 8 rows' K and V into their private cache
+    /// buffers — the same bytes into the same slots the 16 per-row slice
+    /// assignments write — for a FRESH, uniform, contiguous-backend cohort
+    /// at the ranked geometry. `0`/`false`/`no`/`off` restores the promoted
+    /// per-row append road everywhere; every gate the batched path fails
+    /// also falls back to that road, which stays correct on pristine and
+    /// written rows alike.
+    static let prefillBatchKVAppendEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PREFILL_BATCH_KV_APPEND"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// Join prompt attention blocks directly into the token-major layout that
     /// the following output projection consumes. The returned value remains a
     /// head-major view, so callers keep the same typed interface while their
@@ -734,12 +750,35 @@ enum CBv2AttentionV1 {
         var cachedValues: [MLXArray] = []
         cachedKeys.reserveCapacity(B)
         cachedValues.reserveCapacity(B)
-        for (index, row) in rows.enumerated() {
-            let (rowKeys, rowValues) = row.update(
-                keys: keys[index ..< (index + 1)],
-                values: values[index ..< (index + 1)])
-            cachedKeys.append(rowKeys)
-            cachedValues.append(rowValues)
+
+        // CUT-3: a fresh uniform batch-8 cohort commits with ONE fence-chained
+        // in-place store dispatch instead of B per-row slice assignments (see
+        // `batchedPrefillKVAppend`). Full layers return their attention output
+        // directly (the alias arm); sliding layers keep the established
+        // attention flow below over the returned chunk views.
+        switch batchedPrefillKVAppend(
+            rows: rows, kind: kind,
+            queries: queries, keys: keys, values: values,
+            scale: scale, sinks: effectiveSinks, softcap: softcap,
+            spanContexts: spanContexts,
+            decodeRingWriteFence: decodeRingWriteFence,
+            allowFusedRingWrite: allowFusedRingWrite)
+        {
+        case .full(let output):
+            CBv2EngageMark.once("prefill-batchkv-append")
+            return output
+        case .windowed(let rowKeys, let rowValues):
+            CBv2EngageMark.once("prefill-batchkv-append")
+            cachedKeys = rowKeys
+            cachedValues = rowValues
+        case .refused:
+            for (index, row) in rows.enumerated() {
+                let (rowKeys, rowValues) = row.update(
+                    keys: keys[index ..< (index + 1)],
+                    values: values[index ..< (index + 1)])
+                cachedKeys.append(rowKeys)
+                cachedValues.append(rowValues)
+            }
         }
 
         if let batched = batchedPackedAttention(
@@ -942,11 +981,32 @@ enum CBv2AttentionV1 {
     /// newest query (see LastQueryPrefillV2.swift). The newest causal query
     /// sees every key the chunk just wrote, so this is exactly the final row
     /// of ordinary chunk attention — mask-free by construction, which is why
-    /// a bound span overlay cannot change it either.
+    /// a bound vision-span overlay cannot change it either.
+    ///
+    /// The unfenced entry: CUT-3's batched store requires the layer's write
+    /// fence, so this road always keeps the pinned per-row commits.
     static func updateAndAttendLastQuery(
         rows: [CBv2SequenceKV], kind: CBv2LayerKind,
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?, softcap: Float? = nil
+    ) -> MLXArray {
+        updateAndAttendLastQuery(
+            rows: rows, kind: kind,
+            queries: queries, keys: keys, values: values,
+            scale: scale, sinks: sinks, softcap: softcap,
+            decodeRingWriteFence: nil, allowFusedRingWrite: false)
+    }
+
+    /// Fenced entry: `CBv2LayerCache` hands the layer's write fence and the
+    /// borrower-retention gate so a fresh uniform cohort can take the CUT-3
+    /// batched store (see `batchedLastQueryKVAppend`); everything the batched
+    /// path refuses keeps the pinned per-row commits below.
+    static func updateAndAttendLastQuery(
+        rows: [CBv2SequenceKV], kind: CBv2LayerKind,
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?, softcap: Float?,
+        decodeRingWriteFence: CBv2DecodeRingWriteFence?,
+        allowFusedRingWrite: Bool
     ) -> MLXArray {
         precondition(
             kind.attention == .full,
@@ -980,6 +1040,16 @@ enum CBv2AttentionV1 {
 
         let effectiveSinks = dispatchSinks(
             sinks, kind: kind, queries: queries, softcap: softcap)
+        if let batched = batchedLastQueryKVAppend(
+            rows: rows, kind: kind,
+            queries: queries, keys: keys, values: values,
+            scale: scale, sinks: effectiveSinks, softcap: softcap,
+            decodeRingWriteFence: decodeRingWriteFence,
+            allowFusedRingWrite: allowFusedRingWrite)
+        {
+            CBv2EngageMark.once("prefill-batchkv-append-lq")
+            return batched
+        }
         var outputs: [MLXArray] = []
         outputs.reserveCapacity(batch)
         for (index, row) in rows.enumerated() {
@@ -1323,6 +1393,293 @@ enum CBv2AttentionV1 {
             queries: queries, keys: cachedKeys, values: cachedValues,
             scale: scale, L: 1, kL: offset + 1, window: nil,
             sinks: nil, softcap: nil)
+    }
+
+    // MARK: - CUT-3 batched prefill KV append
+
+    /// The batched prefill store: one threadgroup per (row, kv head), each
+    /// of its 128 threads copying 16-byte segments of that row's K and V
+    /// chunk rectangle into `[0, n)` of the row's PRIVATE cache buffer
+    /// through a const_cast on the input pointer — the WRITE-022
+    /// `ringStoreKernel` pattern extended from one token to the whole
+    /// rectangle. Pure data movement: every written element is the bit
+    /// pattern of exactly one input element, no arithmetic. `params` carries
+    /// `[n, D, rowCapacity_0..7]` exactly as `ringStoreKernel` does, and the
+    /// per-row capacity lets the same kernel text serve the full layers'
+    /// growable buffers (`[1, 2, capacity, 512]`) and the sliding layers'
+    /// fixed rings (`[1, 8, window, 256]`, region `[0, n)` — a fresh chunk
+    /// never wraps). The fence output is the WRITE-016 pattern: a real graph
+    /// edge whose inter-kernel barrier orders every buffer write this
+    /// dispatch issued before any fenced consumer reads them.
+    private static let prefillBatchKVStoreKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "cbv2_prefill_batch_kv_store_bf16_v1",
+            inputNames: [
+                "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+                "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+                "params", "new_keys", "new_values", "write_fence",
+            ],
+            outputNames: ["fence"],
+            source: """
+                const int z = int(threadgroup_position_in_grid.z);
+                const int row = z / KVH;
+                const int kv_head = z % KVH;
+                const int lane = int(thread_position_in_threadgroup.x);
+                const uint n_tokens = params[0];
+                const uint D_ = params[1];
+                const uint row_capacity = params[2 + row];
+
+                const device T* key_plane = k0;
+                const device T* value_plane = v0;
+                switch (row) {
+                    case 1: key_plane = k1; value_plane = v1; break;
+                    case 2: key_plane = k2; value_plane = v2; break;
+                    case 3: key_plane = k3; value_plane = v3; break;
+                    case 4: key_plane = k4; value_plane = v4; break;
+                    case 5: key_plane = k5; value_plane = v5; break;
+                    case 6: key_plane = k6; value_plane = v6; break;
+                    case 7: key_plane = k7; value_plane = v7; break;
+                    default: break;
+                }
+                key_plane += size_t(kv_head) * size_t(row_capacity) * D_;
+                value_plane += size_t(kv_head) * size_t(row_capacity) * D_;
+
+                const device T* src_keys = new_keys
+                    + (size_t(row) * KVH + size_t(kv_head)) * size_t(n_tokens) * D_;
+                const device T* src_values = new_values
+                    + (size_t(row) * KVH + size_t(kv_head)) * size_t(n_tokens) * D_;
+
+                const size_t segments = (size_t(n_tokens) * D_) / 8;
+                const device uint4* sk = (const device uint4*)(src_keys);
+                const device uint4* sv = (const device uint4*)(src_values);
+                device uint4* dk = (device uint4*)(const_cast<device T*>(key_plane));
+                device uint4* dv = (device uint4*)(const_cast<device T*>(value_plane));
+                for (size_t i = lane; i < segments; i += 128) {
+                    dk[i] = sk[i];
+                    dv[i] = sv[i];
+                }
+                if (z == 0 && lane == 0) {
+                    fence[0] = write_fence[0] + 1;
+                }
+                """,
+            ensureRowContiguous: true
+        )
+
+    /// Dispatch `prefillBatchKVStoreKernel` over one prepared cohort and
+    /// chain the layer's write fence through it.
+    private static func prefillBatchKVStore(
+        kind: CBv2LayerKind, keys: MLXArray, values: MLXArray,
+        prepared: [(keys: MLXArray, values: MLXArray)],
+        fence: CBv2DecodeRingWriteFence
+    ) {
+        var params: [UInt32] = [UInt32(keys.dim(2)), UInt32(kind.headDim)]
+        params.reserveCapacity(prepared.count + 2)
+        for slot in prepared {
+            params.append(UInt32(slot.keys.dim(2)))
+        }
+        let storeFence = prefillBatchKVStoreKernel(
+            prepared.map(\.keys) + prepared.map(\.values)
+                + [MLXArray(params), keys, values, fence.value],
+            template: [("T", keys.dtype), ("KVH", kind.kvHeads)],
+            grid: (128, 1, prepared.count * kind.kvHeads),
+            threadGroup: (128, 1, 1),
+            outputShapes: [[1]],
+            outputDTypes: [.int32]
+        )[0]
+        fence.value = storeFence
+    }
+
+    /// Outcome of `batchedPrefillKVAppend`: refused (caller keeps the pinned
+    /// per-row road), fully handled for a full-attention cohort (the direct
+    /// attention output), or committed-and-viewed for a sliding cohort (the
+    /// caller keeps the established attention flow over the returned views).
+    private enum PrefillBatchAppendOutcome {
+        case refused
+        case full(MLXArray)
+        case windowed([MLXArray], [MLXArray])
+    }
+
+    /// CUT-3: batched PREFILL KV append for a fresh, uniform, batch-8
+    /// cohort on the contiguous backend — the prefill twin of the decode
+    /// path's single-store KV commit (WRITE-022), replacing the 16 per-row
+    /// slice assignments per layer with ONE fence-chained in-place store
+    /// dispatch that writes the same bytes into the same private-buffer
+    /// slots at the same dtype.
+    ///
+    /// Exactness: the store is a pure 16-bit copy of each row's chunk
+    /// rectangle into the region `[0, n)` of that row's buffer — the exact
+    /// bytes the per-row `keys![.ellipsis, 0..<n, 0...] = newKeys` writes —
+    /// so the committed cache state is bit-identical, and every subsequent
+    /// reader (decode's fenced kernels, snapshots, rollbacks, the D512
+    /// gates) observes identical storage with identical strides. The
+    /// attention this step consumes the ORIGINAL chunk rectangles, never
+    /// the just-written regions: full layers take the PREFILL-PACKED-KV-ALIAS
+    /// arm verbatim (which is why the batched store also requires that
+    /// alias to be enabled), and sliding layers' fresh-row views ARE the
+    /// chunk tensors (history is empty), so the established
+    /// `batchedPackedAttention` flow reads no ring byte either way.
+    ///
+    /// Safety of the in-place write follows the promoted WRITE-016/022
+    /// discipline: it engages only when no same-step graph reads or writes
+    /// the stored regions (fresh rows, no span contexts, no serialized
+    /// queries, no KV-sharing borrower via `allowFusedRingWrite`), the fence
+    /// output is a real graph edge published through the layer's
+    /// `innerState()`, and the next write-side consumer (the first decode
+    /// step's fenced kernels) consumes the fence this store produced.
+    ///
+    /// Fails closed — returns `.refused` before any row state changes — on
+    /// any other batch size, geometry, dtype, non-uniform or non-fresh rows
+    /// (continuation chunks, MTP verify rounds, prefix-replay rows), pooled
+    /// rows, bound span contexts, or a disabled kill switch.
+    private static func batchedPrefillKVAppend(
+        rows: [CBv2SequenceKV], kind: CBv2LayerKind,
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?, softcap: Float?,
+        spanContexts: [CBv2SpanChunkContext?]?,
+        decodeRingWriteFence: CBv2DecodeRingWriteFence?,
+        allowFusedRingWrite: Bool
+    ) -> PrefillBatchAppendOutcome {
+        guard prefillBatchKVAppendEnabled,
+            allowFusedRingWrite,
+            let fence = decodeRingWriteFence,
+            fence.value.dtype == .int32, fence.value.shape == [1],
+            rows.count == 8,
+            queries.ndim == 4, keys.ndim == 4, values.ndim == 4,
+            queries.dim(0) == 8, keys.dim(0) == 8, values.dim(0) == 8,
+            queries.dim(2) > 1,
+            queries.dim(2) == keys.dim(2),
+            keys.dim(2) == values.dim(2),
+            keys.dim(1) == kind.kvHeads, values.dim(1) == kind.kvHeads,
+            keys.dim(3) == kind.headDim, values.dim(3) == kind.headDim,
+            queries.dim(1) == kind.queryHeads, queries.dim(3) == kind.headDim,
+            keys.dtype == .bfloat16, values.dtype == .bfloat16,
+            queries.dtype == .bfloat16,
+            !kind.isBidirectional, !kind.hasSinks,
+            spanContexts?.allSatisfy({ $0 == nil }) ?? true
+        else { return .refused }
+
+        if case .full = kind.attention {
+            guard kind.kvHeads == 2, kind.headDim == 512, packedKVAliasEnabled,
+                let fullRows = rows as? [CBv2FullSequenceKV]
+            else { return .refused }
+            var prepared: [(keys: MLXArray, values: MLXArray)] = []
+            prepared.reserveCapacity(fullRows.count)
+            for (index, row) in fullRows.enumerated() {
+                guard let slot = row.prepareFreshBatchedPrefillAppend(
+                    keys: keys[index ..< (index + 1)],
+                    values: values[index ..< (index + 1)])
+                else { return .refused }
+                prepared.append(slot)
+            }
+            prefillBatchKVStore(
+                kind: kind, keys: keys, values: values, prepared: prepared,
+                fence: fence)
+            for row in fullRows {
+                row.confirmFreshBatchedPrefillAppend(keys.dim(2))
+            }
+            // The alias arm verbatim: the committed cache holds exactly the
+            // chunk's bytes, so attending the original rectangles feeds the
+            // same bytes to the same kernels the restacked road would.
+            CBv2EngageMark.once("prefill-packedkv-alias")
+            return .full(
+                attendCommittedRow(
+                    kind: kind, queries: queries,
+                    cachedKeys: contiguous(keys), cachedValues: contiguous(values),
+                    window: window(of: kind), scale: scale,
+                    sinks: sinks, softcap: softcap, spanContext: nil))
+        }
+
+        guard case .slidingWindow(let slidingWindow) = kind.attention,
+            kind.kvHeads == 8, kind.headDim == 256,
+            keys.dim(2) <= slidingWindow,
+            let windowedRows = rows as? [CBv2WindowedSequenceKV]
+        else { return .refused }
+        var prepared: [(keys: MLXArray, values: MLXArray)] = []
+        prepared.reserveCapacity(windowedRows.count)
+        for (index, row) in windowedRows.enumerated() {
+            guard row.window == slidingWindow,
+                let slot = row.prepareFreshBatchedPrefillAppend(
+                    keys: keys[index ..< (index + 1)],
+                    values: values[index ..< (index + 1)])
+            else { return .refused }
+            prepared.append(slot)
+        }
+        prefillBatchKVStore(
+            kind: kind, keys: keys, values: values, prepared: prepared, fence: fence)
+        var cachedKeys: [MLXArray] = []
+        var cachedValues: [MLXArray] = []
+        cachedKeys.reserveCapacity(windowedRows.count)
+        cachedValues.reserveCapacity(windowedRows.count)
+        for (index, row) in windowedRows.enumerated() {
+            let (rowKeys, rowValues) = row.confirmBatchedPrefillRingAppend(
+                keys: keys[index ..< (index + 1)],
+                values: values[index ..< (index + 1)])
+            cachedKeys.append(rowKeys)
+            cachedValues.append(rowValues)
+        }
+        return .windowed(cachedKeys, cachedValues)
+    }
+
+    /// CUT-3: the last-query prefill twin of `batchedPrefillKVAppend`. Same
+    /// gates, same single-store commit for a fresh full-attention cohort;
+    /// each row's attention then runs the pinned per-row L=1 call against
+    /// the CONTIGUOUS row slice of the original rectangle — the same bytes
+    /// (a fresh append makes row `i`'s cache content exactly `keys[i]`), the
+    /// same shapes, the same last-two-dim strides and dtype the committed
+    /// views carry, so every kernel-selection input is unchanged.
+    private static func batchedLastQueryKVAppend(
+        rows: [CBv2SequenceKV], kind: CBv2LayerKind,
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?, softcap: Float?,
+        decodeRingWriteFence: CBv2DecodeRingWriteFence?,
+        allowFusedRingWrite: Bool
+    ) -> MLXArray? {
+        guard prefillBatchKVAppendEnabled,
+            allowFusedRingWrite,
+            let fence = decodeRingWriteFence,
+            fence.value.dtype == .int32, fence.value.shape == [1],
+            rows.count == 8,
+            case .full = kind.attention,
+            kind.kvHeads == 2, kind.headDim == 512,
+            queries.ndim == 4, keys.ndim == 4, values.ndim == 4,
+            queries.dim(0) == 8, keys.dim(0) == 8, values.dim(0) == 8,
+            queries.dim(2) == 1,
+            queries.dim(1) == kind.queryHeads, queries.dim(3) == kind.headDim,
+            keys.dim(1) == kind.kvHeads, values.dim(1) == kind.kvHeads,
+            keys.dim(3) == kind.headDim, values.dim(3) == kind.headDim,
+            keys.dim(2) > 1, keys.dim(2) == values.dim(2),
+            keys.dtype == .bfloat16, values.dtype == .bfloat16,
+            queries.dtype == .bfloat16,
+            !kind.isBidirectional, !kind.hasSinks,
+            let fullRows = rows as? [CBv2FullSequenceKV]
+        else { return nil }
+        var prepared: [(keys: MLXArray, values: MLXArray)] = []
+        prepared.reserveCapacity(fullRows.count)
+        for (index, row) in fullRows.enumerated() {
+            guard let slot = row.prepareFreshBatchedPrefillAppend(
+                keys: keys[index ..< (index + 1)],
+                values: values[index ..< (index + 1)])
+            else { return nil }
+            prepared.append(slot)
+        }
+        prefillBatchKVStore(
+            kind: kind, keys: keys, values: values, prepared: prepared, fence: fence)
+        let kvLength = keys.dim(2)
+        for row in fullRows {
+            row.confirmFreshBatchedPrefillAppend(kvLength)
+        }
+        var outputs: [MLXArray] = []
+        outputs.reserveCapacity(fullRows.count)
+        for index in fullRows.indices {
+            outputs.append(
+                attend(
+                    queries: queries[index ..< (index + 1)],
+                    keys: contiguous(keys[index ..< (index + 1)]),
+                    values: contiguous(values[index ..< (index + 1)]),
+                    scale: scale, L: 1, kL: kvLength, window: nil,
+                    sinks: sinks, softcap: softcap))
+        }
+        return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 0)
     }
 
     /// The only shape for which the custom batch-wide dispatch is a literal

@@ -124,6 +124,21 @@ enum CBv2AttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// PREFILL-FRESH-RING-ADOPT. On the exact ranked sliding-attention seed
+    /// geometry, the incoming packed K/V rectangle is already the physical
+    /// full ring every row would allocate and fill. Retain its row slices as
+    /// ring storage instead of allocating 16 zero buffers and copying the
+    /// same bytes through 16 `SliceUpdate` graphs per layer. The row class
+    /// owns the zero-offset/modular-layout proof and refuses every non-fresh
+    /// or partial-window input. `0`/`false`/`no`/`off` restores the ordinary
+    /// per-row allocate-and-write path.
+    static let freshWindowAdoptionEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PREFILL_FRESH_WINDOW_ADOPT"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// Join prompt attention blocks directly into the token-major layout that
     /// the following output projection consumes. The returned value remains a
     /// head-major view, so callers keep the same typed interface while their
@@ -470,40 +485,6 @@ enum CBv2AttentionV1 {
                 cachedValueRows.reserveCapacity(B)
                 let ringRows = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
                 if ringRows.count == B && ringRows.allSatisfy({ $0.decodeRingView != nil }) {
-                    // Q4-LIVE-WRITE: admit all rows before any host state
-                    // mutation. Pass A writes only the live q4 mirror slot;
-                    // the established BF16 SliceUpdates and counters remain
-                    // on their incumbent path below.
-                    if CBv2WindowedSequenceKV.q4FusedMirrorWriteEnabled,
-                        allowFusedRingWrite, let decodeRingWriteFence
-                    {
-                        let preWrite = ringRows.compactMap {
-                            $0.decodeRingQuantViewBeforeWrite
-                        }
-                        if preWrite.count == B,
-                            let fused = CBv2RaggedTwoPassDecodeAttentionV1
-                                .attendRingQuantWriting(
-                                    queries: queries,
-                                    mirrors: preWrite.map(\.mirror),
-                                    starts: preWrite.map(\.start),
-                                    newKeys: keys, newValues: values,
-                                    previousWriteFence: decodeRingWriteFence.value,
-                                    scale: scale,
-                                    slidingWindowLength: ringRows[0].window)
-                        {
-                            for (index, row) in ringRows.enumerated() {
-                                row.decodeRingWriteBF16Only(
-                                    keys: keys[index ..< (index + 1)],
-                                    values: values[index ..< (index + 1)])
-                            }
-                            // The next pass-A consumes this fence; this
-                            // step's pass-B output also consumes pass-A's
-                            // first three outputs, so the live store remains
-                            // rooted both in observable output and cache state.
-                            decodeRingWriteFence.value = fused.nextWriteFence
-                            return fused.output
-                        }
-                    }
                     // WRITE-016: fold this step's one-token ring write into
                     // ring pass A. The separate `decodeRingWrite` below is a
                     // `SliceUpdate` over a 4 MiB allocation the direct-ring
@@ -719,14 +700,70 @@ enum CBv2AttentionV1 {
         // it is what lets the uniform case below see all B views at once.
         var cachedKeys: [MLXArray] = []
         var cachedValues: [MLXArray] = []
+        var packedKeysForAttention = keys
+        var packedValuesForAttention = values
         cachedKeys.reserveCapacity(B)
         cachedValues.reserveCapacity(B)
-        for (index, row) in rows.enumerated() {
-            let (rowKeys, rowValues) = row.update(
-                keys: keys[index ..< (index + 1)],
-                values: values[index ..< (index + 1)])
-            cachedKeys.append(rowKeys)
-            cachedValues.append(rowValues)
+
+        // The ranked seed fills every sliding ring from absolute position
+        // zero with exactly one 1024-token packed rectangle. At that boundary
+        // temporal order and physical ring-slot order are identical. Check
+        // every row before mutating any of them, then retain the original
+        // row-contiguous slices as storage. The target's fused decode pass A
+        // subsequently writes these non-overlapping slices in place behind
+        // its existing fence.
+        let freshWindowRows = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
+        if freshWindowAdoptionEnabled,
+            B == 8, L == 1024,
+            kind.headDim == 256, kind.kvHeads == 8,
+            keys.dtype == .bfloat16, values.dtype == .bfloat16,
+            freshWindowRows.count == B
+        {
+            // Canonicalize each B-wide producer once. This is a zero-cost
+            // identity for the ranked fused-QKV output and a single safe copy
+            // for any transposed fallback. Reuse the same roots for prompt
+            // attention so no second materialization can be introduced.
+            let storageKeys = contiguous(keys)
+            let storageValues = contiguous(values)
+            let sharedStorageCharge = CBv2WindowedSharedStorageCharge(
+                totalBytes: storageKeys.nbytes + storageValues.nbytes,
+                rowCount: B)
+            var slices: [(keys: MLXArray, values: MLXArray)] = []
+            slices.reserveCapacity(B)
+            for index in 0 ..< B {
+                let rowKeys = storageKeys[index ..< (index + 1)]
+                let rowValues = storageValues[index ..< (index + 1)]
+                guard freshWindowRows[index].canAdoptFreshWindow(
+                    keys: rowKeys, values: rowValues)
+                else {
+                    slices.removeAll(keepingCapacity: true)
+                    break
+                }
+                slices.append((rowKeys, rowValues))
+            }
+            if slices.count == B {
+                for index in 0 ..< B {
+                    freshWindowRows[index].adoptFreshWindow(
+                        keys: slices[index].keys, values: slices[index].values,
+                        sharedStorageCharge: sharedStorageCharge,
+                        sharedStorageIndex: index)
+                    cachedKeys.append(slices[index].keys)
+                    cachedValues.append(slices[index].values)
+                }
+                packedKeysForAttention = storageKeys
+                packedValuesForAttention = storageValues
+                CBv2EngageMark.once("prefill-fresh-window-adopt")
+            }
+        }
+
+        if cachedKeys.isEmpty {
+            for (index, row) in rows.enumerated() {
+                let (rowKeys, rowValues) = row.update(
+                    keys: keys[index ..< (index + 1)],
+                    values: values[index ..< (index + 1)])
+                cachedKeys.append(rowKeys)
+                cachedValues.append(rowValues)
+            }
         }
 
         if let batched = batchedPackedAttention(
@@ -734,7 +771,7 @@ enum CBv2AttentionV1 {
             cachedKeys: cachedKeys, cachedValues: cachedValues,
             window: window(of: kind), scale: scale,
             sinks: effectiveSinks, softcap: softcap, spanContexts: spanContexts,
-            newKeys: keys, newValues: values)
+            newKeys: packedKeysForAttention, newValues: packedValuesForAttention)
         {
             return batched
         }

@@ -310,6 +310,15 @@ enum CBv2AttentionV1 {
     /// throughout and widens the sinks itself, so narrowing them first would
     /// be a real precision loss. Both callers carve that case out on
     /// `softcap != nil`, which is what selects the composed path.
+    /// `MLX_CBV2_BORROW_Q4=0` sends the batch-8 borrowed sliding decode back
+    /// to the rotated bf16 read. Default ON. `MLX_` prefix: the worker env
+    /// sanitizer only passes that namespace through.
+    static let borrowQuantEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_CBV2_BORROW_Q4"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     @inline(__always)
     static func sdpaSinks(_ sinks: MLXArray?, queryDType: DType) -> MLXArray? {
         // `asType` returns `self` when the dtypes already match, so the
@@ -1125,6 +1134,34 @@ enum CBv2AttentionV1 {
             batch: B, cacheKind: sourceKind, queryKind: kind,
             scale: scale, sinks: effectiveSinks, softcap: softcap)
         {
+            // BORROW-Q4: the sixteen KV-borrowing sliding layers are the last
+            // sliding decode reads still on the bf16 ring. The source layer
+            // already maintains the promoted q4g64 mirror of that same ring
+            // for its own attention, so a borrower can read the 144-byte
+            // packed rows the owning layer reads instead of rotating the ring
+            // into temporal order and streaming 1024-byte bf16 rows. The
+            // (mirror, start) pair is the one the storage-owning path passes:
+            // `decodeRingQuantView` and `decodeRingView.start`, both pure
+            // accessors over the same object, under the same guards.
+            if Self.borrowQuantEnabled {
+                let ringSourceRows = sourceRows.compactMap {
+                    $0 as? CBv2WindowedSequenceKV
+                }
+                if ringSourceRows.count == B {
+                    let mirrors = ringSourceRows.compactMap { $0.decodeRingQuantView }
+                    let starts = ringSourceRows.compactMap { $0.decodeRingView?.start }
+                    if mirrors.count == B, starts.count == B,
+                        let output = CBv2RaggedTwoPassDecodeAttentionV1
+                            .attendRingQuant(
+                                queries: queries, mirrors: mirrors, starts: starts,
+                                scale: scale,
+                                slidingWindowLength: ringSourceRows[0].window)
+                    {
+                        CBv2EngageMark.once("borrow-q4")
+                        return output
+                    }
+                }
+            }
             var cachedKeyRows: [MLXArray] = []
             var cachedValueRows: [MLXArray] = []
             cachedKeyRows.reserveCapacity(B)

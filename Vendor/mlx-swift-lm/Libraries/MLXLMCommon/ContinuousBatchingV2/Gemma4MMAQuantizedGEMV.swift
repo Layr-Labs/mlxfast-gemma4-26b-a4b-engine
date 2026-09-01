@@ -2239,35 +2239,36 @@ public enum Gemma4MMAQuantizedGEMV {
                     simdgroup_multiply_accumulate(accg1, A1, B, accg1);
             """,
             with: """
-                    simdgroup_matrix<T, 8, 8> A0;
-                    simdgroup_matrix<T, 8, 8> A1;
-                    simdgroup_matrix<T, 8, 8> A2;
-                    simdgroup_matrix<T, 8, 8> A3;
-                    simdgroup_matrix<T, 8, 8> B;
+                    simdgroup_matrix<float, 8, 8> A0;
+                    simdgroup_matrix<float, 8, 8> A1;
+                    simdgroup_matrix<float, 8, 8> A2;
+                    simdgroup_matrix<float, 8, 8> A3;
+                    simdgroup_matrix<float, 8, 8> B;
                     const uint packed0 = t < 4 ? packedLo0[t] : packedHi0[t - 4];
                     const uint packed1 = t < 4 ? packedLo1[t] : packedHi1[t - 4];
                     const uint packed2 = t < 4 ? packedLo2[t] : packedHi2[t - 4];
                     const uint packed3 = t < 4 ? packedLo3[t] : packedHi3[t - 4];
                     A0.thread_elements()[0] =
-                        T(float((packed0 >> (4 * fragmentCol)) & 0xFu));
+                        float((packed0 >> (4 * fragmentCol)) & 0xFu);
                     A0.thread_elements()[1] =
-                        T(float((packed0 >> (4 * (fragmentCol + 1))) & 0xFu));
+                        float((packed0 >> (4 * (fragmentCol + 1))) & 0xFu);
                     A1.thread_elements()[0] =
-                        T(float((packed1 >> (4 * fragmentCol)) & 0xFu));
+                        float((packed1 >> (4 * fragmentCol)) & 0xFu);
                     A1.thread_elements()[1] =
-                        T(float((packed1 >> (4 * (fragmentCol + 1))) & 0xFu));
+                        float((packed1 >> (4 * (fragmentCol + 1))) & 0xFu);
                     A2.thread_elements()[0] =
-                        T(float((packed2 >> (4 * fragmentCol)) & 0xFu));
+                        float((packed2 >> (4 * fragmentCol)) & 0xFu);
                     A2.thread_elements()[1] =
-                        T(float((packed2 >> (4 * (fragmentCol + 1))) & 0xFu));
+                        float((packed2 >> (4 * (fragmentCol + 1))) & 0xFu);
                     A3.thread_elements()[0] =
-                        T(float((packed3 >> (4 * fragmentCol)) & 0xFu));
+                        float((packed3 >> (4 * fragmentCol)) & 0xFu);
                     A3.thread_elements()[1] =
-                        T(float((packed3 >> (4 * (fragmentCol + 1))) & 0xFu));
+                        float((packed3 >> (4 * (fragmentCol + 1))) & 0xFu);
                     const uint activationK = g * GROUP + t * 8 + fragmentRow;
-                    B.thread_elements()[0] = x[fragmentCol * K + activationK];
+                    B.thread_elements()[0] =
+                        float(x[fragmentCol * K + activationK]);
                     B.thread_elements()[1] =
-                        x[(fragmentCol + 1) * K + activationK];
+                        float(x[(fragmentCol + 1) * K + activationK]);
                     simdgroup_multiply_accumulate(accg0, A0, B, accg0);
                     simdgroup_multiply_accumulate(accg1, A1, B, accg1);
                     simdgroup_multiply_accumulate(accg2, A2, B, accg2);
@@ -2565,7 +2566,7 @@ public enum Gemma4MMAQuantizedGEMV {
     }()
 
     private static let kernelV27: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks",
+        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_fpmma_v1",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["out"],
         source: sourceV27,

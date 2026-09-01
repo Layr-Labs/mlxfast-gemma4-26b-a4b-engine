@@ -387,25 +387,28 @@ private func geGLUProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
 /// and directly emits the three routing products consumed downstream.
 private let routeSimdRank64Kernel: MLXFast.MLXFastKernel =
     MLXFast.metalKernel(
-        name: "mlx_lm_route_simd_rank_scatter_m8_u32_n64_unroll_v2",
+        name: "mlx_lm_route_simd_rank_scatter_m8_u32_n64_pair_v3",
         inputNames: ["indices"],
         outputNames: ["row_order", "sorted_keys", "inverse_order"],
         source: """
             const uint assignment = thread_position_in_grid.x;
             const uint lane = thread_index_in_simdgroup;
             const uint key = (uint)indices[assignment];
-            const uint key_low = (uint)indices[lane];
-            const uint key_high = (uint)indices[32u + lane];
+            // Keep the two halves of the 64-entry route table together in one
+            // SIMD value.  A vector broadcast carries both keys through the
+            // same source-lane walk while retaining the two exact tie tests.
+            const uint2 key_pair = uint2(
+                (uint)indices[lane], (uint)indices[32u + lane]);
             uint rank = 0;
             #pragma clang loop unroll(full)
             for (uint source = 0; source < 32; ++source) {
-                const uint other_low = simd_broadcast(key_low, ushort(source));
-                rank += (other_low < key)
-                    || (other_low == key && source < assignment);
-                const uint other_high = simd_broadcast(key_high, ushort(source));
+                const uint2 other_pair =
+                    simd_broadcast(key_pair, ushort(source));
+                rank += (other_pair.x < key)
+                    || (other_pair.x == key && source < assignment);
                 const uint high_assignment = 32u + source;
-                rank += (other_high < key)
-                    || (other_high == key && high_assignment < assignment);
+                rank += (other_pair.y < key)
+                    || (other_pair.y == key && high_assignment < assignment);
             }
             row_order[rank] = assignment >> 3;
             sorted_keys[rank] = key;

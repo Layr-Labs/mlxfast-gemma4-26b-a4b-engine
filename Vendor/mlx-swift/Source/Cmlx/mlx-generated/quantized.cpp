@@ -2350,6 +2350,11 @@ METAL_FUNC void gemma4_qmv_mma8_affine4_g64_impl(
   float acc1 = 0.0f;
   simdgroup_float8x8 A;
   simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+  uint2 wv_next = (g_begin < g_end)
+      ? *((const device uint2*)(wrow + 32 * g_begin))
+      : uint2(0);
+  T s_next = (g_begin < g_end) ? srow[g_begin] : T(0);
+  T b_next = (g_begin < g_end) ? brow[g_begin] : T(0);
 
   for (int g = g_begin; g < g_end; ++g) {
     const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
@@ -2372,9 +2377,13 @@ METAL_FUNC void gemma4_qmv_mma8_affine4_g64_impl(
     MMA8_SETB(B6, w, lo)
     MMA8_SETB(B7, w, hi)
 
-    const uint2 wv = *((const device uint2*)(wrow + 32 * g));
-    const float s = float(srow[g]);
-    const float b = float(brow[g]);
+    const uint2 wv = wv_next;
+    const float s = float(s_next);
+    const float b = float(b_next);
+    const int g_next = min(g + 1, g_end - 1);
+    wv_next = *((const device uint2*)(wrow + 32 * g_next));
+    s_next = srow[g_next];
+    b_next = brow[g_next];
 
     simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
     MMA8_STEP(B0, 0)

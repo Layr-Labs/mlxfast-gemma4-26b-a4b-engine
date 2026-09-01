@@ -134,6 +134,28 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// and the following update).
     private var borrowableChunkViews: (keys: MLXArray, values: MLXArray)?
 
+    /// ELIDE-024: one-token bf16 ring writes the fused q4 decode road has
+    /// deferred, oldest first, all consecutive from `pendingBF16FirstPosition`.
+    ///
+    /// On the fused q4 road the mirror is the only plane pass A reads, so the
+    /// bf16 slot store is dead until something asks for a bf16 view. Holding
+    /// the tokens instead of storing them keeps the ring's observable content
+    /// identical: every accessor that can hand out bf16 bytes flushes first,
+    /// and a flush writes the same bytes into the same slots in the same
+    /// order, so a reader can never tell a deferred write from an immediate
+    /// one. What it can tell is the cost: `window` deferred steps collapse into
+    /// one whole-ring store instead of `window` of them.
+    private var pendingBF16: [(keys: MLXArray, values: MLXArray)] = []
+    private var pendingBF16FirstPosition = 0
+
+    /// ELIDE-024 kill switch. `=0` keeps the incumbent per-step store.
+    static let bf16RingElideEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_BF16_RING_ELIDE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// Transaction opened by `beginSpeculativeWrite()` and closed by commit.
     /// Every intervening update stages instead of writing the ring.
     private var speculativeWriteArmed = false
@@ -172,6 +194,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     }
 
     public func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
+        flushPendingBF16()
         let n = newKeys.dim(2)
         precondition(newKeys.dim(0) == 1 && newValues.dim(0) == 1,
             "CBv2WindowedSequenceKV holds ONE sequence; got batch \(newKeys.dim(0))")
@@ -230,6 +253,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     }
 
     func decodeRingWrite(keys newKeys: MLXArray, values newValues: MLXArray) {
+        flushPendingBF16()
         precondition(staged == nil && newKeys.dim(2) == 1 && newValues.dim(2) == 1)
         allocateIfNeeded(keyTemplate: newKeys, valueTemplate: newValues)
         writeDecodeToken(keys: newKeys, values: newValues)
@@ -238,6 +262,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// Preserve the incumbent BF16 SliceUpdates and counter transition while
     /// the fused q4 attention pass owns only the live mirror-slot write.
     func decodeRingWriteBF16Only(keys newKeys: MLXArray, values newValues: MLXArray) {
+        flushPendingBF16()
         precondition(
             staged == nil && newKeys.dim(2) == 1 && newValues.dim(2) == 1
                 && keys != nil && values != nil && retainedCount == window)
@@ -249,8 +274,84 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     }
 
     var decodeRingView: (keys: MLXArray, values: MLXArray, start: Int)? {
+        flushPendingBF16()
         guard staged == nil, let keys, let values, retainedCount == window else { return nil }
         return (keys, values, oldestValidPosition % window)
+    }
+
+    /// WRITE-023: the live bf16 ring allocations and the physical slot this
+    /// step's token belongs in, offered BEFORE the write happens. The slot is
+    /// `absoluteOffset % window` — exactly where `decodeRingWriteBF16Only`'s
+    /// `writeRing` would land a one-token update.
+    var decodeRingStoreTarget: (keys: MLXArray, values: MLXArray, slot: Int)? {
+        flushPendingBF16()
+        guard staged == nil, let keys, let values, retainedCount == window
+        else { return nil }
+        return (keys, values, absoluteOffset % window)
+    }
+
+    /// ELIDE-024: take this step's token onto the deferred list and advance
+    /// exactly the counters `decodeRingWriteBF16Only` would, building no
+    /// `SliceUpdate` and issuing no store dispatch at all.
+    ///
+    /// The caller has already had the fused pass A write the q4 mirror slot,
+    /// which is the plane every kernel on this road reads. Nothing else can
+    /// observe the bf16 ring without going through an accessor that flushes.
+    func deferDecodeRingBF16Store(keys newKeys: MLXArray, values newValues: MLXArray) {
+        precondition(
+            staged == nil && newKeys.dim(2) == 1 && newValues.dim(2) == 1
+                && keys != nil && values != nil && retainedCount == window,
+            "CBv2WindowedSequenceKV: bf16 defer outside a full-ring decode step")
+        if pendingBF16.isEmpty {
+            pendingBF16FirstPosition = absoluteOffset
+        }
+        pendingBF16.append((newKeys, newValues))
+        borrowableChunkViews = nil
+        absoluteOffset += 1
+        oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
+        // A full ring's worth of deferrals leaves no live slot unwritten, so
+        // this bounds the held tokens at one window and amortizes the store to
+        // one whole-ring write per `window` decode steps.
+        if pendingBF16.count >= window {
+            flushPendingBF16()
+        }
+    }
+
+    /// ELIDE-024: store every deferred token, oldest first, into the slots it
+    /// would have gone into. The positions are consecutive from
+    /// `pendingBF16FirstPosition` because every other mutation and every bf16
+    /// accessor flushes before it runs, so one `writeRing` per plane covers
+    /// them and reuses the same wrap handling a prefill chunk uses.
+    ///
+    /// `mirrorPlane` stays nil: the fused pass A already wrote each of these
+    /// slots' q4 mirror bytes at the step that deferred them.
+    private func flushPendingBF16() {
+        guard !pendingBF16.isEmpty, let keys, let values else {
+            pendingBF16.removeAll(keepingCapacity: true)
+            return
+        }
+        let batchedKeys = pendingBF16.count == 1
+            ? pendingBF16[0].keys
+            : concatenated(pendingBF16.map(\.keys), axis: 2)
+        let batchedValues = pendingBF16.count == 1
+            ? pendingBF16[0].values
+            : concatenated(pendingBF16.map(\.values), axis: 2)
+        pendingBF16.removeAll(keepingCapacity: true)
+        writeRing(keys, tokens: batchedKeys, firstPosition: pendingBF16FirstPosition)
+        writeRing(values, tokens: batchedValues, firstPosition: pendingBF16FirstPosition)
+    }
+
+    /// Bookkeeping half of WRITE-023. The store dispatch already deposited
+    /// this step's token into the ring allocation, so advance exactly the
+    /// counters `decodeRingWriteBF16Only` would and build no `SliceUpdate`.
+    func advanceDecodeRingAfterBF16Store() {
+        flushPendingBF16()
+        precondition(
+            staged == nil && keys != nil && values != nil && retainedCount == window,
+            "CBv2WindowedSequenceKV: bf16 store advance outside a full-ring decode step")
+        borrowableChunkViews = nil
+        absoluteOffset += 1
+        oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
     }
 
     /// KVQ-001: the packed 8-bit mirror for the same full-ring decode step
@@ -282,6 +383,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// lands in is `absoluteOffset % window`, i.e. `(start + window - 1) %
     /// window` — the slot the returned start has just stepped past.
     var decodeRingViewBeforeWrite: (keys: MLXArray, values: MLXArray, start: Int)? {
+        flushPendingBF16()
         guard staged == nil, let keys, let values, retainedCount == window else { return nil }
         return (keys, values, (oldestValidPosition + 1) % window)
     }
@@ -292,6 +394,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// `SliceUpdate`. Precondition mirrors `decodeRingViewBeforeWrite`, which
     /// the caller must have consulted for the very same step.
     func advanceDecodeRingAfterFusedWrite() {
+        flushPendingBF16()
         precondition(
             staged == nil && keys != nil && retainedCount == window,
             "CBv2WindowedSequenceKV: fused ring advance outside a full-ring decode step")
@@ -314,6 +417,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     public var supportsSpeculativeWrites: Bool { true }
 
     public func beginSpeculativeWrite() {
+        flushPendingBF16()
         precondition(
             !speculativeWriteArmed,
             "CBv2WindowedSequenceKV: beginSpeculativeWrite while already armed")
@@ -410,6 +514,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// identical to `snapshot()`. Step-scoped: valid between the source
     /// layer's `update()` and the next mutation; never retain across steps.
     public func borrowableViews() -> (keys: MLXArray, values: MLXArray) {
+        flushPendingBF16()
         if let views = borrowableChunkViews { return views }
         let snap = snapshot()
         return (snap.keys, snap.values)
@@ -419,6 +524,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// serial MTP transaction the ring deliberately has not been written, so
     /// the source layer's current logical post-update view is authoritative.
     func decodeBorrowableViews() -> (keys: MLXArray, values: MLXArray) {
+        flushPendingBF16()
         if staged != nil {
             precondition(
                 borrowableChunkViews != nil,
@@ -434,6 +540,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     }
 
     public func snapshot() -> (keys: MLXArray, values: MLXArray, offset: Int) {
+        flushPendingBF16()
         if let staged {
             return stagedSnapshot(staged)
         }
@@ -491,6 +598,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// during prefix-cache adoption so the engine's trailing-window replay
     /// lands at true absolute positions.
     public func fastForward(to offset: Int) {
+        flushPendingBF16()
         precondition(
             keys == nil && absoluteOffset == oldestValidPosition,
             "CBv2WindowedSequenceKV.fastForward requires a fresh state")
@@ -506,6 +614,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     }
 
     public func rollback(_ n: Int) {
+        flushPendingBF16()
         precondition(n >= 0, "CBv2WindowedSequenceKV.rollback: negative n")
         if let staged {
             // Pure counter move: the staged tokens were never written to
@@ -535,7 +644,8 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     }
 
     func cbv2InnerState() -> [MLXArray] {
-        [keys, values, quantMirror].compactMap { $0 }
+        flushPendingBF16()
+        return [keys, values, quantMirror].compactMap { $0 }
     }
 
     // MARK: - Ring geometry

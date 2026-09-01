@@ -112,7 +112,7 @@ public func resetWeightedExpertUnsortStats() {
 /// permutation and writes `[tokens, hidden]` directly, avoiding that full
 /// `[tokens, topK, hidden]` intermediate.
 private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "weighted_expert_unsort_vec8_v3",
+    name: "weighted_expert_unsort_vec8_staged_v4",
     inputNames: ["sorted_outputs", "inverse_order", "weights"],
     outputNames: ["output"],
     source: """
@@ -125,15 +125,33 @@ private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
         uint token = thread_position_in_grid.y;
         const uint hidden = threads_per_grid.x * 8u;
 
-        T8 accumulator = T8((T)0);
+        // The K sorted rows and K weights of a token are the same values for
+        // every lane that owns a slice of that token, and each lane read all
+        // of them. The threadgroup covers TOKENS_PER_GROUP tokens, so lanes
+        // 0 to K-1 of each token row stage them once and one barrier
+        // publishes them. Each staged value is the value the device read
+        // returned under the same cast, so every product, the ascending slot
+        // order and the accumulator each lands in are unchanged.
+        constexpr uint TOKENS_PER_GROUP = 4u;
+        threadgroup uint staged_rows[TOKENS_PER_GROUP][8];
+        threadgroup float staged_weights[TOKENS_PER_GROUP][8];
+        const uint tx = thread_position_in_threadgroup.x;
+        const uint ty = thread_position_in_threadgroup.y;
         const uint assignment_base = token * (uint)K;
+        if (tx < (uint)K) {
+            staged_rows[ty][tx] = (uint)inverse_order[assignment_base + tx];
+            staged_weights[ty][tx] = (float)weights[assignment_base + tx];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        T8 accumulator = T8((T)0);
+        #pragma clang loop unroll(full)
         for (uint slot = 0; slot < (uint)K; ++slot) {
-            const uint assignment = assignment_base + slot;
-            const uint sorted_row = (uint)inverse_order[assignment];
+            const uint sorted_row = staged_rows[ty][slot];
             const device T8* row = reinterpret_cast<const device T8*>(
                 sorted_outputs + sorted_row * hidden);
             const T8 source = row[oct];
-            const float weight = (float)weights[assignment];
+            const float weight = staged_weights[ty][slot];
             // Preserve the legacy bfloat16 multiply-then-reduce rounding.
             #pragma clang loop unroll(full)
             for (int j = 0; j < 8; ++j) {

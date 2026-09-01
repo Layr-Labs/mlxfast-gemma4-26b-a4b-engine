@@ -1067,9 +1067,9 @@ public enum Gemma4MMAQuantizedGEMV {
                     simdgroup_matrix<T, 8, 8> B;
                     const uint packed = fragmentWRow[g * (GROUP / 8) + t];
                     A.thread_elements()[0] =
-                        T(float((packed >> (4 * fragmentCol)) & 0xFu));
+                        T(float(extract_bits(packed, 4 * fragmentCol, 4)));
                     A.thread_elements()[1] =
-                        T(float((packed >> (4 * (fragmentCol + 1))) & 0xFu));
+                        T(float(extract_bits(packed, 4 * (fragmentCol + 1), 4)));
                     simdgroup_load(B, Xs + t * 8 * X_STRIDE, X_STRIDE);
                     simdgroup_multiply_accumulate(accg, A, B, accg);
                 }
@@ -1944,9 +1944,9 @@ public enum Gemma4MMAQuantizedGEMV {
                     simdgroup_matrix<T, 8, 8> B;
                     const uint packed = t < 4 ? packedLo[t] : packedHi[t - 4];
                     A.thread_elements()[0] =
-                        T(float((packed >> (4 * fragmentCol)) & 0xFu));
+                        T(float(extract_bits(packed, 4 * fragmentCol, 4)));
                     A.thread_elements()[1] =
-                        T(float((packed >> (4 * (fragmentCol + 1))) & 0xFu));
+                        T(float(extract_bits(packed, 4 * (fragmentCol + 1), 4)));
                     const uint activationK = g * GROUP + t * 8 + fragmentRow;
                     B.thread_elements()[0] = x[fragmentCol * K + activationK];
                     B.thread_elements()[1] =
@@ -1960,13 +1960,13 @@ public enum Gemma4MMAQuantizedGEMV {
                     const uint packed0 = t < 4 ? packedLo0[t] : packedHi0[t - 4];
                     const uint packed1 = t < 4 ? packedLo1[t] : packedHi1[t - 4];
                     A0.thread_elements()[0] =
-                        T(float((packed0 >> (4 * fragmentCol)) & 0xFu));
+                        T(float(extract_bits(packed0, 4 * fragmentCol, 4)));
                     A0.thread_elements()[1] =
-                        T(float((packed0 >> (4 * (fragmentCol + 1))) & 0xFu));
+                        T(float(extract_bits(packed0, 4 * (fragmentCol + 1), 4)));
                     A1.thread_elements()[0] =
-                        T(float((packed1 >> (4 * fragmentCol)) & 0xFu));
+                        T(float(extract_bits(packed1, 4 * fragmentCol, 4)));
                     A1.thread_elements()[1] =
-                        T(float((packed1 >> (4 * (fragmentCol + 1))) & 0xFu));
+                        T(float(extract_bits(packed1, 4 * (fragmentCol + 1), 4)));
                     const uint activationK = g * GROUP + t * 8 + fragmentRow;
                     B.thread_elements()[0] = x[fragmentCol * K + activationK];
                     B.thread_elements()[1] =
@@ -2224,13 +2224,13 @@ public enum Gemma4MMAQuantizedGEMV {
                     const uint packed0 = t < 4 ? packedLo0[t] : packedHi0[t - 4];
                     const uint packed1 = t < 4 ? packedLo1[t] : packedHi1[t - 4];
                     A0.thread_elements()[0] =
-                        T(float((packed0 >> (4 * fragmentCol)) & 0xFu));
+                        T(float(extract_bits(packed0, 4 * fragmentCol, 4)));
                     A0.thread_elements()[1] =
-                        T(float((packed0 >> (4 * (fragmentCol + 1))) & 0xFu));
+                        T(float(extract_bits(packed0, 4 * (fragmentCol + 1), 4)));
                     A1.thread_elements()[0] =
-                        T(float((packed1 >> (4 * fragmentCol)) & 0xFu));
+                        T(float(extract_bits(packed1, 4 * fragmentCol, 4)));
                     A1.thread_elements()[1] =
-                        T(float((packed1 >> (4 * (fragmentCol + 1))) & 0xFu));
+                        T(float(extract_bits(packed1, 4 * (fragmentCol + 1), 4)));
                     const uint activationK = g * GROUP + t * 8 + fragmentRow;
                     B.thread_elements()[0] = x[fragmentCol * K + activationK];
                     B.thread_elements()[1] =
@@ -2249,21 +2249,21 @@ public enum Gemma4MMAQuantizedGEMV {
                     const uint packed2 = t < 4 ? packedLo2[t] : packedHi2[t - 4];
                     const uint packed3 = t < 4 ? packedLo3[t] : packedHi3[t - 4];
                     A0.thread_elements()[0] =
-                        T(float((packed0 >> (4 * fragmentCol)) & 0xFu));
+                        T(float(extract_bits(packed0, 4 * fragmentCol, 4)));
                     A0.thread_elements()[1] =
-                        T(float((packed0 >> (4 * (fragmentCol + 1))) & 0xFu));
+                        T(float(extract_bits(packed0, 4 * (fragmentCol + 1), 4)));
                     A1.thread_elements()[0] =
-                        T(float((packed1 >> (4 * fragmentCol)) & 0xFu));
+                        T(float(extract_bits(packed1, 4 * fragmentCol, 4)));
                     A1.thread_elements()[1] =
-                        T(float((packed1 >> (4 * (fragmentCol + 1))) & 0xFu));
+                        T(float(extract_bits(packed1, 4 * (fragmentCol + 1), 4)));
                     A2.thread_elements()[0] =
-                        T(float((packed2 >> (4 * fragmentCol)) & 0xFu));
+                        T(float(extract_bits(packed2, 4 * fragmentCol, 4)));
                     A2.thread_elements()[1] =
-                        T(float((packed2 >> (4 * (fragmentCol + 1))) & 0xFu));
+                        T(float(extract_bits(packed2, 4 * (fragmentCol + 1), 4)));
                     A3.thread_elements()[0] =
-                        T(float((packed3 >> (4 * fragmentCol)) & 0xFu));
+                        T(float(extract_bits(packed3, 4 * fragmentCol, 4)));
                     A3.thread_elements()[1] =
-                        T(float((packed3 >> (4 * (fragmentCol + 1))) & 0xFu));
+                        T(float(extract_bits(packed3, 4 * (fragmentCol + 1), 4)));
                     const uint activationK = g * GROUP + t * 8 + fragmentRow;
                     B.thread_elements()[0] = x[fragmentCol * K + activationK];
                     B.thread_elements()[1] =
@@ -2565,7 +2565,7 @@ public enum Gemma4MMAQuantizedGEMV {
     }()
 
     private static let kernelV27: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks",
+        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_ebits",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["out"],
         source: sourceV27,

@@ -1026,7 +1026,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// next decode dispatch after this write completes.
     private static let portQuantFusedWriteKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_2pass_a_q4g64_d256_g2_regpack_vec4_carry_pair_b\(blocks)_v5",
+            name: "cbv2_ragged8_sdpa_ringwrite_2pass_a_q4g64_d256_g2_regpack_vec4_carry_pair_b\(blocks)_fold_v6",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -1236,8 +1236,18 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         score_lo += q_lo[element] * key_element;
                         score_hi += q_hi[element] * key_element;
                     }
-                    score_lo = simd_sum(score_lo);
-                    score_hi = simd_sum(score_hi);
+                    // GQA-FOLD: the pair folds in ONE butterfly over a float2
+                    // instead of two scalar reductions. The same lane is
+                    // paired at every step for both components, so each one
+                    // sees the scalar reduction's add sequence while the
+                    // simdgroup issues five shuffles per token instead of ten.
+                    float2 score2 = float2(score_lo, score_hi);
+                    #pragma unroll
+                    for (ushort mask = 1; mask < 32; mask <<= 1) {
+                        score2 += simd_shuffle_xor(score2, mask);
+                    }
+                    score_lo = score2.x;
+                    score_hi = score2.y;
 
                     const float new_max_lo = max(max_lo, score_lo);
                     const float new_max_hi = max(max_hi, score_hi);

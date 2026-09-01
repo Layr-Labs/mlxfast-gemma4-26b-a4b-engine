@@ -480,21 +480,28 @@ enum CBv2AttentionV1 {
                         let preWrite = ringRows.compactMap {
                             $0.decodeRingQuantViewBeforeWrite
                         }
-                        if preWrite.count == B,
+                        // The BF16 ring allocations for the same step. Both
+                        // views report the same post-write start, so the two
+                        // stores target the same evicted slot.
+                        let bf16PreWrite = ringRows.compactMap {
+                            $0.decodeRingViewBeforeWrite
+                        }
+                        if preWrite.count == B, bf16PreWrite.count == B,
+                            zip(preWrite, bf16PreWrite).allSatisfy({ $0.start == $1.start }),
                             let fused = CBv2RaggedTwoPassDecodeAttentionV1
                                 .attendRingQuantWriting(
                                     queries: queries,
                                     mirrors: preWrite.map(\.mirror),
+                                    keys: bf16PreWrite.map(\.keys),
+                                    values: bf16PreWrite.map(\.values),
                                     starts: preWrite.map(\.start),
                                     newKeys: keys, newValues: values,
                                     previousWriteFence: decodeRingWriteFence.value,
                                     scale: scale,
                                     slidingWindowLength: ringRows[0].window)
                         {
-                            for (index, row) in ringRows.enumerated() {
-                                row.decodeRingWriteBF16Only(
-                                    keys: keys[index ..< (index + 1)],
-                                    values: values[index ..< (index + 1)])
+                            for row in ringRows {
+                                row.advanceDecodeRingAfterFusedWrite()
                             }
                             // The next pass-A consumes this fence; this
                             // step's pass-B output also consumes pass-A's

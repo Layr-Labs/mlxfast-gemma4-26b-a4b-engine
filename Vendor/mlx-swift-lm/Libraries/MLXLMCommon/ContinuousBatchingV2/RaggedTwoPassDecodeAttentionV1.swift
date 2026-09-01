@@ -1026,11 +1026,13 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// next decode dispatch after this write completes.
     private static let portQuantFusedWriteKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_2pass_a_q4g64_d256_g2_b\(blocks)_v1",
+            name: "cbv2_ragged8_sdpa_ringwrite_2pass_a_q4g64_d256_g2_bf16w_b\(blocks)_v2",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
-                "starts", "new_keys", "new_values", "write_fence",
+                "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+                "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+                "starts_fence", "new_kv",
             ],
             outputNames: ["partials", "sums", "maxs", "fence"],
             source: """
@@ -1063,14 +1065,47 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     mirror_w + kv_head * N * row_words;
                 const device uint32_t* mvalues_w =
                     mirror_w + (KV_HEADS + kv_head) * N * row_words;
-                const device T* new_key = new_keys
+                // `new_kv` is this step's K rows followed by its V rows;
+                // `starts_fence` is the eight ring starts followed by the
+                // incoming write fence.
+                const device T* new_key = new_kv
                     + (batch_index * KV_HEADS + kv_head) * D
                     + lane * values_per_lane;
-                const device T* new_value = new_values
-                    + (batch_index * KV_HEADS + kv_head) * D
+                const device T* new_value = new_kv
+                    + ((8 + batch_index) * KV_HEADS + kv_head) * D
                     + lane * values_per_lane;
-                const uint start = starts[batch_index];
+                const uint start = uint(starts_fence[batch_index]);
                 const uint write_slot = (start + uint(N - 1)) % uint(N);
+
+                // The same evicted slot the mirror store targets, in the BF16
+                // ring allocations. One threadgroup per (row, kv head) stores
+                // it; every other block reads the pre-write history and serves
+                // logical token N-1 from `new_key`/`new_value`, so no block
+                // reads the slot this writes.
+                const device T* row_keys = k0;
+                const device T* row_values = v0;
+                switch (batch_index) {
+                    case 1: row_keys = k1; row_values = v1; break;
+                    case 2: row_keys = k2; row_values = v2; break;
+                    case 3: row_keys = k3; row_values = v3; break;
+                    case 4: row_keys = k4; row_values = v4; break;
+                    case 5: row_keys = k5; row_values = v5; break;
+                    case 6: row_keys = k6; row_values = v6; break;
+                    case 7: row_keys = k7; row_values = v7; break;
+                    default: break;
+                }
+                row_keys += kv_head * N * D + lane * values_per_lane;
+                row_values += kv_head * N * D + lane * values_per_lane;
+                if (block == 0 && query_head_in_group == 0) {
+                    device T* write_key =
+                        const_cast<device T*>(row_keys) + write_slot * D;
+                    device T* write_value =
+                        const_cast<device T*>(row_values) + write_slot * D;
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        write_key[element] = new_key[element];
+                        write_value[element] = new_value[element];
+                    }
+                }
 
                 half khs = half(0.0f);
                 half khb = half(0.0f);
@@ -1133,7 +1168,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 }
                 if (batch_index == 0 && kv_head == 0
                     && block == current_block && query_head_in_group == 0 && lane == 0) {
-                    fence[0] = write_fence[0] + 1;
+                    fence[0] = starts_fence[8] + 1;
                 }
 
                 const device T* query =
@@ -1306,6 +1341,8 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     static func attendRingQuantWriting(
         queries: MLXArray,
         mirrors: [MLXArray],
+        keys: [MLXArray],
+        values: [MLXArray],
         starts: [Int],
         newKeys: MLXArray,
         newValues: MLXArray,
@@ -1334,14 +1371,30 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             mirrors.allSatisfy({
                 $0.dtype == .uint32
                     && $0.shape == [2, kvHeads, sequenceLength, headDim / 8 + headDim / 64]
+            }),
+            keys.count == batch, values.count == batch,
+            keys.allSatisfy({
+                $0.dtype == .bfloat16
+                    && $0.shape == [1, kvHeads, sequenceLength, headDim]
+            }),
+            values.allSatisfy({
+                $0.dtype == .bfloat16
+                    && $0.shape == [1, kvHeads, sequenceLength, headDim]
             })
         else { return nil }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        // Two packed inputs keep the dispatch inside Metal's 31-buffer
+        // limit. Concatenating the incoming fence into `startsFence` keeps the
+        // fence an input edge of this kernel, which is the ordering the mirror
+        // read depends on.
+        let startsFence = concatenated(
+            [MLXArray(starts.map(Int32.init), [batch]), previousWriteFence],
+            axis: 0)
+        let newKV = concatenated([newKeys, newValues], axis: 0)
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let passA = portQuantFusedWriteKernel(
-            [queries] + mirrors + [startArray, newKeys, newValues, previousWriteFence],
+            [queries] + mirrors + keys + values + [startsFence, newKV],
             template: [
                 ("T", queries.dtype),
                 ("D", headDim),

@@ -128,7 +128,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_impl(
   float acc0 = 0.0f;
   float acc1 = 0.0f;
   simdgroup_float8x8 A;
-  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+  simdgroup_float8x8 B;
 
   uint2 wv_next = *((const device uint2*)(wrow + 32 * g0));
   uint2 wv_next2 =
@@ -157,28 +157,23 @@ METAL_FUNC void qkv_mma8_affine4_g64_impl(
     rs += simd_shuffle_xor(rs, 4u);
     rs += simd_shuffle_xor(rs, 16u);
 
-    // Each operand is filled immediately before the step that reads it, so
-    // one is live at a time instead of eight. `r0`/`r1` are not written
-    // across the run, so every fill yields the value it yielded before and
-    // the eight steps keep their order into `C`. The multitile body keeps
-    // its hoisted fills: there one fill set serves both tiles.
     simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
-    MMA8_SETB(B0, x, lo)
-    MMA8_STEP(B0, 0)
-    MMA8_SETB(B1, x, hi)
-    MMA8_STEP(B1, 1)
-    MMA8_SETB(B2, y, lo)
-    MMA8_STEP(B2, 2)
-    MMA8_SETB(B3, y, hi)
-    MMA8_STEP(B3, 3)
-    MMA8_SETB(B4, z, lo)
-    MMA8_STEP(B4, 4)
-    MMA8_SETB(B5, z, hi)
-    MMA8_STEP(B5, 5)
-    MMA8_SETB(B6, w, lo)
-    MMA8_STEP(B6, 6)
-    MMA8_SETB(B7, w, hi)
-    MMA8_STEP(B7, 7)
+    MMA8_SETB(B, x, lo)
+    MMA8_STEP(B, 0)
+    MMA8_SETB(B, x, hi)
+    MMA8_STEP(B, 1)
+    MMA8_SETB(B, y, lo)
+    MMA8_STEP(B, 2)
+    MMA8_SETB(B, y, hi)
+    MMA8_STEP(B, 3)
+    MMA8_SETB(B, z, lo)
+    MMA8_STEP(B, 4)
+    MMA8_SETB(B, z, hi)
+    MMA8_STEP(B, 5)
+    MMA8_SETB(B, w, lo)
+    MMA8_STEP(B, 6)
+    MMA8_SETB(B, w, hi)
+    MMA8_STEP(B, 7)
 
     acc0 += s * C.thread_elements()[0] + rs.x * b;
     acc1 += s * C.thread_elements()[1] + rs.y * b;
@@ -264,13 +259,6 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
   simdgroup_float8x8 A;
   simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
 
-  // The per-group weight operands are carried in registers: group g0's
-  // packed word, scale and bias are read before the walk, and each trip
-  // reads the next group's while the current group's stay resident. The
-  // addresses are functions of the group index alone, so the value each
-  // trip consumes is the value the in-place read produced. The clamp on
-  // `g_next` keeps the last trip inside the simdgroup's group range; the
-  // value it re-reads is discarded at loop exit.
   uint2 wv_next[TILES];
   uint2 wv_next2[TILES];
   T s_next[TILES];
@@ -407,7 +395,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
         ensureRowContiguous: true)
 
     private static let mma8Kernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_carry2_bfill_v4",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_carry2_bfill_v5",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """

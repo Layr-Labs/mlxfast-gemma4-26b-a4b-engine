@@ -796,15 +796,16 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     private static let passBKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name:
             "cbv2_ragged8_sdpa_2pass_b_direct_bf16_d256_b\(blocks)"
-            + "_c\(combineColumns)_vec4_v6",
+            + "_c\(combineColumns)_vec8_v7",
         inputNames: ["partials", "sums", "maxs"],
         outputNames: ["out"],
         source: """
             typedef vec<T, 4> T4;
+            typedef vec<T, 8> T8;
             constexpr int simd_width = 32;
             constexpr int values_per_lane = D / simd_width;
             constexpr int vectors_per_lane = values_per_lane / 4;
-            static_assert(values_per_lane % 4 == 0, "lane run is four-wide");
+            static_assert(values_per_lane == 8, "one sixteen-byte word per lane run");
             // COMBINE-PACK-001: a lane owns one partition column of one output
             // group, and a simdgroup carries `sets` output groups side by
             // side. COLS is min(BLOCKS, simd_width) rounded to a power of two,
@@ -876,17 +877,17 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 const int column = block_lane + COLS * round;
                 if (column < BLOCKS) {
                     const float factor = lane_factor[round];
-                    const device T4* partial_vectors =
-                        reinterpret_cast<const device T4*>(
-                            partials + column * D);
+                    // A lane's whole run of the column is one sixteen-byte
+                    // word at this element type, so it is read as a single
+                    // eight-wide vector. Each component is widened where it
+                    // is multiplied, so every product and every accumulator
+                    // update is the one the four-wide read performed.
+                    const T8 partial_run = *reinterpret_cast<
+                        const device T8*>(partials + column * D);
                     #pragma clang loop unroll(full)
-                    for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
-                        const T4 partial_vector = partial_vectors[chunk];
-                        #pragma clang loop unroll(full)
-                        for (int j = 0; j < 4; ++j) {
-                            accumulator[chunk * 4 + j] +=
-                                factor * float(partial_vector[j]);
-                        }
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        accumulator[element] +=
+                            factor * float(partial_run[element]);
                     }
                 }
             }

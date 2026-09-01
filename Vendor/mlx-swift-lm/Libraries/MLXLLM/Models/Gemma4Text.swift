@@ -2489,6 +2489,7 @@ private enum Gemma4RouteGlueFoldV1 {
                 const uint key_low = sel[lane];
                 const uint key_high = sel[32u + lane];
                 uint rank = 0;
+                #pragma clang loop unroll(full)
                 for (uint source = 0; source < 32; ++source) {
                     const uint other_low = simd_broadcast(key_low, ushort(source));
                     rank += (other_low < key)

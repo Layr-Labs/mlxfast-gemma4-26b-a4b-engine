@@ -207,6 +207,156 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         ensureRowContiguous: true
     )
 
+    /// BORROW-VEC4: VEC4-PASSA-001's addressing width applied to the last
+    /// scalar pass A in the file, the one every sliding borrower reads.
+    ///
+    /// `passAKernel` above loads K and V one element at a time. A lane owns
+    /// `D / 32 == 8` contiguous elements, so each retained position costs it
+    /// eight scalar 2-byte loads for K and eight more for V. Every address in
+    /// a run is `lane * 8` elements past a `D`-aligned base and `D` is 256, so
+    /// the run is 16 contiguous bytes at a 16-byte-aligned address and two
+    /// `vec<T, 4>` loads fetch the same bytes of the same cache line in a
+    /// quarter of the instructions.
+    ///
+    /// This is the lever `ee77bc4` measured at +1.37% of decode on the fused
+    /// ring pass A, unchanged, on the kernel it was never applied to. Nothing
+    /// else moves: the grid, the threadgroup, the two-simdgroups-per-group
+    /// layout, the live register set and the arithmetic order are all the
+    /// incumbent's. Values are still loaded inside the accumulator loop rather
+    /// than prefetched alongside the keys, so no extra vectors stay live
+    /// across the reduction.
+    ///
+    /// Kill switch: `DARKBLOOM_CBV2_BORROW_PASSA_VEC4=0` restores the scalar
+    /// kernel, which stays in the file untouched.
+    private static let passAVec4Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_2pass_a_vec4_bf16_d256_g2_b\(blocks)_v1",
+        inputNames: [
+            "queries",
+            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+        ],
+        outputNames: ["partials", "sums", "maxs"],
+        source: """
+            constexpr int simd_width = 32;
+            constexpr int values_per_lane = D / simd_width;
+            constexpr int vectors_per_lane = values_per_lane / 4;
+            static_assert(values_per_lane % 4 == 0, "lane run must be a multiple of four");
+            static_assert(D % 4 == 0, "head dim must be a multiple of four");
+            typedef vec<T, 4> T4;
+
+            const int kv_head = int(threadgroup_position_in_grid.x);
+            const int batch_index = int(threadgroup_position_in_grid.y);
+            const int block = int(threadgroup_position_in_grid.z);
+            const int query_head_in_group = int(thread_position_in_threadgroup.y);
+            const int query_head = GQA * kv_head + query_head_in_group;
+            const int batch_head = batch_index * 16 + query_head;
+            const int lane = int(thread_index_in_simdgroup);
+
+            const device T* keys = k0;
+            const device T* values = v0;
+            switch (batch_index) {
+                case 1: keys = k1; values = v1; break;
+                case 2: keys = k2; values = v2; break;
+                case 3: keys = k3; values = v3; break;
+                case 4: keys = k4; values = v4; break;
+                case 5: keys = k5; values = v5; break;
+                case 6: keys = k6; values = v6; break;
+                case 7: keys = k7; values = v7; break;
+                default: break;
+            }
+
+            const device T* query =
+                queries + batch_head * D + lane * values_per_lane;
+            keys += kv_head * N * D + block * D + lane * values_per_lane;
+            values += kv_head * N * D + block * D + lane * values_per_lane;
+            device T* partial = partials
+                + batch_head * BLOCKS * D + block * D + lane * values_per_lane;
+            device float* sum_out = sums + batch_head * BLOCKS + block;
+            device float* max_out = maxs + batch_head * BLOCKS + block;
+
+            thread float q[values_per_lane];
+            thread float accumulator[values_per_lane];
+            {
+                const device T4* query_vectors =
+                    reinterpret_cast<const device T4*>(query);
+                #pragma clang loop unroll(full)
+                for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
+                    const T4 query_vector = query_vectors[chunk];
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        const int element = chunk * 4 + j;
+                        q[element] = 1.0f * float(query_vector[j]);
+                        accumulator[element] = 0.0f;
+                    }
+                }
+            }
+
+            float max_score = -3.402823466e+38F;
+            float sum_exp_score = 0.0f;
+            for (int token = block; token < N; token += BLOCKS) {
+                const device T4* key_vectors =
+                    reinterpret_cast<const device T4*>(keys);
+                float score = 0.0f;
+                #pragma clang loop unroll(full)
+                for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
+                    const T4 key_vector = key_vectors[chunk];
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        score += q[chunk * 4 + j] * float(key_vector[j]);
+                    }
+                }
+                score = simd_sum(score);
+
+                const float new_max = max(max_score, score);
+                const float old_factor = fast::exp(max_score - new_max);
+                const float score_factor = fast::exp(score - new_max);
+                max_score = new_max;
+                sum_exp_score = sum_exp_score * old_factor + score_factor;
+                const device T4* value_vectors =
+                    reinterpret_cast<const device T4*>(values);
+                #pragma clang loop unroll(full)
+                for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
+                    const T4 value_vector = value_vectors[chunk];
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        const int element = chunk * 4 + j;
+                        accumulator[element] = accumulator[element] * old_factor
+                            + score_factor * float(value_vector[j]);
+                    }
+                }
+
+                keys += BLOCKS * D;
+                values += BLOCKS * D;
+            }
+
+            if (lane == 0) {
+                sum_out[0] = sum_exp_score;
+                max_out[0] = max_score;
+            }
+            {
+                device T4* partial_vectors = reinterpret_cast<device T4*>(partial);
+                #pragma clang loop unroll(full)
+                for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
+                    T4 partial_vector;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        partial_vector[j] = T(accumulator[chunk * 4 + j]);
+                    }
+                    partial_vectors[chunk] = partial_vector;
+                }
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    /// BORROW-VEC4 kill switch.
+    static let borrowPassAVec4Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_BORROW_PASSA_VEC4"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let ringPassAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "cbv2_ragged8_sdpa_ring_2pass_a_bf16_d256_g2_b\(blocks)_v1",
         inputNames: [
@@ -914,7 +1064,9 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         scale: Float
     ) -> MLXArray? {
         attend(
-            passAKernel: passAKernel, queries: queries, keys: keys, values: values,
+            passAKernel: borrowPassAVec4Enabled && headDim % 4 == 0
+                ? passAVec4Kernel : passAKernel,
+            queries: queries, keys: keys, values: values,
             extraInputs: [], scale: scale)
     }
 
@@ -1440,6 +1592,125 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         )[0]
         CBv2EngageMark.once("kvq4-fused-live-write")
         return (output, passA[3])
+    }
+
+    /// WRITE-023 store dispatch: one threadgroup per (row, kv head) — 64
+    /// threadgroups of 64 threads — each thread copying 4 contiguous
+    /// elements of K and 4 of V into the row's evicted ring slot through a
+    /// const_cast on the input pointer. 64 KiB total. The fence output is
+    /// the WRITE-016/WRITE-022 pattern: a real graph edge whose inter-kernel
+    /// barrier orders every buffer write this dispatch issued.
+    private static let slidingRingStoreKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sliding_ringstore_bf16_d256_v1",
+        inputNames: [
+            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+            "params", "new_keys", "new_values", "write_fence",
+        ],
+        outputNames: ["fence"],
+        source: """
+            constexpr int D = 256;
+            const int z = int(threadgroup_position_in_grid.z);
+            const int row = z / KV_HEADS;
+            const int kv_head = z % KV_HEADS;
+            const int lane = int(thread_position_in_threadgroup.x);
+            const int window = int(params[0]);
+            const int slot = int(params[1 + row]);
+
+            const device T* key_plane = k0;
+            const device T* value_plane = v0;
+            switch (row) {
+                case 1: key_plane = k1; value_plane = v1; break;
+                case 2: key_plane = k2; value_plane = v2; break;
+                case 3: key_plane = k3; value_plane = v3; break;
+                case 4: key_plane = k4; value_plane = v4; break;
+                case 5: key_plane = k5; value_plane = v5; break;
+                case 6: key_plane = k6; value_plane = v6; break;
+                case 7: key_plane = k7; value_plane = v7; break;
+                default: break;
+            }
+            key_plane += size_t(kv_head) * size_t(window) * D;
+            value_plane += size_t(kv_head) * size_t(window) * D;
+
+            device T* write_key = const_cast<device T*>(key_plane)
+                + size_t(slot) * D + lane * 4;
+            device T* write_value = const_cast<device T*>(value_plane)
+                + size_t(slot) * D + lane * 4;
+            const device T* src_key = new_keys
+                + size_t(row * KV_HEADS + kv_head) * D + lane * 4;
+            const device T* src_value = new_values
+                + size_t(row * KV_HEADS + kv_head) * D + lane * 4;
+            for (int element = 0; element < 4; ++element) {
+                write_key[element] = src_key[element];
+                write_value[element] = src_value[element];
+            }
+            if (z == 0 && lane == 0) {
+                fence[0] = write_fence[0] + 1;
+            }
+        """,
+        ensureRowContiguous: true)
+
+    /// WRITE-023 kill switch: `DARKBLOOM_CBV2_SLIDING_STORE_DISPATCH` set to
+    /// 0/false/no/off restores the per-row BF16 `SliceUpdate` pair.
+    static let slidingStoreDispatchEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_SLIDING_STORE_DISPATCH"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// WRITE-023: deposit this decode step's K/V into every row's bf16 ring
+    /// slot with one fenced in-place dispatch instead of sixteen whole-ring
+    /// `SliceUpdate`s. Returns nil (nothing written, no graph built) whenever
+    /// a predicate fails, so the caller keeps the established write.
+    static func storeSlidingRing(
+        keyRings: [MLXArray],
+        valueRings: [MLXArray],
+        slots: [Int],
+        newKeys: MLXArray,
+        newValues: MLXArray,
+        previousWriteFence: MLXArray,
+        slidingWindowLength: Int
+    ) -> MLXArray? {
+        guard slidingStoreDispatchEnabled,
+            enabled,
+            slidingWindowLength == sequenceLength,
+            headDim == 256, kvHeads == 8,
+            keyRings.count == batch, valueRings.count == batch,
+            slots.count == batch,
+            slots.allSatisfy({ 0 <= $0 && $0 < sequenceLength }),
+            newKeys.dtype == .bfloat16,
+            newKeys.shape == [batch, kvHeads, 1, headDim],
+            newValues.dtype == .bfloat16,
+            newValues.shape == newKeys.shape,
+            previousWriteFence.dtype == .int32,
+            previousWriteFence.shape == [1],
+            keyRings.allSatisfy({
+                $0.dtype == .bfloat16
+                    && $0.shape == [1, kvHeads, sequenceLength, headDim]
+            }),
+            valueRings.allSatisfy({
+                $0.dtype == .bfloat16
+                    && $0.shape == [1, kvHeads, sequenceLength, headDim]
+            })
+        else { return nil }
+
+        var params: [UInt32] = [UInt32(sequenceLength)]
+        params.append(contentsOf: slots.map(UInt32.init))
+        let fence = slidingRingStoreKernel(
+            keyRings + valueRings
+                + [MLXArray(params), newKeys, newValues, previousWriteFence],
+            template: [
+                ("T", newKeys.dtype),
+                ("KV_HEADS", kvHeads),
+            ],
+            grid: (headDim / 4, 1, batch * kvHeads),
+            threadGroup: (headDim / 4, 1, 1),
+            outputShapes: [[1]],
+            outputDTypes: [.int32]
+        )[0]
+        CBv2EngageMark.once("write023-sliding-store")
+        return fence
     }
 
     static func attendRing(

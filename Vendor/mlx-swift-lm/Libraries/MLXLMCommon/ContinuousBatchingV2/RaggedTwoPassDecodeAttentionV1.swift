@@ -2174,7 +2174,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     private static let storeDispatchEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_D512_STORE_DISPATCH"]
-        else { return true }
+        else { return false }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 

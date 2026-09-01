@@ -139,9 +139,12 @@ public enum Gemma4MMAQuantizedGEMV {
     /// packed-weight cursor across those tiles. Version `27` keeps that cursor
     /// and replaces the v13 `min(8u, N_GROUPS - biasBlock)` inner trip with a
     /// compile-time-8 walk plus a four-group tail `continue`, fully unrolling
-    /// the 44-group outer block walk. Versions 1...16 are shippable and
-    /// numerically validated; see each version's source for what differs.
-    /// Anything unrecognised takes the default.
+    /// the 44-group outer block walk. On the default v27 path, a separate
+    /// `DARKBLOOM_GEMMA4_MMA_HEAD_PACKED32=0` restore keeps that body and
+    /// instead issues each affine group's already-aligned 32-byte code pair
+    /// as one device load. Versions 1...16 are shippable and numerically
+    /// validated; see each version's source for what differs. Anything
+    /// unrecognised takes the default.
     private static let version: Int = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_MMA_HEAD_VERSION"]
@@ -170,6 +173,17 @@ public enum Gemma4MMAQuantizedGEMV {
     }()
 
     private static let defaultVersion = 27
+
+    /// Overlay on the default v27 kernel. An absent setting enables the
+    /// 32-byte packed-group load; an explicit off value restores
+    /// `kernelV27` and its metallib name byte for byte.
+    private static let packed32Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MMA_HEAD_PACKED32"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespaces).lowercased())
+    }()
 
     /// Whether the selected tied-head implementation consumes the exact
     /// per-row/per-group activation sums. The final RMSNorm uses this to avoid
@@ -2573,6 +2587,90 @@ public enum Gemma4MMAQuantizedGEMV {
         ensureRowContiguous: true
     )
 
+    // MARK: - Packed32 overlay --- one 32-byte load per affine group
+
+    /// v27 already fetches each group's eight packed uint32 codes as two
+    /// consecutive `uint4` values (`packedGroup[0]`, `packedGroup[1]`). Those
+    /// 32 bytes are 32-byte aligned: `W_ROW_U32 = 352` and `GROUP/8 = 8`. This
+    /// overlay issues the same eight words through one `CBv2MmaPacked32`
+    /// device load so the four tile rows still see the same `uint4` registers
+    /// in the same order. It does not prefetch the next group (not
+    /// head-carry) and does not change A/B fragment construction, the `accg`
+    /// chain, the scale `fma`, the batched affine-bias MMA, or the store.
+    /// `DARKBLOOM_GEMMA4_MMA_HEAD_PACKED32=0` restores `kernelV27`.
+    private static let sourceV28: String = {
+        var result = sourceV27
+
+        func replaceOnce(_ old: String, with new: String) {
+            let count = result.components(separatedBy: old).count
+            precondition(count == 2, "sourceV28 replacement count \(count): \(old)")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+
+        replaceOnce(
+            """
+                const uint packedWord0 =
+                    (sgN0 + fragmentRow) * W_ROW_U32 + g * (GROUP / 8);
+                const uint packedTileStride = N_PSG * W_ROW_U32;
+                const device uint4* packedGroup =
+                    reinterpret_cast<const device uint4*>(w + packedWord0);
+                const uint4 packedLo0 = packedGroup[0];
+                const uint4 packedHi0 = packedGroup[1];
+                packedGroup = reinterpret_cast<const device uint4*>(
+                    w + packedWord0 + packedTileStride);
+                const uint4 packedLo1 = packedGroup[0];
+                const uint4 packedHi1 = packedGroup[1];
+                packedGroup = reinterpret_cast<const device uint4*>(
+                    w + packedWord0 + packedTileStride * 2);
+                const uint4 packedLo2 = packedGroup[0];
+                const uint4 packedHi2 = packedGroup[1];
+                packedGroup = reinterpret_cast<const device uint4*>(
+                    w + packedWord0 + packedTileStride * 3);
+                const uint4 packedLo3 = packedGroup[0];
+                const uint4 packedHi3 = packedGroup[1];
+            """,
+            with: """
+                const uint packedWord0 =
+                    (sgN0 + fragmentRow) * W_ROW_U32 + g * (GROUP / 8);
+                const uint packedTileStride = N_PSG * W_ROW_U32;
+                const device CBv2MmaPacked32* packedPair =
+                    reinterpret_cast<const device CBv2MmaPacked32*>(
+                        w + packedWord0);
+                const uint4 packedLo0 = packedPair->lo;
+                const uint4 packedHi0 = packedPair->hi;
+                packedPair = reinterpret_cast<const device CBv2MmaPacked32*>(
+                    w + packedWord0 + packedTileStride);
+                const uint4 packedLo1 = packedPair->lo;
+                const uint4 packedHi1 = packedPair->hi;
+                packedPair = reinterpret_cast<const device CBv2MmaPacked32*>(
+                    w + packedWord0 + packedTileStride * 2);
+                const uint4 packedLo2 = packedPair->lo;
+                const uint4 packedHi2 = packedPair->hi;
+                packedPair = reinterpret_cast<const device CBv2MmaPacked32*>(
+                    w + packedWord0 + packedTileStride * 3);
+                const uint4 packedLo3 = packedPair->lo;
+                const uint4 packedHi3 = packedPair->hi;
+            """
+        )
+
+        return result
+    }()
+
+    private static let kernelV28: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_affine4_qmv_m8_v28_packed32",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["out"],
+        source: sourceV28,
+        header: """
+            #include <metal_simdgroup_matrix>
+            struct CBv2MmaPacked32 {
+                metal::uint4 lo;
+                metal::uint4 hi;
+            };
+            """,
+        ensureRowContiguous: true
+    )
+
     /// Tied-head GEMV, or `nil` when any gate above fails.
     ///
     /// - Parameters:
@@ -2644,7 +2742,13 @@ public enum Gemma4MMAQuantizedGEMV {
                 )[0]
             }
             switch version {
-            case 27: selected = kernelV27
+            case 27:
+                if packed32Enabled {
+                    selected = kernelV28
+                    CBv2EngageMark.once("mma-head-packed32")
+                } else {
+                    selected = kernelV27
+                }
             case 26: selected = kernelV26
             case 16: selected = kernelV16
             case 15: selected = kernelV15

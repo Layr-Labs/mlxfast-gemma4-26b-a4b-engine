@@ -207,6 +207,165 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         ensureRowContiguous: true
     )
 
+    /// Kill switch: `DARKBLOOM_CBV2_DECODE_PAIRED_PASSA_LINEAR_VEC4=0`. Default ON.
+    static let linearPairedVec4Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_DECODE_PAIRED_PASSA_LINEAR_VEC4"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// GQA-PAIR-VEC4-PASSA-LINEAR: one simdgroup owns both query heads of the
+    /// GQA pair during linear Pass-A decode attention, reading K and V vectors
+    /// 4-wide (T4), halving redundant KV DRAM bandwidth and doubling vector
+    /// load efficiency for all KV-shared sliding attention layers.
+    private static let passAPairedVec4Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_2pass_a_gqapair_vec4_bf16_d256_g2_b\(blocks)_v1",
+        inputNames: [
+            "queries",
+            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+        ],
+        outputNames: ["partials", "sums", "maxs"],
+        source: """
+            constexpr int simd_width = 32;
+            constexpr int values_per_lane = D / simd_width;
+            constexpr int vectors_per_lane = values_per_lane / 4;
+            static_assert(GQA == 2, "this kernel pairs exactly two query heads");
+            static_assert(values_per_lane % 4 == 0, "lane run must be a multiple of four");
+            typedef vec<T, 4> T4;
+
+            const int kv_head = int(threadgroup_position_in_grid.x);
+            const int batch_index = int(threadgroup_position_in_grid.y);
+            const int block = int(threadgroup_position_in_grid.z);
+            const int query_head = GQA * kv_head;
+            const int batch_head = batch_index * 16 + query_head;
+            const int lane = int(thread_index_in_simdgroup);
+
+            const device T* keys = k0;
+            const device T* values = v0;
+            switch (batch_index) {
+                case 1: keys = k1; values = v1; break;
+                case 2: keys = k2; values = v2; break;
+                case 3: keys = k3; values = v3; break;
+                case 4: keys = k4; values = v4; break;
+                case 5: keys = k5; values = v5; break;
+                case 6: keys = k6; values = v6; break;
+                case 7: keys = k7; values = v7; break;
+                default: break;
+            }
+
+            const device T* query =
+                queries + batch_head * D + lane * values_per_lane;
+            keys += kv_head * N * D + block * D + lane * values_per_lane;
+            values += kv_head * N * D + block * D + lane * values_per_lane;
+            device T* partial = partials
+                + batch_head * BLOCKS * D + block * D + lane * values_per_lane;
+            device float* sum_out = sums + batch_head * BLOCKS + block;
+            device float* max_out = maxs + batch_head * BLOCKS + block;
+
+            thread T4 q_lo_vectors[vectors_per_lane];
+            thread T4 q_hi_vectors[vectors_per_lane];
+            thread float acc_lo[values_per_lane];
+            thread float acc_hi[values_per_lane];
+            {
+                const device T4* query_lo =
+                    reinterpret_cast<const device T4*>(query);
+                const device T4* query_hi =
+                    reinterpret_cast<const device T4*>(query + D);
+                #pragma clang loop unroll(full)
+                for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
+                    q_lo_vectors[chunk] = query_lo[chunk];
+                    q_hi_vectors[chunk] = query_hi[chunk];
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        acc_lo[chunk * 4 + j] = 0.0f;
+                        acc_hi[chunk * 4 + j] = 0.0f;
+                    }
+                }
+            }
+
+            float max_lo = -3.402823466e+38F;
+            float max_hi = -3.402823466e+38F;
+            float sum_lo = 0.0f;
+            float sum_hi = 0.0f;
+            for (int token = block; token < N; token += BLOCKS) {
+                const device T4* k = reinterpret_cast<const device T4*>(keys);
+                const device T4* v = reinterpret_cast<const device T4*>(values);
+                float score_lo = 0.0f;
+                float score_hi = 0.0f;
+                thread T4 value_vectors[vectors_per_lane];
+                #pragma clang loop unroll(full)
+                for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
+                    const T4 key_vector = k[chunk];
+                    const T4 q_lo_vector = q_lo_vectors[chunk];
+                    const T4 q_hi_vector = q_hi_vectors[chunk];
+                    value_vectors[chunk] = v[chunk];
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        const float key_element = float(key_vector[j]);
+                        score_lo += float(q_lo_vector[j]) * key_element;
+                        score_hi += float(q_hi_vector[j]) * key_element;
+                    }
+                }
+                score_lo = simd_sum(score_lo);
+                score_hi = simd_sum(score_hi);
+
+                const float new_max_lo = max(max_lo, score_lo);
+                const float new_max_hi = max(max_hi, score_hi);
+                const float old_factor_lo = fast::exp(max_lo - new_max_lo);
+                const float old_factor_hi = fast::exp(max_hi - new_max_hi);
+                const float score_factor_lo = fast::exp(score_lo - new_max_lo);
+                const float score_factor_hi = fast::exp(score_hi - new_max_hi);
+                max_lo = new_max_lo;
+                max_hi = new_max_hi;
+                sum_lo = sum_lo * old_factor_lo + score_factor_lo;
+                sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                #pragma clang loop unroll(full)
+                for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
+                    const T4 value_vector = value_vectors[chunk];
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        const int element = chunk * 4 + j;
+                        const float value_element = float(value_vector[j]);
+                        acc_lo[element] = acc_lo[element] * old_factor_lo
+                            + score_factor_lo * value_element;
+                        acc_hi[element] = acc_hi[element] * old_factor_hi
+                            + score_factor_hi * value_element;
+                    }
+                }
+
+                keys += BLOCKS * D;
+                values += BLOCKS * D;
+            }
+
+            if (lane == 0) {
+                sum_out[0] = sum_lo;
+                max_out[0] = max_lo;
+                sum_out[BLOCKS] = sum_hi;
+                max_out[BLOCKS] = max_hi;
+            }
+            {
+                device T4* partial_lo = reinterpret_cast<device T4*>(partial);
+                device T4* partial_hi =
+                    reinterpret_cast<device T4*>(partial + BLOCKS * D);
+                #pragma clang loop unroll(full)
+                for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
+                    T4 lo_vector;
+                    T4 hi_vector;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        lo_vector[j] = T(acc_lo[chunk * 4 + j]);
+                        hi_vector[j] = T(acc_hi[chunk * 4 + j]);
+                    }
+                    partial_lo[chunk] = lo_vector;
+                    partial_hi[chunk] = hi_vector;
+                }
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
     private static let ringPassAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "cbv2_ragged8_sdpa_ring_2pass_a_bf16_d256_g2_b\(blocks)_v1",
         inputNames: [
@@ -913,9 +1072,64 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         values: [MLXArray],
         scale: Float
     ) -> MLXArray? {
-        attend(
-            passAKernel: passAKernel, queries: queries, keys: keys, values: values,
-            extraInputs: [], scale: scale)
+        guard enabled,
+            blocks > 0,
+            sequenceLength.isMultiple(of: blocks),
+            scale == 1.0,
+            queries.dtype == .bfloat16,
+            queries.shape == [batch, queryHeads, 1, headDim],
+            keys.count == batch,
+            values.count == batch
+        else { return nil }
+
+        for index in 0 ..< batch {
+            let key = keys[index]
+            let value = values[index]
+            guard key.dtype == .bfloat16,
+                value.dtype == .bfloat16,
+                key.shape == [1, kvHeads, sequenceLength, headDim],
+                value.shape == key.shape
+            else { return nil }
+        }
+
+        let paired = linearPairedVec4Enabled && gqaPairedPassAEnabled && gqa == 2
+            && gqaPairedPassAVec4Enabled && headDim % 4 == 0
+        if paired {
+            CBv2EngageMark.once("decode-gqa-paired-passa-linear-vec4")
+        }
+
+        let partialShape = [batch, queryHeads, 1, blocks, headDim]
+        let summaryShape = [batch, queryHeads, 1, blocks]
+        let passA = (paired ? passAPairedVec4Kernel : passAKernel)(
+            [queries] + keys + values,
+            template: [
+                ("T", queries.dtype),
+                ("D", headDim),
+                ("N", sequenceLength),
+                ("GQA", gqa),
+                ("BLOCKS", blocks),
+            ],
+            grid: paired
+                ? (kvHeads * 32, batch, blocks)
+                : (kvHeads * 32, batch * gqa, blocks),
+            threadGroup: paired ? (32, 1, 1) : (32, gqa, 1),
+            outputShapes: [partialShape, summaryShape, summaryShape],
+            outputDTypes: [.bfloat16, .float32, .float32]
+        )
+
+        return passBKernel(
+            passA,
+            template: [
+                ("T", queries.dtype),
+                ("D", headDim),
+                ("BLOCKS", blocks),
+                ("COLS", combineColumns),
+            ],
+            grid: (batch * queryHeads * combineThreads, 1, 1),
+            threadGroup: (combineThreads, 1, 1),
+            outputShapes: [[batch, queryHeads, 1, headDim]],
+            outputDTypes: [.bfloat16]
+        )[0]
     }
 
     private static let portQuantReadKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(

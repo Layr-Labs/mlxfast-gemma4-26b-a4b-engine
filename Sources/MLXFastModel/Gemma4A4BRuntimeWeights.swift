@@ -109,7 +109,7 @@ public final class Gemma4A4BRuntimeWeightCache {
                    startupEnvironment["DARKBLOOM_QWEN_MTP_POST_WIRE_COMMAND_BUFFER"]
            )
         {
-            setenv("MLX_MAX_MB_PER_BUFFER", "512", 1)
+            setenv("MLX_MAX_MB_PER_BUFFER", "768", 1)
             setenv("MLX_MAX_OPS_PER_BUFFER", "512", 1)
             Memory.cacheLimit = 32 << 30
         }

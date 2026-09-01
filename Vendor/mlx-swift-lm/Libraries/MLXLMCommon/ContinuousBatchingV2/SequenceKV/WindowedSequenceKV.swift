@@ -13,6 +13,38 @@ import Foundation
 import MLX
 import MLXFast
 
+/// Charge one physical packed K/V allocation exactly once across all live
+/// row views that retain it. Releasing or detaching the charged row transfers
+/// the charge to the lowest remaining row, so `bytesInUse` stays truthful as
+/// cohort membership changes.
+final class CBv2WindowedSharedStorageCharge {
+    let totalBytes: Int
+    let rowCount: Int
+
+    private let lock = NSLock()
+    private var activeRows: Set<Int>
+
+    init(totalBytes: Int, rowCount: Int) {
+        precondition(totalBytes > 0 && rowCount > 0)
+        self.totalBytes = totalBytes
+        self.rowCount = rowCount
+        self.activeRows = Set(0 ..< rowCount)
+    }
+
+    func chargedBytes(for row: Int) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        guard activeRows.contains(row), row == activeRows.min() else { return 0 }
+        return totalBytes
+    }
+
+    func release(row: Int) {
+        lock.lock()
+        activeRows.remove(row)
+        lock.unlock()
+    }
+}
+
 /// `CBv2SequenceKV` for sliding-window attention.
 ///
 /// ## Temporal-order guarantee
@@ -121,6 +153,10 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         Self.quantEnabled && headDim == 256 && window > 0
             && (window & (window - 1)) == 0
     }
+    /// Accounting identity while `keys`/`values` are row views into one
+    /// packed B-wide parent.
+    private var sharedStorageCharge: CBv2WindowedSharedStorageCharge?
+    private var sharedStorageIndex: Int?
 
     /// Step-scoped PRE-EVICTION views captured by the most recent MULTI-token
     /// `update()` (`retainedHistory ++ chunk`, up to `window - 1 + n` entries).
@@ -163,12 +199,85 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     public var byteCount: Int {
         // Staged tensors are physically held until commit (bounded: one
         // 1+k-token chunk per in-flight MTP round).
-        // KVQ-001: the packed 8-bit mirror is real resident memory and must
-        // be visible to the engine's capacity accounting (the original
-        // KVQ-001 revision omitted it, under-counting ~850 MB at B=8).
-        (keys?.nbytes ?? 0) + (values?.nbytes ?? 0)
+        // The B-wide parent is charged once across its row views. The packed
+        // quantized mirror remains a separate resident allocation below.
+        (sharedStorageCharge.map { charge in
+            charge.chargedBytes(for: sharedStorageIndex!)
+        } ?? ((keys?.nbytes ?? 0) + (values?.nbytes ?? 0)))
             + (staged.map { $0.keys.nbytes + $0.values.nbytes } ?? 0)
             + (quantMirror?.nbytes ?? 0)
+    }
+
+    /// Whether this fresh row can retain an already-materialized full window
+    /// as its ring storage without allocating and copying it through
+    /// `writeRing`.
+    ///
+    /// The zero-offset requirement is structural: a tensor laid out in
+    /// temporal order `[0, window)` is also in physical ring-slot order only
+    /// when absolute position zero maps to slot zero. Prefix-cache replay can
+    /// start at any absolute offset and therefore keeps the established ring
+    /// writer, which rotates the incoming bytes into their modular slots.
+    func canAdoptFreshWindow(keys newKeys: MLXArray, values newValues: MLXArray) -> Bool {
+        !speculativeWriteArmed && staged == nil
+            && keys == nil && values == nil
+            && sharedStorageCharge == nil && sharedStorageIndex == nil
+            && borrowableChunkViews == nil
+            && absoluteOffset == 0 && oldestValidPosition == 0
+            && newKeys.ndim == 4 && newValues.ndim == 4
+            && newKeys.shape == [1, kvHeads, window, headDim]
+            && newValues.shape == newKeys.shape
+            && newValues.dtype == newKeys.dtype
+    }
+
+    /// Retain a fresh full-window K/V rectangle as the physical ring.
+    ///
+    /// The caller supplies one row-contiguous slice of the packed prefill
+    /// producer's `[B, kvHeads, window, headDim]` output. The slice's temporal
+    /// order is exactly physical slot order at absolute offset zero, so this
+    /// is the state the ordinary `allocateIfNeeded` + `writeRing` path would
+    /// have produced, byte for byte. Subsequent decode steps use the existing
+    /// fused ring-write path and mutate these non-overlapping row slices in
+    /// place behind its write fence.
+    func adoptFreshWindow(
+        keys newKeys: MLXArray, values newValues: MLXArray,
+        sharedStorageCharge: CBv2WindowedSharedStorageCharge,
+        sharedStorageIndex: Int
+    ) {
+        precondition(
+            canAdoptFreshWindow(keys: newKeys, values: newValues),
+            "CBv2WindowedSequenceKV: fresh-window adoption outside its exact gate")
+        precondition(
+            sharedStorageCharge.totalBytes >= newKeys.nbytes + newValues.nbytes,
+            "CBv2WindowedSequenceKV: shared adoption accounting below row bytes")
+        precondition(
+            0 <= sharedStorageIndex && sharedStorageIndex < sharedStorageCharge.rowCount,
+            "CBv2WindowedSequenceKV: shared adoption row index out of range")
+        keys = newKeys
+        values = newValues
+        // Fresh BF16 adoption bypasses `update`, so it must also construct the
+        // active Q4 mirror that `allocateIfNeeded` + `writeMirror` would have
+        // produced. Packing both planes here preserves the ranked quantized
+        // decode road while still deleting the BF16 ring allocation/copy.
+        if quantEligible, newKeys.dtype == .bfloat16 {
+            Self.selfTestKVQ4()
+            quantMirror = stacked(
+                [Self.quantPackGPU(newKeys), Self.quantPackGPU(newValues)],
+                axis: 0)
+        }
+        self.sharedStorageCharge = sharedStorageCharge
+        self.sharedStorageIndex = sharedStorageIndex
+        absoluteOffset = window
+        oldestValidPosition = 0
+        borrowableChunkViews = (newKeys, newValues)
+    }
+
+    /// Backend release hook. The shared parent remains accounted by another
+    /// live row until the last row releases it.
+    func releaseSharedStorageCharge() {
+        guard let charge = sharedStorageCharge, let index = sharedStorageIndex else { return }
+        charge.release(row: index)
+        sharedStorageCharge = nil
+        sharedStorageIndex = nil
     }
 
     public func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
@@ -188,6 +297,8 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             staged == nil,
             "CBv2WindowedSequenceKV: plain update with a staged speculative write pending — commit first"
         )
+
+        detachSharedStorageIfNeeded()
 
         allocateIfNeeded(keyTemplate: newKeys, valueTemplate: newValues)
 
@@ -385,6 +496,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         // (cancelled) row writes nothing.
         let confirmed = absoluteOffset - staged.basePosition
         if confirmed > 0 {
+            detachSharedStorageIfNeeded()
             allocateIfNeeded(keyTemplate: staged.keys, valueTemplate: staged.values)
             let writeCount = min(confirmed, window)
             let skip = confirmed - writeCount
@@ -1601,6 +1713,23 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
             quantMirror[plane ..< (plane + 1), 0..., 0 ..< (n - first), 0...] =
                 packed[.ellipsis, first..., 0...]
         }
+    }
+
+    /// Plain updates need independent row ownership. Materialize this row out
+    /// of the shared B-wide parent before the established copy-on-write ring
+    /// mutation, then transfer the parent's byte charge to a surviving row.
+    /// The ranked fused decode path never calls this helper: it stores into
+    /// disjoint row slices in place behind the layer write fence.
+    private func detachSharedStorageIfNeeded() {
+        guard sharedStorageCharge != nil, let keys, let values else { return }
+        let detachedKeys = MLXArray.zeros(keys.shape, dtype: keys.dtype)
+        let detachedValues = MLXArray.zeros(values.shape, dtype: values.dtype)
+        detachedKeys[0..., 0..., 0..., 0...] = keys
+        detachedValues[0..., 0..., 0..., 0...] = values
+        self.keys = detachedKeys
+        self.values = detachedValues
+        borrowableChunkViews = nil
+        releaseSharedStorageCharge()
     }
 
     private func allocateIfNeeded(keyTemplate: MLXArray, valueTemplate: MLXArray) {

@@ -861,6 +861,67 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         """
     )
 
+    /// Batched fresh-prefill commit. The source
+    /// rectangles are already contiguous `[B,H,N,D]`; one dispatch packs both
+    /// planes for all rows into `[B,2,H,N,D/8+D/64]` without changing the
+    /// established per-(row,plane,head,token) quantization arithmetic.
+    private static let quantPackFreshBatchKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_kvq4g64_pack_fresh_batch_d256_v1",
+        inputNames: ["keys", "values"],
+        outputNames: ["packed_w"],
+        source: """
+            constexpr int D = 256;
+            constexpr int simd_width = 32;
+            constexpr int per_lane = D / simd_width;
+            constexpr int group_size = 64;
+            constexpr int payload_words = D / 8;
+            constexpr int row_words = payload_words + D / group_size;
+
+            const int packed_row = int(threadgroup_position_in_grid.x);
+            const int token = packed_row % TOKENS;
+            const int head = (packed_row / TOKENS) % HEADS;
+            const int plane = (packed_row / (TOKENS * HEADS)) % 2;
+            const int batch = packed_row / (TOKENS * HEADS * 2);
+            const int lane = int(thread_position_in_threadgroup.x);
+            const size_t source_row =
+                (size_t(batch) * HEADS + head) * TOKENS + token;
+            const device T* src = (plane == 0 ? keys : values) + source_row * D;
+            device uint32_t* out = packed_w + size_t(packed_row) * row_words;
+
+            float lane_values[per_lane];
+            float vmin = 3.402823466e+38F;
+            float vmax = -3.402823466e+38F;
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < per_lane; ++i) {
+                const float v = float(src[lane * per_lane + i]);
+                lane_values[i] = v;
+                vmin = min(vmin, v);
+                vmax = max(vmax, v);
+            }
+            for (uint m = 1; m < 8; m <<= 1) {
+                vmin = min(vmin, simd_shuffle_xor(vmin, m));
+                vmax = max(vmax, simd_shuffle_xor(vmax, m));
+            }
+
+            const half hs = half(max((vmax - vmin) / 15.0f, 1e-6f));
+            const half hb = half(vmin);
+            const float s = float(hs);
+            const float b = float(hb);
+
+            uint32_t word = 0u;
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < per_lane; ++i) {
+                const float q = metal::rint((lane_values[i] - b) / s);
+                word |= uint32_t(clamp(q, 0.0f, 15.0f)) << (4 * i);
+            }
+            out[lane] = word;
+            if (lane % 8 == 0) {
+                out[payload_words + lane / 8] =
+                    uint32_t(as_type<ushort>(hs)) | (uint32_t(as_type<ushort>(hb)) << 16);
+            }
+        """
+    )
+
 
     // MARK: - KVQ-DIAG: compute-and-discard probe
 
@@ -1559,6 +1620,80 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
             outputShapes: [[2, heads, 1, headDim / 8 + headDim / 64]],
             outputDTypes: [.uint32]
         )[0]
+    }
+
+    /// `MLX_KV_Q4_BATCHED_PREFILL_COMMIT=0` restores the established eight
+    /// independent row updates. The specialized path is admitted only for
+    /// the ranked fresh B=8, N=1024, D=256 geometry.
+    private static let freshPackedBatchCommitEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "MLX_KV_Q4_BATCHED_PREFILL_COMMIT"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Perform the exact fresh-prompt state transition as one batch-wide
+    /// mirror pack while retaining row views of the caller's contiguous BF16
+    /// rectangles. No arithmetic or attention input changes: K/V are the
+    /// original row slices, and the mirror kernel transcribes the established
+    /// per-row q4/g64 packer.
+    static func freshPackedBatchCommit(
+        rows: [CBv2WindowedSequenceKV], keys newKeys: MLXArray, values newValues: MLXArray
+    ) -> (keys: [MLXArray], values: [MLXArray], mirror: MLXArray)? {
+        let batch = rows.count
+        guard Self.freshPackedBatchCommitEnabled,
+            batch == 8,
+            Self.quantEnabled, Self.gpuPackEnabled, !Self.gpuPackCheck,
+            !Self.quantSimulate,
+            newKeys.dtype == .bfloat16,
+            newValues.dtype == newKeys.dtype,
+            newKeys.ndim == 4,
+            newValues.shape == newKeys.shape,
+            newKeys.dim(0) == batch,
+            newKeys.dim(1) == 8,
+            newKeys.dim(2) == 1024,
+            newKeys.dim(3) == 256,
+            rows.allSatisfy({
+                $0.window == 1024 && $0.kvHeads == 8 && $0.headDim == 256
+                    && $0.absoluteOffset == 0 && $0.oldestValidPosition == 0
+                    && $0.keys == nil && $0.values == nil && $0.quantMirror == nil
+                    && $0.staged == nil && !$0.speculativeWriteArmed
+            })
+        else { return nil }
+
+        let tokens = newKeys.dim(2)
+        let rowWords = newKeys.dim(3) / 8 + newKeys.dim(3) / 64
+        let packed = Self.quantPackFreshBatchKernel(
+            [newKeys, newValues],
+            template: [
+                ("T", newKeys.dtype),
+                ("HEADS", newKeys.dim(1)),
+                ("TOKENS", tokens),
+            ],
+            grid: (batch * 2 * newKeys.dim(1) * tokens * 32, 1, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[batch, 2, newKeys.dim(1), tokens, rowWords]],
+            outputDTypes: [.uint32]
+        )[0]
+
+        var keyRows: [MLXArray] = []
+        var valueRows: [MLXArray] = []
+        keyRows.reserveCapacity(batch)
+        valueRows.reserveCapacity(batch)
+        for index in 0 ..< batch {
+            let keyRow = newKeys[index ..< (index + 1)]
+            let valueRow = newValues[index ..< (index + 1)]
+            let row = rows[index]
+            row.keys = keyRow
+            row.values = valueRow
+            row.quantMirror = packed[index]
+            row.absoluteOffset = tokens
+            row.oldestValidPosition = 0
+            row.borrowableChunkViews = (keyRow, valueRow)
+            keyRows.append(keyRow)
+            valueRows.append(valueRow)
+        }
+        return (keyRows, valueRows, packed)
     }
 
     /// KVQ-PAIRWRITE. Maintaining the mirror plane by plane builds TWO

@@ -734,12 +734,22 @@ enum CBv2AttentionV1 {
         var cachedValues: [MLXArray] = []
         cachedKeys.reserveCapacity(B)
         cachedValues.reserveCapacity(B)
-        for (index, row) in rows.enumerated() {
-            let (rowKeys, rowValues) = row.update(
-                keys: keys[index ..< (index + 1)],
-                values: values[index ..< (index + 1)])
-            cachedKeys.append(rowKeys)
-            cachedValues.append(rowValues)
+        let windowRows = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
+        if windowRows.count == B,
+            let committed = CBv2WindowedSequenceKV.freshPackedBatchCommit(
+                rows: windowRows, keys: keys, values: values)
+        {
+            CBv2EngageMark.once("kvq4-batched-prefill-commit")
+            cachedKeys = committed.keys
+            cachedValues = committed.values
+        } else {
+            for (index, row) in rows.enumerated() {
+                let (rowKeys, rowValues) = row.update(
+                    keys: keys[index ..< (index + 1)],
+                    values: values[index ..< (index + 1)])
+                cachedKeys.append(rowKeys)
+                cachedValues.append(rowValues)
+            }
         }
 
         if let batched = batchedPackedAttention(

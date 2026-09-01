@@ -3416,6 +3416,9 @@ private class Gemma4Experts: Module {
     struct Output {
         let output: MLXArray
         let unsortCarrier: WeightedExpertUnsortCarrier?
+        /// Present only on the SKIP-EAGER-UNSORT prefill path, where `output`
+        /// is an unread placeholder. Rebuilds the identical eager reduction.
+        let lazyOutput: (() -> MLXArray)?
     }
 
     init(
@@ -3442,7 +3445,8 @@ private class Gemma4Experts: Module {
         topKIndices: MLXArray,
         topKWeights: MLXArray,
         isExpertPrefill: Bool,
-        sortedPlane: SwitchSortedPlaneProducer? = nil
+        sortedPlane: SwitchSortedPlaneProducer? = nil,
+        deferEagerUnsort: Bool = false
     ) -> Output {
         // Flatten [B, S, H] and always enter SwitchGLU's combined API. It
         // selects direct sorted reduction only for the exact production
@@ -3458,10 +3462,26 @@ private class Gemma4Experts: Module {
             // Rectangular MTP verification explicitly passes false.
             isProductionPrefill: isExpertPrefill,
             // PRENORM-GATHER: the prefill producer of the sorted plane.
-            sortedPlane: sortedPlane)
+            sortedPlane: sortedPlane,
+            // SKIP-EAGER-UNSORT: prefill-only lazy reduction; the caller
+            // rebuilds the identical eager output if every tail declines.
+            deferEagerUnsort: deferEagerUnsort && isExpertPrefill)
+        // SKIP-EAGER-UNSORT: on the prefill carrier path the `output` member
+        // is a placeholder that no caller may read; the real reduction is
+        // rebuilt from the carrier only if every fused-tail path declines.
+        let deferred = deferEagerUnsort && isExpertPrefill && result.carrier != nil
+        // `result.output` is the expert-sorted carrier plane while the eager
+        // unsort is deferred, so it cannot be reshaped to the model plane.
+        // Keep a shape-correct unread placeholder instead; `lazyOutput` is
+        // the only way the caller can recover the model-shaped result.
         return Output(
-            output: result.output.reshaped(B, S, H),
-            unsortCarrier: result.carrier)
+            output: deferred ? x : result.output.reshaped(B, S, H),
+            unsortCarrier: result.carrier,
+            lazyOutput: deferred
+                ? { [carrier = result.carrier!] in
+                    carrier.eagerOutput().reshaped(B, S, H)
+                }
+                : nil)
     }
 
     /// Decode-only producer for the fused layer-tail consumer. The promoted
@@ -3998,7 +4018,8 @@ public class Gemma4DecoderLayer: Module {
             let expertBranch: (
                 raw: MLXArray?,
                 deferred: DeferredWeightedExpertRows?,
-                unsortCarrier: WeightedExpertUnsortCarrier?
+                unsortCarrier: WeightedExpertUnsortCarrier?,
+                lazyOutput: (() -> MLXArray)?
             )
             // The deferred carrier has a consumer only when the decode tail
             // may also fold the layer scalar. PLE geometries select the
@@ -4014,7 +4035,8 @@ public class Gemma4DecoderLayer: Module {
             ) -> (
                 raw: MLXArray?,
                 deferred: DeferredWeightedExpertRows?,
-                unsortCarrier: WeightedExpertUnsortCarrier?
+                unsortCarrier: WeightedExpertUnsortCarrier?,
+                lazyOutput: (() -> MLXArray)?
             ) {
                 if canFoldScalar,
                     let deferred = experts.deferredWeightedRows(
@@ -4024,15 +4046,20 @@ public class Gemma4DecoderLayer: Module {
                         isExpertPrefill: isExpertPrefill,
                         routeTable: routeTable)
                 {
-                    return (nil, deferred, nil)
+                    return (nil, deferred, nil, nil)
                 }
                 let result = experts(
                     input,
                     topKIndices: indices,
                     topKWeights: weights,
                     isExpertPrefill: isExpertPrefill,
-                    sortedPlane: sortedPlane)
-                return (result.output, nil, result.unsortCarrier)
+                    sortedPlane: sortedPlane,
+                    deferEagerUnsort: true)
+                return (
+                    result.lazyOutput == nil ? result.output : nil,
+                    nil,
+                    result.unsortCarrier,
+                    result.lazyOutput)
             }
 
             // ZIP-ROUTER-001: emit the router chain and the dense chain
@@ -4149,6 +4176,91 @@ public class Gemma4DecoderLayer: Module {
                 out = fusedTail
                 tailApplied = true
                 scalarFolded = true
+            } else if canFoldScalar, let chain = glueChain,
+                let nextWeight = nextInputLayernormWeight,
+                let expert = expertBranch.unsortCarrier,
+                let chained = Gemma4PrefillGlueV1.branchTailChainedUnsort(
+                    h1: h1Raw,
+                    expert: expert,
+                    w1: postFeedforwardLayernorm1.weight,
+                    w2: postFeedforwardLayernorm2.weight,
+                    w3: postFeedforwardLayernorm.weight,
+                    residual2: residual2,
+                    layerScalar: layerScalar,
+                    nextInputNormWeight: nextWeight,
+                    eps: config.rmsNormEps)
+            {
+                // Consume the carrier before materializing its eager output.
+                // This is the dispatch SEU removes on production prefill; a
+                // decline falls through to the exact lazy reconstruction.
+                out = chained.out
+                chain.pending = (source: chained.out, normed: chained.normedNext)
+                tailApplied = true
+                scalarFolded = true
+            } else if let lazy = expertBranch.lazyOutput {
+                // The carrier consumer declined. Rebuild the eager reduction
+                // through the incumbent kernel and rejoin its fallback ladder.
+                let h2Raw = lazy()
+                if canFoldScalar, let chain = glueChain,
+                    let nextWeight = nextInputLayernormWeight,
+                    let chained = Gemma4FusedLayerGlue.tailChained(
+                        mlpOut: h1Raw, expertOut: h2Raw, residual: residual2,
+                        w1: postFeedforwardLayernorm1.weight,
+                        w2: postFeedforwardLayernorm2.weight,
+                        w3: postFeedforwardLayernorm.weight,
+                        layerScalar: layerScalar,
+                        nextInputNormWeight: nextWeight,
+                        eps: config.rmsNormEps)
+                {
+                    out = chained.out
+                    chain.pending = (source: chained.out, normed: chained.normedNext)
+                    tailApplied = true
+                    scalarFolded = true
+                } else if canFoldScalar,
+                    let fusedTail = Gemma4FusedLayerGlue.tail(
+                        mlpOut: h1Raw, expertOut: h2Raw, residual: residual2,
+                        w1: postFeedforwardLayernorm1.weight,
+                        w2: postFeedforwardLayernorm2.weight,
+                        w3: postFeedforwardLayernorm.weight,
+                        layerScalar: layerScalar,
+                        eps: config.rmsNormEps)
+                {
+                    out = fusedTail
+                    tailApplied = true
+                    scalarFolded = true
+                } else if canFoldScalar, let chain = glueChain,
+                    let nextWeight = nextInputLayernormWeight,
+                    let chained = Gemma4PrefillGlueV1.branchTailChained(
+                        h1: h1Raw,
+                        h2: h2Raw,
+                        w1: postFeedforwardLayernorm1.weight,
+                        w2: postFeedforwardLayernorm2.weight,
+                        w3: postFeedforwardLayernorm.weight,
+                        residual2: residual2,
+                        layerScalar: layerScalar,
+                        nextInputNormWeight: nextWeight,
+                        eps: config.rmsNormEps)
+                {
+                    out = chained.out
+                    chain.pending = (source: chained.out, normed: chained.normedNext)
+                    tailApplied = true
+                    scalarFolded = true
+                } else if let fusedTail = Gemma4PrefillGlueV1.branchTail(
+                    h1: h1Raw,
+                    h2: h2Raw,
+                    w1: postFeedforwardLayernorm1.weight,
+                    w2: postFeedforwardLayernorm2.weight,
+                    w3: postFeedforwardLayernorm.weight,
+                    residual2: residual2,
+                    eps: config.rmsNormEps)
+                {
+                    out = fusedTail
+                    tailApplied = true
+                } else {
+                    let h1 = postFeedforwardLayernorm1(h1Raw)
+                    let h2 = postFeedforwardLayernorm2(h2Raw)
+                    out = h1 + h2
+                }
             } else {
                 let h2Raw: MLXArray
                 if let raw = expertBranch.raw {

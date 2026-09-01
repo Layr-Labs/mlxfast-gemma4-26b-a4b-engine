@@ -1188,6 +1188,15 @@ public struct WeightedExpertUnsortCarrier {
     let sortedOutputs: MLXArray
     let inverseOrder: MLXArray
     let weights: MLXArray
+
+    /// Reconstruct the eager reduction with the identical public kernel the
+    /// pre-defer path used, for callers whose every fused-tail path declined.
+    public func eagerOutput() -> MLXArray {
+        weightedExpertUnsort(
+            sortedOutputs: sortedOutputs,
+            inverseOrder: inverseOrder,
+            weights: weights)
+    }
 }
 
 public class SwitchGLU: Module {
@@ -1652,7 +1661,8 @@ public class SwitchGLU: Module {
         weights: MLXArray,
         fuseSortedReduction: Bool,
         isProductionPrefill: Bool = true,
-        sortedPlane: SwitchSortedPlaneProducer? = nil
+        sortedPlane: SwitchSortedPlaneProducer? = nil,
+        deferEagerUnsort: Bool = false
     ) -> (output: MLXArray, carrier: WeightedExpertUnsortCarrier?) {
         // At B=8 decode there are exactly 64 assignments (8 rows x top-k 8),
         // which is the sorting threshold and the minimum geometry accepted by
@@ -1685,6 +1695,18 @@ public class SwitchGLU: Module {
         }
 
         let sortedOutputs = MLX.squeezed(projected.output, axis: -2)
+        // SKIP-EAGER-UNSORT: when the prefill fused tail consumes the
+        // carrier, the eager reduction below is a redundant dispatch of the
+        // exact same kernel `branchTailChainedUnsort` replaces. Deferring
+        // keeps `output` uncomputed; the caller reconstructs it with the
+        // identical public kernel if every tail path declines.
+        if deferEagerUnsort && isProductionPrefill {
+            let carrier = WeightedExpertUnsortCarrier(
+                sortedOutputs: sortedOutputs,
+                inverseOrder: inverseOrder,
+                weights: weights)
+            return (sortedOutputs, carrier)
+        }
         let output = weightedExpertUnsort(
             sortedOutputs: sortedOutputs,
             inverseOrder: inverseOrder,

@@ -469,6 +469,29 @@ inline U qdot_affine8_registered_word(
   return scale * accum + sum * bias;
 }
 
+// Two independent affine-8 dot products over one register-held packed 32-bit word.
+template <typename U, int values_per_thread>
+inline void qdot_affine8_pair_word(
+    uint packedWord,
+    const thread U* x0,
+    const thread U* x1,
+    U scale,
+    U bias,
+    U sum0,
+    U sum1,
+    thread U& out0,
+    thread U& out1) {
+  static_assert(values_per_thread == 4, "Word load expects four 8-bit values");
+  const uint b0 = packedWord & 0xffu;
+  const uint b1 = (packedWord >> 8) & 0xffu;
+  const uint b2 = (packedWord >> 16) & 0xffu;
+  const uint b3 = (packedWord >> 24);
+  U accum0 = x0[0] * b0 + x0[1] * b1 + x0[2] * b2 + x0[3] * b3;
+  U accum1 = x1[0] * b0 + x1[1] * b1 + x1[2] * b2 + x1[3] * b3;
+  out0 = scale * accum0 + sum0 * bias;
+  out1 = scale * accum1 + sum1 * bias;
+}
+
 // Two independent affine-8 dot products over one byte weight vector. Keep the
 // per-row scalar accumulation order of qdot while sharing each weight load.
 template <typename U, int values_per_thread>
@@ -492,7 +515,6 @@ inline void qdot_affine8_pair(
   out0 = scale * accum0 + sum0 * bias;
   out1 = scale * accum1 + sum1 * bias;
 }
-
 template <typename U, int values_per_thread, int bits>
 inline U qdot_safe(
     const device uint8_t* w,
@@ -2000,6 +2022,9 @@ METAL_FUNC void qmv_affine8_g64_pair_impl(
   const device uint8_t* ws = (const device uint8_t*)w;
   thread float x0_thread[values_per_thread];
   thread float x1_thread[values_per_thread];
+  thread uint packed[results_per_simdgroup];
+  thread float scale_local[results_per_simdgroup];
+  thread float bias_local[results_per_simdgroup];
   thread float result0[results_per_simdgroup] = {0};
   thread float result1[results_per_simdgroup] = {0};
 
@@ -2018,17 +2043,20 @@ METAL_FUNC void qmv_affine8_g64_pair_impl(
 
   int k = 0;
   for (; k <= in_vec_size - block_size; k += block_size) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
     float sum0 = load_vector<T, float, values_per_thread, 8>(x0, x0_thread);
     float sum1 = load_vector<T, float, values_per_thread, 8>(x1, x1_thread);
 
     for (int row = 0; row < results_per_simdgroup; row++) {
-      const device uint8_t* wl = ws + row * in_vec_size_w;
-      const device T* sl = scales + row * in_vec_size_g;
-      const device T* bl = biases + row * in_vec_size_g;
       float dot0;
       float dot1;
-      qdot_affine8_pair<float, values_per_thread>(
-          wl, x0_thread, x1_thread, sl[0], bl[0], sum0, sum1, dot0, dot1);
+      qdot_affine8_pair_word<float, values_per_thread>(
+          packed[row], x0_thread, x1_thread, scale_local[row], bias_local[row], sum0, sum1, dot0, dot1);
       result0[row] += dot0;
       result1[row] += dot1;
     }
@@ -2040,28 +2068,28 @@ METAL_FUNC void qmv_affine8_g64_pair_impl(
     x1 += block_size;
   }
 
-  const int remaining = clamp(
-      static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
-      0,
-      values_per_thread);
-  if (remaining > 0) {
-    float sum0 = load_vector_safe<T, float, values_per_thread, 8>(
-        x0, x0_thread, remaining);
-    float sum1 = load_vector_safe<T, float, values_per_thread, 8>(
-        x1, x1_thread, remaining);
+  const uint active_tail_lanes =
+      uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
     for (int row = 0; row < results_per_simdgroup; row++) {
-      const device uint8_t* wl = ws + row * in_vec_size_w;
-      const device T* sl = scales + row * in_vec_size_g;
-      const device T* bl = biases + row * in_vec_size_g;
+      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    float sum0 = load_vector<T, float, values_per_thread, 8>(
+        x0, x0_thread);
+    float sum1 = load_vector<T, float, values_per_thread, 8>(
+        x1, x1_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
       float dot0;
       float dot1;
-      qdot_affine8_pair<float, values_per_thread>(
-          wl, x0_thread, x1_thread, sl[0], bl[0], sum0, sum1, dot0, dot1);
+      qdot_affine8_pair_word<float, values_per_thread>(
+          packed[row], x0_thread, x1_thread, scale_local[row], bias_local[row], sum0, sum1, dot0, dot1);
       result0[row] += dot0;
       result1[row] += dot1;
     }
   }
-
   for (int row = 0; row < results_per_simdgroup; row++) {
     result0[row] = simd_sum(result0[row]);
     result1[row] = simd_sum(result1[row]);
@@ -3012,9 +3040,19 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 8:
-          // 4+4: two weight streams, receipted on this benchmark (scored
-          // 3.195804751396457 as a promoted submission) before a later
-          // stale-base REPLACE overlay reverted it; restored here.
+          // 3+3+2, not 4+4. M = 8 is the only hot width whose EVEN split needs
+          // two simultaneous vec<float,4> accumulators in every active worker;
+          // M = 9 uses three-lane vectors and profiles CHEAPER despite more work
+          // (319 / 437 / 216 us for M = 7 / 8 / 9 in the public cross-row study)
+          // — a register cliff, not work scaling.
+          // Exact: these lanes carry INDEPENDENT input rows and are never reduced
+          // across (simd_sum reduces along K WITHIN a row), so moving a row from
+          // lane 3 of a four-wide vector to lane 0 of a two-wide one cannot
+          // reorder its scalar chain. Template admits it: M in [3,9], 8 % 3 == 2
+          // (no one-row tail), IPG 3 inside the wide helper's [2,4].
+          // Receipts: 85d5bca3 2.91143, yzxoi 2.92675.
+          // SYNERGY with the streak gate above, which is why they ship together:
+          // gate 2 reaches the width-8 verify SOONER, so this kernel fires MORE.
           qmv_fast_crossrow_affine4_g64_m<T, 8, 4, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);

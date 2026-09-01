@@ -2609,13 +2609,51 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         ensureRowContiguous: true
     )
 
-    /// Dispatch 3 — probs·V. Grid: (row, kv head, column tile of 64) × 128
-    /// threads (4 simdgroups — exactly the stock gemv_t threadgroup shape).
-    /// Replays the stock GEMVTKernel<bf16,1,4,8,4,4,4> row-striding and
-    /// butterfly for all 8 heads of the GQA group at once (shared V tile
+    /// AV-TILES-001: the column tiling of dispatch 3.
+    ///
+    /// probs·V is the heaviest byte stream of the D=512 decode chain — it
+    /// reads every row's whole value plane once per full-attention layer, and
+    /// nothing else in the chain touches that much memory. It shipped as 8
+    /// column tiles of 64 per row and kv head, so the launch is
+    /// `batch * kvHeads * 8` = 128 threadgroups of four simdgroups. Every
+    /// threadgroup walks the entire key length, so they all cost the same,
+    /// and 128 divides no shipped core count evenly: the cores that draw one
+    /// threadgroup more than their neighbours hold the whole dispatch open
+    /// for a full extra tile while the rest stand idle.
+    ///
+    /// Halving the tile to 32 columns doubles the launch to 256 threadgroups
+    /// of two simdgroups, which cuts that residue term roughly in half at the
+    /// same total thread count and the same per-lane register footprint.
+    ///
+    /// Exactness: a simdgroup keeps its lane→column stride, its 4×4 value
+    /// tile, its key-major walk over the same 32-key blocks and the same
+    /// cross-lane butterfly, because none of those read `sg`. Only the base
+    /// column a simdgroup starts from moves, so every output element is
+    /// accumulated from the same terms in the same order. The value plane
+    /// stays partitioned into disjoint column runs and a simdgroup still
+    /// issues one 32-byte contiguous run per key row, so the coalescing is
+    /// unchanged too; only the probability rows, which are small next to the
+    /// value plane and stay resident, are re-read by twice as many tiles.
+    ///
+    /// `DARKBLOOM_GEMMA4_D512_AV_TILES=8` restores the incumbent geometry.
+    private static let avColumnTiles: Int = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_AV_TILES"], let value = Int(raw)
+        else { return 16 }
+        return value == 8 || value == 16 ? value : 16
+    }()
+
+    /// Columns one threadgroup of dispatch 3 owns, and the simdgroups it
+    /// needs to cover them at the frozen 16 columns per simdgroup.
+    private static let avTileColumns = headDim / avColumnTiles
+    private static let avSimdgroups = avTileColumns / 16
+
+    /// Dispatch 3 — probs·V. Grid: (row, kv head, column tile) × 32·SG
+    /// threads. Replays the stock GEMVTKernel<bf16,1,4,8,4,4,4> row-striding
+    /// and butterfly for all 8 heads of the GQA group at once (shared V tile
     /// loads). params as dispatch 1.
     private static let avKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_xfold_v3",
+        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -2629,8 +2667,8 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int key_length = int(params[0]);
 
             const int z = int(threadgroup_position_in_grid.z);
-            const int tile = z % 8;
-            const int row_kv = z / 8;
+            const int tile = z % \(avColumnTiles);
+            const int row_kv = z / \(avColumnTiles);
             const int row = row_kv / 2;
             const int kv_head = row_kv % 2;
             const int sg = int(simdgroup_index_in_threadgroup);
@@ -2657,7 +2695,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int thrM = lane / 4;
             const int thrN = lane % 4;
             int bm = thrM * 4;
-            const int out_col = tile * 64 + (4 * sg + thrN) * 4;
+            const int out_col = tile * \(avTileColumns) + (4 * sg + thrN) * 4;
 
             // XFOLD: one flat accumulator over the same 32 partial sums, so
             // the cross-lane fold below can address the whole set with
@@ -3304,8 +3342,8 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let output = avKernel(
             [probs] + valueBuffers + [paramsArray],
             template: template,
-            grid: (32, 4, batch * kvHeads * 8),
-            threadGroup: (32, 4, 1),
+            grid: (32, avSimdgroups, batch * kvHeads * avColumnTiles),
+            threadGroup: (32, avSimdgroups, 1),
             outputShapes: [[batch, queryHeads, 1, headDim]],
             outputDTypes: [.bfloat16]
         )[0]
@@ -3542,8 +3580,8 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         return avKernel(
             [probs] + valueBuffers + [paramsArray],
             template: template,
-            grid: (32, 4, batch * kvHeads * 8),
-            threadGroup: (32, 4, 1),
+            grid: (32, avSimdgroups, batch * kvHeads * avColumnTiles),
+            threadGroup: (32, avSimdgroups, 1),
             outputShapes: [[batch, queryHeads, 1, headDim]],
             outputDTypes: [.bfloat16]
         )[0]

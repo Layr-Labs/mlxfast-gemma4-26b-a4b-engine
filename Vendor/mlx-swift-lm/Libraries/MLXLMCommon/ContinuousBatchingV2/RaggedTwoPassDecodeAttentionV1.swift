@@ -2517,97 +2517,228 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         ensureRowContiguous: true
     )
 
+    /// Kill switch for the barrier-free cross-simdgroup broadcast below:
+    /// `DARKBLOOM_GEMMA4_D512_SOFTMAX_BCAST` set to `0`/`false`/`no`/`off`
+    /// restores the verbatim five-barrier transcription. Default ON.
+    private static let softmaxBroadcastEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_SOFTMAX_BCAST"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// Dispatch 2 — softmax. A verbatim transcription of
     /// `softmax_single_row` (block_softmax_precise, AccT=float, N_READS=4)
     /// over the 128 score rows; the CALLER sizes the threadgroup exactly
     /// like softmax.cpp:64-68 (32·ceil(ceil(kL/4)/32)). params[0] = kL.
-    private static let softmaxKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_softmax_bf16_v1",
-        inputNames: ["scores", "params"],
-        outputNames: ["probs"],
-        source: """
-            const int axis_size = int(params[0]);
-            const int gid = int(threadgroup_position_in_grid.x);
-            const int lid = int(thread_position_in_threadgroup.x);
-            const int simd_lane_id = int(thread_index_in_simdgroup);
-            const int simd_group_id = int(simdgroup_index_in_threadgroup);
+    private static let softmaxIncumbentKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "cbv2_ragged8_sdpa_d512_softmax_bf16_v1",
+            inputNames: ["scores", "params"],
+            outputNames: ["probs"],
+            source: """
+                const int axis_size = int(params[0]);
+                const int gid = int(threadgroup_position_in_grid.x);
+                const int lid = int(thread_position_in_threadgroup.x);
+                const int simd_lane_id = int(thread_index_in_simdgroup);
+                const int simd_group_id = int(simdgroup_index_in_threadgroup);
 
-            threadgroup float local_max[32];
-            threadgroup float local_normalizer[32];
+                threadgroup float local_max[32];
+                threadgroup float local_normalizer[32];
 
-            float ld[4];
-            const device T* in =
-                scores + size_t(gid) * axis_size + lid * 4;
-            if (lid * 4 + 4 <= axis_size) {
-                for (int i = 0; i < 4; i++) {
-                    ld[i] = static_cast<float>(in[i]);
-                }
-            } else {
-                for (int i = 0; i < 4; i++) {
-                    ld[i] = ((lid * 4 + i) < axis_size)
-                        ? static_cast<float>(in[i]) : -INFINITY;
-                }
-            }
-            if (simd_group_id == 0) {
-                local_max[simd_lane_id] = -INFINITY;
-                local_normalizer[simd_lane_id] = 0.0f;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            float maxval = -3.402823466e+38F;
-            for (int i = 0; i < 4; i++) {
-                maxval = (maxval < ld[i]) ? ld[i] : maxval;
-            }
-            maxval = simd_max(maxval);
-            if (simd_lane_id == 0) {
-                local_max[simd_group_id] = maxval;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_group_id == 0) {
-                maxval = simd_max(local_max[simd_lane_id]);
-                if (simd_lane_id == 0) {
-                    local_max[0] = maxval;
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            maxval = local_max[0];
-
-            float normalizer = 0.0f;
-            for (int i = 0; i < 4; i++) {
-                float exp_x = fast::exp(ld[i] - maxval);
-                ld[i] = exp_x;
-                normalizer += exp_x;
-            }
-            normalizer = simd_sum(normalizer);
-            if (simd_lane_id == 0) {
-                local_normalizer[simd_group_id] = normalizer;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_group_id == 0) {
-                normalizer = simd_sum(local_normalizer[simd_lane_id]);
-                if (simd_lane_id == 0) {
-                    local_normalizer[0] = normalizer;
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            normalizer = 1 / local_normalizer[0];
-
-            device T* out_row =
-                probs + size_t(gid) * axis_size + lid * 4;
-            if (lid * 4 + 4 <= axis_size) {
-                for (int i = 0; i < 4; i++) {
-                    out_row[i] = static_cast<T>(ld[i] * normalizer);
-                }
-            } else {
-                for (int i = 0; i < 4; i++) {
-                    if ((lid * 4 + i) < axis_size) {
-                        out_row[i] = static_cast<T>(ld[i] * normalizer);
+                float ld[4];
+                const device T* in =
+                    scores + size_t(gid) * axis_size + lid * 4;
+                if (lid * 4 + 4 <= axis_size) {
+                    for (int i = 0; i < 4; i++) {
+                        ld[i] = static_cast<float>(in[i]);
+                    }
+                } else {
+                    for (int i = 0; i < 4; i++) {
+                        ld[i] = ((lid * 4 + i) < axis_size)
+                            ? static_cast<float>(in[i]) : -INFINITY;
                     }
                 }
-            }
-        """,
-        ensureRowContiguous: true
-    )
+                if (simd_group_id == 0) {
+                    local_max[simd_lane_id] = -INFINITY;
+                    local_normalizer[simd_lane_id] = 0.0f;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                float maxval = -3.402823466e+38F;
+                for (int i = 0; i < 4; i++) {
+                    maxval = (maxval < ld[i]) ? ld[i] : maxval;
+                }
+                maxval = simd_max(maxval);
+                if (simd_lane_id == 0) {
+                    local_max[simd_group_id] = maxval;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simd_group_id == 0) {
+                    maxval = simd_max(local_max[simd_lane_id]);
+                    if (simd_lane_id == 0) {
+                        local_max[0] = maxval;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                maxval = local_max[0];
+
+                float normalizer = 0.0f;
+                for (int i = 0; i < 4; i++) {
+                    float exp_x = fast::exp(ld[i] - maxval);
+                    ld[i] = exp_x;
+                    normalizer += exp_x;
+                }
+                normalizer = simd_sum(normalizer);
+                if (simd_lane_id == 0) {
+                    local_normalizer[simd_group_id] = normalizer;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simd_group_id == 0) {
+                    normalizer = simd_sum(local_normalizer[simd_lane_id]);
+                    if (simd_lane_id == 0) {
+                        local_normalizer[0] = normalizer;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                normalizer = 1 / local_normalizer[0];
+
+                device T* out_row =
+                    probs + size_t(gid) * axis_size + lid * 4;
+                if (lid * 4 + 4 <= axis_size) {
+                    for (int i = 0; i < 4; i++) {
+                        out_row[i] = static_cast<T>(ld[i] * normalizer);
+                    }
+                } else {
+                    for (int i = 0; i < 4; i++) {
+                        if ((lid * 4 + i) < axis_size) {
+                            out_row[i] = static_cast<T>(ld[i] * normalizer);
+                        }
+                    }
+                }
+            """,
+            ensureRowContiguous: true
+        )
+
+    /// Dispatch 2, BCAST-SOFTMAX-001. Same row work as
+    /// `softmaxIncumbentKernel`, three fewer threadgroup barriers.
+    ///
+    /// The transcription inherited `softmax_single_row`'s sync structure:
+    /// five `threadgroup_barrier`s per row-threadgroup. One orders a
+    /// zero-fill of the 32-slot reduction banks; two more exist only so
+    /// simdgroup 0 can publish its cross-simdgroup result through slot 0 for
+    /// the other simdgroups to read back. At the shapes this route runs
+    /// (kL a multiple of 64 up to 4095, so 2 to 32 simdgroups per row) that
+    /// is three full-threadgroup rendezvous spent moving two floats that
+    /// every simdgroup can derive for itself, on 128 threadgroups per
+    /// dispatch and one dispatch per full-attention layer per decode round.
+    ///
+    /// Both removals are value-preserving, not approximations:
+    ///
+    /// 1. The zero-fill exists so the surplus lanes of the cross-simdgroup
+    ///    reduce read the reduction identity. `live_groups` recomputes the
+    ///    caller's own threadgroup sizing — 32·ceil(ceil(kL/4)/32) over 32,
+    ///    the same expression, from the same `axis_size` — so a lane at or
+    ///    above it supplies that identity (`-INFINITY` for the max,
+    ///    `0.0f` for the sum) directly from a register instead of reading it
+    ///    back out of threadgroup memory. The 32 values entering `simd_max`
+    ///    and `simd_sum`, and the lanes they sit in, are unchanged; only the
+    ///    store-then-load round trip and the barrier that ordered it go.
+    ///
+    /// 2. The publish-and-broadcast is replaced by every simdgroup running
+    ///    the same 32-slot reduce itself. It is the same intrinsic over the
+    ///    same lane contents, so it returns the same bits; the redundant work
+    ///    is five shuffle steps against a threadgroup-wide rendezvous.
+    ///
+    /// The two barriers that remain are the load-bearing ones: each orders
+    /// the per-simdgroup partials into the bank before they are read back.
+    /// The element walk, the `fast::exp` call, the accumulation order of the
+    /// per-lane sum, the `simd_sum`/`simd_max` reduction trees, and the
+    /// output cast are character-identical to the incumbent above.
+    private static let softmaxBroadcastKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "cbv2_ragged8_sdpa_d512_softmax_bf16_bcast_v2",
+            inputNames: ["scores", "params"],
+            outputNames: ["probs"],
+            source: """
+                const int axis_size = int(params[0]);
+                const int gid = int(threadgroup_position_in_grid.x);
+                const int lid = int(thread_position_in_threadgroup.x);
+                const int simd_lane_id = int(thread_index_in_simdgroup);
+                const int simd_group_id = int(simdgroup_index_in_threadgroup);
+
+                // The caller sizes the threadgroup at 32·ceil(ceil(kL/4)/32)
+                // (softmax.cpp:64-68); this is that expression over 32, so it
+                // is exactly the number of simdgroups holding a live partial.
+                // kL ≤ 4095 bounds it at 32, the bank width.
+                const int live_groups = ((axis_size + 3) / 4 + 31) / 32;
+
+                threadgroup float local_max[32];
+                threadgroup float local_normalizer[32];
+
+                float ld[4];
+                const device T* in =
+                    scores + size_t(gid) * axis_size + lid * 4;
+                if (lid * 4 + 4 <= axis_size) {
+                    for (int i = 0; i < 4; i++) {
+                        ld[i] = static_cast<float>(in[i]);
+                    }
+                } else {
+                    for (int i = 0; i < 4; i++) {
+                        ld[i] = ((lid * 4 + i) < axis_size)
+                            ? static_cast<float>(in[i]) : -INFINITY;
+                    }
+                }
+
+                float maxval = -3.402823466e+38F;
+                for (int i = 0; i < 4; i++) {
+                    maxval = (maxval < ld[i]) ? ld[i] : maxval;
+                }
+                maxval = simd_max(maxval);
+                if (simd_lane_id == 0) {
+                    local_max[simd_group_id] = maxval;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                maxval = simd_max(simd_lane_id < live_groups
+                    ? local_max[simd_lane_id] : -INFINITY);
+
+                float normalizer = 0.0f;
+                for (int i = 0; i < 4; i++) {
+                    float exp_x = fast::exp(ld[i] - maxval);
+                    ld[i] = exp_x;
+                    normalizer += exp_x;
+                }
+                normalizer = simd_sum(normalizer);
+                if (simd_lane_id == 0) {
+                    local_normalizer[simd_group_id] = normalizer;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                normalizer = simd_sum(simd_lane_id < live_groups
+                    ? local_normalizer[simd_lane_id] : 0.0f);
+                normalizer = 1 / normalizer;
+
+                device T* out_row =
+                    probs + size_t(gid) * axis_size + lid * 4;
+                if (lid * 4 + 4 <= axis_size) {
+                    for (int i = 0; i < 4; i++) {
+                        out_row[i] = static_cast<T>(ld[i] * normalizer);
+                    }
+                } else {
+                    for (int i = 0; i < 4; i++) {
+                        if ((lid * 4 + i) < axis_size) {
+                            out_row[i] = static_cast<T>(ld[i] * normalizer);
+                        }
+                    }
+                }
+            """,
+            ensureRowContiguous: true
+        )
+
+    /// Engage mark for BCAST-SOFTMAX-001. Resolved once, so a process can
+    /// never run mismatched softmax shapes across the three entry points.
+    private static let softmaxKernel: MLXFast.MLXFastKernel =
+        softmaxBroadcastEnabled
+            ? softmaxBroadcastKernel : softmaxIncumbentKernel
 
     /// Dispatch 3 — probs·V. Grid: (row, kv head, column tile of 64) × 128
     /// threads (4 simdgroups — exactly the stock gemv_t threadgroup shape).

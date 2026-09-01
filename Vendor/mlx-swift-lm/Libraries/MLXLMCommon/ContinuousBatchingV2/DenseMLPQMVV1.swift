@@ -585,7 +585,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
   float acc0 = 0.0f;
   float acc1 = 0.0f;
   simdgroup_float8x8 A;
-  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+  simdgroup_float8x8 B;
 
   for (int g = g_begin; g < g_end; ++g) {
     const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
@@ -599,28 +599,31 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     rs += simd_shuffle_xor(rs, 4u);
     rs += simd_shuffle_xor(rs, 16u);
 
-    MMA8_SETB(B0, x, lo)
-    MMA8_SETB(B1, x, hi)
-    MMA8_SETB(B2, y, lo)
-    MMA8_SETB(B3, y, hi)
-    MMA8_SETB(B4, z, lo)
-    MMA8_SETB(B5, z, hi)
-    MMA8_SETB(B6, w, lo)
-    MMA8_SETB(B7, w, hi)
-
+    // BFILL: each B operand is filled immediately before the step that
+    // consumes it instead of all eight ahead of the run, so one B is live
+    // at a time rather than eight. `r0`/`r1` are not written between here
+    // and the last step, and the accumulation order into `C` is unchanged.
     const uint4 wv = *((const device uint4*)(wrow + 64 * g));
     const float s = float(srow[g]);
     const float b = float(brow[g]);
 
     simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
-    MMA8_STEP8(B0, x, z, 0)
-    MMA8_STEP8(B1, x, z, 8)
-    MMA8_STEP8(B2, x, z, 16)
-    MMA8_STEP8(B3, x, z, 24)
-    MMA8_STEP8(B4, y, w, 0)
-    MMA8_STEP8(B5, y, w, 8)
-    MMA8_STEP8(B6, y, w, 16)
-    MMA8_STEP8(B7, y, w, 24)
+    MMA8_SETB(B, x, lo)
+    MMA8_STEP8(B, x, z, 0)
+    MMA8_SETB(B, x, hi)
+    MMA8_STEP8(B, x, z, 8)
+    MMA8_SETB(B, y, lo)
+    MMA8_STEP8(B, x, z, 16)
+    MMA8_SETB(B, y, hi)
+    MMA8_STEP8(B, x, z, 24)
+    MMA8_SETB(B, z, lo)
+    MMA8_STEP8(B, y, w, 0)
+    MMA8_SETB(B, z, hi)
+    MMA8_STEP8(B, y, w, 8)
+    MMA8_SETB(B, w, lo)
+    MMA8_STEP8(B, y, w, 16)
+    MMA8_SETB(B, w, hi)
+    MMA8_STEP8(B, y, w, 24)
 
     acc0 += s * C.thread_elements()[0] + rs.x * b;
     acc1 += s * C.thread_elements()[1] + rs.y * b;
@@ -645,7 +648,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
 """
 
     private static let mma8Kernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_v1",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_b1_v2",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -729,10 +732,10 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         // hand-off is register renaming in a fully unrolled body, not a copy.
         replaceOnce(
             """
-              simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+              simdgroup_float8x8 B;
             """,
             with: """
-              simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+              simdgroup_float8x8 B;
 
               uint4 wv_next = *((const device uint4*)(wrow + 64 * g0));
               uint4 wv_next2 =
@@ -760,7 +763,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     }()
 
     private static let mma8DownStaticKKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_carry2_v3",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_carry2_b1_v5",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -778,7 +781,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     /// One complete SIMD group per g64 group. Keep all lane results rather
     /// than canonicalizing row sums: the consumer reads its own lane's tree.
     private static let mma8DownLaneSumKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_down_lane_sums_v1",
+        name: "cbv2_b8_l1_dense_mlp_mma8_down_lane_sums_b1_v2",
         inputNames: ["x"],
         outputNames: ["laneSums"],
         source: """
@@ -838,7 +841,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     }()
 
     private static let mma8DownLaneSumQMVKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_lane_sums_v1",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_lane_sums_b1_v2",
         inputNames: ["x", "w", "scales", "biases", "laneSums"],
         outputNames: ["y"],
         source: """
@@ -855,7 +858,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         ensureRowContiguous: true)
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_v2_unroll",
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_b1_v3",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -917,7 +920,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     )
 
     private static let activationSumQMVKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_v2_unroll",
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_b1_v3",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["y"],
         source: """

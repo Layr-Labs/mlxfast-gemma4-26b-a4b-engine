@@ -216,7 +216,9 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         let mtpDriver: CBv2MTPRoundDriver?
         if samplerSupportsMTP {
             mtpDriver = CBv2MTPRoundDriver.build(
-                model: model, drafter: mtpDrafter, config: mtpConfig)
+                model: model, drafter: mtpDrafter, config: mtpConfig,
+                cacheSupportsInstalledVerification:
+                    cacheProvider.supportsMTPRectangularVerification)
         } else {
             mtpDriver = nil
         }

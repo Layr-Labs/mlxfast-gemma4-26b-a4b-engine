@@ -3,6 +3,7 @@
 import Foundation
 import MLX
 import MLXLMCommon
+import MLXNN
 
 /// Abstraction over a Gemma 4 text tower that can drive MTP speculative
 /// decoding.
@@ -48,4 +49,133 @@ extension Gemma4TextModel: Gemma4MTPTarget {
     // `embedTokensForDrafter`, `forwardForMTP`, and `rollbackSpeculativeCache`
     // are declared directly on `Gemma4TextModel` with matching signatures, so
     // they satisfy the protocol without further work.
+}
+
+// MARK: - Construction-bound CBv2 verifier
+
+/// Runtime module paths promoted to eight-bit in the shipped target.  The set
+/// is derived from the certified layer count so a missing or extra promoted
+/// projection prevents installation instead of becoming a decode-time check.
+private func gemma4MTPVerifierOverridePaths() -> Set<String> {
+    var paths: Set<String> = []
+    for layer in 0..<30 {
+        for family in ["mlp.down_proj", "mlp.gate_proj", "mlp.up_proj", "router.proj"] {
+            paths.insert("model.layers.\(layer).\(family)")
+        }
+    }
+    return paths
+}
+
+/// Certify the materialized target once, while the adapter is being built.
+/// The installed route consequently owns only quantized affine leaves with the
+/// exact width table it was designed around; no metadata inspection or stock
+/// fallback remains in the measured forward.
+private func gemma4CanInstallBatch8Depth1Verifier(_ target: Gemma4TextModel) -> Bool {
+    guard gemma4SupportsBatch8Depth1MTPVerifier(target.configuration) else { return false }
+
+    let overrides = gemma4MTPVerifierOverridePaths()
+    var foundOverrides: Set<String> = []
+    var foundEmbedding = false
+    var foundQuantizedLinear = false
+    var foundQuantizedExperts = false
+
+    for (path, module) in target.leafModules().flattened() {
+        if module is Linear && !(module is QuantizedLinear) { return false }
+        if module is SwitchLinear && !(module is QuantizedSwitchLinear) { return false }
+        if module is Embedding && !(module is QuantizedEmbedding) { return false }
+
+        guard let quantized = module as? Quantized else { continue }
+        let isOverride = overrides.contains(path)
+        let expectedBits = isOverride ? 8 : 4
+        guard quantized.bits == expectedBits,
+            quantized.groupSize == 64,
+            quantized.mode == .affine
+        else { return false }
+
+        let parameters = Dictionary(
+            module.parameters().flattened(), uniquingKeysWith: { first, _ in first })
+        guard parameters["weight"] != nil,
+            parameters["scales"] != nil,
+            parameters["biases"] != nil
+        else { return false }
+
+        if isOverride { foundOverrides.insert(path) }
+        if path == "model.embed_tokens", module is QuantizedEmbedding {
+            foundEmbedding = true
+        }
+        if module is QuantizedLinear { foundQuantizedLinear = true }
+        if module is QuantizedSwitchLinear { foundQuantizedExperts = true }
+    }
+
+    return foundOverrides == overrides
+        && foundEmbedding
+        && foundQuantizedLinear
+        && foundQuantizedExperts
+}
+
+/// Replace all dense quantized leaves as one module-tree update after the
+/// complete inventory has succeeded. A failed candidate leaves the target
+/// untouched; the enabled M16 call therefore needs no eligibility fallback.
+private func gemma4InstallMTPVerifyLinears(_ target: Gemma4TextModel) -> Bool {
+    var updates: [(String, Module)] = []
+    for (path, module) in target.leafModules().flattened() {
+        guard let linear = module as? QuantizedLinear else { continue }
+        guard let installed = Gemma4MTPVerifyQuantizedLinear.install(linear) else {
+            return false
+        }
+        updates.append((path, installed))
+    }
+    guard !updates.isEmpty else { return false }
+    target.update(modules: ModuleChildren.unflattened(updates))
+    return true
+}
+
+private final class Gemma4Batch8Depth1Verifier: CBv2MTPInstalledVerifier {
+    let geometry = CBv2MTPVerificationGeometry(batchSize: 8, draftDepth: 1)
+    unowned let target: Gemma4TextModel
+    let tiedHead: Gemma4MTPVerifyTiedHead
+
+    init(target: Gemma4TextModel, tiedHead: Gemma4MTPVerifyTiedHead) {
+        self.target = target
+        self.tiedHead = tiedHead
+    }
+
+    func forwardWithHidden(
+        tokens: MLXArray, caches: [KVCache]
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        precondition(tokens.ndim == 2 && tokens.shape == [8, geometry.draftDepth + 1])
+        let hidden = target.cbv2MTPVerifyHiddenStates(tokens, caches: caches)
+        let logits = target.cbv2MTPVerifySoftcap(tiedHead(hidden.postNorm))
+        return (logits, hidden.preNorm)
+    }
+}
+
+/// Process-level kill switch for the packed MTP verifier route. With `0`,
+/// installation is refused and the engine runs the promoted target-only
+/// behavior byte for byte (depth stays 0 on every round).
+private let gemma4PackedMTPVerifyEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_MTP_PACKED_VERIFY"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+extension Gemma4TextModel: CBv2MTPVerifierInstallable {
+    public func installCBv2MTPVerifier() -> (any CBv2MTPInstalledVerifier)? {
+        guard gemma4PackedMTPVerifyEnabled else { return nil }
+        guard gemma4CanInstallBatch8Depth1Verifier(self) else {
+            fputs("gemma4: packed MTP verifier NOT installed (module inventory declined)\n", stderr)
+            return nil
+        }
+        guard let tiedHead = makeMTPVerifyTiedHead() else {
+            fputs("gemma4: packed MTP verifier NOT installed (tied head declined)\n", stderr)
+            return nil
+        }
+        guard gemma4InstallMTPVerifyLinears(self) else {
+            fputs("gemma4: packed MTP verifier NOT installed (linear install declined)\n", stderr)
+            return nil
+        }
+        fputs("gemma4: packed MTP verifier installed (B8 K1)\n", stderr)
+        return Gemma4Batch8Depth1Verifier(target: self, tiedHead: tiedHead)
+    }
 }

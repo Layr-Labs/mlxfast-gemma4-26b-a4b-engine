@@ -47,6 +47,37 @@ public struct CBv2MTPCaptureLayers: Sendable, Equatable {
     }
 }
 
+/// Fixed logical shape covered by a construction-installed MTP target
+/// verifier.  Geometry is immutable after the model adapter is built so the
+/// measured path never revalidates model metadata.
+public struct CBv2MTPVerificationGeometry: Sendable, Equatable {
+    public let batchSize: Int
+    public let draftDepth: Int
+
+    public init(batchSize: Int, draftDepth: Int) {
+        precondition(batchSize > 0, "CBv2 MTP verifier batch size must be positive")
+        precondition(draftDepth > 0, "CBv2 MTP verifier draft depth must be positive")
+        self.batchSize = batchSize
+        self.draftDepth = draftDepth
+    }
+}
+
+/// A target-specific verifier whose topology, quantization, storage layout,
+/// and fixed shape were certified before the engine begins generation.
+public protocol CBv2MTPInstalledVerifier: AnyObject {
+    var geometry: CBv2MTPVerificationGeometry { get }
+
+    func forwardWithHidden(
+        tokens: MLXArray, caches: [KVCache]
+    ) -> (logits: MLXArray, lastHidden: MLXArray)
+}
+
+/// Model construction seam for installing a fixed verifier after target
+/// weights and quantized module replacements have been loaded.
+public protocol CBv2MTPVerifierInstallable: AnyObject {
+    func installCBv2MTPVerifier() -> (any CBv2MTPInstalledVerifier)?
+}
+
 /// Model-level surface for `LanguageModel` conformers reached through
 /// `CBv2SteppableLanguageModelAdapter` (Gemma4TextModel conforms): the
 /// KVCache-shaped twin of the `CBv2MTPSteppableModel` requirements.

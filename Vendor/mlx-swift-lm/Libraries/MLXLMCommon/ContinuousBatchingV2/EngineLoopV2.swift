@@ -78,12 +78,21 @@ public protocol CBv2LayerCacheProvider: AnyObject {
     /// per rectangular row. This is stricter than single-row multimodal
     /// support and fails closed for paged/custom providers.
     var supportsPackedMultimodalSpans: Bool { get }
+    /// Construction-certified cache-bank route for per-column MTP attention.
+    /// Providers answering true must prebind every cache they vend and toggle
+    /// that fixed set directly in `setMTPRectangularVerification`.
+    var supportsMTPRectangularVerification: Bool { get }
+    func setMTPRectangularVerification(_ enabled: Bool)
 }
 
 extension CBv2LayerCacheProvider {
     public var supportsMultimodalSpans: Bool { false }
     public var supportsPackedPrefill: Bool { false }
     public var supportsPackedMultimodalSpans: Bool { false }
+    public var supportsMTPRectangularVerification: Bool { false }
+    public func setMTPRectangularVerification(_ enabled: Bool) {
+        precondition(!enabled, "cache provider did not install rectangular MTP attention")
+    }
 }
 
 // MARK: - Sampler interface (WS-E's CBv2DefaultSampler is the production impl)

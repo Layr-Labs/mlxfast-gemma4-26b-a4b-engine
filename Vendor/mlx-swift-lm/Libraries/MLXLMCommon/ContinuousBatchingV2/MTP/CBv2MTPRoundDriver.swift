@@ -164,14 +164,14 @@ final class CBv2MTPRoundDriver {
     /// each round. A higher value widens the adaptive range. It does not force
     /// speculation. The trusted MTP envelope (`config.maxDraftTokens`, ceiling 3
     /// at batch 8) also bounds it, so the effective cap is
-    /// `min(envelope, submissionDraftDepth)`. Compiled at the envelope.
+    /// `min(envelope, submissionDraftDepth)`. Default 1.
     ///
     /// UNIFORM WITH DFLASH. `DFlashDraftModel.submissionDraftDepth` is the DFlash
     /// counterpart. It has the same name, the same meaning, and the same default
     /// 1. The per-arm behaviour differs. MTP adapts up to this ceiling each round.
     /// DFlash proposes a fixed block of this size, because block diffusion drafts
     /// a whole block at once. The constant you edit is the same on both arms.
-    static let submissionDraftDepth = 3
+    static let submissionDraftDepth = 1
 
     /// The effective adaptive-depth ceiling: the trusted envelope's max, bounded
     /// by the participant's `submissionDraftDepth`. Pure and static so the cap is
@@ -181,12 +181,20 @@ final class CBv2MTPRoundDriver {
         min(envelopeMax, submissionDraftDepth)
     }
 
+    /// Fixed Phase A production route. The installed verifier geometry is
+    /// construction-bound; only the scheduler's current decode width varies.
+    static func phaseADepth(batchSize: Int, routeInstalled: Bool) -> Int {
+        batchSize == 8 && routeInstalled ? submissionDraftDepth : 0
+    }
+
     let config: CBv2MTPConfig
     let drafter: any CBv2MTPDrafter
     /// The engine's model, downcast once at build (verify forwards go
     /// through `forwardWithHidden`).
     let model: any CBv2MTPSteppableModel
     let captureLayers: CBv2MTPCaptureLayers
+    private let installedVerificationModel: CBv2SteppableLanguageModelAdapter?
+    private let installedVerificationGeometry: CBv2MTPVerificationGeometry?
     private let depthController: CBv2MTPDepthController
 
     // Engine-thread confined.
@@ -211,20 +219,32 @@ final class CBv2MTPRoundDriver {
 
     private init(
         config: CBv2MTPConfig, drafter: any CBv2MTPDrafter,
-        model: any CBv2MTPSteppableModel, captureLayers: CBv2MTPCaptureLayers
+        model: any CBv2MTPSteppableModel, captureLayers: CBv2MTPCaptureLayers,
+        cacheSupportsInstalledVerification: Bool
     ) {
         self.config = config
         self.drafter = drafter
         self.model = model
         self.captureLayers = captureLayers
-        // The adaptive controller's CEILING: the trusted envelope cap
-        // (`config.maxDraftTokens`), further bounded by the participant's
-        // `submissionDraftDepth`. `fixedDepth` stays `config.fixedDraftTokens`
-        // (adaptive) — submissionDraftDepth is a ceiling, NEVER a fixed pin, so
-        // the controller keeps choosing 0…this per round.
+        let installedAdapter = model as? CBv2SteppableLanguageModelAdapter
+        self.installedVerificationGeometry = cacheSupportsInstalledVerification
+            ? installedAdapter?.mtpVerificationGeometry : nil
+        self.installedVerificationModel =
+            self.installedVerificationGeometry == nil ? nil : installedAdapter
+        // The production Gemma verifier is a construction-installed B8/K1
+        // route. Pin that route once here: the packed single-forward verify
+        // changes the cost model enough that the generic controller's old
+        // B8 verifier samples are not transferable. Other geometries keep the
+        // caller's fixed/adaptive policy unchanged.
+        let productionGeometry = CBv2MTPVerificationGeometry(
+            batchSize: 8, draftDepth: Self.submissionDraftDepth)
+        let installedFixedDepth =
+            self.installedVerificationGeometry == productionGeometry
+            ? Self.submissionDraftDepth
+            : config.fixedDraftTokens
         self.depthController = CBv2MTPDepthController(
             maxDepth: Self.effectiveDraftCeiling(envelopeMax: config.maxDraftTokens),
-            fixedDepth: config.fixedDraftTokens)
+            fixedDepth: installedFixedDepth)
         self.metrics.verificationMode = config.verificationMode
         self.metrics.maxAutomaticRectangularTokens = config.maxAutomaticRectangularTokens
     }
@@ -233,7 +253,8 @@ final class CBv2MTPRoundDriver {
     /// `DARKBLOOM_CBV2_MTP` kill switch), no drafter, or a model that cannot
     /// drive rounds. nil ⇒ the engine is byte-identical to MTP-less builds.
     static func build(
-        model: CBv2SteppableModel, drafter: (any CBv2MTPDrafter)?, config: CBv2MTPConfig
+        model: CBv2SteppableModel, drafter: (any CBv2MTPDrafter)?, config: CBv2MTPConfig,
+        cacheSupportsInstalledVerification: Bool = false
     ) -> CBv2MTPRoundDriver? {
         guard config.effectiveEnabled, let drafter else { return nil }
         guard let mtpModel = model as? (any CBv2MTPSteppableModel),
@@ -244,7 +265,9 @@ final class CBv2MTPRoundDriver {
             modelTarget == drafterTarget
         else { return nil }
         return CBv2MTPRoundDriver(
-            config: config, drafter: drafter, model: mtpModel, captureLayers: captureLayers)
+            config: config, drafter: drafter, model: mtpModel,
+            captureLayers: captureLayers,
+            cacheSupportsInstalledVerification: cacheSupportsInstalledVerification)
     }
 
     // MARK: Plan-scoped marks
@@ -283,7 +306,20 @@ final class CBv2MTPRoundDriver {
         // The envelope cap, bounded by the participant's submissionDraftDepth —
         // the same ceiling the depth controller was built with above.
         let cap = Self.effectiveDraftCeiling(envelopeMax: config.maxDraftTokens)
-        guard config.verificationMode == .automatic, plannedDecodeRows > 0 else {
+        // An empty scheduler plan has no verifier geometry.  Return the
+        // target-only depth before comparing against the construction-bound
+        // positive `(B, K)` route; constructing a synthetic `B == 0` geometry
+        // would violate that route's type invariant.
+        guard plannedDecodeRows > 0 else { return 0 }
+        if installedVerificationGeometry != nil {
+            return min(
+                cap,
+                Self.phaseADepth(
+                    batchSize: plannedDecodeRows,
+                    routeInstalled: supportsInstalledVerification(
+                        batchSize: plannedDecodeRows, draftDepth: cap)))
+        }
+        guard config.verificationMode == .automatic else {
             return cap
         }
         let maxWidth = config.maxAutomaticRectangularTokens / plannedDecodeRows
@@ -314,6 +350,22 @@ final class CBv2MTPRoundDriver {
 
     var planDepth: Int { planDecision.depth }
     var planDecodeRowBucket: Int { planDecision.decodeRowBucket }
+
+    func supportsInstalledVerification(batchSize: Int, draftDepth: Int) -> Bool {
+        installedVerificationGeometry
+            == CBv2MTPVerificationGeometry(
+                batchSize: batchSize, draftDepth: draftDepth)
+    }
+
+    /// Direct fixed-route dispatch. Planning and the engine's column builder
+    /// have already selected the immutable `(B=8,K=1)` geometry.
+    func forwardInstalledMTPVerification(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        recordVerificationStrategy(rectangular: true)
+        return installedVerificationModel!.forwardInstalledMTPVerification(
+            tokens: tokens, caches: caches)
+    }
 
     /// A plan boundary can discover that one otherwise eligible row cannot
     /// complete the selected full round (typically a max-token tail). Mixing

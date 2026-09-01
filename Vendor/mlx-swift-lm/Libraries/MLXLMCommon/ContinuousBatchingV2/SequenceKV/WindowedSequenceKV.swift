@@ -104,6 +104,14 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// MTP-PV-QSTAGE kill switch: `MLX_KV_QUANT_MTP_STAGED=0` returns the
+    /// staged verify attention to the bf16 ring road. Default ON.
+    static let quantStagedMTPEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_KV_QUANT_MTP_STAGED"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// `MLX_KV_QUANT_SIM=1` (default OFF, local only): after every ring
     /// write, overwrite the bf16 slot with its quantize→dequantize round
     /// trip, so the SINGLE-STREAM fallback path — the one a local
@@ -249,6 +257,26 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         guard staged == nil, quantMirror != nil, retainedCount == window
         else { return nil }
         return quantMirror
+    }
+
+    /// Immutable pre-write ring for the fixed B8 verifier lane. The lane
+    /// is admitted only while a speculative transaction is armed and before
+    /// any staged token has been appended, so every row can be validated
+    /// before the first mutation occurs.
+    var mtpPrewriteRingView: (keys: MLXArray, values: MLXArray, start: Int)? {
+        guard speculativeWriteArmed, staged == nil else { return nil }
+        return decodeRingView
+    }
+
+    /// Stage the verifier's target columns after the whole cohort's
+    /// pre-write rings have been admitted. This does not touch ring storage;
+    /// finalize-time rollback/commit remains the only mutation boundary.
+    func stageMTPColumns(keys newKeys: MLXArray, values newValues: MLXArray) {
+        precondition(speculativeWriteArmed && staged == nil)
+        let count = newKeys.dim(2)
+        precondition((2...4).contains(count) && newValues.dim(2) == count)
+        _ = stageSpeculativeUpdate(
+            newKeys: newKeys, newValues: newValues, count: count)
     }
 
     /// The ring view a fused decode step should attend: the SAME allocations

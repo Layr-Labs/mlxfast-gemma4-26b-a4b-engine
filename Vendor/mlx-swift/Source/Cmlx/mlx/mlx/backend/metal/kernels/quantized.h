@@ -3978,9 +3978,12 @@ template <typename T, int group_size, int bits>
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   int M = x_shape[x_batch_ndims];
+  const uint assignment_count =
+      batch_ndims == 1 ? uint(batch_shape[0]) : 0u;
   const bool gemma4_pair_geometry =
       group_size == 64 && bits == 4 && M == 1 && batch_ndims == 1 &&
-      batch_shape[0] == 64 && x_batch_ndims == 1 && w_batch_ndims == 1 &&
+      (assignment_count == 64 || assignment_count == 128) &&
+      x_batch_ndims == 1 && w_batch_ndims == 1 &&
       ((in_vec_size == 2816 && out_vec_size == 704) ||
        (in_vec_size == 704 && out_vec_size == 2816));
   if (gemma4_pair_geometry) {
@@ -3989,7 +3992,7 @@ template <typename T, int group_size, int bits>
     // Flip to false to return every plane to the incumbent per-y-group
     // election below; the two arms are bit-identical by construction.
     constexpr bool gemma4_down_tile = true;
-    if (gemma4_down_tile && in_vec_size == 704) {
+    if (gemma4_down_tile && in_vec_size == 704 && assignment_count == 64) {
       gather_qmv_gemma4_down_tile<T, group_size, bits>(
           w,
           scales,
@@ -4043,7 +4046,7 @@ template <typename T, int group_size, int bits>
     if (expert_prefix_bounds) {
       run_len = min(4u, ((route_word >> 14) & 0x3fu) + 1u);
     } else {
-      while (run_len < 4 && assignment + run_len < 64 &&
+      while (run_len < 4 && assignment + run_len < assignment_count &&
              rhs_indices[(assignment + run_len) * (uint)rhs_strides[0]] ==
                  expert) {
         run_len++;

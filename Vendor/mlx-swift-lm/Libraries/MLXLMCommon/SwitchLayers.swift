@@ -1353,11 +1353,16 @@ public class SwitchGLU: Module {
         sortedPlane: SwitchSortedPlaneProducer? = nil,
         routeTable: SwitchRouteTable? = nil
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
-        let useLhsIndices =
-            indices.size == 64 && indices.ndim == 2 && indices.shape == [8, 8]
-            && x.ndim == 2 && x.shape == [8, inputDims]
+        // Direct sorted-LHS admission: the retiled decode cohort ([8, 8])
+        // and the fixed MTP verify plane ([16, 8]) share the same layout;
+        // every wider shape keeps the incumbent path.
+        let directSortedRows =
+            indices.ndim == 2 && indices.dim(1) == 8
+            && x.ndim == 2 && x.dim(1) == inputDims
+            && indices.dim(0) == x.dim(0) ? x.dim(0) : 0
+        let useLhsIndices = directSortedRows == 8 || directSortedRows == 16
         let useExpertPrefixBounds =
-            expertPrefixBoundsEnabled && useLhsIndices
+            expertPrefixBoundsEnabled && useLhsIndices && directSortedRows == 8
             && indices.dtype == .uint32 && x.dtype == .bfloat16
             && expertPrefixBoundsProjectionsEligible
         var x = MLX.expandedDimensions(x, axes: [-2, -3])

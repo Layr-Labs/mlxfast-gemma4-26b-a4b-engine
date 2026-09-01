@@ -15,6 +15,8 @@ import MLX
 import MLXFast
 
 enum CBv2RaggedTwoPassDecodeAttentionV1 {
+    static var stagedMTPLaneEnabled: Bool { enabled }
+
     private static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_RAGGED_TWO_PASS_ATTENTION"]
@@ -793,6 +795,414 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             ensureRowContiguous: true
         )
 
+    /// Two query columns over one untouched full ring. Column zero replaces
+    /// the evicted tail with candidate zero; column one replaces the final
+    /// two logical slots with candidates zero and one. The block-strided
+    /// traversal and online-softmax arithmetic are otherwise identical to
+    /// `ringPassAKernel` for each independent query column.
+    private static let stagedMTPPassAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_staged_mtp2_sdpa_2pass_a_bf16_d256_g2_b\(blocks)_v1",
+        inputNames: [
+            "queries",
+            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+            "starts", "new_keys", "new_values",
+        ],
+        outputNames: ["partials", "sums", "maxs"],
+        source: """
+            constexpr int simd_width = 32;
+            constexpr int values_per_lane = D / simd_width;
+
+            const int kv_head = int(threadgroup_position_in_grid.x);
+            const int batch_column = int(threadgroup_position_in_grid.y);
+            const int batch_index = batch_column / COLUMNS;
+            const int column = batch_column % COLUMNS;
+            const int block = int(threadgroup_position_in_grid.z);
+            const int query_head_in_group = int(thread_position_in_threadgroup.y);
+            const int query_head = GQA * kv_head + query_head_in_group;
+            const int output_row =
+                (batch_index * 16 + query_head) * COLUMNS + column;
+            const int lane = int(thread_index_in_simdgroup);
+
+            const device T* keys = k0;
+            const device T* values = v0;
+            switch (batch_index) {
+                case 1: keys = k1; values = v1; break;
+                case 2: keys = k2; values = v2; break;
+                case 3: keys = k3; values = v3; break;
+                case 4: keys = k4; values = v4; break;
+                case 5: keys = k5; values = v5; break;
+                case 6: keys = k6; values = v6; break;
+                case 7: keys = k7; values = v7; break;
+                default: break;
+            }
+
+            const device T* query =
+                queries + output_row * D + lane * values_per_lane;
+            keys += kv_head * N * D + lane * values_per_lane;
+            values += kv_head * N * D + lane * values_per_lane;
+            const device T* candidate_keys = new_keys
+                + (batch_index * KV_HEADS + kv_head) * COLUMNS * D
+                + lane * values_per_lane;
+            const device T* candidate_values = new_values
+                + (batch_index * KV_HEADS + kv_head) * COLUMNS * D
+                + lane * values_per_lane;
+            const uint ring_start = starts[batch_index];
+            uint slot =
+                (ring_start + uint(column + 1 + block)) % uint(N);
+
+            device T* partial = partials
+                + output_row * BLOCKS * D + block * D + lane * values_per_lane;
+            device float* sum_out = sums + output_row * BLOCKS + block;
+            device float* max_out = maxs + output_row * BLOCKS + block;
+
+            thread float q[values_per_lane];
+            thread float accumulator[values_per_lane];
+            for (int element = 0; element < values_per_lane; ++element) {
+                q[element] = 1.0f * float(query[element]);
+                accumulator[element] = 0.0f;
+            }
+
+            float max_score = -3.402823466e+38F;
+            float sum_exp_score = 0.0f;
+            for (int token = block; token < N; token += BLOCKS) {
+                const int first_candidate = N - column - 1;
+                const bool candidate = token >= first_candidate;
+                const int candidate_index = token - first_candidate;
+                const device T* k = candidate
+                    ? candidate_keys + candidate_index * D
+                    : keys + slot * D;
+                const device T* v = candidate
+                    ? candidate_values + candidate_index * D
+                    : values + slot * D;
+                float score = 0.0f;
+                for (int element = 0; element < values_per_lane; ++element) {
+                    score += q[element] * float(k[element]);
+                }
+                score = simd_sum(score);
+
+                const float new_max = max(max_score, score);
+                const float old_factor = fast::exp(max_score - new_max);
+                const float score_factor = fast::exp(score - new_max);
+                max_score = new_max;
+                sum_exp_score = sum_exp_score * old_factor + score_factor;
+                for (int element = 0; element < values_per_lane; ++element) {
+                    accumulator[element] = accumulator[element] * old_factor
+                        + score_factor * float(v[element]);
+                }
+
+                slot += BLOCKS;
+                if (slot >= uint(N)) {
+                    slot -= uint(N);
+                }
+            }
+
+            if (lane == 0) {
+                sum_out[0] = sum_exp_score;
+                max_out[0] = max_score;
+            }
+            for (int element = 0; element < values_per_lane; ++element) {
+                partial[element] = T(accumulator[element]);
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    /// MTP-PV-QSTAGE: `stagedMTPPassAKernel` with the RING reads moved to
+    /// the packed 8-bit mirror — the same words, tails, and fma
+    /// reconstruction order as the promoted `portQuantReadKernel` — while
+    /// the staged candidate columns are attended through the identical
+    /// quantize→dequantize round trip their committed writes will land, so
+    /// the verify's attention numerics are the ones the serial reference's
+    /// own mirror road produces. The bf16 rings are not bound at all, which
+    /// removes the verify round's largest read stream.
+    private static let stagedMTPQuantPassAKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_staged_mtp2_sdpa_2pass_a_q4g64_d256_g2_b\(blocks)_v1",
+        inputNames: [
+            "queries",
+            "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
+            "starts", "new_keys", "new_values",
+        ],
+        outputNames: ["partials", "sums", "maxs"],
+        source: """
+            constexpr int simd_width = 32;
+            constexpr int values_per_lane = D / simd_width;
+            // KVQ4: 32 payload words + one fp16 (scale,bias) tail per group.
+            constexpr int row_words = D / 8 + D / 64;
+
+            const int kv_head = int(threadgroup_position_in_grid.x);
+            const int batch_column = int(threadgroup_position_in_grid.y);
+            const int batch_index = batch_column / COLUMNS;
+            const int column = batch_column % COLUMNS;
+            const int block = int(threadgroup_position_in_grid.z);
+            const int query_head_in_group = int(thread_position_in_threadgroup.y);
+            const int query_head = GQA * kv_head + query_head_in_group;
+            const int output_row =
+                (batch_index * 16 + query_head) * COLUMNS + column;
+            const int lane = int(thread_index_in_simdgroup);
+
+            const device uint32_t* mirror_w = m0;
+            switch (batch_index) {
+                case 1: mirror_w = m1; break;
+                case 2: mirror_w = m2; break;
+                case 3: mirror_w = m3; break;
+                case 4: mirror_w = m4; break;
+                case 5: mirror_w = m5; break;
+                case 6: mirror_w = m6; break;
+                case 7: mirror_w = m7; break;
+                default: break;
+            }
+
+            const device T* query =
+                queries + output_row * D + lane * values_per_lane;
+            const device uint32_t* mkeys_w =
+                mirror_w + kv_head * N * row_words;
+            const device uint32_t* mvalues_w =
+                mirror_w + (KV_HEADS + kv_head) * N * row_words;
+            const device T* candidate_keys = new_keys
+                + (batch_index * KV_HEADS + kv_head) * COLUMNS * D
+                + lane * values_per_lane;
+            const device T* candidate_values = new_values
+                + (batch_index * KV_HEADS + kv_head) * COLUMNS * D
+                + lane * values_per_lane;
+            const uint ring_start = starts[batch_index];
+            uint slot =
+                (ring_start + uint(column + 1 + block)) % uint(N);
+
+            device T* partial = partials
+                + output_row * BLOCKS * D + block * D + lane * values_per_lane;
+            device float* sum_out = sums + output_row * BLOCKS + block;
+            device float* max_out = maxs + output_row * BLOCKS + block;
+
+            thread float q[values_per_lane];
+            thread float accumulator[values_per_lane];
+            for (int element = 0; element < values_per_lane; ++element) {
+                q[element] = 1.0f * float(query[element]);
+                accumulator[element] = 0.0f;
+            }
+
+            float max_score = -3.402823466e+38F;
+            float sum_exp_score = 0.0f;
+            for (int token = block; token < N; token += BLOCKS) {
+                const int first_candidate = N - column - 1;
+                const bool candidate = token >= first_candidate;
+                const int candidate_index = token - first_candidate;
+                float score = 0.0f;
+                float cur_vs = 0.0f;
+                float cur_vb = 0.0f;
+                if (candidate) {
+                    const device T* ck = candidate_keys + candidate_index * D;
+                    const device T* cv = candidate_values + candidate_index * D;
+                    float kmn = 3.402823466e+38F;
+                    float kmx = -3.402823466e+38F;
+                    float vmn = 3.402823466e+38F;
+                    float vmx = -3.402823466e+38F;
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        const float kx = float(ck[element]);
+                        const float vx = float(cv[element]);
+                        kmn = min(kmn, kx);
+                        kmx = max(kmx, kx);
+                        vmn = min(vmn, vx);
+                        vmx = max(vmx, vx);
+                    }
+                    for (uint m = 1; m < 8; m <<= 1) {
+                        kmn = min(kmn, simd_shuffle_xor(kmn, m));
+                        kmx = max(kmx, simd_shuffle_xor(kmx, m));
+                        vmn = min(vmn, simd_shuffle_xor(vmn, m));
+                        vmx = max(vmx, simd_shuffle_xor(vmx, m));
+                    }
+                    const float cks = float(half(max((kmx - kmn) / 15.0f, 1e-6f)));
+                    const float ckb = float(half(kmn));
+                    cur_vs = float(half(max((vmx - vmn) / 15.0f, 1e-6f)));
+                    cur_vb = float(half(vmn));
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        const float kq = clamp(
+                            rint((float(ck[element]) - ckb) / cks),
+                            0.0f, 15.0f);
+                        score += q[element] * fma(kq, cks, ckb);
+                    }
+                } else {
+                    const device uint32_t* krow_w = mkeys_w + slot * row_words;
+                    const int group = lane / 8;
+                    const uint32_t ktw = krow_w[D / 8 + group];
+                    const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
+                    const float kb = float(as_type<half>(ushort(ktw >> 16)));
+                    const uint32_t kw = krow_w[lane];
+                    for (int element = 0; element < 8; ++element) {
+                        score += q[element]
+                            * fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
+                    }
+                }
+                score = simd_sum(score);
+
+                const float new_max = max(max_score, score);
+                const float old_factor = fast::exp(max_score - new_max);
+                const float score_factor = fast::exp(score - new_max);
+                max_score = new_max;
+                sum_exp_score = sum_exp_score * old_factor + score_factor;
+                if (candidate) {
+                    const device T* cv = candidate_values + candidate_index * D;
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        const float vq = clamp(
+                            rint((float(cv[element]) - cur_vb) / cur_vs),
+                            0.0f, 15.0f);
+                        accumulator[element] = accumulator[element] * old_factor
+                            + score_factor * fma(vq, cur_vs, cur_vb);
+                    }
+                } else {
+                    const device uint32_t* vrow_w = mvalues_w + slot * row_words;
+                    const int group = lane / 8;
+                    const uint32_t vtw = vrow_w[D / 8 + group];
+                    const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
+                    const float vb = float(as_type<half>(ushort(vtw >> 16)));
+                    const uint32_t vw = vrow_w[lane];
+                    for (int element = 0; element < 8; ++element) {
+                        accumulator[element] = accumulator[element] * old_factor
+                            + score_factor
+                                * fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
+                    }
+                }
+
+                slot += BLOCKS;
+                if (slot >= uint(N)) {
+                    slot -= uint(N);
+                }
+            }
+
+            if (lane == 0) {
+                sum_out[0] = sum_exp_score;
+                max_out[0] = max_score;
+            }
+            for (int element = 0; element < values_per_lane; ++element) {
+                partial[element] = T(accumulator[element]);
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    /// MTP-PV-QSTAGE entry: the staged verify attention over the 8-bit
+    /// mirrors. Same outputs and combine as the bf16 staged road.
+    static func attendInstalledStagedMTPQuant(
+        queries: MLXArray,
+        mirrors: [MLXArray],
+        starts: [Int],
+        newKeys: MLXArray,
+        newValues: MLXArray
+    ) -> MLXArray? {
+        guard CBv2WindowedSequenceKV.quantEnabled,
+            mirrors.count == batch,
+            starts.count == batch,
+            starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength }),
+            mirrors.allSatisfy({
+                $0.dtype == .uint32
+                    && $0.shape == [2, kvHeads, sequenceLength, headDim / 8 + headDim / 64]
+            }),
+            queries.dtype == .bfloat16,
+            queries.dim(0) == batch,
+            queries.dim(1) == queryHeads,
+            queries.dim(3) == headDim,
+            headDim == 256, kvHeads == 8
+        else { return nil }
+        let columns = queries.dim(2)
+        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let partialShape = [batch, queryHeads, columns, blocks, headDim]
+        let summaryShape = [batch, queryHeads, columns, blocks]
+        let passA = stagedMTPQuantPassAKernel(
+            [queries] + mirrors + [startArray, newKeys, newValues],
+            template: [
+                ("T", queries.dtype),
+                ("D", headDim),
+                ("N", sequenceLength),
+                ("GQA", gqa),
+                ("KV_HEADS", kvHeads),
+                ("COLUMNS", columns),
+                ("BLOCKS", blocks),
+            ],
+            grid: (kvHeads * 32, batch * columns * gqa, blocks),
+            threadGroup: (32, gqa, 1),
+            outputShapes: [partialShape, summaryShape, summaryShape],
+            outputDTypes: [.bfloat16, .float32, .float32]
+        )
+        CBv2EngageMark.once("mtpqstage")
+        return stagedMTPPassBKernel(
+            passA,
+            template: [
+                ("T", queries.dtype),
+                ("D", headDim),
+                ("BLOCKS", blocks),
+            ],
+            grid: (batch * queryHeads * columns * 1024, 1, 1),
+            threadGroup: (1024, 1, 1),
+            outputShapes: [[batch, queryHeads, columns, headDim]],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
+
+    private static let stagedMTPPassBKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_staged_mtp_sdpa_2pass_b_bf16_d256_b\(blocks)_v2",
+        inputNames: ["partials", "sums", "maxs"],
+        outputNames: ["out"],
+        source: """
+            constexpr int simd_width = 32;
+            constexpr int values_per_lane = D / simd_width;
+            static_assert(
+                BLOCKS <= simd_width,
+                "staged combine carries at most one partition column per lane");
+
+            const int batch_head = int(threadgroup_position_in_grid.x);
+            const int simdgroup = int(simdgroup_index_in_threadgroup);
+            const int lane = int(thread_index_in_simdgroup);
+
+            partials += batch_head * BLOCKS * D
+                + simdgroup * D + lane * values_per_lane;
+            sums += batch_head * BLOCKS;
+            maxs += batch_head * BLOCKS;
+            out += batch_head * D + simdgroup * values_per_lane;
+
+            thread float accumulator[values_per_lane];
+            threadgroup float partial_outputs[simd_width * simd_width];
+
+            // Lane l holds partition column l (dead lanes hold the identity),
+            // one pass; the promoted partition count is 8, so BLOCKS is
+            // always at most one simdgroup wide here.
+            const bool live_lane = lane < BLOCKS;
+            float max_score = simd_max(
+                live_lane ? maxs[lane] : -3.402823466e+38F);
+            float sum_exp_score = simd_sum(
+                live_lane ? fast::exp(maxs[lane] - max_score) * sums[lane]
+                          : 0.0f);
+
+            // Simdgroup s owns partition column s of this output row. Dead
+            // simdgroups contribute exact zeros to the transpose fold below.
+            const bool live_group = simdgroup < BLOCKS;
+            const float factor = live_group
+                ? fast::exp(maxs[simdgroup] - max_score)
+                : 0.0f;
+            for (int element = 0; element < values_per_lane; ++element) {
+                accumulator[element] =
+                    live_group ? factor * float(partials[element]) : 0.0f;
+            }
+
+            for (int element = 0; element < values_per_lane; ++element) {
+                partial_outputs[lane * simd_width + simdgroup] = accumulator[element];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                accumulator[element] = simd_sum(
+                    partial_outputs[simdgroup * simd_width + lane]);
+                accumulator[element] = sum_exp_score == 0.0f
+                    ? accumulator[element]
+                    : accumulator[element] / sum_exp_score;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            if (lane == 0) {
+                for (int element = 0; element < values_per_lane; ++element) {
+                    out[element] = T(accumulator[element]);
+                }
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
     private static let passBKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name:
             "cbv2_ragged8_sdpa_2pass_b_direct_bf16_d256_b\(blocks)"
@@ -1229,6 +1639,65 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         return (output, passA[3])
     }
 
+    /// Direct installed-lane dispatch. The caller has already admitted the
+    /// immutable model geometry and every row's full pre-write ring before
+    /// staging any token, so this path performs no retry or fallback checks.
+    static func attendInstalledStagedMTP(
+        queries: MLXArray,
+        newKeys: MLXArray,
+        newValues: MLXArray,
+        keys: [MLXArray],
+        values: [MLXArray],
+        starts: [Int]
+    ) -> MLXArray {
+        dispatchStagedMTP(
+            queries: queries, newKeys: newKeys, newValues: newValues,
+            keys: keys, values: values, starts: starts)
+    }
+
+    private static func dispatchStagedMTP(
+        queries: MLXArray,
+        newKeys: MLXArray,
+        newValues: MLXArray,
+        keys: [MLXArray],
+        values: [MLXArray],
+        starts: [Int]
+    ) -> MLXArray {
+        let columns = queries.dim(2)
+        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let partialShape = [batch, queryHeads, columns, blocks, headDim]
+        let summaryShape = [batch, queryHeads, columns, blocks]
+        let passA = stagedMTPPassAKernel(
+            [queries] + keys + values + [startArray, newKeys, newValues],
+            template: [
+                ("T", queries.dtype),
+                ("D", headDim),
+                ("N", sequenceLength),
+                ("GQA", gqa),
+                ("KV_HEADS", kvHeads),
+                ("COLUMNS", columns),
+                ("BLOCKS", blocks),
+            ],
+            grid: (kvHeads * 32, batch * columns * gqa, blocks),
+            threadGroup: (32, gqa, 1),
+            outputShapes: [partialShape, summaryShape, summaryShape],
+            outputDTypes: [.bfloat16, .float32, .float32]
+        )
+
+        return stagedMTPPassBKernel(
+            passA,
+            template: [
+                ("T", queries.dtype),
+                ("D", headDim),
+                ("BLOCKS", blocks),
+            ],
+            grid: (batch * queryHeads * columns * 1024, 1, 1),
+            threadGroup: (1024, 1, 1),
+            outputShapes: [[batch, queryHeads, columns, headDim]],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
+
     private static func attend(
         passAKernel: MLXFast.MLXFastKernel,
         queries: MLXArray,
@@ -1360,6 +1829,8 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// Kill switch: `DARKBLOOM_GEMMA4_D512_DECODE_SDPA` set to
     /// `0`/`false`/`no`/`off` restores the established per-row chain.
     /// Default ON.
+    static var stagedMTPLaneEnabled: Bool { enabled }
+
     private static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_D512_DECODE_SDPA"]

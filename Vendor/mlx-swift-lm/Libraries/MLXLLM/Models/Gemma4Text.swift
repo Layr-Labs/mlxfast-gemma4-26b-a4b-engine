@@ -3051,14 +3051,44 @@ private enum Gemma4FusedLayerGlue {
             }
     """
 
-    private static let deferredTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1",
-        inputNames: [
-            "a", "sorted", "inverse", "route_weights", "res",
-            "w1", "w2", "w3", "s",
-        ],
-        outputNames: ["out"],
-        source: """
+    private static let pairedDeferredRmsSource = """
+        float av[4];
+        float bv[4];
+        threadgroup float local_sums_b[32];
+        {
+            float acc_a = 0;
+            float acc_b = 0;
+            for (int i = 0; i < 4; i++) {
+                av[i] = (float)a[base + i];
+                bv[i] = (float)expertv[i];
+                acc_a += av[i] * av[i];
+                acc_b += bv[i] * bv[i];
+            }
+            acc_a = simd_sum(acc_a);
+            acc_b = simd_sum(acc_b);
+            if (simd_group_id == 0) {
+                local_sums[simd_lane_id] = 0;
+                local_sums_b[simd_lane_id] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_lane_id == 0) {
+                local_sums[simd_group_id] = acc_a;
+                local_sums_b[simd_group_id] = acc_b;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+                acc_a = simd_sum(local_sums[simd_lane_id]);
+                acc_b = simd_sum(local_sums_b[simd_lane_id]);
+                if (simd_lane_id == 0) {
+                    local_inv[0] = metal::precise::rsqrt(acc_a / 2816.0f + 1e-06f);
+                    local_inv[1] = metal::precise::rsqrt(acc_b / 2816.0f + 1e-06f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    """
+
+    private static let deferredTailSource = """
             const uint row = threadgroup_position_in_grid.x;
             const uint lid = thread_position_in_threadgroup.x;
             const uint simd_lane_id = thread_index_in_simdgroup;
@@ -3091,9 +3121,152 @@ private enum Gemma4FusedLayerGlue {
                 const T summed = res[base + i] + normed3;
                 out[base + i] = summed * scalar;
             }
-        """,
+    """
+
+    private static let pairedDeferredTailSource = """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float local_inv[2];
+            threadgroup float local_sums[32];
+            const uint base = row * 2816 + lid * 4;
+            const uint wbase = lid * 4;
+        \(deferredExpertValuesSource)
+        \(pairedDeferredRmsSource)
+            const float inv1 = local_inv[0];
+            const float inv2 = local_inv[1];
+            T sv[4];
+            for (int i = 0; i < 4; i++) {
+                const T h1 = w1[wbase + i]
+                    * static_cast<T>(av[i] * inv1);
+                const T h2 = w2[wbase + i]
+                    * static_cast<T>(bv[i] * inv2);
+                sv[i] = h1 + h2;
+            }
+        \(rmsReduce("sv", into: "local_inv[0]").replacingOccurrences(
+            of: "(float)sv[base + i]", with: "(float)sv[i]"))
+            const float inv3 = local_inv[0];
+            const T scalar = s[0];
+            for (int i = 0; i < 4; i++) {
+                const T normed3 = static_cast<T>(
+                    w3[wbase + i] * static_cast<T>((float)sv[i] * inv3));
+                const T summed = res[base + i] + normed3;
+                out[base + i] = summed * scalar;
+            }
+    """
+
+    private static let deferredTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1",
+        inputNames: [
+            "a", "sorted", "inverse", "route_weights", "res",
+            "w1", "w2", "w3", "s",
+        ],
+        outputNames: ["out"],
+        source: deferredTailSource,
         ensureRowContiguous: true
     )
+
+    private static let pairedDeferredTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_glue_deferred_expert_tail_paired_rms_2816_bf16_v1",
+        inputNames: [
+            "a", "sorted", "inverse", "route_weights", "res",
+            "w1", "w2", "w3", "s",
+        ],
+        outputNames: ["out"],
+        source: pairedDeferredTailSource,
+        ensureRowContiguous: true
+    )
+
+    private static let deferredTailChainSource = """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float local_inv[2];
+            threadgroup float local_sums[32];
+            const uint base = row * 2816 + lid * 4;
+            const uint wbase = lid * 4;
+        \(rmsReduce("a", into: "local_inv[0]"))
+        \(deferredExpertValuesSource)
+        \(rmsReduce("expertv", into: "local_inv[1]").replacingOccurrences(
+            of: "(float)expertv[base + i]", with: "(float)expertv[i]"))
+            const float inv1 = local_inv[0];
+            const float inv2 = local_inv[1];
+            T sv[4];
+            for (int i = 0; i < 4; i++) {
+                const T h1 = w1[wbase + i]
+                    * static_cast<T>((float)a[base + i] * inv1);
+                const T h2 = w2[wbase + i]
+                    * static_cast<T>((float)expertv[i] * inv2);
+                sv[i] = h1 + h2;
+            }
+        \(rmsReduce("sv", into: "local_inv[0]").replacingOccurrences(
+            of: "(float)sv[base + i]", with: "(float)sv[i]"))
+            const float inv3 = local_inv[0];
+            const T scalar = s[0];
+            T outv[4];
+            for (int i = 0; i < 4; i++) {
+                const T normed3 = static_cast<T>(
+                    w3[wbase + i]
+                        * static_cast<T>((float)sv[i] * inv3));
+                const T summed = res[base + i] + normed3;
+                outv[i] = summed * scalar;
+                out[base + i] = outv[i];
+            }
+        \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
+            of: "(float)outv[base + i]", with: "(float)outv[i]"))
+            const float inv4 = local_inv[0];
+            for (int i = 0; i < 4; i++) {
+                normed[base + i] =
+                    wn[wbase + i]
+                        * static_cast<T>((float)outv[i] * inv4);
+            }
+    """
+
+    private static let pairedDeferredTailChainSource = """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float local_inv[2];
+            threadgroup float local_sums[32];
+            const uint base = row * 2816 + lid * 4;
+            const uint wbase = lid * 4;
+        \(deferredExpertValuesSource)
+        \(pairedDeferredRmsSource)
+            const float inv1 = local_inv[0];
+            const float inv2 = local_inv[1];
+            T sv[4];
+            for (int i = 0; i < 4; i++) {
+                const T h1 = w1[wbase + i]
+                    * static_cast<T>(av[i] * inv1);
+                const T h2 = w2[wbase + i]
+                    * static_cast<T>(bv[i] * inv2);
+                sv[i] = h1 + h2;
+            }
+        \(rmsReduce("sv", into: "local_inv[0]").replacingOccurrences(
+            of: "(float)sv[base + i]", with: "(float)sv[i]"))
+            const float inv3 = local_inv[0];
+            const T scalar = s[0];
+            T outv[4];
+            for (int i = 0; i < 4; i++) {
+                const T normed3 = static_cast<T>(
+                    w3[wbase + i]
+                        * static_cast<T>((float)sv[i] * inv3));
+                const T summed = res[base + i] + normed3;
+                outv[i] = summed * scalar;
+                out[base + i] = outv[i];
+            }
+        \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
+            of: "(float)outv[base + i]", with: "(float)outv[i]"))
+            const float inv4 = local_inv[0];
+            for (int i = 0; i < 4; i++) {
+                normed[base + i] =
+                    wn[wbase + i]
+                        * static_cast<T>((float)outv[i] * inv4);
+            }
+    """
 
     private static let deferredTailChainKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
@@ -3103,54 +3276,21 @@ private enum Gemma4FusedLayerGlue {
                 "w1", "w2", "w3", "s", "wn",
             ],
             outputNames: ["out", "normed"],
-            source: """
-                const uint row = threadgroup_position_in_grid.x;
-                const uint lid = thread_position_in_threadgroup.x;
-                const uint simd_lane_id = thread_index_in_simdgroup;
-                const uint simd_group_id = simdgroup_index_in_threadgroup;
-                threadgroup float local_inv[2];
-                threadgroup float local_sums[32];
-                const uint base = row * 2816 + lid * 4;
-                const uint wbase = lid * 4;
-            \(rmsReduce("a", into: "local_inv[0]"))
-            \(deferredExpertValuesSource)
-            \(rmsReduce("expertv", into: "local_inv[1]").replacingOccurrences(
-                of: "(float)expertv[base + i]", with: "(float)expertv[i]"))
-                const float inv1 = local_inv[0];
-                const float inv2 = local_inv[1];
-                T sv[4];
-                for (int i = 0; i < 4; i++) {
-                    const T h1 = w1[wbase + i]
-                        * static_cast<T>((float)a[base + i] * inv1);
-                    const T h2 = w2[wbase + i]
-                        * static_cast<T>((float)expertv[i] * inv2);
-                    sv[i] = h1 + h2;
-                }
-            \(rmsReduce("sv", into: "local_inv[0]").replacingOccurrences(
-                of: "(float)sv[base + i]", with: "(float)sv[i]"))
-                const float inv3 = local_inv[0];
-                const T scalar = s[0];
-                T outv[4];
-                for (int i = 0; i < 4; i++) {
-                    const T normed3 = static_cast<T>(
-                        w3[wbase + i]
-                            * static_cast<T>((float)sv[i] * inv3));
-                    const T summed = res[base + i] + normed3;
-                    outv[i] = summed * scalar;
-                    out[base + i] = outv[i];
-                }
-            \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
-                of: "(float)outv[base + i]", with: "(float)outv[i]"))
-                const float inv4 = local_inv[0];
-                for (int i = 0; i < 4; i++) {
-                    normed[base + i] =
-                        wn[wbase + i]
-                            * static_cast<T>((float)outv[i] * inv4);
-                }
-            """,
+            source: deferredTailChainSource,
             ensureRowContiguous: true
         )
 
+    private static let pairedDeferredTailChainKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_glue_deferred_expert_tail_chain_paired_rms_2816_bf16_v1",
+            inputNames: [
+                "a", "sorted", "inverse", "route_weights", "res",
+                "w1", "w2", "w3", "s", "wn",
+            ],
+            outputNames: ["out", "normed"],
+            source: pairedDeferredTailChainSource,
+            ensureRowContiguous: true
+        )
     private static func admitsDeferred(
         _ expertRows: DeferredWeightedExpertRows
     ) -> Bool {
@@ -3186,7 +3326,8 @@ private enum Gemma4FusedLayerGlue {
             nextInputNormWeight.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-deferred-expert-tail-chain")
-        let outs = deferredTailChainKernel(
+        let selected = pairedRmsEnabled ? pairedDeferredTailChainKernel : deferredTailChainKernel
+        let outs = selected(
             [
                 mlpOut, expertRows.sortedOutputs, expertRows.inverseOrder,
                 expertRows.weights, residual, w1, w2, w3, layerScalar,
@@ -3220,7 +3361,8 @@ private enum Gemma4FusedLayerGlue {
             layerScalar.size == 1, layerScalar.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-deferred-expert-tail")
-        return deferredTailKernel(
+        let selected = pairedRmsEnabled ? pairedDeferredTailKernel : deferredTailKernel
+        return selected(
             [
                 mlpOut, expertRows.sortedOutputs, expertRows.inverseOrder,
                 expertRows.weights, residual, w1, w2, w3, layerScalar,

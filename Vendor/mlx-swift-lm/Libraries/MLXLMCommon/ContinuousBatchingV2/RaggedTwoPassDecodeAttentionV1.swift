@@ -1523,7 +1523,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// removes only the global partial write/read and the second dispatch.
     private static let portQuantFusedWriteResidentKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_v1",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_pad65t4_v2",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -1534,7 +1534,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 typedef vec<T, 4> T4;
                 constexpr int simd_width = 32;
                 constexpr int values_per_lane = D / simd_width;
-                constexpr int vectors_per_lane = values_per_lane / 4;
+                constexpr int partial_stride = 65;
                 constexpr int payload_words = D / 8;
                 constexpr int row_words = payload_words + D / 64;
                 constexpr int current_block = (N - 1) % BLOCKS;
@@ -1552,10 +1552,15 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 const int batch_head = batch_index * 16 + query_head;
                 const int lane = int(thread_index_in_simdgroup);
 
-                threadgroup T local_partials[GQA * BLOCKS * D];
+                // A 65-vector stride pads each 64-vector head/tile slab.
+                // The transposed [chunk][set][block] map cuts the promoted
+                // row-major pass-B alias while retaining two T4 loads/lane.
+                threadgroup T4 local_partials[GQA * BLOCKS * partial_stride];
                 threadgroup float local_sums[GQA * BLOCKS];
                 threadgroup float local_maxs[GQA * BLOCKS];
 
+                // End pass-A's register-heavy lexical scope before merge.
+                {
                 const device uint32_t* mirror_w = m0;
                 switch (batch_index) {
                     case 1: mirror_w = m1; break;
@@ -1657,8 +1662,6 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
 
                 const device T* query =
                     queries + batch_head * D + lane * values_per_lane;
-                threadgroup T* partial = local_partials
-                    + block * D + lane * values_per_lane;
                 threadgroup float* sum_out = local_sums + block;
                 threadgroup float* max_out = local_maxs + block;
 
@@ -1752,18 +1755,31 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     sum_out[BLOCKS] = sum_hi;
                     max_out[BLOCKS] = max_hi;
                 }
-                for (int element = 0; element < values_per_lane; ++element) {
-                    partial[element] = T(acc_lo[element]);
-                    partial[BLOCKS * D + element] = T(acc_hi[element]);
+                const int output_tile = lane >> 2;
+                const int output_set = lane & 3;
+                for (int chunk = 0; chunk < values_per_lane / 4; ++chunk) {
+                    const int chunk_offset =
+                        chunk * simd_width + output_set * BLOCKS + block;
+                    T4 lo_vector;
+                    T4 hi_vector;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        lo_vector[j] = T(acc_lo[chunk * 4 + j]);
+                        hi_vector[j] = T(acc_hi[chunk * 4 + j]);
+                    }
+                    local_partials[output_tile * partial_stride + chunk_offset] =
+                        lo_vector;
+                    local_partials[(BLOCKS + output_tile) * partial_stride
+                        + chunk_offset] = hi_vector;
+                }
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
                 const int block_lane = lane % COLS;
-                const int output_group = block * sets + lane / COLS;
+                const int merge_set = lane / COLS;
+                const int output_group = block * sets + merge_set;
                 #pragma clang loop unroll(full)
                 for (int head = 0; head < GQA; ++head) {
-                    const threadgroup T* head_partials = local_partials
-                        + head * BLOCKS * D + output_group * values_per_lane;
                     const threadgroup float* head_sums =
                         local_sums + head * BLOCKS;
                     const threadgroup float* head_maxs =
@@ -1809,12 +1825,15 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         const int column = block_lane + COLS * round;
                         if (column < BLOCKS) {
                             const float factor = lane_factor[round];
-                            const threadgroup T4* partial_vectors =
-                                reinterpret_cast<const threadgroup T4*>(
-                                    head_partials + column * D);
                             #pragma clang loop unroll(full)
-                            for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
-                                const T4 partial_vector = partial_vectors[chunk];
+                            for (int chunk = 0;
+                                chunk < values_per_lane / 4; ++chunk) {
+                                const int partial_index =
+                                    (head * BLOCKS + block) * partial_stride
+                                    + chunk * simd_width
+                                    + merge_set * BLOCKS + column;
+                                const T4 partial_vector =
+                                    local_partials[partial_index];
                                 #pragma clang loop unroll(full)
                                 for (int j = 0; j < 4; ++j) {
                                     accumulator[chunk * 4 + j] +=

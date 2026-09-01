@@ -4,6 +4,8 @@
 //
 //  Port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/gemma4_text.py
 
+// Ranked executable-identical sample of promoted source 16c281c.
+
 import Foundation
 import MLX
 import MLXLMCommon

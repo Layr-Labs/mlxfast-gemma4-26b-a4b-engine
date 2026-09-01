@@ -680,7 +680,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// packer stores (`metal::rint` matches MLX `round`), quantized bytes
     /// plus the fp16 tail written at the identical offsets.
     private static let quantPackKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_kvq4g64_pack_d256_v1",
+        name: "cbv2_kvq4g64_pack_d256_unrollvec_v2",
         inputNames: ["x"],
         outputNames: ["packed_w"],
         source: """
@@ -698,12 +698,25 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             // A lane owns 8 consecutive elements, so it lies wholly inside one
             // 64-element group; the eight lanes of a group are contiguous and
             // aligned, so an xor butterfly over 1,2,4 reduces exactly them.
+            // Read the lane's values as two aligned four-wide vectors. The
+            // quantized nibble loop retains its original element order.
+            typedef vec<T, 4> T4;
+            const device T4* xq =
+                reinterpret_cast<const device T4*>(xr + lane * per_lane);
+            const T4 lo4 = xq[0];
+            const T4 hi4 = xq[1];
+            float e[per_lane];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 4; ++i) {
+                e[i] = float(lo4[i]);
+                e[4 + i] = float(hi4[i]);
+            }
             float vmin = 3.402823466e+38F;
             float vmax = -3.402823466e+38F;
+            #pragma clang loop unroll(full)
             for (int i = 0; i < per_lane; ++i) {
-                const float v = float(xr[lane * per_lane + i]);
-                vmin = min(vmin, v);
-                vmax = max(vmax, v);
+                vmin = min(vmin, e[i]);
+                vmax = max(vmax, e[i]);
             }
             for (uint m = 1; m < 8; m <<= 1) {
                 vmin = min(vmin, simd_shuffle_xor(vmin, m));
@@ -716,8 +729,9 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             const float b = float(hb);
 
             uint32_t word = 0u;
+            #pragma clang loop unroll(full)
             for (int i = 0; i < per_lane; ++i) {
-                const float q = metal::rint((float(xr[lane * per_lane + i]) - b) / s);
+                const float q = metal::rint((e[i] - b) / s);
                 word |= uint32_t(clamp(q, 0.0f, 15.0f)) << (4 * i);
             }
             out[lane] = word;
@@ -740,7 +754,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// its text, and a Swift-hosted kernel that changes text without
     /// changing name serves a stale cached body.
     private static let quantPackPairKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_kvq4g64_pack_pair_d256_v1",
+        name: "cbv2_kvq4g64_pack_pair_d256_unrollvec_v2",
         inputNames: ["keys", "values"],
         outputNames: ["packed_w"],
         source: """
@@ -758,12 +772,23 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             const device T* src = (plane == 0 ? keys : values) + head * D;
             device uint32_t* out = packed_w + row * row_words;
 
+            typedef vec<T, 4> T4;
+            const device T4* sq =
+                reinterpret_cast<const device T4*>(src + lane * per_lane);
+            const T4 lo4 = sq[0];
+            const T4 hi4 = sq[1];
+            float e[per_lane];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 4; ++i) {
+                e[i] = float(lo4[i]);
+                e[4 + i] = float(hi4[i]);
+            }
             float vmin = 3.402823466e+38F;
             float vmax = -3.402823466e+38F;
+            #pragma clang loop unroll(full)
             for (int i = 0; i < per_lane; ++i) {
-                const float v = float(src[lane * per_lane + i]);
-                vmin = min(vmin, v);
-                vmax = max(vmax, v);
+                vmin = min(vmin, e[i]);
+                vmax = max(vmax, e[i]);
             }
             for (uint m = 1; m < 8; m <<= 1) {
                 vmin = min(vmin, simd_shuffle_xor(vmin, m));
@@ -776,8 +801,9 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             const float b = float(hb);
 
             uint32_t word = 0u;
+            #pragma clang loop unroll(full)
             for (int i = 0; i < per_lane; ++i) {
-                const float q = metal::rint((float(src[lane * per_lane + i]) - b) / s);
+                const float q = metal::rint((e[i] - b) / s);
                 word |= uint32_t(clamp(q, 0.0f, 15.0f)) << (4 * i);
             }
             out[lane] = word;

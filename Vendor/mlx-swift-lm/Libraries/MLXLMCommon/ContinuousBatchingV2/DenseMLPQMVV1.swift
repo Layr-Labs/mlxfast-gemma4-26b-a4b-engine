@@ -215,10 +215,11 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
     #pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint8_t* wl = ws + row * in_vec_size_w;
-      #pragma unroll
-      for (int i = 0; i < bytes_per_thread; i++) {
-        packed[row][i] = wl[i];
-      }
+      const uint32_t word = *((const device uint32_t*)wl);
+      packed[row][0] = uint8_t(word & 0xffu);
+      packed[row][1] = uint8_t((word >> 8) & 0xffu);
+      packed[row][2] = uint8_t((word >> 16) & 0xffu);
+      packed[row][3] = uint8_t(word >> 24);
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }
@@ -855,7 +856,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         ensureRowContiguous: true)
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_v2_unroll",
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_wordsolo_v1",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -917,7 +918,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     )
 
     private static let activationSumQMVKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_v2_unroll",
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_wordsolo_v1",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["y"],
         source: """

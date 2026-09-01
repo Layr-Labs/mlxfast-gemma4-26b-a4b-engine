@@ -24,36 +24,6 @@ constant bool align_M [[function_constant(200)]];
 constant bool align_N [[function_constant(201)]];
 constant bool align_K [[function_constant(202)]];
 
-// DARKBLOOM GEMMA4 NAX SKIP-EMPTY.
-// Restores NAX-SKIP-EMPTY-001 (upstream ml-explore/mlx 66a0407) behind a kill
-// switch. A steel NAX GEMM simdgroup whose output extent is empty in either
-// dimension (sgp_sm <= 0 or sgp_sn <= 0) stores nothing: the tail store is
-// store_safe with a zero or negative extent, which writes no element. Such a
-// simdgroup skips its A and B loads and its MMA instead of computing an
-// accumulator that is then discarded.
-//
-// BARRIER SAFETY, the hazard this mechanism has to clear. The skip in the main
-// K loop is placed strictly AFTER threadgroup_barrier(mem_flags::mem_none), so
-// every simdgroup -- skipping or not -- still executes that barrier on every
-// iteration, and the loop trip count gemm_k_iterations_ is threadgroup uniform.
-// No threadgroup barrier is ever enclosed by the skip. In the unaligned-K tail
-// the only synchronisation is a simdgroup_barrier, the skip is placed after it
-// as well, and nothing after the early return contains any barrier at all.
-// has_output is derived from sgp_sm and sgp_sn, which are simdgroup uniform, so
-// all lanes of a simdgroup take the same branch and no intra-simdgroup
-// divergence is introduced either.
-//
-// THREADGROUP MEMORY. gemm_loop reads A and B straight from device memory into
-// per-simdgroup register tiles; it declares no threadgroup array, runs no
-// cooperative loader and writes no threadgroup memory. A skipped simdgroup
-// therefore produces nothing any other simdgroup reads.
-//
-// Kill switch: build with -DDARKBLOOM_GEMMA4_NAX_SKIP_EMPTY=0 and both guards
-// fold to the incumbent unconditional form.
-#ifndef DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY
-#define DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY 1
-#endif
-
 // clang-format off
 template <
     bool kAlignedM,
@@ -243,18 +213,14 @@ template <
             params->gemm_k_iterations_aligned,
             sgp_sm,
             sgp_sn);
-        if ((DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY == 0) ||
-            ((kAlignedM.value || sgp_sm > 0) &&
-             (kAlignedN.value || sgp_sn > 0))) {
-          if (use_out_source) {
-            gemm_epilogue<kAlignedM.value, kAlignedN.value>(
-                Dtile, C, params, addmm_params, sgp_sm, sgp_sn);
-          }
-          if constexpr (kAlignedM && kAlignedN) {
-            Dtile.store(D, int(params->ldd));
-          } else {
-            Dtile.store_safe(D, int(params->ldd), short2(sgp_sn, sgp_sm));
-          }
+        if (use_out_source) {
+          gemm_epilogue<kAlignedM.value, kAlignedN.value>(
+              Dtile, C, params, addmm_params, sgp_sm, sgp_sn);
+        }
+        if constexpr (kAlignedM && kAlignedN) {
+          Dtile.store(D, int(params->ldd));
+        } else {
+          Dtile.store_safe(D, int(params->ldd), short2(sgp_sn, sgp_sm));
         }
       });
     });

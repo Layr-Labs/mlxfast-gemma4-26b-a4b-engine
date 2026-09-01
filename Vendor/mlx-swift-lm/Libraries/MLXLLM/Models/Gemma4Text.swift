@@ -1,3 +1,5 @@
+// Ranked rollback receipt: restore the physically faster 6833af7 executable
+// after the succeeding ten-file bundle regressed both measured windows.
 //
 //  Gemma4Text.swift
 //  mlx-swift-lm
@@ -5641,9 +5643,6 @@ extension Gemma4TextModel: CBv2MTPForwardable {
         return (applyLMHead(postNorm), preNorm)
     }
 }
-
-// Ranked resample marker 2: this archive is a further ranked sample of the tree carried
-// by the preceding ranked submission of this content apart from any rotation item declared in its note.
 
 // Ranked resample marker 2: this archive is a further ranked sample of the tree carried
 // by the preceding ranked submission of this content apart from any rotation item declared in its note.

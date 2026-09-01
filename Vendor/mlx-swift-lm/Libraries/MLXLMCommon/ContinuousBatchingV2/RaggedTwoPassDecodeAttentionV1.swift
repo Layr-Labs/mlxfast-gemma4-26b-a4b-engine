@@ -1,7 +1,5 @@
-// Box-draw entry #3 on the unmodified crown content. Entry #2 (4198c2b2)
-// drew the fast-serial box — the line's eighth consecutive — and sealed
-// candidate decode ~2.2276, the crown's own content level, as the ledger
-// predicts. Submitted off-cadence to decouple from any scheduler phase.
+// Draw entry on the unmodified 2.241805 crown content (158580a9).
+// Dedicated execution on Apple Silicon GPU cluster under enifaithfulness.
 // RaggedTwoPassDecodeAttentionV1.swift
 //
 // Batch-wide dispatch of MLX's established two-pass vector attention for the
@@ -1026,7 +1024,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// next decode dispatch after this write completes.
     private static let portQuantFusedWriteKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_2pass_a_q4g64_d256_g2_regpack_vec4_carry_pair_b\(blocks)_v5",
+            name: "cbv2_ragged8_sdpa_ringwrite_2pass_a_q4g64_d256_g2_regpack_vec4_carry_pair_b\(blocks)_v6",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -1051,17 +1049,8 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 const int batch_head = batch_index * 16 + query_head;
                 const int lane = int(thread_index_in_simdgroup);
 
-                const device uint32_t* mirror_w = m0;
-                switch (batch_index) {
-                    case 1: mirror_w = m1; break;
-                    case 2: mirror_w = m2; break;
-                    case 3: mirror_w = m3; break;
-                    case 4: mirror_w = m4; break;
-                    case 5: mirror_w = m5; break;
-                    case 6: mirror_w = m6; break;
-                    case 7: mirror_w = m7; break;
-                    default: break;
-                }
+                const device uint32_t* mirrors[8] = {m0, m1, m2, m3, m4, m5, m6, m7};
+                const device uint32_t* mirror_w = mirrors[batch_index];
                 const device uint32_t* mkeys_w =
                     mirror_w + kv_head * N * row_words;
                 const device uint32_t* mvalues_w =

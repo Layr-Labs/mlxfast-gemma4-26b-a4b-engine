@@ -231,6 +231,7 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
         defer { lock.unlock() }
         for row in state {
             guard let row else { continue }
+            (row as? CBv2WindowedSequenceKV)?.releaseSharedStorageCharge()
             let key = ObjectIdentifier(row)
             live.removeValue(forKey: key)
             reservations.removeValue(forKey: key)

@@ -243,12 +243,16 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
   simdgroup_float8x8 A;
   simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
 
-  // Same register carry as the Q/K/V tier: one group's weight operands stay
-  // resident while the next group's are read. Addresses are functions of the
-  // group index alone and `g_next` is clamped to the simdgroup's last group.
+  // Two-stage weight operand carry plus activation register prefetch:
+  // weights are prefetched two groups ahead (wv_next2) and activations, scales
+  // and biases one group ahead (r0_next, r1_next, s_next, b_next).
   uint2 wv_next = *((const device uint2*)(wrow + 32 * g0));
+  uint2 wv_next2 =
+      *((const device uint2*)(wrow + 32 * (g0 + min(1, nGroups - 1))));
   T s_next = srow[g0];
   T b_next = brow[g0];
+  uint4 r0_next = *((const device uint4*)(x0 + 64 * g0));
+  uint4 r1_next = *((const device uint4*)(x1 + 64 * g0));
 
 #pragma unroll
   for (int gi = 0; gi < nGroups; ++gi) {
@@ -256,13 +260,16 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
     const uint2 wv = wv_next;
     const float s = float(s_next);
     const float b = float(b_next);
+    const uint4 r0 = r0_next;
+    const uint4 r1 = r1_next;
     const int g_next = g0 + min(gi + 1, nGroups - 1);
-    wv_next = *((const device uint2*)(wrow + 32 * g_next));
+    const int g_next2 = g0 + min(gi + 2, nGroups - 1);
+    wv_next = wv_next2;
+    wv_next2 = *((const device uint2*)(wrow + 32 * g_next2));
     s_next = srow[g_next];
     b_next = brow[g_next];
-    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
-    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
-
+    r0_next = *((const device uint4*)(x0 + 64 * g_next));
+    r1_next = *((const device uint4*)(x1 + 64 * g_next));
     float2 rs = float2(mma8_runsum4<T>(r0), mma8_runsum4<T>(r1));
     rs += simd_shuffle_xor(rs, 2u);
     rs += simd_shuffle_xor(rs, 4u);
@@ -313,7 +320,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
 """
 
     private static let mma8KernelK4096 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry_bfill_v4",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry2_rcarry_bfill_v5",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -330,7 +337,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
         ensureRowContiguous: true)
 
     private static let mma8KernelK8192 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_carry_bfill_v4",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_carry2_rcarry_bfill_v5",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -400,6 +407,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
         else { return nil }
 
         if mma8Enabled {
+            CBv2EngageMark.once("attn-o-mma8-carry2")
             // One threadgroup per 8-column output tile; all eight cohort rows
             // are served from a single weight fetch, so the o_proj plane is
             // streamed once per round instead of four times. Grid is in

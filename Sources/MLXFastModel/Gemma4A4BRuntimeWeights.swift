@@ -110,6 +110,11 @@ public final class Gemma4A4BRuntimeWeightCache {
            )
         {
             setenv("MLX_MAX_MB_PER_BUFFER", "512", 1)
+            // OPSCAP-256 is credited to samfenwick's public Yukon submission
+            // 48ff7a7c: let the established 512 MiB referenced-byte budget,
+            // rather than MLX's much smaller operation count, set the command
+            // buffer boundary on the ranked high-memory profile.
+            setenv("MLX_MAX_OPS_PER_BUFFER", "256", 1)
             Memory.cacheLimit = 32 << 30
         }
 

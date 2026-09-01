@@ -30,6 +30,14 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
+    /// The resident N=1024 walk always has a valid first packed row for
+    /// every compile-time block. Keep the old guarded loads available.
+    private static let q4ResidentDirectPrefetchEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_Q4_RESIDENT_DIRECT_PREFETCH"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
 
     private static let batch = 8
     private static let queryHeads = 16
@@ -1523,7 +1531,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// removes only the global partial write/read and the second dispatch.
     private static let portQuantFusedWriteResidentKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c4",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -1542,6 +1550,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 constexpr int sets = simd_width / COLS;
                 constexpr int rounds = (BLOCKS + COLS - 1) / COLS;
                 static_assert(BLOCKS == 8, "resident kernel requires eight blocks");
+                static_assert(N == 1024, "resident kernel requires a 1024-row ring");
                 static_assert(GQA == 2, "resident kernel requires GQA two");
                 static_assert(values_per_lane % 4 == 0, "lane run is four-wide");
 
@@ -1689,17 +1698,14 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 float sum_lo = 0.0f;
                 float sum_hi = 0.0f;
                 uint slot = (start + uint(block)) % uint(N);
-                const bool prefetch_first = block < N - 1;
                 uint next_slot = slot + uint(BLOCKS);
                 if (next_slot >= uint(N)) next_slot -= uint(N);
-                uint32_t kw_pre = prefetch_first
-                    ? mkeys_w[slot * row_words + lane] : 0u;
-                uint32_t vw_pre = prefetch_first
-                    ? mvalues_w[slot * row_words + lane] : 0u;
-                uint32_t ktw_pre = prefetch_first
-                    ? mkeys_w[slot * row_words + payload_words + lane / 8] : 0u;
-                uint32_t vtw_pre = prefetch_first
-                    ? mvalues_w[slot * row_words + payload_words + lane / 8] : 0u;
+                uint32_t kw_pre = mkeys_w[slot * row_words + lane];
+                uint32_t vw_pre = mvalues_w[slot * row_words + lane];
+                uint32_t ktw_pre =
+                    mkeys_w[slot * row_words + payload_words + lane / 8];
+                uint32_t vtw_pre =
+                    mvalues_w[slot * row_words + payload_words + lane / 8];
                 for (int token = block; token < N; token += BLOCKS) {
                     const bool current = token == N - 1;
                     const uint32_t kw = current ? kword : kw_pre;
@@ -2024,6 +2030,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         let inputs = [queries] + mirrors
             + [startArray, newKeys, newValues, previousWriteFence]
         if q4ResidentMergeEnabled,
+            q4ResidentDirectPrefetchEnabled,
             blocks == 8,
             combineColumns == 8,
             combineThreads == 256
@@ -2045,6 +2052,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             )
             CBv2EngageMark.once("kvq4-fused-live-write")
             CBv2EngageMark.once("kvq4-resident-merge")
+            CBv2EngageMark.once("kvq4-resident-direct-prefetch")
             return (resident[0], resident[1])
         }
 

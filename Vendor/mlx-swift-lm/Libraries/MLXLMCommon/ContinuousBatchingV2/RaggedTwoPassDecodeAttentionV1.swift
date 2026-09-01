@@ -1026,7 +1026,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// next decode dispatch after this write completes.
     private static let portQuantFusedWriteKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_2pass_a_q4g64_d256_g2_regpack_vec4_carry_pair_b\(blocks)_v5",
+            name: "cbv2_ragged8_sdpa_ringwrite_2pass_a_q4g64_d256_g2_regpack_vec4_carry_pair_qvec_b\(blocks)_v6",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -1161,8 +1161,15 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     fence[0] = write_fence[0] + 1;
                 }
 
-                const device T* query =
-                    queries + batch_head * D + lane * values_per_lane;
+                // QVEC: the lane owns eight contiguous D256 elements of each
+                // paired query head. That span is 16-byte aligned, so two
+                // vec4 loads replace eight scalar loads per head. Conversion
+                // order is still element 0..7 of head 2k then 2k+1.
+                using T4 = vec<T, 4>;
+                const device T4* qlo_vec = reinterpret_cast<const device T4*>(
+                    queries + batch_head * D + lane * values_per_lane);
+                const device T4* qhi_vec = reinterpret_cast<const device T4*>(
+                    queries + (batch_head + 1) * D + lane * values_per_lane);
                 device T* partial = partials
                     + batch_head * BLOCKS * D + block * D + lane * values_per_lane;
                 device float* sum_out = sums + batch_head * BLOCKS + block;
@@ -1172,11 +1179,17 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 thread float q_hi[values_per_lane];
                 thread float acc_lo[values_per_lane];
                 thread float acc_hi[values_per_lane];
-                for (int element = 0; element < values_per_lane; ++element) {
-                    q_lo[element] = float(query[element]);
-                    q_hi[element] = float(query[D + element]);
-                    acc_lo[element] = 0.0f;
-                    acc_hi[element] = 0.0f;
+                #pragma unroll
+                for (int q = 0; q < values_per_lane / 4; ++q) {
+                    const T4 qlo4 = qlo_vec[q];
+                    const T4 qhi4 = qhi_vec[q];
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        q_lo[q * 4 + j] = float(qlo4[j]);
+                        q_hi[q * 4 + j] = float(qhi4[j]);
+                        acc_lo[q * 4 + j] = 0.0f;
+                        acc_hi[q * 4 + j] = 0.0f;
+                    }
                 }
 
                 float max_lo = -3.402823466e+38F;
@@ -1230,6 +1243,10 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     const float vb = float(as_type<half>(ushort(vtw >> 16)));
                     float score_lo = 0.0f;
                     float score_hi = 0.0f;
+                    // Same 8 nibble FMAs in the same order as the counted
+                    // loop; unrolled so the shift/mask is a constant and the
+                    // two heads share one dequantized key element.
+                    #pragma unroll
                     for (int element = 0; element < values_per_lane; ++element) {
                         const float key_element =
                             fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
@@ -1249,6 +1266,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     max_hi = new_max_hi;
                     sum_lo = sum_lo * old_factor_lo + score_factor_lo;
                     sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                    #pragma unroll
                     for (int element = 0; element < values_per_lane; ++element) {
                         const float value_element =
                             fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
@@ -1266,9 +1284,20 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     sum_out[BLOCKS] = sum_hi;
                     max_out[BLOCKS] = max_hi;
                 }
-                for (int element = 0; element < values_per_lane; ++element) {
-                    partial[element] = T(acc_lo[element]);
-                    partial[BLOCKS * D + element] = T(acc_hi[element]);
+                device T4* plo = reinterpret_cast<device T4*>(partial);
+                device T4* phi = reinterpret_cast<device T4*>(
+                    partial + BLOCKS * D);
+                #pragma unroll
+                for (int q = 0; q < values_per_lane / 4; ++q) {
+                    T4 lo4;
+                    T4 hi4;
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        lo4[j] = T(acc_lo[q * 4 + j]);
+                        hi4[j] = T(acc_hi[q * 4 + j]);
+                    }
+                    plo[q] = lo4;
+                    phi[q] = hi4;
                 }
             """,
             ensureRowContiguous: true

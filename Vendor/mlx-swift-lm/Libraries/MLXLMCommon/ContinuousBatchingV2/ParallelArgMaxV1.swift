@@ -71,7 +71,7 @@ enum CBv2ParallelArgMaxV1 {
         """
 
     private static let tileKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_parallel_argmax_tiles_unroll_v2",
+        name: "cbv2_parallel_argmax_tiles_unroll_v3",
         inputNames: ["logits"],
         outputNames: ["tile_values", "tile_indices"],
         source: """
@@ -85,10 +85,15 @@ enum CBv2ParallelArgMaxV1 {
 
             CBv2ArgMaxPairV1 best = {0u, Limits<float>::min};
             for (uint offset = lid * 4; offset < TILE_SIZE; offset += 256 * 4) {
+                // DECODE-VEC2: the lane's four consecutive logits arrive as one
+                // vec<T, 4> load (row_base, tile_base and offset are multiples of
+                // four); element i is the value logits[row_base + index] read.
+                const vec<T, 4> logits4 = *reinterpret_cast<const device vec<T, 4>*>(
+                    logits + row_base + tile_base + offset);
                 #pragma clang loop unroll(full)
                 for (uint i = 0; i < 4; ++i) {
                     const uint index = tile_base + offset + i;
-                    const float value = float(logits[row_base + index]);
+                    const float value = float(logits4[i]);
                     // Classify NaNs by bits so fast-math cannot discard the
                     // stock rule that an unordered comparison never wins.
                     const bool is_nan =
@@ -180,7 +185,7 @@ enum CBv2ParallelArgMaxV1 {
         let tiles = vocab / tileSize
         let partial = tileKernel(
             [logits],
-            template: [("VOCAB", vocab), ("TILE_SIZE", tileSize), ("TILES", tiles)],
+            template: [("T", logits.dtype), ("VOCAB", vocab), ("TILE_SIZE", tileSize), ("TILES", tiles)],
             grid: (tiles * tileThreads, rows, 1),
             threadGroup: (tileThreads, 1, 1),
             outputShapes: [[rows, tiles], [rows, tiles]],

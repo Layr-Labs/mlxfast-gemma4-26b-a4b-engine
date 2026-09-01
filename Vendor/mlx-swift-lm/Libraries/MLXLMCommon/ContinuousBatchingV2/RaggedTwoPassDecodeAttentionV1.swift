@@ -1026,7 +1026,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// next decode dispatch after this write completes.
     private static let portQuantFusedWriteKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_2pass_a_q4g64_d256_g2_regpack_vec4_carry_pair_b\(blocks)_v5",
+            name: "cbv2_ragged8_sdpa_ringwrite_2pass_a_q4g64_d256_g2_regpack_vec4_carry_pair_b\(blocks)_fold_vec_v7",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -1236,26 +1236,40 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         score_lo += q_lo[element] * key_element;
                         score_hi += q_hi[element] * key_element;
                     }
-                    score_lo = simd_sum(score_lo);
-                    score_hi = simd_sum(score_hi);
+                    // GQA-FOLD: the pair folds in ONE butterfly over a float2
+                    // instead of two scalar reductions. The same lane is
+                    // paired at every step for both components, so each one
+                    // sees the scalar reduction's add sequence while the
+                    // simdgroup issues five shuffles per token instead of ten.
+                    float2 score2 = float2(score_lo, score_hi);
+                    #pragma unroll
+                    for (ushort mask = 1; mask < 32; mask <<= 1) {
+                        score2 += simd_shuffle_xor(score2, mask);
+                    }
+                    score_lo = score2.x;
+                    score_hi = score2.y;
 
-                    const float new_max_lo = max(max_lo, score_lo);
-                    const float new_max_hi = max(max_hi, score_hi);
-                    const float old_factor_lo = fast::exp(max_lo - new_max_lo);
-                    const float old_factor_hi = fast::exp(max_hi - new_max_hi);
-                    const float score_factor_lo = fast::exp(score_lo - new_max_lo);
-                    const float score_factor_hi = fast::exp(score_hi - new_max_hi);
-                    max_lo = new_max_lo;
-                    max_hi = new_max_hi;
-                    sum_lo = sum_lo * old_factor_lo + score_factor_lo;
-                    sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                    // GQA-VEC: the pair's rescale runs as two-component
+                    // vectors. Every operation is componentwise, so the low
+                    // and high halves see the same operands in the same order
+                    // they saw as scalars, and the simdgroup issues two vector
+                    // exponentials per token instead of four scalar ones.
+                    const float2 score2v = float2(score_lo, score_hi);
+                    const float2 max2 = float2(max_lo, max_hi);
+                    const float2 new_max2 = max(max2, score2v);
+                    const float2 old_factor2 = fast::exp(max2 - new_max2);
+                    const float2 score_factor2 = fast::exp(score2v - new_max2);
+                    max_lo = new_max2.x;
+                    max_hi = new_max2.y;
+                    sum_lo = sum_lo * old_factor2.x + score_factor2.x;
+                    sum_hi = sum_hi * old_factor2.y + score_factor2.y;
                     for (int element = 0; element < values_per_lane; ++element) {
                         const float value_element =
                             fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
-                        acc_lo[element] = acc_lo[element] * old_factor_lo
-                            + score_factor_lo * value_element;
-                        acc_hi[element] = acc_hi[element] * old_factor_hi
-                            + score_factor_hi * value_element;
+                        float2 acc2 = float2(acc_lo[element], acc_hi[element]);
+                        acc2 = acc2 * old_factor2 + score_factor2 * value_element;
+                        acc_lo[element] = acc2.x;
+                        acc_hi[element] = acc2.y;
                     }
 
                 }

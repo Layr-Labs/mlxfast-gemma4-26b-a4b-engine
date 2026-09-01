@@ -680,7 +680,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// packer stores (`metal::rint` matches MLX `round`), quantized bytes
     /// plus the fp16 tail written at the identical offsets.
     private static let quantPackKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_kvq4g64_pack_d256_v1",
+        name: "cbv2_kvq4g64_pack_d256_v2",
         inputNames: ["x"],
         outputNames: ["packed_w"],
         source: """
@@ -700,10 +700,12 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             // aligned, so an xor butterfly over 1,2,4 reduces exactly them.
             float vmin = 3.402823466e+38F;
             float vmax = -3.402823466e+38F;
+            float v[8];
+            #pragma unroll
             for (int i = 0; i < per_lane; ++i) {
-                const float v = float(xr[lane * per_lane + i]);
-                vmin = min(vmin, v);
-                vmax = max(vmax, v);
+                v[i] = float(xr[lane * per_lane + i]);
+                vmin = min(vmin, v[i]);
+                vmax = max(vmax, v[i]);
             }
             for (uint m = 1; m < 8; m <<= 1) {
                 vmin = min(vmin, simd_shuffle_xor(vmin, m));
@@ -716,8 +718,9 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             const float b = float(hb);
 
             uint32_t word = 0u;
+            #pragma unroll
             for (int i = 0; i < per_lane; ++i) {
-                const float q = metal::rint((float(xr[lane * per_lane + i]) - b) / s);
+                const float q = metal::rint((v[i] - b) / s);
                 word |= uint32_t(clamp(q, 0.0f, 15.0f)) << (4 * i);
             }
             out[lane] = word;
@@ -740,7 +743,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// its text, and a Swift-hosted kernel that changes text without
     /// changing name serves a stale cached body.
     private static let quantPackPairKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_kvq4g64_pack_pair_d256_v1",
+        name: "cbv2_kvq4g64_pack_pair_d256_v2",
         inputNames: ["keys", "values"],
         outputNames: ["packed_w"],
         source: """
@@ -760,10 +763,12 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
 
             float vmin = 3.402823466e+38F;
             float vmax = -3.402823466e+38F;
+            float v[8];
+            #pragma unroll
             for (int i = 0; i < per_lane; ++i) {
-                const float v = float(src[lane * per_lane + i]);
-                vmin = min(vmin, v);
-                vmax = max(vmax, v);
+                v[i] = float(src[lane * per_lane + i]);
+                vmin = min(vmin, v[i]);
+                vmax = max(vmax, v[i]);
             }
             for (uint m = 1; m < 8; m <<= 1) {
                 vmin = min(vmin, simd_shuffle_xor(vmin, m));
@@ -776,8 +781,9 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             const float b = float(hb);
 
             uint32_t word = 0u;
+            #pragma unroll
             for (int i = 0; i < per_lane; ++i) {
-                const float q = metal::rint((float(src[lane * per_lane + i]) - b) / s);
+                const float q = metal::rint((v[i] - b) / s);
                 word |= uint32_t(clamp(q, 0.0f, 15.0f)) << (4 * i);
             }
             out[lane] = word;

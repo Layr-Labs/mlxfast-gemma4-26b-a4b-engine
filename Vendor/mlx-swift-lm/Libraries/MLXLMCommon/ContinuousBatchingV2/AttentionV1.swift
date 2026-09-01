@@ -469,14 +469,25 @@ enum CBv2AttentionV1 {
                 cachedKeyRows.reserveCapacity(B)
                 cachedValueRows.reserveCapacity(B)
                 let ringRows = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
-                if ringRows.count == B && ringRows.allSatisfy({ $0.decodeRingView != nil }) {
-                    // Q4-LIVE-WRITE: admit all rows before any host state
-                    // mutation. Pass A writes only the live q4 mirror slot;
-                    // the established BF16 SliceUpdates and counters remain
-                    // on their incumbent path below.
+                var deferredQuantWrite = false
+                // A BF16 view flushes the deferred journal, so exact-path
+                // admission must inspect storage without requesting that view.
+                if ringRows.count == B
+                    && ringRows.allSatisfy({ $0.hasFullDecodeRingStorage })
+                {
+                    // Q4-LIVE-WRITE + KVQ-DEFER-BF16. Pass A owns the live
+                    // mirror store. When every row also admits the deferred
+                    // road, retain the exact BF16 token instead of building
+                    // the otherwise-unused full-ring SliceUpdates.
                     if CBv2WindowedSequenceKV.q4FusedMirrorWriteEnabled,
                         allowFusedRingWrite, let decodeRingWriteFence
                     {
+                        let deferFusedBF16 = B == 8
+                            && ringRows.enumerated().allSatisfy { index, row in
+                                row.canDeferDecodeRingWriteBF16Only(
+                                    keys: keys[index ..< (index + 1)],
+                                    values: values[index ..< (index + 1)])
+                            }
                         let preWrite = ringRows.compactMap {
                             $0.decodeRingQuantViewBeforeWrite
                         }
@@ -492,9 +503,15 @@ enum CBv2AttentionV1 {
                                     slidingWindowLength: ringRows[0].window)
                         {
                             for (index, row) in ringRows.enumerated() {
-                                row.decodeRingWriteBF16Only(
-                                    keys: keys[index ..< (index + 1)],
-                                    values: values[index ..< (index + 1)])
+                                let rowKeys = keys[index ..< (index + 1)]
+                                let rowValues = values[index ..< (index + 1)]
+                                if deferFusedBF16 {
+                                    precondition(row.deferDecodeRingWriteBF16Only(
+                                        keys: rowKeys, values: rowValues))
+                                } else {
+                                    row.decodeRingWriteBF16Only(
+                                        keys: rowKeys, values: rowValues)
+                                }
                             }
                             // The next pass-A consumes this fence; this
                             // step's pass-B output also consumes pass-A's
@@ -502,6 +519,42 @@ enum CBv2AttentionV1 {
                             // rooted both in observable output and cache state.
                             decodeRingWriteFence.value = fused.nextWriteFence
                             return fused.output
+                        }
+                    }
+
+                    // If fused q4 admission is disabled or refused, retain
+                    // the independently validated separate-pack deferred road.
+                    if B == 8,
+                        ringRows.enumerated().allSatisfy({ index, row in
+                        row.canDeferDecodeRingWrite(
+                            keys: keys[index ..< (index + 1)],
+                            values: values[index ..< (index + 1)])
+                    })
+                    {
+                        for (index, row) in ringRows.enumerated() {
+                            precondition(row.deferDecodeRingWrite(
+                                keys: keys[index ..< (index + 1)],
+                                values: values[index ..< (index + 1)]))
+                        }
+                        deferredQuantWrite = true
+                        let quantViews = ringRows.compactMap {
+                            $0.deferredDecodeQuantView
+                        }
+                        if quantViews.count == B,
+                            let quantOutput = CBv2RaggedTwoPassDecodeAttentionV1
+                                .attendRingQuant(
+                                    queries: queries,
+                                    mirrors: quantViews.map(\.mirror),
+                                    starts: quantViews.map(\.start), scale: scale,
+                                    slidingWindowLength: ringRows[0].window)
+                        {
+                            return quantOutput
+                        }
+                        // Mirror/counters already advanced. Restore BF16
+                        // before the generic reader, without a second append.
+                        for row in ringRows {
+                            row.flushDeferredBF16Writes(
+                                reason: "quant-attention-fallback")
                         }
                     }
                     // WRITE-016: fold this step's one-token ring write into
@@ -549,10 +602,12 @@ enum CBv2AttentionV1 {
                         }
                     }
 
-                    for (index, row) in ringRows.enumerated() {
-                        row.decodeRingWrite(
-                            keys: keys[index ..< (index + 1)],
-                            values: values[index ..< (index + 1)])
+                    if !deferredQuantWrite {
+                        for (index, row) in ringRows.enumerated() {
+                            row.decodeRingWrite(
+                                keys: keys[index ..< (index + 1)],
+                                values: values[index ..< (index + 1)])
+                        }
                     }
                     let views = ringRows.compactMap { $0.decodeRingView }
                     // KVQ-PORT: the ring write above is the promoted stock

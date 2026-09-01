@@ -30,6 +30,16 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
+    /// The resident q4 ring is fixed at the power-of-two 1024 window. Use
+    /// bit masking for the two initial slot computations; the existing
+    /// branch-wrap remains the per-token control path.
+    private static let q4ResidentPowerOfTwoSlotsEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_Q4_RESIDENT_POWER_OF_TWO_SLOTS"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
 
     private static let batch = 8
     private static let queryHeads = 16
@@ -1523,7 +1533,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// removes only the global partial write/read and the second dispatch.
     private static let portQuantFusedWriteResidentKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c4",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -1538,9 +1548,12 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 constexpr int payload_words = D / 8;
                 constexpr int row_words = payload_words + D / 64;
                 constexpr int current_block = (N - 1) % BLOCKS;
+                constexpr uint ring_mask = uint(N - 1);
                 constexpr int COLS = BLOCKS;
                 constexpr int sets = simd_width / COLS;
                 constexpr int rounds = (BLOCKS + COLS - 1) / COLS;
+                static_assert((N & (N - 1)) == 0,
+                    "resident kernel requires a power-of-two ring");
                 static_assert(BLOCKS == 8, "resident kernel requires eight blocks");
                 static_assert(GQA == 2, "resident kernel requires GQA two");
                 static_assert(values_per_lane % 4 == 0, "lane run is four-wide");
@@ -1578,7 +1591,9 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     + (batch_index * KV_HEADS + kv_head) * D
                     + lane * values_per_lane;
                 const uint start = starts[batch_index];
-                const uint write_slot = (start + uint(N - 1)) % uint(N);
+                const uint write_slot = USE_RING_MASK
+                    ? (start + uint(N - 1)) & ring_mask
+                    : (start + uint(N - 1)) % uint(N);
 
                 half khs = half(0.0f);
                 half khb = half(0.0f);
@@ -1688,7 +1703,9 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 float max_hi = -3.402823466e+38F;
                 float sum_lo = 0.0f;
                 float sum_hi = 0.0f;
-                uint slot = (start + uint(block)) % uint(N);
+                uint slot = USE_RING_MASK
+                    ? (start + uint(block)) & ring_mask
+                    : (start + uint(block)) % uint(N);
                 const bool prefetch_first = block < N - 1;
                 uint next_slot = slot + uint(BLOCKS);
                 if (next_slot >= uint(N)) next_slot -= uint(N);
@@ -2037,12 +2054,14 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     ("GQA", gqa),
                     ("KV_HEADS", kvHeads),
                     ("BLOCKS", blocks),
+                    ("USE_RING_MASK", q4ResidentPowerOfTwoSlotsEnabled ? 1 : 0),
                 ],
                 grid: (kvHeads * blocks * 32, batch, 1),
                 threadGroup: (blocks * 32, 1, 1),
                 outputShapes: [[batch, queryHeads, 1, headDim], [1]],
                 outputDTypes: [.bfloat16, .int32]
             )
+            CBv2EngageMark.once("kvq4-resident-ring-mask")
             CBv2EngageMark.once("kvq4-fused-live-write")
             CBv2EngageMark.once("kvq4-resident-merge")
             return (resident[0], resident[1])

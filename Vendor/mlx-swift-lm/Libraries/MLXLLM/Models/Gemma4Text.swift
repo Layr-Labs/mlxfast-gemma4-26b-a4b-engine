@@ -902,13 +902,14 @@ private let gemma4QKVNormRopeEnabled: Bool = {
 }()
 
 private let gemma4QKVNormKernel = MLXFast.metalKernel(
-    name: "gemma4_b8_qkv_rms_norm_rope_v2",
+        name: "gemma4_b8_qkv_rms_norm_rope_v2_vec1",
     inputNames: [
         "q", "k", "v", "q_weight", "k_weight",
         "position_offsets", "rope_log2_base", "rope_freqs",
     ],
     outputNames: ["q_out", "k_out", "v_out"],
     source: """
+        typedef vec<T, 4> T4;
         constexpr uint reads = 4;
         const uint row = threadgroup_position_in_grid.x;
         const uint lid = thread_position_in_threadgroup.x;
@@ -945,9 +946,10 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
             shared_value_output += local_row * D + lid * reads;
         }
 
+        const T4 vin = *reinterpret_cast<const device T4*>(input);
         float sum = 0.0f;
         for (uint i = 0; i < reads; ++i) {
-            const float value = float(input[i]);
+            const float value = float(vin[i]);
             sum += value * value;
         }
         sum = simd_sum(sum);
@@ -967,15 +969,23 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint i = 0; i < reads; ++i) {
-            const uint element = lid * reads + i;
-            const T normalized = T(float(input[i]) * inverse_rms);
-            if (APPLY_ROPE && weighted) {
-                // Reproduce the separate norm kernel's BF16 output-store
-                // boundary before any RoPE arithmetic reads the value.
-                rounded[element] = T(weight[i] * normalized);
+        if (weighted) {
+            const T4 wv = *reinterpret_cast<const device T4*>(weight);
+            if (APPLY_ROPE) {
+                for (uint i = 0; i < reads; ++i) {
+                    const uint element = lid * reads + i;
+                    const T normalized = T(float(vin[i]) * inverse_rms);
+                    // Reproduce the separate norm kernel's BF16 output-store
+                    // boundary before any RoPE arithmetic reads the value.
+                    rounded[element] = T(wv[i] * normalized);
+                }
             } else {
-                output[i] = weighted ? weight[i] * normalized : T(1) * normalized;
+                T4 outv;
+                for (uint i = 0; i < reads; ++i) {
+                    const T normalized = T(float(vin[i]) * inverse_rms);
+                    outv[i] = wv[i] * normalized;
+                }
+                *reinterpret_cast<device T4*>(output) = outv;
             }
             // Gemma's full-attention K-eq-V layers feed the same raw key
             // projection to K RMSNorm and V RMSNormNoScale. The reduction
@@ -983,8 +993,20 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
             // output's established final expression, but write V while the
             // exact normalizer and input value are live.
             if (KEY_VALUE_SHARED && is_key) {
-                shared_value_output[i] = T(1) * normalized;
+                T4 sharedv;
+                for (uint i = 0; i < reads; ++i) {
+                    const T normalized = T(float(vin[i]) * inverse_rms);
+                    sharedv[i] = T(1) * normalized;
+                }
+                *reinterpret_cast<device T4*>(shared_value_output) = sharedv;
             }
+        } else {
+            T4 outv;
+            for (uint i = 0; i < reads; ++i) {
+                const T normalized = T(float(vin[i]) * inverse_rms);
+                outv[i] = T(1) * normalized;
+            }
+            *reinterpret_cast<device T4*>(output) = outv;
         }
         if (APPLY_ROPE) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -3033,14 +3055,19 @@ private enum Gemma4FusedLayerGlue {
     private static let deferredExpertValuesSource = """
             T expertv[4];
             const uint assignment_base = row * 8u;
+            uint sorted_rows[8];
+            T routed_weights[8];
+            for (uint slot = 0u; slot < 8u; ++slot) {
+                const uint assignment = assignment_base + slot;
+                sorted_rows[slot] = (uint)inverse[assignment];
+                routed_weights[slot] = route_weights[assignment];
+            }
             for (int i = 0; i < 4; ++i) {
                 T accumulator = static_cast<T>(0.0f);
                 for (uint slot = 0u; slot < 8u; ++slot) {
-                    const uint assignment = assignment_base + slot;
-                    const uint sorted_row = (uint)inverse[assignment];
                     const T weighted = static_cast<T>(
-                        (float)sorted[sorted_row * 2816u + wbase + (uint)i]
-                        * (float)route_weights[assignment]);
+                        (float)sorted[sorted_rows[slot] * 2816u + wbase + (uint)i]
+                        * (float)routed_weights[slot]);
                     accumulator = accumulator + weighted;
                 }
                 expertv[i] = accumulator;
@@ -3048,7 +3075,7 @@ private enum Gemma4FusedLayerGlue {
     """
 
     private static let deferredTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1_nb1",
+        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1_nb1_vec1",
         inputNames: [
             "a", "sorted", "inverse", "route_weights", "res",
             "w1", "w2", "w3", "s",
@@ -3093,7 +3120,7 @@ private enum Gemma4FusedLayerGlue {
 
     private static let deferredTailChainKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1_nb1",
+            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1_nb1_vec1",
             inputNames: [
                 "a", "sorted", "inverse", "route_weights", "res",
                 "w1", "w2", "w3", "s", "wn",

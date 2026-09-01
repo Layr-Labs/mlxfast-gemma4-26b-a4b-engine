@@ -99,6 +99,8 @@ inline float mma8_runsum4(uint4 r) {
 
 #define MMA8_STEP(BB, J) A.thread_elements()[0] = float(extract_bits(wv.x, 4 * (J), 4)); A.thread_elements()[1] = float(extract_bits(wv.y, 4 * (J), 4)); simdgroup_multiply_accumulate(C, A, BB, C);
 
+#define MMA8_STEP_CARRY(CC, BB, WV, J) A.thread_elements()[0] = float(extract_bits(WV.x, 4 * (J), 4)); A.thread_elements()[1] = float(extract_bits(WV.y, 4 * (J), 4)); simdgroup_multiply_accumulate(CC, A, BB, CC);
+
 template <typename T, int KS, int KFIX>
 METAL_FUNC void qkv_mma8_affine4_g64_impl(
     const device uint32_t* w,
@@ -232,6 +234,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
     threadgroup float2* red,
     uint simd_gid,
     uint simd_lid) {
+  static_assert(TILES == 2, "the live-range schedule is specialized for two tiles");
   constexpr int K = KFIX;
   constexpr int G = K / 64;
   constexpr int gh = (G + 1) / 2;
@@ -258,7 +261,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
   const device T* x1 = x0 + K;
 
   simdgroup_float8x8 A;
-  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+  simdgroup_float8x8 B;
 
   // The per-group weight operands are carried in registers: group g0's
   // packed word, scale and bias are read before the walk, and each trip
@@ -311,34 +314,43 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
     rs += simd_shuffle_xor(rs, 4u);
     rs += simd_shuffle_xor(rs, 16u);
 
-    MMA8_SETB(B0, x, lo)
-    MMA8_SETB(B1, x, hi)
-    MMA8_SETB(B2, y, lo)
-    MMA8_SETB(B3, y, hi)
-    MMA8_SETB(B4, z, lo)
-    MMA8_SETB(B5, z, hi)
-    MMA8_SETB(B6, w, lo)
-    MMA8_SETB(B7, w, hi)
+    const uint2 wv0 = wv_cur[0];
+    const uint2 wv1 = wv_cur[1];
+    simdgroup_float8x8 C0 = simdgroup_float8x8(0.0f);
+    simdgroup_float8x8 C1 = simdgroup_float8x8(0.0f);
 
-#pragma clang loop unroll(full)
-    for (int t = 0; t < TILES; ++t) {
-      const uint2 wv = wv_cur[t];
-      const float s = s_cur[t];
-      const float b = b_cur[t];
+    // Build one shared activation operand at a time, consume it in both
+    // output tiles, then reuse the register allocation for the next operand.
+    // Each tile's eight MMA steps remain in their original 0...7 order.
+    MMA8_SETB(B, x, lo)
+    MMA8_STEP_CARRY(C0, B, wv0, 0)
+    MMA8_STEP_CARRY(C1, B, wv1, 0)
+    MMA8_SETB(B, x, hi)
+    MMA8_STEP_CARRY(C0, B, wv0, 1)
+    MMA8_STEP_CARRY(C1, B, wv1, 1)
+    MMA8_SETB(B, y, lo)
+    MMA8_STEP_CARRY(C0, B, wv0, 2)
+    MMA8_STEP_CARRY(C1, B, wv1, 2)
+    MMA8_SETB(B, y, hi)
+    MMA8_STEP_CARRY(C0, B, wv0, 3)
+    MMA8_STEP_CARRY(C1, B, wv1, 3)
+    MMA8_SETB(B, z, lo)
+    MMA8_STEP_CARRY(C0, B, wv0, 4)
+    MMA8_STEP_CARRY(C1, B, wv1, 4)
+    MMA8_SETB(B, z, hi)
+    MMA8_STEP_CARRY(C0, B, wv0, 5)
+    MMA8_STEP_CARRY(C1, B, wv1, 5)
+    MMA8_SETB(B, w, lo)
+    MMA8_STEP_CARRY(C0, B, wv0, 6)
+    MMA8_STEP_CARRY(C1, B, wv1, 6)
+    MMA8_SETB(B, w, hi)
+    MMA8_STEP_CARRY(C0, B, wv0, 7)
+    MMA8_STEP_CARRY(C1, B, wv1, 7)
 
-      simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
-      MMA8_STEP(B0, 0)
-      MMA8_STEP(B1, 1)
-      MMA8_STEP(B2, 2)
-      MMA8_STEP(B3, 3)
-      MMA8_STEP(B4, 4)
-      MMA8_STEP(B5, 5)
-      MMA8_STEP(B6, 6)
-      MMA8_STEP(B7, 7)
-
-      acc0[t] += s * C.thread_elements()[0] + rs.x * b;
-      acc1[t] += s * C.thread_elements()[1] + rs.y * b;
-    }
+    acc0[0] += s_cur[0] * C0.thread_elements()[0] + rs.x * b_cur[0];
+    acc1[0] += s_cur[0] * C0.thread_elements()[1] + rs.y * b_cur[0];
+    acc0[1] += s_cur[1] * C1.thread_elements()[0] + rs.x * b_cur[1];
+    acc1[1] += s_cur[1] * C1.thread_elements()[1] + rs.y * b_cur[1];
   }
 
   if (KS == 2) {
@@ -386,7 +398,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
     private static let tilesPerGroup = 2
 
     private static let multiTileKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_v4",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_bfill2_v5",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """

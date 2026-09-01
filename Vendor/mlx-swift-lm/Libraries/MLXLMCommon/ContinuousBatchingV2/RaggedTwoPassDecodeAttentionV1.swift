@@ -2095,6 +2095,176 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         ensureRowContiguous: true
     )
 
+    /// KVQ-D512-VAL. Dispatch 3 reading the packed 4-bit value mirror instead
+    /// of the bf16 value plane. Identical grid, identical threadgroup shape,
+    /// identical accumulation order and an identical cross-lane fold; the
+    /// only difference is where `v_tile` comes from.
+    ///
+    /// A threadgroup owns columns `[tile * 64, tile * 64 + 64)`, which is
+    /// exactly ONE quantization group, so the whole threadgroup shares one
+    /// (scale, bias) word per key row and the 64 columns of a row cost 8
+    /// payload words plus that one group word — 36 bytes where the bf16 plane
+    /// costs 128.
+    private static let avQuantKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_av_q4g64_g8_xfold_v1",
+        inputNames: [
+            "probs",
+            "q0", "q1", "q2", "q3", "q4", "q5", "q6", "q7",
+            "params",
+        ],
+        outputNames: ["out"],
+        source: """
+            constexpr int D = 512;
+            constexpr int GQA = 8;
+            constexpr int PAYLOAD_WORDS = D / 8;                  // 64
+            constexpr int ROW_WORDS = PAYLOAD_WORDS + D / 64;     // 72
+
+            const int key_length = int(params[0]);
+
+            const int z = int(threadgroup_position_in_grid.z);
+            const int tile = z % 8;
+            const int row_kv = z / 8;
+            const int row = row_kv / 2;
+            const int kv_head = row_kv % 2;
+            const int sg = int(simdgroup_index_in_threadgroup);
+            const int lane = int(thread_index_in_simdgroup);
+
+            const int row_capacity = int(params[2 + row]);
+
+            const device uint32_t* value_q = q0;
+            switch (row) {
+                case 1: value_q = q1; break;
+                case 2: value_q = q2; break;
+                case 3: value_q = q3; break;
+                case 4: value_q = q4; break;
+                case 5: value_q = q5; break;
+                case 6: value_q = q6; break;
+                case 7: value_q = q7; break;
+                default: break;
+            }
+            value_q += size_t(kv_head) * size_t(row_capacity) * ROW_WORDS;
+
+            const device T* prob_rows =
+                probs + size_t(row * 16 + kv_head * GQA) * key_length;
+
+            const int thrM = lane / 4;
+            const int thrN = lane % 4;
+            int bm = thrM * 4;
+            const int out_col = tile * 64 + (4 * sg + thrN) * 4;
+            // The four columns this lane wants are four consecutive nibbles
+            // of one payload word: the low half when out_col is 8-aligned,
+            // the high half otherwise.
+            const int word_index = out_col >> 3;
+            const int nibble_shift = (out_col & 4) * 4;
+
+            float result[GQA * 4] = {0.0f};
+            float v_tile[4][4];
+            float p_coeff[4];
+            const int n_iter = key_length / 32;
+            const int leftover = key_length - n_iter * 32;
+
+            for (int i = 0; i < n_iter; ++i) {
+                threadgroup_barrier(mem_flags::mem_none);
+                #pragma clang loop unroll(full)
+                for (int tm = 0; tm < 4; ++tm) {
+                    const device uint32_t* vrow =
+                        value_q + size_t(bm + tm) * ROW_WORDS;
+                    const uint32_t payload = vrow[word_index];
+                    const uint32_t group = vrow[PAYLOAD_WORDS + tile];
+                    const float vs = float(as_type<half>(ushort(group & 0xffffu)));
+                    const float vb = float(as_type<half>(ushort(group >> 16)));
+                    #pragma clang loop unroll(full)
+                    for (int tn = 0; tn < 4; ++tn) {
+                        v_tile[tm][tn] = fma(
+                            float((payload >> (nibble_shift + 4 * tn)) & 0xfu),
+                            vs, vb);
+                    }
+                }
+                #pragma clang loop unroll(full)
+                for (int h = 0; h < GQA; ++h) {
+                    #pragma clang loop unroll(full)
+                    for (int tm = 0; tm < 4; ++tm) {
+                        p_coeff[tm] = static_cast<float>(
+                            prob_rows[size_t(h) * key_length + bm + tm]);
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int tm = 0; tm < 4; ++tm) {
+                        float vc = p_coeff[tm];
+                        for (int tn = 0; tn < 4; ++tn) {
+                            result[h * 4 + tn] += vc * v_tile[tm][tn];
+                        }
+                    }
+                }
+                bm += 32;
+            }
+            if (leftover > 0) {
+                for (int tm = 0; tm < 4 && bm + tm < key_length; ++tm) {
+                    const device uint32_t* vrow =
+                        value_q + size_t(bm + tm) * ROW_WORDS;
+                    const uint32_t payload = vrow[word_index];
+                    const uint32_t group = vrow[PAYLOAD_WORDS + tile];
+                    const float vs = float(as_type<half>(ushort(group & 0xffffu)));
+                    const float vb = float(as_type<half>(ushort(group >> 16)));
+                    #pragma clang loop unroll(full)
+                    for (int tn = 0; tn < 4; ++tn) {
+                        v_tile[0][tn] = fma(
+                            float((payload >> (nibble_shift + 4 * tn)) & 0xfu),
+                            vs, vb);
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int h = 0; h < GQA; ++h) {
+                        const float pc = static_cast<float>(
+                            prob_rows[size_t(h) * key_length + bm + tm]);
+                        #pragma clang loop unroll(full)
+                        for (int tn = 0; tn < 4; ++tn) {
+                            result[h * 4 + tn] += pc * v_tile[0][tn];
+                        }
+                    }
+                }
+            }
+            {
+                const bool hi = (lane & 16) != 0;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 16; ++j) {
+                    const float a = result[j];
+                    const float b = result[16 + j];
+                    result[j] = (hi ? b : a)
+                        + simd_shuffle_xor(hi ? a : b, ushort(16));
+                }
+            }
+            {
+                const bool hi = (lane & 8) != 0;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 8; ++j) {
+                    const float a = result[j];
+                    const float b = result[8 + j];
+                    result[j] = (hi ? b : a)
+                        + simd_shuffle_xor(hi ? a : b, ushort(8));
+                }
+            }
+            {
+                const bool hi = (lane & 4) != 0;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 4; ++j) {
+                    const float a = result[j];
+                    const float b = result[4 + j];
+                    result[j] = (hi ? b : a)
+                        + simd_shuffle_xor(hi ? a : b, ushort(4));
+                }
+            }
+            {
+                device T* out_ptr = out
+                    + size_t(row * 16 + kv_head * GQA + thrM) * D
+                    + out_col;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 4; ++j) {
+                    out_ptr[j] = static_cast<T>(result[j]);
+                }
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
     // ATTRIBUTION. Everything in this WRITE-016-D512 section, and the
     // matching hunks in AttentionV1.swift and SequenceKV/FullSequenceKV.swift,
     // is taken VERBATIM from public ranked submission
@@ -2508,6 +2678,94 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         """,
         ensureRowContiguous: true)
 
+    /// KVQ-D512-VAL store dispatch: one threadgroup of 64 lanes per
+    /// (row, kv head) — 16 threadgroups, 4 KiB of output — packing the new
+    /// token's value row straight into slot kL-1 of the row's mirror through
+    /// a const_cast, exactly as `ringStoreKernel` writes the bf16 ring. The
+    /// arithmetic is a transcription of the promoted D=256 mirror packer.
+    ///
+    /// It runs FIRST in the chain and feeds its fence into the bf16 store, so
+    /// the encoder-wide barrier that already orders the store against the QK
+    /// read also orders this write against the AV read.
+    private static let mirrorStoreKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_d512_mirrorstore_q4v_v1",
+        inputNames: [
+            "q0", "q1", "q2", "q3", "q4", "q5", "q6", "q7",
+            "params", "new_values", "write_fence",
+        ],
+        outputNames: ["fence"],
+        source: """
+            constexpr int D = 512;
+            constexpr int per_lane = 8;
+            constexpr int PAYLOAD_WORDS = D / 8;                  // 64
+            constexpr int ROW_WORDS = PAYLOAD_WORDS + D / 64;     // 72
+
+            const int z = int(threadgroup_position_in_grid.z);
+            const int row = z / 2;
+            const int kv_head = z % 2;
+            const int lane = int(thread_position_in_threadgroup.x);
+            const int key_length = int(params[0]);
+            const int row_capacity = int(params[2 + row]);
+
+            const device uint32_t* mirror = q0;
+            switch (row) {
+                case 1: mirror = q1; break;
+                case 2: mirror = q2; break;
+                case 3: mirror = q3; break;
+                case 4: mirror = q4; break;
+                case 5: mirror = q5; break;
+                case 6: mirror = q6; break;
+                case 7: mirror = q7; break;
+                default: break;
+            }
+            device uint32_t* out_row = const_cast<device uint32_t*>(mirror)
+                + (size_t(kv_head) * size_t(row_capacity)
+                    + size_t(key_length - 1)) * ROW_WORDS;
+            const device T* src = new_values
+                + size_t(row * 2 + kv_head) * D;
+
+            float vmin = 3.402823466e+38F;
+            float vmax = -3.402823466e+38F;
+            for (int i = 0; i < per_lane; ++i) {
+                const float v = float(src[lane * per_lane + i]);
+                vmin = min(vmin, v);
+                vmax = max(vmax, v);
+            }
+            for (uint m = 1; m < 8; m <<= 1) {
+                vmin = min(vmin, simd_shuffle_xor(vmin, m));
+                vmax = max(vmax, simd_shuffle_xor(vmax, m));
+            }
+
+            const half hs = half(max((vmax - vmin) / 15.0f, 1e-6f));
+            const half hb = half(vmin);
+            const float s = float(hs);
+            const float b = float(hb);
+
+            uint32_t word = 0u;
+            for (int i = 0; i < per_lane; ++i) {
+                const float q = metal::rint((float(src[lane * per_lane + i]) - b) / s);
+                word |= uint32_t(clamp(q, 0.0f, 15.0f)) << (4 * i);
+            }
+            out_row[lane] = word;
+            if (lane % 8 == 0) {
+                out_row[PAYLOAD_WORDS + lane / 8] =
+                    uint32_t(as_type<ushort>(hs)) | (uint32_t(as_type<ushort>(hb)) << 16);
+            }
+            if (z == 0 && lane == 0) {
+                fence[0] = write_fence[0] + 1;
+            }
+        """,
+        ensureRowContiguous: true)
+
+    /// KVQ-D512-VAL kill switch: `DARKBLOOM_GEMMA4_D512_VALUE_Q4=0` keeps the
+    /// bf16 value read in the same binary.
+    private static let valueQuantEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_VALUE_Q4"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// WRITE-022 kill switch: `DARKBLOOM_GEMMA4_D512_STORE_DISPATCH=0` falls
     /// back to the v2 fold (and its own switch falls back to the append path).
     private static let storeDispatchEnabled: Bool = {
@@ -2586,14 +2844,52 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         }
         let paramsArray = MLXArray(params)
 
+        // KVQ-D512-VAL: take the quantized value road only when EVERY row
+        // offers a mirror that is caught up with its bf16 plane and shaped
+        // slot-for-slot with it. Any gap and the whole cohort reads bf16.
+        var valueMirrors: [MLXArray] = []
+        valueMirrors.reserveCapacity(batch)
+        if valueQuantEnabled {
+            for (index, row) in fullRows.enumerated() {
+                guard let mirror = row.cbv2QuantValuePlane,
+                    mirror.dtype == .uint32,
+                    mirror.ndim == 3,
+                    mirror.dim(0) == kvHeads,
+                    mirror.dim(1) == Int(params[2 + index]),
+                    mirror.dim(2) == CBv2FullSequenceKV.mirrorRowWords
+                else {
+                    valueMirrors.removeAll()
+                    break
+                }
+                valueMirrors.append(mirror)
+            }
+        }
+        let quantized = valueMirrors.count == batch
+
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)
         ]
         let scratchShape = [batch, queryHeads, 1, keyLength]
 
+        // The mirror store leads the chain so that the fence edge already
+        // ordering the bf16 store against the QK read also covers it.
+        let entryFence: MLXArray
+        if quantized {
+            entryFence = mirrorStoreKernel(
+                valueMirrors + [paramsArray, values, previousWriteFence],
+                template: template,
+                grid: (64, 1, batch * kvHeads),
+                threadGroup: (64, 1, 1),
+                outputShapes: [[1]],
+                outputDTypes: [.int32]
+            )[0]
+        } else {
+            entryFence = previousWriteFence
+        }
+
         let storeFence = ringStoreKernel(
             keyBuffers + valueBuffers
-                + [paramsArray, keys, values, previousWriteFence],
+                + [paramsArray, keys, values, entryFence],
             template: template,
             grid: (128, 1, batch * kvHeads),
             threadGroup: (128, 1, 1),
@@ -2621,8 +2917,8 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             outputDTypes: [.bfloat16]
         )[0]
 
-        let output = avKernel(
-            [probs] + valueBuffers + [paramsArray],
+        let output = (quantized ? avQuantKernel : avKernel)(
+            [probs] + (quantized ? valueMirrors : valueBuffers) + [paramsArray],
             template: template,
             grid: (32, 4, batch * kvHeads * 8),
             threadGroup: (32, 4, 1),
@@ -2631,7 +2927,11 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         )[0]
 
         for row in fullRows {
-            row.advanceAfterFusedAppend()
+            if quantized {
+                row.advanceAfterFusedAppendWithMirror()
+            } else {
+                row.advanceAfterFusedAppend()
+            }
         }
         return (output, storeFence)
     }

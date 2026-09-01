@@ -124,6 +124,17 @@ enum CBv2AttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// BORROW-RING: shared sliding-window layers borrow the source rows'
+    /// physical rings directly instead of materializing temporal-order
+    /// concatenations for every borrower. Any non-full, staged, or non-ring
+    /// row fails closed to the established borrowed-view path.
+    static let borrowRingEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "MLX_CBV2_BORROW_RING"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// Join prompt attention blocks directly into the token-major layout that
     /// the following output projection consumes. The returned value remains a
     /// head-major view, so callers keep the same typed interface while their
@@ -1125,6 +1136,26 @@ enum CBv2AttentionV1 {
             batch: B, cacheKind: sourceKind, queryKind: kind,
             scale: scale, sinks: effectiveSinks, softcap: softcap)
         {
+            if borrowRingEnabled {
+                let ringSourceRows = sourceRows.compactMap {
+                    $0 as? CBv2WindowedSequenceKV
+                }
+                if ringSourceRows.count == B {
+                    let views = ringSourceRows.compactMap { $0.decodeRingView }
+                    if views.count == B,
+                        let output = CBv2RaggedTwoPassDecodeAttentionV1.attendRing(
+                            queries: queries,
+                            keys: views.map(\.keys),
+                            values: views.map(\.values),
+                            starts: views.map(\.start),
+                            scale: scale,
+                            slidingWindowLength: ringSourceRows[0].window)
+                    {
+                        return output
+                    }
+                }
+            }
+
             var cachedKeyRows: [MLXArray] = []
             var cachedValueRows: [MLXArray] = []
             cachedKeyRows.reserveCapacity(B)

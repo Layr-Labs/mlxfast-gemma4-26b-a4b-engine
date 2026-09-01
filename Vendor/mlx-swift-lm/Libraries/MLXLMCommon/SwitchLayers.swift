@@ -171,7 +171,7 @@ public func weightedExpertUnsort(
             && weights.dtype == .bfloat16,
         "weightedExpertUnsort weights must be sorted-prefill bfloat16 [tokens, 8]")
     precondition(
-        sortedOutputs.dim(0) == weights.size && inverseOrder.size == weights.size,
+        sortedOutputs.dim(0) >= weights.size && inverseOrder.size == weights.size,
         "weightedExpertUnsort assignment counts must match")
 
     let tokens = weights.dim(0)
@@ -843,6 +843,115 @@ private let routeCsortPrefillScanKernel: MLXFast.MLXFastKernel = MLXFast.metalKe
     ensureRowContiguous: true
 )
 
+/// PAD64: the scan above, with every expert's bin padded up to the 64-row
+/// NAX tile so no gather-GEMM tile ever straddles two experts. The bin base
+/// is the exclusive prefix over the padded totals; block offsets inside a
+/// bin are unchanged. `pad_range[e] = (base + total, base + padded)` names
+/// the phantom slots of expert `e`, and `pad_range[WIDTH] = (n_pad, n_pad)`
+/// carries the padded row count for the tail fill.
+private let routeCsortPrefillScanPad64Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "mlx_lm_route_csort128_scan_pad64_v1",
+    inputNames: ["block_hist"],
+    outputNames: ["block_offset", "pad_range"],
+    source: """
+        constexpr uint WIDTH = \(routeCsortPrefillWidth);
+        constexpr uint TILE = 64u;
+        uint e = thread_position_in_threadgroup.x;
+        uint simd_id = e / 32;
+        uint lane = e % 32;
+        uint nblocks = (uint)block_hist_shape[0];
+        uint total = 0u;
+        for (uint b = 0; b < nblocks; ++b) {
+            total += block_hist[b * WIDTH + e];
+        }
+        uint padded = (total + TILE - 1u) / TILE * TILE;
+        // Global bin base: exclusive prefix over the 256 PADDED expert totals.
+        uint lane_excl = simd_prefix_exclusive_sum(padded);
+        threadgroup uint simd_totals[8];
+        if (lane == 31) {
+            simd_totals[simd_id] = lane_excl + padded;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint running = 0u;
+        for (uint s = 0; s < simd_id; ++s) {
+            running += simd_totals[s];
+        }
+        running += lane_excl;
+        const uint base = running;
+        // Exclusive scan over blocks for this expert, offset by the bin base.
+        for (uint b = 0; b < nblocks; ++b) {
+            block_offset[b * WIDTH + e] = running;
+            running += block_hist[b * WIDTH + e];
+        }
+        pad_range[e * 2u] = base + total;
+        pad_range[e * 2u + 1u] = base + padded;
+        if (e == 0u) {
+            uint n_pad = 0u;
+            for (uint s = 0; s < 8u; ++s) {
+                n_pad += simd_totals[s];
+            }
+            pad_range[WIDTH * 2u] = n_pad;
+            pad_range[WIDTH * 2u + 1u] = n_pad;
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+/// PAD64 scatter: the incumbent scatter over the real assignments, plus the
+/// phantom fill. Block 0 writes the phantom key into every pad slot of every
+/// expert and into the tail `[n_pad, NMAX)`; those positions are never the
+/// target of a real assignment, so no write races a real one. Phantom slots
+/// get `row_order = 0` (a valid row, never consumed on the plane path).
+private let routeCsortPrefillScatterPad64Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "mlx_lm_route_csort128_scatter_pad64_v1",
+    inputNames: ["keys", "block_offset", "pad_range"],
+    outputNames: ["row_order", "sorted_keys", "inverse_order"],
+    source: """
+        constexpr uint BLOCK = \(routeCsortPrefillBlock);
+        constexpr uint WIDTH = \(routeCsortPrefillWidth);
+        constexpr uint PHANTOM = 0x80000000u;
+        uint b = threadgroup_position_in_grid.x;
+        uint k = thread_position_in_threadgroup.x;
+        uint n = keys_shape[0];
+        uint idx = b * BLOCK + k;
+        // Tail block: the sentinel is outside the proven key space (keys are
+        // below the 256-wide counter table), so it can never tie a real key.
+        uint key = (idx < n) ? keys[idx] : 0xffffffffu;
+        threadgroup uint tg_keys[BLOCK];
+        tg_keys[k] = key;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (idx < n) {
+            // Stable local rank: earlier keys in this block only. Read in
+            // index order from threadgroup memory, so no write position ever
+            // depends on scheduling.
+            uint rank = 0u;
+            for (uint j = 0; j < k; ++j) {
+                rank += (tg_keys[j] == key) ? 1u : 0u;
+            }
+            uint pos = block_offset[b * WIDTH + key] + rank;
+            row_order[pos] = idx / (uint)M;
+            sorted_keys[pos] = key;
+            inverse_order[idx] = pos;
+        }
+        if (b == 0u) {
+            // Expert k's pad slots.
+            const uint pad_lo = pad_range[k * 2u];
+            const uint pad_hi = pad_range[k * 2u + 1u];
+            for (uint p = pad_lo; p < pad_hi; ++p) {
+                row_order[p] = 0u;
+                sorted_keys[p] = PHANTOM;
+            }
+            // The tail beyond the padded row count, strided over the block.
+            const uint n_pad = pad_range[WIDTH * 2u];
+            for (uint p = n_pad + k; p < (uint)NMAX; p += WIDTH) {
+                row_order[p] = 0u;
+                sorted_keys[p] = PHANTOM;
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
 private let routeCsortPrefillScatterKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
     name: "mlx_lm_route_csort128_scatter_v1",
     inputNames: ["keys", "block_offset"],
@@ -879,8 +988,29 @@ private let routeCsortPrefillScatterKernel: MLXFast.MLXFastKernel = MLXFast.meta
 
 /// Exact stable counting sort of a flat uint32 route table. Returns nil (fail
 /// closed onto `argSort`) unless every precondition of the kernels holds.
+/// PAD64 switch: `DARKBLOOM_GEMMA4_ROUTE_PAD64=0` restores the unpadded plane.
+private let routeCsortPrefillPad64Enabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_ROUTE_PAD64"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// PAD64 admits only real prompt rectangles: below this many assignments
+/// the static plane bound (63 phantom rows per expert) would dominate.
+private let routeCsortPrefillPad64MinKeys = 4096
+
+/// Static row count of a PAD64 sorted plane for `n` assignments over
+/// `numExperts` experts: every expert may carry up to 63 phantom rows, and
+/// the total is rounded up to the tile so the gather GEMM keeps its aligned
+/// row path. Phantom rows beyond the padded count sit in the tail.
+public func routePad64PlaneRows(assignments n: Int, numExperts: Int) -> Int {
+    let raw = n + 63 * numExperts
+    return (raw + 63) / 64 * 64
+}
+
 private func routeCountingSortPrefill(
-    _ indices: MLXArray, m: Int, numExperts: Int
+    _ indices: MLXArray, m: Int, numExperts: Int, pad64: Bool = false
 ) -> (rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray)? {
     let n = indices.size
     guard routeCsortPrefillEnabled,
@@ -903,6 +1033,26 @@ private func routeCountingSortPrefill(
         outputShapes: [[blocks, width]],
         outputDTypes: [.uint32]
     )[0]
+    if pad64, routeCsortPrefillPad64Enabled, numExperts <= width, n >= routeCsortPrefillPad64MinKeys {
+        CBv2EngageMark.once("route-csort-prefill-pad64")
+        let nmax = routePad64PlaneRows(assignments: n, numExperts: numExperts)
+        let scanned = routeCsortPrefillScanPad64Kernel(
+            [hist],
+            grid: (width, 1, 1),
+            threadGroup: (width, 1, 1),
+            outputShapes: [[blocks, width], [(width + 1) * 2]],
+            outputDTypes: [.uint32, .uint32]
+        )
+        let outputs = routeCsortPrefillScatterPad64Kernel(
+            [indices, scanned[0], scanned[1]],
+            template: [("M", m), ("NMAX", nmax)],
+            grid: (blocks * width, 1, 1),
+            threadGroup: (width, 1, 1),
+            outputShapes: [[nmax], [nmax], [n]],
+            outputDTypes: [.uint32, .uint32, .uint32]
+        )
+        return (outputs[0], outputs[1], outputs[2])
+    }
     let offsets = routeCsortPrefillScanKernel(
         [hist],
         grid: (width, 1, 1),
@@ -988,7 +1138,8 @@ public func gatherSortOrder(
         "gatherSortOrder n=\(indices.size) m=\(m) E=\(numExperts) "
             + "dtype=\(indices.dtype)"
     }
-    if let fused = routeCountingSortPrefill(indices, m: m, numExperts: numExperts) {
+    if let fused = routeCountingSortPrefill(
+        indices, m: m, numExperts: numExperts, pad64: true) {
         return (fused.rowOrder, fused.sortedKeys, fused.inverseOrder)
     }
     let order = argSort(indices)
@@ -1001,7 +1152,7 @@ public func gatherSortOrder(
 /// `SwitchGLU` never issues its standalone gather of the activations it was
 /// handed. Returning `nil`, or a plane of any other shape or dtype, selects
 /// that gather.
-public typealias SwitchSortedPlaneProducer = (_ inverseOrder: MLXArray) -> MLXArray?
+public typealias SwitchSortedPlaneProducer = (_ inverseOrder: MLXArray, _ planeRows: Int) -> MLXArray?
 
 /// `numExperts` is the exclusive upper bound of the index key space; callers
 /// that know it (SwitchGLU) pass it so the counting-sort fast path can prove
@@ -1400,8 +1551,9 @@ public class SwitchGLU: Module {
                 // PRENORM-GATHER: the producer writes the sorted plane from
                 // the inverse order; `x` is only read if it declines.
                 let order = gatherSortOrder(indices: indices, numExperts: numExperts)
-                if let plane = sortedPlane(order.inverseOrder),
-                    plane.ndim == 3, plane.dim(0) == indices.size,
+                let planeRows = order.sortedKeys.size
+                if let plane = sortedPlane(order.inverseOrder, planeRows),
+                    plane.ndim == 3, plane.dim(0) == planeRows, planeRows >= indices.size,
                     plane.dim(1) == 1, plane.dim(2) == inputDims,
                     plane.dtype == x.dtype
                 {

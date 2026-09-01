@@ -431,7 +431,7 @@ public enum Gemma4PrefillGlueV1 {
     /// `uint32` per assignment.
     public static func preNormScatter(
         x: MLXArray, weight: MLXArray, inverseOrder: MLXArray, topK: Int,
-        eps epsIn: Float
+        eps epsIn: Float, planeRows planeRowsIn: Int? = nil
     ) -> MLXArray? {
         guard prenormGatherEnabled,
             let rows = planeRows(x, weight: weight, eps: epsIn),
@@ -440,6 +440,10 @@ public enum Gemma4PrefillGlueV1 {
             inverseOrder.dtype == .uint32,
             inverseOrder.dim(0) == rows * topK
         else { return nil }
+        // PAD64: the plane may be wider than the assignment count; only the
+        // real positions are written.
+        let planeTotal = planeRowsIn ?? (rows * topK)
+        guard planeTotal >= rows * topK else { return nil }
 
         CBv2EngageMark.once("prefill-prenorm-gather")
         return preNormScatterKernel(
@@ -447,7 +451,7 @@ public enum Gemma4PrefillGlueV1 {
             template: [("T", x.dtype), ("K", topK)],
             grid: (threadsPerRow, rows, 1),
             threadGroup: (threadsPerRow, 1, 1),
-            outputShapes: [[rows * topK, 1, axis]],
+            outputShapes: [[planeTotal, 1, axis]],
             outputDTypes: [x.dtype]
         )[0]
     }

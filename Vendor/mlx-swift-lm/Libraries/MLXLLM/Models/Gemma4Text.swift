@@ -2380,6 +2380,36 @@ private enum Gemma4RouterFinalistsV1 {
             outputDTypes: [.uint32]
         )[0]
     }
+
+    /// ROUTER-FINALISTS-PREFILL: the same selection kernel over a prompt
+    /// rectangle `[B, L, 128]`. One 128-thread group per (row, position)
+    /// score vector, exactly the geometry the decode cell runs per row, so
+    /// every emitted index is the stable ascending top-8 the incumbent
+    /// `argPartition(kth: 120)[..., 120...]` slice produces. Kill switch:
+    /// `DARKBLOOM_GEMMA4_ROUTER_FINALISTS32_PREFILL=0`.
+    static let prefillEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ROUTER_FINALISTS32_PREFILL"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    static func applyPrefill(_ scores: MLXArray, topK: Int, kth: Int) -> MLXArray? {
+        guard enabled, prefillEnabled, topK == 8, kth == 120,
+            scores.ndim == 3, scores.dim(0) >= 1,
+            scores.dim(1) > 1, scores.dim(2) == 128,
+            scores.dtype == .bfloat16
+        else { return nil }
+        let rows = scores.dim(0) * scores.dim(1)
+        CBv2EngageMark.once("router-finalists32-prefill")
+        return kernel(
+            [scores],
+            grid: (rows * 128, 1, 1),
+            threadGroup: (128, 1, 1),
+            outputShapes: [[scores.dim(0), scores.dim(1), 8]],
+            outputDTypes: [.uint32]
+        )[0]
+    }
 }
 
 /// GLUE-FOLD (G2): merge the two ADJACENT single-threadgroup route glue
@@ -3335,8 +3365,15 @@ private class Gemma4Router: Module {
             return (fused.indices, fused.weights)
         }
 
-        var topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
-        topKIndices = topKIndices[.ellipsis, kth...]
+        var topKIndices: MLXArray
+        if let selected = Gemma4RouterFinalistsV1.applyPrefill(
+            expertScores, topK: topK, kth: kth)
+        {
+            topKIndices = selected
+        } else {
+            topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
+            topKIndices = topKIndices[.ellipsis, kth...]
+        }
 
         var topKWeights = MLX.takeAlong(expertScores, topKIndices, axis: -1)
         topKWeights = MLX.softmax(topKWeights, axis: -1, precise: true)
@@ -4090,13 +4127,14 @@ public class Gemma4DecoderLayer: Module {
                         n2,
                         indices: topKIndices,
                         weights: topKWeights,
-                        sortedPlane: { inverseOrder in
+                        sortedPlane: { inverseOrder, planeRows in
                             Gemma4PrefillGlueV1.preNormScatter(
                                 x: out,
                                 weight: expertNormWeight,
                                 inverseOrder: inverseOrder,
                                 topK: expertTopK,
-                                eps: normEps)
+                                eps: normEps,
+                                planeRows: planeRows)
                         })
                 } else if let (n1, n2) = Gemma4PrefillGlueV1.dualPreNorm(
                     x: out,
@@ -4344,6 +4382,21 @@ enum Gemma4FusedScaledEmbedding {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// EMBED-DECODE: DEFAULT ON for the `[B, 1]` decode column as well. The
+    /// kernel body is unchanged and geometry-agnostic (one thread per packed
+    /// word of one token row), so the decode step takes the same single
+    /// launch instead of the five stock dispatches (`weight[x]`, `scales[x]`,
+    /// `biases[x]`, `affine_dequantize`, `* embedScale`). Values are
+    /// byte-identical by the same two-boundary argument as prefill. Kill
+    /// switch `DARKBLOOM_GEMMA4_SCALED_EMBEDDING_DECODE=0` restores the
+    /// prefill-only gate. Engage mark: `scaled-embedding-decode`.
+    static let decodeEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_SCALED_EMBEDDING_DECODE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// This checkpoint's embedding quantization. Anything else fails closed.
     private static let groupSize = 64
     private static let bits = 4
@@ -4401,8 +4454,9 @@ enum Gemma4FusedScaledEmbedding {
         guard enabled,
             tokens.ndim == 2,
             tokens.dtype == .int32,
-            // Prefill rectangle only; [B, 1] decode keeps the stock chain.
-            tokens.dim(1) > 1,
+            // Prefill rectangle, or the [B, 1] decode column when
+            // EMBED-DECODE is on; otherwise decode keeps the stock chain.
+            tokens.dim(1) > 1 || (decodeEnabled && tokens.dim(1) == 1),
             let quantized = embedding as? QuantizedEmbedding,
             quantized.mode == .affine,
             quantized.bits == bits,
@@ -4429,7 +4483,7 @@ enum Gemma4FusedScaledEmbedding {
         let length = tokens.dim(1)
         let wordsPerRow = weight.dim(1)
 
-        CBv2EngageMark.once("scaled-embedding")
+        CBv2EngageMark.once(length == 1 ? "scaled-embedding-decode" : "scaled-embedding")
         return kernel(
             // `asMLXArray(dtype:)` is the exact conversion the stock
             // `MLXArray * Float` overload performs on the scalar.

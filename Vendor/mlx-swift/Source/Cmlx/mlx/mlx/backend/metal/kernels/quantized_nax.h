@@ -1504,6 +1504,8 @@ template <
 // function constant magnitude (pipeline-key law).
 MLX_MTL_CONST bool kGatherRhsSegmentElide = true;
 MLX_MTL_CONST bool kGatherRhsSortedEndpointElide = true;
+// Indices at or above this value name no expert (see PHANTOM-PAD below).
+MLX_MTL_CONST uint32_t kGatherRhsPhantomBase = 0x80000000u;
 
 // Loads one 16-row fragment row of an A tile from device memory. The
 // address arithmetic matches NAXTile::load exactly for that fragment row
@@ -1735,6 +1737,14 @@ template <
           break;
         }
       }
+    }
+    // PHANTOM-PAD: a sorted plane may pad every expert segment up to the
+    // tile width with rows whose index carries the phantom bit. Such a
+    // segment owns no expert: nothing is loaded, multiplied or stored for
+    // it, and the decision is threadgroup-uniform (every thread reads the
+    // same index), so barrier counts stay consistent across the group.
+    if (index >= kGatherRhsPhantomBase) {
+      continue;
     }
     threadgroup_barrier(mem_flags::mem_none);
 

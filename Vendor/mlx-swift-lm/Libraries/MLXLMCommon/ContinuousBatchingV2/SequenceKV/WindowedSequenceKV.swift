@@ -241,8 +241,26 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         let firstWritten = absoluteOffset + n - writeCount
         let kTail = writeCount == n ? newKeys : newKeys[.ellipsis, (n - writeCount)..., 0...]
         let vTail = writeCount == n ? newValues : newValues[.ellipsis, (n - writeCount)..., 0...]
-        writeRing(keys!, tokens: kTail, firstPosition: firstWritten, mirrorPlane: 0)
-        writeRing(values!, tokens: vTail, firstPosition: firstWritten, mirrorPlane: 1)
+        let paired = writePairedMirror(
+            keys: kTail, values: vTail, firstPosition: firstWritten)
+        let adoptedFullWindow =
+            paired && Self.fullWindowAdoptEnabled
+            && writeCount == window && firstWritten % window == 0
+        if adoptedFullWindow {
+            // A whole modular ring beginning at slot zero is already in the
+            // ring's physical order. Keep row-contiguous authoritative BF16
+            // storage directly instead of copying it through two full-buffer
+            // SliceUpdates; later functional updates remain copy-on-write.
+            keys = contiguous(kTail)
+            values = contiguous(vTail)
+        } else {
+            writeRing(
+                keys!, tokens: kTail, firstPosition: firstWritten,
+                mirrorPlane: paired ? nil : 0)
+            writeRing(
+                values!, tokens: vTail, firstPosition: firstWritten,
+                mirrorPlane: paired ? nil : 1)
+        }
 
         absoluteOffset += n
         oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
@@ -720,12 +738,22 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    /// KVQ-PAIRWRITE: `MLX_KV_QUANT_PAIRWRITE=0` returns a decode step's
-    /// mirror maintenance to one pack dispatch and one `SliceUpdate` PER
-    /// PLANE. Default ON: both planes of the one token share a single pack
-    /// dispatch and a single `SliceUpdate`.
+    /// KVQ-PAIRWRITE: `MLX_KV_QUANT_PAIRWRITE=0` returns mirror maintenance
+    /// to one pack dispatch and one `SliceUpdate` per plane. Default ON: both
+    /// planes of each decode or prefill range share one pack dispatch and one
+    /// `SliceUpdate` (two only when a range crosses the ring boundary).
     static let pairedMirrorWriteEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment["MLX_KV_QUANT_PAIRWRITE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// `MLX_KV_Q4_FULL_FILL_ADOPT=0` restores the two BF16 ring
+    /// `SliceUpdate`s for a whole-window, slot-zero prefill. Default ON: the
+    /// incoming rectangles already contain every physical ring slot in order,
+    /// so retain row-contiguous storage directly and keep it authoritative.
+    static let fullWindowAdoptEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_KV_Q4_FULL_FILL_ADOPT"]
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
@@ -801,11 +829,10 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         """
     )
 
-    /// KVQ-PAIRWRITE: both mirror planes of ONE decode token in a single
-    /// dispatch. Rows `[0, HEADS)` are packed out of `xk`, rows
-    /// `[HEADS, 2 * HEADS)` out of `xv`, and the output rows land in that
-    /// order, which is the `[2, kvHeads, 1, row_words]` block the mirror
-    /// update wants.
+    /// KVQ-PAIRWRITE: both mirror planes of one token range in a single
+    /// dispatch. Grid Y chooses K or V while grid X walks flattened
+    /// `(head, token)` rows, producing the planar `[2, H, N, row_words]`
+    /// block the mirror update wants.
     ///
     /// The per-row arithmetic below is a transcription of `quantPackKernel`
     /// above, deliberately duplicated rather than shared: that packer is the
@@ -813,7 +840,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// its text, and a Swift-hosted kernel that changes text without
     /// changing name serves a stale cached body.
     private static let quantPackPairKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_kvq4g64_pack_pair_d256_v1",
+        name: "cbv2_kvq4g64_pack_pair_d256_range_v2",
         inputNames: ["keys", "values"],
         outputNames: ["packed_w"],
         source: """
@@ -825,11 +852,11 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             constexpr int row_words = payload_words + D / group_size;
 
             const int row = int(threadgroup_position_in_grid.x);
-            const int plane = row / HEADS;
-            const int head = row % HEADS;
+            const int plane = int(threadgroup_position_in_grid.y);
             const int lane = int(thread_position_in_threadgroup.x);
-            const device T* src = (plane == 0 ? keys : values) + head * D;
-            device uint32_t* out = packed_w + row * row_words;
+            const device T* src = (plane == 0 ? keys : values) + row * D;
+            device uint32_t* out = packed_w
+                + (plane * ROWS + row) * row_words;
 
             float vmin = 3.402823466e+38F;
             float vmax = -3.402823466e+38F;
@@ -1546,31 +1573,30 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
         return (q * scale + bias).reshaped(f.shape).asType(x.dtype)
     }
 
-    /// `[1, H, 1, D]` keys and values -> `[2, H, 1, D/8 + D/64]` uint32,
+    /// Matching `[1, H, N, D]` keys and values -> `[2, H, N, R]` uint32,
     /// row for row what `quantPackGPU` produces for each plane separately.
     static func quantPackPairGPU(keys: MLXArray, values: MLXArray) -> MLXArray {
         let heads = keys.dim(1)
+        let tokens = keys.dim(2)
         let headDim = keys.dim(3)
+        let rows = heads * tokens
         return quantPackPairKernel(
             [keys, values],
-            template: [("T", keys.dtype), ("HEADS", heads)],
-            grid: (2 * heads * 32, 1, 1),
+            template: [("T", keys.dtype), ("ROWS", rows)],
+            grid: (rows * 32, 2, 1),
             threadGroup: (32, 1, 1),
-            outputShapes: [[2, heads, 1, headDim / 8 + headDim / 64]],
+            outputShapes: [[2, heads, tokens, headDim / 8 + headDim / 64]],
             outputDTypes: [.uint32]
         )[0]
     }
 
-    /// KVQ-PAIRWRITE. Maintaining the mirror plane by plane builds TWO
-    /// `SliceUpdate`s over the whole mirror allocation per decode token, and
-    /// the second one takes the first one's output as its input. The mirror
-    /// is an attention input on every step of the quantized road, so neither
-    /// update can donate its buffer: depositing 520 bytes per head copies
-    /// the full ring twice.
+    /// KVQ-PAIRWRITE. Maintaining the mirror plane by plane builds two
+    /// `SliceUpdate`s over the whole mirror allocation, and the second takes
+    /// the first one's output as input. Both planes are always available
+    /// together, so one paired pack and one update serve decode and prefill.
     ///
-    /// Both planes of a decode token are known at the same instant, so they
-    /// can share one pack dispatch and one update, which halves that copy
-    /// and takes the step's mirror dispatches from four to two. Returns
+    /// Both planes of every incoming token range are known at the same
+    /// instant, so they can share one pack dispatch and one update. Returns
     /// false — leaving the per-plane road to run untouched — whenever a
     /// precondition does not hold.
     private func writePairedMirror(
@@ -1580,13 +1606,24 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
             let quantMirror,
             Self.gpuPackEnabled, !Self.gpuPackCheck, !Self.quantSimulate,
             headDim == 256,
+            newKeys.dim(2) > 0,
+            newKeys.dim(2) <= window,
             newKeys.dtype == newValues.dtype,
-            newKeys.shape == [1, kvHeads, 1, headDim],
-            newValues.shape == [1, kvHeads, 1, headDim]
+            newKeys.shape == [1, kvHeads, newKeys.dim(2), headDim],
+            newValues.shape == [1, kvHeads, newKeys.dim(2), headDim]
         else { return false }
         let packed = Self.quantPackPairGPU(keys: newKeys, values: newValues)
-        let slot = firstPosition % window
-        quantMirror[0..., 0..., slot ..< (slot + 1), 0...] = packed
+        let n = newKeys.dim(2)
+        let start = firstPosition % window
+        if start + n <= window {
+            quantMirror[0..., 0..., start ..< (start + n), 0...] = packed
+        } else {
+            let first = window - start
+            quantMirror[0..., 0..., start ..< window, 0...] =
+                packed[0..., 0..., ..<first, 0...]
+            quantMirror[0..., 0..., 0 ..< (n - first), 0...] =
+                packed[0..., 0..., first..., 0...]
+        }
         return true
     }
 

@@ -796,7 +796,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     private static let passBKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name:
             "cbv2_ragged8_sdpa_2pass_b_direct_bf16_d256_b\(blocks)"
-            + "_c\(combineColumns)_vec4_v6",
+            + "_c\(combineColumns)_vec4_v7",
         inputNames: ["partials", "sums", "maxs"],
         outputNames: ["out"],
         source: """
@@ -891,16 +891,26 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 }
             }
 
+            const float inv_sum = sum_exp_score == 0.0f ? 0.0f : (1.0f / sum_exp_score);
+            thread float reduced[values_per_lane];
+            #pragma clang loop unroll(full)
             for (int element = 0; element < values_per_lane; ++element) {
-                float reduced = accumulator[element];
+                float r = accumulator[element];
+                #pragma clang loop unroll(full)
                 for (int stride = 1; stride < COLS; stride <<= 1) {
-                    reduced += simd_shuffle_xor(reduced, ushort(stride));
+                    r += simd_shuffle_xor(r, ushort(stride));
                 }
-                if (block_lane == 0) {
-                    out[element] = T(
-                        sum_exp_score == 0.0f
-                            ? reduced
-                            : reduced / sum_exp_score);
+                reduced[element] = r;
+            }
+            if (block_lane == 0) {
+                device T4* out_vectors = reinterpret_cast<device T4*>(out);
+                #pragma clang loop unroll(full)
+                for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
+                    out_vectors[chunk] = T4(
+                        T(reduced[chunk * 4 + 0] * inv_sum),
+                        T(reduced[chunk * 4 + 1] * inv_sum),
+                        T(reduced[chunk * 4 + 2] * inv_sum),
+                        T(reduced[chunk * 4 + 3] * inv_sum));
                 }
             }
         """,
@@ -1026,7 +1036,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// next decode dispatch after this write completes.
     private static let portQuantFusedWriteKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_2pass_a_q4g64_d256_g2_regpack_vec4_carry_pair_b\(blocks)_v5",
+            name: "cbv2_ragged8_sdpa_ringwrite_2pass_a_q4g64_d256_g2_regpack_vec4_carry_pair_b\(blocks)_v6",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -1039,6 +1049,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 constexpr int payload_words = D / 8;
                 constexpr int row_words = payload_words + D / 64;
                 constexpr int current_block = (N - 1) % BLOCKS;
+                typedef vec<T, 4> T4;
 
                 const int kv_head = int(threadgroup_position_in_grid.x);
                 const int batch_index = int(threadgroup_position_in_grid.y);
@@ -1096,7 +1107,6 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     // starting at a multiple of that count, so the span is
                     // vector-aligned and the eight scalar loads become two
                     // four-wide ones per plane.
-                    using T4 = vec<T, 4>;
                     const device T4* kvec =
                         reinterpret_cast<const device T4*>(new_key);
                     const device T4* vvec =
@@ -1172,11 +1182,22 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 thread float q_hi[values_per_lane];
                 thread float acc_lo[values_per_lane];
                 thread float acc_hi[values_per_lane];
-                for (int element = 0; element < values_per_lane; ++element) {
-                    q_lo[element] = float(query[element]);
-                    q_hi[element] = float(query[D + element]);
-                    acc_lo[element] = 0.0f;
-                    acc_hi[element] = 0.0f;
+                const device T4* q_lo_vec = reinterpret_cast<const device T4*>(query);
+                const device T4* q_hi_vec = reinterpret_cast<const device T4*>(query + D);
+                const T4 q0 = q_lo_vec[0];
+                const T4 q1 = q_lo_vec[1];
+                const T4 qh0 = q_hi_vec[0];
+                const T4 qh1 = q_hi_vec[1];
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    q_lo[j] = float(q0[j]);
+                    q_lo[4 + j] = float(q1[j]);
+                    q_hi[j] = float(qh0[j]);
+                    q_hi[4 + j] = float(qh1[j]);
+                    acc_lo[j] = 0.0f;
+                    acc_lo[4 + j] = 0.0f;
+                    acc_hi[j] = 0.0f;
+                    acc_hi[4 + j] = 0.0f;
                 }
 
                 float max_lo = -3.402823466e+38F;
@@ -1230,6 +1251,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     const float vb = float(as_type<half>(ushort(vtw >> 16)));
                     float score_lo = 0.0f;
                     float score_hi = 0.0f;
+                    #pragma clang loop unroll(full)
                     for (int element = 0; element < values_per_lane; ++element) {
                         const float key_element =
                             fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
@@ -1249,6 +1271,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     max_hi = new_max_hi;
                     sum_lo = sum_lo * old_factor_lo + score_factor_lo;
                     sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                    #pragma clang loop unroll(full)
                     for (int element = 0; element < values_per_lane; ++element) {
                         const float value_element =
                             fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
@@ -1266,10 +1289,12 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     sum_out[BLOCKS] = sum_hi;
                     max_out[BLOCKS] = max_hi;
                 }
-                for (int element = 0; element < values_per_lane; ++element) {
-                    partial[element] = T(acc_lo[element]);
-                    partial[BLOCKS * D + element] = T(acc_hi[element]);
-                }
+                device T4* partial_lo_vec = reinterpret_cast<device T4*>(partial);
+                device T4* partial_hi_vec = reinterpret_cast<device T4*>(partial + BLOCKS * D);
+                partial_lo_vec[0] = T4(T(acc_lo[0]), T(acc_lo[1]), T(acc_lo[2]), T(acc_lo[3]));
+                partial_lo_vec[1] = T4(T(acc_lo[4]), T(acc_lo[5]), T(acc_lo[6]), T(acc_lo[7]));
+                partial_hi_vec[0] = T4(T(acc_hi[0]), T(acc_hi[1]), T(acc_hi[2]), T(acc_hi[3]));
+                partial_hi_vec[1] = T4(T(acc_hi[4]), T(acc_hi[5]), T(acc_hi[6]), T(acc_hi[7]));
             """,
             ensureRowContiguous: true
         )

@@ -3,6 +3,7 @@
 //  mlx-swift-lm
 //
 //  Port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/gemma4_text.py
+//  Ranked executable-identical sample of the composed c890b35 frontier.
 
 import Foundation
 import MLX

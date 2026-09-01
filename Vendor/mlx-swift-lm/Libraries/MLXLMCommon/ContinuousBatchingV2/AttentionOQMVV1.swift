@@ -277,23 +277,26 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
     rs += simd_shuffle_xor(rs, 4u);
     rs += simd_shuffle_xor(rs, 16u);
 
-    MMA8_SETB(B0, x, lo)
-    MMA8_SETB(B1, x, hi)
-    MMA8_SETB(B2, y, lo)
-    MMA8_SETB(B3, y, hi)
-    MMA8_SETB(B4, z, lo)
-    MMA8_SETB(B5, z, hi)
-    MMA8_SETB(B6, w, lo)
-    MMA8_SETB(B7, w, hi)
-
+    // BFILL: each B operand is filled immediately before the step that
+    // consumes it instead of all eight ahead of the run, so one B is live
+    // at a time rather than eight. `r0`/`r1` are not written between here
+    // and the last step, and the accumulation order into `C` is unchanged.
     simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+    MMA8_SETB(B0, x, lo)
     MMA8_STEP(B0, 0)
+    MMA8_SETB(B1, x, hi)
     MMA8_STEP(B1, 1)
+    MMA8_SETB(B2, y, lo)
     MMA8_STEP(B2, 2)
+    MMA8_SETB(B3, y, hi)
     MMA8_STEP(B3, 3)
+    MMA8_SETB(B4, z, lo)
     MMA8_STEP(B4, 4)
+    MMA8_SETB(B5, z, hi)
     MMA8_STEP(B5, 5)
+    MMA8_SETB(B6, w, lo)
     MMA8_STEP(B6, 6)
+    MMA8_SETB(B7, w, hi)
     MMA8_STEP(B7, 7)
 
     acc0 += s * C.thread_elements()[0] + rs.x * b;
@@ -319,7 +322,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
 """
 
     private static let mma8KernelK4096 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry2_v4",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry2_bfill_v5",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -336,7 +339,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
         ensureRowContiguous: true)
 
     private static let mma8KernelK8192 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_carry2_v4",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_carry2_bfill_v5",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """

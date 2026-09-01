@@ -1620,12 +1620,45 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   y0 += out_row;
   y1 += out_row;
 
-  int k = 0;
-  for (; k <= in_vec_size - block_size; k += block_size) {
+  // WSTREAM-PF: this block's packed weight words are fetched ONE BLOCK AHEAD,
+  // the same software pipeline `qmv_affine4_g64_singles_impl` already runs for
+  // this model's singleton-expert gathers (the common MoE run length). Issuing
+  // block b+1's device loads BEFORE block b's dot products lets the unified
+  // memory round trip retire underneath the arithmetic instead of stalling at
+  // the top of every iteration; the incumbent form hoists within a block only,
+  // so each iteration still opens on a cold load.
+  //
+  // Arithmetic is untouched. The same qdot calls consume the same words,
+  // scales and biases, in the same row order, into the same per-(output,input)
+  // accumulators, closed by the same simd_sum -- so every output element's add
+  // sequence, and therefore every output bit, is exactly what the
+  // un-prefetched loop produced. Only the ISSUE TIME of loads moves. The final
+  // iteration re-reads its own block rather than stepping past the row slice,
+  // the same clamp the singles kernel uses, so no address is touched that the
+  // incumbent did not already touch.
+  constexpr int block_bytes = block_size / 2;
+  const int nblocks = in_vec_size / block_size;
+  const device uint8_t* ws0 = ws;
+
+  thread uint wpf[results_per_simdgroup];
+  if (nblocks > 0) {
     for (int row = 0; row < results_per_simdgroup; row++) {
-      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
+      wpf[row] = *((const device uint*)(ws0 + row * in_vec_size_w));
+    }
+  }
+
+  for (int blk = 0; blk < nblocks; blk++) {
+    thread uint wcur[results_per_simdgroup];
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      wcur[row] = wpf[row];
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    const int nextblk = (blk + 1 < nblocks) ? (blk + 1) : blk;
+    const device uint8_t* wsn = ws0 + nextblk * block_bytes;
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      wpf[row] = *((const device uint*)(wsn + row * in_vec_size_w));
     }
 
     float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
@@ -1635,17 +1668,19 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
       float dot0;
       float dot1;
       qdot_affine4_pair_word<float, values_per_thread>(
-          packed[row], x0_thread, x1_thread, scale_local[row], bias_local[row], sum0, sum1, dot0, dot1);
+          wcur[row], x0_thread, x1_thread, scale_local[row], bias_local[row], sum0, sum1, dot0, dot1);
       result0[row] += dot0;
       result1[row] += dot1;
     }
 
-    ws += block_size / 2;
     scales += block_size / 64;
     biases += block_size / 64;
     x0 += block_size;
     x1 += block_size;
   }
+
+  const int k = nblocks * block_size;
+  ws = ws0 + nblocks * block_bytes;
 
   // Every Gemma 4 caller entering this specialized g64 path has K aligned to
   // 64.  The final block therefore contains an integral number of complete
@@ -1758,37 +1793,68 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
   y2 += out_row;
   y3 += out_row;
 
-  int k = 0;
-  for (; k <= in_vec_size - block_size; k += block_size) {
+  // WSTREAM-PF: this block's packed weight words are fetched ONE BLOCK AHEAD,
+  // the same software pipeline `qmv_affine4_g64_singles_impl` already runs for
+  // this model's singleton-expert gathers. Issuing block b+1's device loads
+  // BEFORE block b's dot products lets the unified memory round trip retire
+  // underneath the arithmetic instead of stalling at the top of every
+  // iteration; the incumbent form hoists within a block only, so each
+  // iteration still opens on a cold load.
+  //
+  // Arithmetic is untouched. The same qdot calls consume the same words,
+  // scales and biases, in the same row order, into the same per-(output,input)
+  // accumulators, closed by the same simd_sum -- so every output element's add
+  // sequence, and therefore every output bit, is exactly what the
+  // un-prefetched loop produced. Only the ISSUE TIME of loads moves. The final
+  // iteration re-reads its own block rather than stepping past the row slice,
+  // the same clamp the singles kernel uses, so no address is touched that the
+  // incumbent did not already touch.
+  constexpr int block_bytes = block_size / 2;
+  const int nblocks = in_vec_size / block_size;
+  const device uint8_t* ws0 = ws;
+
+  thread uint wpf[results_per_simdgroup];
+  if (nblocks > 0) {
     for (int row = 0; row < results_per_simdgroup; row++) {
-      packed[row] =
-          *((const device uint*)(ws + row * in_vec_size_w));
+      wpf[row] = *((const device uint*)(ws0 + row * in_vec_size_w));
+    }
+  }
+
+  for (int blk = 0; blk < nblocks; blk++) {
+    thread uint wcur[results_per_simdgroup];
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      wcur[row] = wpf[row];
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    const int nextblk = (blk + 1 < nblocks) ? (blk + 1) : blk;
+    const device uint8_t* wsn = ws0 + nextblk * block_bytes;
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      wpf[row] = *((const device uint*)(wsn + row * in_vec_size_w));
     }
 
     float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+          wcur[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine4_registered_word<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+          wcur[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine4_registered_word<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+          wcur[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x3, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result3[row] += qdot_affine4_registered_word<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+          wcur[row], x_thread, scale_local[row], bias_local[row], sum);
     }
 
-    ws += block_size / 2;
     scales += block_size / 64;
     biases += block_size / 64;
     x0 += block_size;
@@ -1796,6 +1862,9 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     x2 += block_size;
     x3 += block_size;
   }
+
+  const int k = nblocks * block_size;
+  ws = ws0 + nblocks * block_bytes;
 
   const int remaining = clamp(
       static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
@@ -1900,38 +1969,72 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
   y1 += out_row;
   y2 += out_row;
 
-  int k = 0;
-  for (; k <= in_vec_size - block_size; k += block_size) {
+  // WSTREAM-PF: this block's packed weight words are fetched ONE BLOCK AHEAD,
+  // the same software pipeline `qmv_affine4_g64_singles_impl` already runs for
+  // this model's singleton-expert gathers. Issuing block b+1's device loads
+  // BEFORE block b's dot products lets the unified memory round trip retire
+  // underneath the arithmetic instead of stalling at the top of every
+  // iteration; the incumbent form hoists within a block only, so each
+  // iteration still opens on a cold load.
+  //
+  // Arithmetic is untouched. The same qdot calls consume the same words,
+  // scales and biases, in the same row order, into the same per-(output,input)
+  // accumulators, closed by the same simd_sum -- so every output element's add
+  // sequence, and therefore every output bit, is exactly what the
+  // un-prefetched loop produced. Only the ISSUE TIME of loads moves. The final
+  // iteration re-reads its own block rather than stepping past the row slice,
+  // the same clamp the singles kernel uses, so no address is touched that the
+  // incumbent did not already touch.
+  constexpr int block_bytes = block_size / 2;
+  const int nblocks = in_vec_size / block_size;
+  const device uint8_t* ws0 = ws;
+
+  thread uint wpf[results_per_simdgroup];
+  if (nblocks > 0) {
     for (int row = 0; row < results_per_simdgroup; row++) {
-      packed[row] =
-          *((const device uint*)(ws + row * in_vec_size_w));
+      wpf[row] = *((const device uint*)(ws0 + row * in_vec_size_w));
+    }
+  }
+
+  for (int blk = 0; blk < nblocks; blk++) {
+    thread uint wcur[results_per_simdgroup];
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      wcur[row] = wpf[row];
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    const int nextblk = (blk + 1 < nblocks) ? (blk + 1) : blk;
+    const device uint8_t* wsn = ws0 + nextblk * block_bytes;
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      wpf[row] = *((const device uint*)(wsn + row * in_vec_size_w));
     }
 
     float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+          wcur[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine4_registered_word<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+          wcur[row], x_thread, scale_local[row], bias_local[row], sum);
     }
     sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine4_registered_word<float, values_per_thread>(
-          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+          wcur[row], x_thread, scale_local[row], bias_local[row], sum);
     }
 
-    ws += block_size / 2;
     scales += block_size / 64;
     biases += block_size / 64;
     x0 += block_size;
     x1 += block_size;
     x2 += block_size;
   }
+
+  const int k = nblocks * block_size;
+  ws = ws0 + nblocks * block_bytes;
 
   const int remaining = clamp(
       static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),

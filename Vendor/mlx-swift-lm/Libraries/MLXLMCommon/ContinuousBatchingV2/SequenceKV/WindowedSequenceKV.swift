@@ -235,19 +235,6 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         writeDecodeToken(keys: newKeys, values: newValues)
     }
 
-    /// Preserve the incumbent BF16 SliceUpdates and counter transition while
-    /// the fused q4 attention pass owns only the live mirror-slot write.
-    func decodeRingWriteBF16Only(keys newKeys: MLXArray, values newValues: MLXArray) {
-        precondition(
-            staged == nil && newKeys.dim(2) == 1 && newValues.dim(2) == 1
-                && keys != nil && values != nil && retainedCount == window)
-        borrowableChunkViews = nil
-        writeRing(keys!, tokens: newKeys, firstPosition: absoluteOffset)
-        writeRing(values!, tokens: newValues, firstPosition: absoluteOffset)
-        absoluteOffset += 1
-        oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
-    }
-
     var decodeRingView: (keys: MLXArray, values: MLXArray, start: Int)? {
         guard staged == nil, let keys, let values, retainedCount == window else { return nil }
         return (keys, values, oldestValidPosition % window)
@@ -262,13 +249,6 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         guard staged == nil, quantMirror != nil, retainedCount == window
         else { return nil }
         return quantMirror
-    }
-
-    /// Live q4 mirror plus the logical post-write start. No mutation: the
-    /// fused pass-A owns the mirror write and consumes the new token directly.
-    var decodeRingQuantViewBeforeWrite: (mirror: MLXArray, start: Int)? {
-        guard staged == nil, let quantMirror, retainedCount == window else { return nil }
-        return (quantMirror, (oldestValidPosition + 1) % window)
     }
 
     /// The ring view a fused decode step should attend: the SAME allocations
@@ -682,15 +662,6 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// dispatch and a single `SliceUpdate`.
     static let pairedMirrorWriteEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment["MLX_KV_QUANT_PAIRWRITE"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
-    /// `MLX_KV_Q4_FUSED_WRITE=0` restores the separate q4 pack + mirror
-    /// SliceUpdate path in the same worker binary. Default ON: exact D256,
-    /// B8 q4g64 decode packs the current token inside attention pass A.
-    static let q4FusedMirrorWriteEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment["MLX_KV_Q4_FUSED_WRITE"]
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()

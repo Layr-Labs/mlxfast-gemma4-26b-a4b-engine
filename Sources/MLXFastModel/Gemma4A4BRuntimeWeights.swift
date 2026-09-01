@@ -111,7 +111,7 @@ public final class Gemma4A4BRuntimeWeightCache {
         {
             setenv("MLX_MAX_MB_PER_BUFFER", "512", 1)
             setenv("MLX_MAX_OPS_PER_BUFFER", "512", 1)
-            Memory.cacheLimit = 32 << 30
+            Memory.cacheLimit = 48 << 30
         }
 
         do {

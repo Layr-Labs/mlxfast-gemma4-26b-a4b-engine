@@ -480,6 +480,24 @@ enum CBv2AttentionV1 {
                         let preWrite = ringRows.compactMap {
                             $0.decodeRingQuantViewBeforeWrite
                         }
+                        // SLIDE-STORE-001 placement: ahead of pass A, so the
+                        // store is not appended to the layer's dependent chain.
+                        let bf16PreWrite = ringRows.compactMap {
+                            $0.decodeRingViewBeforeWrite
+                        }
+                        let slidingStoreFence: MLXArray? =
+                            (bf16PreWrite.count == B
+                                && zip(preWrite, bf16PreWrite)
+                                    .allSatisfy({ $0.start == $1.start }))
+                            ? CBv2RaggedTwoPassDecodeAttentionV1
+                                .storeSlidingRings(
+                                    keys: bf16PreWrite.map(\.keys),
+                                    values: bf16PreWrite.map(\.values),
+                                    starts: bf16PreWrite.map(\.start),
+                                    newKeys: keys, newValues: values,
+                                    previousWriteFence:
+                                        decodeRingWriteFence.value)
+                            : nil
                         if preWrite.count == B,
                             let fused = CBv2RaggedTwoPassDecodeAttentionV1
                                 .attendRingQuantWriting(
@@ -487,20 +505,39 @@ enum CBv2AttentionV1 {
                                     mirrors: preWrite.map(\.mirror),
                                     starts: preWrite.map(\.start),
                                     newKeys: keys, newValues: values,
-                                    previousWriteFence: decodeRingWriteFence.value,
+                                    previousWriteFence: slidingStoreFence
+                                        ?? decodeRingWriteFence.value,
                                     scale: scale,
                                     slidingWindowLength: ringRows[0].window)
                         {
-                            for (index, row) in ringRows.enumerated() {
-                                row.decodeRingWriteBF16Only(
-                                    keys: keys[index ..< (index + 1)],
-                                    values: values[index ..< (index + 1)])
+                            // SLIDE-STORE-001: attention on this road reads the
+                            // packed mirror, never the BF16 ring, so the ring's
+                            // append does not have to precede pass A -- only the
+                            // next BF16 consumer. Writing it in place as one
+                            // small dispatch chained after pass A's fence drops
+                            // two functional whole-ring updates per row per
+                            // layer. The pre-write starts are captured before
+                            // any counter moves, and the store is only reached
+                            // once pass A has been admitted, so a refusal
+                            // cannot leave the ring written and the counters
+                            // behind it.
+                            let nextFence = fused.nextWriteFence
+                            if slidingStoreFence != nil {
+                                for row in ringRows {
+                                    row.advanceDecodeRingAfterFusedWrite()
+                                }
+                            } else {
+                                for (index, row) in ringRows.enumerated() {
+                                    row.decodeRingWriteBF16Only(
+                                        keys: keys[index ..< (index + 1)],
+                                        values: values[index ..< (index + 1)])
+                                }
                             }
                             // The next pass-A consumes this fence; this
                             // step's pass-B output also consumes pass-A's
                             // first three outputs, so the live store remains
                             // rooted both in observable output and cache state.
-                            decodeRingWriteFence.value = fused.nextWriteFence
+                            decodeRingWriteFence.value = nextFence
                             return fused.output
                         }
                     }

@@ -3035,24 +3035,44 @@ private enum Gemma4FusedLayerGlue {
     /// feeds the expert RMS directly, deleting only the reduced `[8, 2816]`
     /// materialization and its standalone dispatch.
     private static let deferredExpertValuesSource = """
-            T expertv[4];
+            // The row's eight assignments and eight route weights do not
+            // depend on the component index, and the incumbent re-read both on
+            // every one of the four component passes. They are read once into
+            // registers here. The four values a lane takes from one sorted row
+            // are contiguous -- `wbase` is `lid * 4` and the row stride 2816 is
+            // a multiple of four -- so walking slots outermost turns four
+            // scalar reads into one aligned four-wide read while leaving every
+            // component's accumulation in the incumbent's ascending slot order.
             const uint assignment_base = row * 8u;
+            uint slot_row[8];
+            float slot_weight[8];
+            #pragma unroll
+            for (uint slot = 0u; slot < 8u; ++slot) {
+                const uint assignment = assignment_base + slot;
+                slot_row[slot] = (uint)inverse[assignment];
+                slot_weight[slot] = (float)route_weights[assignment];
+            }
+            using T4 = vec<T, 4>;
+            T expertv[4];
+            #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                T accumulator = static_cast<T>(0.0f);
-                for (uint slot = 0u; slot < 8u; ++slot) {
-                    const uint assignment = assignment_base + slot;
-                    const uint sorted_row = (uint)inverse[assignment];
+                expertv[i] = static_cast<T>(0.0f);
+            }
+            #pragma unroll
+            for (uint slot = 0u; slot < 8u; ++slot) {
+                const T4 sorted4 = *reinterpret_cast<const device T4*>(
+                    sorted + slot_row[slot] * 2816u + wbase);
+                #pragma unroll
+                for (int i = 0; i < 4; ++i) {
                     const T weighted = static_cast<T>(
-                        (float)sorted[sorted_row * 2816u + wbase + (uint)i]
-                        * (float)route_weights[assignment]);
-                    accumulator = accumulator + weighted;
+                        (float)sorted4[i] * slot_weight[slot]);
+                    expertv[i] = expertv[i] + weighted;
                 }
-                expertv[i] = accumulator;
             }
     """
 
     private static let deferredTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1",
+        name: "gemma4_glue_deferred_expert_tail_2816_bf16_reg_vec4_v3",
         inputNames: [
             "a", "sorted", "inverse", "route_weights", "res",
             "w1", "w2", "w3", "s",
@@ -3097,7 +3117,7 @@ private enum Gemma4FusedLayerGlue {
 
     private static let deferredTailChainKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1",
+            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_reg_vec4_v3",
             inputNames: [
                 "a", "sorted", "inverse", "route_weights", "res",
                 "w1", "w2", "w3", "s", "wn",

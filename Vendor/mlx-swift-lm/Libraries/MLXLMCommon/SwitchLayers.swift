@@ -382,20 +382,27 @@ private func geGLUProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
 }
 // MARK: - ROUTE-SIMD-RANK-64: exact decode route table
 
-/// Stable rank sort for the exact B=8/top-K=8 decode plane. One SIMDgroup
-/// loads the 64 keys once (two keys per lane), broadcasts them to every lane,
-/// and directly emits the three routing products consumed downstream.
+/// Stable rank sort for the exact B=8/top-K=8 decode plane. One 64-thread
+/// threadgroup stages the 64 keys once, both SIMD groups broadcast them to
+/// their lanes, and the kernel directly emits all three downstream products.
 private let routeSimdRank64Kernel: MLXFast.MLXFastKernel =
     MLXFast.metalKernel(
-        name: "mlx_lm_route_simd_rank_scatter_m8_u32_n64_unroll_v2",
+        name: "mlx_lm_route_simd_rank_scatter_m8_u32_n64_stage64_v1",
         inputNames: ["indices"],
         outputNames: ["row_order", "sorted_keys", "inverse_order"],
         source: """
             const uint assignment = thread_position_in_grid.x;
             const uint lane = thread_index_in_simdgroup;
-            const uint key = (uint)indices[assignment];
-            const uint key_low = (uint)indices[lane];
-            const uint key_high = (uint)indices[32u + lane];
+            // Both SIMD groups rank against the same 64-entry route table.
+            // Stage each entry once so the rank loop reuses threadgroup data
+            // instead of issuing duplicate global key/low/high reads.
+            threadgroup uint route_keys[64];
+            route_keys[thread_index_in_threadgroup] =
+                (uint)indices[assignment];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const uint key = route_keys[assignment];
+            const uint key_low = route_keys[lane];
+            const uint key_high = route_keys[32u + lane];
             uint rank = 0;
             #pragma clang loop unroll(full)
             for (uint source = 0; source < 32; ++source) {

@@ -470,6 +470,40 @@ enum CBv2AttentionV1 {
                 cachedValueRows.reserveCapacity(B)
                 let ringRows = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
                 if ringRows.count == B && ringRows.allSatisfy({ $0.decodeRingView != nil }) {
+                    // Q4-LIVE-WRITE: admit all rows before any host state
+                    // mutation. Pass A writes only the live q4 mirror slot;
+                    // the established BF16 SliceUpdates and counters remain
+                    // on their incumbent path below.
+                    if CBv2WindowedSequenceKV.q4FusedMirrorWriteEnabled,
+                        allowFusedRingWrite, let decodeRingWriteFence
+                    {
+                        let preWrite = ringRows.compactMap {
+                            $0.decodeRingQuantViewBeforeWrite
+                        }
+                        if preWrite.count == B,
+                            let fused = CBv2RaggedTwoPassDecodeAttentionV1
+                                .attendRingQuantWriting(
+                                    queries: queries,
+                                    mirrors: preWrite.map(\.mirror),
+                                    starts: preWrite.map(\.start),
+                                    newKeys: keys, newValues: values,
+                                    previousWriteFence: decodeRingWriteFence.value,
+                                    scale: scale,
+                                    slidingWindowLength: ringRows[0].window)
+                        {
+                            for (index, row) in ringRows.enumerated() {
+                                row.decodeRingWriteBF16Only(
+                                    keys: keys[index ..< (index + 1)],
+                                    values: values[index ..< (index + 1)])
+                            }
+                            // The next pass-A consumes this fence; this
+                            // step's pass-B output also consumes pass-A's
+                            // first three outputs, so the live store remains
+                            // rooted both in observable output and cache state.
+                            decodeRingWriteFence.value = fused.nextWriteFence
+                            return fused.output
+                        }
+                    }
                     // WRITE-016: fold this step's one-token ring write into
                     // ring pass A. The separate `decodeRingWrite` below is a
                     // `SliceUpdate` over a 4 MiB allocation the direct-ring

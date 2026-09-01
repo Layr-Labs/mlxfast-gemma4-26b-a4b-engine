@@ -916,238 +916,6 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         ensureRowContiguous: true
     )
 
-    private static let passBFoldKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name:
-            "cbv2_ragged8_sdpa_2pass_b_direct_bf16_d256_b\(blocks)"
-            + "_c\(combineColumns)_vec4_xfold_v1",
-        inputNames: ["partials", "sums", "maxs"],
-        outputNames: ["out"],
-        source: """
-            typedef vec<T, 4> T4;
-            constexpr int simd_width = 32;
-            constexpr int values_per_lane = D / simd_width;
-            constexpr int vectors_per_lane = values_per_lane / 4;
-            static_assert(values_per_lane % 4 == 0, "lane run is four-wide");
-            // COMBINE-PACK-001: a lane owns one partition column of one output
-            // group, and a simdgroup carries `sets` output groups side by
-            // side. COLS is min(BLOCKS, simd_width) rounded to a power of two,
-            // so every lane holds a live column and the surplus-lane guard
-            // below is the constant true whenever the partition fits a
-            // simdgroup. At COLS == simd_width this is the incumbent one
-            // output group per simdgroup, one column per lane.
-            constexpr int sets = simd_width / COLS;
-            constexpr int rounds = (BLOCKS + COLS - 1) / COLS;
-
-            const int batch_head = int(threadgroup_position_in_grid.x);
-            const int lane = int(thread_index_in_simdgroup);
-            const int block_lane = lane % COLS;
-            const int output_group =
-                int(simdgroup_index_in_threadgroup) * sets + lane / COLS;
-
-            partials += batch_head * BLOCKS * D
-                + output_group * values_per_lane;
-            sums += batch_head * BLOCKS;
-            maxs += batch_head * BLOCKS;
-            out += batch_head * D + output_group * values_per_lane;
-
-            thread float accumulator[values_per_lane];
-            for (int element = 0; element < values_per_lane; ++element) {
-                accumulator[element] = 0.0f;
-            }
-            // COMBINE-HOIST-001: a lane's column summaries are invariant
-            // across the three passes below, and its rescale factor is
-            // invariant across the last two. The incumbent re-read `maxs`
-            // three times and `sums` once, and evaluated the same
-            // `fast::exp` twice per column. Each is kept in a register
-            // instead. `rounds` is a compile-time constant, so these are
-            // named registers rather than an indexed stack array.
-            thread float lane_max[rounds];
-            thread float lane_sum[rounds];
-            thread float lane_factor[rounds];
-            float sum_exp_score = 0.0f;
-            float max_score = -3.402823466e+38F;
-            for (int round = 0; round < rounds; ++round) {
-                const int column = block_lane + COLS * round;
-                const bool live = column < BLOCKS;
-                lane_max[round] = live ? maxs[column] : -3.402823466e+38F;
-                lane_sum[round] = live ? sums[column] : 0.0f;
-                max_score = max(max_score, lane_max[round]);
-            }
-            // The columns of one output group sit on the contiguous lane run
-            // [set * COLS, set * COLS + COLS), so an ascending xor butterfly
-            // bounded at COLS never leaves the set. It is the same tree the
-            // full-width reduction ran over the live columns, with the rounds
-            // that only folded in the identity dropped.
-            for (int stride = 1; stride < COLS; stride <<= 1) {
-                max_score =
-                    max(max_score, simd_shuffle_xor(max_score, ushort(stride)));
-            }
-
-            for (int round = 0; round < rounds; ++round) {
-                lane_factor[round] = fast::exp(lane_max[round] - max_score);
-                sum_exp_score += lane_factor[round] * lane_sum[round];
-            }
-            for (int stride = 1; stride < COLS; stride <<= 1) {
-                sum_exp_score += simd_shuffle_xor(sum_exp_score, ushort(stride));
-            }
-
-            // A lane's run of the column is contiguous, so it is read as
-            // four-wide vectors of the same element type. Each component is
-            // widened where it is multiplied, so every product and every
-            // accumulator update is the one the element walk performed.
-            for (int round = 0; round < rounds; ++round) {
-                const int column = block_lane + COLS * round;
-                if (column < BLOCKS) {
-                    const float factor = lane_factor[round];
-                    const device T4* partial_vectors =
-                        reinterpret_cast<const device T4*>(
-                            partials + column * D);
-                    #pragma clang loop unroll(full)
-                    for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
-                        const T4 partial_vector = partial_vectors[chunk];
-                        #pragma clang loop unroll(full)
-                        for (int j = 0; j < 4; ++j) {
-                            accumulator[chunk * 4 + j] +=
-                                factor * float(partial_vector[j]);
-                        }
-                    }
-                }
-            }
-
-            // COMBINE-XFOLD-001: fold the lane run with ONE cross-lane
-            // butterfly instead of `values_per_lane` independent chains, and
-            // let every lane store its own element.
-            //
-            // The incumbent ran one log2(COLS) shuffle chain per element, so
-            // every lane carried every element to the last step, and then the
-            // single lane with `block_lane == 0` issued the whole run of
-            // stores while the other COLS-1 lanes sat in the branch shadow.
-            //
-            // Step k pairs the lanes that differ in bit k of `block_lane`,
-            // exactly as chain step k did. Each lane keeps the half of the
-            // element set whose low index bit equals its own bit k and sends
-            // the half its partner keeps, so `simd_shuffle_xor(upper ? a : b,
-            // stride)` returns the partner's evaluation of that select and
-            // the partner has the opposite `upper`. After the last step a
-            // lane holds, in `fold[j]`, the complete sum for element
-            // `j * COLS + block_lane`.
-            //
-            // Every element's additions therefore still fold lane bit 0
-            // first, then bit 1, and so on in the same ascending order, over
-            // the same values, so each stored element is bit for bit the one
-            // the chains produced. `sum_exp_score` is bitwise equal on every
-            // lane of the set already: its own butterfly gives each lane the
-            // same operands in commuted pairs, and IEEE addition is
-            // commutative.
-            //
-            // Each step is a literal-bound block rather than a loop over a
-            // runtime delta, so the array is addressed with compile-time
-            // indices and cannot be spilled.
-            constexpr bool lane_fold = values_per_lane >= COLS;
-            if (lane_fold) {
-                float fold[values_per_lane];
-                #pragma clang loop unroll(full)
-                for (int element = 0; element < values_per_lane; ++element) {
-                    fold[element] = accumulator[element];
-                }
-                if (COLS > 1) {
-                    const bool upper = (block_lane & 1) != 0;
-                    #pragma clang loop unroll(full)
-                    for (int j = 0; j < values_per_lane / 2; ++j) {
-                        const float a = fold[2 * j];
-                        const float b = fold[2 * j + 1];
-                        fold[j] = (upper ? b : a)
-                            + simd_shuffle_xor(upper ? a : b, ushort(1));
-                    }
-                }
-                if (COLS > 2) {
-                    const bool upper = (block_lane & 2) != 0;
-                    #pragma clang loop unroll(full)
-                    for (int j = 0; j < values_per_lane / 4; ++j) {
-                        const float a = fold[2 * j];
-                        const float b = fold[2 * j + 1];
-                        fold[j] = (upper ? b : a)
-                            + simd_shuffle_xor(upper ? a : b, ushort(2));
-                    }
-                }
-                if (COLS > 4) {
-                    const bool upper = (block_lane & 4) != 0;
-                    #pragma clang loop unroll(full)
-                    for (int j = 0; j < values_per_lane / 8; ++j) {
-                        const float a = fold[2 * j];
-                        const float b = fold[2 * j + 1];
-                        fold[j] = (upper ? b : a)
-                            + simd_shuffle_xor(upper ? a : b, ushort(4));
-                    }
-                }
-                if (COLS > 8) {
-                    const bool upper = (block_lane & 8) != 0;
-                    #pragma clang loop unroll(full)
-                    for (int j = 0; j < values_per_lane / 16; ++j) {
-                        const float a = fold[2 * j];
-                        const float b = fold[2 * j + 1];
-                        fold[j] = (upper ? b : a)
-                            + simd_shuffle_xor(upper ? a : b, ushort(8));
-                    }
-                }
-                if (COLS > 16) {
-                    const bool upper = (block_lane & 16) != 0;
-                    #pragma clang loop unroll(full)
-                    for (int j = 0; j < values_per_lane / 32; ++j) {
-                        const float a = fold[2 * j];
-                        const float b = fold[2 * j + 1];
-                        fold[j] = (upper ? b : a)
-                            + simd_shuffle_xor(upper ? a : b, ushort(16));
-                    }
-                }
-                // The run the lane kept is contiguous across the set, so the
-                // COLS stores of one output group are one coalesced run
-                // instead of a serial run issued by one lane.
-                #pragma clang loop unroll(full)
-                for (int j = 0; j < values_per_lane / COLS; ++j) {
-                    out[j * COLS + block_lane] = T(
-                        sum_exp_score == 0.0f
-                            ? fold[j]
-                            : fold[j] / sum_exp_score);
-                }
-            } else {
-                // A partition wider than the lane run cannot be folded into
-                // the lane index; that shape keeps the incumbent chains.
-                for (int element = 0; element < values_per_lane; ++element) {
-                    float reduced = accumulator[element];
-                    for (int stride = 1; stride < COLS; stride <<= 1) {
-                        reduced += simd_shuffle_xor(reduced, ushort(stride));
-                    }
-                    if (block_lane == 0) {
-                        out[element] = T(
-                            sum_exp_score == 0.0f
-                                ? reduced
-                                : reduced / sum_exp_score);
-                    }
-                }
-            }
-        """,
-        ensureRowContiguous: true
-    )
-
-    /// COMBINE-XFOLD-001 selector. ON by default;
-    /// `DARKBLOOM_GEMMA4_PASSA_COMBFOLD=0` restores the incumbent merge
-    /// kernel byte for byte, including its cached pipeline name.
-    private static let combineFold: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_PASSA_COMBFOLD"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
-    private static var passBActive: MLXFast.MLXFastKernel {
-        if combineFold {
-            CBv2EngageMark.once("passb-xfold")
-            return passBFoldKernel
-        }
-        return passBKernel
-    }
-
     static func attend(
         queries: MLXArray,
         keys: [MLXArray],
@@ -1523,7 +1291,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// removes only the global partial write/read and the second dispatch.
     private static let portQuantFusedWriteResidentKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_v1",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_r4",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -1824,19 +1592,34 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         }
                     }
 
-                    for (int element = 0; element < values_per_lane; ++element) {
-                        float reduced = accumulator[element];
-                        for (int stride = 1; stride < COLS; stride <<= 1) {
-                            reduced +=
-                                simd_shuffle_xor(reduced, ushort(stride));
-                        }
-                        if (block_lane == 0) {
-                            head_out[element] = T(
-                                sum_exp_score == 0.0f
-                                    ? reduced
-                                    : reduced / sum_exp_score);
+                    // Each step trades the half of the live slots whose
+                    // element bit matches the partner's column bit and keeps
+                    // the other half, so the live count runs 8, 4, 2, 1 and
+                    // the lane that survives for an element is the one whose
+                    // column index equals it. Every node of the addition tree
+                    // pairs the same two column subtrees the per-element
+                    // butterfly paired.
+                    #pragma clang loop unroll(full)
+                    for (int step = 0; (1 << step) < COLS; ++step) {
+                        const ushort stride = ushort(1 << step);
+                        const bool upper = (block_lane & int(stride)) != 0;
+                        const int live = values_per_lane >> step;
+                        #pragma clang loop unroll(full)
+                        for (int slot = 0; slot < live; slot += 2) {
+                            const float keep = upper
+                                ? accumulator[slot + 1]
+                                : accumulator[slot];
+                            const float trade = upper
+                                ? accumulator[slot]
+                                : accumulator[slot + 1];
+                            accumulator[slot >> 1] =
+                                keep + simd_shuffle_xor(trade, stride);
                         }
                     }
+                    head_out[block_lane] = T(
+                        sum_exp_score == 0.0f
+                            ? accumulator[0]
+                            : accumulator[0] / sum_exp_score);
                 }
             """,
             ensureRowContiguous: true
@@ -1923,7 +1706,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             outputDTypes: [.bfloat16, .float32, .float32]
         )
         CBv2EngageMark.once("kvq8port")
-        return passBActive(
+        return passBKernel(
             passA,
             template: [
                 ("T", queries.dtype),
@@ -2020,7 +1803,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             outputShapes: [partialShape, summaryShape, summaryShape, [1]],
             outputDTypes: [.bfloat16, .float32, .float32, .int32]
         )
-        let output = passBActive(
+        let output = passBKernel(
             Array(passA.prefix(3)),
             template: [
                 ("T", queries.dtype),
@@ -2134,7 +1917,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             outputDTypes: [.bfloat16, .float32, .float32, .int32]
         )
 
-        let output = passBActive(
+        let output = passBKernel(
             Array(passA.prefix(3)),
             template: [
                 ("T", queries.dtype),
@@ -2196,7 +1979,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             outputDTypes: [.bfloat16, .float32, .float32]
         )
 
-        return passBActive(
+        return passBKernel(
             passA,
             template: [
                 ("T", queries.dtype),

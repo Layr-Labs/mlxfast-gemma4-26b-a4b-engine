@@ -2616,6 +2616,7 @@ private enum Gemma4FusedLayerGlue {
         """
             {
                 float acc = 0;
+                #pragma unroll
                 for (int i = 0; i < 4; i++) {
                     float xi = (float)\(src)[base + i];
                     acc += xi * xi;
@@ -2647,6 +2648,7 @@ private enum Gemma4FusedLayerGlue {
         {
             float acc_a = 0;
             float acc_b = 0;
+            #pragma unroll
             for (int i = 0; i < 4; i++) {
                 av[i] = (float)a[base + i];
                 bv[i] = (float)b[base + i];
@@ -2698,7 +2700,7 @@ private enum Gemma4FusedLayerGlue {
     }
 
     private static let normResidualKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_norm_residual_2816_bf16_v1",
+        name: "gemma4_glue_norm_residual_2816_bf16_v2",
         inputNames: ["x", "res", "w"],
         outputNames: ["out"],
         source: """
@@ -2712,6 +2714,7 @@ private enum Gemma4FusedLayerGlue {
             const uint wbase = lid * 4;
         \(rmsReduce("x", into: "local_inv[0]"))
             const float inv = local_inv[0];
+            #pragma unroll
             for (int i = 0; i < 4; i++) {
                 // The stock chain rounds the norm's output to T in memory
                 // before the residual add reads it; reproduce both roundings.
@@ -2732,7 +2735,7 @@ private enum Gemma4FusedLayerGlue {
 // T28 second sample marker (r2): content identical to ranked 32f5d19f apart from this comment.
     private static let attentionBranchPrefixKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_glue_attention_branch_prefix_2816_bf16_v1",
+            name: "gemma4_glue_attention_branch_prefix_2816_bf16_v2",
             inputNames: ["attn", "res", "wa", "wd", "we", "wr"],
             outputNames: ["out", "dense", "expert", "router", "xSums"],
             source: """
@@ -2747,6 +2750,7 @@ private enum Gemma4FusedLayerGlue {
             \(rmsReduce("attn", into: "local_inv[0]"))
                 const float attn_inv = local_inv[0];
                 T outv[4];
+                #pragma unroll
                 for (int i = 0; i < 4; i++) {
                     const T normed = static_cast<T>(
                         wa[wbase + i]
@@ -2759,6 +2763,7 @@ private enum Gemma4FusedLayerGlue {
                 of: "(float)outv[base + i]", with: "(float)outv[i]"))
                 const float branch_inv = local_inv[0];
                 float xsum = 0.0f;
+                #pragma unroll
                 for (int i = 0; i < 4; i++) {
                     const T nx =
                         static_cast<T>((float)outv[i] * branch_inv);
@@ -2774,7 +2779,7 @@ private enum Gemma4FusedLayerGlue {
         )
 
     private static let dualPreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_dual_prenorm_xsum_2816_bf16_v2",
+        name: "gemma4_glue_dual_prenorm_xsum_2816_bf16_v3",
         inputNames: ["x", "w1", "w2"],
         outputNames: ["out1", "out2", "xSums"],
         source: """
@@ -2789,6 +2794,7 @@ private enum Gemma4FusedLayerGlue {
         \(rmsReduce("x", into: "local_inv[0]"))
             const float inv = local_inv[0];
             float xsum = 0.0f;
+            #pragma unroll
             for (int i = 0; i < 4; i++) {
                 const T nx = static_cast<T>((float)x[base + i] * inv);
                 const T dense = w1[wbase + i] * nx;
@@ -2817,6 +2823,7 @@ private enum Gemma4FusedLayerGlue {
             const float inv1 = local_inv[0];
             const float inv2 = local_inv[1];
             T sv[4];
+            #pragma unroll
             for (int i = 0; i < 4; i++) {
                 const T h1 = w1[wbase + i] * static_cast<T>((float)a[base + i] * inv1);
                 const T h2 = w2[wbase + i] * static_cast<T>((float)b[base + i] * inv2);
@@ -2826,6 +2833,7 @@ private enum Gemma4FusedLayerGlue {
             of: "(float)sv[base + i]", with: "(float)sv[i]"))
             const float inv3 = local_inv[0];
             const T scalar = s[0];
+            #pragma unroll
             for (int i = 0; i < 4; i++) {
                 // Same double rounding as the stock norm-then-add pair, then
                 // the layer-scalar multiply with its own stock rounding: the
@@ -2840,7 +2848,7 @@ private enum Gemma4FusedLayerGlue {
         """
 
     private static let tailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_2816_bf16_v2",
+        name: "gemma4_glue_tail_2816_bf16_v3",
         inputNames: ["a", "b", "res", "w1", "w2", "w3", "s"],
         outputNames: ["out"],
         source: tailSource,
@@ -2848,7 +2856,7 @@ private enum Gemma4FusedLayerGlue {
     )
 
     private static let pairedTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_paired_rms_2816_bf16_v1",
+        name: "gemma4_glue_tail_paired_rms_2816_bf16_v2",
         inputNames: ["a", "b", "res", "w1", "w2", "w3", "s"],
         outputNames: ["out"],
         source: pairedRmsTailSource(tailSource),
@@ -2988,6 +2996,7 @@ private enum Gemma4FusedLayerGlue {
             const float inv1 = local_inv[0];
             const float inv2 = local_inv[1];
             T sv[4];
+            #pragma unroll
             for (int i = 0; i < 4; i++) {
                 const T h1 = w1[wbase + i] * static_cast<T>((float)a[base + i] * inv1);
                 const T h2 = w2[wbase + i] * static_cast<T>((float)b[base + i] * inv2);
@@ -2998,6 +3007,7 @@ private enum Gemma4FusedLayerGlue {
             const float inv3 = local_inv[0];
             const T scalar = s[0];
             T outv[4];
+            #pragma unroll
             for (int i = 0; i < 4; i++) {
                 const T normed3 = static_cast<T>(
                     w3[wbase + i] * static_cast<T>((float)sv[i] * inv3));
@@ -3008,6 +3018,7 @@ private enum Gemma4FusedLayerGlue {
         \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
             of: "(float)outv[base + i]", with: "(float)outv[i]"))
             const float inv4 = local_inv[0];
+            #pragma unroll
             for (int i = 0; i < 4; i++) {
                 normed[base + i] =
                     wn[wbase + i] * static_cast<T>((float)outv[i] * inv4);
@@ -3015,7 +3026,7 @@ private enum Gemma4FusedLayerGlue {
         """
 
     private static let tailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_chain_2816_bf16_v1",
+        name: "gemma4_glue_tail_chain_2816_bf16_v2",
         inputNames: ["a", "b", "res", "w1", "w2", "w3", "s", "wn"],
         outputNames: ["out", "normed"],
         source: tailChainSource,
@@ -3023,7 +3034,7 @@ private enum Gemma4FusedLayerGlue {
     )
 
     private static let pairedTailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_chain_paired_rms_2816_bf16_v1",
+        name: "gemma4_glue_tail_chain_paired_rms_2816_bf16_v2",
         inputNames: ["a", "b", "res", "w1", "w2", "w3", "s", "wn"],
         outputNames: ["out", "normed"],
         source: pairedRmsTailSource(tailChainSource),
@@ -3037,8 +3048,10 @@ private enum Gemma4FusedLayerGlue {
     private static let deferredExpertValuesSource = """
             T expertv[4];
             const uint assignment_base = row * 8u;
+            #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 T accumulator = static_cast<T>(0.0f);
+                #pragma unroll
                 for (uint slot = 0u; slot < 8u; ++slot) {
                     const uint assignment = assignment_base + slot;
                     const uint sorted_row = (uint)inverse[assignment];
@@ -3052,7 +3065,7 @@ private enum Gemma4FusedLayerGlue {
     """
 
     private static let deferredTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1",
+        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v2",
         inputNames: [
             "a", "sorted", "inverse", "route_weights", "res",
             "w1", "w2", "w3", "s",
@@ -3074,6 +3087,7 @@ private enum Gemma4FusedLayerGlue {
             const float inv1 = local_inv[0];
             const float inv2 = local_inv[1];
             T sv[4];
+            #pragma unroll
             for (int i = 0; i < 4; i++) {
                 const T h1 = w1[wbase + i]
                     * static_cast<T>((float)a[base + i] * inv1);
@@ -3085,6 +3099,7 @@ private enum Gemma4FusedLayerGlue {
             of: "(float)sv[base + i]", with: "(float)sv[i]"))
             const float inv3 = local_inv[0];
             const T scalar = s[0];
+            #pragma unroll
             for (int i = 0; i < 4; i++) {
                 const T normed3 = static_cast<T>(
                     w3[wbase + i] * static_cast<T>((float)sv[i] * inv3));
@@ -3097,7 +3112,7 @@ private enum Gemma4FusedLayerGlue {
 
     private static let deferredTailChainKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1",
+            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v2",
             inputNames: [
                 "a", "sorted", "inverse", "route_weights", "res",
                 "w1", "w2", "w3", "s", "wn",
@@ -3119,6 +3134,7 @@ private enum Gemma4FusedLayerGlue {
                 const float inv1 = local_inv[0];
                 const float inv2 = local_inv[1];
                 T sv[4];
+                #pragma unroll
                 for (int i = 0; i < 4; i++) {
                     const T h1 = w1[wbase + i]
                         * static_cast<T>((float)a[base + i] * inv1);
@@ -3131,6 +3147,7 @@ private enum Gemma4FusedLayerGlue {
                 const float inv3 = local_inv[0];
                 const T scalar = s[0];
                 T outv[4];
+                #pragma unroll
                 for (int i = 0; i < 4; i++) {
                     const T normed3 = static_cast<T>(
                         w3[wbase + i]
@@ -3142,6 +3159,7 @@ private enum Gemma4FusedLayerGlue {
             \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
                 of: "(float)outv[base + i]", with: "(float)outv[i]"))
                 const float inv4 = local_inv[0];
+                #pragma unroll
                 for (int i = 0; i < 4; i++) {
                     normed[base + i] =
                         wn[wbase + i]
@@ -4463,7 +4481,7 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
     private static let eps: Float = 1e-6
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_final_rmsnorm_mma_xsum_2816_bf16_v1",
+        name: "gemma4_final_rmsnorm_mma_xsum_2816_bf16_v2",
         inputNames: ["x", "w"],
         outputNames: ["out", "xSums"],
         source: """
@@ -4480,6 +4498,7 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
 
             // Exact `rms_single_row<T, 4>` reduction for axis 2816.
             float acc = 0.0f;
+            #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 const float xi = x[base + i];
                 acc += xi * xi;
@@ -4503,6 +4522,7 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             T outv[4];
+            #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 // Preserve the stock RMSNorm's BF16 boundary exactly.
                 outv[i] = w[wbase + i]
@@ -4520,6 +4540,7 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
             // group. No SIMD reassociation is introduced.
             if ((lid % 16) == 0) {
                 float s = 0.0f;
+                #pragma unroll
                 for (uint c = 0; c < 8; ++c) {
                     const uint q = lid + c * 2;
                     s += quad_sums[q];

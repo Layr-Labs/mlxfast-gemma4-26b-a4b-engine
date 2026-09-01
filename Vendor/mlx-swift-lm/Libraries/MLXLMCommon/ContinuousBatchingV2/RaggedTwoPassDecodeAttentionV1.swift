@@ -2394,8 +2394,13 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
 
             const device T* query =
                 queries + size_t(row * 16 + kv_head * GQA) * D;
+            // SPAD: the score and probability planes are allocated with
+            // their row stride rounded up to four elements, so every row
+            // base sits on an eight-byte boundary for bf16. The pad columns
+            // are never written and never read; only the stride moves.
+            const int p_stride = (key_length + 3) & ~3;
             device T* score_rows =
-                scores + size_t(row * 16 + kv_head * GQA) * key_length;
+                scores + size_t(row * 16 + kv_head * GQA) * p_stride;
 
             const int virtual_groups = (key_length + 15) / 16;
             const int vtg_lo = chunk * 4;
@@ -2518,13 +2523,13 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     result[0] = (hi ? b : a)
                         + simd_shuffle_xor(hi ? a : b, ushort(1));
                 }
-                score_rows[size_t(lane >> 2) * key_length + out_row
+                score_rows[size_t(lane >> 2) * p_stride + out_row
                     + (lane & 3)] = static_cast<T>(result[0]);
             }
         """
 
     private static let qkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_qk_bf16_g8_xfold_v3_vec1",
+        name: "cbv2_ragged8_sdpa_d512_qk_bf16_g8_xfold_v3_vec1_spad1",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -2536,7 +2541,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     )
 
     private static let qkFencedKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_qk_fenced_bf16_g8_xfold_v3_vec1",
+        name: "cbv2_ragged8_sdpa_d512_qk_fenced_bf16_g8_xfold_v3_vec1_spad1",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -2552,11 +2557,14 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// over the 128 score rows; the CALLER sizes the threadgroup exactly
     /// like softmax.cpp:64-68 (32·ceil(ceil(kL/4)/32)). params[0] = kL.
     private static let softmaxKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_softmax_bf16_v1",
+        name: "cbv2_ragged8_sdpa_d512_softmax_bf16_v1_spad1",
         inputNames: ["scores", "params"],
         outputNames: ["probs"],
         source: """
             const int axis_size = int(params[0]);
+            // SPAD: rows are stored at a four-element-aligned stride, so a
+            // thread's four-element run is one eight-byte access.
+            const int p_stride = (axis_size + 3) & ~3;
             const int gid = int(threadgroup_position_in_grid.x);
             const int lid = int(thread_position_in_threadgroup.x);
             const int simd_lane_id = int(thread_index_in_simdgroup);
@@ -2567,10 +2575,12 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
 
             float ld[4];
             const device T* in =
-                scores + size_t(gid) * axis_size + lid * 4;
+                scores + size_t(gid) * p_stride + lid * 4;
             if (lid * 4 + 4 <= axis_size) {
+                const vec<T, 4> in4 =
+                    *reinterpret_cast<const device vec<T, 4>*>(in);
                 for (int i = 0; i < 4; i++) {
-                    ld[i] = static_cast<float>(in[i]);
+                    ld[i] = static_cast<float>(in4[i]);
                 }
             } else {
                 for (int i = 0; i < 4; i++) {
@@ -2623,11 +2633,13 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             normalizer = 1 / local_normalizer[0];
 
             device T* out_row =
-                probs + size_t(gid) * axis_size + lid * 4;
+                probs + size_t(gid) * p_stride + lid * 4;
             if (lid * 4 + 4 <= axis_size) {
+                vec<T, 4> out4;
                 for (int i = 0; i < 4; i++) {
-                    out_row[i] = static_cast<T>(ld[i] * normalizer);
+                    out4[i] = static_cast<T>(ld[i] * normalizer);
                 }
+                *reinterpret_cast<device vec<T, 4>*>(out_row) = out4;
             } else {
                 for (int i = 0; i < 4; i++) {
                     if ((lid * 4 + i) < axis_size) {
@@ -2683,7 +2695,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// and butterfly for all 8 heads of the GQA group at once (shared V tile
     /// loads). params as dispatch 1.
     private static let avKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1",
+        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1_spad1",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -2719,8 +2731,12 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             }
             value_plane += size_t(kv_head) * size_t(row_capacity) * D;
 
+            // SPAD: see the QK kernel. The stride is four-element aligned,
+            // so a lane's four consecutive probabilities are one aligned
+            // eight-byte load instead of four two-byte loads.
+            const int p_stride = (key_length + 3) & ~3;
             const device T* prob_rows =
-                probs + size_t(row * 16 + kv_head * GQA) * key_length;
+                probs + size_t(row * 16 + kv_head * GQA) * p_stride;
 
             const int thrM = lane / 4;
             const int thrN = lane % 4;
@@ -2748,10 +2764,12 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 }
                 #pragma clang loop unroll(full)
                 for (int h = 0; h < GQA; ++h) {
+                    const vec<T, 4> p_raw =
+                        *reinterpret_cast<const device vec<T, 4>*>(
+                            prob_rows + size_t(h) * p_stride + bm);
                     #pragma clang loop unroll(full)
                     for (int tm = 0; tm < 4; ++tm) {
-                        p_coeff[tm] = static_cast<float>(
-                            prob_rows[size_t(h) * key_length + bm + tm]);
+                        p_coeff[tm] = static_cast<float>(p_raw[tm]);
                     }
                     #pragma clang loop unroll(full)
                     for (int tm = 0; tm < 4; ++tm) {
@@ -2773,7 +2791,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
                         const float pc = static_cast<float>(
-                            prob_rows[size_t(h) * key_length + bm + tm]);
+                            prob_rows[size_t(h) * p_stride + bm + tm]);
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
                             result[h * 4 + tn] += pc * v_tile[0][tn];
@@ -2863,7 +2881,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// served from `new_keys` during scoring, never from the slot being
     /// written, so no read races the store.
     private static let fusedQkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_qk_bf16_g8_ktile_v3_vec1",
+        name: "cbv2_ragged8_writesdpa_d512_qk_bf16_g8_ktile_v3_vec1_spad1",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -2922,8 +2940,13 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
 
             const device T* query =
                 queries + size_t(row * 16 + kv_head * GQA) * D;
+            // SPAD: the score and probability planes are allocated with
+            // their row stride rounded up to four elements, so every row
+            // base sits on an eight-byte boundary for bf16. The pad columns
+            // are never written and never read; only the stride moves.
+            const int p_stride = (key_length + 3) & ~3;
             device T* score_rows =
-                scores + size_t(row * 16 + kv_head * GQA) * key_length;
+                scores + size_t(row * 16 + kv_head * GQA) * p_stride;
 
             const int virtual_groups = (key_length + 15) / 16;
             const int vtg_lo = chunk * 4;
@@ -3009,7 +3032,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                         #pragma clang loop unroll(full)
                         for (int tm = 0; tm < 4; ++tm) {
                             score_rows[
-                                size_t(h) * key_length + out_row + tm] =
+                                size_t(h) * p_stride + out_row + tm] =
                                 static_cast<T>(result[h][tm]);
                         }
                     }
@@ -3048,7 +3071,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// `new_values` rather than the cache slot the fused QK dispatch wrote,
     /// so this kernel has no read-after-in-place-write hazard at all.
     private static let fusedAvKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_vtile_v3_vec1",
+        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_vtile_v3_vec1_spad1",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -3086,8 +3109,12 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const device T* new_value_plane =
                 new_values + size_t(row * 2 + kv_head) * D;
 
+            // SPAD: see the QK kernel. The stride is four-element aligned,
+            // so a lane's four consecutive probabilities are one aligned
+            // eight-byte load instead of four two-byte loads.
+            const int p_stride = (key_length + 3) & ~3;
             const device T* prob_rows =
-                probs + size_t(row * 16 + kv_head * GQA) * key_length;
+                probs + size_t(row * 16 + kv_head * GQA) * p_stride;
 
             const int thrM = lane / 4;
             const int thrN = lane % 4;
@@ -3127,10 +3154,12 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 }
                 #pragma clang loop unroll(full)
                 for (int h = 0; h < GQA; ++h) {
+                    const vec<T, 4> p_raw =
+                        *reinterpret_cast<const device vec<T, 4>*>(
+                            prob_rows + size_t(h) * p_stride + bm);
                     #pragma clang loop unroll(full)
                     for (int tm = 0; tm < 4; ++tm) {
-                        p_coeff[tm] = static_cast<float>(
-                            prob_rows[size_t(h) * key_length + bm + tm]);
+                        p_coeff[tm] = static_cast<float>(p_raw[tm]);
                     }
                     #pragma clang loop unroll(full)
                     for (int tm = 0; tm < 4; ++tm) {
@@ -3155,7 +3184,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
                         const float pc = static_cast<float>(
-                            prob_rows[size_t(h) * key_length + bm + tm]);
+                            prob_rows[size_t(h) * p_stride + bm + tm]);
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
                             result[h][tn] += pc * v_tile[0][tn];
@@ -3339,7 +3368,10 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)
         ]
-        let scratchShape = [batch, queryHeads, 1, keyLength]
+        // SPAD: the score and probability scratch rows are padded up to a
+        // multiple of four bf16 elements so every row base is eight-byte
+        // aligned. The pad columns are never written and never read.
+        let scratchShape = [batch, queryHeads, 1, (keyLength + 3) / 4 * 4]
 
         let storeFence = ringStoreKernel(
             keyBuffers + valueBuffers
@@ -3467,7 +3499,10 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)
         ]
-        let scratchShape = [batch, queryHeads, 1, keyLength]
+        // SPAD: the score and probability scratch rows are padded up to a
+        // multiple of four bf16 elements so every row base is eight-byte
+        // aligned. The pad columns are never written and never read.
+        let scratchShape = [batch, queryHeads, 1, (keyLength + 3) / 4 * 4]
 
         let chunks = (keyLength + 63) / 64
         let passQK = fusedQkKernel(
@@ -3586,7 +3621,10 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)
         ]
-        let scratchShape = [batch, queryHeads, 1, keyLength]
+        // SPAD: the score and probability scratch rows are padded up to a
+        // multiple of four bf16 elements so every row base is eight-byte
+        // aligned. The pad columns are never written and never read.
+        let scratchShape = [batch, queryHeads, 1, (keyLength + 3) / 4 * 4]
 
         let chunks = (keyLength + 63) / 64
         let scores = qkKernel(

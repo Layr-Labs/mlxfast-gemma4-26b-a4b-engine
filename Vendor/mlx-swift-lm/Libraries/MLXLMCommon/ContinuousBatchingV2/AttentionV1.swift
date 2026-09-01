@@ -480,6 +480,28 @@ enum CBv2AttentionV1 {
                         let preWrite = ringRows.compactMap {
                             $0.decodeRingQuantViewBeforeWrite
                         }
+                        // SLIDE-STORE-001: the BF16 ring append as one in-place
+                        // dispatch, placed AHEAD of pass A so it does not extend
+                        // the layer's dependent chain. Attention on this road
+                        // reads the mirror, so the store needs to precede only
+                        // the next BF16 consumer -- but chaining it after pass A
+                        // costs far more than the copies it removes.
+                        let bf16PreWrite = ringRows.compactMap {
+                            $0.decodeRingViewBeforeWrite
+                        }
+                        let slidingStoreFence: MLXArray? =
+                            (bf16PreWrite.count == B
+                                && zip(preWrite, bf16PreWrite)
+                                    .allSatisfy({ $0.start == $1.start }))
+                            ? CBv2RaggedTwoPassDecodeAttentionV1
+                                .storeSlidingRings(
+                                    keys: bf16PreWrite.map(\.keys),
+                                    values: bf16PreWrite.map(\.values),
+                                    starts: bf16PreWrite.map(\.start),
+                                    newKeys: keys, newValues: values,
+                                    previousWriteFence:
+                                        decodeRingWriteFence.value)
+                            : nil
                         if preWrite.count == B,
                             let fused = CBv2RaggedTwoPassDecodeAttentionV1
                                 .attendRingQuantWriting(
@@ -487,14 +509,21 @@ enum CBv2AttentionV1 {
                                     mirrors: preWrite.map(\.mirror),
                                     starts: preWrite.map(\.start),
                                     newKeys: keys, newValues: values,
-                                    previousWriteFence: decodeRingWriteFence.value,
+                                    previousWriteFence: slidingStoreFence
+                                        ?? decodeRingWriteFence.value,
                                     scale: scale,
                                     slidingWindowLength: ringRows[0].window)
                         {
-                            for (index, row) in ringRows.enumerated() {
-                                row.decodeRingWriteBF16Only(
-                                    keys: keys[index ..< (index + 1)],
-                                    values: values[index ..< (index + 1)])
+                            if slidingStoreFence != nil {
+                                for row in ringRows {
+                                    row.advanceDecodeRingAfterFusedWrite()
+                                }
+                            } else {
+                                for (index, row) in ringRows.enumerated() {
+                                    row.decodeRingWriteBF16Only(
+                                        keys: keys[index ..< (index + 1)],
+                                        values: values[index ..< (index + 1)])
+                                }
                             }
                             // The next pass-A consumes this fence; this
                             // step's pass-B output also consumes pass-A's

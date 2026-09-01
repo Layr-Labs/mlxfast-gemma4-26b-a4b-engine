@@ -1615,6 +1615,111 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             outputDTypes: [.bfloat16]
         )[0]
     }
+    /// SLIDE-STORE-001: the sliding road's BF16 ring append as its own small
+    /// dispatch, the sliding twin of WRITE-022.
+    ///
+    /// On the fused q4 road attention reads the packed mirror and never the
+    /// BF16 ring, but the host still builds two functional `writeRing` updates
+    /// per row per layer to keep that ring current. Each is a `SliceUpdate`
+    /// over an allocation the decode graph retains, so 512 bytes of new K/V
+    /// cost a whole-ring copy, twice per row, every sliding layer of every
+    /// decode step. This writes the same bytes to the same slot in place.
+    private static let slidingRingStoreKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "cbv2_ragged8_sliding_ringstore_bf16_d256_v1",
+            inputNames: [
+                "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+                "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+                "starts", "new_keys", "new_values", "write_fence",
+            ],
+            outputNames: ["fence"],
+            source: """
+                constexpr int D = 256;
+                constexpr int KVH = 8;
+                const int z = int(threadgroup_position_in_grid.z);
+                const int row = z / KVH;
+                const int kv_head = z % KVH;
+                const int lane = int(thread_position_in_threadgroup.x);
+
+                const device T* key_plane = k0;
+                const device T* value_plane = v0;
+                switch (row) {
+                    case 1: key_plane = k1; value_plane = v1; break;
+                    case 2: key_plane = k2; value_plane = v2; break;
+                    case 3: key_plane = k3; value_plane = v3; break;
+                    case 4: key_plane = k4; value_plane = v4; break;
+                    case 5: key_plane = k5; value_plane = v5; break;
+                    case 6: key_plane = k6; value_plane = v6; break;
+                    case 7: key_plane = k7; value_plane = v7; break;
+                    default: break;
+                }
+                key_plane += size_t(kv_head) * size_t(N) * D;
+                value_plane += size_t(kv_head) * size_t(N) * D;
+
+                const uint start = starts[row];
+                const uint write_slot = (start + uint(N - 1)) % uint(N);
+
+                device T* write_key = const_cast<device T*>(key_plane)
+                    + size_t(write_slot) * D + lane * 2;
+                device T* write_value = const_cast<device T*>(value_plane)
+                    + size_t(write_slot) * D + lane * 2;
+                const device T* src_key = new_keys
+                    + size_t(row * KVH + kv_head) * D + lane * 2;
+                const device T* src_value = new_values
+                    + size_t(row * KVH + kv_head) * D + lane * 2;
+                for (int element = 0; element < 2; ++element) {
+                    write_key[element] = src_key[element];
+                    write_value[element] = src_value[element];
+                }
+                if (z == 0 && lane == 0) {
+                    fence[0] = write_fence[0] + 1;
+                }
+            """,
+            ensureRowContiguous: true)
+
+    /// `DARKBLOOM_CBV2_SLIDING_STORE_DISPATCH=0` restores the host's two
+    /// functional ring updates per row.
+    static let slidingStoreDispatchEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_SLIDING_STORE_DISPATCH"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    static func storeSlidingRings(
+        keys: [MLXArray], values: [MLXArray], starts: [Int],
+        newKeys: MLXArray, newValues: MLXArray, previousWriteFence: MLXArray
+    ) -> MLXArray? {
+        guard slidingStoreDispatchEnabled, enabled,
+            keys.count == batch, values.count == batch, starts.count == batch,
+            starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength }),
+            newKeys.dtype == .bfloat16,
+            newKeys.shape == [batch, kvHeads, 1, headDim],
+            newValues.dtype == .bfloat16,
+            newValues.shape == newKeys.shape,
+            previousWriteFence.dtype == .int32,
+            previousWriteFence.shape == [1],
+            keys.allSatisfy({
+                $0.dtype == .bfloat16
+                    && $0.shape == [1, kvHeads, sequenceLength, headDim]
+            }),
+            values.allSatisfy({
+                $0.dtype == .bfloat16
+                    && $0.shape == [1, kvHeads, sequenceLength, headDim]
+            })
+        else { return nil }
+        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        return slidingRingStoreKernel(
+            keys + values + [startArray, newKeys, newValues, previousWriteFence],
+            template: [("T", newKeys.dtype), ("N", sequenceLength)],
+            grid: (headDim / 2, 1, batch * kvHeads),
+            threadGroup: (headDim / 2, 1, 1),
+            outputShapes: [[1]],
+            outputDTypes: [.int32]
+        )[0]
+    }
+
+
 }
 
 /// D512-SDPA: batch-wide FULL-attention decode for the exact Gemma 4 decode

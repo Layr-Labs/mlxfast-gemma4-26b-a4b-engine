@@ -902,14 +902,13 @@ private let gemma4QKVNormRopeEnabled: Bool = {
 }()
 
 private let gemma4QKVNormKernel = MLXFast.metalKernel(
-        name: "gemma4_b8_qkv_rms_norm_rope_v2_vec1",
+    name: "gemma4_b8_qkv_rms_norm_rope_v2",
     inputNames: [
         "q", "k", "v", "q_weight", "k_weight",
         "position_offsets", "rope_log2_base", "rope_freqs",
     ],
     outputNames: ["q_out", "k_out", "v_out"],
     source: """
-        typedef vec<T, 4> T4;
         constexpr uint reads = 4;
         const uint row = threadgroup_position_in_grid.x;
         const uint lid = thread_position_in_threadgroup.x;
@@ -946,10 +945,9 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
             shared_value_output += local_row * D + lid * reads;
         }
 
-        const T4 vin = *reinterpret_cast<const device T4*>(input);
         float sum = 0.0f;
         for (uint i = 0; i < reads; ++i) {
-            const float value = float(vin[i]);
+            const float value = float(input[i]);
             sum += value * value;
         }
         sum = simd_sum(sum);
@@ -969,23 +967,15 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (weighted) {
-            const T4 wv = *reinterpret_cast<const device T4*>(weight);
-            if (APPLY_ROPE) {
-                for (uint i = 0; i < reads; ++i) {
-                    const uint element = lid * reads + i;
-                    const T normalized = T(float(vin[i]) * inverse_rms);
-                    // Reproduce the separate norm kernel's BF16 output-store
-                    // boundary before any RoPE arithmetic reads the value.
-                    rounded[element] = T(wv[i] * normalized);
-                }
+        for (uint i = 0; i < reads; ++i) {
+            const uint element = lid * reads + i;
+            const T normalized = T(float(input[i]) * inverse_rms);
+            if (APPLY_ROPE && weighted) {
+                // Reproduce the separate norm kernel's BF16 output-store
+                // boundary before any RoPE arithmetic reads the value.
+                rounded[element] = T(weight[i] * normalized);
             } else {
-                T4 outv;
-                for (uint i = 0; i < reads; ++i) {
-                    const T normalized = T(float(vin[i]) * inverse_rms);
-                    outv[i] = wv[i] * normalized;
-                }
-                *reinterpret_cast<device T4*>(output) = outv;
+                output[i] = weighted ? weight[i] * normalized : T(1) * normalized;
             }
             // Gemma's full-attention K-eq-V layers feed the same raw key
             // projection to K RMSNorm and V RMSNormNoScale. The reduction
@@ -993,20 +983,8 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
             // output's established final expression, but write V while the
             // exact normalizer and input value are live.
             if (KEY_VALUE_SHARED && is_key) {
-                T4 sharedv;
-                for (uint i = 0; i < reads; ++i) {
-                    const T normalized = T(float(vin[i]) * inverse_rms);
-                    sharedv[i] = T(1) * normalized;
-                }
-                *reinterpret_cast<device T4*>(shared_value_output) = sharedv;
+                shared_value_output[i] = T(1) * normalized;
             }
-        } else {
-            T4 outv;
-            for (uint i = 0; i < reads; ++i) {
-                const T normalized = T(float(vin[i]) * inverse_rms);
-                outv[i] = T(1) * normalized;
-            }
-            *reinterpret_cast<device T4*>(output) = outv;
         }
         if (APPLY_ROPE) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2643,11 +2621,12 @@ private enum Gemma4FusedLayerGlue {
                     acc += xi * xi;
                 }
                 acc = simd_sum(acc);
+                if (simd_group_id == 0) local_sums[simd_lane_id] = 0;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
                 if (simd_lane_id == 0) local_sums[simd_group_id] = acc;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 if (simd_group_id == 0) {
-                    acc = simd_sum(
-                        simd_lane_id < 22 ? local_sums[simd_lane_id] : 0.0f);
+                    acc = simd_sum(local_sums[simd_lane_id]);
                     if (simd_lane_id == 0) {
                         \(slot) = metal::precise::rsqrt(acc / 2816.0f + 1e-06f);
                     }
@@ -2676,16 +2655,19 @@ private enum Gemma4FusedLayerGlue {
             }
             acc_a = simd_sum(acc_a);
             acc_b = simd_sum(acc_b);
+            if (simd_group_id == 0) {
+                local_sums[simd_lane_id] = 0;
+                local_sums_b[simd_lane_id] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
             if (simd_lane_id == 0) {
                 local_sums[simd_group_id] = acc_a;
                 local_sums_b[simd_group_id] = acc_b;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (simd_group_id == 0) {
-                acc_a = simd_sum(
-                    simd_lane_id < 22 ? local_sums[simd_lane_id] : 0.0f);
-                acc_b = simd_sum(
-                    simd_lane_id < 22 ? local_sums_b[simd_lane_id] : 0.0f);
+                acc_a = simd_sum(local_sums[simd_lane_id]);
+                acc_b = simd_sum(local_sums_b[simd_lane_id]);
                 if (simd_lane_id == 0) {
                     local_inv[0] = metal::precise::rsqrt(acc_a / 2816.0f + 1e-06f);
                     local_inv[1] = metal::precise::rsqrt(acc_b / 2816.0f + 1e-06f);
@@ -2716,7 +2698,7 @@ private enum Gemma4FusedLayerGlue {
     }
 
     private static let normResidualKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_norm_residual_2816_bf16_v1_nb1",
+        name: "gemma4_glue_norm_residual_2816_bf16_v1",
         inputNames: ["x", "res", "w"],
         outputNames: ["out"],
         source: """
@@ -2750,7 +2732,7 @@ private enum Gemma4FusedLayerGlue {
 // T28 second sample marker (r2): content identical to ranked 32f5d19f apart from this comment.
     private static let attentionBranchPrefixKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_glue_attention_branch_prefix_2816_bf16_v1_nb1",
+            name: "gemma4_glue_attention_branch_prefix_2816_bf16_v1",
             inputNames: ["attn", "res", "wa", "wd", "we", "wr"],
             outputNames: ["out", "dense", "expert", "router", "xSums"],
             source: """
@@ -2792,7 +2774,7 @@ private enum Gemma4FusedLayerGlue {
         )
 
     private static let dualPreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_dual_prenorm_xsum_2816_bf16_v2_nb1",
+        name: "gemma4_glue_dual_prenorm_xsum_2816_bf16_v2",
         inputNames: ["x", "w1", "w2"],
         outputNames: ["out1", "out2", "xSums"],
         source: """
@@ -2858,7 +2840,7 @@ private enum Gemma4FusedLayerGlue {
         """
 
     private static let tailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_2816_bf16_v2_nb1",
+        name: "gemma4_glue_tail_2816_bf16_v2",
         inputNames: ["a", "b", "res", "w1", "w2", "w3", "s"],
         outputNames: ["out"],
         source: tailSource,
@@ -2866,7 +2848,7 @@ private enum Gemma4FusedLayerGlue {
     )
 
     private static let pairedTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_paired_rms_2816_bf16_v1_nb1",
+        name: "gemma4_glue_tail_paired_rms_2816_bf16_v1",
         inputNames: ["a", "b", "res", "w1", "w2", "w3", "s"],
         outputNames: ["out"],
         source: pairedRmsTailSource(tailSource),
@@ -3033,7 +3015,7 @@ private enum Gemma4FusedLayerGlue {
         """
 
     private static let tailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_chain_2816_bf16_v1_nb1",
+        name: "gemma4_glue_tail_chain_2816_bf16_v1",
         inputNames: ["a", "b", "res", "w1", "w2", "w3", "s", "wn"],
         outputNames: ["out", "normed"],
         source: tailChainSource,
@@ -3041,7 +3023,7 @@ private enum Gemma4FusedLayerGlue {
     )
 
     private static let pairedTailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_chain_paired_rms_2816_bf16_v1_nb1",
+        name: "gemma4_glue_tail_chain_paired_rms_2816_bf16_v1",
         inputNames: ["a", "b", "res", "w1", "w2", "w3", "s", "wn"],
         outputNames: ["out", "normed"],
         source: pairedRmsTailSource(tailChainSource),
@@ -3055,19 +3037,14 @@ private enum Gemma4FusedLayerGlue {
     private static let deferredExpertValuesSource = """
             T expertv[4];
             const uint assignment_base = row * 8u;
-            uint sorted_rows[8];
-            T routed_weights[8];
-            for (uint slot = 0u; slot < 8u; ++slot) {
-                const uint assignment = assignment_base + slot;
-                sorted_rows[slot] = (uint)inverse[assignment];
-                routed_weights[slot] = route_weights[assignment];
-            }
             for (int i = 0; i < 4; ++i) {
                 T accumulator = static_cast<T>(0.0f);
                 for (uint slot = 0u; slot < 8u; ++slot) {
+                    const uint assignment = assignment_base + slot;
+                    const uint sorted_row = (uint)inverse[assignment];
                     const T weighted = static_cast<T>(
-                        (float)sorted[sorted_rows[slot] * 2816u + wbase + (uint)i]
-                        * (float)routed_weights[slot]);
+                        (float)sorted[sorted_row * 2816u + wbase + (uint)i]
+                        * (float)route_weights[assignment]);
                     accumulator = accumulator + weighted;
                 }
                 expertv[i] = accumulator;
@@ -3075,7 +3052,7 @@ private enum Gemma4FusedLayerGlue {
     """
 
     private static let deferredTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1_nb1_vec1",
+        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1",
         inputNames: [
             "a", "sorted", "inverse", "route_weights", "res",
             "w1", "w2", "w3", "s",
@@ -3120,7 +3097,7 @@ private enum Gemma4FusedLayerGlue {
 
     private static let deferredTailChainKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1_nb1_vec1",
+            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1",
             inputNames: [
                 "a", "sorted", "inverse", "route_weights", "res",
                 "w1", "w2", "w3", "s", "wn",
@@ -5664,9 +5641,6 @@ extension Gemma4TextModel: CBv2MTPForwardable {
         return (applyLMHead(postNorm), preNorm)
     }
 }
-
-// Ranked resample marker 2: this archive is a further ranked sample of the tree carried
-// by the preceding ranked submission of this content apart from any rotation item declared in its note.
 
 // Ranked resample marker 2: this archive is a further ranked sample of the tree carried
 // by the preceding ranked submission of this content apart from any rotation item declared in its note.

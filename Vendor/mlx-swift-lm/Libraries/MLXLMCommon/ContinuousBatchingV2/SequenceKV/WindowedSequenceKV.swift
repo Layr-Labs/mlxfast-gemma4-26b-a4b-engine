@@ -71,8 +71,18 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     let kvHeads: Int
     let headDim: Int
 
-    private var keys: MLXArray?
-    private var values: MLXArray?
+    /// One allocation for both BF16 planes. Keeping K and V adjacent lets the
+    /// q4 decode pass bind one buffer per row and preserve the BF16 source of
+    /// truth in the same dispatch without exceeding Metal's buffer limit.
+    private var bf16Storage: MLXArray?
+
+    private var keys: MLXArray? {
+        bf16Storage.map { $0[0].expandedDimensions(axis: 0) }
+    }
+
+    private var values: MLXArray? {
+        bf16Storage.map { $0[1].expandedDimensions(axis: 0) }
+    }
 
     /// KVQ-001: 8-bit affine mirror of the ring, maintained ALONGSIDE the
     /// bf16 ring (which stays the source of truth for every logical view,
@@ -166,7 +176,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         // KVQ-001: the packed 8-bit mirror is real resident memory and must
         // be visible to the engine's capacity accounting (the original
         // KVQ-001 revision omitted it, under-counting ~850 MB at B=8).
-        (keys?.nbytes ?? 0) + (values?.nbytes ?? 0)
+        (bf16Storage?.nbytes ?? 0)
             + (staged.map { $0.keys.nbytes + $0.values.nbytes } ?? 0)
             + (quantMirror?.nbytes ?? 0)
     }
@@ -217,10 +227,17 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         // when the chunk itself exceeds the window.
         let writeCount = min(n, window)
         let firstWritten = absoluteOffset + n - writeCount
-        let kTail = writeCount == n ? newKeys : newKeys[.ellipsis, (n - writeCount)..., 0...]
-        let vTail = writeCount == n ? newValues : newValues[.ellipsis, (n - writeCount)..., 0...]
-        writeRing(keys!, tokens: kTail, firstPosition: firstWritten, mirrorPlane: 0)
-        writeRing(values!, tokens: vTail, firstPosition: firstWritten, mirrorPlane: 1)
+        var kTail = writeCount == n ? newKeys : newKeys[.ellipsis, (n - writeCount)..., 0...]
+        var vTail = writeCount == n ? newValues : newValues[.ellipsis, (n - writeCount)..., 0...]
+        if quantMirror != nil {
+            writeMirror(plane: 0, tokens: kTail, firstPosition: firstWritten)
+            writeMirror(plane: 1, tokens: vTail, firstPosition: firstWritten)
+            if Self.quantSimulate {
+                kTail = Self.quantRoundTrip(kTail)
+                vTail = Self.quantRoundTrip(vTail)
+            }
+        }
+        writeRingPair(keys: kTail, values: vTail, firstPosition: firstWritten)
 
         absoluteOffset += n
         oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
@@ -233,19 +250,6 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         precondition(staged == nil && newKeys.dim(2) == 1 && newValues.dim(2) == 1)
         allocateIfNeeded(keyTemplate: newKeys, valueTemplate: newValues)
         writeDecodeToken(keys: newKeys, values: newValues)
-    }
-
-    /// Preserve the incumbent BF16 SliceUpdates and counter transition while
-    /// the fused q4 attention pass owns only the live mirror-slot write.
-    func decodeRingWriteBF16Only(keys newKeys: MLXArray, values newValues: MLXArray) {
-        precondition(
-            staged == nil && newKeys.dim(2) == 1 && newValues.dim(2) == 1
-                && keys != nil && values != nil && retainedCount == window)
-        borrowableChunkViews = nil
-        writeRing(keys!, tokens: newKeys, firstPosition: absoluteOffset)
-        writeRing(values!, tokens: newValues, firstPosition: absoluteOffset)
-        absoluteOffset += 1
-        oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
     }
 
     var decodeRingView: (keys: MLXArray, values: MLXArray, start: Int)? {
@@ -266,9 +270,12 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
 
     /// Live q4 mirror plus the logical post-write start. No mutation: the
     /// fused pass-A owns the mirror write and consumes the new token directly.
-    var decodeRingQuantViewBeforeWrite: (mirror: MLXArray, start: Int)? {
-        guard staged == nil, let quantMirror, retainedCount == window else { return nil }
-        return (quantMirror, (oldestValidPosition + 1) % window)
+    var decodeRingQuantViewBeforeWrite: (
+        mirror: MLXArray, bf16Storage: MLXArray, start: Int
+    )? {
+        guard staged == nil, let quantMirror, let bf16Storage, retainedCount == window
+        else { return nil }
+        return (quantMirror, bf16Storage, (oldestValidPosition + 1) % window)
     }
 
     /// The ring view a fused decode step should attend: the SAME allocations
@@ -293,7 +300,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// the caller must have consulted for the very same step.
     func advanceDecodeRingAfterFusedWrite() {
         precondition(
-            staged == nil && keys != nil && retainedCount == window,
+            staged == nil && bf16Storage != nil && retainedCount == window,
             "CBv2WindowedSequenceKV: fused ring advance outside a full-ring decode step")
         borrowableChunkViews = nil
         // KVQ-DIAG: dispatch the quantized reader on the full ring this step
@@ -388,12 +395,19 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             allocateIfNeeded(keyTemplate: staged.keys, valueTemplate: staged.values)
             let writeCount = min(confirmed, window)
             let skip = confirmed - writeCount
-            writeRing(
-                keys!, tokens: staged.keys[.ellipsis, skip ..< confirmed, 0...],
-                firstPosition: absoluteOffset - writeCount, mirrorPlane: 0)
-            writeRing(
-                values!, tokens: staged.values[.ellipsis, skip ..< confirmed, 0...],
-                firstPosition: absoluteOffset - writeCount, mirrorPlane: 1)
+            var confirmedKeys = staged.keys[.ellipsis, skip ..< confirmed, 0...]
+            var confirmedValues = staged.values[.ellipsis, skip ..< confirmed, 0...]
+            let firstPosition = absoluteOffset - writeCount
+            if quantMirror != nil {
+                writeMirror(plane: 0, tokens: confirmedKeys, firstPosition: firstPosition)
+                writeMirror(plane: 1, tokens: confirmedValues, firstPosition: firstPosition)
+                if Self.quantSimulate {
+                    confirmedKeys = Self.quantRoundTrip(confirmedKeys)
+                    confirmedValues = Self.quantRoundTrip(confirmedValues)
+                }
+            }
+            writeRingPair(
+                keys: confirmedKeys, values: confirmedValues, firstPosition: firstPosition)
         }
         oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
         // Step-scoped views die at finalize (the plain paths replace them on
@@ -492,7 +506,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// lands at true absolute positions.
     public func fastForward(to offset: Int) {
         precondition(
-            keys == nil && absoluteOffset == oldestValidPosition,
+            bf16Storage == nil && absoluteOffset == oldestValidPosition,
             "CBv2WindowedSequenceKV.fastForward requires a fresh state")
         // A fully-rolled-back staged row can look "fresh" (offset back at
         // oldestValidPosition, ring never allocated) while a commit is
@@ -535,7 +549,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     }
 
     func cbv2InnerState() -> [MLXArray] {
-        [keys, values, quantMirror].compactMap { $0 }
+        [bf16Storage, quantMirror].compactMap { $0 }
     }
 
     // MARK: - Ring geometry
@@ -544,14 +558,20 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         borrowableChunkViews = nil
         // KVQ-PAIRWRITE: when both mirror planes go out together the ring
         // writes carry no mirror plane of their own.
-        let paired = writePairedMirror(
+        let pairedMirror = writePairedMirror(
             keys: newKeys, values: newValues, firstPosition: absoluteOffset)
-        writeRing(
-            keys!, tokens: newKeys, firstPosition: absoluteOffset,
-            mirrorPlane: paired ? nil : 0)
-        writeRing(
-            values!, tokens: newValues, firstPosition: absoluteOffset,
-            mirrorPlane: paired ? nil : 1)
+        var storedKeys = newKeys
+        var storedValues = newValues
+        if !pairedMirror, quantMirror != nil {
+            writeMirror(plane: 0, tokens: newKeys, firstPosition: absoluteOffset)
+            writeMirror(plane: 1, tokens: newValues, firstPosition: absoluteOffset)
+            if Self.quantSimulate {
+                storedKeys = Self.quantRoundTrip(newKeys)
+                storedValues = Self.quantRoundTrip(newValues)
+            }
+        }
+        writeRingPair(
+            keys: storedKeys, values: storedValues, firstPosition: absoluteOffset)
         absoluteOffset += 1
         oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
     }
@@ -593,25 +613,21 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// `MLX_KV_QUANT_SIM` — replaces the bf16 payload with its
     /// quantize→dequantize round trip so the single-stream fallback sees the
     /// mirror's numerics.
-    private func writeRing(
-        _ buffer: MLXArray, tokens: MLXArray, firstPosition: Int, mirrorPlane: Int? = nil
+    private func writeRingPair(
+        keys: MLXArray, values: MLXArray, firstPosition: Int
     ) {
-        var tokens = tokens
-        let n = tokens.dim(2)
-        precondition(n <= window, "writeRing: more tokens than slots")
-        if let plane = mirrorPlane, quantMirror != nil {
-            writeMirror(plane: plane, tokens: tokens, firstPosition: firstPosition)
-            if Self.quantSimulate {
-                tokens = Self.quantRoundTrip(tokens)
-            }
-        }
+        let n = keys.dim(2)
+        precondition(n == values.dim(2) && n <= window,
+            "writeRingPair: mismatched token count or more tokens than slots")
+        let buffer = bf16Storage!
+        let pair = concatenated([keys, values], axis: 0)
         let start = firstPosition % window
         if start + n <= window {
-            buffer[.ellipsis, start ..< (start + n), 0...] = tokens
+            buffer[0..., 0..., start ..< (start + n), 0...] = pair
         } else {
             let first = window - start
-            buffer[.ellipsis, start ..< window, 0...] = tokens[.ellipsis, ..<first, 0...]
-            buffer[.ellipsis, 0 ..< (n - first), 0...] = tokens[.ellipsis, first..., 0...]
+            buffer[0..., 0..., start ..< window, 0...] = pair[0..., 0..., ..<first, 0...]
+            buffer[0..., 0..., 0 ..< (n - first), 0...] = pair[0..., 0..., first..., 0...]
         }
     }
 
@@ -1604,11 +1620,10 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
     }
 
     private func allocateIfNeeded(keyTemplate: MLXArray, valueTemplate: MLXArray) {
-        guard keys == nil else { return }
-        keys = MLXArray.zeros(
-            [1, kvHeads, window, keyTemplate.dim(3)], dtype: keyTemplate.dtype)
-        values = MLXArray.zeros(
-            [1, kvHeads, window, valueTemplate.dim(3)], dtype: valueTemplate.dtype)
+        guard bf16Storage == nil else { return }
+        precondition(keyTemplate.dtype == valueTemplate.dtype)
+        bf16Storage = MLXArray.zeros(
+            [2, kvHeads, window, keyTemplate.dim(3)], dtype: keyTemplate.dtype)
         if quantEligible, keyTemplate.dtype == .bfloat16,
             keyTemplate.dim(3) == headDim, valueTemplate.dim(3) == headDim
         {

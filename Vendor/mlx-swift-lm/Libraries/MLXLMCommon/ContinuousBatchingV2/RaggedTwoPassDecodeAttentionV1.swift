@@ -1026,10 +1026,11 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// next decode dispatch after this write completes.
     private static let portQuantFusedWriteKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_2pass_a_q4g64_d256_g2_regpack_vec4_carry_pair_b\(blocks)_v5",
+            name: "cbv2_ragged8_sdpa_ringwrite_2pass_a_q4g64_d256_g2_regpack_vec4_carry_pair_b\(blocks)_v6",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
+                "b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7",
                 "starts", "new_keys", "new_values", "write_fence",
             ],
             outputNames: ["partials", "sums", "maxs", "fence"],
@@ -1066,6 +1067,17 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     mirror_w + kv_head * N * row_words;
                 const device uint32_t* mvalues_w =
                     mirror_w + (KV_HEADS + kv_head) * N * row_words;
+                const device T* bf16_w = b0;
+                switch (batch_index) {
+                    case 1: bf16_w = b1; break;
+                    case 2: bf16_w = b2; break;
+                    case 3: bf16_w = b3; break;
+                    case 4: bf16_w = b4; break;
+                    case 5: bf16_w = b5; break;
+                    case 6: bf16_w = b6; break;
+                    case 7: bf16_w = b7; break;
+                    default: break;
+                }
                 const device T* new_key = new_keys
                     + (batch_index * KV_HEADS + kv_head) * D
                     + lane * values_per_lane;
@@ -1153,6 +1165,27 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                             write_value[payload_words + lane / 8] =
                                 uint32_t(as_type<ushort>(vhs))
                                 | (uint32_t(as_type<ushort>(vhb)) << 16);
+                        }
+
+                        // Preserve the exact BF16 source-of-truth ring in the
+                        // same writer threadgroup. K and V are adjacent planes
+                        // in one row-local allocation, so eight extra inputs
+                        // cover the whole cohort without crossing Metal's
+                        // buffer binding limit.
+                        device T* write_bf16_key = const_cast<device T*>(bf16_w)
+                            + (kv_head * N + write_slot) * D
+                            + lane * values_per_lane;
+                        device T* write_bf16_value = const_cast<device T*>(bf16_w)
+                            + ((KV_HEADS + kv_head) * N + write_slot) * D
+                            + lane * values_per_lane;
+                        device T4* write_bf16_key4 =
+                            reinterpret_cast<device T4*>(write_bf16_key);
+                        device T4* write_bf16_value4 =
+                            reinterpret_cast<device T4*>(write_bf16_value);
+                        #pragma unroll
+                        for (int q = 0; q < values_per_lane / 4; ++q) {
+                            write_bf16_key4[q] = kvec[q];
+                            write_bf16_value4[q] = vvec[q];
                         }
                     }
                 }
@@ -1376,6 +1409,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     static func attendRingQuantWriting(
         queries: MLXArray,
         mirrors: [MLXArray],
+        bf16Storage: [MLXArray],
         starts: [Int],
         newKeys: MLXArray,
         newValues: MLXArray,
@@ -1404,6 +1438,11 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             mirrors.allSatisfy({
                 $0.dtype == .uint32
                     && $0.shape == [2, kvHeads, sequenceLength, headDim / 8 + headDim / 64]
+            }),
+            bf16Storage.count == batch,
+            bf16Storage.allSatisfy({
+                $0.dtype == .bfloat16
+                    && $0.shape == [2, kvHeads, sequenceLength, headDim]
             })
         else { return nil }
 
@@ -1411,7 +1450,8 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let passA = portQuantFusedWriteKernel(
-            [queries] + mirrors + [startArray, newKeys, newValues, previousWriteFence],
+            [queries] + mirrors + bf16Storage
+                + [startArray, newKeys, newValues, previousWriteFence],
             template: [
                 ("T", queries.dtype),
                 ("D", headDim),

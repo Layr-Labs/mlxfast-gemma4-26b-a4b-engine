@@ -485,16 +485,15 @@ enum CBv2AttentionV1 {
                                 .attendRingQuantWriting(
                                     queries: queries,
                                     mirrors: preWrite.map(\.mirror),
+                                    bf16Storage: preWrite.map(\.bf16Storage),
                                     starts: preWrite.map(\.start),
                                     newKeys: keys, newValues: values,
                                     previousWriteFence: decodeRingWriteFence.value,
                                     scale: scale,
                                     slidingWindowLength: ringRows[0].window)
                         {
-                            for (index, row) in ringRows.enumerated() {
-                                row.decodeRingWriteBF16Only(
-                                    keys: keys[index ..< (index + 1)],
-                                    values: values[index ..< (index + 1)])
+                            for row in ringRows {
+                                row.advanceDecodeRingAfterFusedWrite()
                             }
                             // The next pass-A consumes this fence; this
                             // step's pass-B output also consumes pass-A's

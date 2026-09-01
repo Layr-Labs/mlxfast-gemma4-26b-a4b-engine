@@ -1148,6 +1148,16 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         return passBKernel
     }
 
+
+    /// Fold the resident pass-B partial base to remove the repeated
+    /// block-column address calculation from its fixed eight-block load.
+    /// Disabling this gate selects the incumbent separate-dispatch path.
+    private static let q4ResidentPassBPointerFoldEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_Q4_RESIDENT_PASSB_POINTER_FOLD"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
     static func attend(
         queries: MLXArray,
         keys: [MLXArray],
@@ -1523,7 +1533,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// removes only the global partial write/read and the second dispatch.
     private static let portQuantFusedWriteResidentKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c4",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -1795,6 +1805,9 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     device T* head_out = out
                         + (batch_head + head) * D
                         + output_group * values_per_lane;
+                    const threadgroup T4* partial_vectors =
+                        reinterpret_cast<const threadgroup T4*>(
+                            head_partials + block_lane * D);
 
                     thread float accumulator[values_per_lane];
                     #pragma clang loop unroll(full)
@@ -1839,9 +1852,6 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         const int column = block_lane + COLS * round;
                         if (column < BLOCKS) {
                             const float factor = lane_factor[round];
-                            const threadgroup T4* partial_vectors =
-                                reinterpret_cast<const threadgroup T4*>(
-                                    head_partials + column * D);
                             #pragma clang loop unroll(full)
                             for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
                                 const T4 partial_vector = partial_vectors[chunk];
@@ -2024,6 +2034,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         let inputs = [queries] + mirrors
             + [startArray, newKeys, newValues, previousWriteFence]
         if q4ResidentMergeEnabled,
+            q4ResidentPassBPointerFoldEnabled,
             blocks == 8,
             combineColumns == 8,
             combineThreads == 256
@@ -2044,6 +2055,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 outputDTypes: [.bfloat16, .int32]
             )
             CBv2EngageMark.once("kvq4-fused-live-write")
+            CBv2EngageMark.once("kvq4-resident-passb-pointer-fold")
             CBv2EngageMark.once("kvq4-resident-merge")
             return (resident[0], resident[1])
         }

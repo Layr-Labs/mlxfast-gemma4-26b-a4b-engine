@@ -1313,6 +1313,43 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             "[kvq4-kernel] blocks=\(blocks) maxs[0..3]=\(maxs[0..<4]) partial[0..5]=\(partial[0..<6])\n".utf8))
     }
 
+    /// `DARKBLOOM_CBV2_STARTARRAY_MEMO=0` (local attribution switch; the
+    /// ranked runner sets no environment) disables the per-step start
+    /// array memo below.
+    static let startArrayMemoEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_STARTARRAY_MEMO"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// STARTARRAY-MEMO: every full-ring decode dispatch builds
+    /// `MLXArray(starts.map(UInt32.init), [batch])` — 25 layers x 8 rows
+    /// per forward step for ONE small host-to-device array whose values
+    /// are layer-invariant within the step (all rows advance
+    /// synchronously, verified in the dispatch). The memo rebuilds the
+    /// array once per step (on the first value change) and hands the SAME
+    /// immutable allocation to every layer of that step; the prior step's
+    /// array stays alive through any graph that already captured it.
+    /// Value-keyed, so any topology where starts differ across layers
+    /// simply rebuilds. Same construction, same values, same shape —
+    /// bit-identical by construction.
+    nonisolated(unsafe) private static var memoStarts: [UInt32] = []
+    nonisolated(unsafe) private static var memoArray: MLXArray?
+    @inline(__always)
+    private static func memoizedStartArray(_ starts: [Int]) -> MLXArray {
+        let u = starts.map(UInt32.init)
+        if startArrayMemoEnabled, u.count == memoStarts.count, u == memoStarts,
+            let array = memoArray
+        {
+            CBv2EngageMark.once("cbv2-startarray-memo")
+            return array
+        }
+        memoStarts = u
+        memoArray = MLXArray(u, [u.count])
+        return memoArray!
+    }
+
     static func attendRingQuant(
         queries: MLXArray,
         mirrors: [MLXArray],
@@ -1336,7 +1373,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             })
         else { return nil }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = memoizedStartArray(starts)
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let passA = portQuantReadKernel(
@@ -1407,7 +1444,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             })
         else { return nil }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = memoizedStartArray(starts)
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let passA = portQuantFusedWriteKernel(
@@ -1454,7 +1491,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             starts.count == batch,
             starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength })
         else { return nil }
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = memoizedStartArray(starts)
         return attend(
             passAKernel: ringPassAKernel, queries: queries, keys: keys, values: values,
             extraInputs: [startArray], scale: scale)
@@ -1507,7 +1544,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             else { return nil }
         }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = memoizedStartArray(starts)
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let paired = gqaPairedPassAEnabled && gqa == 2

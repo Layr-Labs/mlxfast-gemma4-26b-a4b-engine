@@ -1912,7 +1912,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// over the 128 score rows; the CALLER sizes the threadgroup exactly
     /// like softmax.cpp:64-68 (32·ceil(ceil(kL/4)/32)). params[0] = kL.
     private static let softmaxKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_softmax_bf16_v1",
+        name: "cbv2_ragged8_sdpa_d512_softmax_bf16_masked_v2",
         inputNames: ["scores", "params"],
         outputNames: ["probs"],
         source: """
@@ -1921,6 +1921,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int lid = int(thread_position_in_threadgroup.x);
             const int simd_lane_id = int(thread_index_in_simdgroup);
             const int simd_group_id = int(simdgroup_index_in_threadgroup);
+            const int active_simdgroups = (axis_size + 127) / 128;
 
             threadgroup float local_max[32];
             threadgroup float local_normalizer[32];
@@ -1938,12 +1939,6 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                         ? static_cast<float>(in[i]) : -INFINITY;
                 }
             }
-            if (simd_group_id == 0) {
-                local_max[simd_lane_id] = -INFINITY;
-                local_normalizer[simd_lane_id] = 0.0f;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
             float maxval = -3.402823466e+38F;
             for (int i = 0; i < 4; i++) {
                 maxval = (maxval < ld[i]) ? ld[i] : maxval;
@@ -1954,7 +1949,9 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (simd_group_id == 0) {
-                maxval = simd_max(local_max[simd_lane_id]);
+                const float group_max = simd_lane_id < active_simdgroups
+                    ? local_max[simd_lane_id] : -INFINITY;
+                maxval = simd_max(group_max);
                 if (simd_lane_id == 0) {
                     local_max[0] = maxval;
                 }
@@ -1974,7 +1971,10 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (simd_group_id == 0) {
-                normalizer = simd_sum(local_normalizer[simd_lane_id]);
+                const float group_normalizer =
+                    simd_lane_id < active_simdgroups
+                        ? local_normalizer[simd_lane_id] : 0.0f;
+                normalizer = simd_sum(group_normalizer);
                 if (simd_lane_id == 0) {
                     local_normalizer[0] = normalizer;
                 }

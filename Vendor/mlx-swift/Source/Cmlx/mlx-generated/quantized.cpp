@@ -3926,6 +3926,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     const int64_t w_stride,
     const int64_t s_stride,
     const int64_t b_stride,
+    const uint assignment_count,
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
@@ -3961,7 +3962,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   device T* tile_y0 = y + assignment * out_vec_size;
   const bool has_pair = expert_prefix_bounds
       ? (((route_word >> 14) & 0x3fu) + 1u) > 1u
-      : assignment + 1 < 64 &&
+      : assignment + 1 < assignment_count &&
           rhs_indices[(assignment + 1) * rhs_stride] == expert;
   if (has_pair) {
     const device T* tile_x1 =
@@ -4031,7 +4032,9 @@ template <typename T, int group_size, int bits>
   int M = x_shape[x_batch_ndims];
   const bool gemma4_pair_geometry =
       group_size == 64 && bits == 4 && M == 1 && batch_ndims == 1 &&
-      batch_shape[0] == 64 && x_batch_ndims == 1 && w_batch_ndims == 1 &&
+      batch_shape[0] >= 64 && batch_shape[0] < 512 &&
+      batch_shape[0] % 64 == 0 && x_batch_ndims == 1 &&
+      w_batch_ndims == 1 &&
       ((in_vec_size == 2816 && out_vec_size == 704) ||
        (in_vec_size == 704 && out_vec_size == 2816));
   if (gemma4_pair_geometry) {
@@ -4057,6 +4060,7 @@ template <typename T, int group_size, int bits>
           w_strides[0],
           s_strides[0],
           b_strides[0],
+          uint(batch_shape[0]),
           tid,
           simd_gid,
           simd_lid);
@@ -4094,7 +4098,7 @@ template <typename T, int group_size, int bits>
     if (expert_prefix_bounds) {
       run_len = min(4u, ((route_word >> 14) & 0x3fu) + 1u);
     } else {
-      while (run_len < 4 && assignment + run_len < 64 &&
+      while (run_len < 4 && assignment + run_len < uint(batch_shape[0]) &&
              rhs_indices[(assignment + run_len) * (uint)rhs_strides[0]] ==
                  expert) {
         run_len++;

@@ -94,14 +94,6 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// the mirror needs no bookkeeping of its own.
     private var quantMirror: MLXArray?
 
-    /// Q4-BF16-ELIDE: true once a fused q4 decode step advanced this row
-    /// WITHOUT writing its BF16 ring slot (the fused pass owns the mirror
-    /// write and serves the live token from the new K/V arrays). The BF16
-    /// ring contents are stale from that step on; every BF16 view refuses
-    /// loudly rather than serve wrong bytes. The q4 mirror stays
-    /// authoritative and self-consistent.
-    private(set) var bf16RingStale = false
-
     /// `MLX_KV_QUANT=0` disables the quantized-ring read path wholesale
     /// (mirror never allocated, kernels take the established bf16 road).
     /// Default ON. `MLX_` prefix: the worker env sanitizer only passes
@@ -123,19 +115,6 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         ["1", "true", "yes", "on"].contains(
             (ProcessInfo.processInfo.environment["MLX_KV_QUANT_SIM"] ?? "")
                 .lowercased())
-    }()
-
-    /// `MLX_KV_Q4_BF16_ELIDE=0` restores the per-step BF16 ring
-    /// SliceUpdates while the fused q4 pass owns the live mirror-slot
-    /// write. Default ON: on the quant-authoritative road no reader touches
-    /// the BF16 rings (the fused pass and the mirror-read road cover every
-    /// full-ring decode step), so the two per-layer-per-row SliceUpdates
-    /// over the whole ring allocation are dead graph work. Static, read
-    /// once per process like the switch it complements.
-    static let q4BF16RingElideEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment["MLX_KV_Q4_BF16_ELIDE"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
     private var quantEligible: Bool {
@@ -206,9 +185,8 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             return stageSpeculativeUpdate(newKeys: newKeys, newValues: newValues, count: n)
         }
         precondition(
-            !bf16RingStale,
-            "CBv2WindowedSequenceKV: update after fused quant elided writes — "
-                + "BF16 ring is stale; set MLX_KV_Q4_BF16_ELIDE=0 to keep it authoritative"
+            staged == nil,
+            "CBv2WindowedSequenceKV: plain update with a staged speculative write pending — commit first"
         )
 
         allocateIfNeeded(keyTemplate: newKeys, valueTemplate: newValues)
@@ -270,23 +248,6 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
     }
 
-    /// Q4-BF16-ELIDE: bookkeeping half of a fused q4 decode step. The fused
-    /// pass already stored this step's mirror slot in place and served its
-    /// live token from the new K/V arrays, and on the quant-authoritative
-    /// road no reader observes the BF16 ring, so the incumbent BF16
-    /// SliceUpdates `decodeRingWriteBF16Only` performs are dead graph work.
-    /// Advance exactly the counters that method would and write nothing.
-    /// Marks the BF16 ring stale; BF16 views refuse from here on.
-    func advanceDecodeRingAfterQuantWrite() {
-        precondition(
-            staged == nil && keys != nil && retainedCount == window,
-            "CBv2WindowedSequenceKV: fused quant advance outside a full-ring decode step")
-        borrowableChunkViews = nil
-        bf16RingStale = true
-        absoluteOffset += 1
-        oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
-    }
-
     var decodeRingView: (keys: MLXArray, values: MLXArray, start: Int)? {
         guard staged == nil, let keys, let values, retainedCount == window else { return nil }
         return (keys, values, oldestValidPosition % window)
@@ -321,7 +282,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// lands in is `absoluteOffset % window`, i.e. `(start + window - 1) %
     /// window` — the slot the returned start has just stepped past.
     var decodeRingViewBeforeWrite: (keys: MLXArray, values: MLXArray, start: Int)? {
-        guard staged == nil, !bf16RingStale, let keys, let values, retainedCount == window else { return nil }
+        guard staged == nil, let keys, let values, retainedCount == window else { return nil }
         return (keys, values, (oldestValidPosition + 1) % window)
     }
 
@@ -361,6 +322,154 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             "CBv2WindowedSequenceKV: beginSpeculativeWrite with a staged update pending — commit first"
         )
         speculativeWriteArmed = true
+        verifyStripeSlots = []
+        verifyStripeConcat = nil
+    }
+
+    // MARK: - MTP-VERIFY-EXACT packed stripe
+
+    /// The round's staged columns, packed with the SAME q4g64 pair packer
+    /// the mirror trusts (`cbv2_kvq4g64_pack_pair_d256_v1`), one
+    /// `[2, kvHeads, 1, row_words]` block per staged column in stage order.
+    /// Consumed by `attendRingQuantVerify` so a verify column reads its
+    /// round predecessors as exactly the bytes serial decode would have
+    /// found packed in the mirror.
+    private var verifyStripeSlots: [MLXArray] = []
+
+    /// MTP widened-round mode: the round's staged K/V and packed stripe
+    /// live on the BANK as two widened arrays; this row carries only the
+    /// staged-column count. Nothing is written to the ring or mirror until
+    /// the widened commit kernel writes the confirmed prefixes.
+    var widenedStagedCount = 0
+
+    /// Counters-only stage for the widened round.
+    func stageWidenedCountersOnly(_ columns: Int) {
+        precondition(
+            speculativeWriteArmed && staged == nil && widenedStagedCount == 0
+                && verifyStripeSlots.isEmpty,
+            "CBv2WindowedSequenceKV: widened stage over a dirty transaction")
+        widenedStagedCount = columns
+        absoluteOffset += columns
+        borrowableChunkViews = nil
+    }
+
+    /// Revert a widened stage that could not attend (no bytes were written).
+    func revertWidenedStage() {
+        precondition(widenedStagedCount > 0)
+        absoluteOffset -= widenedStagedCount
+        widenedStagedCount = 0
+    }
+
+    /// The buffers the widened commit kernel writes in place.
+    var verifyCommitBuffers: (ringKeys: MLXArray, ringValues: MLXArray, mirror: MLXArray)? {
+        guard let keys, let values, let quantMirror else { return nil }
+        return (keys, values, quantMirror)
+    }
+
+    /// Whether the NEXT one-token staged update on this row can extend the
+    /// packed verify stripe (and therefore take the exact q4 verify road).
+    /// Checked by the dispatcher BEFORE it stages anything, so ineligible
+    /// cohorts fall to the established staged-view road without any row
+    /// having been half-staged.
+    var verifyStripeEligible: Bool {
+        speculativeWriteArmed
+            && widenedStagedCount == 0
+            && quantMirror != nil
+            && Self.quantEnabled
+            && Self.gpuPackEnabled
+            && !Self.gpuPackCheck
+            && !Self.quantSimulate
+            && headDim == 256
+            && retainedCount >= window
+            && verifyStripeSlots.count
+                == (staged.map { absoluteOffset - $0.basePosition } ?? 0)
+    }
+
+    /// The verify road's per-row inputs after this column's stage: the
+    /// pre-round mirror (untouched for the whole round), the packed stripe
+    /// `[2, kvHeads, J, row_words]`, the ring-relative start the plain
+    /// decode step at this position would use, and J itself.
+    var verifyQuantStripe: (mirror: MLXArray, stripe: MLXArray, start: Int, count: Int)? {
+        guard speculativeWriteArmed,
+            let quantMirror,
+            !verifyStripeSlots.isEmpty,
+            let staged,
+            verifyStripeSlots.count == absoluteOffset - staged.basePosition
+        else { return nil }
+        if verifyStripeConcat == nil {
+            verifyStripeConcat =
+                verifyStripeSlots.count == 1
+                ? verifyStripeSlots[0]
+                : concatenated(verifyStripeSlots, axis: 2)
+        }
+        return (quantMirror, verifyStripeConcat!, absoluteOffset % window, verifyStripeSlots.count)
+    }
+
+    /// Concat of `verifyStripeSlots`, invalidated on every append so the
+    /// 25-layer walk of one column reuses one node instead of rebuilding.
+    private var verifyStripeConcat: MLXArray?
+
+    /// The staged-road concat views (history ++ staged), built ON DEMAND for
+    /// the exact verify road's never-taken fallback; identical math to what
+    /// `stageSpeculativeUpdate` returns.
+    func stagedVerifyViews() -> (keys: MLXArray, values: MLXArray)? {
+        guard let staged else { return nil }
+        let logical = snapshot()
+        let historyCount = min(logical.keys.dim(2), window - 1)
+        let historyFrom = logical.keys.dim(2) - historyCount
+        var kParts: [MLXArray] = []
+        var vParts: [MLXArray] = []
+        if historyCount > 0 {
+            kParts.append(logical.keys[.ellipsis, historyFrom..., 0...])
+            vParts.append(logical.values[.ellipsis, historyFrom..., 0...])
+        }
+        let confirmed = absoluteOffset - staged.basePosition
+        kParts.append(staged.keys[.ellipsis, ..<confirmed, 0...])
+        vParts.append(staged.values[.ellipsis, ..<confirmed, 0...])
+        return (
+            kParts.count == 1 ? kParts[0] : concatenated(kParts, axis: 2),
+            vParts.count == 1 ? vParts[0] : concatenated(vParts, axis: 2)
+        )
+    }
+
+    /// MTP-VERIFY-EXACT stage WITHOUT the returned history-concat views:
+    /// the exact verify road attends the mirror + stripe, never the staged
+    /// BF16 views, so building them (2-3 graph nodes per row per layer per
+    /// column) is dead work on that road. Semantically identical to
+    /// `update` under an armed transaction: stages the token, extends the
+    /// stripe, advances the offset. The caller must have proven
+    /// `verifyStripeEligible` first.
+    func stageVerifyColumnOnly(keys newKeys: MLXArray, values newValues: MLXArray) {
+        if !speculativeWriteArmed || newKeys.dim(2) != 1 || newValues.dim(2) != 1
+            || widenedStagedCount != 0
+        {
+            let message = "[stage-fatal] armed=\(speculativeWriteArmed) "
+                + "kdim=\(newKeys.shape) widened=\(widenedStagedCount) "
+                + "slots=\(verifyStripeSlots.count)\n"
+            FileHandle.standardError.write(Data(message.utf8))
+        }
+        precondition(speculativeWriteArmed, "stageVerifyColumnOnly without a transaction")
+        precondition(
+            newKeys.dim(2) == 1 && newValues.dim(2) == 1,
+            "stageVerifyColumnOnly stages exactly one token")
+        if let existing = staged {
+            let confirmed = absoluteOffset - existing.basePosition
+            let existingKeys = existing.keys[.ellipsis, ..<confirmed, 0...]
+            let existingValues = existing.values[.ellipsis, ..<confirmed, 0...]
+            staged = (
+                concatenated([existingKeys, newKeys], axis: 2),
+                concatenated([existingValues, newValues], axis: 2),
+                existing.basePosition)
+        } else {
+            staged = (newKeys, newValues, absoluteOffset)
+        }
+        if verifyStripeSlots.count == absoluteOffset - staged!.basePosition {
+            verifyStripeSlots.append(
+                Self.quantPackPairGPU(keys: newKeys, values: newValues))
+            verifyStripeConcat = nil
+        }
+        absoluteOffset += 1
+        borrowableChunkViews = nil
     }
 
     /// One update in the active transaction: return EXACTLY the views the
@@ -405,6 +514,21 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         } else {
             staged = (newKeys, newValues, absoluteOffset)
         }
+        // MTP-VERIFY-EXACT: extend the packed stripe in step with the staged
+        // tokens whenever the exact verify road's packer preconditions hold.
+        // A column staged while the guards fail leaves the stripe short; the
+        // eligibility check then keeps every LATER column of the round off
+        // the exact road too, so the round stays on one attention road.
+        if n == 1, quantMirror != nil, Self.quantEnabled, Self.gpuPackEnabled,
+            !Self.gpuPackCheck, !Self.quantSimulate, headDim == 256,
+            newKeys.shape == [1, kvHeads, 1, headDim],
+            newValues.shape == [1, kvHeads, 1, headDim],
+            verifyStripeSlots.count == absoluteOffset - staged!.basePosition
+        {
+            verifyStripeSlots.append(
+                Self.quantPackPairGPU(keys: newKeys, values: newValues))
+            verifyStripeConcat = nil
+        }
         absoluteOffset += n
         // KV-borrowing layers attend the SAME views this step (the ring does
         // not hold the staged tokens yet) — set for n == 1 too, unlike the
@@ -415,6 +539,15 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
 
     public func commitSpeculativeWrite() {
         speculativeWriteArmed = false
+        verifyStripeSlots = []
+        verifyStripeConcat = nil
+        if widenedStagedCount > 0 {
+            // The bank's widened commit kernel wrote this row's confirmed
+            // prefix; only the counters close here.
+            oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
+            widenedStagedCount = 0
+            return
+        }
         guard let staged else { return }
         self.staged = nil
         // Confirmed range after finalize-time rollback: [basePosition,
@@ -473,11 +606,6 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     }
 
     public func snapshot() -> (keys: MLXArray, values: MLXArray, offset: Int) {
-        precondition(
-            !bf16RingStale,
-            "CBv2WindowedSequenceKV: snapshot after fused quant elided writes — "
-                + "BF16 ring is stale; set MLX_KV_Q4_BF16_ELIDE=0 to keep it authoritative"
-        )
         if let staged {
             return stagedSnapshot(staged)
         }
@@ -561,6 +689,15 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
                 "CBv2WindowedSequenceKV.rollback(\(n)) exceeds staged range "
                     + "\(absoluteOffset - staged.basePosition)")
             absoluteOffset -= n
+            borrowableChunkViews = nil
+            return
+        }
+        if widenedStagedCount > 0 {
+            precondition(
+                n <= widenedStagedCount,
+                "CBv2WindowedSequenceKV.rollback(\(n)) exceeds widened staged \(widenedStagedCount)")
+            absoluteOffset -= n
+            widenedStagedCount -= n
             borrowableChunkViews = nil
             return
         }

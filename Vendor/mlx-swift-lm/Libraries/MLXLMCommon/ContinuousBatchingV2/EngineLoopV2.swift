@@ -1324,6 +1324,29 @@ public final class EngineLoopV2: @unchecked Sendable {
         caches.flatMap { ($0 as? KVCache)?.innerState() ?? [] }
     }
 
+    /// MTP-COMPACT-ROOTS: the verify round's evaluation roots in the compact
+    /// decode form — the shared position chain plus the per-layer write
+    /// fences — instead of every cache's full inner state (~3 arrays x 30
+    /// layers). The argmax/hidden roots the caller already carries force the
+    /// forward graph; staged K/V concats stay lazy until the commit that
+    /// consumes them, exactly like chained decode leaves next-step state to
+    /// its consumer. Falls back to the full inner state whenever the bank is
+    /// not the affirming all-contiguous decode shape.
+    func mtpCompactVerifyRoots(_ caches: [CBv2AttendingLayerCache]) -> [MLXArray] {
+        let contiguous = caches.compactMap { $0 as? CBv2LayerCache }
+        guard cbv2CompactDecodeRootsEnabled,
+            model is any CBv2LanguageModelDecodeOutputCoversCacheMutations,
+            !contiguous.isEmpty,
+            contiguous.count == caches.count,
+            contiguous.allSatisfy({ $0.kind.sharesKVWithLayer == nil }),
+            let offsets = contiguous.first?.unifiedPositionOffsets
+        else { return eagerCacheInnerState(caches) }
+        var roots = [offsets]
+        roots.reserveCapacity(1 + contiguous.count)
+        roots.append(contentsOf: contiguous.map(\.decodeRingWriteFenceEvaluationRoot))
+        return roots
+    }
+
     /// Decode-only counterpart to `eagerCacheInnerState`. The MODEL, not just
     /// the cache provider, must affirm that its output graph consumes every
     /// cache mutation. This matters because `CBv2SteppableModel` permits
@@ -2707,6 +2730,13 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     deinit {
         watchdogTimer?.cancel()
+        // Local profiling only: emit the phase table when CBV2_STEP_PROFILE
+        // armed the profiler — the startup warm's emitter never covers a
+        // measured free-run session, and this engine object dies with it.
+        if CBv2StepProfiler.enabled {
+            FileHandle.standardError.write(
+                Data("[engine-deinit] step profile\n\(CBv2StepProfiler.summaryTable())\n".utf8))
+        }
     }
 
     private func startWatchdog() {

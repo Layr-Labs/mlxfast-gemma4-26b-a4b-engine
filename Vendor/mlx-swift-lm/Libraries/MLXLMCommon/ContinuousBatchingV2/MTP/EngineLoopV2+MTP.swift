@@ -45,8 +45,12 @@ extension EngineLoopV2 {
         }
         mtp.recordSeedSteps(graph.seedRows.count)
 
+        let submitStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         asyncEval(graph.asyncEvalTargets)
         if CBv2StepProfiler.enabled {
+            CBv2StepProfiler.record(
+                "v2.mtp.asyncEval.submit",
+                seconds: CFAbsoluteTimeGetCurrent() - submitStart)
             CBv2StepProfiler.record(
                 "v2.mtp.launch.total", seconds: CFAbsoluteTimeGetCurrent() - buildStart)
         }

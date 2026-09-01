@@ -2239,36 +2239,35 @@ public enum Gemma4MMAQuantizedGEMV {
                     simdgroup_multiply_accumulate(accg1, A1, B, accg1);
             """,
             with: """
-                    simdgroup_matrix<float, 8, 8> A0;
-                    simdgroup_matrix<float, 8, 8> A1;
-                    simdgroup_matrix<float, 8, 8> A2;
-                    simdgroup_matrix<float, 8, 8> A3;
-                    simdgroup_matrix<float, 8, 8> B;
+                    simdgroup_matrix<T, 8, 8> A0;
+                    simdgroup_matrix<T, 8, 8> A1;
+                    simdgroup_matrix<T, 8, 8> A2;
+                    simdgroup_matrix<T, 8, 8> A3;
+                    simdgroup_matrix<T, 8, 8> B;
                     const uint packed0 = t < 4 ? packedLo0[t] : packedHi0[t - 4];
                     const uint packed1 = t < 4 ? packedLo1[t] : packedHi1[t - 4];
                     const uint packed2 = t < 4 ? packedLo2[t] : packedHi2[t - 4];
                     const uint packed3 = t < 4 ? packedLo3[t] : packedHi3[t - 4];
                     A0.thread_elements()[0] =
-                        float((packed0 >> (4 * fragmentCol)) & 0xFu);
+                        T(float((packed0 >> (4 * fragmentCol)) & 0xFu));
                     A0.thread_elements()[1] =
-                        float((packed0 >> (4 * (fragmentCol + 1))) & 0xFu);
+                        T(float((packed0 >> (4 * (fragmentCol + 1))) & 0xFu));
                     A1.thread_elements()[0] =
-                        float((packed1 >> (4 * fragmentCol)) & 0xFu);
+                        T(float((packed1 >> (4 * fragmentCol)) & 0xFu));
                     A1.thread_elements()[1] =
-                        float((packed1 >> (4 * (fragmentCol + 1))) & 0xFu);
+                        T(float((packed1 >> (4 * (fragmentCol + 1))) & 0xFu));
                     A2.thread_elements()[0] =
-                        float((packed2 >> (4 * fragmentCol)) & 0xFu);
+                        T(float((packed2 >> (4 * fragmentCol)) & 0xFu));
                     A2.thread_elements()[1] =
-                        float((packed2 >> (4 * (fragmentCol + 1))) & 0xFu);
+                        T(float((packed2 >> (4 * (fragmentCol + 1))) & 0xFu));
                     A3.thread_elements()[0] =
-                        float((packed3 >> (4 * fragmentCol)) & 0xFu);
+                        T(float((packed3 >> (4 * fragmentCol)) & 0xFu));
                     A3.thread_elements()[1] =
-                        float((packed3 >> (4 * (fragmentCol + 1))) & 0xFu);
+                        T(float((packed3 >> (4 * (fragmentCol + 1))) & 0xFu));
                     const uint activationK = g * GROUP + t * 8 + fragmentRow;
-                    B.thread_elements()[0] =
-                        float(x[fragmentCol * K + activationK]);
+                    B.thread_elements()[0] = x[fragmentCol * K + activationK];
                     B.thread_elements()[1] =
-                        float(x[(fragmentCol + 1) * K + activationK]);
+                        x[(fragmentCol + 1) * K + activationK];
                     simdgroup_multiply_accumulate(accg0, A0, B, accg0);
                     simdgroup_multiply_accumulate(accg1, A1, B, accg1);
                     simdgroup_multiply_accumulate(accg2, A2, B, accg2);
@@ -2566,7 +2565,7 @@ public enum Gemma4MMAQuantizedGEMV {
     }()
 
     private static let kernelV27: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_fpmma_v1",
+        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["out"],
         source: sourceV27,
@@ -2576,9 +2575,8 @@ public enum Gemma4MMAQuantizedGEMV {
 
     // MARK: - Version 27 carry --- weight-operand register carry
 
-    /// `false` only when `DARKBLOOM_GEMMA4_MMA_HEAD_CARRY` is an explicit off
-    /// value. Resolved once; the kill switch is a process-level decision. Off
-    /// restores `kernelV27` and its source byte for byte.
+    /// Moves only the tied-head weight/scales reads one group ahead. Explicit
+    /// off values restore v27 and both of its incumbent pipeline names.
     private static let carryEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_MMA_HEAD_CARRY"]
@@ -2589,34 +2587,10 @@ public enum Gemma4MMAQuantizedGEMV {
         }
     }()
 
-    /// MMA-HEAD-CARRY-013. The weight-operand register carry the frontier
-    /// applied to the two attention matrix-unit tiers and to the dense down
-    /// plane, now on the tied language head --- the last matrix-unit body in
-    /// the tree without it, and the one leaning hardest on DRAM: roughly
-    /// 415 MB of packed vocabulary plane per decode step, one dispatch per
-    /// step, the largest per-dispatch cost in the decode window.
-    ///
-    /// Every address in this body is a function of the group index alone, so
-    /// one group's four packed code pairs and four group scales are read a
-    /// whole iteration ahead and stay resident in registers while the current
-    /// group's thirty-two matrix-unit steps run. `gNext` is clamped to the
-    /// last valid group, so the final look-ahead re-reads a group already read
-    /// and its value is discarded at loop exit. The `g >= N_GROUPS` trips of
-    /// the unrolled tail block neither consume nor advance the carry.
-    ///
-    /// The read stays at the statement the incumbent load already occupied.
-    /// Moving it to the top of the body instead perturbs the close's
-    /// floating-point contraction and stops the output matching version 27
-    /// bit for bit; keeping it here leaves the emitted arithmetic word for
-    /// word what version 27 emits. Nothing else moves: the same eight `uint4`
-    /// values reach the same `A0...A3` fragments in the same tile order, the
-    /// `accg` chain, the `metal::fma` scale close, the batched affine-bias MMA
-    /// and the store are untouched, and no dtype changes. Output is
-    /// bit-identical to version 27's.
-    ///
-    /// The affine bias is NOT carried. Version 13 batched it out of the group
-    /// walk into one rank-8 MMA per eight groups, so there is no per-group
-    /// bias read left in this body to move.
+    /// The same eight packed operands and four scales reach the same v27 MMA
+    /// chain, but are loaded during the preceding group's arithmetic. Reads
+    /// stay at the incumbent load site: moving them above it changes Metal's
+    /// contraction choice in the close and would forfeit bit identity.
     private static let sourceV27Carry: String = {
         var result = sourceV27
 
@@ -2640,9 +2614,6 @@ public enum Gemma4MMAQuantizedGEMV {
             simdgroup_matrix<float, 8, 8> acc2 = simdgroup_matrix<float, 8, 8>(0.0f);
             simdgroup_matrix<float, 8, 8> acc3 = simdgroup_matrix<float, 8, 8>(0.0f);
 
-            // Weight operands carried one group ahead. Both row bases are
-            // functions of the fragment row alone, so the value each trip
-            // consumes is the value the in-place read produced.
             const uint carryWordBase = (sgN0 + fragmentRow) * W_ROW_U32;
             const uint carryTileStride = N_PSG * W_ROW_U32;
             uint4 carryLo0;
@@ -2750,13 +2721,119 @@ public enum Gemma4MMAQuantizedGEMV {
     }()
 
     private static let kernelV27Carry: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_carry_fpmma_v2",
+        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_carry_v1",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["out"],
         source: sourceV27Carry,
         header: "#include <metal_simdgroup_matrix>\n",
         ensureRowContiguous: true
     )
+
+    /// MTP-BATCHED-VERIFY: the v27 body over widened verify rows — one
+    /// 8-row column tile per grid.z, with every x/out/xSums access (all
+    /// row-relative in the body) offset by the tile's base. Arithmetic per
+    /// tile is the v27 dispatch's own, so each column's logits are the
+    /// serial column's words.
+    private static let sourceV27VerifyRows: String = {
+        let prelude = """
+            const uint vtTile = threadgroup_position_in_grid.z;
+            const uint vtOffX = vtTile * 8u * uint(K);
+            const uint vtOffOut = vtTile * 8u * uint(N);
+            const uint vtOffS = vtTile * 8u * (uint(K) / 64u);
+
+        """
+        var body = carryEnabled ? sourceV27Carry : sourceV27
+        body = body.replacingOccurrences(
+            of: "\\bx\\[", with: "x[vtOffX + ", options: .regularExpression)
+        body = body.replacingOccurrences(
+            of: "\\bout\\[", with: "out[vtOffOut + ", options: .regularExpression)
+        body = body.replacingOccurrences(
+            of: "\\bxSums\\[", with: "xSums[vtOffS + ", options: .regularExpression)
+        return prelude + body
+    }()
+
+    private static let kernelV27VerifyRows: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: carryEnabled
+                ? "gemma4_verify_mma_affine4_qmv_m8_v27_mrows_carry_v1"
+                : "gemma4_verify_mma_affine4_qmv_m8_v27_mrows_v1",
+            inputNames: ["x", "w", "scales", "biases", "xSums"],
+            outputNames: ["out"],
+            source: sourceV27VerifyRows,
+            header: "#include <metal_simdgroup_matrix>\n",
+            ensureRowContiguous: true
+        )
+
+    /// Widened tied-head entry: `x` flattens to `[8L, K]` column-major; the
+    /// per-tile xsum tables are computed with the SAME m8 xsum kernel per
+    /// tile and concatenated. Only version 27 is served; anything else
+    /// declines and the caller keeps per-column `apply`.
+    public static func applyVerifyRows(
+        x: MLXArray,
+        w: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int
+    ) -> MLXArray? {
+        guard enabled, version == 27 else { return nil }
+        guard let biases else { return nil }
+        guard groupSize == 64, bits == 4 else { return nil }
+        guard x.dtype == .bfloat16, scales.dtype == .bfloat16, biases.dtype == .bfloat16
+        else { return nil }
+        guard w.dtype == .uint32 else { return nil }
+        guard w.ndim == 2, scales.ndim == 2, biases.ndim == 2 else { return nil }
+        guard x.ndim == 2 || (x.ndim == 3 && x.dim(1) == 1) else { return nil }
+        let rows = x.dim(0)
+        guard rows > mRows, rows <= 8 * mRows, rows.isMultiple(of: mRows)
+        else { return nil }
+        let k = x.dim(-1)
+        guard k > 0, x.size == rows * k else { return nil }
+        let n = w.dim(0)
+        let selectedColsPerThreadgroup = colsPerThreadgroup * 4
+        guard n >= minOutputWidth, n % selectedColsPerThreadgroup == 0 else { return nil }
+        guard k % 64 == 0, k % 8 == 0 else { return nil }
+        guard w.dim(1) == k * bits / 32 else { return nil }
+        guard scales.dim(0) == n, biases.dim(0) == n else { return nil }
+        guard scales.dim(1) == k / 64, biases.dim(1) == k / 64 else { return nil }
+
+        let flatX = x.reshaped([rows, k])
+        let tiles = rows / mRows
+        let sumCells = mRows * (k / 64)
+        var sumTables: [MLXArray] = []
+        sumTables.reserveCapacity(tiles)
+        let sumThreads = 128
+        let sumThreadgroups = (sumCells + sumThreads - 1) / sumThreads
+        for t in 0 ..< tiles {
+            let tileX = flatX[(t * mRows) ..< ((t + 1) * mRows), 0...]
+            sumTables.append(
+                xSumKernel(
+                    [tileX],
+                    template: [("T", x.dtype), ("K", k)],
+                    grid: (sumThreadgroups * sumThreads, 1, 1),
+                    threadGroup: (sumThreads, 1, 1),
+                    outputShapes: [[sumCells]],
+                    outputDTypes: [.float32]
+                )[0])
+        }
+        let xSums = concatenated(sumTables, axis: 0)
+
+        let threadgroups = n / selectedColsPerThreadgroup
+        let outputs = kernelV27VerifyRows(
+            [flatX, w, scales, biases, xSums],
+            template: [("T", x.dtype), ("K", k), ("N", n)],
+            grid: (threadgroups * threadsPerThreadgroup, 1, tiles),
+            threadGroup: (threadsPerThreadgroup, 1, 1),
+            outputShapes: [[rows, n]],
+            outputDTypes: [x.dtype]
+        )
+        CBv2EngageMark.once("mtp-verify-head-vt")
+        if carryEnabled {
+            CBv2EngageMark.once("mma-head-carry")
+            CBv2EngageMark.once("mtp-verify-head-carry")
+        }
+        return outputs[0]
+    }
 
     /// Tied-head GEMV, or `nil` when any gate above fails.
     ///

@@ -105,37 +105,23 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    /// W4-LOAD (engage mark `mlp-w4-load`). The four packed affine-8 codes a
-    /// lane owns for one output row are four CONTIGUOUS bytes at a 4-byte
-    /// aligned address, so they can be fetched as ONE aligned 32-bit load
-    /// instead of four separate 1-byte loads. The codes, their order and every
-    /// arithmetic statement that consumes them are unchanged, so the arm is
-    /// bit-identical to the promoted bodies by construction.
-    ///
-    /// Alignment holds for every address this arm forms. The quad-stream body
-    /// advances `ws` by `out_row * in_vec_size_w + simd_lid * bytes_per_thread`
-    /// once and by `block_size` per K block, and the fetch adds
-    /// `row * in_vec_size_w`, so
-    ///
-    ///     addr - base = (out_row + row) * in_vec_size_w
-    ///                 + bytes_per_thread * simd_lid
-    ///                 + block_size * n
-    ///
-    /// with the body's own constants `bytes_per_thread == 4` and
-    /// `block_size == 128`, both multiples of 4, and `in_vec_size_w == inDim`
-    /// where `liveShape` admits only 2816 (= 4 * 704) and 2112 (= 4 * 528).
-    /// Every term is a multiple of 4. `weight.dtype == .uint32` is required by
-    /// `matmul`, so the buffer base is itself at least 4-byte aligned. The tail
-    /// block forms the same addresses under a lane predicate, which restricts
-    /// WHICH lanes load and never the address. The load reads exactly the bytes
-    /// `wl[0 ..< 4]` the incumbent loop read, so no new byte is touched and the
-    /// bounds are unchanged.
-    ///
-    /// `DARKBLOOM_GEMMA4_MLP_W4_LOAD=0` restores the promoted quad-stream and
-    /// activation-sum bodies byte for byte in the same binary.
-    public static let w4Enabled: Bool = {
+    /// MTP router projection. Each `grid.z` tile keeps one serial eight-row
+    /// column, while one custom-kernel node replaces the per-column
+    /// QuantizedLinear nodes. Set the variable to zero to restore those nodes.
+    private static let verifyRouterScoresEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_MLP_W4_LOAD"]
+            "DARKBLOOM_CBV2_MTP_ROUTER_QMV"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// MTP-W4-LOAD. In the widened gate/up and router QMV bodies, each lane's
+    /// four affine-8 codes are contiguous and four-byte aligned. Load them as
+    /// one `uchar4`; the dot-product loop and every reduction remain unchanged.
+    /// The switch restores the incumbent headers and pipeline names exactly.
+    private static let verifyW4LoadEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_MTP_VERIFY_W4_LOAD"]
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
@@ -450,6 +436,66 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
         return result
     }()
 
+    /// `uchar4` twin of the promoted registered affine-8 dot product. Only
+    /// the already-loaded code container changes; the fp32 accumulation text
+    /// is deliberately identical.
+    private static let verifyWideDotHelper = """
+
+        template <typename U, int values_per_thread>
+        inline U qdot_affine8_registered_v4(
+            const thread uchar4 w,
+            const thread U* x_thread,
+            U scale,
+            U bias,
+            U sum) {
+          U accum = 0;
+          #pragma unroll
+          for (int i = 0; i < values_per_thread; i++) {
+            accum += x_thread[i] * w[i];
+          }
+          return scale * accum + sum * bias;
+        }
+
+        """
+
+    /// Checked textual transform of the exact promoted QMV body. The admitted
+    /// K sizes (2816 here) and the body constants (4 and 128) make every load
+    /// address a multiple of four; the uint32 weight buffer aligns the base.
+    private static func verifyW4Header(_ source: String) -> String {
+        var text = source
+        func replaceExactly(_ old: String, _ new: String, _ count: Int) {
+            precondition(text.components(separatedBy: old).count == count + 1)
+            text = text.replacingOccurrences(of: old, with: new)
+        }
+        replaceExactly(
+            "qdot_affine8_registered<", "qdot_affine8_registered_v4<", 8)
+        replaceExactly(
+            "  thread uint8_t packed[results_per_simdgroup][bytes_per_thread];",
+            "  thread uchar4 packed[results_per_simdgroup];",
+            1)
+        replaceExactly(
+            "      const device uint8_t* wl = ws + row * in_vec_size_w;\n"
+                + "      #pragma unroll\n"
+                + "      for (int i = 0; i < bytes_per_thread; i++) {\n"
+                + "        packed[row][i] = wl[i];\n"
+                + "      }",
+            "      packed[row] =\n"
+                + "          *((const device uchar4*)(ws + row * in_vec_size_w));",
+            2)
+        replaceExactly(
+            "template <typename U, int values_per_thread>\n"
+                + "inline U qdot_affine8_registered(",
+            verifyWideDotHelper
+                + "template <typename U, int values_per_thread>\n"
+                + "inline U qdot_affine8_registered(",
+            1)
+        return text
+    }
+
+    private static let verifyW4KernelHeader = verifyW4Header(kernelHeader)
+    private static let verifyW4ActivationSumKernelHeader =
+        verifyW4Header(activationSumKernelHeader)
+
     /// MMA-MLP-001. Verbatim transcription of the `kGemma4QmvMma8Affine8`
     /// tier body from `zarar/t6-mma-s2` (quantized.h / quantized.cpp twins,
     /// `gemma4_qmv_mma8_affine8_g64_impl`), hosted here the way
@@ -634,30 +680,27 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     rs += simd_shuffle_xor(rs, 4u);
     rs += simd_shuffle_xor(rs, 16u);
 
-    // BFILL: each B operand is filled immediately before the step that
-    // consumes it instead of all eight ahead of the run, so one B is live
-    // at a time rather than eight. `r0`/`r1` are not written between here
-    // and the last step, and the accumulation order into `C` is unchanged.
+    MMA8_SETB(B0, x, lo)
+    MMA8_SETB(B1, x, hi)
+    MMA8_SETB(B2, y, lo)
+    MMA8_SETB(B3, y, hi)
+    MMA8_SETB(B4, z, lo)
+    MMA8_SETB(B5, z, hi)
+    MMA8_SETB(B6, w, lo)
+    MMA8_SETB(B7, w, hi)
+
     const uint4 wv = *((const device uint4*)(wrow + 64 * g));
     const float s = float(srow[g]);
     const float b = float(brow[g]);
 
     simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
-    MMA8_SETB(B0, x, lo)
     MMA8_STEP8(B0, x, z, 0)
-    MMA8_SETB(B1, x, hi)
     MMA8_STEP8(B1, x, z, 8)
-    MMA8_SETB(B2, y, lo)
     MMA8_STEP8(B2, x, z, 16)
-    MMA8_SETB(B3, y, hi)
     MMA8_STEP8(B3, x, z, 24)
-    MMA8_SETB(B4, z, lo)
     MMA8_STEP8(B4, y, w, 0)
-    MMA8_SETB(B5, z, hi)
     MMA8_STEP8(B5, y, w, 8)
-    MMA8_SETB(B6, w, lo)
     MMA8_STEP8(B6, y, w, 16)
-    MMA8_SETB(B7, w, hi)
     MMA8_STEP8(B7, y, w, 24)
 
     acc0 += s * C.thread_elements()[0] + rs.x * b;
@@ -798,7 +841,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     }()
 
     private static let mma8DownStaticKKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_carry2_bfill_v4",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_carry2_v3",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -992,147 +1035,6 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         ensureRowContiguous: true
     )
 
-    /// The `uchar4` twin of the promoted registered dot product. The
-    /// accumulation text is identical; only the container of the four
-    /// already-loaded weight codes changes, from four separate `thread uint8_t`
-    /// to one `uchar4` that a single 32-bit device load fills.
-    private static let wideDotHelper = """
-
-template <typename U, int values_per_thread>
-inline U qdot_affine8_registered_v4(
-    const thread uchar4 w,
-    const thread U* x_thread,
-    U scale,
-    U bias,
-    U sum) {
-  U accum = 0;
-  #pragma unroll
-  for (int i = 0; i < values_per_thread; i++) {
-    accum += x_thread[i] * w[i];
-  }
-  return scale * accum + sum * bias;
-}
-
-"""
-
-    /// Rewrite a promoted quad-stream header into its W4 twin. Three
-    /// single-purpose substitutions with checked occurrence counts, so any
-    /// future drift in the donor body fails construction instead of silently
-    /// transforming an unintended text.
-    private static func w4Header(_ source: String) -> String {
-        var text = source
-        func replaceExactly(_ old: String, _ new: String, _ count: Int) {
-            precondition(text.components(separatedBy: old).count == count + 1)
-            text = text.replacingOccurrences(of: old, with: new)
-        }
-        replaceExactly(
-            "qdot_affine8_registered<", "qdot_affine8_registered_v4<", 8)
-        replaceExactly(
-            "  thread uint8_t packed[results_per_simdgroup][bytes_per_thread];",
-            "  thread uchar4 packed[results_per_simdgroup];",
-            1)
-        replaceExactly(
-            "      const device uint8_t* wl = ws + row * in_vec_size_w;\n"
-                + "      #pragma unroll\n"
-                + "      for (int i = 0; i < bytes_per_thread; i++) {\n"
-                + "        packed[row][i] = wl[i];\n"
-                + "      }",
-            "      packed[row] =\n"
-                + "          *((const device uchar4*)(ws + row * in_vec_size_w));",
-            2)
-        replaceExactly(
-            "template <typename U, int values_per_thread>\n"
-                + "inline U qdot_affine8_registered(",
-            wideDotHelper
-                + "template <typename U, int values_per_thread>\n"
-                + "inline U qdot_affine8_registered(",
-            1)
-        return text
-    }
-
-    private static let w4KernelHeader: String = w4Header(kernelHeader)
-
-    private static let w4ActivationSumKernelHeader: String =
-        w4Header(activationSumKernelHeader)
-
-    /// The W4 twins. Source text is the promoted kernels' own, character for
-    /// character; only the name and the header differ, so the grid, threadgroup
-    /// shape, dispatch count, operands and bytes moved are all unchanged.
-    private static let w4Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_w4_v1",
-        inputNames: ["x", "w", "scales", "biases"],
-        outputNames: ["y"],
-        source: """
-            const uint3 tid = threadgroup_position_in_grid;
-            const uint simd_gid = simdgroup_index_in_threadgroup;
-            const uint simd_lid = thread_index_in_simdgroup;
-
-            const int in_vec_size = x_shape[x_ndim - 1];
-            const int out_vec_size = w_shape[0];
-            const int first_m = int(tid.x) * 4;
-            if (first_m >= 8) {
-                return;
-            }
-            qmv_affine8_g64_quad_stream_impl<T, 64, 8>(
-                w,
-                scales,
-                biases,
-                x + first_m * in_vec_size,
-                x + (first_m + 1) * in_vec_size,
-                x + (first_m + 2) * in_vec_size,
-                x + (first_m + 3) * in_vec_size,
-                y + first_m * out_vec_size,
-                y + (first_m + 1) * out_vec_size,
-                y + (first_m + 2) * out_vec_size,
-                y + (first_m + 3) * out_vec_size,
-                in_vec_size,
-                tid,
-                simd_gid,
-                simd_lid);
-            return;
-            """,
-        header: w4KernelHeader,
-        ensureRowContiguous: true
-    )
-
-    private static let w4ActivationSumQMVKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_w4_v1",
-        inputNames: ["x", "w", "scales", "biases", "xSums"],
-        outputNames: ["y"],
-        source: """
-            const uint3 tid = threadgroup_position_in_grid;
-            const uint simd_gid = simdgroup_index_in_threadgroup;
-            const uint simd_lid = thread_index_in_simdgroup;
-
-            const int in_vec_size = x_shape[x_ndim - 1];
-            const int out_vec_size = w_shape[0];
-            const int first_m = int(tid.x) * 4;
-            if (first_m >= 8) {
-                return;
-            }
-            qmv_affine8_g64_quad_stream_xsum_impl<T, 64, 8>(
-                w,
-                scales,
-                biases,
-                xSums,
-                x + first_m * in_vec_size,
-                x + (first_m + 1) * in_vec_size,
-                x + (first_m + 2) * in_vec_size,
-                x + (first_m + 3) * in_vec_size,
-                y + first_m * out_vec_size,
-                y + (first_m + 1) * out_vec_size,
-                y + (first_m + 2) * out_vec_size,
-                y + (first_m + 3) * out_vec_size,
-                in_vec_size,
-                tid,
-                simd_gid,
-                simd_lid);
-            return;
-            """,
-        header: w4ActivationSumKernelHeader,
-        ensureRowContiguous: true
-    )
-
     @inline(__always)
     private static func liveShape(inDim: Int, outDim: Int) -> Bool {
         (inDim == 2816 && outDim == 2112)
@@ -1185,6 +1087,353 @@ inline U qdot_affine8_registered_v4(
             values.size == blocks * simdWidth * batch
         else { return nil }
         return ActivationSums(values: values)
+    }
+
+    // MARK: - MTP-BATCHED-VERIFY widened-row entries
+
+    /// The per-column xsum tables of a verify rectangle, concatenated in
+    /// column order for the widened gate/up dispatch. Each table's values
+    /// are the exact words the serial column consumed.
+    public static func verifyConcatenatedSums(
+        _ tables: [ActivationSums]
+    ) -> MLXArray? {
+        guard tables.count >= 2 else { return nil }
+        let expected = (2816 / kBlock) * simdWidth * batch
+        for table in tables where table.values.size != expected { return nil }
+        return concatenated(tables.map { $0.values }, axis: 0)
+    }
+
+    /// Gate/up quad-stream body over widened rows: one verify column's
+    /// 8 rows (and its 5632-word xsum table window) per grid.z tile; the
+    /// body is untouched, so per-column outputs are the [8,1] dispatch's.
+    private static let verifyQuadXsumKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: verifyW4LoadEnabled
+                ? "cbv2_verify_dense_mlp_qmv_affine8_g64_quad_stream_xsum_mrows_w4_v1"
+                : "cbv2_verify_dense_mlp_qmv_affine8_g64_quad_stream_xsum_mrows_v1",
+            inputNames: ["x", "w", "scales", "biases", "xSums"],
+            outputNames: ["y"],
+            source: """
+                const uint3 tid = threadgroup_position_in_grid;
+                const uint simd_gid = simdgroup_index_in_threadgroup;
+                const uint simd_lid = thread_index_in_simdgroup;
+
+                const int in_vec_size = x_shape[x_ndim - 1];
+                const int out_vec_size = w_shape[0];
+                const int first_m = int(tid.x) * 4;
+                if (first_m >= 8) {
+                    return;
+                }
+                const device T* xt = x + tid.z * 8 * in_vec_size;
+                device T* yt = y + tid.z * 8 * out_vec_size;
+                const device float* st =
+                    ((const device float*)xSums)
+                    + tid.z * ((in_vec_size / 128) * 32 * 8);
+                qmv_affine8_g64_quad_stream_xsum_impl<T, 64, 8>(
+                    w,
+                    scales,
+                    biases,
+                    st,
+                    xt + first_m * in_vec_size,
+                    xt + (first_m + 1) * in_vec_size,
+                    xt + (first_m + 2) * in_vec_size,
+                    xt + (first_m + 3) * in_vec_size,
+                    yt + first_m * out_vec_size,
+                    yt + (first_m + 1) * out_vec_size,
+                    yt + (first_m + 2) * out_vec_size,
+                    yt + (first_m + 3) * out_vec_size,
+                    in_vec_size,
+                    tid,
+                    simd_gid,
+                    simd_lid);
+                return;
+                """,
+            header: verifyW4LoadEnabled
+                ? verifyW4ActivationSumKernelHeader
+                : activationSumKernelHeader,
+            ensureRowContiguous: true
+        )
+
+    /// Router score projection over a verify rectangle. A z tile owns one
+    /// eight-row serial column; `first_m` therefore remains column-local and
+    /// every output keeps the exact affine8 K loop and simd reduction of the
+    /// promoted QMV helper. The only widened dimension is the dispatch grid.
+    private static let verifyRouterScoresKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: verifyW4LoadEnabled
+                ? "cbv2_verify_router_qmv_affine8_g64_quad_stream_mrows_w4_v1"
+                : "cbv2_verify_router_qmv_affine8_g64_quad_stream_mrows_v1",
+            inputNames: ["x", "w", "scales", "biases"],
+            outputNames: ["y"],
+            source: """
+                const uint3 tid = threadgroup_position_in_grid;
+                const uint simd_gid = simdgroup_index_in_threadgroup;
+                const uint simd_lid = thread_index_in_simdgroup;
+
+                const int in_vec_size = x_shape[x_ndim - 1];
+                const int out_vec_size = w_shape[0];
+                const int first_m = int(tid.x) * 4;
+                if (first_m >= 8) {
+                    return;
+                }
+                const device T* xt = x + tid.z * 8 * in_vec_size;
+                device T* yt = y + tid.z * 8 * out_vec_size;
+                qmv_affine8_g64_quad_stream_impl<T, 64, 8>(
+                    w,
+                    scales,
+                    biases,
+                    xt + first_m * in_vec_size,
+                    xt + (first_m + 1) * in_vec_size,
+                    xt + (first_m + 2) * in_vec_size,
+                    xt + (first_m + 3) * in_vec_size,
+                    yt + first_m * out_vec_size,
+                    yt + (first_m + 1) * out_vec_size,
+                    yt + (first_m + 2) * out_vec_size,
+                    yt + (first_m + 3) * out_vec_size,
+                    in_vec_size,
+                    tid,
+                    simd_gid,
+                    simd_lid);
+                return;
+                """,
+            header: verifyW4LoadEnabled ? verifyW4KernelHeader : kernelHeader,
+            ensureRowContiguous: true
+        )
+
+    /// Down-plane lane sums over widened rows: one column per grid.z tile.
+    private static let verifyDownLaneSumKernel = MLXFast.metalKernel(
+        name: "cbv2_verify_dense_mlp_mma8_down_lane_sums_mrows_v1",
+        inputNames: ["x"],
+        outputNames: ["laneSums"],
+        source: """
+            const uint lane = thread_index_in_simdgroup;
+            const int g = int(threadgroup_position_in_grid.y);
+            const int tile = int(threadgroup_position_in_grid.z);
+            const int K = x_shape[x_ndim - 1];
+            const mma8_coord c = mma8_lane(lane);
+            const device T* xt = x + tile * 8 * K;
+            const device T* x0 = xt + c.fn * K + 8 * c.fm;
+            const device T* x1 = x0 + K;
+            const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+            const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+            float2 rs = float2(mma8_runsum8<T>(r0), mma8_runsum8<T>(r1));
+            rs += simd_shuffle_xor(rs, 2u);
+            rs += simd_shuffle_xor(rs, 4u);
+            rs += simd_shuffle_xor(rs, 16u);
+            ((device float2*)laneSums)[(tile * (K / 64) + g) * 32 + lane] = rs;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
+    /// Down-plane MMA8 lane-sums body over widened rows.
+    private static let verifyDownLaneSumQMVKernel = MLXFast.metalKernel(
+        name: "cbv2_verify_dense_mlp_mma8_affine8_g64_down_lane_sums_mrows_v1",
+        inputNames: ["x", "w", "scales", "biases", "laneSums"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            const int K = x_shape[x_ndim - 1];
+            gemma4_qmv_mma8_affine8_g64_lane_sums_impl<T, 2>(
+                w, scales, biases,
+                x + tid.z * 8 * K,
+                ((const device float2*)laneSums) + tid.z * (K / 64) * 32,
+                y + tid.z * 8 * w_shape[0],
+                K, w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8DownLaneSumHeader,
+        ensureRowContiguous: true)
+
+    /// Down-plane static-K MMA8 body over widened rows (the default down
+    /// road when lane sums are disabled).
+    private static let verifyDownStaticKKernel = MLXFast.metalKernel(
+        name: "cbv2_verify_dense_mlp_mma8_affine8_g64_down_k2112_mrows_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            gemma4_qmv_mma8_affine8_g64_down_k2112_impl<T, 2>(
+                w, scales, biases,
+                x + tid.z * 8 * 2112,
+                y + tid.z * 8 * w_shape[0],
+                w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            """,
+        header: mma8DownStaticKHeader,
+        ensureRowContiguous: true)
+
+    /// MTP-BATCHED-VERIFY gate/up entry: `x` `[8L, 1, 2816]` column-major
+    /// with the columns' concatenated xsum tables. Bit-identical per column
+    /// to `matmul` with that column's table.
+    public static func matmulVerifyRowsGateUp(
+        x: MLXArray,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode,
+        concatenatedSums: MLXArray
+    ) -> MLXArray? {
+        guard enabled, !mma8GateUpEnabled,
+            groupSize == Self.groupSize,
+            bits == Self.bits,
+            mode == .affine,
+            let biases,
+            x.dtype == .bfloat16,
+            scales.dtype == x.dtype,
+            biases.dtype == x.dtype,
+            weight.dtype == .uint32,
+            x.ndim == 3,
+            x.dim(0) > batch,
+            x.dim(0).isMultiple(of: batch),
+            x.dim(0) <= 8 * batch,
+            x.dim(1) == sequence,
+            x.dim(2) == 2816,
+            weight.ndim == 2,
+            weight.dim(0) == 2112,
+            weight.dim(1) == 2816 * Self.bits / 32,
+            scales.shape == [2112, 2816 / Self.groupSize],
+            biases.shape == scales.shape,
+            concatenatedSums.dtype == .float32,
+            concatenatedSums.size
+                == (x.dim(0) / batch) * (2816 / kBlock) * simdWidth * batch
+        else { return nil }
+        let rows = x.dim(0)
+        let yGroups = 2112 / outputsPerGroup
+        if verifyW4LoadEnabled {
+            CBv2EngageMark.once("mtp-verify-w4-load")
+        }
+        return verifyQuadXsumKernel(
+            [x, weight, scales, biases, concatenatedSums],
+            template: [("T", x.dtype)],
+            grid: (2 * simdWidth, yGroups * simdGroups, rows / batch),
+            threadGroup: (simdWidth, simdGroups, 1),
+            outputShapes: [[rows, sequence, 2112]],
+            outputDTypes: [x.dtype]
+        )[0]
+    }
+
+    /// MTP router entry: `x` is `[8L, 1, 2816]`, in column-major order,
+    /// and the q8/g64 router plane is `[128, 2816]`. Returning nil leaves the
+    /// established per-column QuantizedLinear road untouched.
+    public static func matmulVerifyRowsRouterScores(
+        x: MLXArray,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode
+    ) -> MLXArray? {
+        guard enabled, verifyRouterScoresEnabled,
+            groupSize == Self.groupSize,
+            bits == Self.bits,
+            mode == .affine,
+            let biases,
+            x.dtype == .bfloat16,
+            scales.dtype == x.dtype,
+            biases.dtype == x.dtype,
+            weight.dtype == .uint32,
+            x.ndim == 3,
+            x.dim(0) > batch,
+            x.dim(0).isMultiple(of: batch),
+            x.dim(0) <= 8 * batch,
+            x.dim(1) == sequence,
+            x.dim(2) == 2816,
+            weight.ndim == 2,
+            weight.dim(0) == 128,
+            weight.dim(1) == 2816 * Self.bits / 32,
+            scales.shape == [128, 2816 / Self.groupSize],
+            biases.shape == scales.shape
+        else { return nil }
+        let rows = x.dim(0)
+        CBv2EngageMark.once("mtp-verify-router-qmv-mrows")
+        if verifyW4LoadEnabled {
+            CBv2EngageMark.once("mtp-verify-w4-load")
+        }
+        return verifyRouterScoresKernel(
+            [x, weight, scales, biases],
+            template: [("T", x.dtype)],
+            grid: (
+                2 * simdWidth,
+                (128 / outputsPerGroup) * simdGroups,
+                rows / batch),
+            threadGroup: (simdWidth, simdGroups, 1),
+            outputShapes: [[rows, sequence, 128]],
+            outputDTypes: [x.dtype]
+        )[0]
+    }
+
+    /// MTP-BATCHED-VERIFY down entry: `x` `[8L, 1, 2112]` column-major.
+    /// Serves the same road the serial column takes (lane-sums MMA8 when
+    /// armed, static-K MMA8 otherwise), tile-identical per column.
+    public static func matmulVerifyRowsDown(
+        x: MLXArray,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode
+    ) -> MLXArray? {
+        guard enabled, mma8DownEnabled,
+            groupSize == Self.groupSize,
+            bits == Self.bits,
+            mode == .affine,
+            let biases,
+            x.dtype == .bfloat16,
+            scales.dtype == x.dtype,
+            biases.dtype == x.dtype,
+            weight.dtype == .uint32,
+            x.ndim == 3,
+            x.dim(0) > batch,
+            x.dim(0).isMultiple(of: batch),
+            x.dim(0) <= 8 * batch,
+            x.dim(1) == sequence,
+            x.dim(2) == 2112,
+            weight.ndim == 2,
+            weight.dim(0) == 2816,
+            weight.dim(1) == 2112 * Self.bits / 32,
+            scales.shape == [2816, 2112 / Self.groupSize],
+            biases.shape == scales.shape
+        else { return nil }
+        let rows = x.dim(0)
+        let tiles = rows / batch
+        let yTiles = 2816 / outputsPerGroup
+        if mma8DownStaticKEnabled, !mma8DownLaneSumsEnabled {
+            return verifyDownStaticKKernel(
+                [x, weight, scales, biases],
+                template: [("T", x.dtype)],
+                grid: (simdWidth, yTiles * simdGroups, tiles),
+                threadGroup: (simdWidth, simdGroups, 1),
+                outputShapes: [[rows, sequence, 2816]],
+                outputDTypes: [x.dtype]
+            )[0]
+        }
+        guard mma8DownLaneSumsEnabled else { return nil }
+        let groups = 2112 / Self.groupSize
+        let laneSums = verifyDownLaneSumKernel(
+            [x],
+            template: [("T", x.dtype)],
+            grid: (simdWidth, groups, tiles),
+            threadGroup: (simdWidth, 1, 1),
+            outputShapes: [[tiles * groups, simdWidth, 2]],
+            outputDTypes: [.float32]
+        )[0]
+        return verifyDownLaneSumQMVKernel(
+            [x, weight, scales, biases, laneSums],
+            template: [("T", x.dtype)],
+            grid: (simdWidth, yTiles * simdGroups, tiles),
+            threadGroup: (simdWidth, simdGroups, 1),
+            outputShapes: [[rows, sequence, 2816]],
+            outputDTypes: [x.dtype]
+        )[0]
     }
 
     /// Returns `nil` unless every production pin holds. The caller then invokes
@@ -1275,15 +1524,7 @@ inline U qdot_affine8_registered_v4(
         let useActivationSums = activationSums != nil
             && inDim == 2816
             && outDim == 2112
-        if w4Enabled {
-            CBv2EngageMark.once("mlp-w4-load")
-        }
-        let selected: MLXFast.MLXFastKernel
-        if useActivationSums {
-            selected = w4Enabled ? w4ActivationSumQMVKernel : activationSumQMVKernel
-        } else {
-            selected = w4Enabled ? w4Kernel : kernel
-        }
+        let selected = useActivationSums ? activationSumQMVKernel : kernel
         let inputs = useActivationSums
             ? [x, weight, scales, biases, activationSums!.values]
             : [x, weight, scales, biases]

@@ -204,6 +204,148 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         return output
     }
 
+    /// MTP widened-round stash: the whole round's staged K/V and packed
+    /// stripe for this layer, consumed by `mtpCommitWidened`.
+    public private(set) var mtpWidenedStash:
+        (keys: MLXArray, values: MLXArray, stripe: MLXArray,
+         columns: Int, bases: [Int])?
+
+    /// MTP-BATCHED-VERIFY widened road: ONE grouped stripe pack, counters-only
+    /// staging, ONE multi-column attend. All admissions are checked (and the
+    /// stripe built) BEFORE any counter moves; a kernel refusal after staging
+    /// reverts the counters and returns nil so the caller's fallback starts
+    /// clean.
+    public func mtpVerifyStageAndAttendColumnsWidened(
+        queries: MLXArray,
+        keysAll: MLXArray,
+        valuesAll: MLXArray,
+        columns: Int,
+        scale: Float
+    ) -> MLXArray? {
+        // Refusal is an ordinary, exact fallback (not an error). Keep it
+        // silent: full-attention layers intentionally try this sliding arm
+        // before the D512 arm, so synchronous stderr writes here would sit in
+        // every layer/round hot path.
+        func refuse(_: String) -> MLXArray? { nil }
+        guard kind.sharesKVWithLayer == nil else { return refuse("shared") }
+        guard columns >= 2, columns <= 8 else { return refuse("columns") }
+        guard attentionSoftcap == nil else { return refuse("softcap") }
+        guard boundSpanContexts == nil else { return refuse("span") }
+        guard scale == 1.0 else { return refuse("scale=\(scale)") }
+        guard queries.ndim == 4,
+            queries.dim(0) == rows.count * columns,
+            queries.dim(2) == 1
+        else { return refuse("queries=\(queries.shape) rows=\(rows.count)") }
+        guard mtpWidenedStash == nil else { return refuse("stash-live") }
+        let ringRows = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
+        guard ringRows.count == rows.count else { return refuse("rows-kind") }
+        guard ringRows.allSatisfy({ $0.verifyStripeEligible })
+        else { return refuse("eligible") }
+        guard ringRows.allSatisfy({ $0.window == queriesWindowPin })
+        else { return refuse("window") }
+        guard ringRows.allSatisfy({ $0.verifyCommitBuffers != nil })
+        else { return refuse("buffers") }
+        guard
+            let stripe = CBv2RaggedTwoPassDecodeAttentionV1.packVerifyStripeGrouped(
+                keysAll: keysAll, valuesAll: valuesAll, columns: columns)
+        else {
+            return refuse(
+                "pack keys=\(keysAll.shape) values=\(valuesAll.shape) cols=\(columns)")
+        }
+
+        let bases = ringRows.map { $0.absoluteOffset }
+        for row in ringRows { row.stageWidenedCountersOnly(columns) }
+        let starts = ringRows.map {
+            ($0.absoluteOffset - (columns - 1)) % queriesWindowPin
+        }
+        var mirrors: [MLXArray] = []
+        for row in ringRows {
+            guard let buffers = row.verifyCommitBuffers else {
+                for staged in ringRows where staged.widenedStagedCount > 0 {
+                    staged.revertWidenedStage()
+                }
+                return nil
+            }
+            mirrors.append(buffers.mirror)
+        }
+        guard let output = CBv2RaggedTwoPassDecodeAttentionV1.attendRingQuantVerifyMC(
+            queries: queries, mirrors: mirrors, stripe: stripe,
+            starts: starts, columns: columns, scale: scale,
+            slidingWindowLength: queriesWindowPin,
+            orderingFence: decodeRingWriteFence.value)
+        else {
+            for staged in ringRows where staged.widenedStagedCount > 0 {
+                staged.revertWidenedStage()
+            }
+            return refuse("mc-kernel q=\(queries.shape) starts=\(starts)")
+        }
+        mtpWidenedStash = (keysAll, valuesAll, stripe, columns, bases)
+        if advancesPositionOffsets {
+            positionOffsetsState.value = positionOffsetsState.value + Int32(columns)
+        }
+        return output
+    }
+
+    /// MTP-BATCHED-VERIFY, D512 full-attention arm: ONE widened store then
+    /// per-column chains fenced only on it. nil BEFORE side effects.
+    public func mtpVerifyAttendColumnsD512(
+        queriesAll: MLXArray,
+        keysAll: MLXArray,
+        valuesAll: MLXArray,
+        columns: Int,
+        scale: Float
+    ) -> MLXArray? {
+        guard kind.sharesKVWithLayer == nil,
+            attentionSoftcap == nil,
+            boundSpanContexts == nil
+        else { return nil }
+        guard
+            let fused = CBv2RaggedComposedD512DecodeAttentionV1
+                .updateAndAttendVerifyColumns(
+                    rows: rows, kind: kind,
+                    queriesAll: queriesAll, keysAll: keysAll,
+                    valuesAll: valuesAll, columns: columns,
+                    previousWriteFence: decodeRingWriteFence.value,
+                    scale: scale)
+        else { return nil }
+        decodeRingWriteFence.value = fused.nextWriteFence
+        if advancesPositionOffsets {
+            positionOffsetsState.value = positionOffsetsState.value + Int32(columns)
+        }
+        return fused.output
+    }
+
+    /// The pinned sliding geometry the exact verify kernels serve.
+    private var queriesWindowPin: Int { 1024 }
+
+    /// Commit the widened round's confirmed prefixes through the widened
+    /// commit kernel (ring BF16 + mirror q4 in place, fence-chained).
+    /// `confirmed[r]` counts row r's committed columns; 0 writes nothing.
+    public func mtpCommitWidened(confirmed: [Int]) {
+        guard let stash = mtpWidenedStash else { return }
+        mtpWidenedStash = nil
+        let ringRows = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
+        guard ringRows.count == rows.count, confirmed.count == ringRows.count
+        else { return }
+        var ringKeys: [MLXArray] = []
+        var ringValues: [MLXArray] = []
+        var mirrors: [MLXArray] = []
+        for row in ringRows {
+            guard let buffers = row.verifyCommitBuffers else { return }
+            ringKeys.append(buffers.ringKeys)
+            ringValues.append(buffers.ringValues)
+            mirrors.append(buffers.mirror)
+        }
+        if let fence = CBv2RaggedTwoPassDecodeAttentionV1.commitVerifyWidened(
+            keysAll: stash.keys, valuesAll: stash.values, stripe: stash.stripe,
+            confirmed: confirmed, bases: stash.bases, columns: stash.columns,
+            ringKeys: ringKeys, ringValues: ringValues, mirrors: mirrors,
+            previousWriteFence: decodeRingWriteFence.value)
+        {
+            decodeRingWriteFence.value = fence
+        }
+    }
+
     /// Final-layer prompt specialization (see LastQueryPrefillV2.swift):
     /// commit the whole chunk's K/V, attend only its newest query row.
     /// Offsets advance by the K/V length, NOT the query length — the chunk

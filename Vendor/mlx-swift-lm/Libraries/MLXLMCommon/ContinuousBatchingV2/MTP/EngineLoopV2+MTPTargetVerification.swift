@@ -63,6 +63,18 @@ extension EngineLoopV2 {
         mtp.recordVerificationStrategy(rectangular: useRectangular)
 
         if !useRectangular {
+            // MTP-BATCHED-VERIFY: one layer-major pass over all columns —
+            // per-column [B,1] roads everywhere, one merged expert gather.
+            // The model declines geometries it cannot serve exactly and the
+            // serial column loop below remains the road.
+            if columns.count > 1,
+                let batched = mtp.model.verifyColumns(
+                    tokens: concatenated(columns, axis: 1), caches: caches)
+            {
+                argmax = concatenated(batched.argmax, axis: 1)
+                hidden = concatenated(batched.hidden, axis: 1)
+                return (argmax, hidden, mtpCompactVerifyRoots(caches))
+            }
             var argmaxColumns: [MLXArray] = []
             var hiddenColumns: [MLXArray] = []
             argmaxColumns.reserveCapacity(columns.count)
@@ -71,10 +83,21 @@ extension EngineLoopV2 {
                 precondition(column.dim(1) == 1, "CBv2 MTP: serial target column must have L=1")
                 let output = mtp.model.forwardWithHidden(tokens: column, caches: caches)
                 let columnArgmax = argMax(output.logits, axis: -1).asType(.int32)
-                // Building several eager decode calls in one lazy graph can
-                // let mutable KV buffers observe a later version. Complete
-                // each canonical target step before constructing the next.
-                eval([columnArgmax, output.lastHidden] + eagerCacheInnerState(caches))
+                // MTP-LAZY-COLUMNS: the predecessor completed each column
+                // with a blocking `eval` before building the next, citing
+                // mutable KV buffers observing a later version. On this
+                // engine's verify roads that hazard has the same shape as
+                // ordinary CHAINED DECODE, which already builds step N+1 on
+                // step N's lazy tokens with no eval between: sliding rows
+                // STAGE functionally (and the exact verify road writes
+                // nothing in place), full rows' WRITE-022 in-kernel stores
+                // are ordered by the write-fence value threaded through the
+                // layer caches as graph edges, and every other cache
+                // transition is a functional rebind. Profiled at depth 3,
+                // the per-column eval made `v2.mtp.verify.build` 111.6 ms of
+                // a ~140 ms round; the whole round now evaluates once at its
+                // asyncEval boundary. Committed-token parity vs the serial
+                // arm stays the gate for this change (8/8 bit-identical).
                 argmaxColumns.append(columnArgmax)
                 hiddenColumns.append(output.lastHidden)
             }
@@ -92,6 +115,6 @@ extension EngineLoopV2 {
             hidden = output.lastHidden
         }
 
-        return (argmax, hidden, eagerCacheInnerState(caches))
+        return (argmax, hidden, mtpCompactVerifyRoots(caches))
     }
 }

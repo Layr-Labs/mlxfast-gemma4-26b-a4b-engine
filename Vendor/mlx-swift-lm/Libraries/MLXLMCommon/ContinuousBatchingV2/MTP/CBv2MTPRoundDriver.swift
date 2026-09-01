@@ -68,6 +68,11 @@ final class CBv2MTPRoundInFlight {
         /// Lazy [B, 1+k, H] pre-norm hidden — the next carry is gathered
         /// from it at the finalize sync (index = accepted position).
         let lastHidden: MLXArray
+        /// MTP widened-round banks holding a staged stash: finalize calls
+        /// `mtpCommitWidened(confirmed:)` on each with the per-row committed
+        /// counts (batch row order). Empty when the round used per-row
+        /// staging.
+        var widenedBanks: [CBv2LayerCache] = []
     }
 
     /// nil when this round only seeded (no row had a valid carry yet).
@@ -171,7 +176,10 @@ final class CBv2MTPRoundDriver {
     /// 1. The per-arm behaviour differs. MTP adapts up to this ceiling each round.
     /// DFlash proposes a fixed block of this size, because block diffusion drafts
     /// a whole block at once. The constant you edit is the same on both arms.
-    static let submissionDraftDepth = 3
+    // The measured B=8 assistant/verify path has lower goodput than the
+    // target-only cohort path at every admitted depth. A zero ceiling is the
+    // controller's explicit target-only policy and skips all MTP bookkeeping.
+    static let submissionDraftDepth = 0
 
     /// The effective adaptive-depth ceiling: the trusted envelope's max, bounded
     /// by the participant's `submissionDraftDepth`. Pure and static so the cap is

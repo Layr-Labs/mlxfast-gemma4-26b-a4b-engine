@@ -40,14 +40,25 @@ extension EngineLoopV2 {
             let rec: CBv2ScheduledRequest
             let targets: [Int]
             let accepted: Int
+            let naturalEmitted: Int
         }
 
-        // Resolve each row's natural target-authoritative prefix, then choose
-        // one committed width for the rectangular step. This keeps subsequent
-        // quantized MoE target batches shape-identical across all rows.
+        // MTP-ROWCOMMIT: resolve each row's natural target-authoritative
+        // prefix and commit EACH ROW ITS OWN width. The predecessor clamped
+        // every row to the cohort MINIMUM ("one committed width for the
+        // rectangular step"), which at B=8 collapses realized speculation to
+        // P(all 8 rows accept) — measured 1.215 tokens/stream/round at a
+        // 0.827 per-draft acceptance, where per-row commit realizes 1.83.
+        // The rectangular-shape invariant the min() protected does NOT bind
+        // the commit width: the NEXT round plans the same [B, 1+k] verify
+        // rectangle regardless of how many tokens each row confirmed here
+        // (every surviving row carries exactly one seed token + hidden), the
+        // staged KV transaction below already rolls back PER ROW, and row
+        // positions are already ragged in CBv2. Step-global draft DEPTH
+        // (port-notes section 3.2) is untouched — one k per plan, chosen
+        // before the round.
         var outcomes: [RowOutcome] = []
         outcomes.reserveCapacity(verify.rows.count)
-        var commonEmitted = targetWidth
 
         for (batchIndex, metadata) in verify.rows.enumerated() {
             let id = metadata.id
@@ -74,14 +85,14 @@ extension EngineLoopV2 {
             }) {
                 naturalEmitted = stopIndex + 1
             }
-            commonEmitted = min(commonEmitted, naturalEmitted)
             outcomes.append(
                 RowOutcome(
                     batchIndex: batchIndex,
                     metadata: metadata,
                     rec: rec,
                     targets: targets,
-                    accepted: accepted))
+                    accepted: accepted,
+                    naturalEmitted: naturalEmitted))
         }
 
         round.finalizedVerifyIDs = Set(outcomes.map { $0.metadata.id })
@@ -89,14 +100,34 @@ extension EngineLoopV2 {
             decodeRowBucket: mtp.planDecodeRowBucket,
             finalizedVerifyIDs: round.finalizedVerifyIDs)
 
-        if !outcomes.isEmpty {
-            let stepAccepted = outcomes.map { min($0.accepted, commonEmitted) }.min() ?? 0
+        // MTP widened staging: the banks' commit kernel writes every row's
+        // confirmed prefix (ring BF16 + mirror q4) in one dispatch per
+        // layer; the per-row rollback/commit below then only closes
+        // counters. Confirmed counts are in BATCH ROW ORDER; departed rows
+        // commit nothing.
+        if let anyVerify = round.verify, !anyVerify.widenedBanks.isEmpty {
+            var confirmedByRow = [Int](repeating: 0, count: anyVerify.rows.count)
+            for outcome in outcomes {
+                confirmedByRow[outcome.batchIndex] = min(
+                    outcome.naturalEmitted, targetWidth)
+            }
+            for bank in anyVerify.widenedBanks {
+                bank.mtpCommitWidened(confirmed: confirmedByRow)
+            }
+        }
+
+        // MTP-ROWCOMMIT: acceptance statistics feed the adaptive depth
+        // controller per row rather than as the cohort minimum — the
+        // controller's expected-committed estimator should price what a row
+        // actually realizes, not the all-eight-agree tail event.
+        for outcome in outcomes {
+            let rowAccepted = min(outcome.accepted, outcome.naturalEmitted)
             let observedDrafts =
-                commonEmitted <= stepAccepted
-                ? commonEmitted : min(k, stepAccepted + 1)
+                outcome.naturalEmitted <= rowAccepted
+                ? outcome.naturalEmitted : min(k, rowAccepted + 1)
             mtp.recordStepAcceptance(
                 drafted: k,
-                accepted: stepAccepted,
+                accepted: rowAccepted,
                 observedDrafts: observedDrafts,
                 decodeRowBucket: mtp.planDecodeRowBucket)
         }
@@ -107,7 +138,8 @@ extension EngineLoopV2 {
             let id = metadata.id
             let rec = outcome.rec
             let accepted = outcome.accepted
-            let emitted = Array(outcome.targets.prefix(commonEmitted))
+            // MTP-ROWCOMMIT: each row commits its own natural width.
+            let emitted = Array(outcome.targets.prefix(outcome.naturalEmitted))
 
             // Confirm in order with the same stop and length semantics as the
             // ordinary finalize loop.

@@ -46,17 +46,30 @@ final class CBv2MTPDepthController {
     /// PARTICIPANT POLICY LEVER (editable; the participant contract names
     /// this controller as the adaptive policy a submission may change).
     ///
-    /// This submission runs TARGET-ONLY: the controller never selects a
-    /// positive draft depth, so no seed step, no verify step, and no cost
-    /// probe is ever planned. The sealed verification mode for this track is
-    /// `.serialTarget`, where a depth-k round costs 1+k FULL target forwards;
-    /// the adaptive policy therefore converges to depth 0 on its own, but it
-    /// keeps re-proving that at every probe cadence (a seed step plus a
-    /// 1+k verify step) — pure loss on this arm. Pinning the policy at 0
-    /// removes those rounds. Every committed token is still produced by an
-    /// ordinary target decode step, so the emitted stream stays bit-identical
-    /// to serial decode.
-    static let speculationEnabled = false
+    /// Re-armed by the MTP-B8 lane: the incumbent pinned this false because
+    /// under the `.serialTarget` oracle a depth-k round costs 1+k FULL target
+    /// forwards and the adaptive policy converged to 0 while paying probe
+    /// rounds to keep re-proving it. This branch replaces the oracle's
+    /// EXECUTION with a batched-exact strategy (per-column bit-identical to
+    /// the serial oracle by construction), so a positive depth can pay and
+    /// the adaptive policy is worth running again. The policy still owns the
+    /// decision: with the exact strategy slower than plain decode on a given
+    /// machine, goodput converges to depth 0 exactly as before.
+    static let speculationEnabled = true
+
+    /// PROBE-ONLY depth force. `DARKBLOOM_CBV2_MTP_FORCE_DEPTH=<k>` pins the
+    /// controller's decision to `min(k, maxDepth)` for local acceptance and
+    /// cost measurement, bypassing the adaptive policy's convergence. Absent
+    /// (the ranked box sets nothing) this is inert and the adaptive policy
+    /// above is the only decision-maker.
+    private static let probeForcedDepth: Int? = {
+        guard
+            let raw = ProcessInfo.processInfo.environment[
+                "DARKBLOOM_CBV2_MTP_FORCE_DEPTH"],
+            let value = Int(raw), value >= 0
+        else { return nil }
+        return value
+    }()
 
     private struct CostState {
         var samples = 0
@@ -324,6 +337,13 @@ final class CBv2MTPDepthController {
                     depth: 0, decodeRowBucket: bucket,
                     reason: maxDepth == 0 ? "max_depth_zero" : "ineligible",
                     isExploration: false),
+                mutate: mutate)
+        }
+        if let forced = Self.probeForcedDepth {
+            return finish(
+                CBv2MTPDepthDecision(
+                    depth: min(forced, maxDepth), decodeRowBucket: bucket,
+                    reason: "probe_forced", isExploration: false),
                 mutate: mutate)
         }
         if let fixedDepth {

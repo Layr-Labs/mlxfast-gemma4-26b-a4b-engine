@@ -59,6 +59,23 @@ public protocol CBv2MTPForwardable: AnyObject {
     /// plain forward on the logits side.
     func cbv2ForwardWithHidden(_ tokens: MLXArray, caches: [KVCache])
         -> (logits: MLXArray, lastHidden: MLXArray)
+    /// MTP-BATCHED-VERIFY: one LAYER-MAJOR pass over `tokens` = [B, 1+k]
+    /// verify columns, per-column exact against the serial column loop
+    /// (each column's attention, norms, router, and tail run the same
+    /// [B, 1] roads a lone column forward runs; only cross-column
+    /// weight-plane batching that is row-exact may differ). Returns
+    /// per-column argmax [B, 1] int32 and pre-norm hidden [B, 1, H]
+    /// arrays, or nil when the model cannot serve this geometry — the
+    /// caller then keeps the serial column loop.
+    func cbv2VerifyColumns(_ tokens: MLXArray, caches: [KVCache])
+        -> (argmax: [MLXArray], hidden: [MLXArray])?
+}
+
+extension CBv2MTPForwardable {
+    /// Models without a batched verify road keep the serial column loop.
+    public func cbv2VerifyColumns(_ tokens: MLXArray, caches: [KVCache])
+        -> (argmax: [MLXArray], hidden: [MLXArray])?
+    { nil }
 }
 
 /// Steppable models that can drive MTP rounds. Additive refinement of
@@ -76,10 +93,19 @@ public protocol CBv2MTPSteppableModel: CBv2SteppableModel {
     /// [B, L, hidden]. Same cache/attention semantics as `forward`.
     func forwardWithHidden(tokens: MLXArray, caches: [CBv2AttendingLayerCache])
         -> (logits: MLXArray, lastHidden: MLXArray)
+    /// MTP-BATCHED-VERIFY twin of `CBv2MTPForwardable.cbv2VerifyColumns`.
+    /// nil keeps the serial column loop.
+    func verifyColumns(tokens: MLXArray, caches: [CBv2AttendingLayerCache])
+        -> (argmax: [MLXArray], hidden: [MLXArray])?
 }
 
 extension CBv2MTPSteppableModel {
     public var mtpTargetIdentity: ObjectIdentifier? { nil }
+
+    /// Default: no batched verify road.
+    public func verifyColumns(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> (argmax: [MLXArray], hidden: [MLXArray])? { nil }
 }
 
 // MARK: - Drafter seam

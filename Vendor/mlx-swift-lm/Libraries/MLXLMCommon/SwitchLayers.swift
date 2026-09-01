@@ -199,7 +199,7 @@ public struct DeferredWeightedExpertRows {
     public let inverseOrder: MLXArray
     public let weights: MLXArray
 
-    init(sortedOutputs: MLXArray, inverseOrder: MLXArray, weights: MLXArray) {
+    public init(sortedOutputs: MLXArray, inverseOrder: MLXArray, weights: MLXArray) {
         self.sortedOutputs = sortedOutputs
         self.inverseOrder = inverseOrder
         self.weights = weights
@@ -1599,9 +1599,16 @@ public class SwitchGLU: Module {
         isProductionPrefill: Bool = true,
         routeTable: SwitchRouteTable? = nil
     ) -> DeferredWeightedExpertRows? {
-        let isEightRowDecode =
-            !isProductionPrefill && x.dim(0) == 8 && indices.size == 64
-        guard fuseSortedReduction && isEightRowDecode,
+        // MTP-BATCHED-VERIFY: the widened verify rectangle (8L rows,
+        // L <= 8 columns of the decode cohort) takes the same deferred road;
+        // the sorted gather and the unsort carrier are per-row exact at any
+        // admitted row count, and the per-8-row consumers slice their own
+        // inverse-order windows.
+        let rowCount = x.dim(0)
+        let isDecodeCohort =
+            !isProductionPrefill && rowCount >= 8 && rowCount <= 64
+                && rowCount.isMultiple(of: 8) && indices.size == rowCount * 8
+        guard fuseSortedReduction && isDecodeCohort,
             supportsWeightedExpertUnsort(x, indices, weights: weights)
         else { return nil }
 

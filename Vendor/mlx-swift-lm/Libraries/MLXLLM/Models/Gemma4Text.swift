@@ -382,6 +382,10 @@ func geluFusionClaimsPinnedDecode(_ gate: MLXArray, _ up: MLXArray) -> Bool {
     else { return false }
     let s = gate.shape
     if s.count == 3, s[1] == 1, s[0] == 8 || s[0] == 64 { return true }
+    // MTP-BATCHED-VERIFY widened rectangles (8L rows, L in 2...8): the
+    // shaped trace is per-element, so each widened row computes exactly the
+    // serial column's words.
+    if s.count == 3, s[1] == 1, s[0] > 8, s[0] <= 64, s[0] % 8 == 0 { return true }
     if s.count == 2, s[0] == 64 { return true }
     return false
 }
@@ -893,6 +897,13 @@ private struct Gemma4QKVRopeParameters {
     let frequencies: MLXArray
     let usesFrequencies: Bool
 }
+
+let gemma4VerifyHeadWidenedEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_CBV2_MTP_HEAD_WIDENED"]
+    else { return false }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}()
 
 private let gemma4QKVNormRopeEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
@@ -1466,6 +1477,63 @@ private func gemma4FusedQKVNorm(
     return (outputs[0], outputs[1], outputs[2], fusedRope)
 }
 
+/// MTP-BATCHED-VERIFY: the fused QKV norm+RoPE over widened verify rows.
+/// The kernel body is untouched and row-generic (`batch = local_row /
+/// heads` indexes the offsets array), so passing `8 * L` rows with a
+/// widened per-row offsets array (`base[b] + column(row)`) produces each
+/// column's exact decode-kernel words. Outputs are head-major widened:
+/// q `[8L, 16, 1, D]`, k/v `[8L, kvHeads, 1, D]`.
+private func gemma4FusedQKVNormVerifyRows(
+    q: MLXArray, k: MLXArray, v: MLXArray,
+    qWeight: MLXArray, kWeight: MLXArray, eps: Float,
+    keyValueShared: Bool, positionOffsets: MLXArray,
+    ropeParameters: Gemma4QKVRopeParameters
+) -> (q: MLXArray, k: MLXArray, v: MLXArray)? {
+    guard gemma4QKVNormRopeEnabled,
+        eps == 1.0e-6,
+        q.dtype == .bfloat16, k.dtype == .bfloat16, v.dtype == .bfloat16,
+        qWeight.dtype == .bfloat16, kWeight.dtype == .bfloat16,
+        positionOffsets.dtype == .int32,
+        q.ndim == 4, k.ndim == 4, v.ndim == 4,
+        q.dim(0) > 8, q.dim(0) <= 64, q.dim(0).isMultiple(of: 8),
+        q.dim(1) == 1, q.dim(2) == 16,
+        k.dim(0) == q.dim(0), k.dim(1) == 1, v.shape == k.shape,
+        q.dim(3) == k.dim(3),
+        (q.dim(3) == 256 && k.dim(2) == 8) || (q.dim(3) == 512 && k.dim(2) == 2),
+        qWeight.shape == [q.dim(3)], kWeight.shape == [q.dim(3)],
+        positionOffsets.shape == [q.dim(0)],
+        !keyValueShared || v.shape == k.shape,
+        !ropeParameters.usesFrequencies
+            || ropeParameters.frequencies.size == q.dim(3) / 2
+    else { return nil }
+
+    let rows = q.dim(0)
+    let dimension = q.dim(3)
+    let qRows = rows * 16
+    let kRows = rows * k.dim(2)
+    let threads = dimension / 4
+    let normRows = qRows + kRows + (keyValueShared ? 0 : kRows)
+    let outputs = gemma4QKVNormKernel(
+        [q, k, v, qWeight, kWeight, positionOffsets,
+         ropeParameters.log2Base, ropeParameters.frequencies],
+        template: [
+            ("T", q.dtype), ("D", dimension), ("Q_ROWS", qRows), ("K_ROWS", kRows),
+            ("Q_HEADS", 16), ("K_HEADS", k.dim(2)),
+            ("KEY_VALUE_SHARED", keyValueShared), ("APPLY_ROPE", true),
+            ("USE_FREQS", ropeParameters.usesFrequencies),
+        ],
+        grid: (normRows * threads, 1, 1), threadGroup: (threads, 1, 1),
+        outputShapes: [
+            [rows, 16, 1, dimension], [rows, k.dim(2), 1, dimension], v.shape,
+        ],
+        outputDTypes: [q.dtype, k.dtype, v.dtype]
+    )
+    CBv2EngageMark.once("qkv-norm-rope-verify-rows")
+    // The kernel writes V in its input layout; head-major is applied here
+    // exactly as the decode path applies it after the fused call.
+    return (outputs[0], outputs[1], outputs[2].transposed(0, 2, 1, 3))
+}
+
 private class ScaledLinear: Module {
     let weight: MLXArray
     let scalar: Float
@@ -1878,6 +1946,125 @@ private class Gemma4Attention: Module {
     /// Invariant 1 (report 10 §4): RoPE offsets are per-row absolutes,
     /// snapshotted BEFORE `updateAndAttend` advances the rows, and KV-shared
     /// layers reuse the SOURCE layer's captured snapshot byte-identically.
+    /// MTP-BATCHED-VERIFY: every verify column's attention for this layer.
+    /// The Q/K/V projections run ONCE over the column-major widened rows
+    /// (per-column outputs are the [8,1] dispatch's words by tile identity);
+    /// norms and RoPE run per column through the exact decode kernels; the
+    /// attend runs as ONE multi-column exact-q4 dispatch on sliding layers
+    /// (per-column write-through on full layers); the output projection runs
+    /// per column. Returns per-column [8, 1, H] outputs, or nil BEFORE any
+    /// cache side effect.
+    /// MTP-BATCHED-VERIFY widened: the whole verify rectangle's attention
+    /// with ONE batched Q/K/V, ONE fused norm+RoPE over widened rows (the
+    /// kernel is row-generic; the widened offsets array carries each row's
+    /// column position), ONE grouped stripe pack + multi-column attend on
+    /// sliding layers (per-column write-through on full layers), and ONE
+    /// batched output projection. Returns the widened `[8L, 1, H]`
+    /// attention output, or nil BEFORE any cache side effect.
+    fileprivate func mtpVerifyForwardWidened(
+        normedAll: MLXArray,
+        columnCount: Int,
+        cache: KVCache?,
+        offsetsWidened: MLXArray
+    ) -> MLXArray? {
+        guard !usesSharedKV, columnCount >= 2, columnCount <= 8,
+            let layerCache = cache as? CBv2LayerCache,
+            let kProj, let kNorm, vNorm != nil,
+            let qQuant = qProj as? QuantizedLinear, qQuant.bias == nil,
+            let kQuant = kProj as? QuantizedLinear, kQuant.bias == nil,
+            normedAll.ndim == 3, normedAll.dim(0) == 8 * columnCount,
+            normedAll.dim(1) == 1
+        else { return nil }
+        var vQuant: QuantizedLinear?
+        if let vProj {
+            guard let quantized = vProj as? QuantizedLinear, quantized.bias == nil
+            else { return nil }
+            vQuant = quantized
+        }
+        let widenedRows = 8 * columnCount
+
+        guard
+            let qAll = CBv2AttentionQKVMMA8V1.matmulVerifyRows(
+                x: normedAll, weight: qQuant.weight, scales: qQuant.scales,
+                biases: qQuant.biases, groupSize: qQuant.groupSize,
+                bits: qQuant.bits, mode: qQuant.mode),
+            let kAll = CBv2AttentionQKVMMA8V1.matmulVerifyRows(
+                x: normedAll, weight: kQuant.weight, scales: kQuant.scales,
+                biases: kQuant.biases, groupSize: kQuant.groupSize,
+                bits: kQuant.bits, mode: kQuant.mode)
+        else { return nil }
+        var vProjected: MLXArray?
+        if let vQuant {
+            guard
+                let projected = CBv2AttentionQKVMMA8V1.matmulVerifyRows(
+                    x: normedAll, weight: vQuant.weight, scales: vQuant.scales,
+                    biases: vQuant.biases, groupSize: vQuant.groupSize,
+                    bits: vQuant.bits, mode: vQuant.mode)
+            else { return nil }
+            vProjected = projected
+        }
+
+        let qRaw = qAll.reshaped(widenedRows, 1, nHeads, effectiveHeadDim)
+        let kRaw = kAll.reshaped(widenedRows, 1, nKvHeads, effectiveHeadDim)
+        let vRaw =
+            vProjected?.reshaped(widenedRows, 1, nKvHeads, effectiveHeadDim) ?? kRaw
+        guard
+            let fused = gemma4FusedQKVNormVerifyRows(
+                q: qRaw, k: kRaw, v: vRaw,
+                qWeight: qNorm.weight, kWeight: kNorm.weight,
+                eps: config.rmsNormEps,
+                keyValueShared: vProj == nil,
+                positionOffsets: offsetsWidened,
+                ropeParameters: qkvRopeParameters),
+            fused.q.dtype == .bfloat16
+        else { return nil }
+
+        let attnAll: MLXArray
+        if let widened = layerCache.mtpVerifyStageAndAttendColumnsWidened(
+            queries: fused.q, keysAll: fused.k, valuesAll: fused.v,
+            columns: columnCount, scale: scale)
+        {
+            attnAll = widened
+        } else if let widenedFull = layerCache.mtpVerifyAttendColumnsD512(
+            queriesAll: fused.q, keysAll: fused.k, valuesAll: fused.v,
+            columns: columnCount, scale: scale)
+        {
+            attnAll = widenedFull
+        } else {
+            // Any refusal above happens before side effects: per-column
+            // write-through attends remain the exact fallback.
+            var perColumn: [MLXArray] = []
+            perColumn.reserveCapacity(columnCount)
+            for c in 0 ..< columnCount {
+                let rowRange = (c * 8) ..< ((c + 1) * 8)
+                perColumn.append(
+                    layerCache.updateAndAttend(
+                        queries: fused.q[rowRange, 0..., 0..., 0...],
+                        keys: fused.k[rowRange, 0..., 0..., 0...],
+                        values: fused.v[rowRange, 0..., 0..., 0...],
+                        scale: scale, sinks: nil))
+            }
+            attnAll = concatenated(perColumn, axis: 0)
+        }
+
+        let merged = attnAll.transposed(0, 2, 1, 3).reshaped(widenedRows, 1, -1)
+        if let oQuant = oProj as? QuantizedLinear, oQuant.bias == nil,
+            let projected = CBv2AttentionOQMVV1.matmulVerifyRows(
+                x: merged, weight: oQuant.weight, scales: oQuant.scales,
+                biases: oQuant.biases, groupSize: oQuant.groupSize,
+                bits: oQuant.bits, mode: oQuant.mode)
+        {
+            return projected
+        }
+        var outs: [MLXArray] = []
+        outs.reserveCapacity(columnCount)
+        for c in 0 ..< columnCount {
+            outs.append(
+                outputProjection(merged[(c * 8) ..< ((c + 1) * 8), 0..., 0...]))
+        }
+        return concatenated(outs, axis: 0)
+    }
+
     private func forwardV2(
         _ x: MLXArray,
         layerCache: any CBv2AttendingLayerCache,
@@ -2380,6 +2567,28 @@ private enum Gemma4RouterFinalistsV1 {
             outputDTypes: [.uint32]
         )[0]
     }
+
+    /// MTP-BATCHED-VERIFY: the identical per-row selection network over the
+    /// widened verify rows (the kernel is row-generic; the glue fold's own
+    /// phase 1 is this network verbatim, so indices match the serial road's
+    /// integer-for-integer, ties included).
+    static func applyVerifyRows(_ scores: MLXArray, topK: Int, kth: Int) -> MLXArray? {
+        guard enabled, topK == 8, kth == 120,
+            scores.ndim == 3,
+            scores.dim(0) > 8, scores.dim(0) <= 64,
+            scores.dim(0).isMultiple(of: 8),
+            scores.dim(1) == 1, scores.dim(2) == 128,
+            scores.dtype == .bfloat16
+        else { return nil }
+        let rows = scores.dim(0)
+        return kernel(
+            [scores],
+            grid: (rows * 128, 1, 1),
+            threadGroup: (128, 1, 1),
+            outputShapes: [[rows, 1, 8]],
+            outputDTypes: [.uint32]
+        )[0]
+    }
 }
 
 /// GLUE-FOLD (G2): merge the two ADJACENT single-threadgroup route glue
@@ -2621,11 +2830,12 @@ private enum Gemma4FusedLayerGlue {
                     acc += xi * xi;
                 }
                 acc = simd_sum(acc);
+                if (simd_group_id == 0) local_sums[simd_lane_id] = 0;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
                 if (simd_lane_id == 0) local_sums[simd_group_id] = acc;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 if (simd_group_id == 0) {
-                    acc = simd_sum(
-                        simd_lane_id < 22 ? local_sums[simd_lane_id] : 0.0f);
+                    acc = simd_sum(local_sums[simd_lane_id]);
                     if (simd_lane_id == 0) {
                         \(slot) = metal::precise::rsqrt(acc / 2816.0f + 1e-06f);
                     }
@@ -2654,16 +2864,19 @@ private enum Gemma4FusedLayerGlue {
             }
             acc_a = simd_sum(acc_a);
             acc_b = simd_sum(acc_b);
+            if (simd_group_id == 0) {
+                local_sums[simd_lane_id] = 0;
+                local_sums_b[simd_lane_id] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
             if (simd_lane_id == 0) {
                 local_sums[simd_group_id] = acc_a;
                 local_sums_b[simd_group_id] = acc_b;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (simd_group_id == 0) {
-                acc_a = simd_sum(
-                    simd_lane_id < 22 ? local_sums[simd_lane_id] : 0.0f);
-                acc_b = simd_sum(
-                    simd_lane_id < 22 ? local_sums_b[simd_lane_id] : 0.0f);
+                acc_a = simd_sum(local_sums[simd_lane_id]);
+                acc_b = simd_sum(local_sums_b[simd_lane_id]);
                 if (simd_lane_id == 0) {
                     local_inv[0] = metal::precise::rsqrt(acc_a / 2816.0f + 1e-06f);
                     local_inv[1] = metal::precise::rsqrt(acc_b / 2816.0f + 1e-06f);
@@ -2694,7 +2907,7 @@ private enum Gemma4FusedLayerGlue {
     }
 
     private static let normResidualKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_norm_residual_2816_bf16_v1_nb1",
+        name: "gemma4_glue_norm_residual_2816_bf16_v1",
         inputNames: ["x", "res", "w"],
         outputNames: ["out"],
         source: """
@@ -2728,7 +2941,7 @@ private enum Gemma4FusedLayerGlue {
 // T28 second sample marker (r2): content identical to ranked 32f5d19f apart from this comment.
     private static let attentionBranchPrefixKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_glue_attention_branch_prefix_2816_bf16_v1_nb1",
+            name: "gemma4_glue_attention_branch_prefix_2816_bf16_v1",
             inputNames: ["attn", "res", "wa", "wd", "we", "wr"],
             outputNames: ["out", "dense", "expert", "router", "xSums"],
             source: """
@@ -2770,7 +2983,7 @@ private enum Gemma4FusedLayerGlue {
         )
 
     private static let dualPreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_dual_prenorm_xsum_2816_bf16_v2_nb1",
+        name: "gemma4_glue_dual_prenorm_xsum_2816_bf16_v2",
         inputNames: ["x", "w1", "w2"],
         outputNames: ["out1", "out2", "xSums"],
         source: """
@@ -2836,7 +3049,7 @@ private enum Gemma4FusedLayerGlue {
         """
 
     private static let tailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_2816_bf16_v2_nb1",
+        name: "gemma4_glue_tail_2816_bf16_v2",
         inputNames: ["a", "b", "res", "w1", "w2", "w3", "s"],
         outputNames: ["out"],
         source: tailSource,
@@ -2844,7 +3057,7 @@ private enum Gemma4FusedLayerGlue {
     )
 
     private static let pairedTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_paired_rms_2816_bf16_v1_nb1",
+        name: "gemma4_glue_tail_paired_rms_2816_bf16_v1",
         inputNames: ["a", "b", "res", "w1", "w2", "w3", "s"],
         outputNames: ["out"],
         source: pairedRmsTailSource(tailSource),
@@ -2884,6 +3097,119 @@ private enum Gemma4FusedLayerGlue {
         let expertNorm: MLXArray
         let routerNorm: MLXArray
         let denseSums: CBv2DenseMLPQMVV1.ActivationSums
+    }
+
+    /// MTP-BATCHED-VERIFY: the branch prefix over widened verify rows. The
+    /// body is the promoted kernel's with ONE changed line: the xsum table
+    /// lands in per-8-row windows (`(row/8)*5632 + lid*8 + row%8`) so each
+    /// column's window is byte-identical to the serial column's own table
+    /// and the widened gate/up twin consumes windows directly.
+    private static let attentionBranchPrefixVerifyKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_glue_attention_branch_prefix_2816_bf16_mrows_v1",
+            inputNames: ["attn", "res", "wa", "wd", "we", "wr"],
+            outputNames: ["out", "dense", "expert", "router", "xSums"],
+            source: """
+                const uint row = threadgroup_position_in_grid.x;
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint simd_lane_id = thread_index_in_simdgroup;
+                const uint simd_group_id = simdgroup_index_in_threadgroup;
+                threadgroup float local_inv[1];
+                threadgroup float local_sums[32];
+                const uint base = row * 2816 + lid * 4;
+                const uint wbase = lid * 4;
+            \(rmsReduce("attn", into: "local_inv[0]"))
+                const float attn_inv = local_inv[0];
+                T outv[4];
+                for (int i = 0; i < 4; i++) {
+                    const T normed = static_cast<T>(
+                        wa[wbase + i]
+                            * static_cast<T>(
+                                (float)attn[base + i] * attn_inv));
+                    outv[i] = res[base + i] + normed;
+                    out[base + i] = outv[i];
+                }
+            \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
+                of: "(float)outv[base + i]", with: "(float)outv[i]"))
+                const float branch_inv = local_inv[0];
+                float xsum = 0.0f;
+                for (int i = 0; i < 4; i++) {
+                    const T nx =
+                        static_cast<T>((float)outv[i] * branch_inv);
+                    const T densev = wd[wbase + i] * nx;
+                    dense[base + i] = densev;
+                    expert[base + i] = we[wbase + i] * nx;
+                    router[base + i] = wr[wbase + i] * nx;
+                    xsum += densev;
+                }
+                xSums[(row >> 3) * 5632u + lid * 8 + (row & 7u)] = xsum;
+            """,
+            ensureRowContiguous: true
+        )
+
+    struct VerifyBranchPrefix {
+        let out: MLXArray
+        let denseNorm: MLXArray
+        let expertNorm: MLXArray
+        let routerNorm: MLXArray
+        let rawSums: MLXArray
+    }
+
+    static func attentionBranchPrefixVerifyRows(
+        attn: MLXArray,
+        residual: MLXArray,
+        postAttentionWeight: MLXArray,
+        denseWeight: MLXArray,
+        expertWeight: MLXArray,
+        routerWeight: MLXArray,
+        eps: Float
+    ) -> VerifyBranchPrefix? {
+        guard CBv2DenseMLPQMVV1.enabled,
+            CBv2DenseMLPQMVV1.activationSumsEnabled,
+            enabled,
+            eps == Self.eps,
+            attn.ndim == 3,
+            attn.dim(0) > rows, attn.dim(0) <= 8 * rows,
+            attn.dim(0).isMultiple(of: rows),
+            attn.dim(1) == 1, attn.dim(2) == axis,
+            attn.dtype == .bfloat16,
+            postAttentionWeight.ndim == 1, postAttentionWeight.dim(0) == axis,
+            postAttentionWeight.dtype == .bfloat16,
+            residual.shape == attn.shape, residual.dtype == .bfloat16,
+            denseWeight.ndim == 1, denseWeight.dim(0) == axis,
+            denseWeight.dtype == .bfloat16,
+            expertWeight.ndim == 1, expertWeight.dim(0) == axis,
+            expertWeight.dtype == .bfloat16,
+            routerWeight.ndim == 1, routerWeight.dim(0) == axis,
+            routerWeight.dtype == .bfloat16
+        else { return nil }
+        let widenedRows = attn.dim(0)
+        let outs = attentionBranchPrefixVerifyKernel(
+            [
+                attn, residual, postAttentionWeight, denseWeight,
+                expertWeight, routerWeight,
+            ],
+            template: [("T", attn.dtype)],
+            grid: (widenedRows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: [
+                [widenedRows, 1, axis],
+                [widenedRows, 1, axis],
+                [widenedRows, 1, axis],
+                [widenedRows, 1, axis],
+                [(axis / 128) * 32 * widenedRows],
+            ],
+            outputDTypes: [
+                .bfloat16, .bfloat16, .bfloat16, .bfloat16, .float32,
+            ]
+        )
+        CBv2EngageMark.once("attention-branch-prefix-verify-rows")
+        return VerifyBranchPrefix(
+            out: outs[0],
+            denseNorm: outs[1],
+            expertNorm: outs[2],
+            routerNorm: outs[3],
+            rawSums: outs[4])
     }
 
     /// PREFIX-001. The returned `out` is still materialized because the layer
@@ -3011,7 +3337,7 @@ private enum Gemma4FusedLayerGlue {
         """
 
     private static let tailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_chain_2816_bf16_v1_nb1",
+        name: "gemma4_glue_tail_chain_2816_bf16_v1",
         inputNames: ["a", "b", "res", "w1", "w2", "w3", "s", "wn"],
         outputNames: ["out", "normed"],
         source: tailChainSource,
@@ -3019,7 +3345,7 @@ private enum Gemma4FusedLayerGlue {
     )
 
     private static let pairedTailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_chain_paired_rms_2816_bf16_v1_nb1",
+        name: "gemma4_glue_tail_chain_paired_rms_2816_bf16_v1",
         inputNames: ["a", "b", "res", "w1", "w2", "w3", "s", "wn"],
         outputNames: ["out", "normed"],
         source: pairedRmsTailSource(tailChainSource),
@@ -3048,7 +3374,7 @@ private enum Gemma4FusedLayerGlue {
     """
 
     private static let deferredTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1_nb1",
+        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1",
         inputNames: [
             "a", "sorted", "inverse", "route_weights", "res",
             "w1", "w2", "w3", "s",
@@ -3093,7 +3419,7 @@ private enum Gemma4FusedLayerGlue {
 
     private static let deferredTailChainKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1_nb1",
+            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1",
             inputNames: [
                 "a", "sorted", "inverse", "route_weights", "res",
                 "w1", "w2", "w3", "s", "wn",
@@ -3150,13 +3476,131 @@ private enum Gemma4FusedLayerGlue {
     private static func admitsDeferred(
         _ expertRows: DeferredWeightedExpertRows
     ) -> Bool {
+        // MTP-BATCHED-VERIFY: the sorted plane may be the MERGED verify
+        // rectangle's ([64 * columns, axis]); the kernel reads it only
+        // through this carrier's 64 inverse-order indices, so any
+        // 64-multiple row count with the same width serves the identical
+        // per-row arithmetic.
         expertRows.sortedOutputs.dtype == .bfloat16
-            && expertRows.sortedOutputs.shape == [64, axis]
+            && expertRows.sortedOutputs.ndim == 2
+            && expertRows.sortedOutputs.dim(0) >= 64
+            && expertRows.sortedOutputs.dim(0).isMultiple(of: 64)
+            && expertRows.sortedOutputs.dim(1) == axis
             && expertRows.inverseOrder.dtype == .uint32
             && expertRows.inverseOrder.ndim == 1
             && expertRows.inverseOrder.size == 64
             && expertRows.weights.dtype == .bfloat16
             && expertRows.weights.shape == [rows, 8]
+    }
+
+    /// MTP-BATCHED-VERIFY: the deferred chained tail over widened verify
+    /// rows in ONE dispatch. The kernel is the promoted
+    /// `gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1` UNCHANGED —
+    /// its expert gather (`inverse[row*8+slot]` into the sorted plane) and
+    /// every norm are per-row, so widened rows with the MERGED carrier
+    /// (inverse and weights flat over all columns) produce each column's
+    /// exact serial words.
+    static func tailChainedDeferredVerifyRows(
+        mlpOut: MLXArray,
+        sortedOutputs: MLXArray,
+        inverseOrder: MLXArray,
+        routeWeights: MLXArray,
+        residual: MLXArray,
+        w1: MLXArray,
+        w2: MLXArray,
+        w3: MLXArray,
+        layerScalar: MLXArray,
+        nextInputNormWeight: MLXArray,
+        eps: Float
+    ) -> (out: MLXArray, normedNext: MLXArray)? {
+        guard enabled, eps == Self.eps,
+            mlpOut.ndim == 3,
+            mlpOut.dim(0) > rows, mlpOut.dim(0) <= 8 * rows,
+            mlpOut.dim(0).isMultiple(of: rows),
+            mlpOut.dim(1) == 1, mlpOut.dim(2) == axis,
+            mlpOut.dtype == .bfloat16,
+            w1.ndim == 1, w1.dim(0) == axis, w1.dtype == .bfloat16,
+            sortedOutputs.dtype == .bfloat16,
+            sortedOutputs.ndim == 2,
+            sortedOutputs.dim(0) == mlpOut.dim(0) * 8,
+            sortedOutputs.dim(1) == axis,
+            inverseOrder.dtype == .uint32,
+            inverseOrder.size == mlpOut.dim(0) * 8,
+            routeWeights.dtype == .bfloat16,
+            routeWeights.size == mlpOut.dim(0) * 8,
+            residual.shape == mlpOut.shape,
+            residual.dtype == .bfloat16,
+            w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16,
+            w3.ndim == 1, w3.dim(0) == axis, w3.dtype == .bfloat16,
+            layerScalar.size == 1, layerScalar.dtype == .bfloat16,
+            nextInputNormWeight.ndim == 1,
+            nextInputNormWeight.dim(0) == axis,
+            nextInputNormWeight.dtype == .bfloat16
+        else { return nil }
+        CBv2EngageMark.once("glue-deferred-expert-tail-chain-verify-rows")
+        let widenedRows = mlpOut.dim(0)
+        let outs = deferredTailChainKernel(
+            [
+                mlpOut, sortedOutputs, inverseOrder,
+                routeWeights, residual, w1, w2, w3, layerScalar,
+                nextInputNormWeight,
+            ],
+            template: [("T", mlpOut.dtype)],
+            grid: (widenedRows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: [[widenedRows, 1, axis], [widenedRows, 1, axis]],
+            outputDTypes: [.bfloat16, .bfloat16]
+        )
+        return (outs[0], outs[1])
+    }
+
+    /// Widened plain deferred tail (final layer: no next-norm chain).
+    static func tailDeferredVerifyRows(
+        mlpOut: MLXArray,
+        sortedOutputs: MLXArray,
+        inverseOrder: MLXArray,
+        routeWeights: MLXArray,
+        residual: MLXArray,
+        w1: MLXArray,
+        w2: MLXArray,
+        w3: MLXArray,
+        layerScalar: MLXArray,
+        eps: Float
+    ) -> MLXArray? {
+        guard enabled, eps == Self.eps,
+            mlpOut.ndim == 3,
+            mlpOut.dim(0) > rows, mlpOut.dim(0) <= 8 * rows,
+            mlpOut.dim(0).isMultiple(of: rows),
+            mlpOut.dim(1) == 1, mlpOut.dim(2) == axis,
+            mlpOut.dtype == .bfloat16,
+            w1.ndim == 1, w1.dim(0) == axis, w1.dtype == .bfloat16,
+            sortedOutputs.dtype == .bfloat16,
+            sortedOutputs.ndim == 2,
+            sortedOutputs.dim(0) == mlpOut.dim(0) * 8,
+            sortedOutputs.dim(1) == axis,
+            inverseOrder.dtype == .uint32,
+            inverseOrder.size == mlpOut.dim(0) * 8,
+            routeWeights.dtype == .bfloat16,
+            routeWeights.size == mlpOut.dim(0) * 8,
+            residual.shape == mlpOut.shape,
+            residual.dtype == .bfloat16,
+            w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16,
+            w3.ndim == 1, w3.dim(0) == axis, w3.dtype == .bfloat16,
+            layerScalar.size == 1, layerScalar.dtype == .bfloat16
+        else { return nil }
+        CBv2EngageMark.once("glue-deferred-expert-tail-verify-rows")
+        let widenedRows = mlpOut.dim(0)
+        return deferredTailKernel(
+            [
+                mlpOut, sortedOutputs, inverseOrder,
+                routeWeights, residual, w1, w2, w3, layerScalar,
+            ],
+            template: [("T", mlpOut.dtype)],
+            grid: (widenedRows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: [[widenedRows, 1, axis]],
+            outputDTypes: [.bfloat16]
+        )[0]
     }
 
     static func tailChainedDeferred(
@@ -3786,6 +4230,125 @@ private enum Gemma4ZipRouterV1 {
             topKWeights: topKWeights,
             routeTable: routeTable)
     }
+
+    /// MTP-BATCHED-VERIFY: the zip's chains over a whole verify rectangle.
+    /// Router scores and the top-8 fold stay per column (their serial
+    /// kernels are M-pinned); the dense gate/up/GeLU/down chain and the
+    /// router weight tail run ONCE over column-major widened rows through
+    /// the widened twins of the serial kernels (tile-identical per column).
+    /// nil (no nodes with cache effects — everything here is pure graph)
+    /// sends the caller to the per-column zip.
+    struct VerifyZipped {
+        let denseOutByColumn: [MLXArray]
+        let expertNorms: MLXArray
+        let topKIndices: MLXArray
+        let topKWeights: MLXArray
+        let indicesByColumn: [MLXArray]
+        let weightsByColumn: [MLXArray]
+    }
+
+    static func runVerify(
+        router: Gemma4Router,
+        mlp: Gemma4MLP,
+        outs: [MLXArray],
+        prefixes: [Gemma4FusedLayerGlue.AttentionBranchPrefix],
+        eps: Float
+    ) -> VerifyZipped? {
+        let columns = outs.count
+        guard enabled, router.zipAdmits, columns >= 2, columns <= 8,
+            prefixes.count == columns,
+            outs.allSatisfy({
+                $0.ndim == 3 && $0.dim(0) == 8 && $0.dim(1) == 1
+                    && $0.dtype == .bfloat16
+            }),
+            let gateQuant = mlp.gateProj as? QuantizedLinear, gateQuant.bias == nil,
+            let upQuant = mlp.upProj as? QuantizedLinear, upQuant.bias == nil,
+            let downQuant = mlp.downProj as? QuantizedLinear, downQuant.bias == nil
+        else { return nil }
+        guard
+            let sumsAll = CBv2DenseMLPQMVV1.verifyConcatenatedSums(
+                prefixes.map { $0.denseSums })
+        else { return nil }
+
+        // Per column: the serial router chain's own kernels, INTERLEAVED
+        // with the batched dense chain through the same `MLX.depends`
+        // pairing discipline the serial zip uses — the encoder pairs
+        // independent dispatches into shared barrier stages so the router's
+        // small latency chain rides the dense chain's wide dispatches
+        // instead of serializing after them.
+        let n1All = concatenated(prefixes.map { $0.denseNorm }, axis: 0)
+        var scoresByColumn: [MLXArray] = []
+        scoresByColumn.reserveCapacity(columns)
+        for c in 0 ..< columns {
+            scoresByColumn.append(
+                router.zipScores(
+                    MLX.depends(input: prefixes[c].routerNorm, dependencies: [sumsAll])))
+        }
+        let denseIn = MLX.depends(
+            input: n1All, dependencies: [scoresByColumn[0]])
+        guard
+            let gateAll = CBv2DenseMLPQMVV1.matmulVerifyRowsGateUp(
+                x: denseIn, weight: gateQuant.weight, scales: gateQuant.scales,
+                biases: gateQuant.biases, groupSize: gateQuant.groupSize,
+                bits: gateQuant.bits, mode: gateQuant.mode,
+                concatenatedSums: sumsAll),
+            let upAll = CBv2DenseMLPQMVV1.matmulVerifyRowsGateUp(
+                x: denseIn, weight: upQuant.weight, scales: upQuant.scales,
+                biases: upQuant.biases, groupSize: upQuant.groupSize,
+                bits: upQuant.bits, mode: upQuant.mode,
+                concatenatedSums: sumsAll)
+        else { return nil }
+        let held = MLX.depends(
+            inputs: [gateAll, upAll], dependencies: [scoresByColumn[columns - 1]])
+        let activatedAll = gemma4GeluProduct(held[0], held[1])
+        guard
+            let downAll = CBv2DenseMLPQMVV1.matmulVerifyRowsDown(
+                x: activatedAll, weight: downQuant.weight,
+                scales: downQuant.scales, biases: downQuant.biases,
+                groupSize: downQuant.groupSize, bits: downQuant.bits,
+                mode: downQuant.mode)
+        else { return nil }
+        var indicesByColumn: [MLXArray] = []
+        indicesByColumn.reserveCapacity(columns)
+        for c in 0 ..< columns {
+            let fenced = MLX.depends(
+                input: scoresByColumn[c], dependencies: [downAll])
+            if let fold = Gemma4RouteGlueFoldV1.apply(
+                fenced, topK: router.topK, kth: router.kth)
+            {
+                indicesByColumn.append(fold.indices)
+            } else {
+                indicesByColumn.append(
+                    router.zipSelected(router.zipPartition(fenced)))
+            }
+        }
+
+        // Batched router weight tail (the serial tail's own stock kernels,
+        // row-exact over widened rows).
+        let scoresAll = concatenated(scoresByColumn, axis: 0)
+        let indicesAll = concatenated(indicesByColumn, axis: 0)
+        var weightsAll = MLX.takeAlong(scoresAll, indicesAll, axis: -1)
+        weightsAll = MLX.softmax(weightsAll, axis: -1, precise: true)
+        weightsAll = weightsAll * router.perExpertScale[indicesAll]
+
+        let n2All = concatenated(prefixes.map { $0.expertNorm }, axis: 0)
+        var denseOutByColumn: [MLXArray] = []
+        var weightsByColumn: [MLXArray] = []
+        denseOutByColumn.reserveCapacity(columns)
+        weightsByColumn.reserveCapacity(columns)
+        for c in 0 ..< columns {
+            denseOutByColumn.append(downAll[(c * 8) ..< ((c + 1) * 8), 0..., 0...])
+            weightsByColumn.append(weightsAll[(c * 8) ..< ((c + 1) * 8), 0..., 0...])
+        }
+        CBv2EngageMark.once("mtp-verify-zip-batched")
+        return VerifyZipped(
+            denseOutByColumn: denseOutByColumn,
+            expertNorms: n2All,
+            topKIndices: indicesAll,
+            topKWeights: weightsAll,
+            indicesByColumn: indicesByColumn,
+            weightsByColumn: weightsByColumn)
+    }
 }
 
 // MARK: - Decoder Layer
@@ -3873,6 +4436,401 @@ public class Gemma4DecoderLayer: Module {
         self._layerScalar.wrappedValue = MLXArray.ones([1], dtype: .float16)
 
         super.init()
+    }
+
+    // MARK: - MTP-BATCHED-VERIFY layer seams
+
+    /// One verify column's state between the layer's attention/route half
+    /// and its expert tail half, so the trunk can run all columns' routes
+    /// before ONE merged expert gather serves every column.
+    struct Gemma4VerifySeam {
+        let residual2: MLXArray
+        let denseOut: MLXArray
+        let expertNorm: MLXArray
+        let indices: MLXArray
+        let weights: MLXArray
+    }
+
+    /// Whether the batched verify trunk may drive this layer at all. Pure
+    /// host predicates — checked for EVERY layer before the trunk builds a
+    /// single node, so an ineligible model walks away side-effect free.
+    var mtpVerifyEligible: Bool {
+        isMoE && router != nil && experts != nil
+            && preFeedforwardLayernorm2 != nil
+            && postFeedforwardLayernorm1 != nil
+            && postFeedforwardLayernorm2 != nil
+            && perLayerInputGate == nil
+    }
+
+    /// The layer's chain-aware input norm for one verify column: consume a
+    /// pending fused-tail norm when it was produced from exactly this
+    /// hidden, else the stock input layernorm — the decode rule verbatim.
+    func mtpVerifyInputNorm(
+        _ x: MLXArray, glueChain: Gemma4GlueChainBox
+    ) -> MLXArray {
+        if let pending = glueChain.pending, pending.source === x {
+            glueChain.pending = nil
+            return pending.normed
+        }
+        glueChain.pending = nil
+        return inputLayernorm(x)
+    }
+
+    /// Per-column attention through the module's own (exact) road — the
+    /// fallback when the batched attention declines.
+    func mtpVerifyAttentionColumn(
+        _ normed: MLXArray,
+        cache: KVCache?,
+        positionOffset: Gemma4.PositionOffset
+    ) -> MLXArray {
+        let (attnOut, _, _) = selfAttn(
+            normed, mask: nil, cache: cache, sharedKV: nil,
+            positionOffset: positionOffset, v2SharedSource: nil,
+            outputStart: 0, useLastQueryPrefill: false)
+        return attnOut
+    }
+
+    /// All columns' attention with batched QKV/O and (sliding layers) one
+    /// multi-column attend. nil BEFORE any cache side effect; the caller
+    /// then runs `mtpVerifyAttentionColumn` per column.
+    fileprivate func mtpVerifyAttentionWidened(
+        normedAll: MLXArray,
+        columnCount: Int,
+        cache: KVCache?,
+        offsetsWidened: MLXArray
+    ) -> MLXArray? {
+        selfAttn.mtpVerifyForwardWidened(
+            normedAll: normedAll, columnCount: columnCount,
+            cache: cache, offsetsWidened: offsetsWidened)
+    }
+
+    /// Widened branch prefix (one dispatch for the whole rectangle).
+    fileprivate func mtpVerifyBranchPrefixWidened(
+        attnAll: MLXArray, residualAll: MLXArray
+    ) -> Gemma4FusedLayerGlue.VerifyBranchPrefix? {
+        guard let router, let preFeedforwardLayernorm2, router.zipAdmits
+        else { return nil }
+        return Gemma4FusedLayerGlue.attentionBranchPrefixVerifyRows(
+            attn: attnAll,
+            residual: residualAll,
+            postAttentionWeight: postAttentionLayernorm.weight,
+            denseWeight: preFeedforwardLayernorm.weight,
+            expertWeight: preFeedforwardLayernorm2.weight,
+            routerWeight: router.zipEffectiveScale(),
+            eps: config.rmsNormEps)
+    }
+
+    /// Widened zip: per-column router scores/fold over slices of the
+    /// widened router norm, ONE widened dense chain fed by the widened
+    /// prefix's raw xsum windows, ONE widened weight tail.
+    fileprivate func mtpVerifyZipWidened(
+        prefix: Gemma4FusedLayerGlue.VerifyBranchPrefix,
+        columnCount: Int
+    ) -> (denseOut: MLXArray, indices: MLXArray, weights: MLXArray)? {
+        guard let router,
+            let gateQuant = mlp.gateProj as? QuantizedLinear, gateQuant.bias == nil,
+            let upQuant = mlp.upProj as? QuantizedLinear, upQuant.bias == nil,
+            let downQuant = mlp.downProj as? QuantizedLinear, downQuant.bias == nil,
+            router.zipAdmits
+        else { return nil }
+        // A generic widened score projection remains forbidden: MLX folds
+        // [rows, 1, H] x [H, E] into an M=rows GEMM whose k-split differs
+        // from serial M=8 (measured parity 2/8). The admitted custom road
+        // below widens only the dispatch: every grid.z tile retains one M=8
+        // column and the exact affine QMV accumulation. Finalists and the
+        // weight tail are independently row-exact at any admitted width.
+        let scoresAll: MLXArray
+        if let routerQuant = router.proj as? QuantizedLinear,
+            routerQuant.bias == nil,
+            let widened = CBv2DenseMLPQMVV1.matmulVerifyRowsRouterScores(
+                x: prefix.routerNorm, weight: routerQuant.weight,
+                scales: routerQuant.scales, biases: routerQuant.biases,
+                groupSize: routerQuant.groupSize, bits: routerQuant.bits,
+                mode: routerQuant.mode)
+        {
+            scoresAll = widened
+        } else {
+            var columns: [MLXArray] = []
+            columns.reserveCapacity(columnCount)
+            for c in 0 ..< columnCount {
+                let normed = prefix.routerNorm[
+                    (c * 8) ..< ((c + 1) * 8), 0..., 0...]
+                columns.append(router.zipScores(normed))
+            }
+            scoresAll = concatenated(columns, axis: 0)
+        }
+        var scoresByColumn: [MLXArray] = []
+        scoresByColumn.reserveCapacity(columnCount)
+        for c in 0 ..< columnCount {
+            scoresByColumn.append(
+                scoresAll[(c * 8) ..< ((c + 1) * 8), 0..., 0...])
+        }
+        let indicesAll: MLXArray
+        if let widened = Gemma4RouterFinalistsV1.applyVerifyRows(
+            scoresAll, topK: router.topK, kth: router.kth)
+        {
+            indicesAll = widened
+        } else {
+            var indicesByColumn: [MLXArray] = []
+            indicesByColumn.reserveCapacity(columnCount)
+            for c in 0 ..< columnCount {
+                let scores = scoresByColumn[c]
+                if let fold = Gemma4RouteGlueFoldV1.apply(
+                    scores, topK: router.topK, kth: router.kth)
+                {
+                    indicesByColumn.append(fold.indices)
+                } else {
+                    indicesByColumn.append(
+                        router.zipSelected(router.zipPartition(scores)))
+                }
+            }
+            indicesAll = concatenated(indicesByColumn, axis: 0)
+        }
+        guard
+            let gateAll = CBv2DenseMLPQMVV1.matmulVerifyRowsGateUp(
+                x: prefix.denseNorm, weight: gateQuant.weight,
+                scales: gateQuant.scales, biases: gateQuant.biases,
+                groupSize: gateQuant.groupSize, bits: gateQuant.bits,
+                mode: gateQuant.mode, concatenatedSums: prefix.rawSums),
+            let upAll = CBv2DenseMLPQMVV1.matmulVerifyRowsGateUp(
+                x: prefix.denseNorm, weight: upQuant.weight,
+                scales: upQuant.scales, biases: upQuant.biases,
+                groupSize: upQuant.groupSize, bits: upQuant.bits,
+                mode: upQuant.mode, concatenatedSums: prefix.rawSums)
+        else { return nil }
+        let activatedAll = gemma4GeluProduct(gateAll, upAll)
+        guard
+            let downAll = CBv2DenseMLPQMVV1.matmulVerifyRowsDown(
+                x: activatedAll, weight: downQuant.weight,
+                scales: downQuant.scales, biases: downQuant.biases,
+                groupSize: downQuant.groupSize, bits: downQuant.bits,
+                mode: downQuant.mode)
+        else { return nil }
+        let weightsAll = router.zipWeights(
+            expertScores: scoresAll, topKIndices: indicesAll)
+        return (downAll, indicesAll, weightsAll)
+    }
+
+    /// Widened deferred tails (chained and final-layer).
+    fileprivate func mtpVerifyTailWidened(
+        denseOut: MLXArray,
+        merged: DeferredWeightedExpertRows,
+        routeWeightsFlat: MLXArray,
+        residualAll: MLXArray,
+        nextInputLayernormWeight: MLXArray?
+    ) -> (out: MLXArray, normedNext: MLXArray?)? {
+        guard let postFeedforwardLayernorm1, let postFeedforwardLayernorm2
+        else { return nil }
+        if let nextWeight = nextInputLayernormWeight {
+            guard
+                let chained = Gemma4FusedLayerGlue.tailChainedDeferredVerifyRows(
+                    mlpOut: denseOut,
+                    sortedOutputs: merged.sortedOutputs,
+                    inverseOrder: merged.inverseOrder,
+                    routeWeights: routeWeightsFlat,
+                    residual: residualAll,
+                    w1: postFeedforwardLayernorm1.weight,
+                    w2: postFeedforwardLayernorm2.weight,
+                    w3: postFeedforwardLayernorm.weight,
+                    layerScalar: layerScalar,
+                    nextInputNormWeight: nextWeight,
+                    eps: config.rmsNormEps)
+            else { return nil }
+            return (chained.out, chained.normedNext)
+        }
+        guard
+            let out = Gemma4FusedLayerGlue.tailDeferredVerifyRows(
+                mlpOut: denseOut,
+                sortedOutputs: merged.sortedOutputs,
+                inverseOrder: merged.inverseOrder,
+                routeWeights: routeWeightsFlat,
+                residual: residualAll,
+                w1: postFeedforwardLayernorm1.weight,
+                w2: postFeedforwardLayernorm2.weight,
+                w3: postFeedforwardLayernorm.weight,
+                layerScalar: layerScalar,
+                eps: config.rmsNormEps)
+        else { return nil }
+        return (out, nil)
+    }
+
+    /// The decode branch prefix for one verify column, or nil when the
+    /// fused producer declines (the per-column route path then builds its
+    /// own prefix-or-fallback chain).
+    fileprivate func mtpVerifyBranchPrefix(
+        attnOut: MLXArray, residual: MLXArray
+    ) -> (out: MLXArray, prefix: Gemma4FusedLayerGlue.AttentionBranchPrefix)? {
+        guard let router, let preFeedforwardLayernorm2 else { return nil }
+        guard let prefix = Gemma4ZipRouterV1.makeAttentionBranchPrefix(
+            router: router,
+            attn: attnOut,
+            residual: residual,
+            postAttentionWeight: postAttentionLayernorm.weight,
+            denseWeight: preFeedforwardLayernorm.weight,
+            expertWeight: preFeedforwardLayernorm2.weight,
+            eps: config.rmsNormEps)
+        else { return nil }
+        return (prefix.out, prefix)
+    }
+
+    /// The batched zip over a whole verify rectangle.
+    fileprivate func mtpVerifyZipBatched(
+        outs: [MLXArray],
+        prefixes: [Gemma4FusedLayerGlue.AttentionBranchPrefix]
+    ) -> Gemma4ZipRouterV1.VerifyZipped? {
+        guard let router else { return nil }
+        return Gemma4ZipRouterV1.runVerify(
+            router: router, mlp: mlp, outs: outs, prefixes: prefixes,
+            eps: config.rmsNormEps)
+    }
+
+    /// Post-attention glue + router/dense zip for ONE verify column,
+    /// transcribed from the decode path of `callAsFunction` (branch prefix
+    /// enabled, zip road). Falls back to the un-zipped route chain when a
+    /// fused producer declines, exactly as `callAsFunction` does.
+    func mtpVerifyRoute(
+        attnOut: MLXArray,
+        residual: MLXArray
+    ) -> Gemma4VerifySeam? {
+        guard let router, let preFeedforwardLayernorm2 else { return nil }
+
+        let prefix = Gemma4ZipRouterV1.makeAttentionBranchPrefix(
+            router: router,
+            attn: attnOut,
+            residual: residual,
+            postAttentionWeight: postAttentionLayernorm.weight,
+            denseWeight: preFeedforwardLayernorm.weight,
+            expertWeight: preFeedforwardLayernorm2.weight,
+            eps: config.rmsNormEps)
+        let out: MLXArray
+        if let prefix {
+            out = prefix.out
+        } else if let fusedOut = Gemma4FusedLayerGlue.normResidual(
+            x: attnOut, residual: residual,
+            weight: postAttentionLayernorm.weight, eps: config.rmsNormEps)
+        {
+            out = fusedOut
+        } else if let fusedOut = Gemma4PrefillGlueV1.normResidual(
+            x: attnOut,
+            weight: postAttentionLayernorm.weight,
+            residual: residual,
+            eps: config.rmsNormEps)
+        {
+            out = fusedOut
+        } else {
+            out = residual + postAttentionLayernorm(attnOut)
+        }
+
+        if let zipped = Gemma4ZipRouterV1.run(
+            router: router,
+            mlp: mlp,
+            out: out,
+            w1: preFeedforwardLayernorm.weight,
+            w2: preFeedforwardLayernorm2.weight,
+            eps: config.rmsNormEps,
+            prefix: prefix)
+        {
+            return Gemma4VerifySeam(
+                residual2: out,
+                denseOut: zipped.denseOut,
+                expertNorm: zipped.expertNorm,
+                indices: zipped.topKIndices,
+                weights: zipped.topKWeights)
+        }
+        let (topKIndices, topKWeights) = router(out)
+        if let (n1, n2, denseSums) = Gemma4FusedLayerGlue.dualPreNorm(
+            x: out,
+            w1: preFeedforwardLayernorm.weight,
+            w2: preFeedforwardLayernorm2.weight,
+            eps: config.rmsNormEps)
+        {
+            return Gemma4VerifySeam(
+                residual2: out, denseOut: mlp(n1, activationSums: denseSums),
+                expertNorm: n2, indices: topKIndices, weights: topKWeights)
+        }
+        if let (n1, n2) = Gemma4PrefillGlueV1.dualPreNorm(
+            x: out,
+            w1: preFeedforwardLayernorm.weight,
+            w2: preFeedforwardLayernorm2.weight,
+            eps: config.rmsNormEps)
+        {
+            return Gemma4VerifySeam(
+                residual2: out, denseOut: mlp(n1),
+                expertNorm: n2, indices: topKIndices, weights: topKWeights)
+        }
+        return Gemma4VerifySeam(
+            residual2: out,
+            denseOut: mlp(preFeedforwardLayernorm(out)),
+            expertNorm: preFeedforwardLayernorm2(out),
+            indices: topKIndices, weights: topKWeights)
+    }
+
+    /// The MERGED expert projection for a whole verify rectangle: the
+    /// trunk concatenates every column's expert pre-norm rows column-major
+    /// (`[8 * L, 1, H]`) so column c's inverse-order slice is the
+    /// contiguous `[c*64, (c+1)*64)` window of the merged carrier.
+    func mtpVerifyMergedDeferredRows(
+        expertNorms: MLXArray, indices: MLXArray, weights: MLXArray
+    ) -> DeferredWeightedExpertRows? {
+        guard let experts else { return nil }
+        return experts.deferredWeightedRows(
+            expertNorms, topKIndices: indices, topKWeights: weights,
+            isExpertPrefill: false, routeTable: nil)
+    }
+
+    /// Per-column deferred fallback when the merged call declines.
+    func mtpVerifyDeferredRows(
+        expertNorm: MLXArray, indices: MLXArray, weights: MLXArray
+    ) -> DeferredWeightedExpertRows? {
+        guard let experts else { return nil }
+        return experts.deferredWeightedRows(
+            expertNorm, topKIndices: indices, topKWeights: weights,
+            isExpertPrefill: false, routeTable: nil)
+    }
+
+    /// One verify column's expert tail: the fused deferred tail roads the
+    /// decode path uses, falling back to the stock chain (which is the
+    /// `callAsFunction` un-fused tail transcribed).
+    func mtpVerifyTail(
+        seam: Gemma4VerifySeam,
+        carrier: DeferredWeightedExpertRows,
+        nextInputLayernormWeight: MLXArray?,
+        glueChain: Gemma4GlueChainBox
+    ) -> MLXArray {
+        guard let postFeedforwardLayernorm1, let postFeedforwardLayernorm2 else {
+            preconditionFailure("mtpVerifyTail on a layer that preflighted eligible")
+        }
+        if let nextWeight = nextInputLayernormWeight,
+            let chained = Gemma4FusedLayerGlue.tailChainedDeferred(
+                mlpOut: seam.denseOut, expertRows: carrier, residual: seam.residual2,
+                w1: postFeedforwardLayernorm1.weight,
+                w2: postFeedforwardLayernorm2.weight,
+                w3: postFeedforwardLayernorm.weight,
+                layerScalar: layerScalar,
+                nextInputNormWeight: nextWeight,
+                eps: config.rmsNormEps)
+        {
+            glueChain.pending = (source: chained.out, normed: chained.normedNext)
+            return chained.out
+        }
+        if let fusedTail = Gemma4FusedLayerGlue.tailDeferred(
+            mlpOut: seam.denseOut, expertRows: carrier, residual: seam.residual2,
+            w1: postFeedforwardLayernorm1.weight,
+            w2: postFeedforwardLayernorm2.weight,
+            w3: postFeedforwardLayernorm.weight,
+            layerScalar: layerScalar,
+            eps: config.rmsNormEps)
+        {
+            return fusedTail
+        }
+        // Stock chain, exactly the un-fused `callAsFunction` tail.
+        let h2Raw = resolveDeferredWeightedExpertRows(carrier)
+        let h1 = postFeedforwardLayernorm1(seam.denseOut)
+        let h2 = postFeedforwardLayernorm2(h2Raw)
+        var out = h1 + h2
+        out = postFeedforwardLayernorm(out)
+        out = seam.residual2 + out
+        return out * layerScalar
     }
 
     public func callAsFunction(
@@ -5235,6 +6193,23 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         return mma.reshaped(Array(hidden.shape.dropLast()) + [mma.dim(-1)])
     }
 
+    /// MTP-BATCHED-VERIFY: the tied head over widened verify rows in ONE
+    /// dispatch (v27 body per 8-row tile). nil declines to per-column.
+    fileprivate func tiedLMHeadMMAVerifyRows(_ hiddenAll: MLXArray) -> MLXArray? {
+        guard lmHead == nil,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.mode == .affine,
+            let mma = Gemma4MMAQuantizedGEMV.applyVerifyRows(
+                x: hiddenAll,
+                w: quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                groupSize: quantized.groupSize,
+                bits: quantized.bits)
+        else { return nil }
+        return mma.reshaped(Array(hiddenAll.shape.dropLast()) + [mma.dim(-1)])
+    }
+
     /// Apply the LM head (tied embedding or explicit `lm_head`) plus the
     /// configured final-logit softcap. Pure function of the post-norm hidden.
     /// LMH-001: tight-grid dispatch for the tied lm_head ordinary QMV.
@@ -5636,10 +6611,177 @@ extension Gemma4TextModel: CBv2MTPForwardable {
         let (postNorm, preNorm) = model.callCapturingPreNorm(tokens, cache: caches)
         return (applyLMHead(postNorm), preNorm)
     }
-}
 
-// Ranked resample marker 2: this archive is a further ranked sample of the tree carried
-// by the preceding ranked submission of this content apart from any rotation item declared in its note.
+    /// MTP-BATCHED-VERIFY: one LAYER-MAJOR trunk pass over `[8, 1+k]` verify
+    /// columns. Per column, every plane runs the same `[8, 1]` road a lone
+    /// column forward runs (embedding, chain-aware input norm, attention —
+    /// which stages its K/V and takes the exact q4 stripe road — the
+    /// post-attention glue, the zip router/dense chain, the fused deferred
+    /// tail, the final norm, and the LM head), so the committed-token
+    /// numerics match the serial column loop. The one cross-column change
+    /// is the MERGED expert gather: all columns' expert rows go through a
+    /// single sorted gather trio (row-exact per row — the same stock
+    /// gather kernels the decode road already trusts at the 64-row plane),
+    /// and each column's fused tail consumes its contiguous inverse-order
+    /// window of the merged carrier. Kill switch
+    /// `DARKBLOOM_CBV2_MTP_BATCHED_VERIFY=0` removes the road entirely.
+    public func cbv2VerifyColumns(
+        _ tokens: MLXArray, caches: [KVCache]
+    ) -> (argmax: [MLXArray], hidden: [MLXArray])? {
+        guard Self.batchedVerifyEnabled else { return nil }
+        let batch = tokens.dim(0)
+        let columnCount = tokens.ndim == 2 ? tokens.dim(1) : -1
+        let layers = model.layers
+        guard batch == 8, columnCount >= 2, columnCount <= 8,
+            model.hiddenSizePerLayerInput == 0,
+            caches.count == layers.count,
+            model.previousKvs.enumerated().allSatisfy({ $0.element == $0.offset }),
+            layers.allSatisfy({ $0.mtpVerifyEligible }),
+            caches.allSatisfy({ ($0 as? (any CBv2AttendingLayerCache)) != nil })
+        else { return nil }
+
+        // Unified position chain base, discovered exactly as `forwardTrunk`
+        // discovers it. Column c's queries sit `c` positions past the base;
+        // positions are integers, so the explicit `base + c` is the same
+        // value the serial column loop's per-forward snapshot observes.
+        var chainBase: MLXArray?
+        for cache in caches {
+            if let offsets = (cache as? CBv2LayerCache)?.unifiedPositionOffsets {
+                chainBase = offsets + 0
+                break
+            }
+        }
+        guard let chainBase else { return nil }
+        var offsetColumns: [MLXArray] = []
+        offsetColumns.reserveCapacity(columnCount)
+        for c in 0 ..< columnCount {
+            offsetColumns.append(chainBase + Int32(c))
+        }
+        let offsetsWidened = concatenated(offsetColumns, axis: 0)
+
+        // Per-column scaled embeddings (the exact [8,1] road), concatenated
+        // once into the widened hidden the whole trunk carries.
+        var embedColumns: [MLXArray] = []
+        embedColumns.reserveCapacity(columnCount)
+        for c in 0 ..< columnCount {
+            let col = tokens[0..., c ..< (c + 1)]
+            if let fusedEmbed = Gemma4FusedScaledEmbedding.apply(
+                tokens: col, embedding: model.embedTokens,
+                embedScale: model.embedScale,
+                hiddenSize: model.config.hiddenSize)
+            {
+                embedColumns.append(fusedEmbed)
+            } else {
+                embedColumns.append(model.embedTokens(col) * model.embedScale)
+            }
+        }
+        var hiddenAll = concatenated(embedColumns, axis: 0)
+        let chain = Gemma4GlueChainBox()
+
+        for (idx, layer) in layers.enumerated() {
+            let nextWeight =
+                idx + 1 < layers.count ? layers[idx + 1].inputLayernorm.weight : nil
+            let normedAll: MLXArray
+            if let pending = chain.pending, pending.source === hiddenAll {
+                chain.pending = nil
+                normedAll = pending.normed
+            } else {
+                chain.pending = nil
+                normedAll = layer.inputLayernorm(hiddenAll)
+            }
+
+            func trunkRefuse(_ why: String) {
+                FileHandle.standardError.write(
+                    Data("[widened-trunk-refuse] layer=\(idx) \(why)\n".utf8))
+            }
+            guard let attnAll = layer.mtpVerifyAttentionWidened(
+                normedAll: normedAll, columnCount: columnCount,
+                cache: caches[idx], offsetsWidened: offsetsWidened)
+            else { trunkRefuse("attention"); CBv2EngageMark.once("mtp-widened-verify-refused"); return nil }
+            guard let prefix = layer.mtpVerifyBranchPrefixWidened(
+                attnAll: attnAll, residualAll: hiddenAll)
+            else { trunkRefuse("prefix"); CBv2EngageMark.once("mtp-widened-verify-refused"); return nil }
+            guard let zipped = layer.mtpVerifyZipWidened(
+                prefix: prefix, columnCount: columnCount)
+            else { trunkRefuse("zip"); CBv2EngageMark.once("mtp-widened-verify-refused"); return nil }
+            guard let merged = layer.mtpVerifyMergedDeferredRows(
+                expertNorms: prefix.expertNorm,
+                indices: zipped.indices,
+                weights: zipped.weights)
+            else { trunkRefuse("gather"); CBv2EngageMark.once("mtp-widened-verify-refused"); return nil }
+            guard let tailed = layer.mtpVerifyTailWidened(
+                denseOut: zipped.denseOut,
+                merged: merged,
+                routeWeightsFlat: zipped.weights.reshaped([8 * columnCount * 8]),
+                residualAll: prefix.out,
+                nextInputLayernormWeight: nextWeight)
+            else {
+                trunkRefuse("tail")
+                CBv2EngageMark.once("mtp-widened-verify-refused")
+                return nil
+            }
+            hiddenAll = tailed.out
+            if let normedNext = tailed.normedNext {
+                chain.pending = (source: hiddenAll, normed: normedNext)
+            }
+        }
+
+        var argmaxColumns: [MLXArray] = []
+        var hiddenColumns: [MLXArray] = []
+        argmaxColumns.reserveCapacity(columnCount)
+        hiddenColumns.reserveCapacity(columnCount)
+        var postNorms: [MLXArray] = []
+        postNorms.reserveCapacity(columnCount)
+        for c in 0 ..< columnCount {
+            let column = hiddenAll[(c * 8) ..< ((c + 1) * 8), 0..., 0...]
+            postNorms.append(model.norm(column))
+            hiddenColumns.append(column)
+        }
+        // ONE widened tied-head dispatch (the head plane read once for all
+        // columns); per-column argmax on logit slices. Softcap keeps the
+        // per-column road's semantics: the order-only skip applies
+        // identically, and the fallback runs the head per column.
+        if !CBv2OrderOnlyLogits.engaged || config.finalLogitSoftcapping <= 0,
+            config.finalLogitSoftcapping > 0
+        {
+            // Softcap required: keep the per-column exact road whole.
+            for c in 0 ..< columnCount {
+                let logits = applyLMHead(postNorms[c])
+                argmaxColumns.append(argMax(logits, axis: -1).asType(.int32))
+            }
+        } else if gemma4VerifyHeadWidenedEnabled,
+            let logitsAll = tiedLMHeadMMAVerifyRows(
+                concatenated(postNorms, axis: 0))
+        {
+            for c in 0 ..< columnCount {
+                let logits = logitsAll[(c * 8) ..< ((c + 1) * 8), 0..., 0...]
+                argmaxColumns.append(argMax(logits, axis: -1).asType(.int32))
+            }
+        } else {
+            for c in 0 ..< columnCount {
+                let logits = applyLMHead(postNorms[c])
+                argmaxColumns.append(argMax(logits, axis: -1).asType(.int32))
+            }
+        }
+        CBv2EngageMark.once("mtp-batched-verify-trunk")
+        return (argmaxColumns, hiddenColumns)
+    }
+
+    /// `DARKBLOOM_CBV2_MTP_HEAD_WIDENED=1` arms the widened tied-head
+    /// dispatch. Default OFF: the head plane (370 MB) exceeds L2, so the
+    /// grid.z row tiles re-read DRAM and the win needs the in-body M-tile
+    /// variant first; per-column heads stay the road until then.
+
+    /// `DARKBLOOM_CBV2_MTP_BATCHED_VERIFY=0` removes the batched verify
+    /// road; the executor keeps the serial column loop.
+    private static let batchedVerifyEnabled: Bool = {
+        guard
+            let raw = ProcessInfo.processInfo.environment[
+                "DARKBLOOM_CBV2_MTP_BATCHED_VERIFY"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+}
 
 // Ranked resample marker 2: this archive is a further ranked sample of the tree carried
 // by the preceding ranked submission of this content apart from any rotation item declared in its note.

@@ -77,9 +77,7 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         let sharedKV: Gemma4SharedKV
         let masks: Gemma4DrafterMasks
         let positionOffset: Gemma4.PositionOffset
-        /// Pre-computed drafter cos/sin covering this round's
-        /// `[anchorMin, anchorMin + windowAhead)`. May be nil if the
-        /// drafter's geometry made the table empty.
+        /// Historical CBv2 input re-RoPE table. Nil on the reference route.
         let ropeTable: DrafterRoPETable?
 
         init(
@@ -96,6 +94,16 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
 
     private let drafter: Gemma4AssistantDraftModel
     private let target: any Gemma4MTPTarget
+
+    /// Compatibility switch for the historical CBv2-only input re-RoPE.
+    /// The reference drafter feeds the carried target hidden directly; set
+    /// this switch explicitly to restore the former CBv2 behavior.
+    private static let preRotatesCarriedHidden: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_MTP_DRAFTER_INPUT_REROPE"]
+        else { return false }
+        return ["1", "true", "yes", "on"].contains(raw.lowercased())
+    }()
 
     /// Round-cached RoPE table. Written by `prepare(rows:)` and consumed
     /// by `draftStep(...)`. A fresh drafter instance has no table.
@@ -124,15 +132,18 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
             MLXArray(rows.map { Int32($0.anchor) }))
 
         let slidingWindow = drafter.config.textConfig.slidingWindow
-        // Materialize the round's cos/sin table once. Anchor the table at
-        // the minimum anchor across the batch so a per-row query position
-        // anywhere inside `[anchorMin, anchorMin + windowAhead)` indexes
-        // into the table with a non-negative step.
-        let anchorMin = rows.map(\.anchor).min() ?? 0
-        let ropeTable = Self.materializeDrafterRoPETable(
-            drafterConfig: drafter.config.textConfig,
-            startPosition: anchorMin,
-            windowAhead: Self.defaultRoPEWindowAhead)
+        // The historical arm materializes its round cos/sin table once. The
+        // reference route avoids both the table and the anchor reduction.
+        let ropeTable: DrafterRoPETable?
+        if Self.preRotatesCarriedHidden {
+            let anchorMin = rows.map(\.anchor).min() ?? 0
+            ropeTable = Self.materializeDrafterRoPETable(
+                drafterConfig: drafter.config.textConfig,
+                startPosition: anchorMin,
+                windowAhead: Self.defaultRoPEWindowAhead)
+        } else {
+            ropeTable = nil
+        }
         cachedRoPETable = ropeTable
 
         if rows.count == 1 {
@@ -175,27 +186,40 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
                 "Gemma4CBv2MTPDrafter.draftStep: prepared capture "
                     + "\(type(of: prepared)) was not built by prepare(rows:)")
         }
-        // If the round has a cached RoPE table, pre-rotate the drafter's
-        // carried hidden along its rotary prefix using the cached
-        // (cos, sin) for the per-step query position. The drafter's
-        // `preProjection` is a Linear, so pre-rotation of the input is
-        // a real, distinct transformation from the drafter's downstream
-        // RoPE on Q/K. The pre-rotation is intentionally cheap (one
-        // per-round table lookup + an `a*cos-b*sin` slice) and amortizes
-        // the per-step `MLXFast.RoPE` frequency compute into the single
-        // `prepare(rows:)` materialization: the downstream rope module
-        // no longer pays the table-build cost on every draft step.
-        let rotatedHidden: MLXArray
+        // The reference MTP route concatenates the carried target hidden
+        // unchanged; drafter layers apply RoPE to their own Q/K. Retain the
+        // former CBv2-only input transform solely behind the compatibility
+        // switch above.
+        let carriedHidden: MLXArray
         if let table = prepared.ropeTable {
-            rotatedHidden = Self.applyCachedDrafterRoPE(
+            carriedHidden = Self.applyCachedDrafterRoPE(
                 hidden: hidden, table: table, positionOffset: prepared.positionOffset)
         } else {
-            rotatedHidden = hidden
+            carriedHidden = hidden
         }
         // Mirror runGemma4MTPGreedyRound: seed = concat(target embedding of
         // the token, carried hidden) along the feature axis.
-        let inputsEmbeds = concatenated(
-            [target.embedTokensForDrafter(tokens), rotatedHidden], axis: -1)
+        //
+        // MTP-B8-FIX (token-axis alignment): the target embedding of a
+        // `[B, 1]` token column is `[B, 1, He]`, while the carried hidden
+        // arrives either as `[B, Hh]` (a seed carry concatenated on axis 0)
+        // or `[B, 1, Hh]` (a verify-column slice). A rank-2 carry must gain
+        // its token axis BEFORE the feature-axis concat — concatenating
+        // mismatched ranks is the `[concatenate]` fatal that killed every
+        // B>1 draft round. Rank-general, fail-closed on anything else.
+        let embeds = target.embedTokensForDrafter(tokens)  // [B, 1, He]
+        let alignedHidden: MLXArray
+        switch carriedHidden.ndim {
+        case embeds.ndim:
+            alignedHidden = carriedHidden
+        case embeds.ndim - 1:
+            alignedHidden = carriedHidden.expandedDimensions(axis: 1)
+        default:
+            preconditionFailure(
+                "Gemma4CBv2MTPDrafter.draftStep: carried hidden rank "
+                    + "\(carriedHidden.ndim) cannot align with embedding rank \(embeds.ndim)")
+        }
+        let inputsEmbeds = concatenated([embeds, alignedHidden], axis: -1)
         let (newHidden, logits) = drafter(
             inputsEmbeds: inputsEmbeds,
             sharedKV: prepared.sharedKV,
@@ -360,31 +384,52 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         let inRange = steps.allSatisfy { $0 >= 0 && $0 < Int32(table.windowAhead) }
         guard inRange else { return hidden }
 
-        let indices = MLXArray(steps, [perRow.count, 1])
+        // MTP-B8-FIX (RoPE shape generality): the previous lead-shape math
+        // dropped the ROW axis for a rank-2 `[B, H]` hidden (its
+        // `prefixLead = leadShape.dropLast()` was written for one 1-dim
+        // row), and the `[B, 1]` gather left an unsqueezed `[B, 1, halfDim]`
+        // cos/sin that right-align broadcast a `[B, halfDim]` operand to
+        // `[B, B, halfDim]`. Both faults are B>1-only: the single-stream leg
+        // never sees them. This rewrite is shape-driven over the row axis:
+        // rank-2 `[B, H]` and rank-3 `[B, 1, H]` hiddens rotate per row with
+        // the identical `a*cos - b*sin` / `a*sin + b*cos` expressions, and
+        // any other rank fails closed by returning the input unrotated only
+        // for an EMPTY rotary range (never silently mis-rotating).
+        let rank = hidden.ndim
+        precondition(
+            rank == 2 || rank == 3,
+            "Gemma4CBv2MTPDrafter.applyCachedDrafterRoPE: hidden rank \(rank) "
+                + "is neither [B, H] nor [B, 1, H]")
+        let rows = hidden.dim(0)
+        precondition(
+            perRow.count == rows,
+            "Gemma4CBv2MTPDrafter.applyCachedDrafterRoPE: \(perRow.count) positions "
+                + "for \(rows) hidden rows")
+
+        let indices = MLXArray(steps, [rows])
         let cosRows = table.cos[indices]  // [B, halfDim]
         let sinRows = table.sin[indices]  // [B, halfDim]
 
-        // Reshape hidden so the rotary prefix is `[B, L, 1, halfDim, 2]`.
+        // Rotary prefix as interleaved (a, b) pairs, per row:
+        // leadShape + [halfDim, 2] where leadShape keeps every axis but the
+        // feature axis (row axis included — the old code lost it).
         let leadShape = Array(hidden.shape.dropLast())
-        let flat = hidden.reshaped(leadShape + [featureDim])
-        let prefixLead = leadShape.dropLast()
-        let prefixShape = Array(prefixLead) + [1, halfDim, 2]
-        let pairs = flat[.ellipsis, 0 ..< rotaryPrefix]
-            .reshaped(Array(prefixShape))
-        let a = pairs[.ellipsis, 0]  // [.., halfDim]
-        let b = pairs[.ellipsis, 1]  // [.., halfDim]
+        let prefixShape = leadShape + [halfDim, 2]
+        let pairs = hidden[.ellipsis, 0 ..< rotaryPrefix]
+            .reshaped(prefixShape)
+        let a = pairs[.ellipsis, 0]  // leadShape + [halfDim]
+        let b = pairs[.ellipsis, 1]  // leadShape + [halfDim]
 
-        // Broadcast cos/sin to the query/head axes.
-        let cosBroadcastShape = Array(prefixLead) + [1, halfDim]
-        let sinBroadcastShape = Array(prefixLead) + [1, halfDim]
-        let cosB = cosRows.reshaped(cosBroadcastShape)
-        let sinB = sinRows.reshaped(sinBroadcastShape)
+        // Broadcast cos/sin over any interior axes between the row axis and
+        // the halfDim axis (none for rank 2, one query axis for rank 3).
+        let broadcastShape = [rows] + Array(repeating: 1, count: rank - 2) + [halfDim]
+        let cosB = cosRows.reshaped(broadcastShape)
+        let sinB = sinRows.reshaped(broadcastShape)
         let aRot = a * cosB - b * sinB
         let bRot = a * sinB + b * cosB
         let rotatedPrefix = MLX.stacked([aRot, bRot], axis: -1)
-            .reshaped(Array(prefixShape))
-            .reshaped(Array(prefixLead) + [rotaryPrefix])
-        let tail = flat[.ellipsis, rotaryPrefix ..< featureDim]
+            .reshaped(leadShape + [rotaryPrefix])
+        let tail = hidden[.ellipsis, rotaryPrefix ..< featureDim]
         return MLX.concatenated([rotatedPrefix, tail], axis: -1)
     }
 }

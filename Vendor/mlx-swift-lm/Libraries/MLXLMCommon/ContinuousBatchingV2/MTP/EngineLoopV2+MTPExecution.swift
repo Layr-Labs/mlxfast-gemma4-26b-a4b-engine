@@ -101,7 +101,7 @@ extension EngineLoopV2 {
                 .reshaped([decodeRows.count, 1])
             let caches = eagerCaches(rowStates: decodeRows.map { kvStates[$0.rec.id]! })
             let (logits, hidden) = mtp.model.forwardWithHidden(tokens: inputs, caches: caches)
-            cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
+            cacheInnerState.append(contentsOf: mtpCompactVerifyRoots(caches))
             decodeSampled = sampler.sample(
                 logits: logits[0..., -1, 0...],
                 params: decodeRows.map(\.rec.request.sampling),
@@ -141,7 +141,7 @@ extension EngineLoopV2 {
                     tokens: inputs, inputEmbeddings: nil, caches: caches,
                     requirement: requirement)
             }
-            cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
+            cacheInnerState.append(contentsOf: mtpCompactVerifyRoots(caches))
             if row.samples {
                 prefillSampled[rec.id] = sampler.sample(
                     logits: output,
@@ -206,6 +206,16 @@ extension EngineLoopV2 {
             seedHidden: seedHidden)
     }
 
+    /// Banks holding a widened verify stash for this round's rows.
+    private func mtpWidenedStashBanks(rows: [CBv2MTPRowWork]) -> [CBv2LayerCache] {
+        guard let first = rows.first else { return [] }
+        let caches = eagerCaches(rowStates: [kvStates[first.rec.id]!])
+        _ = caches
+        return eagerCaches(rowStates: rows.map { kvStates[$0.rec.id]! })
+            .compactMap { $0 as? CBv2LayerCache }
+            .filter { $0.mtpWidenedStash != nil }
+    }
+
     private func mtpBuildVerifyGraph(
         _ verifyRows: [CBv2MTPRowWork],
         driver mtp: CBv2MTPRoundDriver,
@@ -227,6 +237,16 @@ extension EngineLoopV2 {
         captures.reserveCapacity(batch)
         captured.reserveCapacity(2 * batch)
 
+        // MTP widened commit writes the ring IN PLACE (fence-chained); the
+        // drafter's frozen captures must read POST-commit bytes, so every
+        // capture view is fenced on the banks' write fences. `MLX.depends`
+        // adds ordering edges only — no dispatch, no value change.
+        let captureFences = eagerCaches(rowStates: verifyRows.map { kvStates[$0.rec.id]! })
+            .compactMap { ($0 as? CBv2LayerCache)?.decodeRingWriteFenceEvaluationRoot }
+        func fenced(_ view: MLXArray) -> MLXArray {
+            captureFences.isEmpty
+                ? view : MLX.depends(input: view, dependencies: captureFences)
+        }
         for row in verifyRows {
             let state = kvStates[row.rec.id]!
             let carry = row.carry!
@@ -244,10 +264,10 @@ extension EngineLoopV2 {
             let slidingSnapshot = slidingRow.snapshot()
             captures.append(
                 CBv2MTPRowCapture(
-                    fullKeys: fullSnapshot.keys,
-                    fullValues: fullSnapshot.values,
-                    slidingKeys: slidingSnapshot.keys,
-                    slidingValues: slidingSnapshot.values,
+                    fullKeys: fenced(fullSnapshot.keys),
+                    fullValues: fenced(fullSnapshot.values),
+                    slidingKeys: fenced(slidingSnapshot.keys),
+                    slidingValues: fenced(slidingSnapshot.values),
                     slidingStart: slidingRow.absoluteOffset - slidingRow.retainedCount,
                     anchor: fullRow.absoluteOffset))
             captured.append((fullRow, fullSnapshot.keys, fullSnapshot.values))
@@ -296,11 +316,15 @@ extension EngineLoopV2 {
         }
         let acceptancePacket = concatenated(
             [draftIDs.reshaped([-1]), target.argmax.reshaped([-1])], axis: 0)
-        return CBv2MTPRoundInFlight.Verify(
+        var built = CBv2MTPRoundInFlight.Verify(
             k: k,
             rows: rowMetadata,
             acceptancePacket: acceptancePacket,
             lastHidden: target.hidden)
+        // MTP widened staging: banks that took the widened road carry a
+        // stash finalize must commit with the per-row confirmed counts.
+        built.widenedBanks = mtpWidenedStashBanks(rows: verifyRows)
+        return built
     }
 
     /// Freeze the round's pre-write KV captures against the in-place writes

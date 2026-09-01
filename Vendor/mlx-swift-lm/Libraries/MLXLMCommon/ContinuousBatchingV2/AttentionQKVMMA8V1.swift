@@ -157,27 +157,23 @@ METAL_FUNC void qkv_mma8_affine4_g64_impl(
     rs += simd_shuffle_xor(rs, 4u);
     rs += simd_shuffle_xor(rs, 16u);
 
-    // Each operand is filled immediately before the step that reads it, so
-    // one is live at a time instead of eight. `r0`/`r1` are not written
-    // across the run, so every fill yields the value it yielded before and
-    // the eight steps keep their order into `C`. The multitile body keeps
-    // its hoisted fills: there one fill set serves both tiles.
-    simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
     MMA8_SETB(B0, x, lo)
-    MMA8_STEP(B0, 0)
     MMA8_SETB(B1, x, hi)
-    MMA8_STEP(B1, 1)
     MMA8_SETB(B2, y, lo)
-    MMA8_STEP(B2, 2)
     MMA8_SETB(B3, y, hi)
-    MMA8_STEP(B3, 3)
     MMA8_SETB(B4, z, lo)
-    MMA8_STEP(B4, 4)
     MMA8_SETB(B5, z, hi)
-    MMA8_STEP(B5, 5)
     MMA8_SETB(B6, w, lo)
-    MMA8_STEP(B6, 6)
     MMA8_SETB(B7, w, hi)
+
+    simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+    MMA8_STEP(B0, 0)
+    MMA8_STEP(B1, 1)
+    MMA8_STEP(B2, 2)
+    MMA8_STEP(B3, 3)
+    MMA8_STEP(B4, 4)
+    MMA8_STEP(B5, 5)
+    MMA8_STEP(B6, 6)
     MMA8_STEP(B7, 7)
 
     acc0 += s * C.thread_elements()[0] + rs.x * b;
@@ -407,7 +403,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
         ensureRowContiguous: true)
 
     private static let mma8Kernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_carry2_bfill_v4",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_carry2_v3",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -426,6 +422,84 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
     @inline(__always)
     private static func liveOutputWidth(_ width: Int) -> Bool {
         width == 1024 || width == 2048 || width == 4096 || width == 8192
+    }
+
+    /// MTP-BATCHED-VERIFY: the promoted multi-tile body over a WIDENED row
+    /// axis — one verify column's 8 rows per grid.z tile. The kernel body is
+    /// byte-identical to `multiTileKernel`'s; the wrapper offsets x/y by the
+    /// tile's 8-row base, so each column's outputs are the exact words the
+    /// [8,1] dispatch produces for that column alone, and the weight plane
+    /// is served across adjacent tiles from cache instead of once per
+    /// column from DRAM.
+    private static let verifyRowsKernel = MLXFast.metalKernel(
+        name: "cbv2_verify_qkv_mma8_affine4_g64_tight_mt2_k2816_mrows_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            qkv_mma8_affine4_g64_mt<T, 2, 2, 2816>(
+                w, scales, biases,
+                x + tid.z * 8 * 2816,
+                y + tid.z * 8 * w_shape[0],
+                w_shape[0], int(tid.y) * 16, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
+    /// MTP-BATCHED-VERIFY entry: `x` is `[8 * L, 1, 2816]` column-major
+    /// (column c's 8 rows at [8c, 8c+8)); output `[8 * L, 1, N]` with the
+    /// same layout. Bit-identical per column to `matmul` on that column's
+    /// [8, 1, 2816] slice.
+    public static func matmulVerifyRows(
+        x: MLXArray,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode
+    ) -> MLXArray? {
+        guard enabled, multiTileEnabled,
+            groupSize == Self.groupSize,
+            bits == Self.bits,
+            mode == .affine,
+            let biases,
+            x.dtype == .bfloat16,
+            scales.dtype == x.dtype,
+            biases.dtype == x.dtype,
+            weight.dtype == .uint32,
+            x.ndim == 3,
+            x.dim(0) > batch,
+            x.dim(0).isMultiple(of: batch),
+            x.dim(0) <= 8 * batch,
+            x.dim(1) == sequence,
+            x.dim(2) == inputWidth,
+            weight.ndim == 2,
+            weight.dim(1) == inputWidth * Self.bits / 32
+        else { return nil }
+
+        let rows = x.dim(0)
+        let outputWidth = weight.dim(0)
+        guard liveOutputWidth(outputWidth),
+            x.size == rows * sequence * inputWidth,
+            scales.shape == [outputWidth, inputWidth / Self.groupSize],
+            biases.shape == scales.shape
+        else { return nil }
+
+        let yTiles = outputWidth / outputsPerGroup
+        guard yTiles % tilesPerGroup == 0 else { return nil }
+        return verifyRowsKernel(
+            [x, weight, scales, biases],
+            template: [("T", x.dtype)],
+            grid: (simdWidth, (yTiles / tilesPerGroup) * simdGroups, rows / batch),
+            threadGroup: (simdWidth, simdGroups, 1),
+            outputShapes: [[rows, sequence, outputWidth]],
+            outputDTypes: [x.dtype]
+        )[0]
     }
 
     public static func matmul(

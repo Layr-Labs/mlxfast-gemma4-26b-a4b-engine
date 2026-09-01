@@ -268,26 +268,23 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
     rs += simd_shuffle_xor(rs, 4u);
     rs += simd_shuffle_xor(rs, 16u);
 
-    // Each operand is filled immediately before the step that reads it, so
-    // one is live at a time instead of eight. `r0`/`r1` are not written
-    // across the run, so every fill yields the value it yielded before and
-    // the eight steps keep their order into `C`.
-    simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
     MMA8_SETB(B0, x, lo)
-    MMA8_STEP(B0, 0)
     MMA8_SETB(B1, x, hi)
-    MMA8_STEP(B1, 1)
     MMA8_SETB(B2, y, lo)
-    MMA8_STEP(B2, 2)
     MMA8_SETB(B3, y, hi)
-    MMA8_STEP(B3, 3)
     MMA8_SETB(B4, z, lo)
-    MMA8_STEP(B4, 4)
     MMA8_SETB(B5, z, hi)
-    MMA8_STEP(B5, 5)
     MMA8_SETB(B6, w, lo)
-    MMA8_STEP(B6, 6)
     MMA8_SETB(B7, w, hi)
+
+    simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+    MMA8_STEP(B0, 0)
+    MMA8_STEP(B1, 1)
+    MMA8_STEP(B2, 2)
+    MMA8_STEP(B3, 3)
+    MMA8_STEP(B4, 4)
+    MMA8_STEP(B5, 5)
+    MMA8_STEP(B6, 6)
     MMA8_STEP(B7, 7)
 
     acc0 += s * C.thread_elements()[0] + rs.x * b;
@@ -313,7 +310,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
 """
 
     private static let mma8KernelK4096 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry_bfill_v4",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry_v3",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -330,7 +327,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
         ensureRowContiguous: true)
 
     private static let mma8KernelK8192 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_carry_bfill_v4",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_carry_v3",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -365,6 +362,97 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
     @inline(__always)
     private static func liveInputWidth(_ width: Int) -> Bool {
         width == 4096 || width == 8192
+    }
+
+    /// MTP-BATCHED-VERIFY: the promoted MMA8 body over a widened row axis,
+    /// one verify column's 8 rows per grid.z tile (body untouched; wrapper
+    /// offsets x/y), so each column's outputs are the [8,1] dispatch's words
+    /// by identity and the o_proj plane is served across columns from cache.
+    private static let verifyRowsKernelK4096 = MLXFast.metalKernel(
+        name: "cbv2_verify_attention_o_mma8_affine4_g64_k4096_mrows_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            attention_o_qmv_mma8_affine4_g64_impl<T, 2, 4096>(
+                w, scales, biases,
+                x + tid.z * 8 * 4096,
+                y + tid.z * 8 * w_shape[0],
+                w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
+    private static let verifyRowsKernelK8192 = MLXFast.metalKernel(
+        name: "cbv2_verify_attention_o_mma8_affine4_g64_k8192_mrows_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            attention_o_qmv_mma8_affine4_g64_impl<T, 2, 8192>(
+                w, scales, biases,
+                x + tid.z * 8 * 8192,
+                y + tid.z * 8 * w_shape[0],
+                w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
+    /// `x` is `[8 * L, 1, K]` column-major; output `[8 * L, 1, 2816]`.
+    /// Bit-identical per column to `matmul` on that column's slice.
+    public static func matmulVerifyRows(
+        x: MLXArray,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode
+    ) -> MLXArray? {
+        guard enabled, mma8Enabled,
+            groupSize == Self.groupSize,
+            bits == Self.bits,
+            mode == .affine,
+            let biases,
+            x.dtype == .bfloat16,
+            scales.dtype == x.dtype,
+            biases.dtype == x.dtype,
+            weight.dtype == .uint32,
+            x.ndim == 3,
+            x.dim(0) > batch,
+            x.dim(0).isMultiple(of: batch),
+            x.dim(0) <= 8 * batch,
+            x.dim(1) == sequence,
+            weight.ndim == 2
+        else { return nil }
+
+        let rows = x.dim(0)
+        let inDim = x.dim(2)
+        guard liveInputWidth(inDim),
+            x.size == rows * sequence * inDim,
+            weight.shape == [outputWidth, inDim * Self.bits / 32],
+            scales.shape == [outputWidth, inDim / Self.groupSize],
+            biases.shape == scales.shape
+        else { return nil }
+
+        let yTiles = outputWidth / outputsPerGroup
+        let kernel = inDim == 8192 ? verifyRowsKernelK8192 : verifyRowsKernelK4096
+        return kernel(
+            [x, weight, scales, biases],
+            template: [("T", x.dtype)],
+            grid: (simdWidth, yTiles * simdGroups, rows / batch),
+            threadGroup: (simdWidth, simdGroups, 1),
+            outputShapes: [[rows, sequence, outputWidth]],
+            outputDTypes: [x.dtype]
+        )[0]
     }
 
     public static func matmul(

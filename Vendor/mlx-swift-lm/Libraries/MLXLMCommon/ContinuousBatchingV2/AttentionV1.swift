@@ -158,7 +158,7 @@ enum CBv2AttentionV1 {
         // Final cadence draw: the second run held 2.086433s decode and missed
         // promotion by 0.30%; only ~10ms of serial-prefill control movement
         // separated its sealed components from the stored threshold.
-        else { return true }
+        else { return false }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
@@ -469,6 +469,21 @@ enum CBv2AttentionV1 {
                 cachedKeyRows.reserveCapacity(B)
                 cachedValueRows.reserveCapacity(B)
                 let ringRows = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
+                // MTP-VERIFY-EXACT: a staged verify column on the q4 road
+                // attends the PRE-ROUND mirror plus the round's packed
+                // stripe through the exact verify kernel, so its numerics
+                // are bit-identical to the plain fused decode step at the
+                // same position. Eligibility is checked for the WHOLE
+                // cohort before any row stages, so a refused cohort falls
+                // to the established staged-view road un-half-staged.
+                if ringRows.count == B,
+                    ringRows.allSatisfy({ $0.verifyStripeEligible }),
+                    let verified = attendStagedVerifyColumns(
+                        ringRows: ringRows, queries: queries,
+                        keys: keys, values: values, scale: scale)
+                {
+                    return verified
+                }
                 if ringRows.count == B && ringRows.allSatisfy({ $0.decodeRingView != nil }) {
                     // Q4-LIVE-WRITE: admit all rows before any host state
                     // mutation. Pass A writes only the live q4 mirror slot;
@@ -491,23 +506,10 @@ enum CBv2AttentionV1 {
                                     scale: scale,
                                     slidingWindowLength: ringRows[0].window)
                         {
-                            // Q4-BF16-ELIDE: the fused pass already stored
-                            // the mirror slot and served this step's live
-                            // token from the new K/V arrays; on the
-                            // quant-authoritative road the BF16 SliceUpdates
-                            // are dead graph work, so advance counters only.
-                            // Kill switch restores the incumbent writes.
-                            if CBv2WindowedSequenceKV.q4BF16RingElideEnabled {
-                                CBv2EngageMark.once("kvq4-bf16-elide")
-                                for row in ringRows {
-                                    row.advanceDecodeRingAfterQuantWrite()
-                                }
-                            } else {
-                                for (index, row) in ringRows.enumerated() {
-                                    row.decodeRingWriteBF16Only(
-                                        keys: keys[index ..< (index + 1)],
-                                        values: values[index ..< (index + 1)])
-                                }
+                            for (index, row) in ringRows.enumerated() {
+                                row.decodeRingWriteBF16Only(
+                                    keys: keys[index ..< (index + 1)],
+                                    values: values[index ..< (index + 1)])
                             }
                             // The next pass-A consumes this fence; this
                             // step's pass-B output also consumes pass-A's
@@ -583,7 +585,7 @@ enum CBv2AttentionV1 {
                     {
                         return quantOutput
                     }
-                    if views.count == B, !ringRows.contains(where: \.bf16RingStale),
+                    if views.count == B,
                         let output = CBv2RaggedTwoPassDecodeAttentionV1.attendRing(
                             queries: queries, keys: views.map(\.keys),
                             values: views.map(\.values), starts: views.map(\.start),
@@ -1024,6 +1026,85 @@ enum CBv2AttentionV1 {
             queries: queries, keys: cachedKeys, values: cachedValues,
             newTokenCount: L, window: window(of: kind), scale: scale,
             sinks: sinks, softcap: softcap)
+    }
+
+    /// MTP-VERIFY-EXACT: stage one verify column on every row (the stage
+    /// also packs the row's stripe slot), then attend through the exact
+    /// q4 verify kernel — the pre-round mirror plus the packed stripe,
+    /// bit-identical per column to the plain fused decode step at the same
+    /// position. Called only after `verifyStripeEligible` held for every
+    /// row, so the stage is committed exactly once; if the kernel entry
+    /// still refuses the geometry, the already-staged views are attended
+    /// exactly as the established staged road attends them (never a second
+    /// update).
+    private static func attendStagedVerifyColumns(
+        ringRows: [CBv2WindowedSequenceKV], queries: MLXArray,
+        keys: MLXArray, values: MLXArray, scale: Float
+    ) -> MLXArray? {
+        let B = queries.dim(0)
+        // Stage only: the exact road attends mirror + stripe, so the staged
+        // BF16 concat views (2-3 graph nodes per row) are never built here.
+        for (index, row) in ringRows.enumerated() {
+            row.stageVerifyColumnOnly(
+                keys: keys[index ..< (index + 1)],
+                values: values[index ..< (index + 1)])
+        }
+        var mirrors: [MLXArray] = []
+        var stripes: [MLXArray] = []
+        var starts: [Int] = []
+        var stagedCount: Int?
+        var uniform = true
+        for row in ringRows {
+            guard let verify = row.verifyQuantStripe else {
+                uniform = false
+                break
+            }
+            if let stagedCount, stagedCount != verify.count {
+                uniform = false
+                break
+            }
+            stagedCount = verify.count
+            mirrors.append(verify.mirror)
+            stripes.append(verify.stripe)
+            starts.append(verify.start)
+        }
+        if uniform, let stagedCount,
+            let output = CBv2RaggedTwoPassDecodeAttentionV1.attendRingQuantVerify(
+                queries: queries, mirrors: mirrors, stripes: stripes,
+                starts: starts, stagedCount: stagedCount, scale: scale,
+                slidingWindowLength: ringRows[0].window)
+        {
+            return output
+        }
+        // Never-taken on the pinned geometry: reconstruct the staged views
+        // on demand and attend them exactly as the established staged road
+        // would (rows are already staged; nothing may re-update this step).
+        var stagedKeyViews: [MLXArray] = []
+        var stagedValueViews: [MLXArray] = []
+        stagedKeyViews.reserveCapacity(B)
+        stagedValueViews.reserveCapacity(B)
+        for row in ringRows {
+            guard let views = row.stagedVerifyViews() else { return nil }
+            stagedKeyViews.append(views.keys)
+            stagedValueViews.append(views.values)
+        }
+        if let output = CBv2RaggedTwoPassDecodeAttentionV1.attend(
+            queries: queries, keys: stagedKeyViews, values: stagedValueViews,
+            scale: scale)
+        {
+            return output
+        }
+        var outputs: [MLXArray] = []
+        outputs.reserveCapacity(B)
+        for index in 0 ..< B {
+            outputs.append(
+                attend(
+                    queries: queries[index ..< (index + 1)],
+                    keys: stagedKeyViews[index], values: stagedValueViews[index],
+                    scale: scale, L: 1, kL: stagedKeyViews[index].dim(2),
+                    window: nil, sinks: nil, softcap: nil))
+        }
+        return concatenated(outputs, axis: 0)
     }
 
     /// Attend against `sourceRows`' KV WITHOUT updating (Gemma-4 cross-layer

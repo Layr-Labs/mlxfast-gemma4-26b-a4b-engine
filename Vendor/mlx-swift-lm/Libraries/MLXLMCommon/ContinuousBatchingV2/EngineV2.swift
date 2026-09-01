@@ -569,6 +569,15 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// caller's response path. `CBv2DetachedDrainRegistry.joinAll` gives a
     /// later phase a bounded fence before it builds a new engine.
     public func shutdown() async {
+        // Local profiling only: the measured session's phases are complete
+        // by the time a caller shuts the engine down, and the loop object
+        // can outlive process interest — emit here, not in deinit.
+        if CBv2StepProfiler.enabled {
+            FileHandle.standardError.write(
+                Data(
+                    "[engine-shutdown] step profile\n\(CBv2StepProfiler.summaryTable())\n"
+                        .utf8))
+        }
         beginRejectingSubmissions()
         if Self.fastAckShutdown {
             let loop = self.loop

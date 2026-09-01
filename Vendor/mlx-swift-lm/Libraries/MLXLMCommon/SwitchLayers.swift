@@ -112,36 +112,37 @@ public func resetWeightedExpertUnsortStats() {
 /// permutation and writes `[tokens, hidden]` directly, avoiding that full
 /// `[tokens, topK, hidden]` intermediate.
 private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "weighted_expert_unsort_vec8_v3",
+    name: "weighted_expert_unsort_vec4_v2",
     inputNames: ["sorted_outputs", "inverse_order", "weights"],
     outputNames: ["output"],
     source: """
-        typedef vec<T, 8> T8;
-        // One lane owns eight consecutive features (128-bit load/store), so the
-        // grid is an eighth as wide and each row read and store are one
-        // eight-wide vector. The hidden extent is `threads_per_grid.x * 8u`,
-        // which is 2816.
-        uint oct = thread_position_in_grid.x;
+        typedef vec<T, 4> T4;
+        // One lane owns four consecutive features instead of one, so the
+        // grid is a quarter as wide and each row read and the store are one
+        // four-wide vector. The hidden extent is `threads_per_grid.x * 4`,
+        // which is the extent the one-feature form read as
+        // `threads_per_grid.x`.
+        uint quad = thread_position_in_grid.x;
         uint token = thread_position_in_grid.y;
-        const uint hidden = threads_per_grid.x * 8u;
+        const uint hidden = threads_per_grid.x * 4u;
 
-        T8 accumulator = T8((T)0);
+        T4 accumulator = T4((T)0);
         const uint assignment_base = token * (uint)K;
         for (uint slot = 0; slot < (uint)K; ++slot) {
             const uint assignment = assignment_base + slot;
             const uint sorted_row = (uint)inverse_order[assignment];
-            const device T8* row = reinterpret_cast<const device T8*>(
+            const device T4* row = reinterpret_cast<const device T4*>(
                 sorted_outputs + sorted_row * hidden);
-            const T8 source = row[oct];
+            const T4 source = row[quad];
             const float weight = (float)weights[assignment];
             // Preserve the legacy bfloat16 multiply-then-reduce rounding.
             #pragma clang loop unroll(full)
-            for (int j = 0; j < 8; ++j) {
+            for (int j = 0; j < 4; ++j) {
                 const T weighted = (T)((float)source[j] * weight);
                 accumulator[j] = accumulator[j] + weighted;
             }
         }
-        reinterpret_cast<device T8*>(output + token * hidden)[oct] =
+        reinterpret_cast<device T4*>(output + token * hidden)[quad] =
             accumulator;
     """,
     ensureRowContiguous: true
@@ -182,8 +183,8 @@ public func weightedExpertUnsort(
             ("T", sortedOutputs.dtype),
             ("K", 8),
         ],
-        grid: (352, tokens, 1),
-        threadGroup: (32, 4, 1),
+        grid: (704, tokens, 1),
+        threadGroup: (64, 4, 1),
         outputShapes: [[tokens, 2816]],
         outputDTypes: [.bfloat16]
     )[0]
@@ -387,7 +388,7 @@ private func geGLUProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
 /// and directly emits the three routing products consumed downstream.
 private let routeSimdRank64Kernel: MLXFast.MLXFastKernel =
     MLXFast.metalKernel(
-        name: "mlx_lm_route_simd_rank_scatter_m8_u32_n64_unroll_v2",
+        name: "mlx_lm_route_simd_rank_scatter_m8_u32_n64_v1",
         inputNames: ["indices"],
         outputNames: ["row_order", "sorted_keys", "inverse_order"],
         source: """
@@ -397,7 +398,6 @@ private let routeSimdRank64Kernel: MLXFast.MLXFastKernel =
             const uint key_low = (uint)indices[lane];
             const uint key_high = (uint)indices[32u + lane];
             uint rank = 0;
-            #pragma clang loop unroll(full)
             for (uint source = 0; source < 32; ++source) {
                 const uint other_low = simd_broadcast(key_low, ushort(source));
                 rank += (other_low < key)
@@ -407,7 +407,7 @@ private let routeSimdRank64Kernel: MLXFast.MLXFastKernel =
                 rank += (other_high < key)
                     || (other_high == key && high_assignment < assignment);
             }
-            row_order[rank] = assignment >> 3;
+            row_order[rank] = assignment / 8;
             sorted_keys[rank] = key;
             inverse_order[assignment] = rank;
         """,
@@ -429,7 +429,7 @@ private let routeSimdRank64Kernel: MLXFast.MLXFastKernel =
 /// whose generic `bias[indices]` lookup must continue to receive raw indices.
 private let routeSimdRank64PrefixBoundsKernel: MLXFast.MLXFastKernel =
     MLXFast.metalKernel(
-        name: "mlx_lm_route_simd_rank_bounds_scatter_m8_u32_n64_unroll_v2",
+        name: "mlx_lm_route_simd_rank_bounds_scatter_m8_u32_n64_v1",
         inputNames: ["indices"],
         outputNames: ["row_order", "sorted_keys", "inverse_order"],
         source: """
@@ -441,7 +441,6 @@ private let routeSimdRank64PrefixBoundsKernel: MLXFast.MLXFastKernel =
             uint rank = 0;
             uint run_offset = 0;
             uint run_length = 0;
-            #pragma clang loop unroll(full)
             for (uint source = 0; source < 32; ++source) {
                 const uint other_low = simd_broadcast(key_low, ushort(source));
                 rank += (other_low < key)
@@ -456,7 +455,7 @@ private let routeSimdRank64PrefixBoundsKernel: MLXFast.MLXFastKernel =
                 run_length += other_high == key;
             }
             const uint run_remaining = run_length - run_offset;
-            row_order[rank] = assignment >> 3;
+            row_order[rank] = assignment / 8;
             sorted_keys[rank] = 0x80000000u | key
                 | (run_offset << 8) | ((run_remaining - 1) << 14);
             inverse_order[assignment] = rank;

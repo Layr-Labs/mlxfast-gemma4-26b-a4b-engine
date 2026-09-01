@@ -394,45 +394,6 @@ inline void qdot_affine4_pair(
   out1 = scale * accum1 + sum1 * bias;
 }
 
-// Two independent affine-4 dot products over one register-held packed 32-bit word.
-template <typename U, int values_per_thread>
-inline void qdot_affine4_pair_word(
-    uint packedWord,
-    const thread U* x0,
-    const thread U* x1,
-    U scale,
-    U bias,
-    U sum0,
-    U sum1,
-    thread U& out0,
-    thread U& out1) {
-  static_assert(values_per_thread == 8, "Word load expects eight 4-bit values");
-  const uint packed0 = packedWord & 0xffffu;
-  const uint packed1 = packedWord >> 16;
-  U accum0 =
-      (x0[0] * (packed0 & 0x000f) +
-       x0[1] * (packed0 & 0x00f0) +
-       x0[2] * (packed0 & 0x0f00) +
-       x0[3] * (packed0 & 0xf000));
-  U accum1 =
-      (x1[0] * (packed0 & 0x000f) +
-       x1[1] * (packed0 & 0x00f0) +
-       x1[2] * (packed0 & 0x0f00) +
-       x1[3] * (packed0 & 0xf000));
-  accum0 +=
-      (x0[4] * (packed1 & 0x000f) +
-       x0[5] * (packed1 & 0x00f0) +
-       x0[6] * (packed1 & 0x0f00) +
-       x0[7] * (packed1 & 0xf000));
-  accum1 +=
-      (x1[4] * (packed1 & 0x000f) +
-       x1[5] * (packed1 & 0x00f0) +
-       x1[6] * (packed1 & 0x0f00) +
-       x1[7] * (packed1 & 0xf000));
-  out0 = scale * accum0 + sum0 * bias;
-  out1 = scale * accum1 + sum1 * bias;
-}
-
 // One affine-8 dot product against a byte weight vector ALREADY held in
 // registers. Byte-for-byte the bits == 8 arm of qdot: same per-element
 // multiply, same accumulation order over i, same `scale * accum + sum * bias`
@@ -1601,9 +1562,6 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   const device uint8_t* ws = (const device uint8_t*)w;
   thread float x0_thread[values_per_thread];
   thread float x1_thread[values_per_thread];
-  thread uint packed[results_per_simdgroup];
-  thread float scale_local[results_per_simdgroup];
-  thread float bias_local[results_per_simdgroup];
   thread float result0[results_per_simdgroup] = {0};
   thread float result1[results_per_simdgroup] = {0};
 
@@ -1622,20 +1580,17 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
 
   int k = 0;
   for (; k <= in_vec_size - block_size; k += block_size) {
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
-      scale_local[row] = scales[row * in_vec_size_g];
-      bias_local[row] = biases[row * in_vec_size_g];
-    }
-
     float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
     float sum1 = load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
 
     for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      const device T* sl = scales + row * in_vec_size_g;
+      const device T* bl = biases + row * in_vec_size_g;
       float dot0;
       float dot1;
-      qdot_affine4_pair_word<float, values_per_thread>(
-          packed[row], x0_thread, x1_thread, scale_local[row], bias_local[row], sum0, sum1, dot0, dot1);
+      qdot_affine4_pair<float, values_per_thread>(
+          wl, x0_thread, x1_thread, sl[0], bl[0], sum0, sum1, dot0, dot1);
       result0[row] += dot0;
       result1[row] += dot1;
     }
@@ -1654,21 +1609,18 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   const uint active_tail_lanes =
       uint((in_vec_size - k) / values_per_thread);
   if (simd_lid < active_tail_lanes) {
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
-      scale_local[row] = scales[row * in_vec_size_g];
-      bias_local[row] = biases[row * in_vec_size_g];
-    }
-
     float sum0 =
         load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
     float sum1 =
         load_vector<T, float, values_per_thread, 4>(x1, x1_thread);
     for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      const device T* sl = scales + row * in_vec_size_g;
+      const device T* bl = biases + row * in_vec_size_g;
       float dot0;
       float dot1;
-      qdot_affine4_pair_word<float, values_per_thread>(
-          packed[row], x0_thread, x1_thread, scale_local[row], bias_local[row], sum0, sum1, dot0, dot1);
+      qdot_affine4_pair<float, values_per_thread>(
+          wl, x0_thread, x1_thread, sl[0], bl[0], sum0, sum1, dot0, dot1);
       result0[row] += dot0;
       result1[row] += dot1;
     }

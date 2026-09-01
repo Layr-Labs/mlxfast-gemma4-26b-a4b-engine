@@ -310,6 +310,15 @@ enum CBv2AttentionV1 {
     /// throughout and widens the sinks itself, so narrowing them first would
     /// be a real precision loss. Both callers carve that case out on
     /// `softcap != nil`, which is what selects the composed path.
+    /// `MLX_CBV2_BORROW_RING=0` sends the batch-8 borrowed sliding decode back
+    /// to the rotated temporal-order read. Default ON. `MLX_` prefix: the
+    /// worker env sanitizer only passes that namespace through.
+    static let borrowRingEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_CBV2_BORROW_RING"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     @inline(__always)
     static func sdpaSinks(_ sinks: MLXArray?, queryDType: DType) -> MLXArray? {
         // `asType` returns `self` when the dtypes already match, so the
@@ -1125,6 +1134,31 @@ enum CBv2AttentionV1 {
             batch: B, cacheKind: sourceKind, queryKind: kind,
             scale: scale, sinks: effectiveSinks, softcap: softcap)
         {
+            // BORROW-RING: `decodeBorrowableViews()` rotates the whole retained
+            // ring into temporal order, and each of Gemma 4's KV-borrowing
+            // sliding layers repeats that rotation over the same allocation.
+            // `attendRing` reads the allocation in place: block `b` walks
+            // logical tokens `b, b + BLOCKS, ...` through the modular slot
+            // `(start + t) % N`, which is the same token in the same order the
+            // rotated read hands it, so pass A sees identical bf16 words.
+            if Self.borrowRingEnabled {
+                let ringSourceRows = sourceRows.compactMap {
+                    $0 as? CBv2WindowedSequenceKV
+                }
+                if ringSourceRows.count == B {
+                    let views = ringSourceRows.compactMap { $0.decodeRingView }
+                    if views.count == B,
+                        let output = CBv2RaggedTwoPassDecodeAttentionV1.attendRing(
+                            queries: queries, keys: views.map(\.keys),
+                            values: views.map(\.values), starts: views.map(\.start),
+                            scale: scale,
+                            slidingWindowLength: ringSourceRows[0].window)
+                    {
+                        CBv2EngageMark.once("borrow-ring")
+                        return output
+                    }
+                }
+            }
             var cachedKeyRows: [MLXArray] = []
             var cachedValueRows: [MLXArray] = []
             cachedKeyRows.reserveCapacity(B)

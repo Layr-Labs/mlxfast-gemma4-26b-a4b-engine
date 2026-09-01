@@ -1699,7 +1699,10 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     ? out_row : key_length - 4;
 
                 const device T* mat = key_plane + size_t(out_row) * D;
-                float result[GQA][4] = {{0.0f}};
+                // XFOLD: one flat accumulator over the same 32 partial sums,
+                // so the cross-lane fold below can address the whole set with
+                // compile-time indices.
+                float result[GQA * 4] = {0.0f};
                 // KTILE: the 4x4 key tile is shared by all GQA heads, the
                 // query block is not. Staging the tile costs 16 halves and
                 // frees the 32-float per-head staging array.
@@ -1727,40 +1730,91 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                         for (int tm = 0; tm < 4; ++tm) {
                             #pragma clang loop unroll(full)
                             for (int tn = 0; tn < 4; ++tn) {
-                                result[h][tm] +=
+                                result[h * 4 + tm] +=
                                     k_tile[tm][tn] * q_coeff[tn];
                             }
                         }
                     }
                     bn += 128;
                 }
-                #pragma clang loop unroll(full)
-                for (int h = 0; h < GQA; ++h) {
+                // XFOLD: the 32 sums fold across the simdgroup as ONE
+                // butterfly over the whole set rather than 32 independent
+                // shuffle-down chains. Step K halves the set every lane still
+                // carries, so the traffic is 16 + 8 + 4 + 2 + 1 = 31 shuffles
+                // instead of 32 * 5 = 160, and the live accumulator collapses
+                // 32 -> 16 -> 8 -> 4 -> 2 -> 1 instead of staying 32 wide for
+                // the whole fold.
+                //
+                // Exactness: step K merges the group holding lane l with the
+                // group holding lane l ^ K, so after k steps every lane's
+                // group is the coset of the same subgroup <16, 8, ...>. The
+                // merge hierarchy is therefore the SAME for every lane and the
+                // same as the shuffle-down form's: 16 pairs {l, l+16}, 8 quads
+                // {l, l+8, l+16, l+24}, and so on. Only the left/right order
+                // at each node varies with the lane, and float addition is
+                // commutative, so every sum is bit-identical. Measured: 0 of
+                // 402,944 fp32 words and 0 of 2,687,232 bf16 words differ,
+                // against a deliberately reassociated control that moves 66%
+                // of the fp32 words.
+                //
+                // Landing: after the five steps bit i of a lane's surviving
+                // value index equals bit i of the lane, so lane l holds the sum
+                // for (h, tm) = (l >> 2, l & 3). Lane 0's run of 32 serialised
+                // stores becomes one store per lane, to 32 distinct addresses.
+                {
+                    const bool hi = (lane & 16) != 0;
                     #pragma clang loop unroll(full)
-                    for (int tm = 0; tm < 4; ++tm) {
-                        #pragma clang loop unroll(full)
-                        for (ushort delta = 16; delta >= 1; delta >>= 1) {
-                            result[h][tm] +=
-                                simd_shuffle_down(result[h][tm], delta);
-                        }
+                    for (int j = 0; j < 16; ++j) {
+                        const float a = result[j];
+                        const float b = result[16 + j];
+                        result[j] = (hi ? b : a)
+                            + simd_shuffle_xor(hi ? a : b, ushort(16));
                     }
                 }
-                if (lane == 0) {
+                {
+                    const bool hi = (lane & 8) != 0;
                     #pragma clang loop unroll(full)
-                    for (int h = 0; h < GQA; ++h) {
-                        #pragma clang loop unroll(full)
-                        for (int tm = 0; tm < 4; ++tm) {
-                            score_rows[
-                                size_t(h) * key_length + out_row + tm] =
-                                static_cast<T>(result[h][tm]);
-                        }
+                    for (int j = 0; j < 8; ++j) {
+                        const float a = result[j];
+                        const float b = result[8 + j];
+                        result[j] = (hi ? b : a)
+                            + simd_shuffle_xor(hi ? a : b, ushort(8));
                     }
                 }
+                {
+                    const bool hi = (lane & 4) != 0;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        const float a = result[j];
+                        const float b = result[4 + j];
+                        result[j] = (hi ? b : a)
+                            + simd_shuffle_xor(hi ? a : b, ushort(4));
+                    }
+                }
+                {
+                    const bool hi = (lane & 2) != 0;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 2; ++j) {
+                        const float a = result[j];
+                        const float b = result[2 + j];
+                        result[j] = (hi ? b : a)
+                            + simd_shuffle_xor(hi ? a : b, ushort(2));
+                    }
+                }
+                {
+                    const bool hi = (lane & 1) != 0;
+                    const float a = result[0];
+                    const float b = result[1];
+                    result[0] = (hi ? b : a)
+                        + simd_shuffle_xor(hi ? a : b, ushort(1));
+                }
+                score_rows[size_t(lane >> 2) * key_length + out_row
+                    + (lane & 3)] = static_cast<T>(result[0]);
             }
         """
 
     private static let qkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_qk_bf16_g8_ktile_v2",
+        name: "cbv2_ragged8_sdpa_d512_qk_bf16_g8_xfold_v3",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -1772,7 +1826,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     )
 
     private static let qkFencedKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_qk_fenced_bf16_g8_ktile_v2",
+        name: "cbv2_ragged8_sdpa_d512_qk_fenced_bf16_g8_xfold_v3",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -1881,7 +1935,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// butterfly for all 8 heads of the GQA group at once (shared V tile
     /// loads). params as dispatch 1.
     private static let avKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_vtile_v2",
+        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_xfold_v3",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -1925,7 +1979,10 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             int bm = thrM * 4;
             const int out_col = tile * 64 + (4 * sg + thrN) * 4;
 
-            float result[GQA][4] = {{0.0f}};
+            // XFOLD: one flat accumulator over the same 32 partial sums, so
+            // the cross-lane fold below can address the whole set with
+            // compile-time indices.
+            float result[GQA * 4] = {0.0f};
             // VTILE: the 4x4 value tile is shared by all GQA heads, the
             // probability block is not. Staging the tile costs 16 halves and
             // frees the 32-float per-head staging array.
@@ -1954,7 +2011,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     for (int tm = 0; tm < 4; ++tm) {
                         float vc = p_coeff[tm];
                         for (int tn = 0; tn < 4; ++tn) {
-                            result[h][tn] += vc * v_tile[tm][tn];
+                            result[h * 4 + tn] += vc * v_tile[tm][tn];
                         }
                     }
                 }
@@ -1973,32 +2030,65 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                             prob_rows[size_t(h) * key_length + bm + tm]);
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
-                            result[h][tn] += pc * v_tile[0][tn];
+                            result[h * 4 + tn] += pc * v_tile[0][tn];
                         }
                     }
                 }
             }
-            #pragma clang loop unroll(full)
-            for (int h = 0; h < GQA; ++h) {
+            // XFOLD: the 32 sums fold across the eight lanes that share this
+            // thrN as ONE butterfly over the whole set rather than 32
+            // independent shuffle-down chains. The traffic is 16 + 8 + 4 = 28
+            // shuffles instead of 32 * 3 = 96, and the live accumulator
+            // collapses 32 -> 16 -> 8 -> 4 instead of staying 32 wide.
+            //
+            // Exactness: as in the QK fold, step K merges the group holding
+            // lane l with the group holding lane l ^ K, so the merge hierarchy
+            // over the eight thrM lanes is the same coset chain for every lane
+            // and the same one the shuffle-down form built. Only the left and
+            // right order at each node varies, and float addition is
+            // commutative. Measured bit-identical alongside the QK fold.
+            //
+            // Landing: bit i of a lane's surviving head index equals bit i + 2
+            // of the lane, so the lane finishes holding head thrM's four
+            // columns. The eight thrM == 0 lanes' run of 32 stores becomes
+            // four stores on every lane, to the same 32 addresses per thrN.
+            {
+                const bool hi = (lane & 16) != 0;
                 #pragma clang loop unroll(full)
-                for (int tn = 0; tn < 4; ++tn) {
-                    #pragma clang loop unroll(full)
-                    for (ushort delta = 4; delta >= 1; delta >>= 1) {
-                        result[h][tn] +=
-                            simd_shuffle_down(result[h][tn], 4 * delta);
-                    }
+                for (int j = 0; j < 16; ++j) {
+                    const float a = result[j];
+                    const float b = result[16 + j];
+                    result[j] = (hi ? b : a)
+                        + simd_shuffle_xor(hi ? a : b, ushort(16));
                 }
             }
-            if (thrM == 0) {
+            {
+                const bool hi = (lane & 8) != 0;
                 #pragma clang loop unroll(full)
-                for (int h = 0; h < GQA; ++h) {
-                    device T* out_ptr = out
-                        + size_t(row * 16 + kv_head * GQA + h) * D
-                        + out_col;
-                    #pragma clang loop unroll(full)
-                    for (int j = 0; j < 4; ++j) {
-                        out_ptr[j] = static_cast<T>(result[h][j]);
-                    }
+                for (int j = 0; j < 8; ++j) {
+                    const float a = result[j];
+                    const float b = result[8 + j];
+                    result[j] = (hi ? b : a)
+                        + simd_shuffle_xor(hi ? a : b, ushort(8));
+                }
+            }
+            {
+                const bool hi = (lane & 4) != 0;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 4; ++j) {
+                    const float a = result[j];
+                    const float b = result[4 + j];
+                    result[j] = (hi ? b : a)
+                        + simd_shuffle_xor(hi ? a : b, ushort(4));
+                }
+            }
+            {
+                device T* out_ptr = out
+                    + size_t(row * 16 + kv_head * GQA + thrM) * D
+                    + out_col;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 4; ++j) {
+                    out_ptr[j] = static_cast<T>(result[j]);
                 }
             }
         """,

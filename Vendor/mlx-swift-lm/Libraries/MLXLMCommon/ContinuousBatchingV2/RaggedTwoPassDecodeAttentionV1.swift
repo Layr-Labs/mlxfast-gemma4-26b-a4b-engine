@@ -919,7 +919,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     }
 
     private static let portQuantReadKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_ring_2pass_a_q4g64_d256_g2_port_b\(blocks)_v1",
+        name: "cbv2_ragged8_sdpa_ring_2pass_a_q4g64_d256_g2_port_pair_b\(blocks)_v2",
         inputNames: [
             "queries",
             "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7", "starts",
@@ -933,8 +933,10 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             const int kv_head = int(threadgroup_position_in_grid.x);
             const int batch_index = int(threadgroup_position_in_grid.y);
             const int block = int(threadgroup_position_in_grid.z);
-            const int query_head_in_group = int(thread_position_in_threadgroup.y);
-            const int query_head = GQA * kv_head + query_head_in_group;
+            // GQA-PAIR: one simdgroup serves BOTH query heads of its group.
+            // Each packed word is loaded once and each nibble dequant is
+            // evaluated once, feeding two chains that never mix.
+            const int query_head = GQA * kv_head;
             const int batch_head = batch_index * 16 + query_head;
             const int lane = int(thread_index_in_simdgroup);
 
@@ -963,14 +965,20 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             device float* max_out = maxs + batch_head * BLOCKS + block;
 
             thread float q[values_per_lane];
-            thread float accumulator[values_per_lane];
+            thread float q_hi[values_per_lane];
+            thread float acc_lo[values_per_lane];
+            thread float acc_hi[values_per_lane];
             for (int element = 0; element < values_per_lane; ++element) {
                 q[element] = 1.0f * float(query[element]);
-                accumulator[element] = 0.0f;
+                q_hi[element] = 1.0f * float(query[D + element]);
+                acc_lo[element] = 0.0f;
+                acc_hi[element] = 0.0f;
             }
 
             float max_score = -3.402823466e+38F;
+            float max_hi = -3.402823466e+38F;
             float sum_exp_score = 0.0f;
+            float sum_hi = 0.0f;
             for (int token = block; token < N; token += BLOCKS) {
                 const device uint32_t* krow_w =
                     mirror_w + (kv_head * N + slot) * row_words;
@@ -988,21 +996,33 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 const uint32_t kw = krow_w[lane];
                 const uint32_t vw = vrow_w[lane];
                 float score = 0.0f;
+                float score_hi = 0.0f;
                 for (int element = 0; element < 8; ++element) {
-                    score += q[element]
-                        * fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
+                    const float key_element =
+                        fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
+                    score += q[element] * key_element;
+                    score_hi += q_hi[element] * key_element;
                 }
                 score = simd_sum(score);
+                score_hi = simd_sum(score_hi);
 
                 const float new_max = max(max_score, score);
+                const float new_max_hi = max(max_hi, score_hi);
                 const float old_factor = fast::exp(max_score - new_max);
+                const float old_factor_hi = fast::exp(max_hi - new_max_hi);
                 const float score_factor = fast::exp(score - new_max);
+                const float score_factor_hi = fast::exp(score_hi - new_max_hi);
                 max_score = new_max;
+                max_hi = new_max_hi;
                 sum_exp_score = sum_exp_score * old_factor + score_factor;
+                sum_hi = sum_hi * old_factor_hi + score_factor_hi;
                 for (int element = 0; element < 8; ++element) {
-                    accumulator[element] = accumulator[element] * old_factor
-                        + score_factor
-                            * fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
+                    const float value_element =
+                        fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
+                    acc_lo[element] = acc_lo[element] * old_factor
+                        + score_factor * value_element;
+                    acc_hi[element] = acc_hi[element] * old_factor_hi
+                        + score_factor_hi * value_element;
                 }
 
                 slot += BLOCKS;
@@ -1012,9 +1032,12 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             if (lane == 0) {
                 sum_out[0] = sum_exp_score;
                 max_out[0] = max_score;
+                sum_out[BLOCKS] = sum_hi;
+                max_out[BLOCKS] = max_hi;
             }
             for (int element = 0; element < values_per_lane; ++element) {
-                partial[element] = T(accumulator[element]);
+                partial[element] = T(acc_lo[element]);
+                partial[BLOCKS * D + element] = T(acc_hi[element]);
             }
         """,
         ensureRowContiguous: true
@@ -1302,8 +1325,8 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 ("T", queries.dtype), ("D", headDim), ("N", sequenceLength),
                 ("GQA", gqa), ("KV_HEADS", kvHeads), ("BLOCKS", blocks),
             ],
-            grid: (kvHeads * 32, batch * gqa, blocks),
-            threadGroup: (32, gqa, 1),
+            grid: (kvHeads * 32, batch, blocks),
+            threadGroup: (32, 1, 1),
             outputShapes: [partialShape, summaryShape, summaryShape],
             outputDTypes: [.bfloat16, .float32, .float32]
         )
@@ -1349,8 +1372,8 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 ("KV_HEADS", kvHeads),
                 ("BLOCKS", blocks),
             ],
-            grid: (kvHeads * 32, batch * gqa, blocks),
-            threadGroup: (32, gqa, 1),
+            grid: (kvHeads * 32, batch, blocks),
+            threadGroup: (32, 1, 1),
             outputShapes: [partialShape, summaryShape, summaryShape],
             outputDTypes: [.bfloat16, .float32, .float32]
         )

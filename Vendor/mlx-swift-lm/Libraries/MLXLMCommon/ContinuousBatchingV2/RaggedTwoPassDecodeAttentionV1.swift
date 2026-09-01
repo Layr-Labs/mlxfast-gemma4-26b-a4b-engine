@@ -31,6 +31,20 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Q4-RESIDENT-PACKED-UNROLL. The live resident kernel's token walk is
+    /// runtime-rolled (`token += BLOCKS`). Each token then runs three
+    /// compile-time eight-wide packed walks: query staging, nibble-dequant
+    /// QK, nibble-dequant AV. Metal JIT does not unroll those unless marked.
+    /// The arithmetic, shift order, FMA arguments and simd reductions stay
+    /// character-identical; only the trip is named. Off restores the
+    /// two-dispatch q4 road already in this file.
+    private static let q4ResidentPackedUnrollEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_Q4_RESIDENT_PACKED_UNROLL"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let batch = 8
     private static let queryHeads = 16
     private static let kvHeads = 8
@@ -1523,7 +1537,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// removes only the global partial write/read and the second dispatch.
     private static let portQuantFusedWriteResidentKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_v1",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_unroll_v2",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -1666,6 +1680,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 thread float q_hi[values_per_lane];
                 thread float acc_lo[values_per_lane];
                 thread float acc_hi[values_per_lane];
+                #pragma unroll
                 for (int element = 0; element < values_per_lane; ++element) {
                     q_lo[element] = float(query[element]);
                     q_hi[element] = float(query[D + element]);
@@ -1717,6 +1732,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     const float vb = float(as_type<half>(ushort(vtw >> 16)));
                     float score_lo = 0.0f;
                     float score_hi = 0.0f;
+                    #pragma unroll
                     for (int element = 0; element < values_per_lane; ++element) {
                         const float key_element =
                             fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
@@ -1736,6 +1752,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     max_hi = new_max_hi;
                     sum_lo = sum_lo * old_factor_lo + score_factor_lo;
                     sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                    #pragma unroll
                     for (int element = 0; element < values_per_lane; ++element) {
                         const float value_element =
                             fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
@@ -1752,6 +1769,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     sum_out[BLOCKS] = sum_hi;
                     max_out[BLOCKS] = max_hi;
                 }
+                #pragma unroll
                 for (int element = 0; element < values_per_lane; ++element) {
                     partial[element] = T(acc_lo[element]);
                     partial[BLOCKS * D + element] = T(acc_hi[element]);
@@ -1773,6 +1791,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         + output_group * values_per_lane;
 
                     thread float accumulator[values_per_lane];
+                    #pragma unroll
                     for (int element = 0; element < values_per_lane; ++element) {
                         accumulator[element] = 0.0f;
                     }
@@ -1824,8 +1843,10 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         }
                     }
 
+                    #pragma unroll
                     for (int element = 0; element < values_per_lane; ++element) {
                         float reduced = accumulator[element];
+                        #pragma unroll
                         for (int stride = 1; stride < COLS; stride <<= 1) {
                             reduced +=
                                 simd_shuffle_xor(reduced, ushort(stride));
@@ -1979,6 +2000,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         let inputs = [queries] + mirrors
             + [startArray, newKeys, newValues, previousWriteFence]
         if q4ResidentMergeEnabled,
+            q4ResidentPackedUnrollEnabled,
             blocks == 8,
             combineColumns == 8,
             combineThreads == 256
@@ -2000,6 +2022,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             )
             CBv2EngageMark.once("kvq4-fused-live-write")
             CBv2EngageMark.once("kvq4-resident-merge")
+            CBv2EngageMark.once("q4-resident-packed-unroll")
             return (resident[0], resident[1])
         }
 

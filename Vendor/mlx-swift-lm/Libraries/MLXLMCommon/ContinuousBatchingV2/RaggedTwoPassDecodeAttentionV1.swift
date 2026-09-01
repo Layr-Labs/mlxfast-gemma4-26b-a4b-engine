@@ -1523,7 +1523,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// removes only the global partial write/read and the second dispatch.
     private static let portQuantFusedWriteResidentKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_u2",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -1700,6 +1700,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     ? mkeys_w[slot * row_words + payload_words + lane / 8] : 0u;
                 uint32_t vtw_pre = prefetch_first
                     ? mvalues_w[slot * row_words + payload_words + lane / 8] : 0u;
+                #pragma clang loop unroll_count(2)
                 for (int token = block; token < N; token += BLOCKS) {
                     const bool current = token == N - 1;
                     const uint32_t kw = current ? kword : kw_pre;

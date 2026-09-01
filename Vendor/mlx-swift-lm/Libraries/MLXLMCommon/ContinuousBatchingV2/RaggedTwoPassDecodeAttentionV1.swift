@@ -30,6 +30,15 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
+    /// Q4 metadata is shared by the eight lanes covering one q4g64 group.
+    /// Disable to retain the independent metadata-load control.
+    private static let q4ReadMetadataBroadcastEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_Q4_READ_METADATA_BROADCAST"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
 
     private static let batch = 8
     private static let queryHeads = 16
@@ -1160,7 +1169,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     }
 
     private static let portQuantReadKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_ring_2pass_a_q4g64_d256_g2_port_b\(blocks)_v1",
+        name: "cbv2_ragged8_sdpa_ring_2pass_a_q4g64_d256_g2_port_b\(blocks)_meta_bcast_v2",
         inputNames: [
             "queries",
             "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7", "starts",
@@ -1220,8 +1229,28 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 // One lane owns 8 consecutive elements, so it sits wholly
                 // inside one 64-element group: group = (lane * 8) / 64.
                 const int group = lane / 8;
-                const uint32_t ktw = krow_w[D / 8 + group];
-                const uint32_t vtw = vrow_w[D / 8 + group];
+                const bool metadata_leader = (lane & 7) == 0;
+                uint32_t ktw = META_BROADCAST
+                    ? (metadata_leader ? krow_w[D / 8 + group] : 0u)
+                    : krow_w[D / 8 + group];
+                uint32_t vtw = META_BROADCAST
+                    ? (metadata_leader ? vrow_w[D / 8 + group] : 0u)
+                    : vrow_w[D / 8 + group];
+                if (META_BROADCAST) {
+                    // Propagate lane 0's metadata through each 8-lane coset.
+                    if ((lane & 7) >= 4) {
+                        ktw = simd_shuffle_xor(ktw, ushort(4));
+                        vtw = simd_shuffle_xor(vtw, ushort(4));
+                    }
+                    if ((lane & 7) >= 2) {
+                        ktw = simd_shuffle_xor(ktw, ushort(2));
+                        vtw = simd_shuffle_xor(vtw, ushort(2));
+                    }
+                    if (lane & 1) {
+                        ktw = simd_shuffle_xor(ktw, ushort(1));
+                        vtw = simd_shuffle_xor(vtw, ushort(1));
+                    }
+                }
                 const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
                 const float kb = float(as_type<half>(ushort(ktw >> 16)));
                 const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
@@ -1914,6 +1943,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             template: [
                 ("T", queries.dtype), ("D", headDim), ("N", sequenceLength),
                 ("GQA", gqa), ("KV_HEADS", kvHeads), ("BLOCKS", blocks),
+                ("META_BROADCAST", q4ReadMetadataBroadcastEnabled ? 1 : 0),
             ],
             grid: (kvHeads * 32, batch * gqa, blocks),
             threadGroup: (32, gqa, 1),
@@ -1955,18 +1985,19 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         let passA = portQuantReadKernel(
             [queries] + mirrors + [startArray],
             template: [
-                ("T", queries.dtype),
-                ("D", headDim),
-                ("N", sequenceLength),
-                ("GQA", gqa),
-                ("KV_HEADS", kvHeads),
+                ("T", queries.dtype), ("D", headDim), ("N", sequenceLength),
+                ("GQA", gqa), ("KV_HEADS", kvHeads),
                 ("BLOCKS", blocks),
+                ("META_BROADCAST", q4ReadMetadataBroadcastEnabled ? 1 : 0),
             ],
             grid: (kvHeads * 32, batch * gqa, blocks),
             threadGroup: (32, gqa, 1),
             outputShapes: [partialShape, summaryShape, summaryShape],
             outputDTypes: [.bfloat16, .float32, .float32]
         )
+        if q4ReadMetadataBroadcastEnabled {
+            CBv2EngageMark.once("kvq4-read-meta-broadcast")
+        }
         CBv2EngageMark.once("kvq8port")
         return passBActive(
             passA,

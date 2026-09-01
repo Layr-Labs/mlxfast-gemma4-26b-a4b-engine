@@ -193,18 +193,21 @@ inline float mma8_hi(uint u) {
 
 template <typename T>
 inline float mma8_runsum4(uint4 r) {
-  thread T xt[8];
-  xt[0] = mma8_u16<T>::cast(ushort(r.x & 0xFFFFu));
-  xt[1] = mma8_u16<T>::cast(ushort(r.x >> 16));
-  xt[2] = mma8_u16<T>::cast(ushort(r.y & 0xFFFFu));
-  xt[3] = mma8_u16<T>::cast(ushort(r.y >> 16));
-  xt[4] = mma8_u16<T>::cast(ushort(r.z & 0xFFFFu));
-  xt[5] = mma8_u16<T>::cast(ushort(r.z >> 16));
-  xt[6] = mma8_u16<T>::cast(ushort(r.w & 0xFFFFu));
-  xt[7] = mma8_u16<T>::cast(ushort(r.w >> 16));
+  // Keep the two four-value trees in source order, but feed them directly from
+  // the packed words.  The prior thread array made eight scalar temporaries
+  // live across both trees; direct operands let Metal schedule the extracts
+  // beside the weight load without an addressable local.
   float sum = 0;
-  sum += xt[0] + xt[1] + xt[2] + xt[3];
-  sum += xt[4] + xt[5] + xt[6] + xt[7];
+  sum +=
+      mma8_u16<T>::cast(ushort(r.x & 0xFFFFu))
+      + mma8_u16<T>::cast(ushort(r.x >> 16))
+      + mma8_u16<T>::cast(ushort(r.y & 0xFFFFu))
+      + mma8_u16<T>::cast(ushort(r.y >> 16));
+  sum +=
+      mma8_u16<T>::cast(ushort(r.z & 0xFFFFu))
+      + mma8_u16<T>::cast(ushort(r.z >> 16))
+      + mma8_u16<T>::cast(ushort(r.w & 0xFFFFu))
+      + mma8_u16<T>::cast(ushort(r.w >> 16));
   return sum;
 }
 

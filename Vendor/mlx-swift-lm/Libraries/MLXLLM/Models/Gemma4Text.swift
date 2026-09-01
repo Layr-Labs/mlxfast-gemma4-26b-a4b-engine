@@ -3,6 +3,7 @@
 //  mlx-swift-lm
 //
 //  Port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/gemma4_text.py
+// Ranked reproducibility sample of the promoted paired-GQA q4 frontier.
 
 import Foundation
 import MLX

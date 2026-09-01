@@ -30,8 +30,17 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
+    /// Only the first lane of each eight-lane metadata subgroup fetches the
+    /// shared scale/bias word; other lanes receive it through SIMD shuffle.
+    private static let q4ResidentMetadataBroadcastEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_Q4_RESIDENT_META_BCAST"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
 
-    private static let batch = 8
+
+
     private static let queryHeads = 16
     private static let kvHeads = 8
     private static let gqa = 2
@@ -1514,7 +1523,6 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             """,
             ensureRowContiguous: true
         )
-
     /// B8-Q4-RESIDENT-001: the eight block SIMD groups that previously ran as
     /// separate pass-A threadgroups now share one 256-thread threadgroup. Each
     /// group executes the incumbent block-strided walk and casts both head
@@ -1523,7 +1531,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// removes only the global partial write/read and the second dispatch.
     private static let portQuantFusedWriteResidentKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c4",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -1696,10 +1704,21 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     ? mkeys_w[slot * row_words + lane] : 0u;
                 uint32_t vw_pre = prefetch_first
                     ? mvalues_w[slot * row_words + lane] : 0u;
-                uint32_t ktw_pre = prefetch_first
-                    ? mkeys_w[slot * row_words + payload_words + lane / 8] : 0u;
-                uint32_t vtw_pre = prefetch_first
-                    ? mvalues_w[slot * row_words + payload_words + lane / 8] : 0u;
+                uint32_t ktw_pre;
+                uint32_t vtw_pre;
+                if (META_BCAST != 0) {
+                    ktw_pre = prefetch_first && (lane % 8 == 0)
+                        ? mkeys_w[slot * row_words + payload_words + lane / 8] : 0u;
+                    vtw_pre = prefetch_first && (lane % 8 == 0)
+                        ? mvalues_w[slot * row_words + payload_words + lane / 8] : 0u;
+                    ktw_pre = simd_shuffle_xor(ktw_pre, ushort(lane % 8));
+                    vtw_pre = simd_shuffle_xor(vtw_pre, ushort(lane % 8));
+                } else {
+                    ktw_pre = prefetch_first
+                        ? mkeys_w[slot * row_words + payload_words + lane / 8] : 0u;
+                    vtw_pre = prefetch_first
+                        ? mvalues_w[slot * row_words + payload_words + lane / 8] : 0u;
+                }
                 for (int token = block; token < N; token += BLOCKS) {
                     const bool current = token == N - 1;
                     const uint32_t kw = current ? kword : kw_pre;
@@ -1715,10 +1734,19 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     if (token + BLOCKS < N - 1) {
                         kw_pre = mkeys_w[next_slot * row_words + lane];
                         vw_pre = mvalues_w[next_slot * row_words + lane];
-                        ktw_pre =
-                            mkeys_w[next_slot * row_words + payload_words + lane / 8];
-                        vtw_pre =
-                            mvalues_w[next_slot * row_words + payload_words + lane / 8];
+                        if (META_BCAST != 0) {
+                            ktw_pre = (lane % 8 == 0)
+                                ? mkeys_w[next_slot * row_words + payload_words + lane / 8] : 0u;
+                            vtw_pre = (lane % 8 == 0)
+                                ? mvalues_w[next_slot * row_words + payload_words + lane / 8] : 0u;
+                            ktw_pre = simd_shuffle_xor(ktw_pre, ushort(lane % 8));
+                            vtw_pre = simd_shuffle_xor(vtw_pre, ushort(lane % 8));
+                        } else {
+                            ktw_pre =
+                                mkeys_w[next_slot * row_words + payload_words + lane / 8];
+                            vtw_pre =
+                                mvalues_w[next_slot * row_words + payload_words + lane / 8];
+                        }
                         next_slot += uint(BLOCKS);
                         if (next_slot >= uint(N)) next_slot -= uint(N);
                     }
@@ -2037,6 +2065,8 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     ("GQA", gqa),
                     ("KV_HEADS", kvHeads),
                     ("BLOCKS", blocks),
+                    ("META_BCAST",
+                        q4ResidentMetadataBroadcastEnabled ? 1 : 0),
                 ],
                 grid: (kvHeads * blocks * 32, batch, 1),
                 threadGroup: (blocks * 32, 1, 1),
@@ -2045,6 +2075,9 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             )
             CBv2EngageMark.once("kvq4-fused-live-write")
             CBv2EngageMark.once("kvq4-resident-merge")
+            if q4ResidentMetadataBroadcastEnabled {
+                CBv2EngageMark.once("kvq4-resident-meta-bcast")
+            }
             return (resident[0], resident[1])
         }
 

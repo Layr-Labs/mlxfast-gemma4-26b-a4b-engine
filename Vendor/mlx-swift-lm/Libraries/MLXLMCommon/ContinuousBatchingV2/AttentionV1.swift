@@ -60,13 +60,22 @@ enum CBv2AttentionV1 {
     /// softmax reduction still runs over the whole key axis, in the same
     /// order, so the produced values are unchanged.
     ///
-    /// `0` disables the specialization (the block width falls back to
-    /// `queryBlockSize`), which is the kill switch.
+    /// Default 128: wide-head prompt passes take the same 128-row query
+    /// block as every other layer, halving the per-pass attention dispatch
+    /// count (one score rectangle per 128 query rows instead of two per 64)
+    /// while the per-row arithmetic and reduction order stay identical.
+    /// Because the specialization arm requires a width strictly below
+    /// `queryBlockSize`, 128 disables it — the widest legal grouping wins.
+    ///
+    /// `0` (or any width `>= queryBlockSize`) disables the specialization
+    /// (the block width falls back to `queryBlockSize`); an explicit
+    /// `DARKBLOOM_CBV2_ATTN_QUERY_BLOCK_WIDE=64` restores the previous
+    /// narrow-rectangle behavior. The environment variable is the kill switch.
     static let wideHeadQueryBlockSize: Int = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_ATTN_QUERY_BLOCK_WIDE"],
             let value = Int(raw), value >= 0
-        else { return 64 }
+        else { return 128 }
         return value
     }()
 

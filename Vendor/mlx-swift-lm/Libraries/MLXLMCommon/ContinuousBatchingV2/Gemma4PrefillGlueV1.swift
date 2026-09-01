@@ -392,6 +392,7 @@ public enum Gemma4PrefillGlueV1 {
             // inverse[t * K + k]. The inverse order is a permutation of the
             // plane rows, so every plane row is written exactly once.
             const size_t assignment_base = size_t(row) * K;
+            #pragma clang loop unroll(full)
             for (int k = 0; k < K; k++) {
                 const size_t pos = size_t(inverse[assignment_base + k]);
                 const size_t obase = pos * GLUE_AXIS + lid * GLUE_NREADS;
@@ -675,6 +676,7 @@ public enum Gemma4PrefillGlueV1 {
                 const uint feature = lid * GLUE_NREADS + i;
                 av[i] = static_cast<float>(h1[base + i]);
                 T accumulator = (T)0;
+                #pragma clang loop unroll(full)
                 for (uint slot = 0; slot < 8; ++slot) {
                     const uint assignment = assignment_base + slot;
                     const uint sorted_row = (uint)inverse_order[assignment];

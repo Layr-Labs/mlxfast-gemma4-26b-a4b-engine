@@ -2712,6 +2712,7 @@ private enum Gemma4FusedLayerGlue {
             const uint wbase = lid * 4;
         \(rmsReduce("x", into: "local_inv[0]"))
             const float inv = local_inv[0];
+            #pragma clang loop unroll(full)
             for (int i = 0; i < 4; i++) {
                 // The stock chain rounds the norm's output to T in memory
                 // before the residual add reads it; reproduce both roundings.
@@ -2747,6 +2748,7 @@ private enum Gemma4FusedLayerGlue {
             \(rmsReduce("attn", into: "local_inv[0]"))
                 const float attn_inv = local_inv[0];
                 T outv[4];
+                #pragma clang loop unroll(full)
                 for (int i = 0; i < 4; i++) {
                     const T normed = static_cast<T>(
                         wa[wbase + i]
@@ -2759,6 +2761,7 @@ private enum Gemma4FusedLayerGlue {
                 of: "(float)outv[base + i]", with: "(float)outv[i]"))
                 const float branch_inv = local_inv[0];
                 float xsum = 0.0f;
+                #pragma clang loop unroll(full)
                 for (int i = 0; i < 4; i++) {
                     const T nx =
                         static_cast<T>((float)outv[i] * branch_inv);
@@ -2789,6 +2792,7 @@ private enum Gemma4FusedLayerGlue {
         \(rmsReduce("x", into: "local_inv[0]"))
             const float inv = local_inv[0];
             float xsum = 0.0f;
+            #pragma clang loop unroll(full)
             for (int i = 0; i < 4; i++) {
                 const T nx = static_cast<T>((float)x[base + i] * inv);
                 const T dense = w1[wbase + i] * nx;
@@ -2817,6 +2821,7 @@ private enum Gemma4FusedLayerGlue {
             const float inv1 = local_inv[0];
             const float inv2 = local_inv[1];
             T sv[4];
+            #pragma clang loop unroll(full)
             for (int i = 0; i < 4; i++) {
                 const T h1 = w1[wbase + i] * static_cast<T>((float)a[base + i] * inv1);
                 const T h2 = w2[wbase + i] * static_cast<T>((float)b[base + i] * inv2);
@@ -2826,6 +2831,7 @@ private enum Gemma4FusedLayerGlue {
             of: "(float)sv[base + i]", with: "(float)sv[i]"))
             const float inv3 = local_inv[0];
             const T scalar = s[0];
+            #pragma clang loop unroll(full)
             for (int i = 0; i < 4; i++) {
                 // Same double rounding as the stock norm-then-add pair, then
                 // the layer-scalar multiply with its own stock rounding: the
@@ -3037,8 +3043,10 @@ private enum Gemma4FusedLayerGlue {
     private static let deferredExpertValuesSource = """
             T expertv[4];
             const uint assignment_base = row * 8u;
+            #pragma clang loop unroll(full)
             for (int i = 0; i < 4; ++i) {
                 T accumulator = static_cast<T>(0.0f);
+                #pragma clang loop unroll(full)
                 for (uint slot = 0u; slot < 8u; ++slot) {
                     const uint assignment = assignment_base + slot;
                     const uint sorted_row = (uint)inverse[assignment];
@@ -4480,6 +4488,7 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
 
             // Exact `rms_single_row<T, 4>` reduction for axis 2816.
             float acc = 0.0f;
+            #pragma clang loop unroll(full)
             for (int i = 0; i < 4; ++i) {
                 const float xi = x[base + i];
                 acc += xi * xi;
@@ -4503,6 +4512,7 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             T outv[4];
+            #pragma clang loop unroll(full)
             for (int i = 0; i < 4; ++i) {
                 // Preserve the stock RMSNorm's BF16 boundary exactly.
                 outv[i] = w[wbase + i]

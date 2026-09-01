@@ -3789,6 +3789,7 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
 
   thread uint wpf[results_per_simdgroup];
   if (PF) {
+#pragma unroll
     for (int row = 0; row < results_per_simdgroup; row++) {
       wpf[row] = *((const device uint*)(ws0 + row * in_vec_size_w));
     }
@@ -3799,11 +3800,13 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
 
     thread uint wcur[results_per_simdgroup];
     if (PF) {
+#pragma unroll
       for (int row = 0; row < results_per_simdgroup; row++) {
         wcur[row] = wpf[row];
       }
       const int nextblk = (blk + 1 < nblocks) ? (blk + 1) : blk;
       const device uint8_t* wsn = ws0 + nextblk * block_bytes;
+#pragma unroll
       for (int row = 0; row < results_per_simdgroup; row++) {
         wpf[row] = *((const device uint*)(wsn + row * in_vec_size_w));
       }
@@ -4174,8 +4177,15 @@ template <typename T, int group_size, int bits>
     const device T* single_biases = biases + expert * b_strides[0];
     device T* single_y = y + assignment * (uint)out_vec_size;
     if (in_vec_size == 2816) {
+      // EXPERT-SINGLES-PF. Software prefetch of the next K-block's four
+      // weight words on the gate/up singleton arm. One x-row is live, so
+      // the extra occupancy that sank PF on the 4-row quad_stream body
+      // does not apply. Arithmetic, qdot grouping and simd_sum stay the
+      // WVEC singles sequence. Kill: set gemma4_singles_prefetch false
+      // to restore the incumbent WVEC-only instantiation.
+      constexpr bool gemma4_singles_prefetch = true;
       qmv_affine4_g64_singles_impl<
-          T, group_size, bits, 2816, true, false>(
+          T, group_size, bits, 2816, true, gemma4_singles_prefetch>(
           single_w, single_scales, single_biases, single_x, single_y,
           in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
     } else {

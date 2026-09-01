@@ -623,4 +623,23 @@ public enum CBv2OrderOnlyLogits {
         defer { set(false) }
         return build()
     }
+
+    /// MTP-VERIFY-ORDER-ONLY: the target verification columns consume their
+    /// logits through `argMax` alone, independent of any request's sampling
+    /// params, so the order-only declaration holds by construction there.
+    /// Kill switch DARKBLOOM_CBV2_MTP_VERIFY_ORDER_ONLY=0 keeps the softcap
+    /// dispatch on those columns.
+    public static let verifyOrderOnlyEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_MTP_VERIFY_ORDER_ONLY"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Engage unconditionally (argmax-only consumer) for one graph build.
+    public static func withVerifyOrderOnly<T>(_ build: () -> T) -> T {
+        set(verifyOrderOnlyEnabled)
+        defer { set(false) }
+        return build()
+    }
 }

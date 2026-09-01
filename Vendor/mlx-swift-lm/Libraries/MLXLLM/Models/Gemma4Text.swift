@@ -26,6 +26,27 @@ private let gemma4CompiledDecodeSupported: Bool = {
     return true
 }()
 
+// MARK: - MTP-ENTRY-FUSE: same fused decode ladder on the MTP verify/seed entry
+//
+// The trusted harness seals `.serialTarget` verification, so every MTP verify
+// and seed column is its own `[8, 1]` target forward through
+// `cbv2ForwardWithHidden` -> `callCapturingPreNorm`. That entry previously
+// declined PREFIX-001 (`enableAttentionBranchPrefix` required
+// `!capturePreNorm`) and never asked the trunk for the fused final-norm +
+// head activation-sums producer, so each MoE layer ran normResidual +
+// dualPreNorm + router rmsNorm as three dispatches and the head re-derived
+// its activation sums from a standalone prepass. Capturing the pre-norm
+// hidden only changes what the trunk RETURNS; no layer math depends on it.
+// With this flag on, the MTP entry builds exactly the graph the chained
+// greedy decode entry already builds by default. Kill switch:
+// DARKBLOOM_GEMMA4_MTP_ENTRY_FUSIONS=0 (also `false`/`no`/`off`).
+private let gemma4MTPEntryFusionsEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_MTP_ENTRY_FUSIONS"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 // MARK: - CBv2 B=8 decode graph-submission ladder
 
 /// Earlier graph submission is ON by default for the one scored decode
@@ -4724,6 +4745,26 @@ public class Gemma4TextModelInner: Module {
         return (r.postNorm, r.preNorm!)
     }
 
+    /// MTP-ENTRY-FUSE: the `callCapturingPreNorm` trunk with the fused
+    /// final-RMSNorm + MMA-head activation-sums producer requested, exactly
+    /// as `callWithMMAHeadSums` does for the chained greedy entry. Returns the
+    /// same post-norm and pre-norm hiddens; the sums carrier is nil whenever
+    /// the producer declines, and the head then runs its own prepass.
+    fileprivate func callCapturingPreNormWithMMAHeadSums(
+        _ inputs: MLXArray,
+        cache: [KVCache]? = nil
+    ) -> (
+        postNorm: MLXArray,
+        preNorm: MLXArray,
+        activationSums: Gemma4MMAQuantizedGEMV.ActivationSums?
+    ) {
+        let inputs = inputs.ndim == 1 ? inputs.expandedDimensions(axis: 0) : inputs
+        let r = forwardTrunk(
+            inputs, cache: cache, captureHook: nil, capturePreNorm: true,
+            emitMMAHeadSums: gemma4MTPEntryFusionsEnabled)
+        return (r.postNorm, r.preNorm!, r.mmaHeadSums)
+    }
+
     /// DFlash target-hidden capture (2026-08-25, gemma4-dflash-real-loader
     /// lane). The z-lab DFlash drafter conditions on the CONCATENATION of the
     /// target's post-layer hidden states at `dflash_config.target_layer_ids`,
@@ -4958,7 +4999,8 @@ public class Gemma4TextModelInner: Module {
                 enableAttentionBranchPrefix:
                     isCBv2 && !schedulePrefill
                     && inputBatchSize == 8 && inputLength == 1
-                    && !capturePreNorm && dFlashHiddenCapture == nil
+                    && (!capturePreNorm || gemma4MTPEntryFusionsEnabled)
+                    && dFlashHiddenCapture == nil
             )
             h = out
             intermediates[idx] = (kvPair, positionOffset)
@@ -5633,8 +5675,9 @@ extension Gemma4TextModel: CBv2MTPForwardable {
     public func cbv2ForwardWithHidden(
         _ tokens: MLXArray, caches: [KVCache]
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
-        let (postNorm, preNorm) = model.callCapturingPreNorm(tokens, cache: caches)
-        return (applyLMHead(postNorm), preNorm)
+        let (postNorm, preNorm, sums) = model.callCapturingPreNormWithMMAHeadSums(
+            tokens, cache: caches)
+        return (applyLMHead(postNorm, activationSums: sums), preNorm)
     }
 }
 

@@ -100,7 +100,13 @@ extension EngineLoopV2 {
             let inputs = MLXArray(decodeRows.map { Int32($0.rec.tokens[$0.start]) })
                 .reshaped([decodeRows.count, 1])
             let caches = eagerCaches(rowStates: decodeRows.map { kvStates[$0.rec.id]! })
-            let (logits, hidden) = mtp.model.forwardWithHidden(tokens: inputs, caches: caches)
+            // SOFTCAP-SKIP on the MTP seed/decode rows: the same order-only
+            // declaration the chained greedy entry makes for its graph build.
+            let (logits, hidden) = CBv2OrderOnlyLogits.withOrderOnly(
+                decodeRows.map(\.rec.request.sampling)
+            ) {
+                mtp.model.forwardWithHidden(tokens: inputs, caches: caches)
+            }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             decodeSampled = sampler.sample(
                 logits: logits[0..., -1, 0...],

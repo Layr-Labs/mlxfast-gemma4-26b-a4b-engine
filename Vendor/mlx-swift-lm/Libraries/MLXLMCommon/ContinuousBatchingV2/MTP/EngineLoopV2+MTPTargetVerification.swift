@@ -69,7 +69,10 @@ extension EngineLoopV2 {
             hiddenColumns.reserveCapacity(columns.count)
             for column in columns {
                 precondition(column.dim(1) == 1, "CBv2 MTP: serial target column must have L=1")
-                let output = mtp.model.forwardWithHidden(tokens: column, caches: caches)
+                // MTP-VERIFY-ORDER-ONLY: this column's logits feed argMax only.
+                let output = CBv2OrderOnlyLogits.withVerifyOrderOnly {
+                    mtp.model.forwardWithHidden(tokens: column, caches: caches)
+                }
                 let columnArgmax = argMax(output.logits, axis: -1).asType(.int32)
                 // Building several eager decode calls in one lazy graph can
                 // let mutable KV buffers observe a later version. Complete

@@ -112,25 +112,38 @@ public func resetWeightedExpertUnsortStats() {
 /// permutation and writes `[tokens, hidden]` directly, avoiding that full
 /// `[tokens, topK, hidden]` intermediate.
 private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "weighted_expert_unsort",
+    name: "weighted_expert_unsort_vec4_v2",
     inputNames: ["sorted_outputs", "inverse_order", "weights"],
     outputNames: ["output"],
     source: """
-        uint feature = thread_position_in_grid.x;
+        typedef vec<T, 4> T4;
+        // One lane owns four consecutive features instead of one, so the
+        // grid is a quarter as wide and each row read and the store are one
+        // four-wide vector. The hidden extent is `threads_per_grid.x * 4`,
+        // which is the extent the one-feature form read as
+        // `threads_per_grid.x`.
+        uint quad = thread_position_in_grid.x;
         uint token = thread_position_in_grid.y;
+        const uint hidden = threads_per_grid.x * 4u;
 
-        T accumulator = (T)0;
+        T4 accumulator = T4((T)0);
         const uint assignment_base = token * (uint)K;
         for (uint slot = 0; slot < (uint)K; ++slot) {
             const uint assignment = assignment_base + slot;
             const uint sorted_row = (uint)inverse_order[assignment];
+            const device T4* row = reinterpret_cast<const device T4*>(
+                sorted_outputs + sorted_row * hidden);
+            const T4 source = row[quad];
+            const float weight = (float)weights[assignment];
             // Preserve the legacy bfloat16 multiply-then-reduce rounding.
-            const T weighted = (T)(
-                (float)sorted_outputs[sorted_row * threads_per_grid.x + feature]
-                * (float)weights[assignment]);
-            accumulator = accumulator + weighted;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < 4; ++j) {
+                const T weighted = (T)((float)source[j] * weight);
+                accumulator[j] = accumulator[j] + weighted;
+            }
         }
-        output[token * threads_per_grid.x + feature] = accumulator;
+        reinterpret_cast<device T4*>(output + token * hidden)[quad] =
+            accumulator;
     """,
     ensureRowContiguous: true
 )
@@ -170,7 +183,7 @@ public func weightedExpertUnsort(
             ("T", sortedOutputs.dtype),
             ("K", 8),
         ],
-        grid: (2816, tokens, 1),
+        grid: (704, tokens, 1),
         threadGroup: (64, 4, 1),
         outputShapes: [[tokens, 2816]],
         outputDTypes: [.bfloat16]

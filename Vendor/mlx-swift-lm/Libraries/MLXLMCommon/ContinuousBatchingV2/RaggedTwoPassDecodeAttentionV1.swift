@@ -80,6 +80,11 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// ~225 KB a 450 GB/s part needs to cover its own DRAM latency.
     ///
     /// Everything below the target is scratch that does not have to be written.
+    /// A matched B=8/N=1024 sweep on the development M4 measured candidate
+    /// decode windows of 4.58259 s at eight blocks, 4.53159 s at four, and
+    /// 4.56678 s at two, with identical greedy trajectories throughout. Four
+    /// is the measured balance between halving pass-A threadgroups/scratch and
+    /// retaining enough independent groups to cover the longer per-block walk.
     /// `MLX_SDPA_BLOCKS` keeps its stock meaning and still wins, so a process
     /// can never run mismatched partitions; `DARKBLOOM_CBV2_2PASS_BLOCKS`
     /// restores the stock answer (`=0`) or selects any other divisor of the
@@ -96,7 +101,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             return value > 0 && sequenceLength.isMultiple(of: value)
                 ? value : stockBlocks
         }
-        return min(8, stockBlocks)
+        return min(4, stockBlocks)
     }()
 
     /// Attribution: COMBINE-PACK-001 and COMBINE-HOIST-001 below are adapted

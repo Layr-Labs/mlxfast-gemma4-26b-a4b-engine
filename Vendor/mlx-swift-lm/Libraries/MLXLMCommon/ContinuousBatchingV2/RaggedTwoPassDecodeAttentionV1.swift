@@ -31,6 +31,15 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Fold the fixed resident ring's row stride into pointer increments. The
+    /// dynamic-slot control remains available for parity and diagnostics.
+    private static let q4ResidentRowPointerEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_Q4_RESIDENT_ROW_POINTER"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let batch = 8
     private static let queryHeads = 16
     private static let kvHeads = 8
@@ -1523,7 +1532,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// removes only the global partial write/read and the second dispatch.
     private static let portQuantFusedWriteResidentKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_rowptr_c4",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -1692,14 +1701,18 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 const bool prefetch_first = block < N - 1;
                 uint next_slot = slot + uint(BLOCKS);
                 if (next_slot >= uint(N)) next_slot -= uint(N);
+                const device uint32_t* key_row =
+                    mkeys_w + slot * row_words;
+                const device uint32_t* value_row =
+                    mvalues_w + slot * row_words;
                 uint32_t kw_pre = prefetch_first
-                    ? mkeys_w[slot * row_words + lane] : 0u;
+                    ? key_row[lane] : 0u;
                 uint32_t vw_pre = prefetch_first
-                    ? mvalues_w[slot * row_words + lane] : 0u;
+                    ? value_row[lane] : 0u;
                 uint32_t ktw_pre = prefetch_first
-                    ? mkeys_w[slot * row_words + payload_words + lane / 8] : 0u;
+                    ? key_row[payload_words + lane / 8] : 0u;
                 uint32_t vtw_pre = prefetch_first
-                    ? mvalues_w[slot * row_words + payload_words + lane / 8] : 0u;
+                    ? value_row[payload_words + lane / 8] : 0u;
                 for (int token = block; token < N; token += BLOCKS) {
                     const bool current = token == N - 1;
                     const uint32_t kw = current ? kword : kw_pre;
@@ -1713,14 +1726,19 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                             | (uint32_t(as_type<ushort>(vhb)) << 16))
                         : vtw_pre;
                     if (token + BLOCKS < N - 1) {
-                        kw_pre = mkeys_w[next_slot * row_words + lane];
-                        vw_pre = mvalues_w[next_slot * row_words + lane];
-                        ktw_pre =
-                            mkeys_w[next_slot * row_words + payload_words + lane / 8];
-                        vtw_pre =
-                            mvalues_w[next_slot * row_words + payload_words + lane / 8];
                         next_slot += uint(BLOCKS);
-                        if (next_slot >= uint(N)) next_slot -= uint(N);
+                        if (next_slot >= uint(N)) {
+                            next_slot -= uint(N);
+                            key_row = mkeys_w + next_slot * row_words;
+                            value_row = mvalues_w + next_slot * row_words;
+                        } else {
+                            key_row += BLOCKS * row_words;
+                            value_row += BLOCKS * row_words;
+                        }
+                        kw_pre = key_row[lane];
+                        vw_pre = value_row[lane];
+                        ktw_pre = key_row[payload_words + lane / 8];
+                        vtw_pre = value_row[payload_words + lane / 8];
                     }
                     const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
                     const float kb = float(as_type<half>(ushort(ktw >> 16)));
@@ -2024,6 +2042,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         let inputs = [queries] + mirrors
             + [startArray, newKeys, newValues, previousWriteFence]
         if q4ResidentMergeEnabled,
+            q4ResidentRowPointerEnabled,
             blocks == 8,
             combineColumns == 8,
             combineThreads == 256
@@ -2045,6 +2064,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             )
             CBv2EngageMark.once("kvq4-fused-live-write")
             CBv2EngageMark.once("kvq4-resident-merge")
+            CBv2EngageMark.once("kvq4-resident-row-pointer")
             return (resident[0], resident[1])
         }
 

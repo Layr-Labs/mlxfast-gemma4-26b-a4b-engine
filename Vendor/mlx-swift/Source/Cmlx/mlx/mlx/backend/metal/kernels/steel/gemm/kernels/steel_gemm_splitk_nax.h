@@ -135,10 +135,14 @@ template <
   // Store result
   dispatch_bool(align_M || !is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(align_N || !is_unaligned_sn, [&](auto kAlignedN) {
-      if constexpr (kAlignedM && kAlignedN) {
-        Dtile.store(C, int(params->ldc));
-      } else {
-        Dtile.store_safe(C, int(params->ldc), short2(sgp_sn, sgp_sm));
+      if ((DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY == 0) ||
+          ((kAlignedM.value || sgp_sm > 0) &&
+           (kAlignedN.value || sgp_sn > 0))) {
+        if constexpr (kAlignedM && kAlignedN) {
+          Dtile.store(C, int(params->ldc));
+        } else {
+          Dtile.store_safe(C, int(params->ldc), short2(sgp_sn, sgp_sm));
+        }
       }
     });
   });

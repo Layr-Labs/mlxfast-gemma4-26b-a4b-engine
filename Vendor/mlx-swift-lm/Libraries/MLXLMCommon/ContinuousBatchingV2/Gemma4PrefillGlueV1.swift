@@ -101,16 +101,13 @@ public enum Gemma4PrefillGlueV1 {
             acc += xv[i] * xv[i];
           }
           acc = simd_sum(acc);
-          if (simd_group_id == 0) {
-            local_sums[simd_lane_id] = 0;
-          }
-          threadgroup_barrier(mem_flags::mem_threadgroup);
           if (simd_lane_id == 0) {
             local_sums[simd_group_id] = acc;
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
           if (simd_group_id == 0) {
-            acc = simd_sum(local_sums[simd_lane_id]);
+            acc = simd_sum(
+                simd_lane_id < 22 ? local_sums[simd_lane_id] : 0.0f);
             if (simd_lane_id == 0) {
               local_inv[0] = metal::precise::rsqrt(acc / GLUE_AXIS + eps);
             }
@@ -141,19 +138,16 @@ public enum Gemma4PrefillGlueV1 {
           }
           acc_a = simd_sum(acc_a);
           acc_b = simd_sum(acc_b);
-          if (simd_group_id == 0) {
-            local_sums_a[simd_lane_id] = 0;
-            local_sums_b[simd_lane_id] = 0;
-          }
-          threadgroup_barrier(mem_flags::mem_threadgroup);
           if (simd_lane_id == 0) {
             local_sums_a[simd_group_id] = acc_a;
             local_sums_b[simd_group_id] = acc_b;
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
           if (simd_group_id == 0) {
-            acc_a = simd_sum(local_sums_a[simd_lane_id]);
-            acc_b = simd_sum(local_sums_b[simd_lane_id]);
+            acc_a = simd_sum(
+                simd_lane_id < 22 ? local_sums_a[simd_lane_id] : 0.0f);
+            acc_b = simd_sum(
+                simd_lane_id < 22 ? local_sums_b[simd_lane_id] : 0.0f);
             if (simd_lane_id == 0) {
               local_inv2[0] = metal::precise::rsqrt(acc_a / GLUE_AXIS + eps);
               local_inv2[1] = metal::precise::rsqrt(acc_b / GLUE_AXIS + eps);
@@ -168,7 +162,7 @@ public enum Gemma4PrefillGlueV1 {
     // MARK: - norm + residual (2 dispatches -> 1)
 
     private static let normResidualKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_norm_residual_2816_unroll_v2",
+        name: "gemma4_prefill_glue_norm_residual_2816_unroll_v2_nb1",
         inputNames: ["x", "w", "res"],
         outputNames: ["out"],
         source: """
@@ -226,7 +220,7 @@ public enum Gemma4PrefillGlueV1 {
     // MARK: - dual pre-norm (2 dispatches -> 1)
 
     private static let dualPreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_dual_prenorm_2816_unroll_v2",
+        name: "gemma4_prefill_glue_dual_prenorm_2816_unroll_v2_nb1",
         inputNames: ["x", "w1", "w2"],
         outputNames: ["out1", "out2"],
         source: """
@@ -315,7 +309,7 @@ public enum Gemma4PrefillGlueV1 {
     /// `dualPreNorm` with its second output removed: the same reduction, the
     /// same `w * T(x * inv)` store, one weight.
     private static let preNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_prenorm_2816_unroll_v2",
+        name: "gemma4_prefill_glue_prenorm_2816_unroll_v2_nb1",
         inputNames: ["x", "w"],
         outputNames: ["out"],
         source: """
@@ -354,7 +348,7 @@ public enum Gemma4PrefillGlueV1 {
     /// values are computed once into registers and stored to each of the
     /// row's K sorted positions.
     private static let preNormScatterKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_prenorm_scatter_2816_unroll_v2",
+        name: "gemma4_prefill_glue_prenorm_scatter_2816_unroll_v2_nb1",
         inputNames: ["x", "w", "inverse"],
         outputNames: ["out"],
         source: """
@@ -455,7 +449,7 @@ public enum Gemma4PrefillGlueV1 {
     // MARK: - branch tail (5 dispatches -> 1)
 
     private static let tailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_tail_2816_unroll_v2",
+        name: "gemma4_prefill_glue_tail_2816_unroll_v2_nb1",
         inputNames: ["h1", "h2", "w1", "w2", "w3", "res2"],
         outputNames: ["out"],
         source: """
@@ -545,7 +539,7 @@ public enum Gemma4PrefillGlueV1 {
     /// stores `out`, so both cost one extra in-kernel reduction rather than a
     /// re-read of the row plus two launches.
     private static let tailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_glue_tail_chain_2816_unroll_v2",
+        name: "gemma4_prefill_glue_tail_chain_2816_unroll_v2_nb1",
         inputNames: ["h1", "h2", "w1", "w2", "w3", "res2", "s", "wn"],
         outputNames: ["out", "normed"],
         source: """
@@ -650,7 +644,7 @@ public enum Gemma4PrefillGlueV1 {
     /// same `[tokens, hidden]` expert result. Produce each reduced expert value
     /// in the tail thread that consumes it, removing the intermediate tensor.
     private static let expertTailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_expert_unsort_tail_chain_2816_unroll_v2",
+        name: "gemma4_prefill_expert_unsort_tail_chain_2816_unroll_v2_nb1",
         inputNames: [
             "sorted", "inverse_order", "route_weights", "h1",
             "w1", "w2", "w3", "res2", "s", "wn",

@@ -383,6 +383,16 @@ func geluFusionClaimsPinnedDecode(_ gate: MLXArray, _ up: MLXArray) -> Bool {
     let s = gate.shape
     if s.count == 3, s[1] == 1, s[0] == 8 || s[0] == 64 { return true }
     if s.count == 2, s[0] == 64 { return true }
+    // Wide MTP verify: the same signatures at 8 * (1+k) dense rows and
+    // 64 * (1+k) expert rows. The shape-specialised trace is the SAME
+    // one-kernel body, so every element rounds exactly as the pinned decode
+    // cell does; the shapeless closure would split it into two kernels with
+    // a materialised bf16 intermediate. Bounded: at most three widths.
+    if CBv2MTPWideVerifyContext.active {
+        let columns = CBv2MTPWideVerifyContext.columns
+        if s.count == 3, s[1] == 1, s[0] == 8 * columns || s[0] == 64 * columns { return true }
+        if s.count == 2, s[0] == 64 * columns { return true }
+    }
     return false
 }
 
@@ -1424,15 +1434,18 @@ private func gemma4FusedQKVNorm(
     keyValueShared: Bool, positionOffsets: MLXArray,
     ropeParameters: Gemma4QKVRopeParameters, applyRope: Bool
 ) -> (q: MLXArray, k: MLXArray, v: MLXArray, appliedRope: Bool)? {
+    let qkvRows = q.ndim == 4 ? q.dim(0) : 0
     guard eps == 1.0e-6,
         q.dtype == .bfloat16, k.dtype == .bfloat16, v.dtype == .bfloat16,
         qWeight.dtype == .bfloat16, kWeight.dtype == .bfloat16,
-        positionOffsets.dtype == .int32, positionOffsets.shape == [8],
+        positionOffsets.dtype == .int32, positionOffsets.shape == [qkvRows],
         ropeParameters.log2Base.dtype == .float32, ropeParameters.log2Base.size == 1,
         ropeParameters.frequencies.dtype == .float32,
         q.ndim == 4, k.ndim == 4, v.ndim == 4,
-        q.dim(0) == 8, q.dim(1) == 1, q.dim(2) == 16,
-        k.dim(0) == 8, k.dim(1) == 1, v.shape == k.shape,
+        qkvRows == 8
+            || (CBv2MTPWideVerifyContext.active && qkvRows % 8 == 0 && qkvRows > 0),
+        q.dim(1) == 1, q.dim(2) == 16,
+        k.dim(0) == qkvRows, k.dim(1) == 1, v.shape == k.shape,
         q.dim(3) == k.dim(3),
         (q.dim(3) == 256 && k.dim(2) == 8) || (q.dim(3) == 512 && k.dim(2) == 2),
         qWeight.shape == [q.dim(3)], kWeight.shape == [q.dim(3)],
@@ -1442,8 +1455,8 @@ private func gemma4FusedQKVNorm(
     else { return nil }
 
     let dimension = q.dim(3)
-    let qRows = 8 * 16
-    let kRows = 8 * k.dim(2)
+    let qRows = qkvRows * 16
+    let kRows = qkvRows * k.dim(2)
     let threads = dimension / 4
     let fusedRope = gemma4QKVNormRopeEnabled && applyRope
     let normRows = qRows + kRows + (keyValueShared ? 0 : kRows)
@@ -1458,7 +1471,7 @@ private func gemma4FusedQKVNorm(
         ],
         grid: (normRows * threads, 1, 1), threadGroup: (threads, 1, 1),
         outputShapes: fusedRope
-            ? [[8, 16, 1, dimension], [8, k.dim(2), 1, dimension], v.shape]
+            ? [[qkvRows, 16, 1, dimension], [qkvRows, k.dim(2), 1, dimension], v.shape]
             : [q.shape, k.shape, v.shape],
         outputDTypes: [q.dtype, k.dtype, v.dtype]
     )
@@ -1736,7 +1749,8 @@ private class Gemma4Attention: Module {
         positionOffset: Gemma4.PositionOffset? = nil,
         v2SharedSource: (any CBv2AttendingLayerCache)? = nil,
         outputStart: Int = 0,
-        useLastQueryPrefill: Bool = false
+        useLastQueryPrefill: Bool = false,
+        wideColumns: Int = 1
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         // ContinuousBatchingV2: the layer cache owns both the KV update and
         // the attention computation (no masks, no padding — see
@@ -1746,7 +1760,8 @@ private class Gemma4Attention: Module {
             return forwardV2(
                 x, layerCache: layerCacheV2, source: v2SharedSource,
                 sharedKV: sharedKV, positionOffset: positionOffset,
-                outputStart: outputStart, useLastQueryPrefill: useLastQueryPrefill)
+                outputStart: outputStart, useLastQueryPrefill: useLastQueryPrefill,
+                wideColumns: wideColumns)
         }
         precondition(
             outputStart == 0 && !useLastQueryPrefill,
@@ -1885,12 +1900,23 @@ private class Gemma4Attention: Module {
         sharedKV: (MLXArray, MLXArray)?,
         positionOffset: Gemma4.PositionOffset?,
         outputStart: Int = 0,
-        useLastQueryPrefill: Bool = false
+        useLastQueryPrefill: Bool = false,
+        wideColumns: Int = 1
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         let (B, L) = (x.dim(0), x.dim(1))
         precondition(
             outputStart >= 0 && outputStart < L,
             "Gemma4: output narrowing start \(outputStart) outside chunk length \(L)")
+        // WIDE MTP VERIFY: the rectangle travels through this layer as
+        // `B = cohort * wideColumns` single-token rows (row = cohort row *
+        // wideColumns + column), so every token-local plane runs once over
+        // all rows. Only attention needs the cohort geometry back: the
+        // head-major projections are folded to `[cohort, heads, columns, D]`
+        // for the cache, whose dispatcher serializes the columns through the
+        // exact decode road, and the result is unfolded to rows again.
+        precondition(
+            wideColumns == 1 || (L == 1 && B % wideColumns == 0 && !useLastQueryPrefill),
+            "Gemma4: wide verify rows must be single-token and a multiple of the column count")
 
         // Last-query prefill projects Q for the frontier row only. Every
         // other path keeps the full query rectangle and narrows (if at all)
@@ -2037,6 +2063,20 @@ private class Gemma4Attention: Module {
         if let lastQueryCache {
             attention = lastQueryCache.updateAndAttendLastQuery(
                 queries: attentionQueries, keys: k, values: v, scale: scale, sinks: nil)
+        } else if wideColumns > 1 {
+            // Fold rows -> [cohort, heads, columns, D]. The row-major
+            // `[cohort * columns, heads, 1, D]` buffer reshapes to
+            // `[cohort, columns, heads, D]` for free; the transpose is the
+            // same one ordinary decode applies to its projections.
+            let cohort = B / wideColumns
+            func fold(_ t: MLXArray) -> MLXArray {
+                t.reshaped([cohort, wideColumns, t.dim(1), t.dim(3)]).transposed(0, 2, 1, 3)
+            }
+            let folded = layerCache.updateAndAttend(
+                queries: fold(attentionQueries), keys: fold(k), values: fold(v),
+                scale: scale, sinks: nil)
+            // Unfold [cohort, heads, columns, D] -> rows [B, heads, 1, D].
+            attention = folded.transposed(0, 2, 1, 3).reshaped([B, folded.dim(1), 1, folded.dim(3)])
         } else {
             attention = layerCache.updateAndAttend(
                 queries: attentionQueries, keys: k, values: v, scale: scale, sinks: nil)
@@ -2259,7 +2299,9 @@ private enum Gemma4FusedRouterTop8 {
         guard enabled,
             topK == selected,
             expertScores.ndim == 3,
-            expertScores.dim(0) == rows,
+            expertScores.dim(0) == rows
+                || (CBv2MTPWideVerifyContext.active && expertScores.dim(0) % rows == 0
+                    && expertScores.dim(0) > 0),
             expertScores.dim(1) == 1,
             expertScores.dim(2) == experts,
             expertScores.dtype == .bfloat16,
@@ -2268,6 +2310,7 @@ private enum Gemma4FusedRouterTop8 {
             perExpertScale.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("router-top8")
+        let rows = expertScores.dim(0)
 
         let outputs = kernel(
             [expertScores, perExpertScale],
@@ -2368,15 +2411,21 @@ private enum Gemma4RouterFinalistsV1 {
 
     static func apply(_ scores: MLXArray, topK: Int, kth: Int) -> MLXArray? {
         guard enabled, topK == 8, kth == 120,
-            scores.ndim == 3, scores.dim(0) == 8,
+            scores.ndim == 3,
+            scores.dim(0) == 8
+                || (CBv2MTPWideVerifyContext.active && scores.dim(0) % 8 == 0
+                    && scores.dim(0) > 0),
             scores.dim(1) == 1, scores.dim(2) == 128,
             scores.dtype == .bfloat16
         else { return nil }
+        // One 128-thread threadgroup per row; the wide verify rectangle's
+        // 8 * (1+k) rows extend the grid and touch no other row.
+        let rows = scores.dim(0)
         return kernel(
             [scores],
-            grid: (8 * 128, 1, 1),
+            grid: (rows * 128, 1, 1),
             threadGroup: (128, 1, 1),
-            outputShapes: [[8, 1, 8]],
+            outputShapes: [[rows, 1, 8]],
             outputDTypes: [.uint32]
         )[0]
     }
@@ -2851,11 +2900,24 @@ private enum Gemma4FusedLayerGlue {
         ensureRowContiguous: true
     )
 
+    /// The row count a glue dispatch runs over: the pinned decode cohort (8),
+    /// or — inside a wide MTP verify forward, where the rectangle travels as
+    /// `8 * (1+k)` single-token rows — any multiple of eight. Every kernel in
+    /// this enum is one threadgroup per row and reads nothing across rows, so
+    /// widening the grid changes no row's arithmetic.
+    private static func glueRows(_ x: MLXArray) -> Int? {
+        guard x.ndim == 3, x.dim(1) == 1, x.dim(2) == axis else { return nil }
+        if x.dim(0) == rows { return rows }
+        if CBv2MTPWideVerifyContext.active, x.dim(0) % rows == 0, x.dim(0) > 0 {
+            return x.dim(0)
+        }
+        return nil
+    }
+
     private static func admits(_ x: MLXArray, weight: MLXArray, eps: Float) -> Bool {
         enabled
             && eps == Self.eps
-            && x.ndim == 3
-            && x.dim(0) == rows && x.dim(1) == 1 && x.dim(2) == axis
+            && glueRows(x) != nil
             && x.dtype == .bfloat16
             && weight.ndim == 1 && weight.dim(0) == axis
             && weight.dtype == .bfloat16
@@ -2868,6 +2930,7 @@ private enum Gemma4FusedLayerGlue {
             residual.shape == x.shape, residual.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-norm-residual")
+        let rows = glueRows(x)!
         return normResidualKernel(
             [x, residual, weight],
             template: [("T", x.dtype)],
@@ -2909,6 +2972,7 @@ private enum Gemma4FusedLayerGlue {
             routerWeight.ndim == 1, routerWeight.dim(0) == axis,
             routerWeight.dtype == .bfloat16
         else { return nil }
+        let rows = glueRows(attn)!
         let outs = attentionBranchPrefixKernel(
             [
                 attn, residual, postAttentionWeight, denseWeight,
@@ -2947,6 +3011,7 @@ private enum Gemma4FusedLayerGlue {
             w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-dual-prenorm")
+        let rows = glueRows(x)!
         let outs = dualPreNormKernel(
             [x, w1, w2],
             template: [("T", x.dtype)],
@@ -3148,13 +3213,13 @@ private enum Gemma4FusedLayerGlue {
         )
 
     private static func admitsDeferred(
-        _ expertRows: DeferredWeightedExpertRows
+        _ expertRows: DeferredWeightedExpertRows, rows: Int
     ) -> Bool {
         expertRows.sortedOutputs.dtype == .bfloat16
-            && expertRows.sortedOutputs.shape == [64, axis]
+            && expertRows.sortedOutputs.shape == [rows * 8, axis]
             && expertRows.inverseOrder.dtype == .uint32
             && expertRows.inverseOrder.ndim == 1
-            && expertRows.inverseOrder.size == 64
+            && expertRows.inverseOrder.size == rows * 8
             && expertRows.weights.dtype == .bfloat16
             && expertRows.weights.shape == [rows, 8]
     }
@@ -3171,7 +3236,8 @@ private enum Gemma4FusedLayerGlue {
         eps: Float
     ) -> (out: MLXArray, normedNext: MLXArray)? {
         guard admits(mlpOut, weight: w1, eps: eps),
-            admitsDeferred(expertRows),
+            let rows = glueRows(mlpOut),
+            admitsDeferred(expertRows, rows: rows),
             residual.shape == mlpOut.shape,
             residual.dtype == .bfloat16,
             w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16,
@@ -3208,7 +3274,8 @@ private enum Gemma4FusedLayerGlue {
         eps: Float
     ) -> MLXArray? {
         guard admits(mlpOut, weight: w1, eps: eps),
-            admitsDeferred(expertRows),
+            let rows = glueRows(mlpOut),
+            admitsDeferred(expertRows, rows: rows),
             residual.shape == mlpOut.shape,
             residual.dtype == .bfloat16,
             w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16,
@@ -3244,6 +3311,7 @@ private enum Gemma4FusedLayerGlue {
             nextInputNormWeight.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-tail-chain")
+        let rows = glueRows(mlpOut)!
         let selected = pairedRmsEnabled ? pairedTailChainKernel : tailChainKernel
         let outs = selected(
             [mlpOut, expertOut, residual, w1, w2, w3, layerScalar,
@@ -3270,6 +3338,7 @@ private enum Gemma4FusedLayerGlue {
             layerScalar.size == 1, layerScalar.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-tail")
+        let rows = glueRows(mlpOut)!
         let selected = pairedRmsEnabled ? pairedTailKernel : tailKernel
         return selected(
             [mlpOut, expertOut, residual, w1, w2, w3, layerScalar],
@@ -3387,7 +3456,7 @@ private class Gemma4Router: Module {
         // A depends node wrapped around it by ZIP plan2 keeps that shape and
         // remains the returned value, preserving the activated dependency.
         if topK == 8, kth == 120, partition.ndim == 3,
-            partition.dim(0) == 8, partition.dim(1) == 1,
+            partition.dim(0) % 8 == 0, partition.dim(1) == 1,
             partition.dim(2) == 8, partition.dtype == .uint32
         {
             return partition
@@ -3684,7 +3753,9 @@ private enum Gemma4ZipRouterV1 {
         // below holds, so prefill, MTP rectangles and any other cohort walk
         // away from here without having built anything.
         guard enabled, router.zipAdmits,
-            out.ndim == 3, out.dim(0) == 8, out.dim(1) == 1,
+            out.ndim == 3, out.dim(1) == 1,
+            out.dim(0) == 8
+                || (CBv2MTPWideVerifyContext.active && out.dim(0) % 8 == 0 && out.dim(0) > 0),
             out.dtype == .bfloat16
         else { return nil }
 
@@ -3888,7 +3959,8 @@ public class Gemma4DecoderLayer: Module {
         isExpertPrefill: Bool = false,
         glueChain: Gemma4GlueChainBox? = nil,
         nextInputLayernormWeight: MLXArray? = nil,
-        enableAttentionBranchPrefix: Bool = false
+        enableAttentionBranchPrefix: Bool = false,
+        wideColumns: Int = 1
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         // Prompt-path narrowing (CBv2 only): attention and every K/V write
         // still cover the full chunk; only the token-local work AFTER
@@ -3933,7 +4005,7 @@ public class Gemma4DecoderLayer: Module {
         let (attnOut, kvPair, attnPositionOffset) = selfAttn(
             h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset,
             v2SharedSource: v2SharedSource, outputStart: outputStart,
-            useLastQueryPrefill: useLastQueryPrefill)
+            useLastQueryPrefill: useLastQueryPrefill, wideColumns: wideColumns)
         // PREFIX-001: only build the joined producer when the ZIP consumer is
         // guaranteed to accept it. A nil leaves the established attention
         // residual and branch pre-norm paths untouched.
@@ -4534,14 +4606,16 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
             eps == Self.eps,
             x.dtype == .bfloat16,
             x.ndim == 3,
-            x.dim(0) == rows,
+            x.dim(0) == rows
+                || (CBv2MTPWideVerifyContext.active && x.dim(0) % rows == 0 && x.dim(0) > 0),
             x.dim(1) == 1,
             x.dim(2) == axis,
-            x.size == rows * axis,
+            x.size == x.dim(0) * axis,
             weight.dtype == .bfloat16,
             weight.ndim == 1,
             weight.dim(0) == axis
         else { return nil }
+        let rows = x.dim(0)
 
         let outputs = kernel(
             [x, weight],
@@ -4776,8 +4850,22 @@ public class Gemma4TextModelInner: Module {
         // Shape queries cross the Swift/C boundary. Cache the two immutable
         // input dimensions once rather than paying for them at every ladder
         // policy check while the host is building the decode graph.
-        let inputBatchSize = inputs.dim(0)
-        let inputLength = inputs.dim(1)
+        let rectangleBatchSize = inputs.dim(0)
+        let rectangleLength = inputs.dim(1)
+        // WIDE MTP VERIFY (CBv2MTPWideVerifyContext): a `[cohort, 1+k]`
+        // verify rectangle is carried through the trunk as
+        // `cohort * (1+k)` single-token rows, so every token-local kernel
+        // runs once over the whole rectangle and reads its weight plane once.
+        // Attention folds the rows back per layer (Gemma4Attention.forwardV2).
+        let wideColumns: Int = {
+            guard CBv2MTPWideVerifyContext.active, !schedulePrefill, rectangleLength > 1,
+                rectangleLength == CBv2MTPWideVerifyContext.columns,
+                inputEmbedding == nil, imageTokenMask == nil, dFlashHiddenCapture == nil
+            else { return 1 }
+            return rectangleLength
+        }()
+        let inputBatchSize = wideColumns > 1 ? rectangleBatchSize * wideColumns : rectangleBatchSize
+        let inputLength = wideColumns > 1 ? 1 : rectangleLength
 
         // Vision prefill (mirrors the inline VLM twin `TextModel.callAsFunction`):
         // `inputEmbedding` — the scaled text embeddings with image soft-token
@@ -4796,6 +4884,10 @@ public class Gemma4TextModelInner: Module {
             } else {
                 h = embedTokens(inputs) * embedScale
             }
+        }
+        if wideColumns > 1 {
+            h = h.reshaped([inputBatchSize, 1, config.hiddenSize])
+            CBv2EngageMark.once("mtp-wide-verify-trunk")
         }
 
         // Compute per-layer inputs (PLE)
@@ -4855,6 +4947,16 @@ public class Gemma4TextModelInner: Module {
             guard isCBv2 else { return nil }
             for case let entry? in fullCache {
                 if let offsets = (entry as? CBv2LayerCache)?.unifiedPositionOffsets {
+                    if wideColumns > 1 {
+                        // Row r * columns + c sits at absolute position
+                        // offset[r] + c: expand the per-cohort-row chain to
+                        // one entry per rectangle row, still on device.
+                        let columnSteps = MLXArray((0 ..< Int32(wideColumns)).map { $0 })
+                            .reshaped([1, wideColumns])
+                        let expanded = (offsets.reshaped([rectangleBatchSize, 1]) + columnSteps)
+                            .reshaped([inputBatchSize])
+                        return .batch(expanded)
+                    }
                     return .batch(offsets + 0)
                 }
             }
@@ -4957,8 +5059,10 @@ public class Gemma4TextModelInner: Module {
                     ? layers[idx + 1].inputLayernorm.weight : nil,
                 enableAttentionBranchPrefix:
                     isCBv2 && !schedulePrefill
-                    && inputBatchSize == 8 && inputLength == 1
-                    && !capturePreNorm && dFlashHiddenCapture == nil
+                    && (inputBatchSize == 8 || (wideColumns > 1 && inputBatchSize % 8 == 0))
+                    && inputLength == 1
+                    && !capturePreNorm && dFlashHiddenCapture == nil,
+                wideColumns: wideColumns
             )
             h = out
             intermediates[idx] = (kvPair, positionOffset)

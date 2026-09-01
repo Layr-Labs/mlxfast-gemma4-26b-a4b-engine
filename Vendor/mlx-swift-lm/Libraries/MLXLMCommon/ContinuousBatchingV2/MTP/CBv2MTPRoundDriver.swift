@@ -68,6 +68,11 @@ final class CBv2MTPRoundInFlight {
         /// Lazy [B, 1+k, H] pre-norm hidden — the next carry is gathered
         /// from it at the finalize sync (index = accepted position).
         let lastHidden: MLXArray
+        /// Mirror road (MTP/CBv2MTPMirrorOps.swift): per sliding layer, the
+        /// eight windowed rows whose verify columns wrote the live q4 mirror
+        /// in place, with the undo log finalize restores rejected slots
+        /// from. Empty on the vendored staging path.
+        var mirrorRestore: [CBv2MTPMirrorRestoreLayer] = []
     }
 
     /// nil when this round only seeded (no row had a valid carry yet).

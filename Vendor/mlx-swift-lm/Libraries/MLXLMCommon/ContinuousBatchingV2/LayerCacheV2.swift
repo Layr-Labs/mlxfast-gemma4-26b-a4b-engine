@@ -253,6 +253,17 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         CBv2CoreInstrumentation.recordPositionOffsetsHostRebuild()
         positionOffsetsState.rebuild(from: rows)
     }
+
+    // MARK: - MTP mirror road fence plumbing (see MTP/CBv2MTPMirrorOps.swift)
+
+    /// The layer's live write fence. The MTP round reads it to chain its
+    /// finalize-time restore dispatch and writes the restore's output back
+    /// so the next in-place ring store waits on the restore.
+    var mtpWriteFence: MLXArray {
+        get { decodeRingWriteFence.value }
+        set { decodeRingWriteFence.value = newValue }
+    }
+
 }
 
 // MARK: - Borrower retention (fused ring-write eligibility)

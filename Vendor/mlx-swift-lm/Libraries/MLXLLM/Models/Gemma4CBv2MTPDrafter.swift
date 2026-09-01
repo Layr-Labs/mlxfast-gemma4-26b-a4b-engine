@@ -185,6 +185,12 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         // the per-step `MLXFast.RoPE` frequency compute into the single
         // `prepare(rows:)` materialization: the downstream rope module
         // no longer pays the table-build cost on every draft step.
+        // B > 1 shape discipline: the target's pre-norm hidden reaches this
+        // seam as `[B, 1, H]` on the stock trunk but as `[B, H]` from the
+        // promoted fused decode tail; the token embedding below is always
+        // `[B, 1, He]`. Normalize once so the RoPE prefix math and the
+        // feature-axis concat see one rank.
+        let hidden = hidden.ndim == 2 ? hidden.expandedDimensions(axis: 1) : hidden
         let rotatedHidden: MLXArray
         if let table = prepared.ropeTable {
             rotatedHidden = Self.applyCachedDrafterRoPE(
@@ -360,31 +366,30 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         let inRange = steps.allSatisfy { $0 >= 0 && $0 < Int32(table.windowAhead) }
         guard inRange else { return hidden }
 
-        let indices = MLXArray(steps, [perRow.count, 1])
-        let cosRows = table.cos[indices]  // [B, halfDim]
-        let sinRows = table.sin[indices]  // [B, halfDim]
+        // Shape-generic rotation over the ROW axis. `hidden` is `[B, 1, H]`
+        // (or `[B, H]`); every leading axis is kept as-is, the rotary prefix
+        // is viewed as `[..., halfDim, 2]` pairs, and the per-row (cos, sin)
+        // rows broadcast along the leading axes after the row axis. The
+        // previous form dropped the row axis's neighbour and produced a
+        // rank-2 prefix beside a rank-3 tail, which the concat below refuses
+        // for every B.
+        let indices = MLXArray(steps, [perRow.count])
+        let leadShape = Array(hidden.shape.dropLast())  // [B] or [B, 1]
+        let broadcastShape =
+            [perRow.count] + Array(repeating: 1, count: max(0, leadShape.count - 1))
+            + [halfDim]
+        let cosB = table.cos[indices].reshaped(broadcastShape)  // [B, (1,) halfDim]
+        let sinB = table.sin[indices].reshaped(broadcastShape)
 
-        // Reshape hidden so the rotary prefix is `[B, L, 1, halfDim, 2]`.
-        let leadShape = Array(hidden.shape.dropLast())
-        let flat = hidden.reshaped(leadShape + [featureDim])
-        let prefixLead = leadShape.dropLast()
-        let prefixShape = Array(prefixLead) + [1, halfDim, 2]
-        let pairs = flat[.ellipsis, 0 ..< rotaryPrefix]
-            .reshaped(Array(prefixShape))
-        let a = pairs[.ellipsis, 0]  // [.., halfDim]
-        let b = pairs[.ellipsis, 1]  // [.., halfDim]
-
-        // Broadcast cos/sin to the query/head axes.
-        let cosBroadcastShape = Array(prefixLead) + [1, halfDim]
-        let sinBroadcastShape = Array(prefixLead) + [1, halfDim]
-        let cosB = cosRows.reshaped(cosBroadcastShape)
-        let sinB = sinRows.reshaped(sinBroadcastShape)
+        let prefix = hidden[.ellipsis, 0 ..< rotaryPrefix]
+        let pairs = prefix.reshaped(leadShape + [halfDim, 2])
+        let a = pairs[.ellipsis, 0]  // [..., halfDim]
+        let b = pairs[.ellipsis, 1]
         let aRot = a * cosB - b * sinB
         let bRot = a * sinB + b * cosB
         let rotatedPrefix = MLX.stacked([aRot, bRot], axis: -1)
-            .reshaped(Array(prefixShape))
-            .reshaped(Array(prefixLead) + [rotaryPrefix])
-        let tail = flat[.ellipsis, rotaryPrefix ..< featureDim]
+            .reshaped(leadShape + [rotaryPrefix])
+        let tail = hidden[.ellipsis, rotaryPrefix ..< featureDim]
         return MLX.concatenated([rotatedPrefix, tail], axis: -1)
     }
 }

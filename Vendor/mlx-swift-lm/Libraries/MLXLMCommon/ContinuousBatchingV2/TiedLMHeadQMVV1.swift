@@ -487,6 +487,16 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
         inDim: Int,
         outDim: Int
     ) -> MLXArray? {
+        // Wide MTP verify: eight-row tiles through this exact body.
+        if x.ndim == 3, x.dim(1) == 1, x.dim(0) > batch,
+            let tiled = CBv2MTPWideVerifyContext.rowTiles(x, tile: batch, {
+                matmul(
+                    x: $0, weight: weight, scales: scales, biases: biases,
+                    inDim: inDim, outDim: outDim)
+            })
+        {
+            return tiled
+        }
         // Every dimension is validated against every other, so the gate is a
         // full shape pin at runtime even though the tower's hidden size is not
         // written as a literal here.

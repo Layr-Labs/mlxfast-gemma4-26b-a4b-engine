@@ -20,8 +20,16 @@ extension EngineLoopV2 {
     /// It is also strictly slower than MTP-off: `1 + k` target forwards emit
     /// at most `1 + k` tokens where plain decode emits one per forward.
     /// Degrading to it is a SAFETY NET, never a plan.
+    /// `lazyColumns` (mirror road, see MTP/CBv2MTPMirrorOps.swift): the
+    /// serial columns are built into ONE lazy graph. The per-column blocking
+    /// `eval` below exists to keep mutable KV buffers from observing a later
+    /// version; on the mirror road every in-place ring store is fence-chained
+    /// (pass-A consumes the previous column's fence) and every other KV
+    /// mutation is functional, so the chain is already ordered by data edges
+    /// and the host never has to wait between columns.
     func mtpBuildTargetVerification(
-        columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver
+        columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver,
+        lazyColumns: Bool = false
     ) -> (argmax: MLXArray, hidden: MLXArray, cacheInnerState: [MLXArray]) {
         precondition(!columns.isEmpty, "CBv2 MTP: target verification requires a seed column")
         let caches = eagerCaches(rowStates: rows.map { kvStates[$0.rec.id]! })
@@ -34,6 +42,13 @@ extension EngineLoopV2 {
         case .automatic:
             columns.count * columns[0].dim(0) <= mtp.config.maxAutomaticRectangularTokens
         }
+        // WIDE VERIFY on the mirror road: the same per-column-exact
+        // arithmetic as the serial loop below, expressed as one [B, 1+k]
+        // forward whose attention is serialized per column through the fused
+        // decode road (see CBv2MTPWideVerifyContext). Opt-in until every
+        // token-local plane carries its widened body.
+        let wideVerify = lazyColumns && CBv2MTPWideVerifyContext.enabled && columns.count > 1
+        if wideVerify { useRectangular = true }
 
         // Rectangular verification obliges every layer cache in the bank to
         // serialise its attention one query position at a time for the
@@ -70,13 +85,17 @@ extension EngineLoopV2 {
             for column in columns {
                 precondition(column.dim(1) == 1, "CBv2 MTP: serial target column must have L=1")
                 let output = mtp.model.forwardWithHidden(tokens: column, caches: caches)
+                let columnHidden = Self.mtpRank3Hidden(output.lastHidden)
                 let columnArgmax = argMax(output.logits, axis: -1).asType(.int32)
                 // Building several eager decode calls in one lazy graph can
                 // let mutable KV buffers observe a later version. Complete
-                // each canonical target step before constructing the next.
-                eval([columnArgmax, output.lastHidden] + eagerCacheInnerState(caches))
+                // each canonical target step before constructing the next —
+                // except on the fence-ordered mirror road (`lazyColumns`).
+                if !lazyColumns {
+                    eval([columnArgmax, columnHidden] + eagerCacheInnerState(caches))
+                }
                 argmaxColumns.append(columnArgmax)
-                hiddenColumns.append(output.lastHidden)
+                hiddenColumns.append(columnHidden)
             }
             argmax = concatenated(argmaxColumns, axis: 1)
             hidden = concatenated(hiddenColumns, axis: 1)
@@ -87,11 +106,40 @@ extension EngineLoopV2 {
                 for cache in serializingCaches { cache.mtpSerializesRectangularAttention = false }
             }
             let tokens = concatenated(columns, axis: 1)
-            let output = mtp.model.forwardWithHidden(tokens: tokens, caches: caches)
-            argmax = argMax(output.logits, axis: -1).asType(.int32)
-            hidden = output.lastHidden
+            let output: (logits: MLXArray, lastHidden: MLXArray)
+            if wideVerify {
+                CBv2EngageMark.once("mtp-wide-verify")
+                output = CBv2MTPWideVerifyContext.with(columns: columns.count) {
+                    mtp.model.forwardWithHidden(tokens: tokens, caches: caches)
+                }
+            } else {
+                output = mtp.model.forwardWithHidden(tokens: tokens, caches: caches)
+            }
+            var logits = output.logits
+            var lastHidden = Self.mtpRank3Hidden(output.lastHidden)
+            if wideVerify {
+                // The trunk carried the rectangle as B * (1+k) rows; restore
+                // the [B, 1+k, ...] geometry the accept walk indexes.
+                let batch = columns[0].dim(0)
+                let width = columns.count
+                if logits.dim(0) == batch * width {
+                    logits = logits.reshaped([batch, width, logits.dim(-1)])
+                }
+                if lastHidden.dim(0) == batch * width {
+                    lastHidden = lastHidden.reshaped([batch, width, lastHidden.dim(-1)])
+                }
+            }
+            argmax = argMax(logits, axis: -1).asType(.int32)
+            hidden = lastHidden
         }
 
         return (argmax, hidden, eagerCacheInnerState(caches))
+    }
+
+    /// The pre-norm hidden as `[B, L, H]`. The promoted fused decode tail
+    /// hands back `[B, H]` for an `L == 1` forward; every carry slice and the
+    /// per-column concat below index a rank-3 tensor.
+    static func mtpRank3Hidden(_ hidden: MLXArray) -> MLXArray {
+        hidden.ndim == 2 ? hidden.expandedDimensions(axis: 1) : hidden
     }
 }

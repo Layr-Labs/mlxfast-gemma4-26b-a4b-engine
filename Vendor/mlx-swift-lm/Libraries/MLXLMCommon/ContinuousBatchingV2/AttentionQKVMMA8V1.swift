@@ -437,6 +437,16 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
         bits: Int,
         mode: QuantizationMode
     ) -> MLXArray? {
+        // Wide MTP verify: eight-row tiles through this exact body.
+        if x.ndim == 3, x.dim(1) == sequence, x.dim(0) > batch,
+            let tiled = CBv2MTPWideVerifyContext.rowTiles(x, tile: batch, {
+                matmul(
+                    x: $0, weight: weight, scales: scales, biases: biases,
+                    groupSize: groupSize, bits: bits, mode: mode)
+            })
+        {
+            return tiled
+        }
         guard enabled,
             groupSize == Self.groupSize,
             bits == Self.bits,

@@ -233,6 +233,47 @@ public final class CBv2NullDetokenizerFactory: CBv2DetokenizerFactory {
 // MARK: - Loop configuration
 
 public struct CBv2EngineLoopConfig: Sendable {
+    /// The natural-shutdown drain bound (10 s). PROBE SWITCH (local
+    /// measurement only, inert when unset): `DARKBLOOM_CBV2_SHUTDOWN_TIMEOUT`
+    /// widens it on a development box where a round takes seconds, so the
+    /// engine thread is drained before the worker process exits (a forced
+    /// exit under an in-flight step races the process teardown).
+    public static let defaultShutdownTimeout: TimeInterval = {
+        guard let cRaw = getenv("DARKBLOOM_CBV2_SHUTDOWN_TIMEOUT"),
+            let value = TimeInterval(String(cString: cRaw).trimmingCharacters(in: .whitespaces)),
+            value > 10
+        else { return 10 }
+        return value
+    }()
+
+    /// The request-derived safety ceiling's decode floor (5 tokens/s).
+    /// PROBE SWITCH (local measurement only, inert when unset):
+    /// `DARKBLOOM_CBV2_SAFETY_FLOOR_TPS` lowers it on a development box whose
+    /// swapped-out model decodes far below five tokens per second, so a
+    /// legitimately slow local run is not terminated as a pathology. Never
+    /// raises it.
+    public static let defaultSafetyFloorTPS: Double = {
+        guard let cRaw = getenv("DARKBLOOM_CBV2_SAFETY_FLOOR_TPS"),
+            let value = Double(String(cString: cRaw).trimmingCharacters(in: .whitespaces)),
+            value > 0, value < 5
+        else { return 5 }
+        return value
+    }()
+
+    /// The single-step watchdog default (30 s). PROBE SWITCH (local
+    /// measurement only, inert when unset): `DARKBLOOM_CBV2_STEP_TIMEOUT`
+    /// widens it for a development box whose swapped-out model makes a
+    /// warm-up or seed-prefill step legitimately exceed 30 s. Never lowers it.
+    public static let defaultStepTimeout: TimeInterval = {
+        // Read through the C environment directly: this static may be
+        // forced before Foundation's process-info snapshot is populated.
+        guard let cRaw = getenv("DARKBLOOM_CBV2_STEP_TIMEOUT"),
+            let value = TimeInterval(String(cString: cRaw).trimmingCharacters(in: .whitespaces)),
+            value > 30
+        else { return 30 }
+        return value
+    }()
+
     /// LEGACY single total-lifetime wall (seconds), used ONLY when
     /// `useLegacyRequestTimeout` is true (the rollback kill-switch). In the
     /// default new-lease behavior this value is inert — the monotonic
@@ -288,15 +329,17 @@ public struct CBv2EngineLoopConfig: Sendable {
     public var shutdownTimeout: TimeInterval
 
     public init(
-        requestTimeout: TimeInterval = 120, stepTimeout: TimeInterval = 30,
+        requestTimeout: TimeInterval = 120,
+        stepTimeout: TimeInterval = CBv2EngineLoopConfig.defaultStepTimeout,
         watchdogInterval: TimeInterval = 0.25, idleRecheckInterval: TimeInterval = 0.001,
-        eventBufferCapacity: Int = 256, shutdownTimeout: TimeInterval = 10,
+        eventBufferCapacity: Int = 256,
+        shutdownTimeout: TimeInterval = CBv2EngineLoopConfig.defaultShutdownTimeout,
         useLegacyRequestTimeout: Bool = false,
         admissionLease: TimeInterval = 120,
         prefillProgressLease: TimeInterval = 120,
         decodeProgressLease: TimeInterval = 120,
         backpressureLease: TimeInterval = 120,
-        safetyCeilingDecodeFloorTPS: Double = 5,
+        safetyCeilingDecodeFloorTPS: Double = CBv2EngineLoopConfig.defaultSafetyFloorTPS,
         clock: CBv2Clock = .continuous
     ) {
         self.requestTimeout = requestTimeout
@@ -802,6 +845,13 @@ public final class EngineLoopV2: @unchecked Sendable {
         running = false
         draining = false
         stopWatchdog()
+        // Opt-in diagnostics (CBV2_STEP_PROFILE=1): the phase decomposition
+        // of this engine's steps, on stderr at shutdown. Reads only the
+        // profiler's own samples; nothing measured or scored depends on it.
+        if CBv2StepProfiler.enabled {
+            FileHandle.standardError.write(
+                Data(("[cbv2-step-profile]\n" + CBv2StepProfiler.summaryTable()).utf8))
+        }
     }
 
     /// Natural shutdown barrier. Donation completion hops back to the engine

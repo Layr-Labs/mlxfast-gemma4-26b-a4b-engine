@@ -179,7 +179,24 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         mtpConfig: CBv2MTPConfig = CBv2MTPConfig()
     ) {
         self.schedulerConfig = schedulerConfig
+        // PROBE SWITCH (see CBv2EngineLoopConfig.defaultStepTimeout): a caller
+        // that captured the compiled-in 30 s default still honours a wider
+        // local watchdog. Raise-only, inert when the environment is unset.
+        var loopConfig = loopConfig
+        if loopConfig.stepTimeout < CBv2EngineLoopConfig.defaultStepTimeout {
+            loopConfig.stepTimeout = CBv2EngineLoopConfig.defaultStepTimeout
+        }
+        if loopConfig.shutdownTimeout < CBv2EngineLoopConfig.defaultShutdownTimeout {
+            loopConfig.shutdownTimeout = CBv2EngineLoopConfig.defaultShutdownTimeout
+        }
+        if loopConfig.safetyCeilingDecodeFloorTPS > CBv2EngineLoopConfig.defaultSafetyFloorTPS {
+            loopConfig.safetyCeilingDecodeFloorTPS = CBv2EngineLoopConfig.defaultSafetyFloorTPS
+        }
         self.loopConfig = loopConfig
+        if CBv2StepProfiler.enabled {
+            FileHandle.standardError.write(
+                Data("[cbv2-engine] stepTimeout=\(loopConfig.stepTimeout)s\n".utf8))
+        }
         self.layerKinds = layerKinds
         self.backend = backend
         self.samplerSupportsTokenConstraints = sampler.supportsTokenConstraints

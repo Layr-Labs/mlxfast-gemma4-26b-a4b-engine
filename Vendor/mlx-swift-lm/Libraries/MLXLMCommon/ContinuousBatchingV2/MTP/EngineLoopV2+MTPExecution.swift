@@ -115,7 +115,7 @@ extension EngineLoopV2 {
             for (index, row) in decodeRows.enumerated() where row.isSeed {
                 seedRows.append((id: row.rec.id, decodeIndex: index))
             }
-            if !seedRows.isEmpty { seedHidden = hidden }
+            if !seedRows.isEmpty { seedHidden = Self.mtpRank3Hidden(hidden) }
         }
 
         // Chunked prefills remain per-request [1, chunk], matching executeMixed.
@@ -227,8 +227,46 @@ extension EngineLoopV2 {
         captures.reserveCapacity(batch)
         captured.reserveCapacity(2 * batch)
 
-        for row in verifyRows {
-            let state = kvStates[row.rec.id]!
+        // MIRROR ROAD (MTP/CBv2MTPMirrorOps.swift). On the promoted
+        // quant-authoritative decode road the BF16 ring is stale and the
+        // vendored staging path cannot run. Every verify column is instead an
+        // ordinary [B, 1] decode forward whose fused pass-A writes the live
+        // mirror slot in place, and the k slots columns 1...k will overwrite
+        // are copied out per layer by a fenced capture dispatch BEFORE the
+        // columns run. Finalize restores the rejected suffix from that log.
+        let verifyStates = verifyRows.map { kvStates[$0.rec.id]! }
+        let roundCaches = eagerCaches(rowStates: verifyStates)
+        let mirrorRoad = mtpMirrorRoadAdmits(states: verifyStates, caches: roundCaches)
+        var mirrorRestore: [CBv2MTPMirrorRestoreLayer] = []
+        if mirrorRoad {
+            for (layerIndex, cache) in roundCaches.enumerated() {
+                guard let layerCache = cache as? CBv2LayerCache,
+                    layerCache.kind.sharesKVWithLayer == nil
+                else { continue }
+                let windowed = verifyStates.compactMap {
+                    $0[layerIndex] as? CBv2WindowedSequenceKV
+                }
+                guard windowed.count == batch else { continue }
+                let mirrors = windowed.compactMap(\.mtpQuantMirror)
+                precondition(mirrors.count == batch, "CBv2 MTP mirror road: admitted row without a mirror")
+                let slotBases = windowed.map(\.mtpSlotBase)
+                let captured = CBv2MTPMirrorOps.capture(
+                    mirrors: mirrors, slotBases: slotBases, depth: k,
+                    kvHeads: windowed[0].kvHeads, headDim: windowed[0].headDim,
+                    window: windowed[0].window, fence: layerCache.mtpWriteFence)
+                layerCache.mtpWriteFence = captured.fence
+                mirrorRestore.append(
+                    CBv2MTPMirrorRestoreLayer(
+                        cache: layerCache, rows: windowed, mirrors: mirrors,
+                        slotBases: slotBases, undo: captured.undo, depth: k,
+                        kvHeads: windowed[0].kvHeads, headDim: windowed[0].headDim,
+                        window: windowed[0].window))
+            }
+            CBv2EngageMark.once("mtp-mirror-road")
+        }
+
+        for (rowIndex, row) in verifyRows.enumerated() {
+            let state = verifyStates[rowIndex]
             let carry = row.carry!
             // Captured BEFORE the target forward writes the round's
             // speculative columns. On a backend whose snapshots are lazy
@@ -241,7 +279,20 @@ extension EngineLoopV2 {
                 "CBv2 MTP: verify row anchor \(fullRow.absoluteOffset) != carry \(carry.kvOffset)"
             )
             let fullSnapshot = fullRow.snapshot()
-            let slidingSnapshot = slidingRow.snapshot()
+            let slidingSnapshot: (keys: MLXArray, values: MLXArray)
+            if mirrorRoad,
+                let windowed = slidingRow as? CBv2WindowedSequenceKV,
+                let slidingCache = roundCaches[mtp.captureLayers.sliding] as? CBv2LayerCache,
+                let dequantized = windowed.mtpDequantizedRetainedViews(
+                    fence: slidingCache.mtpWriteFence)
+            {
+                // The drafter attends the bytes the target attends: the q4
+                // mirror, dequantized, ordered after this round's capture.
+                slidingSnapshot = dequantized
+            } else {
+                let snapshot = slidingRow.snapshot()
+                slidingSnapshot = (snapshot.keys, snapshot.values)
+            }
             captures.append(
                 CBv2MTPRowCapture(
                     fullKeys: fullSnapshot.keys,
@@ -282,13 +333,20 @@ extension EngineLoopV2 {
 
         // Windowed rows stage provisional writes; other supported storage
         // backends implement the transaction hooks as exact no-ops/rollback.
+        // On the mirror road the windowed rows are NOT armed: their columns
+        // write the live mirror in place and finalize undoes the rejected
+        // suffix from the captured log instead.
         let verifyStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         for metadata in rowMetadata {
-            for sequence in metadata.storageRows { sequence.beginSpeculativeWrite() }
+            for sequence in metadata.storageRows {
+                if mirrorRoad, sequence is CBv2WindowedSequenceKV { continue }
+                sequence.beginSpeculativeWrite()
+            }
         }
         let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
         let target = mtpBuildTargetVerification(
-            columns: targetColumns, rows: verifyRows, driver: mtp)
+            columns: targetColumns, rows: verifyRows, driver: mtp,
+            lazyColumns: mirrorRoad)
         cacheInnerState.append(contentsOf: target.cacheInnerState)
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
@@ -300,7 +358,33 @@ extension EngineLoopV2 {
             k: k,
             rows: rowMetadata,
             acceptancePacket: acceptancePacket,
-            lastHidden: target.hidden)
+            lastHidden: target.hidden,
+            mirrorRestore: mirrorRestore)
+    }
+
+    /// Mirror-road admission for one round: every verify row's storage-owning
+    /// sliding layer is a full-ring windowed row with a live q4 mirror and no
+    /// staged transaction, every storage-owning cache is the contiguous
+    /// `CBv2LayerCache` (the fence owner), and the kill switch is not set.
+    /// Anything else keeps the vendored staging path for the whole round —
+    /// the two roads never mix within a round.
+    private func mtpMirrorRoadAdmits(
+        states: [[CBv2SequenceKV?]], caches: [CBv2AttendingLayerCache]
+    ) -> Bool {
+        guard CBv2MTPMirrorOps.enabled, states.count == 8 else { return false }
+        var sawWindowed = false
+        for (layerIndex, cache) in caches.enumerated() {
+            guard cache.kind.sharesKVWithLayer == nil else { continue }
+            guard cache is CBv2LayerCache else { return false }
+            for state in states {
+                guard let sequence = state[layerIndex] else { return false }
+                if let windowed = sequence as? CBv2WindowedSequenceKV {
+                    guard windowed.mtpMirrorRoadAvailable else { return false }
+                    sawWindowed = true
+                }
+            }
+        }
+        return sawWindowed
     }
 
     /// Freeze the round's pre-write KV captures against the in-place writes

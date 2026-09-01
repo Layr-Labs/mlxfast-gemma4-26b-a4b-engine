@@ -582,6 +582,53 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         [keys, values, quantMirror].compactMap { $0 }
     }
 
+    // MARK: - MTP mirror road (see MTP/CBv2MTPMirrorOps.swift)
+
+    /// True when a verify column on this row can take the production fused
+    /// q4 decode road: a full ring with a live mirror and no staged
+    /// transaction. This is the state the promoted B=8 decode leaves every
+    /// sliding row in after the 1024-token seed prefill.
+    var mtpMirrorRoadAvailable: Bool {
+        staged == nil && !speculativeWriteArmed && quantMirror != nil
+            && retainedCount == window
+    }
+
+    /// The live mirror, for the round-level undo capture and restore.
+    var mtpQuantMirror: MLXArray? { quantMirror }
+
+    /// Physical slot of the NEXT token this row writes (column 0 of a
+    /// round). Read before the round's columns advance the counters.
+    var mtpSlotBase: Int { absoluteOffset % window }
+
+    /// Finalize-time rollback of `n` rejected verify columns whose in-place
+    /// mirror slots are being restored by the layer's fenced restore
+    /// dispatch: both counters rewind, so the ring is whole again (the
+    /// restored slots hold exactly the positions they held before the
+    /// round). Column 0 of a round is never rolled back.
+    func mtpRollbackMirrorRoad(_ n: Int) {
+        precondition(n >= 0, "CBv2WindowedSequenceKV.mtpRollbackMirrorRoad: negative n")
+        precondition(
+            staged == nil && !speculativeWriteArmed,
+            "CBv2WindowedSequenceKV.mtpRollbackMirrorRoad on a staged row")
+        precondition(
+            n <= retainedCount,
+            "CBv2WindowedSequenceKV.mtpRollbackMirrorRoad(\(n)) exceeds retained \(retainedCount)")
+        absoluteOffset -= n
+        oldestValidPosition -= n
+        borrowableChunkViews = nil
+    }
+
+    /// The drafter's frozen sliding capture on the mirror road: the retained
+    /// ring in temporal order, dequantized from the q4 mirror (the bytes the
+    /// target attends), `[1, kvHeads, retained, headDim]` bf16.
+    func mtpDequantizedRetainedViews(fence: MLXArray) -> (keys: MLXArray, values: MLXArray)? {
+        guard let quantMirror, staged == nil, retainedCount > 0, headDim == 256 else { return nil }
+        return CBv2MTPMirrorOps.dequantize(
+            mirror: quantMirror, start: oldestValidPosition % window,
+            count: retainedCount, kvHeads: kvHeads, headDim: headDim, window: window,
+            fence: fence)
+    }
+
     // MARK: - Ring geometry
 
     private func writeDecodeToken(keys newKeys: MLXArray, values newValues: MLXArray) {

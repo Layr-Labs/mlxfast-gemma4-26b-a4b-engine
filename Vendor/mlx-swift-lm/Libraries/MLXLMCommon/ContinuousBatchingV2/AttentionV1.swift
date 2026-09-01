@@ -445,6 +445,33 @@ enum CBv2AttentionV1 {
         let effectiveSinks = dispatchSinks(
             sinks, kind: kind, queries: queries, softcap: softcap)
 
+        // MTP WIDE VERIFY (MTP/CBv2MTPMirrorOps.swift): a [B > 1, L > 1]
+        // verify rectangle whose queries must be serialized takes each
+        // column through the EXACT [B, 1] decode road below — the same fused
+        // in-place ring write serial decode runs, fence-chained column to
+        // column — instead of the vendored per-row BF16 view path. Column c's
+        // attention therefore sees exactly the KV a plain decode of that
+        // token would have seen, and its K/V lands in the same slot.
+        if serializeQueries, L > 1, B > 1 {
+            var columns: [MLXArray] = []
+            columns.reserveCapacity(L)
+            for column in 0 ..< L {
+                columns.append(
+                    updateAndAttend(
+                        rows: rows, kind: kind,
+                        queries: queries[0..., 0..., column ..< (column + 1), 0...],
+                        keys: keys[0..., 0..., column ..< (column + 1), 0...],
+                        values: values[0..., 0..., column ..< (column + 1), 0...],
+                        scale: scale, sinks: sinks, softcap: softcap,
+                        spanContexts: nil,
+                        serializeQueries: false,
+                        decodeRingWriteFence: decodeRingWriteFence,
+                        allowFusedRingWrite: allowFusedRingWrite))
+            }
+            CBv2EngageMark.once("mtp-wide-verify-attention-columns")
+            return concatenated(columns, axis: 2)
+        }
+
         if B == 1 {
             if serializeQueries, L > 1 {
                 return updateAndAttendRowSerialQueries(

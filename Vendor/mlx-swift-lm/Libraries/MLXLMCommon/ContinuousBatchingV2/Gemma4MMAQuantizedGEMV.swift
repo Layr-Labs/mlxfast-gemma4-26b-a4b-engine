@@ -2776,6 +2776,20 @@ public enum Gemma4MMAQuantizedGEMV {
         activationSums: ActivationSums? = nil
     ) -> MLXArray? {
         guard enabled else { return nil }
+        // Wide MTP verify: eight-row tiles through this exact body. Each
+        // tile recomputes its activation group sums with the standalone
+        // prepass (the producer table covers the whole rectangle and is not
+        // sliced here); the two tables are built with the same accumulation
+        // order, so the tile's arithmetic is the cohort's.
+        if (x.ndim == 2 || (x.ndim == 3 && x.dim(1) == 1)), x.dim(0) > mRows,
+            let tiled = CBv2MTPWideVerifyContext.rowTiles(x, tile: mRows, {
+                apply(
+                    x: $0, w: w, scales: scales, biases: biases,
+                    groupSize: groupSize, bits: bits, activationSums: nil)
+            })
+        {
+            return tiled
+        }
         guard let biases else { return nil }
         guard groupSize == 64, bits == 4 else { return nil }
         guard x.dtype == .bfloat16, scales.dtype == .bfloat16, biases.dtype == .bfloat16

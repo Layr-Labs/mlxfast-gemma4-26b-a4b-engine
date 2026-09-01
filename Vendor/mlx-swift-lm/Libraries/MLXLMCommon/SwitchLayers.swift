@@ -308,6 +308,13 @@ private func geGLUClaimsPinnedDecode(_ gate: MLXArray, _ up: MLXArray) -> Bool {
     let s = gate.shape
     if s.count == 3, s[0] == 64, s[1] == 1 { return true }
     if s.count == 2, s[0] == 64 { return true }
+    // Wide MTP verify: 64 * (1+k) expert rows through the same one-kernel
+    // shape-specialised trace (see Gemma4Text's `geluFusionClaimsPinnedDecode`).
+    if CBv2MTPWideVerifyContext.active {
+        let rows = 64 * CBv2MTPWideVerifyContext.columns
+        if s.count == 3, s[0] == rows, s[1] == 1 { return true }
+        if s.count == 2, s[0] == rows { return true }
+    }
     return false
 }
 
@@ -1599,11 +1606,49 @@ public class SwitchGLU: Module {
         isProductionPrefill: Bool = true,
         routeTable: SwitchRouteTable? = nil
     ) -> DeferredWeightedExpertRows? {
+        // The eight-row decode cohort, or — inside a wide MTP verify, where
+        // the [8, 1+k] rectangle arrives as 8 * (1+k) single-token rows —
+        // any multiple of eight rows with their 8 assignments each. The
+        // sorted gather below is per assignment (each dot product is one
+        // row's), so the wider table changes no assignment's arithmetic.
         let isEightRowDecode =
             !isProductionPrefill && x.dim(0) == 8 && indices.size == 64
-        guard fuseSortedReduction && isEightRowDecode,
+        let isWideVerifyRows =
+            !isProductionPrefill && CBv2MTPWideVerifyContext.active
+            && x.dim(0) > 8 && x.dim(0) % 8 == 0 && indices.size == 8 * x.dim(0)
+        guard fuseSortedReduction && (isEightRowDecode || isWideVerifyRows),
             supportsWeightedExpertUnsort(x, indices, weights: weights)
         else { return nil }
+
+        // Wide verify, eight-row tiles: each tile is exactly the promoted
+        // 64-assignment decode gather (tagged route keys, lhs-indexed gather,
+        // the gemma4 pair arm), so every assignment's dot product is the
+        // narrow path's. The tiles' sorted planes are stacked and the inverse
+        // orders offset by 64 per tile for the row-generic tail.
+        // DARKBLOOM_CBV2_MTP_EXPERT_MERGE=1 instead runs one merged gather
+        // over all rows (weights read once per distinct expert).
+        if isWideVerifyRows, !CBv2MTPWideVerifyContext.mergedExpertGather {
+            var sortedTiles: [MLXArray] = []
+            var inverseTiles: [MLXArray] = []
+            var weightTiles: [MLXArray] = []
+            let rows = x.dim(0)
+            for (tileIndex, start) in stride(from: 0, to: rows, by: 8).enumerated() {
+                guard let tile = callAndDeferWeightedReduce(
+                    x[start ..< (start + 8)], indices[start ..< (start + 8)],
+                    weights: weights[start ..< (start + 8)],
+                    fuseSortedReduction: fuseSortedReduction,
+                    isProductionPrefill: isProductionPrefill, routeTable: nil)
+                else { return nil }
+                sortedTiles.append(tile.sortedOutputs)
+                inverseTiles.append(tile.inverseOrder + UInt32(64 * tileIndex))
+                weightTiles.append(tile.weights)
+            }
+            CBv2EngageMark.once("mtp-wide-verify-expert-tiles")
+            return DeferredWeightedExpertRows(
+                sortedOutputs: concatenated(sortedTiles, axis: 0),
+                inverseOrder: concatenated(inverseTiles, axis: 0),
+                weights: concatenated(weightTiles, axis: 0))
+        }
 
         let projected = projectExperts(x, indices, routeTable: routeTable)
         guard projected.sorted,

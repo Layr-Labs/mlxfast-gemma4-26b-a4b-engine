@@ -1142,23 +1142,32 @@ inline U qdot_affine8_registered_v4(
     /// Builds the shared gate/up table only for the exact dense decode input.
     /// Returning an opaque value prevents callers from fabricating a table with
     /// a plausible shape; all other inputs keep DMLP-001 unchanged.
+    /// Rows an activation-sum table covers: the pinned decode cohort, or a
+    /// wide MTP verify rectangle's `8 * (1+k)` single-token rows (the table
+    /// is per row; the widened grid touches no other row).
+    private static func sumRows(_ x: MLXArray) -> Int? {
+        guard x.ndim == 3, x.dim(1) == sequence, x.dim(2) == 2816 else { return nil }
+        if x.dim(0) == batch { return batch }
+        if CBv2MTPWideVerifyContext.active, x.dim(0) > batch, x.dim(0) % batch == 0 {
+            return x.dim(0)
+        }
+        return nil
+    }
+
     public static func activationSums(for x: MLXArray) -> ActivationSums? {
         guard enabled,
             activationSumsEnabled,
             x.dtype == .bfloat16,
-            x.ndim == 3,
-            x.dim(0) == batch,
-            x.dim(1) == sequence,
-            x.dim(2) == 2816,
-            x.size == batch * sequence * 2816
+            let rows = sumRows(x),
+            x.size == rows * sequence * 2816
         else { return nil }
         let blocks = 2816 / kBlock
         let values = activationSumKernel(
             [x],
             template: [("T", x.dtype)],
-            grid: (simdWidth, blocks, batch),
+            grid: (simdWidth, blocks, rows),
             threadGroup: (simdWidth, 1, 1),
-            outputShapes: [[blocks * simdWidth * batch]],
+            outputShapes: [[blocks * simdWidth * rows]],
             outputDTypes: [.float32]
         )[0]
         return ActivationSums(values: values)
@@ -1175,14 +1184,11 @@ inline U qdot_affine8_registered_v4(
         guard enabled,
             activationSumsEnabled,
             x.dtype == .bfloat16,
-            x.ndim == 3,
-            x.dim(0) == batch,
-            x.dim(1) == sequence,
-            x.dim(2) == 2816,
-            x.size == batch * sequence * 2816,
+            let rows = sumRows(x),
+            x.size == rows * sequence * 2816,
             values.dtype == .float32,
             values.ndim == 1,
-            values.size == blocks * simdWidth * batch
+            values.size == blocks * simdWidth * rows
         else { return nil }
         return ActivationSums(values: values)
     }
@@ -1199,6 +1205,20 @@ inline U qdot_affine8_registered_v4(
         mode: QuantizationMode,
         activationSums: ActivationSums? = nil
     ) -> MLXArray? {
+        // Wide MTP verify: eight-row tiles through this exact body, each
+        // tile with its own exact activation-sum table (the same prepass
+        // the pinned decode cell runs), so the tile takes the identical
+        // kernel variant the eight-row cohort takes.
+        if x.ndim == 3, x.dim(1) == sequence, x.dim(0) > batch,
+            let tiled = CBv2MTPWideVerifyContext.rowTiles(x, tile: batch, { tile in
+                matmul(
+                    x: tile, weight: weight, scales: scales, biases: biases,
+                    groupSize: groupSize, bits: bits, mode: mode,
+                    activationSums: Self.activationSums(for: tile))
+            })
+        {
+            return tiled
+        }
         guard enabled,
             groupSize == Self.groupSize,
             bits == Self.bits,

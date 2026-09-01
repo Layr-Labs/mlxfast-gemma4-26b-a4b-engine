@@ -52,6 +52,15 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Default ON: GATE/UP packed-word load. `0/false/no/off` restores the
+    /// tip byte-walk bodies and original kernel names.
+    public static let packedWordEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_DENSE_MLP_PACKED_WORD"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// MMA-MLP-001 arms, one per dense MLP plane. The two planes are separate
     /// because they behave differently, not for convenience.
     ///
@@ -312,6 +321,69 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
   }
 }
 """
+
+    /// Packed-word GATE/UP body: one aligned `uint` load per lane-trip.
+    /// Derived from `kernelHeader` so the OFF path keeps the original
+    /// byte-walk text. Extraction order matches the promoted
+    /// `qdot_affine8_registered_word` helper in the quantized twins.
+    private static let packedWordKernelHeader: String = {
+        var result = kernelHeader
+        func replaceOnce(_ old: String, with new: String) {
+            precondition(result.components(separatedBy: old).count == 2)
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        func replaceAll(_ old: String, with new: String, times: Int) {
+            precondition(result.components(separatedBy: old).count == times + 1)
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        replaceOnce(
+            """
+            template <typename U, int values_per_thread>
+            inline U qdot_affine8_registered(
+            """,
+            with: """
+            template <typename U, int values_per_thread>
+            inline U qdot_affine8_registered_word(
+                uint packed_word,
+                const thread U* x_thread,
+                U scale,
+                U bias,
+                U sum) {
+              U accum = 0;
+              accum += x_thread[0] * U(packed_word & 0xffu);
+              accum += x_thread[1] * U((packed_word >> 8) & 0xffu);
+              accum += x_thread[2] * U((packed_word >> 16) & 0xffu);
+              accum += x_thread[3] * U(packed_word >> 24);
+              return scale * accum + sum * bias;
+            }
+
+            template <typename U, int values_per_thread>
+            inline U qdot_affine8_registered(
+            """)
+        replaceOnce(
+            "METAL_FUNC void qmv_affine8_g64_quad_stream_impl(",
+            with: "METAL_FUNC void qmv_affine8_g64_quad_stream_packed_word_impl(")
+        replaceOnce(
+            "thread uint8_t packed[results_per_simdgroup][bytes_per_thread];",
+            with: "thread uint packed[results_per_simdgroup];")
+        replaceAll(
+            """
+                  const device uint8_t* wl = ws + row * in_vec_size_w;
+                  #pragma unroll
+                  for (int i = 0; i < bytes_per_thread; i++) {
+                    packed[row][i] = wl[i];
+                  }
+            """,
+            with: """
+                  packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
+            """,
+            times: 2)
+        replaceAll(
+            "qdot_affine8_registered<float, values_per_thread>(",
+            with: "qdot_affine8_registered_word<float, values_per_thread>(",
+            times: 8)
+        return result
+    }()
 
     /// DMLP-002 keeps DMLP-001's kernel text intact and derives a second body
     /// which replaces only the four-value activation sum. The x values are
@@ -891,6 +963,43 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         ensureRowContiguous: true
     )
 
+    private static let packedWordKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_packed_word_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+
+            const int in_vec_size = x_shape[x_ndim - 1];
+            const int out_vec_size = w_shape[0];
+            const int first_m = int(tid.x) * 4;
+            if (first_m >= 8) {
+                return;
+            }
+            qmv_affine8_g64_quad_stream_packed_word_impl<T, 64, 8>(
+                w,
+                scales,
+                biases,
+                x + first_m * in_vec_size,
+                x + (first_m + 1) * in_vec_size,
+                x + (first_m + 2) * in_vec_size,
+                x + (first_m + 3) * in_vec_size,
+                y + first_m * out_vec_size,
+                y + (first_m + 1) * out_vec_size,
+                y + (first_m + 2) * out_vec_size,
+                y + (first_m + 3) * out_vec_size,
+                in_vec_size,
+                tid,
+                simd_gid,
+                simd_lid);
+            return;
+            """,
+        header: packedWordKernelHeader,
+        ensureRowContiguous: true
+    )
+
     /// One exact float sum for each `(K/128 block, simd lane, cohort row)`.
     /// The expression is the bits==8 arm of stock `load_vector`: a float zero
     /// followed by four ascending `sum += bf16` operations. Row is the unit-
@@ -1093,6 +1202,16 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
 
         let xGroups = batch / rowsPerGroup
         let yGroups = outDim / outputsPerGroup
+        if isGateUp && packedWordEnabled {
+            return packedWordKernel(
+                [x, weight, scales, biases],
+                template: [("T", x.dtype)],
+                grid: (xGroups * simdWidth, yGroups * simdGroups, 1),
+                threadGroup: (simdWidth, simdGroups, 1),
+                outputShapes: [[batch, sequence, outDim]],
+                outputDTypes: [x.dtype]
+            )[0]
+        }
         let useActivationSums = activationSums != nil
             && inDim == 2816
             && outDim == 2112

@@ -1523,7 +1523,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// removes only the global partial write/read and the second dispatch.
     private static let portQuantFusedWriteResidentKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_v1",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_v2",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -1666,9 +1666,20 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 thread float q_hi[values_per_lane];
                 thread float acc_lo[values_per_lane];
                 thread float acc_hi[values_per_lane];
+                const device T4* qvec = reinterpret_cast<const device T4*>(query);
+                const device T4* qvec_hi = reinterpret_cast<const device T4*>(query + D);
+                #pragma clang loop unroll(full)
+                for (int q = 0; q < values_per_lane / 4; ++q) {
+                    const T4 q4_lo = qvec[q];
+                    const T4 q4_hi = qvec_hi[q];
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        q_lo[q * 4 + j] = float(q4_lo[j]);
+                        q_hi[q * 4 + j] = float(q4_hi[j]);
+                    }
+                }
+                #pragma clang loop unroll(full)
                 for (int element = 0; element < values_per_lane; ++element) {
-                    q_lo[element] = float(query[element]);
-                    q_hi[element] = float(query[D + element]);
                     acc_lo[element] = 0.0f;
                     acc_hi[element] = 0.0f;
                 }
@@ -1717,6 +1728,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     const float vb = float(as_type<half>(ushort(vtw >> 16)));
                     float score_lo = 0.0f;
                     float score_hi = 0.0f;
+                    #pragma clang loop unroll(full)
                     for (int element = 0; element < values_per_lane; ++element) {
                         const float key_element =
                             fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
@@ -1736,6 +1748,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     max_hi = new_max_hi;
                     sum_lo = sum_lo * old_factor_lo + score_factor_lo;
                     sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                    #pragma clang loop unroll(full)
                     for (int element = 0; element < values_per_lane; ++element) {
                         const float value_element =
                             fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
@@ -1752,9 +1765,20 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     sum_out[BLOCKS] = sum_hi;
                     max_out[BLOCKS] = max_hi;
                 }
-                for (int element = 0; element < values_per_lane; ++element) {
-                    partial[element] = T(acc_lo[element]);
-                    partial[BLOCKS * D + element] = T(acc_hi[element]);
+                threadgroup T4* partial_vec_lo =
+                    reinterpret_cast<threadgroup T4*>(partial);
+                threadgroup T4* partial_vec_hi =
+                    reinterpret_cast<threadgroup T4*>(partial + BLOCKS * D);
+                #pragma clang loop unroll(full)
+                for (int q = 0; q < values_per_lane / 4; ++q) {
+                    T4 p4_lo, p4_hi;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        p4_lo[j] = T(acc_lo[q * 4 + j]);
+                        p4_hi[j] = T(acc_hi[q * 4 + j]);
+                    }
+                    partial_vec_lo[q] = p4_lo;
+                    partial_vec_hi[q] = p4_hi;
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1773,6 +1797,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         + output_group * values_per_lane;
 
                     thread float accumulator[values_per_lane];
+                    #pragma clang loop unroll(full)
                     for (int element = 0; element < values_per_lane; ++element) {
                         accumulator[element] = 0.0f;
                     }
@@ -1781,6 +1806,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     thread float lane_factor[rounds];
                     float sum_exp_score = 0.0f;
                     float max_score = -3.402823466e+38F;
+                    #pragma clang loop unroll(full)
                     for (int round = 0; round < rounds; ++round) {
                         const int column = block_lane + COLS * round;
                         const bool live = column < BLOCKS;
@@ -1789,22 +1815,26 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         lane_sum[round] = live ? head_sums[column] : 0.0f;
                         max_score = max(max_score, lane_max[round]);
                     }
+                    #pragma clang loop unroll(full)
                     for (int stride = 1; stride < COLS; stride <<= 1) {
                         max_score = max(
                             max_score,
                             simd_shuffle_xor(max_score, ushort(stride)));
                     }
 
+                    #pragma clang loop unroll(full)
                     for (int round = 0; round < rounds; ++round) {
                         lane_factor[round] =
                             fast::exp(lane_max[round] - max_score);
                         sum_exp_score += lane_factor[round] * lane_sum[round];
                     }
+                    #pragma clang loop unroll(full)
                     for (int stride = 1; stride < COLS; stride <<= 1) {
                         sum_exp_score +=
                             simd_shuffle_xor(sum_exp_score, ushort(stride));
                     }
 
+                    #pragma clang loop unroll(full)
                     for (int round = 0; round < rounds; ++round) {
                         const int column = block_lane + COLS * round;
                         if (column < BLOCKS) {
@@ -1824,17 +1854,83 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         }
                     }
 
-                    for (int element = 0; element < values_per_lane; ++element) {
-                        float reduced = accumulator[element];
-                        for (int stride = 1; stride < COLS; stride <<= 1) {
-                            reduced +=
-                                simd_shuffle_xor(reduced, ushort(stride));
+                    constexpr bool lane_fold = values_per_lane >= COLS;
+                    if (lane_fold) {
+                        float fold[values_per_lane];
+                        #pragma clang loop unroll(full)
+                        for (int element = 0; element < values_per_lane; ++element) {
+                            fold[element] = accumulator[element];
                         }
-                        if (block_lane == 0) {
-                            head_out[element] = T(
+                        if (COLS > 1) {
+                            const bool upper = (block_lane & 1) != 0;
+                            #pragma clang loop unroll(full)
+                            for (int j = 0; j < values_per_lane / 2; ++j) {
+                                const float a = fold[2 * j];
+                                const float b = fold[2 * j + 1];
+                                fold[j] = (upper ? b : a)
+                                    + simd_shuffle_xor(upper ? a : b, ushort(1));
+                            }
+                        }
+                        if (COLS > 2) {
+                            const bool upper = (block_lane & 2) != 0;
+                            #pragma clang loop unroll(full)
+                            for (int j = 0; j < values_per_lane / 4; ++j) {
+                                const float a = fold[2 * j];
+                                const float b = fold[2 * j + 1];
+                                fold[j] = (upper ? b : a)
+                                    + simd_shuffle_xor(upper ? a : b, ushort(2));
+                            }
+                        }
+                        if (COLS > 4) {
+                            const bool upper = (block_lane & 4) != 0;
+                            #pragma clang loop unroll(full)
+                            for (int j = 0; j < values_per_lane / 8; ++j) {
+                                const float a = fold[2 * j];
+                                const float b = fold[2 * j + 1];
+                                fold[j] = (upper ? b : a)
+                                    + simd_shuffle_xor(upper ? a : b, ushort(4));
+                            }
+                        }
+                        if (COLS > 8) {
+                            const bool upper = (block_lane & 8) != 0;
+                            #pragma clang loop unroll(full)
+                            for (int j = 0; j < values_per_lane / 16; ++j) {
+                                const float a = fold[2 * j];
+                                const float b = fold[2 * j + 1];
+                                fold[j] = (upper ? b : a)
+                                    + simd_shuffle_xor(upper ? a : b, ushort(8));
+                            }
+                        }
+                        if (COLS > 16) {
+                            const bool upper = (block_lane & 16) != 0;
+                            #pragma clang loop unroll(full)
+                            for (int j = 0; j < values_per_lane / 32; ++j) {
+                                const float a = fold[2 * j];
+                                const float b = fold[2 * j + 1];
+                                fold[j] = (upper ? b : a)
+                                    + simd_shuffle_xor(upper ? a : b, ushort(16));
+                            }
+                        }
+                        #pragma clang loop unroll(full)
+                        for (int j = 0; j < values_per_lane / COLS; ++j) {
+                            head_out[j * COLS + block_lane] = T(
                                 sum_exp_score == 0.0f
-                                    ? reduced
-                                    : reduced / sum_exp_score);
+                                    ? fold[j]
+                                    : fold[j] / sum_exp_score);
+                        }
+                    } else {
+                        for (int element = 0; element < values_per_lane; ++element) {
+                            float reduced = accumulator[element];
+                            for (int stride = 1; stride < COLS; stride <<= 1) {
+                                reduced +=
+                                    simd_shuffle_xor(reduced, ushort(stride));
+                            }
+                            if (block_lane == 0) {
+                                head_out[element] = T(
+                                    sum_exp_score == 0.0f
+                                        ? reduced
+                                        : reduced / sum_exp_score);
+                            }
                         }
                     }
                 }

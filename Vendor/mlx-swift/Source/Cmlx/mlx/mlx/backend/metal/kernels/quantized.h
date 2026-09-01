@@ -1588,9 +1588,14 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   const device uint8_t* ws = (const device uint8_t*)w;
   thread float x0_thread[values_per_thread];
   thread float x1_thread[values_per_thread];
-  thread uint packed[results_per_simdgroup];
-  thread float scale_local[results_per_simdgroup];
-  thread float bias_local[results_per_simdgroup];
+  // NARROW: these three arrays stay live across both x loads and the whole
+  // row loop, and each held a widened copy of a 16-bit source. Keeping the
+  // source width halves their footprint; the widening moves to the point of
+  // use, where exactly one row is live.
+  thread ushort packed_lo[results_per_simdgroup];
+  thread ushort packed_hi[results_per_simdgroup];
+  thread T scale_local[results_per_simdgroup];
+  thread T bias_local[results_per_simdgroup];
   thread float result0[results_per_simdgroup] = {0};
   thread float result1[results_per_simdgroup] = {0};
 
@@ -1610,7 +1615,10 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   int k = 0;
   for (; k <= in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
-      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
+      const device ushort* wl =
+          (const device ushort*)(ws + row * in_vec_size_w);
+      packed_lo[row] = wl[0];
+      packed_hi[row] = wl[1];
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }
@@ -1622,7 +1630,9 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
       float dot0;
       float dot1;
       qdot_affine4_pair_word<float, values_per_thread>(
-          packed[row], x0_thread, x1_thread, scale_local[row], bias_local[row], sum0, sum1, dot0, dot1);
+          (uint(packed_hi[row]) << 16) | uint(packed_lo[row]),
+          x0_thread, x1_thread, float(scale_local[row]),
+          float(bias_local[row]), sum0, sum1, dot0, dot1);
       result0[row] += dot0;
       result1[row] += dot1;
     }
@@ -1642,7 +1652,10 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
       uint((in_vec_size - k) / values_per_thread);
   if (simd_lid < active_tail_lanes) {
     for (int row = 0; row < results_per_simdgroup; row++) {
-      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
+      const device ushort* wl =
+          (const device ushort*)(ws + row * in_vec_size_w);
+      packed_lo[row] = wl[0];
+      packed_hi[row] = wl[1];
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }
@@ -1655,7 +1668,9 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
       float dot0;
       float dot1;
       qdot_affine4_pair_word<float, values_per_thread>(
-          packed[row], x0_thread, x1_thread, scale_local[row], bias_local[row], sum0, sum1, dot0, dot1);
+          (uint(packed_hi[row]) << 16) | uint(packed_lo[row]),
+          x0_thread, x1_thread, float(scale_local[row]),
+          float(bias_local[row]), sum0, sum1, dot0, dot1);
       result0[row] += dot0;
       result1[row] += dot1;
     }

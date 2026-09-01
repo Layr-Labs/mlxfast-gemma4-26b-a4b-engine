@@ -599,27 +599,28 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     rs += simd_shuffle_xor(rs, 4u);
     rs += simd_shuffle_xor(rs, 16u);
 
-    MMA8_SETB(B0, x, lo)
-    MMA8_SETB(B1, x, hi)
-    MMA8_SETB(B2, y, lo)
-    MMA8_SETB(B3, y, hi)
-    MMA8_SETB(B4, z, lo)
-    MMA8_SETB(B5, z, hi)
-    MMA8_SETB(B6, w, lo)
-    MMA8_SETB(B7, w, hi)
 
     const uint4 wv = *((const device uint4*)(wrow + 64 * g));
     const float s = float(srow[g]);
     const float b = float(brow[g]);
 
+    // Each B operand is filled immediately before the step that reads it.
     simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+    MMA8_SETB(B0, x, lo)
     MMA8_STEP8(B0, x, z, 0)
+    MMA8_SETB(B1, x, hi)
     MMA8_STEP8(B1, x, z, 8)
+    MMA8_SETB(B2, y, lo)
     MMA8_STEP8(B2, x, z, 16)
+    MMA8_SETB(B3, y, hi)
     MMA8_STEP8(B3, x, z, 24)
+    MMA8_SETB(B4, z, lo)
     MMA8_STEP8(B4, y, w, 0)
+    MMA8_SETB(B5, z, hi)
     MMA8_STEP8(B5, y, w, 8)
+    MMA8_SETB(B6, w, lo)
     MMA8_STEP8(B6, y, w, 16)
+    MMA8_SETB(B7, w, hi)
     MMA8_STEP8(B7, y, w, 24)
 
     acc0 += s * C.thread_elements()[0] + rs.x * b;
@@ -760,7 +761,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     }()
 
     private static let mma8DownStaticKKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_carry2_v3",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_carry2_bfill_v4",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """

@@ -425,6 +425,74 @@ public enum Gemma4PrefillGlueV1 {
     }
 
     /// `rmsNorm(x, weight)` written straight into expert-sorted order: row
+    /// Top-eight twin of `preNormScatterKernel`. Lanes 0 to 7 stage the row's
+    /// eight sorted positions into a threadgroup table before the RMS helper
+    /// is entered; that helper's first `mem_threadgroup` barrier is
+    /// unconditional and reached by every thread of the row group, so the
+    /// table is published before any thread reads it after the helper
+    /// returns. Values, dtype, positions, store order and shapes are those of
+    /// the one-lane-per-read form.
+    private static let preNormScatterK8Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_prefill_glue_prenorm_scatter_2816_tgmeta_k8_v1",
+        inputNames: ["x", "w", "inverse"],
+        outputNames: ["out"],
+        source: """
+            threadgroup float local_sums[32];
+            threadgroup float local_inv[1];
+            threadgroup uint sorted_positions[8];
+
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+
+            const size_t assignment_base = size_t(row) * 8;
+            if (lid < 8) {
+                sorted_positions[lid] = inverse[assignment_base + lid];
+            }
+
+            const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+
+            float xv[GLUE_NREADS];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                xv[i] = static_cast<float>(x[base + i]);
+            }
+
+            const float inv = glue_inv_rms(
+                xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
+
+            T normed[GLUE_NREADS];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                const uint j = lid * GLUE_NREADS + i;
+                const T scaled = static_cast<T>(xv[i] * inv);
+                normed[i] = w[j] * scaled;
+            }
+
+            #pragma clang loop unroll(full)
+            for (int k = 0; k < 8; k++) {
+                const size_t pos = size_t(sorted_positions[k]);
+                const size_t obase = pos * GLUE_AXIS + lid * GLUE_NREADS;
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    out[obase + i] = normed[i];
+                }
+            }
+            """,
+        header: kernelHeader,
+        ensureRowContiguous: true
+    )
+
+    /// Unset default selects the top-eight twin; `=0`, `false`, `no` or `off`
+    /// keeps the one-lane-per-read kernel for every top-K.
+    private static let prenormTgmetaK8Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_PRENORM_TGMETA_K8"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// `inverseOrder[t * topK + k]` of the returned `[rows * topK, 1, 2816]`
     /// plane is the normed row `t`. Returns `nil` off the prefill plane, with
     /// the arm switched off, or for an inverse order that is not exactly one
@@ -442,6 +510,17 @@ public enum Gemma4PrefillGlueV1 {
         else { return nil }
 
         CBv2EngageMark.once("prefill-prenorm-gather")
+        if prenormTgmetaK8Enabled, topK == 8 {
+            CBv2EngageMark.once("prefill-prenorm-scatter-tgmeta-k8")
+            return preNormScatterK8Kernel(
+                [x, weight, inverseOrder],
+                template: [("T", x.dtype)],
+                grid: (threadsPerRow, rows, 1),
+                threadGroup: (threadsPerRow, 1, 1),
+                outputShapes: [[rows * topK, 1, axis]],
+                outputDTypes: [x.dtype]
+            )[0]
+        }
         return preNormScatterKernel(
             [x, weight, inverseOrder],
             template: [("T", x.dtype), ("K", topK)],
@@ -650,7 +729,7 @@ public enum Gemma4PrefillGlueV1 {
     /// same `[tokens, hidden]` expert result. Produce each reduced expert value
     /// in the tail thread that consumes it, removing the intermediate tensor.
     private static let expertTailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_expert_unsort_tail_chain_2816_unroll_v2",
+        name: "gemma4_prefill_expert_unsort_tail_chain_2816_staged_v3",
         inputNames: [
             "sorted", "inverse_order", "route_weights", "h1",
             "w1", "w2", "w3", "res2", "s", "wn",
@@ -668,6 +747,23 @@ public enum Gemma4PrefillGlueV1 {
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
             const uint assignment_base = row * 8;
 
+            // The row group's eight sorted rows and eight route weights are
+            // the same values for every one of its threads, and each thread
+            // read them once per feature. Lanes 0 to 7 stage them once and a
+            // single barrier publishes them; every consumer then reads the
+            // staged copy. Each staged value is the value the device read
+            // returned, so every product, its order and the accumulator it
+            // lands in are unchanged.
+            threadgroup uint staged_rows[8];
+            threadgroup float staged_weights[8];
+            if (lid < 8) {
+                staged_rows[lid] =
+                    (uint)inverse_order[assignment_base + lid];
+                staged_weights[lid] =
+                    (float)route_weights[assignment_base + lid];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
             float av[GLUE_NREADS];
             float bv[GLUE_NREADS];
             #pragma clang loop unroll(full)
@@ -675,12 +771,12 @@ public enum Gemma4PrefillGlueV1 {
                 const uint feature = lid * GLUE_NREADS + i;
                 av[i] = static_cast<float>(h1[base + i]);
                 T accumulator = (T)0;
+                #pragma clang loop unroll(full)
                 for (uint slot = 0; slot < 8; ++slot) {
-                    const uint assignment = assignment_base + slot;
-                    const uint sorted_row = (uint)inverse_order[assignment];
                     const T weighted = (T)(
-                        (float)sorted[size_t(sorted_row) * GLUE_AXIS + feature]
-                        * (float)route_weights[assignment]);
+                        (float)sorted[size_t(staged_rows[slot]) * GLUE_AXIS
+                                      + feature]
+                        * staged_weights[slot]);
                     accumulator = accumulator + weighted;
                 }
                 bv[i] = static_cast<float>(accumulator);

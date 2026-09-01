@@ -3035,16 +3035,32 @@ private enum Gemma4FusedLayerGlue {
     /// feeds the expert RMS directly, deleting only the reduced `[8, 2816]`
     /// materialization and its standalone dispatch.
     private static let deferredExpertValuesSource = """
-            T expertv[4];
+            // The row group's eight sorted rows and eight route weights are
+            // the same values for every thread of the group, and each thread
+            // read all sixteen once per feature. Lanes 0 to 7 stage them and
+            // one barrier publishes them; each staged value is the value the
+            // device read returned, under the same cast, so every product,
+            // the ascending slot order and the accumulator each lands in are
+            // unchanged.
+            threadgroup uint staged_rows[8];
+            threadgroup float staged_weights[8];
             const uint assignment_base = row * 8u;
+            if (lid < 8u) {
+                staged_rows[lid] = (uint)inverse[assignment_base + lid];
+                staged_weights[lid] =
+                    (float)route_weights[assignment_base + lid];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            T expertv[4];
+            #pragma clang loop unroll(full)
             for (int i = 0; i < 4; ++i) {
                 T accumulator = static_cast<T>(0.0f);
+                #pragma clang loop unroll(full)
                 for (uint slot = 0u; slot < 8u; ++slot) {
-                    const uint assignment = assignment_base + slot;
-                    const uint sorted_row = (uint)inverse[assignment];
                     const T weighted = static_cast<T>(
-                        (float)sorted[sorted_row * 2816u + wbase + (uint)i]
-                        * (float)route_weights[assignment]);
+                        (float)sorted[staged_rows[slot] * 2816u
+                                      + wbase + (uint)i]
+                        * staged_weights[slot]);
                     accumulator = accumulator + weighted;
                 }
                 expertv[i] = accumulator;
@@ -3052,7 +3068,7 @@ private enum Gemma4FusedLayerGlue {
     """
 
     private static let deferredTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1",
+        name: "gemma4_glue_deferred_expert_tail_2816_bf16_staged_v2",
         inputNames: [
             "a", "sorted", "inverse", "route_weights", "res",
             "w1", "w2", "w3", "s",
@@ -3097,7 +3113,7 @@ private enum Gemma4FusedLayerGlue {
 
     private static let deferredTailChainKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1",
+            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_staged_v2",
             inputNames: [
                 "a", "sorted", "inverse", "route_weights", "res",
                 "w1", "w2", "w3", "s", "wn",

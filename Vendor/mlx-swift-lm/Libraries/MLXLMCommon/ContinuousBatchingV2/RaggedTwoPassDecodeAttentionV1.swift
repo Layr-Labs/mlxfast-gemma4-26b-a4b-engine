@@ -2317,6 +2317,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// the unrolled inner loop (the addressing perturbation WRITE-021/v2
     /// paid ~-1.34% decode for).
     private static let qkSource: String = """
+            typedef vec<T, 4> T4;
             constexpr int D = 512;
             constexpr int GQA = 8;
 
@@ -2378,18 +2379,21 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     int mat_offset = 0;
                     #pragma clang loop unroll(full)
                     for (int tm = 0; tm < 4; ++tm) {
+                        const device T4* mat_vec = reinterpret_cast<const device T4*>(mat + mat_offset + bn);
+                        const T4 kv = mat_vec[0];
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
-                            k_tile[tm][tn] = mat[mat_offset + bn + tn];
+                            k_tile[tm][tn] = kv[tn];
                         }
                         mat_offset += D;
                     }
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
+                        const device T4* q_vec = reinterpret_cast<const device T4*>(query + h * D + bn);
+                        const T4 qv = q_vec[0];
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
-                            q_coeff[tn] = static_cast<float>(
-                                query[h * D + bn + tn]);
+                            q_coeff[tn] = static_cast<float>(qv[tn]);
                         }
                         #pragma clang loop unroll(full)
                         for (int tm = 0; tm < 4; ++tm) {
@@ -2479,7 +2483,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         """
 
     private static let qkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_qk_bf16_g8_xfold_v3",
+        name: "cbv2_ragged8_sdpa_d512_qk_bf16_g8_xfold_vec4_v4",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -2491,7 +2495,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     )
 
     private static let qkFencedKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_qk_fenced_bf16_g8_xfold_v3",
+        name: "cbv2_ragged8_sdpa_d512_qk_fenced_bf16_g8_xfold_vec4_v4",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -2600,7 +2604,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// butterfly for all 8 heads of the GQA group at once (shared V tile
     /// loads). params as dispatch 1.
     private static let avKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_xfold_v3",
+        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_xfold_vec4_v4",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -2608,6 +2612,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         ],
         outputNames: ["out"],
         source: """
+            typedef vec<T, 4> T4;
             constexpr int D = 512;
             constexpr int GQA = 8;
 
@@ -2660,9 +2665,12 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 threadgroup_barrier(mem_flags::mem_none);
                 #pragma clang loop unroll(full)
                 for (int tm = 0; tm < 4; ++tm) {
+                    const device T4* v_vec = reinterpret_cast<const device T4*>(
+                        value_plane + size_t(bm + tm) * D + out_col);
+                    const T4 vv = v_vec[0];
+                    #pragma clang loop unroll(full)
                     for (int tn = 0; tn < 4; ++tn) {
-                        v_tile[tm][tn] = value_plane[
-                            size_t(bm + tm) * D + out_col + tn];
+                        v_tile[tm][tn] = vv[tn];
                     }
                 }
                 #pragma clang loop unroll(full)
@@ -2684,10 +2692,12 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             }
             if (leftover > 0) {
                 for (int tm = 0; tm < 4 && bm + tm < key_length; ++tm) {
+                    const device T4* v_vec = reinterpret_cast<const device T4*>(
+                        value_plane + size_t(bm + tm) * D + out_col);
+                    const T4 vv = v_vec[0];
                     #pragma clang loop unroll(full)
                     for (int tn = 0; tn < 4; ++tn) {
-                        v_tile[0][tn] = value_plane[
-                            size_t(bm + tm) * D + out_col + tn];
+                        v_tile[0][tn] = vv[tn];
                     }
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
@@ -2748,13 +2758,15 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 }
             }
             {
-                device T* out_ptr = out
+                device T4* out_ptr = reinterpret_cast<device T4*>(out
                     + size_t(row * 16 + kv_head * GQA + thrM) * D
-                    + out_col;
+                    + out_col);
+                T4 out_v;
                 #pragma clang loop unroll(full)
                 for (int j = 0; j < 4; ++j) {
-                    out_ptr[j] = static_cast<T>(result[j]);
+                    out_v[j] = static_cast<T>(result[j]);
                 }
+                out_ptr[0] = out_v;
             }
         """,
         ensureRowContiguous: true
@@ -2782,7 +2794,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// served from `new_keys` during scoring, never from the slot being
     /// written, so no read races the store.
     private static let fusedQkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_qk_bf16_g8_ktile_v3",
+        name: "cbv2_ragged8_writesdpa_d512_qk_bf16_g8_ktile_vec4_v4",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -2791,6 +2803,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         ],
         outputNames: ["scores", "fence"],
         source: """
+            typedef vec<T, 4> T4;
             constexpr int D = 512;
             constexpr int GQA = 8;
 
@@ -2874,9 +2887,11 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     if (!tile_has_new_token) {
                     #pragma clang loop unroll(full)
                     for (int tm = 0; tm < 4; ++tm) {
+                        const device T4* mat_vec = reinterpret_cast<const device T4*>(mat + mat_offset + bn);
+                        const T4 kv = mat_vec[0];
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
-                            k_tile[tm][tn] = mat[mat_offset + bn + tn];
+                            k_tile[tm][tn] = kv[tn];
                         }
                         mat_offset += D;
                     }
@@ -2896,10 +2911,11 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     }
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
+                        const device T4* q_vec = reinterpret_cast<const device T4*>(query + h * D + bn);
+                        const T4 qv = q_vec[0];
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
-                            q_coeff[tn] = static_cast<float>(
-                                query[h * D + bn + tn]);
+                            q_coeff[tn] = static_cast<float>(qv[tn]);
                         }
                         #pragma clang loop unroll(full)
                         for (int tm = 0; tm < 4; ++tm) {
@@ -2937,13 +2953,14 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             }
 
             if (chunk == 0 && sg == 0) {
-                device T* write_key = const_cast<device T*>(key_plane)
-                    + size_t(key_length - 1) * D + lane * 16;
-                device T* write_value = const_cast<device T*>(value_plane)
-                    + size_t(key_length - 1) * D + lane * 16;
-                const device T* src_key = new_key_plane + lane * 16;
-                const device T* src_value = new_value_plane + lane * 16;
-                for (int element = 0; element < 16; ++element) {
+                device T4* write_key = reinterpret_cast<device T4*>(const_cast<device T*>(key_plane)
+                    + size_t(key_length - 1) * D + lane * 16);
+                device T4* write_value = reinterpret_cast<device T4*>(const_cast<device T*>(value_plane)
+                    + size_t(key_length - 1) * D + lane * 16);
+                const device T4* src_key = reinterpret_cast<const device T4*>(new_key_plane + lane * 16);
+                const device T4* src_value = reinterpret_cast<const device T4*>(new_value_plane + lane * 16);
+                #pragma clang loop unroll(full)
+                for (int element = 0; element < 4; ++element) {
                     write_key[element] = src_key[element];
                     write_value[element] = src_value[element];
                 }
@@ -2961,7 +2978,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// `new_values` rather than the cache slot the fused QK dispatch wrote,
     /// so this kernel has no read-after-in-place-write hazard at all.
     private static let fusedAvKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_vtile_v3",
+        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_vtile_vec4_v4",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -2969,6 +2986,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         ],
         outputNames: ["out"],
         source: """
+            typedef vec<T, 4> T4;
             constexpr int D = 512;
             constexpr int GQA = 8;
 
@@ -3024,9 +3042,12 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 if (bm + 4 <= key_length - 1) {
                 #pragma clang loop unroll(full)
                 for (int tm = 0; tm < 4; ++tm) {
+                    const device T4* v_vec = reinterpret_cast<const device T4*>(
+                        value_plane + size_t(bm + tm) * D + out_col);
+                    const T4 vv = v_vec[0];
+                    #pragma clang loop unroll(full)
                     for (int tn = 0; tn < 4; ++tn) {
-                        v_tile[tm][tn] = value_plane[
-                            size_t(bm + tm) * D + out_col + tn];
+                        v_tile[tm][tn] = vv[tn];
                     }
                 }
                 } else {
@@ -3093,15 +3114,16 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             if (thrM == 0) {
                 #pragma clang loop unroll(full)
                 for (int h = 0; h < GQA; ++h) {
-                    device T* out_ptr = out
+                    device T4* out_ptr = reinterpret_cast<device T4*>(out
                         + size_t(row * 16 + kv_head * GQA + h) * D
-                        + out_col;
+                        + out_col);
+                    T4 out_v;
                     #pragma clang loop unroll(full)
                     for (int j = 0; j < 4; ++j) {
-                        out_ptr[j] = static_cast<T>(result[h][j]);
+                        out_v[j] = static_cast<T>(result[h][j]);
                     }
+                    out_ptr[0] = out_v;
                 }
-            }
         """,
         ensureRowContiguous: true
     )
@@ -3124,7 +3146,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// barrier (BarrierScopeBuffers, encoder-wide) orders every buffer write
     /// this dispatch issued before the fenced QK reads them.
     private static let ringStoreKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_d512_ringstore_bf16_v1",
+        name: "cbv2_ragged8_d512_store_bf16_vec4_v2",
         inputNames: [
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -3132,6 +3154,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         ],
         outputNames: ["fence"],
         source: """
+            typedef vec<T, 4> T4;
             constexpr int D = 512;
             const int z = int(threadgroup_position_in_grid.z);
             const int row = z / 2;
@@ -3155,18 +3178,16 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             key_plane += size_t(kv_head) * size_t(row_capacity) * D;
             value_plane += size_t(kv_head) * size_t(row_capacity) * D;
 
-            device T* write_key = const_cast<device T*>(key_plane)
-                + size_t(key_length - 1) * D + lane * 4;
-            device T* write_value = const_cast<device T*>(value_plane)
-                + size_t(key_length - 1) * D + lane * 4;
-            const device T* src_key = new_keys
-                + size_t(row * 2 + kv_head) * D + lane * 4;
-            const device T* src_value = new_values
-                + size_t(row * 2 + kv_head) * D + lane * 4;
-            for (int element = 0; element < 4; ++element) {
-                write_key[element] = src_key[element];
-                write_value[element] = src_value[element];
-            }
+            device T4* write_key = reinterpret_cast<device T4*>(const_cast<device T*>(key_plane)
+                + size_t(key_length - 1) * D + lane * 4);
+            device T4* write_value = reinterpret_cast<device T4*>(const_cast<device T*>(value_plane)
+                + size_t(key_length - 1) * D + lane * 4);
+            const device T4* src_key = reinterpret_cast<const device T4*>(new_keys
+                + size_t(row * 2 + kv_head) * D + lane * 4);
+            const device T4* src_value = reinterpret_cast<const device T4*>(new_values
+                + size_t(row * 2 + kv_head) * D + lane * 4);
+            write_key[0] = src_key[0];
+            write_value[0] = src_value[0];
             if (z == 0 && lane == 0) {
                 fence[0] = write_fence[0] + 1;
             }
@@ -3298,6 +3319,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         for row in fullRows {
             row.advanceAfterFusedAppend()
         }
+        CBv2EngageMark.once("d512-vec4-pass")
         return (output, storeFence)
     }
 
@@ -3419,6 +3441,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         for row in fullRows {
             row.advanceAfterFusedAppend()
         }
+        CBv2EngageMark.once("d512-vec4-pass")
         return (output, nextWriteFence)
     }
 
@@ -3524,7 +3547,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             outputDTypes: [.bfloat16]
         )[0]
 
-        return avKernel(
+        let output = avKernel(
             [probs] + valueBuffers + [paramsArray],
             template: template,
             grid: (32, 4, batch * kvHeads * 8),
@@ -3532,5 +3555,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             outputShapes: [[batch, queryHeads, 1, headDim]],
             outputDTypes: [.bfloat16]
         )[0]
+        CBv2EngageMark.once("d512-vec4-pass")
+        return output
     }
 }

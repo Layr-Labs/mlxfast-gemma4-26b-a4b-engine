@@ -943,6 +943,7 @@ enum CBv2AttentionV1 {
     /// sees every key the chunk just wrote, so this is exactly the final row
     /// of ordinary chunk attention — mask-free by construction, which is why
     /// a bound span overlay cannot change it either.
+    @inline(__always)
     static func updateAndAttendLastQuery(
         rows: [CBv2SequenceKV], kind: CBv2LayerKind,
         queries: MLXArray, keys: MLXArray, values: MLXArray,

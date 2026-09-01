@@ -462,7 +462,11 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
         else { return nil }
 
         let yTiles = outputWidth / outputsPerGroup
-        if multiTileEnabled, yTiles % tilesPerGroup == 0 {
+        // QKV-MT-002: the matrix-unit multi-tile body is admitted only for
+        // the full-width projection plane. Narrow Q/K/V cells retain the
+        // single-tile body, avoiding a register-heavy variant where its
+        // duplicated accumulators cannot amortize the launch reduction.
+        if multiTileEnabled, outputWidth == 8192, yTiles % tilesPerGroup == 0 {
             return multiTileKernel(
                 [x, weight, scales, biases],
                 template: [("T", x.dtype)],

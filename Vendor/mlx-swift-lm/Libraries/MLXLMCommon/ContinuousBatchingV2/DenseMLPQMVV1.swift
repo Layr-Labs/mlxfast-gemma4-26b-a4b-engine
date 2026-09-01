@@ -105,41 +105,6 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    /// W4-LOAD (engage mark `mlp-w4-load`). The four packed affine-8 codes a
-    /// lane owns for one output row are four CONTIGUOUS bytes at a 4-byte
-    /// aligned address, so they can be fetched as ONE aligned 32-bit load
-    /// instead of four separate 1-byte loads. The codes, their order and every
-    /// arithmetic statement that consumes them are unchanged, so the arm is
-    /// bit-identical to the promoted bodies by construction.
-    ///
-    /// Alignment holds for every address this arm forms. The quad-stream body
-    /// advances `ws` by `out_row * in_vec_size_w + simd_lid * bytes_per_thread`
-    /// once and by `block_size` per K block, and the fetch adds
-    /// `row * in_vec_size_w`, so
-    ///
-    ///     addr - base = (out_row + row) * in_vec_size_w
-    ///                 + bytes_per_thread * simd_lid
-    ///                 + block_size * n
-    ///
-    /// with the body's own constants `bytes_per_thread == 4` and
-    /// `block_size == 128`, both multiples of 4, and `in_vec_size_w == inDim`
-    /// where `liveShape` admits only 2816 (= 4 * 704) and 2112 (= 4 * 528).
-    /// Every term is a multiple of 4. `weight.dtype == .uint32` is required by
-    /// `matmul`, so the buffer base is itself at least 4-byte aligned. The tail
-    /// block forms the same addresses under a lane predicate, which restricts
-    /// WHICH lanes load and never the address. The load reads exactly the bytes
-    /// `wl[0 ..< 4]` the incumbent loop read, so no new byte is touched and the
-    /// bounds are unchanged.
-    ///
-    /// `DARKBLOOM_GEMMA4_MLP_W4_LOAD=0` restores the promoted quad-stream and
-    /// activation-sum bodies byte for byte in the same binary.
-    public static let w4Enabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_MLP_W4_LOAD"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
     private static let batch = 8
     private static let sequence = 1
     private static let groupSize = 64
@@ -992,147 +957,6 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         ensureRowContiguous: true
     )
 
-    /// The `uchar4` twin of the promoted registered dot product. The
-    /// accumulation text is identical; only the container of the four
-    /// already-loaded weight codes changes, from four separate `thread uint8_t`
-    /// to one `uchar4` that a single 32-bit device load fills.
-    private static let wideDotHelper = """
-
-template <typename U, int values_per_thread>
-inline U qdot_affine8_registered_v4(
-    const thread uchar4 w,
-    const thread U* x_thread,
-    U scale,
-    U bias,
-    U sum) {
-  U accum = 0;
-  #pragma unroll
-  for (int i = 0; i < values_per_thread; i++) {
-    accum += x_thread[i] * w[i];
-  }
-  return scale * accum + sum * bias;
-}
-
-"""
-
-    /// Rewrite a promoted quad-stream header into its W4 twin. Three
-    /// single-purpose substitutions with checked occurrence counts, so any
-    /// future drift in the donor body fails construction instead of silently
-    /// transforming an unintended text.
-    private static func w4Header(_ source: String) -> String {
-        var text = source
-        func replaceExactly(_ old: String, _ new: String, _ count: Int) {
-            precondition(text.components(separatedBy: old).count == count + 1)
-            text = text.replacingOccurrences(of: old, with: new)
-        }
-        replaceExactly(
-            "qdot_affine8_registered<", "qdot_affine8_registered_v4<", 8)
-        replaceExactly(
-            "  thread uint8_t packed[results_per_simdgroup][bytes_per_thread];",
-            "  thread uchar4 packed[results_per_simdgroup];",
-            1)
-        replaceExactly(
-            "      const device uint8_t* wl = ws + row * in_vec_size_w;\n"
-                + "      #pragma unroll\n"
-                + "      for (int i = 0; i < bytes_per_thread; i++) {\n"
-                + "        packed[row][i] = wl[i];\n"
-                + "      }",
-            "      packed[row] =\n"
-                + "          *((const device uchar4*)(ws + row * in_vec_size_w));",
-            2)
-        replaceExactly(
-            "template <typename U, int values_per_thread>\n"
-                + "inline U qdot_affine8_registered(",
-            wideDotHelper
-                + "template <typename U, int values_per_thread>\n"
-                + "inline U qdot_affine8_registered(",
-            1)
-        return text
-    }
-
-    private static let w4KernelHeader: String = w4Header(kernelHeader)
-
-    private static let w4ActivationSumKernelHeader: String =
-        w4Header(activationSumKernelHeader)
-
-    /// The W4 twins. Source text is the promoted kernels' own, character for
-    /// character; only the name and the header differ, so the grid, threadgroup
-    /// shape, dispatch count, operands and bytes moved are all unchanged.
-    private static let w4Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_w4_v1",
-        inputNames: ["x", "w", "scales", "biases"],
-        outputNames: ["y"],
-        source: """
-            const uint3 tid = threadgroup_position_in_grid;
-            const uint simd_gid = simdgroup_index_in_threadgroup;
-            const uint simd_lid = thread_index_in_simdgroup;
-
-            const int in_vec_size = x_shape[x_ndim - 1];
-            const int out_vec_size = w_shape[0];
-            const int first_m = int(tid.x) * 4;
-            if (first_m >= 8) {
-                return;
-            }
-            qmv_affine8_g64_quad_stream_impl<T, 64, 8>(
-                w,
-                scales,
-                biases,
-                x + first_m * in_vec_size,
-                x + (first_m + 1) * in_vec_size,
-                x + (first_m + 2) * in_vec_size,
-                x + (first_m + 3) * in_vec_size,
-                y + first_m * out_vec_size,
-                y + (first_m + 1) * out_vec_size,
-                y + (first_m + 2) * out_vec_size,
-                y + (first_m + 3) * out_vec_size,
-                in_vec_size,
-                tid,
-                simd_gid,
-                simd_lid);
-            return;
-            """,
-        header: w4KernelHeader,
-        ensureRowContiguous: true
-    )
-
-    private static let w4ActivationSumQMVKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_w4_v1",
-        inputNames: ["x", "w", "scales", "biases", "xSums"],
-        outputNames: ["y"],
-        source: """
-            const uint3 tid = threadgroup_position_in_grid;
-            const uint simd_gid = simdgroup_index_in_threadgroup;
-            const uint simd_lid = thread_index_in_simdgroup;
-
-            const int in_vec_size = x_shape[x_ndim - 1];
-            const int out_vec_size = w_shape[0];
-            const int first_m = int(tid.x) * 4;
-            if (first_m >= 8) {
-                return;
-            }
-            qmv_affine8_g64_quad_stream_xsum_impl<T, 64, 8>(
-                w,
-                scales,
-                biases,
-                xSums,
-                x + first_m * in_vec_size,
-                x + (first_m + 1) * in_vec_size,
-                x + (first_m + 2) * in_vec_size,
-                x + (first_m + 3) * in_vec_size,
-                y + first_m * out_vec_size,
-                y + (first_m + 1) * out_vec_size,
-                y + (first_m + 2) * out_vec_size,
-                y + (first_m + 3) * out_vec_size,
-                in_vec_size,
-                tid,
-                simd_gid,
-                simd_lid);
-            return;
-            """,
-        header: w4ActivationSumKernelHeader,
-        ensureRowContiguous: true
-    )
-
     @inline(__always)
     private static func liveShape(inDim: Int, outDim: Int) -> Bool {
         (inDim == 2816 && outDim == 2112)
@@ -1275,15 +1099,7 @@ inline U qdot_affine8_registered_v4(
         let useActivationSums = activationSums != nil
             && inDim == 2816
             && outDim == 2112
-        if w4Enabled {
-            CBv2EngageMark.once("mlp-w4-load")
-        }
-        let selected: MLXFast.MLXFastKernel
-        if useActivationSums {
-            selected = w4Enabled ? w4ActivationSumQMVKernel : activationSumQMVKernel
-        } else {
-            selected = w4Enabled ? w4Kernel : kernel
-        }
+        let selected = useActivationSums ? activationSumQMVKernel : kernel
         let inputs = useActivationSums
             ? [x, weight, scales, biases, activationSums!.values]
             : [x, weight, scales, biases]

@@ -650,13 +650,14 @@ public enum Gemma4PrefillGlueV1 {
     /// same `[tokens, hidden]` expert result. Produce each reduced expert value
     /// in the tail thread that consumes it, removing the intermediate tensor.
     private static let expertTailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_expert_unsort_tail_chain_2816_unroll_v2",
+        name: "gemma4_prefill_expert_unsort_tail_chain_2816_vec4_full_v4",
         inputNames: [
             "sorted", "inverse_order", "route_weights", "h1",
             "w1", "w2", "w3", "res2", "s", "wn",
         ],
         outputNames: ["out", "normed"],
         source: """
+            typedef vec<T, 4> T4;
             threadgroup float local_sums_a[32];
             threadgroup float local_sums_b[32];
             threadgroup float local_inv2[2];
@@ -668,22 +669,37 @@ public enum Gemma4PrefillGlueV1 {
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
             const uint assignment_base = row * 8;
 
+            uint sorted_rows[8];
+            float weights[8];
+            for (uint slot = 0; slot < 8; ++slot) {
+                const uint assignment = assignment_base + slot;
+                sorted_rows[slot] = (uint)inverse_order[assignment];
+                weights[slot] = (float)route_weights[assignment];
+            }
+
+            const T4 h1_v = *reinterpret_cast<const device T4*>(h1 + base);
             float av[GLUE_NREADS];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                av[i] = static_cast<float>(h1_v[i]);
+            }
+
+            T4 accumulator = (T)0;
+            for (uint slot = 0; slot < 8; ++slot) {
+                const device T4* s_row = reinterpret_cast<const device T4*>(
+                    sorted + size_t(sorted_rows[slot]) * GLUE_AXIS);
+                const T4 sv = s_row[lid];
+                const float w = weights[slot];
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    accumulator[i] = accumulator[i] + (T)((float)sv[i] * w);
+                }
+            }
+
             float bv[GLUE_NREADS];
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint feature = lid * GLUE_NREADS + i;
-                av[i] = static_cast<float>(h1[base + i]);
-                T accumulator = (T)0;
-                for (uint slot = 0; slot < 8; ++slot) {
-                    const uint assignment = assignment_base + slot;
-                    const uint sorted_row = (uint)inverse_order[assignment];
-                    const T weighted = (T)(
-                        (float)sorted[size_t(sorted_row) * GLUE_AXIS + feature]
-                        * (float)route_weights[assignment]);
-                    accumulator = accumulator + weighted;
-                }
-                bv[i] = static_cast<float>(accumulator);
+                bv[i] = static_cast<float>(accumulator[i]);
             }
 
             float inv_a = 0;
@@ -692,14 +708,18 @@ public enum Gemma4PrefillGlueV1 {
                 av, bv, local_sums_a, local_sums_b, local_inv2,
                 simd_lane_id, simd_group_id, GLUE_EPS, inv_a, inv_b);
 
+            const device T4* w1_v = reinterpret_cast<const device T4*>(w1);
+            const T4 w1_val = w1_v[lid];
+            const device T4* w2_v = reinterpret_cast<const device T4*>(w2);
+            const T4 w2_val = w2_v[lid];
+
             float tv[GLUE_NREADS];
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
                 const T n1 = static_cast<T>(
-                    w1[j] * static_cast<T>(av[i] * inv_a));
+                    w1_val[i] * static_cast<T>(av[i] * inv_a));
                 const T n2 = static_cast<T>(
-                    w2[j] * static_cast<T>(bv[i] * inv_b));
+                    w2_val[i] * static_cast<T>(bv[i] * inv_b));
                 tv[i] = static_cast<float>(static_cast<T>(n1 + n2));
             }
 
@@ -708,28 +728,37 @@ public enum Gemma4PrefillGlueV1 {
                 simd_lane_id, simd_group_id, GLUE_EPS);
 
             const T scalar = s[0];
+            const device T4* w3_v = reinterpret_cast<const device T4*>(w3);
+            const T4 w3_val = w3_v[lid];
+            const device T4* res2_v = reinterpret_cast<const device T4*>(res2 + size_t(row) * GLUE_AXIS);
+            const T4 res2_val = res2_v[lid];
+
+            T4 scaled_v;
             float ov[GLUE_NREADS];
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
                 const T normed3 = static_cast<T>(
-                    w3[j] * static_cast<T>(tv[i] * inv_t));
-                const T summed = static_cast<T>(res2[base + i] + normed3);
+                    w3_val[i] * static_cast<T>(tv[i] * inv_t));
+                const T summed = static_cast<T>(res2_val[i] + normed3);
                 const T scaled = static_cast<T>(summed * scalar);
-                out[base + i] = scaled;
+                scaled_v[i] = scaled;
                 ov[i] = static_cast<float>(scaled);
             }
+            reinterpret_cast<device T4*>(out + size_t(row) * GLUE_AXIS)[lid] = scaled_v;
 
             const float inv_n = glue_inv_rms(
                 ov, local_sums_a, local_inv2,
                 simd_lane_id, simd_group_id, GLUE_EPS);
 
+            const device T4* wn_v = reinterpret_cast<const device T4*>(wn);
+            const T4 wn_val = wn_v[lid];
+
+            T4 normed_v;
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
-                normed[base + i] =
-                    wn[j] * static_cast<T>(ov[i] * inv_n);
+                normed_v[i] = wn_val[i] * static_cast<T>(ov[i] * inv_n);
             }
+            reinterpret_cast<device T4*>(normed + size_t(row) * GLUE_AXIS)[lid] = normed_v;
         """,
         header: kernelHeader,
         ensureRowContiguous: true

@@ -2239,36 +2239,35 @@ public enum Gemma4MMAQuantizedGEMV {
                     simdgroup_multiply_accumulate(accg1, A1, B, accg1);
             """,
             with: """
-                    simdgroup_matrix<float, 8, 8> A0;
-                    simdgroup_matrix<float, 8, 8> A1;
-                    simdgroup_matrix<float, 8, 8> A2;
-                    simdgroup_matrix<float, 8, 8> A3;
-                    simdgroup_matrix<float, 8, 8> B;
+                    simdgroup_matrix<T, 8, 8> A0;
+                    simdgroup_matrix<T, 8, 8> A1;
+                    simdgroup_matrix<T, 8, 8> A2;
+                    simdgroup_matrix<T, 8, 8> A3;
+                    simdgroup_matrix<T, 8, 8> B;
                     const uint packed0 = t < 4 ? packedLo0[t] : packedHi0[t - 4];
                     const uint packed1 = t < 4 ? packedLo1[t] : packedHi1[t - 4];
                     const uint packed2 = t < 4 ? packedLo2[t] : packedHi2[t - 4];
                     const uint packed3 = t < 4 ? packedLo3[t] : packedHi3[t - 4];
                     A0.thread_elements()[0] =
-                        float((packed0 >> (4 * fragmentCol)) & 0xFu);
+                        T(float((packed0 >> (4 * fragmentCol)) & 0xFu));
                     A0.thread_elements()[1] =
-                        float((packed0 >> (4 * (fragmentCol + 1))) & 0xFu);
+                        T(float((packed0 >> (4 * (fragmentCol + 1))) & 0xFu));
                     A1.thread_elements()[0] =
-                        float((packed1 >> (4 * fragmentCol)) & 0xFu);
+                        T(float((packed1 >> (4 * fragmentCol)) & 0xFu));
                     A1.thread_elements()[1] =
-                        float((packed1 >> (4 * (fragmentCol + 1))) & 0xFu);
+                        T(float((packed1 >> (4 * (fragmentCol + 1))) & 0xFu));
                     A2.thread_elements()[0] =
-                        float((packed2 >> (4 * fragmentCol)) & 0xFu);
+                        T(float((packed2 >> (4 * fragmentCol)) & 0xFu));
                     A2.thread_elements()[1] =
-                        float((packed2 >> (4 * (fragmentCol + 1))) & 0xFu);
+                        T(float((packed2 >> (4 * (fragmentCol + 1))) & 0xFu));
                     A3.thread_elements()[0] =
-                        float((packed3 >> (4 * fragmentCol)) & 0xFu);
+                        T(float((packed3 >> (4 * fragmentCol)) & 0xFu));
                     A3.thread_elements()[1] =
-                        float((packed3 >> (4 * (fragmentCol + 1))) & 0xFu);
+                        T(float((packed3 >> (4 * (fragmentCol + 1))) & 0xFu));
                     const uint activationK = g * GROUP + t * 8 + fragmentRow;
-                    B.thread_elements()[0] =
-                        float(x[fragmentCol * K + activationK]);
+                    B.thread_elements()[0] = x[fragmentCol * K + activationK];
                     B.thread_elements()[1] =
-                        float(x[(fragmentCol + 1) * K + activationK]);
+                        x[(fragmentCol + 1) * K + activationK];
                     simdgroup_multiply_accumulate(accg0, A0, B, accg0);
                     simdgroup_multiply_accumulate(accg1, A1, B, accg1);
                     simdgroup_multiply_accumulate(accg2, A2, B, accg2);
@@ -2566,194 +2565,10 @@ public enum Gemma4MMAQuantizedGEMV {
     }()
 
     private static let kernelV27: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_fpmma_v1",
+        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["out"],
         source: sourceV27,
-        header: "#include <metal_simdgroup_matrix>\n",
-        ensureRowContiguous: true
-    )
-
-    // MARK: - Version 27 carry --- weight-operand register carry
-
-    /// `false` only when `DARKBLOOM_GEMMA4_MMA_HEAD_CARRY` is an explicit off
-    /// value. Resolved once; the kill switch is a process-level decision. Off
-    /// restores `kernelV27` and its source byte for byte.
-    private static let carryEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_MMA_HEAD_CARRY"]
-        else { return true }
-        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
-        case "0", "false", "no", "off": return false
-        default: return true
-        }
-    }()
-
-    /// MMA-HEAD-CARRY-013. The weight-operand register carry the frontier
-    /// applied to the two attention matrix-unit tiers and to the dense down
-    /// plane, now on the tied language head --- the last matrix-unit body in
-    /// the tree without it, and the one leaning hardest on DRAM: roughly
-    /// 415 MB of packed vocabulary plane per decode step, one dispatch per
-    /// step, the largest per-dispatch cost in the decode window.
-    ///
-    /// Every address in this body is a function of the group index alone, so
-    /// one group's four packed code pairs and four group scales are read a
-    /// whole iteration ahead and stay resident in registers while the current
-    /// group's thirty-two matrix-unit steps run. `gNext` is clamped to the
-    /// last valid group, so the final look-ahead re-reads a group already read
-    /// and its value is discarded at loop exit. The `g >= N_GROUPS` trips of
-    /// the unrolled tail block neither consume nor advance the carry.
-    ///
-    /// The read stays at the statement the incumbent load already occupied.
-    /// Moving it to the top of the body instead perturbs the close's
-    /// floating-point contraction and stops the output matching version 27
-    /// bit for bit; keeping it here leaves the emitted arithmetic word for
-    /// word what version 27 emits. Nothing else moves: the same eight `uint4`
-    /// values reach the same `A0...A3` fragments in the same tile order, the
-    /// `accg` chain, the `metal::fma` scale close, the batched affine-bias MMA
-    /// and the store are untouched, and no dtype changes. Output is
-    /// bit-identical to version 27's.
-    ///
-    /// The affine bias is NOT carried. Version 13 batched it out of the group
-    /// walk into one rank-8 MMA per eight groups, so there is no per-group
-    /// bias read left in this body to move.
-    private static let sourceV27Carry: String = {
-        var result = sourceV27
-
-        func replaceOnce(_ old: String, with new: String) {
-            let count = result.components(separatedBy: old).count
-            precondition(
-                count == 2, "sourceV27Carry replacement count \(count): \(old)")
-            result = result.replacingOccurrences(of: old, with: new)
-        }
-
-        replaceOnce(
-            """
-            simdgroup_matrix<float, 8, 8> acc0 = simdgroup_matrix<float, 8, 8>(0.0f);
-            simdgroup_matrix<float, 8, 8> acc1 = simdgroup_matrix<float, 8, 8>(0.0f);
-            simdgroup_matrix<float, 8, 8> acc2 = simdgroup_matrix<float, 8, 8>(0.0f);
-            simdgroup_matrix<float, 8, 8> acc3 = simdgroup_matrix<float, 8, 8>(0.0f);
-            """,
-            with: """
-            simdgroup_matrix<float, 8, 8> acc0 = simdgroup_matrix<float, 8, 8>(0.0f);
-            simdgroup_matrix<float, 8, 8> acc1 = simdgroup_matrix<float, 8, 8>(0.0f);
-            simdgroup_matrix<float, 8, 8> acc2 = simdgroup_matrix<float, 8, 8>(0.0f);
-            simdgroup_matrix<float, 8, 8> acc3 = simdgroup_matrix<float, 8, 8>(0.0f);
-
-            // Weight operands carried one group ahead. Both row bases are
-            // functions of the fragment row alone, so the value each trip
-            // consumes is the value the in-place read produced.
-            const uint carryWordBase = (sgN0 + fragmentRow) * W_ROW_U32;
-            const uint carryTileStride = N_PSG * W_ROW_U32;
-            uint4 carryLo0;
-            uint4 carryHi0;
-            uint4 carryLo1;
-            uint4 carryHi1;
-            uint4 carryLo2;
-            uint4 carryHi2;
-            uint4 carryLo3;
-            uint4 carryHi3;
-            T carryS0;
-            T carryS1;
-            T carryS2;
-            T carryS3;
-            {
-                const device uint4* carryGroup =
-                    reinterpret_cast<const device uint4*>(w + carryWordBase);
-                carryLo0 = carryGroup[0];
-                carryHi0 = carryGroup[1];
-                carryGroup = reinterpret_cast<const device uint4*>(
-                    w + carryWordBase + carryTileStride);
-                carryLo1 = carryGroup[0];
-                carryHi1 = carryGroup[1];
-                carryGroup = reinterpret_cast<const device uint4*>(
-                    w + carryWordBase + carryTileStride * 2);
-                carryLo2 = carryGroup[0];
-                carryHi2 = carryGroup[1];
-                carryGroup = reinterpret_cast<const device uint4*>(
-                    w + carryWordBase + carryTileStride * 3);
-                carryLo3 = carryGroup[0];
-                carryHi3 = carryGroup[1];
-                carryS0 = fragmentSRow0[0];
-                carryS1 = fragmentSRow1[0];
-                carryS2 = fragmentSRow2[0];
-                carryS3 = fragmentSRow3[0];
-            }
-            """
-        )
-
-        replaceOnce(
-            """
-                const uint packedWord0 =
-                    (sgN0 + fragmentRow) * W_ROW_U32 + g * (GROUP / 8);
-                const uint packedTileStride = N_PSG * W_ROW_U32;
-                const device uint4* packedGroup =
-                    reinterpret_cast<const device uint4*>(w + packedWord0);
-                const uint4 packedLo0 = packedGroup[0];
-                const uint4 packedHi0 = packedGroup[1];
-                packedGroup = reinterpret_cast<const device uint4*>(
-                    w + packedWord0 + packedTileStride);
-                const uint4 packedLo1 = packedGroup[0];
-                const uint4 packedHi1 = packedGroup[1];
-                packedGroup = reinterpret_cast<const device uint4*>(
-                    w + packedWord0 + packedTileStride * 2);
-                const uint4 packedLo2 = packedGroup[0];
-                const uint4 packedHi2 = packedGroup[1];
-                packedGroup = reinterpret_cast<const device uint4*>(
-                    w + packedWord0 + packedTileStride * 3);
-                const uint4 packedLo3 = packedGroup[0];
-                const uint4 packedHi3 = packedGroup[1];
-                    const float rowScale0 = float(fragmentSRow0[g]);
-                const float rowScale1 = float(fragmentSRow1[g]);
-                const float rowScale2 = float(fragmentSRow2[g]);
-                const float rowScale3 = float(fragmentSRow3[g]);
-            """,
-            with: """
-                const uint4 packedLo0 = carryLo0;
-                const uint4 packedHi0 = carryHi0;
-                const uint4 packedLo1 = carryLo1;
-                const uint4 packedHi1 = carryHi1;
-                const uint4 packedLo2 = carryLo2;
-                const uint4 packedHi2 = carryHi2;
-                const uint4 packedLo3 = carryLo3;
-                const uint4 packedHi3 = carryHi3;
-                const float rowScale0 = float(carryS0);
-                const float rowScale1 = float(carryS1);
-                const float rowScale2 = float(carryS2);
-                const float rowScale3 = float(carryS3);
-                const uint gNext = min(g + 1u, N_GROUPS - 1u);
-                const uint packedWordNext = carryWordBase + gNext * (GROUP / 8);
-                const device uint4* packedGroup =
-                    reinterpret_cast<const device uint4*>(w + packedWordNext);
-                carryLo0 = packedGroup[0];
-                carryHi0 = packedGroup[1];
-                packedGroup = reinterpret_cast<const device uint4*>(
-                    w + packedWordNext + carryTileStride);
-                carryLo1 = packedGroup[0];
-                carryHi1 = packedGroup[1];
-                packedGroup = reinterpret_cast<const device uint4*>(
-                    w + packedWordNext + carryTileStride * 2);
-                carryLo2 = packedGroup[0];
-                carryHi2 = packedGroup[1];
-                packedGroup = reinterpret_cast<const device uint4*>(
-                    w + packedWordNext + carryTileStride * 3);
-                carryLo3 = packedGroup[0];
-                carryHi3 = packedGroup[1];
-                carryS0 = fragmentSRow0[gNext];
-                carryS1 = fragmentSRow1[gNext];
-                carryS2 = fragmentSRow2[gNext];
-                carryS3 = fragmentSRow3[gNext];
-            """
-        )
-
-        return result
-    }()
-
-    private static let kernelV27Carry: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_carry_fpmma_v2",
-        inputNames: ["x", "w", "scales", "biases", "xSums"],
-        outputNames: ["out"],
-        source: sourceV27Carry,
         header: "#include <metal_simdgroup_matrix>\n",
         ensureRowContiguous: true
     )
@@ -2829,13 +2644,7 @@ public enum Gemma4MMAQuantizedGEMV {
                 )[0]
             }
             switch version {
-            case 27:
-                if carryEnabled {
-                    CBv2EngageMark.once("mma-head-carry")
-                    selected = kernelV27Carry
-                } else {
-                    selected = kernelV27
-                }
+            case 27: selected = kernelV27
             case 26: selected = kernelV26
             case 16: selected = kernelV16
             case 15: selected = kernelV15

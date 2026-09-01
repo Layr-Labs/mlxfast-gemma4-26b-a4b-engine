@@ -918,6 +918,135 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             extraInputs: [], scale: scale)
     }
 
+    /// Kill switch: `DARKBLOOM_CBV2_DECODE_Q4_GQA_PAIRED=0`. Default ON.
+    static let quantGQAPairedPassAEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_DECODE_Q4_GQA_PAIRED"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let portQuantReadPairedKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_ring_2pass_a_q4g64_gqapair_d256_g2_port_b\(blocks)_v2",
+        inputNames: [
+            "queries",
+            "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7", "starts",
+        ],
+        outputNames: ["partials", "sums", "maxs"],
+        source: """
+            constexpr int simd_width = 32;
+            constexpr int values_per_lane = D / simd_width;
+            static_assert(GQA == 2, "this kernel pairs exactly two query heads");
+            static_assert(values_per_lane == 8, "lane run must be 8 for D=256");
+
+            constexpr int row_words = D / 8 + D / 64;
+            const int kv_head = int(threadgroup_position_in_grid.x);
+            const int batch_index = int(threadgroup_position_in_grid.y);
+            const int block = int(threadgroup_position_in_grid.z);
+            const int query_head = GQA * kv_head;
+            const int batch_head = batch_index * 16 + query_head;
+            const int lane = int(thread_index_in_simdgroup);
+
+            const device uint32_t* mirror_w = m0;
+            switch (batch_index) {
+                case 1: mirror_w = m1; break;
+                case 2: mirror_w = m2; break;
+                case 3: mirror_w = m3; break;
+                case 4: mirror_w = m4; break;
+                case 5: mirror_w = m5; break;
+                case 6: mirror_w = m6; break;
+                case 7: mirror_w = m7; break;
+                default: break;
+            }
+            const uint start = starts[batch_index];
+
+            const device T* query =
+                queries + batch_head * D + lane * values_per_lane;
+            int slot = int((start + block) % N);
+            device T* partial = partials
+                + batch_head * BLOCKS * D + block * D + lane * values_per_lane;
+            device float* sum_out = sums + batch_head * BLOCKS + block;
+            device float* max_out = maxs + batch_head * BLOCKS + block;
+
+            thread float q_lo[values_per_lane];
+            thread float q_hi[values_per_lane];
+            thread float acc_lo[values_per_lane];
+            thread float acc_hi[values_per_lane];
+            #pragma clang loop unroll(full)
+            for (int element = 0; element < values_per_lane; ++element) {
+                q_lo[element] = float(query[element]);
+                q_hi[element] = float(query[D + element]);
+                acc_lo[element] = 0.0f;
+                acc_hi[element] = 0.0f;
+            }
+
+            float max_lo = -3.402823466e+38F;
+            float max_hi = -3.402823466e+38F;
+            float sum_lo = 0.0f;
+            float sum_hi = 0.0f;
+            for (int token = block; token < N; token += BLOCKS) {
+                const device uint32_t* krow_w =
+                    mirror_w + (kv_head * N + slot) * row_words;
+                const device uint32_t* vrow_w =
+                    mirror_w + ((KV_HEADS + kv_head) * N + slot) * row_words;
+                const int group = lane / 8;
+                const uint32_t ktw = krow_w[D / 8 + group];
+                const uint32_t vtw = vrow_w[D / 8 + group];
+                const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
+                const float kb = float(as_type<half>(ushort(ktw >> 16)));
+                const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
+                const float vb = float(as_type<half>(ushort(vtw >> 16)));
+                const uint32_t kw = krow_w[lane];
+                const uint32_t vw = vrow_w[lane];
+                float score_lo = 0.0f;
+                float score_hi = 0.0f;
+                #pragma clang loop unroll(full)
+                for (int element = 0; element < values_per_lane; ++element) {
+                    const float deq_k = fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
+                    score_lo += q_lo[element] * deq_k;
+                    score_hi += q_hi[element] * deq_k;
+                }
+                score_lo = simd_sum(score_lo);
+                score_hi = simd_sum(score_hi);
+
+                const float new_max_lo = max(max_lo, score_lo);
+                const float new_max_hi = max(max_hi, score_hi);
+                const float old_factor_lo = fast::exp(max_lo - new_max_lo);
+                const float old_factor_hi = fast::exp(max_hi - new_max_hi);
+                const float score_factor_lo = fast::exp(score_lo - new_max_lo);
+                const float score_factor_hi = fast::exp(score_hi - new_max_hi);
+                max_lo = new_max_lo;
+                max_hi = new_max_hi;
+                sum_lo = sum_lo * old_factor_lo + score_factor_lo;
+                sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                #pragma clang loop unroll(full)
+                for (int element = 0; element < values_per_lane; ++element) {
+                    const float deq_v = fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
+                    acc_lo[element] = acc_lo[element] * old_factor_lo
+                        + score_factor_lo * deq_v;
+                    acc_hi[element] = acc_hi[element] * old_factor_hi
+                        + score_factor_hi * deq_v;
+                }
+
+                slot += BLOCKS;
+                if (slot >= N) slot -= N;
+            }
+
+            if (lane == 0) {
+                sum_out[0] = sum_lo;
+                max_out[0] = max_lo;
+                sum_out[BLOCKS] = sum_hi;
+                max_out[BLOCKS] = max_hi;
+            }
+            #pragma clang loop unroll(full)
+            for (int element = 0; element < values_per_lane; ++element) {
+                partial[element] = T(acc_lo[element]);
+                partial[BLOCKS * D + element] = T(acc_hi[element]);
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
     private static let portQuantReadKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "cbv2_ragged8_sdpa_ring_2pass_a_q4g64_d256_g2_port_b\(blocks)_v1",
         inputNames: [
@@ -1024,6 +1153,211 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// token is always consumed from the just-computed packed word, so no
     /// threadgroup races the in-place store. The returned fence orders the
     /// next decode dispatch after this write completes.
+    private static let portQuantFusedWritePairedKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "cbv2_ragged8_sdpa_ringwrite_2pass_a_q4g64_gqapair_d256_g2_b\(blocks)_v2",
+            inputNames: [
+                "queries",
+                "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
+                "starts", "new_keys", "new_values", "write_fence",
+            ],
+            outputNames: ["partials", "sums", "maxs", "fence"],
+            source: """
+                constexpr int simd_width = 32;
+                constexpr int values_per_lane = D / simd_width;
+                constexpr int payload_words = D / 8;
+                constexpr int row_words = payload_words + D / 64;
+                constexpr int current_block = (N - 1) % BLOCKS;
+                static_assert(GQA == 2, "this kernel pairs exactly two query heads");
+                static_assert(values_per_lane == 8, "lane run must be 8 for D=256");
+
+                const int kv_head = int(threadgroup_position_in_grid.x);
+                const int batch_index = int(threadgroup_position_in_grid.y);
+                const int block = int(threadgroup_position_in_grid.z);
+                const int query_head = GQA * kv_head;
+                const int batch_head = batch_index * 16 + query_head;
+                const int lane = int(thread_index_in_simdgroup);
+
+                const device uint32_t* mirror_w = m0;
+                switch (batch_index) {
+                    case 1: mirror_w = m1; break;
+                    case 2: mirror_w = m2; break;
+                    case 3: mirror_w = m3; break;
+                    case 4: mirror_w = m4; break;
+                    case 5: mirror_w = m5; break;
+                    case 6: mirror_w = m6; break;
+                    case 7: mirror_w = m7; break;
+                    default: break;
+                }
+                const device uint32_t* mkeys_w =
+                    mirror_w + kv_head * N * row_words;
+                const device uint32_t* mvalues_w =
+                    mirror_w + (KV_HEADS + kv_head) * N * row_words;
+                const device T* new_key = new_keys
+                    + (batch_index * KV_HEADS + kv_head) * D
+                    + lane * values_per_lane;
+                const device T* new_value = new_values
+                    + (batch_index * KV_HEADS + kv_head) * D
+                    + lane * values_per_lane;
+                const uint start = starts[batch_index];
+                const uint write_slot = (start + uint(N - 1)) % uint(N);
+
+                half khs = half(0.0f);
+                half khb = half(0.0f);
+                half vhs = half(0.0f);
+                half vhb = half(0.0f);
+                uint32_t kword = 0u;
+                uint32_t vword = 0u;
+                if (block == current_block) {
+                    float kmin = 3.402823466e+38F;
+                    float kmax = -3.402823466e+38F;
+                    float vmin = 3.402823466e+38F;
+                    float vmax = -3.402823466e+38F;
+                    #pragma clang loop unroll(full)
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        const float kx = float(new_key[element]);
+                        const float vx = float(new_value[element]);
+                        kmin = min(kmin, kx);
+                        kmax = max(kmax, kx);
+                        vmin = min(vmin, vx);
+                        vmax = max(vmax, vx);
+                    }
+                    #pragma clang loop unroll(full)
+                    for (uint mask = 1; mask < 8; mask <<= 1) {
+                        kmin = min(kmin, simd_shuffle_xor(kmin, mask));
+                        kmax = max(kmax, simd_shuffle_xor(kmax, mask));
+                        vmin = min(vmin, simd_shuffle_xor(vmin, mask));
+                        vmax = max(vmax, simd_shuffle_xor(vmax, mask));
+                    }
+                    khs = half(max((kmax - kmin) / 15.0f, 1e-6f));
+                    khb = half(kmin);
+                    vhs = half(max((vmax - vmin) / 15.0f, 1e-6f));
+                    vhb = half(vmin);
+                    const float ks = float(khs);
+                    const float kb = float(khb);
+                    const float vs = float(vhs);
+                    const float vb = float(vhb);
+                    #pragma clang loop unroll(full)
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        const float kq = metal::rint((float(new_key[element]) - kb) / ks);
+                        const float vq = metal::rint((float(new_value[element]) - vb) / vs);
+                        kword |= uint32_t(clamp(kq, 0.0f, 15.0f)) << (4 * element);
+                        vword |= uint32_t(clamp(vq, 0.0f, 15.0f)) << (4 * element);
+                    }
+
+                    device uint32_t* write_key =
+                        const_cast<device uint32_t*>(mkeys_w)
+                        + write_slot * row_words;
+                    device uint32_t* write_value =
+                        const_cast<device uint32_t*>(mvalues_w)
+                        + write_slot * row_words;
+                    write_key[lane] = kword;
+                    write_value[lane] = vword;
+                    if (lane % 8 == 0) {
+                        write_key[payload_words + lane / 8] =
+                            uint32_t(as_type<ushort>(khs))
+                            | (uint32_t(as_type<ushort>(khb)) << 16);
+                        write_value[payload_words + lane / 8] =
+                            uint32_t(as_type<ushort>(vhs))
+                            | (uint32_t(as_type<ushort>(vhb)) << 16);
+                    }
+                }
+                if (batch_index == 0 && kv_head == 0
+                    && block == current_block && lane == 0) {
+                    fence[0] = write_fence[0] + 1;
+                }
+
+                const device T* query =
+                    queries + batch_head * D + lane * values_per_lane;
+                device T* partial = partials
+                    + batch_head * BLOCKS * D + block * D + lane * values_per_lane;
+                device float* sum_out = sums + batch_head * BLOCKS + block;
+                device float* max_out = maxs + batch_head * BLOCKS + block;
+
+                thread float q_lo[values_per_lane];
+                thread float q_hi[values_per_lane];
+                thread float acc_lo[values_per_lane];
+                thread float acc_hi[values_per_lane];
+                #pragma clang loop unroll(full)
+                for (int element = 0; element < values_per_lane; ++element) {
+                    q_lo[element] = float(query[element]);
+                    q_hi[element] = float(query[D + element]);
+                    acc_lo[element] = 0.0f;
+                    acc_hi[element] = 0.0f;
+                }
+
+                float max_lo = -3.402823466e+38F;
+                float max_hi = -3.402823466e+38F;
+                float sum_lo = 0.0f;
+                float sum_hi = 0.0f;
+                uint slot = (start + uint(block)) % uint(N);
+                for (int token = block; token < N; token += BLOCKS) {
+                    const bool current = token == N - 1;
+                    const uint32_t kw = current
+                        ? kword : mkeys_w[slot * row_words + lane];
+                    const uint32_t vw = current
+                        ? vword : mvalues_w[slot * row_words + lane];
+                    const uint32_t ktw = current
+                        ? (uint32_t(as_type<ushort>(khs))
+                            | (uint32_t(as_type<ushort>(khb)) << 16))
+                        : mkeys_w[slot * row_words + payload_words + lane / 8];
+                    const uint32_t vtw = current
+                        ? (uint32_t(as_type<ushort>(vhs))
+                            | (uint32_t(as_type<ushort>(vhb)) << 16))
+                        : mvalues_w[slot * row_words + payload_words + lane / 8];
+                    const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
+                    const float kb = float(as_type<half>(ushort(ktw >> 16)));
+                    const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
+                    const float vb = float(as_type<half>(ushort(vtw >> 16)));
+                    float score_lo = 0.0f;
+                    float score_hi = 0.0f;
+                    #pragma clang loop unroll(full)
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        const float deq_k = fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
+                        score_lo += q_lo[element] * deq_k;
+                        score_hi += q_hi[element] * deq_k;
+                    }
+                    score_lo = simd_sum(score_lo);
+                    score_hi = simd_sum(score_hi);
+
+                    const float new_max_lo = max(max_lo, score_lo);
+                    const float new_max_hi = max(max_hi, score_hi);
+                    const float old_factor_lo = fast::exp(max_lo - new_max_lo);
+                    const float old_factor_hi = fast::exp(max_hi - new_max_hi);
+                    const float score_factor_lo = fast::exp(score_lo - new_max_lo);
+                    const float score_factor_hi = fast::exp(score_hi - new_max_hi);
+                    max_lo = new_max_lo;
+                    max_hi = new_max_hi;
+                    sum_lo = sum_lo * old_factor_lo + score_factor_lo;
+                    sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                    #pragma clang loop unroll(full)
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        const float deq_v = fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
+                        acc_lo[element] = acc_lo[element] * old_factor_lo
+                            + score_factor_lo * deq_v;
+                        acc_hi[element] = acc_hi[element] * old_factor_hi
+                            + score_factor_hi * deq_v;
+                    }
+
+                    slot += uint(BLOCKS);
+                    if (slot >= uint(N)) slot -= uint(N);
+                }
+
+                if (lane == 0) {
+                    sum_out[0] = sum_lo;
+                    max_out[0] = max_lo;
+                    sum_out[BLOCKS] = sum_hi;
+                    max_out[BLOCKS] = max_hi;
+                }
+                #pragma clang loop unroll(full)
+                for (int element = 0; element < values_per_lane; ++element) {
+                    partial[element] = T(acc_lo[element]);
+                    partial[BLOCKS * D + element] = T(acc_hi[element]);
+                }
+            """,
+            ensureRowContiguous: true
+        )
+
     private static let portQuantFusedWriteKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
             name: "cbv2_ragged8_sdpa_ringwrite_2pass_a_q4g64_d256_g2_b\(blocks)_v1",
@@ -1269,7 +1603,11 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         let startArray = MLXArray(starts.map(UInt32.init), [batch])
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
-        let passA = portQuantReadKernel(
+        let paired = quantGQAPairedPassAEnabled && gqa == 2
+        if paired {
+            CBv2EngageMark.once("kvq8port-gqapair")
+        }
+        let passA = (paired ? portQuantReadPairedKernel : portQuantReadKernel)(
             [queries] + mirrors + [startArray],
             template: [
                 ("T", queries.dtype),
@@ -1279,8 +1617,10 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 ("KV_HEADS", kvHeads),
                 ("BLOCKS", blocks),
             ],
-            grid: (kvHeads * 32, batch * gqa, blocks),
-            threadGroup: (32, gqa, 1),
+            grid: paired
+                ? (kvHeads * 32, batch, blocks)
+                : (kvHeads * 32, batch * gqa, blocks),
+            threadGroup: paired ? (32, 1, 1) : (32, gqa, 1),
             outputShapes: [partialShape, summaryShape, summaryShape],
             outputDTypes: [.bfloat16, .float32, .float32]
         )
@@ -1340,7 +1680,11 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         let startArray = MLXArray(starts.map(UInt32.init), [batch])
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
-        let passA = portQuantFusedWriteKernel(
+        let paired = quantGQAPairedPassAEnabled && gqa == 2
+        if paired {
+            CBv2EngageMark.once("kvq4-fused-live-write-gqapair")
+        }
+        let passA = (paired ? portQuantFusedWritePairedKernel : portQuantFusedWriteKernel)(
             [queries] + mirrors + [startArray, newKeys, newValues, previousWriteFence],
             template: [
                 ("T", queries.dtype),
@@ -1350,8 +1694,10 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 ("KV_HEADS", kvHeads),
                 ("BLOCKS", blocks),
             ],
-            grid: (kvHeads * 32, batch * gqa, blocks),
-            threadGroup: (32, gqa, 1),
+            grid: paired
+                ? (kvHeads * 32, batch, blocks)
+                : (kvHeads * 32, batch * gqa, blocks),
+            threadGroup: paired ? (32, 1, 1) : (32, gqa, 1),
             outputShapes: [partialShape, summaryShape, summaryShape, [1]],
             outputDTypes: [.bfloat16, .float32, .float32, .int32]
         )

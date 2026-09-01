@@ -110,8 +110,27 @@ public final class Gemma4A4BRuntimeWeightCache {
            )
         {
             setenv("MLX_MAX_MB_PER_BUFFER", "512", 1)
+            // The referenced-byte budget above was raised to 512 MiB but the
+            // operation cap was left at the MLX per-architecture default (40
+            // to 50), so that cap, not the byte budget, is what actually ends
+            // a decode command buffer: a decode round is dominated by small
+            // per-layer kernels whose referenced bytes are mostly already-seen
+            // resident weights, which `set_input_array` counts once. Each
+            // commit costs a submit-to-start gap, and the round pays that gap
+            // tens of times. Raising the cap lets the 512 MiB byte budget
+            // remain the binding wall it was set to be, so it cannot admit
+            // more in-flight bytes than the already-measured profile does.
+            setenv("MLX_MAX_OPS_PER_BUFFER", "256", 1)
             Memory.cacheLimit = 32 << 30
         }
+
+        // MLX hands its command queue a residency set and inserts every
+        // non-heap buffer into it, but the set's capacity starts at zero, so
+        // with no caller for `set_wired_limit` nothing is ever wired and the
+        // resident weights are re-made-resident by the driver on every
+        // command buffer. Raising the capacity before the weights load lets
+        // them land on the wired side of that set.
+        CBv2WiredResidency.install()
 
         do {
             let model = try Self.loadLibraryModel(

@@ -94,6 +94,14 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// the mirror needs no bookkeeping of its own.
     private var quantMirror: MLXArray?
 
+    /// Q4-BF16-ELIDE: true once a fused q4 decode step advanced this row
+    /// WITHOUT writing its BF16 ring slot (the fused pass owns the mirror
+    /// write and serves the live token from the new K/V arrays). The BF16
+    /// ring contents are stale from that step on; every BF16 view refuses
+    /// loudly rather than serve wrong bytes. The q4 mirror stays
+    /// authoritative and self-consistent.
+    private(set) var bf16RingStale = false
+
     /// `MLX_KV_QUANT=0` disables the quantized-ring read path wholesale
     /// (mirror never allocated, kernels take the established bf16 road).
     /// Default ON. `MLX_` prefix: the worker env sanitizer only passes
@@ -115,6 +123,19 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         ["1", "true", "yes", "on"].contains(
             (ProcessInfo.processInfo.environment["MLX_KV_QUANT_SIM"] ?? "")
                 .lowercased())
+    }()
+
+    /// `MLX_KV_Q4_BF16_ELIDE=0` restores the per-step BF16 ring
+    /// SliceUpdates while the fused q4 pass owns the live mirror-slot
+    /// write. Default ON: on the quant-authoritative road no reader touches
+    /// the BF16 rings (the fused pass and the mirror-read road cover every
+    /// full-ring decode step), so the two per-layer-per-row SliceUpdates
+    /// over the whole ring allocation are dead graph work. Static, read
+    /// once per process like the switch it complements.
+    static let q4BF16RingElideEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_KV_Q4_BF16_ELIDE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
     private var quantEligible: Bool {
@@ -185,8 +206,9 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             return stageSpeculativeUpdate(newKeys: newKeys, newValues: newValues, count: n)
         }
         precondition(
-            staged == nil,
-            "CBv2WindowedSequenceKV: plain update with a staged speculative write pending — commit first"
+            !bf16RingStale,
+            "CBv2WindowedSequenceKV: update after fused quant elided writes — "
+                + "BF16 ring is stale; set MLX_KV_Q4_BF16_ELIDE=0 to keep it authoritative"
         )
 
         allocateIfNeeded(keyTemplate: newKeys, valueTemplate: newValues)
@@ -248,6 +270,23 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
     }
 
+    /// Q4-BF16-ELIDE: bookkeeping half of a fused q4 decode step. The fused
+    /// pass already stored this step's mirror slot in place and served its
+    /// live token from the new K/V arrays, and on the quant-authoritative
+    /// road no reader observes the BF16 ring, so the incumbent BF16
+    /// SliceUpdates `decodeRingWriteBF16Only` performs are dead graph work.
+    /// Advance exactly the counters that method would and write nothing.
+    /// Marks the BF16 ring stale; BF16 views refuse from here on.
+    func advanceDecodeRingAfterQuantWrite() {
+        precondition(
+            staged == nil && keys != nil && retainedCount == window,
+            "CBv2WindowedSequenceKV: fused quant advance outside a full-ring decode step")
+        borrowableChunkViews = nil
+        bf16RingStale = true
+        absoluteOffset += 1
+        oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
+    }
+
     var decodeRingView: (keys: MLXArray, values: MLXArray, start: Int)? {
         guard staged == nil, let keys, let values, retainedCount == window else { return nil }
         return (keys, values, oldestValidPosition % window)
@@ -282,7 +321,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// lands in is `absoluteOffset % window`, i.e. `(start + window - 1) %
     /// window` — the slot the returned start has just stepped past.
     var decodeRingViewBeforeWrite: (keys: MLXArray, values: MLXArray, start: Int)? {
-        guard staged == nil, let keys, let values, retainedCount == window else { return nil }
+        guard staged == nil, !bf16RingStale, let keys, let values, retainedCount == window else { return nil }
         return (keys, values, (oldestValidPosition + 1) % window)
     }
 
@@ -434,6 +473,11 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     }
 
     public func snapshot() -> (keys: MLXArray, values: MLXArray, offset: Int) {
+        precondition(
+            !bf16RingStale,
+            "CBv2WindowedSequenceKV: snapshot after fused quant elided writes — "
+                + "BF16 ring is stale; set MLX_KV_Q4_BF16_ELIDE=0 to keep it authoritative"
+        )
         if let staged {
             return stagedSnapshot(staged)
         }

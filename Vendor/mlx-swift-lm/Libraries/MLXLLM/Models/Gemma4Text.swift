@@ -1790,7 +1790,8 @@ private class Gemma4Attention: Module {
         positionOffset: Gemma4.PositionOffset? = nil,
         v2SharedSource: (any CBv2AttendingLayerCache)? = nil,
         outputStart: Int = 0,
-        useLastQueryPrefill: Bool = false
+        useLastQueryPrefill: Bool = false,
+        precomputedRunsumTable: MLXArray? = nil
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         // ContinuousBatchingV2: the layer cache owns both the KV update and
         // the attention computation (no masks, no padding — see
@@ -1800,7 +1801,8 @@ private class Gemma4Attention: Module {
             return forwardV2(
                 x, layerCache: layerCacheV2, source: v2SharedSource,
                 sharedKV: sharedKV, positionOffset: positionOffset,
-                outputStart: outputStart, useLastQueryPrefill: useLastQueryPrefill)
+                outputStart: outputStart, useLastQueryPrefill: useLastQueryPrefill,
+                precomputedRunsumTable: precomputedRunsumTable)
         }
         precondition(
             outputStart == 0 && !useLastQueryPrefill,
@@ -1939,7 +1941,8 @@ private class Gemma4Attention: Module {
         sharedKV: (MLXArray, MLXArray)?,
         positionOffset: Gemma4.PositionOffset?,
         outputStart: Int = 0,
-        useLastQueryPrefill: Bool = false
+        useLastQueryPrefill: Bool = false,
+        precomputedRunsumTable: MLXArray? = nil
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         let (B, L) = (x.dim(0), x.dim(1))
         precondition(
@@ -1970,7 +1973,14 @@ private class Gemma4Attention: Module {
         // requires the exact L=1 decode shape, and the incumbent dispatch
         // runs). The table kernel is lazy: it executes only when a projection
         // actually consumes it.
-        let qkvRunsumTable = CBv2AttentionQKVMMA8V1.runsumTable(for: x)
+        // RSFOLD-001: when the previous layer's fused tail already emitted
+        // this table alongside the norm it belongs to, take it and skip the
+        // standalone prepass entirely. The table is validated against the
+        // exact shape and dtype the rsp bodies admit before it is accepted,
+        // and a mismatch falls back to the prepass.
+        let qkvRunsumTable =
+            CBv2AttentionQKVMMA8V1.acceptRunsumTable(precomputedRunsumTable, for: x)
+            ?? CBv2AttentionQKVMMA8V1.runsumTable(for: x)
 
         // Keep Q/K/V on the promoted matrix-unit tier's arithmetic. At the
         // exact B=8/L=1 decode shapes the tight-grid host re-dispatches the
@@ -2701,7 +2711,10 @@ private enum Gemma4RouteGlueFoldV1 {
 /// identity on the source array, so any intervening transformation falls back
 /// to the stock `inputLayernorm(x)`.
 public final class Gemma4GlueChainBox {
-    var pending: (source: MLXArray, normed: MLXArray)?
+    /// RSFOLD-001 widens the deposit with the run-sum table of `normed` when
+    /// the tail kernel produced it in the same dispatch. `nil` means the
+    /// consumer runs the standalone prepass, which is the incumbent.
+    var pending: (source: MLXArray, normed: MLXArray, runsum: MLXArray?)?
     public init() {}
 }
 
@@ -3243,15 +3256,48 @@ private enum Gemma4FusedLayerGlue {
         ensureRowContiguous: true
     )
 
-    private static let deferredTailChainKernel: MLXFast.MLXFastKernel =
-        MLXFast.metalKernel(
-            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1_nb1_vec1",
-            inputNames: [
-                "a", "sorted", "inverse", "route_weights", "res",
-                "w1", "w2", "w3", "s", "wn",
-            ],
-            outputNames: ["out", "normed"],
-            source: """
+    /// RSFOLD-001 arm. Default ON. `DARKBLOOM_GEMMA4_QKV_RS_FOLD=0` selects
+    /// the incumbent two-output tail kernel and leaves the next layer to run
+    /// the standalone `cbv2_b8_rs_table_k2816_v1` prepass.
+    static let rsFoldEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_QKV_RS_FOLD"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// RSFOLD-001. The next layer's Q/K/V projections need the affine run-sum
+    /// table of `normed`, one float per (row, 64-wide group of K). The
+    /// standalone prepass re-reads all 45 KB of `normed` back out of device
+    /// memory to produce 44 floats per row, and because it consumes this
+    /// kernel's output and feeds the projections it is a DEPENDENT dispatch:
+    /// MLX's concurrent encoder has to drain a buffer barrier before it and
+    /// another after it. This block computes the same 44 floats from the
+    /// values already live in registers here.
+    ///
+    /// Thread `lid` owns elements `[4*lid, 4*lid+4)` of the row, so a 64-wide
+    /// group is exactly the 16 threads `16g .. 16g+15`, and 16 divides the
+    /// simdgroup width, so those threads are always in one simdgroup and a
+    /// `simd_shuffle_xor` butterfly over masks 1, 2, 4, 8 stays inside the
+    /// group. See the exactness argument in the submission note: `p_m` here
+    /// is one of the two four-element halves the prepass's `mma8_runsum4`
+    /// accumulates, written as the identical statement, and the four-stage
+    /// butterfly reproduces the prepass's `((v0+v1)+(v2+v3)) +
+    /// ((v4+v5)+(v6+v7))` association term for term.
+    private static let runsumFoldSource = """
+                float rsp = 0;
+                rsp += nv[0] + nv[1] + nv[2] + nv[3];
+                rsp += simd_shuffle_xor(rsp, 1u);
+                rsp += simd_shuffle_xor(rsp, 2u);
+                rsp += simd_shuffle_xor(rsp, 4u);
+                rsp += simd_shuffle_xor(rsp, 8u);
+                if ((lid & 15u) == 0u) {
+                    rs[row * 44u + (lid >> 4)] = rsp;
+                }
+        """
+
+    private static func deferredTailChainSource(withRunsum: Bool) -> String {
+        """
                 const uint row = threadgroup_position_in_grid.x;
                 const uint lid = thread_position_in_threadgroup.x;
                 const uint simd_lane_id = thread_index_in_simdgroup;
@@ -3290,12 +3336,38 @@ private enum Gemma4FusedLayerGlue {
             \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
                 of: "(float)outv[base + i]", with: "(float)outv[i]"))
                 const float inv4 = local_inv[0];
+                T nv[4];
                 for (int i = 0; i < 4; i++) {
-                    normed[base + i] =
+                    nv[i] =
                         wn[wbase + i]
                             * static_cast<T>((float)outv[i] * inv4);
+                    normed[base + i] = nv[i];
                 }
-            """,
+        \(withRunsum ? runsumFoldSource : "")
+        """
+    }
+
+    private static let deferredTailChainKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1_nb1_vec1",
+            inputNames: [
+                "a", "sorted", "inverse", "route_weights", "res",
+                "w1", "w2", "w3", "s", "wn",
+            ],
+            outputNames: ["out", "normed"],
+            source: deferredTailChainSource(withRunsum: false),
+            ensureRowContiguous: true
+        )
+
+    private static let deferredTailChainRunsumKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_glue_deferred_expert_tail_chain_rs_2816_bf16_v1_nb1_vec1",
+            inputNames: [
+                "a", "sorted", "inverse", "route_weights", "res",
+                "w1", "w2", "w3", "s", "wn",
+            ],
+            outputNames: ["out", "normed", "rs"],
+            source: deferredTailChainSource(withRunsum: true),
             ensureRowContiguous: true
         )
 
@@ -3321,7 +3393,7 @@ private enum Gemma4FusedLayerGlue {
         layerScalar: MLXArray,
         nextInputNormWeight: MLXArray,
         eps: Float
-    ) -> (out: MLXArray, normedNext: MLXArray)? {
+    ) -> (out: MLXArray, normedNext: MLXArray, runsum: MLXArray?)? {
         guard admits(mlpOut, weight: w1, eps: eps),
             admitsDeferred(expertRows),
             residual.shape == mlpOut.shape,
@@ -3334,19 +3406,32 @@ private enum Gemma4FusedLayerGlue {
             nextInputNormWeight.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-deferred-expert-tail-chain")
-        let outs = deferredTailChainKernel(
-            [
-                mlpOut, expertRows.sortedOutputs, expertRows.inverseOrder,
-                expertRows.weights, residual, w1, w2, w3, layerScalar,
-                nextInputNormWeight,
-            ],
+        let inputs = [
+            mlpOut, expertRows.sortedOutputs, expertRows.inverseOrder,
+            expertRows.weights, residual, w1, w2, w3, layerScalar,
+            nextInputNormWeight,
+        ]
+        guard rsFoldEnabled else {
+            let outs = deferredTailChainKernel(
+                inputs,
+                template: [("T", mlpOut.dtype)],
+                grid: (rows * tgThreads, 1, 1),
+                threadGroup: (tgThreads, 1, 1),
+                outputShapes: [[rows, 1, axis], [rows, 1, axis]],
+                outputDTypes: [.bfloat16, .bfloat16]
+            )
+            return (outs[0], outs[1], nil)
+        }
+        CBv2EngageMark.once("glue-tail-chain-runsum-fold")
+        let outs = deferredTailChainRunsumKernel(
+            inputs,
             template: [("T", mlpOut.dtype)],
             grid: (rows * tgThreads, 1, 1),
             threadGroup: (tgThreads, 1, 1),
-            outputShapes: [[rows, 1, axis], [rows, 1, axis]],
-            outputDTypes: [.bfloat16, .bfloat16]
+            outputShapes: [[rows, 1, axis], [rows, 1, axis], [rows, axis / 64]],
+            outputDTypes: [.bfloat16, .bfloat16, .float32]
         )
-        return (outs[0], outs[1])
+        return (outs[0], outs[1], outs[2])
     }
 
     static func tailDeferred(
@@ -4089,19 +4174,27 @@ public class Gemma4DecoderLayer: Module {
         // produced this layer's input norm. Pointer identity on the source
         // guarantees the normed tensor was computed from exactly this input.
         let h: MLXArray
+        // RSFOLD-001: the same deposit can carry the run-sum table of that
+        // norm, computed inside the tail dispatch. It is only ever used for
+        // the tensor it was computed from, because it travels with `normed`
+        // under the same pointer-identity guard.
+        let hRunsum: MLXArray?
         if let chain = glueChain, let pending = chain.pending,
             pending.source === x
         {
             chain.pending = nil
             h = pending.normed
+            hRunsum = pending.runsum
         } else {
             glueChain?.pending = nil
             h = inputLayernorm(x)
+            hRunsum = nil
         }
         let (attnOut, kvPair, attnPositionOffset) = selfAttn(
             h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset,
             v2SharedSource: v2SharedSource, outputStart: outputStart,
-            useLastQueryPrefill: useLastQueryPrefill)
+            useLastQueryPrefill: useLastQueryPrefill,
+            precomputedRunsumTable: hRunsum)
         // PREFIX-001: only build the joined producer when the ZIP consumer is
         // guaranteed to accept it. A nil leaves the established attention
         // residual and branch pre-norm paths untouched.
@@ -4298,7 +4391,9 @@ public class Gemma4DecoderLayer: Module {
                     eps: config.rmsNormEps)
             {
                 out = chained.out
-                chain.pending = (source: chained.out, normed: chained.normedNext)
+                chain.pending = (
+                    source: chained.out, normed: chained.normedNext,
+                    runsum: chained.runsum)
                 tailApplied = true
                 scalarFolded = true
             } else if canFoldScalar, let deferred = expertBranch.deferred,
@@ -4335,7 +4430,7 @@ public class Gemma4DecoderLayer: Module {
                         eps: config.rmsNormEps)
                 {
                     out = chained.out
-                    chain.pending = (source: chained.out, normed: chained.normedNext)
+                    chain.pending = (source: chained.out, normed: chained.normedNext, runsum: nil)
                     tailApplied = true
                     scalarFolded = true
                 } else if canFoldScalar,
@@ -4365,7 +4460,7 @@ public class Gemma4DecoderLayer: Module {
                         eps: config.rmsNormEps)
                 {
                     out = chained.out
-                    chain.pending = (source: chained.out, normed: chained.normedNext)
+                    chain.pending = (source: chained.out, normed: chained.normedNext, runsum: nil)
                     tailApplied = true
                     scalarFolded = true
                 } else if canFoldScalar, let chain = glueChain,
@@ -4382,7 +4477,7 @@ public class Gemma4DecoderLayer: Module {
                         eps: config.rmsNormEps)
                 {
                     out = chained.out
-                    chain.pending = (source: chained.out, normed: chained.normedNext)
+                    chain.pending = (source: chained.out, normed: chained.normedNext, runsum: nil)
                     tailApplied = true
                     scalarFolded = true
                 } else if let fusedTail = Gemma4PrefillGlueV1.branchTail(

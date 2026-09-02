@@ -860,6 +860,27 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         )[0]
     }
 
+    /// RSFOLD-001. Accept a table another kernel already produced for `x`
+    /// instead of dispatching the prepass. The caller owns the proof that the
+    /// table belongs to this tensor; this only re-checks the shape contract
+    /// the rsp bodies index against, so a table of the wrong geometry can
+    /// never reach a kernel.
+    @inline(__always)
+    public static func acceptRunsumTable(
+        _ table: MLXArray?, for x: MLXArray
+    ) -> MLXArray? {
+        guard rsPrepassEnabled, let table,
+            table.dtype == .float32,
+            table.shape == [batch, inputWidth / groupSize],
+            x.dtype == .bfloat16,
+            x.ndim == 3,
+            x.dim(0) == batch,
+            x.dim(1) == sequence,
+            x.dim(2) == inputWidth
+        else { return nil }
+        return table
+    }
+
     @inline(__always)
     private static let fusedLock = NSLock()
     nonisolated(unsafe) private static var fusedPlanes:

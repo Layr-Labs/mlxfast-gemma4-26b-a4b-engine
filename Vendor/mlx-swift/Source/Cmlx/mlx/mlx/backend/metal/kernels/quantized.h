@@ -671,9 +671,14 @@ qouter(const thread uint8_t* w, U x, U scale, U bias, thread U* result) {
   }
 }
 
-template <typename U, int N, int bits>
-inline void
-dequantize(const device uint8_t* w, U scale, U bias, threadgroup U* w_local) {
+// PREFILL-DEQ-HOIST: the packed-weight pointer is a deduced template
+// parameter so this one body serves both a `device` run (the stock call) and
+// a `thread` register run (the hoisted call in QuantizedBlockLoader below).
+// The arithmetic, the operand order and the store order are untouched; only
+// the address space of the packed source varies, so every stored element is
+// bit-identical for either instantiation.
+template <typename U, int N, int bits, typename WPtr, typename DPtr>
+inline void dequantize(WPtr w, U scale, U bias, DPtr w_local) {
   static_assert(
       bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
           bits == 8,
@@ -816,6 +821,103 @@ struct QuantizedBlockLoader {
         scales(scales_ + bi * src_ld / group_size),
         biases(biases_ + bi * src_ld / group_size) {}
 
+  // PREFILL-DEQ-WIDE: fetch this thread's whole contiguous packed-byte run
+  // with the widest vector load its runtime alignment permits.
+  //
+  // Why this is the prefill lever. A k-iteration of the qmm loops below is
+  // barrier-serialized: a threadgroup barrier both precedes and follows the
+  // weight load, so nothing overlaps it. At this track's only instantiated
+  // shape (BM=BN=BK=64, WM=WN=2 => tgp_size 128) a 4-bit g64 weight tile
+  // gives BCOLS_PACKED=32, so n_reads=16: the stock loader issues sixteen
+  // separate 1-byte device loads per thread per k-iteration, against just
+  // sixteen MMA ops (TM=TN=TK=2 over two kk1 steps) in the compute phase.
+  // The loader, not the matmul, dominates the loop's memory-instruction
+  // count. Sixteen contiguous bytes are one 128-bit load.
+  //
+  // Why the stock form cannot be auto-vectorized: `src` is a
+  // `device uint8_t*` whose offset carries the runtime row stride
+  // (`bi * src_ld * bytes_per_pack / pack_factor`), so the compiler cannot
+  // prove any alignment and emits scalar byte loads. Confirmed by reading
+  // the emitted AIR for this shape. The alignment is nevertheless satisfied
+  // in practice here (bj is a multiple of n_reads, and this model's packed
+  // row strides K/2 are 1408 and 352 bytes, both multiples of 16), so the
+  // test below is a runtime check of a condition that is uniform across the
+  // simdgroup rather than a divergent branch.
+  //
+  // Bit-exactness: a `uchar16`/`uchar4` device load reads the same bytes in
+  // memory order into the same lane positions, so `run` holds byte-for-byte
+  // what the scalar loop would have produced, and the dequantize arithmetic
+  // downstream is untouched. Each wider arm is entered only when the load's
+  // own alignment requirement is proven to hold, and the scalar arm remains
+  // as the fully general fallback, so no instantiation can fault.
+  METAL_FUNC void load_run(thread uint8_t* run) const {
+    const short run_bytes = n_reads * bytes_per_pack;
+    if ((n_reads * bytes_per_pack) % 16 == 0 &&
+        (reinterpret_cast<size_t>(src) & 15) == 0) {
+      for (short v = 0; v + 16 <= run_bytes; v += 16) {
+        const uint4 words = *reinterpret_cast<const device uint4*>(src + v);
+        for (short w = 0; w < 4; ++w) {
+          const uchar4 quad = as_type<uchar4>(words[w]);
+          for (short b = 0; b < 4; ++b) {
+            run[v + 4 * w + b] = quad[b];
+          }
+        }
+      }
+    } else if (
+        (n_reads * bytes_per_pack) % 4 == 0 &&
+        (reinterpret_cast<size_t>(src) & 3) == 0) {
+      for (short v = 0; v + 4 <= run_bytes; v += 4) {
+        const uchar4 chunk = *reinterpret_cast<const device uchar4*>(src + v);
+        for (short b = 0; b < 4; ++b) {
+          run[v + b] = chunk[b];
+        }
+      }
+    } else {
+      for (short b = 0; b < run_bytes; ++b) {
+        run[b] = src[b];
+      }
+    }
+  }
+
+  // PREFILL-DEQ-WIDE (store side): commit this thread's dequantized run to
+  // threadgroup memory with the widest vector store its runtime alignment
+  // permits. The stock loader stores one element at a time, so at this
+  // track's only instantiated shape a 4-bit g64 tile costs
+  // n_reads * pack_factor = 32 separate 2-byte threadgroup stores per thread
+  // per k-iteration. That is twice the instruction count of the sixteen byte
+  // loads the load side above merges, and it sits on the same
+  // barrier-serialized critical path, so it is the larger half of the win.
+  // Those 32 halves occupy 64 contiguous bytes, i.e. four 128-bit stores.
+  //
+  // Alignment: `dst` is `dst_ + bi * dst_ld + bj * pack_factor`. At this shape
+  // dst_ld is 72 and bj * pack_factor is 0 or 32, so the byte offset is
+  // bi * 144 + {0, 64} and every term is a multiple of 16. As on the load
+  // side the test is a runtime check of a simdgroup-uniform condition rather
+  // than a divergent branch, and the scalar arm is retained as the fully
+  // general fallback so no instantiation can fault or mis-store.
+  //
+  // Bit-exactness: `stage` holds exactly the values the stock path stored,
+  // produced by the same dequantize arithmetic in the same order -- only the
+  // address space of dequantize's destination changed, via a deduced template
+  // parameter. Widening the stores that move them into threadgroup memory
+  // moves the same bytes to the same addresses.
+  METAL_FUNC void store_run(thread const T* stage) const {
+    const short stage_elems = n_reads * pack_factor;
+    const short stage_bytes = stage_elems * sizeof(T);
+    if ((n_reads * pack_factor * sizeof(T)) % 16 == 0 &&
+        (reinterpret_cast<size_t>(dst) & 15) == 0) {
+      thread const uint4* s4 = reinterpret_cast<thread const uint4*>(stage);
+      threadgroup uint4* d4 = reinterpret_cast<threadgroup uint4*>(dst);
+      for (short v = 0; v < stage_bytes / 16; ++v) {
+        d4[v] = s4[v];
+      }
+    } else {
+      for (short v = 0; v < stage_elems; ++v) {
+        dst[v] = stage[v];
+      }
+    }
+  }
+
   void load_unsafe() const {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
       return;
@@ -823,10 +925,28 @@ struct QuantizedBlockLoader {
 
     T scale = *scales;
     T bias = *biases;
+    // PREFILL-DEQ-HOIST: fetch this thread's whole contiguous packed-byte
+    // run into registers before any dequantize arithmetic runs. The stock
+    // form interleaves each pack's device load with that pack's own
+    // dependent multiply-adds and threadgroup stores, so all n_reads load
+    // latencies land on the critical path of a k-iteration that is fully
+    // barrier-serialized against the MMA (see the qmm k-loops below: a
+    // threadgroup barrier both precedes and follows this call, so nothing
+    // else is available to cover the loads). Issuing the run first lets the
+    // loads overlap one another and lets adjacent bytes coalesce.
+    //
+    // Bit-exactness: the loaded byte values, the scale and bias operands,
+    // the per-value multiply-add expressions and the threadgroup store
+    // order are all unchanged. Only the device-load schedule differs, so
+    // every stored element is identical to the stock path.
+    uint8_t packed_run[n_reads * bytes_per_pack];
+    load_run(packed_run);
+    alignas(16) T stage[n_reads * pack_factor];
     for (int i = 0; i < n_reads; i++) {
       dequantize<T, pack_factor, bits>(
-          src + i * bytes_per_pack, scale, bias, dst + i * pack_factor);
+          &packed_run[i * bytes_per_pack], scale, bias, stage + i * pack_factor);
     }
+    store_run(stage);
   }
 
   void load_safe(short2 src_tile_dim) const {
@@ -850,13 +970,18 @@ struct QuantizedBlockLoader {
 
     T scale = *scales;
     T bias = *biases;
+    // PREFILL-DEQ-HOIST, same transformation as load_unsafe above and for
+    // the same reason. This arm is only reached once the two bounds guards
+    // have already proven the full run is in range, so hoisting the whole
+    // run reads exactly the bytes the stock path reads.
+    uint8_t packed_run[n_reads * bytes_per_pack];
+    load_run(packed_run);
+    alignas(16) T stage[n_reads * pack_factor];
     for (int i = 0; i < n_reads; i++) {
       dequantize<T, pack_factor, bits>(
-          (device uint8_t*)(src + i * bytes_per_pack),
-          scale,
-          bias,
-          dst + i * pack_factor);
+          &packed_run[i * bytes_per_pack], scale, bias, stage + i * pack_factor);
     }
+    store_run(stage);
   }
 
   void next() {

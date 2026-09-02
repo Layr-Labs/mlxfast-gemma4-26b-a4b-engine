@@ -2697,6 +2697,59 @@ private enum Gemma4FusedLayerGlue {
     private static let nReads = 4
     private static let tgThreads = 704  // 2816 / 4, exactly rms_single_row's shape
 
+    /// GLUE-VLOAD-001: the four-run device traffic of the decode glue.
+    ///
+    /// Every kernel in this enum partitions the 2816-wide hidden state as
+    /// `rms_single_row<T, 4>` does: 704 threads per row, four adjacent
+    /// features each, addressed through
+    ///
+    ///     const uint base = row * 2816 + lid * 4;
+    ///     const uint wbase = lid * 4;
+    ///
+    /// and every activation read, weight read and output write is then issued
+    /// as four separate scalar operations on consecutive addresses. In the
+    /// attention-branch prefix that is forty-eight scalar device operations
+    /// per thread across six operands and four outputs; the norm-residual and
+    /// dual-prenorm kernels carry the same shape at smaller width. These run
+    /// once per layer per decode step, over the whole hidden state.
+    ///
+    /// Every one of those addresses is four-element aligned without any
+    /// runtime condition, because 2816 is a multiple of four and both `base`
+    /// and `wbase` add only `lid * 4` to a multiple of it. So each run is one
+    /// aligned four-wide access, and no guard, no branch and no remainder
+    /// path is introduced.
+    ///
+    /// Exactness: the same bits are read from the same addresses, each
+    /// component is widened at the statement that widened it before, and the
+    /// per-thread accumulations (`acc` in the reduction, `xsum` in the
+    /// producers) run over i = 0..3 in the order they ran in. The reduction
+    /// preambles reduce the already-loaded register vector through the tree's
+    /// own idiom for reducing a thread-local run, the one the incumbent
+    /// second reduction of the prefix kernel already uses. The only statement
+    /// that moves is the prefix kernel's `out` store, which leaves the first
+    /// loop to become one vector store still ahead of the same barrier.
+    /// Bit-exact by construction; no token budget is spent.
+    ///
+    /// `DARKBLOOM_GEMMA4_GLUE_VLOAD=0` restores the incumbent scalar runs and
+    /// the incumbent pipeline names with them.
+    static let glueVloadEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_GLUE_VLOAD"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let glueVloadSuffix: String =
+        glueVloadEnabled ? "_vload_v1" : ""
+
+    /// The reduction preamble over an already-loaded four-wide register run,
+    /// built from the shared preamble through the same index substitution the
+    /// prefix kernel's second reduction already applies.
+    private static func rmsReduceRun(_ run: String, into slot: String) -> String {
+        rmsReduce(run, into: slot).replacingOccurrences(
+            of: "(float)\(run)[base + i]", with: "(float)\(run)[i]")
+    }
+
     /// Shared reduction preamble: the exact rms_single_row tree at 704x4.
     /// `PREFIX` names the array to reduce; `SLOT` the shared slot written.
     private static func rmsReduce(_ src: String, into slot: String) -> String {
@@ -2781,10 +2834,36 @@ private enum Gemma4FusedLayerGlue {
     }
 
     private static let normResidualKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_norm_residual_2816_bf16_v1_nb1",
+        name: "gemma4_glue_norm_residual_2816_bf16_v1_nb1\(glueVloadSuffix)",
         inputNames: ["x", "res", "w"],
         outputNames: ["out"],
-        source: """
+        source: glueVloadEnabled ? """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float local_inv[1];
+            threadgroup float local_sums[32];
+            const uint base = row * 2816 + lid * 4;
+            const uint wbase = lid * 4;
+            const vec<T, 4> xv =
+                *reinterpret_cast<const device vec<T, 4>*>(x + base);
+        \(rmsReduceRun("xv", into: "local_inv[0]"))
+            const float inv = local_inv[0];
+            const vec<T, 4> wv =
+                *reinterpret_cast<const device vec<T, 4>*>(w + wbase);
+            const vec<T, 4> rv =
+                *reinterpret_cast<const device vec<T, 4>*>(res + base);
+            vec<T, 4> ov;
+            for (int i = 0; i < 4; i++) {
+                // The stock chain rounds the norm's output to T in memory
+                // before the residual add reads it; reproduce both roundings.
+                const T normed = static_cast<T>(
+                    wv[i] * static_cast<T>((float)xv[i] * inv));
+                ov[i] = rv[i] + normed;
+            }
+            *reinterpret_cast<device vec<T, 4>*>(out + base) = ov;
+        """ : """
             const uint row = threadgroup_position_in_grid.x;
             const uint lid = thread_position_in_threadgroup.x;
             const uint simd_lane_id = thread_index_in_simdgroup;
@@ -2815,10 +2894,62 @@ private enum Gemma4FusedLayerGlue {
 // T28 second sample marker (r2): content identical to ranked 32f5d19f apart from this comment.
     private static let attentionBranchPrefixKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_glue_attention_branch_prefix_2816_bf16_v1_nb1",
+            name: "gemma4_glue_attention_branch_prefix_2816_bf16_v1_nb1\(glueVloadSuffix)",
             inputNames: ["attn", "res", "wa", "wd", "we", "wr"],
             outputNames: ["out", "dense", "expert", "router", "xSums"],
-            source: """
+            source: glueVloadEnabled ? """
+                const uint row = threadgroup_position_in_grid.x;
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint simd_lane_id = thread_index_in_simdgroup;
+                const uint simd_group_id = simdgroup_index_in_threadgroup;
+                threadgroup float local_inv[1];
+                threadgroup float local_sums[32];
+                const uint base = row * 2816 + lid * 4;
+                const uint wbase = lid * 4;
+                const vec<T, 4> attnv =
+                    *reinterpret_cast<const device vec<T, 4>*>(attn + base);
+            \(rmsReduceRun("attnv", into: "local_inv[0]"))
+                const float attn_inv = local_inv[0];
+                const vec<T, 4> wav =
+                    *reinterpret_cast<const device vec<T, 4>*>(wa + wbase);
+                const vec<T, 4> resv =
+                    *reinterpret_cast<const device vec<T, 4>*>(res + base);
+                vec<T, 4> outv;
+                for (int i = 0; i < 4; i++) {
+                    const T normed = static_cast<T>(
+                        wav[i]
+                            * static_cast<T>((float)attnv[i] * attn_inv));
+                    outv[i] = resv[i] + normed;
+                }
+                *reinterpret_cast<device vec<T, 4>*>(out + base) = outv;
+            \(rmsReduceRun("outv", into: "local_inv[0]"))
+                const float branch_inv = local_inv[0];
+                const vec<T, 4> wdv =
+                    *reinterpret_cast<const device vec<T, 4>*>(wd + wbase);
+                const vec<T, 4> wev =
+                    *reinterpret_cast<const device vec<T, 4>*>(we + wbase);
+                const vec<T, 4> wrv =
+                    *reinterpret_cast<const device vec<T, 4>*>(wr + wbase);
+                vec<T, 4> densev4;
+                vec<T, 4> expertv4;
+                vec<T, 4> routerv4;
+                float xsum = 0.0f;
+                for (int i = 0; i < 4; i++) {
+                    const T nx =
+                        static_cast<T>((float)outv[i] * branch_inv);
+                    const T densev = wdv[i] * nx;
+                    densev4[i] = densev;
+                    expertv4[i] = wev[i] * nx;
+                    routerv4[i] = wrv[i] * nx;
+                    xsum += densev;
+                }
+                *reinterpret_cast<device vec<T, 4>*>(dense + base) = densev4;
+                *reinterpret_cast<device vec<T, 4>*>(expert + base) =
+                    expertv4;
+                *reinterpret_cast<device vec<T, 4>*>(router + base) =
+                    routerv4;
+                xSums[lid * 8 + row] = xsum;
+            """ : """
                 const uint row = threadgroup_position_in_grid.x;
                 const uint lid = thread_position_in_threadgroup.x;
                 const uint simd_lane_id = thread_index_in_simdgroup;
@@ -2857,10 +2988,42 @@ private enum Gemma4FusedLayerGlue {
         )
 
     private static let dualPreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_dual_prenorm_xsum_2816_bf16_v2_nb1",
+        name: "gemma4_glue_dual_prenorm_xsum_2816_bf16_v2_nb1\(glueVloadSuffix)",
         inputNames: ["x", "w1", "w2"],
         outputNames: ["out1", "out2", "xSums"],
-        source: """
+        source: glueVloadEnabled ? """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float local_inv[1];
+            threadgroup float local_sums[32];
+            const uint base = row * 2816 + lid * 4;
+            const uint wbase = lid * 4;
+            const vec<T, 4> xv =
+                *reinterpret_cast<const device vec<T, 4>*>(x + base);
+        \(rmsReduceRun("xv", into: "local_inv[0]"))
+            const float inv = local_inv[0];
+            const vec<T, 4> w1v =
+                *reinterpret_cast<const device vec<T, 4>*>(w1 + wbase);
+            const vec<T, 4> w2v =
+                *reinterpret_cast<const device vec<T, 4>*>(w2 + wbase);
+            vec<T, 4> o1v;
+            vec<T, 4> o2v;
+            float xsum = 0.0f;
+            for (int i = 0; i < 4; i++) {
+                const T nx = static_cast<T>((float)xv[i] * inv);
+                const T dense = w1v[i] * nx;
+                o1v[i] = dense;
+                o2v[i] = w2v[i] * nx;
+                xsum += dense;
+            }
+            *reinterpret_cast<device vec<T, 4>*>(out1 + base) = o1v;
+            *reinterpret_cast<device vec<T, 4>*>(out2 + base) = o2v;
+            // `lid == k_block * 32 + lane`, exactly the standalone DMLP
+            // xsum table's first two coordinates. Row remains unit stride.
+            xSums[lid * 8 + row] = xsum;
+        """ : """
             const uint row = threadgroup_position_in_grid.x;
             const uint lid = thread_position_in_threadgroup.x;
             const uint simd_lane_id = thread_index_in_simdgroup;
@@ -2955,6 +3118,7 @@ private enum Gemma4FusedLayerGlue {
             residual.shape == x.shape, residual.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-norm-residual")
+        if glueVloadEnabled { CBv2EngageMark.once("glue-vload") }
         return normResidualKernel(
             [x, residual, weight],
             template: [("T", x.dtype)],
@@ -2996,6 +3160,7 @@ private enum Gemma4FusedLayerGlue {
             routerWeight.ndim == 1, routerWeight.dim(0) == axis,
             routerWeight.dtype == .bfloat16
         else { return nil }
+        if glueVloadEnabled { CBv2EngageMark.once("glue-vload") }
         let outs = attentionBranchPrefixKernel(
             [
                 attn, residual, postAttentionWeight, denseWeight,
@@ -3034,6 +3199,7 @@ private enum Gemma4FusedLayerGlue {
             w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-dual-prenorm")
+        if glueVloadEnabled { CBv2EngageMark.once("glue-vload") }
         let outs = dualPreNormKernel(
             [x, w1, w2],
             template: [("T", x.dtype)],
@@ -3117,7 +3283,54 @@ private enum Gemma4FusedLayerGlue {
     /// features owned by this tail thread. The value remains in registers and
     /// feeds the expert RMS directly, deleting only the reduced `[8, 2816]`
     /// materialization and its standalone dispatch.
-    private static let deferredExpertValuesSource = """
+    /// EXPERT-TAIL-VLOAD-001: the sorted-row reads of the deferred expert
+    /// tail.
+    ///
+    /// The tail rebuilds each thread's four expert features from the eight
+    /// routed slots of its row. The base already lifts the per-slot
+    /// permutation entry and routing weight into registers ahead of the
+    /// walk, so the two small operands are read once each. What is still
+    /// issued four times per slot is the read of the slot's sorted row: the
+    /// four features are the OUTER loop, so a slot's four adjacent elements
+    /// are never in hand together and that row is visited four separate
+    /// times for one element each. Per thread that is thirty-two scalar
+    /// reads of `sorted` for eight rows' worth of data.
+    ///
+    /// Interchanging the loops puts the eight slots on the outside, and a
+    /// slot's four adjacent elements become one four-wide read: eight wide
+    /// reads instead of thirty-two scalar ones. The register hoist the base
+    /// introduced is kept exactly as it is.
+    ///
+    /// The interchange preserves the accumulation order of every output
+    /// element, which is the only thing that could make it inexact. Each
+    /// feature keeps its own accumulator, and that accumulator still folds in
+    /// slot 0, then slot 1, and so on to slot 7, with the same addend at each
+    /// step and the same rounding to T after each addition. The four folds
+    /// never share an operand in either form, so no two partial sums that met
+    /// in one order now meet in another. Only the interleaving of four
+    /// independent chains changes, not any chain.
+    ///
+    /// Alignment: the sorted plane is a bf16 `[64, 2816]` row-contiguous
+    /// buffer by the admission predicate, the row stride 2816 is a multiple
+    /// of four and `wbase` is `lid * 4`, so `sorted_row * 2816 + wbase` is
+    /// four-element aligned for every thread and every slot with no runtime
+    /// condition. Each run stays inside its own row, since `wbase` is at most
+    /// 2812.
+    ///
+    /// Bit-exact by construction; no token budget is spent.
+    /// `DARKBLOOM_GEMMA4_EXPERT_TAIL_VLOAD=0` restores the incumbent walk and
+    /// the incumbent pipeline names with it.
+    static let expertTailVloadEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_EXPERT_TAIL_VLOAD"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let expertTailVloadSuffix: String =
+        expertTailVloadEnabled ? "_vload_v1" : ""
+
+    private static let deferredExpertValuesBaseSource = """
             T expertv[4];
             const uint assignment_base = row * 8u;
             uint sorted_rows[8];
@@ -3139,8 +3352,40 @@ private enum Gemma4FusedLayerGlue {
             }
     """
 
+    private static let deferredExpertValuesVloadSource = """
+            T expertv[4];
+            const uint assignment_base = row * 8u;
+            uint sorted_rows[8];
+            T routed_weights[8];
+            for (uint slot = 0u; slot < 8u; ++slot) {
+                const uint assignment = assignment_base + slot;
+                sorted_rows[slot] = (uint)inverse[assignment];
+                routed_weights[slot] = route_weights[assignment];
+            }
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 4; ++i) {
+                expertv[i] = static_cast<T>(0.0f);
+            }
+            for (uint slot = 0u; slot < 8u; ++slot) {
+                const vec<T, 4> sorted_run =
+                    *reinterpret_cast<const device vec<T, 4>*>(
+                        sorted + sorted_rows[slot] * 2816u + wbase);
+                const float route_weight = (float)routed_weights[slot];
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < 4; ++i) {
+                    const T weighted = static_cast<T>(
+                        (float)sorted_run[i] * route_weight);
+                    expertv[i] = expertv[i] + weighted;
+                }
+            }
+    """
+
+    private static let deferredExpertValuesSource =
+        expertTailVloadEnabled
+        ? deferredExpertValuesVloadSource : deferredExpertValuesBaseSource
+
     private static let deferredTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1_nb1_vec1",
+        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1_nb1_vec1\(expertTailVloadSuffix)",
         inputNames: [
             "a", "sorted", "inverse", "route_weights", "res",
             "w1", "w2", "w3", "s",
@@ -3185,7 +3430,7 @@ private enum Gemma4FusedLayerGlue {
 
     private static let deferredTailChainKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1_nb1_vec1",
+            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1_nb1_vec1\(expertTailVloadSuffix)",
             inputNames: [
                 "a", "sorted", "inverse", "route_weights", "res",
                 "w1", "w2", "w3", "s", "wn",
@@ -3274,6 +3519,9 @@ private enum Gemma4FusedLayerGlue {
             nextInputNormWeight.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-deferred-expert-tail-chain")
+        if expertTailVloadEnabled {
+            CBv2EngageMark.once("expert-tail-vload")
+        }
         let outs = deferredTailChainKernel(
             [
                 mlpOut, expertRows.sortedOutputs, expertRows.inverseOrder,
@@ -3308,6 +3556,9 @@ private enum Gemma4FusedLayerGlue {
             layerScalar.size == 1, layerScalar.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-deferred-expert-tail")
+        if expertTailVloadEnabled {
+            CBv2EngageMark.once("expert-tail-vload")
+        }
         return deferredTailKernel(
             [
                 mlpOut, expertRows.sortedOutputs, expertRows.inverseOrder,
@@ -4584,11 +4835,135 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
     private static let threadgroupSize = axis / valuesPerThread
     private static let eps: Float = 1e-6
 
+    /// FINAL-NORM-NB-001: the surplus-slot init and its barrier, and the
+    /// four-run device traffic, of the final norm.
+    ///
+    /// (a) THE PROLOGUE. The threadgroup is 2816 / 4 = 704 threads, which is
+    /// 22 simdgroups, and the cross-simdgroup scratch is declared 32 wide
+    /// because a simdgroup reduction reads a full 32 lanes. Slots 22 through
+    /// 31 therefore have NO producer, and the incumbent supplies their value
+    /// by having simdgroup 0 zero all 32 slots first:
+    ///
+    ///     if (simd_group_id == 0) local_sums[simd_lane_id] = 0.0f;
+    ///     threadgroup_barrier(mem_flags::mem_threadgroup);
+    ///
+    /// That is worth stating carefully, because the init is not guarding a
+    /// race between a thread and its own slot. Every producer writes its own
+    /// slot, and the barrier BELOW the writes already orders those against
+    /// the read. What the init actually does is supply a constant for the ten
+    /// slots nobody writes. So it can be supplied at the read instead, and
+    /// once it is, the write it ordered is gone and the barrier that ordered
+    /// it has nothing left to order:
+    ///
+    ///     acc = simd_sum(
+    ///         simd_lane_id < 22 ? local_sums[simd_lane_id] : 0.0f);
+    ///
+    /// The reduction sees the same 32 addends, with the same values in the
+    /// same lanes, so its tree and its result are unchanged. This is the
+    /// rewrite the tip already carries in every other kernel of the decode
+    /// glue; this one kernel was not converted with them.
+    ///
+    /// (b) THE RUNS. The kernel partitions the row as the glue kernels do,
+    /// `base = row * 2816 + lid * 4` and `wbase = lid * 4`, and then reads its
+    /// activation twice, reads its weight and writes its output as four
+    /// scalar operations each. 2816 is a multiple of four and both bases add
+    /// only `lid * 4` to a multiple of it, so every run is four-element
+    /// aligned with no runtime condition, and each becomes one four-wide
+    /// access. The activation is loaded once and the second read is served
+    /// from the register run.
+    ///
+    /// Exactness: the same bits from the same addresses, each component
+    /// widened at the statement that widened it, `acc` folded over i = 0..3
+    /// in the order it was folded, and the BF16 boundary of the norm
+    /// preserved. The `out` store leaves the loop to become one vector store,
+    /// still ahead of the same barrier and of the `quad_sums` write, which
+    /// still sums the same four activation-type values left to right. The
+    /// serial leader loop that reproduces the head prepass is untouched.
+    ///
+    /// This kernel runs once per decode step rather than once per layer, so
+    /// the traffic it saves is small in absolute terms. It is carried because
+    /// it is exact and because the deleted barrier sits on the dependent
+    /// chain.
+    ///
+    /// `DARKBLOOM_GEMMA4_FINAL_NORM_NB=0` restores the incumbent body and the
+    /// incumbent pipeline name with it.
+    static let finalNormNbEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_FINAL_NORM_NB"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let finalNormNbSuffix: String =
+        finalNormNbEnabled ? "_nb1_vload_v1" : ""
+
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_final_rmsnorm_mma_xsum_2816_bf16_v1",
+        name: "gemma4_final_rmsnorm_mma_xsum_2816_bf16_v1\(finalNormNbSuffix)",
         inputNames: ["x", "w"],
         outputNames: ["out", "xSums"],
-        source: """
+        source: finalNormNbEnabled ? """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float local_inv[1];
+            threadgroup float local_sums[32];
+            threadgroup float quad_sums[704];
+
+            const uint base = row * 2816 + lid * 4;
+            const uint wbase = lid * 4;
+
+            // Exact `rms_single_row<T, 4>` reduction for axis 2816.
+            const vec<T, 4> xv =
+                *reinterpret_cast<const device vec<T, 4>*>(x + base);
+            float acc = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+                const float xi = xv[i];
+                acc += xi * xi;
+            }
+            acc = simd_sum(acc);
+            if (simd_lane_id == 0) {
+                local_sums[simd_group_id] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+                acc = simd_sum(
+                    simd_lane_id < 22 ? local_sums[simd_lane_id] : 0.0f);
+                if (simd_lane_id == 0) {
+                    local_inv[0] =
+                        metal::precise::rsqrt(acc / 2816.0f + 1e-06f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const vec<T, 4> wv =
+                *reinterpret_cast<const device vec<T, 4>*>(w + wbase);
+            vec<T, 4> outv;
+            for (int i = 0; i < 4; ++i) {
+                // Preserve the stock RMSNorm's BF16 boundary exactly.
+                outv[i] = wv[i]
+                    * static_cast<T>((float)xv[i] * local_inv[0]);
+            }
+            *reinterpret_cast<device vec<T, 4>*>(out + base) = outv;
+
+            // This four-value expression is exactly one addend of the head's
+            // stock xsum loop, evaluated at activation dtype then widened.
+            quad_sums[lid] = outv[0] + outv[1] + outv[2] + outv[3];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // One leader serially reproduces the head prepass's sixteen
+            // ascending `s += four BF16 values` statements for this 64-wide
+            // group. No SIMD reassociation is introduced.
+            if ((lid % 16) == 0) {
+                float s = 0.0f;
+                for (uint c = 0; c < 8; ++c) {
+                    const uint q = lid + c * 2;
+                    s += quad_sums[q];
+                    s += quad_sums[q + 1];
+                }
+                xSums[row * 44 + lid / 16] = s;
+            }
+            """ : """
             const uint row = threadgroup_position_in_grid.x;
             const uint lid = thread_position_in_threadgroup.x;
             const uint simd_lane_id = thread_index_in_simdgroup;
@@ -4681,6 +5056,9 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
             produced: outputs[1], for: outputs[0])
         else { return nil }
         CBv2EngageMark.once("final-norm-mma-xsum")
+        if finalNormNbEnabled {
+            CBv2EngageMark.once("final-norm-nb")
+        }
         return (outputs[0], sums)
     }
 }
@@ -5771,4 +6149,7 @@ extension Gemma4TextModel: CBv2MTPForwardable {
 // by the preceding ranked submission of this content apart from any rotation item declared in its note.
 
 // Ranked resample marker 2: this archive is a further ranked sample of the tree carried
+// by the preceding ranked submission of this content apart from any rotation item declared in its note.
+
+// Ranked resample marker 11: this archive is a further ranked sample of the tree carried
 // by the preceding ranked submission of this content apart from any rotation item declared in its note.

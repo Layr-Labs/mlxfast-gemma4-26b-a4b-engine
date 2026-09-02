@@ -295,6 +295,88 @@ void qmv(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+// This vendored runtime only installs the affine half of upstream MLX's
+// qmv_wide family. It is profitable for affine quantization on gen-15+.
+inline bool use_qmv_wide(const std::string& mode, metal::Device& d) {
+  return mode == "affine" && d.get_architecture_gen() >= 15;
+}
+
+void qmv_wide(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    array& out,
+    int group_size,
+    int bits,
+    int M,
+    int N,
+    int K,
+    metal::Device& d,
+    const Stream& s,
+    const std::string& mode) {
+  int n_tiles = (M + 4) / 5;
+  int vecs_per_tg = (M + n_tiles - 1) / n_tiles;
+
+  int k_lanes = mode == "affine" ? 8 : 16;
+  constexpr int num_simdgroups = 2;
+  int B = out.size() / M / N;
+  bool batched = B > 1;
+  int rows_per_tg = (32 / k_lanes) * num_simdgroups;
+
+  MTL::Size group_dims(32, num_simdgroups, 1);
+  MTL::Size grid_dims(
+      (M + vecs_per_tg - 1) / vecs_per_tg,
+      (N + rows_per_tg - 1) / rows_per_tg,
+      B);
+
+  std::string kname;
+  kname.reserve(64);
+  std::string type_string = get_type_string(x.dtype());
+  concatenate(
+      kname,
+      mode + "_qmv_wide_",
+      type_string,
+      "_gs_",
+      group_size,
+      "_b_",
+      bits,
+      "_nv_",
+      vecs_per_tg,
+      "_kl_",
+      k_lanes,
+      batched ? "_batch_1" : "_batch_0");
+  auto kernel = get_quantized_kernel_wrapped(
+      d,
+      kname,
+      "qmv_wide",
+      mode,
+      type_string,
+      group_size,
+      bits,
+      vecs_per_tg,
+      k_lanes,
+      batched);
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  int c = 0;
+  compute_encoder.set_input_array(w, c++);
+  compute_encoder.set_input_array(scales, c++);
+  if (biases) {
+    compute_encoder.set_input_array(*biases, c++);
+  }
+  compute_encoder.set_input_array(x, c++);
+  compute_encoder.set_output_array(out, c++);
+  compute_encoder.set_bytes(K, c++);
+  compute_encoder.set_bytes(N, c++);
+  compute_encoder.set_bytes(M, c++);
+  add_strides_and_shapes(compute_encoder, !batched, x, w, scales, biases, c);
+
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
 void qvm_split_k(
     const array& x,
     const array& w,
@@ -1385,6 +1467,10 @@ void dispatch_qmv(
   // It is a qmv with a small inner dimension so route to qmv_quad kernel
   if ((K == 128 || K == 64) && is_power_of_2(bits)) {
     qmv_quad(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
+    return;
+  }
+  if (M >= 2 && use_qmv_wide(mode, d)) {
+    qmv_wide(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
     return;
   }
   qmv(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);

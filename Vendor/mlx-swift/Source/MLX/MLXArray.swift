@@ -581,6 +581,14 @@ public final class MLXArray {
         return MLXArray(new)
     }
 
+    /// Cross-module counterpart used by stateful compile bindings that must
+    /// temporarily install tracer contexts and then restore the exact prior
+    /// array context. This has the same implementation-only status as
+    /// `_updateInternal`; it does not copy or evaluate array storage.
+    public func _copyContextInternal() -> MLXArray {
+        copyContext()
+    }
+
     /// Used to apply update at given indices.
     ///
     /// An assignment through indices `array[indices]` will produce

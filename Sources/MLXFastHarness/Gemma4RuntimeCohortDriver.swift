@@ -528,14 +528,18 @@ extension Gemma4Runtime {
     /// Build a fresh CBv2 engine over the resident Gemma 4 text tower for one
     /// closed cohort of `batchSize` streams: CONTIGUOUS KV (explicitly — no
     /// paged type is constructible from this path), greedy default sampler,
-    /// prefix cache off, and a scheduler sized so the whole cohort prefills
-    /// together and decodes in lockstep `[B, 1]` rounds:
+    /// prefix cache off, and a scheduler sized so multi-stream cohorts prefill
+    /// together and decode in lockstep `[B, 1]` rounds:
     ///
     ///   * `maxConcurrentRequests = batchSize` — the cohort IS the capacity;
-    ///   * `maxBatchedTokensPerStep >= batchSize * seedTokenCount` and
-    ///     `prefillChunkSize >= seedTokenCount` — one planned step admits
-    ///     every stream's whole (equal-length) seed, so no stream enters
-    ///     decode while another still prefills.
+    ///   * multi-stream cohorts retain
+    ///     `maxBatchedTokensPerStep >= batchSize * seedTokenCount` and
+    ///     `prefillChunkSize >= seedTokenCount`, so one planned step admits
+    ///     every stream's whole (equal-length) seed;
+    ///   * the physical-B1 lane caps long prefill steps at 16K tokens. A
+    ///     single stream has no cohort peer to keep in lockstep, and the
+    ///     bounded step stays below the engine-health watchdog on the exact
+    ///     64K/128K benchmark prompts.
     ///
     /// A nil drafter builds the unchanged serial engine. A production Gemma
     /// MTP drafter is legal only at physical B1 and arrives with the sealed
@@ -580,15 +584,30 @@ extension Gemma4Runtime {
             backend: backend,
             cacheProvider: CBv2LayerCacheBank(caches: caches),
             sampler: CBv2DefaultSampler(),
-            schedulerConfig: CBv2SchedulerConfig(
-                maxConcurrentRequests: batchSize,
-                maxBatchedTokensPerStep: Swift.max(
-                    2048, batchSize * seedTokenCount),
-                prefillChunkSize: Swift.max(512, seedTokenCount),
-                maxWaiting: batchSize,
-                enablePrefixCache: false),
+            schedulerConfig: cohortSchedulerConfig(
+                batchSize: batchSize, seedTokenCount: seedTokenCount),
             mtpDrafter: mtpDrafter,
             mtpConfig: mtpConfig)
+    }
+
+    /// Construction-time scheduler geometry for the closed cohort. The B1
+    /// cap is a fixed workload route, not a per-step eligibility decision.
+    static func cohortSchedulerConfig(
+        batchSize: Int, seedTokenCount: Int
+    ) -> CBv2SchedulerConfig {
+        let wholeSeedChunk = Swift.max(512, seedTokenCount)
+        let prefillChunkSize =
+            batchSize == 1 ? Swift.min(16_384, wholeSeedChunk) : wholeSeedChunk
+        let maxBatchedTokensPerStep =
+            batchSize == 1
+            ? Swift.max(2048, prefillChunkSize)
+            : Swift.max(2048, batchSize * seedTokenCount)
+        return CBv2SchedulerConfig(
+            maxConcurrentRequests: batchSize,
+            maxBatchedTokensPerStep: maxBatchedTokensPerStep,
+            prefillChunkSize: prefillChunkSize,
+            maxWaiting: batchSize,
+            enablePrefixCache: false)
     }
 
     /// Production Gemma installs exact verifier entrypoints only for B1/C2,

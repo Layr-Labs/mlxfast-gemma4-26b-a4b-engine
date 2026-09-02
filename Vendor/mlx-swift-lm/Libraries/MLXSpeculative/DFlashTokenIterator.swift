@@ -19,7 +19,7 @@ public struct DFlashTokenIterator: TokenIteratorProtocol {
     private let promptTokenCount: Int
 
     private var bonus: Int
-    private var targetHidden: MLXArray
+    private var draftContext: MLXArray
 
     private var pendingTokens: [Int] = []
     private var pendingIndex = 0
@@ -78,10 +78,11 @@ public struct DFlashTokenIterator: TokenIteratorProtocol {
             targetLayerIds: drafter.config.targetLayerIds
         )
         let firstBonusArray = prefillOut.tokens[0..., -1]
-        eval(firstBonusArray, prefillOut.targetHidden)
+        let draftContext = try drafter.projectTargetHidden(prefillOut.targetHidden)
+        eval(firstBonusArray, draftContext)
 
         self.bonus = Int(firstBonusArray.item(Int32.self))
-        self.targetHidden = prefillOut.targetHidden
+        self.draftContext = draftContext
         self.promptPrefillTime = -prefillStart.timeIntervalSinceNow
         self.pendingTokens.append(self.bonus)
     }
@@ -114,14 +115,14 @@ public struct DFlashTokenIterator: TokenIteratorProtocol {
                 targetCache: &targetCache,
                 draftCache: draftCache,
                 bonus: bonus,
-                targetHidden: targetHidden,
+                projectedContext: draftContext,
                 promptTokenCount: promptTokenCount,
                 generatedTokenCount: tokenCount,
                 blockSize: roundBlockSize,
                 maxEmitCount: remaining
             )
             bonus = round.bonus
-            targetHidden = round.targetHidden
+            draftContext = try drafter.projectTargetHidden(round.targetHidden)
             pendingTokens.append(contentsOf: round.tokens)
         } catch {
             // IteratorProtocol cannot throw. Fail closed rather than

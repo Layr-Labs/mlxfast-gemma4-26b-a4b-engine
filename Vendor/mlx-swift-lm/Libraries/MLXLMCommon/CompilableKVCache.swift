@@ -155,6 +155,64 @@ public class CompilableKVCache: BaseKVCache {
         return (self.keys!, self.values!)
     }
 
+    /// Install a committed prefix into this cache without changing the
+    /// identity of any state array already captured by `compile`.
+    ///
+    /// The first call establishes the fixed buffer geometry. Later calls are
+    /// session-boundary resets for a persistent compiled verifier: they replace
+    /// the arrays' graph values through `_updateInternal`, so the compiled
+    /// closure continues to observe the same state objects.
+    public func installCommittedPrefix(
+        keys prefixKeys: MLXArray,
+        values prefixValues: MLXArray,
+        offset: Int
+    ) {
+        precondition(offset >= 0 && offset <= maxLength)
+        precondition(prefixKeys.dim(2) == offset && prefixValues.dim(2) == offset)
+        precondition(prefixKeys.dim(0) == prefixValues.dim(0))
+        precondition(prefixKeys.dim(1) == prefixValues.dim(1))
+
+        if let keys, let values {
+            precondition(
+                keys.shape
+                    == [prefixKeys.dim(0), prefixKeys.dim(1), maxLength, prefixKeys.dim(3)]
+                    && keys.dtype == prefixKeys.dtype)
+            precondition(
+                values.shape
+                    == [prefixValues.dim(0), prefixValues.dim(1), maxLength, prefixValues.dim(3)]
+                    && values.dtype == prefixValues.dtype)
+            if offset > 0 {
+                let start = MLXArray([Int32(0)])
+                keys._updateInternal(
+                    dynamicSliceUpdate(keys, update: prefixKeys, start: start, axes: [2]))
+                values._updateInternal(
+                    dynamicSliceUpdate(values, update: prefixValues, start: start, axes: [2]))
+            }
+        } else {
+            let keyBuffer = MLXArray.zeros(
+                [prefixKeys.dim(0), prefixKeys.dim(1), maxLength, prefixKeys.dim(3)],
+                dtype: prefixKeys.dtype)
+            let valueBuffer = MLXArray.zeros(
+                [prefixValues.dim(0), prefixValues.dim(1), maxLength, prefixValues.dim(3)],
+                dtype: prefixValues.dtype)
+            if offset > 0 {
+                keyBuffer[.ellipsis, ..<offset, 0...] = prefixKeys
+                valueBuffer[.ellipsis, ..<offset, 0...] = prefixValues
+            }
+            self.keys = keyBuffer
+            self.values = valueBuffer
+        }
+        offsetArray._updateInternal(MLXArray([Int32(offset)]))
+    }
+
+    /// Roll back a speculative tail while preserving compile-captured state
+    /// identity. The stale bytes remain masked and are overwritten by the next
+    /// verifier write, exactly like `KVCacheSimple.trim`.
+    public func rewindCompiledOffset(by count: Int) {
+        precondition(count >= 0)
+        offsetArray._updateInternal(offsetArray - MLXArray([Int32(count)]))
+    }
+
     // MARK: - Mask (Overflow Bin)
 
     /// Generate attention mask for the full-buffer return.

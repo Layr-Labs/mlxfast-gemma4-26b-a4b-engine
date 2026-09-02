@@ -91,7 +91,6 @@ public struct WidthProbeOptions {
     /// Default 0.05 is a generous cover over the contract's EPS_REL (~0.4-0.8%)
     /// with a safety factor; the box sweeps it.
     public let relEnvelope: Double
-
     public init(
         weightsPath: String, tapePath: String, steps: Int,
         windowWidths: [Int], batchWidth: Int?, outputPath: String?,
@@ -105,6 +104,19 @@ public struct WidthProbeOptions {
         self.outputPath = outputPath
         self.logitTopK = logitTopK
         self.relEnvelope = relEnvelope
+    }
+}
+
+/// Exact first-audit A/B/C localization over production CBv2 caches.
+public struct CBv2MTPAuditProbeOptions {
+    public let weightsPath: String
+    public let tapePath: String
+    public let outputPath: String
+
+    public init(weightsPath: String, tapePath: String, outputPath: String) {
+        self.weightsPath = weightsPath
+        self.tapePath = tapePath
+        self.outputPath = outputPath
     }
 }
 
@@ -140,6 +152,10 @@ struct WidthProbeTape {
 /// Everything one probed forward records, per fed position: layer K/V, MoE
 /// router scores/selections (layer execution order), and final logits.
 struct ForwardCapture {
+    /// Exact scaled embedding entering layer zero.
+    var inputHidden: MLXArray?
+    /// Post-layer hidden states in layer execution order.
+    var layerHiddenStates: [MLXArray] = []
     /// [layerIdx: (keys, values)] for the fed window — shapes [1, H, L, D].
     var layerKV: [Int: (MLXArray, MLXArray)] = [:]
     /// Router events in layer execution order: (expertScores [.., E],
@@ -158,6 +174,21 @@ private final class RouterBox {
     var events: [(scores: MLXArray, indices: MLXArray)] = []
 }
 
+/// Legacy caches return the complete committed K/V view from attention. The
+/// width probe compares the columns produced by this call, so retain only its
+/// trailing `count` positions. CBv2/new-column hooks already have that length
+/// and pass through the same slice unchanged.
+func trailingKVColumns(
+    _ pair: (MLXArray, MLXArray), count: Int
+) -> (MLXArray, MLXArray) {
+    let keyStart = pair.0.dim(2) - count
+    let valueStart = pair.1.dim(2) - count
+    precondition(keyStart >= 0 && valueStart >= 0)
+    return (
+        pair.0[0..., 0..., keyStart..., 0...],
+        pair.1[0..., 0..., valueStart..., 0...])
+}
+
 func capturedForward(
     model: Gemma4TextModel, tokens: [Int], batch: Int, cache: [KVCache]
 ) -> ForwardCapture {
@@ -173,12 +204,198 @@ func capturedForward(
     let box = CaptureBox()
     let logits = model.widthProbeForward(
         input, cache: cache,
-        captureHook: { idx, kvPair in box.layerKV[idx] = kvPair })
+        captureHook: { idx, kvPair in
+            box.layerKV[idx] = trailingKVColumns(kvPair, count: tokens.count)
+        })
     capture.layerKV = box.layerKV
     capture.routerEvents = routerBox.events
     capture.logits = logits
     eval(logits)
     return capture
+}
+
+func capturedCBv2DiagnosticForward(
+    model: Gemma4TextModel, tokens: [Int], cache: [KVCache],
+    installedVerifier: Bool
+) -> ForwardCapture {
+    var capture = ForwardCapture()
+    let routerBox = RouterBox()
+    Gemma4RouterProbe.recorder = { scores, indices in
+        routerBox.events.append((scores, indices))
+    }
+    defer { Gemma4RouterProbe.recorder = nil }
+    let input = MLXArray(tokens.map(Int32.init)).reshaped([1, tokens.count])
+    let box = CaptureBox()
+    let result = model.cbv2MTPVerifierDiagnosticForward(
+        input, caches: cache,
+        installedVerifier: installedVerifier,
+        captureHook: { idx, kvPair in
+            box.layerKV[idx] = trailingKVColumns(kvPair, count: tokens.count)
+        })
+    capture.layerKV = box.layerKV
+    capture.routerEvents = routerBox.events
+    capture.inputHidden = result.inputHidden
+    capture.layerHiddenStates = result.layerHiddenStates
+    capture.logits = result.logits
+    eval([result.inputHidden, result.logits] + result.layerHiddenStates)
+    return capture
+}
+
+/// One independent production-contiguous CBv2 state stack. Separate stacks
+/// avoid rollback/copy semantics entirely: A, B, and C start from identical
+/// scheduled-prefill and ordinary-L1 graphs, then diverge only at the probed
+/// audit transition.
+private final class CBv2MTPAuditProbeRig {
+    let backend: CBv2ContiguousKVBackend
+    let bank: CBv2LayerCacheBank
+    let rowState: [CBv2SequenceKV?]
+    let caches: [CBv2AttendingLayerCache]
+    let kvCaches: [KVCache]
+
+    init(model: Gemma4TextModel, promptLength: Int) throws {
+        let kinds = model.cbv2LayerKinds
+        backend = CBv2ContiguousKVBackend(
+            config: .init(bytesCapacity: 4 << 30))
+        rowState = try backend.makeSequenceState(
+            layerKinds: kinds, promptLength: promptLength,
+            maxLength: promptLength + 16)
+        let installedCaches = try model.newCacheV2 { index, kind in
+            CBv2LayerCache(layerIndex: index, kind: kind)
+        }
+        bank = CBv2LayerCacheBank(caches: installedCaches)
+        caches = bank.layerCaches(rowStates: [rowState])
+        kvCaches = caches.map { cache in
+            guard let kv = cache as? KVCache else {
+                preconditionFailure(
+                    "CBv2 audit cache \(type(of: cache)) does not conform to KVCache")
+            }
+            return kv
+        }
+    }
+
+    deinit {
+        backend.release(rowState)
+    }
+
+    func scheduledPrefill(model: Gemma4TextModel, tokens: [Int]) -> MLXArray {
+        let input = MLXArray(tokens.map(Int32.init)).reshaped([1, tokens.count])
+        let logits = model.cbv2Prefill(
+            input, inputEmbedding: nil, cache: kvCaches,
+            requirement: .lastPositionLogits)
+        eval(logits)
+        eval(kvCaches)
+        return logits
+    }
+}
+
+private func hiddenColumn(_ hidden: MLXArray, position: Int) -> MLXArray {
+    hidden[0 ..< 1, position ..< position + 1, 0...]
+}
+
+private func auditTensorComparison(_ lhs: MLXArray, _ rhs: MLXArray) -> [String: Any] {
+    [
+        "bit_equal": probeBitEqual(lhs, rhs),
+        "max_abs_diff": maxAbsDiff(lhs, rhs),
+        "lhs_shape": lhs.shape,
+        "rhs_shape": rhs.shape,
+    ]
+}
+
+private func auditSelectionEqual(
+    _ lhs: MLXArray, lhsPosition: Int,
+    _ rhs: MLXArray, rhsPosition: Int
+) -> Bool {
+    let width = lhs.dim(-1)
+    let lhsRow = lhs.reshaped([-1, width])[lhsPosition ..< lhsPosition + 1, 0...]
+    let rhsRow = rhs.reshaped([-1, width])[rhsPosition ..< rhsPosition + 1, 0...]
+    return lhsRow.asArray(Int32.self) == rhsRow.asArray(Int32.self)
+}
+
+/// Ordered comparison for one logical audit column. The first-divergence
+/// order follows real execution: scaled embedding, then each layer's K, V,
+/// router scores/selection and completed hidden, then final logits.
+private func compareCBv2AuditColumn(
+    lhs: ForwardCapture, lhsPosition: Int,
+    rhs: ForwardCapture, rhsPosition: Int
+) -> [String: Any] {
+    var first: [String: Any]?
+    func recordFirst(kind: String, layer: Int?, comparison: [String: Any]) {
+        guard first == nil, comparison["bit_equal"] as? Bool == false else { return }
+        var value: [String: Any] = [
+            "kind": kind,
+            "max_abs_diff": comparison["max_abs_diff"] as? Double ?? .infinity,
+        ]
+        if let layer { value["layer"] = layer }
+        first = value
+    }
+
+    var result: [String: Any] = [:]
+    if let lhsInput = lhs.inputHidden, let rhsInput = rhs.inputHidden {
+        let comparison = auditTensorComparison(
+            hiddenColumn(lhsInput, position: lhsPosition),
+            hiddenColumn(rhsInput, position: rhsPosition))
+        result["input_hidden"] = comparison
+        recordFirst(kind: "input_hidden", layer: nil, comparison: comparison)
+    }
+
+    var layerReports: [[String: Any]] = []
+    for layer in lhs.layerKV.keys.sorted() {
+        guard let lhsKV = lhs.layerKV[layer], let rhsKV = rhs.layerKV[layer] else { continue }
+        let k = auditTensorComparison(
+            kvColumn(lhsKV.0, batchRow: 0, position: lhsPosition),
+            kvColumn(rhsKV.0, batchRow: 0, position: rhsPosition))
+        let v = auditTensorComparison(
+            kvColumn(lhsKV.1, batchRow: 0, position: lhsPosition),
+            kvColumn(rhsKV.1, batchRow: 0, position: rhsPosition))
+        var layerReport: [String: Any] = ["layer": layer, "k": k, "v": v]
+        recordFirst(kind: "k", layer: layer, comparison: k)
+        recordFirst(kind: "v", layer: layer, comparison: v)
+
+        if layer < lhs.routerEvents.count, layer < rhs.routerEvents.count {
+            let lhsRouter = lhs.routerEvents[layer]
+            let rhsRouter = rhs.routerEvents[layer]
+            let expertCount = lhsRouter.scores.dim(-1)
+            let lhsScores = lhsRouter.scores.reshaped([-1, expertCount])[
+                lhsPosition ..< lhsPosition + 1, 0...]
+            let rhsScores = rhsRouter.scores.reshaped([-1, expertCount])[
+                rhsPosition ..< rhsPosition + 1, 0...]
+            let scores = auditTensorComparison(lhsScores, rhsScores)
+            let selectionEqual = auditSelectionEqual(
+                lhsRouter.indices, lhsPosition: lhsPosition,
+                rhsRouter.indices, rhsPosition: rhsPosition)
+            layerReport["router_scores"] = scores
+            layerReport["router_selection_equal"] = selectionEqual
+            recordFirst(kind: "router_scores", layer: layer, comparison: scores)
+            if first == nil && !selectionEqual {
+                first = ["kind": "router_selection", "layer": layer]
+            }
+        }
+
+        if layer < lhs.layerHiddenStates.count, layer < rhs.layerHiddenStates.count {
+            let hidden = auditTensorComparison(
+                hiddenColumn(lhs.layerHiddenStates[layer], position: lhsPosition),
+                hiddenColumn(rhs.layerHiddenStates[layer], position: rhsPosition))
+            layerReport["hidden"] = hidden
+            recordFirst(kind: "hidden", layer: layer, comparison: hidden)
+        }
+        layerReports.append(layerReport)
+    }
+    result["layers"] = layerReports
+
+    if let lhsLogits = lhs.logits, let rhsLogits = rhs.logits {
+        let lhsColumn = hiddenColumn(lhsLogits, position: lhsPosition)
+        let rhsColumn = hiddenColumn(rhsLogits, position: rhsPosition)
+        let logits = auditTensorComparison(lhsColumn, rhsColumn)
+        result["logits"] = logits
+        result["lhs_argmax"] = Int(
+            lhsColumn.asType(.float32).argMax(axis: -1).item(Int32.self))
+        result["rhs_argmax"] = Int(
+            rhsColumn.asType(.float32).argMax(axis: -1).item(Int32.self))
+        recordFirst(kind: "logits", layer: nil, comparison: logits)
+    }
+    result["bit_identical_everywhere"] = first == nil
+    if let first { result["first_divergence"] = first }
+    return result
 }
 
 // MARK: - Comparison
@@ -443,6 +660,152 @@ struct WidthProbeResult {
 }
 
 extension Gemma4Runtime {
+
+    /// Reproduce the first production MTP audit transition over three
+    /// independent CBv2 states and localize the first width-dependent tensor.
+    public static func runCBv2MTPAuditProbe(
+        _ options: CBv2MTPAuditProbeOptions
+    ) throws {
+        try validateRuntimeWorkerPinnedConfiguration(weightsPath: options.weightsPath)
+        let config = try Gemma4A4BConfig.load(from: options.weightsPath)
+        let loader = try Gemma4A4BWeightLoader(weightsPath: options.weightsPath)
+        let weightCache = Gemma4A4BRuntimeWeightCache(loader: loader, config: config)
+        let model = try weightCache.requireLibraryModelAtDrainFencedBoundary()
+        let tape = try WidthProbeTape.load(path: options.tapePath)
+        guard tape.chain.count >= 4 else {
+            throw MLXFastError.invalidInput(
+                "CBv2 MTP audit probe requires four teacher-forced chain tokens")
+        }
+
+        let installed = try CBv2MTPAuditProbeRig(
+            model: model, promptLength: tape.seedTokens.count)
+        let stockRectangular = try CBv2MTPAuditProbeRig(
+            model: model, promptLength: tape.seedTokens.count)
+        let serial = try CBv2MTPAuditProbeRig(
+            model: model, promptLength: tape.seedTokens.count)
+
+        let prefillInstalled = installed.scheduledPrefill(
+            model: model, tokens: tape.seedTokens)
+        let prefillStock = stockRectangular.scheduledPrefill(
+            model: model, tokens: tape.seedTokens)
+        let prefillSerial = serial.scheduledPrefill(
+            model: model, tokens: tape.seedTokens)
+        let prefillToken = Int(
+            prefillInstalled.asType(.float32).argMax(axis: -1).item(Int32.self))
+
+        // The newest confirmed token is not yet in target KV after prefill.
+        // Feed it once through the ordinary B1/L1 target on every stack,
+        // exactly matching the plain target seed round before audit zero.
+        let seedInstalled = capturedCBv2DiagnosticForward(
+            model: model, tokens: [tape.chain[0]], cache: installed.kvCaches,
+            installedVerifier: false)
+        let seedStock = capturedCBv2DiagnosticForward(
+            model: model, tokens: [tape.chain[0]], cache: stockRectangular.kvCaches,
+            installedVerifier: false)
+        let seedSerial = capturedCBv2DiagnosticForward(
+            model: model, tokens: [tape.chain[0]], cache: serial.kvCaches,
+            installedVerifier: false)
+        eval(installed.kvCaches)
+        eval(stockRectangular.kvCaches)
+        eval(serial.kvCaches)
+
+        // Audit zero consumes [chain1, chain2] and should predict
+        // [chain2, chain3]. A uses every installed B1/C2 binding; B retains
+        // stock rectangular arithmetic; both use the same construction-bound
+        // serialized-attention controller as production. C executes two
+        // independent ordinary B1/L1 forwards.
+        guard installed.bank.supportsCertifiedMTPRectangularVerification,
+            stockRectangular.bank.supportsCertifiedMTPRectangularVerification
+        else {
+            throw MLXFastError.invalidInput(
+                "CBv2 audit probe requires the contiguous serialized-attention controller")
+        }
+        installed.bank.setCertifiedMTPRectangularVerification(true)
+        stockRectangular.bank.setCertifiedMTPRectangularVerification(true)
+        let auditInputs = [tape.chain[1], tape.chain[2]]
+        let installedC2 = capturedCBv2DiagnosticForward(
+            model: model, tokens: auditInputs, cache: installed.kvCaches,
+            installedVerifier: true)
+        let stockC2 = capturedCBv2DiagnosticForward(
+            model: model, tokens: auditInputs, cache: stockRectangular.kvCaches,
+            installedVerifier: false)
+        eval(installed.kvCaches)
+        eval(stockRectangular.kvCaches)
+
+        let serialColumns = auditInputs.map { token -> ForwardCapture in
+            let capture = capturedCBv2DiagnosticForward(
+                model: model, tokens: [token], cache: serial.kvCaches,
+                installedVerifier: false)
+            eval(serial.kvCaches)
+            return capture
+        }
+
+        let prefillInstalledStock = auditTensorComparison(
+            prefillInstalled, prefillStock)
+        let prefillInstalledSerial = auditTensorComparison(
+            prefillInstalled, prefillSerial)
+        let seedInstalledStock = compareCBv2AuditColumn(
+            lhs: seedInstalled, lhsPosition: 0,
+            rhs: seedStock, rhsPosition: 0)
+        let seedInstalledSerial = compareCBv2AuditColumn(
+            lhs: seedInstalled, lhsPosition: 0,
+            rhs: seedSerial, rhsPosition: 0)
+
+        var installedVsStock: [[String: Any]] = []
+        var installedVsSerial: [[String: Any]] = []
+        var stockVsSerial: [[String: Any]] = []
+        for column in 0..<2 {
+            var aB = compareCBv2AuditColumn(
+                lhs: installedC2, lhsPosition: column,
+                rhs: stockC2, rhsPosition: column)
+            aB["column"] = column
+            installedVsStock.append(aB)
+
+            var aC = compareCBv2AuditColumn(
+                lhs: installedC2, lhsPosition: column,
+                rhs: serialColumns[column], rhsPosition: 0)
+            aC["column"] = column
+            installedVsSerial.append(aC)
+
+            var bC = compareCBv2AuditColumn(
+                lhs: stockC2, lhsPosition: column,
+                rhs: serialColumns[column], rhsPosition: 0)
+            bC["column"] = column
+            stockVsSerial.append(bC)
+        }
+
+        let report: [String: Any] = [
+            "probe": "gemma4-cbv2-first-mtp-audit-abc",
+            "weights": options.weightsPath,
+            "tape": options.tapePath,
+            "physical_batch": 1,
+            "audit_width": 2,
+            "seed_prompt_tokens": tape.seedTokens.count,
+            "prefill_argmax": prefillToken,
+            "expected_prefill_argmax": tape.chain[0],
+            "plain_l1_input": tape.chain[0],
+            "audit_inputs": auditInputs,
+            "expected_audit_argmax": [tape.chain[2], tape.chain[3]],
+            "prefill_parity": [
+                "installed_vs_stock": prefillInstalledStock,
+                "installed_vs_serial": prefillInstalledSerial,
+            ],
+            "plain_l1_parity": [
+                "installed_vs_stock": seedInstalledStock,
+                "installed_vs_serial": seedInstalledSerial,
+            ],
+            "comparisons": [
+                "installed_c2_vs_stock_c2": installedVsStock,
+                "installed_c2_vs_serial_l1": installedVsSerial,
+                "stock_c2_vs_serial_l1": stockVsSerial,
+            ],
+        ]
+        let data = try JSONSerialization.data(
+            withJSONObject: report, options: [.sortedKeys, .prettyPrinted])
+        try data.write(to: URL(fileURLWithPath: options.outputPath))
+        FileHandle.standardError.write(
+            Data("CBv2 audit probe: report written to \(options.outputPath)\n".utf8))
+    }
 
     public static func runWidthProbe(_ options: WidthProbeOptions) throws {
         try validateRuntimeWorkerPinnedConfiguration(weightsPath: options.weightsPath)

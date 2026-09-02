@@ -71,6 +71,83 @@ public enum Gemma4PrefillGlueV1 {
     private static let nReads = 4
     private static let threadsPerRow = 704
     private static let eps: Float = 1e-6
+    private static let verifierColumns: Set<Int> = [2, 3, 4, 8, 16]
+
+    /// Fixed-width glue entrypoints installed with a physical-B1 C2-C4/C8/C16
+    /// verifier. All shape, dtype, epsilon, and weight checks happen in
+    /// `bindVerifier`; the measured closures dispatch directly.
+    public struct VerifierBindings {
+        public let normResidual: (MLXArray, MLXArray) -> MLXArray
+        public let dualPreNorm: (MLXArray) -> (MLXArray, MLXArray)
+        public let branchTail: (MLXArray, MLXArray, MLXArray) -> MLXArray
+    }
+
+    /// Bind the three rectangular norm/residual fusions used by one verifier
+    /// layer. The kernels preserve the same BF16 materialization boundaries as
+    /// the unfused chain; only intermediate device round trips are removed.
+    public static func bindVerifier(
+        columns: Int,
+        postAttentionWeight: MLXArray,
+        densePreWeight: MLXArray,
+        expertPreWeight: MLXArray,
+        densePostWeight: MLXArray,
+        expertPostWeight: MLXArray,
+        postFeedforwardWeight: MLXArray,
+        eps epsIn: Float
+    ) -> VerifierBindings? {
+        let weights = [
+            postAttentionWeight,
+            densePreWeight,
+            expertPreWeight,
+            densePostWeight,
+            expertPostWeight,
+            postFeedforwardWeight,
+        ]
+        guard verifierColumns.contains(columns), epsIn == eps,
+            weights.allSatisfy({
+                $0.dtype == .bfloat16 && $0.ndim == 1 && $0.dim(0) == axis
+            })
+        else { return nil }
+
+        let shape = [1, columns, axis]
+        let rows = columns
+        return VerifierBindings(
+            normResidual: { x, residual in
+                normResidualKernel(
+                    [x, postAttentionWeight, residual],
+                    template: [("T", DType.bfloat16)],
+                    grid: (threadsPerRow, rows, 1),
+                    threadGroup: (threadsPerRow, 1, 1),
+                    outputShapes: [shape],
+                    outputDTypes: [.bfloat16]
+                )[0]
+            },
+            dualPreNorm: { x in
+                let outputs = dualPreNormKernel(
+                    [x, densePreWeight, expertPreWeight],
+                    template: [("T", DType.bfloat16)],
+                    grid: (threadsPerRow, rows, 1),
+                    threadGroup: (threadsPerRow, 1, 1),
+                    outputShapes: [shape, shape],
+                    outputDTypes: [.bfloat16, .bfloat16]
+                )
+                return (outputs[0], outputs[1])
+            },
+            branchTail: { dense, expert, residual in
+                tailKernel(
+                    [
+                        dense, expert, densePostWeight, expertPostWeight,
+                        postFeedforwardWeight, residual,
+                    ],
+                    template: [("T", DType.bfloat16)],
+                    grid: (threadsPerRow, rows, 1),
+                    threadGroup: (threadsPerRow, 1, 1),
+                    outputShapes: [shape],
+                    outputDTypes: [.bfloat16]
+                )[0]
+            }
+        )
+    }
 
     /// `rms_single_row`'s reduction, reproduced so the fused kernels see the
     /// same accumulation order, the same cross-simd combine and the same

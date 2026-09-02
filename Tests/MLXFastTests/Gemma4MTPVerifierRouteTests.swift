@@ -6,6 +6,86 @@ import Testing
 @Suite("Gemma 4 MTP verifier route")
 struct Gemma4MTPVerifierRouteTests {
     @Test
+    func fixedC16RouteIsSerialReductionOnlyAndDoesNotAdmitOtherWidths() throws {
+        let route = CBv2Gemma4MTPVerifierRoute.testing(
+            gateUpUsesMMA8: false, tiedHeadVersion: 26)
+
+        for columns in [2, 3, 4, 8, 16] {
+            #expect(route.supports(.init(batch: 1, columns: columns)))
+            #expect(route.attentionStrategy(columns: columns) == .serializedDecode)
+            #expect(
+                Gemma4B1MTPFullAttentionGeometry.visibleKeyLengths(
+                    historyLength: 64, columns: columns)
+                    == (0..<columns).map { 65 + $0 })
+            #expect(CBv2AttentionQKVMMA8V1.supportsVerifierColumns(columns))
+            #expect(CBv2DenseMLPQMVV1.supportsVerifierColumns(columns))
+            #expect(Gemma4MMAQuantizedGEMV.supportsVerifierColumns(columns))
+            #expect(CBv2Gemma4MTPRouterProjection.supportsVerifierColumns(columns))
+        }
+        for columns in [1, 5, 6, 7, 9, 15, 17, 32] {
+            #expect(!route.supports(.init(batch: 1, columns: columns)))
+            #expect(route.strategy(for: .qkv, columns: columns) == nil)
+            #expect(route.attentionStrategy(columns: columns) == nil)
+        }
+        #expect(!route.supports(.init(batch: 8, columns: 8)))
+
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/"
+                    + "MTP/Gemma4MTPVerifierRoute.swift"),
+            encoding: .utf8)
+        #expect(source.contains("case sharedSerialReduction"))
+        #expect(source.contains("public static let certifiedColumns: Set<Int> = [2, 3, 4, 8, 16]"))
+        #expect(!source.contains("case stockModule"))
+
+        let c8Projections: [CBv2Gemma4MTPVerifierProjection] = [
+            .qkv, .attentionOutput, .denseGateUp, .denseDown,
+            .expert, .router, .tiedHead,
+        ]
+        for projection in c8Projections {
+            #expect(route.strategy(for: projection, columns: 8)
+                == .sharedSerialReduction)
+            #expect(route.strategy(for: projection, columns: 16)
+                == .sharedSerialReduction)
+        }
+    }
+
+    @Test
+    func sharedKVAttentionCandidateIsFullOnlyAndProductionStaysSerial() {
+        let route = CBv2Gemma4MTPVerifierRoute.production
+        for columns in 2...4 {
+            #expect(
+                route.candidateAttentionStrategy(
+                    kind: .full, columns: columns) == .sharedKVExact)
+            #expect(
+                route.candidateAttentionStrategy(
+                    kind: .slidingWindow(1_024), columns: columns)
+                    == .serializedDecode)
+            #expect(route.attentionStrategy(columns: columns) == .serializedDecode)
+        }
+        #expect(route.candidateAttentionStrategy(kind: .full, columns: 1) == nil)
+        #expect(route.candidateAttentionStrategy(kind: .full, columns: 5) == nil)
+    }
+
+    @Test
+    func sharedKVAttentionUsesAnIndependentVisibleEndPerColumn() {
+        for columns in 2...4 {
+            for history in [0, 1_024, 4_095, 4_096, 8_191, 8_192, 16_384, 65_536,
+                131_072]
+            {
+                #expect(
+                    Gemma4B1MTPFullAttentionGeometry.visibleKeyLengths(
+                        historyLength: history, columns: columns)
+                        == (0..<columns).map { history + $0 + 1 })
+            }
+        }
+    }
+
+    @Test
     func singlePromptShapesAreExplicitAndCannotAliasB8() throws {
         for columns in 2...4 {
             let b1 = CBv2Gemma4MTPVerifierShape(batch: 1, columns: columns)
@@ -92,7 +172,80 @@ struct Gemma4MTPVerifierRouteTests {
     }
 
     @Test
-    func installedLayerPathHasNoFailableDecodeHelperFallbacks() throws {
+    func installedAttentionSeparatesC2ToC4AndC8SerialReductionBinders() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourceURL = repositoryRoot.appendingPathComponent(
+            "Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Gemma4Text.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        let bindStart = try #require(source.range(
+            of: "    fileprivate func bindMTPVerifier(\n"
+                + "        columns: Int,\n"
+                + "        route: CBv2Gemma4MTPVerifierRoute\n"
+                + "    ) throws -> Gemma4MTPVerifierAttentionBindings"))
+        let bindEnd = try #require(source.range(
+            of: "    /// Exact B8/L1 Q/K/V projection",
+            range: bindStart.upperBound..<source.endIndex))
+        let binder = String(source[bindStart.lowerBound..<bindEnd.lowerBound])
+
+        #expect(binder.contains(
+            "let outputValue = try quantized(\n"
+                + "            oProj, component: \"\\(prefix) attention output projection\")"))
+        #expect(binder.contains("switch outputStrategy"))
+        #expect(binder.contains("case .combined:"))
+        #expect(binder.contains(
+            "output = CBv2AttentionOQMVV1.bindB1Verifier("))
+        #expect(binder.contains("case .sharedSerialReduction:"))
+        #expect(binder.contains(
+            "output = CBv2AttentionOQMVV1.bindB1SharedSerialReductionVerifier("))
+        #expect(binder.contains(
+            "inDim: outputValue.scales.dim(1) * outputValue.groupSize,"))
+        #expect(binder.contains("weight: outputValue.weight, scales: outputValue.scales,"))
+        #expect(binder.contains("biases: outputValue.biases, groupSize: outputValue.groupSize,"))
+        #expect(binder.contains("bits: outputValue.bits, mode: outputValue.mode"))
+        #expect(!binder.contains("outputValue(input)"))
+    }
+
+    @Test
+    func operatorDiagnosticCapturesTheSameCBv2TrunkWithAndWithoutInstalledBindings() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourceURL = repositoryRoot.appendingPathComponent(
+            "Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Gemma4Text.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+
+        let diagnosticStart = try #require(source.range(
+            of: "    fileprivate func callCapturingMTPVerifierDiagnostic("))
+        let trunkStart = try #require(source.range(
+            of: "    private func forwardTrunk(",
+            range: diagnosticStart.upperBound..<source.endIndex))
+        let diagnostic = String(
+            source[diagnosticStart.lowerBound..<trunkStart.lowerBound])
+        #expect(diagnostic.contains(
+            "Gemma4DFlashHiddenCapture(\n"
+                + "            layerIds: Array(layers.indices), layerCount: layers.count)"))
+        #expect(diagnostic.contains("dFlashHiddenCapture: hiddenCapture"))
+        #expect(diagnostic.contains("verifier: verifier"))
+        #expect(diagnostic.contains("hiddenCapture.orderedHiddenStates()"))
+
+        let publicStart = try #require(source.range(
+            of: "    public func cbv2MTPVerifierDiagnosticForward("))
+        let publicDiagnostic = String(source[publicStart.lowerBound..<source.endIndex])
+        #expect(publicDiagnostic.contains("installedVerifier: Bool"))
+        #expect(publicDiagnostic.contains(
+            "let verifier: Gemma4MTPVerifierContext? = installedVerifier ? context : nil"))
+        #expect(publicDiagnostic.contains(
+            "model.callCapturingMTPVerifierDiagnostic("))
+        #expect(publicDiagnostic.contains("layerHiddenStates:"))
+        #expect(publicDiagnostic.contains("inputHidden:"))
+    }
+
+    @Test
+    func installedLayerPathUsesConstructionBoundRectangularGlue() throws {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -103,12 +256,15 @@ struct Gemma4MTPVerifierRouteTests {
 
         let routerStart = try #require(source.range(
             of: "fileprivate func bindMTPVerifier(\n"
-                + "        columns: Int\n"
-                + "    ) throws -> (MLXArray) -> MLXArray"))
+                + "        columns: Int,\n"
+                + "        route: CBv2Gemma4MTPVerifierRoute\n"
+                + "    ) throws -> Gemma4MTPVerifierRouterBindings"))
         let routerEnd = try #require(source.range(
             of: "    // MARK: ZIP-ROUTER-001 stages",
             range: routerStart.upperBound..<source.endIndex))
         let routerPath = String(source[routerStart.lowerBound..<routerEnd.lowerBound])
+        #expect(!routerPath.contains("Gemma4FusedRouterTop8.bindVerifier("))
+        #expect(routerPath.contains("projection: bound"))
         let verifierSelection = try #require(
             routerPath.range(of: "return selectTopK(verifier(normed))"))
         let decodeOnlyFusedSelection = try #require(
@@ -124,38 +280,164 @@ struct Gemma4MTPVerifierRouteTests {
             range: layerStart.upperBound..<source.endIndex))
         let verifierLayerPath = String(
             source[layerStart.lowerBound..<ordinaryRoute.lowerBound])
-        #expect(verifierLayerPath.contains("if verifier != nil"))
         #expect(verifierLayerPath.contains("if let verifier {"))
-        #expect(verifierLayerPath.contains("let postAttn = postAttentionLayernorm(attnOut)"))
         #expect(verifierLayerPath.contains(
-            "let n1 = preFeedforwardLayernorm(out)"))
+            "var out = verifier.glue.normResidual(attnOut, residual)"))
         #expect(verifierLayerPath.contains(
-            "let n2 = preFeedforwardLayernorm2(out)"))
+            "let (n1, n2) = verifier.glue.dualPreNorm(out)"))
+        #expect(verifierLayerPath.contains(
+            "out = verifier.glue.branchTail(h1Raw, h2Raw, residual2)"))
         #expect(verifierLayerPath.contains("return (out, kvPair, attnPositionOffset)"))
+        #expect(!verifierLayerPath.contains("postAttentionLayernorm(attnOut)"))
+        #expect(!verifierLayerPath.contains("preFeedforwardLayernorm(out)"))
+        #expect(!verifierLayerPath.contains("preFeedforwardLayernorm2(out)"))
         #expect(!verifierLayerPath.contains("Gemma4FusedLayerGlue"))
         #expect(!verifierLayerPath.contains("Gemma4PrefillGlueV1"))
+
+        let bindingsStart = try #require(source.range(
+            of: "public struct Gemma4MTPVerifierLayerBindings"))
+        let bindingsEnd = try #require(source.range(
+            of: "private struct Gemma4MTPVerifierModelBindings",
+            range: bindingsStart.upperBound..<source.endIndex))
+        let bindings = String(source[bindingsStart.lowerBound..<bindingsEnd.lowerBound])
+        #expect(bindings.contains(
+            "let glue: Gemma4PrefillGlueV1.VerifierBindings"))
+        #expect(source.contains("Gemma4PrefillGlueV1.bindVerifier("))
     }
 
     @Test
     func exactProductionConstructionFixtureInstallsEveryFixedWidthEntrypoint() throws {
         let fixture = Gemma4MTPVerifierConstructionFixture.production
         let installed = try fixture.install()
-        let shapes = (2...4).map {
+        let shapes = [2, 3, 4, 8, 16].map {
             CBv2Gemma4MTPVerifierShape(batch: 1, columns: $0)
         }
 
         #expect(fixture.topology.vocabularySize == 262_144)
         #expect(fixture.topology.requiredProjectionEntrypoints == 266)
+        #expect(fixture.topology.requiredGlueEntrypoints == 90)
+        #expect(fixture.topology.requiredEntrypoints == 356)
         #expect(installed.shapes == shapes)
         #expect(fixture.cbv2MTPVerifierInstalled)
         for shape in shapes {
             #expect(
                 installed.entrypointCount(shape: shape)
-                    == fixture.topology.requiredProjectionEntrypoints)
+                    == fixture.topology.requiredEntrypoints)
             #expect(installed.context(
                 batch: shape.batch, columns: shape.columns) != nil)
         }
         #expect(installed.context(batch: 8, columns: 2) == nil)
+    }
+
+    @Test
+    func oneMissingC8BindingLeavesNoPublishedContexts() {
+        let fixture = Gemma4MTPVerifierConstructionFixture.production
+            .removingBinding(
+                component: "layer 0 q projection",
+                shape: .init(batch: 1, columns: 8))
+
+        do {
+            _ = try fixture.install()
+            Issue.record("construction accepted a missing C8 projection binding")
+        } catch let error as Gemma4MTPVerifierInstallationError {
+            #expect(error.description.contains("layer 0 q projection"))
+            #expect(!fixture.cbv2MTPVerifierInstalled)
+            #expect(fixture.installedShapeCount == 0)
+        } catch {
+            Issue.record("unexpected installation error: \(error)")
+        }
+    }
+
+    @Test
+    func everyMissingC8EntrypointLeavesNoPublishedContexts() {
+        let components = [
+            "layer 0 q projection",
+            "layer 0 k projection",
+            "layer 0 v projection",
+            "layer 0 attention output projection",
+            "layer 0 dense gate projection",
+            "layer 0 dense up projection",
+            "layer 0 dense down projection",
+            "layer 0 router projection",
+            "layer 0 expert projection",
+            "layer 0 post-attention glue",
+            "layer 0 dual-prenorm glue",
+            "layer 0 branch-tail glue",
+            "tied language-model head",
+        ]
+
+        for component in components {
+            let fixture = Gemma4MTPVerifierConstructionFixture.production
+                .removingBinding(
+                    component: component,
+                    shape: .init(batch: 1, columns: 8))
+            do {
+                _ = try fixture.install()
+                Issue.record("construction accepted missing C8 \(component)")
+            } catch let error as Gemma4MTPVerifierInstallationError {
+                #expect(error.description.contains(component))
+                #expect(!fixture.cbv2MTPVerifierInstalled)
+                #expect(fixture.installedShapeCount == 0)
+            } catch {
+                Issue.record("unexpected installation error for \(component): \(error)")
+            }
+        }
+    }
+
+    @Test
+    func everyMissingC16EntrypointLeavesNoPublishedContexts() {
+        let components = [
+            "layer 0 q projection",
+            "layer 0 k projection",
+            "layer 0 v projection",
+            "layer 0 attention output projection",
+            "layer 0 dense gate projection",
+            "layer 0 dense up projection",
+            "layer 0 dense down projection",
+            "layer 0 router projection",
+            "layer 0 expert projection",
+            "layer 0 post-attention glue",
+            "layer 0 dual-prenorm glue",
+            "layer 0 branch-tail glue",
+            "tied language-model head",
+        ]
+
+        for component in components {
+            let fixture = Gemma4MTPVerifierConstructionFixture.production
+                .removingBinding(
+                    component: component,
+                    shape: .init(batch: 1, columns: 16))
+            do {
+                _ = try fixture.install()
+                Issue.record("construction accepted missing C16 \(component)")
+            } catch let error as Gemma4MTPVerifierInstallationError {
+                #expect(error.description.contains(component))
+                #expect(!fixture.cbv2MTPVerifierInstalled)
+                #expect(fixture.installedShapeCount == 0)
+                #expect(fixture.installedContexts == nil)
+            } catch {
+                Issue.record("unexpected error for missing C16 \(component): \(error)")
+            }
+        }
+    }
+
+    @Test
+    func oneMissingRectangularGlueBindingLeavesNoPublishedContexts() {
+        let fixture = Gemma4MTPVerifierConstructionFixture.production
+            .removingBinding(
+                component: "layer 0 branch-tail glue",
+                shape: .init(batch: 1, columns: 4))
+
+        do {
+            _ = try fixture.install()
+            Issue.record("construction accepted a missing rectangular glue binding")
+        } catch let error as Gemma4MTPVerifierInstallationError {
+            #expect(error.description.contains("layer 0 branch-tail glue"))
+            #expect(!fixture.cbv2MTPVerifierInstalled)
+            #expect(fixture.installedShapeCount == 0)
+        } catch {
+            Issue.record("unexpected installation error: \(error)")
+        }
     }
 
     @Test
@@ -193,10 +475,9 @@ struct Gemma4MTPVerifierRouteTests {
         #expect(source.contains(
             "public func cbv2MTPVerifierContext(\n"
                 + "        batch: Int, columns: Int"))
-        #expect(source.contains("let shapes = (2...4).map"))
+        #expect(source.contains("let shapes = [2, 3, 4, 8, 16].map"))
         #expect(source.contains("batch: 1, columns: $0"))
         #expect(source.contains("CBv2AttentionQKVMMA8V1.bindB1Verifier("))
-        #expect(source.contains("CBv2AttentionOQMVV1.bindB1Verifier("))
         #expect(source.contains("CBv2DenseMLPQMVV1.bindB1Verifier("))
         #expect(source.contains("CBv2Gemma4MTPRouterProjection.bindB1Verifier("))
         #expect(source.contains("CBv2Gemma4MTPExpertProjection.bindB1Verifier("))
@@ -240,6 +521,61 @@ struct Gemma4MTPVerifierRouteTests {
     }
 
     @Test
+    func dflashSmallRowsUseTheInstalledFixedWidthVerifierWithoutFallback() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let dflash = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Gemma4TextDFlash.swift"),
+            encoding: .utf8)
+        let model = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Gemma4Text.swift"),
+            encoding: .utf8)
+
+        #expect(dflash.contains(
+            "let verifier = dFlashInstalledVerifier(for: inputs)"))
+        #expect(dflash.contains(
+            "verifier: verifier"))
+        #expect(dflash.contains(
+            "applyLMHead(forward.postNorm, verifier: verifier).argMax(axis: -1)"))
+
+        let captureStart = try #require(model.range(
+            of: "    func callCapturingDFlashHiddenStates("))
+        let trunkStart = try #require(model.range(
+            of: "    private func forwardTrunk(",
+            range: captureStart.upperBound..<model.endIndex))
+        let capture = String(model[captureStart.lowerBound..<trunkStart.lowerBound])
+        #expect(capture.contains("verifier: Gemma4MTPVerifierContext? = nil"))
+        #expect(capture.contains("verifier: verifier"))
+
+        // Width is the only runtime-varying route key. The immutable table was
+        // validated and installed while loading the exact target, so DFlash
+        // must not add an eligible-or-stock branch over model metadata here.
+        #expect(dflash.contains("inputs.dim(0), columns: inputs.dim(1)"))
+        #expect(!dflash.contains("try-custom"))
+        #expect(!dflash.contains("eligible"))
+    }
+
+    @Test
+    func dflashSlicesAcceptedTapRowsBeforeConcatenatingDraftContext() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Vendor/mlx-swift-lm/Libraries/MLXSpeculative/DFlashGreedyRound.swift"),
+            encoding: .utf8)
+
+        #expect(source.contains("let acceptedHiddenStates = hiddenStates.map"))
+        #expect(source.contains("0 ..< accepted + 1"))
+        #expect(source.contains("concatenated(acceptedHiddenStates, axis: -1)"))
+    }
+
+    @Test
     func rectangularTargetVerificationUsesExplicitPhaseSeam() throws {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -267,12 +603,18 @@ struct Gemma4MTPVerifierRouteTests {
         #expect(adapter.contains(
             "mtpRectangularVerificationForward(tokens, asKVCaches(caches))"))
 
-        let serialStart = try #require(verification.range(of: "if !useRectangular"))
+        let serialStart = try #require(verification.range(
+            of: "    func mtpBuildSerialTargetVerification("))
         let rectangularStart = try #require(verification.range(
-            of: "        } else {", range: serialStart.upperBound..<verification.endIndex))
+            of: "    func mtpBuildCertifiedRectangularVerification(",
+            range: serialStart.upperBound..<verification.endIndex))
+        let automaticStart = try #require(verification.range(
+            of: "    func mtpBuildGenericAutomaticVerification(",
+            range: rectangularStart.upperBound..<verification.endIndex))
         let serial = String(
             verification[serialStart.lowerBound..<rectangularStart.lowerBound])
-        let rectangular = String(verification[rectangularStart.lowerBound..<verification.endIndex])
+        let rectangular = String(
+            verification[rectangularStart.lowerBound..<automaticStart.lowerBound])
         #expect(serial.contains("mtp.model.forwardWithHidden("))
         #expect(!serial.contains("forwardRectangularVerificationWithHidden"))
         #expect(rectangular.contains(
@@ -296,7 +638,7 @@ struct Gemma4MTPVerifierRouteTests {
         }
 
         #expect(fixture.cbv2MTPVerifierInstalled)
-        #expect(fixture.installedShapeCount == 3)
+        #expect(fixture.installedShapeCount == 5)
         let retained = try #require(fixture.installedContexts)
         #expect(retained.shapes == firstShapes)
         #expect(retained.shapes.map(retained.entrypointCount(shape:)) == firstCounts)

@@ -373,6 +373,34 @@ private let routeSimdRank64Kernel: MLXFast.MLXFastKernel =
         ensureRowContiguous: true
     )
 
+/// Stable rank sort for the exact physical-B1 C16/top-K=8 verifier plane.
+/// The fixed 128-thread group snapshots all keys once, then assigns every row
+/// the lexicographic rank `(expert, originalAssignment)`. Equal expert IDs
+/// therefore retain the incumbent stable assignment ordering exactly.
+private let routeStableRank128Kernel: MLXFast.MLXFastKernel =
+    MLXFast.metalKernel(
+        name: "mlx_lm_route_stable_rank_scatter_b1_c16_u32_n128_v1",
+        inputNames: ["indices"],
+        outputNames: ["row_order", "sorted_keys", "inverse_order"],
+        source: """
+            const uint assignment = thread_position_in_grid.x;
+            const uint lane = thread_index_in_threadgroup;
+            threadgroup uint keys[128];
+            const uint key = (uint)indices[assignment];
+            keys[lane] = key;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint rank = 0;
+            for (uint source = 0; source < 128; ++source) {
+                const uint other = keys[source];
+                rank += other < key || (other == key && source < assignment);
+            }
+            row_order[rank] = assignment / 8;
+            sorted_keys[rank] = key;
+            inverse_order[assignment] = rank;
+        """,
+        ensureRowContiguous: true
+    )
+
 /// EXPERT-PREFIX-BOUNDS-001 carrier for the exact decode route table. The
 /// gathered-QMV host ABI has no spare buffer, so each sorted rhs-index word
 /// carries its expert plus the within-run bounds that the gather kernel needs:
@@ -996,7 +1024,7 @@ public enum CBv2Gemma4MTPRouterProjection {
     private static let outputWidth = 128
 
     public static func supportsVerifierColumns(_ columns: Int) -> Bool {
-        (2...4).contains(columns)
+        [2, 3, 4, 8, 16].contains(columns)
     }
 
     public static func supportsProductionQuantization(
@@ -1077,7 +1105,7 @@ public enum CBv2Gemma4MTPExpertProjection {
     private static let topK = 8
 
     public static func supportsVerifierColumns(_ columns: Int) -> Bool {
-        (2...4).contains(columns)
+        [2, 3, 4, 8, 16].contains(columns)
     }
 
     /// The production Gemma expert activation, exposed so parity oracles can
@@ -1141,7 +1169,40 @@ public enum CBv2Gemma4MTPExpertProjection {
         }
     }
 
-    /// Prebind the physical-B1 C2...C4 expert verifier. The complete immutable
+    /// Prebind C independent copies of the ordinary physical-B1/L1 expert
+    /// block. Each column keeps the established eight-assignment unsorted
+    /// gather route; no cross-column sort or generic small-M expert schedule
+    /// is introduced into the verifier.
+    public static func bindIndependentB1Verifier(
+        columns: Int,
+        gateWeight: MLXArray, gateScales: MLXArray, gateBiases: MLXArray?,
+        upWeight: MLXArray, upScales: MLXArray, upBiases: MLXArray?,
+        downWeight: MLXArray, downScales: MLXArray, downBiases: MLXArray?,
+        groupSize: Int, bits: Int, mode: QuantizationMode
+    ) -> Projection? {
+        guard supportsVerifierColumns(columns), let captured = bindWeights(
+            gateWeight: gateWeight, gateScales: gateScales,
+            gateBiases: gateBiases, upWeight: upWeight, upScales: upScales,
+            upBiases: upBiases, downWeight: downWeight,
+            downScales: downScales, downBiases: downBiases,
+            groupSize: groupSize, bits: bits, mode: mode)
+        else { return nil }
+
+        return { x, indices, routeWeights in
+            concatenated(
+                (0..<columns).map { column in
+                    runIndependentB1(
+                        x: x[0..., column, 0...].reshaped([1, hidden]),
+                        indices: indices[0..., column, 0...].reshaped([1, topK]),
+                        routeWeights: routeWeights[0..., column, 0...]
+                            .reshaped([1, topK]),
+                        captured: captured).reshaped([1, 1, hidden])
+                },
+                axis: 1)
+        }
+    }
+
+    /// Prebind the physical-B1 C2/C3/C4/C8/C16 expert verifier. The complete immutable
     /// quantized expert surface is captured once. At execution, stable expert
     /// sorting groups only equal IDs; each gathered projection continues to
     /// select its own rhs plane before the unchanged inverse permutation and
@@ -1160,6 +1221,30 @@ public enum CBv2Gemma4MTPExpertProjection {
             downScales: downScales, downBiases: downBiases,
             groupSize: groupSize, bits: bits, mode: mode)
         else { return nil }
+
+        if columns == 8 {
+            return { x, indices, routeWeights in
+                let positionMajorX = x.reshaped([columns, hidden])
+                let positionMajorIndices = indices.reshaped([columns, topK])
+                let positionMajorWeights = routeWeights.reshaped([columns, topK])
+                return runCombinedC8(
+                    x: positionMajorX, indices: positionMajorIndices,
+                    routeWeights: positionMajorWeights,
+                    captured: captured).reshaped([1, columns, hidden])
+            }
+        }
+
+        if columns == 16 {
+            return { x, indices, routeWeights in
+                let positionMajorX = x.reshaped([columns, hidden])
+                let positionMajorIndices = indices.reshaped([columns, topK])
+                let positionMajorWeights = routeWeights.reshaped([columns, topK])
+                return runCombinedC16(
+                    x: positionMajorX, indices: positionMajorIndices,
+                    routeWeights: positionMajorWeights,
+                    captured: captured).reshaped([1, columns, hidden])
+            }
+        }
 
         return { x, indices, routeWeights in
             let positionMajorX = x.reshaped([columns, hidden])
@@ -1286,6 +1371,42 @@ public enum CBv2Gemma4MTPExpertProjection {
         return weightedExpertSum(MLX.squeezed(unsorted, axis: -2), routeWeights)
     }
 
+    /// C8 verifier twin of the production direct sorted reduction. The
+    /// construction-bound caller fixes `[columns, 8]` route weights and q4
+    /// expert tensors, so this path can consume sorted down-projection rows
+    /// without materializing the inverse-permuted assignment cube.
+    private static func finishB1(
+        baseX: MLXArray,
+        sortedIndices: MLXArray,
+        lhsIndices: MLXArray,
+        inverseOrder: MLXArray,
+        routeWeights: MLXArray,
+        captured: Weights
+    ) -> MLXArray {
+        let up = project(
+            baseX, weight: captured.upWeight, scales: captured.upScales,
+            biases: captured.upBiases, lhsIndices: lhsIndices,
+            rhsIndices: sortedIndices)
+        let gate = project(
+            baseX, weight: captured.gateWeight, scales: captured.gateScales,
+            biases: captured.gateBiases, lhsIndices: lhsIndices,
+            rhsIndices: sortedIndices)
+        let activated = compiledGeGLU(gate, up)
+        let down = project(
+            activated, weight: captured.downWeight,
+            scales: captured.downScales, biases: captured.downBiases,
+            lhsIndices: nil, rhsIndices: sortedIndices)
+        let sortedRows = MLX.squeezed(down, axis: -2)
+        let columns = routeWeights.dim(0)
+        return weightedExpertUnsortKernel(
+            [sortedRows, inverseOrder, routeWeights],
+            template: [("T", DType.bfloat16), ("K", topK)],
+            grid: (hidden, columns, 1),
+            threadGroup: (64, 4, 1),
+            outputShapes: [[columns, hidden]],
+            outputDTypes: [.bfloat16])[0]
+    }
+
     private static func runCombined(
         x: MLXArray,
         indices: MLXArray,
@@ -1302,6 +1423,82 @@ public enum CBv2Gemma4MTPExpertProjection {
             lhsIndices: nil, inverseOrder: inverseOrder,
             routeWeights: routeWeights, rowShape: indices.shape,
             activation: compiledGeGLU, captured: captured)
+    }
+
+    private static func runCombinedC8(
+        x: MLXArray,
+        indices: MLXArray,
+        routeWeights: MLXArray,
+        captured: Weights
+    ) -> MLXArray {
+        let flatIndices = indices.flattened()
+        let route = routeSimdRank64Kernel(
+            [flatIndices],
+            grid: (64, 1, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [[64], [64], [64]],
+            outputDTypes: [.uint32, .uint32, .uint32])
+        let baseX = MLX.expandedDimensions(x, axes: [-2, -3])
+            .flattened(start: 0, end: -3)
+        return finishB1(
+            baseX: baseX, sortedIndices: route[1], lhsIndices: route[0],
+            inverseOrder: route[2], routeWeights: routeWeights,
+            captured: captured)
+    }
+
+    private static func runCombinedC16(
+        x: MLXArray,
+        indices: MLXArray,
+        routeWeights: MLXArray,
+        captured: Weights
+    ) -> MLXArray {
+        let flatIndices = indices.flattened()
+        let route = routeStableRank128Kernel(
+            [flatIndices],
+            grid: (128, 1, 1),
+            threadGroup: (128, 1, 1),
+            outputShapes: [[128], [128], [128]],
+            outputDTypes: [.uint32, .uint32, .uint32])
+        let baseX = MLX.expandedDimensions(x, axes: [-2, -3])
+            .flattened(start: 0, end: -3)
+        return finishB1(
+            baseX: baseX, sortedIndices: route[1], lhsIndices: route[0],
+            inverseOrder: route[2], routeWeights: routeWeights,
+            captured: captured)
+    }
+
+    private static func runIndependentB1(
+        x: MLXArray,
+        indices: MLXArray,
+        routeWeights: MLXArray,
+        captured: Weights
+    ) -> MLXArray {
+        let expandedX = MLX.expandedDimensions(x, axes: [-2, -3])
+
+        func projectUnsorted(
+            _ input: MLXArray,
+            weight: MLXArray,
+            scales: MLXArray,
+            biases: MLXArray
+        ) -> MLXArray {
+            gatherQuantizedMM(
+                input, weight, scales: scales, biases: biases,
+                lhsIndices: nil, rhsIndices: indices,
+                transpose: true, groupSize: 64, bits: 4, mode: .affine,
+                sortedIndices: false)
+        }
+
+        let up = projectUnsorted(
+            expandedX, weight: captured.upWeight, scales: captured.upScales,
+            biases: captured.upBiases)
+        let gate = projectUnsorted(
+            expandedX, weight: captured.gateWeight, scales: captured.gateScales,
+            biases: captured.gateBiases)
+        let activated = compiledGeGLU(gate, up)
+        let down = projectUnsorted(
+            activated, weight: captured.downWeight,
+            scales: captured.downScales, biases: captured.downBiases)
+        return weightedExpertSum(MLX.squeezed(down, axis: -2), routeWeights)
     }
 
     private static func runIndependentB8(

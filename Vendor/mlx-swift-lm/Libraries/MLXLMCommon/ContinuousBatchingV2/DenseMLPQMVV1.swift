@@ -117,7 +117,7 @@ public enum CBv2DenseMLPQMVV1 {
     }
 
     public static func supportsVerifierColumns(_ columns: Int) -> Bool {
-        (2...4).contains(columns)
+        [2, 3, 4, 8, 16].contains(columns)
     }
 
     static func supportsVerifierWeightRank(_ rank: Int) -> Bool {

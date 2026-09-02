@@ -28,6 +28,36 @@ struct Gemma4MTPVerifierDenseMLPKernelTests {
                 == reference.asData(access: .copy).data)
     }
 
+    @Test
+    func b1VerifierDenseSourceAdmitsTheFixedC16SerialReduction() throws {
+        for columns in [2, 3, 4, 8, 16] {
+            #expect(CBv2DenseMLPQMVV1.supportsVerifierColumns(columns))
+        }
+        for columns in [1, 5, 7, 9, 15, 17, 32] {
+            #expect(!CBv2DenseMLPQMVV1.supportsVerifierColumns(columns))
+        }
+
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/"
+                    + "DenseMLPQMVV1.swift"),
+            encoding: .utf8)
+        let binderStart = try #require(source.range(
+            of: "    public static func bindB1Verifier("))
+        let binderEnd = try #require(source.range(
+            of: "    public static func bindVerifier(",
+            range: binderStart.upperBound..<source.endIndex))
+        let binder = String(source[binderStart.lowerBound..<binderEnd.lowerBound])
+        #expect(binder.contains("Gemma4B1MTPQuantizedProjection.bind("))
+        #expect(!binder.contains("ProcessInfo"))
+        #expect(!binder.contains("guard columns == 16"))
+        #expect(!binder.contains("catch"))
+    }
+
     @Test(
         .enabled(if: runtimeEnabled),
         arguments: [(2816, 2112), (2112, 2816)])
@@ -47,7 +77,7 @@ struct Gemma4MTPVerifierDenseMLPKernelTests {
         let scales = MLXArray(scaleValues).reshaped([outDim, inDim / 64]).asType(.bfloat16)
         let biases = MLXArray(biasValues).reshaped([outDim, inDim / 64]).asType(.bfloat16)
 
-        for columns in 2...4 {
+        for columns in [2, 3, 4, 8, 16] {
             let xValues: [Float] = (0..<(columns * inDim)).map { index in
                 Float((index * 41 + columns * 17) % 271 - 135) / 128.0
             }

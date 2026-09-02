@@ -932,6 +932,10 @@ extension Gemma4Runtime {
             // emitted on FAILURE paths too — the divergent legs are exactly
             // the ones whose observability matters.
             let diagnosticsSession = state.freeRunSession
+            let dflashPhysicalVerifierWidth =
+                route == .dflash
+                ? state.dflashFreeRunSession?.maximumPhysicalVerifierWidth
+                : nil
             let result: RuntimeWorkerFreeRunResult
             do {
                 result = try runFreeDecode(
@@ -958,7 +962,8 @@ extension Gemma4Runtime {
                 acceptanceLengths: result.acceptanceLengths,
                 draftedTotal: result.draftedTotal,
                 acceptedTotal: result.acceptedTotal,
-                committedTotal: result.committedTotal
+                committedTotal: result.committedTotal,
+                physicalVerifierWidth: dflashPhysicalVerifierWidth
             )
 
         case "free_decode_run_timed":
@@ -1323,7 +1328,9 @@ extension Gemma4Runtime {
                         + "already consumed — validation drift)")
             }
             state.dflashFreeRunSession = nil
-            return try dflashSession.run(targetN: targetN)
+            let result = try dflashSession.run(targetN: targetN)
+            state.dflashCompiledVerifierBank = dflashSession.compiledVerifierBank
+            return result
         }
         guard let session = state.freeRunSession else {
             throw MLXFastError.invalidInput(
@@ -1427,12 +1434,14 @@ extension Gemma4Runtime {
             let depth =
                 requestedDepth
                 ?? gemma4DFlashMaxDepth(for: dflashDrafter)
+            let dflashCompiledVerifierBank = state.dflashCompiledVerifierBank
             let dflashSession = try RuntimeWorkerDFlashFreeRunSession(
                 target: model,
                 drafter: dflashDrafter,
                 seedTokens: seedTokens,
                 depth: depth,
-                stopTokens: stopTokens)
+                stopTokens: stopTokens,
+                compiledVerifierBank: dflashCompiledVerifierBank)
             state.dflashFreeRunSession = dflashSession
             state.freeRunSeedTokenCount = seedTokens.count
             state.freeRunConfigEcho = (
@@ -2056,6 +2065,11 @@ struct RuntimeWorkerState {
     /// two slots is ever non-nil for a given phase; both are cleared the
     /// same way.
     var dflashFreeRunSession: RuntimeWorkerDFlashFreeRunSession?
+    /// Physical-B1 DFlash verifier cache/compile state retained across
+    /// sequential free-run samples. The current session owns its live use;
+    /// this slot only preserves the construction-bound graph identities for
+    /// the next session after the prior one is consumed.
+    var dflashCompiledVerifierBank: Gemma4DFlashCompiledVerifierBank?
     /// RECORDING (trusted-CLI-only): the live engine-backed session opened
     /// by `record_reference_begin` — the SAME width-1 CBv2 session type as
     /// `freeRunSession`, held in its own slot so a recording window and a
@@ -2198,6 +2212,7 @@ struct RuntimeWorkerResponse: Codable {
     let draftedTotal: Int?
     let acceptedTotal: Int?
     let committedTotal: Int?
+    let physicalVerifierWidth: Int?
     // Protocol v1.2 (additive, COHORT — batched free-run). The cohort form of
     // the free-run verbs, gated by the `batched_free_run_decode` capability
     // (wire names match benchd's `WorkerResponse` on the cohort branch):
@@ -2306,6 +2321,7 @@ struct RuntimeWorkerResponse: Codable {
         draftedTotal: Int? = nil,
         acceptedTotal: Int? = nil,
         committedTotal: Int? = nil,
+        physicalVerifierWidth: Int? = nil,
         maxBatchSize: Int? = nil,
         seedTokenByStream: [Int]? = nil,
         effectiveBatchSize: Int? = nil,
@@ -2373,6 +2389,7 @@ struct RuntimeWorkerResponse: Codable {
         self.draftedTotal = draftedTotal
         self.acceptedTotal = acceptedTotal
         self.committedTotal = committedTotal
+        self.physicalVerifierWidth = physicalVerifierWidth
         self.maxBatchSize = maxBatchSize
         self.seedTokenByStream = seedTokenByStream
         self.effectiveBatchSize = effectiveBatchSize
@@ -2595,6 +2612,10 @@ struct RuntimeWorkerResponse: Codable {
             Int.self,
             forKey: .committedTotal
         )
+        physicalVerifierWidth = try container.decodeIfPresent(
+            Int.self,
+            forKey: .physicalVerifierWidth
+        )
         maxBatchSize = try container.decodeIfPresent(
             Int.self,
             forKey: .maxBatchSize
@@ -2788,6 +2809,10 @@ struct RuntimeWorkerResponse: Codable {
         try container.encodeIfPresent(draftedTotal, forKey: .draftedTotal)
         try container.encodeIfPresent(acceptedTotal, forKey: .acceptedTotal)
         try container.encodeIfPresent(committedTotal, forKey: .committedTotal)
+        try container.encodeIfPresent(
+            physicalVerifierWidth,
+            forKey: .physicalVerifierWidth
+        )
         try container.encodeIfPresent(maxBatchSize, forKey: .maxBatchSize)
         try container.encodeIfPresent(
             seedTokenByStream,
@@ -2881,6 +2906,7 @@ struct RuntimeWorkerResponse: Codable {
         case draftedTotal = "drafted_total"
         case acceptedTotal = "accepted_total"
         case committedTotal = "committed_total"
+        case physicalVerifierWidth = "physical_verifier_width"
         case maxBatchSize = "max_batch_size"
         case seedTokenByStream = "seed_token_by_stream"
         case effectiveBatchSize = "effective_batch_size"

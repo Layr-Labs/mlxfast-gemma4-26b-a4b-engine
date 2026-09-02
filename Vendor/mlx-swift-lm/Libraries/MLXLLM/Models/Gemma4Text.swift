@@ -1692,7 +1692,8 @@ private class Gemma4Attention: Module {
     }
 
     fileprivate func bindMTPVerifier(
-        columns: Int
+        columns: Int,
+        route: CBv2Gemma4MTPVerifierRoute
     ) throws -> Gemma4MTPVerifierAttentionBindings {
         func quantized(
             _ layer: Linear?, component: String
@@ -1712,6 +1713,15 @@ private class Gemma4Attention: Module {
             _ layer: Linear?, component: String
         ) throws -> (MLXArray) -> MLXArray {
             let value = try quantized(layer, component: component)
+            guard let strategy = route.strategy(for: .qkv, columns: columns) else {
+                throw Gemma4MTPVerifierInstallationError.incompatibleModel(component)
+            }
+            switch strategy {
+            case .combined, .sharedSerialReduction:
+                break
+            case .independentB8:
+                throw Gemma4MTPVerifierInstallationError.incompatibleModel(component)
+            }
             guard let bound = CBv2AttentionQKVMMA8V1.bindB1Verifier(
                 columns: columns, weight: value.weight, scales: value.scales,
                 biases: value.biases, groupSize: value.groupSize,
@@ -1726,27 +1736,63 @@ private class Gemma4Attention: Module {
         let q = try bindQKV(qProj, component: "\(prefix) q projection")
         let k = try bindQKV(kProj, component: "\(prefix) k projection")
         let v: ((MLXArray) -> MLXArray)?
+        let value: (MLXArray, MLXArray) -> MLXArray
         if vProj != nil {
-            v = try bindQKV(vProj, component: "\(prefix) v projection")
+            let bound = try bindQKV(
+                vProj, component: "\(prefix) v projection")
+            v = bound
+            value = { input, _ in bound(input) }
         } else {
             guard useKeqV else {
                 throw Gemma4MTPVerifierInstallationError.incompatibleModel(
                     "\(prefix) v projection")
             }
             v = nil
+            value = { _, keyRaw in keyRaw }
         }
         let outputValue = try quantized(
             oProj, component: "\(prefix) attention output projection")
-        guard let output = CBv2AttentionOQMVV1.bindB1Verifier(
-            columns: columns, inDim: nHeads * effectiveHeadDim,
-            weight: outputValue.weight, scales: outputValue.scales,
-            biases: outputValue.biases, groupSize: outputValue.groupSize,
-            bits: outputValue.bits, mode: outputValue.mode)
+        let outputStrategy = route.strategy(
+            for: .attentionOutput, columns: columns)
+        let output: ((MLXArray) -> MLXArray)?
+        switch outputStrategy {
+        case .combined:
+            // C2-C4 retain the audited independent physical-B1 stock
+            // projections and therefore the serial B1/L1 reduction.
+            output = CBv2AttentionOQMVV1.bindB1Verifier(
+                columns: columns,
+                inDim: outputValue.scales.dim(1) * outputValue.groupSize,
+                weight: outputValue.weight, scales: outputValue.scales,
+                biases: outputValue.biases, groupSize: outputValue.groupSize,
+                bits: outputValue.bits, mode: outputValue.mode)
+        case .sharedSerialReduction:
+            // C8 has its own construction-certified shared-weight kernel with
+            // the same serial reduction order. It never enters stock M>=2.
+            output = CBv2AttentionOQMVV1.bindB1SharedSerialReductionVerifier(
+                columns: columns,
+                inDim: outputValue.scales.dim(1) * outputValue.groupSize,
+                weight: outputValue.weight, scales: outputValue.scales,
+                biases: outputValue.biases, groupSize: outputValue.groupSize,
+                bits: outputValue.bits, mode: outputValue.mode)
+        case .independentB8, nil:
+            output = nil
+        }
+        guard let output
         else {
             throw Gemma4MTPVerifierInstallationError.incompatibleModel(
                 "\(prefix) attention output projection")
         }
-        return Gemma4MTPVerifierAttentionBindings(q: q, k: k, v: v, output: output)
+        guard let kNorm, let vNorm else {
+            throw Gemma4MTPVerifierInstallationError.incompatibleModel(
+                "\(prefix) attention normalization")
+        }
+        return Gemma4MTPVerifierAttentionBindings(
+            q: q, k: k, v: v,
+            value: { input, keyRaw in value(input, keyRaw) },
+            output: output,
+            normalizeQ: { [qNorm] in qNorm($0) },
+            normalizeK: { [kNorm] in kNorm($0) },
+            normalizeV: { [vNorm] in vNorm($0) })
     }
 
     /// Exact B8/L1 Q/K/V projection: the tight-grid host for the promoted
@@ -2154,6 +2200,47 @@ private class Gemma4Attention: Module {
         return (
             outputProjection(output, verifier: verifier?.output),
             (k, v), captured)
+    }
+
+    /// Nonoptional physical-B1 C4/C16 verifier attention. Installation has
+    /// already pinned non-shared K-equals-V topology, CBv2 cache ownership,
+    /// projection storage, and every fixed projection closure. This entrypoint
+    /// therefore contains no verifier selection or stock projection fallback.
+    fileprivate func callCertifiedMTPVerifier(
+        _ x: MLXArray,
+        layerCache: any CBv2AttendingLayerCache,
+        positionOffset: Gemma4.PositionOffset,
+        bindings: Gemma4MTPVerifierAttentionBindings
+    ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
+        let (batch, columns) = (x.dim(0), x.dim(1))
+        let queryRaw = bindings.q(x).reshaped(
+            batch, columns, nHeads, effectiveHeadDim)
+        let keyRaw = bindings.k(x).reshaped(
+            batch, columns, nKvHeads, effectiveHeadDim)
+        let valueRaw = bindings.value(x, keyRaw).reshaped(
+            batch, columns, nKvHeads, effectiveHeadDim)
+
+        var queries = bindings.normalizeQ(queryRaw).transposed(0, 2, 1, 3)
+        var keys = bindings.normalizeK(keyRaw).transposed(0, 2, 1, 3)
+        let values = bindings.normalizeV(valueRaw).transposed(0, 2, 1, 3)
+        queries = gemma4ApplyRotaryPosition(
+            rope, to: queries, offset: positionOffset)
+        keys = gemma4ApplyRotaryPosition(
+            rope, to: keys, offset: positionOffset)
+
+        let outputDType = queries.dtype
+        let attentionQueries =
+            outputDType == .float16 ? queries.asType(.float32) : queries
+        let attention = layerCache.updateAndAttend(
+            queries: attentionQueries, keys: keys, values: values,
+            scale: scale, sinks: nil)
+        var output = attention.transposed(0, 2, 1, 3)
+            .reshaped(batch, columns, -1)
+        if output.dtype != outputDType {
+            output = output.asType(outputDType)
+        }
+        return (
+            bindings.output(output), (keys, values), positionOffset)
     }
 }
 
@@ -2862,9 +2949,14 @@ private class Gemma4Router: Module {
     }
 
     fileprivate func bindMTPVerifier(
-        columns: Int
-    ) throws -> (MLXArray) -> MLXArray {
+        columns: Int,
+        route: CBv2Gemma4MTPVerifierRoute
+    ) throws -> Gemma4MTPVerifierRouterBindings {
         let component = "layer \(layerIdx) router projection"
+        let strategy = route.strategy(for: .router, columns: columns)
+        guard strategy == .independentB8 || strategy == .sharedSerialReduction else {
+            throw Gemma4MTPVerifierInstallationError.incompatibleModel(component)
+        }
         guard let value = proj as? QuantizedLinear,
             value.bias == nil, value.mode == .affine,
             value.weight.dtype == .uint32,
@@ -2877,7 +2969,26 @@ private class Gemma4Router: Module {
         else {
             throw Gemma4MTPVerifierInstallationError.incompatibleModel(component)
         }
-        return bound
+        let effectiveScale = scale * rootSize
+        let kth = self.kth
+        let perExpertScale = self.perExpertScale
+        let eps = self.eps
+        return Gemma4MTPVerifierRouterBindings(
+            projection: bound,
+            forward: { x in
+                let normed = MLXFast.rmsNorm(
+                    x, weight: effectiveScale, eps: eps)
+                let expertScores = bound(normed)
+                var topKIndices = MLX.argPartition(
+                    expertScores, kth: kth, axis: -1)
+                topKIndices = topKIndices[.ellipsis, kth...]
+                var topKWeights = MLX.takeAlong(
+                    expertScores, topKIndices, axis: -1)
+                topKWeights = MLX.softmax(
+                    topKWeights, axis: -1, precise: true)
+                topKWeights = topKWeights * perExpertScale[topKIndices]
+                return (topKIndices, topKWeights)
+            })
     }
 
     private func selectTopK(
@@ -2911,10 +3022,6 @@ private class Gemma4Router: Module {
         }
         let normed = MLXFast.rmsNorm(x, weight: effScale, eps: eps)
         if let verifier {
-            // The installed verifier owns a rectangular C2-C4 route. Its
-            // construction contract already pins every invariant, so execute
-            // the exact selection chain directly instead of probing the
-            // decode-only L=1 fused helper and falling through every layer.
             return selectTopK(verifier(normed))
         }
         let expertScores = proj(normed)
@@ -3014,9 +3121,14 @@ private class Gemma4Experts: Module {
     }
 
     fileprivate func bindMTPVerifier(
-        columns: Int
+        columns: Int,
+        route: CBv2Gemma4MTPVerifierRoute
     ) throws -> CBv2Gemma4MTPExpertProjection.Projection {
         let component = "layer \(layerIdx) expert projection"
+        let strategy = route.strategy(for: .expert, columns: columns)
+        guard strategy == .combined || strategy == .sharedSerialReduction else {
+            throw Gemma4MTPVerifierInstallationError.incompatibleModel(component)
+        }
         let leaves = Dictionary(uniqueKeysWithValues: switchGLU.leafModules().flattened())
 
         func tensors(
@@ -3116,10 +3228,12 @@ private class Gemma4MLP: Module {
     }
 
     fileprivate func bindMTPVerifier(
-        columns: Int
+        columns: Int,
+        route: CBv2Gemma4MTPVerifierRoute
     ) throws -> Gemma4MTPVerifierDenseBindings {
         func bind(
             _ layer: Linear, inDim: Int, outDim: Int,
+            projection: CBv2Gemma4MTPVerifierProjection,
             component: String
         ) throws -> (MLXArray) -> MLXArray {
             guard let value = layer as? QuantizedLinear,
@@ -3127,8 +3241,7 @@ private class Gemma4MLP: Module {
                 value.weight.dtype == .uint32,
                 value.scales.dtype == .bfloat16,
                 value.biases?.dtype == .bfloat16,
-                CBv2Gemma4MTPVerifierRoute.production.supports(
-                    .init(batch: 1, columns: columns))
+                route.strategy(for: projection, columns: columns) != nil
             else {
                 throw Gemma4MTPVerifierInstallationError.incompatibleModel(component)
             }
@@ -3146,12 +3259,15 @@ private class Gemma4MLP: Module {
         return try Gemma4MTPVerifierDenseBindings(
             gate: bind(
                 gateProj, inDim: 2_816, outDim: 2_112,
+                projection: .denseGateUp,
                 component: "layer \(layerIdx) dense gate projection"),
             up: bind(
                 upProj, inDim: 2_816, outDim: 2_112,
+                projection: .denseGateUp,
                 component: "layer \(layerIdx) dense up projection"),
             down: bind(
                 downProj, inDim: 2_112, outDim: 2_816,
+                projection: .denseDown,
                 component: "layer \(layerIdx) dense down projection"))
     }
 
@@ -3516,17 +3632,66 @@ public class Gemma4DecoderLayer: Module {
     }
 
     fileprivate func bindMTPVerifier(
-        columns: Int
+        columns: Int,
+        route: CBv2Gemma4MTPVerifierRoute
     ) throws -> Gemma4MTPVerifierLayerBindings {
-        guard let router, let experts, isMoE else {
+        guard let router, let experts, let preFeedforwardLayernorm2,
+            let postFeedforwardLayernorm1, let postFeedforwardLayernorm2,
+            isMoE
+        else {
             throw Gemma4MTPVerifierInstallationError.incompatibleModel(
                 "layer \(layerIdx) MoE topology")
         }
+        guard let glue = Gemma4PrefillGlueV1.bindVerifier(
+            columns: columns,
+            postAttentionWeight: postAttentionLayernorm.weight,
+            densePreWeight: preFeedforwardLayernorm.weight,
+            expertPreWeight: preFeedforwardLayernorm2.weight,
+            densePostWeight: postFeedforwardLayernorm1.weight,
+            expertPostWeight: postFeedforwardLayernorm2.weight,
+            postFeedforwardWeight: postFeedforwardLayernorm.weight,
+            eps: config.rmsNormEps)
+        else {
+            throw Gemma4MTPVerifierInstallationError.incompatibleModel(
+                "layer \(layerIdx) rectangular glue")
+        }
         return try Gemma4MTPVerifierLayerBindings(
-            attention: selfAttn.bindMTPVerifier(columns: columns),
-            dense: mlp.bindMTPVerifier(columns: columns),
-            router: router.bindMTPVerifier(columns: columns),
-            expert: experts.bindMTPVerifier(columns: columns))
+            attention: selfAttn.bindMTPVerifier(columns: columns, route: route),
+            dense: mlp.bindMTPVerifier(columns: columns, route: route),
+            router: router.bindMTPVerifier(columns: columns, route: route),
+            expert: experts.bindMTPVerifier(columns: columns, route: route),
+            glue: glue)
+    }
+
+    /// Direct layer entrypoint for the construction-certified physical-B1
+    /// C4/C16 verifier. Every callable below is nonoptional and was captured
+    /// only after the complete layer surface passed installation.
+    fileprivate func callCertifiedMTPVerifier(
+        _ x: MLXArray,
+        layerCache: any CBv2AttendingLayerCache,
+        positionOffset: Gemma4.PositionOffset,
+        bindings: Gemma4MTPVerifierLayerBindings
+    ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
+        let h = inputLayernorm(x)
+        let (attention, kvPair, attentionPositionOffset) =
+            selfAttn.callCertifiedMTPVerifier(
+                h, layerCache: layerCache,
+                positionOffset: positionOffset,
+                bindings: bindings.attention)
+
+        var out = bindings.glue.normResidual(attention, x)
+        let residual = out
+        let (topKIndices, topKWeights) = bindings.router.forward(out)
+        let (denseInput, expertInput) = bindings.glue.dualPreNorm(out)
+        let dense = bindings.dense.down(
+            gemma4GeluProduct(
+                bindings.dense.gate(denseInput),
+                bindings.dense.up(denseInput)))
+        let expert = bindings.expert(
+            expertInput, topKIndices, topKWeights)
+        out = bindings.glue.branchTail(dense, expert, residual)
+        out = out * layerScalar
+        return (out, kvPair, attentionPositionOffset)
     }
 
     public func callAsFunction(
@@ -3597,32 +3762,24 @@ public class Gemma4DecoderLayer: Module {
             verifier: verifier?.attention)
 
         if let verifier {
-            // The installed C2-C4 verifier route is direct by construction.
-            // Preserve the exact arithmetic of the former stock fallbacks,
-            // but return before any failable L=1 decode or prefill helper.
+            // The installed C2-C4/C8/C16 verifier route is direct by construction.
+            // Projection and glue bindings were all validated before the
+            // context table was published, so this path has no enabled-lane
+            // eligibility checks or stock fallbacks.
             let router = router!
             let experts = experts!
-            let preFeedforwardLayernorm2 = preFeedforwardLayernorm2!
-            let postFeedforwardLayernorm1 = postFeedforwardLayernorm1!
-            let postFeedforwardLayernorm2 = postFeedforwardLayernorm2!
 
-            let postAttn = postAttentionLayernorm(attnOut)
-            var out = residual + postAttn
+            var out = verifier.glue.normResidual(attnOut, residual)
             let residual2 = out
             let (topKIndices, topKWeights) = router(
-                out, verifier: verifier.router)
-            let n1 = preFeedforwardLayernorm(out)
-            let n2 = preFeedforwardLayernorm2(out)
+                out, verifier: verifier.router.projection)
+            let (n1, n2) = verifier.glue.dualPreNorm(out)
             let h1Raw = mlp(n1, verifier: verifier.dense)
             let h2Raw = experts(
                 n2, topKIndices: topKIndices,
                 topKWeights: topKWeights,
                 isExpertPrefill: false, verifier: verifier.expert)
-            let h1 = postFeedforwardLayernorm1(h1Raw)
-            let h2 = postFeedforwardLayernorm2(h2Raw)
-            out = h1 + h2
-            out = postFeedforwardLayernorm(out)
-            out = residual2 + out
+            out = verifier.glue.branchTail(h1Raw, h2Raw, residual2)
             out = out * layerScalar
             return (out, kvPair, attnPositionOffset)
         }
@@ -4297,6 +4454,72 @@ public class Gemma4TextModelInner: Module {
         return (r.postNorm, r.preNorm!)
     }
 
+    /// Certified DFlash physical-B1 C4/C16 target forward. Target tap topology
+    /// was validated before binding, and the requested post-layer values are
+    /// observed from the same direct layer chain that produces final logits.
+    fileprivate func callCapturingCertifiedDFlashVerifierHiddenStates(
+        _ inputs: MLXArray,
+        cacheStack: CBv2CertifiedContiguousLayerCacheStack,
+        targetLayerIds: [Int],
+        bindings: Gemma4MTPVerifierModelBindings
+    ) -> (postNorm: MLXArray, hiddenStates: [MLXArray]) {
+        let hiddenCapture = Gemma4DFlashHiddenCapture(
+            layerIds: targetLayerIds, layerCount: layers.count)
+        var hidden = bindings.scaledEmbedding(inputs)
+        let positionOffset = Gemma4.PositionOffset.batch(
+            cacheStack.positionOffsets + 0)
+
+        for index in layers.indices {
+            let layerCache = cacheStack.layers[index]
+            hidden = layers[index].callCertifiedMTPVerifier(
+                hidden,
+                layerCache: layerCache,
+                positionOffset: positionOffset,
+                bindings: bindings.layers[index]).0
+            hiddenCapture.capture(hidden, layer: index)
+        }
+        return (norm(hidden), hiddenCapture.orderedHiddenStates())
+    }
+
+    /// Operator-only CBv2 verifier localization. Reuse the trunk's existing
+    /// DFlash layer-output observer so the diagnostic sees the exact same
+    /// layer graph as production without adding another hook to measured
+    /// forwards. The separately produced input hidden identifies divergence
+    /// at the embedding boundary before layer zero.
+    fileprivate func callCapturingMTPVerifierDiagnostic(
+        _ inputs: MLXArray,
+        cache: [KVCache],
+        captureHook: @escaping (Int, (MLXArray, MLXArray)) -> Void,
+        verifier: Gemma4MTPVerifierContext?
+    ) -> (
+        postNorm: MLXArray,
+        inputHidden: MLXArray,
+        layerHiddenStates: [MLXArray]
+    ) {
+        let inputs = inputs.ndim == 1 ? inputs.expandedDimensions(axis: 0) : inputs
+        let inputHidden: MLXArray
+        if let verifier {
+            inputHidden = verifier.bindings.scaledEmbedding(inputs)
+        } else if let fused = Gemma4FusedScaledEmbedding.apply(
+            tokens: inputs, embedding: embedTokens, embedScale: embedScale,
+            hiddenSize: config.hiddenSize)
+        {
+            inputHidden = fused
+        } else {
+            inputHidden = embedTokens(inputs) * embedScale
+        }
+        let hiddenCapture = Gemma4DFlashHiddenCapture(
+            layerIds: Array(layers.indices), layerCount: layers.count)
+        let result = forwardTrunk(
+            inputs, cache: cache, captureHook: captureHook,
+            capturePreNorm: true, dFlashHiddenCapture: hiddenCapture,
+            verifier: verifier)
+        return (
+            result.postNorm,
+            inputHidden,
+            hiddenCapture.orderedHiddenStates())
+    }
+
     /// DFlash target-hidden capture (2026-08-25, gemma4-dflash-real-loader
     /// lane). The z-lab DFlash drafter conditions on the CONCATENATION of the
     /// target's post-layer hidden states at `dflash_config.target_layer_ids`,
@@ -4312,10 +4535,30 @@ public class Gemma4TextModelInner: Module {
         _ inputs: MLXArray,
         cache: [KVCache]? = nil,
         targetLayerIds: [Int],
-        forceArrayMask: Bool = false
+        forceArrayMask: Bool = false,
+        verifier: Gemma4MTPVerifierContext? = nil
     ) throws -> (postNorm: MLXArray, hiddenStates: [MLXArray]) {
         try DFlashTargetValidation.validateTargetLayerIds(
             targetLayerIds, layerCount: layers.count)
+        return callCapturingValidatedDFlashHiddenStates(
+            inputs,
+            cache: cache,
+            targetLayerIds: targetLayerIds,
+            forceArrayMask: forceArrayMask,
+            verifier: verifier)
+    }
+
+    /// Construction-bound twin used by a DFlash verifier binding after its
+    /// layer-id topology was validated once. Keeping this separate prevents a
+    /// persistent compiled/direct verifier from rechecking immutable model
+    /// metadata in every measured round.
+    func callCapturingValidatedDFlashHiddenStates(
+        _ inputs: MLXArray,
+        cache: [KVCache]? = nil,
+        targetLayerIds: [Int],
+        forceArrayMask: Bool = false,
+        verifier: Gemma4MTPVerifierContext? = nil
+    ) -> (postNorm: MLXArray, hiddenStates: [MLXArray]) {
         // Same rank-1 defense as `callAsFunction`.
         let inputs = inputs.ndim == 1 ? inputs.expandedDimensions(axis: 0) : inputs
         let hiddenCapture = Gemma4DFlashHiddenCapture(
@@ -4326,7 +4569,8 @@ public class Gemma4TextModelInner: Module {
             captureHook: nil,
             capturePreNorm: false,
             dFlashHiddenCapture: hiddenCapture,
-            forceArrayMask: forceArrayMask)
+            forceArrayMask: forceArrayMask,
+            verifier: verifier)
         return (r.postNorm, hiddenCapture.orderedHiddenStates())
     }
 
@@ -4682,10 +4926,10 @@ public enum Gemma4MTPVerifierInstallationError: Error, CustomStringConvertible {
         case .incompatibleModel(let component):
             return "Gemma 4 MTP verifier rejected \(component); installation "
                 + "requires the exact 30-layer 26B-A4B topology, pinned affine "
-                + "storage, and complete B1/C2-C4 projection bindings"
+                + "storage, and complete B1/C2-C4/C8/C16 projection bindings"
         case .alreadyInstalled:
             return "Gemma 4 MTP verifier is already installed; its published "
-                + "B1/C2-C4 context table is immutable"
+                + "B1/C2-C4/C8/C16 context table is immutable"
         }
     }
 }
@@ -4707,6 +4951,13 @@ struct Gemma4MTPVerifierConstructionFixture {
         /// V on the 25 sliding layers, plus the tied head.
         var requiredProjectionEntrypoints: Int {
             layerCount * 8 + 25 + 1
+        }
+
+        /// Post-attention, dual-prenorm, and branch-tail glue on every layer.
+        var requiredGlueEntrypoints: Int { layerCount * 3 }
+
+        var requiredEntrypoints: Int {
+            requiredProjectionEntrypoints + requiredGlueEntrypoints
         }
     }
 
@@ -4764,6 +5015,17 @@ struct Gemma4MTPVerifierConstructionFixture {
     }
 
     private static let slidingLayers = Set((0..<30).filter { ($0 + 1) % 6 != 0 })
+    private static let certifiedColumns = [2, 3, 4, 8, 16]
+
+    private static var expectedGlueComponents: [String] {
+        (0..<30).flatMap { layer in
+            [
+                "layer \(layer) post-attention glue",
+                "layer \(layer) dual-prenorm glue",
+                "layer \(layer) branch-tail glue",
+            ]
+        }
+    }
 
     private static var expectedQuantization: [String: Quantization] {
         var result: [String: Quantization] = [:]
@@ -4800,6 +5062,7 @@ struct Gemma4MTPVerifierConstructionFixture {
 
     static var production: Self {
         let quantization = expectedQuantization
+        let components = Array(quantization.keys) + expectedGlueComponents
         return Self(
             topology: Topology(
                 hiddenSize: 2_816, layerCount: 30, expertCount: 128, topK: 8,
@@ -4808,8 +5071,8 @@ struct Gemma4MTPVerifierConstructionFixture {
             tiedHead: true, routeVersion: 1,
             headVersion: Gemma4MMAQuantizedGEMV.activeVersion,
             quantization: quantization,
-            bindings: Set(quantization.keys.flatMap { component in
-                (2...4).map {
+            bindings: Set(components.flatMap { component in
+                certifiedColumns.map {
                     Binding(
                         component: component,
                         shape: .init(batch: 1, columns: $0))
@@ -4924,7 +5187,7 @@ struct Gemma4MTPVerifierConstructionFixture {
             guard quantization[component] == expected else {
                 throw Gemma4MTPVerifierInstallationError.incompatibleModel(component)
             }
-            for columns in 2...4 where !bindings.contains(
+            for columns in Self.certifiedColumns where !bindings.contains(
                 Binding(
                     component: component,
                     shape: .init(batch: 1, columns: columns)))
@@ -4932,13 +5195,22 @@ struct Gemma4MTPVerifierConstructionFixture {
                 throw Gemma4MTPVerifierInstallationError.incompatibleModel(component)
             }
         }
-        let shapes = (2...4).map {
+        for component in Self.expectedGlueComponents {
+            for columns in Self.certifiedColumns where !bindings.contains(
+                Binding(
+                    component: component,
+                    shape: .init(batch: 1, columns: columns)))
+            {
+                throw Gemma4MTPVerifierInstallationError.incompatibleModel(component)
+            }
+        }
+        let shapes = Self.certifiedColumns.map {
             CBv2Gemma4MTPVerifierShape(batch: 1, columns: $0)
         }
         var contexts: [CBv2Gemma4MTPVerifierShape: Set<Binding>] = [:]
         for shape in shapes {
             let entrypoints = Set(bindings.filter { $0.shape == shape })
-            guard entrypoints.count == topology.requiredProjectionEntrypoints else {
+            guard entrypoints.count == topology.requiredEntrypoints else {
                 throw Gemma4MTPVerifierInstallationError.incompatibleModel(
                     "B\(shape.batch)/C\(shape.columns) projection table")
             }
@@ -4954,7 +5226,11 @@ public struct Gemma4MTPVerifierAttentionBindings {
     let q: (MLXArray) -> MLXArray
     let k: (MLXArray) -> MLXArray
     let v: ((MLXArray) -> MLXArray)?
+    let value: (MLXArray, MLXArray) -> MLXArray
     let output: (MLXArray) -> MLXArray
+    let normalizeQ: (MLXArray) -> MLXArray
+    let normalizeK: (MLXArray) -> MLXArray
+    let normalizeV: (MLXArray) -> MLXArray
 }
 
 public struct Gemma4MTPVerifierDenseBindings {
@@ -4963,11 +5239,20 @@ public struct Gemma4MTPVerifierDenseBindings {
     let down: (MLXArray) -> MLXArray
 }
 
+public struct Gemma4MTPVerifierRouterBindings {
+    typealias Forward = (MLXArray) -> (
+        topKIndices: MLXArray, topKWeights: MLXArray)
+
+    let projection: (MLXArray) -> MLXArray
+    let forward: Forward
+}
+
 public struct Gemma4MTPVerifierLayerBindings {
     let attention: Gemma4MTPVerifierAttentionBindings
     let dense: Gemma4MTPVerifierDenseBindings
-    let router: (MLXArray) -> MLXArray
+    let router: Gemma4MTPVerifierRouterBindings
     let expert: CBv2Gemma4MTPExpertProjection.Projection
+    let glue: Gemma4PrefillGlueV1.VerifierBindings
 }
 
 private struct Gemma4MTPVerifierModelBindings {
@@ -5056,7 +5341,7 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         installedMTPVerifierContexts?[.init(batch: batch, columns: columns)]
     }
 
-    /// Bind the complete physical-B1 C2-C4 table after checkpoint installation.
+    /// Bind the complete physical-B1 C2-C4/C8/C16 table after checkpoint installation.
     /// The local table is published only after every projection succeeds, so
     /// no failure can leave a partially installed performance lane.
     public func installCBv2MTPVerifier() throws {
@@ -5098,7 +5383,7 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             throw Gemma4MTPVerifierInstallationError.incompatibleModel("head version")
         }
         let route = CBv2Gemma4MTPVerifierRoute.production
-        let shapes = (2...4).map {
+        let shapes = [2, 3, 4, 8, 16].map {
             CBv2Gemma4MTPVerifierShape(batch: 1, columns: $0)
         }
         for shape in shapes {
@@ -5131,7 +5416,11 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         for shape in shapes {
             let columns = shape.columns
             let layers = try model.layers.map {
-                try $0.bindMTPVerifier(columns: columns)
+                try $0.bindMTPVerifier(columns: columns, route: route)
+            }
+            guard route.strategy(for: .tiedHead, columns: columns) != nil else {
+                throw Gemma4MTPVerifierInstallationError.incompatibleModel(
+                    "tied language-model head")
             }
             let head = Gemma4MMAQuantizedGEMV.bindB1Verifier(
                 columns: columns, inDim: config.hiddenSize,
@@ -5293,6 +5582,40 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 out, MLXArray(config.finalLogitSoftcapping))
         }
         return out
+    }
+
+    /// Nonoptional tied-head close for the certified physical-B1 C4/C16
+    /// verifier. The fixed head closure was installed with the trunk bindings;
+    /// only the model's ordinary final-logit transform remains afterward.
+    func applyCertifiedMTPVerifierHead(
+        _ hidden: MLXArray,
+        verifier: Gemma4MTPVerifierContext
+    ) -> MLXArray {
+        let bindings = verifier.bindings
+        var out = bindings.tiedHead(hidden)
+        if config.finalLogitSoftcapping > 0, !CBv2OrderOnlyLogits.engaged {
+            out = gemma4CompiledLogitSoftcap(
+                out, MLXArray(config.finalLogitSoftcapping))
+        }
+        return out
+    }
+
+    /// Construction-bound DFlash greedy target entrypoint. The caller passes
+    /// the already-installed nonoptional context; this wrapper reaches only
+    /// the certified trunk and tied-head closures and returns the token plane
+    /// followed by the requested post-layer hidden planes.
+    func certifiedDFlashGreedyVerifier(
+        _ input: MLXArray,
+        cacheStack: CBv2CertifiedContiguousLayerCacheStack,
+        targetLayerIds: [Int],
+        verifier: Gemma4MTPVerifierContext
+    ) -> [MLXArray] {
+        let forward = model.callCapturingCertifiedDFlashVerifierHiddenStates(
+            input, cacheStack: cacheStack, targetLayerIds: targetLayerIds,
+            bindings: verifier.bindings)
+        let tokens = applyCertifiedMTPVerifierHead(
+            forward.postNorm, verifier: verifier).argMax(axis: -1)
+        return [tokens] + forward.hiddenStates
     }
 
     /// The LM head WITHOUT the configured final-logit softcap.
@@ -5620,5 +5943,35 @@ extension Gemma4TextModel: CBv2MTPForwardable {
                 tokens, cache: caches, verifier: verifier)
             return (applyLMHead(postNorm, verifier: verifier), preNorm)
         }
+    }
+
+    /// Operator-only localization seam for the installed fixed-width verifier.
+    /// It is not bound into CBv2 and is never reachable from serving or scored
+    /// decode. The width probe uses it to capture the already-produced per-layer
+    /// K/V tensors while comparing B1/C2-C4/C8/C16 with independent B1/L1 forwards.
+    public func cbv2MTPVerifierDiagnosticForward(
+        _ tokens: MLXArray, caches: [KVCache],
+        installedVerifier: Bool,
+        captureHook: @escaping (Int, (MLXArray, MLXArray)) -> Void
+    ) -> (
+        logits: MLXArray,
+        inputHidden: MLXArray,
+        layerHiddenStates: [MLXArray]
+    ) {
+        let shape = CBv2Gemma4MTPVerifierShape(
+            batch: tokens.dim(0), columns: tokens.dim(1))
+        let context = installedMTPVerifierContexts?[shape]
+        if installedVerifier && context == nil {
+            preconditionFailure(
+                "Gemma 4 diagnostic has no installed B\(shape.batch)/C\(shape.columns) verifier")
+        }
+        let verifier: Gemma4MTPVerifierContext? = installedVerifier ? context : nil
+        let result = model.callCapturingMTPVerifierDiagnostic(
+            tokens, cache: caches, captureHook: captureHook,
+            verifier: verifier)
+        return (
+            applyLMHead(result.postNorm, verifier: verifier),
+            result.inputHidden,
+            result.layerHiddenStates)
     }
 }

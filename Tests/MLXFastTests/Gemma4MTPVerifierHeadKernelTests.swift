@@ -60,13 +60,23 @@ struct Gemma4MTPVerifierHeadKernelTests {
                 == reference.asData(access: .copy).data)
     }
 
+    @Test
+    func tiedHeadAdmitsTheFixedC16SerialReductionEntrypoint() {
+        for columns in [2, 3, 4, 8, 16] {
+            #expect(Gemma4MMAQuantizedGEMV.supportsVerifierColumns(columns))
+        }
+        for columns in [1, 5, 7, 9, 15, 17, 32] {
+            #expect(!Gemma4MMAQuantizedGEMV.supportsVerifierColumns(columns))
+        }
+    }
+
     @Test(.enabled(if: runtimeEnabled))
     func b1VerifierHeadAtArtifactWidthIsBitExactToIndependentB1Columns() throws {
         let k = 2816
         let n = 262_144
         let (weight, scales, biases) = deterministicHeadWeights(k: k, n: n)
 
-        for columns in 2...4 {
+        for columns in [2, 3, 4, 8, 16] {
             let xValues: [Float] = (0..<(columns * k)).map { index in
                 Float((index * 29 + columns * 7) % 257 - 128) / 128.0
             }

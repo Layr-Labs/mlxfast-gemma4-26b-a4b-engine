@@ -1266,6 +1266,7 @@ struct RuntimeWorkerResponse: Codable {
     let draftedTotal: Int?
     let acceptedTotal: Int?
     let committedTotal: Int?
+    let physicalVerifierWidth: Int?
     // v1.2 batched (cohort) free-run surface. Same superset rationale as the
     // v1.1 block above: the trusted native CLI never issues the batched verbs,
     // but its strict decoder must keep parsing every line the worker can emit
@@ -1347,6 +1348,7 @@ struct RuntimeWorkerResponse: Codable {
         draftedTotal: Int? = nil,
         acceptedTotal: Int? = nil,
         committedTotal: Int? = nil,
+        physicalVerifierWidth: Int? = nil,
         maxBatchSize: Int? = nil,
         seedTokenByStream: [Int]? = nil,
         effectiveBatchSize: Int? = nil,
@@ -1414,6 +1416,7 @@ struct RuntimeWorkerResponse: Codable {
         self.draftedTotal = draftedTotal
         self.acceptedTotal = acceptedTotal
         self.committedTotal = committedTotal
+        self.physicalVerifierWidth = physicalVerifierWidth
         self.maxBatchSize = maxBatchSize
         self.seedTokenByStream = seedTokenByStream
         self.effectiveBatchSize = effectiveBatchSize
@@ -1639,6 +1642,10 @@ struct RuntimeWorkerResponse: Codable {
             Int.self,
             forKey: .committedTotal
         )
+        physicalVerifierWidth = try container.decodeIfPresent(
+            Int.self,
+            forKey: .physicalVerifierWidth
+        )
         maxBatchSize = try container.decodeIfPresent(
             Int.self,
             forKey: .maxBatchSize
@@ -1829,6 +1836,10 @@ struct RuntimeWorkerResponse: Codable {
         try container.encodeIfPresent(draftedTotal, forKey: .draftedTotal)
         try container.encodeIfPresent(acceptedTotal, forKey: .acceptedTotal)
         try container.encodeIfPresent(committedTotal, forKey: .committedTotal)
+        try container.encodeIfPresent(
+            physicalVerifierWidth,
+            forKey: .physicalVerifierWidth
+        )
         try container.encodeIfPresent(maxBatchSize, forKey: .maxBatchSize)
         try container.encodeIfPresent(
             seedTokenByStream,
@@ -1922,6 +1933,7 @@ struct RuntimeWorkerResponse: Codable {
         case draftedTotal = "drafted_total"
         case acceptedTotal = "accepted_total"
         case committedTotal = "committed_total"
+        case physicalVerifierWidth = "physical_verifier_width"
         case maxBatchSize = "max_batch_size"
         case seedTokenByStream = "seed_token_by_stream"
         case effectiveBatchSize = "effective_batch_size"

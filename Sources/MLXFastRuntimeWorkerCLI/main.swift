@@ -145,6 +145,24 @@ private enum ParticipantWorkerCLI {
                         + "docs/gemma4-port-notes.md section 8."
                 )
 
+            case "cbv2-mtp-audit-probe":
+                // Operator-only production-CBv2 A/B/C localization for the
+                // first B1/C2 MTP audit transition. Never accepted by the
+                // runtime-worker wire verb or benchd's argv fence.
+                let weights = options.value(for: "--weights")
+                let tapePath = options.value(for: "--tape")
+                let outputPath = options.value(for: "--out")
+                guard !weights.isEmpty, !tapePath.isEmpty, !outputPath.isEmpty else {
+                    throw MLXFastError.invalidInput(
+                        "cbv2-mtp-audit-probe requires --weights, --tape, and --out")
+                }
+                try Gemma4Runtime.runCBv2MTPAuditProbe(
+                    CBv2MTPAuditProbeOptions(
+                        weightsPath: weights,
+                        tapePath: tapePath,
+                        outputPath: outputPath))
+                return 0
+
             case "width-probe":
                 // OPERATOR-ONLY diagnostic (exactness round three,
                 // 2026-08-25): forward-width divergence localization.

@@ -338,14 +338,17 @@ public final class DFlashDraftModel: Module, @unchecked Sendable {
     /// round. `gemma4DFlashMaxDepth` clamps it to the drafter ceiling
     /// (`recommendedBlockSize - 1`) and the engine ceiling
     /// (`experimentalDFlashMaxBlockSize - 1`, which is 15). A value above a
-    /// ceiling clamps to the ceiling. The engine does not refuse it. Default 1.
+    /// ceiling clamps to the ceiling. The engine does not refuse it. The
+    /// retained 1K/128 D15 setting starts on C4 and installs its full C16
+    /// target-verified proposal phase only after the generated chain exposes
+    /// the period-two anchor.
     ///
     /// UNIFORM WITH MTP. `CBv2MTPRoundDriver.submissionDraftDepth` is the MTP
-    /// counterpart. It has the same name, the same meaning, and the same default
-    /// 1. The per-arm behaviour differs. MTP adapts up to its ceiling each round.
+    /// counterpart. It has the same name and the same meaning. The per-arm
+    /// behaviour differs. MTP adapts up to its ceiling each round.
     /// DFlash proposes a fixed block of this size. The constant you edit is the
     /// same on both arms.
-    public static let submissionDraftDepth = 1
+    public static let submissionDraftDepth = 15
 
     /// The pure DFlash depth clamp. A requested draft depth, bounded by the
     /// drafter ceiling and the engine ceiling, floored at 1. A value above a
@@ -433,6 +436,36 @@ public final class DFlashDraftModel: Module, @unchecked Sendable {
         cache: [KVCache],
         logitsStart: Int = 0
     ) throws -> MLXArray {
+        let projectedContext = try projectTargetHidden(targetHidden)
+        return try callWithProjectedContext(
+            inputs,
+            projectedContext: projectedContext,
+            cache: cache,
+            logitsStart: logitsStart,
+            applyFinalLogitSoftcap: true)
+    }
+
+    /// Project target tap features exactly once when they enter the DFlash
+    /// feature store. The reference runner performs this work during target
+    /// prefill and then feeds the installed projected context to every draft
+    /// layer; keeping it as a named boundary prevents the first decode round
+    /// from re-owning prompt projection work.
+    public func projectTargetHidden(_ targetHidden: MLXArray) throws -> MLXArray {
+        guard targetHidden.dim(-1) == config.targetHiddenSize else {
+            throw DFlashError.targetHiddenSizeMismatch(
+                expected: config.targetHiddenSize,
+                actual: targetHidden.dim(-1))
+        }
+        return hiddenNorm(contextProjection(targetHidden))
+    }
+
+    private func callWithProjectedContext(
+        _ inputs: MLXArray,
+        projectedContext: MLXArray,
+        cache: [KVCache],
+        logitsStart: Int,
+        applyFinalLogitSoftcap: Bool
+    ) throws -> MLXArray {
         guard let targetEmbed, let targetLMHead else {
             throw DFlashError.drafterNotBound
         }
@@ -442,18 +475,16 @@ public final class DFlashDraftModel: Module, @unchecked Sendable {
         guard logitsStart >= 0 else {
             throw DFlashError.invalidLogitsStart(logitsStart)
         }
-        guard targetHidden.dim(-1) == config.targetHiddenSize else {
+        guard projectedContext.dim(-1) == config.hiddenSize else {
             throw DFlashError.targetHiddenSizeMismatch(
-                expected: config.targetHiddenSize,
-                actual: targetHidden.dim(-1)
-            )
+                expected: config.hiddenSize,
+                actual: projectedContext.dim(-1))
         }
 
         var h = targetEmbed(inputs)
-        let context = hiddenNorm(contextProjection(targetHidden))
 
         for (i, layer) in layers.enumerated() {
-            h = try layer(h, context: context, rope: rope, cache: cache[i])
+            h = try layer(h, context: projectedContext, rope: rope, cache: cache[i])
         }
 
         if logitsStart > 0 {
@@ -461,7 +492,7 @@ public final class DFlashDraftModel: Module, @unchecked Sendable {
         }
 
         var logits = targetLMHead(norm(h))
-        if let cap = config.finalLogitSoftcapping {
+        if applyFinalLogitSoftcap, let cap = config.finalLogitSoftcapping {
             logits = tanh(logits / cap) * cap
         }
         return logits
@@ -478,12 +509,35 @@ public final class DFlashDraftModel: Module, @unchecked Sendable {
         }
         let maskValues = Array(repeating: Int32(config.maskTokenId), count: blockSize - 1)
         let block = MLXArray([Int32(bonus)] + maskValues)[.newAxis, .ellipsis]
-        let logits = try self(
+        let projectedContext = try projectTargetHidden(targetHidden)
+        let logits = try callWithProjectedContext(
             block,
-            targetHidden: targetHidden,
+            projectedContext: projectedContext,
             cache: cache,
-            logitsStart: 1
-        )
+            logitsStart: 1,
+            applyFinalLogitSoftcap: false)
+        return logits.argMax(axis: -1)
+    }
+
+    /// Reference-runner entrypoint: the target feature projection has already
+    /// been performed at the feature-store boundary.
+    public func draftBlock(
+        bonus: Int,
+        projectedContext: MLXArray,
+        cache: [KVCache],
+        blockSize: Int
+    ) throws -> MLXArray {
+        guard blockSize >= 2 else {
+            throw DFlashError.invalidBlockSize(blockSize)
+        }
+        let maskValues = Array(repeating: Int32(config.maskTokenId), count: blockSize - 1)
+        let block = MLXArray([Int32(bonus)] + maskValues)[.newAxis, .ellipsis]
+        let logits = try callWithProjectedContext(
+            block,
+            projectedContext: projectedContext,
+            cache: cache,
+            logitsStart: 1,
+            applyFinalLogitSoftcap: false)
         return logits.argMax(axis: -1)
     }
 
@@ -502,12 +556,13 @@ public final class DFlashDraftModel: Module, @unchecked Sendable {
             [Int32(rowBonus)] + maskValues
         }
         let block = MLXArray(rows, [batchSize, blockSize])
-        let logits = try self(
+        let projectedContext = try projectTargetHidden(targetHidden)
+        let logits = try callWithProjectedContext(
             block,
-            targetHidden: targetHidden,
+            projectedContext: projectedContext,
             cache: cache,
-            logitsStart: 1
-        )
+            logitsStart: 1,
+            applyFinalLogitSoftcap: false)
         return logits.argMax(axis: -1)
     }
 

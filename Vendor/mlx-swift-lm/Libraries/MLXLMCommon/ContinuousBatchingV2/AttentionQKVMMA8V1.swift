@@ -563,7 +563,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_verify(
     }
 
     public static func supportsVerifierColumns(_ columns: Int) -> Bool {
-        (2...4).contains(columns)
+        [2, 3, 4, 8, 16].contains(columns)
     }
 
     public static func matmul(

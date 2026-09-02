@@ -3,8 +3,8 @@
 import MLX
 import MLXFast
 
-/// Construction-bound affine QMV shared by two to four verifier positions at
-/// physical batch one.
+/// Construction-bound affine QMV shared by the fixed C2/C3/C4/C8/C16
+/// verifier positions at physical batch one.
 ///
 /// Each output row retains the ordinary single-row QMV lane arithmetic and
 /// `simd_sum` reduction.  The only sharing is that one lane loads a packed
@@ -12,6 +12,7 @@ import MLXFast
 /// packet independently to each verifier column.
 public enum Gemma4B1MTPQuantizedProjection {
     public typealias Projection = (MLXArray) -> MLXArray
+    private static let certifiedColumns: Set<Int> = [2, 3, 4, 8, 16]
 
     public static func bind(
         columns: Int,
@@ -23,7 +24,7 @@ public enum Gemma4B1MTPQuantizedProjection {
         groupSize: Int,
         bits: Int
     ) -> Projection? {
-        guard (2...4).contains(columns),
+        guard certifiedColumns.contains(columns),
             inDim > 0,
             outDim > 0,
             inDim.isMultiple(of: 64),

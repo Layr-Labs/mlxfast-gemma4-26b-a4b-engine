@@ -14,10 +14,13 @@ public enum CBv2Gemma4MTPVerifierProjection: Sendable {
 public enum CBv2Gemma4MTPVerifierProjectionStrategy: Sendable, Equatable {
     case combined
     case independentB8
+    case sharedSerialReduction
 }
 
-/// C2...C4 attention always retains ordinary decode geometry and ownership.
+/// Construction-time attention implementation. The shared-K/V case remains a
+/// candidate until its exactness and width-specific performance gates pass.
 public enum CBv2Gemma4MTPVerifierAttentionStrategy: Sendable, Equatable {
+    case sharedKVExact
     case serializedDecode
 }
 
@@ -31,8 +34,10 @@ public struct CBv2Gemma4MTPVerifierShape: Sendable, Hashable {
     }
 }
 
-/// Fixed route for the only certified physical widths, C2 through C4.
+/// Fixed route for the only certified physical widths, C2, C3, C4, C8, and C16.
 public struct CBv2Gemma4MTPVerifierRoute: Sendable {
+    public static let certifiedColumns: Set<Int> = [2, 3, 4, 8, 16]
+
     public static let production = Self(
         gateUpUsesMMA8: CBv2DenseMLPQMVV1.mma8GateUpEnabled,
         tiedHeadVersion: Gemma4MMAQuantizedGEMV.activeVersion)
@@ -57,7 +62,10 @@ public struct CBv2Gemma4MTPVerifierRoute: Sendable {
         for projection: CBv2Gemma4MTPVerifierProjection,
         columns: Int
     ) -> CBv2Gemma4MTPVerifierProjectionStrategy? {
-        guard (2...4).contains(columns) else { return nil }
+        guard Self.certifiedColumns.contains(columns) else { return nil }
+        if columns == 8 || columns == 16 {
+            return .sharedSerialReduction
+        }
         switch projection {
         case .qkv, .attentionOutput, .denseDown, .expert:
             return .combined
@@ -74,7 +82,22 @@ public struct CBv2Gemma4MTPVerifierRoute: Sendable {
     public func attentionStrategy(
         columns: Int
     ) -> CBv2Gemma4MTPVerifierAttentionStrategy? {
-        (2...4).contains(columns) ? .serializedDecode : nil
+        Self.certifiedColumns.contains(columns) ? .serializedDecode : nil
+    }
+
+    /// Explicit diagnostic candidate route. Normal serving continues to call
+    /// `attentionStrategy(columns:)`, so an unmeasured kernel cannot silently
+    /// replace the serial control.
+    public func candidateAttentionStrategy(
+        kind: CBv2LayerKind.Attention, columns: Int
+    ) -> CBv2Gemma4MTPVerifierAttentionStrategy? {
+        guard (2...4).contains(columns) else { return nil }
+        switch kind {
+        case .full:
+            return .sharedKVExact
+        case .slidingWindow:
+            return .serializedDecode
+        }
     }
 
     /// Preserve the exact four-row gate/up reduction geometry.
@@ -97,8 +120,19 @@ public struct CBv2Gemma4MTPVerifierRoute: Sendable {
     }
 }
 
+/// Pure causal geometry shared by the binder and CPU-only route tests.
+public enum Gemma4B1MTPFullAttentionGeometry {
+    public static func visibleKeyLengths(
+        historyLength: Int, columns: Int
+    ) -> [Int] {
+        precondition(historyLength >= 0)
+        precondition(CBv2Gemma4MTPVerifierRoute.certifiedColumns.contains(columns))
+        return (0..<columns).map { historyLength + $0 + 1 }
+    }
+}
+
 public extension CBv2Gemma4MTPVerifierRoute {
     func supports(_ shape: CBv2Gemma4MTPVerifierShape) -> Bool {
-        shape.batch == 1 && (2...4).contains(shape.columns)
+        shape.batch == 1 && Self.certifiedColumns.contains(shape.columns)
     }
 }

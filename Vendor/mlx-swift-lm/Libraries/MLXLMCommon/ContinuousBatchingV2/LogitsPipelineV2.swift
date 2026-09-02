@@ -623,4 +623,18 @@ public enum CBv2OrderOnlyLogits {
         defer { set(false) }
         return build()
     }
+
+    /// Bracket a graph whose consumer is intrinsically greedy top-1. Unlike
+    /// the sampling-parameter form, this construction boundary needs no
+    /// runtime predicate: the caller's return type exposes tokens rather than
+    /// logits. Preserve a surrounding declaration so nested graph builders do
+    /// not clear their caller's invariant.
+    public static func withGreedyOrderOnly<T>(
+        _ build: () throws -> T
+    ) rethrows -> T {
+        let previous = flag
+        set(true)
+        defer { set(previous) }
+        return try build()
+    }
 }

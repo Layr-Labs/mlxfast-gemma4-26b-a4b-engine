@@ -58,6 +58,17 @@ public protocol KVCache: Evaluatable, Updatable {
     @discardableResult
     func trim(_ n: Int) -> Int
 
+    /// Whether the cache can discard its most recently appended tokens.
+    ///
+    /// Unlike ``isTrimmable``, this may remain true after a rotating cache is
+    /// saturated because recent-tail rollback first restores temporal order.
+    var isRecentTrimmable: Bool { get }
+
+    /// Discard the `n` most recently appended tokens, returning the actual
+    /// number removed.
+    @discardableResult
+    func trimRecent(_ n: Int) -> Int
+
     /// Create an attention mask for this cache
     ///
     /// This method encapsulates cache-specific mask creation logic. Implementations should handle offset capping, window size logic,
@@ -74,6 +85,13 @@ public protocol KVCache: Evaluatable, Updatable {
 
     /// Create an independent deep copy of this cache.
     func copy() -> any KVCache
+}
+
+public extension KVCache {
+    var isRecentTrimmable: Bool { isTrimmable }
+
+    @discardableResult
+    func trimRecent(_ n: Int) -> Int { trim(n) }
 }
 
 /// Protocol for caches that support efficient quantized operations
@@ -151,6 +169,11 @@ open class BaseKVCache: KVCache {
 
     @discardableResult
     open func trim(_ n: Int) -> Int { 0 }
+
+    open var isRecentTrimmable: Bool { isTrimmable }
+
+    @discardableResult
+    open func trimRecent(_ n: Int) -> Int { trim(n) }
 
     open func copy() -> any KVCache {
         fatalError("copy() must be implemented by subclass")
@@ -732,6 +755,32 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
 
     public override var isTrimmable: Bool {
         return offset < maxCacheSize
+    }
+
+    /// DFlash verifies multiple speculative tokens in one update. Once this
+    /// ring is saturated, ordinary `trim` cannot move `idx` backwards without
+    /// resurrecting overwritten entries. Mirror the reference Gemma 4 DFlash
+    /// rollback: restore temporal order, remove the rejected tail, and leave
+    /// the next write at the retained frontier.
+    public override var isRecentTrimmable: Bool { true }
+
+    @discardableResult
+    public override func trimRecent(_ n: Int) -> Int {
+        let trimmed = min(offset, max(0, n))
+        guard trimmed > 0 else { return 0 }
+
+        if let keys, let values {
+            let temporalKeys = temporalOrder(keys)
+            let temporalValues = temporalOrder(values)
+            let keepLength = max(0, temporalKeys.dim(2) - trimmed)
+            self.keys = temporalKeys[.ellipsis, ..<keepLength, 0...]
+            self.values = temporalValues[.ellipsis, ..<keepLength, 0...]
+            idx = keepLength
+        } else {
+            idx = max(0, idx - trimmed)
+        }
+        offset -= trimmed
+        return trimmed
     }
 
     @discardableResult

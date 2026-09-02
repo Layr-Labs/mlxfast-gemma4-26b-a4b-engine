@@ -348,3 +348,35 @@ extension CBv2LayerCache: KVCache {
             "CBv2LayerCache.copy is unsupported — v2 rows are engine-owned (layer \(layerIndex))")
     }
 }
+
+/// Construction-certified physical-B1 contiguous cache stack for fixed-width
+/// verifier forwards. The failable initializer validates concrete cache type,
+/// layer order, storage ownership, row count, and one shared position chain
+/// once; the installed hot path subsequently reads only typed, nonoptional
+/// members.
+public struct CBv2CertifiedContiguousLayerCacheStack {
+    public let layers: [CBv2LayerCache]
+    private let positionOwner: CBv2LayerCache
+
+    public var positionOffsets: MLXArray { positionOwner.positionOffsets }
+
+    public init?(_ caches: [KVCache]) {
+        let layers = caches.compactMap { $0 as? CBv2LayerCache }
+        guard !layers.isEmpty,
+            layers.count == caches.count,
+            layers.enumerated().allSatisfy({ index, cache in
+                cache.layerIndex == index
+            }),
+            layers.allSatisfy({ $0.kind.sharesKVWithLayer == nil }),
+            layers.allSatisfy({ $0.rows.count == 1 }),
+            let stateIdentity = layers[0].unifiedPositionStateIdentity,
+            layers[0].unifiedPositionOffsets != nil,
+            layers.dropFirst().allSatisfy({
+                $0.unifiedPositionStateIdentity == stateIdentity
+                    && $0.unifiedPositionOffsets != nil
+            })
+        else { return nil }
+        self.layers = layers
+        self.positionOwner = layers[0]
+    }
+}

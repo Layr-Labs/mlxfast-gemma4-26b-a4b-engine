@@ -80,6 +80,35 @@ struct Gemma4MTPVerifierExpertKernelTests {
         return weightedExpertSum(
             MLX.squeezed(unsorted, axis: -2), routeWeights)
     }
+
+    /// The canonical physical-B1/L1 SwitchGLU route. Eight assignments do
+    /// not cross SwitchGLU's `indices.size >= 64` sorting threshold, so the
+    /// verifier identity oracle must keep the established unsorted gathers.
+    private func ordinaryB1ExpertBlock(
+        x: MLXArray, indices: MLXArray, routeWeights: MLXArray,
+        gate: (MLXArray, MLXArray, MLXArray),
+        up: (MLXArray, MLXArray, MLXArray),
+        down: (MLXArray, MLXArray, MLXArray)
+    ) -> MLXArray {
+        let expandedX = MLX.expandedDimensions(x, axes: [-2, -3])
+        func project(
+            _ input: MLXArray,
+            _ plane: (MLXArray, MLXArray, MLXArray)
+        ) -> MLXArray {
+            gatherQuantizedMM(
+                input, plane.0, scales: plane.1, biases: plane.2,
+                lhsIndices: nil, rhsIndices: indices,
+                transpose: true, groupSize: 64, bits: 4, mode: .affine,
+                sortedIndices: false)
+        }
+        let gateOutput = project(expandedX, gate)
+        let upOutput = project(expandedX, up)
+        let activated = CBv2Gemma4MTPExpertProjection.productionGeGLU(
+            gate: gateOutput, up: upOutput)
+        let downOutput = project(activated, down)
+        return weightedExpertSum(
+            MLX.squeezed(downOutput, axis: -2), routeWeights)
+    }
     @Test
     func routerBinderAcceptsOnlyProductionAffineQ8Group64() {
         #expect(CBv2Gemma4MTPRouterProjection.supportsProductionQuantization(
@@ -97,6 +126,86 @@ struct Gemma4MTPVerifierExpertKernelTests {
         #expect(CBv2Gemma4ExpertVerifierGeometry.supports(assignments: 256))
         #expect(!CBv2Gemma4ExpertVerifierGeometry.supports(assignments: 64))
         #expect(!CBv2Gemma4ExpertVerifierGeometry.supports(assignments: 320))
+    }
+
+    @Test
+    func physicalB1ExpertRoutePreservesC2ToC8AndUsesStableRank128ForC16() throws {
+        for columns in [2, 3, 4, 8, 16] {
+            #expect(CBv2Gemma4MTPExpertProjection.supportsVerifierColumns(columns))
+        }
+        for columns in [1, 5, 7, 9, 15, 17] {
+            #expect(!CBv2Gemma4MTPExpertProjection.supportsVerifierColumns(columns))
+        }
+
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/SwitchLayers.swift"),
+            encoding: .utf8)
+        let expertStart = try #require(source.range(
+            of: "public enum CBv2Gemma4MTPExpertProjection"))
+        let binderStart = try #require(source.range(
+            of: "    public static func bindB1Verifier(",
+            range: expertStart.upperBound..<source.endIndex))
+        let independentStart = try #require(source.range(
+            of: "    public static func bindIndependentB8(",
+            range: binderStart.upperBound..<source.endIndex))
+        let binder = String(source[binderStart.lowerBound..<independentStart.lowerBound])
+        let c8Start = try #require(binder.range(of: "        if columns == 8 {"))
+        let c16Start = try #require(binder.range(
+            of: "        if columns == 16 {",
+            range: c8Start.upperBound..<binder.endIndex))
+        let c2ToC4Start = try #require(binder.range(
+            of: "\n        return { x, indices, routeWeights in",
+            range: c16Start.upperBound..<binder.endIndex))
+        let c8 = String(binder[c8Start.lowerBound..<c16Start.lowerBound])
+        let c16 = String(binder[c16Start.lowerBound..<c2ToC4Start.lowerBound])
+        let c2ToC4 = String(binder[c2ToC4Start.lowerBound..<binder.endIndex])
+        #expect(c8.contains("runCombinedC8("))
+        #expect(!c8.contains("runCombinedC16("))
+        #expect(c16.contains("runCombinedC16("))
+        #expect(!c16.contains("runCombinedC8("))
+        #expect(!c8.contains("?"))
+        #expect(!c16.contains("?"))
+        #expect(c2ToC4.contains("return runCombined("))
+        #expect(!c2ToC4.contains("runCombinedC8("))
+        #expect(!c2ToC4.contains("runCombinedC16("))
+
+        let c8HelperStart = try #require(source.range(
+            of: "    private static func runCombinedC8("))
+        let c16HelperStart = try #require(source.range(
+            of: "    private static func runCombinedC16(",
+            range: c8HelperStart.upperBound..<source.endIndex))
+        let c8Helper = String(
+            source[c8HelperStart.lowerBound..<c16HelperStart.lowerBound])
+        #expect(c8Helper.contains("routeSimdRank64Kernel("))
+        #expect(c8Helper.contains("grid: (64, 1, 1)"))
+        #expect(c8Helper.contains("threadGroup: (64, 1, 1)"))
+        let independentB1Start = try #require(source.range(
+            of: "    private static func runIndependentB1(",
+            range: c16HelperStart.upperBound..<source.endIndex))
+        let c16Helper = String(
+            source[c16HelperStart.lowerBound..<independentB1Start.lowerBound])
+        #expect(c16Helper.contains("routeStableRank128Kernel("))
+        #expect(c16Helper.contains("grid: (128, 1, 1)"))
+        #expect(c16Helper.contains("threadGroup: (128, 1, 1)"))
+        #expect(c16Helper.contains("outputShapes: [[128], [128], [128]]"))
+        #expect(source.contains("threadgroup uint keys[128]"))
+        #expect(source.contains("other < key || (other == key && source < assignment)"))
+        #expect(source.contains("row_order[rank] = assignment / 8"))
+        #expect(source.contains("sorted_keys[rank] = key"))
+        #expect(source.contains("inverse_order[assignment] = rank"))
+        #expect(!c16.contains("ProcessInfo"))
+        #expect(!c16.contains("fallback"))
+        #expect(!c16.contains("catch"))
+        #expect(!c16Helper.contains("ProcessInfo"))
+        #expect(!c16Helper.contains("fallback"))
+        #expect(!c16Helper.contains("catch"))
+        #expect(!source.contains("routeSimdRank32Kernel"))
+        #expect(!source.contains("b1RouteBinding(columns:"))
     }
 
     @Test(.enabled(if: runtimeEnabled))
@@ -152,7 +261,7 @@ struct Gemma4MTPVerifierExpertKernelTests {
     }
 
     @Test(.enabled(if: runtimeEnabled))
-    func physicalB1RouterPreservesIndependentQ8ScoresForC2ThroughC4() throws {
+    func physicalB1RouterPreservesIndependentQ8ScoresForEveryInstalledWidth() throws {
         let inDim = 2816
         let outDim = 128
         let bits = 8
@@ -171,7 +280,7 @@ struct Gemma4MTPVerifierExpertKernelTests {
         let biases = MLXArray(biasValues).reshaped([outDim, inDim / 64])
             .asType(.bfloat16)
 
-        for columns in 2...4 {
+        for columns in [2, 3, 4, 8, 16] {
             let router = try #require(CBv2Gemma4MTPRouterProjection.bindB1Verifier(
                 columns: columns, weight: weight, scales: scales, biases: biases,
                 groupSize: 64, bits: bits, mode: .affine))
@@ -255,13 +364,20 @@ struct Gemma4MTPVerifierExpertKernelTests {
         let down = expertPlane(experts: experts, inDim: intermediate, outDim: hidden, seed: 71)
 
         MLXRandom.seed(disjoint ? 4_704_2817 : 4_704_2818)
-        for columns in 2...4 {
+        for columns in [2, 3, 4, 8, 16] {
             let combined = try #require(CBv2Gemma4MTPExpertProjection.bindB1Verifier(
                 columns: columns,
                 gateWeight: gate.0, gateScales: gate.1, gateBiases: gate.2,
                 upWeight: up.0, upScales: up.1, upBiases: up.2,
                 downWeight: down.0, downScales: down.1, downBiases: down.2,
                 groupSize: 64, bits: 4, mode: .affine))
+            let independent = try #require(
+                CBv2Gemma4MTPExpertProjection.bindIndependentB1Verifier(
+                    columns: columns,
+                    gateWeight: gate.0, gateScales: gate.1, gateBiases: gate.2,
+                    upWeight: up.0, upScales: up.1, upBiases: up.2,
+                    downWeight: down.0, downScales: down.1, downBiases: down.2,
+                    groupSize: 64, bits: 4, mode: .affine))
             let x = MLXRandom.normal([1, columns, hidden], dtype: .bfloat16)
             let indices = MLXArray(
                 (0..<(columns * 8)).map { assignment in
@@ -277,9 +393,10 @@ struct Gemma4MTPVerifierExpertKernelTests {
                 low: 0, high: 1, [1, columns, 8]).asType(.bfloat16)
 
             let candidate = combined(x, indices, routeWeights)
+            let independentCandidate = independent(x, indices, routeWeights)
             let reference = concatenated(
                 (0..<columns).map { column in
-                    ordinaryB8ExpertBlock(
+                    ordinaryB1ExpertBlock(
                         x: x[0..., column, 0...].reshaped([1, hidden]),
                         indices: indices[0..., column, 0...].reshaped([1, 8]),
                         routeWeights: routeWeights[0..., column, 0...].reshaped([1, 8]),
@@ -287,10 +404,14 @@ struct Gemma4MTPVerifierExpertKernelTests {
                     ).reshaped([1, 1, hidden])
                 },
                 axis: 1)
-            eval(candidate, reference)
+            eval(candidate, independentCandidate, reference)
 
             #expect(candidate.shape == [1, columns, hidden])
             #expect(allClose(candidate, reference, rtol: 0, atol: 0).item(Bool.self))
+            #expect(independentCandidate.shape == [1, columns, hidden])
+            #expect(
+                allClose(independentCandidate, reference, rtol: 0, atol: 0)
+                    .item(Bool.self))
         }
     }
 }

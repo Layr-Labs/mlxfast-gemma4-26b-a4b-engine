@@ -95,10 +95,12 @@ This command checks your toolchain, builds the two Swift binaries, builds
 This command stages the MTP head into `./mtp-head/`. The engine reads the head
 from that exact directory name.
 
-> **NOTE — the DFlash arm is disabled.**
-> Do not run `./setup-gemma4-dflash.sh`. The script stages the DFlash drafter,
-> and the DFlash arm is disabled on this track. See
-> [Scoring and gates](#scoring-and-gates).
+```bash
+./setup-gemma4-dflash.sh
+```
+
+This command stages the pinned DFlash drafter into `./dflash-head/`. Run it
+when `spec-decoder-head.manifest.json` selects the DFlash arm.
 
 ```bash
 .build/release/mlxfast-swift transform \
@@ -151,7 +153,7 @@ This command runs the local test against the checked-in public golden.
 | `tools/` | Setup, build, lint, and measurement scripts. | Trusted |
 | `benchd-bin/` | Where `./tools/fetch-benchd.sh` installs the verified binary. Git ignores it. | Fetched |
 | `mtp-head/` | The slot for your own MTP head. | Editable, optional |
-| `dflash-head/` | The slot for the DFlash drafter. The DFlash arm is disabled. | Not used |
+| `dflash-head/` | The slot for the organizer-pinned DFlash drafter. | Staged, generated |
 | `correctness_prompts/` | The public prompt and the two public goldens. | Trusted |
 | `weights/` | The transformed weights the engine loads. | Generated |
 | `benchmark.json` | The Yukon track manifest. It lists every editable path. | Trusted |
@@ -166,10 +168,9 @@ command by design.
 `fixtures/gemma4_assistant.sha256`.
 
 `./setup-gemma4-dflash.sh` stages the pinned DFlash drafter
-(`z-lab/gemma-4-26B-A4B-it-DFlash`) into `./dflash-head/`. **The DFlash arm is
-disabled on this track. Do not run this script.** The script stays in the tree
-so the staging path remains documented. Nothing else runs it, so it cannot
-break the MTP path.
+(`z-lab/gemma-4-26B-A4B-it-DFlash`) into `./dflash-head/`. It verifies every
+downloaded byte against `fixtures/gemma4_dflash_drafter.sha256`. Nothing else
+runs it, so it remains opt-in and cannot break the MTP path.
 
 Both stagers delegate to `./setup.sh`'s downloader. All artifacts share
 one download, verification, resume, and stall path.
@@ -217,11 +218,9 @@ The editable surface has five groups.
 
 ### The two organizer-pinned heads
 
-Both speculative heads are the organizer's pinned weights. The MTP head is the
-only head a submission can drive: the DFlash arm is disabled. You may
-re-quantize the MTP head. You may not replace either head, and you may not
-upload head weights of your own. Custom head weights are not accepted on this
-track.
+Both speculative heads are the organizer's pinned weights. You may re-quantize
+either head. You may not replace either head, and you may not upload head
+weights of your own. Custom head weights are not accepted on this track.
 
 `mtp-head/` and `dflash-head/` are **not** editable paths, so a submission
 carries no head weight file. A submission that carries one is refused before any
@@ -234,19 +233,18 @@ has a 2 GiB declaration cap (`max_bytes` = 2147483648); a declaration may lower
 it and may not raise it.
 
 `spec-decoder-head.manifest.json` also carries the `arm` key, which names the
-speculative arm the ranked run measures. The DFlash arm is disabled, so
-`"arm": "mtp"` — or no `arm` key, or no file at all — is the only valid
-selection. `mtp-head.manifest.json` does not carry an `arm` key: an `arm` there
-is refused, because nothing reads it. See "Scoring" below and
+speculative arm the ranked run measures. `"arm": "dflash"` selects DFlash;
+`"arm": "mtp"`, no `arm` key, or no file selects MTP.
+`mtp-head.manifest.json` does not carry an `arm` key: an `arm` there is refused,
+because nothing reads it. See "Scoring" below and
 `docs/participant-contract.md` section 5.1.1.
 
 A re-quantization happens ON LOAD, in memory. Nothing on disk changes. The MTP
-head loader already calls `quantize(model:)` while it binds the checkpoint, and
-the file that holds that call is editable:
-`Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Gemma4MTP.swift`. Change the
-geometry that call selects. `docs/participant-contract.md` section 4.4 is the
-authority. (`Vendor/mlx-swift-lm/Libraries/MLXSpeculative/DFlashDraftModel.swift`
-stays listed in `editablePaths`, but the DFlash arm it feeds is disabled.)
+and DFlash loaders already call `quantize(model:)` while binding their
+checkpoints. Their editable seams are
+`Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Gemma4MTP.swift` and
+`Vendor/mlx-swift-lm/Libraries/MLXSpeculative/DFlashDraftModel.swift`.
+`docs/participant-contract.md` section 4.4 is the authority.
 
 The size cap is the only gate on a declaration. A declared `sha256` is optional,
 and the runner does not verify it against the head bytes. Nothing in this
@@ -266,9 +264,8 @@ head.
 > **NOTE — batch size is locked. Draft depth is not.**
 > The batch size stays 8. You may not tune it.
 >
-> The draft depth is a free lever on the MTP arm, and it is not pinned at 1.
-> You set it in code. The arm reads one editable constant,
-> `submissionDraftDepth`. The constant defaults to 1. A value above the ceiling
+> Draft depth is a free lever on both speculative arms. Each arm reads one
+> editable `submissionDraftDepth` constant. A value above the arm's ceiling
 > clamps to the ceiling. The engine does not refuse it.
 >
 > MTP: `CBv2MTPRoundDriver.submissionDraftDepth`. It is a ceiling on the adaptive
@@ -276,6 +273,11 @@ head.
 > The envelope limits the ceiling to 3 (`maxDraftTokens` 3;
 > `maxAutomaticRectangularTokens` 32 at batch 8). The controller
 > (`CBv2MTPDepthController.swift`) is also editable.
+>
+> DFlash: `DFlashDraftModel.submissionDraftDepth` is a fixed block depth. The
+> retained setting is 11, selected as the fastest depth that preserved the
+> public 1K/128 serial chain in the 2026-08-30 sweep. The trained and engine
+> ceilings remain 15.
 >
 > The `fixed_depth = 1` constant in the track fixture is a darkbloom reference
 > constant for stateless Gemma. It is not a limit on your draft depth.
@@ -320,10 +322,10 @@ one. This holds even when the result passes every correctness gate.
 target format. A lossier target substitutes a degraded model instead of
 optimizing the accepted one.
 
-The MTP head is a narrow exception, and the exception is re-quantization only.
-You may re-quantize the MTP head. You may not replace it. It stays within its
-2 GiB cap. A decoder only proposes tokens, and the pinned target decides every
-emitted token.
+The two speculative heads are a narrow exception, and the exception is
+re-quantization only. You may re-quantize either head. You may not replace
+either one. Each stays within its 2 GiB cap. A decoder only proposes tokens,
+and the pinned target decides every emitted token.
 
 ### What you must not change
 
@@ -489,12 +491,10 @@ measured `noop_decode_speedup`. `hidden_correctness_golden` also holds a real
 > The 8 prompts stay hidden. The organizer holds them on the ranked box. You
 > get the pins, not the prompts.
 
-> **NOTE — the DFlash arm is disabled.**
-> This track scores the serial and MTP arms only. Do not select DFlash: do not
-> write `"arm": "dflash"` in `spec-decoder-head.manifest.json`, and do not
-> stage `dflash-head/`. A submission runs the MTP arm with `"arm": "mtp"`, or
-> no `arm` key, or no file at all — the behavior this track had before the key
-> existed.
+The DFlash arm is selected by `"arm": "dflash"` in
+`spec-decoder-head.manifest.json`. It runs single-stream and is scored in the
+free-run v1.1 series; it is never pooled with the batch-8 MTP cohort score.
+`"arm": "mtp"`, an absent key, or an absent file selects MTP.
 
 The repositories stay private until launch.
 
@@ -545,8 +545,8 @@ No local run blocks the upload. Run the local test yourself before you submit.
 | Target manifest | `fixtures/reference_gemma4_26b_a4b_qat4bit.sha256` (11 records, 15,641,239,658 bytes) |
 | MTP head | `mlx-community/gemma-4-26B-A4B-it-qat-assistant-4bit` @ `bb94eae1b70a80dac16cbf959bb4b7d56bd1fb8c` |
 | MTP head manifest | `fixtures/gemma4_assistant.sha256` (8 records) |
-| DFlash drafter (arm disabled) | `z-lab/gemma-4-26B-A4B-it-DFlash` |
-| DFlash drafter manifest (arm disabled) | `fixtures/gemma4_dflash_drafter.sha256` (2 records) |
+| DFlash drafter | `z-lab/gemma-4-26B-A4B-it-DFlash` @ `77d4202772dfe50b2396ec7bac9cfffc7b9e7057` |
+| DFlash drafter manifest | `fixtures/gemma4_dflash_drafter.sha256` (2 records) |
 | Benchmarker | branch `gemma4-26b-a4b-mlx-v1`, resolved at run time from the branch's dist channel (`benchctl.manifest.json` is the authority for the bytes; `tools/fetch-benchd.sh` enforces it and logs the resolved `source_commit`/sha256) |
 | Model fork revision | `ed55bee83beb0623152f4c2e70f0cf99ad379e35` |
 

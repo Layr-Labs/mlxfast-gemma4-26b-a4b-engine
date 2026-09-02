@@ -78,6 +78,10 @@ public struct DFlashTargetForward: @unchecked Sendable {
 public struct DFlashGreedyTargetForward: @unchecked Sendable {
     public let tokens: MLXArray
     public let targetHidden: MLXArray
+    /// Unconcatenated tap tensors let the accept path select committed rows
+    /// before assembling the wide draft context, matching the reference
+    /// runner's hidden-extraction order.
+    public let hiddenStates: [MLXArray]?
     public let verifyTimings: DFlashTargetVerifyTimings?
 
     public init(
@@ -87,6 +91,21 @@ public struct DFlashGreedyTargetForward: @unchecked Sendable {
     ) {
         self.tokens = tokens
         self.targetHidden = targetHidden
+        self.hiddenStates = nil
+        self.verifyTimings = verifyTimings
+    }
+
+    public init(
+        tokens: MLXArray,
+        hiddenStates: [MLXArray],
+        verifyTimings: DFlashTargetVerifyTimings? = nil
+    ) {
+        precondition(!hiddenStates.isEmpty)
+        self.tokens = tokens
+        self.hiddenStates = hiddenStates
+        self.targetHidden = hiddenStates.count == 1
+            ? hiddenStates[0]
+            : concatenated(hiddenStates, axis: -1)
         self.verifyTimings = verifyTimings
     }
 }
@@ -246,7 +265,7 @@ extension DFlashTargetModel {
         )
         return DFlashGreedyTargetForward(
             tokens: forward.logits.argMax(axis: -1),
-            targetHidden: forward.targetHidden
+            hiddenStates: forward.hiddenStates
         )
     }
 

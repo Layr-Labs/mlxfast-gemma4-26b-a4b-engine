@@ -43,7 +43,7 @@ public enum CBv2AttentionOQMVV1 {
     private static let outputsPerGroup = 8
 
     public static func supportsVerifierColumns(_ columns: Int) -> Bool {
-        (2...4).contains(columns)
+        [2, 3, 4, 8, 16].contains(columns)
     }
     private static let kernelHeader = CBv2TiedLMHeadQMVV1.kernelHeader + """
 
@@ -516,9 +516,10 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_verify(
         )[0]
     }
 
-    /// Construction-time binding for physical-B1 verifier columns. The
-    /// returned closure is the exact shared projection itself, not a checked
-    /// wrapper around the ordinary attention-output path.
+    /// Construction-time binding for physical-B1 verifier columns. Each
+    /// position is projected as an independent B1/L1 stock quantized-MM so its
+    /// reduction is identical to ordinary serial decode. All fixed topology
+    /// and quantization validation remains outside the returned hot closure.
     public static func bindB1Verifier(
         columns: Int,
         inDim: Int,
@@ -536,6 +537,48 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_verify(
             weight.dtype == .uint32,
             weight.ndim == 2,
             liveInputWidth(inDim),
+            weight.shape == [outputWidth, inDim * Self.bits / 32],
+            scales.shape == [outputWidth, inDim / Self.groupSize],
+            biases.shape == scales.shape
+        else { return nil }
+
+        return { x in
+            concatenated(
+                (0..<columns).map { column in
+                    let one = x[0..., column..<(column + 1), 0...]
+                        .reshaped([1, 1, inDim])
+                    return quantizedMM(
+                        one, weight, scales: scales, biases: biases,
+                        transpose: true, groupSize: groupSize, bits: bits,
+                        mode: mode)
+                },
+                axis: 1)
+        }
+    }
+
+    /// Construction-time C8/C16 attention-output binding. Unlike the C2-C4
+    /// independent-M1 binding above, this fixed specialization shares packed
+    /// weights while retaining each column's ordinary serial-QMV reduction.
+    public static func bindB1SharedSerialReductionVerifier(
+        columns: Int,
+        inDim: Int,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode
+    ) -> ((MLXArray) -> MLXArray)? {
+        guard [8, 16].contains(columns),
+            enabled,
+            groupSize == Self.groupSize,
+            bits == Self.bits,
+            mode == .affine,
+            let biases,
+            inDim == 4096 || inDim == 8192,
+            weight.dtype == .uint32,
+            scales.dtype == .bfloat16,
+            biases.dtype == .bfloat16,
             weight.shape == [outputWidth, inDim * Self.bits / 32],
             scales.shape == [outputWidth, inDim / Self.groupSize],
             biases.shape == scales.shape

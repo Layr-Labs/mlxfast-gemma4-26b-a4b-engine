@@ -60,6 +60,38 @@ private func beginJSON(batchSize: Int, streams: Int? = nil) -> String {
         + #""seed_tokens_by_stream":[\#(seeds)],"batch_size":\#(batchSize)}"#
 }
 
+// MARK: - Cohort scheduler geometry
+
+@Test
+func widthOneLongPrefillIsChunkedBelowTheEngineWatchdogBoundary() {
+    let config = Gemma4Runtime.cohortSchedulerConfig(
+        batchSize: 1, seedTokenCount: 65_536 + 1_024)
+
+    #expect(config.maxConcurrentRequests == 1)
+    #expect(config.prefillChunkSize == 16_384)
+    #expect(config.maxBatchedTokensPerStep == 16_384)
+    #expect(config.maxWaiting == 1)
+    #expect(!config.enablePrefixCache)
+}
+
+@Test
+func widthOneShortPrefillKeepsItsWholePromptStep() {
+    let config = Gemma4Runtime.cohortSchedulerConfig(
+        batchSize: 1, seedTokenCount: 1_024)
+
+    #expect(config.prefillChunkSize == 1_024)
+    #expect(config.maxBatchedTokensPerStep == 2_048)
+}
+
+@Test
+func batchedCohortKeepsItsExistingLockstepPrefillGeometry() {
+    let config = Gemma4Runtime.cohortSchedulerConfig(
+        batchSize: 8, seedTokenCount: 1_024)
+
+    #expect(config.prefillChunkSize == 1_024)
+    #expect(config.maxBatchedTokensPerStep == 8_192)
+}
+
 // MARK: - Capability constants
 
 @Test

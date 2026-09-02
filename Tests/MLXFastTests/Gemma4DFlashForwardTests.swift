@@ -283,6 +283,40 @@ struct Gemma4DFlashForwardTests {
         }
     }
 
+    @Test func preprojectedDraftContextMatchesRawTargetHidden() throws {
+        guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
+            return
+        }
+        try Device.withDefaultDevice(.cpu) {
+            let model = Gemma4TextModel(try tinyGemma4Config(hiddenLayers: 4))
+            eval(model)
+            let drafter = DFlashDraftModel(config: try tinyDFlashConfig(numTargetLayers: 4))
+            eval(drafter)
+            try drafter.bind(target: model)
+
+            let forward = try model.forwardForDFlash(
+                MLXArray([Int32(1), 2, 3])[.newAxis, .ellipsis],
+                cache: model.newCache(parameters: nil),
+                targetLayerIds: drafter.config.targetLayerIds)
+            let raw = forward.targetHidden
+            let projected = try drafter.projectTargetHidden(raw)
+            let rawTokens = try drafter.draftBlock(
+                bonus: 1,
+                targetHidden: raw,
+                cache: try drafter.makeCache(),
+                blockSize: 4)
+            let projectedTokens = try drafter.draftBlock(
+                bonus: 1,
+                projectedContext: projected,
+                cache: try drafter.makeCache(),
+                blockSize: 4)
+            eval(rawTokens, projectedTokens)
+
+            #expect(projected.shape == [1, 3, 16])
+            #expect((rawTokens .== projectedTokens).all().item(Bool.self))
+        }
+    }
+
     /// `num_target_layers` must equal the TARGET's layer count. This is the
     /// check that makes the real A4B pairing (drafter 30 / target 30) a fact
     /// rather than a hope.
@@ -322,6 +356,381 @@ struct Gemma4DFlashForwardTests {
 
     // MARK: - Depth ceiling (the echo == what runs)
 
+    @Test func d7WidthPolicyPromotesAfterTwoFullC4Rounds() {
+        var policy = Gemma4DFlashWidthPolicy(requestedDepth: 7)
+        #expect(policy.currentDepth == 3)
+        policy.record(roundBlockSize: 4, maxEmitCount: 4, committed: 4)
+        #expect(policy.currentDepth == 3)
+        policy.record(roundBlockSize: 4, maxEmitCount: 4, committed: 4)
+        #expect(policy.currentDepth == 7)
+    }
+
+    @Test func d7WidthPolicyResetsAndDemotesWithoutTreatingTailAsFailure() {
+        var policy = Gemma4DFlashWidthPolicy(requestedDepth: 7)
+        policy.record(roundBlockSize: 4, maxEmitCount: 4, committed: 4)
+        policy.record(roundBlockSize: 4, maxEmitCount: 4, committed: 2)
+        policy.record(roundBlockSize: 4, maxEmitCount: 4, committed: 4)
+        #expect(policy.currentDepth == 3)
+        policy.record(roundBlockSize: 4, maxEmitCount: 4, committed: 4)
+        #expect(policy.currentDepth == 7)
+        policy.record(roundBlockSize: 7, maxEmitCount: 6, committed: 6)
+        #expect(policy.currentDepth == 7)
+        policy.record(roundBlockSize: 8, maxEmitCount: 7, committed: 7)
+        #expect(policy.currentDepth == 7)
+        policy.record(roundBlockSize: 8, maxEmitCount: 8, committed: 3)
+        #expect(policy.currentDepth == 3)
+    }
+
+    @Test func nonD7WidthPoliciesRemainFixed() {
+        for depth in [1, 2, 3, 4, 5, 6, 8, 11] {
+            var policy = Gemma4DFlashWidthPolicy(requestedDepth: depth)
+            policy.record(
+                roundBlockSize: depth + 1,
+                maxEmitCount: depth + 1,
+                committed: depth + 1)
+            policy.record(
+                roundBlockSize: depth + 1,
+                maxEmitCount: depth + 1,
+                committed: 1)
+            #expect(policy.currentDepth == depth)
+        }
+    }
+
+    @Test func recurrenceRequiresThreeConfirmationsAndChoosesShortestPeriod() {
+        var policy = Gemma4DFlashRecurrencePolicy(
+            exactVerifierWidth: 4, verifierWidth: 16)
+        policy.record(
+            committedTokens: [1, 2, 3, 1, 2], accepted: 0, proposed: 3)
+        #expect(policy.phase == .exactDFlashC4)
+        policy.record(committedTokens: [3], accepted: 0, proposed: 3)
+        #expect(policy.phase == .periodicExactWide(cycle: [1, 2, 3]))
+        #expect(policy.makeDraftTokens(count: 8) == [1, 2, 3, 1, 2, 3, 1, 2])
+    }
+
+    @Test func exactAndWideVerifierWidthsRemainSeparateConstructionInputs() {
+        var policy = Gemma4DFlashRecurrencePolicy(
+            exactVerifierWidth: 4, verifierWidth: 16)
+        #expect(policy.verifierBlockSize(remaining: 127) == 4)
+        #expect(policy.verifierBlockSize(remaining: 1) == 4)
+        #expect(policy.verifierBlockSize(remaining: 2) == 4)
+
+        policy.record(
+            committedTokens: [1, 2, 3, 1, 2, 3],
+            accepted: 0,
+            proposed: 3)
+        #expect(policy.verifierBlockSize(remaining: 1) == 16)
+    }
+
+    @Test func d15RecurrencePublishesOnlyItsConstructionCertifiedWidths() {
+        var policy = Gemma4DFlashRecurrencePolicy(
+            exactVerifierWidth:
+                RuntimeWorkerDFlashFreeRunSession.d15ExactC4VerifierWidth,
+            verifierWidth:
+                RuntimeWorkerDFlashFreeRunSession.d15FidelityVerifierWidth)
+
+        for remaining in 1...512 {
+            #expect(policy.verifierBlockSize(remaining: remaining) == 4)
+        }
+
+        policy.record(
+            committedTokens: [1, 2, 3, 1, 2, 3],
+            accepted: 0,
+            proposed: 3)
+        for remaining in 1...512 {
+            #expect(
+                policy.verifierBlockSize(remaining: remaining)
+                    == RuntimeWorkerDFlashFreeRunSession.d15FidelityVerifierWidth)
+        }
+    }
+
+    @Test func replayPlanPreservesFramesContextsAndCommittedFrontiers() {
+        let frames = [
+            Gemma4DFlashReplayFrame(
+                bonus: 11,
+                context: "first-wide",
+                blockSize: 32,
+                generatedTokenCountBeforeRound: 1),
+            Gemma4DFlashReplayFrame(
+                bonus: 22,
+                context: "second-wide",
+                blockSize: 32,
+                generatedTokenCountBeforeRound: 33),
+            Gemma4DFlashReplayFrame(
+                bonus: 33,
+                context: "rejected-current",
+                blockSize: 32,
+                generatedTokenCountBeforeRound: 65),
+        ]
+
+        let plan = gemma4DFlashReplayPlan(
+            frames: frames,
+            promptTokenCount: 1_024,
+            action: .replayWideDrafterAndDemote)
+
+        #expect(plan.map(\.bonus) == [11, 22, 33])
+        #expect(
+            plan.map(\.context)
+                == ["first-wide", "second-wide", "rejected-current"])
+        #expect(plan.map(\.blockSize) == [32, 32, 32])
+        #expect(plan.map(\.committedDraftOffset) == [1_024, 1_056, 1_088])
+
+        let terminalPlan = gemma4DFlashReplayPlan(
+            frames: frames,
+            promptTokenCount: 1_024,
+            action: .none)
+        #expect(terminalPlan.isEmpty)
+    }
+
+    @Test func recurrencePromotesPeriod18AfterTwentyThreeTokens() {
+        let cycle = [
+            100, 101, 102, 103, 104, 105,
+            106, 107, 108, 109, 110, 111,
+            112, 113, 114, 115, 101, 102,
+        ]
+        let leadIn = [900, 901]
+        var policy = Gemma4DFlashRecurrencePolicy(
+            exactVerifierWidth: 4, verifierWidth: 32)
+
+        policy.record(
+            committedTokens: leadIn + cycle + Array(cycle.prefix(2)),
+            accepted: 0,
+            proposed: 3)
+        #expect(policy.phase == .exactDFlashC4)
+
+        policy.record(
+            committedTokens: [cycle[2]],
+            accepted: 0,
+            proposed: 3)
+
+        let nextAlignedCycle = Array(cycle[3...] + cycle[..<3])
+        #expect(policy.phase == .periodicExactWide(cycle: nextAlignedCycle))
+        #expect(
+            policy.makeDraftTokens(count: 5)
+                == Array((cycle + cycle)[3 ..< 8]))
+    }
+
+    @Test func recurrenceRejectsThePeriod3TwoTokenFalsePositive() {
+        let cycle = [
+            100, 101, 102, 103, 104, 105,
+            106, 107, 108, 109, 110, 111,
+            112, 113, 114, 115, 101, 102,
+        ]
+        let observed = [900, 901] + cycle + Array(cycle.prefix(3))
+        #expect(Array(observed.suffix(2)) == Array(observed.dropLast(3).suffix(2)))
+        #expect(Array(observed.suffix(3)) != Array(observed.dropLast(3).suffix(3)))
+
+        var policy = Gemma4DFlashRecurrencePolicy(
+            exactVerifierWidth: 4, verifierWidth: 32)
+        policy.record(committedTokens: observed, accepted: 0, proposed: 3)
+
+        let nextAlignedPeriod18 = Array(cycle[3...] + cycle[..<3])
+        #expect(policy.phase == .periodicExactWide(cycle: nextAlignedPeriod18))
+        #expect(policy.phase != .periodicExactWide(cycle: Array(observed.suffix(3))))
+    }
+
+    @Test func recurrenceRejectsPeriodOneAndPeriodsAboveThirtyTwo() {
+        var policy = Gemma4DFlashRecurrencePolicy(
+            exactVerifierWidth: 4, verifierWidth: 16)
+        policy.record(
+            committedTokens: Array(repeating: 7, count: 64),
+            accepted: 0,
+            proposed: 3)
+        #expect(policy.phase == .exactDFlashC4)
+        let long = Array(0 ..< 33)
+        policy.record(committedTokens: long + long, accepted: 0, proposed: 3)
+        #expect(policy.phase == .exactDFlashC4)
+    }
+
+    @Test func recurrenceDoesNotMistakeADuplicateCycleTailForPeriodOne() {
+        let cycle = [1, 2, 3, 3]
+        var policy = Gemma4DFlashRecurrencePolicy(
+            exactVerifierWidth: 4, verifierWidth: 16)
+        policy.record(
+            committedTokens: cycle + cycle,
+            accepted: 0,
+            proposed: 3)
+
+        #expect(policy.phase == .periodicExactWide(cycle: cycle))
+    }
+
+    @Test func wideRejectionDemotesNextRoundAndClearsTheCycle() {
+        var policy = Gemma4DFlashRecurrencePolicy(
+            exactVerifierWidth: 4, verifierWidth: 16)
+        policy.record(
+            committedTokens: [4, 5, 6, 4, 5, 6],
+            accepted: 0,
+            proposed: 3)
+        #expect(policy.phase == .periodicExactWide(cycle: [4, 5, 6]))
+        let action = policy.record(
+            committedTokens: [4, 99],
+            accepted: 1,
+            proposed: 15,
+            isTerminalRound: false)
+        #expect(policy.phase == .exactDFlashC4)
+        #expect(policy.makeDraftTokens(count: 3) == nil)
+        #expect(action == .replayWideDrafterAndDemote)
+    }
+
+    @Test func terminalWideTailSkipsReplayAndDemotion() {
+        var policy = Gemma4DFlashRecurrencePolicy(
+            exactVerifierWidth: 4, verifierWidth: 16)
+        policy.record(
+            committedTokens: [4, 5, 6, 4, 5, 6],
+            accepted: 0,
+            proposed: 3)
+
+        let action = policy.record(
+            committedTokens: [4],
+            accepted: 0,
+            proposed: 15,
+            isTerminalRound: true)
+
+        #expect(action == .none)
+        #expect(policy.phase == .periodicExactWide(cycle: [4, 5, 6]))
+    }
+
+    @Test func wideTailKeepsItsConstructionBoundPhysicalWidth() {
+        var policy = Gemma4DFlashRecurrencePolicy(
+            exactVerifierWidth: 4, verifierWidth: 16)
+        policy.record(
+            committedTokens: [4, 5, 6, 4, 5, 6],
+            accepted: 0,
+            proposed: 3)
+        #expect(policy.verifierBlockSize(remaining: 1) == 16)
+        #expect(policy.verifierBlockSize(remaining: 127) == 16)
+    }
+
+    @Test func fullyAcceptedWideRoundAdvancesThePeriod18CycleOffset() {
+        let cycle = Array(100 ..< 118)
+        var policy = Gemma4DFlashRecurrencePolicy(
+            exactVerifierWidth: 4, verifierWidth: 32)
+        policy.record(
+            committedTokens: cycle + cycle,
+            accepted: 0,
+            proposed: 3)
+        #expect(policy.makeDraftTokens(count: 4) == [100, 101, 102, 103])
+
+        let committed = Array((cycle + cycle).prefix(32))
+        policy.record(committedTokens: committed, accepted: 31, proposed: 31)
+
+        #expect(policy.makeDraftTokens(count: 4) == [114, 115, 116, 117])
+    }
+
+    @Test func consecutiveWideRoundsContinueFromTheUpdatedCycleOffset() {
+        let cycle = Array(100 ..< 118)
+        var policy = Gemma4DFlashRecurrencePolicy(
+            exactVerifierWidth: 4, verifierWidth: 32)
+        policy.record(
+            committedTokens: cycle + cycle,
+            accepted: 0,
+            proposed: 3)
+        policy.record(
+            committedTokens: Array((cycle + cycle).prefix(32)),
+            accepted: 31,
+            proposed: 31)
+        let fromFourteen = Array(cycle[14...] + cycle + cycle)
+        policy.record(
+            committedTokens: Array(fromFourteen.prefix(32)),
+            accepted: 31,
+            proposed: 31)
+
+        #expect(policy.makeDraftTokens(count: 4) == [110, 111, 112, 113])
+    }
+
+    @Test func d15SessionRoutesOnceIntoDedicatedRecurrenceLoop() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Sources/MLXFastHarness/Gemma4DFlashFreeRunSession.swift"),
+            encoding: .utf8)
+
+        let runStart = try #require(source.range(of: "func run(targetN: Int)"))
+        let standardStart = try #require(
+            source.range(
+                of: "func runStandardRounds(",
+                range: runStart.upperBound ..< source.endIndex))
+        let run = source[runStart.lowerBound ..< standardStart.lowerBound]
+        #expect(run.contains("if depth == 15"))
+        #expect(run.contains("return try runD15ProposalRounds("))
+
+        #expect(
+            source.contains(
+                "let maximumPhysicalVerifierWidth =\n"
+                    + "            depth == 15 ? Self.d15FidelityVerifierWidth : depth + 1"))
+        #expect(
+            source.contains(
+                "self.maximumPhysicalVerifierWidth = maximumPhysicalVerifierWidth"))
+
+        let recurrenceStart = try #require(
+            source.range(of: "func runD15ProposalRounds("))
+        let recurrenceLoop = source[recurrenceStart.lowerBound ..< source.endIndex]
+        #expect(recurrenceLoop.contains("let phase = proposalPhasePolicy.phase"))
+        #expect(recurrenceLoop.contains("switch phase"))
+        #expect(recurrenceLoop.contains("runDFlashGreedyRound("))
+        #expect(recurrenceLoop.contains("runDFlashGreedyProposalRound("))
+        #expect(
+            recurrenceLoop.contains(
+                "let isTerminalRound = round.tokens.count == remaining"))
+        #expect(recurrenceLoop.contains("wideReplayFrames.append(wideReplayFrame)"))
+        #expect(recurrenceLoop.contains("case .replayWideDrafterAndDemote:"))
+        #expect(
+            recurrenceLoop.contains(
+                "try replaySkippedWideDrafterBlocks(replayPlan)"))
+        #expect(recurrenceLoop.contains("let replayPlan = gemma4DFlashReplayPlan("))
+        #expect(recurrenceLoop.contains("wideReplayFrames.removeAll("))
+        #expect(
+            recurrenceLoop.contains(
+                "private func replaySkippedWideDrafterBlocks("))
+        #expect(recurrenceLoop.contains("try drafter.draftBlock("))
+        #expect(recurrenceLoop.contains("eval(replayedDraftTokens)"))
+        #expect(recurrenceLoop.contains("trimPromptCache("))
+        let stopBoundary = try #require(
+            recurrenceLoop.range(
+                of: "if let stopIndex = round.tokens.firstIndex"))
+        let bonusMutation = try #require(
+            recurrenceLoop.range(of: "bonus = round.bonus"))
+        let frameMutation = try #require(
+            recurrenceLoop.range(
+                of: "wideReplayFrames.append(wideReplayFrame)"))
+        let policyMutation = try #require(
+            recurrenceLoop.range(of: "proposalPhasePolicy.record("))
+        #expect(stopBoundary.lowerBound < bonusMutation.lowerBound)
+        #expect(stopBoundary.lowerBound < frameMutation.lowerBound)
+        #expect(stopBoundary.lowerBound < policyMutation.lowerBound)
+        let stopBlock = recurrenceLoop[
+            stopBoundary.lowerBound ..< bonusMutation.lowerBound]
+        #expect(stopBlock.contains("let upToStop = Array(round.tokens[...stopIndex])"))
+        #expect(stopBlock.contains("committedTokens: upToStop"))
+        #expect(stopBlock.contains("generatedTokenCount += upToStop.count"))
+        let replayStart = try #require(
+            recurrenceLoop.range(
+                of: "private func replaySkippedWideDrafterBlocks("))
+        let replayHelper = recurrenceLoop[replayStart.lowerBound...]
+        let replayBeforeTrim = try #require(
+            replayHelper.range(of: "try drafter.draftBlock("))
+        let trimAfterReplay = try #require(
+            replayHelper.range(of: "trimPromptCache("))
+        #expect(replayBeforeTrim.lowerBound < trimAfterReplay.lowerBound)
+        #expect(
+            recurrenceLoop.contains(
+                "proposalPhasePolicy.record(\n"
+                    + "                committedTokens: round.tokens,\n"
+                    + "                accepted: round.accepted,\n"
+                    + "                proposed: proposed,\n"
+                    + "                isTerminalRound: isTerminalRound)"))
+        for forbidden in [
+            "structuralC4",
+            "period2Wide",
+            "try?",
+            "fallback",
+        ] {
+            #expect(!recurrenceLoop.contains(forbidden))
+        }
+    }
+
     /// The dflash `effective_spec` echo and the round loop read the SAME
     /// resolver, so an unclamped default cannot be echoed. A drafter with a
     /// trained block of 4 caps depth at 3 regardless of what a caller asks.
@@ -342,16 +751,14 @@ struct Gemma4DFlashForwardTests {
             RuntimeWorkerSpecRegistry.resolveDFlashDepth(0, maxDepth: ceiling) == 1)
     }
 
-    /// The engine's own block ceiling still applies on top of the drafter's:
-    /// the real z-lab head's trained block is 16, and
-    /// `experimentalDFlashMaxBlockSize` is 16, so the ceiling is 15.
-    @Test func depthCeilingIsAlsoBoundedByTheEngineBlockCeiling() throws {
+    /// The selected submission ceiling applies on top of the drafter and
+    /// engine ceilings. The target-verified D15 period-2 lane uses the trained
+    /// block's full width after its runtime proposal route is installed.
+    @Test func depthCeilingUsesTheSelectedFidelityPassingDepth() throws {
         guard ProcessInfo.processInfo.environment["MLXFAST_RUN_MLX_RUNTIME_TESTS"] == "1" else {
             return
         }
         let drafter = DFlashDraftModel(config: try tinyDFlashConfig(blockSize: 64))
-        #expect(
-            gemma4DFlashMaxDepth(for: drafter)
-                == MLXFastConstants.experimentalDFlashMaxBlockSize - 1)
+        #expect(gemma4DFlashMaxDepth(for: drafter) == 15)
     }
 }

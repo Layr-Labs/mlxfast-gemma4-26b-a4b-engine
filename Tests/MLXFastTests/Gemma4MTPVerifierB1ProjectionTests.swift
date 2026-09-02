@@ -57,6 +57,24 @@ struct Gemma4MTPVerifierB1ProjectionTests {
     }
 
     @Test
+    func sharedProjectionSourceAdmitsExactlyC2C3C4C8AndC16() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/"
+                    + "Gemma4B1MTPQuantizedProjection.swift"),
+            encoding: .utf8)
+
+        #expect(source.contains("private static let certifiedColumns: Set<Int> = [2, 3, 4, 8, 16]"))
+        #expect(source.contains("certifiedColumns.contains(columns)"))
+        #expect(!source.contains("(2...8).contains(columns)"))
+        #expect(!source.contains("(2...16).contains(columns)"))
+    }
+
+    @Test
     func installedProjectionDoesNotInspectRuntimeTopology() throws {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -83,7 +101,7 @@ struct Gemma4MTPVerifierB1ProjectionTests {
 
     @Test(
         .enabled(if: runtimeEnabled),
-        arguments: [2, 3, 4], [4, 8])
+        arguments: [2, 3, 4, 8, 16], [4, 8])
     func fixedWidthProjectionMatchesIndependentB1(
         columns: Int, bits: Int
     ) throws {

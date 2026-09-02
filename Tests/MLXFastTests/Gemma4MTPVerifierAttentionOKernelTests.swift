@@ -26,6 +26,68 @@ struct Gemma4MTPVerifierAttentionOKernelTests {
                 == reference.asData(access: .copy).data)
     }
 
+    @Test
+    func b1VerifierBinderUsesIndependentStockM1Columns() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourceURL = repositoryRoot.appendingPathComponent(
+            "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/"
+                + "AttentionOQMVV1.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        let binderStart = try #require(source.range(
+            of: "    public static func bindB1Verifier("))
+        let binderEnd = try #require(source.range(
+            of: "    /// Construction-time C8/C16 attention-output binding.",
+            range: binderStart.upperBound..<source.endIndex))
+        let binder = String(source[binderStart.lowerBound..<binderEnd.lowerBound])
+        let closureStart = try #require(binder.range(of: "        return { x in"))
+        let closure = String(binder[closureStart.lowerBound..<binder.endIndex])
+
+        #expect(binder.contains("supportsVerifierColumns(columns)"))
+        #expect(binder.contains("groupSize == Self.groupSize"))
+        #expect(binder.contains("bits == Self.bits"))
+        #expect(binder.contains("mode == .affine"))
+        #expect(binder.contains("weight.shape == [outputWidth, inDim * Self.bits / 32]"))
+        #expect(binder.contains("scales.shape == [outputWidth, inDim / Self.groupSize]"))
+        #expect(closure.contains("(0..<columns).map { column in"))
+        #expect(closure.contains("x[0..., column..<(column + 1), 0...]"))
+        #expect(closure.contains(".reshaped([1, 1, inDim])"))
+        #expect(closure.contains("quantizedMM("))
+        #expect(closure.contains("axis: 1"))
+        #expect(!closure.contains("Gemma4B1MTPQuantizedProjection.bind"))
+        #expect(!closure.contains("ProcessInfo"))
+        #expect(!closure.contains("guard "))
+        #expect(!closure.contains("try"))
+        #expect(!closure.contains("catch"))
+    }
+
+    @Test
+    func c8AndC16AttentionOHaveASeparateSharedSerialReductionBinder() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourceURL = repositoryRoot.appendingPathComponent(
+            "Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/"
+                + "AttentionOQMVV1.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        let binderStart = try #require(source.range(
+            of: "    public static func bindB1SharedSerialReductionVerifier("))
+        let binderEnd = try #require(source.range(
+            of: "    /// Construction-time binding for the two live verifier o_proj planes.",
+            range: binderStart.upperBound..<source.endIndex))
+        let binder = String(source[binderStart.lowerBound..<binderEnd.lowerBound])
+
+        #expect(binder.contains("guard [8, 16].contains(columns)"))
+        #expect(binder.contains("Gemma4B1MTPQuantizedProjection.bind("))
+        #expect(!binder.contains("quantizedMM("))
+        #expect(!binder.contains("ProcessInfo"))
+        #expect(!binder.contains("try"))
+        #expect(!binder.contains("catch"))
+    }
+
     @Test(.enabled(if: runtimeEnabled))
     func b1VerifierAttentionOIsBitExactToIndependentB1Columns() throws {
         let n = 2816
@@ -66,6 +128,50 @@ struct Gemma4MTPVerifierAttentionOKernelTests {
                 expectExactBF16Storage(candidate, reference)
             }
         }
+    }
+
+    @Test(.enabled(if: runtimeEnabled), arguments: [8, 16])
+    func c8AndC16SharedAttentionOAreBitExactToIndependentB1Columns(
+        columns: Int
+    ) throws {
+        let inDim = 4096
+        let outDim = 2816
+        let weightValues: [UInt32] = (0..<(outDim * inDim / 8)).map { index in
+            UInt32(truncatingIfNeeded: index &* 2_654_435_761 &+ 109)
+        }
+        let scaleValues: [Float] = (0..<(outDim * inDim / 64)).map { index in
+            Float(128 + (index * 17) % 59) / 128.0
+        }
+        let biasValues: [Float] = (0..<(outDim * inDim / 64)).map { index in
+            Float((index * 3) % 23 - 11) / 128.0
+        }
+        let weight = MLXArray(weightValues).reshaped([outDim, inDim / 8])
+        let scales = MLXArray(scaleValues).reshaped([outDim, inDim / 64])
+            .asType(.bfloat16)
+        let biases = MLXArray(biasValues).reshaped([outDim, inDim / 64])
+            .asType(.bfloat16)
+        let xValues: [Float] = (0..<(columns * inDim)).map { index in
+            Float((index * 37 + columns * 13) % 269 - 134) / 128.0
+        }
+        let x = MLXArray(xValues).reshaped([1, columns, inDim])
+            .asType(.bfloat16)
+        let bound = try #require(
+            CBv2AttentionOQMVV1.bindB1SharedSerialReductionVerifier(
+                columns: columns, inDim: inDim,
+                weight: weight, scales: scales, biases: biases,
+                groupSize: 64, bits: 4, mode: .affine))
+        let candidate = bound(x)
+        let reference = concatenated(
+            (0..<columns).map { column in
+                quantizedMM(
+                    x[0..., column..<(column + 1), 0...], weight,
+                    scales: scales, biases: biases, transpose: true,
+                    groupSize: 64, bits: 4, mode: .affine)
+            },
+            axis: 1)
+
+        #expect(candidate.shape == [1, columns, outDim])
+        expectExactBF16Storage(candidate, reference)
     }
 
     @Test(.enabled(if: runtimeEnabled))

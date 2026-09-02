@@ -3380,7 +3380,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// `new_values` rather than the cache slot the fused QK dispatch wrote,
     /// so this kernel has no read-after-in-place-write hazard at all.
     private static let fusedAvKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_vtile_v3_vec1",
+        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_vtile_v4_t\(avColumnTiles)",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -3394,8 +3394,8 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int key_length = int(params[0]);
 
             const int z = int(threadgroup_position_in_grid.z);
-            const int tile = z % 8;
-            const int row_kv = z / 8;
+            const int tile = z % \(avColumnTiles);
+            const int row_kv = z / \(avColumnTiles);
             const int row = row_kv / 2;
             const int kv_head = row_kv % 2;
             const int sg = int(simdgroup_index_in_threadgroup);
@@ -3424,8 +3424,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int thrM = lane / 4;
             const int thrN = lane % 4;
             int bm = thrM * 4;
-            const int out_col = tile * 64 + (4 * sg + thrN) * 4;
-
+            const int out_col = tile * \(avTileColumns) + (4 * sg + thrN) * 4;
             float result[GQA][4] = {{0.0f}};
             // VTILE: the 4x4 value tile is shared by all GQA heads, the
             // probability block is not. Staging the tile costs 16 halves and
@@ -3528,7 +3527,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// output allocation hands this kernel); the value-tile peel, the
     /// shuffle-down fold and every store are the promoted source verbatim.
     private static let fusedAvVecKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_vtile_v3_vec1_sv1",
+        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_vtile_v4_t\(avColumnTiles)_sv1",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -3543,8 +3542,8 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const bool row_vec4 = (key_length & 3) == 0;
 
             const int z = int(threadgroup_position_in_grid.z);
-            const int tile = z % 8;
-            const int row_kv = z / 8;
+            const int tile = z % \(avColumnTiles);
+            const int row_kv = z / \(avColumnTiles);
             const int row = row_kv / 2;
             const int kv_head = row_kv % 2;
             const int sg = int(simdgroup_index_in_threadgroup);
@@ -3573,7 +3572,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int thrM = lane / 4;
             const int thrN = lane % 4;
             int bm = thrM * 4;
-            const int out_col = tile * 64 + (4 * sg + thrN) * 4;
+            const int out_col = tile * \(avTileColumns) + (4 * sg + thrN) * 4;
 
             float result[GQA][4] = {{0.0f}};
             // VTILE: the 4x4 value tile is shared by all GQA heads, the
@@ -3989,8 +3988,8 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let output = fusedAvActive(
             [probs] + valueBuffers + [paramsArray, values],
             template: template,
-            grid: (32, 4, batch * kvHeads * 8),
-            threadGroup: (32, 4, 1),
+            grid: (32, avSimdgroups, batch * kvHeads * avColumnTiles),
+            threadGroup: (32, avSimdgroups, 1),
             outputShapes: [[batch, queryHeads, 1, headDim]],
             outputDTypes: [.bfloat16]
         )[0]

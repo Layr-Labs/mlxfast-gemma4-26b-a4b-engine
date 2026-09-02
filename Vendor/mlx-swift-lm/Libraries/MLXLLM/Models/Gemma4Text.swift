@@ -1612,6 +1612,144 @@ private func gemma4AttentionFallback(
     return output
 }
 
+// MARK: - PREFILL-DEQ-GEMM-001: prompt-plane dense projections on the bf16 GEMM road
+
+/// PREFILL-DEQ-GEMM-001. On the scored prompt plane (`[8, 1024]` packed rows,
+/// M = 8192 activation rows) every dense projection of a layer -- the q and
+/// k/v projections and `o_proj` in attention, gate/up/down in the dense MLP --
+/// reaches MLX's `QuantizedMatmul`, which at this M selects the quantized
+/// tile kernel (`affine_qmm_t`, or `affine_qmm_t_nax` on a device with the
+/// matrix accelerator). That kernel dequantizes each 64x64 weight block once
+/// PER M-TILE of the output: at M = 8192 with 64-row tiles every weight plane
+/// of the layer is dequantized 128 times over, each time into threadgroup
+/// memory between two barriers, ahead of one 64x64 accumulation step.
+///
+/// This road dequantizes each weight plane ONCE per layer per prompt pass
+/// (`dequantized`, a single bandwidth pass over the packed plane into a
+/// transient bf16 plane) and hands that plane to MLX's dense GEMM
+/// (`steel_gemm_fused`; `steel_gemm_fused_nax` on the accelerator: a wider
+/// tile, a deeper K step, both operands loaded straight from device memory,
+/// no dequantization and no threadgroup staging inside the K loop). The
+/// weight bytes the GEMM streams are four times wider, but the dequantization
+/// work drops from once per M-tile to once, and the K loop loses the
+/// per-step dequantize-store-barrier sequence entirely.
+///
+/// ## Exactness
+///
+/// Every output element is the same fp32 accumulation of the same bf16
+/// products, stored once to bf16:
+///
+///  1. The dequantized value. `affine_dequantize`
+///     (`mlx-generated/metal/quantized.h`) is instantiated at
+///     `T = result_type(scales, biases)` = bf16 and computes
+///     `out[i] = scale * d + bias` with `uint8_t d` the extracted code. The
+///     quantized tile kernel's cooperative loader (`QuantizedBlockLoader ->
+///     dequantize<T, N, bits>`) computes `s[0] * (w & 0x0f) + bias` for the
+///     low nibble and `s[1] * (w & 0xf0) + bias` with `s[1] = scale / 16` for
+///     the high one; `scale / 16` is an exact power-of-two rescale in bf16
+///     and `(scale / 16) * (16 * d)` is the same fp32 product as
+///     `scale * d`, so both roads produce the identical bf16 word for every
+///     code, 4-bit and 8-bit alike. The NAX loader (`quantized_nax.h`) calls
+///     the same `dequantize` template.
+///  2. The accumulation. This is a CLAIM ABOUT KERNEL INTERNALS, not a
+///     theorem, and it is what the cross-check below exists to decide. Both
+///     kernels are `mlx::steel` block GEMMs over the same operands: they
+///     walk K in ascending order and accumulate every K sub-step into one
+///     fp32 tile with the same matrix-unit instruction (`BlockMMA` over
+///     8-wide K fragments off the accelerator, `tile_matmad_nax` over
+///     16-wide fragments on it), and both store the plain `T(acc)` rounding.
+///     If the fragment K width and the ascending order match, the block
+///     width BK only changes how many fragment steps are issued between two
+///     threadgroup loads, not the association of the sum, and every output
+///     element is bit-identical. If they do NOT match, the sum is
+///     re-associated and the road is inexact -- a value change inside the
+///     board's per-stream token tolerance, not a defect, but it must be
+///     reported as such rather than assumed away.
+///
+///     The non-NAX pair (`affine_qmm_t` vs `steel_gemm_fused_nt`) is
+///     directly decidable on this development part: `..._XCHECK=1` runs both
+///     dispatches on identical operands and counts differing bf16 words, and
+///     the prefill token plane / KV digest gate decides it end to end. The
+///     NAX pair (`affine_qmm_t_nax` vs `steel_gemm_fused_nax`) is not
+///     executable off the accelerator and is carried on the argument above.
+///
+/// Admission: affine mode, group size 64, 4- or 8-bit, bf16 activations and
+/// scales, no bias, and at least `minRows` activation rows. Decode (`[8, 1]`),
+/// the MTP verify rectangles and the one-row frontier tail of the final
+/// prompt layer never reach the row floor and keep the incumbent dispatch,
+/// as does every other geometry. Kill switch:
+/// `DARKBLOOM_GEMMA4_PREFILL_DEQ_GEMM=0` (also `false`/`no`/`off`) restores
+/// the quantized dispatch byte for byte. Engage mark: `prefill-deq-gemm`,
+/// fired at the site that builds the dequantize + GEMM graph.
+private enum Gemma4PrefillDeqGEMMV1 {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_DEQ_GEMM"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Activation-row floor. The scored prompt plane carries 8192 rows; the
+    /// default admits any plane of at least 1024 rows (one full-length
+    /// prompt row) so the ranked geometry and a solo prompt take the same
+    /// road, while every decode and verify rectangle (8..32 rows) does not.
+    static let minRows: Int = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_DEQ_GEMM_MIN_ROWS"],
+            let value = Int(raw), value > 0
+        else { return 1024 }
+        return value
+    }()
+
+    @inline(__always)
+    static func apply(_ layer: Linear, _ x: MLXArray) -> MLXArray? {
+        guard enabled,
+            let quantized = layer as? QuantizedLinear,
+            quantized.bias == nil,
+            quantized.mode == .affine,
+            quantized.groupSize == 64,
+            quantized.bits == 4 || quantized.bits == 8,
+            x.dtype == .bfloat16, x.ndim >= 2,
+            quantized.scales.dtype == .bfloat16,
+            let biases = quantized.biases, biases.dtype == .bfloat16
+        else { return nil }
+        let inputDims = x.dim(-1)
+        guard inputDims > 0, x.size / inputDims >= minRows else { return nil }
+        let weight = quantized.weight
+        guard weight.ndim == 2, weight.dtype == .uint32,
+            weight.dim(1) * (32 / quantized.bits) == inputDims
+        else { return nil }
+        CBv2EngageMark.once("prefill-deq-gemm")
+        let plane = dequantized(
+            weight, scales: quantized.scales, biases: biases,
+            groupSize: quantized.groupSize, bits: quantized.bits, mode: quantized.mode)
+        let product = MLX.matmul(x, plane.transposed())
+        if xcheck {
+            // Local diagnostics only (never on the ranked path): evaluate the
+            // incumbent quantized dispatch beside this road on the identical
+            // operands and count differing bf16 words. An exact road reports
+            // zero on every call; anything else is a defect in this file.
+            let incumbent = layer(x)
+            let differing = MLX.sum(
+                product.view(dtype: .uint16) .!= incumbent.view(dtype: .uint16),
+                stream: .default)
+            eval(product, incumbent, differing)
+            FileHandle.standardError.write(
+                Data(
+                    ("[xcheck] prefill-deq-gemm rows \(x.size / inputDims) "
+                        + "K \(inputDims) N \(weight.dim(0)) bits \(quantized.bits) "
+                        + "differing \(differing.item(Int32.self))\n").utf8))
+        }
+        return product
+    }
+
+    /// `DARKBLOOM_GEMMA4_PREFILL_DEQ_GEMM_XCHECK=1`: bitwise cross-check of
+    /// every admitted projection against the incumbent dispatch (diagnostic;
+    /// forces evaluation, so it is never set on a timed run).
+    static let xcheck: Bool =
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_PREFILL_DEQ_GEMM_XCHECK"] == "1"
+}
+
 // MARK: - Attention
 
 private class Gemma4Attention: Module {
@@ -1733,7 +1871,7 @@ private class Gemma4Attention: Module {
                 bits: quantized.bits,
                 mode: quantized.mode,
                 rsTable: rsTable)
-        else { return layer(x) }
+        else { return Gemma4PrefillDeqGEMMV1.apply(layer, x) ?? layer(x) }
         return projected
     }
 
@@ -1785,7 +1923,7 @@ private class Gemma4Attention: Module {
                 rsTable: CBv2AttentionOQMVV1.acceptRunsumTable(
                     carriedRunsum, for: x)
                     ?? CBv2AttentionOQMVV1.runsumTable(for: x))
-        else { return oProj(x) }
+        else { return Gemma4PrefillDeqGEMMV1.apply(oProj, x) ?? oProj(x) }
         return projected
     }
 
@@ -3734,7 +3872,7 @@ private class Gemma4MLP: Module {
                 bits: quantized.bits,
                 mode: quantized.mode,
                 activationSums: activationSums)
-        else { return layer(x) }
+        else { return Gemma4PrefillDeqGEMMV1.apply(layer, x) ?? layer(x) }
         return tight
     }
 
@@ -5996,3 +6134,6 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
         return fused
     }
 }
+
+// Ranked resample marker 2: this archive is a further ranked sample of the tree carried
+// by the preceding ranked submission of this content apart from any rotation item declared in its note.

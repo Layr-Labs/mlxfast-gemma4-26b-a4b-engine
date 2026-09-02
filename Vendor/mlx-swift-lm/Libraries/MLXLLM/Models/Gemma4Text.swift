@@ -2402,6 +2402,48 @@ private enum Gemma4RouterFinalistsV1 {
             outputDTypes: [.uint32]
         )[0]
     }
+
+    /// PREFILL-W1 mechanism 2: admits the identical finalists32 selection
+    /// kernel above to prompt-rectangle shapes `[8, L, 128]` with `L > 1`,
+    /// which `apply` above never reaches (it is pinned to the decode cell's
+    /// `L == 1`). The kernel body is untouched: each threadgroup already
+    /// processes exactly one flattened row of 128 scores addressed by
+    /// `threadgroup_position_in_grid.x`, so a `[B, L, E]` row-major buffer
+    /// flattens to `B*L` such rows the same way `[B, 1, E]` flattens to `B`
+    /// of them, and the `[B, L, 8]` output flattens identically on the
+    /// output side. Nothing about the selection arithmetic depends on how
+    /// the row count was produced.
+    ///
+    /// Fail-closed: any shape, dtype, topK, or kth outside the pin falls
+    /// through to the caller's stock `argPartition` chain. Independent kill
+    /// switch `DARKBLOOM_GEMMA4_ROUTER_FINALISTS32_PREFILL=0` so the prefill
+    /// admission can be disabled without touching the decode path's own
+    /// switch above. Engage mark: `router-finalists32-prefill`.
+    static let prefillEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ROUTER_FINALISTS32_PREFILL"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    static func applyPrefill(_ scores: MLXArray, topK: Int, kth: Int) -> MLXArray? {
+        guard prefillEnabled, topK == 8, kth == 120,
+            scores.ndim == 3, scores.dim(0) == 8,
+            scores.dim(1) > 1, scores.dim(2) == 128,
+            scores.dtype == .bfloat16
+        else { return nil }
+        let b = scores.dim(0)
+        let l = scores.dim(1)
+        let rows = b * l
+        CBv2EngageMark.once("router-finalists32-prefill")
+        return kernel(
+            [scores],
+            grid: (rows * 128, 1, 1),
+            threadGroup: (128, 1, 1),
+            outputShapes: [[b, l, 8]],
+            outputDTypes: [.uint32]
+        )[0]
+    }
 }
 
 /// GLUE-FOLD (G2): merge the two ADJACENT single-threadgroup route glue
@@ -3362,8 +3404,21 @@ private class Gemma4Router: Module {
             return (fused.indices, fused.weights)
         }
 
-        var topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
-        topKIndices = topKIndices[.ellipsis, kth...]
+        // PREFILL-W1 mechanism 2: the finalists32 selection kernel, already
+        // bit-identical to the stock `argPartition` + slice pair on the
+        // decode cell, admitted here to prompt-rectangle shapes as well.
+        // Selection only -- the weight tail below (takeAlong, precise
+        // softmax, per-expert scale) stays the identical stock chain on
+        // whichever indices were produced.
+        var topKIndices: MLXArray
+        if let selected = Gemma4RouterFinalistsV1.applyPrefill(
+            expertScores, topK: topK, kth: kth)
+        {
+            topKIndices = selected
+        } else {
+            topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
+            topKIndices = topKIndices[.ellipsis, kth...]
+        }
 
         var topKWeights = MLX.takeAlong(expertScores, topKIndices, axis: -1)
         topKWeights = MLX.softmax(topKWeights, axis: -1, precise: true)
@@ -4351,14 +4406,24 @@ public class Gemma4DecoderLayer: Module {
 ///
 /// ## Gating (PLE-GLUE-028 lesson)
 ///
-/// Admitted for the PREFILL rectangle only (`L > 1`). At `[B, 1]` the whole
-/// chain produces 22,528 values and a custom-kernel launch is not reliably
-/// cheaper than the five small dispatches it replaces — the same trap
-/// PLE-GLUE-028 and `Gemma4FusedRouterTop8` fell into. Decode keeps the stock
-/// chain byte-identically.
+/// The kernel is geometry-agnostic: `words_per_row` and `row` are read off
+/// the launched grid, not off a compile-time or host-passed `L`, so nothing
+/// in its body assumes a prefill-sized rectangle. It was nonetheless
+/// admitted for the PREFILL rectangle only (`L > 1`) at first, on the
+/// PLE-GLUE-028 lesson that at `[B, 1]` the whole chain produces only 22,528
+/// values and a custom-kernel launch is not reliably cheaper than the five
+/// small dispatches it replaces — the same trap `Gemma4FusedRouterTop8` fell
+/// into.
+///
+/// The decode cell (`L == 1`) is admitted as well below, behind its own
+/// independent switch, since the argument above is a dispatch-count
+/// tradeoff, not a correctness one: the same two-boundary exactness argument
+/// applies unchanged regardless of `L`.
 ///
 /// Kill switch: `DARKBLOOM_GEMMA4_SCALED_EMBEDDING=0` (also `false`/`no`/`off`)
-/// restores the stock expression on the same binary.
+/// restores the stock expression on the same binary for every geometry.
+/// `DARKBLOOM_GEMMA4_SCALED_EMBEDDING_DECODE=0` restores the stock expression
+/// for the decode cell only, leaving the prefill admission untouched.
 ///
 /// Internal rather than file-private only so the local full-vocabulary parity
 /// test can drive this exact kernel instead of a transcription of it.
@@ -4367,6 +4432,16 @@ enum Gemma4FusedScaledEmbedding {
     static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_SCALED_EMBEDDING"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// DEFAULT ON for the `[B, 1]` decode cell, independent of `enabled`
+    /// above so either admission can be disabled without touching the
+    /// other.
+    static let decodeEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_SCALED_EMBEDDING_DECODE"]
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
@@ -4428,8 +4503,9 @@ enum Gemma4FusedScaledEmbedding {
         guard enabled,
             tokens.ndim == 2,
             tokens.dtype == .int32,
-            // Prefill rectangle only; [B, 1] decode keeps the stock chain.
-            tokens.dim(1) > 1,
+            // Prefill rectangle admits unconditionally; the [B, 1] decode
+            // cell admits behind its own independent switch.
+            tokens.dim(1) > 1 || decodeEnabled,
             let quantized = embedding as? QuantizedEmbedding,
             quantized.mode == .affine,
             quantized.bits == bits,
@@ -4456,7 +4532,7 @@ enum Gemma4FusedScaledEmbedding {
         let length = tokens.dim(1)
         let wordsPerRow = weight.dim(1)
 
-        CBv2EngageMark.once("scaled-embedding")
+        CBv2EngageMark.once(length > 1 ? "scaled-embedding" : "scaled-embedding-decode")
         return kernel(
             // `asMLXArray(dtype:)` is the exact conversion the stock
             // `MLXArray * Float` overload performs on the scalar.

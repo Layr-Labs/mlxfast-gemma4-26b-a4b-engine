@@ -62,11 +62,18 @@ enum CBv2AttentionV1 {
     ///
     /// `0` disables the specialization (the block width falls back to
     /// `queryBlockSize`), which is the kill switch.
+    ///
+    /// The default is 128: with `effectiveQueryBlockSize` requiring a width
+    /// strictly below `queryBlockSize` (128) to engage the specialization,
+    /// a default of 128 makes that guard fail, so every blocked prompt call
+    /// — wide-head or not — takes the same 128-row grouping every other
+    /// layer already uses. `DARKBLOOM_CBV2_ATTN_QUERY_BLOCK_WIDE=64` restores
+    /// the narrower rectangles.
     static let wideHeadQueryBlockSize: Int = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_ATTN_QUERY_BLOCK_WIDE"],
             let value = Int(raw), value >= 0
-        else { return 64 }
+        else { return 128 }
         return value
     }()
 

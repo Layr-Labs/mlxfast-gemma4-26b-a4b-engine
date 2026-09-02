@@ -1766,7 +1766,7 @@ private class Gemma4Attention: Module {
     /// MMA-RS-001: the projection input's run-sum table is computed here (the
     /// o_proj plane consumes it alone); nil keeps the incumbent dispatch.
     @inline(__always)
-    private func outputProjection(_ x: MLXArray) -> MLXArray {
+    private func outputProjection(_ x: MLXArray, carried: MLXArray? = nil) -> MLXArray {
         guard let quantized = oProj as? QuantizedLinear,
             quantized.bias == nil,
             let projected = CBv2AttentionOQMVV1.matmul(
@@ -1777,7 +1777,7 @@ private class Gemma4Attention: Module {
                 groupSize: quantized.groupSize,
                 bits: quantized.bits,
                 mode: quantized.mode,
-                rsTable: CBv2AttentionOQMVV1.runsumTable(for: x))
+                rsTable: CBv2AttentionOQMVV1.runsumTable(for: x, carried: carried))
         else { return oProj(x) }
         return projected
     }
@@ -2135,6 +2135,7 @@ private class Gemma4Attention: Module {
 
         let residentProducts =
             CBv2RaggedTwoPassDecodeAttentionV1.takeResidentProducts(for: attention)
+        let carriedORS = CBv2AttentionOQMVV1.takeCarriedTable(for: attention)
         var output = attention.transposed(0, 2, 1, 3).reshaped(B, queryLength, -1)
         if lastQueryCache == nil && outputStart > 0 {
             output = output[0..., outputStart..., 0...]
@@ -2143,7 +2144,7 @@ private class Gemma4Attention: Module {
             output = output.asType(outputDType)
         }
         return (
-            outputProjection(output),
+            outputProjection(output, carried: carriedORS),
             (residentProducts?.normalizedKeys ?? k,
              residentProducts?.normalizedValues ?? v),
             captured)

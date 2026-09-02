@@ -1406,7 +1406,12 @@ public class SwitchGLU: Module {
         let doSort = indices.size >= 64
 
         var idx = indices
-        var inverseOrder = MLXArray()
+        // ROUTE-LAZY-INVERSE-ORDER: the sentinel `MLXArray()` this variable
+        // used to hold is dead at every site -- under `doSort` a real producer
+        // overwrites it, and without it the optional return already carries
+        // nil. Holding the optional avoids one throwaway C++ array handle per
+        // layer per forward.
+        var inverseOrder: MLXArray?
         var lhsIndices: MLXArray?
         if doSort {
             if useLhsIndices {
@@ -1521,7 +1526,10 @@ public class SwitchGLU: Module {
         let downLhs: MLXArray? =
             (doSort && idx.ndim == 1 && idx.size == 64) ? switchDownIdentity64 : nil
         x = downProj(activated, idx, lhsIndices: downLhs, sortedIndices: doSort)
-        return (x, doSort ? inverseOrder : nil, doSort)
+        // Under `doSort` a producer above always assigned `inverseOrder`;
+        // otherwise it is still nil, which is exactly what the old
+        // `doSort ? inverseOrder : nil` produced.
+        return (x, inverseOrder, doSort)
     }
 
     /// Cached eligibility: the projection tensors are bound at load time and

@@ -4129,7 +4129,12 @@ private class Gemma4Router: Module {
     }
 
     fileprivate func zipScores(_ normed: MLXArray) -> MLXArray {
-        proj(normed)
+        // ROUTER-PREFILL-DEQ-CACHE: at prompt width the router projection
+        // reuses the same dequantize-once transposed plane cache the dense
+        // projections use (its own admission floor keeps decode rows on the
+        // incumbent quantized dispatch). Unquantized or off-contract routers
+        // fall through untouched.
+        Gemma4PrefillDeqGEMMV1.apply(proj, normed) ?? proj(normed)
     }
 
     fileprivate func zipPartition(_ expertScores: MLXArray) -> MLXArray {

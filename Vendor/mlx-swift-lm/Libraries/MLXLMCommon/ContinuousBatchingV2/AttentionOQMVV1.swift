@@ -313,7 +313,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
 """
 
     private static let mma8KernelK4096 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry_bfill_v4",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry_bfill_v4" + CBv2TiedLMHeadQMVV1.xvSuffix,
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -330,7 +330,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
         ensureRowContiguous: true)
 
     private static let mma8KernelK8192 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_carry_bfill_v4",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_carry_bfill_v4" + CBv2TiedLMHeadQMVV1.xvSuffix,
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -347,7 +347,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
         ensureRowContiguous: true)
 
     private static let qmvKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_affine4_g64_tight_v1",
+        name: "cbv2_b8_l1_attention_o_affine4_g64_tight_v1" + CBv2TiedLMHeadQMVV1.xvSuffix,
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -400,6 +400,9 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
         else { return nil }
 
         if mma8Enabled {
+            if CBv2TiedLMHeadQMVV1.xvloadEnabled {
+                CBv2EngageMark.once("qmv-xvload-oproj")
+            }
             // One threadgroup per 8-column output tile; all eight cohort rows
             // are served from a single weight fetch, so the o_proj plane is
             // streamed once per round instead of four times. Grid is in

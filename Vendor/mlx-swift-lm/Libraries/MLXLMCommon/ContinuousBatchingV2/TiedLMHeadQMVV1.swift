@@ -84,7 +84,31 @@ public enum CBv2TiedLMHeadQMVV1 {
     /// `values_per_thread * SIMD` in the kernel; the tail block needs one more.
     private static let values_per_thread_block = 256
 
-    static let kernelHeader = """
+    /// QMV-XVLOAD-001. The shared `load_vector` fetched the activation four
+    /// scalars at a time. Every caller advances x by `simd_lid *
+    /// values_per_thread` and walks k by `values_per_thread * SIMD_SIZE`, with
+    /// values_per_thread in {4, 8, 16}, so x is always a multiple of four
+    /// elements from a row base whose stride (in_vec_size) is itself a multiple
+    /// of four on every shape this tower dispatches. The four scalars are
+    /// therefore one naturally aligned `vec<T, 4>` -- unconditionally, with no
+    /// guard and no remainder path. Values, expression text and accumulation
+    /// order are unchanged; only the fetch width differs.
+    ///
+    /// `DARKBLOOM_GEMMA4_QMV_XVLOAD=0` compiles the incumbent scalar walks
+    /// verbatim and drops the cache-key suffix, restoring the shipped bodies.
+    static let xvloadEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_QMV_XVLOAD"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Appended to every kernel name whose source text this switch changes, so
+    /// a name-keyed compiled-kernel cache can never serve the other body.
+    static let xvSuffix: String = xvloadEnabled ? "_xv1" : ""
+
+    static let kernelHeader = (xvloadEnabled
+        ? "#define DB_QMV_XVLOAD 1\n" : "#define DB_QMV_XVLOAD 0\n") + """
 #define METAL_FUNC inline
 constant constexpr const int SIMD_SIZE = 32;
 
@@ -126,6 +150,18 @@ inline U load_vector(const device T* x, thread U* x_thread) {
   }
 
   else if (bits == 4) {
+#if DB_QMV_XVLOAD
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < values_per_thread; i += 4) {
+      const vec<T, 4> xv =
+          *reinterpret_cast<const device vec<T, 4>*>(x + i);
+      sum += xv[0] + xv[1] + xv[2] + xv[3];
+      x_thread[i] = xv[0];
+      x_thread[i + 1] = xv[1] / 16.0f;
+      x_thread[i + 2] = xv[2] / 256.0f;
+      x_thread[i + 3] = xv[3] / 4096.0f;
+    }
+#else
     #pragma clang loop unroll(full)
     for (int i = 0; i < values_per_thread; i += 4) {
       sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
@@ -134,6 +170,7 @@ inline U load_vector(const device T* x, thread U* x_thread) {
       x_thread[i + 2] = x[i + 2] / 256.0f;
       x_thread[i + 3] = x[i + 3] / 4096.0f;
     }
+#endif
   }
 
   else if (bits == 5) {
@@ -164,11 +201,27 @@ inline U load_vector(const device T* x, thread U* x_thread) {
   }
 
   else if (bits == 8) {
+#if DB_QMV_XVLOAD
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < values_per_thread; i += 4) {
+      const vec<T, 4> xv =
+          *reinterpret_cast<const device vec<T, 4>*>(x + i);
+      sum += xv[0];
+      x_thread[i] = xv[0];
+      sum += xv[1];
+      x_thread[i + 1] = xv[1];
+      sum += xv[2];
+      x_thread[i + 2] = xv[2];
+      sum += xv[3];
+      x_thread[i + 3] = xv[3];
+    }
+#else
     #pragma clang loop unroll(full)
     for (int i = 0; i < values_per_thread; i++) {
       sum += x[i];
       x_thread[i] = x[i];
     }
+#endif
   }
 
   return sum;
@@ -441,7 +494,7 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
 """
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_tied_lmhead_qmv_affine4_g64_quad_stream_unroll_v3",
+        name: "cbv2_b8_tied_lmhead_qmv_affine4_g64_quad_stream_unroll_v3" + CBv2TiedLMHeadQMVV1.xvSuffix,
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -512,6 +565,8 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
             scales.dim(1) == inDim / groupSize,
             biases.shape == scales.shape
         else { return nil }
+
+        if xvloadEnabled { CBv2EngageMark.once("qmv-xvload") }
 
         let xGroups = batch / rowsPerGroup
         let yGroups = outDim / outputsPerGroup

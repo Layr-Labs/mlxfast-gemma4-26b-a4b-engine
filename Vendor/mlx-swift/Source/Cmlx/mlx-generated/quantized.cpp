@@ -3929,7 +3929,10 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int gemma4_down_tile_span = 4; // sweep alternate: 2
+  // Span 2 keeps two rows per surviving group.  At the batch-8 Gemma down
+  // projection shape this trades a few extra launches for lower register
+  // pressure and shorter serial strip walks than the span-4 variant.
+  constexpr int gemma4_down_tile_span = 2;
   if (tid.y % uint(gemma4_down_tile_span) != 0u) {
     return;
   }

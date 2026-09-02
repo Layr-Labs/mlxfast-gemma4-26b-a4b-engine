@@ -3926,7 +3926,8 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int gemma4_down_tile_span = 4; // sweep alternate: 2
+  // Keep this readable twin aligned with the runtime-generated source.
+  constexpr int gemma4_down_tile_span = 2;
   if (tid.y % uint(gemma4_down_tile_span) != 0u) {
     return;
   }

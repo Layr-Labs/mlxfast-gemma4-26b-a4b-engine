@@ -3946,9 +3946,36 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
       run_offset++;
     }
   }
-  // Odd positions are produced by the immediately preceding pair leader.
-  if ((run_offset & 1) != 0) {
+  // KERN-DOWN-RUNQUAD: the K = 704 down plane is the one gather plane that
+  // still elects PAIR leaders only, so a same-expert run of three or four
+  // assignments re-streams that expert's weights twice here, while the
+  // K = 2816 gate/up election below streams them once through the triple
+  // and quad stream impls. Those two bodies are already instantiated in
+  // this same kernel for the gate/up plane, so the down plane pays their
+  // register high-water today and collects none of the reuse -- the gap is
+  // an unused fusion, not a missing one. Electing on run_offset % 4 (the
+  // gate/up dispatcher's own alignment) and widening the strip walk to the
+  // matching stream arity adds no register, no instantiation and no new
+  // arithmetic: every (output, input) pair keeps its own accumulator,
+  // K-loop order and qdot, so each output element's add sequence stays the
+  // one the pair-and-single election produces for it. Tile u of a run
+  // leader L is served by L at loop step u % span and by no other group,
+  // exactly as under the pair election. Flip to false to return the plane
+  // to pair-only leaders; the two arms are bit-identical by construction.
+  constexpr bool gemma4_down_run_quad = true;
+  constexpr uint gemma4_down_run_cap = gemma4_down_run_quad ? 4u : 2u;
+  if ((run_offset & (gemma4_down_run_cap - 1u)) != 0u) {
     return;
+  }
+  uint run_len = 1;
+  if (expert_prefix_bounds) {
+    run_len =
+        min(gemma4_down_run_cap, ((route_word >> 14) & 0x3fu) + 1u);
+  } else {
+    while (run_len < gemma4_down_run_cap && assignment + run_len < 64 &&
+           rhs_indices[(assignment + run_len) * rhs_stride] == expert) {
+      run_len++;
+    }
   }
   const device uint32_t* tile_w = w + expert * w_stride;
   const device T* tile_scales = scales + expert * s_stride;
@@ -3956,25 +3983,71 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   const device T* tile_x0 =
       x + lhs_indices[assignment * lhs_stride] * x_stride;
   device T* tile_y0 = y + assignment * out_vec_size;
-  const bool has_pair = expert_prefix_bounds
-      ? (((route_word >> 14) & 0x3fu) + 1u) > 1u
-      : assignment + 1 < 64 &&
-          rhs_indices[(assignment + 1) * rhs_stride] == expert;
-  if (has_pair) {
+  if (run_len > 1) {
     const device T* tile_x1 =
         x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
     device T* tile_y1 = y + (assignment + 1) * out_vec_size;
+    if (run_len == 2) {
+      for (int t = 0; t < gemma4_down_tile_span; t++) {
+        uint3 tile_tid = tid;
+        tile_tid.y = tid.y + uint(t);
+        qmv_affine4_g64_pair_impl<T, group_size, bits>(
+            tile_w,
+            tile_scales,
+            tile_biases,
+            tile_x0,
+            tile_x1,
+            tile_y0,
+            tile_y1,
+            in_vec_size,
+            tile_tid,
+            simd_gid,
+            simd_lid);
+      }
+      return;
+    }
+    const device T* tile_x2 =
+        x + lhs_indices[(assignment + 2) * lhs_stride] * x_stride;
+    device T* tile_y2 = y + (assignment + 2) * out_vec_size;
+    if (run_len == 3) {
+      for (int t = 0; t < gemma4_down_tile_span; t++) {
+        uint3 tile_tid = tid;
+        tile_tid.y = tid.y + uint(t);
+        qmv_affine4_g64_triple_stream_impl<T, group_size, bits>(
+            tile_w,
+            tile_scales,
+            tile_biases,
+            tile_x0,
+            tile_x1,
+            tile_x2,
+            tile_y0,
+            tile_y1,
+            tile_y2,
+            in_vec_size,
+            tile_tid,
+            simd_gid,
+            simd_lid);
+      }
+      return;
+    }
+    const device T* tile_x3 =
+        x + lhs_indices[(assignment + 3) * lhs_stride] * x_stride;
+    device T* tile_y3 = y + (assignment + 3) * out_vec_size;
     for (int t = 0; t < gemma4_down_tile_span; t++) {
       uint3 tile_tid = tid;
       tile_tid.y = tid.y + uint(t);
-      qmv_affine4_g64_pair_impl<T, group_size, bits>(
+      qmv_affine4_g64_quad_stream_impl<T, group_size, bits>(
           tile_w,
           tile_scales,
           tile_biases,
           tile_x0,
           tile_x1,
+          tile_x2,
+          tile_x3,
           tile_y0,
           tile_y1,
+          tile_y2,
+          tile_y3,
           in_vec_size,
           tile_tid,
           simd_gid,

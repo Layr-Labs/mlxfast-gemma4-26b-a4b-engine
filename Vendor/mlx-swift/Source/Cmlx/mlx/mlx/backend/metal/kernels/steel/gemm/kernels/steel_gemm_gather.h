@@ -7,6 +7,11 @@ constant bool align_M [[function_constant(200)]];
 constant bool align_N [[function_constant(201)]];
 constant bool align_K [[function_constant(202)]];
 
+// DARKBLOOM_GATHER_FIRST_BARRIER: ENGAGED; set to 0 to restore the baseline.
+#ifndef DARKBLOOM_GATHER_FIRST_BARRIER
+#define DARKBLOOM_GATHER_FIRST_BARRIER 1
+#endif
+
 template <
     typename T,
     int BM,
@@ -59,6 +64,7 @@ template <
   const size_t c_row_long = size_t(c_row);
   const size_t c_col_long = size_t(c_col);
 
+
   // Prepare threadgroup bounds
   const short tgp_bm = align_M ? BM : short(min(BM, params->M - c_row));
   const short tgp_bn = align_N ? BN : short(min(BN, params->N - c_col));
@@ -85,7 +91,10 @@ template <
         break;
       }
     }
-    threadgroup_barrier(mem_flags::mem_none);
+    // The first tile writes fresh As/Bs; later runs need the hand-off barrier.
+    if (offset != 0 || DARKBLOOM_GATHER_FIRST_BARRIER == 0) {
+      threadgroup_barrier(mem_flags::mem_none);
+    }
 
     // Prepare threadgroup mma operation
     thread mma_t mma_op(simd_group_id, simd_lane_id);

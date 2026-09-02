@@ -2699,12 +2699,22 @@ private enum Gemma4FusedLayerGlue {
 
     /// Shared reduction preamble: the exact rms_single_row tree at 704x4.
     /// `PREFIX` names the array to reduce; `SLOT` the shared slot written.
-    private static func rmsReduce(_ src: String, into slot: String) -> String {
-        """
+    /// Device inputs fetch their four contiguous elements as one `vec<T,4>`
+    /// load; `fromRegisters` reads a per-thread array that already lives in
+    /// registers. Both widen per element in the original read order.
+    private static func rmsReduce(
+        _ src: String, into slot: String, fromRegisters: Bool = false
+    ) -> String {
+        let load = fromRegisters
+            ? ""
+            : "const vec<T,4> xv4 = *((const device vec<T,4>*)(\(src) + base));"
+        let xi = fromRegisters ? "\(src)[i]" : "xv4[i]"
+        return """
             {
+                \(load)
                 float acc = 0;
                 for (int i = 0; i < 4; i++) {
-                    float xi = (float)\(src)[base + i];
+                    float xi = (float)\(xi);
                     acc += xi * xi;
                 }
                 acc = simd_sum(acc);
@@ -2772,16 +2782,16 @@ private enum Gemma4FusedLayerGlue {
         replaceOnce(rmsReduce("a", into: "local_inv[0]"), with: pairedRmsSource)
         replaceOnce(rmsReduce("b", into: "local_inv[1]"), with: "")
         replaceOnce(
-            "const T h1 = w1[wbase + i] * static_cast<T>((float)a[base + i] * inv1);",
-            with: "const T h1 = w1[wbase + i] * static_cast<T>(av[i] * inv1);")
+            "const T h1 = w14[i] * static_cast<T>((float)a4[i] * inv1);",
+            with: "const T h1 = w14[i] * static_cast<T>(av[i] * inv1);")
         replaceOnce(
-            "const T h2 = w2[wbase + i] * static_cast<T>((float)b[base + i] * inv2);",
-            with: "const T h2 = w2[wbase + i] * static_cast<T>(bv[i] * inv2);")
+            "const T h2 = w24[i] * static_cast<T>((float)b4[i] * inv2);",
+            with: "const T h2 = w24[i] * static_cast<T>(bv[i] * inv2);")
         return result
     }
 
     private static let normResidualKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_norm_residual_2816_bf16_v1_nb1",
+        name: "gemma4_glue_norm_residual_2816_bf16_v1_nb1_vec4",
         inputNames: ["x", "res", "w"],
         outputNames: ["out"],
         source: """
@@ -2795,13 +2805,18 @@ private enum Gemma4FusedLayerGlue {
             const uint wbase = lid * 4;
         \(rmsReduce("x", into: "local_inv[0]"))
             const float inv = local_inv[0];
+            const vec<T,4> w4 = *((const device vec<T,4>*)(w + wbase));
+            const vec<T,4> x4 = *((const device vec<T,4>*)(x + base));
+            const vec<T,4> res4 = *((const device vec<T,4>*)(res + base));
+            vec<T,4> out4;
             for (int i = 0; i < 4; i++) {
                 // The stock chain rounds the norm's output to T in memory
                 // before the residual add reads it; reproduce both roundings.
                 const T normed = static_cast<T>(
-                    w[wbase + i] * static_cast<T>((float)x[base + i] * inv));
-                out[base + i] = res[base + i] + normed;
+                    w4[i] * static_cast<T>((float)x4[i] * inv));
+                out4[i] = res4[i] + normed;
             }
+            *((device vec<T,4>*)(out + base)) = out4;
         """,
         ensureRowContiguous: true
     )
@@ -2815,7 +2830,7 @@ private enum Gemma4FusedLayerGlue {
 // T28 second sample marker (r2): content identical to ranked 32f5d19f apart from this comment.
     private static let attentionBranchPrefixKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_glue_attention_branch_prefix_2816_bf16_v1_nb1",
+            name: "gemma4_glue_attention_branch_prefix_2816_bf16_v1_nb1_vec4",
             inputNames: ["attn", "res", "wa", "wd", "we", "wr"],
             outputNames: ["out", "dense", "expert", "router", "xSums"],
             source: """
@@ -2829,35 +2844,46 @@ private enum Gemma4FusedLayerGlue {
                 const uint wbase = lid * 4;
             \(rmsReduce("attn", into: "local_inv[0]"))
                 const float attn_inv = local_inv[0];
-                T outv[4];
+                const vec<T,4> wa4 = *((const device vec<T,4>*)(wa + wbase));
+                const vec<T,4> attn4 = *((const device vec<T,4>*)(attn + base));
+                const vec<T,4> res4 = *((const device vec<T,4>*)(res + base));
+                vec<T,4> outv;
                 for (int i = 0; i < 4; i++) {
                     const T normed = static_cast<T>(
-                        wa[wbase + i]
+                        wa4[i]
                             * static_cast<T>(
-                                (float)attn[base + i] * attn_inv));
-                    outv[i] = res[base + i] + normed;
-                    out[base + i] = outv[i];
+                                (float)attn4[i] * attn_inv));
+                    outv[i] = res4[i] + normed;
                 }
-            \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
-                of: "(float)outv[base + i]", with: "(float)outv[i]"))
+                *((device vec<T,4>*)(out + base)) = outv;
+            \(rmsReduce("outv", into: "local_inv[0]", fromRegisters: true))
                 const float branch_inv = local_inv[0];
+                const vec<T,4> wd4 = *((const device vec<T,4>*)(wd + wbase));
+                const vec<T,4> we4 = *((const device vec<T,4>*)(we + wbase));
+                const vec<T,4> wr4 = *((const device vec<T,4>*)(wr + wbase));
+                vec<T,4> dense4;
+                vec<T,4> expert4;
+                vec<T,4> router4;
                 float xsum = 0.0f;
                 for (int i = 0; i < 4; i++) {
                     const T nx =
                         static_cast<T>((float)outv[i] * branch_inv);
-                    const T densev = wd[wbase + i] * nx;
-                    dense[base + i] = densev;
-                    expert[base + i] = we[wbase + i] * nx;
-                    router[base + i] = wr[wbase + i] * nx;
+                    const T densev = wd4[i] * nx;
+                    dense4[i] = densev;
+                    expert4[i] = we4[i] * nx;
+                    router4[i] = wr4[i] * nx;
                     xsum += densev;
                 }
+                *((device vec<T,4>*)(dense + base)) = dense4;
+                *((device vec<T,4>*)(expert + base)) = expert4;
+                *((device vec<T,4>*)(router + base)) = router4;
                 xSums[lid * 8 + row] = xsum;
             """,
             ensureRowContiguous: true
         )
 
     private static let dualPreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_dual_prenorm_xsum_2816_bf16_v2_nb1",
+        name: "gemma4_glue_dual_prenorm_xsum_2816_bf16_v2_nb1_vec4",
         inputNames: ["x", "w1", "w2"],
         outputNames: ["out1", "out2", "xSums"],
         source: """
@@ -2871,14 +2897,21 @@ private enum Gemma4FusedLayerGlue {
             const uint wbase = lid * 4;
         \(rmsReduce("x", into: "local_inv[0]"))
             const float inv = local_inv[0];
+            const vec<T,4> x4 = *((const device vec<T,4>*)(x + base));
+            const vec<T,4> w14 = *((const device vec<T,4>*)(w1 + wbase));
+            const vec<T,4> w24 = *((const device vec<T,4>*)(w2 + wbase));
+            vec<T,4> out14;
+            vec<T,4> out24;
             float xsum = 0.0f;
             for (int i = 0; i < 4; i++) {
-                const T nx = static_cast<T>((float)x[base + i] * inv);
-                const T dense = w1[wbase + i] * nx;
-                out1[base + i] = dense;
-                out2[base + i] = w2[wbase + i] * nx;
+                const T nx = static_cast<T>((float)x4[i] * inv);
+                const T dense = w14[i] * nx;
+                out14[i] = dense;
+                out24[i] = w24[i] * nx;
                 xsum += dense;
             }
+            *((device vec<T,4>*)(out1 + base)) = out14;
+            *((device vec<T,4>*)(out2 + base)) = out24;
             // `lid == k_block * 32 + lane`, exactly the standalone DMLP
             // xsum table's first two coordinates. Row remains unit stride.
             xSums[lid * 8 + row] = xsum;
@@ -2899,16 +2932,22 @@ private enum Gemma4FusedLayerGlue {
         \(rmsReduce("b", into: "local_inv[1]"))
             const float inv1 = local_inv[0];
             const float inv2 = local_inv[1];
+            const vec<T,4> w14 = *((const device vec<T,4>*)(w1 + wbase));
+            const vec<T,4> a4 = *((const device vec<T,4>*)(a + base));
+            const vec<T,4> w24 = *((const device vec<T,4>*)(w2 + wbase));
+            const vec<T,4> b4 = *((const device vec<T,4>*)(b + base));
             T sv[4];
             for (int i = 0; i < 4; i++) {
-                const T h1 = w1[wbase + i] * static_cast<T>((float)a[base + i] * inv1);
-                const T h2 = w2[wbase + i] * static_cast<T>((float)b[base + i] * inv2);
+                const T h1 = w14[i] * static_cast<T>((float)a4[i] * inv1);
+                const T h2 = w24[i] * static_cast<T>((float)b4[i] * inv2);
                 sv[i] = h1 + h2;
             }
-        \(rmsReduce("sv", into: "local_inv[0]").replacingOccurrences(
-            of: "(float)sv[base + i]", with: "(float)sv[i]"))
+        \(rmsReduce("sv", into: "local_inv[0]", fromRegisters: true))
             const float inv3 = local_inv[0];
             const T scalar = s[0];
+            const vec<T,4> w34 = *((const device vec<T,4>*)(w3 + wbase));
+            const vec<T,4> res4 = *((const device vec<T,4>*)(res + base));
+            vec<T,4> out4;
             for (int i = 0; i < 4; i++) {
                 // Same double rounding as the stock norm-then-add pair, then
                 // the layer-scalar multiply with its own stock rounding: the
@@ -2916,14 +2955,15 @@ private enum Gemma4FusedLayerGlue {
                 // stock graph stored it to memory, and the T*T product rounds
                 // once on the store exactly like the stock multiply kernel.
                 const T normed = static_cast<T>(
-                    w3[wbase + i] * static_cast<T>((float)sv[i] * inv3));
-                const T summed = res[base + i] + normed;
-                out[base + i] = summed * scalar;
+                    w34[i] * static_cast<T>((float)sv[i] * inv3));
+                const T summed = res4[i] + normed;
+                out4[i] = summed * scalar;
             }
+            *((device vec<T,4>*)(out + base)) = out4;
         """
 
     private static let tailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_2816_bf16_v2_nb1",
+        name: "gemma4_glue_tail_2816_bf16_v2_nb1_vec4",
         inputNames: ["a", "b", "res", "w1", "w2", "w3", "s"],
         outputNames: ["out"],
         source: tailSource,
@@ -2931,7 +2971,7 @@ private enum Gemma4FusedLayerGlue {
     )
 
     private static let pairedTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_paired_rms_2816_bf16_v1_nb1",
+        name: "gemma4_glue_tail_paired_rms_2816_bf16_v1_nb1_vec4",
         inputNames: ["a", "b", "res", "w1", "w2", "w3", "s"],
         outputNames: ["out"],
         source: pairedRmsTailSource(tailSource),
@@ -3070,35 +3110,42 @@ private enum Gemma4FusedLayerGlue {
         \(rmsReduce("b", into: "local_inv[1]"))
             const float inv1 = local_inv[0];
             const float inv2 = local_inv[1];
+            const vec<T,4> w14 = *((const device vec<T,4>*)(w1 + wbase));
+            const vec<T,4> a4 = *((const device vec<T,4>*)(a + base));
+            const vec<T,4> w24 = *((const device vec<T,4>*)(w2 + wbase));
+            const vec<T,4> b4 = *((const device vec<T,4>*)(b + base));
             T sv[4];
             for (int i = 0; i < 4; i++) {
-                const T h1 = w1[wbase + i] * static_cast<T>((float)a[base + i] * inv1);
-                const T h2 = w2[wbase + i] * static_cast<T>((float)b[base + i] * inv2);
+                const T h1 = w14[i] * static_cast<T>((float)a4[i] * inv1);
+                const T h2 = w24[i] * static_cast<T>((float)b4[i] * inv2);
                 sv[i] = h1 + h2;
             }
-        \(rmsReduce("sv", into: "local_inv[0]").replacingOccurrences(
-            of: "(float)sv[base + i]", with: "(float)sv[i]"))
+        \(rmsReduce("sv", into: "local_inv[0]", fromRegisters: true))
             const float inv3 = local_inv[0];
             const T scalar = s[0];
-            T outv[4];
+            const vec<T,4> w34 = *((const device vec<T,4>*)(w3 + wbase));
+            const vec<T,4> res4 = *((const device vec<T,4>*)(res + base));
+            vec<T,4> outv;
             for (int i = 0; i < 4; i++) {
                 const T normed3 = static_cast<T>(
-                    w3[wbase + i] * static_cast<T>((float)sv[i] * inv3));
-                const T summed = res[base + i] + normed3;
+                    w34[i] * static_cast<T>((float)sv[i] * inv3));
+                const T summed = res4[i] + normed3;
                 outv[i] = summed * scalar;
-                out[base + i] = outv[i];
             }
-        \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
-            of: "(float)outv[base + i]", with: "(float)outv[i]"))
+            *((device vec<T,4>*)(out + base)) = outv;
+        \(rmsReduce("outv", into: "local_inv[0]", fromRegisters: true))
             const float inv4 = local_inv[0];
+            const vec<T,4> wn4 = *((const device vec<T,4>*)(wn + wbase));
+            vec<T,4> normed4;
             for (int i = 0; i < 4; i++) {
-                normed[base + i] =
-                    wn[wbase + i] * static_cast<T>((float)outv[i] * inv4);
+                normed4[i] =
+                    wn4[i] * static_cast<T>((float)outv[i] * inv4);
             }
+            *((device vec<T,4>*)(normed + base)) = normed4;
         """
 
     private static let tailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_chain_2816_bf16_v1_nb1",
+        name: "gemma4_glue_tail_chain_2816_bf16_v1_nb1_vec4",
         inputNames: ["a", "b", "res", "w1", "w2", "w3", "s", "wn"],
         outputNames: ["out", "normed"],
         source: tailChainSource,
@@ -3106,7 +3153,7 @@ private enum Gemma4FusedLayerGlue {
     )
 
     private static let pairedTailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_chain_paired_rms_2816_bf16_v1_nb1",
+        name: "gemma4_glue_tail_chain_paired_rms_2816_bf16_v1_nb1_vec4",
         inputNames: ["a", "b", "res", "w1", "w2", "w3", "s", "wn"],
         outputNames: ["out", "normed"],
         source: pairedRmsTailSource(tailChainSource),
@@ -3119,6 +3166,7 @@ private enum Gemma4FusedLayerGlue {
     /// materialization and its standalone dispatch.
     private static let deferredExpertValuesSource = """
             T expertv[4];
+            vec<T,4> sortedv[8];
             const uint assignment_base = row * 8u;
             uint sorted_rows[8];
             T routed_weights[8];
@@ -3127,11 +3175,14 @@ private enum Gemma4FusedLayerGlue {
                 sorted_rows[slot] = (uint)inverse[assignment];
                 routed_weights[slot] = route_weights[assignment];
             }
+            for (uint slot = 0u; slot < 8u; ++slot) {
+                sortedv[slot] = *((const device vec<T,4>*)(sorted + sorted_rows[slot] * 2816u + wbase));
+            }
             for (int i = 0; i < 4; ++i) {
                 T accumulator = static_cast<T>(0.0f);
                 for (uint slot = 0u; slot < 8u; ++slot) {
                     const T weighted = static_cast<T>(
-                        (float)sorted[sorted_rows[slot] * 2816u + wbase + (uint)i]
+                        (float)sortedv[slot][i]
                         * (float)routed_weights[slot]);
                     accumulator = accumulator + weighted;
                 }
@@ -3140,7 +3191,7 @@ private enum Gemma4FusedLayerGlue {
     """
 
     private static let deferredTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1_nb1_vec1",
+        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1_nb1_vec4",
         inputNames: [
             "a", "sorted", "inverse", "route_weights", "res",
             "w1", "w2", "w3", "s",
@@ -3157,35 +3208,40 @@ private enum Gemma4FusedLayerGlue {
             const uint wbase = lid * 4;
         \(rmsReduce("a", into: "local_inv[0]"))
         \(deferredExpertValuesSource)
-        \(rmsReduce("expertv", into: "local_inv[1]").replacingOccurrences(
-            of: "(float)expertv[base + i]", with: "(float)expertv[i]"))
+        \(rmsReduce("expertv", into: "local_inv[1]", fromRegisters: true))
             const float inv1 = local_inv[0];
             const float inv2 = local_inv[1];
+            const vec<T,4> w14 = *((const device vec<T,4>*)(w1 + wbase));
+            const vec<T,4> a4 = *((const device vec<T,4>*)(a + base));
+            const vec<T,4> w24 = *((const device vec<T,4>*)(w2 + wbase));
             T sv[4];
             for (int i = 0; i < 4; i++) {
-                const T h1 = w1[wbase + i]
-                    * static_cast<T>((float)a[base + i] * inv1);
-                const T h2 = w2[wbase + i]
+                const T h1 = w14[i]
+                    * static_cast<T>((float)a4[i] * inv1);
+                const T h2 = w24[i]
                     * static_cast<T>((float)expertv[i] * inv2);
                 sv[i] = h1 + h2;
             }
-        \(rmsReduce("sv", into: "local_inv[0]").replacingOccurrences(
-            of: "(float)sv[base + i]", with: "(float)sv[i]"))
+        \(rmsReduce("sv", into: "local_inv[0]", fromRegisters: true))
             const float inv3 = local_inv[0];
             const T scalar = s[0];
+            const vec<T,4> w34 = *((const device vec<T,4>*)(w3 + wbase));
+            const vec<T,4> res4 = *((const device vec<T,4>*)(res + base));
+            vec<T,4> out4;
             for (int i = 0; i < 4; i++) {
                 const T normed3 = static_cast<T>(
-                    w3[wbase + i] * static_cast<T>((float)sv[i] * inv3));
-                const T summed = res[base + i] + normed3;
-                out[base + i] = summed * scalar;
+                    w34[i] * static_cast<T>((float)sv[i] * inv3));
+                const T summed = res4[i] + normed3;
+                out4[i] = summed * scalar;
             }
+            *((device vec<T,4>*)(out + base)) = out4;
         """,
         ensureRowContiguous: true
     )
 
     private static let deferredTailChainKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1_nb1_vec1",
+            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1_nb1_vec4",
             inputNames: [
                 "a", "sorted", "inverse", "route_weights", "res",
                 "w1", "w2", "w3", "s", "wn",
@@ -3202,39 +3258,44 @@ private enum Gemma4FusedLayerGlue {
                 const uint wbase = lid * 4;
             \(rmsReduce("a", into: "local_inv[0]"))
             \(deferredExpertValuesSource)
-            \(rmsReduce("expertv", into: "local_inv[1]").replacingOccurrences(
-                of: "(float)expertv[base + i]", with: "(float)expertv[i]"))
+            \(rmsReduce("expertv", into: "local_inv[1]", fromRegisters: true))
                 const float inv1 = local_inv[0];
                 const float inv2 = local_inv[1];
+                const vec<T,4> w14 = *((const device vec<T,4>*)(w1 + wbase));
+                const vec<T,4> a4 = *((const device vec<T,4>*)(a + base));
+                const vec<T,4> w24 = *((const device vec<T,4>*)(w2 + wbase));
                 T sv[4];
                 for (int i = 0; i < 4; i++) {
-                    const T h1 = w1[wbase + i]
-                        * static_cast<T>((float)a[base + i] * inv1);
-                    const T h2 = w2[wbase + i]
+                    const T h1 = w14[i]
+                        * static_cast<T>((float)a4[i] * inv1);
+                    const T h2 = w24[i]
                         * static_cast<T>((float)expertv[i] * inv2);
                     sv[i] = h1 + h2;
                 }
-            \(rmsReduce("sv", into: "local_inv[0]").replacingOccurrences(
-                of: "(float)sv[base + i]", with: "(float)sv[i]"))
+            \(rmsReduce("sv", into: "local_inv[0]", fromRegisters: true))
                 const float inv3 = local_inv[0];
                 const T scalar = s[0];
-                T outv[4];
+                const vec<T,4> w34 = *((const device vec<T,4>*)(w3 + wbase));
+                const vec<T,4> res4 = *((const device vec<T,4>*)(res + base));
+                vec<T,4> outv;
                 for (int i = 0; i < 4; i++) {
                     const T normed3 = static_cast<T>(
-                        w3[wbase + i]
+                        w34[i]
                             * static_cast<T>((float)sv[i] * inv3));
-                    const T summed = res[base + i] + normed3;
+                    const T summed = res4[i] + normed3;
                     outv[i] = summed * scalar;
-                    out[base + i] = outv[i];
                 }
-            \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
-                of: "(float)outv[base + i]", with: "(float)outv[i]"))
+                *((device vec<T,4>*)(out + base)) = outv;
+            \(rmsReduce("outv", into: "local_inv[0]", fromRegisters: true))
                 const float inv4 = local_inv[0];
+                const vec<T,4> wn4 = *((const device vec<T,4>*)(wn + wbase));
+                vec<T,4> normed4;
                 for (int i = 0; i < 4; i++) {
-                    normed[base + i] =
-                        wn[wbase + i]
+                    normed4[i] =
+                        wn4[i]
                             * static_cast<T>((float)outv[i] * inv4);
                 }
+                *((device vec<T,4>*)(normed + base)) = normed4;
             """,
             ensureRowContiguous: true
         )

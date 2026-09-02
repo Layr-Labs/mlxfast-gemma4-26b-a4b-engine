@@ -58,6 +58,40 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     nonisolated(unsafe) private static var residentNormRopeInputs:
         [ObjectIdentifier: ResidentNormRopeInputs] = [:]
 
+    /// START-VECTOR-MEMO: every sliding layer of one decode step asks for the
+    /// same ring-start vector. `starts` comes from the per-row absolute
+    /// position, and `CBv2LayerCacheBank.validateUnifiedPositionInvariant`
+    /// holds that position equal across every layer a row owns, so the 25
+    /// sliding layers of a step rebuilt 25 identical `[batch]` uint32 device
+    /// buffers where one is needed -- 3,200 host buffer constructions per
+    /// 128-step round against 128. This is the `switchDownIdentity64`
+    /// treatment applied to a value that is constant per step rather than per
+    /// process.
+    ///
+    /// The memo is keyed on the VALUE, never on a step counter or an identity,
+    /// so a stale hit cannot exist: a hit returns an array whose contents are
+    /// exactly what the caller asked for, and a layer that legitimately
+    /// disagrees simply misses and builds its own. Every caller guards
+    /// `starts.count == batch` before reaching here, so equal starts implies
+    /// equal batch. Reuse across dispatches is the ordinary MLX pattern -- the
+    /// array is an immutable graph value, and sharing it collapses 25
+    /// scheduler dependencies into one.
+    private static let startVectorLock = NSLock()
+    nonisolated(unsafe) private static var startVectorKey: [Int] = []
+    nonisolated(unsafe) private static var startVectorValue: MLXArray?
+
+    private static func startVector(_ starts: [Int], batch: Int) -> MLXArray {
+        startVectorLock.lock()
+        defer { startVectorLock.unlock() }
+        if let cached = startVectorValue, startVectorKey == starts {
+            return cached
+        }
+        let built = MLXArray(starts.map(UInt32.init), [batch])
+        startVectorKey = starts
+        startVectorValue = built
+        return built
+    }
+
     /// Register the raw producer inputs behind an already-built exact
     /// norm+RoPE fallback. The fallback arrays remain what the generic cache
     /// sees; only the exact resident path consumes this carrier, so any miss
@@ -2688,7 +2722,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             })
         else { return nil }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = startVector(starts, batch: batch)
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let passA = portQuantReadKernel(
@@ -2759,7 +2793,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             })
         else { return nil }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = startVector(starts, batch: batch)
         let inputs = [queries] + mirrors
             + [startArray, newKeys, newValues, previousWriteFence]
         if q4ResidentMergeEnabled,
@@ -2899,7 +2933,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             starts.count == batch,
             starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength })
         else { return nil }
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = startVector(starts, batch: batch)
         return attend(
             passAKernel: ringPassAKernel, queries: queries, keys: keys, values: values,
             extraInputs: [startArray], scale: scale)
@@ -2952,7 +2986,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             else { return nil }
         }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = startVector(starts, batch: batch)
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let paired = gqaPairedPassAEnabled && gqa == 2

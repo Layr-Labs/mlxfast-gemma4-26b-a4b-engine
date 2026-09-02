@@ -490,6 +490,36 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
         header: mma8KernelHeader,
         ensureRowContiguous: true)
 
+    /// ORS-IN-ATTN: the resident sliding-attention kernel emits the layer's
+    /// o_proj run-sum table beside its output; the projection consumes that
+    /// table when its input is exactly that output, else builds it here.
+    nonisolated(unsafe) private static var carried: (source: MLXArray, table: MLXArray)?
+    public static func registerCarriedTable(source: MLXArray, table: MLXArray) {
+        carried = (source, table)
+    }
+    public static func takeCarriedTable(for attention: MLXArray) -> MLXArray? {
+        guard let entry = carried, entry.source === attention else { return nil }
+        carried = nil
+        return entry.table
+    }
+    @inline(__always)
+    public static func runsumTable(for x: MLXArray, carried table: MLXArray?) -> MLXArray? {
+        guard rsPrepassEnabled,
+            x.dtype == .bfloat16,
+            x.ndim == 3,
+            x.dim(0) == batch,
+            x.dim(1) == sequence,
+            liveInputWidth(x.dim(2))
+        else { return nil }
+        if let table, table.dtype == .float32, table.ndim == 2,
+            table.dim(0) == batch, table.dim(1) == x.dim(2) / groupSize
+        {
+            CBv2EngageMark.once("ors-in-attn-carried")
+            return table
+        }
+        return runsumTable(for: x)
+    }
+
     /// MMA-RS-001 table for one o_proj activation tensor. nil keeps the
     /// incumbent dispatch.
     @inline(__always)

@@ -1189,6 +1189,179 @@ inline U qdot_affine8_registered_v4(
 
     /// Returns `nil` unless every production pin holds. The caller then invokes
     /// the original QuantizedLinear unchanged.
+
+    // MARK: - GELU-EPILOGUE-DENSE
+
+    /// The compiled decode GeLU product, transcribed operation by operation:
+    /// every intermediate rounds to T exactly where the compiled elementwise
+    /// kernel rounds (`0.5 * g * (1 + tanh(c2 * (g + c1 * g * g * g))) * u`
+    /// with the scalars pre-rounded to T, tanh in precise float).
+    private static let geluProductHelper: String = """
+
+        template <typename T>
+        METAL_FUNC T gemma4_gelu_product_bf16(T g, T u) {
+          const T c1 = T(0.044715f);
+          const T c2 = T(0.797884524f);
+          T t = c1 * g;
+          t = t * g;
+          t = t * g;
+          t = g + t;
+          t = c2 * t;
+          t = T(metal::precise::tanh(float(t)));
+          t = T(1.0f) + t;
+          T h = T(0.5f) * g;
+          h = h * t;
+          return h * u;
+        }
+
+        """
+
+    /// The W4 activation-sum body with the row pairs (gate_j, up_j) of the
+    /// interleaved plane reduced to the activation in the epilogue. The K walk,
+    /// the qdot and the simd reductions are the promoted text character for
+    /// character; only the store changes.
+    /// False when the promoted body text drifted from the anchors above; the
+    /// host then keeps the incumbent chain instead of dispatching this body.
+    nonisolated(unsafe) private static var geluHeaderValid = true
+
+    private static let w4GeluGateUpKernelHeader: String = {
+        var text = w4ActivationSumKernelHeader
+        var valid = true
+        func replaceExactly(_ old: String, _ new: String, _ count: Int) {
+            let found = text.components(separatedBy: old).count - 1
+            if found != count { valid = false }
+            text = text.replacingOccurrences(of: old, with: new)
+        }
+        defer { geluHeaderValid = valid }
+        replaceExactly(
+            "METAL_FUNC void qmv_affine8_g64_quad_stream_xsum_impl(",
+            "METAL_FUNC void qmv_affine8_g64_quad_stream_xsum_gelu_impl(", 1)
+        replaceExactly(
+            "  y0 += out_row;\n  y1 += out_row;\n  y2 += out_row;\n  y3 += out_row;\n",
+            "  y0 += out_row / 2;\n  y1 += out_row / 2;\n  y2 += out_row / 2;\n  y3 += out_row / 2;\n", 2)
+        replaceExactly(
+            "    if (simd_lid == 0) {\n"
+                + "      y0[row] = static_cast<T>(result0[row]);\n"
+                + "      y1[row] = static_cast<T>(result1[row]);\n"
+                + "      y2[row] = static_cast<T>(result2[row]);\n"
+                + "      y3[row] = static_cast<T>(result3[row]);\n"
+                + "    }\n"
+                + "  }\n",
+            "  }\n"
+                + "  if (simd_lid == 0) {\n"
+                + "    y0[0] = gemma4_gelu_product_bf16<T>(static_cast<T>(result0[0]), static_cast<T>(result0[1]));\n"
+                + "    y0[1] = gemma4_gelu_product_bf16<T>(static_cast<T>(result0[2]), static_cast<T>(result0[3]));\n"
+                + "    y1[0] = gemma4_gelu_product_bf16<T>(static_cast<T>(result1[0]), static_cast<T>(result1[1]));\n"
+                + "    y1[1] = gemma4_gelu_product_bf16<T>(static_cast<T>(result1[2]), static_cast<T>(result1[3]));\n"
+                + "    y2[0] = gemma4_gelu_product_bf16<T>(static_cast<T>(result2[0]), static_cast<T>(result2[1]));\n"
+                + "    y2[1] = gemma4_gelu_product_bf16<T>(static_cast<T>(result2[2]), static_cast<T>(result2[3]));\n"
+                + "    y3[0] = gemma4_gelu_product_bf16<T>(static_cast<T>(result3[0]), static_cast<T>(result3[1]));\n"
+                + "    y3[1] = gemma4_gelu_product_bf16<T>(static_cast<T>(result3[2]), static_cast<T>(result3[3]));\n"
+                + "  }\n", 2)
+        replaceExactly(
+            "template <typename T, const int group_size, const int bits>\nMETAL_FUNC void qmv_affine8_g64_quad_stream_xsum_gelu_impl(",
+            geluProductHelper + "template <typename T, const int group_size, const int bits>\nMETAL_FUNC void qmv_affine8_g64_quad_stream_xsum_gelu_impl(", 1)
+        return text
+    }()
+
+    private static let w4GeluGateUpKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_w4_gelu_v1",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const int in_vec_size = x_shape[x_ndim - 1];
+            const int out_vec_size = w_shape[0] / 2;
+            const int first_m = int(tid.x) * 4;
+            if (first_m >= 8) {
+                return;
+            }
+            qmv_affine8_g64_quad_stream_xsum_gelu_impl<T, 64, 8>(
+                w,
+                scales,
+                biases,
+                xSums,
+                x + first_m * in_vec_size,
+                x + (first_m + 1) * in_vec_size,
+                x + (first_m + 2) * in_vec_size,
+                x + (first_m + 3) * in_vec_size,
+                y + first_m * out_vec_size,
+                y + (first_m + 1) * out_vec_size,
+                y + (first_m + 2) * out_vec_size,
+                y + (first_m + 3) * out_vec_size,
+                in_vec_size,
+                tid,
+                simd_gid,
+                simd_lid);
+            return;
+            """,
+        header: w4GeluGateUpKernelHeader,
+        ensureRowContiguous: true
+    )
+
+    private static let gateUpLock = NSLock()
+    nonisolated(unsafe) private static var gateUpPlanes:
+        [ObjectIdentifier: (MLXArray, MLXArray, MLXArray)] = [:]
+
+    /// Row-interleaved gate/up planes (row 2j = gate_j, row 2j+1 = up_j) built
+    /// once per module from the shipped words: a relayout, not a requantization.
+    private static func interleavedGateUp(
+        key: ObjectIdentifier,
+        gateWeight: MLXArray, gateScales: MLXArray, gateBiases: MLXArray,
+        upWeight: MLXArray, upScales: MLXArray, upBiases: MLXArray
+    ) -> (MLXArray, MLXArray, MLXArray) {
+        gateUpLock.lock(); defer { gateUpLock.unlock() }
+        if let cached = gateUpPlanes[key] { return cached }
+        let outDim = gateWeight.dim(0)
+        let w = stacked([gateWeight, upWeight], axis: 1).reshaped(2 * outDim, gateWeight.dim(1))
+        let s = stacked([gateScales, upScales], axis: 1).reshaped(2 * outDim, gateScales.dim(1))
+        let b = stacked([gateBiases, upBiases], axis: 1).reshaped(2 * outDim, gateBiases.dim(1))
+        eval(w, s, b)
+        gateUpPlanes[key] = (w, s, b)
+        return (w, s, b)
+    }
+
+    /// One dispatch for the dense gate and up projections whose epilogue
+    /// stores the activation `gelu(gate) * up` directly ([8, 1, 2112]).
+    public static func gateUpGeluMatmul(
+        x: MLXArray,
+        key: ObjectIdentifier,
+        gateWeight: MLXArray, gateScales: MLXArray, gateBiases: MLXArray?,
+        upWeight: MLXArray, upScales: MLXArray, upBiases: MLXArray?,
+        groupSize: Int, bits: Int, mode: QuantizationMode,
+        activationSums: ActivationSums?
+    ) -> MLXArray? {
+        _ = w4GeluGateUpKernelHeader
+        guard geluHeaderValid, enabled, w4Enabled, !mma8GateUpEnabled,
+            groupSize == Self.groupSize, bits == Self.bits, mode == .affine,
+            let gateBiases, let upBiases, let activationSums,
+            x.dtype == .bfloat16, x.ndim == 3, x.dim(0) == batch, x.dim(1) == sequence, x.dim(2) == 2816,
+            x.size == batch * sequence * 2816,
+            gateWeight.dtype == .uint32, upWeight.dtype == .uint32,
+            gateWeight.shape == [2112, 2816 * Self.bits / 32], upWeight.shape == gateWeight.shape,
+            gateScales.shape == [2112, 2816 / Self.groupSize], upScales.shape == gateScales.shape,
+            gateBiases.shape == gateScales.shape, upBiases.shape == gateScales.shape,
+            gateScales.dtype == x.dtype, upScales.dtype == x.dtype,
+            gateBiases.dtype == x.dtype, upBiases.dtype == x.dtype
+        else { return nil }
+        let (w, s, b) = interleavedGateUp(
+            key: key, gateWeight: gateWeight, gateScales: gateScales, gateBiases: gateBiases,
+            upWeight: upWeight, upScales: upScales, upBiases: upBiases)
+        CBv2EngageMark.once("dense-gateup-gelu-epilogue")
+        let xGroups = batch / rowsPerGroup
+        let yGroups = (2 * 2112) / outputsPerGroup
+        return w4GeluGateUpKernel(
+            [x, w, s, b, activationSums.values],
+            template: [("T", x.dtype)],
+            grid: (xGroups * simdWidth, yGroups * simdGroups, 1),
+            threadGroup: (simdWidth, simdGroups, 1),
+            outputShapes: [[batch, sequence, 2112]],
+            outputDTypes: [x.dtype]
+        )[0]
+    }
+
     public static func matmul(
         x: MLXArray,
         weight: MLXArray,

@@ -813,7 +813,7 @@ private let routeCsortPrefillHistKernel: MLXFast.MLXFastKernel = MLXFast.metalKe
 )
 
 private let routeCsortPrefillScanKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "mlx_lm_route_csort128_scan_v1",
+    name: "mlx_lm_route_csort128_scan_v3",
     inputNames: ["block_hist"],
     outputNames: ["block_offset"],
     source: """
@@ -823,8 +823,14 @@ private let routeCsortPrefillScanKernel: MLXFast.MLXFastKernel = MLXFast.metalKe
         uint lane = e % 32;
         uint nblocks = (uint)block_hist_shape[0];
         uint total = 0u;
-        for (uint b = 0; b < nblocks; ++b) {
-            total += block_hist[b * WIDTH + e];
+        // Admission proves every key is below NE, so columns at or above it are
+        // zero in every block and cannot contribute to the total. Skipping the
+        // accumulation retires whole SIMD groups at once when the counter table
+        // is wider than the model's expert count.
+        if (e < (uint)NE) {
+            for (uint b = 0; b < nblocks; ++b) {
+                total += block_hist[b * WIDTH + e];
+            }
         }
         // Global bin base: exclusive prefix over the 256 expert totals.
         uint lane_excl = simd_prefix_exclusive_sum(total);
@@ -839,9 +845,16 @@ private let routeCsortPrefillScanKernel: MLXFast.MLXFastKernel = MLXFast.metalKe
         }
         running += lane_excl;
         // Exclusive scan over blocks for this expert, offset by the bin base.
-        for (uint b = 0; b < nblocks; ++b) {
-            block_offset[b * WIDTH + e] = running;
-            running += block_hist[b * WIDTH + e];
+        // Column `e` of `block_offset` is read by the scatter only as
+        // `block_offset[b * WIDTH + key]` for a key that occurs in block `b`,
+        // so a column whose global total is zero is never read and need not be
+        // written. The counter table is 256 wide while the model routes 128
+        // experts, so at minimum half the columns are unconditionally dead.
+        if (total > 0u) {
+            for (uint b = 0; b < nblocks; ++b) {
+                block_offset[b * WIDTH + e] = running;
+                running += block_hist[b * WIDTH + e];
+            }
         }
         """,
     ensureRowContiguous: true
@@ -909,6 +922,7 @@ private func routeCountingSortPrefill(
     )[0]
     let offsets = routeCsortPrefillScanKernel(
         [hist],
+        template: [("NE", numExperts)],
         grid: (width, 1, 1),
         threadGroup: (width, 1, 1),
         outputShapes: [[blocks, width]],
@@ -1344,6 +1358,14 @@ public class SwitchGLU: Module {
     /// fused storage is dispatched with. It is read from the bound split
     /// projections, which must be the exact production contract; anything
     /// else resolves to nil once and the split views are used forever after.
+    /// GELU-EPILOGUE-EXPERT kill switch (DARKBLOOM_GEMMA4_EXPERT_GATEUP_GELU=0
+    /// restores the gate / up / product chain).
+    static let expertGateUpGeluEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_EXPERT_GATEUP_GELU"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private func fusedGateUpDispatch()
         -> (storage: SwitchGateUpFusedStorage, groupSize: Int, bits: Int, mode: QuantizationMode)?
     {
@@ -1480,12 +1502,40 @@ public class SwitchGLU: Module {
                 )
                 xGate = xGateUp[.ellipsis, ..<hiddenDims]
                 xUp = xGateUp[.ellipsis, hiddenDims...]
+            } else if useLhsIndices, Self.expertGateUpGeluEnabled,
+                activationProduct == nil, isGeluActivation,
+                inputDims == 2816, hiddenDims == 704, numExperts == 128,
+                let lhsIndices, lhsIndices.dtype == .uint32, lhsIndices.ndim == 1, lhsIndices.size == 64,
+                idx.dtype == .uint32, idx.ndim == 1, idx.size == 64,
+                x.dtype == .bfloat16, x.ndim == 3, x.shape == [8, 1, 2816],
+                let fused = fusedGateUpDispatch()
+            {
+                // GELU-EPILOGUE-EXPERT: one gather over the concatenated gate|up
+                // storage; the kernel's epilogue stores gelu(gate) * up compacted
+                // into the first 64 x 704 elements of the [64, 1, 1408] output,
+                // which the reshaped prefix view hands to the down projection.
+                CBv2EngageMark.once("expert-gateup-gelu-epilogue")
+                let packed = MLX.gatherQuantizedMM(
+                    x,
+                    fused.storage.weight,
+                    scales: fused.storage.scales,
+                    biases: fused.storage.biases,
+                    lhsIndices: lhsIndices,
+                    rhsIndices: idx,
+                    transpose: true,
+                    groupSize: fused.groupSize,
+                    bits: fused.bits,
+                    mode: fused.mode,
+                    sortedIndices: doSort
+                )
+                let fusedActivation = packed.reshaped([2 * 64, 1, hiddenDims])[..<64]
+                x = downProj(fusedActivation, idx, sortedIndices: doSort)
+                return (x, doSort ? inverseOrder : nil, doSort)
             } else {
                 xUp = upProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
                 xGate = gateProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
             }
         }
-
         let activated: MLXArray
         if let activationProduct {
             activated = activationProduct(xGate, xUp)

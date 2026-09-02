@@ -901,8 +901,17 @@ private let gemma4QKVNormRopeEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+/// QKVNORM-RPT-001 arm. Default ON. `DARKBLOOM_GEMMA4_QKV_NORM_RPT=0` pins
+/// `RPT` to 1, which is the incumbent one-row-per-threadgroup dispatch.
+private let gemma4QKVNormRowsPerGroupEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_QKV_NORM_RPT"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 private let gemma4QKVNormKernel = MLXFast.metalKernel(
-        name: "gemma4_b8_qkv_rms_norm_rope_v2_vec1",
+        name: "gemma4_b8_qkv_rms_norm_rope_v3_rpt",
     inputNames: [
         "q", "k", "v", "q_weight", "k_weight",
         "position_offsets", "rope_log2_base", "rope_freqs",
@@ -911,10 +920,19 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
     source: """
         typedef vec<T, 4> T4;
         constexpr uint reads = 4;
-        const uint row = threadgroup_position_in_grid.x;
-        const uint lid = thread_position_in_threadgroup.x;
+        // RPT rows share one threadgroup. Each row keeps its own D/reads
+        // threads, its own simdgroups and its own reduction tree, so the
+        // arithmetic is row for row what RPT == 1 computes. Only the
+        // threadgroup the row happens to sit in changes.
+        constexpr uint row_threads = D / reads;
+        const uint tid = thread_position_in_threadgroup.x;
+        const uint slot = tid / row_threads;
+        const uint lid = tid - slot * row_threads;
+        const uint row = threadgroup_position_in_grid.x * RPT + slot;
         const uint lane = thread_index_in_simdgroup;
-        const uint simd_group = simdgroup_index_in_threadgroup;
+        // Row-local simdgroup index. `row_threads` is 64 or 128, so a row's
+        // threads are a whole number of simdgroups and `lane` is unchanged.
+        const uint simd_group = lid / 32;
 
         const bool is_query = row < Q_ROWS;
         const bool is_key = row >= Q_ROWS && row < Q_ROWS + K_ROWS;
@@ -954,17 +972,18 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
         }
         sum = simd_sum(sum);
 
-        threadgroup float partials[32];
-        threadgroup float inverse_rms;
-        threadgroup T rounded[D];
-        if (simd_group == 0) partials[lane] = 0.0f;
+        threadgroup float partials[RPT][32];
+        threadgroup float inverse_rms[RPT];
+        threadgroup T rounded[RPT][D];
+        if (simd_group == 0) partials[slot][lane] = 0.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (lane == 0) partials[simd_group] = sum;
+        if (lane == 0) partials[slot][simd_group] = sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (simd_group == 0) {
-            sum = simd_sum(partials[lane]);
+            sum = simd_sum(partials[slot][lane]);
             if (lane == 0) {
-                inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+                inverse_rms[slot] =
+                    metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -974,15 +993,15 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
             if (APPLY_ROPE) {
                 for (uint i = 0; i < reads; ++i) {
                     const uint element = lid * reads + i;
-                    const T normalized = T(float(vin[i]) * inverse_rms);
+                    const T normalized = T(float(vin[i]) * inverse_rms[slot]);
                     // Reproduce the separate norm kernel's BF16 output-store
                     // boundary before any RoPE arithmetic reads the value.
-                    rounded[element] = T(wv[i] * normalized);
+                    rounded[slot][element] = T(wv[i] * normalized);
                 }
             } else {
                 T4 outv;
                 for (uint i = 0; i < reads; ++i) {
-                    const T normalized = T(float(vin[i]) * inverse_rms);
+                    const T normalized = T(float(vin[i]) * inverse_rms[slot]);
                     outv[i] = wv[i] * normalized;
                 }
                 *reinterpret_cast<device T4*>(output) = outv;
@@ -995,7 +1014,7 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
             if (KEY_VALUE_SHARED && is_key) {
                 T4 sharedv;
                 for (uint i = 0; i < reads; ++i) {
-                    const T normalized = T(float(vin[i]) * inverse_rms);
+                    const T normalized = T(float(vin[i]) * inverse_rms[slot]);
                     sharedv[i] = T(1) * normalized;
                 }
                 *reinterpret_cast<device T4*>(shared_value_output) = sharedv;
@@ -1003,7 +1022,7 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
         } else {
             T4 outv;
             for (uint i = 0; i < reads; ++i) {
-                const T normalized = T(float(vin[i]) * inverse_rms);
+                const T normalized = T(float(vin[i]) * inverse_rms[slot]);
                 outv[i] = T(1) * normalized;
             }
             *reinterpret_cast<device T4*>(output) = outv;
@@ -1025,8 +1044,8 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
                 const float theta = L * inv_freq;
                 const float costheta = metal::fast::cos(theta);
                 const float sintheta = metal::fast::sin(theta);
-                const float x1 = static_cast<float>(rounded[pair]);
-                const float x2 = static_cast<float>(rounded[pair + D / 2]);
+                const float x1 = static_cast<float>(rounded[slot][pair]);
+                const float x2 = static_cast<float>(rounded[slot][pair + D / 2]);
                 const float rx1 = x1 * costheta - x2 * sintheta;
                 const float rx2 = x1 * sintheta + x2 * costheta;
                 output_row[pair] = static_cast<T>(rx1);
@@ -1469,6 +1488,17 @@ private func gemma4FusedQKVNorm(
     let threads = dimension / 4
     let fusedRope = gemma4QKVNormRopeEnabled && applyRope
     let normRows = qRows + kRows + (keyValueShared ? 0 : kRows)
+    // QKVNORM-RPT-001: pack whole rows into a 256-thread threadgroup instead of
+    // dispatching one 64-thread group per row. The row count is 256 (sliding,
+    // D = 256) or 144 (full, D = 512), both divisible by the factor this
+    // picks; anything else falls back to 1 and dispatches as before.
+    let rowsPerGroup: Int = {
+        guard gemma4QKVNormRowsPerGroupEnabled else { return 1 }
+        let target = 256 / threads
+        guard target > 1, normRows % target == 0 else { return 1 }
+        return target
+    }()
+    if rowsPerGroup > 1 { CBv2EngageMark.once("qkv-norm-rope-rpt") }
     let outputs = gemma4QKVNormKernel(
         [q, k, v, qWeight, kWeight, positionOffsets,
          ropeParameters.log2Base, ropeParameters.frequencies],
@@ -1477,8 +1507,10 @@ private func gemma4FusedQKVNorm(
             ("Q_HEADS", 16), ("K_HEADS", k.dim(2)),
             ("KEY_VALUE_SHARED", keyValueShared), ("APPLY_ROPE", fusedRope),
             ("USE_FREQS", ropeParameters.usesFrequencies),
+            ("RPT", rowsPerGroup),
         ],
-        grid: (normRows * threads, 1, 1), threadGroup: (threads, 1, 1),
+        grid: (normRows * threads, 1, 1),
+        threadGroup: (threads * rowsPerGroup, 1, 1),
         outputShapes: fusedRope
             ? [[8, 16, 1, dimension], [8, k.dim(2), 1, dimension], v.shape]
             : [q.shape, k.shape, v.shape],

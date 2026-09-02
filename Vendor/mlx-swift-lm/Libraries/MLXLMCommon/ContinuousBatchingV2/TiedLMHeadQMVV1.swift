@@ -73,7 +73,6 @@ public enum CBv2TiedLMHeadQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    /// Packed-word loads are aligned by the fixed 4-byte lane stride.
     private static let packed32Enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_TIED_LMHEAD_PACKED32"]
@@ -81,7 +80,6 @@ public enum CBv2TiedLMHeadQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    /// Pinned to the ruled decode cohort and this checkpoint's tower.
     private static let batch = 8
     private static let groupSize = 64
     private static let bits = 4
@@ -89,7 +87,6 @@ public enum CBv2TiedLMHeadQMVV1 {
     private static let simdWidth = 32
     private static let simdGroups = 2
     private static let outputsPerGroup = 8
-    /// `values_per_thread * SIMD` in the kernel; the tail block needs one more.
     private static let values_per_thread_block = 256
 
     static let kernelHeader = """
@@ -603,7 +600,6 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
         ensureRowContiguous: true
     )
 
-    /// Returns `nil` unless every pin holds; the caller then keeps the stock path.
     public static func matmul(
         x: MLXArray,
         weight: MLXArray,
@@ -612,9 +608,15 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
         inDim: Int,
         outDim: Int
     ) -> MLXArray? {
-        // Every dimension is validated against every other, so the gate is a
-        // full shape pin at runtime even though the tower's hidden size is not
-        // written as a literal here.
+        if x.ndim == 3, x.dim(1) == 1, x.dim(0) > batch,
+            let tiled = CBv2MTPWideVerifyContext.rowTiles(x, tile: batch, {
+                matmul(
+                    x: $0, weight: weight, scales: scales, biases: biases,
+                    inDim: inDim, outDim: outDim)
+            })
+        {
+            return tiled
+        }
         guard enabled,
             let biases,
             x.dtype == .bfloat16,

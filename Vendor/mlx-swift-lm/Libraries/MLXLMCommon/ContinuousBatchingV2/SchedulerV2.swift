@@ -649,6 +649,31 @@ public final class SchedulerV2 {
         for id in ids { byID[id]?.pendingSamples += 1 }
     }
 
+    /// Chained MTP rounds bypass `plan()`: advance the optimistic computed
+    /// count by `n` tokens for a running decode-ready row and take its
+    /// capacity reservation. Returns false (state untouched) when the row is
+    /// not eligible or the reservation is refused.
+    public func advanceComputedForChainedRound(id: CBv2RequestID, tokens n: Int) -> Bool {
+        guard let rec = byID[id], rec.status == .running || running.contains(where: { $0 === rec }),
+            !rec.cancelRequested, !rec.isPaused, n > 0
+        else { return false }
+        let reservationTokens = rec.prefixReusePlan?.capacityTokensForChunk(
+            start: rec.numComputedTokens, count: n) ?? n
+        let reservationBytes = rec.prefixReusePlan?.capacityBytesForChunk(
+            start: rec.numComputedTokens, count: n) ?? 0
+        if let capacity, reservationTokens > 0 || reservationBytes > 0 {
+            do {
+                try capacity.reserve(
+                    id: id, additionalTokens: reservationTokens,
+                    additionalBytes: reservationBytes)
+            } catch {
+                return false
+            }
+        }
+        rec.numComputedTokens += n
+        return true
+    }
+
     /// Multi-count variant for MTP speculation: the launched step samples
     /// `count` tokens (1 known + k drafts) for each row.
     public func markPendingSamples(counts: [(id: CBv2RequestID, count: Int)]) {

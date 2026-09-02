@@ -51,8 +51,6 @@ public struct PagedBackendBenchmark {
         self.timedSteps = timedSteps
     }
 
-    /// GPT-OSS-20B-shaped attention (64 Q / 8 KV heads, headDim 64) across
-    /// the spec's batch/context matrix.
     public static let defaultScenarios: [Scenario] = {
         var scenarios: [Scenario] = []
         for context in [512, 4096, 16384] {
@@ -68,7 +66,6 @@ public struct PagedBackendBenchmark {
 
     // MARK: - Engines
 
-    /// Paged backend: per-row page-table writes + one kernel dispatch.
     func measurePaged(_ s: Scenario) throws -> Measurement {
         let kinds = [
             CBv2LayerKind(
@@ -92,7 +89,6 @@ public struct PagedBackendBenchmark {
         defer { states.forEach { backend.release($0) } }
         let rows = states.map { $0[0]! as! PagedSequenceKV }
 
-        // Prefill the context in chunks.
         for row in rows {
             var remaining = s.context
             while remaining > 0 {
@@ -104,7 +100,6 @@ public struct PagedBackendBenchmark {
             }
         }
         cache.setRows(rows)
-        // Force the prefill write chain (in-place writes ride the fence).
         eval([backend.pool.group(rows[0].groupKey).writeFence])
 
         let scale = Float(1.0 / Double(s.headDim).squareRoot())
@@ -117,8 +112,6 @@ public struct PagedBackendBenchmark {
         return time(engine: "paged-kernel", scenario: s, step: step)
     }
 
-    /// v1-style backend: per-row contiguous caches, B separate SDPA
-    /// dispatches per step.
     func measurePerRowSDPA(_ s: Scenario) -> Measurement {
         let capacity = s.context + warmupSteps + timedSteps + 8
         var ks: [MLXArray] = []
@@ -159,8 +152,6 @@ public struct PagedBackendBenchmark {
         return time(engine: "v1-per-row-sdpa", scenario: s, step: step)
     }
 
-    /// Legacy dense-batch shape: one rectangular [B, H, T, D] cache, one
-    /// SDPA dispatch (uniform lengths — the dense engine's best case).
     func measureDenseBatch(_ s: Scenario) -> Measurement {
         let capacity = s.context + warmupSteps + timedSteps + 8
         let k = MLXArray.zeros([s.batch, s.kvHeads, capacity, s.headDim], dtype: .float16)
@@ -201,7 +192,6 @@ public struct PagedBackendBenchmark {
         }
         let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1e9
         let msPerStep = elapsed * 1000 / Double(timedSteps)
-        // KV bytes touched per step: K+V for the (average) context, fp16.
         let avgContext = Double(s.context) + Double(warmupSteps) + Double(timedSteps) / 2
         let kvBytes = Double(s.batch) * 2 * Double(s.kvHeads) * avgContext * Double(s.headDim) * 2
         let gbPerSec = kvBytes / (elapsed / Double(timedSteps)) / 1e9
@@ -213,8 +203,6 @@ public struct PagedBackendBenchmark {
 
     // MARK: - Runner
 
-    /// Run all engines over `scenarios`, returning a markdown report plus
-    /// the raw measurements (for gate assertions).
     public func run(
         scenarios: [Scenario] = PagedBackendBenchmark.defaultScenarios
     ) throws -> (markdown: String, measurements: [Measurement]) {

@@ -4,8 +4,6 @@
 
 extension EngineLoopV2 {
 
-    /// Per-row hard gates. Ineligible rows remain ordinary target rows and do
-    /// not contribute MTP skip metrics.
     private func mtpBasicEligible(_ rec: CBv2ScheduledRequest) -> Bool {
         let sampling = rec.request.sampling
         guard rec.request.tokenConstraint == nil,
@@ -23,8 +21,6 @@ extension EngineLoopV2 {
         return true
     }
 
-    /// Every storage-owning row must support value-exact multi-token writes
-    /// and rollback. Kept internal for backend contract tests.
     static func mtpStorageEligible(_ state: [CBv2SequenceKV?]) -> Bool {
         state.allSatisfy { $0?.supportsSpeculativeWrites ?? true }
     }
@@ -48,8 +44,6 @@ extension EngineLoopV2 {
             return .none
         }
 
-        // Verify writes 1+k entries at [C-1, C-1+k]. A seed only pays off
-        // when a full round can follow after its one generated token.
         let remainingToLength = rec.request.maxTokens - rec.generatedTokenCount
         switch mtp.validatedCarry(for: rec) {
         case .valid:
@@ -67,9 +61,9 @@ extension EngineLoopV2 {
         }
     }
 
-    /// Scheduler speculation hook for one decode-ready running row.
     func mtpPlanSpeculation(for rec: CBv2ScheduledRequest) -> Int {
         guard let mtp else { return 0 }
+        guard !mtp.isTargetOnlyPolicy else { return 0 }
         switch mtpPlanAction(for: rec, recordSkips: true) {
         case .round(let k):
             mtp.markRound(rec.id, k: k)
@@ -82,11 +76,8 @@ extension EngineLoopV2 {
         }
     }
 
-    /// Break the chained fast path when the next step must seed or verify.
     func mtpWantsStep(ids: [CBv2RequestID]) -> Bool {
         guard let mtp else { return false }
-        // Target-only policy: no seed or verify step can ever be wanted, so
-        // the chained decode fast path is never broken on MTP's account.
         if mtp.isTargetOnlyPolicy { return false }
         let rows = ids.compactMap { scheduler.record(for: $0) }
         let withinBatchGate = ids.count <= mtp.config.maxSpeculativeBatch
@@ -116,19 +107,8 @@ extension EngineLoopV2 {
         }
     }
 
-    /// Select one controller depth for all decode rows in the scheduler plan.
-    /// Chunked-prefill neighbors do not change the controller batch bucket.
     func beginMTPPlan() {
         guard let mtp else { return }
-        // Target-only policy: `planDepth` can only be 0, so everything below
-        // is per-step host bookkeeping for speculation that cannot be planned
-        // — two `scheduler.running` filter allocations, the eligibility
-        // sweeps, the no-op carry invalidation loop, and a locked rebuild of
-        // the controller metric snapshot. Skipping it leaves `planDecision` at
-        // its inactive default (depth 0, bucket 0) and both mark sets empty,
-        // which is exactly the state the full path would have produced: no
-        // carry is ever stored without a round, so the invalidation loop has
-        // nothing to drop.
         if mtp.isTargetOnlyPolicy { return }
         let rows = scheduler.running.filter {
             !$0.isPaused && !$0.cancelRequested && $0.isDecodeReady
@@ -170,8 +150,6 @@ extension EngineLoopV2 {
         if mtp.planDepth > 0,
             eligibleRows.contains(where: { !mtp.hasValidCarry(for: $0) })
         {
-            // Seeding is step-global. Mixing L=1 seed rows with verify rows
-            // would recreate the batch-shape drift synchronized commits avoid.
             for rec in eligibleRows { mtp.invalidateCarry(rec.id) }
             mtp.recordControllerFallback("synchronized_seed")
         }
@@ -191,13 +169,25 @@ extension EngineLoopV2 {
     }
 
     private func mtpRowsCanSpeculate(_ rows: [CBv2ScheduledRequest]) -> Bool {
-        !rows.isEmpty && rows.allSatisfy { rec in
+        guard !rows.isEmpty, rows.allSatisfy({ rec in
             guard mtpBasicEligible(rec), let state = kvStates[rec.id] else { return false }
             return Self.mtpStorageEligible(state)
+        }) else { return false }
+        let needsMirrorRoad = rows.contains { rec in
+            kvStates[rec.id]!.contains { ($0 as? CBv2WindowedSequenceKV)?.mtpNeedsMirrorRoad ?? false }
         }
+        if needsMirrorRoad {
+            guard CBv2MTPMirrorOps.enabled, rows.count == 8 else { return false }
+            return rows.allSatisfy { rec in
+                kvStates[rec.id]!.allSatisfy { sequence in
+                    guard let windowed = sequence as? CBv2WindowedSequenceKV else { return true }
+                    return windowed.mtpMirrorRoadAvailable
+                }
+            }
+        }
+        return true
     }
 
-    /// True when this scheduler plan carries seed or verify work.
     func mtpRoundNeeded(_ plan: CBv2StepPlan) -> Bool {
         guard let mtp, mtp.planHasMTPWork else { return false }
         return plan.assignments.contains {

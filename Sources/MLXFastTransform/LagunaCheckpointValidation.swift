@@ -2,9 +2,6 @@ import CoreFoundation
 import Foundation
 import MLXFastCore
 
-/// Quantization expectations parsed from Poolside Laguna's matching
-/// `quantization` and `quantization_config` blocks. The intended checkpoint
-/// is exactly NVFP4 4-bit group-16 with no per-tensor overrides.
 struct LagunaTransformQuantizationSpec: Equatable {
     struct Override: Equatable {
         let groupSize: Int
@@ -16,9 +13,6 @@ struct LagunaTransformQuantizationSpec: Equatable {
     let mode: String
     let overrides: [String: Override]
 
-    /// Expected quantization for a quantized tensor, resolved from the
-    /// per-tensor overrides with fallback to the global spec. `stem` is the
-    /// source tensor name without the trailing `.weight`.
     func expected(forTensorStem stem: String) -> (groupSize: Int, bits: Int) {
         if let override = overrides[stem] {
             return (override.groupSize, override.bits)
@@ -27,28 +21,6 @@ struct LagunaTransformQuantizationSpec: Equatable {
     }
 }
 
-/// Transform-side structural validation of the Laguna text-tower tensor set
-/// against `docs/laguna-weight-contract.md`. The source
-/// checkpoint (`poolside/Laguna-XS-2.1-NVFP4-mlx`) is already MLX
-/// NVFP4-quantized, so the transform passes tensors through unchanged; this
-/// pass fails fast -- before the multi-GB copy -- when the set it would copy
-/// cannot satisfy the runtime loader (`LagunaWeightLoader`):
-///
-/// - every recognized expert projection stored as packed U32 codes must ship
-///   U8 `.scales` with matching leading dimensions and no affine `.biases`;
-/// - the SwitchGLU expert tensors (`mlp.switch_mlp.{gate,up,down}_proj`)
-///   must keep the stacked 3D layout (leading experts axis; never split per
-///   expert), while every other projection -- attention q/k/v/o and the
-///   per-head `g_proj` gate, the layer-0 dense MLP, the shared expert, the
-///   router, the embedding, and the untied `lm_head` -- is 2D;
-/// - each tensor's packed width must match the group size and bit width the
-///   emitted config.json declares (NVFP4 4-bit group-16);
-/// - each raw BF16 router pairs with an F32 correction vector, and the
-///   stacked expert tensors agree with the router on expert count.
-///
-/// Unquantized tensors are passed through without NVFP4 packing checks; the
-/// runtime validates their full BF16/F32 dtype and exact geometry against
-/// `LagunaConfig` before the first forward.
 enum LagunaCheckpointValidation {
     struct ExpectedTensorMetadata: Equatable {
         let dtype: String
@@ -57,10 +29,7 @@ enum LagunaCheckpointValidation {
 
     struct RecognizedQuantizedStem: Equatable {
         enum Kind: Equatable {
-            /// Ordinary 2D projection: `[rows, in]`.
             case matrix
-            /// SwitchGLU stacked expert projection: 3D
-            /// `[experts, rows, in]`.
             case stackedExperts
         }
 
@@ -70,9 +39,6 @@ enum LagunaCheckpointValidation {
 
     private static let layerPrefix = "model.layers."
 
-    /// Recognizes the quantized-projection stems of the Laguna text tower.
-    /// Norm weights (`*_layernorm`, `q_norm`, `k_norm`, `model.norm`) and
-    /// the router correction bias are raw tensors and are not returned here.
     static func recognizedQuantizedStem(forWeightName name: String) -> RecognizedQuantizedStem? {
         guard name.hasSuffix(".weight") else {
             return nil
@@ -100,8 +66,6 @@ enum LagunaCheckpointValidation {
         }
     }
 
-    /// Parses the two explicit, byte-contract quantization blocks carried by
-    /// Poolside's config. Both blocks are required and must agree exactly.
     static func quantizationSpec(
         fromConfigRoot root: [String: Any]
     ) throws -> LagunaTransformQuantizationSpec {
@@ -302,15 +266,6 @@ enum LagunaCheckpointValidation {
         )
     }
 
-    /// Exact metadata contract extracted from the public five-shard
-    /// `poolside/Laguna-XS-2.1-NVFP4-mlx` artifact at revision
-    /// `841778bda563a36104dd521e37d99218e46f4f25`.
-    ///
-    /// This is intentionally independent of shard placement: the public
-    /// fixture pins placement and header hashes, while transform validation
-    /// pins the complete tensor namespace, dtype, and shape before copying
-    /// 21.6 GB. It rejects compressed-tensors aliases, affine companions,
-    /// split per-expert namespaces, and geometrically similar Laguna variants.
     static func expectedTensorInventory() -> [String: ExpectedTensorMetadata] {
         let hiddenSize = 2_048
         let denseIntermediateSize = 8_192
@@ -458,9 +413,6 @@ enum LagunaCheckpointValidation {
         }
     }
 
-    /// A raw BF16 router (`<layer>.mlp.gate.weight`) always pairs with the
-    /// `<layer>.mlp.gate.e_score_correction_bias` vector: F32, one
-    /// entry per routed expert.
     private static func validateRouterCorrectionBias(
         routerName: String,
         routerRows: Int,

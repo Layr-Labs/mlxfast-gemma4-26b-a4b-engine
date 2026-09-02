@@ -9,16 +9,10 @@ import MLX
 
 extension EngineLoopV2 {
 
-    /// Execute a plan containing MTP work. Graph construction includes seed
-    /// decodes, frozen-KV drafting, target-authoritative verification, ordinary
-    /// decode neighbors, and per-request prefill chunks.
     func executeMTPRound(_ plan: CBv2StepPlan) -> CBv2InFlightStep? {
         guard let mtp else { return executeMixed(plan) }
         let wallStartedNanos = DispatchTime.now().uptimeNanoseconds
 
-        // A per-row reserve retry can demote a round after the step-global
-        // preflight. Demote all round rows so the target still sees one L=1
-        // batch, and refund every speculative suffix before graph build.
         let demoteAllRounds = plan.assignments.contains { assignment in
             guard let k = mtp.roundMark(for: assignment.id) else { return false }
             return assignment.numTokens != 1 + k
@@ -27,17 +21,18 @@ extension EngineLoopV2 {
             mtp.recordControllerFallback("step_reservation_race")
         }
 
-        let buildStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        let profile = CBv2StepProfiler.enabled
+        let buildStart = profile ? CFAbsoluteTimeGetCurrent() : 0
         let work = mtpPrepareRoundWork(
             plan, driver: mtp, demoteAllRounds: demoteAllRounds)
         guard !work.isEmpty else {
-            // Undo optimistic scheduler advances before pending samples can
-            // block waiting admission.
             scheduler.rollback(plan)
             return nil
         }
+        let workEnd = profile ? CFAbsoluteTimeGetCurrent() : 0
 
         let graph = mtpBuildRoundGraph(work, driver: mtp)
+        let graphEnd = profile ? CFAbsoluteTimeGetCurrent() : 0
         scheduler.markPendingSamples(ids: graph.sampledRows)
         if let verify = graph.verify {
             scheduler.markPendingSamples(
@@ -45,10 +40,22 @@ extension EngineLoopV2 {
         }
         mtp.recordSeedSteps(graph.seedRows.count)
 
+        let launchMemory: CBv2MTPRoundInFlight.MemorySnapshot? =
+            profile ? CBv2MTPRoundInFlight.MemorySnapshot() : nil
         asyncEval(graph.asyncEvalTargets)
-        if CBv2StepProfiler.enabled {
-            CBv2StepProfiler.record(
-                "v2.mtp.launch.total", seconds: CFAbsoluteTimeGetCurrent() - buildStart)
+        if profile {
+            let now = CFAbsoluteTimeGetCurrent()
+            CBv2StepProfiler.record("v2.mtp.launch.total", seconds: now - buildStart)
+            if graph.verify == nil, !graph.seedRows.isEmpty {
+                Self.mtpSeedProfileLine("plan-work", seconds: workEnd - buildStart)
+                Self.mtpSeedProfileLine("graph-build", seconds: graphEnd - workEnd)
+                Self.mtpSeedProfileLine("submit", seconds: now - graphEnd)
+                Self.mtpSeedProfileLine("launch-total", seconds: now - buildStart)
+            } else if graph.verify != nil {
+                FileHandle.standardError.write(
+                    Data(String(format: "[mtp-round] first launch %.1f ms submit %.1f ms\n",
+                        (now - buildStart) * 1000, (now - graphEnd) * 1000).utf8))
+            }
         }
 
         let step = CBv2InFlightStep(
@@ -59,10 +66,12 @@ extension EngineLoopV2 {
             wallStartedNanos: wallStartedNanos)
         step.logprobSegments = graph.logprobSegments
         if graph.verify != nil || !graph.seedRows.isEmpty {
-            step.mtpRound = CBv2MTPRoundInFlight(
+            let round = CBv2MTPRoundInFlight(
                 verify: graph.verify,
                 seedRows: graph.seedRows,
                 seedHidden: graph.seedHidden)
+            round.launchMemory = launchMemory
+            step.mtpRound = round
         }
         return step
     }

@@ -33,14 +33,6 @@ public enum PagedAttentionResourceError: Error, Equatable, CustomStringConvertib
 enum PagedAttentionResources {
     static let resourceName = "pagedattention.metal"
 
-    /// Canonical sealed resource root when the current executable is inside
-    /// a macOS app. No caller may add fallback roots in this context.
-    ///
-    /// The installer exposes the app executable through `bin/` symlinks
-    /// (and operators add their own in /usr/local/bin), so the invocation
-    /// path may not sit inside the .app at all. Resolve symlinks first —
-    /// mirroring SelfUpdater's install-root resolution — otherwise a
-    /// symlinked launch would silently miss the sealed resources.
     static func packagedAppResourcesURL(
         executableURL: URL? = Bundle.main.executableURL
     ) -> URL? {
@@ -63,8 +55,6 @@ enum PagedAttentionResources {
             isDirectory: true)
     }
 
-    /// Development/test lookup roots. This path is used only when the
-    /// executable is not packaged inside an app.
     static func developmentRoots(
         mainBundleURL: URL = Bundle.main.bundleURL,
         mainResourceURL: URL? = Bundle.main.resourceURL,
@@ -104,10 +94,6 @@ enum PagedAttentionResources {
         roots.append(workingDirectory.appendingPathComponent(".build/debug", isDirectory: true))
         roots.append(workingDirectory.appendingPathComponent(".build/release", isDirectory: true))
 
-        // Development/test fallback. Release artifacts resolve from the app
-        // root above; this makes a standalone `swift test` find the bundle
-        // beside its package build without using Bundle.module's fatal
-        // accessor or baking an architecture-specific output path.
         var sourceAncestor = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
         for _ in 0 ..< 12 {
@@ -125,18 +111,12 @@ enum PagedAttentionResources {
             sourceAncestor.deleteLastPathComponent()
         }
 
-        // Dedupe on the RESOLVED path, in lockstep with `locate`. SwiftPM
-        // writes `.build/debug` as a symlink to `.build/<triple>/debug`, so
-        // the two roots appended above can name the same directory.
         var seen = Set<String>()
         return roots.filter {
             seen.insert($0.resolvingSymlinksInPath().standardizedFileURL.path).inserted
         }
     }
 
-    /// Production-safe process lookup. A packaged executable is restricted
-    /// to its sealed Contents/Resources tree; cwd and compile-time build
-    /// roots are considered only for an unbundled development/test process.
     static func loadSourceForCurrentProcess(
         executableURL: URL? = Bundle.main.executableURL,
         developmentSearchRoots: [URL]? = nil,
@@ -159,15 +139,6 @@ enum PagedAttentionResources {
     ) throws -> URL {
         var matches: [URL] = []
         for root in roots {
-            // Resolve before touching the filesystem. `.build/debug` is a
-            // symlink to `.build/<triple>/debug`, and a URL-based directory
-            // enumeration does NOT follow it: `contentsOfDirectory` returns
-            // zero children, the resource inside the SwiftPM bundle is never
-            // seen, preflight throws `.missing`, and the factory falls back
-            // to contiguous WITHOUT a word. That silent fallback is the one
-            // failure mode that makes a paged benchmark meaningless.
-            // `packagedAppResourcesURL` above already resolves for the same
-            // class of reason; this mirrors it.
             let resolved = root.resolvingSymlinksInPath()
             let direct = resolved.appendingPathComponent(resourceName)
             if fileManager.isReadableFile(atPath: direct.path) {
@@ -188,33 +159,12 @@ enum PagedAttentionResources {
             }
         }
 
-        // Dedupe on CONTENT, not on path.
-        //
-        // Path dedupe cannot express what this check is actually for. The
-        // `.ambiguous` error exists to stop the process loading an unknown
-        // variant of the kernel source, so two matches only conflict when
-        // their BYTES differ. Two are routinely reachable at once and are
-        // identical: building `provider-swift` populates its own
-        // `.build/<triple>/debug/mlx-swift-lm_MLXLMCommon.bundle`, and
-        // building the submodule standalone populates
-        // `libs/mlx-swift-lm/.build/...` — the source-ancestor walk above
-        // finds the second. `pagedattention.metal` is copied verbatim as a
-        // resource, never compiled, so both copies are byte-identical and
-        // choosing either is the same choice.
-        //
-        // This also subsumes the symlink case: the same physical file reached
-        // through `.build/debug` and `.build/<triple>/debug` reads identical
-        // bytes and collapses here. Root order decides which URL is kept, so
-        // the result is deterministic. A genuinely divergent resource still
-        // throws.
         var seenContent = Set<Data>()
         var seenUnreadable = Set<String>()
         let unique = matches.filter { url in
             if let data = try? Data(contentsOf: url) {
                 return seenContent.insert(data).inserted
             }
-            // Unreadable: keep it distinct so the caller still gets a real
-            // diagnostic rather than a silent drop.
             return seenUnreadable.insert(
                 url.resolvingSymlinksInPath().standardizedFileURL.path
             ).inserted

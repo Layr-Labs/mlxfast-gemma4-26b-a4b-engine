@@ -81,19 +81,6 @@ private final class DFlashMLP: Module, UnaryLayer {
     }
 }
 
-// PORT NOTE (engine, 2026-08-25). The fork's left-padding helpers
-// (`dFlashDrafterLeftPadding` / `dFlashDrafterLeftPaddingMask`) and
-// `makeBatchedCache(leftPadding:)` are NOT ported. They exist solely to
-// serve `BatchKVCache` / `BatchRotatingKVCache`, the v1 batched KV stack
-// upstream deleted at ffede00 and which this engine's vendored
-// `MLXLMCommon` therefore does not carry (see docs/gemma4-port-notes.md).
-// Every cache type this tree can hand the drafter — `StandardKVCache`,
-// `RotatingKVCache` — reports no left padding, so the fork's helpers would
-// return `nil` on every call here and the mask branches they gate are
-// unreachable. Dropping them is behavior-preserving for the caches that
-// exist; a future batched DFlash cohort has to bring a batched cache type
-// with it and restore this pair alongside it.
-
 private final class DFlashAttention: Module {
     let config: DFlashConfiguration
     let layerType: DFlashLayerType
@@ -219,9 +206,6 @@ private final class DFlashAttention: Module {
         let keys = concatenated([cachedKeys, proposalKeys], axis: 2)
         let values = concatenated([cachedValues, proposalValues], axis: 2)
 
-        // No left padding is reachable in this tree — see the port note above
-        // `DFlashDraftModel`'s cache helpers — so the fork's `hasLeftPadding`
-        // branches collapse to their unpadded arms.
         let mask: MLXFast.ScaledDotProductAttentionMaskMode
         if layerType == .slidingAttention {
             let slidingWindow = config.slidingWindow!
@@ -330,27 +314,8 @@ private final class DFlashDecoderLayer: Module {
 }
 
 public final class DFlashDraftModel: Module, @unchecked Sendable {
-    /// PARTICIPANT DRAFT-DEPTH LEVER (editable). The DFlash draft depth this
-    /// submission runs. It is the number of speculative tokens the drafter
-    /// proposes per round. The block that it emits is `depth + 1`. The extra
-    /// column is a bonus token. This depth is FIXED for the run. Block diffusion
-    /// drafts a whole block at once, so unlike MTP this depth does not adapt each
-    /// round. `gemma4DFlashMaxDepth` clamps it to the drafter ceiling
-    /// (`recommendedBlockSize - 1`) and the engine ceiling
-    /// (`experimentalDFlashMaxBlockSize - 1`, which is 15). A value above a
-    /// ceiling clamps to the ceiling. The engine does not refuse it. Default 1.
-    ///
-    /// UNIFORM WITH MTP. `CBv2MTPRoundDriver.submissionDraftDepth` is the MTP
-    /// counterpart. It has the same name, the same meaning, and the same default
-    /// 1. The per-arm behaviour differs. MTP adapts up to its ceiling each round.
-    /// DFlash proposes a fixed block of this size. The constant you edit is the
-    /// same on both arms.
     public static let submissionDraftDepth = 1
 
-    /// The pure DFlash depth clamp. A requested draft depth, bounded by the
-    /// drafter ceiling and the engine ceiling, floored at 1. A value above a
-    /// ceiling clamps to the ceiling. The engine does not refuse it.
-    /// `gemma4DFlashMaxDepth` calls this with `submissionDraftDepth`.
     public static func clampDepth(requested: Int, drafterCeiling: Int, engineCeiling: Int) -> Int {
         Swift.max(1, Swift.min(requested, drafterCeiling, engineCeiling))
     }
@@ -531,20 +496,6 @@ public final class DFlashDraftModel: Module, @unchecked Sendable {
     ) async throws -> DFlashDraftModel {
         let document = try DFlashConfigurationDocument.read(from: directory)
 
-        // THE STRUCTURAL REFUSALS COME FIRST, BEFORE ANY MLX WORK.
-        // `loadWeights` refuses a directory with no `config.json`, one that
-        // cannot be enumerated, one with no `*.safetensors` at all, and a
-        // duplicate tensor key. Constructing `DFlashDraftModel` allocates MLX
-        // arrays and therefore initializes an MLX stream, and on a machine with
-        // no usable Metal library that initialization ABORTS THE PROCESS rather
-        // than throwing -- so a checkpoint that was never going to load used to
-        // take the whole process down instead of returning its own named error.
-        // Reading the weights first makes the refusal reachable everywhere,
-        // which is better behaviour for a participant pointing the loader at a
-        // half-staged directory as well as for a test host without a metallib.
-        //
-        // Nothing downstream depends on the old order: `sanitize` needs the
-        // drafter, and it still runs after both.
         let weights = try loadWeights(from: directory)
 
         let drafter = DFlashDraftModel(config: document.config)
@@ -561,22 +512,6 @@ public final class DFlashDraftModel: Module, @unchecked Sendable {
         return drafter
     }
 
-    /// Quantize the drafter's modules to match a quantized checkpoint, BEFORE
-    /// its weights are bound.
-    ///
-    /// This is the DFlash half of the participant contract's head-requant
-    /// promise (docs/participant-contract.md §3.4) and it mirrors the MTP head
-    /// loader's flow (`Gemma4AssistantDraftModel.load(from:)` in
-    /// Libraries/MLXLLM/Models/Gemma4MTP.swift): a module is quantized iff the
-    /// checkpoint carries its `.scales` tensor, the geometry comes from the
-    /// head's OWN `config.json`, and the quantize step runs against the
-    /// SANITIZED weights so the borrowed `embed_tokens.`/`lm_head.` tensors a
-    /// DFlash drafter never owns cannot decide anything here.
-    ///
-    /// Both mismatch directions fail closed, because either one would make the
-    /// worker report a drafter it did not run: quantized weights with no
-    /// declaration cannot bind at full precision, and a declaration whose
-    /// checkpoint carries no packed tensor cannot quietly load as fp16.
     private static func applyDeclaredQuantization(
         _ quantization: BaseConfiguration.PerLayerQuantization?,
         to drafter: DFlashDraftModel,

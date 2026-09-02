@@ -15,14 +15,11 @@
 
 import Foundation
 
-/// `CBv2IncrementalDetokenizer` over DetokenizerV2 + StopHoldback.
 public final class CBv2TextDetokenizer: CBv2IncrementalDetokenizer {
 
     private let detokenizer: DetokenizerV2
     private let holdback: StopHoldback
 
-    /// True once a stop string fully matched; the engine finishes the
-    /// request with `.stop` and no further text is ever emitted.
     public private(set) var matchedStopString = false
 
     public init(detokenizer: DetokenizerV2, holdback: StopHoldback) {
@@ -46,7 +43,6 @@ public final class CBv2TextDetokenizer: CBv2IncrementalDetokenizer {
         guard !matchedStopString else { return "" }
         let tail = detokenizer.flush()
         guard !holdback.isPassthrough else { return tail }
-        // The released UTF-8 tail can still complete a stop string.
         let scan = holdback.ingest(tail)
         if scan.stopped {
             matchedStopString = true
@@ -56,8 +52,6 @@ public final class CBv2TextDetokenizer: CBv2IncrementalDetokenizer {
     }
 }
 
-/// Engine-level factory: one tokenizer, one detokenizer per request with
-/// that request's stop strings.
 public final class CBv2TextDetokenizerFactory: CBv2DetokenizerFactory {
 
     private let tokenizer: any Tokenizer

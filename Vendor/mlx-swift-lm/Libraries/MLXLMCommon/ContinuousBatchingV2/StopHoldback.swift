@@ -23,11 +23,7 @@
 import Foundation
 
 public struct CBv2StopScan: Sendable, Equatable {
-    /// Text that is safe to emit now.
     public var text: String
-    /// True when a stop string fully matched. All text at and after the
-    /// match start has been discarded; every further `ingest`/`flush`
-    /// yields nothing.
     public var stopped: Bool
 
     public init(text: String, stopped: Bool) {
@@ -39,10 +35,7 @@ public struct CBv2StopScan: Sendable, Equatable {
 public final class StopHoldback {
 
     private let stops: [[Unicode.Scalar]]
-    /// Longest stop length — an upper bound on how much text can be held.
     private let maxHold: Int
-    /// Held-back tail: the longest suffix of everything ingested so far
-    /// that is a prefix of at least one stop string.
     private var pending: [Unicode.Scalar] = []
     private var stopped = false
 
@@ -51,10 +44,8 @@ public final class StopHoldback {
         self.maxHold = stops.map(\.count).max() ?? 0
     }
 
-    /// True when no stop strings are configured (pass-through mode).
     public var isPassthrough: Bool { stops.isEmpty }
 
-    /// Feed newly detokenized text; returns what may be emitted.
     public func ingest(_ text: String) -> CBv2StopScan {
         if stopped {
             return CBv2StopScan(text: "", stopped: true)
@@ -65,8 +56,6 @@ public final class StopHoldback {
 
         pending.append(contentsOf: text.unicodeScalars)
 
-        // 1) Earliest full match across all stop strings wins; everything
-        //    from the match start on is discarded.
         if let matchStart = earliestMatchStart() {
             stopped = true
             let emit = String(String.UnicodeScalarView(pending[..<matchStart]))
@@ -74,8 +63,6 @@ public final class StopHoldback {
             return CBv2StopScan(text: emit, stopped: true)
         }
 
-        // 2) No full match: hold the longest suffix that could still grow
-        //    into a stop string; emit the rest.
         let hold = longestAmbiguousSuffix()
         let emitCount = pending.count - hold
         guard emitCount > 0 else {
@@ -86,7 +73,6 @@ public final class StopHoldback {
         return CBv2StopScan(text: emit, stopped: false)
     }
 
-    /// Release held text at natural end of generation (no stop matched).
     public func flush() -> String {
         guard !stopped, !pending.isEmpty else { return "" }
         let emit = String(String.UnicodeScalarView(pending))
@@ -96,11 +82,6 @@ public final class StopHoldback {
 
     // MARK: - Internals
 
-    /// Index in `pending` of the earliest occurrence of any stop string,
-    /// or nil. Scanning is bounded: text before the held tail was already
-    /// proven stop-free, so only positions where a stop could overlap the
-    /// newly appended scalars need checking — but `pending` only ever
-    /// contains the held tail plus this chunk, so a full scan is O(|pending|·Σ|stop|).
     private func earliestMatchStart() -> Int? {
         var earliest: Int? = nil
         for stop in stops {
@@ -121,8 +102,6 @@ public final class StopHoldback {
         return earliest
     }
 
-    /// Length of the longest suffix of `pending` that is a proper prefix
-    /// of at least one stop string (the part that must be held back).
     private func longestAmbiguousSuffix() -> Int {
         var longest = 0
         for stop in stops {

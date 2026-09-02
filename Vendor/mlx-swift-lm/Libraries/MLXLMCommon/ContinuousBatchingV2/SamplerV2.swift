@@ -29,29 +29,19 @@ import MLXRandom
 
 public final class SamplerV2 {
 
-    /// Temperatures below this are treated as greedy (matches vLLM and
-    /// `LogitsPipelineV2.greedyEpsilon`).
     public static let greedyEpsilon: Float = LogitsPipelineV2.greedyEpsilon
 
-    /// Engine-level fallback used for rows that did not supply a seed.
-    /// Fixed at init so nil-seed rows are still batch-invariant within a
-    /// process; across runs they are intentionally non-deterministic.
     private let fallbackSeed: UInt64
 
     private struct RowState {
         var id: CBv2RequestID
         var seed: UInt64
         var greedy: Bool
-        /// Per-request decode step index (number of tokens sampled so far
-        /// for this request). Keying noise to the per-request index — not
-        /// the global engine step — is what keeps a row's stream
-        /// independent of when it joined the batch.
         var step: UInt64
     }
 
     private var rows: [RowState] = []
     private var allGreedy = true
-    /// [B] bool, built once per membership change.
     private var greedyMask: MLXArray?
 
     public init(fallbackSeed: UInt64? = nil) {
@@ -60,10 +50,6 @@ public final class SamplerV2 {
 
     // MARK: Membership change
 
-    /// Rebuild per-row sampling state. Row order must match the logits row
-    /// order passed to `sample`. Mid-flight rows resume their step index
-    /// from `outputTokens.count`, so re-vectorization after a membership
-    /// change does not perturb their random streams.
     public func setRows(_ rows: [CBv2SamplerRow]) {
         self.rows = rows.map { row in
             RowState(
@@ -79,25 +65,17 @@ public final class SamplerV2 {
 
     // MARK: Step path
 
-    /// Select one token per row from transformed logits [B, vocab].
-    /// Returns [B] int32. Pure graph construction — call `commit()` once
-    /// per step afterwards to advance the per-row step indices.
     public func sample(from logits: MLXArray) -> MLXArray {
         precondition(
             logits.dim(0) == rows.count,
             "logits rows (\(logits.dim(0))) != configured rows (\(rows.count)) — call setRows")
 
-        // The pipeline, grammar and raw-logprob capture already ran before
-        // this boundary. Change only how a large all-greedy axis is reduced.
         if allGreedy {
             return CBv2ParallelArgMaxV1.apply(logits)
                 ?? argMax(logits, axis: -1).asType(.int32)
         }
         let greedyTokens = argMax(logits, axis: -1).asType(.int32)
 
-        // Mixed batch: exponential-race Gumbel-max. probs/e keeps masked
-        // tokens (-inf logits → probability 0) unreachable, and argmax of
-        // the ratio is an exact categorical draw.
         let vocab = logits.dim(-1)
         let probs = softmax(logits, axis: -1)
         let noise = exponentialNoise(vocab: vocab)
@@ -107,8 +85,6 @@ public final class SamplerV2 {
         return which(greedyMask, greedyTokens, sampledTokens)
     }
 
-    /// Advance every row's per-request step index. Call exactly once per
-    /// sampled step, after `sample` (alongside `LogitsPipelineV2.commit`).
     public func commit() {
         for i in rows.indices {
             rows[i].step &+= 1
@@ -117,11 +93,6 @@ public final class SamplerV2 {
 
     // MARK: - Per-row keyed noise
 
-    /// Exp(1) noise [B, vocab]; row r is generated from key
-    /// mix(seed_r, id_r, step_r) and stacked, so each row's draw is a pure
-    /// function of that row's identity — never of batchmates. Greedy rows
-    /// receive a constant placeholder (their sampled pick is discarded by
-    /// the `where` merge).
     private func exponentialNoise(vocab: Int) -> MLXArray {
         var perRow = [MLXArray]()
         perRow.reserveCapacity(rows.count)
@@ -133,18 +104,12 @@ public final class SamplerV2 {
             let key = MLXRandom.key(Self.mix(seed: row.seed, id: row.id.raw, step: row.step))
             let u = MLXRandom.uniform(
                 low: Float(0), high: Float(1), [1, vocab], type: Float.self, key: key)
-            // e = -log(1 - u) ~ Exp(1); u ∈ [0, 1) keeps the log argument in
-            // (0, 1]. Clamp away e == 0 (u == 0) so probs/e never divides
-            // by zero.
             let e = maximum(-log(1 - u), MLXArray(Float(1e-20)))
             perRow.append(e)
         }
         return concatenated(perRow, axis: 0)
     }
 
-    /// SplitMix64-style mix of (seed, requestID, step) into one RNG key
-    /// seed. Deterministic across processes (no `Hasher`), and a pure
-    /// function of exactly the three inputs the contract allows.
     static func mix(seed: UInt64, id: UInt64, step: UInt64) -> UInt64 {
         func splitmix(_ value: UInt64) -> UInt64 {
             var z = value &+ 0x9E37_79B9_7F4A_7C15

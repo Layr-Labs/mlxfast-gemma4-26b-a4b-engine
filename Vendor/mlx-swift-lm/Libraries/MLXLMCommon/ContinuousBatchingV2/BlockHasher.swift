@@ -20,21 +20,14 @@
 import CryptoKit
 import Foundation
 
-/// Stateless block chain hasher. Configure once per (model, tenant scope)
-/// and reuse; all methods are pure.
 public struct CBv2BlockHasher: Sendable, Equatable {
     public static let version = "darkbloom-block-chain-v1"
     public static let domain = Data("darkbloom.prefix-block-chain.v1".utf8)
 
-    /// Tokens per block. 256 matches the legacy checkpoint tier and the
-    /// coarsest common divisor of the fleet's checkpoint ladders.
     public static let defaultBlockSize = 256
 
     public let blockSize: Int
-    /// Prompt-contract identity derived from immutable tokenizer/template/config
-    /// artifacts and semantic versions.
     public let promptContractID: String
-    /// Authenticated cache-scope identity.
     public let scopeID: String
 
     public init(
@@ -52,7 +45,6 @@ public struct CBv2BlockHasher: Sendable, Equatable {
 
     // MARK: - Single block
 
-    /// Hash one block. `parent == nil` emits the all-zero 32-byte root.
     public func blockHash(
         parent: Data?,
         blockTokens: some Collection<Int>,
@@ -91,23 +83,14 @@ public struct CBv2BlockHasher: Sendable, Equatable {
 
     // MARK: - Chains
 
-    /// Number of whole blocks covered by `tokenCount` tokens.
     public func fullBlockCount(tokenCount: Int) -> Int {
         max(0, tokenCount) / blockSize
     }
 
-    /// Largest number of whole blocks a LOOKUP over `tokenCount` tokens may
-    /// match: at least one token must remain uncached so the engine always
-    /// recomputes the final position for logits (vLLM last-token rule,
-    /// report 08 §2). Equivalent to reserving the last block when the count
-    /// is an exact block multiple.
     public func maxLookupBlocks(tokenCount: Int) -> Int {
         max(0, tokenCount - 1) / blockSize
     }
 
-    /// Chain hashes `[h_1, …, h_k]` for the first `k` whole blocks of
-    /// `tokens`, where `k = min(fullBlockCount, maxBlocks ?? ∞)`.
-    /// `h_j` (index `j-1`) fingerprints the entire prefix `tokens[0 ..< j·bs]`.
     public func chainHashes(tokens: [Int], maxBlocks: Int? = nil) -> [Data] {
         var count = fullBlockCount(tokenCount: tokens.count)
         if let maxBlocks { count = min(count, max(0, maxBlocks)) }

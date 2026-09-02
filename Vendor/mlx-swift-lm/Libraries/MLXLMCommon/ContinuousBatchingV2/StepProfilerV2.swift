@@ -14,22 +14,18 @@ import Foundation
 
 public enum CBv2StepProfiler {
 
-    /// Master switch. Read on hot paths; set it BEFORE the run under
-    /// measurement and do not toggle mid-run (plain non-atomic Bool).
-    nonisolated(unsafe) public static var enabled: Bool =
-        ProcessInfo.processInfo.environment["CBV2_STEP_PROFILE"].map {
-            ["1", "true", "yes", "on"].contains($0.lowercased())
-        } ?? false
+    nonisolated(unsafe) public static var enabled: Bool = {
+        let environment = ProcessInfo.processInfo.environment
+        let raw = environment["CBV2_STEP_PROFILE"] ?? environment["DARKBLOOM_CBV2_STEP_PROFILE"]
+        return raw.map { ["1", "true", "yes", "on"].contains($0.lowercased()) } ?? false
+    }()
 
-    /// Independent event-counter switch. Benchmark boundaries guarantee that
-    /// no engine work is in flight while this plain Bool is changed.
     nonisolated(unsafe) public private(set) static var eventsEnabled = false
 
     private static let lock = NSLock()
     nonisolated(unsafe) private static var samples: [String: [Double]] = [:]
     nonisolated(unsafe) private static var eventCounts: [String: Int] = [:]
 
-    /// Record one duration (seconds) for a phase. No-op when disabled.
     @inline(__always)
     public static func record(_ phase: StaticString, seconds: Double) {
         guard enabled else { return }
@@ -39,8 +35,6 @@ public enum CBv2StepProfiler {
         lock.unlock()
     }
 
-    /// Time a closure and record it under `phase`. No-op overhead when
-    /// disabled beyond the closure call itself.
     @inline(__always)
     public static func time<T>(_ phase: StaticString, _ body: () -> T) -> T {
         guard enabled else { return body() }
@@ -49,23 +43,16 @@ public enum CBv2StepProfiler {
         record(phase, seconds: CFAbsoluteTimeGetCurrent() - start)
         return result
     }
-    /// Count an observable graph-submission event without enabling phase
-    /// clocks. The disabled path is one predictable plain-Bool branch and
-    /// performs no string conversion, locking, allocation, or atomic access.
     @inline(__always)
     public static func recordEvent(_ event: StaticString) {
         guard eventsEnabled else { return }
         let key = "\(event)"
         lock.lock()
         defer { lock.unlock() }
-        // Arm/disarm happens only while the engine is idle. This under-lock
-        // recheck additionally rejects a recorder that passed the fast branch
-        // immediately before a boundary acquired the lock.
         guard eventsEnabled else { return }
         eventCounts[key, default: 0] += 1
     }
 
-    /// Clear and arm only event counting at an idle measurement boundary.
     public static func armEvents() {
         lock.lock()
         eventCounts.removeAll(keepingCapacity: true)
@@ -73,7 +60,6 @@ public enum CBv2StepProfiler {
         lock.unlock()
     }
 
-    /// Disarm and snapshot one measured event scope.
     public static func snapshotAndDisarmEvents() -> [String: Int] {
         lock.lock()
         eventsEnabled = false
@@ -81,7 +67,6 @@ public enum CBv2StepProfiler {
         return eventCounts
     }
 
-    /// Clear all profiler state. Call only at an idle boundary.
     public static func reset() {
         lock.lock()
         eventsEnabled = false
@@ -90,22 +75,17 @@ public enum CBv2StepProfiler {
         lock.unlock()
     }
 
-    /// Snapshot of all recorded phases (name → sorted durations, seconds).
     public static func snapshot() -> [String: [Double]] {
         lock.lock()
         defer { lock.unlock() }
         return samples.mapValues { $0.sorted() }
     }
-    /// Snapshot of explicitly counted events (name → cumulative count).
     public static func eventCountsSnapshot() -> [String: Int] {
         lock.lock()
         defer { lock.unlock() }
         return eventCounts
     }
 
-
-    /// Markdown decomposition table: per phase count, total, mean, p50,
-    /// p95, max (milliseconds), sorted by total descending.
     public static func summaryTable() -> String {
         let snap = snapshot()
         func pct(_ sorted: [Double], _ q: Double) -> Double {

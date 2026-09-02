@@ -5,24 +5,11 @@ import Foundation
 import MLX
 import MLXFast
 
-/// Exact two-stage argmax for a small batch with a large vocabulary.
-///
-/// The stock Metal ArgReduce launches one threadgroup per row. A [8, 262144]
-/// head therefore scans all logits with just eight groups. Here each group
-/// scans 4096 values, then one SIMD group per row reduces the tile winners.
-/// Only the decomposition changes: no values are added, scaled or rounded.
-///
-/// This is called on the sampler's already-transformed logits, after grammar,
-/// penalties and probability filtering. It neither replaces those transforms
-/// nor changes raw-logprob capture or sampler state.
 enum CBv2ParallelArgMaxV1 {
     private static let tileSize = 4096
     private static let tileThreads = 256
     private static let finalThreads = 32
 
-    /// Independent fallback for attribution and emergency bisection.
-    /// An absent setting enables the implementation; an explicit off value
-    /// restores the stock argMax + int32 conversion.
     private static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_PARALLEL_ARGMAX"]
@@ -36,12 +23,6 @@ enum CBv2ParallelArgMaxV1 {
         return mlx_metal_is_available(&available) == 0 && available
     }()
 
-    /// Stock ArgMax starts from {index: 0, value: -infinity}, updates each
-    /// lane only for a strictly greater value, and breaks inter-lane ties by
-    /// the smaller original index. Thus NaNs never win and an all-NaN/-inf
-    /// row returns zero. Each tile retains GLOBAL indices, including the
-    /// stock zero sentinel when it contains no value greater than -inf.
-    /// BF16 -> float is exact, and float32 inputs need no conversion.
     private static let header = """
         struct CBv2ArgMaxPairV1 {
             uint index;
@@ -149,11 +130,6 @@ enum CBv2ParallelArgMaxV1 {
         ensureRowContiguous: true
     )
 
-    /// Returns nil outside the narrow performance envelope. All shape and
-    /// dtype checks use lazy metadata only. Never read Swift array strides:
-    /// they are unstable before evaluation. Instead both kernels REQUIRE
-    /// row-contiguous storage via MLX's eval-time ensureRowContiguous check;
-    /// a strided input is bit-copied before the kernel, never misindexed.
     static func apply(_ logits: MLXArray) -> MLXArray? {
         guard enabled, logits.ndim == 2,
             logits.dtype == .bfloat16 || logits.dtype == .float32
@@ -165,8 +141,6 @@ enum CBv2ParallelArgMaxV1 {
             vocab % tileSize == 0
         else { return nil }
 
-        // Preserve CPU execution, including a task-scoped CPU stream on a
-        // Metal-capable host. These checks inspect host metadata only.
         guard metalAvailable else { return nil }
         let stream = StreamOrDevice.default
         var device = mlx_device_new()

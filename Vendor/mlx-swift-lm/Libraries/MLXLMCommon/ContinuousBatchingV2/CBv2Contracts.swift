@@ -32,8 +32,6 @@ public struct CBv2RequestID: Hashable, Sendable, CustomStringConvertible {
     public var description: String { "cbv2-\(raw)" }
 }
 
-/// Per-request sampling parameters. All fields are per-request; the sampler
-/// vectorizes them into per-row tensors (never a Swift loop over rows).
 public struct CBv2SamplingParams: Sendable {
     public var temperature: Float
     public var topP: Float
@@ -43,13 +41,8 @@ public struct CBv2SamplingParams: Sendable {
     public var repetitionContextSize: Int
     public var frequencyPenalty: Float
     public var presencePenalty: Float
-    /// Per-request seed. Reproducibility is best-effort under batching
-    /// (documented); the RNG key is (seed, requestID, stepIndex).
     public var seed: UInt64?
-    /// Token-id → additive logit bias.
     public var logitBias: [Int: Float]
-    /// Number of top logprobs to report per emitted token (0 = none).
-    /// Logprobs are captured from RAW logits, before any transform.
     public var topLogprobs: Int
 
     public init(
@@ -77,37 +70,13 @@ public struct CBv2Request: Sendable {
     public var promptTokens: [Int]
     public var sampling: CBv2SamplingParams
     public var maxTokens: Int
-    /// Stop token ids (already resolved — string EOS resolution happens at
-    /// engine construction, identically for B=1 and batched paths).
     public var stopTokens: Set<Int>
-    /// Stop strings; matched against held-back detokenized text.
     public var stopStrings: [String]
-    /// Higher value = more important. Used by admission and preemption.
     public var priority: Int
-    /// Per-request prefix-cache scope (TB-007). When non-nil it REPLACES the
-    /// cache-level salt in the first block hash (h_0), so requests carrying
-    /// different salts can never share cached KV; nil falls back to the
-    /// cache-level salt (byte-identical hashes to the pre-salt behavior).
     public var cacheSalt: String?
-    /// Per-request cache participation gate. Remote bridges set this false
-    /// when no authenticated cache scope was supplied, preventing nil salt
-    /// from silently becoming an unscoped shared cache. Defaults true for
-    /// local and backwards-compatible direct engine callers.
     public var prefixCacheEnabled: Bool
-    /// Correlation identity for prefix-cache donation receipts. This is
-    /// deliberately separate from `id`, which remains the sampler and
-    /// scheduler identity and may be reused after a request finishes. nil
-    /// preserves the direct-caller behavior by correlating donations with
-    /// `id`.
     public var prefixCacheReceiptID: CBv2RequestID?
-    /// Vision prefill (additive): precomputed image-embedding spans spliced
-    /// at placeholder-token positions of `promptTokens`. nil = text-only —
-    /// every code path is byte-identical to the pre-multimodal engine.
-    /// See `CBv2MultimodalInput` for the full semantics.
     public var multimodal: CBv2MultimodalInput?
-    /// Optional inference-time token automaton. nil preserves the ordinary
-    /// sampler byte-for-byte. Required/named/none tool choices install a
-    /// row-local machine compiled before submission.
     public var tokenConstraint: (any CBv2TokenConstraint)?
 
     public init(
@@ -135,11 +104,6 @@ public struct CBv2Request: Sendable {
 
 // MARK: - Multimodal input (vision prefill; additive)
 
-/// One image's soft-token span inside the prompt: `length` placeholder token
-/// ids starting at `tokenOffset` (absolute prompt position). That is how VLM
-/// chat templates render images — the vision tower's soft-token count worth
-/// of placeholder ids, wrapped by ordinary begin/end-of-image text tokens
-/// (which are NOT part of the span).
 public struct CBv2ImageSpan: Sendable, Equatable {
     public var tokenOffset: Int
     public var length: Int
@@ -150,27 +114,8 @@ public struct CBv2ImageSpan: Sendable, Equatable {
     var end: Int { tokenOffset + length }
 }
 
-/// Vision input for one request: ordered image spans plus an embeddings
-/// provider the engine calls EXACTLY ONCE per request, on the submit thread
-/// (never on the engine step thread, never on the decode hot path). The
-/// provider returns one array per span — `[length, hidden]` or
-/// `[1, length, hidden]` — containing the FINAL text-space values for that
-/// span (vision tower + multimodal projector output, in the model's
-/// activation dtype). The engine splices them verbatim over the scaled text
-/// embeddings at the span positions (the `maskedScatter` semantics of the
-/// MLXVLM Gemma4 wrapper); it never applies the model's embedding scale to
-/// them.
-///
-/// `@unchecked Sendable`: the closure is consumed exactly once on the submit
-/// thread; callers must make it safe to invoke there (typically it returns
-/// precomputed arrays, or lazily runs the vision tower — MLX graph building
-/// off the engine thread is the established pattern for submit-side work).
 public struct CBv2MultimodalInput: @unchecked Sendable {
-    /// Image spans in ascending `tokenOffset` order, non-overlapping, fully
-    /// inside the prompt. Validated at submit; violations throw
-    /// `CBv2MultimodalError`.
     public var spans: [CBv2ImageSpan]
-    /// Embeddings provider — one array per span, same order as `spans`.
     public var embeddings: () throws -> [MLXArray]
 
     public init(spans: [CBv2ImageSpan], embeddings: @escaping () throws -> [MLXArray]) {
@@ -179,47 +124,24 @@ public struct CBv2MultimodalInput: @unchecked Sendable {
     }
 }
 
-/// Submit-time multimodal rejections (thrown by `CBv2Engine.submit`).
 public enum CBv2MultimodalError: Error, Equatable {
-    /// The engine's model does not support embedding-spliced prefill.
     case unsupportedModel(String)
-    /// The engine's layer-cache provider cannot honor span attention masks
-    /// (e.g. the paged backend).
     case unsupportedBackend(String)
-    /// Spans empty, unsorted, overlapping, non-positive, or out of bounds.
     case invalidSpans(String)
-    /// A contiguous placeholder run (adjacent spans coalesce — they attend
-    /// bidirectionally as ONE block, so they must ride one prefill chunk)
-    /// exceeds the per-step token budget and could never be scheduled.
     case spanTooLong(blockTokens: Int, maxBatchedTokensPerStep: Int)
-    /// Provider returned the wrong number of arrays, a length that does not
-    /// match its span, or an inconsistent hidden dimension.
     case embeddingMismatch(String)
 }
 
 // MARK: - Layer descriptions (model structure as data)
 
-/// Attention structure of one transformer layer, derived from model config.
-/// Models declare this; the KV/attention layer validates against it.
 public struct CBv2LayerKind: Sendable, Equatable {
     public enum Attention: Sendable, Equatable {
         case full
-        /// Sliding-window attention with the given window (in tokens).
         case slidingWindow(Int)
     }
     public var attention: Attention
-    /// Layer index whose K/V this layer reuses (Gemma-4 cross-layer KV
-    /// sharing). A shared layer owns NO storage; it borrows (K, V) and the
-    /// position offset from the source layer at attention time.
     public var sharesKVWithLayer: Int?
-    /// Multi-token prompt attention is bidirectional within the current
-    /// chunk. Cached prefix columns retain their established visibility;
-    /// decode remains unchanged because no future keys exist yet.
     public var isBidirectional: Bool
-    /// Learned per-head attention sinks (GPT-OSS). Sinks are a kernel
-    /// parameter (folded into the softmax denominator), never KV state.
-    /// A backend that cannot honor sinks MUST be statically ineligible for
-    /// models with `hasSinks == true` (it must throw at engine build).
     public var hasSinks: Bool
     public var headDim: Int
     public var kvHeads: Int
@@ -240,10 +162,6 @@ public struct CBv2LayerKind: Sendable, Equatable {
     }
 }
 
-/// Prefix snapshots are reusable only when prefill visibility is independent
-/// of the donor's chunk history. Fully bidirectional chunks do not satisfy
-/// that contract: generated rows donated one token at a time had no future
-/// visibility, while those same rows in a later prompt would.
 @inline(__always)
 func cbv2LayerKindsAllowPrefixReuse(_ layerKinds: [CBv2LayerKind]) -> Bool {
     !layerKinds.contains(where: \.isBidirectional)
@@ -251,164 +169,50 @@ func cbv2LayerKindsAllowPrefixReuse(_ layerKinds: [CBv2LayerKind]) -> Bool {
 
 // MARK: - Per-sequence KV state
 
-/// KV storage for ONE sequence at ONE layer. Self-contained: owns its
-/// absolute position counter and its storage. There is no shared frontier.
 public protocol CBv2SequenceKV: AnyObject {
-    /// Absolute position of the next token to be written (== number of
-    /// tokens processed for this sequence at this layer). Monotonic; never
-    /// mutated by other sequences joining/leaving.
     var absoluteOffset: Int { get }
-    /// Number of KV entries physically retained (≤ absoluteOffset for
-    /// windowed caches; == absoluteOffset for full caches).
     var retainedCount: Int { get }
-    /// Append K/V for `n` new tokens and return (keys, values) views suitable
-    /// for attention: shapes [1, kvHeads, retainedAfterUpdate, headDim], in
-    /// temporal order (oldest → newest). Windowed impls evict by absolute
-    /// position and keep the RECENT end.
     func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray)
-    /// Zero-copy-ish snapshot for prefix-cache donation / checkpointing.
-    /// Returns (keys, values, absoluteOffset) in temporal order.
     func snapshot() -> (keys: MLXArray, values: MLXArray, offset: Int)
-    /// Rollback the last `n` tokens (speculative rejection). Must scrub
-    /// un-confirmed tail state so it can never be attended to.
     func rollback(_ n: Int)
 
     // MARK: Speculative (MTP) writes
 
-    /// True when this row can take a multi-token `update()` under
-    /// `beginSpeculativeWrite()` such that the sequence
-    /// `beginSpeculativeWrite(); update(...); ...; rollback(m);
-    /// commitSpeculativeWrite()` leaves state VALUE-EXACTLY equal to plain
-    /// updates of only the confirmed prefix. The transaction may contain one
-    /// multi-token update or multiple serial one-token updates. This is the
-    /// eligibility gate for speculative (MTP) decoding: a row whose storage
-    /// cannot guarantee exact rollback (e.g. a paged windowed ring, whose
-    /// in-place writes destroy the oldest in-window entries — see
-    /// `CBv2WindowedSequenceKV`'s rollback discussion) MUST return false so
-    /// the engine falls back to plain decode for that row. Default: false
-    /// (fail-safe — unknown row classes never speculate).
     var supportsSpeculativeWrites: Bool { get }
-    /// Begin one speculative-write transaction. Storage
-    /// whose plain rollback is already value-exact (full, paged-full) may
-    /// make this a no-op. Ring storage (contiguous windowed)
-    /// must STAGE every update until commit — each call returns the exact
-    /// views its corresponding plain update would return and advances
-    /// counters, but destructive ring writes are deferred so a final
-    /// `rollback(m)` is a pure counter move. At most one speculative
-    /// transaction may be in flight per row.
     func beginSpeculativeWrite()
-    /// Commit the staged speculative update (if any): persist storage for
-    /// the still-confirmed positions `[stagedBase, absoluteOffset)` and
-    /// disarm. Called at step finalization AFTER `rollback` of rejected
-    /// tokens. No-op when nothing is staged. The engine guarantees no
-    /// attention runs against this row between the speculative `update()`
-    /// and this commit except through the views that update returned.
     func commitSpeculativeWrite()
-    /// Advance the absolute position counter WITHOUT writing storage.
-    /// Only valid on a FRESH windowed state during prefix-cache adoption:
-    /// the engine recomputes the trailing window tokens for windowed layers,
-    /// and those recomputed tokens must land at their TRUE absolute positions
-    /// (RoPE offsets and window clamping are keyed to absolute positions).
-    /// Full-attention implementations trap (they adopt real snapshots).
     func fastForward(to offset: Int)
-    /// Approximate bytes held (for accounting/telemetry).
     var byteCount: Int { get }
 }
 
 extension CBv2SequenceKV {
-    /// Default: only sliding-window storage supports position fast-forward.
     public func fastForward(to offset: Int) {
         preconditionFailure(
             "fastForward(to:) is only valid on windowed sequence KV (\(type(of: self)))")
     }
 
-    /// Default: fail-safe — unknown row classes never speculate.
     public var supportsSpeculativeWrites: Bool { false }
-    /// Default: no-op (rows whose plain rollback is already value-exact).
     public func beginSpeculativeWrite() {}
-    /// Default: no-op.
     public func commitSpeculativeWrite() {}
 }
 
-/// Affirmative storage proof for decode evaluation-root compaction.
-///
-/// Conformance means every mutation an ordinary one-token decode performs is
-/// ordered by either the K/V views consumed by the attention output or the
-/// owning `CBv2LayerCache`'s explicit fused-ring-write fence. Unknown/custom
-/// row implementations make no such claim, so the engine must keep their full
-/// cache inner state as evaluation roots.
 public protocol CBv2DecodeRootCompactionCapableSequenceKV: CBv2SequenceKV {}
 
-/// Factory for per-sequence KV state; implemented by the v1 contiguous
-/// backend and the v2 paged backend.
 public protocol CBv2KVBackend: AnyObject {
-    /// Exact prefix-reuse identity. Unknown backends fail cold.
     var prefixReuseBackend: CBv2PrefixReuseBackend { get }
-    /// Create per-layer sequence state for a new request. `layerKinds` has
-    /// one entry per model layer; entries with `sharesKVWithLayer != nil`
-    /// receive NO storage (return nil at that index).
     func makeSequenceState(layerKinds: [CBv2LayerKind], promptLength: Int, maxLength: Int)
         throws -> [CBv2SequenceKV?]
-    /// Adopt a donated/forked prefix (prefix-cache hit). `prefix` holds
-    /// per-layer snapshots for the ADOPTED token range (full-attention
-    /// layers only; windowed and KV-shared layers are nil).
-    ///
-    /// `plan` is authoritative for M/C/R and backend support. Ordinary safe
-    /// layouts receive full snapshots through C. Frozen-full hybrid replay
-    /// receives exact full snapshots through M while every windowed row starts
-    /// empty at C. Unsupported backend/layout pairs must throw before state is
-    /// published.
     func makeSequenceState(
         adopting prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?],
         plan: CBv2PrefixReusePlan,
         layerKinds: [CBv2LayerKind], maxLength: Int
     ) throws -> [CBv2SequenceKV?]
-    /// Free all storage for a sequence (cancellation, finish, preemption).
-    /// O(1) metadata for paged; releases arrays for contiguous.
-    ///
-    /// Fencing invariant (engine discipline, promoted from WS-B issue §4):
-    /// state that participated in a still-in-flight step must NOT be
-    /// released until that step is finalized (its sampled tokens have been
-    /// materialized). The engine loop defers such releases; backends may
-    /// therefore recycle storage immediately on `release`.
     func release(_ state: [CBv2SequenceKV?])
-    /// Bytes currently in use / capacity, for truthful admission.
     var bytesInUse: Int { get }
     var bytesCapacity: Int { get }
-    /// Update `bytesCapacity` at runtime (multi-model co-residency
-    /// re-slicing: the provider shrinks resident engines to fair shares
-    /// before granting a newcomer, and grows survivors back on unload).
-    /// Shrink never evicts live rows — registrations above a new lower
-    /// ceiling stay resident; new admissions fail with `capacityExhausted`
-    /// until usage drains below the new ceiling. Grow admits immediately.
-    /// Default no-op: backends with a construction-fixed budget (the paged
-    /// slabs are physically preallocated) ignore the call, and `AdmissionV2`
-    /// — which the engine resizes in the same breath — remains the primary
-    /// admission gate.
     func updateBytesCapacity(_ bytes: Int)
-    /// Admission-relevant bytes: worst-case reservations of live requests
-    /// (paged backend reserves pages up front so `update` can never fail).
-    /// Defaults to `bytesInUse` for backends that do not reserve.
     var bytesReserved: Int { get }
-    /// True when `snapshot()` views over this backend's storage reference
-    /// RECYCLABLE memory (the paged backend's shared slabs: pages return to
-    /// the pool on `release` and are rewritten by later requests). A prefix
-    /// cache fed by such a backend MUST materialize donated snapshots
-    /// before indexing them (`PrefixCacheV2.Config.materializeOnDonate`),
-    /// or cached entries silently decay into other requests' bytes.
-    /// `EngineV2` enforces this pairing at construction. Defaults to false
-    /// (contiguous per-sequence buffers are ARC-owned by their views).
     var requiresMaterializedSnapshots: Bool { get }
-    /// How this backend's rows OCCUPY storage, consulted by `AdmissionV2`
-    /// so the byte ledger charges what will really be allocated instead of
-    /// inferring it from `CBv2LayerKind` alone. The distinction is
-    /// load-bearing: a contiguous windowed row allocates its whole
-    /// `window`-row ring on the first write, while a paged row reserves
-    /// `min(ceil(maxLength / pageSize), ringPageCount)` pages and never
-    /// commits the ring for a short request (PR#87 review).
-    /// Defaults to `CBv2ContiguousKVResidency` — the CONSERVATIVE policy, so
-    /// a backend that forgets to declare one over-charges and under-admits
-    /// rather than over-committing the device.
     var kvResidency: any CBv2KVResidencyPolicy { get }
 }
 
@@ -428,8 +232,6 @@ extension CBv2KVBackend {
             reason: "backend \(type(of: self)) has no proven prefix-reuse implementation")
     }
 
-    /// Source-compatibility convenience for direct backend tests. Production
-    /// engine adoption always supplies the explicit typed plan.
     public func makeSequenceState(
         adopting prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?],
         layerKinds: [CBv2LayerKind],
@@ -479,55 +281,21 @@ public enum CBv2KVError: Error {
 }
 
 extension CBv2KVError {
-    /// Stable machine prefix on the terminal `.error` finish when a request
-    /// exhausts its capacity requeues (`EngineLoopV2.ensureKVState`). This is
-    /// a RETRYABLE capacity condition — the backend is full of other tenants'
-    /// KV, not broken — so bridges must map finishes carrying this prefix to
-    /// their retryable capacity error (429-class), never a server error.
     public static let capacityExhaustedFinishPrefix = "kv_capacity_exhausted: "
 }
 
 // MARK: - Attention dispatch (owned by the layer cache object)
 
-/// The per-layer batch-facing cache object the model interacts with.
-/// It conforms to the existing `KVCache` protocol so unmodified models can
-/// still call `update(keys:values:)`, but v2-adapted models call
-/// `updateAndAttend`, which owns BOTH the KV update and the attention
-/// computation. This is what makes attention backends swappable.
 public protocol CBv2AttendingLayerCache: AnyObject {
     var layerIndex: Int { get }
     var kind: CBv2LayerKind { get }
-    /// Ordered per-row sequence states (row order == batch row order).
-    /// Rows with different retained lengths are handled internally — the
-    /// caller never pads and never builds masks.
     var rows: [CBv2SequenceKV] { get }
-    /// Bind the current batch's rows (row order == batch row order). O(B):
-    /// join = append a row object, leave = drop it — no storage moves.
-    /// Rows must originate from this cache's own backend (foreign rows
-    /// trap). KV-shared layers own no rows and require `rows.isEmpty`.
     func setRows(_ rows: [CBv2SequenceKV])
-    /// Per-row absolute RoPE offsets, as a device array [B], for models that
-    /// apply RoPE with array offsets (MLXFast.RoPE dynamic-offset overload).
-    ///
-    /// Snapshot semantics: the value read BEFORE `updateAndAttend` reflects
-    /// the PRE-update absolute offsets of the tokens about to be processed;
-    /// models must capture it before dispatching (graph-safe `+ 0` copy) and
-    /// KV-shared layers must reuse the SOURCE layer's pre-update capture —
-    /// a KV-shared cache owns no rows, so its own `positionOffsets` is empty.
     var positionOffsets: MLXArray { get }
-    /// Update per-row KV with this step's K/V and compute attention.
-    ///  - queries/keys/values: [B, heads, L, headDim]; L == 1 for decode,
-    ///    B == 1 for prefill chunks.
-    ///  - sinks: per-head learned sink logits, or nil.
-    ///  - Returns attention output [B, queryHeads, L, headDim].
-    /// Implementations MUST be numerically pinned: one attention path per
-    /// (model, phase), never switching mask representation across steps.
     func updateAndAttend(
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?
     ) -> MLXArray
-    /// Borrow the source layer's K/V for Gemma-style KV-shared layers.
-    /// Only valid when `kind.sharesKVWithLayer != nil`.
     func attendBorrowing(
         source: CBv2AttendingLayerCache,
         queries: MLXArray, scale: Float, sinks: MLXArray?
@@ -548,27 +316,12 @@ public enum CBv2FinishReason: Sendable, Equatable {
     case length         // maxTokens or context limit
     case cancelled
     case error(String)
-    /// A typed platform/engine terminal: a monotonic deadline lease
-    /// (admission / prefill / decode / backpressure / safety) or the step
-    /// watchdog. Unlike `.error(String)`, this preserves the MACHINE-READABLE
-    /// cause so the provider bridge and coordinator can classify health,
-    /// retry, and billing without parsing a string. The reconciled usage
-    /// (prompt/completion token counts) rides the same
-    /// `CBv2Event.finished(reason:usage:)` envelope — a typed terminal always
-    /// carries the tokens generated before it fired. `message` is diagnostic
-    /// only (never a wire contract). See `CBv2DeadlineLeases.swift`.
     case terminal(cause: CBv2TerminalCause, message: String)
 }
 
-/// One step's work assignment: token counts per request under a single
-/// budget. Decode requests get 1 (or 1+k with speculation later); prefilling
-/// requests get a chunk. There is no prefill/decode phase distinction.
 public struct CBv2StepPlan: Sendable {
     public var assignments: [(id: CBv2RequestID, numTokens: Int)]
     public var preemptions: [CBv2RequestID]
-    /// Rows whose requested speculative width was demoted to plain decode,
-    /// with the exact reason. This is execution metadata only; it never
-    /// changes scheduling or preemption behavior.
     public var speculationFallbacks: [CBv2RequestID: CBv2SpeculationFallback]
     public init(
         assignments: [(id: CBv2RequestID, numTokens: Int)] = [],
@@ -587,17 +340,10 @@ public enum CBv2SpeculationFallback: Sendable, Equatable {
 }
 
 public struct CBv2SchedulerConfig: Sendable {
-    /// Hard cap on concurrently RUNNING requests (product target: 4, max 8).
     public var maxConcurrentRequests: Int
-    /// Token budget per step across decode + prefill chunks.
     public var maxBatchedTokensPerStep: Int
-    /// Preferred prefill chunk size (adaptive sizer may override).
     public var prefillChunkSize: Int
-    /// Max queue depth before rejecting with capacity error.
     public var maxWaiting: Int
-    /// Prefix-cache participation (lookup+adopt on submit, donate on
-    /// finish). Off by default; requires a `CBv2PrefixCache` instance to be
-    /// supplied at engine construction as well.
     public var enablePrefixCache: Bool
     public init(
         maxConcurrentRequests: Int = 4, maxBatchedTokensPerStep: Int = 2048,
@@ -626,16 +372,6 @@ public struct CBv2TokenLogprob: Sendable {
 }
 
 public enum CBv2Event: Sendable {
-    /// New generated text, already detokenized incrementally with UTF-8 and
-    /// stop-string holdback applied (never emits text past a stop match).
-    ///
-    /// `text` is the AUTHORITATIVE user-facing content: a matched stop
-    /// TOKEN's rendering is suppressed and text at/past a stop-string
-    /// match is withheld (OpenAI behavior). `tokens` are the RAW sampled
-    /// ids for consumers that count or replay tokens — they MAY include
-    /// the stop token itself and MAY extend past a stop-string match
-    /// (those ids still count toward `usage.completionTokens`). Do not
-    /// detokenize `tokens` to reconstruct content; use `text`.
     case delta(text: String, tokens: [Int], logprobs: [CBv2TokenLogprob]?)
     case finished(reason: CBv2FinishReason, usage: CBv2Usage)
 }
@@ -643,22 +379,12 @@ public enum CBv2Event: Sendable {
 public struct CBv2Usage: Sendable {
     public var promptTokens: Int
     public var completionTokens: Int
-    /// Final per-request prefix lookup/adoption result. This describes the
-    /// in-memory engine tier only; SSD staging remains a provider concern.
     public var prefixCacheOutcome: CBv2PrefixCacheOutcome
-    /// Whole-block tokens matched by lookup before the model-specific
-    /// recompute bound and backend adoption are applied.
     public var prefixCacheMatchedTokens: Int
-    /// Tokens the engine actually skipped after successful adoption. This is
-    /// the routing-relevant prefill saving, not the raw lookup match.
     public var prefixCachePrefillTokensSaved: Int
-    /// Exact replay strategy, replay work, and scheduler boundary splits for
-    /// low-cardinality provider telemetry. Nil/zero on non-hits.
     public var prefixCacheStrategy: CBv2PrefixReuseStrategy?
     public var prefixCacheReplayTokens: Int
     public var prefixCacheBoundarySplits: Int
-    /// Backwards-compatible alias retained for existing provider bridges.
-    /// New integrations should read `prefixCachePrefillTokensSaved`.
     public var prefixCacheHitTokens: Int
     public init(
         promptTokens: Int, completionTokens: Int, prefixCacheHitTokens: Int = 0,
@@ -681,59 +407,23 @@ public struct CBv2Usage: Sendable {
     }
 }
 
-/// Engine-local prefix-cache result. The provider maps this to its wire
-/// receipt vocabulary after combining it with SSD staging policy/outcomes.
 public enum CBv2PrefixCacheOutcome: Sendable, Equatable {
-    /// Prefix caching was not configured for this engine/request.
     case disabled
-    /// Lookup/adoption was intentionally excluded (for example multimodal,
-    /// or a match whose mandatory recompute bound leaves no tokens to save).
     case skippedPolicy
-    /// Lookup ran and no in-memory entry matched.
     case miss
-    /// A matched prefix was successfully adopted and skipped real prefill.
     case hit
-    /// A match existed but the capacity ledger could not admit adoption.
     case skippedCapacity
-    /// A match existed but backend adoption failed for another reason.
     case adoptionFailed
 }
 
-/// Capacity snapshot for provider heartbeats (same field semantics as today,
-/// but numbers become truthful: actual bytes/tokens in use, not worst case).
 public struct CBv2CapacitySnapshot: Sendable {
     public var activeRequests: Int
     public var waitingRequests: Int
     public var kvBytesInUse: Int
-    /// The ADMISSION ceiling (runtime-resizable soft ledger). On the
-    /// contiguous backend this equals the backend's capacity (resize fans
-    /// out to both); on the paged backend a re-slice moves only this
-    /// ledger — the physically preallocated slabs stay at
-    /// `kvBytesBackendCapacity`.
     public var kvBytesCapacity: Int
-    /// The backend's PHYSICAL byte capacity (paged: pageCount × pageBytes
-    /// over all groups, construction-fixed; contiguous: == the admission
-    /// ceiling). Capacity planning binds to min(kvBytesCapacity, this)
-    /// ONLY WHEN THIS IS NONZERO — after a ledger GROW past pool truth the
-    /// pool is what actually admits. 0 means UNKNOWN (snapshots built
-    /// through the backwards-compatible initializer, e.g. test stubs) and
-    /// must never be read as zero capacity.
     public var kvBytesBackendCapacity: Int
-    /// Bytes NOT available for new admissions: the backend's admission
-    /// truth — bytes PROMISED to admitted sequences (the paged pool's
-    /// atomic worst-case page charges; the contiguous backend's per-row
-    /// `max(allocated, reservation)`) — PLUS the compiled decode path's
-    /// live padding carve (`AdmissionV2.bytesExternallyReserved`, 0 after
-    /// a warmup refund and always 0 on paged backends, where compiled
-    /// decode is vetoed). `kvBytesInUse` lags this — storage materializes
-    /// lazily as tokens are written — so capacity planning (provider
-    /// heartbeats) must subtract RESERVED, not in-use, or several
-    /// admitted-but-cold requests look like free headroom.
     public var kvBytesReserved: Int
     public var activeTokens: Int
-    /// Monotonic count of engine steps executed. Providers use this as a
-    /// direct liveness/wedge signal (a stalled engine stops incrementing)
-    /// instead of proxying via event counts.
     public var stepsExecuted: Int
     public init(
         activeRequests: Int, waitingRequests: Int, kvBytesInUse: Int, kvBytesCapacity: Int,
@@ -753,89 +443,36 @@ public struct CBv2CapacitySnapshot: Sendable {
 
 // MARK: - Prefix cache
 
-/// Content-addressed prefix cache over per-sequence KV snapshots.
-/// Keys are SHA-256 chain hashes at fixed block granularity (256 tokens),
-/// compatible with the existing on-disk checkpoint tier.
-///
-/// `Sendable`: implementations MUST be thread-safe — lookup runs on submit
-/// threads while donation runs on the engine's donation queue by design.
 public protocol CBv2PrefixCache: AnyObject, Sendable {
-    /// Longest cached prefix for `tokens`, in whole blocks.
-    /// Returns nil or (matchedTokenCount, per-layer snapshots for
-    /// full-attention layers; windowed layers are always nil — the engine
-    /// recomputes the trailing `window` tokens for those layers).
-    ///
-    /// PIN BALANCE: a successful lookup MAY take an in-use pin on the
-    /// matched entry (pinning implementations never evict pinned entries).
-    /// The caller MUST balance every hit with exactly one
-    /// `endAdoption(tokens:matched:)` once the adoption is consumed or
-    /// abandoned — on every path, including rejection and shutdown —
-    /// or the entry leaks as unevictable.
     func lookup(tokens: [Int], layerKinds: [CBv2LayerKind])
         -> (matched: Int, prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?])?
-    /// Donate a finished request's state. Zero-copy move; the cache owns the
-    /// arrays afterwards. Must be called OFF the engine step thread.
     func donate(
         tokens: [Int], state: [CBv2SequenceKV?], layerKinds: [CBv2LayerKind])
-    /// Pre-snapshotted donation (the engine-integration path): per-layer
-    /// snapshots are graph-built on the ENGINE thread — consistent with
-    /// in-flight writes to shared storage (paged slabs) — and donated here
-    /// from the engine's donation queue. Windowed / KV-shared layers are
-    /// nil. Same indexing semantics as `donate(tokens:state:layerKinds:)`.
     func donate(
         tokens: [Int],
         snapshots: [(keys: MLXArray, values: MLXArray, offset: Int)?],
         layerKinds: [CBv2LayerKind])
-    /// Release the in-use pin taken by a successful `lookup` once adoption
-    /// has completed (or been abandoned). `matched` is the matched token
-    /// count that `lookup` returned for these `tokens`. Pinned entries are
-    /// never evicted, so every `lookup` hit MUST be balanced by exactly one
-    /// `endAdoption`. Default: no-op (for caches that do not pin).
     func endAdoption(tokens: [Int], matched: Int)
-    /// Evict to fit `byteBudget`. LRU.
     func evict(toFit byteBudget: Int)
     var bytesInUse: Int { get }
 
     // MARK: Per-request salt scope (TB-007; additive, D§2 follow-up)
 
-    /// Salted `lookup`: a non-nil `cacheSalt` replaces the cache-level salt
-    /// in the key chain's first block hash, so different salts can never
-    /// resolve each other's entries; nil behaves exactly like the unsalted
-    /// overload. Every hit is balanced with `endAdoption(...cacheSalt:)`
-    /// carrying the SAME salt. Default: ignores the salt (delegates to the
-    /// unsalted method), so pre-salt implementations stay conformant.
     func lookup(tokens: [Int], layerKinds: [CBv2LayerKind], cacheSalt: String?)
         -> (matched: Int, prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?])?
-    /// Request-correlated salted lookup. Engine integrations use one stable
-    /// correlation identity for both this lookup and its balancing
-    /// `endAdoption`, allowing durable-cache bridges to bind any staging pin
-    /// or ticket to the exact request even when multiple requests carry an
-    /// identical token prefix. The default delegates to the legacy salted
-    /// overload, preserving existing conformers.
     func lookup(
         requestID: CBv2RequestID, tokens: [Int], layerKinds: [CBv2LayerKind],
         cacheSalt: String?
     ) -> (matched: Int, prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?])?
-    /// Salted pre-snapshotted donation; same semantics as the unsalted
-    /// overload with the entry indexed under the request's salt scope.
     func donate(
         tokens: [Int],
         snapshots: [(keys: MLXArray, values: MLXArray, offset: Int)?],
         layerKinds: [CBv2LayerKind], cacheSalt: String?)
-    /// Request-correlated salted donation. Engine integrations use this for
-    /// both early and terminal donations so asynchronous durable-cache
-    /// settlement can be bound to the exact originating request. The
-    /// default delegates to the legacy salted overload, preserving existing
-    /// conformers that do not need correlation.
     func donate(
         requestID: CBv2RequestID, tokens: [Int],
         snapshots: [(keys: MLXArray, values: MLXArray, offset: Int)?],
         layerKinds: [CBv2LayerKind], cacheSalt: String?)
-    /// Salted pin release; must carry the salt the balancing `lookup` used.
     func endAdoption(tokens: [Int], matched: Int, cacheSalt: String?)
-    /// Request-correlated salted pin release. `requestID` must equal the
-    /// identity passed to the lookup that created this pin. The default
-    /// delegates to the legacy salted overload.
     func endAdoption(
         requestID: CBv2RequestID, tokens: [Int], matched: Int, cacheSalt: String?)
 }
@@ -885,13 +522,6 @@ extension CBv2PrefixCache {
     }
 }
 
-/// Conservative replay length R for rebuilding finite-window rows.
-///
-/// Each windowed layer can extend the inexact replay frontier by at most the
-/// largest configured window, so `windowed-layer count × largest window` is a
-/// model-shape-only upper bound, clamped to M. Interleaved hybrids use the same
-/// R, but their storage-owning full rows must remain frozen through M; replayed
-/// projections must never overwrite the exact cached full K/V.
 public func cbv2RequiredRecompute(layerKinds: [CBv2LayerKind], matched: Int) -> Int {
     guard matched > 0 else { return 0 }
     var maxWindow = 0
@@ -910,30 +540,9 @@ public func cbv2RequiredRecompute(layerKinds: [CBv2LayerKind], matched: Int) -> 
 
 // MARK: - Engine public API (what the provider binds to)
 
-/// Packed-prefill EVIDENCE: what the engine is allowed to do, and what it
-/// actually did.
-///
-/// `EngineLoopV2.executeMixed` coalesces equal-length text prompt chunks
-/// into one rectangular `[B > 1, chunk]` forward when BOTH capability gates
-/// agree (`CBv2LayerCacheProvider.supportsPackedPrefill` and
-/// `CBv2PackedPrefillSteppableModel.supportsPackedPrefill`). Those gates are
-/// CONFIGURATION: a model may claim rectangular safety and still never pack
-/// — one row per step, unequal chunk lengths, or span-bearing chunks all
-/// keep the per-request `[1, chunk]` path. `rowsExecuted` / `groupsExecuted`
-/// are the only fields that prove the path RAN; they are incremented at the
-/// packed forward itself and stay zero otherwise, whatever `isSupported`
-/// says. Callers gating a parity claim on packed prefill MUST read the
-/// counters, never `isSupported` alone.
-///
-/// MTP round steps never pack (their chunked prefills stay per-request), so
-/// the counters describe the plain-decode prefill path only.
 public struct CBv2PackedPrefillActivity: Sendable, Equatable {
-    /// Both gates answer true, so the engine MAY pack. Configuration.
     public let isSupported: Bool
-    /// Cumulative prompt rows carried by a rectangular packed forward.
     public let rowsExecuted: Int
-    /// Cumulative rectangular forwards issued; `rowsExecuted` counts the
-    /// rows inside them, so `rowsExecuted >= 2 * groupsExecuted`.
     public let groupsExecuted: Int
 
     public init(isSupported: Bool, rowsExecuted: Int, groupsExecuted: Int) {
@@ -942,147 +551,40 @@ public struct CBv2PackedPrefillActivity: Sendable, Equatable {
         self.groupsExecuted = groupsExecuted
     }
 
-    /// The measured answer: at least one rectangular forward happened.
     public var didExecute: Bool { groupsExecuted > 0 }
 
-    /// Fail-closed default for engines with no packed-prefill path.
     public static let none = CBv2PackedPrefillActivity(
         isSupported: false, rowsExecuted: 0, groupsExecuted: 0)
 }
 
-/// `Sendable`: engine handles cross concurrency domains by design (the
-/// provider submits from request tasks, cancels from disconnect handlers,
-/// and reads capacity from heartbeat timers). Implementations synchronize
-/// internally (EngineV2 is engine-queue + lock confined) rather than being
-/// value-isolated, hence `@unchecked Sendable` conformances downstream.
 public protocol CBv2Engine: AnyObject, Sendable {
-    /// Submit a request; events stream until `.finished`.
-    /// Throws CBv2KVError.capacityExhausted when admission fails (the
-    /// provider maps this to 429/503 exactly as today).
     func submit(_ request: CBv2Request) throws -> AsyncStream<CBv2Event>
-    /// Cancel promptly: in-flight step completes, row is dropped O(1).
     func cancel(_ id: CBv2RequestID)
     func capacity() -> CBv2CapacitySnapshot
-    /// Packed-prefill capability AND cumulative execution evidence. Cheap
-    /// (plain counter reads); safe to poll from a benchmark harness or
-    /// heartbeat. Fail-closed default: `.none`.
     func packedPrefillActivity() -> CBv2PackedPrefillActivity
-    /// Update the engine's KV byte budget at runtime (multi-model
-    /// co-residency re-slicing). Fans out to the admission ledger and the
-    /// KV backend; safe from any thread. Shrink leaves in-flight
-    /// reservations untouched — new admissions fail until the pool drains
-    /// below the new ceiling; grow admits immediately. Default no-op for
-    /// engines without a resizable KV budget.
     func updateKVBytesCapacity(_ bytes: Int)
-    /// Graceful drain: finish running requests, reject new submissions.
     func shutdown() async
-    /// Teacher-forced top-1 scoring: force `continuation` through the
-    /// engine and return the ARGMAX at each continuation position.
-    ///
-    /// Backend parity is what this exists for. Comparing two arms by FREE
-    /// RUNNING is only valid up to their first disagreement — past it each
-    /// arm is reading its own context and every later position compares two
-    /// unrelated conversations, so a harness can report a first-flip index
-    /// but must refuse to compute an agreement RATE. Under teacher forcing
-    /// both arms score position `i` against the IDENTICAL context
-    /// `promptTokens + continuation[0..<i]`, so agreement is a real rate
-    /// over `continuation.count` comparable positions, and the threshold
-    /// can come from a control arm instead of a chosen number.
-    ///
-    /// Contract: the engine MUST consume `continuation` through its normal
-    /// path — same caches, same chunking, same masks. Scoring positions
-    /// outside the engine measures the MODEL, and the model is the one
-    /// thing the two backends share. Argmax only (returning logits would
-    /// make this the logit-digest seam with extra steps), and deterministic
-    /// by construction: no sampler, no temperature, no top-k.
-    ///
-    /// Returns exactly `continuation.count` ids. `result[0]` is the argmax
-    /// after the prompt alone; `result[i]` the argmax once
-    /// `continuation[i - 1]` has been forced in. Forcing a continuation the
-    /// engine would itself have produced therefore returns it unchanged.
-    ///
-    /// Fail-closed default: throws `CBv2TeacherForcingError.unsupported`.
     func teacherForcedTop1(promptTokens: [Int], continuation: [Int]) throws -> [Int]
-    /// Fingerprint of the FINAL-POSITION prefill logit vector for
-    /// `promptTokens`, taken on this engine's own prefill path.
-    ///
-    /// Backend parity is what this exists for. `submit` yields tokens, text
-    /// and top-k logprobs; a top-k slice cannot reconstruct a full vector,
-    /// and calling the model directly bypasses the engine — which is the
-    /// thing under test. So the digest is taken where the engine's prompt
-    /// frontier actually produces logits: same caches, same chunking, same
-    /// masks, same backend.
-    ///
-    /// A digest rather than the vector, because this keeps tensors out of
-    /// the protocol and is cheap enough to call once per arm: gemma-4's
-    /// vocabulary is 262,144, so returning the vector would be 512 KB per
-    /// call at fp16.
-    ///
-    /// Fail-closed default: throws `CBv2PrefillLogitDigestError.unsupported`.
     func prefillLogitDigest(_ promptTokens: [Int]) throws -> CBv2PrefillLogitDigest
-    /// Cumulative EVIDENCE that teacher-forced scoring drove real engine
-    /// forwards, not a shortcut that produced the same shape of answer.
-    /// Cheap (plain counter reads). Fail-closed default: `.none`.
     func teacherForcedScoringActivity() -> CBv2TeacherForcedScoringActivity
 }
 
 extension CBv2Engine {
     public func updateKVBytesCapacity(_ bytes: Int) {}
-    /// An engine with no packed-prefill path reports neither capability nor
-    /// execution.
     public func packedPrefillActivity() -> CBv2PackedPrefillActivity { .none }
 }
 
 // MARK: - Teacher-forced top-1 scoring (backend parity measurement)
 
-/// Rejections from `CBv2Engine.teacherForcedTop1(promptTokens:continuation:)`.
-///
-/// Every case is a REFUSAL to produce a number. A parity harness divides
-/// agreements by positions scored; a seam that answered `[]`, or scored a
-/// truncated range, or silently fell back to free running would hand it a
-/// rate that reads like a measurement and is not one. Scoring either ran
-/// end to end on the engine or it throws.
 public enum CBv2TeacherForcingError: Error, Equatable {
-    /// This engine has no teacher-forced scoring path. Thrown by the
-    /// fail-closed protocol default: an unimplemented seam must never be
-    /// mistaken for a measured 100% agreement.
     case unsupported(engine: String)
-    /// Empty prompt or empty continuation — there are no positions to score.
     case nothingToScore(promptTokens: Int, continuation: Int)
-    /// Other requests are live. Scoring is refused not because it would be
-    /// unsafe — the row is bound alone, so batch composition cannot reach
-    /// its arithmetic — but because it would not be COMPARABLE: a contended
-    /// pool seats the row on different pages, and storage order is exactly
-    /// the drift a parity harness is measuring. Score on a quiet engine or
-    /// do not score.
     case engineBusy(scheduledRequests: Int)
-    /// The engine is shut down or draining: no forward will run.
     case engineNotRunning
 }
 
-/// Teacher-forced scoring EXECUTION evidence — what the engine RAN, never
-/// what a caller asked for.
-///
-/// `teacherForcedTop1` returns `continuation.count` ids whatever produced
-/// them: the engine's own chunked prefill plus one forward per forced
-/// token, an offline batched scoring pass, or a reference implementation
-/// that never touched a KV page. Only the first measures the ENGINE, which
-/// is the one thing the two backends do not share. These counters move at
-/// the forwards themselves, so the identity a harness should assert across
-/// one call is exact:
-///
-/// ```
-/// after.decodeForwardsExecuted - before.decodeForwardsExecuted
-///     == continuation.count - 1
-/// ```
-///
-/// A shortcut leaves them flat while still returning a plausible rate.
 public struct CBv2TeacherForcedScoringActivity: Sendable, Equatable {
-    /// Cumulative prompt chunks driven through the engine's prefill seam.
     public let prefillChunksExecuted: Int
-    /// Cumulative `[1, 1]` decode forwards issued for FORCED tokens. One
-    /// per continuation position except the last, whose logits would score
-    /// past the measured range.
     public let decodeForwardsExecuted: Int
 
     public init(prefillChunksExecuted: Int, decodeForwardsExecuted: Int) {
@@ -1090,60 +592,28 @@ public struct CBv2TeacherForcedScoringActivity: Sendable, Equatable {
         self.decodeForwardsExecuted = decodeForwardsExecuted
     }
 
-    /// The measured answer: at least one prompt chunk really ran.
     public var didExecute: Bool { prefillChunksExecuted > 0 }
 
-    /// Fail-closed default for engines with no teacher-forced path.
     public static let none = CBv2TeacherForcedScoringActivity(
         prefillChunksExecuted: 0, decodeForwardsExecuted: 0)
 }
 
 extension CBv2Engine {
-    /// Fail-closed: an engine with no teacher-forced scoring path REFUSES.
-    /// The alternative defaults are all worse than an error — `[]` divides
-    /// to a vacuous 100%, echoing `continuation` back reports perfect
-    /// agreement for two arms that were never run, and free running
-    /// reintroduces exactly the post-flip incomparability this seam exists
-    /// to remove. A capability that never executed must not be readable as
-    /// a measurement.
     public func teacherForcedTop1(promptTokens: [Int], continuation: [Int]) throws -> [Int] {
         throw CBv2TeacherForcingError.unsupported(engine: String(describing: type(of: self)))
     }
 }
 
 extension CBv2Engine {
-    /// An engine with no teacher-forced scoring path reports no execution.
     public func teacherForcedScoringActivity() -> CBv2TeacherForcedScoringActivity { .none }
 }
 
 // MARK: - Prefill logit digest (backend parity measurement)
 
-/// Fingerprint of ONE engine's final-position prefill logit vector.
-///
-/// `sha256` is over the RAW BYTES of that vector in the MODEL's dtype — no
-/// upcast, no rounding, no host-side renormalization. Two arms that agree
-/// here agreed bit-for-bit at the prompt frontier; two that disagree
-/// disagreed somewhere upstream of sampling, which is the half of a
-/// divergence a token stream cannot separate.
-///
-/// `dtype` is the RESOLVED dtype the digest was taken in, never a requested
-/// one: a bf16 model reporting `"float32"` would mean the seam upcast
-/// behind the caller's back and the hash describes something the engine
-/// never computed. `count` and `maxAbs` exist so a mismatch can be SIZED
-/// rather than merely flagged — a differing `count` is a vocabulary or
-/// shape defect, an order-of-magnitude `maxAbs` gap is a scale defect, and
-/// equal `count`/`maxAbs` with differing `sha256` is the numerical-drift
-/// case this whole gate was built to distinguish.
 public struct CBv2PrefillLogitDigest: Sendable, Equatable {
-    /// Resolved MLX dtype name of the digested vector ("bfloat16",
-    /// "float16", "float32", …). Reported, never requested.
     public let dtype: String
-    /// Elements in the digested vector — the model's vocabulary size.
     public let count: Int
-    /// Lowercase hex SHA-256 over `count * itemSize` raw bytes.
     public let sha256: String
-    /// max(|logit|) over the vector, read in fp32 (a widening conversion
-    /// from every supported dtype, so this loses nothing).
     public let maxAbs: Float
 
     public init(dtype: String, count: Int, sha256: String, maxAbs: Float) {
@@ -1154,33 +624,14 @@ public struct CBv2PrefillLogitDigest: Sendable, Equatable {
     }
 }
 
-/// Rejections from `CBv2Engine.prefillLogitDigest(_:)`.
-///
-/// Every case is a REFUSAL to produce a digest. A fabricated one — the hash
-/// of an empty buffer, of a zero vector, of a re-run outside the engine —
-/// would compare EQUAL across two arms and read as parity. The digest was
-/// taken on the engine's prefill path or this throws.
 public enum CBv2PrefillLogitDigestError: Error, Equatable {
-    /// This engine has no prefill-digest path. Thrown by the fail-closed
-    /// protocol default.
     case unsupported(engine: String)
-    /// No prompt, so no frontier position exists to digest.
     case emptyPrompt
-    /// The probe prefill never reached a sampled prompt frontier within
-    /// `seconds` — a wedged step, a rejected admission, or a cancelled row.
-    /// No digest is invented for it.
     case prefillProducedNoLogits(seconds: Double)
-    /// The frontier handed back something that is not a single logit
-    /// vector. Hashing it anyway would produce a stable, comparable, wrong
-    /// answer.
     case unexpectedLogitShape([Int])
 }
 
 extension CBv2Engine {
-    /// Fail-closed: an engine with no prefill-digest path REFUSES. Every
-    /// alternative default is worse than an error — a digest of nothing is
-    /// still a digest, and two engines that both fabricated one compare
-    /// EQUAL, which is precisely the false PASS this seam replaces.
     public func prefillLogitDigest(_ promptTokens: [Int]) throws -> CBv2PrefillLogitDigest {
         throw CBv2PrefillLogitDigestError.unsupported(
             engine: String(describing: type(of: self)))

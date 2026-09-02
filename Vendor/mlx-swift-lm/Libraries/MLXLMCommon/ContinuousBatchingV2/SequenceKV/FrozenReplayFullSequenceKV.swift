@@ -7,13 +7,6 @@
 import Foundation
 import MLX
 
-/// Full-attention row with independent logical and physical frontiers.
-///
-/// During `[C, M)` updates, newly projected K/V is deliberately ignored:
-/// attention reads the exact cached prefix through the current chunk end.
-/// This prevents incomplete sliding-window replay activations from poisoning
-/// persistent downstream full-attention state. Chunks must not cross M; the
-/// scheduler enforces that boundary from the same `CBv2PrefixReusePlan`.
 public final class CBv2FrozenReplayFullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
     public private(set) var absoluteOffset: Int
     public var retainedCount: Int { absoluteOffset }
@@ -54,8 +47,6 @@ public final class CBv2FrozenReplayFullSequenceKV: CBv2SequenceKV, CBv2InnerStat
         self.maxLength = maxLength
         self.kvHeads = kvHeads
         self.headDim = headDim
-        // Ownership transfer: retain the staged arrays directly. No adoption
-        // copy, append buffer, rotation, or reallocation occurs before M.
         self.keys = snapshot.keys
         self.values = snapshot.values
         self.capacity = snapshot.offset
@@ -161,8 +152,6 @@ public final class CBv2FrozenReplayFullSequenceKV: CBv2SequenceKV, CBv2InnerStat
         guard needed > capacity else { return }
         let target: Int
         if capacity == frozenHighWater {
-            // Adoption reserved M + initialSlack before publication. The first
-            // append must not jump to 2*M and outrun that physical promise.
             target = max(needed, frozenHighWater + CBv2FullSequenceKV.initialSlack)
         } else {
             target = max(capacity * 2, needed)

@@ -136,7 +136,7 @@ private let gemma4LongPrefillChunkEvalLayers: Int = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL_LONG"],
         let value = Int(raw), value >= 0
-    else { return 3 }
+    else { return 2 }
     return value
 }()
 
@@ -1440,6 +1440,369 @@ private func gemma4FusedQKVNormHeadMajorSliding(
     return (outputs[0], outputs[1], outputs[2], fusedRope)
 }
 
+/// QKV-CONCAT-DEQ-GEMM-001: the twin of `gemma4_qkv_rms_norm_head_major_v2`
+/// that reads Q and K out of ONE `[B, L, PITCH]` projection plane — the
+/// concatenated dequantized-plane GEMM's product — instead of two separate
+/// `[B, L, N]` tensors. Only the input addressing changes: a row's D values
+/// sit at `qkv + token * PITCH + bank offset + h * D` instead of
+/// `bank + row * D`. The row enumeration, every arithmetic statement, the
+/// reduction tree and the output addressing are the base kernel's, line for
+/// line, so each row reads the same D values in the same order.
+private let gemma4QKVNormPrefillConcatKernel = MLXFast.metalKernel(
+    name: "gemma4_qkv_rms_norm_head_major_qkvcat_v1",
+    inputNames: [
+        "qkv", "q_weight", "k_weight",
+        "position_offsets", "rope_freqs",
+    ],
+    outputNames: ["q_out", "k_out", "v_out"],
+    source: """
+        constexpr uint reads = 4;
+        constexpr uint row_threads = D / reads;
+        const uint tid = thread_position_in_threadgroup.x;
+        const uint slot = tid / row_threads;
+        const uint lid = tid - slot * row_threads;
+        const uint row = threadgroup_position_in_grid.x * RPT + slot;
+        const uint lane = thread_index_in_simdgroup;
+        const uint row_simd = lid / 32;
+
+        threadgroup float partials[RPT][32];
+        threadgroup float inv_rms[RPT];
+        threadgroup T rounded[RPT][D];
+        threadgroup uint row_position[RPT];
+
+        const device T* input = qkv;
+        const device T* weight = q_weight;
+        device T* output = q_out;
+        // Held inside the V allocation on Q rows, which never dereference it.
+        device T* value_output = v_out;
+        bool is_key = false;
+
+        if (row < TOTAL_ROWS) {
+            if (row < Q_ROWS) {
+                const uint b = row / (LQ * HQ);
+                const uint rem = row - b * (LQ * HQ);
+                const uint l = rem / HQ;
+                const uint h = rem - l * HQ;
+                row_position[slot] = l;
+                // Token (b, l) of the concatenated plane, Q bank, head h.
+                input = qkv + ((size_t)b * LQ + l) * PITCH + Q_OFF + h * D;
+                output = q_out + (((size_t)b * HQ + h) * LQ + l) * D;
+            } else {
+                is_key = true;
+                const uint krow = row - Q_ROWS;
+                const uint b = krow / (LK * HK);
+                const uint rem = krow - b * (LK * HK);
+                const uint l = rem / HK;
+                const uint h = rem - l * HK;
+                row_position[slot] = l;
+                const size_t off = (((size_t)b * HK + h) * LK + l) * D;
+                // Token (b, l) of the concatenated plane, K bank, head h.
+                input = qkv + ((size_t)b * LK + l) * PITCH + K_OFF + h * D;
+                weight = k_weight;
+                output = k_out + off;
+                value_output += off;
+            }
+        }
+
+        input += lid * reads;
+        device T* output_row = output;
+        output += lid * reads;
+        weight += lid * reads;
+        value_output += lid * reads;
+
+        float sum = 0.0f;
+        if (row < TOTAL_ROWS) {
+            for (uint i = 0; i < reads; ++i) {
+                const float value = float(input[i]);
+                sum += value * value;
+            }
+        }
+        sum = simd_sum(sum);
+
+        // Slots 2..31 stay exactly zero, so the 32-lane combine returns the
+        // two simdgroup partials' sum whatever order the tree adds them in.
+        if (row_simd == 0) partials[slot][lane] = 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) partials[slot][row_simd] = sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (row_simd == 0) {
+            sum = simd_sum(partials[slot][lane]);
+            if (lane == 0) {
+                inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (row >= TOTAL_ROWS) return;
+        const float inverse_rms = inv_rms[slot];
+        for (uint i = 0; i < reads; ++i) {
+            const T normalized = T(float(input[i]) * inverse_rms);
+            if (APPLY_ROPE) {
+                // Stage the weighted norm AS T first — the BF16 memory
+                // boundary the separate norm kernel's output store performed
+                // before stock RoPE read it.
+                rounded[slot][lid * reads + i] = T(weight[i] * normalized);
+            } else {
+                output[i] = weight[i] * normalized;
+            }
+            // K rows also carry V: same raw input, same normalizer, and
+            // `RMSNormNoScale`'s own final expression.
+            if (is_key) {
+                value_output[i] = T(1) * normalized;
+            }
+        }
+        if (APPLY_ROPE) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (APPLY_ROPE && lid * reads < D / 2) {
+            const uint b = row < Q_ROWS
+                ? row / (LQ * HQ)
+                : (row - Q_ROWS) / (LK * HK);
+            const float L =
+                static_cast<float>(row_position[slot] + position_offsets[b]);
+            for (uint i = 0; i < reads; ++i) {
+                const uint pair = lid * reads + i;
+                const float inv_freq = 1.0f / rope_freqs[pair];
+                const float theta = L * inv_freq;
+                const float costheta = metal::fast::cos(theta);
+                const float sintheta = metal::fast::sin(theta);
+                const float x1 = static_cast<float>(rounded[slot][pair]);
+                const float x2 = static_cast<float>(rounded[slot][pair + D / 2]);
+                const float rx1 = x1 * costheta - x2 * sintheta;
+                const float rx2 = x1 * sintheta + x2 * costheta;
+                output_row[pair] = static_cast<T>(rx1);
+                output_row[pair + D / 2] = static_cast<T>(rx2);
+            }
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+/// QKV-CONCAT-DEQ-GEMM-001: the twin of
+/// `gemma4_qkv_rms_norm_head_major_sliding_v1` over ONE `[B, L, PITCH]`
+/// plane carrying the Q, K and V banks at compile-time column offsets. As
+/// above, only the input pointer changes; the row enumeration, the arithmetic
+/// and the output addressing are the base kernel's.
+private let gemma4QKVNormPrefillSlidingConcatKernel = MLXFast.metalKernel(
+    name: "gemma4_qkv_rms_norm_head_major_sliding_qkvcat_v1",
+    inputNames: [
+        "qkv", "q_weight", "k_weight",
+        "position_offsets", "rope_log2_base",
+    ],
+    outputNames: ["q_out", "k_out", "v_out"],
+    source: """
+        constexpr uint reads = 4;
+        constexpr uint row_threads = D / reads;
+        const uint tid = thread_position_in_threadgroup.x;
+        const uint slot = tid / row_threads;
+        const uint lid = tid - slot * row_threads;
+        const uint row = threadgroup_position_in_grid.x * RPT + slot;
+        const uint lane = thread_index_in_simdgroup;
+        const uint row_simd = lid / 32;
+
+        threadgroup float partials[RPT][32];
+        threadgroup float inv_rms[RPT];
+        threadgroup T rounded[RPT][D];
+        threadgroup uint row_position[RPT];
+
+        // One plane, three banks: the bank picks its column offset.
+        const device T* input = qkv;
+        const device T* weight = q_weight;
+        device T* output = q_out;
+        uint local_row = row;
+        bool weighted = true;
+        uint bank = Q_OFF;
+        if (row >= Q_ROWS + K_ROWS) {
+            output = v_out;
+            local_row = row - Q_ROWS - K_ROWS;
+            weighted = false;
+            bank = V_OFF;
+        } else if (row >= Q_ROWS) {
+            weight = k_weight;
+            output = k_out;
+            local_row = row - Q_ROWS;
+            bank = K_OFF;
+        }
+
+        if (row < TOTAL_ROWS) {
+            // Flat bank rows -> head-major [B, H, L, D] output slots; each
+            // bank carries its own head count and length.
+            const uint h_count = row < Q_ROWS ? HQ : HK;
+            const uint l_count = row < Q_ROWS ? LQ : LK;
+            const uint b = local_row / (l_count * h_count);
+            const uint rem = local_row - b * (l_count * h_count);
+            const uint l = rem / h_count;
+            const uint h = rem - l * h_count;
+            row_position[slot] = l;
+            output += (((size_t)b * h_count + h) * l_count + l) * D;
+            // Token (b, l) of the concatenated plane, this bank, head h.
+            input = qkv + ((size_t)b * l_count + l) * PITCH + bank + h * D;
+        }
+
+        input += lid * reads;
+        device T* output_row = output;
+        output += lid * reads;
+        weight += lid * reads;
+
+        float sum = 0.0f;
+        if (row < TOTAL_ROWS) {
+            for (uint i = 0; i < reads; ++i) {
+                const float value = float(input[i]);
+                sum += value * value;
+            }
+        }
+        sum = simd_sum(sum);
+
+        if (row_simd == 0) partials[slot][lane] = 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) partials[slot][row_simd] = sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (row_simd == 0) {
+            sum = simd_sum(partials[slot][lane]);
+            if (lane == 0) {
+                inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (row >= TOTAL_ROWS) return;
+        const float inverse_rms = inv_rms[slot];
+        for (uint i = 0; i < reads; ++i) {
+            const T normalized = T(float(input[i]) * inverse_rms);
+            if (APPLY_ROPE && weighted) {
+                // The BF16 memory boundary the separate norm kernel's
+                // output store performed before stock RoPE read it.
+                rounded[slot][lid * reads + i] = T(weight[i] * normalized);
+            } else {
+                output[i] = weighted ? weight[i] * normalized : T(1) * normalized;
+            }
+        }
+        if (APPLY_ROPE) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (APPLY_ROPE && weighted && lid * reads < D / 2) {
+            const uint h_count = row < Q_ROWS ? HQ : HK;
+            const uint l_count = row < Q_ROWS ? LQ : LK;
+            const uint b = local_row / (l_count * h_count);
+            const float L =
+                static_cast<float>(row_position[slot] + position_offsets[b]);
+            for (uint i = 0; i < reads; ++i) {
+                const uint pair = lid * reads + i;
+                const float d = static_cast<float>(pair) / static_cast<float>(D / 2);
+                const float inv_freq = metal::exp2(-d * rope_log2_base[0]);
+                const float theta = L * inv_freq;
+                const float costheta = metal::fast::cos(theta);
+                const float sintheta = metal::fast::sin(theta);
+                const float x1 = static_cast<float>(rounded[slot][pair]);
+                const float x2 = static_cast<float>(rounded[slot][pair + D / 2]);
+                const float rx1 = x1 * costheta - x2 * sintheta;
+                const float rx2 = x1 * sintheta + x2 * costheta;
+                output_row[pair] = static_cast<T>(rx1);
+                output_row[pair + D / 2] = static_cast<T>(rx2);
+            }
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+/// QKV-CONCAT-DEQ-GEMM-001: `gemma4FusedQKVNormHeadMajor` /
+/// `gemma4FusedQKVNormHeadMajorSliding` restated on the concatenated plane.
+/// The bank that is present (`valueOffset`) picks the twin; the guards are
+/// the base wrappers' guards on the plane's geometry, and the fused-RoPE
+/// decision is computed exactly as the base wrappers compute it. Returns
+/// `nil` off the plane, and the caller then reads the banks through views.
+private func gemma4FusedQKVNormHeadMajorConcat(
+    _ product: Gemma4PrefillQKVConcatV1.Product,
+    qWeight: MLXArray,
+    kWeight: MLXArray,
+    eps: Float,
+    positionOffsets: MLXArray,
+    ropeParameters: Gemma4QKVRopeParameters, applyRope: Bool
+) -> (q: MLXArray, k: MLXArray, v: MLXArray, appliedRope: Bool)? {
+    let qkv = product.qkv
+    let layout = product.layout
+    guard gemma4QKVNormPrefillEnabled, eps == 1.0e-6,
+        positionOffsets.dtype == .int32,
+        positionOffsets.size == qkv.dim(0),
+        qkv.dtype == .bfloat16, qkv.ndim == 3,
+        qWeight.dtype == .bfloat16, kWeight.dtype == .bfloat16,
+        qkv.dim(0) >= 1, qkv.dim(1) >= 1,
+        qkv.dim(2) == layout.pitch,
+        qkv.dim(0) * qkv.dim(1) >= 1024,
+        layout.heads == 16,
+        (layout.headDim == 256 && layout.kvHeads == 8)
+            || (layout.headDim == 512 && layout.kvHeads == 2),
+        qWeight.shape == [layout.headDim], kWeight.shape == [layout.headDim]
+    else { return nil }
+
+    let (batch, length) = (qkv.dim(0), qkv.dim(1))
+    let (hq, hk, dimension) = (layout.heads, layout.kvHeads, layout.headDim)
+    let qRows = batch * length * hq
+    let kRows = batch * length * hk
+    let rowThreads = dimension / 4
+    let rowsPerGroup = 512 / rowThreads
+    let outputShapes = [
+        [batch, hq, length, dimension], [batch, hk, length, dimension],
+        [batch, hk, length, dimension],
+    ]
+
+    if let valueOffset = layout.valueOffset {
+        // Sliding twin: three banks, base-route RoPE.
+        guard dimension == 256, hk == 8,
+            !ropeParameters.usesFrequencies,
+            ropeParameters.log2Base.dtype == .float32,
+            ropeParameters.log2Base.size == 1
+        else { return nil }
+        let rows = qRows + 2 * kRows
+        let groups = (rows + rowsPerGroup - 1) / rowsPerGroup
+        let fusedRope = gemma4QKVNormRopeEnabled && applyRope
+        let outputs = gemma4QKVNormPrefillSlidingConcatKernel(
+            [qkv, qWeight, kWeight, positionOffsets, ropeParameters.log2Base],
+            template: [
+                ("T", qkv.dtype), ("D", dimension), ("Q_ROWS", qRows),
+                ("K_ROWS", kRows), ("TOTAL_ROWS", rows), ("RPT", rowsPerGroup),
+                ("LQ", length), ("HQ", hq), ("LK", length), ("HK", hk),
+                ("PITCH", layout.pitch), ("Q_OFF", layout.queryOffset),
+                ("K_OFF", layout.keyOffset), ("V_OFF", valueOffset),
+                ("APPLY_ROPE", fusedRope),
+            ],
+            grid: (groups * rowsPerGroup * rowThreads, 1, 1),
+            threadGroup: (rowsPerGroup * rowThreads, 1, 1),
+            outputShapes: outputShapes,
+            outputDTypes: [qkv.dtype, qkv.dtype, qkv.dtype]
+        )
+        if fusedRope { CBv2EngageMark.once("qkv-norm-rope-prefill-sliding-qkvcat") }
+        return (outputs[0], outputs[1], outputs[2], fusedRope)
+    }
+
+    // K-eq-V twin: two banks, V rides the K reduction.
+    guard ropeParameters.frequencies.dtype == .float32 else { return nil }
+    let rows = qRows + kRows
+    let groups = (rows + rowsPerGroup - 1) / rowsPerGroup
+    let fusedRope = gemma4QKVNormRopeEnabled && applyRope
+        && ropeParameters.usesFrequencies
+        && ropeParameters.frequencies.size == dimension / 2
+    let outputs = gemma4QKVNormPrefillConcatKernel(
+        [qkv, qWeight, kWeight, positionOffsets, ropeParameters.frequencies],
+        template: [
+            ("T", qkv.dtype), ("D", dimension), ("Q_ROWS", qRows),
+            ("TOTAL_ROWS", rows), ("RPT", rowsPerGroup),
+            ("LQ", length), ("HQ", hq), ("LK", length), ("HK", hk),
+            ("PITCH", layout.pitch), ("Q_OFF", layout.queryOffset),
+            ("K_OFF", layout.keyOffset),
+            ("APPLY_ROPE", fusedRope),
+        ],
+        grid: (groups * rowsPerGroup * rowThreads, 1, 1),
+        threadGroup: (rowsPerGroup * rowThreads, 1, 1),
+        outputShapes: outputShapes,
+        outputDTypes: [qkv.dtype, qkv.dtype, qkv.dtype]
+    )
+    if fusedRope { CBv2EngageMark.once("qkv-norm-rope-prefill-qkvcat") }
+    return (outputs[0], outputs[1], outputs[2], fusedRope)
+}
+
 private func gemma4FusedQKVNorm(
     q: MLXArray, k: MLXArray, v: MLXArray,
     qWeight: MLXArray, kWeight: MLXArray, eps: Float,
@@ -1681,6 +2044,15 @@ private func gemma4AttentionFallback(
 /// `DARKBLOOM_GEMMA4_PREFILL_DEQ_GEMM=0` (also `false`/`no`/`off`) restores
 /// the quantized dispatch byte for byte. Engage mark: `prefill-deq-gemm`,
 /// fired at the site that builds the dequantize + GEMM graph.
+private enum Gemma4RouterDeqGEMMV1 {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_ROUTER_DEQ_GEMM"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+}
+
 private enum Gemma4PrefillDeqGEMMV1 {
     static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
@@ -1782,6 +2154,373 @@ private enum Gemma4PrefillDeqGEMMV1 {
     /// forces evaluation, so it is never set on a timed run).
     static let xcheck: Bool =
         ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_PREFILL_DEQ_GEMM_XCHECK"] == "1"
+}
+
+/// DENSE-GATEUP-CONCAT-001. On the prompt plane `Gemma4PrefillDeqGEMMV1`
+/// already serves (at least `minRows` activation rows), the dense MLP's gate
+/// and up projections are two separate steel GEMMs (N = 2112 each, K = 2816)
+/// that both stream the same [rows, 2816] bf16 activation plane. This road
+/// runs ONE GEMM with N = 4224 over a per-module concatenated [gate; up] bf16
+/// plane and hands the two column halves of its result to the same GeLU
+/// product as views (no copy).
+///
+/// Exactness.
+/// * The plane: affine dequantization is elementwise per (row, group), so the
+///   dequantized concatenation's rows 0..<N are the gate plane's rows and
+///   rows N..<2N the up plane's rows, bit for bit.
+/// * The GEMM (mlx/backend/metal/matmul.cpp): at this M (8192, or 8 x 1024
+///   collapsed into M at lines 895-904) and K (2816) the tile shape does not
+///   depend on N. The nax road takes bm 64 / bn 128 / bk 256 because K < 8192
+///   (lines 204-214); the non-nax road takes bm 64 / bn 64 / bk 16 through
+///   GEMM_TPARAM_MACRO (lines 88-169: 's' is the medium default at lines
+///   163-169, 'd' is the large-matmul branch at lines 110-117 since
+///   2 * max(M, N) > K). Neither split-K road engages: the non-nax gate (lines
+///   923-924) needs _tm * _tn <= 2048 and the plane has 512 x 132 (or 264)
+///   16-wide tiles; the nax gate (lines 946-948) needs K >= 3 * max(M, N) or
+///   max(M, N) <= 1024. So each output column is the same sequence of bk-wide
+///   MMA steps over K whatever N is: `align_N` (lines 234 / 393) only selects
+///   the bounds-checked B-tile load at the N edge (steel_gemm_fused.h line
+///   139, gemm_nax.h lines 112-118) and never touches the accumulation.
+///   Fast math is off for every JIT kernel (device.cpp line 631).
+/// * The GeLU product is the unchanged compiled graph; on the column-half
+///   views it takes the `_strided_` kernel variant (backend/metal/compiled.cpp
+///   line 372, contiguity test in backend/common/compiled.cpp lines 85-110),
+///   which indexes through `elem_to_loc` and copies nothing.
+///
+/// The concatenated plane is built lazily once per gate module and kept
+/// resident (bf16 [4224, 2816], 23.8 MB per MoE layer). Kill switch
+/// `DARKBLOOM_GEMMA4_PREFILL_DENSE_GATEUP_CONCAT=0` (also false/no/off)
+/// restores the two separate projections; every guard failure does the same.
+private enum Gemma4PrefillDenseGateUpConcatV1 {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_DENSE_GATEUP_CONCAT"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    nonisolated(unsafe) private static var planes: [ObjectIdentifier: MLXArray] = [:]
+    private static let lock = NSLock()
+
+    /// The resident [2N, K] bf16 plane of one gate/up pair, keyed by the gate
+    /// module. Built lazily: it is evaluated with the first prompt graph that
+    /// consumes it and holds its buffer from then on.
+    private static func plane(
+        gate: QuantizedLinear, gateBiases: MLXArray,
+        up: QuantizedLinear, upBiases: MLXArray
+    ) -> MLXArray {
+        let key = ObjectIdentifier(gate)
+        lock.lock()
+        if let cached = planes[key] {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+        let built = MLX.dequantized(
+            MLX.concatenated([gate.weight, up.weight], axis: 0),
+            scales: MLX.concatenated([gate.scales, up.scales], axis: 0),
+            biases: MLX.concatenated([gateBiases, upBiases], axis: 0),
+            groupSize: gate.groupSize, bits: gate.bits, mode: gate.mode
+        ).transposed()
+        eval(built)
+        lock.lock()
+        defer { lock.unlock() }
+        if let cached = planes[key] { return cached }
+        planes[key] = built
+        return built
+    }
+
+    /// `gelu(gate(x)) * up(x)` through the one concatenated GEMM, or nil when
+    /// any guard fails (the caller then keeps the two separate projections).
+    @inline(__always)
+    static func apply(gate: Linear, up: Linear, _ x: MLXArray) -> MLXArray? {
+        guard enabled, Gemma4PrefillDeqGEMMV1.enabled,
+            let gateQ = gate as? QuantizedLinear,
+            let upQ = up as? QuantizedLinear,
+            gateQ.bias == nil, upQ.bias == nil,
+            gateQ.mode == .affine, upQ.mode == .affine,
+            gateQ.groupSize == 64, upQ.groupSize == 64,
+            gateQ.bits == 8, upQ.bits == 8,
+            x.dtype == .bfloat16, x.ndim >= 2,
+            gateQ.scales.dtype == .bfloat16, upQ.scales.dtype == .bfloat16,
+            let gateBiases = gateQ.biases, gateBiases.dtype == .bfloat16,
+            let upBiases = upQ.biases, upBiases.dtype == .bfloat16
+        else { return nil }
+        let inputDims = x.dim(-1)
+        guard inputDims > 0, x.size / inputDims >= Gemma4PrefillDeqGEMMV1.minRows
+        else { return nil }
+        let gateWeight = gateQ.weight
+        let upWeight = upQ.weight
+        guard gateWeight.ndim == 2, upWeight.ndim == 2,
+            gateWeight.dtype == .uint32, upWeight.dtype == .uint32,
+            gateWeight.shape == upWeight.shape,
+            gateWeight.dim(0) > 0,
+            gateWeight.dim(1) * (32 / 8) == inputDims,
+            gateQ.scales.shape == upQ.scales.shape,
+            gateBiases.shape == upBiases.shape
+        else { return nil }
+        CBv2EngageMark.once("prefill-dense-gateup-concat")
+        let plane = self.plane(
+            gate: gateQ, gateBiases: gateBiases, up: upQ, upBiases: upBiases)
+        let halves = MLX.split(MLX.matmul(x, plane), parts: 2, axis: -1)
+        let activated = gemma4GeluProduct(halves[0], halves[1])
+        if Gemma4PrefillDeqGEMMV1.xcheck,
+            let gateOnly = Gemma4PrefillDeqGEMMV1.apply(gate, x),
+            let upOnly = Gemma4PrefillDeqGEMMV1.apply(up, x)
+        {
+            // Local diagnostics only (never on the ranked path): the two
+            // separate projections and their GeLU product beside this road,
+            // counting differing bf16 words. An exact road reports zero.
+            let incumbent = gemma4GeluProduct(gateOnly, upOnly)
+            let differing = MLX.sum(
+                activated.view(dtype: .uint16) .!= incumbent.view(dtype: .uint16),
+                stream: .default)
+            eval(activated, incumbent, differing)
+            FileHandle.standardError.write(
+                Data(
+                    ("[xcheck] prefill-dense-gateup-concat rows \(x.size / inputDims) "
+                        + "K \(inputDims) N \(gateWeight.dim(0)) "
+                        + "differing \(differing.item(Int32.self))\n").utf8))
+        }
+        return activated
+    }
+}
+
+/// QKV-CONCAT-DEQ-GEMM-001 — one dequantized plane and one GEMM for the
+/// prompt road's Q, K (and V) projections.
+///
+/// On the road `Gemma4PrefillDeqGEMMV1` serves, every attention layer issues
+/// three `dequantized` + `matmul` pairs (q, k, v on sliding layers; q, k on
+/// the K-eq-V full layers) that all stream the same activation plane. Here
+/// the modules' packed words, scales and biases are concatenated ONCE per
+/// layer along the output axis (cached by the q_proj module's identity, the
+/// way the decode tier caches its fused Q|K planes), dequantized as one
+/// `[Nq+Nk(+Nv), K]` plane and multiplied in one GEMM; the head-major
+/// norm/RoPE twins then read the banks straight out of the `[B, L, Ntot]`
+/// product through compile-time column offsets, so nothing is sliced or
+/// copied.
+///
+/// Exactness.
+///   * Dequantize: `affine_dequantize` (kernels/quantized.h) computes each
+///     output element as `scale * nibble + bias` with the scale/bias row
+///     taken from `gindex = element / group_size`; row r of the concatenated
+///     plane is row r - offset of its source module beside that module's own
+///     scales/biases row, so every element is the identical expression over
+///     the identical operands. The concatenation re-lays out shipped words;
+///     nothing is re-quantized.
+///   * GEMM: the steel kernel accumulates each output column over K on its
+///     own (`BlockMMA::mma`, steel/gemm/mma.h: ascending 8-wide fragments
+///     inside ascending BK blocks), so a column's association never depends
+///     on N. Tile selection is N-independent at this geometry (metal/
+///     matmul.cpp): the NAX road fixes bn = 128 and takes bm/bk from M, K and
+///     the device only; the non-NAX road decides on `M*N >= 2^20` and
+///     `2*max(M,N) > K`, both settled by M = 8192 for every N here; split-K
+///     needs `K >= max(M, N)` or `K >= 3*max(M, N)`, false at K = 2816; and
+///     align_N holds for 8192/9216 as it does for 4096/2048/8192/1024. Column
+///     n of the fused product is therefore bit-identical to column n of the
+///     separate product.
+///   * Norm/RoPE: the twins keep every arithmetic statement, the row
+///     enumeration and the output addressing of the base kernels; only the
+///     input pointer changes, to `qkv + token * PITCH + OFF + h * D`.
+///
+/// Admission: the exact prompt road (`Gemma4PrefillDeqGEMMV1` on and at
+/// least its `minRows` activation rows; no last-query narrowing, so Q and K
+/// read the same activation), a non-shared-KV layer whose q/k(/v) modules
+/// are bias-free 4-bit affine group-64 `QuantizedLinear` over the same K,
+/// and the head-major twins' geometry (16 query heads; D 256 with 8 KV heads,
+/// or D 512 with 2 on K-eq-V layers). Anything else keeps the base's three
+/// calls byte for byte. Kill switch: `DARKBLOOM_GEMMA4_PREFILL_QKV_CONCAT=0`
+/// (also `false`/`no`/`off`). Engage mark: `prefill-qkv-concat`.
+///
+/// Memory: the cached packed concatenations are 12,976,128 bytes per
+/// sliding layer ([8192, 352] uint32 + two [8192, 44] bf16) and 14,598,144
+/// per full layer ([9216, 352] + two [9216, 44]) — 397,393,920 bytes
+/// (~379 MiB) over 25 + 5 layers. The dequantized plane is transient, as on
+/// the base road; a resident dequantized-plane cache would hold these
+/// concatenated planes in place of the per-module ones, not beside them.
+private enum Gemma4PrefillQKVConcatV1 {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_QKV_CONCAT"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Column layout of the `[B, L, pitch]` product.
+    struct Layout {
+        let heads: Int
+        let kvHeads: Int
+        let headDim: Int
+        let queryOffset: Int
+        let keyOffset: Int
+        /// Nil on K-eq-V layers (no V bank).
+        let valueOffset: Int?
+        let pitch: Int
+    }
+
+    struct Product {
+        let qkv: MLXArray
+        let layout: Layout
+
+        /// Bank views for the fallback road only: lazy strided slices that
+        /// are never evaluated when the concat twins consume the plane.
+        var queryBank: MLXArray {
+            qkv[0..., 0..., layout.queryOffset ..< (layout.queryOffset + layout.heads * layout.headDim)]
+        }
+        var keyBank: MLXArray {
+            qkv[0..., 0..., layout.keyOffset ..< (layout.keyOffset + layout.kvHeads * layout.headDim)]
+        }
+        var valueBank: MLXArray? {
+            guard let valueOffset = layout.valueOffset else { return nil }
+            return qkv[0..., 0..., valueOffset ..< (valueOffset + layout.kvHeads * layout.headDim)]
+        }
+    }
+
+    private struct Plane {
+        let weight: MLXArray
+        let scales: MLXArray
+        let biases: MLXArray
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var planes: [ObjectIdentifier: Plane] = [:]
+    nonisolated(unsafe) private static var dequantPlanes: [ObjectIdentifier: MLXArray] = [:]
+
+    private static func admitted(_ layer: Linear, inputDims: Int) -> QuantizedLinear? {
+        guard let quantized = layer as? QuantizedLinear,
+            quantized.bias == nil,
+            quantized.mode == .affine,
+            quantized.groupSize == 64,
+            quantized.bits == 4,
+            quantized.scales.dtype == .bfloat16,
+            let biases = quantized.biases, biases.dtype == .bfloat16,
+            quantized.weight.ndim == 2, quantized.weight.dtype == .uint32,
+            quantized.weight.dim(1) * 8 == inputDims,
+            quantized.scales.shape == [quantized.weight.dim(0), inputDims / 64],
+            biases.shape == quantized.scales.shape
+        else { return nil }
+        return quantized
+    }
+
+    static func project(
+        qProj: Linear, kProj: Linear?, vProj: Linear?, x: MLXArray,
+        heads: Int, kvHeads: Int, headDim: Int, eps: Float,
+        qWeight: MLXArray, kWeight: MLXArray?,
+        ropeParameters: Gemma4QKVRopeParameters
+    ) -> Product? {
+        guard enabled, Gemma4PrefillDeqGEMMV1.enabled, gemma4QKVNormPrefillEnabled,
+            let kProj, let kWeight,
+            x.dtype == .bfloat16, x.ndim == 3
+        else { return nil }
+        let inputDims = x.dim(2)
+        let rows = x.dim(0) * x.dim(1)
+        guard inputDims > 0, x.dim(0) >= 1, x.dim(1) >= 1,
+            rows >= Gemma4PrefillDeqGEMMV1.minRows,
+            // The twins' own floor (measured in the base wrappers).
+            rows >= 1024,
+            eps == 1.0e-6, heads == 16,
+            (headDim == 256 && kvHeads == 8) || (headDim == 512 && kvHeads == 2),
+            qWeight.dtype == .bfloat16, kWeight.dtype == .bfloat16,
+            qWeight.shape == [headDim], kWeight.shape == [headDim],
+            let q = admitted(qProj, inputDims: inputDims),
+            let k = admitted(kProj, inputDims: inputDims),
+            q.weight.dim(0) == heads * headDim,
+            k.weight.dim(0) == kvHeads * headDim
+        else { return nil }
+        var modules = [q, k]
+        if let vProj {
+            guard let v = admitted(vProj, inputDims: inputDims),
+                v.weight.dim(0) == kvHeads * headDim,
+                headDim == 256, kvHeads == 8,
+                !ropeParameters.usesFrequencies,
+                ropeParameters.log2Base.dtype == .float32,
+                ropeParameters.log2Base.size == 1
+            else { return nil }
+            modules.append(v)
+        } else {
+            guard ropeParameters.frequencies.dtype == .float32 else { return nil }
+        }
+        let widths = modules.map { $0.weight.dim(0) }
+        let total = widths.reduce(0, +)
+
+        let key = ObjectIdentifier(q)
+        lock.lock()
+        var plane = planes[key]
+        if plane == nil {
+            let w = concatenated(modules.map { $0.weight }, axis: 0)
+            let s = concatenated(modules.map { $0.scales }, axis: 0)
+            let b = concatenated(modules.map { $0.biases! }, axis: 0)
+            eval(w, s, b)
+            plane = Plane(weight: w, scales: s, biases: b)
+            planes[key] = plane
+        }
+        lock.unlock()
+        guard let plane else { return nil }
+
+        CBv2EngageMark.once("prefill-qkv-concat")
+        // DEQ-PLANE-CACHE-001 applied to this road: the concatenated
+        // dequantized plane is a pure function of the frozen words, scales
+        // and biases, so it is built once per layer and kept.
+        let dequant: MLXArray
+        if Gemma4PrefillDeqGEMMV1.cacheEnabled {
+            lock.lock()
+            let cached = dequantPlanes[key]
+            lock.unlock()
+            if let cached {
+                dequant = cached
+            } else {
+                let built = dequantized(
+                    plane.weight, scales: plane.scales, biases: plane.biases,
+                    groupSize: 64, bits: 4, mode: .affine
+                ).transposed()
+                eval(built)
+                lock.lock()
+                dequantPlanes[key] = built
+                lock.unlock()
+                dequant = built
+            }
+        } else {
+            dequant = dequantized(
+                plane.weight, scales: plane.scales, biases: plane.biases,
+                groupSize: 64, bits: 4, mode: .affine
+            ).transposed()
+        }
+        let qkv = MLX.matmul(x, dequant)
+        let layout = Layout(
+            heads: heads, kvHeads: kvHeads, headDim: headDim,
+            queryOffset: 0, keyOffset: widths[0],
+            valueOffset: widths.count == 3 ? widths[0] + widths[1] : nil,
+            pitch: total)
+        if Gemma4PrefillDeqGEMMV1.xcheck {
+            // Local diagnostics only: evaluate the base road's per-module
+            // dequantized-plane GEMM beside this one on the identical
+            // operands and count differing bf16 words per bank. An exact
+            // road reports zero on every call.
+            var offset = 0
+            for (index, module) in modules.enumerated() {
+                let width = widths[index]
+                let separate = MLX.matmul(
+                    x,
+                    dequantized(
+                        module.weight, scales: module.scales, biases: module.biases!,
+                        groupSize: 64, bits: 4, mode: .affine
+                    ).transposed())
+                let bank = qkv[0..., 0..., offset ..< (offset + width)].reshaped(-1)
+                let differing = MLX.sum(
+                    bank.view(dtype: .uint16)
+                        .!= separate.reshaped(-1).view(dtype: .uint16),
+                    stream: .default)
+                eval(qkv, separate, differing)
+                FileHandle.standardError.write(
+                    Data(
+                        ("[xcheck] prefill-qkv-concat bank \(index) rows \(rows) "
+                            + "K \(inputDims) N \(width) of \(total) "
+                            + "differing \(differing.item(Int32.self))\n").utf8))
+                offset += width
+            }
+        }
+        return Product(qkv: qkv, layout: layout)
+    }
 }
 
 // MARK: - Attention
@@ -2197,8 +2936,24 @@ private class Gemma4Attention: Module {
             (lastQueryCache == nil && !usesSharedKV
                 && (vProj == nil || gemma4QKFuseSlidingEnabled))
             ? fusedQKProjection(x, rsTable: qkvRunsumTable) : nil
+        // QKV-CONCAT-DEQ-GEMM-001: on the prompt road the layer's Q, K (and
+        // V) projections take ONE dequantized plane and ONE GEMM, and the
+        // head-major norm/RoPE twins read the banks straight out of the
+        // `[B, L, Ntot]` product. Decided here, before Q is projected, so the
+        // base's three tierProjection calls are never issued on this road;
+        // nil leaves every line below on the base road. `queryInput === x`
+        // is guaranteed by `lastQueryCache == nil`.
+        let qkvConcat: Gemma4PrefillQKVConcatV1.Product? =
+            (fusedQK == nil && lastQueryCache == nil && !usesSharedKV)
+            ? Gemma4PrefillQKVConcatV1.project(
+                qProj: qProj, kProj: kProj, vProj: vProj, x: x,
+                heads: nHeads, kvHeads: nKvHeads, headDim: effectiveHeadDim,
+                eps: config.rmsNormEps, qWeight: qNorm.weight, kWeight: kNorm?.weight,
+                ropeParameters: qkvRopeParameters)
+            : nil
         let queryRaw = (
-            fusedQK?.0 ?? tierProjection(qProj, queryInput, rsTable: qkvRunsumTable)
+            qkvConcat?.queryBank ?? fusedQK?.0
+                ?? tierProjection(qProj, queryInput, rsTable: qkvRunsumTable)
         ).reshaped(B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
@@ -2262,12 +3017,14 @@ private class Gemma4Attention: Module {
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
         let kRaw = (
-            fusedQK?.1 ?? tierProjection(kProj, x, rsTable: qkvRunsumTable)
+            qkvConcat?.keyBank ?? fusedQK?.1
+                ?? tierProjection(kProj, x, rsTable: qkvRunsumTable)
         ).reshaped(B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
         if let vProj {
-            vRaw = tierProjection(vProj, x, rsTable: qkvRunsumTable)
-                .reshaped(B, L, nKvHeads, effectiveHeadDim)
+            vRaw = (
+                qkvConcat?.valueBank ?? tierProjection(vProj, x, rsTable: qkvRunsumTable)
+            ).reshaped(B, L, nKvHeads, effectiveHeadDim)
         } else {
             vRaw = kRaw
         }
@@ -2276,7 +3033,18 @@ private class Gemma4Attention: Module {
         var k: MLXArray
         var v: MLXArray
         var appliedRope = false
-        if let normalized = gemma4FusedQKVNorm(
+        if let qkvConcat,
+            let concat = gemma4FusedQKVNormHeadMajorConcat(
+                qkvConcat, qWeight: qNorm.weight, kWeight: kNorm.weight,
+                eps: config.rmsNormEps, positionOffsets: capturedOffsets,
+                ropeParameters: qkvRopeParameters, applyRope: lastQueryCache == nil)
+        {
+            // QKV-CONCAT-DEQ-GEMM-001: one plane in, head-major banks out
+            // (transposes already applied). The bank views above are never
+            // evaluated on this road.
+            (queries, k, v) = (concat.q, concat.k, concat.v)
+            appliedRope = concat.appliedRope
+        } else if let normalized = gemma4FusedQKVNorm(
             q: queryRaw, k: kRaw, v: vRaw,
             qWeight: qNorm.weight, kWeight: kNorm.weight, eps: config.rmsNormEps,
             keyValueShared: vProj == nil, positionOffsets: capturedOffsets,
@@ -4128,8 +4896,17 @@ private class Gemma4Router: Module {
         MLXFast.rmsNorm(x, weight: zipEffectiveScale(), eps: eps)
     }
 
+    /// ROUTER-DEQ-GEMM-001: the prompt plane's router projection takes the
+    /// dequantized-plane GEMM road the other dense prompt projections take
+    /// (its row floor keeps decode and verify rectangles on `proj`).
     fileprivate func zipScores(_ normed: MLXArray) -> MLXArray {
-        proj(normed)
+        if Gemma4RouterDeqGEMMV1.enabled,
+            let scores = Gemma4PrefillDeqGEMMV1.apply(proj, normed)
+        {
+            CBv2EngageMark.once("prefill-router-deq-gemm")
+            return scores
+        }
+        return proj(normed)
     }
 
     fileprivate func zipPartition(_ expertScores: MLXArray) -> MLXArray {
@@ -4289,6 +5066,14 @@ private class Gemma4MLP: Module {
         _ x: MLXArray,
         activationSums producerSums: CBv2DenseMLPQMVV1.ActivationSums? = nil
     ) -> MLXArray {
+        // DENSE-GATEUP-CONCAT-001: the prompt plane takes one [gate; up] GEMM
+        // and the GeLU product over its column halves. Every other geometry,
+        // and the kill switch, keeps the two separate projections below.
+        if let activated = Gemma4PrefillDenseGateUpConcatV1.apply(
+            gate: gateProj, up: upProj, x)
+        {
+            return denseProjection(downProj, activated)
+        }
         // DMLP-002: one exact activation-sum prepass feeds both fallback
         // projections. If either projection is not the pinned affine8 cell,
         // the candidate arrays remain unevaluated and stock takes over.

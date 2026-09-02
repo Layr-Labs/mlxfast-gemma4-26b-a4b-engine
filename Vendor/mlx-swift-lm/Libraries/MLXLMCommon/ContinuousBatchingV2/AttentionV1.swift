@@ -741,12 +741,29 @@ enum CBv2AttentionV1 {
         var cachedValues: [MLXArray] = []
         cachedKeys.reserveCapacity(B)
         cachedValues.reserveCapacity(B)
-        for (index, row) in rows.enumerated() {
-            let (rowKeys, rowValues) = row.update(
-                keys: keys[index ..< (index + 1)],
-                values: values[index ..< (index + 1)])
-            cachedKeys.append(rowKeys)
-            cachedValues.append(rowValues)
+        // PACK-BATCH8. This loop is the layer-level hook the batched packer
+        // needs: it already sees all B rows' chunks — row-slices of the ONE
+        // `[B, kvHeads, L, D]` rectangle — before any of them is committed. On
+        // a sliding layer whose whole cohort seeds a full window, the only GPU
+        // work in each of the B commits is that row's pack dispatch, so one
+        // dispatch with the row on the grid's z axis does all B of them. Fails
+        // closed: any row refusing leaves every row on the established loop,
+        // with nothing mutated in between.
+        if let seeded = CBv2WindowedSequenceKV.seedWholeWindowRingBatch8(
+            rows: rows, keys: keys, values: values)
+        {
+            for (rowKeys, rowValues) in seeded {
+                cachedKeys.append(rowKeys)
+                cachedValues.append(rowValues)
+            }
+        } else {
+            for (index, row) in rows.enumerated() {
+                let (rowKeys, rowValues) = row.update(
+                    keys: keys[index ..< (index + 1)],
+                    values: values[index ..< (index + 1)])
+                cachedKeys.append(rowKeys)
+                cachedValues.append(rowValues)
+            }
         }
 
         if let batched = batchedPackedAttention(

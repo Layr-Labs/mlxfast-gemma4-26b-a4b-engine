@@ -192,6 +192,53 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
     /// don't immediately grow the buffer.
     static let initialSlack = 256
 
+    /// PREFILL-FULLKV-SEED. A row's FIRST prompt chunk on a full-attention
+    /// layer walks the same allocate-then-slice-update road the sliding ring
+    /// walked before PREFILL-RING-SEED, and the same two ops are dead by
+    /// construction on it.
+    ///
+    ///   1. The zero fill. `ensureCapacity`'s first branch builds the whole
+    ///      `[1, kvHeads, capacity, headDim]` allocation with `MLXArray.zeros`
+    ///      — a real `Full` DISPATCH over every slot — and the chunk that
+    ///      follows overwrites the leading `n` of them immediately. Only the
+    ///      `capacity - n` tail slots survive, and those are the slack slots
+    ///      the first decode steps will overwrite in turn.
+    ///   2. The slice update's DESTINATION copy. `SliceUpdate::eval_gpu`
+    ///      (`backend/metal/indexing.cpp`) opens with `copy_gpu(in, out, ...)`
+    ///      — the whole destination into the new buffer — before
+    ///      `copy_gpu_inplace` deposits the chunk. `copy_gpu` elides it only
+    ///      when `set_copy_output_data` finds the destination donatable
+    ///      (`CopyType::Vector` plus refcount one). A census of the ranked
+    ///      geometry says it IS donatable on every one of this path's writes,
+    ///      so that copy costs nothing there today; the seed removes the
+    ///      dependence on that donation rather than a measured cost.
+    ///
+    /// Seeding builds the storage out of the chunk instead: `contiguous` when
+    /// the chunk covers the allocation exactly, else the chunk concatenated
+    /// with a `capacity - n` zero tail on the token axis. `Concatenate` mallocs
+    /// the output and copies each input into its own slice
+    /// (`backend/metal/slicing.cpp`), so the seeded buffer holds the SAME
+    /// bytes in the SAME slots as the zero-fill-then-slice-update road: slot
+    /// `i < n` is token `i` of the chunk (`absoluteOffset == 0`, so the chunk
+    /// starts at slot 0) and every slot `>= n` is zero. The capacity itself is
+    /// computed with `ensureCapacity`'s own first-allocation rule, so the
+    /// allocation is the same size and later growth sees the same state.
+    ///
+    /// FAIL-CLOSED. Anything short of the exact identity keeps the established
+    /// road: a row already holding storage, a row migrated into an ATT-008
+    /// cohort pool, a non-zero offset, a single-token write, a K/V dtype
+    /// disagreement, a head dim that is not the row's own, any shape that is
+    /// not exactly `[1, kvHeads, n, headDim]`, and a capacity rule that would
+    /// not cover the chunk.
+    ///
+    /// Kill switch: `DARKBLOOM_CBV2_PREFILL_FULLKV_SEED=0`.
+    static let prefillFullKVSeedEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PREFILL_FULLKV_SEED"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     public private(set) var absoluteOffset: Int = 0
     public var retainedCount: Int { absoluteOffset }
 
@@ -278,6 +325,13 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
             return pool.rowViews(index: cohortIndex, upTo: absoluteOffset)
         }
 
+        // PREFILL-FULLKV-SEED: a first chunk into an empty row makes the
+        // whole-allocation zero fill dead, and folds the slice update into
+        // the one copy that actually deposits bytes.
+        if let seeded = seedFirstChunk(newKeys: newKeys, newValues: newValues, count: n) {
+            return seeded
+        }
+
         ensureCapacity(absoluteOffset + n, keyTemplate: newKeys, valueTemplate: newValues)
 
         keys![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newKeys
@@ -288,6 +342,85 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
             keys![.ellipsis, ..<absoluteOffset, 0...],
             values![.ellipsis, ..<absoluteOffset, 0...]
         )
+    }
+
+    /// PREFILL-FULLKV-SEED (see `prefillFullKVSeedEnabled`). Build this row's
+    /// K and V storage directly out of a first prompt chunk, instead of
+    /// zero-filling the whole allocation and then slice-updating the leading
+    /// `n` slots of it away.
+    ///
+    /// Returns the pair `update` would have returned — the two temporal-order
+    /// views `[..., ..<absoluteOffset, :]` of the storage, at the same shape
+    /// and the same strides, because the seeded buffer is a fresh
+    /// row-contiguous `[1, kvHeads, capacity, headDim]` allocation exactly as
+    /// the slice update's output was — or nil when this is not provably the
+    /// identity above.
+    private func seedFirstChunk(
+        newKeys: MLXArray, newValues: MLXArray, count n: Int
+    ) -> (MLXArray, MLXArray)? {
+        guard Self.prefillFullKVSeedEnabled,
+            // Nothing to preserve and nowhere else the bytes live: an empty,
+            // unpooled row at slot 0.
+            cohortPool == nil, cohortIndex == -1,
+            keys == nil, values == nil,
+            absoluteOffset == 0,
+            // `n > 1` keeps the single-token first write on the established
+            // road; the seed is the PREFILL commit, not a decode append.
+            n > 1,
+            newKeys.dtype == newValues.dtype,
+            newKeys.dim(3) == headDim, newValues.dim(3) == headDim,
+            newKeys.shape == [1, kvHeads, n, headDim],
+            newValues.shape == [1, kvHeads, n, headDim]
+        else { return nil }
+
+        // `ensureCapacity`'s first-allocation rule, verbatim, so the seeded
+        // allocation is the size the stock road would have allocated.
+        let seededCapacity = min(maxLength, max(capacity, n))
+        guard seededCapacity >= n else { return nil }
+        let tail = seededCapacity - n
+
+        CBv2EngageMark.once("prefill-fullkv-seed")
+        if tail == 0 {
+            // The chunk covers the allocation exactly: the deposit the slice
+            // update was going to make IS a contiguous copy of the chunk.
+            keys = contiguous(newKeys)
+            values = contiguous(newValues)
+        } else {
+            // Chunk in slots `0 ..< n`, zeros in the `tail` slack slots —
+            // element for element what the zero fill plus the slice update
+            // would have left behind.
+            let tailShape = [1, kvHeads, tail, headDim]
+            keys = concatenated(
+                [newKeys, Self.zeroBlock(shape: tailShape, dtype: newKeys.dtype)],
+                axis: 2)
+            values = concatenated(
+                [newValues, Self.zeroBlock(shape: tailShape, dtype: newValues.dtype)],
+                axis: 2)
+        }
+        capacity = seededCapacity
+        absoluteOffset = n
+
+        return (
+            keys![.ellipsis, ..<absoluteOffset, 0...],
+            values![.ellipsis, ..<absoluteOffset, 0...]
+        )
+    }
+
+    /// A block of zeros in `dtype`, built with NO GPU dispatch — the slack
+    /// tail of a seeded allocation.
+    ///
+    /// `MLXArray.zeros` is a real `Full` dispatch, and paying one per plane to
+    /// zero four slots would hand back part of what the seed just deleted.
+    /// Instead: an `itemsize`-byte host-side zero word (`mlx_array_new_data`,
+    /// already evaluated), reinterpreted to `dtype` — `View::eval_gpu`
+    /// `copy_shared_buffer`s a row-contiguous input — and broadcast over the
+    /// block, which `Broadcast::eval_gpu` resolves to a zero-stride view of
+    /// that same word. `Concatenate` then reads it through the ordinary
+    /// general-strided copy it uses for every input. Every byte it deposits is
+    /// zero, which is exactly what `MLXArray.zeros` would have deposited.
+    private static func zeroBlock(shape: [Int], dtype: DType) -> MLXArray {
+        let word = MLXArray([UInt8](repeating: 0, count: dtype.size))
+        return broadcast(word.view(dtype: dtype), to: shape)
     }
 
     /// Confirm this row's slot of a pool-level `batchAppend` (the batched

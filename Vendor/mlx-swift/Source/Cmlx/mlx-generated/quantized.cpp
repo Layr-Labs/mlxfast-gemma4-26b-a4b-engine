@@ -3887,6 +3887,204 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
   }
 }
 
+// EXPERT-SINGLES-SPAN2: y-tile fusion for the SINGLETON arm of the
+// K = 2816 gate/up expert gather (out_vec_size = 704, so the frozen host
+// launches grid (1, 88, 64)). Which arm an assignment takes depends on
+// tid.z alone -- the run election reads only `rhs_indices` -- so all 88 of
+// that assignment's y-groups reach this arm together and the odd ones can
+// hand their eight output rows to their even neighbour. The survivor owns
+// SIXTEEN consecutive output rows as two independent four-row register
+// sets and consumes ONE activation packet per K-block for both, so the
+// arm issues half the activation loads over half the threadgroups while a
+// thread keeps twice the packed-weight streams in flight. Each output row
+// keeps the identical block order, the identical `load_vector` transform,
+// the identical eight-term `qdot_affine4_g64_word` expression in the
+// identical 4 + 4 grouping, its own accumulator, and the identical
+// `simd_sum` and store: every element's add sequence is byte-for-byte the
+// sequence `qmv_affine4_g64_singles_impl` produces for it, so this is
+// loads-only rescheduling. 88 y-groups divide by two, so no ragged tail;
+// an out-of-range upper tile fails closed through `has_upper` and is then
+// produced by nobody, exactly as the per-y-group arm's own guard does.
+template <typename T, int group_size, int bits, int KFIX, bool WVEC>
+METAL_FUNC void qmv_affine4_g64_singles_span2_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int in_vec_size_rt,
+    const int out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 8;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 8;
+  constexpr int block_bytes = 128;
+  constexpr int qgroup = 64;
+  constexpr int rows_per_tile = num_simdgroups * results_per_simdgroup;
+
+  const int in_vec_size = (KFIX > 0) ? KFIX : in_vec_size_rt;
+
+  typedef float U;
+  thread U x_thread[values_per_thread];
+  thread U result_lo[results_per_simdgroup] = {0};
+  thread U result_hi[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / qgroup;
+  const int out_row_lo =
+      tid.y * rows_per_tile + simd_gid * results_per_simdgroup;
+  const int out_row_hi = out_row_lo + rows_per_tile;
+  if (out_row_lo >= out_vec_size) {
+    return;
+  }
+  const bool has_upper = out_row_hi < out_vec_size;
+  const int used_row_lo =
+      min(out_vec_size - results_per_simdgroup, out_row_lo);
+  const int used_row_hi =
+      min(out_vec_size - results_per_simdgroup, out_row_hi);
+
+  const device uint8_t* ws_lo = (const device uint8_t*)w +
+      used_row_lo * in_vec_size_w + simd_lid * bytes_per_thread;
+  const device uint8_t* ws_hi = (const device uint8_t*)w +
+      used_row_hi * in_vec_size_w + simd_lid * bytes_per_thread;
+  const device T* scales_lo =
+      scales + used_row_lo * in_vec_size_g + simd_lid / scale_step_per_thread;
+  const device T* biases_lo =
+      biases + used_row_lo * in_vec_size_g + simd_lid / scale_step_per_thread;
+  const device T* scales_hi =
+      scales + used_row_hi * in_vec_size_g + simd_lid / scale_step_per_thread;
+  const device T* biases_hi =
+      biases + used_row_hi * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x += tid.x * in_vec_size + simd_lid * values_per_thread;
+  device T* y_lo = y + tid.x * out_vec_size + used_row_lo;
+  device T* y_hi = y + tid.x * out_vec_size + used_row_hi;
+
+  const int nblocks = in_vec_size / block_size;
+
+  for (int blk = 0; blk < nblocks; blk++) {
+    U sum = load_vector<T, U, values_per_thread, 4>(x, x_thread);
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      U s = scales_lo[row * in_vec_size_g];
+      U b = biases_lo[row * in_vec_size_g];
+      if (WVEC) {
+        const uint v = *((const device uint*)(ws_lo + row * in_vec_size_w));
+        result_lo[row] += qdot_affine4_g64_word(v, x_thread, s, b, sum);
+      } else {
+        auto wl = (const device uint8_t*)(ws_lo + row * in_vec_size_w);
+        result_lo[row] +=
+            qdot<U, values_per_thread, 4>(wl, x_thread, s, b, sum);
+      }
+    }
+    if (has_upper) {
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        U s = scales_hi[row * in_vec_size_g];
+        U b = biases_hi[row * in_vec_size_g];
+        if (WVEC) {
+          const uint v = *((const device uint*)(ws_hi + row * in_vec_size_w));
+          result_hi[row] += qdot_affine4_g64_word(v, x_thread, s, b, sum);
+        } else {
+          auto wl = (const device uint8_t*)(ws_hi + row * in_vec_size_w);
+          result_hi[row] +=
+              qdot<U, values_per_thread, 4>(wl, x_thread, s, b, sum);
+        }
+      }
+    }
+
+    ws_lo += block_bytes;
+    ws_hi += block_bytes;
+    scales_lo += block_size / qgroup;
+    biases_lo += block_size / qgroup;
+    scales_hi += block_size / qgroup;
+    biases_hi += block_size / qgroup;
+    x += block_size;
+  }
+
+  const int tail_values = in_vec_size - nblocks * block_size;
+  if (tail_values > 0) {
+    // K = 2816 is a whole number of blocks, so this region constant-folds
+    // away under the only instantiation. It is retained in the per-y-group
+    // arm's verbatim form, once per register set.
+    if (tail_values % values_per_thread != 0) {
+      const int remaining = clamp(
+          static_cast<int>(tail_values - simd_lid * values_per_thread),
+          0,
+          values_per_thread);
+      if (remaining > 0) {
+        U sum = load_vector_safe<T, U, values_per_thread, 4>(
+            x, x_thread, remaining);
+        for (int row = 0; row < results_per_simdgroup; row++) {
+          auto wl = (const device uint8_t*)(ws_lo + row * in_vec_size_w);
+          U s = scales_lo[row * in_vec_size_g];
+          U b = biases_lo[row * in_vec_size_g];
+          result_lo[row] += qdot_safe<U, values_per_thread, 4>(
+              wl, x_thread, s, b, sum, remaining);
+        }
+        if (has_upper) {
+          for (int row = 0; row < results_per_simdgroup; row++) {
+            auto wl = (const device uint8_t*)(ws_hi + row * in_vec_size_w);
+            U s = scales_hi[row * in_vec_size_g];
+            U b = biases_hi[row * in_vec_size_g];
+            result_hi[row] += qdot_safe<U, values_per_thread, 4>(
+                wl, x_thread, s, b, sum, remaining);
+          }
+        }
+      }
+    }
+    const uint active_tail_lanes = uint(tail_values / values_per_thread);
+    if (tail_values % values_per_thread == 0 && simd_lid < active_tail_lanes) {
+      U sum = load_vector<T, U, values_per_thread, 4>(x, x_thread);
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        U s = scales_lo[row * in_vec_size_g];
+        U b = biases_lo[row * in_vec_size_g];
+        if (WVEC) {
+          const uint v = *((const device uint*)(ws_lo + row * in_vec_size_w));
+          result_lo[row] += qdot_affine4_g64_word(v, x_thread, s, b, sum);
+        } else {
+          auto wl = (const device uint8_t*)(ws_lo + row * in_vec_size_w);
+          result_lo[row] +=
+              qdot<U, values_per_thread, 4>(wl, x_thread, s, b, sum);
+        }
+      }
+      if (has_upper) {
+        for (int row = 0; row < results_per_simdgroup; row++) {
+          U s = scales_hi[row * in_vec_size_g];
+          U b = biases_hi[row * in_vec_size_g];
+          if (WVEC) {
+            const uint v =
+                *((const device uint*)(ws_hi + row * in_vec_size_w));
+            result_hi[row] += qdot_affine4_g64_word(v, x_thread, s, b, sum);
+          } else {
+            auto wl = (const device uint8_t*)(ws_hi + row * in_vec_size_w);
+            result_hi[row] +=
+                qdot<U, values_per_thread, 4>(wl, x_thread, s, b, sum);
+          }
+        }
+      }
+    }
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result_lo[row] = simd_sum(result_lo[row]);
+    if (simd_lid == 0) {
+      y_lo[row] = static_cast<T>(result_lo[row]);
+    }
+  }
+  if (has_upper) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result_hi[row] = simd_sum(result_hi[row]);
+      if (simd_lid == 0) {
+        y_hi[row] = static_cast<T>(result_hi[row]);
+      }
+    }
+  }
+}
+
 // KERN-DOWN-TILE: y-tile coarsening for the K = 704 expert down gather
 // (the only pair-geometry plane at that K; out_vec_size = 2816). The
 // frozen host launches grid (1, N/8 = 352, 64), so every 64-thread group
@@ -4177,10 +4375,25 @@ template <typename T, int group_size, int bits>
     const device T* single_biases = biases + expert * b_strides[0];
     device T* single_y = y + assignment * (uint)out_vec_size;
     if (in_vec_size == 2816) {
-      qmv_affine4_g64_singles_impl<
-          T, group_size, bits, 2816, true, false>(
-          single_w, single_scales, single_biases, single_x, single_y,
-          in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+      // KERN-SINGLES-SPAN2 gate: compile-time flip; ON here -- the
+      // singleton gate/up arm takes the y-tile-fused pair above. Flip to
+      // false to return every singleton assignment to the per-y-group arm,
+      // which the fused arm is bit-identical to by construction.
+      constexpr bool gemma4_singles_span2 = true;
+      if (gemma4_singles_span2) {
+        // Odd y-groups are produced by their even neighbour's upper tile.
+        if ((tid.y & 1u) != 0u) {
+          return;
+        }
+        qmv_affine4_g64_singles_span2_impl<T, group_size, bits, 2816, true>(
+            single_w, single_scales, single_biases, single_x, single_y,
+            in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+      } else {
+        qmv_affine4_g64_singles_impl<
+            T, group_size, bits, 2816, true, false>(
+            single_w, single_scales, single_biases, single_x, single_y,
+            in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+      }
     } else {
       qmv_impl<T, group_size, bits>(
           single_w, single_scales, single_biases, single_x, single_y,

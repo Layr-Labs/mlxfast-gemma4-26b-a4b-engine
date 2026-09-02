@@ -3717,6 +3717,48 @@ private enum Gemma4FusedLayerGlue {
             }
     """
 
+    /// GLUEVEC-001. Every operand this tail thread reads is a run of four
+    /// contiguous elements at `base` or `wbase`, both multiples of four, so a
+    /// BF16 quad always starts on an 8-byte boundary and a `vec<T, 4>` moves
+    /// it in one instruction instead of four. The expert fold's own operands
+    /// are the same shape: the eight sorted row indices and the eight routing
+    /// weights sit at `row * 8`, and each sorted row contributes exactly this
+    /// thread's quad.
+    ///
+    /// The accumulation runs slot-outer, feature-inner rather than the
+    /// incumbent's feature-outer, slot-inner. Each feature still sums its
+    /// eight slots left to right in T, so every rounding and every partial is
+    /// the incumbent's, and only one sorted quad is live at a time instead of
+    /// all eight — the load count falls without the register file growing.
+    private static let deferredExpertValuesVecSource = """
+            typedef vec<T, 4> T4;
+            const device uint4* inverse_q =
+                (const device uint4*)(inverse + row * 8u);
+            const uint4 sr0 = inverse_q[0];
+            const uint4 sr1 = inverse_q[1];
+            const device T4* route_q =
+                (const device T4*)(route_weights + row * 8u);
+            const T4 rw0 = route_q[0];
+            const T4 rw1 = route_q[1];
+            const uint sorted_rows[8] = {
+                sr0.x, sr0.y, sr0.z, sr0.w, sr1.x, sr1.y, sr1.z, sr1.w};
+            const T routed_weights[8] = {
+                rw0[0], rw0[1], rw0[2], rw0[3],
+                rw1[0], rw1[1], rw1[2], rw1[3]};
+            T expertv[4] = {
+                static_cast<T>(0.0f), static_cast<T>(0.0f),
+                static_cast<T>(0.0f), static_cast<T>(0.0f)};
+            for (uint slot = 0u; slot < 8u; ++slot) {
+                const T4 sq = *((const device T4*)(
+                    sorted + sorted_rows[slot] * 2816u + wbase));
+                const float rw = (float)routed_weights[slot];
+                for (int i = 0; i < 4; ++i) {
+                    expertv[i] = expertv[i]
+                        + static_cast<T>((float)sq[i] * rw);
+                }
+            }
+    """
+
     private static let deferredTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1_nb1_vec1",
         inputNames: [
@@ -3835,6 +3877,148 @@ private enum Gemma4FusedLayerGlue {
             ensureRowContiguous: true
         )
 
+    /// GLUEVEC-001 twin of `deferredTailChainKernel`. Same statements, same
+    /// order, same roundings; `a`, `res`, `w1`, `w2`, `w3` and `wn` arrive as
+    /// one quad each, `out` and `normed` leave as one quad each, and the
+    /// expert fold takes the vector source above. Widening a load or a store
+    /// changes which instruction moves a value, not the value.
+    private static let deferredTailChainVecKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name:
+                "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1_nb1_vec1_rs1_tv1",
+            inputNames: [
+                "a", "sorted", "inverse", "route_weights", "res",
+                "w1", "w2", "w3", "s", "wn",
+            ],
+            outputNames: ["out", "normed", "rs"],
+            source: """
+                const uint row = threadgroup_position_in_grid.x;
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint simd_lane_id = thread_index_in_simdgroup;
+                const uint simd_group_id = simdgroup_index_in_threadgroup;
+                threadgroup float local_inv[2];
+                threadgroup float local_sums[32];
+                const uint base = row * 2816 + lid * 4;
+                const uint wbase = lid * 4;
+            \(rmsReduce("a", into: "local_inv[0]"))
+            \(deferredExpertValuesVecSource)
+            \(rmsReduce("expertv", into: "local_inv[1]").replacingOccurrences(
+                of: "(float)expertv[base + i]", with: "(float)expertv[i]"))
+                const float inv1 = local_inv[0];
+                const float inv2 = local_inv[1];
+                const T4 av = *((const device T4*)(a + base));
+                const T4 w1v = *((const device T4*)(w1 + wbase));
+                const T4 w2v = *((const device T4*)(w2 + wbase));
+                T4 sv;
+                for (int i = 0; i < 4; i++) {
+                    const T h1 = w1v[i]
+                        * static_cast<T>((float)av[i] * inv1);
+                    const T h2 = w2v[i]
+                        * static_cast<T>((float)expertv[i] * inv2);
+                    sv[i] = h1 + h2;
+                }
+            \(rmsReduce("sv", into: "local_inv[0]").replacingOccurrences(
+                of: "(float)sv[base + i]", with: "(float)sv[i]"))
+                const float inv3 = local_inv[0];
+                const T scalar = s[0];
+                const T4 w3v = *((const device T4*)(w3 + wbase));
+                const T4 resv = *((const device T4*)(res + base));
+                T4 outv;
+                for (int i = 0; i < 4; i++) {
+                    const T normed3 = static_cast<T>(
+                        w3v[i] * static_cast<T>((float)sv[i] * inv3));
+                    const T summed = resv[i] + normed3;
+                    outv[i] = summed * scalar;
+                }
+                *((device T4*)(out + base)) = outv;
+            \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
+                of: "(float)outv[base + i]", with: "(float)outv[i]"))
+                const float inv4 = local_inv[0];
+                const T4 wnv = *((const device T4*)(wn + wbase));
+                T4 nq;
+                for (int i = 0; i < 4; i++) {
+                    nq[i] = wnv[i]
+                        * static_cast<T>((float)outv[i] * inv4);
+                }
+                *((device T4*)(normed + base)) = nq;
+                // RS-CHAIN: unchanged. The quad is summed left to right in T
+                // and the same balanced xor tree runs over sixteen lanes.
+                const T nquad = ((nq[0] + nq[1]) + nq[2]) + nq[3];
+                float rsv = 0.0f + (float)nquad;
+                rsv += simd_shuffle_xor(rsv, 1u);
+                rsv += simd_shuffle_xor(rsv, 2u);
+                rsv += simd_shuffle_xor(rsv, 4u);
+                rsv += simd_shuffle_xor(rsv, 8u);
+                if ((lid & 15u) == 0u) {
+                    rs[row * 44 + (lid >> 4)] = rsv;
+                }
+            """,
+            ensureRowContiguous: true
+        )
+
+    /// GLUEVEC-001 twin of `deferredTailKernel` (the final layer, no chained
+    /// next-input norm and no run-sum entry).
+    private static let deferredTailVecKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1_nb1_vec1_tv1",
+            inputNames: [
+                "a", "sorted", "inverse", "route_weights", "res",
+                "w1", "w2", "w3", "s",
+            ],
+            outputNames: ["out"],
+            source: """
+                const uint row = threadgroup_position_in_grid.x;
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint simd_lane_id = thread_index_in_simdgroup;
+                const uint simd_group_id = simdgroup_index_in_threadgroup;
+                threadgroup float local_inv[2];
+                threadgroup float local_sums[32];
+                const uint base = row * 2816 + lid * 4;
+                const uint wbase = lid * 4;
+            \(rmsReduce("a", into: "local_inv[0]"))
+            \(deferredExpertValuesVecSource)
+            \(rmsReduce("expertv", into: "local_inv[1]").replacingOccurrences(
+                of: "(float)expertv[base + i]", with: "(float)expertv[i]"))
+                const float inv1 = local_inv[0];
+                const float inv2 = local_inv[1];
+                const T4 av = *((const device T4*)(a + base));
+                const T4 w1v = *((const device T4*)(w1 + wbase));
+                const T4 w2v = *((const device T4*)(w2 + wbase));
+                T4 sv;
+                for (int i = 0; i < 4; i++) {
+                    const T h1 = w1v[i]
+                        * static_cast<T>((float)av[i] * inv1);
+                    const T h2 = w2v[i]
+                        * static_cast<T>((float)expertv[i] * inv2);
+                    sv[i] = h1 + h2;
+                }
+            \(rmsReduce("sv", into: "local_inv[0]").replacingOccurrences(
+                of: "(float)sv[base + i]", with: "(float)sv[i]"))
+                const float inv3 = local_inv[0];
+                const T scalar = s[0];
+                const T4 w3v = *((const device T4*)(w3 + wbase));
+                const T4 resv = *((const device T4*)(res + base));
+                T4 outq;
+                for (int i = 0; i < 4; i++) {
+                    const T normed3 = static_cast<T>(
+                        w3v[i] * static_cast<T>((float)sv[i] * inv3));
+                    const T summed = resv[i] + normed3;
+                    outq[i] = summed * scalar;
+                }
+                *((device T4*)(out + base)) = outq;
+            """,
+            ensureRowContiguous: true
+        )
+
+    /// Default ON. `DARKBLOOM_GEMMA4_GLUE_TAIL_VEC=0` (also `false`/`no`/`off`)
+    /// restores the scalar-load bodies byte for byte.
+    private static let tailVecEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_GLUE_TAIL_VEC"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static func admitsDeferred(
         _ expertRows: DeferredWeightedExpertRows
     ) -> Bool {
@@ -3870,7 +4054,9 @@ private enum Gemma4FusedLayerGlue {
             nextInputNormWeight.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-deferred-expert-tail-chain")
-        let outs = deferredTailChainKernel(
+        let selectedDeferredChain =
+            tailVecEnabled ? deferredTailChainVecKernel : deferredTailChainKernel
+        let outs = selectedDeferredChain(
             [
                 mlpOut, expertRows.sortedOutputs, expertRows.inverseOrder,
                 expertRows.weights, residual, w1, w2, w3, layerScalar,
@@ -3904,7 +4090,9 @@ private enum Gemma4FusedLayerGlue {
             layerScalar.size == 1, layerScalar.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-deferred-expert-tail")
-        return deferredTailKernel(
+        let selectedDeferred =
+            tailVecEnabled ? deferredTailVecKernel : deferredTailKernel
+        return selectedDeferred(
             [
                 mlpOut, expertRows.sortedOutputs, expertRows.inverseOrder,
                 expertRows.weights, residual, w1, w2, w3, layerScalar,

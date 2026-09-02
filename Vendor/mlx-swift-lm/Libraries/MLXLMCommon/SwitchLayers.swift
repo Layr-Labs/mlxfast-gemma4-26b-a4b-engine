@@ -1155,6 +1155,18 @@ public let switchGateUpFusePrefillEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+/// GATEUP-GEGLU-EPILOGUE-PREFILL. The ranked M5 path can close the fused
+/// gate|up gathered GEMM directly into the rounded GeGLU plane when its
+/// right-hand side is laid out as adjacent 16-column gate/up blocks. Keeping
+/// this independent switch makes `=0` reproduce the promoted concatenated
+/// storage and standalone shaped-GeGLU path exactly.
+public let switchGateUpGeGLUEpiloguePrefillEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_PREFILL_GATEUP_GELU_EPILOGUE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// The concatenated `[gate ; up]` affine 4-bit right-hand side of one expert
 /// layer plus the two zero-copy views the split projections are bound to. A
 /// plain final class (not a `Module`, not an `MLXArray` tuple) so the module
@@ -1172,6 +1184,7 @@ public final class SwitchGateUpFusedStorage {
     public let upScales: MLXArray
     public let upBiases: MLXArray
     public let hiddenDims: Int
+    public let usesGeGLUEpilogueLayout: Bool
 
     /// Exact production geometry only: two packed affine 4-bit / group-64
     /// planes of 2816 -> 704 over 128 experts, `[128, 704, 352]` uint32 with
@@ -1192,22 +1205,45 @@ public final class SwitchGateUpFusedStorage {
             && gateBiases.dtype == .bfloat16 && upBiases.dtype == .bfloat16
         else { return nil }
         let n = 704
-        // Output axis (axis 1 of [experts, out, packed-in]): gate rows
-        // 0..<704 followed by up rows 704..<1408, for weight, scales and
-        // biases alike. Pure copies of the loaded planes; the split
-        // parameters below are slices sharing this storage, not copies.
-        let weight = concatenated([gateWeight, upWeight], axis: 1)
-        let scales = concatenated([gateScales, upScales], axis: 1)
-        let biases = concatenated([gateBiases, upBiases], axis: 1)
-        self.weight = weight
-        self.scales = scales
-        self.biases = biases
-        self.gateWeight = weight[0..., ..<n]
-        self.gateScales = scales[0..., ..<n]
-        self.gateBiases = biases[0..., ..<n]
-        self.upWeight = weight[0..., n...]
-        self.upScales = scales[0..., n...]
-        self.upBiases = biases[0..., n...]
+        if switchGateUpGeGLUEpiloguePrefillEnabled {
+            // Pair one 16-column gate block with the matching up block. Both
+            // the NAX 64-column tile and the portable 32-column tile then own
+            // complete gate/up pairs, so their epilogues need no cross-group
+            // exchange. The split decode projections retain the loaded arrays;
+            // only this private prompt plane uses the paired copy.
+            func paired16(_ gate: MLXArray, _ up: MLXArray, tail: Int) -> MLXArray {
+                let gateBlocks = gate.reshaped(128, n / 16, 16, tail)
+                let upBlocks = up.reshaped(128, n / 16, 16, tail)
+                return MLX.stacked([gateBlocks, upBlocks], axis: 2)
+                    .reshaped(128, n * 2, tail)
+            }
+            self.weight = paired16(gateWeight, upWeight, tail: 352)
+            self.scales = paired16(gateScales, upScales, tail: 44)
+            self.biases = paired16(gateBiases, upBiases, tail: 44)
+            self.gateWeight = gateWeight
+            self.gateScales = gateScales
+            self.gateBiases = gateBiases
+            self.upWeight = upWeight
+            self.upScales = upScales
+            self.upBiases = upBiases
+            self.usesGeGLUEpilogueLayout = true
+        } else {
+            // Promoted GATEUP-FUSE-PREFILL layout: one gate half followed by
+            // one up half, with zero-copy split views for decode.
+            let weight = concatenated([gateWeight, upWeight], axis: 1)
+            let scales = concatenated([gateScales, upScales], axis: 1)
+            let biases = concatenated([gateBiases, upBiases], axis: 1)
+            self.weight = weight
+            self.scales = scales
+            self.biases = biases
+            self.gateWeight = weight[0..., ..<n]
+            self.gateScales = scales[0..., ..<n]
+            self.gateBiases = biases[0..., ..<n]
+            self.upWeight = weight[0..., n...]
+            self.upScales = scales[0..., n...]
+            self.upBiases = biases[0..., n...]
+            self.usesGeGLUEpilogueLayout = false
+        }
         self.hiddenDims = n
     }
 }
@@ -1495,6 +1531,23 @@ public class SwitchGLU: Module {
                     mode: fused.mode,
                     sortedIndices: true
                 )
+                if fused.storage.usesGeGLUEpilogueLayout {
+                    // The specialized gathered-QMM epilogue writes its
+                    // compact [rows, 704] result into the first physical half
+                    // of the ordinary [rows, 1, 1408] output allocation.
+                    // Flatten-prefix-reshape exposes that contiguous plane;
+                    // no strided copy enters the dependent down projection.
+                    let activated = xGateUp.flattened()[..<(xGateUp.size / 2)]
+                        .reshaped(x.dim(0), 1, hiddenDims)
+                    CBv2EngageMark.once("prefill-gateup-gelu-epilogue")
+                    let downLhs: MLXArray? =
+                        (doSort && idx.ndim == 1 && idx.size == 64)
+                        ? switchDownIdentity64 : nil
+                    x = downProj(
+                        activated, idx, lhsIndices: downLhs,
+                        sortedIndices: doSort)
+                    return (x, doSort ? inverseOrder : nil, doSort)
+                }
                 xGate = xGateUp[.ellipsis, ..<hiddenDims]
                 xUp = xGateUp[.ellipsis, hiddenDims...]
             } else {

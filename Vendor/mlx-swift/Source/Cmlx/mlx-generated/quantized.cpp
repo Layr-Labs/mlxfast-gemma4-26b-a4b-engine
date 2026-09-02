@@ -3909,6 +3909,153 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
 // per-assignment quantized_matmul oracle and vs the untiled arm at
 // K = 704, N = 2816, 64 assignments over 128 experts, M = 8, spans 4 and
 // 2, 3 seeds, NaN-filled outputs (parity-down-tile, 2026-08-28).
+// KERN-DOWN-SPAN-FUSE: one K walk for the whole span of the K = 704 down
+// plane's pairless arm. The SPAN y-tiles a survivor owns all read the SAME
+// gathered activation row, so the incumbent walk re-streams x and recomputes
+// the identical `load_vector` sum once per tile, and each tile's short
+// accumulate chain is closed by eight simd_sums and four device stores before
+// the next tile's first weight load is issued -- over a 704-value stream that
+// is three blocks per row, so the group never has more than
+// results_per_simdgroup weight loads of ONE tile in flight. Here the block
+// loop runs once and carries SPAN * results_per_simdgroup accumulators, so
+// every block issues SPAN times the independent weight loads while x and its
+// `sum` are loaded and folded exactly once for the whole span.
+//
+// Exactness: accumulator (t, row) takes the contribution of block k from the
+// same `wl`, `sl[0]`, `bl[0]`, `x_thread` and `sum` values, in the same block
+// order (k = 0, block_size, ... then the fixed tail packet), that
+// `qmv_impl`'s tiled arm gives out_row = (tid.y + t) * tile_stride +
+// simd_gid * results_per_simdgroup + row. `sum` is a pure function of x, so
+// hoisting it out of the tile walk changes no value, and the closing simd_sum
+// and `simd_lid == 0` store stay per accumulator. The arm admits only when the
+// whole span sits inside out_vec_size, so `qmv_impl`'s last-tile clamp
+// (`used_out_row`) is inactive for every tile it serves and the SPAN tiles sit
+// at a uniform row stride.
+template <typename T, int group_size, int bits, int SPAN>
+METAL_FUNC void qmv_gemma4_down_span_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int packs_per_thread = 1;
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+  constexpr int tile_stride = num_simdgroups * results_per_simdgroup;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+
+  typedef float U;
+
+  thread U x_thread[values_per_thread];
+  thread U result[SPAN * results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int out_row =
+      int(tid.y) * tile_stride + int(simd_gid) * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x += tid.x * in_vec_size + simd_lid * values_per_thread;
+  y += tid.x * out_vec_size + out_row;
+
+  int k = 0;
+  for (; k <= in_vec_size - block_size; k += block_size) {
+    U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+
+    for (int t = 0; t < SPAN; t++) {
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        const int rw = t * tile_stride + row;
+        auto wl = (const device uint8_t*)(ws + rw * in_vec_size_w);
+        const device T* sl = scales + rw * in_vec_size_g;
+        const device T* bl = biases + rw * in_vec_size_g;
+
+        U s = sl[0];
+        U b = bl[0];
+        result[t * results_per_simdgroup + row] +=
+            qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+      }
+    }
+
+    ws += block_size * bytes_per_pack / pack_factor;
+    scales += block_size / group_size;
+    biases += block_size / group_size;
+    x += block_size;
+  }
+  const int tail_values = static_cast<int>(in_vec_size - k);
+  if (tail_values > 0) {
+    // Same tail split `qmv_impl` takes: an affine caller leaves a whole
+    // number of values_per_thread lane packets (K = 704 leaves 192 = 24), so
+    // the active lanes run the fixed loader and the dynamic safe tail is kept
+    // only for a genuinely partial packet no affine caller presents.
+    if (tail_values % values_per_thread == 0) {
+      const uint active_tail_lanes = uint(tail_values / values_per_thread);
+      if (simd_lid < active_tail_lanes) {
+        U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+
+        for (int t = 0; t < SPAN; t++) {
+          for (int row = 0; row < results_per_simdgroup; row++) {
+            const int rw = t * tile_stride + row;
+            auto wl = (const device uint8_t*)(ws + rw * in_vec_size_w);
+            const device T* sl = scales + rw * in_vec_size_g;
+            const device T* bl = biases + rw * in_vec_size_g;
+
+            U s = sl[0];
+            U b = bl[0];
+            result[t * results_per_simdgroup + row] +=
+                qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+          }
+        }
+      }
+    } else {
+      const int remaining = clamp(
+          static_cast<int>(tail_values - simd_lid * values_per_thread),
+          0,
+          values_per_thread);
+      if (remaining > 0) {
+        U sum = load_vector_safe<T, U, values_per_thread, bits>(
+            x, x_thread, remaining);
+
+        for (int t = 0; t < SPAN; t++) {
+          for (int row = 0; row < results_per_simdgroup; row++) {
+            const int rw = t * tile_stride + row;
+            auto wl = (const device uint8_t*)(ws + rw * in_vec_size_w);
+            const device T* sl = scales + rw * in_vec_size_g;
+            const device T* bl = biases + rw * in_vec_size_g;
+
+            U s = sl[0];
+            U b = bl[0];
+            result[t * results_per_simdgroup + row] +=
+                qdot_safe<U, values_per_thread, bits>(
+                    wl, x_thread, s, b, sum, remaining);
+          }
+        }
+      }
+    }
+  }
+  for (int t = 0; t < SPAN; t++) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      U acc = simd_sum(result[t * results_per_simdgroup + row]);
+      if (simd_lid == 0) {
+        y[t * tile_stride + row] = static_cast<T>(acc);
+      }
+    }
+  }
+}
+
 template <typename T, int group_size, int bits>
 METAL_FUNC void gather_qmv_gemma4_down_tile(
     const device uint32_t* w,
@@ -3983,6 +4130,30 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
           simd_gid,
           simd_lid);
     }
+    return;
+  }
+  // KERN-DOWN-SPAN-FUSE gate: compile-time flip; ON here -- the pairless arm
+  // walks its whole span through one fused K pass. It admits only when the
+  // span lies inside the output vector, which the frozen (1, 352, 64) launch
+  // of the K = 704 down plane always satisfies. Flip to false to walk the
+  // span through the verbatim stock qmv_impl below; the two arms are
+  // bit-identical by construction.
+  constexpr bool gemma4_down_span_fuse = true;
+  constexpr int gemma4_down_tile_rows = 8;
+  if (gemma4_down_span_fuse &&
+      int(tid.y + uint(gemma4_down_tile_span)) * gemma4_down_tile_rows <=
+          out_vec_size) {
+    qmv_gemma4_down_span_impl<T, group_size, bits, gemma4_down_tile_span>(
+        tile_w,
+        tile_scales,
+        tile_biases,
+        tile_x0,
+        tile_y0,
+        in_vec_size,
+        out_vec_size,
+        tid,
+        simd_gid,
+        simd_lid);
     return;
   }
   for (int t = 0; t < gemma4_down_tile_span; t++) {

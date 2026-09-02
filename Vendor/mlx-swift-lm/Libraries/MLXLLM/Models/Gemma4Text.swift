@@ -1765,8 +1765,13 @@ private class Gemma4Attention: Module {
     /// the tight affine4 fast-QMV replica; every other path keeps the layer.
     /// MMA-RS-001: the projection input's run-sum table is computed here (the
     /// o_proj plane consumes it alone); nil keeps the incumbent dispatch.
+    /// ORSFOLD-001: `carriedRunsum` is the table the resident attention kernel
+    /// emitted for this exact activation; nil, or any table that misses the
+    /// shape contract, falls through to the standalone prepass.
     @inline(__always)
-    private func outputProjection(_ x: MLXArray) -> MLXArray {
+    private func outputProjection(
+        _ x: MLXArray, carriedRunsum: MLXArray? = nil
+    ) -> MLXArray {
         guard let quantized = oProj as? QuantizedLinear,
             quantized.bias == nil,
             let projected = CBv2AttentionOQMVV1.matmul(
@@ -1777,7 +1782,9 @@ private class Gemma4Attention: Module {
                 groupSize: quantized.groupSize,
                 bits: quantized.bits,
                 mode: quantized.mode,
-                rsTable: CBv2AttentionOQMVV1.runsumTable(for: x))
+                rsTable: CBv2AttentionOQMVV1.acceptRunsumTable(
+                    carriedRunsum, for: x)
+                    ?? CBv2AttentionOQMVV1.runsumTable(for: x))
         else { return oProj(x) }
         return projected
     }
@@ -2143,7 +2150,7 @@ private class Gemma4Attention: Module {
             output = output.asType(outputDType)
         }
         return (
-            outputProjection(output),
+            outputProjection(output, carriedRunsum: residentProducts?.runsumTable),
             (residentProducts?.normalizedKeys ?? k,
              residentProducts?.normalizedValues ?? v),
             captured)

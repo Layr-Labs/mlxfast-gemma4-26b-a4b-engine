@@ -143,6 +143,55 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             && (window & (window - 1)) == 0
     }
 
+    /// PREFILL-RING-SEED. A row's FIRST prompt chunk on a sliding layer is
+    /// allocated with `MLXArray.zeros` and then immediately slice-updated,
+    /// and at the ranked geometry that update covers EVERY slot: the chunk is
+    /// 1024 tokens and the window is 1024, written from slot 0. Two things in
+    /// that pair are dead by construction.
+    ///
+    ///   1. The zero fill. `zeros` is a real `Full` DISPATCH that writes the
+    ///      whole ring (`[1, 8, 1024, 256]` bf16 = 4 MiB per plane), and not
+    ///      one of those bytes survives the write that follows it.
+    ///   2. `SliceUpdate::eval_gpu` (`backend/metal/indexing.cpp`) begins with
+    ///      `copy_gpu(in, out, ...)` — a full copy of the DESTINATION into the
+    ///      new buffer — before `copy_gpu_inplace` deposits the update. That
+    ///      copy is elided only when the destination is donatable
+    ///      (`array::is_donatable`, refcount one); a ring the row still holds
+    ///      is not, so the whole allocation is copied and then completely
+    ///      overwritten.
+    ///
+    /// Seeding the ring with the chunk itself replaces `zeros` + `SliceUpdate`
+    /// with one `contiguous` copy per plane, which is exactly the deposit the
+    /// slice update was going to make. The resulting buffer holds the SAME
+    /// bytes in the SAME slots: slot `i` of the ring is token `i` of the
+    /// chunk under both roads, because `firstPosition % window == 0` and the
+    /// chunk covers the ring exactly. The q4 mirror is seeded the same way —
+    /// the two packed planes stacked on the plane axis are, element for
+    /// element, what the two per-plane slice updates would have deposited
+    /// into a zero-filled mirror.
+    ///
+    /// FAIL-CLOSED. Anything short of the exact identity keeps the
+    /// established allocate-then-slice-update road: a ring that already
+    /// exists, a non-zero start offset, a chunk that is not exactly one
+    /// window, a staged speculative write, the quant SIMULATION round trip
+    /// (which rewrites the bf16 payload after the mirror write), and both
+    /// mirror diagnostics (`gpuPackCheck`, `selfTestArmed`), whose extra
+    /// readbacks the seed does not reproduce.
+    ///
+    /// PREFILL-STACK: the mirror half of that seed is the same array
+    /// PREFILL-KVQ-PACK's MIRROR ADOPT installs, so when both mechanisms are
+    /// on the seed builds it with the pair-rows packer — ONE dispatch for both
+    /// planes — instead of two per-plane packs and a concatenate. See
+    /// `seedWholeWindowRing` for the switch matrix.
+    ///
+    /// Kill switch: `DARKBLOOM_CBV2_PREFILL_RING_SEED=0`.
+    static let prefillRingSeedEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PREFILL_RING_SEED"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// Step-scoped PRE-EVICTION views captured by the most recent MULTI-token
     /// `update()` (`retainedHistory ++ chunk`, up to `window - 1 + n` entries).
     /// KV-borrowing layers (Gemma-4 cross-layer sharing) attend these instead
@@ -211,6 +260,12 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
                 + "BF16 ring is stale; set MLX_KV_Q4_BF16_ELIDE=0 to keep it authoritative"
         )
 
+        // PREFILL-RING-SEED: a first chunk that covers the whole ring makes
+        // both the zero fill and the slice update's destination copy dead.
+        if let seeded = seedWholeWindowRing(newKeys: newKeys, newValues: newValues, count: n) {
+            return seeded
+        }
+
         allocateIfNeeded(keyTemplate: newKeys, valueTemplate: newValues)
 
         if n == 1 {
@@ -241,14 +296,152 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         let firstWritten = absoluteOffset + n - writeCount
         let kTail = writeCount == n ? newKeys : newKeys[.ellipsis, (n - writeCount)..., 0...]
         let vTail = writeCount == n ? newValues : newValues[.ellipsis, (n - writeCount)..., 0...]
-        writeRing(keys!, tokens: kTail, firstPosition: firstWritten, mirrorPlane: 0)
-        writeRing(values!, tokens: vTail, firstPosition: firstWritten, mirrorPlane: 1)
+        // PREFILL-KVQ-PACK: when both mirror planes of the chunk go out
+        // together the ring writes carry no mirror plane of their own — the
+        // same split KVQ-PAIRWRITE makes for one decode token.
+        let pairedMirror = writePairedMirrorChunk(
+            keys: kTail, values: vTail, firstPosition: firstWritten)
+        writeRing(
+            keys!, tokens: kTail, firstPosition: firstWritten,
+            mirrorPlane: pairedMirror ? nil : 0)
+        writeRing(
+            values!, tokens: vTail, firstPosition: firstWritten,
+            mirrorPlane: pairedMirror ? nil : 1)
+        if !pairedMirror {
+            logMirrorSignature(
+                n: writeCount, start: firstWritten % window,
+                paired: false, adopted: false)
+        }
 
         absoluteOffset += n
         oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
 
         borrowableChunkViews = (returnedKeys, returnedValues)
         return (returnedKeys, returnedValues)
+    }
+
+    /// PREFILL-RING-SEED (see `prefillRingSeedEnabled`). Build the ring —
+    /// and, when the quantized road is on, the q4 mirror — directly out of a
+    /// first prompt chunk that covers every slot, instead of zero-filling an
+    /// allocation and slice-updating the whole thing away.
+    ///
+    /// Returns the pair `update` would have returned (`kParts == [newKeys]`
+    /// on an empty row, so the returned history IS the chunk), or nil when
+    /// this is not provably the identity above.
+    private func seedWholeWindowRing(
+        newKeys: MLXArray, newValues: MLXArray, count n: Int
+    ) -> (MLXArray, MLXArray)? {
+        guard Self.prefillRingSeedEnabled,
+            keys == nil, values == nil, quantMirror == nil,
+            staged == nil, !speculativeWriteArmed, !bf16RingStale,
+            absoluteOffset == 0, oldestValidPosition == 0,
+            // The chunk covers the ring exactly, starting at slot 0:
+            // `writeCount == window` and `firstPosition % window == 0`.
+            // `n > 1` keeps the decode fast path below reachable for a
+            // degenerate single-slot window.
+            n > 1, n == window,
+            !Self.quantSimulate, !Self.gpuPackCheck, !Self.selfTestArmed,
+            newKeys.dtype == newValues.dtype,
+            newKeys.shape == [1, kvHeads, window, newKeys.dim(3)],
+            newValues.shape == [1, kvHeads, window, newValues.dim(3)]
+        else { return nil }
+
+        // The mirror is allocated exactly where `allocateIfNeeded` allocates
+        // it; refuse the seed rather than diverge on that decision.
+        let wantsMirror =
+            quantEligible && newKeys.dtype == .bfloat16
+            && newKeys.dim(3) == headDim && newValues.dim(3) == headDim
+
+        // PREFILL-STACK. The seed's mirror ("the two packed planes
+        // concatenated on the plane axis") and PREFILL-KVQ-PACK's MIRROR
+        // ADOPT ("a packed block that covers slots `[0, window)` BECOMES the
+        // mirror") are the same array reached from two directions, so the two
+        // mechanisms compose into ONE op instead of stacking: the pair-rows
+        // packer emits `[2, kvHeads, window, rowWords]` in a single
+        // two-dimensional dispatch, which is precisely the block the seed
+        // wants to install and precisely the block ADOPT would have adopted.
+        // Net per (sliding layer, row): ONE pack dispatch, no concatenate, no
+        // `SliceUpdate`, no zero fill, for both the ring and the mirror.
+        //
+        // The three switches stay orthogonal, and each removes exactly its
+        // own arm on this path:
+        //   * `DARKBLOOM_CBV2_PREFILL_RING_SEED=0` — no seed at all; the
+        //     allocate-then-slice-update road runs and the KVQ arms govern
+        //     the mirror exactly as they did before this composition.
+        //   * `DARKBLOOM_KVQ_PREFILL_PAIRPACK=0` — the ring is still seeded,
+        //     but the mirror is built from two per-plane pack dispatches and
+        //     a concatenate, which is PREFILL-RING-SEED's own road.
+        //   * `DARKBLOOM_KVQ_PREFILL_MIRROR_ADOPT=0` — the ring is still
+        //     seeded, but the mirror is zero-filled and slice-updated, which
+        //     is the incumbent mirror maintenance.
+        let fusedPack =
+            wantsMirror && Self.prefillPairedPackEnabled
+            && Self.prefillMirrorAdoptEnabled
+            && Self.gpuPackEnabled && headDim == 256
+        var seededMirror: MLXArray?
+        if wantsMirror {
+            Self.selfTestKVQ4()
+            if fusedPack {
+                // Row `(plane * kvHeads * n + head * n + token)` of the
+                // pair-rows output is, word for word, row
+                // `(head * n + token)` of `quantPackGPU`'s output for that
+                // plane — the same flattening, the same per-row arithmetic —
+                // so this is the identical array the concatenate below
+                // builds, minus one dispatch and one copy.
+                seededMirror = Self.quantPackPairRowsGPU(
+                    keys: newKeys, values: newValues)
+            } else if Self.prefillMirrorAdoptEnabled {
+                // Plane 0 is keys, plane 1 is values — the same order the two
+                // `writeMirror` calls deposit them in.
+                seededMirror = concatenated(
+                    [Self.packMirrorPlane(newKeys), Self.packMirrorPlane(newValues)],
+                    axis: 0)
+            } else {
+                // MIRROR ADOPT off: bring the mirror into being empty, the way
+                // `allocateIfNeeded` does, and let the established mirror
+                // writers fill it below.
+                seededMirror = MLXArray.zeros(
+                    [2, kvHeads, window, headDim / 8 + headDim / 64], dtype: .uint32)
+            }
+        }
+
+        CBv2EngageMark.once("prefill-ring-seed")
+        if fusedPack { CBv2EngageMark.once("prefill-stack-seed-pairpack") }
+        // `contiguous` is the deposit the slice update would have made: the
+        // chunk arrives as a row slice of the cohort's `[B, kvHeads, n, D]`
+        // rectangle, so its buffer is larger than the ring and MLX
+        // materializes a fresh row-contiguous copy (`Contiguous::eval_gpu`
+        // shares the buffer only when it is already the right size, which is
+        // the single-row case where no copy was needed either).
+        keys = contiguous(newKeys)
+        values = contiguous(newValues)
+        quantMirror = seededMirror
+        if wantsMirror {
+            if Self.prefillMirrorAdoptEnabled {
+                logMirrorSignature(n: n, start: 0, paired: fusedPack, adopted: true)
+            } else if !writePairedMirrorChunk(
+                keys: newKeys, values: newValues, firstPosition: 0)
+            {
+                writeMirror(plane: 0, tokens: newKeys, firstPosition: 0)
+                writeMirror(plane: 1, tokens: newValues, firstPosition: 0)
+                logMirrorSignature(n: n, start: 0, paired: false, adopted: false)
+            }
+        }
+        absoluteOffset = n
+        oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
+        borrowableChunkViews = (newKeys, newValues)
+        return (newKeys, newValues)
+    }
+
+    /// One mirror plane's packed rows, `[1, kvHeads, n, words]` uint32 — the
+    /// verbatim non-diagnostic body of `writeMirror`'s packer, lifted so the
+    /// seed above and the per-plane write produce the identical array.
+    private static func packMirrorPlane(_ tokens: MLXArray) -> MLXArray {
+        let packedFlat =
+            gpuPackEnabled
+            ? quantPackGPU(tokens).view(dtype: .uint8)
+            : quantPack(tokens).view(dtype: .uint8)
+        return packedFlat.view(dtype: .uint32).expandedDimensions(axis: 0)
     }
 
     func decodeRingWrite(keys newKeys: MLXArray, values newValues: MLXArray) {
@@ -730,6 +923,68 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// PREFILL-KVQ-PACK: `DARKBLOOM_KVQ_PREFILL_PAIRPACK=0` returns a prefill
+    /// chunk's mirror maintenance to one pack dispatch and one `SliceUpdate`
+    /// PER PLANE — the incumbent road. Default ON: both planes of the whole
+    /// chunk share a single pack dispatch and a single `SliceUpdate`, which is
+    /// the KVQ-PAIRWRITE idea applied at chunk width.
+    static let prefillPairedPackEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_KVQ_PREFILL_PAIRPACK"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// PREFILL-KVQ-PACK: `DARKBLOOM_KVQ_PREFILL_MIRROR_ADOPT=0` keeps the
+    /// `SliceUpdate` even when a chunk's packed block covers the WHOLE ring.
+    /// Default ON: a chunk that writes slots `[0, window)` supersedes every
+    /// byte of the mirror, so the packed block simply BECOMES the mirror and
+    /// the read-modify-write of the full allocation disappears. Only ever
+    /// taken when the packed block's shape and dtype equal the mirror's, so
+    /// the adopted buffer is indistinguishable from the updated one.
+    static let prefillMirrorAdoptEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_KVQ_PREFILL_MIRROR_ADOPT"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// PREFILL-KVQ-PACK receipt (local only). `MLX_KVQ_MIRROR_SIG=1` prints
+    /// one line per prefill mirror write: the write geometry, the running
+    /// pack-dispatch count, and an FNV-1a hash of the ENTIRE mirror after the
+    /// write. Two runs that differ only in `DARKBLOOM_KVQ_PREFILL_PAIRPACK`
+    /// must emit byte-identical logs; that is a stronger statement than token
+    /// parity because it compares the mirror the decode kernels actually read.
+    static let mirrorSignatureArmed: Bool = ["1", "true", "yes", "on"].contains(
+        (ProcessInfo.processInfo.environment["MLX_KVQ_MIRROR_SIG"] ?? "").lowercased())
+
+    nonisolated(unsafe) private static var packDispatchCount = 0
+
+    private static func countPackDispatch() {
+        guard mirrorSignatureArmed else { return }
+        diagLock.lock()
+        packDispatchCount += 1
+        diagLock.unlock()
+    }
+
+    /// FNV-1a over the mirror's words, plus the write geometry, to stderr.
+    private func logMirrorSignature(n: Int, start: Int, paired: Bool, adopted: Bool) {
+        guard Self.mirrorSignatureArmed, let quantMirror else { return }
+        let words = quantMirror.asArray(UInt32.self)
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for word in words {
+            hash = (hash ^ UInt64(word)) &* 0x0000_0100_0000_01b3
+        }
+        Self.diagLock.lock()
+        let dispatches = Self.packDispatchCount
+        Self.diagLock.unlock()
+        let line =
+            "[kvq-mirrorsig] n=\(n) start=\(start) paired=\(paired) adopted=\(adopted) "
+            + "words=\(words.count) packs=\(dispatches) "
+            + "fnv=\(String(hash, radix: 16))\n"
+        FileHandle.standardError.write(Data(line.utf8))
+    }
+
     /// `MLX_KV_Q4_FUSED_WRITE=0` restores the separate q4 pack + mirror
     /// SliceUpdate path in the same worker binary. Default ON: exact D256,
     /// B8 q4g64 decode packs the current token inside attention pass A.
@@ -830,6 +1085,86 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             const int lane = int(thread_position_in_threadgroup.x);
             const device T* src = (plane == 0 ? keys : values) + head * D;
             device uint32_t* out = packed_w + row * row_words;
+
+            float vmin = 3.402823466e+38F;
+            float vmax = -3.402823466e+38F;
+            for (int i = 0; i < per_lane; ++i) {
+                const float v = float(src[lane * per_lane + i]);
+                vmin = min(vmin, v);
+                vmax = max(vmax, v);
+            }
+            for (uint m = 1; m < 8; m <<= 1) {
+                vmin = min(vmin, simd_shuffle_xor(vmin, m));
+                vmax = max(vmax, simd_shuffle_xor(vmax, m));
+            }
+
+            const half hs = half(max((vmax - vmin) / 15.0f, 1e-6f));
+            const half hb = half(vmin);
+            const float s = float(hs);
+            const float b = float(hb);
+
+            uint32_t word = 0u;
+            for (int i = 0; i < per_lane; ++i) {
+                const float q = metal::rint((float(src[lane * per_lane + i]) - b) / s);
+                word |= uint32_t(clamp(q, 0.0f, 15.0f)) << (4 * i);
+            }
+            out[lane] = word;
+            if (lane % 8 == 0) {
+                out[payload_words + lane / 8] =
+                    uint32_t(as_type<ushort>(hs)) | (uint32_t(as_type<ushort>(hb)) << 16);
+            }
+        """
+    )
+
+    /// PREFILL-KVQ-PACK: the chunk-shaped sibling of
+    /// `cbv2_kvq4g64_pack_pair_d256_v1`. A prefill chunk knows BOTH mirror
+    /// planes of all `n` of its tokens at the same instant, exactly as a
+    /// decode step knows both planes of its one token, so the same pairing
+    /// applies at chunk width. The dispatch is TWO-DIMENSIONAL: `x` walks the
+    /// `kvHeads * n` rows of one plane, `y` selects the plane. Rows
+    /// `[0, planeRows)` are packed out of `keys`, rows
+    /// `[planeRows, 2 * planeRows)` out of `values`, and the output rows land
+    /// in that order — the `[2, kvHeads, n, row_words]` block the mirror
+    /// update wants, with no reshape and no host-side stack.
+    ///
+    /// The rows-per-plane stride is read from `threadgroups_per_grid.x`
+    /// rather than a template constant ON PURPOSE. A template value keyed on
+    /// the chunk width would compile a SEPARATE kernel for every distinct
+    /// chunk length a prompt produces, and those JIT compiles would land
+    /// inside the timed prefill — paying back the dispatch this mechanism
+    /// saves, and then some. As written there is exactly ONE variant per input
+    /// dtype for every prompt length, so a run pays at most one compile for
+    /// this packer no matter what the scheduler cuts — the same count the
+    /// incumbent per-plane packer pays, whose body is likewise shape-free.
+    /// (`warmPackPipeline` below would move even that one compile off the
+    /// timed path, and this kernel is wired into it, but nothing on the
+    /// current road calls that helper; the one-variant property is what
+    /// actually bounds the cost.)
+    ///
+    /// The per-row arithmetic is a transcription of `quantPackKernel`, for
+    /// the same reason the decode pair kernel duplicates it: recomposing the
+    /// promoted packer's source string would change its text, and a
+    /// Swift-hosted kernel whose text changes without its name changing
+    /// serves a stale cached body. Only the row → source-pointer mapping
+    /// differs, so the packed bytes are identical row for row.
+    private static let quantPackPairRowsKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_kvq4g64_pack_pair_rows_d256_v1",
+        inputNames: ["keys", "values"],
+        outputNames: ["packed_w"],
+        source: """
+            constexpr int D = 256;
+            constexpr int simd_width = 32;
+            constexpr int per_lane = D / simd_width;      // 8 values
+            constexpr int group_size = 64;
+            constexpr int payload_words = D / 8;          // 32
+            constexpr int row_words = payload_words + D / group_size;
+
+            const int plane_rows = int(threadgroups_per_grid.x);
+            const int index = int(threadgroup_position_in_grid.x);
+            const int plane = int(threadgroup_position_in_grid.y);
+            const int lane = int(thread_position_in_threadgroup.x);
+            const device T* src = (plane == 0 ? keys : values) + index * D;
+            device uint32_t* out = packed_w + (plane * plane_rows + index) * row_words;
 
             float vmin = 3.402823466e+38F;
             float vmax = -3.402823466e+38F;
@@ -1507,6 +1842,14 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
         guard quantEnabled, gpuPackEnabled else { return }
         let dummy = MLXArray.zeros([1, 8, 1, 256], dtype: .float16)
         eval(quantPackGPU(dummy))
+        // PREFILL-KVQ-PACK: the chunk packer has ONE variant per dtype (its
+        // rows-per-plane stride comes from the grid, not a template), so this
+        // single warm covers every prompt length the box will see. A two-token
+        // block is enough to compile it; the compiled body is width-agnostic.
+        if prefillPairedPackEnabled {
+            let chunk = MLXArray.zeros([1, 8, 2, 256], dtype: .bfloat16)
+            eval(quantPackPairRowsGPU(keys: chunk, values: chunk))
+        }
         guard pairedMirrorWriteEnabled else { return }
         let pair = MLXArray.zeros([1, 8, 1, 256], dtype: .bfloat16)
         eval(quantPackPairGPU(keys: pair, values: pair))
@@ -1518,6 +1861,7 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
         let kvHeads = x.dim(1)
         let n = x.dim(2)
         let rows = kvHeads * n
+        countPackDispatch()
         return quantPackKernel(
             [x],
             template: [("T", x.dtype)],
@@ -1551,6 +1895,7 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
     static func quantPackPairGPU(keys: MLXArray, values: MLXArray) -> MLXArray {
         let heads = keys.dim(1)
         let headDim = keys.dim(3)
+        countPackDispatch()
         return quantPackPairKernel(
             [keys, values],
             template: [("T", keys.dtype), ("HEADS", heads)],
@@ -1587,6 +1932,93 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
         let packed = Self.quantPackPairGPU(keys: newKeys, values: newValues)
         let slot = firstPosition % window
         quantMirror[0..., 0..., slot ..< (slot + 1), 0...] = packed
+        return true
+    }
+
+    /// PREFILL-KVQ-PACK: `[1, H, n, D]` keys and values -> `[2, H, n, D/8 +
+    /// D/64]` uint32, row for row what `quantPackGPU` produces for each plane
+    /// separately.
+    static func quantPackPairRowsGPU(keys: MLXArray, values: MLXArray) -> MLXArray {
+        let heads = keys.dim(1)
+        let n = keys.dim(2)
+        let headDim = keys.dim(3)
+        let planeRows = heads * n
+        countPackDispatch()
+        return quantPackPairRowsKernel(
+            [keys, values],
+            template: [("T", keys.dtype)],
+            grid: (planeRows * 32, 2, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[2, heads, n, headDim / 8 + headDim / 64]],
+            outputDTypes: [.uint32]
+        )[0]
+    }
+
+    /// PREFILL-KVQ-PACK. A prefill chunk's mirror maintenance is the whole
+    /// prefill cost of the 4-bit mirror, and the incumbent road pays it
+    /// TWICE — once per plane. Each plane costs one pack dispatch plus one
+    /// `SliceUpdate` over the ENTIRE `[2, kvHeads, window, rowWords]`
+    /// allocation, and the second update takes the first one's output as its
+    /// input, so the two serialize and the full mirror is copied twice per
+    /// (layer, row, chunk).
+    ///
+    /// Both planes of a chunk are known at the same instant — the same fact
+    /// KVQ-PAIRWRITE exploits for one decode token — so they can share one
+    /// pack dispatch and one update. When the chunk additionally covers the
+    /// whole ring (a prompt at least `window` long, landing at slot 0), every
+    /// byte of the mirror is superseded and the packed block simply BECOMES
+    /// the mirror: the read-modify-write disappears entirely.
+    ///
+    /// Returns false — leaving the per-plane road untouched — whenever a
+    /// precondition does not hold.
+    private func writePairedMirrorChunk(
+        keys newKeys: MLXArray, values newValues: MLXArray, firstPosition: Int
+    ) -> Bool {
+        guard Self.prefillPairedPackEnabled,
+            let quantMirror,
+            Self.gpuPackEnabled, !Self.quantSimulate,
+            headDim == 256,
+            newKeys.dtype == newValues.dtype,
+            newKeys.shape == newValues.shape,
+            newKeys.dim(0) == 1, newKeys.dim(1) == kvHeads, newKeys.dim(3) == headDim
+        else { return false }
+        let n = newKeys.dim(2)
+        guard n >= 1, n <= window else { return false }
+
+        let packed = Self.quantPackPairRowsGPU(keys: newKeys, values: newValues)
+        if Self.gpuPackCheck {
+            // The host packer is the definition of the mirror's bytes; the
+            // paired kernel is only legitimate while it reproduces it exactly.
+            let host = concatenated(
+                [
+                    Self.quantPack(newKeys).expandedDimensions(axis: 0),
+                    Self.quantPack(newValues).expandedDimensions(axis: 0),
+                ], axis: 0)
+            let mismatches = (packed .!= host).sum().item(Int.self)
+            if mismatches != 0 {
+                FileHandle.standardError.write(Data(
+                    "[kvq-pairrows] BYTE MISMATCH: \(mismatches) words differ (n=\(n))\n".utf8))
+            }
+        }
+
+        let start = firstPosition % window
+        if Self.prefillMirrorAdoptEnabled, start == 0, n == window,
+            packed.shape == quantMirror.shape
+        {
+            self.quantMirror = packed
+            logMirrorSignature(n: n, start: start, paired: true, adopted: true)
+            return true
+        }
+        if start + n <= window {
+            quantMirror[0..., 0..., start ..< (start + n), 0...] = packed
+        } else {
+            let first = window - start
+            quantMirror[0..., 0..., start ..< window, 0...] =
+                packed[.ellipsis, ..<first, 0...]
+            quantMirror[0..., 0..., 0 ..< (n - first), 0...] =
+                packed[.ellipsis, first..., 0...]
+        }
+        logMirrorSignature(n: n, start: start, paired: true, adopted: false)
         return true
     }
 

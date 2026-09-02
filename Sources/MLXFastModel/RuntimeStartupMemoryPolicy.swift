@@ -103,7 +103,7 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
         // 512 MiB post-wire budget never landed. overwrite=1 makes the
         // promoted Laguna M5-Max command-buffer profile actually apply.
         setenv("MLX_MAX_MB_PER_BUFFER", "512", 1)
-        setenv("MLX_MAX_OPS_PER_BUFFER", "512", 1)
+        setenv("MLX_MAX_OPS_PER_BUFFER", "768", 1)
     }
 
     public static func resolve(

@@ -140,6 +140,71 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// W4-XVLOAD-001. `load_affine8_values` -- the four-value activation walk
+    /// DMLP-002 substitutes for `load_vector` in the LIVE gate/up body -- read
+    /// its four activations as four separate scalar loads. They are four
+    /// adjacent elements at a naturally aligned address, so they become ONE
+    /// aligned `vec<T, 4>`. Same elements, same widening to float, same order
+    /// into `x_thread`, and the `x_sums` term the body adds beside the walk is
+    /// untouched, so every downstream `qdot`, K accumulation and simd
+    /// reduction consumes identical bits. Exact by construction: no tolerance
+    /// budget is spent.
+    ///
+    /// Alignment holds for every address the body forms, with no runtime
+    /// condition. Each x stream enters the impl as `x + (first_m + j) *
+    /// in_vec_size`, is advanced once by `simd_lid * values_per_thread` and by
+    /// `block_size` per K block, so
+    ///
+    ///     x - base = (first_m + j) * in_vec_size
+    ///              + values_per_thread * simd_lid
+    ///              + block_size * n
+    ///
+    /// with the body's own constants `values_per_thread == 4` and
+    /// `block_size == values_per_thread * SIMD_SIZE == 128`, and `in_vec_size`
+    /// pinned by `liveShape` to 2816 (= 4 * 704) or 2112 (= 4 * 528). Every
+    /// term is a multiple of four elements, i.e. eight bytes at bfloat16, so
+    /// the run is a naturally aligned `vec<T, 4>` unconditionally -- no guard,
+    /// no remainder path. The ragged tail forms the same addresses under the
+    /// `simd_lid < active_tail_lanes` predicate, which restricts WHICH lanes
+    /// load and never the address; the live gate/up shape has no tail at all
+    /// (2816 / 128 = 22 exactly). The load reads exactly `x[0 ..< 4]`, the
+    /// elements the incumbent loop read, so no new byte is touched and the
+    /// bounds are unchanged.
+    ///
+    /// `DARKBLOOM_GEMMA4_W4_XVLOAD=0` compiles the incumbent scalar walk
+    /// verbatim and drops the cache-key suffix.
+    public static let w4XvloadEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_W4_XVLOAD"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Appended to every kernel name whose source text this switch changes, so
+    /// a name-keyed compiled-kernel cache can never serve the other body.
+    static let w4xvSuffix: String = w4XvloadEnabled ? "_wx1" : ""
+
+    /// Diagnostics only, armed by `MLXFAST_ENGAGE_MARKS` exactly like
+    /// `CBv2EngageMark` itself and inert otherwise. A mark placed beside a
+    /// dispatch decision proves only that a branch was taken; a mark whose tag
+    /// carries a stable fingerprint of the kernel source string proves that
+    /// THIS text was the text handed to the compiler, and lets the two switch
+    /// arms be compared from the census alone. Swift's `hashValue` is
+    /// per-process seeded and cannot be compared across runs, so this is a
+    /// plain FNV-1a over UTF-8.
+    private static let markArmed =
+        ProcessInfo.processInfo.environment["MLXFAST_ENGAGE_MARKS"] != nil
+
+    private static func srcMark(_ tag: String, _ text: String) {
+        guard markArmed else { return }
+        var h: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in text.utf8 {
+            h ^= UInt64(byte)
+            h = h &* 0x0000_0100_0000_01b3
+        }
+        CBv2EngageMark.once(tag + String(h, radix: 16))
+    }
+
     private static let batch = 8
     private static let sequence = 1
     private static let groupSize = 64
@@ -353,7 +418,9 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
     /// still loaded into the same register array, in the same order, and every
     /// qdot, K accumulation and simd reduction remains text-for-text identical.
     private static let activationSumKernelHeader: String = {
-        var result = kernelHeader
+        var result = (w4XvloadEnabled
+            ? "#define DB_W4_XVLOAD 1\n" : "#define DB_W4_XVLOAD 0\n")
+            + kernelHeader
 
         func replaceOnce(_ old: String, with new: String) {
             precondition(result.components(separatedBy: old).count == 2)
@@ -380,10 +447,30 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
             inline void load_affine8_values(
                 const device T* x,
                 thread U* x_thread) {
+            #if DB_W4_XVLOAD
+              // Every caller reaches this run at a multiple of four elements
+              // from a row base whose stride is itself a multiple of four, so
+              // the fetch is one naturally aligned vector load with no guard
+              // and no remainder path. Same four elements, same widening, same
+              // order into x_thread as the walk below.
+              static_assert(
+                  values_per_thread % 4 == 0,
+                  "load_affine8_values vector run needs values_per_thread % 4 == 0");
+              #pragma unroll
+              for (int i = 0; i < values_per_thread; i += 4) {
+                const vec<T, 4> xv =
+                    *reinterpret_cast<const device vec<T, 4>*>(x + i);
+                x_thread[i] = xv[0];
+                x_thread[i + 1] = xv[1];
+                x_thread[i + 2] = xv[2];
+                x_thread[i + 3] = xv[3];
+              }
+            #else
               #pragma unroll
               for (int i = 0; i < values_per_thread; i++) {
                 x_thread[i] = x[i];
               }
+            #endif
             }
 
             template <typename T, const int group_size, const int bits>
@@ -794,6 +881,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
                 s_next = srow[g_next];
                 b_next = brow[g_next];
             """)
+        srcMark("mlp-down-src-", result)
         return result
     }()
 
@@ -955,8 +1043,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     )
 
     private static let activationSumQMVKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_v2_unroll",
-        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_v2_unroll" + w4xvSuffix,        inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["y"],
         source: """
             const uint3 tid = threadgroup_position_in_grid;
@@ -1052,8 +1139,18 @@ inline U qdot_affine8_registered_v4(
 
     private static let w4KernelHeader: String = w4Header(kernelHeader)
 
-    private static let w4ActivationSumKernelHeader: String =
-        w4Header(activationSumKernelHeader)
+    private static let w4ActivationSumKernelHeader: String = {
+        let text = w4Header(activationSumKernelHeader)
+        // R13 addendum 2. This closure runs exactly once, when
+        // `w4ActivationSumQMVKernel` is first constructed -- and that kernel is
+        // constructed only where `matmul` selects it and immediately
+        // dispatches it. So these marks fire from INSIDE the construction of
+        // the live gate/up kernel's source string, not beside the branch that
+        // chose it, and the fingerprint names the exact text that was compiled.
+        srcMark("mlp-gateup-src-", text)
+        if w4XvloadEnabled { CBv2EngageMark.once("mlp-w4-xvload") }
+        return text
+    }()
 
     /// The W4 twins. Source text is the promoted kernels' own, character for
     /// character; only the name and the header differ, so the grid, threadgroup
@@ -1096,8 +1193,7 @@ inline U qdot_affine8_registered_v4(
     )
 
     private static let w4ActivationSumQMVKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_w4_v1",
-        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_w4_v1" + w4xvSuffix,        inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["y"],
         source: """
             const uint3 tid = threadgroup_position_in_grid;

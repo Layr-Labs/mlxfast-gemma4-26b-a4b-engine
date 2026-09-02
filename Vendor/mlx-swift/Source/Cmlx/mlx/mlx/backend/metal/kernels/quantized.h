@@ -1565,7 +1565,42 @@ METAL_FUNC void qmv_impl(
   }
 }
 
-template <typename T, const int group_size, const int bits>
+// EXPERT-GEGLU: the routed-expert gate|up gather with the GeGLU product in
+// the epilogue. FUSE remaps the four arm rows of one simdgroup from the
+// contiguous rows g..g+3 to the gate rows g, g+1 and their matching up rows
+// 704+g, 705+g of the concatenated [E, 1408, K/8] gate|up storage; every
+// (output row, input row) pair keeps its own accumulator, K-loop order, qdot
+// and simd_sum, so the gate and up values are the bit-identical qmv outputs,
+// rounded to T exactly where the split kernels stored them, before the
+// T-precision GeGLU below combines them. FUSE = false leaves the arms
+// textually unchanged: gemma4_geglu_arm_row<false>(row) == row.
+template <bool FUSE>
+METAL_FUNC constexpr int gemma4_geglu_arm_row(int row) {
+  return FUSE ? (row < 2 ? row : row + 702) : row;
+}
+
+// (0.5 * g * (1 + tanh(sqrt(2/pi) * (g + 0.044715 * g * g * g)))) * u with
+// every scalar rounded to T first and one T rounding per op: the textual twin
+// of the compiled shape-pinned GeGLU the split path applies to [64, 1, 704].
+template <typename T>
+METAL_FUNC T gemma4_geglu_bf16(T g, T u) {
+  const T half_c = static_cast<T>(0.5f);
+  const T k_c = static_cast<T>(0.044715f);
+  const T s_c = static_cast<T>(0.7978845608028654f);
+  const T one_c = static_cast<T>(1.0f);
+  const T t1 = half_c * g;
+  const T a1 = k_c * g;
+  const T a2 = a1 * g;
+  const T a3 = a2 * g;
+  const T inner = g + a3;
+  const T sv = s_c * inner;
+  const T th = static_cast<T>(metal::precise::tanh(static_cast<float>(sv)));
+  const T one_th = one_c + th;
+  const T act = t1 * one_th;
+  return act * u;
+}
+
+template <typename T, const int group_size, const int bits, bool FUSE = false>
 METAL_FUNC void qmv_affine4_g64_pair_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1596,8 +1631,11 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
 
   const int in_vec_size_w = in_vec_size / 2;
   const int in_vec_size_g = in_vec_size / 64;
-  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
-      simd_gid * results_per_simdgroup;
+  const int out_row = FUSE
+      ? (tid.y * (num_simdgroups * (results_per_simdgroup / 2)) +
+         simd_gid * (results_per_simdgroup / 2))
+      : (tid.y * (num_simdgroups * results_per_simdgroup) +
+         simd_gid * results_per_simdgroup);
 
   ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
   scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
@@ -1610,9 +1648,9 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   int k = 0;
   for (; k <= in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
-      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
-      scale_local[row] = scales[row * in_vec_size_g];
-      bias_local[row] = biases[row * in_vec_size_g];
+      packed[row] = *((const device uint*)(ws + gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_w));
+      scale_local[row] = scales[gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_g];
+      bias_local[row] = biases[gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_g];
     }
 
     float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
@@ -1642,9 +1680,9 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
       uint((in_vec_size - k) / values_per_thread);
   if (simd_lid < active_tail_lanes) {
     for (int row = 0; row < results_per_simdgroup; row++) {
-      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
-      scale_local[row] = scales[row * in_vec_size_g];
-      bias_local[row] = biases[row * in_vec_size_g];
+      packed[row] = *((const device uint*)(ws + gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_w));
+      scale_local[row] = scales[gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_g];
+      bias_local[row] = biases[gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_g];
     }
 
     float sum0 =
@@ -1664,9 +1702,17 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   for (int row = 0; row < results_per_simdgroup; row++) {
     result0[row] = simd_sum(result0[row]);
     result1[row] = simd_sum(result1[row]);
-    if (simd_lid == 0) {
+    if (simd_lid == 0 && !FUSE) {
       y0[row] = static_cast<T>(result0[row]);
       y1[row] = static_cast<T>(result1[row]);
+    }
+  }
+  if (FUSE && simd_lid == 0) {
+    for (int p = 0; p < results_per_simdgroup / 2; p++) {
+      y0[p] = gemma4_geglu_bf16<T>(
+          static_cast<T>(result0[p]), static_cast<T>(result0[p + 2]));
+      y1[p] = gemma4_geglu_bf16<T>(
+          static_cast<T>(result1[p]), static_cast<T>(result1[p + 2]));
     }
   }
 }
@@ -1694,7 +1740,7 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
 // `qdot_affine4_registered` is the bits == 4 arm of `qdot` verbatim. Only the
 // LOADS are shared, so every output element's add sequence is identical to
 // stock qmv_impl.
-template <typename T, const int group_size, const int bits>
+template <typename T, const int group_size, const int bits, bool FUSE = false>
 METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1730,8 +1776,11 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
 
   const int in_vec_size_w = in_vec_size / 2;
   const int in_vec_size_g = in_vec_size / 64;
-  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
-      simd_gid * results_per_simdgroup;
+  const int out_row = FUSE
+      ? (tid.y * (num_simdgroups * (results_per_simdgroup / 2)) +
+         simd_gid * (results_per_simdgroup / 2))
+      : (tid.y * (num_simdgroups * results_per_simdgroup) +
+         simd_gid * results_per_simdgroup);
 
   ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
   scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
@@ -1749,9 +1798,9 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
   for (; k <= in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] =
-          *((const device uint*)(ws + row * in_vec_size_w));
-      scale_local[row] = scales[row * in_vec_size_g];
-      bias_local[row] = biases[row * in_vec_size_g];
+          *((const device uint*)(ws + gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_w));
+      scale_local[row] = scales[gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_g];
+      bias_local[row] = biases[gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_g];
     }
 
     float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
@@ -1791,9 +1840,9 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
   if (remaining > 0) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] =
-          *((const device uint*)(ws + row * in_vec_size_w));
-      scale_local[row] = scales[row * in_vec_size_g];
-      bias_local[row] = biases[row * in_vec_size_g];
+          *((const device uint*)(ws + gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_w));
+      scale_local[row] = scales[gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_g];
+      bias_local[row] = biases[gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_g];
     }
 
     float sum =
@@ -1827,11 +1876,23 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     result1[row] = simd_sum(result1[row]);
     result2[row] = simd_sum(result2[row]);
     result3[row] = simd_sum(result3[row]);
-    if (simd_lid == 0) {
+    if (simd_lid == 0 && !FUSE) {
       y0[row] = static_cast<T>(result0[row]);
       y1[row] = static_cast<T>(result1[row]);
       y2[row] = static_cast<T>(result2[row]);
       y3[row] = static_cast<T>(result3[row]);
+    }
+  }
+  if (FUSE && simd_lid == 0) {
+    for (int p = 0; p < results_per_simdgroup / 2; p++) {
+      y0[p] = gemma4_geglu_bf16<T>(
+          static_cast<T>(result0[p]), static_cast<T>(result0[p + 2]));
+      y1[p] = gemma4_geglu_bf16<T>(
+          static_cast<T>(result1[p]), static_cast<T>(result1[p + 2]));
+      y2[p] = gemma4_geglu_bf16<T>(
+          static_cast<T>(result2[p]), static_cast<T>(result2[p + 2]));
+      y3[p] = gemma4_geglu_bf16<T>(
+          static_cast<T>(result3[p]), static_cast<T>(result3[p + 2]));
     }
   }
 }
@@ -1841,7 +1902,7 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
 // register discipline (one live x buffer), K-loop order, per-(output, input)
 // accumulators, and qdot_affine4_registered arithmetic are the quad's own, so
 // every output element's add sequence remains identical to stock qmv_impl.
-template <typename T, const int group_size, const int bits>
+template <typename T, const int group_size, const int bits, bool FUSE = false>
 METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1874,8 +1935,11 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
 
   const int in_vec_size_w = in_vec_size / 2;
   const int in_vec_size_g = in_vec_size / 64;
-  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
-      simd_gid * results_per_simdgroup;
+  const int out_row = FUSE
+      ? (tid.y * (num_simdgroups * (results_per_simdgroup / 2)) +
+         simd_gid * (results_per_simdgroup / 2))
+      : (tid.y * (num_simdgroups * results_per_simdgroup) +
+         simd_gid * results_per_simdgroup);
 
   ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
   scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
@@ -1891,9 +1955,9 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
   for (; k <= in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] =
-          *((const device uint*)(ws + row * in_vec_size_w));
-      scale_local[row] = scales[row * in_vec_size_g];
-      bias_local[row] = biases[row * in_vec_size_g];
+          *((const device uint*)(ws + gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_w));
+      scale_local[row] = scales[gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_g];
+      bias_local[row] = biases[gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_g];
     }
 
     float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
@@ -1927,9 +1991,9 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
   if (remaining > 0) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] =
-          *((const device uint*)(ws + row * in_vec_size_w));
-      scale_local[row] = scales[row * in_vec_size_g];
-      bias_local[row] = biases[row * in_vec_size_g];
+          *((const device uint*)(ws + gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_w));
+      scale_local[row] = scales[gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_g];
+      bias_local[row] = biases[gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_g];
     }
 
     float sum =
@@ -1956,10 +2020,20 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
     result0[row] = simd_sum(result0[row]);
     result1[row] = simd_sum(result1[row]);
     result2[row] = simd_sum(result2[row]);
-    if (simd_lid == 0) {
+    if (simd_lid == 0 && !FUSE) {
       y0[row] = static_cast<T>(result0[row]);
       y1[row] = static_cast<T>(result1[row]);
       y2[row] = static_cast<T>(result2[row]);
+    }
+  }
+  if (FUSE && simd_lid == 0) {
+    for (int p = 0; p < results_per_simdgroup / 2; p++) {
+      y0[p] = gemma4_geglu_bf16<T>(
+          static_cast<T>(result0[p]), static_cast<T>(result0[p + 2]));
+      y1[p] = gemma4_geglu_bf16<T>(
+          static_cast<T>(result1[p]), static_cast<T>(result1[p + 2]));
+      y2[p] = gemma4_geglu_bf16<T>(
+          static_cast<T>(result2[p]), static_cast<T>(result2[p + 2]));
     }
   }
 }
@@ -3741,7 +3815,7 @@ inline float qdot_affine4_g64_word(
 // compile-time false unless group_size == 64 && bits == 4; the affine-4 /
 // g64 constants below are hardcoded exactly as `qmv_affine4_g64_pair_impl`
 // hardcodes them.
-template <typename T, int group_size, int bits, int KFIX, bool WVEC, bool PF>
+template <typename T, int group_size, int bits, int KFIX, bool WVEC, bool PF, bool FUSE = false>
 METAL_FUNC void qmv_affine4_g64_singles_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -3771,9 +3845,13 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
 
   const int in_vec_size_w = in_vec_size / 2;
   const int in_vec_size_g = in_vec_size / qgroup;
-  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
-      simd_gid * results_per_simdgroup;
-  const int used_out_row = min(out_vec_size - results_per_simdgroup, out_row);
+  const int out_row = FUSE
+      ? (tid.y * (num_simdgroups * (results_per_simdgroup / 2)) +
+         simd_gid * (results_per_simdgroup / 2))
+      : (tid.y * (num_simdgroups * results_per_simdgroup) +
+         simd_gid * results_per_simdgroup);
+  const int used_out_row =
+      FUSE ? out_row : min(out_vec_size - results_per_simdgroup, out_row);
   if (out_row >= out_vec_size) {
     return;
   }
@@ -3790,7 +3868,7 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
   thread uint wpf[results_per_simdgroup];
   if (PF) {
     for (int row = 0; row < results_per_simdgroup; row++) {
-      wpf[row] = *((const device uint*)(ws0 + row * in_vec_size_w));
+      wpf[row] = *((const device uint*)(ws0 + gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_w));
     }
   }
 
@@ -3805,22 +3883,22 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
       const int nextblk = (blk + 1 < nblocks) ? (blk + 1) : blk;
       const device uint8_t* wsn = ws0 + nextblk * block_bytes;
       for (int row = 0; row < results_per_simdgroup; row++) {
-        wpf[row] = *((const device uint*)(wsn + row * in_vec_size_w));
+        wpf[row] = *((const device uint*)(wsn + gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_w));
       }
     }
 
     for (int row = 0; row < results_per_simdgroup; row++) {
-      const device T* sl = scales + row * in_vec_size_g;
-      const device T* bl = biases + row * in_vec_size_g;
+      const device T* sl = scales + gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_g;
+      const device T* bl = biases + gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_g;
       U s = sl[0];
       U b = bl[0];
       if (PF) {
         result[row] += qdot_affine4_g64_word(wcur[row], x_thread, s, b, sum);
       } else if (WVEC) {
-        const uint v = *((const device uint*)(ws + row * in_vec_size_w));
+        const uint v = *((const device uint*)(ws + gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_w));
         result[row] += qdot_affine4_g64_word(v, x_thread, s, b, sum);
       } else {
-        auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+        auto wl = (const device uint8_t*)(ws + gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_w);
         result[row] += qdot<U, values_per_thread, 4>(wl, x_thread, s, b, sum);
       }
     }
@@ -3847,9 +3925,9 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
         U sum = load_vector_safe<T, U, values_per_thread, 4>(
             x, x_thread, remaining);
         for (int row = 0; row < results_per_simdgroup; row++) {
-          auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-          const device T* sl = scales + row * in_vec_size_g;
-          const device T* bl = biases + row * in_vec_size_g;
+          auto wl = (const device uint8_t*)(ws + gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_w);
+          const device T* sl = scales + gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_g;
+          const device T* bl = biases + gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_g;
           U s = sl[0];
           U b = bl[0];
           result[row] += qdot_safe<U, values_per_thread, 4>(
@@ -3861,15 +3939,15 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
     if (tail_values % values_per_thread == 0 && simd_lid < active_tail_lanes) {
       U sum = load_vector<T, U, values_per_thread, 4>(x, x_thread);
       for (int row = 0; row < results_per_simdgroup; row++) {
-        const device T* sl = scales + row * in_vec_size_g;
-        const device T* bl = biases + row * in_vec_size_g;
+        const device T* sl = scales + gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_g;
+        const device T* bl = biases + gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_g;
         U s = sl[0];
         U b = bl[0];
         if (WVEC || PF) {
-          const uint v = *((const device uint*)(ws + row * in_vec_size_w));
+          const uint v = *((const device uint*)(ws + gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_w));
           result[row] += qdot_affine4_g64_word(v, x_thread, s, b, sum);
         } else {
-          auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+          auto wl = (const device uint8_t*)(ws + gemma4_geglu_arm_row<FUSE>(row) * in_vec_size_w);
           result[row] += qdot<U, values_per_thread, 4>(wl, x_thread, s, b, sum);
         }
       }
@@ -3878,8 +3956,14 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
 
   for (int row = 0; row < results_per_simdgroup; row++) {
     result[row] = simd_sum(result[row]);
-    if (simd_lid == 0) {
+    if (simd_lid == 0 && !FUSE) {
       y[row] = static_cast<T>(result[row]);
+    }
+  }
+  if (FUSE && simd_lid == 0) {
+    for (int p = 0; p < results_per_simdgroup / 2; p++) {
+      y[p] = gemma4_geglu_bf16<T>(
+          static_cast<T>(result[p]), static_cast<T>(result[p + 2]));
     }
   }
 }
@@ -4030,7 +4114,13 @@ template <typename T, int group_size, int bits>
       group_size == 64 && bits == 4 && M == 1 && batch_ndims == 1 &&
       batch_shape[0] == 64 && x_batch_ndims == 1 && w_batch_ndims == 1 &&
       ((in_vec_size == 2816 && out_vec_size == 704) ||
-       (in_vec_size == 704 && out_vec_size == 2816));
+       (in_vec_size == 704 && out_vec_size == 2816) ||
+       (in_vec_size == 2816 && out_vec_size == 1408 && x_shape[0] == 8));
+  // EXPERT-GEGLU: the [8, 1, 2816] cohort against the concatenated
+  // [E, 1408, K/8] gate|up storage is the fused gate|up + GeGLU launch. The
+  // same run-quad leaders serve it; the activations land compactly at
+  // y + assignment * 704 and the host reads that prefix as [64, 1, 704].
+  const bool fuse_geglu = gemma4_pair_geometry && out_vec_size == 1408;
   if (gemma4_pair_geometry) {
     // KERN-DOWN-TILE gate (strip-walk pattern): compile-time flip; ON
     // here -- the K = 704 down plane takes the y-tile-coarsened arm above.
@@ -4096,6 +4186,80 @@ template <typename T, int group_size, int bits>
                  expert) {
         run_len++;
       }
+    }
+    if (fuse_geglu) {
+      constexpr int act_cols = 704;
+      const device uint32_t* run_w = w + expert * w_strides[0];
+      const device T* run_scales = scales + expert * s_strides[0];
+      const device T* run_biases = biases + expert * b_strides[0];
+      const device T* run_x0 =
+          x + lhs_indices[assignment * (uint)lhs_strides[0]] * x_strides[0];
+      device T* run_y0 = y + assignment * act_cols;
+      if (run_len == 1) {
+        qmv_affine4_g64_singles_impl<
+            T, group_size, bits, 2816, true, false, true>(
+            run_w, run_scales, run_biases, run_x0, run_y0,
+            in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+        return;
+      }
+      const device T* run_x1 = x +
+          lhs_indices[(assignment + 1) * (uint)lhs_strides[0]] * x_strides[0];
+      device T* run_y1 = y + (assignment + 1) * act_cols;
+      if (run_len == 2) {
+        qmv_affine4_g64_pair_impl<T, group_size, bits, true>(
+            run_w,
+            run_scales,
+            run_biases,
+            run_x0,
+            run_x1,
+            run_y0,
+            run_y1,
+            in_vec_size,
+            tid,
+            simd_gid,
+            simd_lid);
+        return;
+      }
+      const device T* run_x2 = x +
+          lhs_indices[(assignment + 2) * (uint)lhs_strides[0]] * x_strides[0];
+      device T* run_y2 = y + (assignment + 2) * act_cols;
+      if (run_len == 3) {
+        qmv_affine4_g64_triple_stream_impl<T, group_size, bits, true>(
+            run_w,
+            run_scales,
+            run_biases,
+            run_x0,
+            run_x1,
+            run_x2,
+            run_y0,
+            run_y1,
+            run_y2,
+            in_vec_size,
+            tid,
+            simd_gid,
+            simd_lid);
+        return;
+      }
+      const device T* run_x3 = x +
+          lhs_indices[(assignment + 3) * (uint)lhs_strides[0]] * x_strides[0];
+      device T* run_y3 = y + (assignment + 3) * act_cols;
+      qmv_affine4_g64_quad_stream_impl<T, group_size, bits, true>(
+          run_w,
+          run_scales,
+          run_biases,
+          run_x0,
+          run_x1,
+          run_x2,
+          run_x3,
+          run_y0,
+          run_y1,
+          run_y2,
+          run_y3,
+          in_vec_size,
+          tid,
+          simd_gid,
+          simd_lid);
+      return;
     }
     if (run_len > 1) {
       const device uint32_t* run_w = w + expert * w_strides[0];

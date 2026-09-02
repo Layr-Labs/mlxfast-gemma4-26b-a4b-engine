@@ -299,6 +299,17 @@ private let compiledGeGLUShaped: @Sendable (MLXArray, MLXArray) -> MLXArray = {
 private let switchGeluShapedFuseEnabled: Bool =
     ProcessInfo.processInfo.environment["DARKBLOOM_GELU_SHAPED_FUSE"] != "0"
 
+/// EXPERT-GEGLU: at the batch-8 sorted decode geometry one gather over the
+/// concatenated gate|up storage computes the gate row and the up row of each
+/// output column in the same simdgroup and applies the GeGLU product in its
+/// epilogue (`affine_gather_qmv`, `fuse_geglu`), so the split gate/up
+/// gathers and the shape-pinned GeGLU launch fold into one launch. Every
+/// gate and up value is the bit-identical qmv output rounded to bfloat16
+/// where the split kernels stored it. Off switch:
+/// DARKBLOOM_GEMMA4_EXPERT_GEGLU_FUSE=0.
+private let switchExpertGeGLUFuseEnabled: Bool =
+    ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_EXPERT_GEGLU_FUSE"] != "0"
+
 /// Admit only the routed-expert decode rectangles: `[64, 1, N]` / `[64, N]`,
 /// both operands bfloat16 with identical shapes. Prefill's per-prompt row
 /// counts stay on the shapeless closure so the compiler cache cannot grow.
@@ -1458,6 +1469,7 @@ public class SwitchGLU: Module {
             }
         }
 
+        var fusedActivated: MLXArray? = nil
         let xGate: MLXArray
         let xUp: MLXArray
         if let gateUpProj {
@@ -1497,6 +1509,37 @@ public class SwitchGLU: Module {
                 )
                 xGate = xGateUp[.ellipsis, ..<hiddenDims]
                 xUp = xGateUp[.ellipsis, hiddenDims...]
+            } else if switchExpertGeGLUFuseEnabled, doSort, useLhsIndices,
+                let lhsIndices, idx.ndim == 1, idx.size == 64,
+                x.ndim == 3, x.dim(0) == 8, x.dim(-2) == 1, x.dim(-1) == inputDims,
+                x.dtype == .bfloat16, hiddenDims == 704,
+                isGeluActivation, activationProduct == nil,
+                let fused = fusedGateUpDispatch()
+            {
+                // EXPERT-GEGLU: the kernel serves the same run-quad leaders
+                // as the split gathers, pairs gate row g with up row 704 + g
+                // inside one simdgroup and stores GeGLU(gate, up) compactly as
+                // the [64, 704] prefix of its [64, 1, 1408] output; the rest
+                // of that buffer is never written or read.
+                CBv2EngageMark.once("expert-geglu-fuse")
+                let gateUpAct = MLX.gatherQuantizedMM(
+                    x,
+                    fused.storage.weight,
+                    scales: fused.storage.scales,
+                    biases: fused.storage.biases,
+                    lhsIndices: lhsIndices,
+                    rhsIndices: idx,
+                    transpose: true,
+                    groupSize: fused.groupSize,
+                    bits: fused.bits,
+                    mode: fused.mode,
+                    sortedIndices: doSort
+                )
+                let act = gateUpAct.flattened()[..<(64 * hiddenDims)]
+                    .reshaped([64, 1, hiddenDims])
+                fusedActivated = act
+                xGate = act
+                xUp = act
             } else {
                 xUp = upProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
                 xGate = gateProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
@@ -1504,7 +1547,9 @@ public class SwitchGLU: Module {
         }
 
         let activated: MLXArray
-        if let activationProduct {
+        if let fusedActivated {
+            activated = fusedActivated
+        } else if let activationProduct {
             activated = activationProduct(xGate, xUp)
         } else if isSiluActivation {
             activated = compiledSwiGLU(xGate, xUp)

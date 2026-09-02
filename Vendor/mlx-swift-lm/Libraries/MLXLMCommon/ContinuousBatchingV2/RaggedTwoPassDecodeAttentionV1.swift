@@ -161,8 +161,10 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     nonisolated(unsafe) private static var residentProducts:
         [ObjectIdentifier: ResidentProducts] = [:]
 
+    /// Shared with the D=512 chain (`CBv2RaggedComposedD512DecodeAttentionV1`),
+    /// whose NORMROPE-D512 / ORS-D512 folds publish through the same carrier.
     @inline(__always)
-    private static func publishResidentProducts(
+    fileprivate static func publishResidentProducts(
         _ products: ResidentProducts, for output: MLXArray
     ) {
         residentProductsLock.lock()
@@ -1686,7 +1688,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// removes only the global partial write/read and the second dispatch.
     private static let portQuantFusedWriteResidentKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_ey29_ey32_yp3",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_ey29_ey32_yp3_ey44",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -2598,7 +2600,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
 
     private static let portQuantFusedWriteResidentNormRopeKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_v1_ey29_ey32_yp3",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_v1_ey29_ey32_yp3_ey44",
             inputNames: [
                 "raw_queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -2614,7 +2616,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// fifth output, so the standalone prepass never runs on a sliding layer.
     private static let portQuantFusedWriteResidentNormRopeORunsumKernel:
         MLXFast.MLXFastKernel = MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_ors_v1_ey29_ey32_yp3",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_ors_v1_ey29_ey32_yp3_ey44",
             inputNames: [
                 "raw_queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -3127,7 +3129,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
 /// lockstep, kL outside [4, 4095] (the transcribed kernel-selection window),
 /// or missing/mismatched backing buffers. All gates are checked BEFORE any
 /// append, so failing closed can never leave a double-append behind.
-enum CBv2RaggedComposedD512DecodeAttentionV1 {
+public enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// Kill switch: `DARKBLOOM_GEMMA4_D512_DECODE_SDPA` set to
     /// `0`/`false`/`no`/`off` restores the established per-row chain.
     /// Default ON.
@@ -3151,6 +3153,135 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// requires kL ≥ TM = 4.
     private static let minKeyLength = 4
     private static let maxKeyLength = 4095
+
+    // MARK: NORMROPE-D512 / ORS-D512
+
+    /// NORMROPE-D512 kill switch: `DARKBLOOM_GEMMA4_D512_NORMROPE` set to
+    /// `0`/`false`/`no`/`off` leaves the standalone
+    /// `gemma4_b8_qkv_rms_norm_rope_v2_vec1` dispatch as the attention input
+    /// and selects the untouched WRITE-022 store kernel. Default ON.
+    static let normRopeFoldEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_NORMROPE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// ORS-D512 kill switch: `DARKBLOOM_GEMMA4_D512_ORS` set to
+    /// `0`/`false`/`no`/`off` selects the untouched dispatch-3 kernel and
+    /// leaves the standalone `cbv2_b8_rs_table_dyn_v1` prepass to build the
+    /// o_proj run-sum table. Default ON. The fold rides the CUT-13 `_sv1`
+    /// dispatch-3 twin only, so `DARKBLOOM_GEMMA4_D512_SOFTMAX_VEC=0` also
+    /// restores the prepass.
+    static let oRunsumFoldEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_ORS"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// NORMROPE-D512 carrier. The three normalized arrays are held weakly:
+    /// the entry is only honoured while the exact objects the producer built
+    /// are still alive, so an address reused by a later array can never match
+    /// a stale record.
+    private struct FullNormRopeInputs {
+        weak var normalizedQueries: MLXArray?
+        weak var normalizedKeys: MLXArray?
+        weak var normalizedValues: MLXArray?
+        let rawQueries: MLXArray
+        let rawKeys: MLXArray
+        let qWeight: MLXArray
+        let kWeight: MLXArray
+        let positionOffsets: MLXArray
+        let ropeFrequencies: MLXArray
+    }
+
+    private static let fullNormRopeLock = NSLock()
+    nonisolated(unsafe) private static var fullNormRopeInputs:
+        [ObjectIdentifier: FullNormRopeInputs] = [:]
+
+    /// NORMROPE-D512: register the raw full-attention decode projections
+    /// behind the already-built exact norm+RoPE arrays. The fallback arrays
+    /// remain what the generic cache sees; only the fused store dispatch
+    /// consumes this carrier, so any miss evaluates the established
+    /// `gemma4_b8_qkv_rms_norm_rope_v2_vec1` graph unchanged. `rawValues`
+    /// must be the raw key projection itself (Gemma's k-eq-v full layers), so
+    /// V is `RMSNormNoScale` of the same row the K RMSNorm reduces.
+    @discardableResult
+    public static func registerFullNormRope(
+        normalizedQueries: MLXArray,
+        normalizedKeys: MLXArray,
+        normalizedValues: MLXArray,
+        rawQueries: MLXArray,
+        rawKeys: MLXArray,
+        rawValues: MLXArray,
+        qWeight: MLXArray,
+        kWeight: MLXArray,
+        positionOffsets: MLXArray,
+        ropeFrequencies: MLXArray,
+        eps: Float,
+        appliedRope: Bool
+    ) -> Bool {
+        guard normRopeFoldEnabled,
+            enabled,
+            storeDispatchEnabled,
+            appliedRope,
+            eps == 1.0e-6,
+            rawValues === rawKeys,
+            normalizedQueries.dtype == .bfloat16,
+            normalizedQueries.shape == [batch, queryHeads, 1, headDim],
+            normalizedKeys.dtype == .bfloat16,
+            normalizedKeys.shape == [batch, kvHeads, 1, headDim],
+            normalizedValues.dtype == .bfloat16,
+            normalizedValues.shape == normalizedKeys.shape,
+            rawQueries.dtype == .bfloat16,
+            rawQueries.shape == [batch, 1, queryHeads, headDim],
+            rawKeys.dtype == .bfloat16,
+            rawKeys.shape == [batch, 1, kvHeads, headDim],
+            qWeight.dtype == .bfloat16,
+            qWeight.shape == [headDim],
+            kWeight.dtype == .bfloat16,
+            kWeight.shape == [headDim],
+            positionOffsets.dtype == .int32,
+            positionOffsets.shape == [batch],
+            ropeFrequencies.dtype == .float32,
+            ropeFrequencies.shape == [headDim / 2]
+        else { return false }
+
+        fullNormRopeLock.lock()
+        if fullNormRopeInputs.count >= 64 {
+            fullNormRopeInputs.removeAll(keepingCapacity: true)
+        }
+        fullNormRopeInputs[ObjectIdentifier(normalizedQueries)] =
+            FullNormRopeInputs(
+                normalizedQueries: normalizedQueries,
+                normalizedKeys: normalizedKeys,
+                normalizedValues: normalizedValues,
+                rawQueries: rawQueries,
+                rawKeys: rawKeys,
+                qWeight: qWeight,
+                kWeight: kWeight,
+                positionOffsets: positionOffsets,
+                ropeFrequencies: ropeFrequencies)
+        fullNormRopeLock.unlock()
+        return true
+    }
+
+    @inline(__always)
+    private static func takeFullNormRope(
+        queries: MLXArray, keys: MLXArray, values: MLXArray
+    ) -> FullNormRopeInputs? {
+        fullNormRopeLock.lock()
+        let inputs = fullNormRopeInputs.removeValue(
+            forKey: ObjectIdentifier(queries))
+        fullNormRopeLock.unlock()
+        guard let inputs,
+            inputs.normalizedQueries === queries,
+            inputs.normalizedKeys === keys,
+            inputs.normalizedValues === values
+        else { return nil }
+        return inputs
+    }
 
     /// LASTQ-D512 kill switch: `DARKBLOOM_GEMMA4_LASTQ_D512` set to
     /// `0`/`false`/`no`/`off` restores the per-row last-query attend loop in
@@ -3980,6 +4111,242 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         softmaxVecEnabled ? avVecKernel : avKernel
     }
 
+    /// ORS-D512: how many per-threadgroup partials one o_proj 64-group of the
+    /// activation is split into. At the AV-TILES-001 default of 32-column
+    /// tiles a 64-group spans two threadgroups, so dispatch 3 emits a
+    /// `[8, 256]` pair table and the o_proj kernel adds each pair (the
+    /// prepass's own final xor-4 stage); at `DARKBLOOM_GEMMA4_D512_AV_TILES=8`
+    /// the group sits inside one threadgroup and the `[8, 128]` table is
+    /// emitted whole.
+    private static let avORunsumPartials = avColumnTiles / 8
+
+    /// ORS-D512 twin of the CUT-13 dispatch-3 kernel: the same body verbatim,
+    /// plus an epilogue that emits the o_proj run-sum table (or its pair
+    /// partials) for the activation this dispatch just stored, so the
+    /// standalone `cbv2_b8_rs_table_dyn_v1` prepass never runs on a full
+    /// layer.
+    ///
+    /// Exactness. The prepass lane `fm` reads the eight consecutive BF16
+    /// values `64g + 8fm ... + 7` of the o_proj input, forms the two quads
+    /// `((x0+x1)+x2)+x3` and `((x4+x5)+x6)+x7` in T, adds them into a float
+    /// as `(0 + qA) + qB`, then butterflies xor 1, 2, 4 over `fm`. Here the
+    /// o_proj input is this kernel's own `out` plane read back head-major
+    /// (column `head * 512 + d`), and after the XFOLD every lane holds the
+    /// four consecutive stored columns `out_col ... + 3` of head `thrM`, so
+    /// the octet `fm` is the lane pair `(thrN, thrN ^ 1)` of one simdgroup:
+    /// the even lane holds `x0..x3`, the odd lane `x4..x7`. Each lane
+    /// gathers the partner's four stored bit patterns, writes the two quads
+    /// and the float sum as the prepass's own statements in the prepass's
+    /// order, and both lanes of the pair hold the identical octet value.
+    /// `fm` bit 0 is lane bit 1 (`simd_shuffle_xor 2`), bit 1 is the
+    /// simdgroup pair (threadgroup memory), bit 2 is the second simdgroup
+    /// pair at 64-column tiles or the neighbouring threadgroup at 32-column
+    /// tiles (the pair table). Every node adds the same two subtrees the
+    /// prepass's butterfly adds; float addition is commutative, so the
+    /// left/right order at a node is immaterial. The `out` store, the
+    /// accumulation and the fold above it are the promoted text.
+    private static let avVecORunsumKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1_sv1_ors1",
+        inputNames: [
+            "probs",
+            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+            "params",
+        ],
+        outputNames: ["out", "rs"],
+        source: """
+            constexpr int D = 512;
+            constexpr int GQA = 8;
+
+            const int key_length = int(params[0]);
+            const bool row_vec4 = (key_length & 3) == 0;
+
+            const int z = int(threadgroup_position_in_grid.z);
+            const int tile = z % \(avColumnTiles);
+            const int row_kv = z / \(avColumnTiles);
+            const int row = row_kv / 2;
+            const int kv_head = row_kv % 2;
+            const int sg = int(simdgroup_index_in_threadgroup);
+            const int lane = int(thread_index_in_simdgroup);
+
+            const int row_capacity = int(params[2 + row]);
+
+            const device T* value_plane = v0;
+            switch (row) {
+                case 1: value_plane = v1; break;
+                case 2: value_plane = v2; break;
+                case 3: value_plane = v3; break;
+                case 4: value_plane = v4; break;
+                case 5: value_plane = v5; break;
+                case 6: value_plane = v6; break;
+                case 7: value_plane = v7; break;
+                default: break;
+            }
+            value_plane += size_t(kv_head) * size_t(row_capacity) * D;
+
+            const device T* prob_rows =
+                probs + size_t(row * 16 + kv_head * GQA) * key_length;
+
+            const int thrM = lane / 4;
+            const int thrN = lane % 4;
+            int bm = thrM * 4;
+            const int out_col = tile * \(avTileColumns) + (4 * sg + thrN) * 4;
+
+            // XFOLD: one flat accumulator over the same 32 partial sums, so
+            // the cross-lane fold below can address the whole set with
+            // compile-time indices.
+            float result[GQA * 4] = {0.0f};
+            // VTILE: the 4x4 value tile is shared by all GQA heads, the
+            // probability block is not. Staging the tile costs 16 halves and
+            // frees the 32-float per-head staging array.
+            typedef vec<T, 4> T4;
+            T4 v_tile[4];
+            float p_coeff[4];
+            const int n_iter = key_length / 32;
+            const int leftover = key_length - n_iter * 32;
+
+            for (int i = 0; i < n_iter; ++i) {
+                #pragma clang loop unroll(full)
+                for (int tm = 0; tm < 4; ++tm) {
+                    v_tile[tm] = *reinterpret_cast<const device T4*>(
+                        value_plane + size_t(bm + tm) * D + out_col);
+                }
+                #pragma clang loop unroll(full)
+                for (int h = 0; h < GQA; ++h) {
+                    if (row_vec4) {
+                        const T4 p_raw = *reinterpret_cast<const device T4*>(
+                            prob_rows + size_t(h) * key_length + bm);
+                        #pragma clang loop unroll(full)
+                        for (int tm = 0; tm < 4; ++tm) {
+                            p_coeff[tm] = static_cast<float>(p_raw[tm]);
+                        }
+                    } else {
+                        #pragma clang loop unroll(full)
+                        for (int tm = 0; tm < 4; ++tm) {
+                            p_coeff[tm] = static_cast<float>(
+                                prob_rows[size_t(h) * key_length + bm + tm]);
+                        }
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int tm = 0; tm < 4; ++tm) {
+                        float vc = p_coeff[tm];
+                        for (int tn = 0; tn < 4; ++tn) {
+                            result[h * 4 + tn] += vc * v_tile[tm][tn];
+                        }
+                    }
+                }
+                bm += 32;
+            }
+            if (leftover > 0) {
+                for (int tm = 0; tm < 4 && bm + tm < key_length; ++tm) {
+                    #pragma clang loop unroll(full)
+                    for (int tn = 0; tn < 4; ++tn) {
+                        v_tile[0][tn] = value_plane[
+                            size_t(bm + tm) * D + out_col + tn];
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int h = 0; h < GQA; ++h) {
+                        const float pc = static_cast<float>(
+                            prob_rows[size_t(h) * key_length + bm + tm]);
+                        #pragma clang loop unroll(full)
+                        for (int tn = 0; tn < 4; ++tn) {
+                            result[h * 4 + tn] += pc * v_tile[0][tn];
+                        }
+                    }
+                }
+            }
+            // XFOLD: the 32 sums fold across the eight lanes that share this
+            // thrN as ONE butterfly over the whole set rather than 32
+            // independent shuffle-down chains. The traffic is 16 + 8 + 4 = 28
+            // shuffles instead of 32 * 3 = 96, and the live accumulator
+            // collapses 32 -> 16 -> 8 -> 4 instead of staying 32 wide.
+            //
+            // Exactness: as in the QK fold, step K merges the group holding
+            // lane l with the group holding lane l ^ K, so the merge hierarchy
+            // over the eight thrM lanes is the same coset chain for every lane
+            // and the same one the shuffle-down form built. Only the left and
+            // right order at each node varies, and float addition is
+            // commutative. Measured bit-identical alongside the QK fold.
+            //
+            // Landing: bit i of a lane's surviving head index equals bit i + 2
+            // of the lane, so the lane finishes holding head thrM's four
+            // columns. The eight thrM == 0 lanes' run of 32 stores becomes
+            // four stores on every lane, to the same 32 addresses per thrN.
+            {
+                const bool hi = (lane & 16) != 0;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 16; ++j) {
+                    const float a = result[j];
+                    const float b = result[16 + j];
+                    result[j] = (hi ? b : a)
+                        + simd_shuffle_xor(hi ? a : b, ushort(16));
+                }
+            }
+            {
+                const bool hi = (lane & 8) != 0;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 8; ++j) {
+                    const float a = result[j];
+                    const float b = result[8 + j];
+                    result[j] = (hi ? b : a)
+                        + simd_shuffle_xor(hi ? a : b, ushort(8));
+                }
+            }
+            {
+                const bool hi = (lane & 4) != 0;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 4; ++j) {
+                    const float a = result[j];
+                    const float b = result[4 + j];
+                    result[j] = (hi ? b : a)
+                        + simd_shuffle_xor(hi ? a : b, ushort(4));
+                }
+            }
+            {
+                device T* out_ptr = out
+                    + size_t(row * 16 + kv_head * GQA + thrM) * D
+                    + out_col;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 4; ++j) {
+                    out_ptr[j] = static_cast<T>(result[j]);
+                }
+            }
+            // ORS-D512 epilogue: the o_proj run-sum octet tree of
+            // cbv2_b8_rs_table_dyn_v1 over the values just stored.
+            threadgroup float rs_partial[\(avSimdgroups)][32];
+            {
+                thread ushort own[4];
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 4; ++j) {
+                    own[j] = as_type<ushort>(static_cast<T>(result[j]));
+                }
+                const ushort partner = ushort(lane ^ 1);
+                const bool upper = (lane & 1) != 0;
+                thread T xt[8];
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 4; ++j) {
+                    const ushort other = simd_shuffle(own[j], partner);
+                    xt[j] = as_type<T>(upper ? other : own[j]);
+                    xt[4 + j] = as_type<T>(upper ? own[j] : other);
+                }
+                float rsv = 0;
+                rsv += xt[0] + xt[1] + xt[2] + xt[3];
+                rsv += xt[4] + xt[5] + xt[6] + xt[7];
+                rsv += simd_shuffle_xor(rsv, 2u);
+                rs_partial[sg][lane] = rsv;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                rsv += rs_partial[sg ^ 1][lane];
+                \(avSimdgroups == 4
+                    ? "rsv += rs_partial[sg ^ 2][lane] + rs_partial[sg ^ 3][lane];"
+                    : "")
+                if (sg == 0 && thrN == 0) {
+                    rs[row * (16 * \(avColumnTiles))
+                        + (kv_head * GQA + thrM) * \(avColumnTiles) + tile] = rsv;
+                }
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
     // ATTRIBUTION. Everything in this WRITE-016-D512 section, and the
     // matching hunks in AttentionV1.swift and SequenceKV/FullSequenceKV.swift,
     // is taken VERBATIM from public ranked submission
@@ -4591,6 +4958,166 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         """,
         ensureRowContiguous: true)
 
+    /// NORMROPE-D512: the WRITE-022 store dispatch with the full layers' Q/K
+    /// RMSNorm + RoPE folded in, so the standalone
+    /// `gemma4_b8_qkv_rms_norm_rope_v2_vec1` dispatch leaves the chain.
+    ///
+    /// Geometry: 144 threadgroups of 128 threads — exactly the standalone
+    /// kernel's one-row-per-threadgroup, four-values-per-thread launch over
+    /// its 16 K rows and 128 Q rows (`threads = D / 4`). Threadgroups 0...15
+    /// are the incumbent store's (row, kv head) pairs: they reduce the raw key
+    /// row, write V = `RMSNormNoScale(raw key)` and K = `RoPE(k_weight ·
+    /// RMSNorm(raw key))` into slot kL-1 of the row's private buffers (and
+    /// mirror both rows into `k_out`/`v_out` for the layer's KV-pair return).
+    /// Threadgroups 16...143 normalize and rotate one query row each into
+    /// `q_out`, the `[8, 16, 1, 512]` plane dispatch 1 reads.
+    ///
+    /// Exactness: every statement of the standalone kernel's K-row and Q-row
+    /// arithmetic is transcribed with the same thread geometry — per-lane
+    /// four-value square sum, one `simd_sum` per simdgroup, the four partials
+    /// in lanes 0...3 (lanes 4...31 zero) of a second `simd_sum`,
+    /// `precise::rsqrt(sum / D + 1e-6)`, the BF16 `rounded[]` store boundary
+    /// before RoPE, `inv_freq = 1 / rope_freqs[pair]` from the 256-entry
+    /// proportional table (+inf pass-through pairs included), `fast::cos/sin`
+    /// of `L * inv_freq`, and the same two rotation expressions. The ring
+    /// slot receives the K row the standalone kernel would have handed the
+    /// incumbent store, so dispatches 1...3 read identical bytes.
+    private static let ringStoreNormRopeKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_d512_ringstore_normrope_freqs_bf16_v1_vec1",
+        inputNames: [
+            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+            "params", "raw_queries", "raw_keys", "q_weight", "k_weight",
+            "position_offsets", "rope_freqs", "write_fence",
+        ],
+        outputNames: ["fence", "q_out", "k_out", "v_out"],
+        source: """
+            constexpr int D = 512;
+            constexpr int KV_ROWS = 16;
+            constexpr int Q_HEADS = 16;
+            constexpr int K_HEADS = 2;
+            constexpr int reads = 4;
+            typedef vec<T, 4> T4;
+
+            const int z = int(threadgroup_position_in_grid.z);
+            const int lid = int(thread_position_in_threadgroup.x);
+            const int lane = int(thread_index_in_simdgroup);
+            const int simd_group = int(simdgroup_index_in_threadgroup);
+            const int key_length = int(params[0]);
+
+            // Threadgroups 0...15 own one (row, kv head) K/V pair each, in the
+            // incumbent store's order; 16...143 own one query row each, in the
+            // standalone kernel's `local_row = batch * 16 + head` order.
+            const bool is_key = z < KV_ROWS;
+            const int local_row = is_key ? z : z - KV_ROWS;
+            const int batch_index = is_key ? local_row / K_HEADS : local_row / Q_HEADS;
+            const int kv_head = local_row % K_HEADS;
+
+            const device T* input = is_key ? raw_keys : raw_queries;
+            const device T* weight = is_key ? k_weight : q_weight;
+            input += local_row * D + lid * reads;
+            weight += lid * reads;
+
+            device T* key_slot = k_out;
+            device T* value_slot = v_out;
+            if (is_key) {
+                const int row_capacity = int(params[2 + batch_index]);
+                const device T* key_plane = k0;
+                const device T* value_plane = v0;
+                switch (batch_index) {
+                    case 1: key_plane = k1; value_plane = v1; break;
+                    case 2: key_plane = k2; value_plane = v2; break;
+                    case 3: key_plane = k3; value_plane = v3; break;
+                    case 4: key_plane = k4; value_plane = v4; break;
+                    case 5: key_plane = k5; value_plane = v5; break;
+                    case 6: key_plane = k6; value_plane = v6; break;
+                    case 7: key_plane = k7; value_plane = v7; break;
+                    default: break;
+                }
+                key_slot = const_cast<device T*>(key_plane)
+                    + size_t(kv_head) * size_t(row_capacity) * D
+                    + size_t(key_length - 1) * D;
+                value_slot = const_cast<device T*>(value_plane)
+                    + size_t(kv_head) * size_t(row_capacity) * D
+                    + size_t(key_length - 1) * D;
+            }
+            device T* output_row = is_key ? key_slot : (q_out + local_row * D);
+            // Query rows never dereference the mirrors; keep their pointers
+            // inside the K/V allocations anyway.
+            device T* key_mirror = k_out + (is_key ? local_row : 0) * D;
+            device T* value_mirror = v_out + (is_key ? local_row : 0) * D;
+
+            const T4 vin = *reinterpret_cast<const device T4*>(input);
+            float sum = 0.0f;
+            for (int i = 0; i < reads; ++i) {
+                const float value = float(vin[i]);
+                sum += value * value;
+            }
+            sum = simd_sum(sum);
+
+            threadgroup float partials[32];
+            threadgroup float inverse_rms;
+            threadgroup T rounded[D];
+            if (simd_group == 0) partials[lane] = 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) partials[simd_group] = sum;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group == 0) {
+                sum = simd_sum(partials[lane]);
+                if (lane == 0) {
+                    inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const T4 wv = *reinterpret_cast<const device T4*>(weight);
+            for (int i = 0; i < reads; ++i) {
+                const int element = lid * reads + i;
+                const T normalized = T(float(vin[i]) * inverse_rms);
+                // Reproduce the separate norm kernel's BF16 output-store
+                // boundary before any RoPE arithmetic reads the value.
+                rounded[element] = T(wv[i] * normalized);
+            }
+            // K rows also carry V: the same raw row and the same normalizer,
+            // written with RMSNormNoScale's own final expression, straight
+            // into slot kL-1 of the value ring (and the layer's V return).
+            if (is_key) {
+                T4 sharedv;
+                for (int i = 0; i < reads; ++i) {
+                    const T normalized = T(float(vin[i]) * inverse_rms);
+                    sharedv[i] = T(1) * normalized;
+                }
+                *reinterpret_cast<device T4*>(value_slot + lid * reads) = sharedv;
+                *reinterpret_cast<device T4*>(value_mirror + lid * reads) = sharedv;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (lid * reads < D / 2) {
+                const float L = static_cast<float>(position_offsets[batch_index]);
+                for (int i = 0; i < reads; ++i) {
+                    const int pair = lid * reads + i;
+                    const float inv_freq = 1.0f / rope_freqs[pair];
+                    const float theta = L * inv_freq;
+                    const float costheta = metal::fast::cos(theta);
+                    const float sintheta = metal::fast::sin(theta);
+                    const float x1 = static_cast<float>(rounded[pair]);
+                    const float x2 = static_cast<float>(rounded[pair + D / 2]);
+                    const float rx1 = x1 * costheta - x2 * sintheta;
+                    const float rx2 = x1 * sintheta + x2 * costheta;
+                    output_row[pair] = static_cast<T>(rx1);
+                    output_row[pair + D / 2] = static_cast<T>(rx2);
+                    if (is_key) {
+                        key_mirror[pair] = static_cast<T>(rx1);
+                        key_mirror[pair + D / 2] = static_cast<T>(rx2);
+                    }
+                }
+            }
+            if (z == 0 && lid == 0) {
+                fence[0] = write_fence[0] + 1;
+            }
+        """,
+        ensureRowContiguous: true)
+
     /// WRITE-022 kill switch: `DARKBLOOM_GEMMA4_D512_STORE_DISPATCH=0` falls
     /// back to the v2 fold (and its own switch falls back to the append path).
     private static let storeDispatchEnabled: Bool = {
@@ -4674,19 +5201,62 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         ]
         let scratchShape = [batch, queryHeads, 1, keyLength]
 
-        let storeFence = ringStoreKernel(
-            keyBuffers + valueBuffers
-                + [paramsArray, keys, values, previousWriteFence],
-            template: template,
-            grid: (128, 1, batch * kvHeads),
-            threadGroup: (128, 1, 1),
-            outputShapes: [[1]],
-            outputDTypes: [.int32]
-        )[0]
+        // NORMROPE-D512: with the raw projections registered for this exact
+        // (queries, keys, values) triple, the store dispatch normalizes and
+        // rotates them itself and hands dispatch 1 its own `q_out`; the
+        // registered fallback arrays are then never evaluated. A miss keeps
+        // the WRITE-022 store byte for byte.
+        let storeFence: MLXArray
+        let liveQueries: MLXArray
+        var normalizedKeys: MLXArray? = nil
+        var normalizedValues: MLXArray? = nil
+        if normRopeFoldEnabled,
+            let normRope = takeFullNormRope(
+                queries: queries, keys: keys, values: values)
+        {
+            let stored = ringStoreNormRopeKernel(
+                keyBuffers + valueBuffers + [
+                    paramsArray,
+                    normRope.rawQueries,
+                    normRope.rawKeys,
+                    normRope.qWeight,
+                    normRope.kWeight,
+                    normRope.positionOffsets,
+                    normRope.ropeFrequencies,
+                    previousWriteFence,
+                ],
+                template: template,
+                grid: (128, 1, batch * kvHeads + batch * queryHeads),
+                threadGroup: (128, 1, 1),
+                outputShapes: [
+                    [1],
+                    [batch, queryHeads, 1, headDim],
+                    [batch, kvHeads, 1, headDim],
+                    [batch, kvHeads, 1, headDim],
+                ],
+                outputDTypes: [.int32, .bfloat16, .bfloat16, .bfloat16]
+            )
+            storeFence = stored[0]
+            liveQueries = stored[1]
+            normalizedKeys = stored[2]
+            normalizedValues = stored[3]
+            CBv2EngageMark.once("d512-normrope-store")
+        } else {
+            storeFence = ringStoreKernel(
+                keyBuffers + valueBuffers
+                    + [paramsArray, keys, values, previousWriteFence],
+                template: template,
+                grid: (128, 1, batch * kvHeads),
+                threadGroup: (128, 1, 1),
+                outputShapes: [[1]],
+                outputDTypes: [.int32]
+            )[0]
+            liveQueries = queries
+        }
 
         let chunks = (keyLength + 63) / 64
         let scores = qkFencedKernel(
-            [queries] + keyBuffers + [paramsArray, storeFence],
+            [liveQueries] + keyBuffers + [paramsArray, storeFence],
             template: template,
             grid: (32, 4, batch * kvHeads * chunks),
             threadGroup: (32, 4, 1),
@@ -4704,14 +5274,46 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             outputDTypes: [.bfloat16]
         )[0]
 
-        let output = avActive(
-            [probs] + valueBuffers + [paramsArray],
-            template: template,
-            grid: (32, avSimdgroups, batch * kvHeads * avColumnTiles),
-            threadGroup: (32, avSimdgroups, 1),
-            outputShapes: [[batch, queryHeads, 1, headDim]],
-            outputDTypes: [.bfloat16]
-        )[0]
+        // ORS-D512: dispatch 3 also emits the o_proj run-sum table (or its
+        // per-threadgroup pair partials) for the activation it stores.
+        let output: MLXArray
+        let oRunsum: MLXArray?
+        if oRunsumFoldEnabled, softmaxVecEnabled {
+            let attended = avVecORunsumKernel(
+                [probs] + valueBuffers + [paramsArray],
+                template: template,
+                grid: (32, avSimdgroups, batch * kvHeads * avColumnTiles),
+                threadGroup: (32, avSimdgroups, 1),
+                outputShapes: [
+                    [batch, queryHeads, 1, headDim],
+                    [batch, queryHeads * headDim / 64 * avORunsumPartials],
+                ],
+                outputDTypes: [.bfloat16, .float32]
+            )
+            output = attended[0]
+            oRunsum = attended[1]
+            CBv2EngageMark.once(
+                avORunsumPartials == 1 ? "d512-ors-av-table" : "d512-ors-av-pairs")
+        } else {
+            output = avActive(
+                [probs] + valueBuffers + [paramsArray],
+                template: template,
+                grid: (32, avSimdgroups, batch * kvHeads * avColumnTiles),
+                threadGroup: (32, avSimdgroups, 1),
+                outputShapes: [[batch, queryHeads, 1, headDim]],
+                outputDTypes: [.bfloat16]
+            )[0]
+            oRunsum = nil
+        }
+
+        if oRunsum != nil || normalizedKeys != nil {
+            CBv2RaggedTwoPassDecodeAttentionV1.publishResidentProducts(
+                CBv2RaggedTwoPassDecodeAttentionV1.ResidentProducts(
+                    runsumTable: oRunsum,
+                    normalizedKeys: normalizedKeys,
+                    normalizedValues: normalizedValues),
+                for: output)
+        }
 
         for row in fullRows {
             row.advanceAfterFusedAppend()

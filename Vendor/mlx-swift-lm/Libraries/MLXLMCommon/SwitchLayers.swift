@@ -1482,19 +1482,42 @@ public class SwitchGLU: Module {
                 let fused = fusedGateUpDispatch()
             {
                 CBv2EngageMark.once("prefill-gateup-fuse")
-                let xGateUp = MLX.gatherQuantizedMM(
-                    x,
-                    fused.storage.weight,
-                    scales: fused.storage.scales,
-                    biases: fused.storage.biases,
-                    lhsIndices: nil,
-                    rhsIndices: idx,
-                    transpose: true,
-                    groupSize: fused.groupSize,
-                    bits: fused.bits,
-                    mode: fused.mode,
-                    sortedIndices: true
-                )
+                // PREFILL-EXPERT-DEQ-GEMM-001: the concatenated gate|up expert
+                // plane is dequantized once per layer per prompt pass and the
+                // gathered bf16 GEMM takes it; `apply` returns nil -- and this
+                // block behaves exactly as before, byte for byte -- whenever
+                // the switch, the quantization cell or the row floor decline.
+                let incumbentGateUp: () -> MLXArray = {
+                    MLX.gatherQuantizedMM(
+                        x,
+                        fused.storage.weight,
+                        scales: fused.storage.scales,
+                        biases: fused.storage.biases,
+                        lhsIndices: nil,
+                        rhsIndices: idx,
+                        transpose: true,
+                        groupSize: fused.groupSize,
+                        bits: fused.bits,
+                        mode: fused.mode,
+                        sortedIndices: true
+                    )
+                }
+                let xGateUp =
+                    SwitchPrefillExpertDeqGEMMV1.apply(
+                        x,
+                        weight: fused.storage.weight,
+                        scales: fused.storage.scales,
+                        biases: fused.storage.biases,
+                        lhsIndices: nil,
+                        rhsIndices: idx,
+                        transpose: true,
+                        groupSize: fused.groupSize,
+                        bits: fused.bits,
+                        mode: fused.mode,
+                        sortedIndices: true,
+                        hasBiasTerm: false,
+                        cacheKey: ObjectIdentifier(fused.storage),
+                        incumbent: incumbentGateUp) ?? incumbentGateUp()
                 xGate = xGateUp[.ellipsis, ..<hiddenDims]
                 xUp = xGateUp[.ellipsis, hiddenDims...]
             } else {
@@ -1747,6 +1770,198 @@ public class SwitchGLU: Module {
     }
 }
 
+/// PREFILL-EXPERT-DEQ-GEMM-001 -- the routed expert planes stop dequantizing
+/// the same weight once per row-tile of the sorted plane.
+///
+/// The prompt pass presents the two routed expert projections as ONE gathered
+/// GEMM over a sorted plane of `tokens * top_k` rows (65536 for the scored
+/// eight-by-1024 geometry). The host answers that with `gather_qmm_rhs`, whose
+/// cooperative loader stages a `BN x BK` weight block into threadgroup memory
+/// once per threadgroup per K step: with `M / BM` row-tiles per expert, every
+/// packed word of every expert is unpacked, scaled, biased and stored to
+/// threadgroup memory `M / BM` times per layer per prompt pass, each time
+/// paying the `barrier -> dequantize -> barrier -> MMA` serialization the tile
+/// kernel is built around.
+///
+/// This road dequantizes each expert plane exactly ONCE and hands the result to
+/// the plain gathered bf16 GEMM (`gather_mm_rhs`), which has no dequantization
+/// and no threadgroup staging of the weight operand anywhere in its K loop.
+/// The operand is the same by construction: `affine_dequantize` and the tile
+/// kernel's loader both compute `scale * d + bias` at bf16, and both roads are
+/// `mlx::steel` block GEMMs that walk K ascending into one fp32 accumulator.
+///
+/// Admission mirrors the host's own sorted right-hand-side selection
+/// (`GatherQMM::eval_gpu`: `M == 1 && B >= 16 && sorted && B / E >= 4`) so the
+/// call this replaces is exactly the one that would have taken the quantized
+/// tile kernel, plus a row floor that keeps every decode and speculative
+/// verification rectangle on the established dispatch.
+///
+/// Kill switch: `DARKBLOOM_GEMMA4_PREFILL_EXPERT_DEQ_GEMM=0`. Row floor:
+/// `DARKBLOOM_GEMMA4_PREFILL_EXPERT_DEQ_GEMM_MIN_ROWS` (default 4096).
+/// Cross-check: `DARKBLOOM_GEMMA4_PREFILL_EXPERT_DEQ_GEMM_XCHECK=1`.
+/// Engage mark: `prefill-expert-deq-gemm`.
+enum SwitchPrefillExpertDeqGEMMV1 {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_EXPERT_DEQ_GEMM"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Sorted-plane row floor. The scored prompt pass presents 65536 rows
+    /// (8 streams x 1024 tokens x top-8); a solo 1024-token prompt presents
+    /// 8192. Every decode step (64 rows) and every speculative verification
+    /// rectangle (64..256 rows) is below the default and never admits.
+    static let minRows: Int = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_EXPERT_DEQ_GEMM_MIN_ROWS"],
+            let value = Int(raw), value > 0
+        else { return 4096 }
+        return value
+    }()
+
+    /// Bitwise cross-check of every admitted expert GEMM against the incumbent
+    /// dispatch on the identical operands (diagnostic; forces evaluation, so it
+    /// is never set on a timed run).
+    static let xcheck: Bool =
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_EXPERT_DEQ_GEMM_XCHECK"] == "1"
+
+    /// Residency of the dequantized expert planes across prompt passes.
+    /// `DARKBLOOM_GEMMA4_PREFILL_EXPERT_DEQ_CACHE=0` rebuilds the plane on
+    /// every admitted call, which is the road the row floor alone describes.
+    static let cacheEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_EXPERT_DEQ_CACHE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Byte budget for that residency, because the routed expert planes are
+    /// large: the fused gate|up plane of one layer is 128 x 1408 x 2816 bf16 =
+    /// 0.945 GiB and the down plane is 128 x 2816 x 704 bf16 = 0.473 GiB, so
+    /// all thirty layers are 42.5 GiB. The default follows the tree's own
+    /// startup policy and keys on physical memory, and it is deliberately NOT
+    /// the whole set: residency that crowds the allocator costs decode, which
+    /// is three quarters of the composite and the row that fails first. On a
+    /// 128 GiB host 32 GiB of planes (22 of the 30 layers) leaves the peak near
+    /// 62 GiB against a recommended working set of about 96 GiB; on a smaller
+    /// machine one plane is kept, which exercises and cross-checks the resident
+    /// road without moving the footprint.
+    /// `DARKBLOOM_GEMMA4_PREFILL_EXPERT_DEQ_CACHE_GIB=N` overrides it; 0
+    /// disables residency without disabling the mechanism.
+    static let cacheBudgetBytes: Int = {
+        if let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_EXPERT_DEQ_CACHE_GIB"],
+            let value = Int(raw), value >= 0
+        {
+            return value << 30
+        }
+        return ProcessInfo.processInfo.physicalMemory >= (UInt64(96) << 30)
+            ? (32 << 30) : (1 << 30)
+    }()
+
+    private static let planeLock = NSLock()
+    nonisolated(unsafe) private static var residentPlanes: [ObjectIdentifier: MLXArray] = [:]
+    nonisolated(unsafe) private static var residentBytes: Int = 0
+
+    /// The dequantized expert plane in its natural `[E, N, K]` layout. The
+    /// caller always applies `swappedAxes(-1, -2)` to it, which is a view and
+    /// costs no kernel, so the cached road and the rebuilt road hand the host
+    /// the identical operand descriptor and reach the identical kernel.
+    @inline(__always)
+    private static func plane(
+        key: ObjectIdentifier, weight: MLXArray, scales: MLXArray, biases: MLXArray,
+        groupSize: Int, bits: Int, mode: QuantizationMode
+    ) -> MLXArray {
+        let build = {
+            MLX.dequantized(
+                weight, scales: scales, biases: biases,
+                groupSize: groupSize, bits: bits, mode: mode)
+        }
+        guard cacheEnabled, cacheBudgetBytes > 0 else { return build() }
+        planeLock.lock()
+        if let existing = residentPlanes[key] {
+            planeLock.unlock()
+            return existing
+        }
+        // Element count of the dequantized plane: the packed weight's last
+        // axis holds `32 / bits` values per word.
+        let elements = weight.size * (32 / bits)
+        let bytes = elements * 2
+        guard residentBytes + bytes <= cacheBudgetBytes else {
+            planeLock.unlock()
+            return build()
+        }
+        let built = build()
+        eval(built)
+        residentPlanes[key] = built
+        residentBytes += bytes
+        planeLock.unlock()
+        CBv2EngageMark.once("prefill-expert-deq-resident")
+        return built
+    }
+
+    @inline(__always)
+    static func apply(
+        _ x: MLXArray,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        lhsIndices: MLXArray?,
+        rhsIndices: MLXArray?,
+        transpose: Bool,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode,
+        sortedIndices: Bool,
+        hasBiasTerm: Bool,
+        cacheKey: ObjectIdentifier,
+        incumbent: () -> MLXArray
+    ) -> MLXArray? {
+        guard enabled, transpose, sortedIndices, !hasBiasTerm,
+            lhsIndices == nil, let idx = rhsIndices,
+            mode == .affine, groupSize == 64, bits == 4 || bits == 8,
+            x.dtype == .bfloat16, x.ndim == 3, x.dim(-2) == 1,
+            scales.dtype == .bfloat16,
+            let biases, biases.dtype == .bfloat16,
+            weight.ndim == 3, weight.dtype == .uint32,
+            idx.ndim == 1
+        else { return nil }
+        let rows = x.dim(0)
+        let inputDims = x.dim(-1)
+        let experts = weight.dim(0)
+        guard rows >= minRows, idx.size == rows, experts >= 1,
+            rows / experts >= 4,
+            weight.dim(2) * (32 / bits) == inputDims
+        else { return nil }
+        CBv2EngageMark.once("prefill-expert-deq-gemm")
+        let dequantizedPlane = plane(
+            key: cacheKey, weight: weight, scales: scales, biases: biases,
+            groupSize: groupSize, bits: bits, mode: mode)
+        let product = MLX.gatherMM(
+            x, dequantizedPlane.swappedAxes(-1, -2),
+            lhsIndices: nil, rhsIndices: idx, sortedIndices: true)
+        if xcheck {
+            // Local diagnostics only (never on the ranked path): evaluate the
+            // incumbent gathered quantized dispatch beside this road on the
+            // identical operands and count differing bf16 words. An exact road
+            // reports zero on every call; anything else is a defect here.
+            let reference = incumbent()
+            let differing = MLX.sum(
+                product.view(dtype: .uint16) .!= reference.view(dtype: .uint16),
+                stream: .default)
+            eval(product, reference, differing)
+            FileHandle.standardError.write(
+                Data(
+                    ("[xcheck] prefill-expert-deq-gemm rows \(rows) E \(experts) "
+                        + "K \(inputDims) N \(weight.dim(1)) bits \(bits) "
+                        + "differing \(differing.item(Int32.self))\n").utf8))
+        }
+        return product
+    }
+}
+
 public class SwitchLinear: Module, Quantizable {
     @ModuleInfo(key: "weight") var weight: MLXArray
     @ModuleInfo(key: "bias") var bias: MLXArray?
@@ -1843,19 +2058,45 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
         _ x: MLXArray, _ indices: MLXArray, lhsIndices: MLXArray? = nil,
         sortedIndices: Bool = false
     ) -> MLXArray {
-        var result = MLX.gatherQuantizedMM(
-            x,
-            self.weight,
-            scales: self.scales,
-            biases: self.biases,
-            lhsIndices: lhsIndices,
-            rhsIndices: indices,
-            transpose: true,
-            groupSize: self.groupSize,
-            bits: self.bits,
-            mode: mode,
-            sortedIndices: sortedIndices
-        )
+        // PREFILL-EXPERT-DEQ-GEMM-001: the routed expert plane (the prompt
+        // pass's down projection, and gate/up whenever the fused storage is
+        // not bound) is dequantized once per layer per prompt pass and the
+        // gathered bf16 GEMM takes it. `apply` returns nil -- and this method
+        // evaluates exactly the expression it evaluated before -- whenever the
+        // switch, the quantization cell, the sorted right-hand-side contract
+        // or the row floor decline, which is every decode and every
+        // speculative verification rectangle.
+        let incumbent: () -> MLXArray = {
+            MLX.gatherQuantizedMM(
+                x,
+                self.weight,
+                scales: self.scales,
+                biases: self.biases,
+                lhsIndices: lhsIndices,
+                rhsIndices: indices,
+                transpose: true,
+                groupSize: self.groupSize,
+                bits: self.bits,
+                mode: self.mode,
+                sortedIndices: sortedIndices
+            )
+        }
+        var result =
+            SwitchPrefillExpertDeqGEMMV1.apply(
+                x,
+                weight: self.weight,
+                scales: self.scales,
+                biases: self.biases,
+                lhsIndices: lhsIndices,
+                rhsIndices: indices,
+                transpose: true,
+                groupSize: self.groupSize,
+                bits: self.bits,
+                mode: self.mode,
+                sortedIndices: sortedIndices,
+                hasBiasTerm: self.bias != nil,
+                cacheKey: ObjectIdentifier(self),
+                incumbent: incumbent) ?? incumbent()
 
         if let bias = self.bias {
             result = result + MLX.expandedDimensions(bias[indices], axis: -2)

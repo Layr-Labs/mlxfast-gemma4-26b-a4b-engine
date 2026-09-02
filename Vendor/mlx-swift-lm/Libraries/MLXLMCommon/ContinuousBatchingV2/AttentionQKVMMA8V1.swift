@@ -224,7 +224,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_impl(
 // identical [0, gh) / [gh, G) split across the threadgroup's two simdgroups
 // and the identical simdgroup-0-adds-simdgroup-1 close, per tile. Every output
 // word is therefore the same float sum accumulated in the same order.
-template <typename T, int KS, int TILES, int KFIX>
+template <typename T, int KS, int TILES, int KFIX, int SPLIT = 0>
 METAL_FUNC void qkv_mma8_affine4_g64_mt(
     const device uint32_t* w,
     const device T* scales,
@@ -235,7 +235,8 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
     const int n0,
     threadgroup float2* red,
     uint simd_gid,
-    uint simd_lid) {
+    uint simd_lid,
+    device T* y2 = nullptr) {
   constexpr int K = KFIX;
   constexpr int G = K / 64;
   constexpr int gh = (G + 1) / 2;
@@ -367,8 +368,23 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
 #pragma clang loop unroll(full)
   for (int t = 0; t < TILES; ++t) {
     const int nt = n0 + t * 8;
-    y[c.fn * N + nt + c.fm] = static_cast<T>(acc0[t]);
-    y[(c.fn + 1) * N + nt + c.fm] = static_cast<T>(acc1[t]);
+    if (SPLIT == 0) {
+      y[c.fn * N + nt + c.fm] = static_cast<T>(acc0[t]);
+      y[(c.fn + 1) * N + nt + c.fm] = static_cast<T>(acc1[t]);
+    } else {
+      // Fused Q||K plane: columns below SPLIT belong to Q, the rest to K.
+      // Both rows of a store pair share one column, so the branch is uniform.
+      const int col = nt + c.fm;
+      if (col < SPLIT) {
+        y[c.fn * SPLIT + col] = static_cast<T>(acc0[t]);
+        y[(c.fn + 1) * SPLIT + col] = static_cast<T>(acc1[t]);
+      } else {
+        const int n2 = N - SPLIT;
+        const int c2 = col - SPLIT;
+        y2[c.fn * n2 + c2] = static_cast<T>(acc0[t]);
+        y2[(c.fn + 1) * n2 + c2] = static_cast<T>(acc1[t]);
+      }
+    }
   }
 }
 """
@@ -406,6 +422,49 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
         header: mma8KernelHeader,
         ensureRowContiguous: true)
 
+    /// QKFUSE-001 arm. Default ON.
+    /// `DARKBLOOM_GEMMA4_QKV_FUSE_QK=0` restores the two separate dispatches.
+    public static let fuseQKEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_QKV_FUSE_QK"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let fusedSlidingKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y", "y2"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            qkv_mma8_affine4_g64_mt<T, 2, 2, 2816, 4096>(
+                w, scales, biases, x, y,
+                w_shape[0], int(tid.y) * 16, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup, y2);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
+    private static let fusedFullKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y", "y2"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            qkv_mma8_affine4_g64_mt<T, 2, 2, 2816, 8192>(
+                w, scales, biases, x, y,
+                w_shape[0], int(tid.y) * 16, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup, y2);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
     private static let mma8Kernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_carry2_bfill_v4",
         inputNames: ["x", "w", "scales", "biases"],
@@ -424,6 +483,91 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
         ensureRowContiguous: true)
 
     @inline(__always)
+    private static let fusedLock = NSLock()
+    nonisolated(unsafe) private static var fusedPlanes:
+        [ObjectIdentifier: (MLXArray, MLXArray, MLXArray)] = [:]
+
+    /// QKFUSE-001. One dispatch for the layer's Q and K projections.
+    ///
+    /// Q and K read the SAME activation at decode (`queryInput === x` whenever
+    /// last-query prefill is off) and share K=2816, group size, bit width and
+    /// quantization mode, so their weight planes concatenate along the output
+    /// axis into one plane. Row r of the fused output is row r of whichever
+    /// source plane it came from: the tier accumulates each output column
+    /// independently, so this is bit-exact, not a reassociation. Threadgroup
+    /// count is unchanged (768 for 4096+2048, the same 512+256 the two
+    /// dispatches launch), so the whole saving is one encoder per layer.
+    ///
+    /// The concatenation is a pure re-layout of the shipped quantized words.
+    /// No value is re-quantized and no numerical format changes.
+    public static func fusedQKMatmul(
+        x: MLXArray,
+        qWeight: MLXArray, qScales: MLXArray, qBiases: MLXArray?,
+        kWeight: MLXArray, kScales: MLXArray, kBiases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode,
+        cacheKey: ObjectIdentifier
+    ) -> (MLXArray, MLXArray)? {
+        guard enabled, fuseQKEnabled, multiTileEnabled,
+            groupSize == Self.groupSize,
+            bits == Self.bits,
+            mode == .affine,
+            let qBiases, let kBiases,
+            x.dtype == .bfloat16,
+            qScales.dtype == x.dtype, qBiases.dtype == x.dtype,
+            kScales.dtype == x.dtype, kBiases.dtype == x.dtype,
+            qWeight.dtype == .uint32, kWeight.dtype == .uint32,
+            x.ndim == 3,
+            x.dim(0) == batch, x.dim(1) == sequence, x.dim(2) == inputWidth,
+            x.size == batch * sequence * inputWidth,
+            qWeight.ndim == 2, kWeight.ndim == 2,
+            qWeight.dim(1) == inputWidth * Self.bits / 32,
+            kWeight.dim(1) == inputWidth * Self.bits / 32
+        else { return nil }
+
+        let qWidth = qWeight.dim(0)
+        let kWidth = kWeight.dim(0)
+        guard liveFusedSplit(qWidth), liveOutputWidth(kWidth),
+            qScales.shape == [qWidth, inputWidth / Self.groupSize],
+            qBiases.shape == qScales.shape,
+            kScales.shape == [kWidth, inputWidth / Self.groupSize],
+            kBiases.shape == kScales.shape
+        else { return nil }
+
+        let kernel = qWidth == 4096 ? fusedSlidingKernel : fusedFullKernel
+        let total = qWidth + kWidth
+        let yTiles = total / outputsPerGroup
+        guard yTiles % tilesPerGroup == 0 else { return nil }
+
+        fusedLock.lock()
+        var plane = fusedPlanes[cacheKey]
+        if plane == nil {
+            let w = concatenated([qWeight, kWeight], axis: 0)
+            let s = concatenated([qScales, kScales], axis: 0)
+            let b = concatenated([qBiases, kBiases], axis: 0)
+            eval(w, s, b)
+            plane = (w, s, b)
+            fusedPlanes[cacheKey] = plane
+        }
+        fusedLock.unlock()
+        guard let (fw, fs, fb) = plane else { return nil }
+
+        let outputs = kernel(
+            [x, fw, fs, fb],
+            template: [("T", x.dtype)],
+            grid: (simdWidth, (yTiles / tilesPerGroup) * simdGroups, 1),
+            threadGroup: (simdWidth, simdGroups, 1),
+            outputShapes: [[batch, sequence, qWidth], [batch, sequence, kWidth]],
+            outputDTypes: [x.dtype, x.dtype])
+        return (outputs[0], outputs[1])
+    }
+
+    /// Q widths the fused kernels bake as a compile-time split point.
+    private static func liveFusedSplit(_ width: Int) -> Bool {
+        width == 4096 || width == 8192
+    }
+
     private static func liveOutputWidth(_ width: Int) -> Bool {
         width == 1024 || width == 2048 || width == 4096 || width == 8192
     }

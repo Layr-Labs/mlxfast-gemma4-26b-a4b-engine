@@ -3162,6 +3162,60 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// D512-STRIDE-PAD-001 kill switch:
+    /// `DARKBLOOM_GEMMA4_D512_STRIDE_PAD` set to `0`/`false`/`no`/`off` makes
+    /// `paddedRowStride` return the key length unchanged, so `row_stride`
+    /// equals `key_length` in all eight kernels, every address expression
+    /// collapses to the promoted one term for term, and the two `row_vec4`
+    /// gates evaluate exactly as `(key_length & 3) == 0` did. Default ON.
+    private static let stridePadEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_STRIDE_PAD"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// The scratch row stride. `kL` is `absoluteOffset + 1` and the cohort
+    /// advances in lockstep, so `kL & 3` is zero on exactly one decode step in
+    /// four; on the other three the tree's own vec4 softmax and AV arms take
+    /// their scalar fallback for every chunk of every row purely because the
+    /// row length happened not to be a multiple of four. Rounding the stride
+    /// up costs at most three bf16 columns per row -- 8 * 16 * 3 * 2 = 768
+    /// bytes against a scratch already about 262 KB -- and those columns are
+    /// written by nothing and read by nothing: every write bound and every
+    /// load mask below stays on `key_length`.
+    @inline(__always)
+    private static func paddedRowStride(_ keyLength: Int) -> Int {
+        guard stridePadEnabled else { return keyLength }
+        CBv2EngageMark.once("d512-stride-pad")
+        return (keyLength + 3) / 4 * 4
+    }
+
+    /// R13 addendum 3: the liveness mark goes at the site that BUILDS the
+    /// edited kernel's source string. Swift initialises a `static let` on
+    /// first access, so a fingerprint emitted here fires exactly when that
+    /// kernel's text is first compiled and dispatched. Both arms of this
+    /// mechanism share one text -- the switch is a host-side stride VALUE,
+    /// not a source selector -- so the gate's job is to prove that the text
+    /// is the same on the candidate and the kill arm, and that the kill arm's
+    /// stride collapses it to the crown's addressing.
+    @inline(__always)
+    private static func fingerprinted(_ tag: String, _ source: String) -> String {
+        var h: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in source.utf8 {
+            h ^= UInt64(byte)
+            h = h &* 0x0000_0100_0000_01b3
+        }
+        // Emitted only on the armed arm. The switch here is a host-side stride
+        // VALUE, not a source selector, so both arms build this identical text;
+        // fingerprinting the kill arm too would make its census differ from the
+        // crown's for a reason that is instrumentation rather than mechanism.
+        if stridePadEnabled {
+            CBv2EngageMark.once("d512-src-\(tag)-\(String(h, radix: 16))")
+        }
+        return source
+    }
+
     /// Dispatch 1 — QKᵀ. Grid: (row, kv head, chunk of 4 virtual gemv
     /// threadgroups = 64 score rows) × 128 threads (4 simdgroups — exactly
     /// the stock gemv threadgroup shape). Each simdgroup replays the stock
@@ -3176,11 +3230,12 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// orders the standalone K/V store before this dispatch without touching
     /// the unrolled inner loop (the addressing perturbation WRITE-021/v2
     /// paid ~-1.34% decode for).
-    private static let qkSource: String = """
+    private static let qkSource: String = fingerprinted("qk", """
             constexpr int D = 512;
             constexpr int GQA = 8;
 
             const int key_length = int(params[0]);
+            const int row_stride = int(params[10]);
             const int in_vec_size = int(params[1]);
 
             const int n_chunks = (key_length + 63) / 64;
@@ -3210,7 +3265,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const device T* query =
                 queries + size_t(row * 16 + kv_head * GQA) * D;
             device T* score_rows =
-                scores + size_t(row * 16 + kv_head * GQA) * key_length;
+                scores + size_t(row * 16 + kv_head * GQA) * row_stride;
 
             const int virtual_groups = (key_length + 15) / 16;
             const int vtg_lo = chunk * 4;
@@ -3333,13 +3388,13 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     result[0] = (hi ? b : a)
                         + simd_shuffle_xor(hi ? a : b, ushort(1));
                 }
-                score_rows[size_t(lane >> 2) * key_length + out_row
+                score_rows[size_t(lane >> 2) * row_stride + out_row
                     + (lane & 3)] = static_cast<T>(result[0]);
             }
-        """
+        """)
 
     private static let qkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_qk_bf16_g8_xfold_v3_vec1",
+        name: "cbv2_ragged8_sdpa_d512_qk_bf16_g8_xfold_v3_vec1_sp1",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -3351,7 +3406,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     )
 
     private static let qkFencedKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_qk_fenced_bf16_g8_xfold_v3_vec1",
+        name: "cbv2_ragged8_sdpa_d512_qk_fenced_bf16_g8_xfold_v3_vec1_sp1",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -3367,11 +3422,12 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// over the 128 score rows; the CALLER sizes the threadgroup exactly
     /// like softmax.cpp:64-68 (32·ceil(ceil(kL/4)/32)). params[0] = kL.
     private static let softmaxKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_softmax_bf16_v1",
+        name: "cbv2_ragged8_sdpa_d512_softmax_bf16_v1_sp1",
         inputNames: ["scores", "params"],
         outputNames: ["probs"],
-        source: """
+        source: fingerprinted("softmax", """
             const int axis_size = int(params[0]);
+            const int row_stride = int(params[10]);
             const int gid = int(threadgroup_position_in_grid.x);
             const int lid = int(thread_position_in_threadgroup.x);
             const int simd_lane_id = int(thread_index_in_simdgroup);
@@ -3382,7 +3438,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
 
             float ld[4];
             const device T* in =
-                scores + size_t(gid) * axis_size + lid * 4;
+                scores + size_t(gid) * row_stride + lid * 4;
             if (lid * 4 + 4 <= axis_size) {
                 for (int i = 0; i < 4; i++) {
                     ld[i] = static_cast<float>(in[i]);
@@ -3438,7 +3494,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             normalizer = 1 / local_normalizer[0];
 
             device T* out_row =
-                probs + size_t(gid) * axis_size + lid * 4;
+                probs + size_t(gid) * row_stride + lid * 4;
             if (lid * 4 + 4 <= axis_size) {
                 for (int i = 0; i < 4; i++) {
                     out_row[i] = static_cast<T>(ld[i] * normalizer);
@@ -3450,29 +3506,30 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     }
                 }
             }
-        """,
+        """),
         ensureRowContiguous: true
     )
 
     /// CUT-13: alignment-gated vec4 twins of dispatch 2 and dispatch 3.
     ///
-    /// The probability-row stride is `key_length`, which is not always a
-    /// multiple of four, so the softmax load/store loops and the AV
+    /// The probability-row stride is `row_stride`, which D512-STRIDE-PAD-001
+    /// keeps a multiple of four (before it the stride was `key_length`, which
+    /// is a multiple of four on only one decode step in four), so the softmax load/store loops and the AV
     /// `p_coeff` loops above issue four scalar transactions per row chunk.
     /// Each `_sv1` twin computes one threadgroup-uniform branch
-    /// `(axis_size & 3) == 0` (softmax) / `(key_length & 3) == 0` (AV) at
+    /// `(row_stride & 3) == 0` (both softmax and AV) at
     /// the top of the kernel. When the row is 4-aligned:
     ///
-    /// - softmax: `gid * axis_size` and `lid * 4` are multiples of four
+    /// - softmax: `gid * row_stride` and `lid * 4` are multiples of four
     ///   elements, so each guarded chunk (`lid * 4 + 4 <= axis_size`) starts
     ///   on an 8-byte boundary for bf16 and covers exactly the four elements
     ///   the scalar run touches. Threads outside that guard — the whole
     ///   masked tail threadgroup included — keep the scalar path, so no
     ///   transaction is issued past the row end.
     /// - AV: `prob_rows` is offset by `(row * 16 + kv_head * GQA) *
-    ///   key_length`, each head row by `h * key_length`, and `bm = 32 * i +
+    ///   row_stride`, each head row by `h * row_stride`, and `bm = 32 * i +
     ///   4 * thrM`; all three terms are multiples of four elements when
-    ///   `key_length % 4 == 0`, and `bm + 4 <= 32 * n_iter <= key_length`
+    ///   `row_stride % 4 == 0`, and `bm + 4 <= 32 * n_iter <= key_length`
     ///   keeps every vec4 inside the row. The leftover tail stays scalar.
     ///
     /// Exactness: identical per-element `static_cast<float>` conversions and
@@ -3493,11 +3550,12 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     }()
 
     private static let softmaxVecKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_softmax_bf16_v1_sv1",
+        name: "cbv2_ragged8_sdpa_d512_softmax_bf16_v1_sv1_sp1",
         inputNames: ["scores", "params"],
         outputNames: ["probs"],
-        source: """
+        source: fingerprinted("softmax-vec", """
             const int axis_size = int(params[0]);
+            const int row_stride = int(params[10]);
             const int gid = int(threadgroup_position_in_grid.x);
             const int lid = int(thread_position_in_threadgroup.x);
             const int simd_lane_id = int(thread_index_in_simdgroup);
@@ -3505,14 +3563,14 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int num_simdgroups = (axis_size + 127) / 128;
 
             typedef vec<T, 4> T4;
-            const bool row_vec4 = (axis_size & 3) == 0;
+            const bool row_vec4 = (row_stride & 3) == 0;
 
             threadgroup float local_max[32];
             threadgroup float local_normalizer[32];
 
             float ld[4];
             const device T* in =
-                scores + size_t(gid) * axis_size + lid * 4;
+                scores + size_t(gid) * row_stride + lid * 4;
             if (lid * 4 + 4 <= axis_size) {
                 if (row_vec4) {
                     const T4 raw = *reinterpret_cast<const device T4*>(in);
@@ -3566,7 +3624,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const float inv_normalizer = 1.0f / normalizer;
 
             device T* out_row =
-                probs + size_t(gid) * axis_size + lid * 4;
+                probs + size_t(gid) * row_stride + lid * 4;
             if (lid * 4 + 4 <= axis_size) {
                 if (row_vec4) {
                     T4 out_vec;
@@ -3586,7 +3644,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     }
                 }
             }
-        """,
+        """),
         ensureRowContiguous: true
     )
 
@@ -3638,18 +3696,19 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// and butterfly for all 8 heads of the GQA group at once (shared V tile
     /// loads). params as dispatch 1.
     private static let avKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1",
+        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1_sp1",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
             "params",
         ],
         outputNames: ["out"],
-        source: """
+        source: fingerprinted("av", """
             constexpr int D = 512;
             constexpr int GQA = 8;
 
             const int key_length = int(params[0]);
+            const int row_stride = int(params[10]);
 
             const int z = int(threadgroup_position_in_grid.z);
             const int tile = z % \(avColumnTiles);
@@ -3675,7 +3734,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             value_plane += size_t(kv_head) * size_t(row_capacity) * D;
 
             const device T* prob_rows =
-                probs + size_t(row * 16 + kv_head * GQA) * key_length;
+                probs + size_t(row * 16 + kv_head * GQA) * row_stride;
 
             const int thrM = lane / 4;
             const int thrN = lane % 4;
@@ -3706,7 +3765,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     #pragma clang loop unroll(full)
                     for (int tm = 0; tm < 4; ++tm) {
                         p_coeff[tm] = static_cast<float>(
-                            prob_rows[size_t(h) * key_length + bm + tm]);
+                            prob_rows[size_t(h) * row_stride + bm + tm]);
                     }
                     #pragma clang loop unroll(full)
                     for (int tm = 0; tm < 4; ++tm) {
@@ -3728,7 +3787,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
                         const float pc = static_cast<float>(
-                            prob_rows[size_t(h) * key_length + bm + tm]);
+                            prob_rows[size_t(h) * row_stride + bm + tm]);
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
                             result[h * 4 + tn] += pc * v_tile[0][tn];
@@ -3792,35 +3851,36 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     out_ptr[j] = static_cast<T>(result[j]);
                 }
             }
-        """,
+        """),
         ensureRowContiguous: true
     )
 
     /// CUT-13: alignment-gated vec4 twin of dispatch 3 above. Identical to
     /// the promoted kernel except for the threadgroup-uniform
-    /// `(key_length & 3) == 0` gate and the `p_coeff` loop: the 4-aligned
+    /// `(row_stride & 3) == 0` gate and the `p_coeff` loop: the 4-aligned
     /// arm loads each head's probability chunk as one `vec<T, 4>` from
-    /// `prob_rows + h * key_length + bm`, an address that is a multiple of
-    /// four elements (row base `(row * 16 + kv_head * GQA) * key_length`,
-    /// head stride `h * key_length`, `bm = 32 * i + 4 * thrM` all are, and
+    /// `prob_rows + h * row_stride + bm`, an address that is a multiple of
+    /// four elements (row base `(row * 16 + kv_head * GQA) * row_stride`,
+    /// head stride `h * row_stride`, `bm = 32 * i + 4 * thrM` all are, and
     /// `bm + 4 <= 32 * n_iter <= key_length` stays in row). Per-element
     /// `static_cast<float>`, the XFOLD butterfly and every store are
     /// unchanged; the scalar arm and the leftover tail are the promoted
     /// source verbatim.
     private static let avVecKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1_sv1",
+        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1_sv1_sp1",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
             "params",
         ],
         outputNames: ["out"],
-        source: """
+        source: fingerprinted("av-vec", """
             constexpr int D = 512;
             constexpr int GQA = 8;
 
             const int key_length = int(params[0]);
-            const bool row_vec4 = (key_length & 3) == 0;
+            const int row_stride = int(params[10]);
+            const bool row_vec4 = (row_stride & 3) == 0;
 
             const int z = int(threadgroup_position_in_grid.z);
             const int tile = z % \(avColumnTiles);
@@ -3846,7 +3906,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             value_plane += size_t(kv_head) * size_t(row_capacity) * D;
 
             const device T* prob_rows =
-                probs + size_t(row * 16 + kv_head * GQA) * key_length;
+                probs + size_t(row * 16 + kv_head * GQA) * row_stride;
 
             const int thrM = lane / 4;
             const int thrN = lane % 4;
@@ -3876,7 +3936,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 for (int h = 0; h < GQA; ++h) {
                     if (row_vec4) {
                         const T4 p_raw = *reinterpret_cast<const device T4*>(
-                            prob_rows + size_t(h) * key_length + bm);
+                            prob_rows + size_t(h) * row_stride + bm);
                         #pragma clang loop unroll(full)
                         for (int tm = 0; tm < 4; ++tm) {
                             p_coeff[tm] = static_cast<float>(p_raw[tm]);
@@ -3885,7 +3945,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                         #pragma clang loop unroll(full)
                         for (int tm = 0; tm < 4; ++tm) {
                             p_coeff[tm] = static_cast<float>(
-                                prob_rows[size_t(h) * key_length + bm + tm]);
+                                prob_rows[size_t(h) * row_stride + bm + tm]);
                         }
                     }
                     #pragma clang loop unroll(full)
@@ -3908,7 +3968,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
                         const float pc = static_cast<float>(
-                            prob_rows[size_t(h) * key_length + bm + tm]);
+                            prob_rows[size_t(h) * row_stride + bm + tm]);
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
                             result[h * 4 + tn] += pc * v_tile[0][tn];
@@ -3972,7 +4032,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     out_ptr[j] = static_cast<T>(result[j]);
                 }
             }
-        """,
+        """),
         ensureRowContiguous: true
     )
 
@@ -4002,7 +4062,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// served from `new_keys` during scoring, never from the slot being
     /// written, so no read races the store.
     private static let fusedQkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_qk_bf16_g8_ktile_v3_vec1",
+        name: "cbv2_ragged8_writesdpa_d512_qk_bf16_g8_ktile_v3_vec1_sp1",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -4010,11 +4070,12 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             "params", "new_keys", "new_values", "write_fence",
         ],
         outputNames: ["scores", "fence"],
-        source: """
+        source: fingerprinted("fused-qk", """
             constexpr int D = 512;
             constexpr int GQA = 8;
 
             const int key_length = int(params[0]);
+            const int row_stride = int(params[10]);
             const int in_vec_size = int(params[1]);
 
             const int n_chunks = (key_length + 63) / 64;
@@ -4062,7 +4123,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const device T* query =
                 queries + size_t(row * 16 + kv_head * GQA) * D;
             device T* score_rows =
-                scores + size_t(row * 16 + kv_head * GQA) * key_length;
+                scores + size_t(row * 16 + kv_head * GQA) * row_stride;
 
             const int virtual_groups = (key_length + 15) / 16;
             const int vtg_lo = chunk * 4;
@@ -4148,7 +4209,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                         #pragma clang loop unroll(full)
                         for (int tm = 0; tm < 4; ++tm) {
                             score_rows[
-                                size_t(h) * key_length + out_row + tm] =
+                                size_t(h) * row_stride + out_row + tm] =
                                 static_cast<T>(result[h][tm]);
                         }
                     }
@@ -4177,7 +4238,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             if (z == 0 && sg == 0 && lane == 0) {
                 fence[0] = write_fence[0] + 1;
             }
-        """,
+        """),
         ensureRowContiguous: true
     )
 
@@ -4187,18 +4248,19 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// `new_values` rather than the cache slot the fused QK dispatch wrote,
     /// so this kernel has no read-after-in-place-write hazard at all.
     private static let fusedAvKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1",
+        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1_sp1",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
             "params", "new_values",
         ],
         outputNames: ["out"],
-        source: """
+        source: fingerprinted("fused-av", """
             constexpr int D = 512;
             constexpr int GQA = 8;
 
             const int key_length = int(params[0]);
+            const int row_stride = int(params[10]);
 
             const int z = int(threadgroup_position_in_grid.z);
             const int tile = z % \(avColumnTiles);
@@ -4226,7 +4288,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 new_values + size_t(row * 2 + kv_head) * D;
 
             const device T* prob_rows =
-                probs + size_t(row * 16 + kv_head * GQA) * key_length;
+                probs + size_t(row * 16 + kv_head * GQA) * row_stride;
 
             const int thrM = lane / 4;
             const int thrN = lane % 4;
@@ -4269,7 +4331,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     #pragma clang loop unroll(full)
                     for (int tm = 0; tm < 4; ++tm) {
                         p_coeff[tm] = static_cast<float>(
-                            prob_rows[size_t(h) * key_length + bm + tm]);
+                            prob_rows[size_t(h) * row_stride + bm + tm]);
                     }
                     #pragma clang loop unroll(full)
                     for (int tm = 0; tm < 4; ++tm) {
@@ -4294,7 +4356,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
                         const float pc = static_cast<float>(
-                            prob_rows[size_t(h) * key_length + bm + tm]);
+                            prob_rows[size_t(h) * row_stride + bm + tm]);
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
                             result[h * 4 + tn] += pc * v_tile[0][tn];
@@ -4341,7 +4403,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     out_ptr[j] = static_cast<T>(result[j]);
                 }
             }
-        """,
+        """),
         ensureRowContiguous: true
     )
 
@@ -4351,19 +4413,20 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// output allocation hands this kernel); the value-tile peel, the
     /// shuffle-down fold and every store are the promoted source verbatim.
     private static let fusedAvVecKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1_sv1",
+        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1_sv1_sp1",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
             "params", "new_values",
         ],
         outputNames: ["out"],
-        source: """
+        source: fingerprinted("fused-av-vec", """
             constexpr int D = 512;
             constexpr int GQA = 8;
 
             const int key_length = int(params[0]);
-            const bool row_vec4 = (key_length & 3) == 0;
+            const int row_stride = int(params[10]);
+            const bool row_vec4 = (row_stride & 3) == 0;
 
             const int z = int(threadgroup_position_in_grid.z);
             const int tile = z % \(avColumnTiles);
@@ -4391,7 +4454,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 new_values + size_t(row * 2 + kv_head) * D;
 
             const device T* prob_rows =
-                probs + size_t(row * 16 + kv_head * GQA) * key_length;
+                probs + size_t(row * 16 + kv_head * GQA) * row_stride;
 
             const int thrM = lane / 4;
             const int thrN = lane % 4;
@@ -4433,7 +4496,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 for (int h = 0; h < GQA; ++h) {
                     if (row_vec4) {
                         const T4 p_raw = *reinterpret_cast<const device T4*>(
-                            prob_rows + size_t(h) * key_length + bm);
+                            prob_rows + size_t(h) * row_stride + bm);
                         #pragma clang loop unroll(full)
                         for (int tm = 0; tm < 4; ++tm) {
                             p_coeff[tm] = static_cast<float>(p_raw[tm]);
@@ -4442,7 +4505,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                         #pragma clang loop unroll(full)
                         for (int tm = 0; tm < 4; ++tm) {
                             p_coeff[tm] = static_cast<float>(
-                                prob_rows[size_t(h) * key_length + bm + tm]);
+                                prob_rows[size_t(h) * row_stride + bm + tm]);
                         }
                     }
                     #pragma clang loop unroll(full)
@@ -4468,7 +4531,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
                         const float pc = static_cast<float>(
-                            prob_rows[size_t(h) * key_length + bm + tm]);
+                            prob_rows[size_t(h) * row_stride + bm + tm]);
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
                             result[h * 4 + tn] += pc * v_tile[0][tn];
@@ -4515,7 +4578,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     out_ptr[j] = static_cast<T>(result[j]);
                 }
             }
-        """,
+        """),
         ensureRowContiguous: true
     )
 
@@ -4649,7 +4712,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         keyBuffers.reserveCapacity(batch)
         valueBuffers.reserveCapacity(batch)
         var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
-        params.reserveCapacity(batch + 2)
+        params.reserveCapacity(batch + 3)
         for row in fullRows {
             let state = row.cbv2InnerState()
             guard state.count == 2,
@@ -4667,12 +4730,18 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             valueBuffers.append(state[1])
             params.append(UInt32(state[0].dim(2)))
         }
-        let paramsArray = MLXArray(params)
+        // D512-STRIDE-PAD-001: the padded stride rides as the last params
+        // entry. Every entry point guards `fullRows.count == batch`, so the
+        // eight per-row KV capacities occupy params[2...9] and the stride
+        // lands at params[10] -- a constant of this fixed batch-eight
+        // geometry, not an inference from a runtime count.
+        let rowStride = paddedRowStride(keyLength)
+        let paramsArray = MLXArray(params + [UInt32(rowStride)])
 
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)
         ]
-        let scratchShape = [batch, queryHeads, 1, keyLength]
+        let scratchShape = [batch, queryHeads, 1, rowStride]
 
         let storeFence = ringStoreKernel(
             keyBuffers + valueBuffers
@@ -4777,7 +4846,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         keyBuffers.reserveCapacity(batch)
         valueBuffers.reserveCapacity(batch)
         var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
-        params.reserveCapacity(batch + 2)
+        params.reserveCapacity(batch + 3)
         for row in fullRows {
             let state = row.cbv2InnerState()
             guard state.count == 2,
@@ -4795,12 +4864,18 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             valueBuffers.append(state[1])
             params.append(UInt32(state[0].dim(2)))
         }
-        let paramsArray = MLXArray(params)
+        // D512-STRIDE-PAD-001: the padded stride rides as the last params
+        // entry. Every entry point guards `fullRows.count == batch`, so the
+        // eight per-row KV capacities occupy params[2...9] and the stride
+        // lands at params[10] -- a constant of this fixed batch-eight
+        // geometry, not an inference from a runtime count.
+        let rowStride = paddedRowStride(keyLength)
+        let paramsArray = MLXArray(params + [UInt32(rowStride)])
 
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)
         ]
-        let scratchShape = [batch, queryHeads, 1, keyLength]
+        let scratchShape = [batch, queryHeads, 1, rowStride]
 
         let chunks = (keyLength + 63) / 64
         let passQK = fusedQkKernel(
@@ -4904,7 +4979,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         keyBuffers.reserveCapacity(batch)
         valueBuffers.reserveCapacity(batch)
         var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
-        params.reserveCapacity(batch + 2)
+        params.reserveCapacity(batch + 3)
         for (index, row) in fullRows.enumerated() {
             _ = row.update(
                 keys: keys[index ..< (index + 1)],
@@ -4981,7 +5056,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         keyBuffers.reserveCapacity(batch)
         valueBuffers.reserveCapacity(batch)
         var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
-        params.reserveCapacity(batch + 2)
+        params.reserveCapacity(batch + 3)
         for row in fullRows {
             let state = row.cbv2InnerState()
             guard state.count == 2,
@@ -5013,12 +5088,18 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         queries: MLXArray, keyBuffers: [MLXArray], valueBuffers: [MLXArray],
         params: [UInt32], keyLength: Int
     ) -> MLXArray {
-        let paramsArray = MLXArray(params)
+        // D512-STRIDE-PAD-001: the padded stride rides as the last params
+        // entry. Every entry point guards `fullRows.count == batch`, so the
+        // eight per-row KV capacities occupy params[2...9] and the stride
+        // lands at params[10] -- a constant of this fixed batch-eight
+        // geometry, not an inference from a runtime count.
+        let rowStride = paddedRowStride(keyLength)
+        let paramsArray = MLXArray(params + [UInt32(rowStride)])
 
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)
         ]
-        let scratchShape = [batch, queryHeads, 1, keyLength]
+        let scratchShape = [batch, queryHeads, 1, rowStride]
 
         let chunks = (keyLength + 63) / 64
         let scores = qkKernel(

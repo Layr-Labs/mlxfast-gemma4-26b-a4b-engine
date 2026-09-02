@@ -3152,6 +3152,16 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     private static let minKeyLength = 4
     private static let maxKeyLength = 4095
 
+    /// LASTQ-D512 kill switch: `DARKBLOOM_GEMMA4_LASTQ_D512` set to
+    /// `0`/`false`/`no`/`off` restores the per-row last-query attend loop in
+    /// `CBv2AttentionV1.updateAndAttendLastQuery`. Default ON.
+    private static let lastQueryPrefillEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_LASTQ_D512"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// Dispatch 1 — QKᵀ. Grid: (row, kv head, chunk of 4 virtual gemv
     /// threadgroups = 64 score rows) × 128 threads (4 simdgroups — exactly
     /// the stock gemv threadgroup shape). Each simdgroup replays the stock
@@ -4904,6 +4914,105 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             valueBuffers.append(state[1])
             params.append(UInt32(state[0].dim(2)))
         }
+        return dispatchChain(
+            queries: queries, keyBuffers: keyBuffers, valueBuffers: valueBuffers,
+            params: params, keyLength: keyLength)
+    }
+
+    /// LASTQ-D512: the attend-only twin of `updateAndAttend` for the final
+    /// layer's last-query prefill (see LastQueryPrefillV2.swift). The caller
+    /// (`CBv2AttentionV1.updateAndAttendLastQuery`) has ALREADY committed
+    /// every row's full K/V chunk — the byte-identical per-row `update`
+    /// calls in row order — so this runs the stock three-dispatch chain over
+    /// the committed buffers with kL = the rows' common committed length and
+    /// appends NOTHING of its own (a chunk can never be double-committed;
+    /// the WRITE variants are not applicable for exactly that reason).
+    ///
+    /// Admission mirrors `updateAndAttend` with the decode-only gates
+    /// translated: kL is the committed length (not `offset + 1` — nothing is
+    /// appended), there is no new-token keys/values shape to check, and
+    /// `absoluteOffset <= maxLength` is a `CBv2FullSequenceKV` invariant
+    /// rather than an append-fit gate. Fails closed (nil, NO side effects)
+    /// on any miss, exactly like `updateAndAttend`.
+    ///
+    /// Exactness: same claim and same scope as `updateAndAttend`. The
+    /// per-row graph this replaces is the SAME `attend(..., L: 1, ...)`
+    /// call — maskMode `.none` at L == 1, scale 1.0, no sinks/softcap,
+    /// same committed `[1, kvHeads, kL, headDim]` views — the decode
+    /// per-row loop makes at the same kL, and the chain is parity-verified
+    /// bit-exact against that graph at kL ∈ {1024, 1027, 1100, 1152, 1055,
+    /// 2048, 4095} (see the enum header). How the committed bytes got there
+    /// (one-token decode append vs one whole-chunk prefill append) is not
+    /// an input the kernels can observe.
+    static func attendCommitted(
+        rows: [CBv2SequenceKV], kind: CBv2LayerKind,
+        queries: MLXArray, scale: Float, sinks: MLXArray?, softcap: Float?
+    ) -> MLXArray? {
+        guard enabled,
+            lastQueryPrefillEnabled,
+            rows.count == batch,
+            scale == 1.0,
+            sinks == nil,
+            softcap == nil,
+            !kind.isBidirectional,
+            kind.queryHeads == queryHeads,
+            kind.kvHeads == kvHeads,
+            kind.headDim == headDim,
+            queries.dtype == .bfloat16,
+            queries.shape == [batch, queryHeads, 1, headDim]
+        else { return nil }
+        guard case .full = kind.attention else { return nil }
+
+        let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
+        guard fullRows.count == batch else { return nil }
+
+        // Lockstep + storage gates, ALL before any dispatch. Pooled
+        // (ATT-008) rows fail closed exactly like the decode path: their
+        // backing layout is the pool's batch axis.
+        let keyLength = fullRows[0].absoluteOffset
+        guard keyLength >= minKeyLength,
+            keyLength <= maxKeyLength,
+            fullRows.allSatisfy({ $0.cohortPool == nil }),
+            fullRows.allSatisfy({ $0.absoluteOffset == keyLength })
+        else { return nil }
+
+        var keyBuffers: [MLXArray] = []
+        var valueBuffers: [MLXArray] = []
+        keyBuffers.reserveCapacity(batch)
+        valueBuffers.reserveCapacity(batch)
+        var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
+        params.reserveCapacity(batch + 2)
+        for row in fullRows {
+            let state = row.cbv2InnerState()
+            guard state.count == 2,
+                state[0].dtype == .bfloat16,
+                state[1].dtype == .bfloat16,
+                state[0].ndim == 4,
+                state[0].dim(0) == 1,
+                state[0].dim(1) == kvHeads,
+                state[0].dim(3) == headDim,
+                state[1].shape == state[0].shape,
+                state[1].dtype == state[0].dtype,
+                state[0].dim(2) >= keyLength
+            else { return nil }
+            keyBuffers.append(state[0])
+            valueBuffers.append(state[1])
+            params.append(UInt32(state[0].dim(2)))
+        }
+        return dispatchChain(
+            queries: queries, keyBuffers: keyBuffers, valueBuffers: valueBuffers,
+            params: params, keyLength: keyLength)
+    }
+
+    /// The stock three-dispatch chain (QKᵀ → precise softmax → probs·V) over
+    /// collected committed row buffers, byte-for-byte as `updateAndAttend`
+    /// always dispatched it. `params` = [kL, D, per-row KV buffer
+    /// capacities...]. Shared by the decode append path and the last-query
+    /// attend-only path so the two cannot drift.
+    private static func dispatchChain(
+        queries: MLXArray, keyBuffers: [MLXArray], valueBuffers: [MLXArray],
+        params: [UInt32], keyLength: Int
+    ) -> MLXArray {
         let paramsArray = MLXArray(params)
 
         let template: [(String, any KernelTemplateArg)] = [

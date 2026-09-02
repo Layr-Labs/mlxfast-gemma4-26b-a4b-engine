@@ -1710,8 +1710,23 @@ private enum Gemma4PrefillDeqGEMMV1 {
         return value
     }()
 
+    /// GATEUP-DEQ-CONCAT. Default ON: at prompt width the dense MLP's gate and
+    /// up projections share one activation plane and one K extent, so their
+    /// two dequantized transposed planes are cached side by side as one
+    /// `[K, 2N]` plane and served by one matmul. Each output column still
+    /// reads its own plane column over the same K chain.
+    /// `DARKBLOOM_GEMMA4_PREFILL_DEQ_GATEUP=0` (also false/no/off) restores the
+    /// two separate matmuls.
+    static let gateUpEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_DEQ_GATEUP"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let planeLock = NSLock()
     nonisolated(unsafe) private static var cachedTransposedPlanes: [ObjectIdentifier: MLXArray] = [:]
+    nonisolated(unsafe) private static var cachedGateUpPlanes: [ObjectIdentifier: MLXArray] = [:]
 
     @inline(__always)
     private static func plane(for quantized: QuantizedLinear, biases: MLXArray) -> MLXArray {
@@ -1735,6 +1750,74 @@ private enum Gemma4PrefillDeqGEMMV1 {
         cachedTransposedPlanes[key] = p
         planeLock.unlock()
         return p
+    }
+
+    /// The non-row admission shared by `apply` and `applyGateUp`.
+    @inline(__always)
+    private static func admitted(_ layer: Linear, _ x: MLXArray) -> QuantizedLinear? {
+        guard enabled,
+            let quantized = layer as? QuantizedLinear,
+            quantized.bias == nil,
+            quantized.mode == .affine,
+            quantized.groupSize == 64,
+            quantized.bits == 4 || quantized.bits == 8,
+            x.dtype == .bfloat16, x.ndim >= 2,
+            quantized.scales.dtype == .bfloat16,
+            let biases = quantized.biases, biases.dtype == .bfloat16
+        else { return nil }
+        let inputDims = x.dim(-1)
+        guard inputDims > 0,
+            quantized.weight.ndim == 2, quantized.weight.dtype == .uint32,
+            quantized.weight.dim(1) * (32 / quantized.bits) == inputDims
+        else { return nil }
+        return quantized
+    }
+
+    /// GATEUP-DEQ-CONCAT. One matmul over the concatenated `[K, 2N]` plane in
+    /// place of two over `[K, N]`. The prompt activation plane is read once
+    /// instead of twice and one dispatch leaves the chain per layer. Returns
+    /// nil for any geometry the single-projection road would also decline,
+    /// and for a gate/up pair whose planes are not the same shape.
+    @inline(__always)
+    static func applyGateUp(
+        _ gate: Linear, _ up: Linear, _ x: MLXArray
+    ) -> (gate: MLXArray, up: MLXArray)? {
+        guard gateUpEnabled, cacheEnabled,
+            let qGate = admitted(gate, x), let qUp = admitted(up, x),
+            let gateBiases = qGate.biases, let upBiases = qUp.biases
+        else { return nil }
+        let inputDims = x.dim(-1)
+        guard x.size / inputDims >= minRows else { return nil }
+        let n = qGate.weight.dim(0)
+        guard n > 0, qUp.weight.dim(0) == n,
+            qGate.bits == qUp.bits, qGate.mode == qUp.mode,
+            qGate.groupSize == qUp.groupSize
+        else { return nil }
+        CBv2EngageMark.once("prefill-deq-gemm-gateup")
+
+        let key = ObjectIdentifier(qGate)
+        planeLock.lock()
+        let fused: MLXArray
+        if let existing = cachedGateUpPlanes[key] {
+            fused = existing
+        } else {
+            let gatePlane = dequantized(
+                qGate.weight, scales: qGate.scales, biases: gateBiases,
+                groupSize: qGate.groupSize, bits: qGate.bits, mode: qGate.mode
+            ).transposed()
+            let upPlane = dequantized(
+                qUp.weight, scales: qUp.scales, biases: upBiases,
+                groupSize: qUp.groupSize, bits: qUp.bits, mode: qUp.mode
+            ).transposed()
+            let p = MLX.concatenated([gatePlane, upPlane], axis: -1)
+            eval(p)
+            cachedGateUpPlanes[key] = p
+            fused = p
+        }
+        planeLock.unlock()
+
+        let product = MLX.matmul(x, fused)
+        return (product[.ellipsis, ..<n], product[.ellipsis, n...])
     }
 
     @inline(__always)
@@ -4298,6 +4381,14 @@ private class Gemma4MLP: Module {
         // projections. If either projection is not the pinned affine8 cell,
         // the candidate arrays remain unevaluated and stock takes over.
         let activationSums = producerSums ?? CBv2DenseMLPQMVV1.activationSums(for: x)
+        // GATEUP-DEQ-CONCAT: at prompt width both projections fall through to
+        // the dequantized-plane road anyway, so serve them from one plane and
+        // one matmul. Declines for every geometry that road declines, which
+        // includes the whole decode cell, and the pair below then runs as
+        // before.
+        if let pair = Gemma4PrefillDeqGEMMV1.applyGateUp(gateProj, upProj, x) {
+            return denseProjection(downProj, gemma4GeluProduct(pair.gate, pair.up))
+        }
         return denseProjection(
             downProj,
             gemma4GeluProduct(

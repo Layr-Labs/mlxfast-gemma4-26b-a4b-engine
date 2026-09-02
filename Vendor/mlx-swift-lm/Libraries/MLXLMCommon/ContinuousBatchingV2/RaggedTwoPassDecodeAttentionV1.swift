@@ -1686,7 +1686,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// removes only the global partial write/read and the second dispatch.
     private static let portQuantFusedWriteResidentKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_ey29_ey32_yp1",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_ey29_ey32_yp2",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -2598,7 +2598,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
 
     private static let portQuantFusedWriteResidentNormRopeKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_v1_ey29_ey32_yp1",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_v1_ey29_ey32_yp2",
             inputNames: [
                 "raw_queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -2614,7 +2614,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// fifth output, so the standalone prepass never runs on a sliding layer.
     private static let portQuantFusedWriteResidentNormRopeORunsumKernel:
         MLXFast.MLXFastKernel = MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_ors_v1_ey29_ey32_yp1",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_ors_v1_ey29_ey32_yp2",
             inputNames: [
                 "raw_queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -3638,7 +3638,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// and butterfly for all 8 heads of the GQA group at once (shared V tile
     /// loads). params as dispatch 1.
     private static let avKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1",
+        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1_v4s1",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -3784,13 +3784,15 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 }
             }
             {
-                device T* out_ptr = out
+                typedef vec<T, 4> T4;
+                device T4* out_ptr = reinterpret_cast<device T4*>(out
                     + size_t(row * 16 + kv_head * GQA + thrM) * D
-                    + out_col;
-                #pragma clang loop unroll(full)
-                for (int j = 0; j < 4; ++j) {
-                    out_ptr[j] = static_cast<T>(result[j]);
-                }
+                    + out_col);
+                *out_ptr = T4(
+                    static_cast<T>(result[0]),
+                    static_cast<T>(result[1]),
+                    static_cast<T>(result[2]),
+                    static_cast<T>(result[3]));
             }
         """,
         ensureRowContiguous: true
@@ -3808,7 +3810,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// unchanged; the scalar arm and the leftover tail are the promoted
     /// source verbatim.
     private static let avVecKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1_sv1",
+        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1_sv1_v4s1",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -3964,13 +3966,15 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 }
             }
             {
-                device T* out_ptr = out
+                typedef vec<T, 4> T4;
+                device T4* out_ptr = reinterpret_cast<device T4*>(out
                     + size_t(row * 16 + kv_head * GQA + thrM) * D
-                    + out_col;
-                #pragma clang loop unroll(full)
-                for (int j = 0; j < 4; ++j) {
-                    out_ptr[j] = static_cast<T>(result[j]);
-                }
+                    + out_col);
+                *out_ptr = T4(
+                    static_cast<T>(result[0]),
+                    static_cast<T>(result[1]),
+                    static_cast<T>(result[2]),
+                    static_cast<T>(result[3]));
             }
         """,
         ensureRowContiguous: true
@@ -4187,7 +4191,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// `new_values` rather than the cache slot the fused QK dispatch wrote,
     /// so this kernel has no read-after-in-place-write hazard at all.
     private static let fusedAvKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1",
+        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1_v4s1",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -4333,13 +4337,15 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 }
             }
             {
-                device T* out_ptr = out
+                typedef vec<T, 4> T4;
+                device T4* out_ptr = reinterpret_cast<device T4*>(out
                     + size_t(row * 16 + kv_head * GQA + thrM) * D
-                    + out_col;
-                #pragma clang loop unroll(full)
-                for (int j = 0; j < 4; ++j) {
-                    out_ptr[j] = static_cast<T>(result[j]);
-                }
+                    + out_col);
+                *out_ptr = T4(
+                    static_cast<T>(result[0]),
+                    static_cast<T>(result[1]),
+                    static_cast<T>(result[2]),
+                    static_cast<T>(result[3]));
             }
         """,
         ensureRowContiguous: true
@@ -4351,7 +4357,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// output allocation hands this kernel); the value-tile peel, the
     /// shuffle-down fold and every store are the promoted source verbatim.
     private static let fusedAvVecKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1_sv1",
+        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1_sv1_v4s1",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -4507,13 +4513,15 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 }
             }
             {
-                device T* out_ptr = out
+                typedef vec<T, 4> T4;
+                device T4* out_ptr = reinterpret_cast<device T4*>(out
                     + size_t(row * 16 + kv_head * GQA + thrM) * D
-                    + out_col;
-                #pragma clang loop unroll(full)
-                for (int j = 0; j < 4; ++j) {
-                    out_ptr[j] = static_cast<T>(result[j]);
-                }
+                    + out_col);
+                *out_ptr = T4(
+                    static_cast<T>(result[0]),
+                    static_cast<T>(result[1]),
+                    static_cast<T>(result[2]),
+                    static_cast<T>(result[3]));
             }
         """,
         ensureRowContiguous: true

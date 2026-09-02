@@ -3736,12 +3736,32 @@ inline float qdot_affine4_g64_word(
 //   KFIX : in_vec_size as a compile-time constant. The gemma4 gate has
 //          already proven in_vec_size is 2816 (gate/up) or 704 (down), so
 //          the K-loop trip count and every stride fold constant-fold.
+//   SBSTAGE : the per-block affine scale/bias fetch, hoisted out of DRAM.
+//          A lane re-reads `scales[row][blk * 4 + simd_lid / 8]` and the
+//          matching bias once per (row, K-block): 8 two-byte device loads
+//          per block, 88 over a KFIX = 2816 stream, for 4 distinct
+//          addresses per row per block (lanes 0..7 share one). With KFIX
+//          the whole window is compile-time -- rows `used_out_row ..
+//          used_out_row + 3` occupy exactly `4 * KFIX / 64` CONTIGUOUS
+//          elements of each plane -- so the simdgroup stages both planes
+//          cooperatively in 12 coalesced loads and the block loop reads
+//          threadgroup memory instead. Every `s` / `b` handed to
+//          `qdot_affine4_g64_word` is the identical bf16 datum widened the
+//          identical way, so the whole add sequence is unchanged: this is
+//          load-issue rescheduling, not arithmetic.
 //
 // Instantiated only under the gemma4 pair-geometry gate, which is
 // compile-time false unless group_size == 64 && bits == 4; the affine-4 /
 // g64 constants below are hardcoded exactly as `qmv_affine4_g64_pair_impl`
 // hardcodes them.
-template <typename T, int group_size, int bits, int KFIX, bool WVEC, bool PF>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int KFIX,
+    bool WVEC,
+    bool PF,
+    bool SBSTAGE>
 METAL_FUNC void qmv_affine4_g64_singles_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -3752,7 +3772,8 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
     const int out_vec_size,
     uint3 tid,
     uint simd_gid,
-    uint simd_lid) {
+    uint simd_lid,
+    threadgroup T* sb_stage) {
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
   constexpr int values_per_thread = 8;
@@ -3784,6 +3805,21 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
   x += tid.x * in_vec_size + simd_lid * values_per_thread;
   y += tid.x * out_vec_size + used_out_row;
 
+  // SBSTAGE staging window: `results_per_simdgroup` whole scale rows, then
+  // the matching bias rows, filling `2 * stage_count` elements of
+  // `sb_stage`.
+  constexpr int stage_groups = (KFIX > 0) ? (KFIX / qgroup) : 0;
+  constexpr int stage_count = results_per_simdgroup * stage_groups;
+  if (SBSTAGE) {
+    const device T* s_src = scales - simd_lid / scale_step_per_thread;
+    const device T* b_src = biases - simd_lid / scale_step_per_thread;
+    for (int i = int(simd_lid); i < stage_count; i += SIMD_SIZE) {
+      sb_stage[i] = s_src[i];
+      sb_stage[stage_count + i] = b_src[i];
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
   const int nblocks = in_vec_size / block_size;
   const device uint8_t* ws0 = ws;
 
@@ -3809,11 +3845,21 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
       }
     }
 
+    const int stage_grp = SBSTAGE
+        ? blk * (block_size / qgroup) + int(simd_lid) / scale_step_per_thread
+        : 0;
     for (int row = 0; row < results_per_simdgroup; row++) {
-      const device T* sl = scales + row * in_vec_size_g;
-      const device T* bl = biases + row * in_vec_size_g;
-      U s = sl[0];
-      U b = bl[0];
+      U s;
+      U b;
+      if (SBSTAGE) {
+        s = sb_stage[row * stage_groups + stage_grp];
+        b = sb_stage[stage_count + row * stage_groups + stage_grp];
+      } else {
+        const device T* sl = scales + row * in_vec_size_g;
+        const device T* bl = biases + row * in_vec_size_g;
+        s = sl[0];
+        b = bl[0];
+      }
       if (PF) {
         result[row] += qdot_affine4_g64_word(wcur[row], x_thread, s, b, sum);
       } else if (WVEC) {
@@ -4025,6 +4071,13 @@ template <typename T, int group_size, int bits>
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
+  // EXPERT-SINGLES-SBSTAGE window: two simdgroups x (4 scale rows + 4 bias
+  // rows) x 2816 / 64 groups. Outermost kernel scope so the allocation is
+  // unconditional and statically sized; only the K = 2816 singleton arm
+  // below reads it. 704 elements = 1408 B at bf16, far under the tile
+  // budget a 64-thread group can claim without losing residency.
+  constexpr int kGemma4SinglesStageSpan = 2 * 4 * (2816 / 64);
+  threadgroup T sb_stage[2 * kGemma4SinglesStageSpan];
   int M = x_shape[x_batch_ndims];
   const bool gemma4_pair_geometry =
       group_size == 64 && bits == 4 && M == 1 && batch_ndims == 1 &&
@@ -4174,10 +4227,24 @@ template <typename T, int group_size, int bits>
     const device T* single_biases = biases + expert * b_strides[0];
     device T* single_y = y + assignment * (uint)out_vec_size;
     if (in_vec_size == 2816) {
+      // EXPERT-SINGLES-SBSTAGE gate (engage mark `expert-singles-sbstage`):
+      // compile-time flip; ON here. Flip to false to restore the incumbent
+      // per-block device scale/bias fetch. The two arms are bit-identical by
+      // construction -- the staged datum is the same bf16 element.
+      constexpr bool gemma4_singles_sb_stage = true;
+      if (gemma4_singles_sb_stage) {
+        qmv_affine4_g64_singles_impl<
+            T, group_size, bits, 2816, true, false, true>(
+            single_w, single_scales, single_biases, single_x, single_y,
+            in_vec_size, out_vec_size, tid, simd_gid, simd_lid,
+            sb_stage + simd_gid * kGemma4SinglesStageSpan);
+        return;
+      }
       qmv_affine4_g64_singles_impl<
-          T, group_size, bits, 2816, true, false>(
+          T, group_size, bits, 2816, true, false, false>(
           single_w, single_scales, single_biases, single_x, single_y,
-          in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+          in_vec_size, out_vec_size, tid, simd_gid, simd_lid,
+          sb_stage + simd_gid * kGemma4SinglesStageSpan);
     } else {
       qmv_impl<T, group_size, bits>(
           single_w, single_scales, single_biases, single_x, single_y,

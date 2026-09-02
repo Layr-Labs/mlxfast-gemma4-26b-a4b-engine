@@ -136,7 +136,7 @@ public enum Gemma4MMAQuantizedGEMV {
     /// adjacent output tiles, reusing each activation fragment across both and
     /// doubling one threadgroup's output width. Version `16` extends the same
     /// reuse to four output tiles per SIMD group. Version `26` probes one reused
-    /// packed-weight cursor across those tiles. Version `27` keeps that cursor
+    /// packed-weight cursor across these tiles. Version `27` keeps that cursor
     /// and replaces the v13 `min(8u, N_GROUPS - biasBlock)` inner trip with a
     /// compile-time-8 walk plus a four-group tail `continue`, fully unrolling
     /// the 44-group outer block walk. Versions 1...16 are shippable and

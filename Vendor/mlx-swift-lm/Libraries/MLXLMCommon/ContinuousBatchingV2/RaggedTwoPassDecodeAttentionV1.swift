@@ -30,6 +30,30 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
+    /// Q4 ring slots are a power-of-two window. The mask form removes the
+    /// per-token wrap branch while retaining the same integer sequence.
+    /// Kill switch: `DARKBLOOM_CBV2_Q4_RING_MASK=0` restores the branch.
+    private static let q4RingMaskEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_Q4_RING_MASK"]
+        else {
+            CBv2EngageMark.once("q4-ring-mask")
+            return true
+        }
+        let enabled = !["0", "false", "no", "off"].contains(raw.lowercased())
+        if enabled { CBv2EngageMark.once("q4-ring-mask") }
+        return enabled
+    }()
+
+    private static let q4RingAdvance: String = q4RingMaskEnabled
+        ? "slot = (slot + BLOCKS) & (N - 1);"
+        : """
+            slot += BLOCKS;
+            if (slot >= N) slot -= N;
+            """
+
+    private static let q4RingKernelVersion = q4RingMaskEnabled ? "v2" : "v1"
+
 
     private static let batch = 8
     private static let queryHeads = 16
@@ -1160,7 +1184,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     }
 
     private static let portQuantReadKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_ring_2pass_a_q4g64_d256_g2_port_b\(blocks)_v1",
+        name: "cbv2_ragged8_sdpa_ring_2pass_a_q4g64_d256_g2_port_b\(blocks)_\(q4RingKernelVersion)",
         inputNames: [
             "queries",
             "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7", "starts",
@@ -1246,8 +1270,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                             * fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
                 }
 
-                slot += BLOCKS;
-                if (slot >= N) slot -= N;
+                \(q4RingAdvance)
             }
 
             if (lane == 0) {

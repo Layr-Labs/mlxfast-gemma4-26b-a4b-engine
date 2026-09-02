@@ -860,26 +860,6 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         )[0]
     }
 
-    /// RS-CHAIN: the previous layer's fused tail already produced this
-    /// layer's table (same values, same reduction tree). Accept it when it has
-    /// exactly this table's shape and dtype; otherwise build the table here.
-    @inline(__always)
-    public static func runsumTable(for x: MLXArray, carried: MLXArray?) -> MLXArray? {
-        guard rsPrepassEnabled,
-            x.dtype == .bfloat16,
-            x.ndim == 3,
-            x.dim(0) == batch,
-            x.dim(1) == sequence,
-            x.dim(2) == inputWidth
-        else { return nil }
-        if let carried, carried.dtype == .float32, carried.ndim == 2,
-            carried.dim(0) == batch, carried.dim(1) == inputWidth / groupSize
-        {
-            return carried
-        }
-        return runsumTable(for: x)
-    }
-
     @inline(__always)
     private static let fusedLock = NSLock()
     nonisolated(unsafe) private static var fusedPlanes:

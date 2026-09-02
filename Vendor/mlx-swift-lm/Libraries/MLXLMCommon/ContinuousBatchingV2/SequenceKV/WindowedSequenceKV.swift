@@ -211,18 +211,6 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
                 + "BF16 ring is stale; set MLX_KV_Q4_BF16_ELIDE=0 to keep it authoritative"
         )
 
-        // FRESH-RING-ADOPT: a fresh row receiving exactly one window of tokens
-        // at a window-aligned position. `writeRing` would store token j in
-        // slot j for every slot, so the ring after the write IS the chunk
-        // tensor: adopt the chunk as the ring storage and pack both mirror
-        // planes straight into the mirror allocation, instead of zero-filling
-        // three private buffers and copying the same bytes into them.
-        if keys == nil, n == window, absoluteOffset % window == 0,
-            adoptsFreshFullWindowChunk(keyTemplate: newKeys, valueTemplate: newValues)
-        {
-            return adoptFreshFullWindowChunk(keys: newKeys, values: newValues)
-        }
-
         allocateIfNeeded(keyTemplate: newKeys, valueTemplate: newValues)
 
         if n == 1 {
@@ -873,77 +861,6 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         """
     )
 
-
-    /// FRESH-RING-ADOPT: `[1, H, N, D]` keys and values -> `[2, H, N, D/8 + D/64]`
-    /// uint32 in the mirror's own (plane, head, token, word) layout, one
-    /// dispatch for both planes; row for row what `quantPackGPU` produces for
-    /// each plane separately.
-    static func quantPackPairChunkGPU(keys: MLXArray, values: MLXArray) -> MLXArray {
-        let heads = keys.dim(1)
-        let n = keys.dim(2)
-        let headDim = keys.dim(3)
-        return quantPackPairChunkKernel(
-            [keys, values],
-            template: [("T", keys.dtype), ("HEADS", heads), ("N", n)],
-            grid: (2 * heads * n * 32, 1, 1),
-            threadGroup: (32, 1, 1),
-            outputShapes: [[2, heads, n, headDim / 8 + headDim / 64]],
-            outputDTypes: [.uint32]
-        )[0]
-    }
-
-    /// The per-row arithmetic is a transcription of `quantPackKernel`, kept
-    /// separate for the same reason `quantPackPairKernel` is: a Swift-hosted
-    /// kernel that changes text without changing name serves a stale body.
-    private static let quantPackPairChunkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_kvq4g64_pack_pair_chunk_d256_v1",
-        inputNames: ["keys", "values"],
-        outputNames: ["packed_w"],
-        source: """
-            constexpr int D = 256;
-            constexpr int simd_width = 32;
-            constexpr int per_lane = D / simd_width;      // 8 values
-            constexpr int group_size = 64;
-            constexpr int payload_words = D / 8;          // 32
-            constexpr int row_words = payload_words + D / group_size;
-
-            const int row = int(threadgroup_position_in_grid.x);
-            const int plane = row / (HEADS * N);
-            const int local = row - plane * (HEADS * N);   // head * N + token
-            const int lane = int(thread_position_in_threadgroup.x);
-            const device T* src = (plane == 0 ? keys : values) + local * D;
-            device uint32_t* out = packed_w + row * row_words;
-
-            float vmin = 3.402823466e+38F;
-            float vmax = -3.402823466e+38F;
-            for (int i = 0; i < per_lane; ++i) {
-                const float v = float(src[lane * per_lane + i]);
-                vmin = min(vmin, v);
-                vmax = max(vmax, v);
-            }
-            for (uint m = 1; m < 8; m <<= 1) {
-                vmin = min(vmin, simd_shuffle_xor(vmin, m));
-                vmax = max(vmax, simd_shuffle_xor(vmax, m));
-            }
-
-            const half hs = half(max((vmax - vmin) / 15.0f, 1e-6f));
-            const half hb = half(vmin);
-            const float s = float(hs);
-            const float b = float(hb);
-
-            uint32_t word = 0u;
-            for (int i = 0; i < per_lane; ++i) {
-                const float q = metal::rint((float(src[lane * per_lane + i]) - b) / s);
-                word |= uint32_t(clamp(q, 0.0f, 15.0f)) << (4 * i);
-            }
-            out[lane] = word;
-            if (lane % 8 == 0) {
-                out[payload_words + lane / 8] =
-                    uint32_t(as_type<ushort>(hs)) | (uint32_t(as_type<ushort>(hb)) << 16);
-            }
-        """,
-        ensureRowContiguous: true
-    )
 
     // MARK: - KVQ-DIAG: compute-and-discard probe
 
@@ -1728,47 +1645,6 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
             quantMirror[plane ..< (plane + 1), 0..., 0 ..< (n - first), 0...] =
                 packed[.ellipsis, first..., 0...]
         }
-    }
-
-    /// FRESH-RING-ADOPT. `MLX_KV_FRESH_CHUNK_ADOPT=0` restores the zero-fill
-    /// plus slice-update materialization of a fresh row's first window.
-    static let freshChunkAdoptionEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment["MLX_KV_FRESH_CHUNK_ADOPT"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
-    /// The adopt path serves only the quantized road at the exact ring
-    /// geometry, with the GPU packer on and no diagnostic mode armed; every
-    /// other configuration keeps the incumbent allocate-and-write path.
-    private func adoptsFreshFullWindowChunk(
-        keyTemplate: MLXArray, valueTemplate: MLXArray
-    ) -> Bool {
-        Self.freshChunkAdoptionEnabled
-            && quantEligible && Self.gpuPackEnabled && !Self.gpuPackCheck
-            && !Self.quantSimulate && !Self.selfTestArmed
-            && keyTemplate.dtype == .bfloat16 && valueTemplate.dtype == .bfloat16
-            && keyTemplate.shape == [1, kvHeads, window, headDim]
-            && valueTemplate.shape == keyTemplate.shape
-    }
-
-    /// Slot j of the ring is token j (a full window written at offset 0 of
-    /// the ring), so the chunk tensors are the ring contents byte for byte;
-    /// the mirror is packed from the same tokens with the same per-row
-    /// arithmetic `writeMirror` applies, one dispatch for both planes. The
-    /// offsets, the retained-window bookkeeping and the borrowable views end
-    /// in the state the incumbent path leaves after the same update.
-    private func adoptFreshFullWindowChunk(
-        keys newKeys: MLXArray, values newValues: MLXArray
-    ) -> (MLXArray, MLXArray) {
-        Self.selfTestKVQ4()
-        keys = newKeys
-        values = newValues
-        quantMirror = Self.quantPackPairChunkGPU(keys: newKeys, values: newValues)
-        absoluteOffset += window
-        oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
-        borrowableChunkViews = (newKeys, newValues)
-        return (newKeys, newValues)
     }
 
     private func allocateIfNeeded(keyTemplate: MLXArray, valueTemplate: MLXArray) {

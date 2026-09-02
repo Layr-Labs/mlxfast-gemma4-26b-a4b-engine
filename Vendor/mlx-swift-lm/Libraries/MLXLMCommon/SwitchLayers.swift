@@ -1402,15 +1402,14 @@ public class SwitchGLU: Module {
             expertPrefixBoundsEnabled && useLhsIndices
             && indices.dtype == .uint32 && x.dtype == .bfloat16
             && expertPrefixBoundsProjectionsEligible
-        var x = MLX.expandedDimensions(x, axes: [-2, -3])
         let doSort = indices.size >= 64
+        var x = useLhsIndices ? MLX.expandedDimensions(x, axis: -2) : MLX.expandedDimensions(x, axes: [-2, -3])
 
         var idx = indices
-        var inverseOrder = MLXArray()
+        var inverseOrder: MLXArray? = nil
         var lhsIndices: MLXArray?
         if doSort {
             if useLhsIndices {
-                x = x.flattened(start: 0, end: -3)
                 // GLUE-FOLD: an upstream producer already emitted the exact
                 // route table beside the top-8 selection; consume it and the
                 // standalone `mlx_lm_route_simd_rank_scatter` dispatch never
@@ -1469,25 +1468,29 @@ public class SwitchGLU: Module {
             guard let gateProj, let upProj else {
                 preconditionFailure("SwitchGLU requires gate_up_proj or gate_proj/up_proj")
             }
-            // GATEUP-FUSE-PREFILL: the sorted right-hand-side plane (the
-            // production prefill) reads its gathered activations once through
-            // one gather over the concatenated gate|up storage. Same kernel
-            // pipeline, same per-column K-chains; the halves are views. The
-            // admission mirrors the host's sorted right-hand-side selection
-            // exactly, so the split views never meet that kernel.
-            if doSort, !useLhsIndices, lhsIndices == nil,
-                x.ndim == 3, x.dim(-2) == 1, x.dim(-1) == inputDims,
-                x.dim(0) >= 16, x.dim(0) / numExperts >= 4,
-                x.dtype == .bfloat16,
-                let fused = fusedGateUpDispatch()
-            {
-                CBv2EngageMark.once("prefill-gateup-fuse")
+            // GATEUP-FUSE: single gather over the concatenated gate|up storage.
+            // Slices xGate and xUp as zero-copy views.
+            let admitPrefill = doSort && !useLhsIndices && lhsIndices == nil
+                && x.ndim == 3 && x.dim(-2) == 1 && x.dim(-1) == inputDims
+                && x.dim(0) >= 16 && x.dim(0) / numExperts >= 4
+                && x.dtype == .bfloat16
+
+            let admitDecode = doSort && useLhsIndices && lhsIndices != nil
+                && x.ndim == 3 && x.dim(-2) == 1 && x.dim(-1) == inputDims
+                && x.dtype == .bfloat16
+
+            if (admitPrefill || admitDecode), let fused = fusedGateUpDispatch() {
+                if admitPrefill {
+                    CBv2EngageMark.once("prefill-gateup-fuse")
+                } else {
+                    CBv2EngageMark.once("decode-gateup-fuse")
+                }
                 let xGateUp = MLX.gatherQuantizedMM(
                     x,
                     fused.storage.weight,
                     scales: fused.storage.scales,
                     biases: fused.storage.biases,
-                    lhsIndices: nil,
+                    lhsIndices: admitDecode ? lhsIndices : nil,
                     rhsIndices: idx,
                     transpose: true,
                     groupSize: fused.groupSize,

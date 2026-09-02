@@ -1804,6 +1804,13 @@ private let gemma4QKFuseSlidingEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+private let gemma4QKVFuseSlidingEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_QKVFUSE_SLIDING"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 private class Gemma4Attention: Module {
     let config: Gemma4TextConfiguration
     let layerIdx: Int
@@ -1946,6 +1953,27 @@ private class Gemma4Attention: Module {
             x: x,
             qWeight: q.weight, qScales: q.scales, qBiases: q.biases,
             kWeight: k.weight, kScales: k.scales, kBiases: k.biases,
+            groupSize: q.groupSize, bits: q.bits, mode: q.mode,
+            cacheKey: ObjectIdentifier(q),
+            rsTable: rsTable)
+    }
+
+    /// QKV-SLIDING-FUSE. Fused Q, K, and V projection for sliding window layers.
+    @inline(__always)
+    private func fusedQKVProjection(
+        _ x: MLXArray, rsTable: MLXArray? = nil
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard let q = qProj as? QuantizedLinear, q.bias == nil,
+            let kProj, let k = kProj as? QuantizedLinear, k.bias == nil,
+            let vProj, let v = vProj as? QuantizedLinear, v.bias == nil,
+            q.groupSize == k.groupSize, q.bits == k.bits, q.mode == k.mode,
+            q.groupSize == v.groupSize, q.bits == v.bits, q.mode == v.mode
+        else { return nil }
+        return CBv2AttentionQKVMMA8V1.fusedQKVMatmul(
+            x: x,
+            qWeight: q.weight, qScales: q.scales, qBiases: q.biases,
+            kWeight: k.weight, kScales: k.scales, kBiases: k.biases,
+            vWeight: v.weight, vScales: v.scales, vBiases: v.biases,
             groupSize: q.groupSize, bits: q.bits, mode: q.mode,
             cacheKey: ObjectIdentifier(q),
             rsTable: rsTable)
@@ -2193,12 +2221,19 @@ private class Gemma4Attention: Module {
         // table — the table is per activation row and per 64-group of K,
         // independent of N, so the concatenated-N dispatch reads the same
         // entries the separate Q and K dispatches would.
-        let fusedQK: (MLXArray, MLXArray)? =
+        // QKV-SLIDING-FUSE: on sliding layers (vProj != nil), fuse Q, K, and V into a single 8192-wide dispatch.
+        let fusedQKV: (MLXArray, MLXArray, MLXArray)? =
             (lastQueryCache == nil && !usesSharedKV
+                && vProj != nil && gemma4QKVFuseSlidingEnabled)
+            ? fusedQKVProjection(x, rsTable: qkvRunsumTable) : nil
+        if fusedQKV != nil { CBv2EngageMark.once("qkv-sliding-fuse") }
+
+        let fusedQK: (MLXArray, MLXArray)? =
+            (fusedQKV == nil && lastQueryCache == nil && !usesSharedKV
                 && (vProj == nil || gemma4QKFuseSlidingEnabled))
             ? fusedQKProjection(x, rsTable: qkvRunsumTable) : nil
         let queryRaw = (
-            fusedQK?.0 ?? tierProjection(qProj, queryInput, rsTable: qkvRunsumTable)
+            fusedQKV?.0 ?? fusedQK?.0 ?? tierProjection(qProj, queryInput, rsTable: qkvRunsumTable)
         ).reshaped(B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
@@ -2262,10 +2297,12 @@ private class Gemma4Attention: Module {
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
         let kRaw = (
-            fusedQK?.1 ?? tierProjection(kProj, x, rsTable: qkvRunsumTable)
+            fusedQKV?.1 ?? fusedQK?.1 ?? tierProjection(kProj, x, rsTable: qkvRunsumTable)
         ).reshaped(B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
-        if let vProj {
+        if let fusedQKV {
+            vRaw = fusedQKV.2.reshaped(B, L, nKvHeads, effectiveHeadDim)
+        } else if let vProj {
             vRaw = tierProjection(vProj, x, rsTable: qkvRunsumTable)
                 .reshaped(B, L, nKvHeads, effectiveHeadDim)
         } else {

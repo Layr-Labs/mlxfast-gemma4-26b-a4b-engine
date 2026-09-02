@@ -22,12 +22,31 @@ import MLX
 final class CBv2PositionOffsetsState {
     var value: MLXArray
 
+    /// STEP-EDGES: `source + by`, already produced beside the outputs of a
+    /// kernel on this step's chain. The owning cache adopts it at its advance
+    /// while `source` is still the chain's value; a rebuild or a different
+    /// step length drops it and the plain add runs as before.
+    var pendingAdvance: (source: MLXArray, advanced: MLXArray, by: Int32)?
+
     init(rows: [CBv2SequenceKV]) {
         value = MLXArray(rows.map { Int32($0.absoluteOffset) })
     }
 
     func rebuild(from rows: [CBv2SequenceKV]) {
         value = MLXArray(rows.map { Int32($0.absoluteOffset) })
+        pendingAdvance = nil
+    }
+
+    /// Advance the chain on-device by `count` positions.
+    func advance(by count: Int32) {
+        if let pending = pendingAdvance,
+            pending.source === value, pending.by == count
+        {
+            value = pending.advanced
+        } else {
+            value = value + count
+        }
+        pendingAdvance = nil
     }
 }
 
@@ -146,6 +165,17 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         advancesPositionOffsets = advances
     }
 
+    /// STEP-EDGES: offer the shared chain its advance for this step, computed
+    /// by a kernel already on the chain (`advanced == source + count`). Only a
+    /// unified bank owns a shared chain; its owning cache consumes the offer
+    /// at its advance if `source` is still the chain's value.
+    public func offerUnifiedPositionAdvance(
+        from source: MLXArray, advanced: MLXArray, by count: Int32
+    ) {
+        guard usesUnifiedPositionOffsets else { return }
+        positionOffsetsState.pendingAdvance = (source, advanced, count)
+    }
+
     // MARK: - Membership (the ONLY places positionOffsets is host-rebuilt)
 
     public func appendRow(_ row: CBv2SequenceKV) {
@@ -199,7 +229,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         // Advance offsets ON-DEVICE. A unified bank elects exactly one owning
         // cache; Gemma snapshots the shared pre-step value before this call.
         if advancesPositionOffsets {
-            positionOffsetsState.value = positionOffsetsState.value + Int32(queries.dim(2))
+            positionOffsetsState.advance(by: Int32(queries.dim(2)))
         }
         return output
     }
@@ -223,7 +253,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             queries: queries, keys: keys, values: values,
             scale: scale, sinks: sinks, softcap: attentionSoftcap)
         if advancesPositionOffsets {
-            positionOffsetsState.value = positionOffsetsState.value + Int32(keys.dim(2))
+            positionOffsetsState.advance(by: Int32(keys.dim(2)))
         }
         return output
     }

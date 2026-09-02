@@ -1723,15 +1723,24 @@ private enum Gemma4PrefillDeqGEMMV1 {
         }
         let key = ObjectIdentifier(quantized)
         planeLock.lock()
-        if let existing = cachedTransposedPlanes[key] {
-            planeLock.unlock()
-            return existing
-        }
+        let existing = cachedTransposedPlanes[key]
+        planeLock.unlock()
+        if let existing { return existing }
+        // DEQ-PLANE-LOCK-001: the plane is built and evaluated with no lock
+        // held (an evaluation under the table lock stalls any other prompt
+        // pass that reaches the table meanwhile); the table is then taken
+        // only to insert. A pass that built the same plane concurrently
+        // keeps the first entry — the same values from the same operation.
         let p = dequantized(
             quantized.weight, scales: quantized.scales, biases: biases,
             groupSize: quantized.groupSize, bits: quantized.bits, mode: quantized.mode
         ).transposed()
         eval(p)
+        planeLock.lock()
+        if let raced = cachedTransposedPlanes[key] {
+            planeLock.unlock()
+            return raced
+        }
         cachedTransposedPlanes[key] = p
         planeLock.unlock()
         return p
@@ -1958,10 +1967,15 @@ private class Gemma4Attention: Module {
     /// ORSFOLD-001: `carriedRunsum` is the table the resident attention kernel
     /// emitted for this exact activation; nil, or any table that misses the
     /// shape contract, falls through to the standalone prepass.
+    /// ORS-D512: a carried `[8, 256]` pair table (the D=512 dispatch-3
+    /// epilogue at 32-column tiles) takes the `_rsp2` o_proj body; a carried
+    /// `[8, 128]` table (64-column tiles) takes the established `_rsp` body.
     @inline(__always)
     private func outputProjection(
         _ x: MLXArray, carriedRunsum: MLXArray? = nil
     ) -> MLXArray {
+        let carriedPairs = CBv2AttentionOQMVV1.acceptRunsumPairTable(
+            carriedRunsum, for: x)
         guard let quantized = oProj as? QuantizedLinear,
             quantized.bias == nil,
             let projected = CBv2AttentionOQMVV1.matmul(
@@ -1972,9 +1986,12 @@ private class Gemma4Attention: Module {
                 groupSize: quantized.groupSize,
                 bits: quantized.bits,
                 mode: quantized.mode,
-                rsTable: CBv2AttentionOQMVV1.acceptRunsumTable(
-                    carriedRunsum, for: x)
-                    ?? CBv2AttentionOQMVV1.runsumTable(for: x))
+                rsTable: carriedPairs != nil
+                    ? nil
+                    : (CBv2AttentionOQMVV1.acceptRunsumTable(
+                        carriedRunsum, for: x)
+                        ?? CBv2AttentionOQMVV1.runsumTable(for: x)),
+                rsPairTable: carriedPairs)
         else { return Gemma4PrefillDeqGEMMV1.apply(oProj, x) ?? oProj(x) }
         return projected
     }
@@ -2324,6 +2341,17 @@ private class Gemma4Attention: Module {
                 qWeight: qNorm.weight, kWeight: kNorm.weight,
                 positionOffsets: capturedOffsets,
                 ropeLog2Base: qkvRopeParameters.log2Base,
+                eps: config.rmsNormEps, appliedRope: appliedRope)
+        } else if vProj == nil, qkvRopeParameters.usesFrequencies {
+            // NORMROPE-D512: the full layers' store dispatch takes the raw
+            // k-eq-v projections and normalizes/rotates them once itself; a
+            // miss falls back to the arrays above.
+            _ = CBv2RaggedComposedD512DecodeAttentionV1.registerFullNormRope(
+                normalizedQueries: queries, normalizedKeys: k, normalizedValues: v,
+                rawQueries: queryRaw, rawKeys: kRaw, rawValues: vRaw,
+                qWeight: qNorm.weight, kWeight: kNorm.weight,
+                positionOffsets: capturedOffsets,
+                ropeFrequencies: qkvRopeParameters.frequencies,
                 eps: config.rmsNormEps, appliedRope: appliedRope)
         }
 
@@ -3186,7 +3214,27 @@ private enum Gemma4RouteGlueFoldV1 {
 /// to the stock `inputLayernorm(x)`.
 public final class Gemma4GlueChainBox {
     var pending: (source: MLXArray, normed: MLXArray, rs: MLXArray?)?
+    /// STEP-EDGES: the final norm the last layer's tail may fold, and the
+    /// (output, normed, head sums) it deposited. The trunk consumes the
+    /// deposit only while `source` is the last layer's output.
+    var finalNorm: (weight: MLXArray, eps: Float)?
+    var finalPending: (source: MLXArray, normed: MLXArray, xSums: MLXArray)?
     public init() {}
+}
+
+/// STEP-EDGES: exact folds at the serial edges of the B=8 decode step — the
+/// embedding scalar cast held instead of re-cast every call, the embedding
+/// fused with layer zero's input norm (emitting the position chain's `+ 1`
+/// beside it), the pre-step position snapshot passed without a `+ 0` copy,
+/// and the last layer's tail fused with the final norm and head sums.
+/// `DARKBLOOM_GEMMA4_STEP_EDGES=0` restores the incumbent dispatches.
+enum Gemma4StepEdges {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_STEP_EDGES"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
 }
 
 /// GLUE-001: fused B8/L1 layer glue. Three single-dispatch kernels
@@ -3577,6 +3625,109 @@ private enum Gemma4FusedLayerGlue {
         return (outs[0], table)
     }
 
+    /// STEP-EDGES (EMB-NORM): RS0 over the embedding row the threadgroup
+    /// dequantizes itself. Thread `lid` owns features `lid*4 ..< lid*4+4`:
+    /// nibbles `4*(lid&1) ..< +4` of packed word `lid>>1`, whose (scale,
+    /// bias) pair is group `lid>>4`. Every feature is the standalone
+    /// embedding kernel's `scale * d + bias` then `* es` with the same
+    /// declared types, so the values do not depend on the launch shape; the
+    /// four rounded T values then feed the RS0 reduction, norm and run-sum
+    /// epilogue from registers. `offsets_next` is the position chain's `+ 1`.
+    private static let embeddingInputNormRunsumKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_glue_embedding_input_rmsnorm_qkv_runsum_2816_bf16_se1",
+            inputNames: [
+                "tokens", "emb", "scales", "biases", "embed_scale", "w", "offsets",
+            ],
+            outputNames: ["out", "normed", "qkv_rs", "offsets_next"],
+            source: """
+                const uint row = threadgroup_position_in_grid.x;
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint simd_lane_id = thread_index_in_simdgroup;
+                const uint simd_group_id = simdgroup_index_in_threadgroup;
+                threadgroup float local_inv[1];
+                threadgroup float local_sums[32];
+                const uint base = row * 2816 + lid * 4;
+                const uint wbase = lid * 4;
+
+                const int raw_token = tokens[row];
+                const int vocab = emb_shape[0];
+                const size_t t = size_t(raw_token < 0 ? raw_token + vocab : raw_token);
+                const uint word = lid >> 1;
+                const uint packed = emb[t * size_t(352) + size_t(word)];
+                const size_t gindex = t * size_t(44) + size_t(word >> 3);
+
+                T scale = scales[gindex];
+                T bias = biases[gindex];
+                T es = embed_scale;
+
+                const int nibble = int(lid & 1u) * 4;
+                T ev[4];
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < 4; i++) {
+                    uint8_t d = (packed >> (4 * (nibble + i))) & 0x0f;
+                    const T dequantized = scale * d + bias;
+                    ev[i] = dequantized * es;
+                    out[base + i] = ev[i];
+                }
+            \(rmsReduce("ev", into: "local_inv[0]").replacingOccurrences(
+                of: "(float)ev[base + i]", with: "(float)ev[i]"))
+                const float inv = local_inv[0];
+                T normedv[4];
+                for (int i = 0; i < 4; ++i) {
+                    normedv[i] = w[wbase + i]
+                        * static_cast<T>((float)ev[i] * inv);
+                    normed[base + i] = normedv[i];
+                }
+            \(qkvRunsumEpilogue("normedv"))
+                if (lid == 0u) {
+                    offsets_next[row] = offsets[row] + 1;
+                }
+            """,
+            ensureRowContiguous: true)
+
+    struct EmbeddingInputNorm {
+        let hidden: MLXArray
+        let normed: MLXArray
+        let qkvRunsumTable: MLXArray
+        let offsetsNext: MLXArray
+    }
+
+    /// STEP-EDGES (EMB-NORM) producer for the exact decode cell. Anywhere
+    /// else, or under the kill switch, nil keeps the standalone embedding and
+    /// RS0 dispatches.
+    static func embeddingInputNormWithQKVRunsum(
+        tokens: MLXArray, embedding: Embedding, embedScale: Float,
+        hiddenSize: Int, offsets: MLXArray, weight: MLXArray, eps: Float
+    ) -> EmbeddingInputNorm? {
+        guard Gemma4StepEdges.enabled, enabled, eps == Self.eps,
+            hiddenSize == axis,
+            tokens.ndim == 2, tokens.dim(0) == rows, tokens.dim(1) == 1,
+            tokens.dtype == .int32,
+            weight.ndim == 1, weight.dim(0) == axis, weight.dtype == .bfloat16,
+            offsets.dtype == .int32, offsets.ndim == 1, offsets.dim(0) == rows,
+            let bound = Gemma4FusedScaledEmbedding.planes(
+                tokens: tokens, embedding: embedding, hiddenSize: hiddenSize)
+        else { return nil }
+        let outs = embeddingInputNormRunsumKernel(
+            [
+                tokens, bound.weight, bound.scales, bound.biases,
+                Gemma4FusedScaledEmbedding.scaleArray(embedScale), weight, offsets,
+            ],
+            template: [("T", DType.bfloat16)],
+            grid: (rows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: [[rows, 1, axis], [rows, 1, axis], [rows, axis / 64], [rows]],
+            outputDTypes: [.bfloat16, .bfloat16, .float32, .int32]
+        )
+        guard let table = CBv2AttentionQKVMMA8V1.runsumTable(
+            produced: outs[2], for: outs[1])
+        else { return nil }
+        return EmbeddingInputNorm(
+            hidden: outs[0], normed: outs[1], qkvRunsumTable: table,
+            offsetsNext: outs[3])
+    }
+
     struct AttentionBranchPrefix {
         let out: MLXArray
         let denseNorm: MLXArray
@@ -3869,6 +4020,80 @@ private enum Gemma4FusedLayerGlue {
             ensureRowContiguous: true
         )
 
+    /// STEP-EDGES (FINAL-CHAIN): the last layer's deferred tail with the
+    /// final RMSNorm and the tied head's activation sums appended over the
+    /// `outv` it already holds. The reduction is `rmsReduce`'s tree (the
+    /// standalone final kernel feeds the same 22 sums and ten zeros to the
+    /// same `simd_sum`), the norm is the same `wn * T(x * inv)` product, and
+    /// the sums loop is the standalone kernel's, statement for statement.
+    private static let deferredTailFinalKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_glue_deferred_expert_tail_final_rmsnorm_mma_xsum_2816_bf16_se1",
+            inputNames: [
+                "a", "sorted", "inverse", "route_weights", "res",
+                "w1", "w2", "w3", "s", "wn",
+            ],
+            outputNames: ["out", "normed", "xSums"],
+            source: """
+                const uint row = threadgroup_position_in_grid.x;
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint simd_lane_id = thread_index_in_simdgroup;
+                const uint simd_group_id = simdgroup_index_in_threadgroup;
+                threadgroup float local_inv[2];
+                threadgroup float local_sums[32];
+                threadgroup float quad_sums[704];
+                const uint base = row * 2816 + lid * 4;
+                const uint wbase = lid * 4;
+            \(rmsReduce("a", into: "local_inv[0]"))
+            \(deferredExpertValuesSource)
+            \(rmsReduce("expertv", into: "local_inv[1]").replacingOccurrences(
+                of: "(float)expertv[base + i]", with: "(float)expertv[i]"))
+                const float inv1 = local_inv[0];
+                const float inv2 = local_inv[1];
+                T sv[4];
+                for (int i = 0; i < 4; i++) {
+                    const T h1 = w1[wbase + i]
+                        * static_cast<T>((float)a[base + i] * inv1);
+                    const T h2 = w2[wbase + i]
+                        * static_cast<T>((float)expertv[i] * inv2);
+                    sv[i] = h1 + h2;
+                }
+            \(rmsReduce("sv", into: "local_inv[0]").replacingOccurrences(
+                of: "(float)sv[base + i]", with: "(float)sv[i]"))
+                const float inv3 = local_inv[0];
+                const T scalar = s[0];
+                T outv[4];
+                for (int i = 0; i < 4; i++) {
+                    const T normed3 = static_cast<T>(
+                        w3[wbase + i]
+                            * static_cast<T>((float)sv[i] * inv3));
+                    const T summed = res[base + i] + normed3;
+                    outv[i] = summed * scalar;
+                    out[base + i] = outv[i];
+                }
+            \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
+                of: "(float)outv[base + i]", with: "(float)outv[i]"))
+                const float inv4 = local_inv[0];
+                T nv[4];
+                for (int i = 0; i < 4; ++i) {
+                    nv[i] = wn[wbase + i]
+                        * static_cast<T>((float)outv[i] * inv4);
+                    normed[base + i] = nv[i];
+                }
+                quad_sums[lid] = nv[0] + nv[1] + nv[2] + nv[3];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if ((lid % 16) == 0) {
+                    float xs = 0.0f;
+                    for (uint c = 0; c < 8; ++c) {
+                        const uint q = lid + c * 2;
+                        xs += quad_sums[q];
+                        xs += quad_sums[q + 1];
+                    }
+                    xSums[row * 44 + lid / 16] = xs;
+                }
+            """,
+            ensureRowContiguous: true)
+
     private static func admitsDeferred(
         _ expertRows: DeferredWeightedExpertRows
     ) -> Bool {
@@ -3949,6 +4174,49 @@ private enum Gemma4FusedLayerGlue {
             outputShapes: [[rows, 1, axis]],
             outputDTypes: [.bfloat16]
         )[0]
+    }
+
+    /// STEP-EDGES (FINAL-CHAIN): `tailDeferred` that also emits the final
+    /// norm and the tied head's sums. Same admission as the tail plus the
+    /// final norm's own weight and eps; nil keeps the two dispatches.
+    static func tailDeferredFinal(
+        mlpOut: MLXArray,
+        expertRows: DeferredWeightedExpertRows,
+        residual: MLXArray,
+        w1: MLXArray,
+        w2: MLXArray,
+        w3: MLXArray,
+        layerScalar: MLXArray,
+        finalNormWeight: MLXArray,
+        eps: Float,
+        finalEps: Float
+    ) -> (out: MLXArray, normed: MLXArray, xSums: MLXArray)? {
+        guard Gemma4StepEdges.enabled,
+            admits(mlpOut, weight: w1, eps: eps),
+            admitsDeferred(expertRows),
+            residual.shape == mlpOut.shape,
+            residual.dtype == .bfloat16,
+            w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16,
+            w3.ndim == 1, w3.dim(0) == axis, w3.dtype == .bfloat16,
+            layerScalar.size == 1, layerScalar.dtype == .bfloat16,
+            finalEps == Self.eps,
+            finalNormWeight.ndim == 1,
+            finalNormWeight.dim(0) == axis,
+            finalNormWeight.dtype == .bfloat16
+        else { return nil }
+        let outs = deferredTailFinalKernel(
+            [
+                mlpOut, expertRows.sortedOutputs, expertRows.inverseOrder,
+                expertRows.weights, residual, w1, w2, w3, layerScalar,
+                finalNormWeight,
+            ],
+            template: [("T", mlpOut.dtype)],
+            grid: (rows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: [[rows, 1, axis], [rows, 1, axis], [rows * (axis / 64)]],
+            outputDTypes: [.bfloat16, .bfloat16, .float32]
+        )
+        return (outs[0], outs[1], outs[2])
     }
 
     static func tailChained(
@@ -4940,6 +5208,26 @@ public class Gemma4DecoderLayer: Module {
                 tailApplied = true
                 scalarFolded = true
             } else if canFoldScalar, let deferred = expertBranch.deferred,
+                let chain = glueChain, nextInputLayernormWeight == nil,
+                let finalNorm = chain.finalNorm,
+                let fused = Gemma4FusedLayerGlue.tailDeferredFinal(
+                    mlpOut: h1Raw, expertRows: deferred, residual: residual2,
+                    w1: postFeedforwardLayernorm1.weight,
+                    w2: postFeedforwardLayernorm2.weight,
+                    w3: postFeedforwardLayernorm.weight,
+                    layerScalar: layerScalar,
+                    finalNormWeight: finalNorm.weight,
+                    eps: config.rmsNormEps,
+                    finalEps: finalNorm.eps)
+            {
+                // STEP-EDGES: the last layer's tail also produced the final
+                // norm and head sums; the trunk takes them from the box.
+                out = fused.out
+                chain.finalPending = (
+                    source: fused.out, normed: fused.normed, xSums: fused.xSums)
+                tailApplied = true
+                scalarFolded = true
+            } else if canFoldScalar, let deferred = expertBranch.deferred,
                 let fusedTail = Gemma4FusedLayerGlue.tailDeferred(
                     mlpOut: h1Raw, expertRows: deferred, residual: residual2,
                     w1: postFeedforwardLayernorm1.weight,
@@ -5219,11 +5507,36 @@ enum Gemma4FusedScaledEmbedding {
         ensureRowContiguous: true
     )
 
-    /// Returns the scaled hidden state, or `nil` when any pin fails — the
-    /// caller then evaluates the pre-existing expression unchanged.
-    static func apply(
-        tokens: MLXArray, embedding: Embedding, embedScale: Float, hiddenSize: Int
-    ) -> MLXArray? {
+    /// STEP-EDGES: `asMLXArray(dtype:)` is the exact conversion the stock
+    /// `MLXArray * Float` overload performs on the scalar. Hold it per value,
+    /// evaluated once, instead of re-casting on every call.
+    private static let scaleLock = NSLock()
+    nonisolated(unsafe) private static var scaleArrays: [Float: MLXArray] = [:]
+
+    static func scaleArray(_ embedScale: Float) -> MLXArray {
+        guard Gemma4StepEdges.enabled else {
+            return embedScale.asMLXArray(dtype: .bfloat16)
+        }
+        scaleLock.lock()
+        defer { scaleLock.unlock() }
+        if let held = scaleArrays[embedScale] { return held }
+        let array = embedScale.asMLXArray(dtype: .bfloat16)
+        eval(array)
+        scaleArrays[embedScale] = array
+        return array
+    }
+
+    struct Planes {
+        let weight: MLXArray
+        let scales: MLXArray
+        let biases: MLXArray
+    }
+
+    /// The pins the kernel needs, returning the planes it binds; nil when any
+    /// fails. Shared with the EMB-NORM producer so both admit identically.
+    static func planes(
+        tokens: MLXArray, embedding: Embedding, hiddenSize: Int
+    ) -> Planes? {
         guard enabled,
             tokens.ndim == 2,
             tokens.dtype == .int32,
@@ -5251,16 +5564,28 @@ enum Gemma4FusedScaledEmbedding {
             scales.dim(1) == hiddenSize / groupSize,
             hiddenSize % groupSize == 0
         else { return nil }
+        return Planes(weight: weight, scales: scales, biases: biases)
+    }
+
+    /// Returns the scaled hidden state, or `nil` when any pin fails — the
+    /// caller then evaluates the pre-existing expression unchanged.
+    static func apply(
+        tokens: MLXArray, embedding: Embedding, embedScale: Float, hiddenSize: Int
+    ) -> MLXArray? {
+        guard let bound = planes(
+            tokens: tokens, embedding: embedding, hiddenSize: hiddenSize)
+        else { return nil }
 
         let batch = tokens.dim(0)
         let length = tokens.dim(1)
-        let wordsPerRow = weight.dim(1)
+        let wordsPerRow = bound.weight.dim(1)
 
         CBv2EngageMark.once(length > 1 ? "scaled-embedding" : "scaled-embedding-decode")
         return kernel(
-            // `asMLXArray(dtype:)` is the exact conversion the stock
-            // `MLXArray * Float` overload performs on the scalar.
-            [tokens, weight, scales, biases, embedScale.asMLXArray(dtype: .bfloat16)],
+            [
+                tokens, bound.weight, bound.scales, bound.biases,
+                scaleArray(embedScale),
+            ],
             template: [("T", DType.bfloat16)],
             grid: (wordsPerRow, batch * length, 1),
             threadGroup: (32, 8, 1),
@@ -5611,9 +5936,65 @@ public class Gemma4TextModelInner: Module {
         // embeddings spliced at placeholder positions — replaces the trunk's
         // own lookup; token ids still feed the per-layer embeddings (PLE)
         // below. nil keeps the text path byte-identical.
+        // Extend cache array for shared layers (which get nil caches)
+        var fullCache: [KVCache?]
+        if let cache {
+            fullCache = cache.map { Optional($0) }
+            while fullCache.count < config.numHiddenLayers {
+                fullCache.append(nil)
+            }
+        } else {
+            fullCache = Array(repeating: nil, count: config.numHiddenLayers)
+        }
+
+        // ContinuousBatchingV2 detection: v2 layer caches own attention AND
+        // masking, so the trunk builds no masks at all on that path (there is
+        // no padding and no shared frontier to mask). In v2 mode every layer
+        // (including KV-shared ones) has a cache object.
+        let isCBv2 = fullCache.contains { ($0 as? (any CBv2AttendingLayerCache)) != nil }
+        // All-contiguous banks expose one position chain. Snapshot it before
+        // the first layer advances the chain, then reuse that same lazy array
+        // for every Q/K RoPE call in this forward.
+        let unifiedCBv2PositionOffset: Gemma4.PositionOffset? = {
+            guard isCBv2 else { return nil }
+            for case let entry? in fullCache {
+                if let offsets = (entry as? CBv2LayerCache)?.unifiedPositionOffsets {
+                    // STEP-EDGES: the chain advances by rebinding the state
+                    // to a new array, so the snapshot is immutable as it is
+                    // and the `+ 0` copy is a dispatch for nothing.
+                    return .batch(Gemma4StepEdges.enabled ? offsets : offsets + 0)
+                }
+            }
+            return nil
+        }()
+
         var h: MLXArray
+        // STEP-EDGES (EMB-NORM): on the decode cell one dispatch yields the
+        // embedding, layer zero's input norm with its run-sum table, and the
+        // position chain's `+ 1`; the chain box hands layer zero the norm.
+        var embeddedInputNorm: Gemma4FusedLayerGlue.EmbeddingInputNorm? = nil
         if let inputEmbedding {
             h = inputEmbedding.ndim == 2 ? inputEmbedding.expandedDimensions(axis: 0) : inputEmbedding
+        } else if isCBv2, !schedulePrefill,
+            inputBatchSize == 8, inputLength == 1,
+            case .batch(let offsets)? = unifiedCBv2PositionOffset,
+            let firstLayer = layers.first,
+            (fullCache[0] as? (any CBv2AttendingLayerCache)) != nil,
+            let fused = Gemma4FusedLayerGlue.embeddingInputNormWithQKVRunsum(
+                tokens: inputs, embedding: embedTokens, embedScale: embedScale,
+                hiddenSize: config.hiddenSize, offsets: offsets,
+                weight: firstLayer.inputLayernorm.weight, eps: config.rmsNormEps)
+        {
+            h = fused.hidden
+            embeddedInputNorm = fused
+            for case let entry? in fullCache {
+                if let contiguous = entry as? CBv2LayerCache {
+                    contiguous.offerUnifiedPositionAdvance(
+                        from: offsets, advanced: fused.offsetsNext, by: 1)
+                    break
+                }
+            }
+            CBv2EngageMark.once("step-edges")
         } else {
             if let fused = Gemma4FusedScaledEmbedding.apply(
                 tokens: inputs, embedding: embedTokens, embedScale: embedScale,
@@ -5658,35 +6039,6 @@ public class Gemma4TextModelInner: Module {
         } else {
             perLayerInputs = Array(repeating: nil, count: config.numHiddenLayers)
         }
-
-        // Extend cache array for shared layers (which get nil caches)
-        var fullCache: [KVCache?]
-        if let cache {
-            fullCache = cache.map { Optional($0) }
-            while fullCache.count < config.numHiddenLayers {
-                fullCache.append(nil)
-            }
-        } else {
-            fullCache = Array(repeating: nil, count: config.numHiddenLayers)
-        }
-
-        // ContinuousBatchingV2 detection: v2 layer caches own attention AND
-        // masking, so the trunk builds no masks at all on that path (there is
-        // no padding and no shared frontier to mask). In v2 mode every layer
-        // (including KV-shared ones) has a cache object.
-        let isCBv2 = fullCache.contains { ($0 as? (any CBv2AttendingLayerCache)) != nil }
-        // All-contiguous banks expose one position chain. Snapshot it before
-        // the first layer advances the chain, then reuse that same lazy array
-        // for every Q/K RoPE call in this forward.
-        let unifiedCBv2PositionOffset: Gemma4.PositionOffset? = {
-            guard isCBv2 else { return nil }
-            for case let entry? in fullCache {
-                if let offsets = (entry as? CBv2LayerCache)?.unifiedPositionOffsets {
-                    return .batch(offsets + 0)
-                }
-            }
-            return nil
-        }()
 
         // Build masks: one per attention type (legacy path only). "vision"
         // overlays bidirectional access within visual spans. "all" preserves
@@ -5733,6 +6085,18 @@ public class Gemma4TextModelInner: Module {
         // GLUE-003: one chain box per forward; layer L's fused tail hands
         // layer L+1 its input norm through it.
         let glueChain = Gemma4GlueChainBox()
+        if let fused = embeddedInputNorm {
+            glueChain.pending = (
+                source: fused.hidden, normed: fused.normed, rs: fused.qkvRunsumTable)
+        }
+        // STEP-EDGES (FINAL-CHAIN): let the last layer's tail fold the final
+        // norm and head sums wherever the standalone producer would engage.
+        if emitMMAHeadSums, Gemma4StepEdges.enabled, isCBv2, !schedulePrefill,
+            inputBatchSize == 8, inputLength == 1,
+            Gemma4MMAQuantizedGEMV.consumesActivationSums
+        {
+            glueChain.finalNorm = (weight: norm.weight, eps: norm.eps)
+        }
         for (idx, layer) in layers.enumerated() {
             let prevIdx = previousKvs[idx]
             let sharedKV = intermediates[prevIdx].kv
@@ -5826,7 +6190,15 @@ public class Gemma4TextModelInner: Module {
 
         let postNorm: MLXArray
         let mmaHeadSums: Gemma4MMAQuantizedGEMV.ActivationSums?
-        if emitMMAHeadSums,
+        if emitMMAHeadSums, let finalFold = glueChain.finalPending,
+            finalFold.source === h,
+            let sums = Gemma4MMAQuantizedGEMV.activationSums(
+                produced: finalFold.xSums, for: finalFold.normed)
+        {
+            postNorm = finalFold.normed
+            mmaHeadSums = sums
+            CBv2EngageMark.once("step-edges")
+        } else if emitMMAHeadSums,
             let produced = Gemma4FinalNormMMAHeadSumsV1.apply(
                 h, weight: norm.weight, eps: norm.eps)
         {

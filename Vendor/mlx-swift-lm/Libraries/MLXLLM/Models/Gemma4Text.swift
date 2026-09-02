@@ -2701,10 +2701,12 @@ private enum Gemma4FusedLayerGlue {
     /// `PREFIX` names the array to reduce; `SLOT` the shared slot written.
     private static func rmsReduce(_ src: String, into slot: String) -> String {
         """
+            float \(src)_c[4];
             {
                 float acc = 0;
                 for (int i = 0; i < 4; i++) {
                     float xi = (float)\(src)[base + i];
+                    \(src)_c[i] = xi;
                     acc += xi * xi;
                 }
                 acc = simd_sum(acc);
@@ -2781,7 +2783,7 @@ private enum Gemma4FusedLayerGlue {
     }
 
     private static let normResidualKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_norm_residual_2816_bf16_v1_nb1",
+        name: "gemma4_glue_norm_residual_2816_bf16_v2_nb1_xc",
         inputNames: ["x", "res", "w"],
         outputNames: ["out"],
         source: """
@@ -2799,7 +2801,7 @@ private enum Gemma4FusedLayerGlue {
                 // The stock chain rounds the norm's output to T in memory
                 // before the residual add reads it; reproduce both roundings.
                 const T normed = static_cast<T>(
-                    w[wbase + i] * static_cast<T>((float)x[base + i] * inv));
+                    w[wbase + i] * static_cast<T>(x_c[i] * inv));
                 out[base + i] = res[base + i] + normed;
             }
         """,
@@ -2815,7 +2817,7 @@ private enum Gemma4FusedLayerGlue {
 // T28 second sample marker (r2): content identical to ranked 32f5d19f apart from this comment.
     private static let attentionBranchPrefixKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_glue_attention_branch_prefix_2816_bf16_v1_nb1",
+            name: "gemma4_glue_attention_branch_prefix_2816_bf16_v2_nb1_xc",
             inputNames: ["attn", "res", "wa", "wd", "we", "wr"],
             outputNames: ["out", "dense", "expert", "router", "xSums"],
             source: """
@@ -2834,7 +2836,7 @@ private enum Gemma4FusedLayerGlue {
                     const T normed = static_cast<T>(
                         wa[wbase + i]
                             * static_cast<T>(
-                                (float)attn[base + i] * attn_inv));
+                                attn_c[i] * attn_inv));
                     outv[i] = res[base + i] + normed;
                     out[base + i] = outv[i];
                 }
@@ -2857,7 +2859,7 @@ private enum Gemma4FusedLayerGlue {
         )
 
     private static let dualPreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_dual_prenorm_xsum_2816_bf16_v2_nb1",
+        name: "gemma4_glue_dual_prenorm_xsum_2816_bf16_v3_nb1_xc",
         inputNames: ["x", "w1", "w2"],
         outputNames: ["out1", "out2", "xSums"],
         source: """
@@ -2873,7 +2875,7 @@ private enum Gemma4FusedLayerGlue {
             const float inv = local_inv[0];
             float xsum = 0.0f;
             for (int i = 0; i < 4; i++) {
-                const T nx = static_cast<T>((float)x[base + i] * inv);
+                const T nx = static_cast<T>(x_c[i] * inv);
                 const T dense = w1[wbase + i] * nx;
                 out1[base + i] = dense;
                 out2[base + i] = w2[wbase + i] * nx;

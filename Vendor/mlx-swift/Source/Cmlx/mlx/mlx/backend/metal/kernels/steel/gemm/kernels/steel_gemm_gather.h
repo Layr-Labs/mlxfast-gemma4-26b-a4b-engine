@@ -6,6 +6,12 @@ constant bool has_batch [[function_constant(10)]];
 constant bool align_M [[function_constant(200)]];
 constant bool align_N [[function_constant(201)]];
 constant bool align_K [[function_constant(202)]];
+#ifndef DARKBLOOM_GATHER_RHS_SIMD_INDEX
+#define DARKBLOOM_GATHER_RHS_SIMD_INDEX 1
+#endif
+
+// DARKBLOOM_GATHER_RHS_SIMD_INDEX: ENGAGED lane-0 metadata broadcast.
+
 
 template <
     typename T,
@@ -70,7 +76,15 @@ template <
   // Do as many matmuls as necessary
   uint32_t index;
   short offset;
-  uint32_t index_next = rhs_indices[c_row];
+  uint32_t index_next = 0;
+#if DARKBLOOM_GATHER_RHS_SIMD_INDEX
+  if (simd_lane_id == 0) {
+    index_next = rhs_indices[c_row];
+  }
+  index_next = simd_broadcast(index_next, 0);
+#else
+  index_next = rhs_indices[c_row];
+#endif
   short offset_next = 0;
   int n = 0;
   while (n < tgp_bm) {
@@ -79,9 +93,22 @@ template <
     index = index_next;
     offset_next = tgp_bm;
     for (; n < tgp_bm; n++) {
+#if DARKBLOOM_GATHER_RHS_SIMD_INDEX
+      uint32_t next_index = 0;
+      if (simd_lane_id == 0) {
+        next_index = rhs_indices[c_row + n];
+      }
+      next_index = simd_broadcast(next_index, 0);
+      if (next_index != index) {
+#else
       if (rhs_indices[c_row + n] != index) {
+#endif
         offset_next = n;
+#if DARKBLOOM_GATHER_RHS_SIMD_INDEX
+        index_next = next_index;
+#else
         index_next = rhs_indices[c_row + n];
+#endif
         break;
       }
     }

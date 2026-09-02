@@ -880,6 +880,26 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         return runsumTable(for: x)
     }
 
+    /// RS0: validate a table emitted beside the exact layer input. Every
+    /// non-ranked shape fails closed so the caller can use the incumbent
+    /// `runsumTable(for:)` producer.
+    @inline(__always)
+    public static func runsumTable(
+        produced values: MLXArray, for x: MLXArray
+    ) -> MLXArray? {
+        guard rsPrepassEnabled,
+            x.dtype == .bfloat16,
+            x.ndim == 3,
+            x.dim(0) == batch,
+            x.dim(1) == sequence,
+            x.dim(2) == inputWidth,
+            x.size == batch * sequence * inputWidth,
+            values.dtype == .float32,
+            values.shape == [batch, inputWidth / groupSize]
+        else { return nil }
+        return values
+    }
+
     @inline(__always)
     private static let fusedLock = NSLock()
     nonisolated(unsafe) private static var fusedPlanes:

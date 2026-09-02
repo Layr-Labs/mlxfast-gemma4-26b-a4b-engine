@@ -1784,6 +1784,16 @@ private enum Gemma4PrefillDeqGEMMV1 {
         ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_PREFILL_DEQ_GEMM_XCHECK"] == "1"
 }
 
+/// ROUTER-PREFILL-DEQ-CACHE: default ON. Enables caching the transposed dequantized
+/// BF16 projection plane for the router scoring linear layer `router.proj` during prefill.
+/// Kill switch: `DARKBLOOM_GEMMA4_ROUTER_PREFILL_DEQ=0` (also `false`/`no`/`off`).
+private let gemma4RouterPrefillDeqEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_ROUTER_PREFILL_DEQ"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 // MARK: - Attention
 
 /// QKFUSE-SLIDING. Default ON: sliding attention layers (vProj != nil) take
@@ -4128,8 +4138,20 @@ private class Gemma4Router: Module {
         MLXFast.rmsNorm(x, weight: zipEffectiveScale(), eps: eps)
     }
 
+    /// ROUTER-PREFILL-DEQ-CACHE: in prefill, `normed` has shape `[tokens, 2816]`
+    /// where `tokens >= 1024` (or `minRows`). Route through `Gemma4PrefillDeqGEMMV1.apply`
+    /// to reuse the cached transposed dequantized BF16 projection plane instead of
+    /// re-dequantizing the router weight on every prefill forward pass.
+    /// Kill switch: `DARKBLOOM_GEMMA4_ROUTER_PREFILL_DEQ=0` restores direct `proj(normed)`.
+    /// Engage mark: `router-prefill-deq-cache`.
     fileprivate func zipScores(_ normed: MLXArray) -> MLXArray {
-        proj(normed)
+        if gemma4RouterPrefillDeqEnabled,
+            let cached = Gemma4PrefillDeqGEMMV1.apply(proj, normed)
+        {
+            CBv2EngageMark.once("router-prefill-deq-cache")
+            return cached
+        }
+        return proj(normed)
     }
 
     fileprivate func zipPartition(_ expertScores: MLXArray) -> MLXArray {

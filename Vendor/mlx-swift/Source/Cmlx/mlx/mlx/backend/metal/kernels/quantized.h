@@ -3736,12 +3736,29 @@ inline float qdot_affine4_g64_word(
 //   KFIX : in_vec_size as a compile-time constant. The gemma4 gate has
 //          already proven in_vec_size is 2816 (gate/up) or 704 (down), so
 //          the K-loop trip count and every stride fold constant-fold.
+//   CARRY: EXPERT-SINGLES-CARRY. The tree's weight-operand register carry,
+//          complete: the packed code word AND the group scale AND the group
+//          bias of the next K block are read one trip ahead and stay
+//          resident while the current block's four dots run. This is the
+//          same carry the two attention matrix-unit tiers, the dense down
+//          plane and the tied language head already run under, re-derived
+//          onto the routed-expert singleton arm -- the largest weight
+//          stream in the decode window that had no carry at all. It
+//          supersedes PF, which carried the code word only and was never
+//          instantiated.
 //
 // Instantiated only under the gemma4 pair-geometry gate, which is
 // compile-time false unless group_size == 64 && bits == 4; the affine-4 /
 // g64 constants below are hardcoded exactly as `qmv_affine4_g64_pair_impl`
 // hardcodes them.
-template <typename T, int group_size, int bits, int KFIX, bool WVEC, bool PF>
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int KFIX,
+    bool WVEC,
+    bool PF,
+    bool CARRY>
 METAL_FUNC void qmv_affine4_g64_singles_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -3786,6 +3803,26 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
 
   const int nblocks = in_vec_size / block_size;
   const device uint8_t* ws0 = ws;
+  const device T* scales0 = scales;
+  const device T* biases0 = biases;
+
+  // EXPERT-SINGLES-CARRY. Three operand registers per row, primed with
+  // block zero before the walk. Both the packed row base and the scale /
+  // bias row bases are functions of the block index alone -- nothing in the
+  // walk writes to the weight, scale or bias planes and nothing in it
+  // depends on a value an earlier trip produced -- so the value each trip
+  // consumes is exactly the value the in-place read produced on the
+  // incumbent body, for every block and every lane.
+  thread uint wcar[results_per_simdgroup];
+  thread T scar[results_per_simdgroup];
+  thread T bcar[results_per_simdgroup];
+  if (CARRY) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      wcar[row] = *((const device uint*)(ws0 + row * in_vec_size_w));
+      scar[row] = scales0[row * in_vec_size_g];
+      bcar[row] = biases0[row * in_vec_size_g];
+    }
+  }
 
   thread uint wpf[results_per_simdgroup];
   if (PF) {
@@ -3809,19 +3846,43 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
       }
     }
 
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      const device T* sl = scales + row * in_vec_size_g;
-      const device T* bl = biases + row * in_vec_size_g;
-      U s = sl[0];
-      U b = bl[0];
-      if (PF) {
-        result[row] += qdot_affine4_g64_word(wcur[row], x_thread, s, b, sum);
-      } else if (WVEC) {
-        const uint v = *((const device uint*)(ws + row * in_vec_size_w));
+    if (CARRY) {
+      // The look-ahead index is clamped to the last block, so the final
+      // trip re-reads a block already read and the value it produces is
+      // discarded at loop exit; the clamp is what keeps every address in
+      // range without a branch inside the walk.
+      const int nextblk = (blk + 1 < nblocks) ? (blk + 1) : blk;
+      const device uint8_t* wsn = ws0 + nextblk * block_bytes;
+      const device T* scn = scales0 + nextblk * (block_size / qgroup);
+      const device T* bcn = biases0 + nextblk * (block_size / qgroup);
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        const uint v = wcar[row];
+        U s = scar[row];
+        U b = bcar[row];
+        // The re-arm stays at the statement the incumbent load occupied.
+        // Hoisting it above the operand reads is what perturbs the shader
+        // compiler's contraction choice; left here the emitted arithmetic
+        // is word for word what the incumbent emits.
+        wcar[row] = *((const device uint*)(wsn + row * in_vec_size_w));
+        scar[row] = scn[row * in_vec_size_g];
+        bcar[row] = bcn[row * in_vec_size_g];
         result[row] += qdot_affine4_g64_word(v, x_thread, s, b, sum);
-      } else {
-        auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-        result[row] += qdot<U, values_per_thread, 4>(wl, x_thread, s, b, sum);
+      }
+    } else {
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        const device T* sl = scales + row * in_vec_size_g;
+        const device T* bl = biases + row * in_vec_size_g;
+        U s = sl[0];
+        U b = bl[0];
+        if (PF) {
+          result[row] += qdot_affine4_g64_word(wcur[row], x_thread, s, b, sum);
+        } else if (WVEC) {
+          const uint v = *((const device uint*)(ws + row * in_vec_size_w));
+          result[row] += qdot_affine4_g64_word(v, x_thread, s, b, sum);
+        } else {
+          auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+          result[row] += qdot<U, values_per_thread, 4>(wl, x_thread, s, b, sum);
+        }
       }
     }
 
@@ -3982,10 +4043,18 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     }
     return;
   }
+  constexpr bool gemma4_singles_carry = true;
   for (int t = 0; t < gemma4_down_tile_span; t++) {
     uint3 tile_tid = tid;
     tile_tid.y = tid.y + uint(t);
-    qmv_impl<T, group_size, bits>(
+    qmv_affine4_g64_singles_impl<
+        T,
+        group_size,
+        bits,
+        704,
+        true,
+        false,
+        gemma4_singles_carry>(
         tile_w,
         tile_scales,
         tile_biases,
@@ -4174,8 +4243,13 @@ template <typename T, int group_size, int bits>
     const device T* single_biases = biases + expert * b_strides[0];
     device T* single_y = y + assignment * (uint)out_vec_size;
     if (in_vec_size == 2816) {
+      // EXPERT-SINGLES-CARRY gate (compile-time flip, same shape as the
+      // KERN-DOWN-TILE gate above): ON here. Flip to false to return the
+      // singleton arm to the incumbent in-place WVEC loads; the two arms
+      // are bit-identical by construction.
+      constexpr bool gemma4_singles_carry = true;
       qmv_affine4_g64_singles_impl<
-          T, group_size, bits, 2816, true, false>(
+          T, group_size, bits, 2816, true, false, gemma4_singles_carry>(
           single_w, single_scales, single_biases, single_x, single_y,
           in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
     } else {

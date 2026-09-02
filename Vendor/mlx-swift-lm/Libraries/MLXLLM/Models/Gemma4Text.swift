@@ -2800,14 +2800,17 @@ private enum Gemma4RouteGlueFoldV1 {
                 #pragma clang loop unroll(full)
                 for (uint source = 0; source < 32; ++source) {
                     const uint other_low = simd_broadcast(key_low, ushort(source));
-                    rank += (other_low < key)
-                        || (other_low == key && source < assignment);
+                    const bool eq_low = (other_low == key);
+                    const bool lt_low = (other_low < key);
+                    rank += (uint)(lt_low | (eq_low & (source < assignment)));
+
                     const uint other_high = simd_broadcast(key_high, ushort(source));
                     const uint high_assignment = 32u + source;
-                    rank += (other_high < key)
-                        || (other_high == key && high_assignment < assignment);
+                    const bool eq_high = (other_high == key);
+                    const bool lt_high = (other_high < key);
+                    rank += (uint)(lt_high | (eq_high & (high_assignment < assignment)));
                 }
-                row_order[rank] = assignment / 8;
+                row_order[rank] = assignment >> 3;
                 sorted_keys[rank] = key;
                 inverse_order[assignment] = rank;
             }

@@ -58,6 +58,13 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
 
     /// Window size in tokens == number of physical ring slots.
     public let window: Int
+    /// Fast bitwise wrap mask (window - 1 when power of 2, else -1).
+    public let windowMask: Int
+
+    @inline(__always)
+    private func ringSlot(_ position: Int) -> Int {
+        windowMask >= 0 ? (position & windowMask) : (position % window)
+    }
 
     /// Absolute position of the next token to be written.
     public private(set) var absoluteOffset: Int
@@ -175,6 +182,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         precondition(window > 0, "CBv2WindowedSequenceKV: window must be > 0")
         precondition(initialOffset >= 0, "CBv2WindowedSequenceKV: negative initialOffset")
         self.window = window
+        self.windowMask = (window & (window - 1)) == 0 ? (window - 1) : -1
         self.kvHeads = kvHeads
         self.headDim = headDim
         self.absoluteOffset = initialOffset
@@ -217,7 +225,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         // tensor: adopt the chunk as the ring storage and pack both mirror
         // planes straight into the mirror allocation, instead of zero-filling
         // three private buffers and copying the same bytes into them.
-        if keys == nil, n == window, absoluteOffset % window == 0,
+        if keys == nil, n == window, ringSlot(absoluteOffset) == 0,
             adoptsFreshFullWindowChunk(keyTemplate: newKeys, valueTemplate: newValues)
         {
             return adoptFreshFullWindowChunk(keys: newKeys, values: newValues)
@@ -301,7 +309,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
 
     var decodeRingView: (keys: MLXArray, values: MLXArray, start: Int)? {
         guard staged == nil, let keys, let values, retainedCount == window else { return nil }
-        return (keys, values, oldestValidPosition % window)
+        return (keys, values, ringSlot(oldestValidPosition))
     }
 
     /// KVQ-001: the packed 8-bit mirror for the same full-ring decode step
@@ -319,7 +327,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// fused pass-A owns the mirror write and consumes the new token directly.
     var decodeRingQuantViewBeforeWrite: (mirror: MLXArray, start: Int)? {
         guard staged == nil, let quantMirror, retainedCount == window else { return nil }
-        return (quantMirror, (oldestValidPosition + 1) % window)
+        return (quantMirror, ringSlot(oldestValidPosition + 1))
     }
 
     /// The ring view a fused decode step should attend: the SAME allocations
@@ -334,7 +342,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// window` — the slot the returned start has just stepped past.
     var decodeRingViewBeforeWrite: (keys: MLXArray, values: MLXArray, start: Int)? {
         guard staged == nil, !bf16RingStale, let keys, let values, retainedCount == window else { return nil }
-        return (keys, values, (oldestValidPosition + 1) % window)
+        return (keys, values, ringSlot(oldestValidPosition + 1))
     }
 
     /// Bookkeeping half of a fused decode step. The attention kernel already
@@ -619,7 +627,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         guard to > from else { return [] }
         let count = to - from
         precondition(count <= window, "ring range exceeds window")
-        let start = from % window
+        let start = ringSlot(from)
         if start + count <= window {
             return [array[.ellipsis, start ..< (start + count), 0...]]
         }
@@ -661,7 +669,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
                 tokens = Self.quantRoundTrip(tokens)
             }
         }
-        let start = firstPosition % window
+        let start = ringSlot(firstPosition)
         if start + n <= window {
             buffer[.ellipsis, start ..< (start + n), 0...] = tokens
         } else {
@@ -1138,7 +1146,7 @@ private static let diagQuantReadKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
         let queries = MLXArray.zeros(
             [batch, queryHeads, 1, headDim], dtype: .bfloat16)
         let starts = MLXArray(
-            Array(repeating: UInt32(oldestValidPosition % window), count: batch),
+            Array(repeating: UInt32(ringSlot(oldestValidPosition)), count: batch),
             [batch])
         let mirrors = Array(repeating: quantMirror, count: batch)
         let out = Self.diagQuantReadKernel(
@@ -1452,7 +1460,7 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
         let queries = MLXArray.zeros(
             [batch, queryHeads, 1, headDim], dtype: .bfloat16)
         let starts = MLXArray(
-            Array(repeating: UInt32(oldestValidPosition % window), count: batch),
+            Array(repeating: UInt32(ringSlot(oldestValidPosition)), count: batch),
             [batch])
         let newKV = MLXArray.zeros([batch, kvHeads, 1, headDim], dtype: .bfloat16)
         let fenceIn = MLXArray.zeros([1], dtype: .int32)
@@ -1668,7 +1676,7 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
             newValues.shape == [1, kvHeads, 1, headDim]
         else { return false }
         let packed = Self.quantPackPairGPU(keys: newKeys, values: newValues)
-        let slot = firstPosition % window
+        let slot = ringSlot(firstPosition)
         quantMirror[0..., 0..., slot ..< (slot + 1), 0...] = packed
         return true
     }
@@ -1696,7 +1704,7 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
         }
         let packed = packedFlat.view(dtype: .uint32).expandedDimensions(axis: 0)
         let n = tokens.dim(2)
-        let start = firstPosition % window
+        let start = ringSlot(firstPosition)
         // KVQ4 in-situ check: read the row we are about to store back through
         // the reader's arithmetic and compare with the source token.
         if Self.selfTestArmed {

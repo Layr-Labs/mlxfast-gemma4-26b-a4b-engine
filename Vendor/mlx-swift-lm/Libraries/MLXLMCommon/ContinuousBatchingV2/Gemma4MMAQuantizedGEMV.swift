@@ -2907,7 +2907,7 @@ public enum Gemma4MMAQuantizedGEMV {
     /// into `pv`/`pi`: `[8, N / 128]`, 128 KB at the tied head's geometry
     /// against the 4 MB the logits store cost.
     private static let sourceV27Argmax: String = {
-        var result = sourceV27
+        var result = carryEnabled ? sourceV27Carry : sourceV27
 
         func replaceOnce(_ old: String, with new: String) {
             let count = result.components(separatedBy: old).count
@@ -2944,30 +2944,51 @@ public enum Gemma4MMAQuantizedGEMV {
             float vb = float(T(acc0.thread_elements()[1]));
             uint ia = outputN0;
             uint ib = outputN0;
+
             const float va1 = float(T(acc1.thread_elements()[0]));
             const float vb1 = float(T(acc1.thread_elements()[1]));
-            if (va1 > va) { va = va1; ia = outputN0 + N_PSG; }
-            if (vb1 > vb) { vb = vb1; ib = outputN0 + N_PSG; }
+            const bool take_a1 = (va1 > va);
+            va = take_a1 ? va1 : va;
+            ia = take_a1 ? (outputN0 + N_PSG) : ia;
+            const bool take_b1 = (vb1 > vb);
+            vb = take_b1 ? vb1 : vb;
+            ib = take_b1 ? (outputN0 + N_PSG) : ib;
+
             const float va2 = float(T(acc2.thread_elements()[0]));
             const float vb2 = float(T(acc2.thread_elements()[1]));
-            if (va2 > va) { va = va2; ia = outputN0 + N_PSG * 2; }
-            if (vb2 > vb) { vb = vb2; ib = outputN0 + N_PSG * 2; }
+            const bool take_a2 = (va2 > va);
+            va = take_a2 ? va2 : va;
+            ia = take_a2 ? (outputN0 + N_PSG * 2) : ia;
+            const bool take_b2 = (vb2 > vb);
+            vb = take_b2 ? vb2 : vb;
+            ib = take_b2 ? (outputN0 + N_PSG * 2) : ib;
+
             const float va3 = float(T(acc3.thread_elements()[0]));
             const float vb3 = float(T(acc3.thread_elements()[1]));
-            if (va3 > va) { va = va3; ia = outputN0 + N_PSG * 3; }
-            if (vb3 > vb) { vb = vb3; ib = outputN0 + N_PSG * 3; }
+            const bool take_a3 = (va3 > va);
+            va = take_a3 ? va3 : va;
+            ia = take_a3 ? (outputN0 + N_PSG * 3) : ia;
+            const bool take_b3 = (vb3 > vb);
+            vb = take_b3 ? vb3 : vb;
+            ib = take_b3 ? (outputN0 + N_PSG * 3) : ib;
 
             // `fragmentRow` is lane bits 1, 2 and 4, so the eight lanes that
             // share a `fragmentCol` differ in exactly those bits and this
             // butterfly closes the simdgroup's 32 columns for both rows.
+            #pragma unroll
             for (uint s = 0; s < 3; ++s) {
                 const ushort xm = s == 0 ? 2 : (s == 1 ? 4 : 16);
                 const float oa = simd_shuffle_xor(va, xm);
                 const uint oia = simd_shuffle_xor(ia, xm);
-                if (oa > va || (oa == va && oia < ia)) { va = oa; ia = oia; }
+                const bool take_a = (oa > va) | ((oa == va) & (oia < ia));
+                va = take_a ? oa : va;
+                ia = take_a ? oia : ia;
+
                 const float ob = simd_shuffle_xor(vb, xm);
                 const uint oib = simd_shuffle_xor(ib, xm);
-                if (ob > vb || (ob == vb && oib < ib)) { vb = ob; ib = oib; }
+                const bool take_b = (ob > vb) | ((ob == vb) & (oib < ib));
+                vb = take_b ? ob : vb;
+                ib = take_b ? oib : ib;
             }
 
             // Lanes 0, 1, 8 and 9 carry the four `fragmentCol` values, i.e.
@@ -2982,10 +3003,13 @@ public enum Gemma4MMAQuantizedGEMV {
             if (lid < M_ROWS) {
                 float rv = bestVal[lid];
                 uint ri = bestIdx[lid];
+                #pragma unroll
                 for (uint s = 1; s < N_SG; ++s) {
                     const float ov = bestVal[s * M_ROWS + lid];
                     const uint oi = bestIdx[s * M_ROWS + lid];
-                    if (ov > rv || (ov == rv && oi < ri)) { rv = ov; ri = oi; }
+                    const bool take = (ov > rv) | ((ov == rv) & (oi < ri));
+                    rv = take ? ov : rv;
+                    ri = take ? oi : ri;
                 }
                 pv[lid * TILES + tg] = rv;
                 pi[lid * TILES + tg] = ri;
@@ -3026,13 +3050,17 @@ public enum Gemma4MMAQuantizedGEMV {
                 for (int e = 0; e < 4; ++e) {
                     const float v = ov[e];
                     const uint idx = oi[e];
-                    if (v > rv || (v == rv && idx < ri)) { rv = v; ri = idx; }
+                    const bool take = (v > rv) | ((v == rv) & (idx < ri));
+                    rv = take ? v : rv;
+                    ri = take ? idx : ri;
                 }
             }
             for (ushort xm = 1; xm < 32; xm <<= 1) {
                 const float ov = simd_shuffle_xor(rv, xm);
                 const uint oi = simd_shuffle_xor(ri, xm);
-                if (ov > rv || (ov == rv && oi < ri)) { rv = ov; ri = oi; }
+                const bool take = (ov > rv) | ((ov == rv) & (oi < ri));
+                rv = take ? ov : rv;
+                ri = take ? oi : ri;
             }
             if (lane == 0) {
                 tokens[m] = int32_t(ri);

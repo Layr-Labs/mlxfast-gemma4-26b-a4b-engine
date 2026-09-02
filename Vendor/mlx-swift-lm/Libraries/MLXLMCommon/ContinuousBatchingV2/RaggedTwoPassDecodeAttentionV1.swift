@@ -1360,7 +1360,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
 
             const device T* query =
                 queries + batch_head * D + lane * values_per_lane;
-            int slot = int((start + block) % N);
+            int slot = int((start + block) & (N - 1));
             device T* partial = partials
                 + batch_head * BLOCKS * D + block * D + lane * values_per_lane;
             device float* sum_out = sums + batch_head * BLOCKS + block;
@@ -1477,7 +1477,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     + (batch_index * KV_HEADS + kv_head) * D
                     + lane * values_per_lane;
                 const uint start = starts[batch_index];
-                const uint write_slot = (start + uint(N - 1)) % uint(N);
+                const uint write_slot = (start + uint(N - 1)) & uint(N - 1);
 
                 half khs = half(0.0f);
                 half khb = half(0.0f);
@@ -1587,7 +1587,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 float max_hi = -3.402823466e+38F;
                 float sum_lo = 0.0f;
                 float sum_hi = 0.0f;
-                uint slot = (start + uint(block)) % uint(N);
+                uint slot = (start + uint(block)) & uint(N - 1);
                 // The walk holds the next position's packed words while it
                 // works on the current one, so each load is issued a whole
                 // iteration before its value is needed. The prefetch is
@@ -1741,7 +1741,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     + (batch_index * KV_HEADS + kv_head) * D
                     + lane * values_per_lane;
                 const uint start = starts[batch_index];
-                const uint write_slot = (start + uint(N - 1)) % uint(N);
+                const uint write_slot = (start + uint(N - 1)) & uint(N - 1);
 
                 half khs = half(0.0f);
                 half khb = half(0.0f);
@@ -1851,7 +1851,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 float max_hi = -3.402823466e+38F;
                 float sum_lo = 0.0f;
                 float sum_hi = 0.0f;
-                uint slot = (start + uint(block)) % uint(N);
+                uint slot = (start + uint(block)) & uint(N - 1);
                 const bool prefetch_first = block < N - 1;
                 uint next_slot = slot + uint(BLOCKS);
                 if (next_slot >= uint(N)) next_slot -= uint(N);
@@ -2170,29 +2170,16 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         reinterpret_cast<const device T4*>(weight_row);
                     const T4 vin_first = raw_vectors[lane];
                     const T4 vin_second = raw_vectors[lane + simd_width];
-                    float sum_first = 0.0f;
-                    float sum_second = 0.0f;
+                    float sum_lane = 0.0f;
                     #pragma clang loop unroll(full)
                     for (int i = 0; i < 4; ++i) {
                         const float first = float(vin_first[i]);
                         const float second = float(vin_second[i]);
-                        sum_first += first * first;
-                        sum_second += second * second;
+                        sum_lane += first * first + second * second;
                     }
-                    sum_first = simd_sum(sum_first);
-                    sum_second = simd_sum(sum_second);
-
-                    // Same second 32-lane tree as partials[0], partials[1],
-                    // partials[2...31] = 0 in the standalone kernel.
-                    float sum = lane == 0 ? sum_first
-                        : (lane == 1 ? sum_second : 0.0f);
-                    sum = simd_sum(sum);
-                    float inverse_rms = 0.0f;
-                    if (lane == 0) {
-                        inverse_rms = metal::precise::rsqrt(
-                            sum / float(D) + 1.0e-6f);
-                    }
-                    inverse_rms = simd_shuffle(inverse_rms, ushort(0));
+                    const float sum = simd_sum(sum_lane);
+                    const float inverse_rms = metal::precise::rsqrt(
+                        sum / float(D) + 1.0e-6f);
 
                     const T4 weight_first = weight_vectors[lane];
                     const T4 weight_second = weight_vectors[lane + simd_width];
@@ -2235,6 +2222,12 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         k_out + (batch_index * KV_HEADS + kv_head) * D;
                     const float L = static_cast<float>(
                         position_offsets[batch_index]);
+                    threadgroup T4* norm_vecs =
+                        reinterpret_cast<threadgroup T4*>(normalized_row);
+                    const T4 x1_vec = norm_vecs[lane];
+                    const T4 x2_vec = norm_vecs[lane + simd_width];
+                    T4 rx1_vec;
+                    T4 rx2_vec;
                     #pragma clang loop unroll(full)
                     for (int i = 0; i < 4; ++i) {
                         const int pair = lane * 4 + i;
@@ -2243,22 +2236,22 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         const float inv_freq =
                             metal::exp2(-d * rope_log2_base[0]);
                         const float theta = L * inv_freq;
-                        const float costheta = metal::fast::cos(theta);
-                        const float sintheta = metal::fast::sin(theta);
-                        const float x1 =
-                            static_cast<float>(normalized_row[pair]);
-                        const float x2 =
-                            static_cast<float>(normalized_row[pair + D / 2]);
-                        const T rx1 = static_cast<T>(
+                        float costheta;
+                        const float sintheta = metal::fast::sincos(theta, costheta);
+                        const float x1 = static_cast<float>(x1_vec[i]);
+                        const float x2 = static_cast<float>(x2_vec[i]);
+                        rx1_vec[i] = static_cast<T>(
                             x1 * costheta - x2 * sintheta);
-                        const T rx2 = static_cast<T>(
+                        rx2_vec[i] = static_cast<T>(
                             x1 * sintheta + x2 * costheta);
-                        normalized_row[pair] = rx1;
-                        normalized_row[pair + D / 2] = rx2;
-                        if (block == GQA) {
-                            key_output[pair] = rx1;
-                            key_output[pair + D / 2] = rx2;
-                        }
+                    }
+                    norm_vecs[lane] = rx1_vec;
+                    norm_vecs[lane + simd_width] = rx2_vec;
+                    if (block == GQA) {
+                        device T4* key_output_vecs =
+                            reinterpret_cast<device T4*>(key_output);
+                        key_output_vecs[lane] = rx1_vec;
+                        key_output_vecs[lane + simd_width] = rx2_vec;
                     }
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2283,7 +2276,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 const threadgroup T* new_value =
                     local_value + lane * values_per_lane;
                 const uint start = starts[batch_index];
-                const uint write_slot = (start + uint(N - 1)) % uint(N);
+                const uint write_slot = (start + uint(N - 1)) & uint(N - 1);
 
                 half khs = half(0.0f);
                 half khb = half(0.0f);
@@ -2395,7 +2388,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 float max_hi = -3.402823466e+38F;
                 float sum_lo = 0.0f;
                 float sum_hi = 0.0f;
-                uint slot = (start + uint(block)) % uint(N);
+                uint slot = (start + uint(block)) & uint(N - 1);
                 const bool prefetch_first = block < N - 1;
                 uint next_slot = slot + uint(BLOCKS);
                 if (next_slot >= uint(N)) next_slot -= uint(N);
@@ -3954,13 +3947,14 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 }
             }
             {
-                device T* out_ptr = out
-                    + size_t(row * 16 + kv_head * GQA + thrM) * D
-                    + out_col;
+                device T4* out_ptr4 = reinterpret_cast<device T4*>(
+                    out + size_t(row * 16 + kv_head * GQA + thrM) * D + out_col);
+                T4 out_vec;
                 #pragma clang loop unroll(full)
                 for (int j = 0; j < 4; ++j) {
-                    out_ptr[j] = static_cast<T>(result[j]);
+                    out_vec[j] = static_cast<T>(result[j]);
                 }
+                out_ptr4[0] = out_vec;
             }
         """,
         ensureRowContiguous: true
@@ -4497,13 +4491,14 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 }
             }
             {
-                device T* out_ptr = out
-                    + size_t(row * 16 + kv_head * GQA + thrM) * D
-                    + out_col;
+                device T4* out_ptr4 = reinterpret_cast<device T4*>(
+                    out + size_t(row * 16 + kv_head * GQA + thrM) * D + out_col);
+                T4 out_vec;
                 #pragma clang loop unroll(full)
                 for (int j = 0; j < 4; ++j) {
-                    out_ptr[j] = static_cast<T>(result[j]);
+                    out_vec[j] = static_cast<T>(result[j]);
                 }
+                out_ptr4[0] = out_vec;
             }
         """,
         ensureRowContiguous: true

@@ -400,12 +400,15 @@ private let routeSimdRank64Kernel: MLXFast.MLXFastKernel =
             #pragma clang loop unroll(full)
             for (uint source = 0; source < 32; ++source) {
                 const uint other_low = simd_broadcast(key_low, ushort(source));
-                rank += (other_low < key)
-                    || (other_low == key && source < assignment);
+                const bool eq_low = (other_low == key);
+                const bool lt_low = (other_low < key);
+                rank += (uint)(lt_low | (eq_low & (source < assignment)));
+
                 const uint other_high = simd_broadcast(key_high, ushort(source));
                 const uint high_assignment = 32u + source;
-                rank += (other_high < key)
-                    || (other_high == key && high_assignment < assignment);
+                const bool eq_high = (other_high == key);
+                const bool lt_high = (other_high < key);
+                rank += (uint)(lt_high | (eq_high & (high_assignment < assignment)));
             }
             row_order[rank] = assignment >> 3;
             sorted_keys[rank] = key;
@@ -444,16 +447,21 @@ private let routeSimdRank64PrefixBoundsKernel: MLXFast.MLXFastKernel =
             #pragma clang loop unroll(full)
             for (uint source = 0; source < 32; ++source) {
                 const uint other_low = simd_broadcast(key_low, ushort(source));
-                rank += (other_low < key)
-                    || (other_low == key && source < assignment);
-                run_offset += other_low == key && source < assignment;
-                run_length += other_low == key;
+                const bool eq_low = (other_low == key);
+                const bool lt_low = (other_low < key);
+                const bool lt_assign_low = (source < assignment);
+                rank += (uint)(lt_low | (eq_low & lt_assign_low));
+                run_offset += (uint)(eq_low & lt_assign_low);
+                run_length += (uint)eq_low;
+
                 const uint other_high = simd_broadcast(key_high, ushort(source));
                 const uint high_assignment = 32u + source;
-                rank += (other_high < key)
-                    || (other_high == key && high_assignment < assignment);
-                run_offset += other_high == key && high_assignment < assignment;
-                run_length += other_high == key;
+                const bool eq_high = (other_high == key);
+                const bool lt_high = (other_high < key);
+                const bool lt_assign_high = (high_assignment < assignment);
+                rank += (uint)(lt_high | (eq_high & lt_assign_high));
+                run_offset += (uint)(eq_high & lt_assign_high);
+                run_length += (uint)eq_high;
             }
             const uint run_remaining = run_length - run_offset;
             row_order[rank] = assignment >> 3;
@@ -582,7 +590,7 @@ private let routeFusedScatterKernelT64: MLXFast.MLXFastKernel = {
                 for (uint i = 0; i < TILE; ++i) {
                     uint idx = t * TILE + i;
                     if (keys[idx] == k) {
-                        row_order[off] = idx / M;
+                        row_order[off] = idx >> 3;
                         sorted_keys[off] = k;
                         inverse_order[idx] = off;
                         ++off;
@@ -650,7 +658,7 @@ private let routeFusedScatterPrefixBoundsKernelT64: MLXFast.MLXFastKernel = {
                     if (keys[idx] == k) {
                         const uint run_offset = off - expert_base;
                         const uint run_remaining = total - run_offset;
-                        row_order[off] = idx / M;
+                        row_order[off] = idx >> 3;
                         sorted_keys[off] = 0x80000000u | k
                             | (run_offset << 8) | ((run_remaining - 1) << 14);
                         inverse_order[idx] = off;

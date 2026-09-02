@@ -536,6 +536,96 @@ enum CBv2PrefillSoftmaxVecV1 {
         ensureRowContiguous: true
     )
 
+    /// Ranked full-lane rows have `axis_size % 128 == 0`, so the launch rule
+    /// gives exactly `threads_per_threadgroup.x * 4 == axis_size`. Derive both
+    /// runtime scalars from the dispatch and avoid allocating/uploading a
+    /// two-word parameter array at every attention block. The same identity
+    /// proves every launched lane owns four valid elements, so this twin also
+    /// removes the load/store bounds branches. Other valid shapes retain the
+    /// original parameterized kernel unchanged. Kill switch:
+    /// `DARKBLOOM_CBV2_PREFILL_SOFTMAX_FULL_LANE=0`.
+    private static let fullLaneEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PREFILL_SOFTMAX_FULL_LANE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let fullLaneSource: String = {
+        var result = source
+        func replaceOnce(_ old: String, with new: String) {
+            precondition(
+                result.components(separatedBy: old).count == 2,
+                "full-lane softmax source seam changed")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+
+        replaceOnce(
+            """
+            const int axis_size = int(params[0]);
+            const int num_simdgroups = int(params[1]);
+            """,
+            with: """
+            const int axis_size = int(threads_per_threadgroup.x) * 4;
+            const int num_simdgroups = int(threads_per_threadgroup.x) / 32;
+            """)
+        replaceOnce(
+            """
+            const bool row_valid = base < axis_size;
+            const device T* row_in = scores + size_t(gid) * axis_size;
+            if (row_valid) {
+                T4 raw = *reinterpret_cast<const device T4*>(row_in + base);
+                #pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    ld[i] = static_cast<float>(raw[i]);
+                }
+            } else {
+                #pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    ld[i] = -INFINITY;
+                }
+            }
+            """,
+            with: """
+            const device T* row_in = scores + size_t(gid) * axis_size;
+            const T4 raw = *reinterpret_cast<const device T4*>(row_in + base);
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                ld[i] = static_cast<float>(raw[i]);
+            }
+            """)
+        replaceOnce(
+            """
+            if (row_valid) {
+                device T* row_out = probs + size_t(gid) * axis_size;
+                T4 result;
+                #pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    result[i] = static_cast<T>(ld[i] * normalizer);
+                }
+                *reinterpret_cast<device T4*>(row_out + base) = result;
+            }
+            """,
+            with: """
+            device T* row_out = probs + size_t(gid) * axis_size;
+            T4 result;
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                result[i] = static_cast<T>(ld[i] * normalizer);
+            }
+            *reinterpret_cast<device T4*>(row_out + base) = result;
+            """)
+        return result
+    }()
+
+    private static let fullLaneKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_prefill_sdpa_softmax_vec_bf16_full_lane_v1",
+        inputNames: ["scores"],
+        outputNames: ["probs"],
+        source: fullLaneSource,
+        ensureRowContiguous: true
+    )
+
     /// Runs the vectorized softmax, or returns nil to keep the caller on
     /// the stock `MLX.softmax(scores, axis: -1, precise: true)` call.
     /// `scores` may be any contiguous rank; it is treated as a flat
@@ -552,15 +642,29 @@ enum CBv2PrefillSoftmaxVecV1 {
         // softmax.cpp:64-68: 32 * ceil(ceil(axis_size / 4) / 32).
         let threadgroupSize = ((axisSize + 3) / 4 + 31) / 32 * 32
         guard threadgroupSize > 0, threadgroupSize <= 1024 else { return nil }
+
+        let template: [(String, any KernelTemplateArg)] = [("T", scores.dtype)]
+        let grid = (threadgroupSize * nRows, 1, 1)
+        let threadGroup = (threadgroupSize, 1, 1)
+        CBv2EngageMark.once("prefill-softmax-vec")
+        if fullLaneEnabled && axisSize % 128 == 0 {
+            return fullLaneKernel(
+                [scores],
+                template: template,
+                grid: grid,
+                threadGroup: threadGroup,
+                outputShapes: [scores.shape],
+                outputDTypes: [.bfloat16]
+            )[0]
+        }
+
         let numSimdgroups = threadgroupSize / 32
         let paramsArray = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
-
-        CBv2EngageMark.once("prefill-softmax-vec")
         return kernel(
             [scores, paramsArray],
-            template: [("T", scores.dtype)],
-            grid: (threadgroupSize * nRows, 1, 1),
-            threadGroup: (threadgroupSize, 1, 1),
+            template: template,
+            grid: grid,
+            threadGroup: threadGroup,
             outputShapes: [scores.shape],
             outputDTypes: [.bfloat16]
         )[0]

@@ -3729,10 +3729,16 @@ inline float qdot_affine4_g64_word(
 //          simd_lid * 4, block stride 128), and `ws[0]` / `ws[1]` are the
 //          low / high half-words of that word, so the four nibble masks
 //          and their two 4-term sums are unchanged.
-//   PF   : software prefetch of the NEXT block's four weight words. One
-//          x row is live in the singleton arm, so the +13..+40% extra
+//   PF   : software prefetch of the NEXT block's four weight words. Loads
+//          only: wcur[row] is bit-identical to the WVEC load at the same
+//          block and feeds the same qdot_affine4_g64_word, so values,
+//          accumulation order and every output byte are unchanged; the
+//          last block clamps nextblk to blk and re-reads its own word.
+//          One x row is live in the singleton arm, so the +13..+40% extra
 //          live state that sank PF on the 4-row quad_stream body does not
-//          apply here.
+//          apply here. ARMED for the gate/up K = 2816 instantiation below
+//          (KFIX = 2816 folds nblocks to 11 and the tail to 0, and keeps
+//          the 128-byte block stride a constant).
 //   KFIX : in_vec_size as a compile-time constant. The gemma4 gate has
 //          already proven in_vec_size is 2816 (gate/up) or 704 (down), so
 //          the K-loop trip count and every stride fold constant-fold.
@@ -4175,7 +4181,7 @@ template <typename T, int group_size, int bits>
     device T* single_y = y + assignment * (uint)out_vec_size;
     if (in_vec_size == 2816) {
       qmv_affine4_g64_singles_impl<
-          T, group_size, bits, 2816, true, false>(
+          T, group_size, bits, 2816, true, true>(
           single_w, single_scales, single_biases, single_x, single_y,
           in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
     } else {

@@ -13,6 +13,64 @@ import Foundation
 import MLX
 import MLXFast
 
+// MARK: - DEEP-1: per-step metadata-table memo
+
+/// One-slot, VALUE-KEYED memo for the tiny host-built UInt32 tables the
+/// decode attention dispatchers bind as kernel inputs (ring starts for the
+/// 25 sliding layers, `[keyLength, headDim, capacity*8]` params for the 5
+/// full layers).
+///
+/// Within one decode step every layer of a kind uploads the IDENTICAL table:
+/// each row's ring start is `(oldestValidPosition + 1) % window` and every
+/// layer's row copy advances in lockstep, while the full-attention layers
+/// share one `keyLength = offset + 1`. The 30 per-step constructions and
+/// host→device uploads therefore collapse to 2 without changing any byte any
+/// kernel reads. This is the same discipline the prefill SDPA already applies
+/// to its `(L, kL)` masks and bf16 scalars (ComposedPrefillSDPAV1.swift's
+/// `maskCache` / `bfloat16LowestScalar`): a cached array is a constant
+/// read-only INPUT, never a mutated output, so sharing one object across
+/// dispatches, graphs and steps is safe.
+///
+/// Exactness: bit-exact by construction. The cache key is the exact value
+/// tuple, so a hit returns an array holding precisely the bytes a fresh
+/// `MLXArray(values, shape)` would hold; a miss builds exactly that. No
+/// arithmetic, no reordering, no dtype or shape drift (shape is always
+/// `[values.count]`, and callers only ever pass `[8]` starts or `[10]`
+/// params tables, which the value-keyed slot cannot confuse). A value change
+/// — the normal +1 advance between steps — is a miss and a fresh build.
+///
+/// Kill switch: `DARKBLOOM_CBV2_DECODE_META_MEMO=0` (also `false`/`no`/`off`)
+/// restores per-call construction on every site below, byte for byte.
+enum CBv2DecodeMetaMemoV1 {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_DECODE_META_MEMO"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    nonisolated(unsafe) private static var cachedKey: [UInt32] = []
+    nonisolated(unsafe) private static var cachedValue: MLXArray?
+    private static let lock = NSLock()
+
+    static func uint32Array(_ values: [UInt32], _ shape: [Int]) -> MLXArray {
+        guard enabled else { return MLXArray(values, shape) }
+        lock.lock()
+        if let cached = cachedValue, cachedKey == values {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+        let fresh = MLXArray(values, shape)
+        lock.lock()
+        cachedKey = values
+        cachedValue = fresh
+        lock.unlock()
+        CBv2EngageMark.once("decode-meta-memo")
+        return fresh
+    }
+}
+
 enum CBv2RaggedTwoPassDecodeAttentionV1 {
     private static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
@@ -1949,7 +2007,8 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             })
         else { return nil }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = CBv2DecodeMetaMemoV1.uint32Array(
+            starts.map(UInt32.init), [batch])
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let passA = portQuantReadKernel(
@@ -2020,7 +2079,8 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             })
         else { return nil }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = CBv2DecodeMetaMemoV1.uint32Array(
+            starts.map(UInt32.init), [batch])
         let inputs = [queries] + mirrors
             + [startArray, newKeys, newValues, previousWriteFence]
         if q4ResidentMergeEnabled,
@@ -2094,7 +2154,8 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             starts.count == batch,
             starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength })
         else { return nil }
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = CBv2DecodeMetaMemoV1.uint32Array(
+            starts.map(UInt32.init), [batch])
         return attend(
             passAKernel: ringPassAKernel, queries: queries, keys: keys, values: values,
             extraInputs: [startArray], scale: scale)
@@ -2147,7 +2208,8 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             else { return nil }
         }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = CBv2DecodeMetaMemoV1.uint32Array(
+            starts.map(UInt32.init), [batch])
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let paired = gqaPairedPassAEnabled && gqa == 2
@@ -3334,7 +3396,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             valueBuffers.append(state[1])
             params.append(UInt32(state[0].dim(2)))
         }
-        let paramsArray = MLXArray(params)
+        let paramsArray = CBv2DecodeMetaMemoV1.uint32Array(params, [params.count])
 
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)
@@ -3462,7 +3524,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             valueBuffers.append(state[1])
             params.append(UInt32(state[0].dim(2)))
         }
-        let paramsArray = MLXArray(params)
+        let paramsArray = CBv2DecodeMetaMemoV1.uint32Array(params, [params.count])
 
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)
@@ -3581,7 +3643,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             valueBuffers.append(state[1])
             params.append(UInt32(state[0].dim(2)))
         }
-        let paramsArray = MLXArray(params)
+        let paramsArray = CBv2DecodeMetaMemoV1.uint32Array(params, [params.count])
 
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)

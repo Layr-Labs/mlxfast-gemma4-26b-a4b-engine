@@ -201,6 +201,28 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     private static let headDim = 256
     private static let sequenceLength = 1024
 
+
+    private static let startArrayLock = NSLock()
+    nonisolated(unsafe) private static var cachedStartsKey: [Int]? = nil
+    nonisolated(unsafe) private static var cachedStartArray: MLXArray? = nil
+
+    /// Memoized `MLXArray(starts.map(UInt32.init), [batch])`.
+    /// All 25 sliding layers within a single batch-8 decode step share identical
+    /// row positions (`starts`). Caching the immutable MLXArray avoids 24 redundant
+    /// host allocations and scheduler registrations per step (3,072 across 128 steps).
+    @inline(__always)
+    private static func memoizedStartArray(starts: [Int]) -> MLXArray {
+        startArrayLock.lock()
+        if let cached = cachedStartArray, cachedStartsKey == starts {
+            startArrayLock.unlock()
+            return cached
+        }
+        let created = MLXArray(starts.map(UInt32.init), [batch])
+        cachedStartsKey = starts
+        cachedStartArray = created
+        startArrayLock.unlock()
+        return created
+    }
     /// PARTITION-001: the stock partition count, sized for ONE row.
     ///
     /// `sdpa_vector_2pass` picks `blocks` from the architecture letter, the key
@@ -2688,7 +2710,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             })
         else { return nil }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = memoizedStartArray(starts: starts)
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let passA = portQuantReadKernel(
@@ -2759,7 +2781,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             })
         else { return nil }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = memoizedStartArray(starts: starts)
         let inputs = [queries] + mirrors
             + [startArray, newKeys, newValues, previousWriteFence]
         if q4ResidentMergeEnabled,
@@ -2899,7 +2921,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             starts.count == batch,
             starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength })
         else { return nil }
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = memoizedStartArray(starts: starts)
         return attend(
             passAKernel: ringPassAKernel, queries: queries, keys: keys, values: values,
             extraInputs: [startArray], scale: scale)
@@ -2952,7 +2974,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             else { return nil }
         }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = memoizedStartArray(starts: starts)
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let paired = gqaPairedPassAEnabled && gqa == 2

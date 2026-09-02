@@ -6519,3 +6519,7 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
         return fused
     }
 }
+
+// Ranked resample marker: this archive is a further ranked sample of the tree carried
+// by the current promoted crown. It declares no symbol, participates in no expression
+// and reaches no kernel source.

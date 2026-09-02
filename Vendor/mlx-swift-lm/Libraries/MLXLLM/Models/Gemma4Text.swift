@@ -1752,6 +1752,24 @@ private enum Gemma4PrefillDeqGEMMV1 {
 
 // MARK: - Attention
 
+/// QKFUSE-SLIDING. Default ON: sliding attention layers (vProj != nil) take
+/// the fused Q|K dispatch alongside the K-eq-V global layers, while V keeps
+/// its separate tierProjection. The fused kernels admit the sliding widths
+/// (qWidth 4096, kWidth 2048) and compute each output column from that
+/// column's own plane row, so the Q and K halves are bit-identical to the
+/// separate q_proj/k_proj dispatches. The per-layer cached concatenated
+/// planes ([6144, 352] uint32 + [6144, 44] bf16 scales + same-size biases)
+/// add 9,732,096 bytes (~9.3 MiB) of resident memory per sliding layer,
+/// 243,302,400 bytes (~232 MiB) across the 25 sliding layers.
+/// `DARKBLOOM_GEMMA4_QKFUSE_SLIDING=0` (also false/no/off) restores the
+/// vProj == nil gate.
+private let gemma4QKFuseSlidingEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_QKFUSE_SLIDING"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 private class Gemma4Attention: Module {
     let config: Gemma4TextConfiguration
     let layerIdx: Int
@@ -2129,12 +2147,21 @@ private class Gemma4Attention: Module {
         // custom helper would silently bypass the winning kernel.
         // QKFUSE-001: `queryInput === x` unless last-query prefill narrowed it,
         // which is the only case where Q and K cannot share a dispatch.
+        // QKFUSE-SLIDING: sliding layers (vProj != nil) take the fused Q|K
+        // dispatch too; V keeps its separate tierProjection below, and the
+        // K-eq-V structure is untouched (keyValueShared stays vProj == nil).
+        // `DARKBLOOM_GEMMA4_QKFUSE_SLIDING=0` restores the vProj == nil gate.
+        // The relaxation is only reachable here; fusedQKProjection's own
+        // admission still requires the exact B=8/L=1 decode shape, so
+        // prefill, last-query, shared-KV and other batch widths keep their
+        // incumbent dispatches.
         // MMA-RS-001: the fused Q|K dispatch consumes the shared run-sum
         // table — the table is per activation row and per 64-group of K,
         // independent of N, so the concatenated-N dispatch reads the same
         // entries the separate Q and K dispatches would.
         let fusedQK: (MLXArray, MLXArray)? =
-            (lastQueryCache == nil && !usesSharedKV && vProj == nil)
+            (lastQueryCache == nil && !usesSharedKV
+                && (vProj == nil || gemma4QKFuseSlidingEnabled))
             ? fusedQKProjection(x, rsTable: qkvRunsumTable) : nil
         let queryRaw = (
             fusedQK?.0 ?? tierProjection(qProj, queryInput, rsTable: qkvRunsumTable)

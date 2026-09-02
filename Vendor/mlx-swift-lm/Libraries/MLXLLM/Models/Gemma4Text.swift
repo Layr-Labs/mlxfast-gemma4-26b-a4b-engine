@@ -1698,6 +1698,14 @@ private enum Gemma4PrefillDeqGEMMV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Shorten critical section by evaluating dequantized plane outside table lock.
+    static let deqLockShortenEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_DEQ_SHORT_LOCK"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// Activation-row floor. The scored prompt plane carries 8192 rows; the
     /// default admits any plane of at least 1024 rows (one full-length
     /// prompt row) so the ranked geometry and a solo prompt take the same
@@ -1727,11 +1735,30 @@ private enum Gemma4PrefillDeqGEMMV1 {
             planeLock.unlock()
             return existing
         }
+        if !deqLockShortenEnabled {
+            let p = dequantized(
+                quantized.weight, scales: quantized.scales, biases: biases,
+                groupSize: quantized.groupSize, bits: quantized.bits, mode: quantized.mode
+            ).transposed()
+            eval(p)
+            cachedTransposedPlanes[key] = p
+            planeLock.unlock()
+            return p
+        }
+        planeLock.unlock()
+
         let p = dequantized(
             quantized.weight, scales: quantized.scales, biases: biases,
             groupSize: quantized.groupSize, bits: quantized.bits, mode: quantized.mode
         ).transposed()
         eval(p)
+        CBv2EngageMark.once("deq-cache-short-lock")
+
+        planeLock.lock()
+        if let existing = cachedTransposedPlanes[key] {
+            planeLock.unlock()
+            return existing
+        }
         cachedTransposedPlanes[key] = p
         planeLock.unlock()
         return p

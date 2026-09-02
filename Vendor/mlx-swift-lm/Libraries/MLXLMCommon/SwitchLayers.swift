@@ -5,6 +5,15 @@ import MLXNN
 /// Identity gather table for the sorted 64-assignment decode geometry.
 nonisolated(unsafe) private let switchDownIdentity64 = MLXArray((0..<64).map { UInt32($0) })
 
+/// Direct 3D left-hand index reshaping for the sorted 64-assignment decode geometry.
+/// Avoids expanding x to 4D and immediately flattening back to 3D.
+private let directLhsReshapeEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_DIRECT_LHS_RESHAPE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 // Port of https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/switch_layers.py
 
 /// Compiled SiLU-gated product (`silu(gate) * up`) for the common MoE GLU path.
@@ -1402,7 +1411,9 @@ public class SwitchGLU: Module {
             expertPrefixBoundsEnabled && useLhsIndices
             && indices.dtype == .uint32 && x.dtype == .bfloat16
             && expertPrefixBoundsProjectionsEligible
-        var x = MLX.expandedDimensions(x, axes: [-2, -3])
+        var x = (directLhsReshapeEnabled && useLhsIndices)
+            ? MLX.expandedDimensions(x, axes: [-2])
+            : MLX.expandedDimensions(x, axes: [-2, -3])
         let doSort = indices.size >= 64
 
         var idx = indices
@@ -1415,7 +1426,11 @@ public class SwitchGLU: Module {
         var lhsIndices: MLXArray?
         if doSort {
             if useLhsIndices {
-                x = x.flattened(start: 0, end: -3)
+                if directLhsReshapeEnabled {
+                    CBv2EngageMark.once("direct-lhs-reshape")
+                } else {
+                    x = x.flattened(start: 0, end: -3)
+                }
                 // GLUE-FOLD: an upstream producer already emitted the exact
                 // route table beside the top-8 selection; consume it and the
                 // standalone `mlx_lm_route_simd_rank_scatter` dispatch never

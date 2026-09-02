@@ -4362,9 +4362,16 @@ public class Gemma4DecoderLayer: Module {
             // is materialised bf16 either way.
             var g = gemma4GeluProduct(gate(out), perLayerInput)
             g = proj(g)
-            // Same `residual + rmsNorm(x, w)` at 2816 and the same eps as the
-            // post-attention site, so the prefill fusion applies unchanged.
-            if let fusedPLE = Gemma4PrefillGlueV1.normResidual(
+            // The PLE output has the same [8, 1, 2816] decode shape as the
+            // post-attention glue. Prefer its existing single-dispatch
+            // norm+residual kernel before the prefill-only fusion.
+            if outputStart == 0 && x.dim(1) == 1,
+                let fusedPLE = Gemma4FusedLayerGlue.normResidual(
+                    x: g, weight: norm.weight, residual: residual3,
+                    eps: config.rmsNormEps)
+            {
+                out = fusedPLE
+            } else if let fusedPLE = Gemma4PrefillGlueV1.normResidual(
                 x: g, weight: norm.weight, residual: residual3,
                 eps: config.rmsNormEps)
             {

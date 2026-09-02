@@ -4176,9 +4176,23 @@ template <typename T, int group_size, int bits>
     const device T* single_scales = scales + expert * s_strides[0];
     const device T* single_biases = biases + expert * b_strides[0];
     device T* single_y = y + assignment * (uint)out_vec_size;
+    // KERN-GATEUP-SINGLES-PF gate: compile-time flip; ON here -- the
+    // K = 2816 singleton arm now issues the NEXT block's four weight words
+    // while the current block's four qdots retire, so the four-byte
+    // dependent weight load stops standing in front of every qdot on the
+    // eleven-block walk. This is the arm the PF parameter was written for:
+    // one x row is live here, so the extra live state is eight uints on a
+    // body that already holds twelve floats, not the +13..+40% that sank PF
+    // on the four-row quad_stream. Flip to false to restore the
+    // demand-loaded WVEC arm; the two are bit-identical by construction --
+    // the same word from the same address (`ws0 + blk * block_bytes +
+    // row * in_vec_size_w`) reaches the same `qdot_affine4_g64_word` with
+    // the same scale, bias and lane sum, in the same block order, and the
+    // whole-packet tail already shares the WVEC word load.
+    constexpr bool gemma4_gateup_singles_pf = true;
     if (in_vec_size == 2816) {
       qmv_affine4_g64_singles_impl<
-          T, group_size, bits, 2816, true, false>(
+          T, group_size, bits, 2816, true, gemma4_gateup_singles_pf>(
           single_w, single_scales, single_biases, single_x, single_y,
           in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
     } else {

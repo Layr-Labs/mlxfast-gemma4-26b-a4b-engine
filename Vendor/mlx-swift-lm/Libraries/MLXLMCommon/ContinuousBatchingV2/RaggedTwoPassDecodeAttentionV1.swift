@@ -2368,7 +2368,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int key_length = int(params[0]);
             const int in_vec_size = int(params[1]);
 
-            const int n_chunks = (key_length + 63) / 64;
+            const int n_chunks = (key_length + 31) / 32;
             const int z = int(threadgroup_position_in_grid.z);
             const int chunk = z % n_chunks;
             const int row_kv = z / n_chunks;
@@ -2398,8 +2398,8 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 scores + size_t(row * 16 + kv_head * GQA) * key_length;
 
             const int virtual_groups = (key_length + 15) / 16;
-            const int vtg_lo = chunk * 4;
-            const int vtg_hi = min(vtg_lo + 4, virtual_groups);
+            const int vtg_lo = chunk * 2;
+            const int vtg_hi = min(vtg_lo + 2, virtual_groups);
             constexpr int n_iter = D / 128;
 
             for (int vtg = vtg_lo; vtg < vtg_hi; ++vtg) {
@@ -2524,7 +2524,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         """
 
     private static let qkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_qk_bf16_g8_xfold_v3_vec1",
+        name: "cbv2_ragged8_sdpa_d512_qk_bf16_g8_xfold_v4_sg2",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -2536,7 +2536,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     )
 
     private static let qkFencedKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_qk_fenced_bf16_g8_xfold_v3_vec1",
+        name: "cbv2_ragged8_sdpa_d512_qk_fenced_bf16_g8_xfold_v4_sg2",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -3195,7 +3195,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// served from `new_keys` during scoring, never from the slot being
     /// written, so no read races the store.
     private static let fusedQkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_qk_bf16_g8_ktile_v3_vec1",
+        name: "cbv2_ragged8_writesdpa_d512_qk_bf16_g8_ktile_v4_sg2",
         inputNames: [
             "queries",
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
@@ -3210,7 +3210,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int key_length = int(params[0]);
             const int in_vec_size = int(params[1]);
 
-            const int n_chunks = (key_length + 63) / 64;
+            const int n_chunks = (key_length + 31) / 32;
             const int z = int(threadgroup_position_in_grid.z);
             const int chunk = z % n_chunks;
             const int row_kv = z / n_chunks;
@@ -3258,8 +3258,8 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 scores + size_t(row * 16 + kv_head * GQA) * key_length;
 
             const int virtual_groups = (key_length + 15) / 16;
-            const int vtg_lo = chunk * 4;
-            const int vtg_hi = min(vtg_lo + 4, virtual_groups);
+            const int vtg_lo = chunk * 2;
+            const int vtg_hi = min(vtg_lo + 2, virtual_groups);
             constexpr int n_iter = D / 128;
 
             for (int vtg = vtg_lo; vtg < vtg_hi; ++vtg) {
@@ -3845,12 +3845,12 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             outputDTypes: [.int32]
         )[0]
 
-        let chunks = (keyLength + 63) / 64
+        let chunks = (keyLength + 31) / 32
         let scores = qkFencedKernel(
             [queries] + keyBuffers + [paramsArray, storeFence],
             template: template,
-            grid: (32, 4, batch * kvHeads * chunks),
-            threadGroup: (32, 4, 1),
+            grid: (32, 2, batch * kvHeads * chunks),
+            threadGroup: (32, 2, 1),
             outputShapes: [scratchShape],
             outputDTypes: [.bfloat16]
         )[0]
@@ -3963,13 +3963,13 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         ]
         let scratchShape = [batch, queryHeads, 1, keyLength]
 
-        let chunks = (keyLength + 63) / 64
+        let chunks = (keyLength + 31) / 32
         let passQK = fusedQkKernel(
             [queries] + keyBuffers + valueBuffers
                 + [paramsArray, keys, values, previousWriteFence],
             template: template,
-            grid: (32, 4, batch * kvHeads * chunks),
-            threadGroup: (32, 4, 1),
+            grid: (32, 2, batch * kvHeads * chunks),
+            threadGroup: (32, 2, 1),
             outputShapes: [scratchShape, [1]],
             outputDTypes: [.bfloat16, .int32]
         )
@@ -4082,12 +4082,12 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         ]
         let scratchShape = [batch, queryHeads, 1, keyLength]
 
-        let chunks = (keyLength + 63) / 64
+        let chunks = (keyLength + 31) / 32
         let scores = qkKernel(
             [queries] + keyBuffers + [paramsArray],
             template: template,
-            grid: (32, 4, batch * kvHeads * chunks),
-            threadGroup: (32, 4, 1),
+            grid: (32, 2, batch * kvHeads * chunks),
+            threadGroup: (32, 2, 1),
             outputShapes: [scratchShape],
             outputDTypes: [.bfloat16]
         )[0]

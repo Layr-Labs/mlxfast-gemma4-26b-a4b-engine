@@ -1716,8 +1716,12 @@ private class Gemma4Attention: Module {
     /// Exact B8/L1 Q/K/V projection: the tight-grid host for the promoted
     /// matrix-unit tier (same kernel text, grid.x = 1). Any guard failure
     /// keeps the quantized module, which reaches the tier through MLX.
+    /// MMA-RS-001: `rsTable` is the layer input's precomputed affine run-sum
+    /// table; nil keeps the incumbent in-kernel reductions.
     @inline(__always)
-    private func tierProjection(_ layer: Linear, _ x: MLXArray) -> MLXArray {
+    private func tierProjection(
+        _ layer: Linear, _ x: MLXArray, rsTable: MLXArray? = nil
+    ) -> MLXArray {
         guard let quantized = layer as? QuantizedLinear,
             quantized.bias == nil,
             let projected = CBv2AttentionQKVMMA8V1.matmul(
@@ -1727,7 +1731,8 @@ private class Gemma4Attention: Module {
                 biases: quantized.biases,
                 groupSize: quantized.groupSize,
                 bits: quantized.bits,
-                mode: quantized.mode)
+                mode: quantized.mode,
+                rsTable: rsTable)
         else { return layer(x) }
         return projected
     }
@@ -1735,8 +1740,14 @@ private class Gemma4Attention: Module {
     /// QKFUSE-001. Q and K read the same activation at decode, so their
     /// planes concatenate into one dispatch. Nil whenever the shapes, the
     /// quantization parameters or the arm's switch say otherwise.
+    /// MMA-RS-001: `rsTable` is the layer input's shared run-sum table; the
+    /// fused concatenated-N dispatch reads the same per-row, per-64-group
+    /// entries the separate Q and K dispatches would; nil keeps the
+    /// incumbent fused dispatch.
     @inline(__always)
-    private func fusedQKProjection(_ x: MLXArray) -> (MLXArray, MLXArray)? {
+    private func fusedQKProjection(
+        _ x: MLXArray, rsTable: MLXArray? = nil
+    ) -> (MLXArray, MLXArray)? {
         guard let q = qProj as? QuantizedLinear, q.bias == nil,
             let kProj, let k = kProj as? QuantizedLinear, k.bias == nil,
             q.groupSize == k.groupSize, q.bits == k.bits, q.mode == k.mode
@@ -1746,11 +1757,43 @@ private class Gemma4Attention: Module {
             qWeight: q.weight, qScales: q.scales, qBiases: q.biases,
             kWeight: k.weight, kScales: k.scales, kBiases: k.biases,
             groupSize: q.groupSize, bits: q.bits, mode: q.mode,
-            cacheKey: ObjectIdentifier(q))
+            cacheKey: ObjectIdentifier(q),
+            rsTable: rsTable)
+    }
+
+    /// QKVFUSE-001. The sliding layers' own V projection reads the same
+    /// activation as Q and K on the same tier, so all three planes
+    /// concatenate into one dispatch. Nil whenever the shapes, the
+    /// quantization parameters or the arm's switch say otherwise.
+    /// MMA-RS-001: `rsTable` is the layer input's shared run-sum table; the
+    /// fused concatenated-N dispatch reads the same per-row, per-64-group
+    /// entries the separate Q, K and V dispatches would; nil keeps the
+    /// incumbent fused dispatch.
+    @inline(__always)
+    private func fusedQKVProjection(
+        _ x: MLXArray, rsTable: MLXArray? = nil
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard let q = qProj as? QuantizedLinear, q.bias == nil,
+            let kProj, let k = kProj as? QuantizedLinear, k.bias == nil,
+            let vProj, let v = vProj as? QuantizedLinear, v.bias == nil,
+            q.groupSize == k.groupSize, q.groupSize == v.groupSize,
+            q.bits == k.bits, q.bits == v.bits,
+            q.mode == k.mode, q.mode == v.mode
+        else { return nil }
+        return CBv2AttentionQKVMMA8V1.fusedQKVMatmul(
+            x: x,
+            qWeight: q.weight, qScales: q.scales, qBiases: q.biases,
+            kWeight: k.weight, kScales: k.scales, kBiases: k.biases,
+            vWeight: v.weight, vScales: v.scales, vBiases: v.biases,
+            groupSize: q.groupSize, bits: q.bits, mode: q.mode,
+            cacheKey: ObjectIdentifier(q),
+            rsTable: rsTable)
     }
 
     /// Exact B8/L1 attention output projection. Sliding/full K widths select
     /// the tight affine4 fast-QMV replica; every other path keeps the layer.
+    /// MMA-RS-001: the projection input's run-sum table is computed here (the
+    /// o_proj plane consumes it alone); nil keeps the incumbent dispatch.
     @inline(__always)
     private func outputProjection(_ x: MLXArray) -> MLXArray {
         guard let quantized = oProj as? QuantizedLinear,
@@ -1762,7 +1805,8 @@ private class Gemma4Attention: Module {
                 biases: quantized.biases,
                 groupSize: quantized.groupSize,
                 bits: quantized.bits,
-                mode: quantized.mode)
+                mode: quantized.mode,
+                rsTable: CBv2AttentionOQMVV1.runsumTable(for: x))
         else { return oProj(x) }
         return projected
     }
@@ -1949,6 +1993,14 @@ private class Gemma4Attention: Module {
         let queryInput = lastQueryCache == nil ? x : x[0..., outputStart..., 0...]
         let queryLength = queryInput.dim(1)
 
+        // MMA-RS-001: one affine run-sum table for the layer input serves
+        // every Q/K/V projection that consumes x (at decode queryInput is x
+        // itself; the prefill paths leave the table nil because the guard
+        // requires the exact L=1 decode shape, and the incumbent dispatch
+        // runs). The table kernel is lazy: it executes only when a projection
+        // actually consumes it.
+        let qkvRunsumTable = CBv2AttentionQKVMMA8V1.runsumTable(for: x)
+
         // Keep Q/K/V on the promoted matrix-unit tier's arithmetic. At the
         // exact B=8/L=1 decode shapes the tight-grid host re-dispatches the
         // tier's own kernel text with grid.x = 1 (the frozen MLX host launches
@@ -1957,11 +2009,24 @@ private class Gemma4Attention: Module {
         // custom helper would silently bypass the winning kernel.
         // QKFUSE-001: `queryInput === x` unless last-query prefill narrowed it,
         // which is the only case where Q and K cannot share a dispatch.
+        // QKVFUSE-001: layers with their own V plane (the sliding layers) go
+        // one step further and fuse Q|K|V; full-attention layers (V shares K)
+        // and K/V-borrowing layers stay on the Q|K road, which for a sliding
+        // layer whose QKV guards fail means the separate dispatches.
+        // MMA-RS-001: the fused Q|K and Q|K|V dispatches consume the shared
+        // run-sum table — the table is per activation row and per 64-group
+        // of K, independent of N, so the concatenated-N dispatch reads the
+        // same entries the separate Q, K and V dispatches would.
+        let fusedQKV: (MLXArray, MLXArray, MLXArray)? =
+            (lastQueryCache == nil && !usesSharedKV && vProj != nil)
+            ? fusedQKVProjection(x, rsTable: qkvRunsumTable) : nil
         let fusedQK: (MLXArray, MLXArray)? =
             (lastQueryCache == nil && !usesSharedKV && vProj == nil)
-            ? fusedQKProjection(x) : nil
-        let queryRaw = (fusedQK?.0 ?? tierProjection(qProj, queryInput)).reshaped(
-            B, queryLength, nHeads, effectiveHeadDim)
+            ? fusedQKProjection(x, rsTable: qkvRunsumTable) : nil
+        let queryRaw = (
+            fusedQKV?.0 ?? fusedQK?.0
+            ?? tierProjection(qProj, queryInput, rsTable: qkvRunsumTable)
+        ).reshaped(B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
             // KV-shared layer: projects queries only and borrows (K, V) from
@@ -2023,11 +2088,15 @@ private class Gemma4Attention: Module {
             lastQueryCache == nil
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
-        let kRaw = (fusedQK?.1 ?? tierProjection(kProj, x)).reshaped(
-            B, L, nKvHeads, effectiveHeadDim)
+        let kRaw = (
+            fusedQKV?.1 ?? fusedQK?.1
+            ?? tierProjection(kProj, x, rsTable: qkvRunsumTable)
+        ).reshaped(B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
         if let vProj {
-            vRaw = tierProjection(vProj, x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            vRaw = (
+                fusedQKV?.2 ?? tierProjection(vProj, x, rsTable: qkvRunsumTable)
+            ).reshaped(B, L, nKvHeads, effectiveHeadDim)
         } else {
             vRaw = kRaw
         }

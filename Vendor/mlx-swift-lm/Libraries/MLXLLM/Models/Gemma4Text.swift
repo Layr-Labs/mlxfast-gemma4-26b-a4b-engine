@@ -5653,7 +5653,7 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     /// Layers or checkpoints outside the exact production geometry, and the
     /// arm's off-state, leave the loaded split arrays untouched.
     private func fuseExpertGateUpStorage(_ sanitized: inout [String: MLXArray]) {
-        guard switchGateUpFusePrefillEnabled else { return }
+        guard switchGateUpFusePrefillEnabled || switchGateUpFuseDecodeEnabled else { return }
         let gateWeightSuffix = ".experts.switch_glu.gate_proj.weight"
         for key in sanitized.keys where key.hasSuffix(gateWeightSuffix) {
             let base = String(key.dropLast(gateWeightSuffix.count))

@@ -1138,6 +1138,18 @@ public let switchGateUpFusePrefillEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+/// Kill switch: `DARKBLOOM_GEMMA4_DECODE_GATEUP_FUSE` set to
+/// `0`/`false`/`no`/`off` restores split gate and up gathers on decode.
+/// Engage mark: `decode-gateup-fuse`.
+public let switchGateUpFuseDecodeEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DECODE_GATEUP_FUSE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+private let switchDownIdentity64: MLXArray = MLXArray(Array(UInt32(0) ..< UInt32(64)))
+
 /// The concatenated `[gate ; up]` affine 4-bit right-hand side of one expert
 /// layer plus the two zero-copy views the split projections are bound to. A
 /// plain final class (not a `Module`, not an `MLXArray` tuple) so the module
@@ -1452,25 +1464,28 @@ public class SwitchGLU: Module {
             guard let gateProj, let upProj else {
                 preconditionFailure("SwitchGLU requires gate_up_proj or gate_proj/up_proj")
             }
-            // GATEUP-FUSE-PREFILL: the sorted right-hand-side plane (the
-            // production prefill) reads its gathered activations once through
-            // one gather over the concatenated gate|up storage. Same kernel
-            // pipeline, same per-column K-chains; the halves are views. The
-            // admission mirrors the host's sorted right-hand-side selection
-            // exactly, so the split views never meet that kernel.
-            if doSort, !useLhsIndices, lhsIndices == nil,
+            // GATEUP-FUSE: the sorted right-hand-side plane reads its gathered
+            // activations once through one gather over the concatenated gate|up storage.
+            // Same kernel pipeline, same per-column K-chains; the halves are views.
+            let canFuseGateUpPrefill =
+                !useLhsIndices && lhsIndices == nil
+                && x.dim(0) >= 16 && x.dim(0) / numExperts >= 4
+            let canFuseGateUpDecode =
+                useLhsIndices && switchGateUpFuseDecodeEnabled
+                && lhsIndices != nil && idx.ndim == 1 && idx.size == 64
+            if doSort,
                 x.ndim == 3, x.dim(-2) == 1, x.dim(-1) == inputDims,
-                x.dim(0) >= 16, x.dim(0) / numExperts >= 4,
                 x.dtype == .bfloat16,
+                canFuseGateUpPrefill || canFuseGateUpDecode,
                 let fused = fusedGateUpDispatch()
             {
-                CBv2EngageMark.once("prefill-gateup-fuse")
+                CBv2EngageMark.once(canFuseGateUpDecode ? "decode-gateup-fuse" : "prefill-gateup-fuse")
                 let xGateUp = MLX.gatherQuantizedMM(
                     x,
                     fused.storage.weight,
                     scales: fused.storage.scales,
                     biases: fused.storage.biases,
-                    lhsIndices: nil,
+                    lhsIndices: lhsIndices,
                     rhsIndices: idx,
                     transpose: true,
                     groupSize: fused.groupSize,
@@ -1497,7 +1512,12 @@ public class SwitchGLU: Module {
             activated = activation(xGate) * xUp
         }
 
-        x = downProj(activated, idx, sortedIndices: doSort)
+        let downLhsIndices = (doSort && useLhsIndices && switchGateUpFuseDecodeEnabled && idx.ndim == 1 && idx.size == 64)
+            ? switchDownIdentity64 : nil
+        if downLhsIndices != nil {
+            CBv2EngageMark.once("down-identity-gather")
+        }
+        x = downProj(activated, idx, lhsIndices: downLhsIndices, sortedIndices: doSort)
         return (x, doSort ? inverseOrder : nil, doSort)
     }
 

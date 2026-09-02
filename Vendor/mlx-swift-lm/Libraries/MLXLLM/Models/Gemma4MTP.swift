@@ -1268,9 +1268,8 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
         // Run drafter sanitize (throws on unexpected K/V weights).
         let sanitized = try drafter.sanitize(weights: weights)
 
-        // Quantize matching modules before applying weights when the checkpoint
-        // is quantized (4-bit QAT drafter). A module is quantized iff its
-        // `.scales` tensor is present. Mirrors `loadWeights` in MLXLMCommon.
+        // Bind the organizer's packed tensors using their declared geometry.
+        // Re-quantization happens below, after those tensors are materialized.
         if let plq = document.baseConfiguration.perLayerQuantization {
             quantize(model: drafter) { path, _ in
                 sanitized["\(path).scales"] != nil
@@ -1278,9 +1277,36 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
             }
         }
 
-        // Apply weights.
+        // Apply the staged 4-bit tensors first, then re-quantize only the
+        // assistant's quantized Linear/Embedding leaves in memory.  The target
+        // remains untouched and verifies every emitted token.
         let params = ModuleParameters.unflattened(sanitized)
         try drafter.update(parameters: params, verify: [.all])
+        quantize(
+            model: drafter,
+            filter: { _, module in
+                guard let quantized = module as? any Quantized else { return nil }
+                return (quantized.groupSize, 2, quantized.mode)
+            },
+            apply: { module, groupSize, bits, mode in
+                if let linear = module as? QuantizedLinear {
+                    let weight = dequantized(
+                        linear.weight, scales: linear.scales, biases: linear.biases,
+                        groupSize: linear.groupSize, bits: linear.bits, mode: linear.mode)
+                    return QuantizedLinear(
+                        weight: weight, bias: linear.bias, groupSize: groupSize,
+                        bits: bits, mode: mode)
+                }
+                if let embedding = module as? QuantizedEmbedding {
+                    let weight = dequantized(
+                        embedding.weight, scales: embedding.scales, biases: embedding.biases,
+                        groupSize: embedding.groupSize, bits: embedding.bits,
+                        mode: embedding.mode)
+                    return QuantizedEmbedding(
+                        weight: weight, groupSize: groupSize, bits: bits, mode: mode)
+                }
+                return nil
+            })
         eval(drafter)
 
         return drafter

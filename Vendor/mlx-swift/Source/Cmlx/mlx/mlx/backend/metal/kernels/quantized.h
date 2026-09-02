@@ -4032,11 +4032,11 @@ template <typename T, int group_size, int bits>
       ((in_vec_size == 2816 && out_vec_size == 704) ||
        (in_vec_size == 704 && out_vec_size == 2816));
   if (gemma4_pair_geometry) {
-    // KERN-DOWN-TILE gate (strip-walk pattern): compile-time flip; ON
-    // here -- the K = 704 down plane takes the y-tile-coarsened arm above.
+    // KERN-DOWN-TILE gate (strip-walk pattern): compile-time flip; OFF
+    // here -- the K = 704 down plane returns to the incumbent path below.
     // Flip to false to return every plane to the incumbent per-y-group
     // election below; the two arms are bit-identical by construction.
-    constexpr bool gemma4_down_tile = true;
+    constexpr bool gemma4_down_tile = false;
     if (gemma4_down_tile && in_vec_size == 704) {
       gather_qmv_gemma4_down_tile<T, group_size, bits>(
           w,

@@ -13,7 +13,7 @@ import Foundation
 import MLX
 import MLXFast
 
-public enum CBv2RaggedTwoPassDecodeAttentionV1 {
+enum CBv2RaggedTwoPassDecodeAttentionV1 {
     private static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_RAGGED_TWO_PASS_ATTENTION"]
@@ -30,169 +30,6 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
-
-    /// F4: consume raw decode Q/K/V in the resident q4 kernel, applying the
-    /// exact Gemma sliding-layer RMSNorm and base RoPE prologue there. Off
-    /// leaves the established `gemma4_b8_qkv_rms_norm_rope_v2_vec1` graph as
-    /// the attention input and selects the untouched crown resident kernel.
-    static let q4ResidentNormRopeEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_Q4_RESIDENT_NORM_ROPE"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
-    private struct ResidentNormRopeInputs {
-        let normalizedKeys: ObjectIdentifier
-        let normalizedValues: ObjectIdentifier
-        let rawQueries: MLXArray
-        let rawKeys: MLXArray
-        let rawValues: MLXArray
-        let qWeight: MLXArray
-        let kWeight: MLXArray
-        let positionOffsets: MLXArray
-        let ropeLog2Base: MLXArray
-    }
-
-    private static let residentNormRopeLock = NSLock()
-    nonisolated(unsafe) private static var residentNormRopeInputs:
-        [ObjectIdentifier: ResidentNormRopeInputs] = [:]
-
-    /// Register the raw producer inputs behind an already-built exact
-    /// norm+RoPE fallback. The fallback arrays remain what the generic cache
-    /// sees; only the exact resident path consumes this carrier, so any miss
-    /// evaluates the established graph unchanged.
-    @discardableResult
-    public static func registerResidentNormRope(
-        normalizedQueries: MLXArray,
-        normalizedKeys: MLXArray,
-        normalizedValues: MLXArray,
-        rawQueries: MLXArray,
-        rawKeys: MLXArray,
-        rawValues: MLXArray,
-        qWeight: MLXArray,
-        kWeight: MLXArray,
-        positionOffsets: MLXArray,
-        ropeLog2Base: MLXArray,
-        eps: Float,
-        appliedRope: Bool
-    ) -> Bool {
-        guard q4ResidentNormRopeEnabled,
-            appliedRope,
-            eps == 1.0e-6,
-            enabled,
-            q4ResidentMergeEnabled,
-            blocks == 8,
-            combineColumns == 8,
-            combineThreads == 256,
-            CBv2WindowedSequenceKV.q4FusedMirrorWriteEnabled,
-            CBv2WindowedSequenceKV.q4BF16RingElideEnabled,
-            CBv2WindowedSequenceKV.quantEnabled,
-            !CBv2WindowedSequenceKV.quantSimulate,
-            !CBv2WindowedSequenceKV.gpuPackCheck,
-            normalizedQueries.dtype == .bfloat16,
-            normalizedQueries.shape == [batch, queryHeads, 1, headDim],
-            normalizedKeys.dtype == .bfloat16,
-            normalizedKeys.shape == [batch, kvHeads, 1, headDim],
-            normalizedValues.dtype == .bfloat16,
-            normalizedValues.shape == normalizedKeys.shape,
-            rawQueries.dtype == .bfloat16,
-            rawQueries.shape == [batch, 1, queryHeads, headDim],
-            rawKeys.dtype == .bfloat16,
-            rawKeys.shape == [batch, 1, kvHeads, headDim],
-            rawValues.dtype == .bfloat16,
-            rawValues.shape == rawKeys.shape,
-            qWeight.dtype == .bfloat16,
-            qWeight.shape == [headDim],
-            kWeight.dtype == .bfloat16,
-            kWeight.shape == [headDim],
-            positionOffsets.dtype == .int32,
-            positionOffsets.shape == [batch],
-            ropeLog2Base.dtype == .float32,
-            ropeLog2Base.shape == [1]
-        else { return false }
-
-        residentNormRopeLock.lock()
-        if residentNormRopeInputs.count >= 64 {
-            residentNormRopeInputs.removeAll(keepingCapacity: true)
-        }
-        residentNormRopeInputs[ObjectIdentifier(normalizedQueries)] =
-            ResidentNormRopeInputs(
-                normalizedKeys: ObjectIdentifier(normalizedKeys),
-                normalizedValues: ObjectIdentifier(normalizedValues),
-                rawQueries: rawQueries,
-                rawKeys: rawKeys,
-                rawValues: rawValues,
-                qWeight: qWeight,
-                kWeight: kWeight,
-                positionOffsets: positionOffsets,
-                ropeLog2Base: ropeLog2Base)
-        residentNormRopeLock.unlock()
-        return true
-    }
-
-    @inline(__always)
-    private static func takeResidentNormRope(
-        queries: MLXArray, keys: MLXArray, values: MLXArray
-    ) -> ResidentNormRopeInputs? {
-        residentNormRopeLock.lock()
-        let inputs = residentNormRopeInputs.removeValue(
-            forKey: ObjectIdentifier(queries))
-        residentNormRopeLock.unlock()
-        guard let inputs,
-            inputs.normalizedKeys == ObjectIdentifier(keys),
-            inputs.normalizedValues == ObjectIdentifier(values)
-        else { return nil }
-        return inputs
-    }
-
-    /// Extra products of the F4 resident attention dispatch. The attention API
-    /// intentionally remains an `MLXArray`; Gemma takes this host-side carrier
-    /// immediately after `updateAndAttend` returns, before reshaping `output`.
-    /// F2 is removed: `runsumTable` remains API-compatible and is always nil so
-    /// Gemma must use `CBv2AttentionOQMVV1.runsumTable(for:)` unchanged.
-    public struct ResidentProducts {
-        public let runsumTable: MLXArray?
-        public let normalizedKeys: MLXArray?
-        public let normalizedValues: MLXArray?
-    }
-
-    private static let residentProductsLock = NSLock()
-    nonisolated(unsafe) private static var residentProducts:
-        [ObjectIdentifier: ResidentProducts] = [:]
-
-    @inline(__always)
-    private static func publishResidentProducts(
-        _ products: ResidentProducts, for output: MLXArray
-    ) {
-        residentProductsLock.lock()
-        // The intended consumer takes the entry synchronously. Keep misuse or
-        // old call sites bounded without retaining an unbounded lazy graph.
-        if residentProducts.count >= 64 {
-            residentProducts.removeAll(keepingCapacity: true)
-        }
-        residentProducts[ObjectIdentifier(output)] = products
-        residentProductsLock.unlock()
-    }
-
-    /// Consume the extra outputs associated with this exact attention array.
-    /// An empty carrier is the F4-off signal: use the established standalone
-    /// producer and the already-normalized K/V values. This deliberately takes
-    /// the same consumer branch as the parity-proven F4-on/F2-off state.
-    @inline(__always)
-    public static func takeResidentProducts(for output: MLXArray) -> ResidentProducts? {
-        residentProductsLock.lock()
-        let products = residentProducts.removeValue(forKey: ObjectIdentifier(output))
-        residentProductsLock.unlock()
-        // The F4 kill switch is also a hard consumer-side barrier. Even if a
-        // future call-site ordering bug leaves a carrier behind, OFF cannot
-        // substitute resident K/V or suppress any standalone crown producer.
-        guard q4ResidentNormRopeEnabled else {
-            return ResidentProducts(
-                runsumTable: nil, normalizedKeys: nil, normalizedValues: nil)
-        }
-        return products
-    }
 
     private static let batch = 8
     private static let queryHeads = 16
@@ -1311,6 +1148,8 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
         return passBKernel
     }
 
+    @inline(__always)
+
     static func attend(
         queries: MLXArray,
         keys: [MLXArray],
@@ -1686,7 +1525,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// removes only the global partial write/read and the second dispatch.
     private static let portQuantFusedWriteResidentKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_ey29",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_ey14",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -2050,582 +1889,6 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             ensureRowContiguous: true
         )
 
-    /// ORSFOLD-001. Default ON. `DARKBLOOM_CBV2_O_RS_FOLD=0` selects the
-    /// four-output resident kernel and leaves the standalone
-    /// `cbv2_b8_rs_table_dyn_v1` prepass to build the o_proj table.
-    static let oRunsumFoldEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_O_RS_FOLD"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
-    /// ORSFOLD-001 epilogue. Each combine lane already holds, in `ov`, the one
-    /// BF16 element it is about to store into `out`, and the o_proj activation
-    /// is that store read back head-major. Lane `l` owns element
-    /// `(block * 4 + l / 8) * 8 + (l % 8)`, so the eight lanes `l & ~7 ..
-    /// (l & ~7) + 7` are exactly one aligned run of eight consecutive elements,
-    /// which is the run one lane of the prepass reads as a `uint4`. Shuffling
-    /// that octet into `xt` and writing the two four-element partials as the
-    /// same two statements the prepass uses reproduces its value exactly,
-    /// including the BF16 rounding of each partial. A 64-wide group is eight
-    /// such octets, held by the four octets of block `2k` and the four of block
-    /// `2k+1`; xor 8 and xor 16 walk the octet index inside a block and give
-    /// `((v0+v1)+(v2+v3))`, the partner block gives `((v4+v5)+(v6+v7))`, and
-    /// the final add is the prepass's xor-4 stage. Same tree, same order.
-    private static let residentORunsumFold = """
-                    const ushort ow = as_type<ushort>(ov);
-                    const ushort obase = ushort(lane & ~7);
-                    thread T xt[8];
-                    #pragma clang loop unroll(full)
-                    for (int p = 0; p < 8; ++p) {
-                        xt[p] = as_type<T>(
-                            simd_shuffle(ow, ushort(obase + ushort(p))));
-                    }
-                    float rsv = 0;
-                    rsv += xt[0] + xt[1] + xt[2] + xt[3];
-                    rsv += xt[4] + xt[5] + xt[6] + xt[7];
-                    rsv += simd_shuffle_xor(rsv, 8u);
-                    rsv += simd_shuffle_xor(rsv, 16u);
-                    if (lane == 0) {
-                        local_o_rs[head * BLOCKS + block] = rsv;
-                    }
-        """
-
-    private static let residentORunsumStore = """
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                constexpr int rs_groups = D / 64;
-                const int rs_flat = block * simd_width + lane;
-                if (rs_flat < GQA * rs_groups) {
-                    const int rs_head = rs_flat / rs_groups;
-                    const int rs_group = rs_flat % rs_groups;
-                    o_rs[batch_index * (KV_HEADS * GQA * rs_groups)
-                            + (query_head + rs_head) * rs_groups + rs_group] =
-                        local_o_rs[rs_head * BLOCKS + 2 * rs_group]
-                        + local_o_rs[rs_head * BLOCKS + 2 * rs_group + 1];
-                }
-        """
-
-    /// F4: exact decode Q/K/V normalization and sliding RoPE in the resident
-    /// attention prologue. SIMD groups 0...3 own Q0, Q1, K, V respectively, so
-    /// every raw element is normalized once; all eight resident attention groups
-    /// reuse the BF16-rounded threadgroup rows.
-    private static func residentNormRopeSource(withORunsum: Bool) -> String {
-        """
-                typedef vec<T, 4> T4;
-                constexpr int simd_width = 32;
-                constexpr int values_per_lane = D / simd_width;
-                constexpr int vectors_per_lane = values_per_lane / 4;
-                constexpr int payload_words = D / 8;
-                constexpr int row_words = payload_words + D / 64;
-                constexpr int current_block = (N - 1) % BLOCKS;
-                constexpr int COLS = BLOCKS;
-                constexpr int sets = simd_width / COLS;
-                constexpr int rounds = (BLOCKS + COLS - 1) / COLS;
-                static_assert(BLOCKS == 8, "resident kernel requires eight blocks");
-                static_assert(GQA == 2, "resident kernel requires GQA two");
-                static_assert(values_per_lane % 4 == 0, "lane run is four-wide");
-
-                const int kv_head = int(threadgroup_position_in_grid.x);
-                const int batch_index = int(threadgroup_position_in_grid.y);
-                const int block = int(simdgroup_index_in_threadgroup);
-                const int query_head = GQA * kv_head;
-                const int batch_head = batch_index * 16 + query_head;
-                const int lane = int(thread_index_in_simdgroup);
-
-                threadgroup T local_partials[GQA * BLOCKS * D];
-                threadgroup float local_sums[GQA * BLOCKS];
-                threadgroup float local_maxs[GQA * BLOCKS];
-                threadgroup T local_queries[GQA * D];
-                threadgroup T local_key[D];
-                threadgroup T local_value[D];
-                \(withORunsum ? "threadgroup float local_o_rs[GQA * BLOCKS];" : "")
-
-                // Transcribe gemma4_b8_qkv_rms_norm_rope_v2_vec1 one row per
-                // designated SIMD group. Each lane owns the same two four-value
-                // runs as the standalone kernel's two 32-lane SIMD groups.
-                if (block < GQA + 2) {
-                    const device T* raw_row = raw_queries;
-                    const device T* weight_row = q_weight;
-                    threadgroup T* normalized_row = local_queries;
-                    bool weighted = true;
-                    if (block < GQA) {
-                        raw_row += (batch_head + block) * D;
-                        normalized_row += block * D;
-                    } else if (block == GQA) {
-                        raw_row = raw_keys
-                            + (batch_index * KV_HEADS + kv_head) * D;
-                        weight_row = k_weight;
-                        normalized_row = local_key;
-                    } else {
-                        raw_row = raw_values
-                            + (batch_index * KV_HEADS + kv_head) * D;
-                        normalized_row = local_value;
-                        weighted = false;
-                    }
-
-                    const device T4* raw_vectors =
-                        reinterpret_cast<const device T4*>(raw_row);
-                    const device T4* weight_vectors =
-                        reinterpret_cast<const device T4*>(weight_row);
-                    const T4 vin_first = raw_vectors[lane];
-                    const T4 vin_second = raw_vectors[lane + simd_width];
-                    float sum_first = 0.0f;
-                    float sum_second = 0.0f;
-                    #pragma clang loop unroll(full)
-                    for (int i = 0; i < 4; ++i) {
-                        const float first = float(vin_first[i]);
-                        const float second = float(vin_second[i]);
-                        sum_first += first * first;
-                        sum_second += second * second;
-                    }
-                    sum_first = simd_sum(sum_first);
-                    sum_second = simd_sum(sum_second);
-
-                    // Same second 32-lane tree as partials[0], partials[1],
-                    // partials[2...31] = 0 in the standalone kernel.
-                    float sum = lane == 0 ? sum_first
-                        : (lane == 1 ? sum_second : 0.0f);
-                    sum = simd_sum(sum);
-                    float inverse_rms = 0.0f;
-                    if (lane == 0) {
-                        inverse_rms = metal::precise::rsqrt(
-                            sum / float(D) + 1.0e-6f);
-                    }
-                    inverse_rms = simd_shuffle(inverse_rms, ushort(0));
-
-                    const T4 weight_first = weight_vectors[lane];
-                    const T4 weight_second = weight_vectors[lane + simd_width];
-                    threadgroup T4* normalized_vectors =
-                        reinterpret_cast<threadgroup T4*>(normalized_row);
-                    T4 rounded_first;
-                    T4 rounded_second;
-                    #pragma clang loop unroll(full)
-                    for (int i = 0; i < 4; ++i) {
-                        const T normalized_first =
-                            T(float(vin_first[i]) * inverse_rms);
-                        const T normalized_second =
-                            T(float(vin_second[i]) * inverse_rms);
-                        rounded_first[i] = weighted
-                            ? T(weight_first[i] * normalized_first)
-                            : T(1) * normalized_first;
-                        rounded_second[i] = weighted
-                            ? T(weight_second[i] * normalized_second)
-                            : T(1) * normalized_second;
-                    }
-                    normalized_vectors[lane] = rounded_first;
-                    normalized_vectors[lane + simd_width] = rounded_second;
-
-                    if (block == GQA + 1) {
-                        device T4* value_vectors =
-                            reinterpret_cast<device T4*>(
-                                v_out + (batch_index * KV_HEADS + kv_head) * D);
-                        value_vectors[lane] = rounded_first;
-                        value_vectors[lane + simd_width] = rounded_second;
-                    }
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-
-                // Q and K preserve the standalone norm kernel's BF16 store
-                // boundary before applying the base-route sliding RoPE.
-                if (block < GQA + 1) {
-                    threadgroup T* normalized_row = block < GQA
-                        ? local_queries + block * D : local_key;
-                    device T* key_output =
-                        k_out + (batch_index * KV_HEADS + kv_head) * D;
-                    const float L = static_cast<float>(
-                        position_offsets[batch_index]);
-                    #pragma clang loop unroll(full)
-                    for (int i = 0; i < 4; ++i) {
-                        const int pair = lane * 4 + i;
-                        const float d = static_cast<float>(pair)
-                            / static_cast<float>(D / 2);
-                        const float inv_freq =
-                            metal::exp2(-d * rope_log2_base[0]);
-                        const float theta = L * inv_freq;
-                        const float costheta = metal::fast::cos(theta);
-                        const float sintheta = metal::fast::sin(theta);
-                        const float x1 =
-                            static_cast<float>(normalized_row[pair]);
-                        const float x2 =
-                            static_cast<float>(normalized_row[pair + D / 2]);
-                        const T rx1 = static_cast<T>(
-                            x1 * costheta - x2 * sintheta);
-                        const T rx2 = static_cast<T>(
-                            x1 * sintheta + x2 * costheta);
-                        normalized_row[pair] = rx1;
-                        normalized_row[pair + D / 2] = rx2;
-                        if (block == GQA) {
-                            key_output[pair] = rx1;
-                            key_output[pair + D / 2] = rx2;
-                        }
-                    }
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-
-                const device uint32_t* mirror_w = m0;
-                switch (batch_index) {
-                    case 1: mirror_w = m1; break;
-                    case 2: mirror_w = m2; break;
-                    case 3: mirror_w = m3; break;
-                    case 4: mirror_w = m4; break;
-                    case 5: mirror_w = m5; break;
-                    case 6: mirror_w = m6; break;
-                    case 7: mirror_w = m7; break;
-                    default: break;
-                }
-                const device uint32_t* mkeys_w =
-                    mirror_w + kv_head * N * row_words;
-                const device uint32_t* mvalues_w =
-                    mirror_w + (KV_HEADS + kv_head) * N * row_words;
-                const threadgroup T* new_key =
-                    local_key + lane * values_per_lane;
-                const threadgroup T* new_value =
-                    local_value + lane * values_per_lane;
-                const uint start = starts[batch_index];
-                const uint write_slot = (start + uint(N - 1)) % uint(N);
-
-                half khs = half(0.0f);
-                half khb = half(0.0f);
-                half vhs = half(0.0f);
-                half vhb = half(0.0f);
-                uint32_t kword = 0u;
-                uint32_t vword = 0u;
-                if (block == current_block) {
-                    float kmin = 3.402823466e+38F;
-                    float kmax = -3.402823466e+38F;
-                    float vmin = 3.402823466e+38F;
-                    float vmax = -3.402823466e+38F;
-                    float kv[values_per_lane];
-                    float vv[values_per_lane];
-                    const threadgroup T4* kvec =
-                        reinterpret_cast<const threadgroup T4*>(new_key);
-                    const threadgroup T4* vvec =
-                        reinterpret_cast<const threadgroup T4*>(new_value);
-                    #pragma unroll
-                    for (int q = 0; q < values_per_lane / 4; ++q) {
-                        const T4 kq4 = kvec[q];
-                        const T4 vq4 = vvec[q];
-                        #pragma unroll
-                        for (int j = 0; j < 4; ++j) {
-                            kv[q * 4 + j] = float(kq4[j]);
-                            vv[q * 4 + j] = float(vq4[j]);
-                            kmin = min(kmin, kv[q * 4 + j]);
-                            kmax = max(kmax, kv[q * 4 + j]);
-                            vmin = min(vmin, vv[q * 4 + j]);
-                            vmax = max(vmax, vv[q * 4 + j]);
-                        }
-                    }
-                    for (uint mask = 1; mask < 8; mask <<= 1) {
-                        kmin = min(kmin, simd_shuffle_xor(kmin, mask));
-                        kmax = max(kmax, simd_shuffle_xor(kmax, mask));
-                        vmin = min(vmin, simd_shuffle_xor(vmin, mask));
-                        vmax = max(vmax, simd_shuffle_xor(vmax, mask));
-                    }
-                    khs = half(max((kmax - kmin) / 15.0f, 1e-6f));
-                    khb = half(kmin);
-                    vhs = half(max((vmax - vmin) / 15.0f, 1e-6f));
-                    vhb = half(vmin);
-                    const float ks = float(khs);
-                    const float kb = float(khb);
-                    const float vs = float(vhs);
-                    const float vb = float(vhb);
-                    #pragma unroll
-                    for (int element = 0; element < values_per_lane; ++element) {
-                        const float kq = metal::rint((kv[element] - kb) / ks);
-                        const float vq = metal::rint((vv[element] - vb) / vs);
-                        kword |= uint32_t(clamp(kq, 0.0f, 15.0f)) << (4 * element);
-                        vword |= uint32_t(clamp(vq, 0.0f, 15.0f)) << (4 * element);
-                    }
-
-                    device uint32_t* write_key =
-                        const_cast<device uint32_t*>(mkeys_w)
-                        + write_slot * row_words;
-                    device uint32_t* write_value =
-                        const_cast<device uint32_t*>(mvalues_w)
-                        + write_slot * row_words;
-                    write_key[lane] = kword;
-                    write_value[lane] = vword;
-                    if (lane % 8 == 0) {
-                        write_key[payload_words + lane / 8] =
-                            uint32_t(as_type<ushort>(khs))
-                            | (uint32_t(as_type<ushort>(khb)) << 16);
-                        write_value[payload_words + lane / 8] =
-                            uint32_t(as_type<ushort>(vhs))
-                            | (uint32_t(as_type<ushort>(vhb)) << 16);
-                    }
-                }
-                if (batch_index == 0 && kv_head == 0
-                    && block == current_block && lane == 0) {
-                    fence[0] = write_fence[0] + 1;
-                }
-
-                const threadgroup T* query =
-                    local_queries + lane * values_per_lane;
-                threadgroup T* partial = local_partials
-                    + block * D + lane * values_per_lane;
-                threadgroup float* sum_out = local_sums + block;
-                threadgroup float* max_out = local_maxs + block;
-
-                thread float q_lo[values_per_lane];
-                thread float q_hi[values_per_lane];
-                thread float acc_lo[values_per_lane];
-                thread float acc_hi[values_per_lane];
-                const threadgroup T4* qvec =
-                    reinterpret_cast<const threadgroup T4*>(query);
-                const threadgroup T4* qvec_hi =
-                    reinterpret_cast<const threadgroup T4*>(query + D);
-                #pragma clang loop unroll(full)
-                for (int q = 0; q < values_per_lane / 4; ++q) {
-                    const T4 q4_lo = qvec[q];
-                    const T4 q4_hi = qvec_hi[q];
-                    #pragma clang loop unroll(full)
-                    for (int j = 0; j < 4; ++j) {
-                        q_lo[q * 4 + j] = float(q4_lo[j]);
-                        q_hi[q * 4 + j] = float(q4_hi[j]);
-                    }
-                }
-                #pragma clang loop unroll(full)
-                for (int element = 0; element < values_per_lane; ++element) {
-                    acc_lo[element] = 0.0f;
-                    acc_hi[element] = 0.0f;
-                }
-
-                float max_lo = -3.402823466e+38F;
-                float max_hi = -3.402823466e+38F;
-                float sum_lo = 0.0f;
-                float sum_hi = 0.0f;
-                uint slot = (start + uint(block)) % uint(N);
-                const bool prefetch_first = block < N - 1;
-                uint next_slot = slot + uint(BLOCKS);
-                if (next_slot >= uint(N)) next_slot -= uint(N);
-                uint32_t kw_pre = prefetch_first
-                    ? mkeys_w[slot * row_words + lane] : 0u;
-                uint32_t vw_pre = prefetch_first
-                    ? mvalues_w[slot * row_words + lane] : 0u;
-                uint32_t ktw_pre = prefetch_first
-                    ? mkeys_w[slot * row_words + payload_words + lane / 8] : 0u;
-                uint32_t vtw_pre = prefetch_first
-                    ? mvalues_w[slot * row_words + payload_words + lane / 8] : 0u;
-                for (int token = block; token < N; token += BLOCKS) {
-                    const bool current = token == N - 1;
-                    const uint32_t kw = current ? kword : kw_pre;
-                    const uint32_t vw = current ? vword : vw_pre;
-                    const uint32_t ktw = current
-                        ? (uint32_t(as_type<ushort>(khs))
-                            | (uint32_t(as_type<ushort>(khb)) << 16))
-                        : ktw_pre;
-                    const uint32_t vtw = current
-                        ? (uint32_t(as_type<ushort>(vhs))
-                            | (uint32_t(as_type<ushort>(vhb)) << 16))
-                        : vtw_pre;
-                    if (token + BLOCKS < N - 1) {
-                        kw_pre = mkeys_w[next_slot * row_words + lane];
-                        vw_pre = mvalues_w[next_slot * row_words + lane];
-                        ktw_pre =
-                            mkeys_w[next_slot * row_words + payload_words + lane / 8];
-                        vtw_pre =
-                            mvalues_w[next_slot * row_words + payload_words + lane / 8];
-                        next_slot += uint(BLOCKS);
-                        if (next_slot >= uint(N)) next_slot -= uint(N);
-                    }
-                    const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
-                    const float kb = float(as_type<half>(ushort(ktw >> 16)));
-                    const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
-                    const float vb = float(as_type<half>(ushort(vtw >> 16)));
-                    float score_lo = 0.0f;
-                    float score_hi = 0.0f;
-                    #pragma clang loop unroll(full)
-                    for (int element = 0; element < values_per_lane; ++element) {
-                        const float key_element =
-                            fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
-                        score_lo += q_lo[element] * key_element;
-                        score_hi += q_hi[element] * key_element;
-                    }
-                    score_lo = simd_sum(score_lo);
-                    score_hi = simd_sum(score_hi);
-
-                    const float new_max_lo = max(max_lo, score_lo);
-                    const float new_max_hi = max(max_hi, score_hi);
-                    const float old_factor_lo = fast::exp(max_lo - new_max_lo);
-                    const float old_factor_hi = fast::exp(max_hi - new_max_hi);
-                    const float score_factor_lo = fast::exp(score_lo - new_max_lo);
-                    const float score_factor_hi = fast::exp(score_hi - new_max_hi);
-                    max_lo = new_max_lo;
-                    max_hi = new_max_hi;
-                    sum_lo = sum_lo * old_factor_lo + score_factor_lo;
-                    sum_hi = sum_hi * old_factor_hi + score_factor_hi;
-                    #pragma clang loop unroll(full)
-                    for (int element = 0; element < values_per_lane; ++element) {
-                        const float value_element =
-                            fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
-                        acc_lo[element] = acc_lo[element] * old_factor_lo
-                            + score_factor_lo * value_element;
-                        acc_hi[element] = acc_hi[element] * old_factor_hi
-                            + score_factor_hi * value_element;
-                    }
-                }
-
-                if (lane == 0) {
-                    sum_out[0] = sum_lo;
-                    max_out[0] = max_lo;
-                    sum_out[BLOCKS] = sum_hi;
-                    max_out[BLOCKS] = max_hi;
-                }
-                threadgroup T4* partial_vec_lo =
-                    reinterpret_cast<threadgroup T4*>(partial);
-                threadgroup T4* partial_vec_hi =
-                    reinterpret_cast<threadgroup T4*>(partial + BLOCKS * D);
-                #pragma clang loop unroll(full)
-                for (int q = 0; q < values_per_lane / 4; ++q) {
-                    T4 p4_lo, p4_hi;
-                    #pragma clang loop unroll(full)
-                    for (int j = 0; j < 4; ++j) {
-                        p4_lo[j] = T(acc_lo[q * 4 + j]);
-                        p4_hi[j] = T(acc_hi[q * 4 + j]);
-                    }
-                    partial_vec_lo[q] = p4_lo;
-                    partial_vec_hi[q] = p4_hi;
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-
-                const int block_lane = lane % COLS;
-                const int output_group = block * sets + lane / COLS;
-                #pragma clang loop unroll(full)
-                for (int head = 0; head < GQA; ++head) {
-                    const threadgroup T* head_partials = local_partials
-                        + head * BLOCKS * D + output_group * values_per_lane;
-                    const threadgroup float* head_sums =
-                        local_sums + head * BLOCKS;
-                    const threadgroup float* head_maxs =
-                        local_maxs + head * BLOCKS;
-                    device T* head_out = out
-                        + (batch_head + head) * D
-                        + output_group * values_per_lane;
-
-                    thread float accumulator[values_per_lane];
-                    #pragma clang loop unroll(full)
-                    for (int element = 0; element < values_per_lane; ++element) {
-                        accumulator[element] = 0.0f;
-                    }
-                    thread float lane_max[rounds];
-                    thread float lane_sum[rounds];
-                    thread float lane_factor[rounds];
-                    float sum_exp_score = 0.0f;
-                    float max_score = -3.402823466e+38F;
-                    #pragma clang loop unroll(full)
-                    for (int round = 0; round < rounds; ++round) {
-                        const int column = block_lane + COLS * round;
-                        const bool live = column < BLOCKS;
-                        lane_max[round] =
-                            live ? head_maxs[column] : -3.402823466e+38F;
-                        lane_sum[round] = live ? head_sums[column] : 0.0f;
-                        max_score = max(max_score, lane_max[round]);
-                    }
-                    #pragma clang loop unroll(full)
-                    for (int stride = 1; stride < COLS; stride <<= 1) {
-                        max_score = max(
-                            max_score,
-                            simd_shuffle_xor(max_score, ushort(stride)));
-                    }
-
-                    #pragma clang loop unroll(full)
-                    for (int round = 0; round < rounds; ++round) {
-                        lane_factor[round] =
-                            fast::exp(lane_max[round] - max_score);
-                        sum_exp_score += lane_factor[round] * lane_sum[round];
-                    }
-                    #pragma clang loop unroll(full)
-                    for (int stride = 1; stride < COLS; stride <<= 1) {
-                        sum_exp_score +=
-                            simd_shuffle_xor(sum_exp_score, ushort(stride));
-                    }
-
-                    #pragma clang loop unroll(full)
-                    for (int round = 0; round < rounds; ++round) {
-                        const int column = block_lane + COLS * round;
-                        if (column < BLOCKS) {
-                            const float factor = lane_factor[round];
-                            const threadgroup T4* partial_vectors =
-                                reinterpret_cast<const threadgroup T4*>(
-                                    head_partials + column * D);
-                            #pragma clang loop unroll(full)
-                            for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
-                                const T4 partial_vector = partial_vectors[chunk];
-                                #pragma clang loop unroll(full)
-                                for (int j = 0; j < 4; ++j) {
-                                    accumulator[chunk * 4 + j] +=
-                                        factor * float(partial_vector[j]);
-                                }
-                            }
-                        }
-                    }
-
-                    // Each step trades the half of the live slots whose
-                    // element bit matches the partner's column bit and keeps
-                    // the other half, so the live count runs 8, 4, 2, 1 and
-                    // the lane that survives for an element is the one whose
-                    // column index equals it. Every node of the addition tree
-                    // pairs the same two column subtrees the per-element
-                    // butterfly paired.
-                    #pragma clang loop unroll(full)
-                    for (int step = 0; (1 << step) < COLS; ++step) {
-                        const ushort stride = ushort(1 << step);
-                        const bool upper = (block_lane & int(stride)) != 0;
-                        const int live = values_per_lane >> step;
-                        #pragma clang loop unroll(full)
-                        for (int slot = 0; slot < live; slot += 2) {
-                            const float keep = upper
-                                ? accumulator[slot + 1]
-                                : accumulator[slot];
-                            const float trade = upper
-                                ? accumulator[slot]
-                                : accumulator[slot + 1];
-                            accumulator[slot >> 1] =
-                                keep + simd_shuffle_xor(trade, stride);
-                        }
-                    }
-                    const T ov = T(
-                        sum_exp_score == 0.0f
-                            ? accumulator[0]
-                            : accumulator[0] / sum_exp_score);
-                    head_out[block_lane] = ov;
-                \(withORunsum ? residentORunsumFold : "")
-                }
-                \(withORunsum ? residentORunsumStore : "")
-            """
-    }
-
-    private static let portQuantFusedWriteResidentNormRopeKernel: MLXFast.MLXFastKernel =
-        MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_v1_ey29",
-            inputNames: [
-                "raw_queries",
-                "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
-                "starts", "raw_keys", "raw_values", "q_weight", "k_weight",
-                "position_offsets", "rope_log2_base", "write_fence",
-            ],
-            outputNames: ["out", "fence", "k_out", "v_out"],
-            source: residentNormRopeSource(withORunsum: false),
-            ensureRowContiguous: true
-        )
-
-    /// ORSFOLD-001 arm: the same kernel with the o_proj run-sum table as a
-    /// fifth output, so the standalone prepass never runs on a sliding layer.
-    private static let portQuantFusedWriteResidentNormRopeORunsumKernel:
-        MLXFast.MLXFastKernel = MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_ors_v1_ey29",
-            inputNames: [
-                "raw_queries",
-                "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
-                "starts", "raw_keys", "raw_values", "q_weight", "k_weight",
-                "position_offsets", "rope_log2_base", "write_fence",
-            ],
-            outputNames: ["out", "fence", "k_out", "v_out", "o_rs"],
-            source: residentNormRopeSource(withORunsum: true),
-            ensureRowContiguous: true
-        )
-
     /// KVQ-PORT: `attendRing` reading the packed 8-bit mirror instead of the
     /// bf16 ring, with the result CONSUMED by pass B exactly as the stock
     /// road consumes it. This is the separate-write road only: the promoted
@@ -2664,6 +1927,8 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
         FileHandle.standardError.write(Data(
             "[kvq4-kernel] blocks=\(blocks) maxs[0..3]=\(maxs[0..<4]) partial[0..5]=\(partial[0..<6])\n".utf8))
     }
+
+    @inline(__always)
 
     static func attendRingQuant(
         queries: MLXArray,
@@ -2725,6 +1990,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// Exact B8/D256 q4g64 ring attention which packs this step's new K/V
     /// into the live mirror from pass A. Pass B consumes the first three
     /// outputs, while the fourth output is the next step's write fence.
+    @inline(__always)
     static func attendRingQuantWriting(
         queries: MLXArray,
         mirrors: [MLXArray],
@@ -2767,72 +2033,6 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             combineColumns == 8,
             combineThreads == 256
         {
-            if let normRope = takeResidentNormRope(
-                queries: queries, keys: newKeys, values: newValues)
-            {
-                let residentInputs =
-                    [normRope.rawQueries] + mirrors + [
-                        startArray,
-                        normRope.rawKeys,
-                        normRope.rawValues,
-                        normRope.qWeight,
-                        normRope.kWeight,
-                        normRope.positionOffsets,
-                        normRope.ropeLog2Base,
-                        previousWriteFence,
-                    ]
-                let residentTemplate: [(String, any KernelTemplateArg)] = [
-                    ("T", normRope.rawQueries.dtype),
-                    ("D", headDim),
-                    ("N", sequenceLength),
-                    ("GQA", gqa),
-                    ("KV_HEADS", kvHeads),
-                    ("BLOCKS", blocks),
-                ]
-                let residentShapes = [
-                    [batch, queryHeads, 1, headDim], [1],
-                    [batch, kvHeads, 1, headDim],
-                    [batch, kvHeads, 1, headDim],
-                ]
-                let residentDTypes: [DType] = [
-                    .bfloat16, .int32, .bfloat16, .bfloat16,
-                ]
-                let resident: [MLXArray]
-                let oRunsum: MLXArray?
-                if oRunsumFoldEnabled {
-                    resident = portQuantFusedWriteResidentNormRopeORunsumKernel(
-                        residentInputs,
-                        template: residentTemplate,
-                        grid: (kvHeads * blocks * 32, batch, 1),
-                        threadGroup: (blocks * 32, 1, 1),
-                        outputShapes: residentShapes
-                            + [[batch, queryHeads * headDim / 64]],
-                        outputDTypes: residentDTypes + [.float32]
-                    )
-                    oRunsum = resident[4]
-                    CBv2EngageMark.once("o-runsum-resident-fold")
-                } else {
-                    resident = portQuantFusedWriteResidentNormRopeKernel(
-                        residentInputs,
-                        template: residentTemplate,
-                        grid: (kvHeads * blocks * 32, batch, 1),
-                        threadGroup: (blocks * 32, 1, 1),
-                        outputShapes: residentShapes,
-                        outputDTypes: residentDTypes
-                    )
-                    oRunsum = nil
-                }
-                publishResidentProducts(
-                    ResidentProducts(
-                        runsumTable: oRunsum,
-                        normalizedKeys: resident[2],
-                        normalizedValues: resident[3]),
-                    for: resident[0])
-                CBv2EngageMark.once("kvq4-fused-live-write")
-                CBv2EngageMark.once("kvq4-resident-merge")
-                CBv2EngageMark.once("kvq4-resident-norm-rope")
-                return (resident[0], resident[1])
-            }
             let resident = portQuantFusedWriteResidentKernel(
                 inputs,
                 template: [
@@ -2887,6 +2087,8 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
         return (output, passA[3])
     }
 
+    @inline(__always)
+
     static func attendRing(
         queries: MLXArray,
         keys: [MLXArray],
@@ -2912,6 +2114,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// handed after a separate `decodeRingWrite`, minus the write. Returns
     /// nil (write NOT performed) whenever any predicate fails, so the caller
     /// falls back to the established write-then-attend pair.
+    @inline(__always)
     static func attendRingWriting(
         queries: MLXArray,
         newKeys: MLXArray,
@@ -3151,16 +2354,6 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// requires kL ≥ TM = 4.
     private static let minKeyLength = 4
     private static let maxKeyLength = 4095
-
-    /// LASTQ-D512 kill switch: `DARKBLOOM_GEMMA4_LASTQ_D512` set to
-    /// `0`/`false`/`no`/`off` restores the per-row last-query attend loop in
-    /// `CBv2AttentionV1.updateAndAttendLastQuery`. Default ON.
-    private static let lastQueryPrefillEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_LASTQ_D512"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
 
     /// Dispatch 1 — QKᵀ. Grid: (row, kv head, chunk of 4 virtual gemv
     /// threadgroups = 64 score rows) × 128 threads (4 simdgroups — exactly
@@ -3502,7 +2695,6 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int lid = int(thread_position_in_threadgroup.x);
             const int simd_lane_id = int(thread_index_in_simdgroup);
             const int simd_group_id = int(simdgroup_index_in_threadgroup);
-            const int num_simdgroups = (axis_size + 127) / 128;
 
             typedef vec<T, 4> T4;
             const bool row_vec4 = (axis_size & 3) == 0;
@@ -3530,6 +2722,11 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                         ? static_cast<float>(in[i]) : -INFINITY;
                 }
             }
+            if (simd_group_id == 0) {
+                local_max[simd_lane_id] = -INFINITY;
+                local_normalizer[simd_lane_id] = 0.0f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
 
             float maxval = -3.402823466e+38F;
             for (int i = 0; i < 4; i++) {
@@ -3540,12 +2737,14 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 local_max[simd_group_id] = maxval;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            maxval = -3.402823466e+38F;
-            for (int s = 0; s < num_simdgroups; ++s) {
-                const float sm = local_max[s];
-                maxval = (maxval < sm) ? sm : maxval;
+            if (simd_group_id == 0) {
+                maxval = simd_max(local_max[simd_lane_id]);
+                if (simd_lane_id == 0) {
+                    local_max[0] = maxval;
+                }
             }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            maxval = local_max[0];
 
             float normalizer = 0.0f;
             for (int i = 0; i < 4; i++) {
@@ -3558,12 +2757,14 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 local_normalizer[simd_group_id] = normalizer;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            normalizer = 0.0f;
-            for (int s = 0; s < num_simdgroups; ++s) {
-                normalizer += local_normalizer[s];
+            if (simd_group_id == 0) {
+                normalizer = simd_sum(local_normalizer[simd_lane_id]);
+                if (simd_lane_id == 0) {
+                    local_normalizer[0] = normalizer;
+                }
             }
-            const float inv_normalizer = 1.0f / normalizer;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            normalizer = 1 / local_normalizer[0];
 
             device T* out_row =
                 probs + size_t(gid) * axis_size + lid * 4;
@@ -3571,18 +2772,18 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 if (row_vec4) {
                     T4 out_vec;
                     for (int i = 0; i < 4; i++) {
-                        out_vec[i] = static_cast<T>(ld[i] * inv_normalizer);
+                        out_vec[i] = static_cast<T>(ld[i] * normalizer);
                     }
                     *reinterpret_cast<device T4*>(out_row) = out_vec;
                 } else {
                     for (int i = 0; i < 4; i++) {
-                        out_row[i] = static_cast<T>(ld[i] * inv_normalizer);
+                        out_row[i] = static_cast<T>(ld[i] * normalizer);
                     }
                 }
             } else {
                 for (int i = 0; i < 4; i++) {
                     if ((lid * 4 + i) < axis_size) {
-                        out_row[i] = static_cast<T>(ld[i] * inv_normalizer);
+                        out_row[i] = static_cast<T>(ld[i] * normalizer);
                     }
                 }
             }
@@ -4187,7 +3388,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// `new_values` rather than the cache slot the fused QK dispatch wrote,
     /// so this kernel has no read-after-in-place-write hazard at all.
     private static let fusedAvKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1",
+        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_vtile_v3_vec1",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -4201,8 +3402,8 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int key_length = int(params[0]);
 
             const int z = int(threadgroup_position_in_grid.z);
-            const int tile = z % \(avColumnTiles);
-            const int row_kv = z / \(avColumnTiles);
+            const int tile = z % 8;
+            const int row_kv = z / 8;
             const int row = row_kv / 2;
             const int kv_head = row_kv % 2;
             const int sg = int(simdgroup_index_in_threadgroup);
@@ -4231,9 +3432,9 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int thrM = lane / 4;
             const int thrN = lane % 4;
             int bm = thrM * 4;
-            const int out_col = tile * \(avTileColumns) + (4 * sg + thrN) * 4;
+            const int out_col = tile * 64 + (4 * sg + thrN) * 4;
 
-            float result[GQA * 4] = {0.0f};
+            float result[GQA][4] = {{0.0f}};
             // VTILE: the 4x4 value tile is shared by all GQA heads, the
             // probability block is not. Staging the tile costs 16 halves and
             // frees the 32-float per-head staging array. The peel keeps both
@@ -4275,7 +3476,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     for (int tm = 0; tm < 4; ++tm) {
                         float vc = p_coeff[tm];
                         for (int tn = 0; tn < 4; ++tn) {
-                            result[h * 4 + tn] += vc * v_tile[tm][tn];
+                            result[h][tn] += vc * v_tile[tm][tn];
                         }
                     }
                 }
@@ -4297,48 +3498,32 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                             prob_rows[size_t(h) * key_length + bm + tm]);
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
-                            result[h * 4 + tn] += pc * v_tile[0][tn];
+                            result[h][tn] += pc * v_tile[0][tn];
                         }
                     }
                 }
             }
-            {
-                const bool hi = (lane & 16) != 0;
+            #pragma clang loop unroll(full)
+            for (int h = 0; h < GQA; ++h) {
                 #pragma clang loop unroll(full)
-                for (int j = 0; j < 16; ++j) {
-                    const float a = result[j];
-                    const float b = result[16 + j];
-                    result[j] = (hi ? b : a)
-                        + simd_shuffle_xor(hi ? a : b, ushort(16));
+                for (int tn = 0; tn < 4; ++tn) {
+                    #pragma clang loop unroll(full)
+                    for (ushort delta = 4; delta >= 1; delta >>= 1) {
+                        result[h][tn] +=
+                            simd_shuffle_down(result[h][tn], 4 * delta);
+                    }
                 }
             }
-            {
-                const bool hi = (lane & 8) != 0;
+            if (thrM == 0) {
                 #pragma clang loop unroll(full)
-                for (int j = 0; j < 8; ++j) {
-                    const float a = result[j];
-                    const float b = result[8 + j];
-                    result[j] = (hi ? b : a)
-                        + simd_shuffle_xor(hi ? a : b, ushort(8));
-                }
-            }
-            {
-                const bool hi = (lane & 4) != 0;
-                #pragma clang loop unroll(full)
-                for (int j = 0; j < 4; ++j) {
-                    const float a = result[j];
-                    const float b = result[4 + j];
-                    result[j] = (hi ? b : a)
-                        + simd_shuffle_xor(hi ? a : b, ushort(4));
-                }
-            }
-            {
-                device T* out_ptr = out
-                    + size_t(row * 16 + kv_head * GQA + thrM) * D
-                    + out_col;
-                #pragma clang loop unroll(full)
-                for (int j = 0; j < 4; ++j) {
-                    out_ptr[j] = static_cast<T>(result[j]);
+                for (int h = 0; h < GQA; ++h) {
+                    device T* out_ptr = out
+                        + size_t(row * 16 + kv_head * GQA + h) * D
+                        + out_col;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        out_ptr[j] = static_cast<T>(result[h][j]);
+                    }
                 }
             }
         """,
@@ -4351,7 +3536,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// output allocation hands this kernel); the value-tile peel, the
     /// shuffle-down fold and every store are the promoted source verbatim.
     private static let fusedAvVecKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1_sv1",
+        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_vtile_v3_vec1_sv1",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -4366,8 +3551,8 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const bool row_vec4 = (key_length & 3) == 0;
 
             const int z = int(threadgroup_position_in_grid.z);
-            const int tile = z % \(avColumnTiles);
-            const int row_kv = z / \(avColumnTiles);
+            const int tile = z % 8;
+            const int row_kv = z / 8;
             const int row = row_kv / 2;
             const int kv_head = row_kv % 2;
             const int sg = int(simdgroup_index_in_threadgroup);
@@ -4396,9 +3581,9 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int thrM = lane / 4;
             const int thrN = lane % 4;
             int bm = thrM * 4;
-            const int out_col = tile * \(avTileColumns) + (4 * sg + thrN) * 4;
+            const int out_col = tile * 64 + (4 * sg + thrN) * 4;
 
-            float result[GQA * 4] = {0.0f};
+            float result[GQA][4] = {{0.0f}};
             // VTILE: the 4x4 value tile is shared by all GQA heads, the
             // probability block is not. Staging the tile costs 16 halves and
             // frees the 32-float per-head staging array. The peel keeps both
@@ -4449,7 +3634,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     for (int tm = 0; tm < 4; ++tm) {
                         float vc = p_coeff[tm];
                         for (int tn = 0; tn < 4; ++tn) {
-                            result[h * 4 + tn] += vc * v_tile[tm][tn];
+                            result[h][tn] += vc * v_tile[tm][tn];
                         }
                     }
                 }
@@ -4471,48 +3656,32 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                             prob_rows[size_t(h) * key_length + bm + tm]);
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
-                            result[h * 4 + tn] += pc * v_tile[0][tn];
+                            result[h][tn] += pc * v_tile[0][tn];
                         }
                     }
                 }
             }
-            {
-                const bool hi = (lane & 16) != 0;
+            #pragma clang loop unroll(full)
+            for (int h = 0; h < GQA; ++h) {
                 #pragma clang loop unroll(full)
-                for (int j = 0; j < 16; ++j) {
-                    const float a = result[j];
-                    const float b = result[16 + j];
-                    result[j] = (hi ? b : a)
-                        + simd_shuffle_xor(hi ? a : b, ushort(16));
+                for (int tn = 0; tn < 4; ++tn) {
+                    #pragma clang loop unroll(full)
+                    for (ushort delta = 4; delta >= 1; delta >>= 1) {
+                        result[h][tn] +=
+                            simd_shuffle_down(result[h][tn], 4 * delta);
+                    }
                 }
             }
-            {
-                const bool hi = (lane & 8) != 0;
+            if (thrM == 0) {
                 #pragma clang loop unroll(full)
-                for (int j = 0; j < 8; ++j) {
-                    const float a = result[j];
-                    const float b = result[8 + j];
-                    result[j] = (hi ? b : a)
-                        + simd_shuffle_xor(hi ? a : b, ushort(8));
-                }
-            }
-            {
-                const bool hi = (lane & 4) != 0;
-                #pragma clang loop unroll(full)
-                for (int j = 0; j < 4; ++j) {
-                    const float a = result[j];
-                    const float b = result[4 + j];
-                    result[j] = (hi ? b : a)
-                        + simd_shuffle_xor(hi ? a : b, ushort(4));
-                }
-            }
-            {
-                device T* out_ptr = out
-                    + size_t(row * 16 + kv_head * GQA + thrM) * D
-                    + out_col;
-                #pragma clang loop unroll(full)
-                for (int j = 0; j < 4; ++j) {
-                    out_ptr[j] = static_cast<T>(result[j]);
+                for (int h = 0; h < GQA; ++h) {
+                    device T* out_ptr = out
+                        + size_t(row * 16 + kv_head * GQA + h) * D
+                        + out_col;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        out_ptr[j] = static_cast<T>(result[h][j]);
+                    }
                 }
             }
         """,
@@ -4604,6 +3773,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// the STOCK three-kernel chain (byte-for-byte dispatch 1-3), fence-
     /// ordered. Removes the same 80 copy-on-write appends as the v2 fold
     /// without the fold's inner-loop addressing perturbation.
+    @inline(__always)
     static func updateAndAttendWriting22(
         rows: [CBv2SequenceKV], kind: CBv2LayerKind,
         queries: MLXArray, keys: MLXArray, values: MLXArray,
@@ -4728,6 +3898,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// `CBv2DecodeRingWriteFence` (published via `innerState()`), and this
     /// function advances each row's bookkeeping (`advanceAfterFusedAppend`)
     /// before returning.
+    @inline(__always)
     static func updateAndAttendWriting(
         rows: [CBv2SequenceKV], kind: CBv2LayerKind,
         queries: MLXArray, keys: MLXArray, values: MLXArray,
@@ -4828,8 +3999,8 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let output = fusedAvActive(
             [probs] + valueBuffers + [paramsArray, values],
             template: template,
-            grid: (32, avSimdgroups, batch * kvHeads * avColumnTiles),
-            threadGroup: (32, avSimdgroups, 1),
+            grid: (32, 4, batch * kvHeads * 8),
+            threadGroup: (32, 4, 1),
             outputShapes: [[batch, queryHeads, 1, headDim]],
             outputDTypes: [.bfloat16]
         )[0]
@@ -4842,6 +4013,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
 
     /// Batched update + attend for the D=512 full-attention decode cohort,
     /// or nil (with NO side effects) when any gate fails.
+    @inline(__always)
     static func updateAndAttend(
         rows: [CBv2SequenceKV], kind: CBv2LayerKind,
         queries: MLXArray, keys: MLXArray, values: MLXArray,
@@ -4914,105 +4086,6 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             valueBuffers.append(state[1])
             params.append(UInt32(state[0].dim(2)))
         }
-        return dispatchChain(
-            queries: queries, keyBuffers: keyBuffers, valueBuffers: valueBuffers,
-            params: params, keyLength: keyLength)
-    }
-
-    /// LASTQ-D512: the attend-only twin of `updateAndAttend` for the final
-    /// layer's last-query prefill (see LastQueryPrefillV2.swift). The caller
-    /// (`CBv2AttentionV1.updateAndAttendLastQuery`) has ALREADY committed
-    /// every row's full K/V chunk — the byte-identical per-row `update`
-    /// calls in row order — so this runs the stock three-dispatch chain over
-    /// the committed buffers with kL = the rows' common committed length and
-    /// appends NOTHING of its own (a chunk can never be double-committed;
-    /// the WRITE variants are not applicable for exactly that reason).
-    ///
-    /// Admission mirrors `updateAndAttend` with the decode-only gates
-    /// translated: kL is the committed length (not `offset + 1` — nothing is
-    /// appended), there is no new-token keys/values shape to check, and
-    /// `absoluteOffset <= maxLength` is a `CBv2FullSequenceKV` invariant
-    /// rather than an append-fit gate. Fails closed (nil, NO side effects)
-    /// on any miss, exactly like `updateAndAttend`.
-    ///
-    /// Exactness: same claim and same scope as `updateAndAttend`. The
-    /// per-row graph this replaces is the SAME `attend(..., L: 1, ...)`
-    /// call — maskMode `.none` at L == 1, scale 1.0, no sinks/softcap,
-    /// same committed `[1, kvHeads, kL, headDim]` views — the decode
-    /// per-row loop makes at the same kL, and the chain is parity-verified
-    /// bit-exact against that graph at kL ∈ {1024, 1027, 1100, 1152, 1055,
-    /// 2048, 4095} (see the enum header). How the committed bytes got there
-    /// (one-token decode append vs one whole-chunk prefill append) is not
-    /// an input the kernels can observe.
-    static func attendCommitted(
-        rows: [CBv2SequenceKV], kind: CBv2LayerKind,
-        queries: MLXArray, scale: Float, sinks: MLXArray?, softcap: Float?
-    ) -> MLXArray? {
-        guard enabled,
-            lastQueryPrefillEnabled,
-            rows.count == batch,
-            scale == 1.0,
-            sinks == nil,
-            softcap == nil,
-            !kind.isBidirectional,
-            kind.queryHeads == queryHeads,
-            kind.kvHeads == kvHeads,
-            kind.headDim == headDim,
-            queries.dtype == .bfloat16,
-            queries.shape == [batch, queryHeads, 1, headDim]
-        else { return nil }
-        guard case .full = kind.attention else { return nil }
-
-        let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
-        guard fullRows.count == batch else { return nil }
-
-        // Lockstep + storage gates, ALL before any dispatch. Pooled
-        // (ATT-008) rows fail closed exactly like the decode path: their
-        // backing layout is the pool's batch axis.
-        let keyLength = fullRows[0].absoluteOffset
-        guard keyLength >= minKeyLength,
-            keyLength <= maxKeyLength,
-            fullRows.allSatisfy({ $0.cohortPool == nil }),
-            fullRows.allSatisfy({ $0.absoluteOffset == keyLength })
-        else { return nil }
-
-        var keyBuffers: [MLXArray] = []
-        var valueBuffers: [MLXArray] = []
-        keyBuffers.reserveCapacity(batch)
-        valueBuffers.reserveCapacity(batch)
-        var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
-        params.reserveCapacity(batch + 2)
-        for row in fullRows {
-            let state = row.cbv2InnerState()
-            guard state.count == 2,
-                state[0].dtype == .bfloat16,
-                state[1].dtype == .bfloat16,
-                state[0].ndim == 4,
-                state[0].dim(0) == 1,
-                state[0].dim(1) == kvHeads,
-                state[0].dim(3) == headDim,
-                state[1].shape == state[0].shape,
-                state[1].dtype == state[0].dtype,
-                state[0].dim(2) >= keyLength
-            else { return nil }
-            keyBuffers.append(state[0])
-            valueBuffers.append(state[1])
-            params.append(UInt32(state[0].dim(2)))
-        }
-        return dispatchChain(
-            queries: queries, keyBuffers: keyBuffers, valueBuffers: valueBuffers,
-            params: params, keyLength: keyLength)
-    }
-
-    /// The stock three-dispatch chain (QKᵀ → precise softmax → probs·V) over
-    /// collected committed row buffers, byte-for-byte as `updateAndAttend`
-    /// always dispatched it. `params` = [kL, D, per-row KV buffer
-    /// capacities...]. Shared by the decode append path and the last-query
-    /// attend-only path so the two cannot drift.
-    private static func dispatchChain(
-        queries: MLXArray, keyBuffers: [MLXArray], valueBuffers: [MLXArray],
-        params: [UInt32], keyLength: Int
-    ) -> MLXArray {
         let paramsArray = MLXArray(params)
 
         let template: [(String, any KernelTemplateArg)] = [

@@ -929,19 +929,26 @@ private func routeCountingSortPrefill(
 /// `sorted_keys`, `inverse_order`, each `[64]` uint32) computed upstream by a
 /// producer that already holds the router scores, so `projectExperts` never
 /// issues its standalone route-table dispatch. The arrays must be exactly what
-/// `gatherSortIndices` would have produced for the same `[8, 8]` indices --
-/// raw (untagged) sorted expert keys included -- and any shape, dtype or
-/// switch-state mismatch declines the carrier and re-issues the incumbent
-/// chain unchanged.
+/// `gatherSortIndices` would have produced for the same `[8, 8]` indices.
+/// `expertPrefixBounds` declares whether `sortedKeys` uses the established
+/// tagged route-word encoding instead of raw expert keys; consumers still
+/// re-check that their exact projection geometry understands that carrier.
+/// Any shape, dtype, tag-contract, or switch-state mismatch declines the
+/// carrier and re-issues the incumbent chain unchanged.
 public struct SwitchRouteTable {
     public let rowOrder: MLXArray
     public let sortedKeys: MLXArray
     public let inverseOrder: MLXArray
+    public let expertPrefixBounds: Bool
 
-    public init(rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray) {
+    public init(
+        rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray,
+        expertPrefixBounds: Bool = false
+    ) {
         self.rowOrder = rowOrder
         self.sortedKeys = sortedKeys
         self.inverseOrder = inverseOrder
+        self.expertPrefixBounds = expertPrefixBounds
     }
 }
 
@@ -1381,8 +1388,9 @@ public class SwitchGLU: Module {
         let useLhsIndices =
             indices.size == 64 && indices.ndim == 2 && indices.shape == [8, 8]
             && x.ndim == 2 && x.shape == [8, inputDims]
+        let routeTablePrefixBounds = routeTable?.expertPrefixBounds == true
         let useExpertPrefixBounds =
-            expertPrefixBoundsEnabled && useLhsIndices
+            (expertPrefixBoundsEnabled || routeTablePrefixBounds) && useLhsIndices
             && indices.dtype == .uint32 && x.dtype == .bfloat16
             && expertPrefixBoundsProjectionsEligible
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
@@ -1402,7 +1410,7 @@ public class SwitchGLU: Module {
                 // disabled incumbent rank path -- re-issues the incumbent
                 // chain, which produces byte-identical arrays.
                 if let table = routeTable,
-                    !useExpertPrefixBounds,
+                    table.expertPrefixBounds == useExpertPrefixBounds,
                     routeSimdRank64Enabled,
                     numExperts == 128,
                     table.rowOrder.dtype == .uint32,

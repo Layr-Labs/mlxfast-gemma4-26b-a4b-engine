@@ -2630,18 +2630,28 @@ private enum Gemma4RouteGlueFoldV1 {
                 const uint key_low = sel[lane];
                 const uint key_high = sel[32u + lane];
                 uint rank = 0;
+                uint run_offset = 0;
+                uint run_total = 0;
                 #pragma clang loop unroll(full)
                 for (uint source = 0; source < 32; ++source) {
                     const uint other_low = simd_broadcast(key_low, ushort(source));
+                    const bool same_low = other_low == key;
                     rank += (other_low < key)
-                        || (other_low == key && source < assignment);
+                        || (same_low && source < assignment);
+                    run_offset += same_low && source < assignment;
+                    run_total += same_low;
                     const uint other_high = simd_broadcast(key_high, ushort(source));
                     const uint high_assignment = 32u + source;
+                    const bool same_high = other_high == key;
                     rank += (other_high < key)
-                        || (other_high == key && high_assignment < assignment);
+                        || (same_high && high_assignment < assignment);
+                    run_offset += same_high && high_assignment < assignment;
+                    run_total += same_high;
                 }
+                const uint run_remaining = run_total - run_offset;
                 row_order[rank] = assignment / 8;
-                sorted_keys[rank] = key;
+                sorted_keys[rank] = 0x80000000u | key
+                    | (run_offset << 8) | ((run_remaining - 1u) << 14);
                 inverse_order[assignment] = rank;
             }
         """,
@@ -2691,7 +2701,8 @@ private enum Gemma4RouteGlueFoldV1 {
             table: SwitchRouteTable(
                 rowOrder: outs[2],
                 sortedKeys: outs[3],
-                inverseOrder: outs[4]))
+                inverseOrder: outs[4],
+                expertPrefixBounds: true))
     }
 }
 

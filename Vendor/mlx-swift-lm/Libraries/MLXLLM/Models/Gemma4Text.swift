@@ -1716,8 +1716,12 @@ private class Gemma4Attention: Module {
     /// Exact B8/L1 Q/K/V projection: the tight-grid host for the promoted
     /// matrix-unit tier (same kernel text, grid.x = 1). Any guard failure
     /// keeps the quantized module, which reaches the tier through MLX.
+    /// MMA-RS-001: `rsTable` is the layer input's precomputed affine run-sum
+    /// table; nil keeps the incumbent in-kernel reductions.
     @inline(__always)
-    private func tierProjection(_ layer: Linear, _ x: MLXArray) -> MLXArray {
+    private func tierProjection(
+        _ layer: Linear, _ x: MLXArray, rsTable: MLXArray? = nil
+    ) -> MLXArray {
         guard let quantized = layer as? QuantizedLinear,
             quantized.bias == nil,
             let projected = CBv2AttentionQKVMMA8V1.matmul(
@@ -1727,13 +1731,16 @@ private class Gemma4Attention: Module {
                 biases: quantized.biases,
                 groupSize: quantized.groupSize,
                 bits: quantized.bits,
-                mode: quantized.mode)
+                mode: quantized.mode,
+                rsTable: rsTable)
         else { return layer(x) }
         return projected
     }
 
     /// Exact B8/L1 attention output projection. Sliding/full K widths select
     /// the tight affine4 fast-QMV replica; every other path keeps the layer.
+    /// MMA-RS-001: the projection input's run-sum table is computed here (the
+    /// o_proj plane consumes it alone); nil keeps the incumbent dispatch.
     @inline(__always)
     private func outputProjection(_ x: MLXArray) -> MLXArray {
         guard let quantized = oProj as? QuantizedLinear,
@@ -1745,7 +1752,8 @@ private class Gemma4Attention: Module {
                 biases: quantized.biases,
                 groupSize: quantized.groupSize,
                 bits: quantized.bits,
-                mode: quantized.mode)
+                mode: quantized.mode,
+                rsTable: CBv2AttentionOQMVV1.runsumTable(for: x))
         else { return oProj(x) }
         return projected
     }
@@ -1932,14 +1940,22 @@ private class Gemma4Attention: Module {
         let queryInput = lastQueryCache == nil ? x : x[0..., outputStart..., 0...]
         let queryLength = queryInput.dim(1)
 
+        // MMA-RS-001: one affine run-sum table for the layer input serves
+        // every Q/K/V projection that consumes x (at decode queryInput is x
+        // itself; the prefill paths leave the table nil because the guard
+        // requires the exact L=1 decode shape, and the incumbent dispatch
+        // runs). The table kernel is lazy: it executes only when a projection
+        // actually consumes it.
+        let qkvRunsumTable = CBv2AttentionQKVMMA8V1.runsumTable(for: x)
+
         // Keep Q/K/V on the promoted matrix-unit tier's arithmetic. At the
         // exact B=8/L=1 decode shapes the tight-grid host re-dispatches the
         // tier's own kernel text with grid.x = 1 (the frozen MLX host launches
         // 8 x-groups and the tier returns from 7 of them); every other shape
         // keeps the module's affine_qmv road. Routing Q or K through the older
         // custom helper would silently bypass the winning kernel.
-        let queryRaw = tierProjection(qProj, queryInput).reshaped(
-            B, queryLength, nHeads, effectiveHeadDim)
+        let queryRaw = tierProjection(qProj, queryInput, rsTable: qkvRunsumTable)
+            .reshaped(B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
             // KV-shared layer: projects queries only and borrows (K, V) from
@@ -2001,10 +2017,12 @@ private class Gemma4Attention: Module {
             lastQueryCache == nil
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
-        let kRaw = tierProjection(kProj, x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+        let kRaw = tierProjection(kProj, x, rsTable: qkvRunsumTable)
+            .reshaped(B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
         if let vProj {
-            vRaw = tierProjection(vProj, x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            vRaw = tierProjection(vProj, x, rsTable: qkvRunsumTable)
+                .reshaped(B, L, nKvHeads, effectiveHeadDim)
         } else {
             vRaw = kRaw
         }

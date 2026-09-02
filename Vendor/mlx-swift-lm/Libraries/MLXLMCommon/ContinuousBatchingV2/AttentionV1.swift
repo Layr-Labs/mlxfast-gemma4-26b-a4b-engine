@@ -48,7 +48,7 @@ enum CBv2AttentionV1 {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_ATTN_QUERY_BLOCK"],
             let value = Int(raw), value >= 0
-        else { return 128 }
+        else { return 256 }
         return value
     }()
 

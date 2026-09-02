@@ -1095,6 +1095,170 @@ inline U qdot_affine8_registered_v4(
         ensureRowContiguous: true
     )
 
+    /// DENSE-GEGLU-FUSE: the gate and up projections as ONE launch over an
+    /// interleaved weight plane (rows g0, u0, g1, u1, ...), with the GeGLU
+    /// product computed in the epilogue and stored as the activation. The
+    /// per-row GEMV is the quad-stream xsum body unchanged (rows are
+    /// independent, so interleaving changes no dot product); the epilogue
+    /// reproduces the compiled `gemma4SafeGeluProductShaped` chain op by op
+    /// on bfloat16 values with the same per-op rounding, the same bfloat16
+    /// constants, and `precise::tanh` in float exactly as MLX's unary op:
+    ///   t1 = 0.5 * g; a = ((0.044715 * g) * g) * g; inner = g + a;
+    ///   s = sqrt(2/pi) * inner; th = tanh(s); act = t1 * (1 + th); out = act * u.
+    /// Removes the dense GeLU dispatch, a dependent dispatch on every layer.
+    /// Kill switch: DARKBLOOM_GEMMA4_DENSE_GEGLU_FUSE=0 (host side).
+    private static let geGLUHelperSource: String = """
+        template <typename T>
+        inline T cbv2_geglu_bf16(T g, T u) {
+          const T half_c = static_cast<T>(0.5f);
+          const T k_c = static_cast<T>(0.044715f);
+          const T s_c = static_cast<T>(0.7978845608028654f);
+          const T one_c = static_cast<T>(1.0f);
+          const T t1 = half_c * g;
+          const T a1 = k_c * g;
+          const T a2 = a1 * g;
+          const T a3 = a2 * g;
+          const T inner = g + a3;
+          const T sv = s_c * inner;
+          const T th = static_cast<T>(metal::precise::tanh(static_cast<float>(sv)));
+          const T one_th = one_c + th;
+          const T act = t1 * one_th;
+          return act * u;
+        }
+
+        """
+
+    private static let w4ActivationSumGeGLUKernelHeader: String = {
+        let h = w4ActivationSumKernelHeader
+        let fnOld = "METAL_FUNC void qmv_affine8_g64_quad_stream_xsum_impl("
+        let fnNew = "METAL_FUNC void qmv_affine8_g64_quad_stream_xsum_geglu_impl("
+        precondition(h.components(separatedBy: fnOld).count == 2)
+        // The header carries the base impl too; only the xsum impl (the text
+        // from its signature to the end) takes the GeGLU epilogue.
+        guard let split = h.range(of: fnOld) else { preconditionFailure("xsum impl missing") }
+        let pre = String(h[h.startIndex..<split.lowerBound])
+        var post = fnNew + String(h[split.upperBound...])
+        let advOld = "  y0 += out_row;\n  y1 += out_row;\n  y2 += out_row;\n  y3 += out_row;\n"
+        precondition(post.components(separatedBy: advOld).count == 2)
+        post = post.replacingOccurrences(
+            of: advOld,
+            with: "  y0 += out_row / 2;\n  y1 += out_row / 2;\n  y2 += out_row / 2;\n  y3 += out_row / 2;\n")
+        let epiOld = """
+            if (simd_lid == 0) {
+              y0[row] = static_cast<T>(result0[row]);
+              y1[row] = static_cast<T>(result1[row]);
+              y2[row] = static_cast<T>(result2[row]);
+              y3[row] = static_cast<T>(result3[row]);
+            }
+          }
+        """
+        precondition(post.components(separatedBy: epiOld).count == 2)
+        let epiNew = """
+          }
+          if (simd_lid == 0) {
+            #pragma unroll
+            for (int p = 0; p < results_per_simdgroup / 2; p++) {
+              y0[p] = cbv2_geglu_bf16<T>(
+                  static_cast<T>(result0[2 * p]), static_cast<T>(result0[2 * p + 1]));
+              y1[p] = cbv2_geglu_bf16<T>(
+                  static_cast<T>(result1[2 * p]), static_cast<T>(result1[2 * p + 1]));
+              y2[p] = cbv2_geglu_bf16<T>(
+                  static_cast<T>(result2[2 * p]), static_cast<T>(result2[2 * p + 1]));
+              y3[p] = cbv2_geglu_bf16<T>(
+                  static_cast<T>(result3[2 * p]), static_cast<T>(result3[2 * p + 1]));
+            }
+          }
+        """
+        post = post.replacingOccurrences(of: epiOld, with: epiNew)
+        return geGLUHelperSource + pre + post
+    }()
+
+    private static let w4ActivationSumGeGLUKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_w4_geglu1",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+
+            const int in_vec_size = x_shape[x_ndim - 1];
+            const int out_vec_size = w_shape[0] / 2;
+            const int first_m = int(tid.x) * 4;
+            if (first_m >= 8) {
+                return;
+            }
+            qmv_affine8_g64_quad_stream_xsum_geglu_impl<T, 64, 8>(
+                w,
+                scales,
+                biases,
+                xSums,
+                x + first_m * in_vec_size,
+                x + (first_m + 1) * in_vec_size,
+                x + (first_m + 2) * in_vec_size,
+                x + (first_m + 3) * in_vec_size,
+                y + first_m * out_vec_size,
+                y + (first_m + 1) * out_vec_size,
+                y + (first_m + 2) * out_vec_size,
+                y + (first_m + 3) * out_vec_size,
+                in_vec_size,
+                tid,
+                simd_gid,
+                simd_lid);
+            return;
+            """,
+        header: w4ActivationSumGeGLUKernelHeader,
+        ensureRowContiguous: true
+    )
+
+    /// DENSE-GEGLU-FUSE entry: interleaved gate|up plane [2N, K/4] words,
+    /// scales/biases [2N, K/64]; returns the GeGLU activation [8, 1, N].
+    public static func matmulGeGLU(
+        x: MLXArray,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode,
+        activationSums: ActivationSums?
+    ) -> MLXArray? {
+        guard enabled, w4Enabled,
+            groupSize == Self.groupSize,
+            bits == Self.bits,
+            mode == .affine,
+            let biases,
+            let activationSums,
+            x.dtype == .bfloat16,
+            scales.dtype == x.dtype,
+            biases.dtype == x.dtype,
+            weight.dtype == .uint32,
+            x.ndim == 3,
+            x.dim(0) == batch,
+            x.dim(1) == sequence
+        else { return nil }
+        let inDim = x.dim(2)
+        guard weight.ndim == 2 else { return nil }
+        let outDim2 = weight.dim(0)
+        guard inDim == 2816, outDim2 == 2 * 2112,
+            outDim2 % outputsPerGroup == 0,
+            x.size == batch * sequence * inDim,
+            weight.dim(1) == inDim * Self.bits / 32,
+            scales.shape == [outDim2, inDim / Self.groupSize],
+            biases.shape == scales.shape
+        else { return nil }
+        let xGroups = batch / rowsPerGroup
+        let yGroups = outDim2 / outputsPerGroup
+        return w4ActivationSumGeGLUKernel(
+            [x, weight, scales, biases, activationSums.values],
+            template: [("T", x.dtype)],
+            grid: (xGroups * simdWidth, yGroups * simdGroups, 1),
+            threadGroup: (simdWidth, simdGroups, 1),
+            outputShapes: [[batch, sequence, outDim2 / 2]],
+            outputDTypes: [x.dtype]
+        )[0]
+    }
+
     private static let w4ActivationSumQMVKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_w4_v1",
         inputNames: ["x", "w", "scales", "biases", "xSums"],

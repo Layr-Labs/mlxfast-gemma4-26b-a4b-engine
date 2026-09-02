@@ -4243,10 +4243,23 @@ private class Gemma4Experts: Module {
 
 // MARK: - MLP
 
+/// DENSE-GEGLU-FUSE kill switch (`DARKBLOOM_GEMMA4_DENSE_GEGLU_FUSE=0`).
+private let gemma4DenseGeGLUFuseEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DENSE_GEGLU_FUSE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 private class Gemma4MLP: Module {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
+
+    /// DENSE-GEGLU-FUSE: the gate and up planes interleaved row by row
+    /// (g0, u0, g1, u1, ...), built once on first use from the loaded
+    /// quantized weights; a pure copy of the pinned values.
+    private var fusedGateUpInterleaved: (weight: MLXArray, scales: MLXArray, biases: MLXArray)?
 
     init(_ config: Gemma4TextConfiguration, layerIdx: Int) {
         let isKvSharedLayer = config.layerUsesSharedKV(layerIdx: layerIdx)
@@ -4327,6 +4340,38 @@ private class Gemma4MLP: Module {
 
     fileprivate func zipDown(_ activated: MLXArray) -> MLXArray {
         denseProjection(downProj, activated)
+    }
+
+    /// DENSE-GEGLU-FUSE: one launch for gate, up and the GeGLU product.
+    /// nil (and no node built) off the pinned decode cell or under the kill
+    /// switch; the caller then keeps the incumbent three-dispatch chain.
+    fileprivate func zipGateUpGelu(
+        _ x: MLXArray, _ activationSums: CBv2DenseMLPQMVV1.ActivationSums?
+    ) -> MLXArray? {
+        guard gemma4DenseGeGLUFuseEnabled, let activationSums,
+            let g = gateProj as? QuantizedLinear, let u = upProj as? QuantizedLinear,
+            g.bias == nil, u.bias == nil,
+            let gb = g.biases, let ub = u.biases,
+            g.groupSize == u.groupSize, g.bits == u.bits, g.mode == u.mode,
+            g.weight.shape == u.weight.shape, g.scales.shape == u.scales.shape,
+            gb.shape == ub.shape
+        else { return nil }
+        if fusedGateUpInterleaved == nil {
+            let n = g.weight.dim(0)
+            let w = stacked([g.weight, u.weight], axis: 1).reshaped([2 * n, g.weight.dim(1)])
+            let s = stacked([g.scales, u.scales], axis: 1).reshaped([2 * n, g.scales.dim(1)])
+            let b = stacked([gb, ub], axis: 1).reshaped([2 * n, gb.dim(1)])
+            eval(w, s, b)
+            fusedGateUpInterleaved = (w, s, b)
+        }
+        guard let f = fusedGateUpInterleaved,
+            let out = CBv2DenseMLPQMVV1.matmulGeGLU(
+                x: x, weight: f.weight, scales: f.scales, biases: f.biases,
+                groupSize: g.groupSize, bits: g.bits, mode: g.mode,
+                activationSums: activationSums)
+        else { return nil }
+        CBv2EngageMark.once("dense-geglu-fuse")
+        return out
     }
 }
 
@@ -4480,13 +4525,17 @@ private enum Gemma4ZipRouterV1 {
         let expertScores = router.zipScores(
             MLX.depends(input: normed, dependencies: [sums.dependencyHandle]))
         let denseIn = MLX.depends(input: n1, dependencies: [normed])
-        let gate = mlp.zipGate(denseIn, sums)
-        let up = mlp.zipUp(denseIn, sums)
+        // DENSE-GEGLU-FUSE: one launch yields the activation directly; the
+        // `gate`/`up` handles then both alias it so every ordering edge
+        // below keeps its shape.
+        let fusedActivated = mlp.zipGateUpGelu(denseIn, sums)
+        let gate = fusedActivated ?? mlp.zipGate(denseIn, sums)
+        let up = fusedActivated ?? mlp.zipUp(denseIn, sums)
 
         // Stage 3: the dense GeLU product, which the router has no partner
         // for -- the argPartition is deliberately NOT paired with it.
         let held = MLX.depends(inputs: [gate, up], dependencies: [expertScores])
-        let activated = gemma4GeluProduct(held[0], held[1])
+        let activated = fusedActivated == nil ? gemma4GeluProduct(held[0], held[1]) : held[0]
 
         // Stage 4: router argPartition | dense down projection. The sort is
         // 8 us and the down projection 25 us, so this is the pairing that

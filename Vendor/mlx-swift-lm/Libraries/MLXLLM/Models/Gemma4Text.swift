@@ -2538,13 +2538,14 @@ private enum Gemma4RouteGlueFoldV1 {
 
     struct Fold {
         let indices: MLXArray
+        let weights: MLXArray
         let table: SwitchRouteTable
     }
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_route_finalists_rank_gluefold_v1",
-        inputNames: ["scores"],
-        outputNames: ["indices", "row_order", "sorted_keys", "inverse_order"],
+        name: "gemma4_route_monolithic_top8_e128_k8_bf16_v2",
+        inputNames: ["scores", "pes"],
+        outputNames: ["indices", "weights", "row_order", "sorted_keys", "inverse_order"],
         source: """
             const uint tid = thread_position_in_threadgroup.x;
             const uint row = tid / 128u;
@@ -2561,7 +2562,9 @@ private enum Gemma4RouteGlueFoldV1 {
             threadgroup uint finalists[256];
             threadgroup uint sel[64];
 
+            #pragma clang loop unroll(full)
             for (uint width = 2u; width <= 32u; width <<= 1) {
+                #pragma clang loop unroll(full)
                 for (uint stride = width >> 1; stride > 0u; stride >>= 1) {
                     const uint other = simd_shuffle_xor(item, ushort(stride));
                     const bool otherBefore = gemma4_finalists_before(other, item);
@@ -2577,9 +2580,12 @@ private enum Gemma4RouteGlueFoldV1 {
             // All thirty-two complete SIMD groups participate in this barrier.
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
+            // Group 0 reduces 32 finalists to top 8 and evaluates in-register softmax + scaling
             if (group == 0u) {
                 item = finalists[row * 32u + lane];
+                #pragma clang loop unroll(full)
                 for (uint width = 2u; width <= 32u; width <<= 1) {
+                    #pragma clang loop unroll(full)
                     for (uint stride = width >> 1; stride > 0u; stride >>= 1) {
                         const uint other = simd_shuffle_xor(item, ushort(stride));
                         const bool otherBefore = gemma4_finalists_before(other, item);
@@ -2588,10 +2594,28 @@ private enum Gemma4RouteGlueFoldV1 {
                         if (takeMinimum ? otherBefore : !otherBefore) item = other;
                     }
                 }
+
+                float score = (lane >= 24u) ? float(uint16_to_bfloat16(uint16_t(item >> 7))) : -1e38f;
+                float max_score = score;
+                max_score = metal::max(max_score, simd_shuffle_xor(max_score, 4));
+                max_score = metal::max(max_score, simd_shuffle_xor(max_score, 2));
+                max_score = metal::max(max_score, simd_shuffle_xor(max_score, 1));
+
+                float exp_score = (lane >= 24u) ? metal::precise::exp(score - max_score) : 0.0f;
+                float sum_exp = exp_score;
+                sum_exp += simd_shuffle_xor(sum_exp, 4);
+                sum_exp += simd_shuffle_xor(sum_exp, 2);
+                sum_exp += simd_shuffle_xor(sum_exp, 1);
+
                 if (lane >= 24u) {
                     const uint selected = item & 127u;
-                    indices[row * 8u + lane - 24u] = selected;
-                    sel[row * 8u + lane - 24u] = selected;
+                    const uint out_idx = row * 8u + (lane - 24u);
+                    indices[out_idx] = selected;
+                    sel[out_idx] = selected;
+
+                    float weight = (sum_exp > 0.0f) ? (exp_score / sum_exp) : 0.0f;
+                    float scale = float(pes[selected]);
+                    weights[out_idx] = bfloat16_t(weight * scale);
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2606,6 +2630,7 @@ private enum Gemma4RouteGlueFoldV1 {
                 const uint key_low = sel[lane];
                 const uint key_high = sel[32u + lane];
                 uint rank = 0;
+                #pragma clang loop unroll(full)
                 for (uint source = 0; source < 32; ++source) {
                     const uint other_low = simd_broadcast(key_low, ushort(source));
                     rank += (other_low < key)
@@ -2641,27 +2666,32 @@ private enum Gemma4RouteGlueFoldV1 {
         ensureRowContiguous: true
     )
 
-    static func apply(_ scores: MLXArray, topK: Int, kth: Int) -> Fold? {
+    static func apply(
+        _ scores: MLXArray, perExpertScale: MLXArray, topK: Int, kth: Int
+    ) -> Fold? {
         guard enabled, Gemma4RouterFinalistsV1.enabled,
             topK == 8, kth == 120,
             scores.ndim == 3, scores.dim(0) == 8,
             scores.dim(1) == 1, scores.dim(2) == 128,
-            scores.dtype == .bfloat16
+            scores.dtype == .bfloat16,
+            perExpertScale.ndim == 1, perExpertScale.dim(0) == 128,
+            perExpertScale.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-fold")
         let outs = kernel(
-            [scores],
+            [scores, perExpertScale],
             grid: (1024, 1, 1),
             threadGroup: (1024, 1, 1),
-            outputShapes: [[8, 1, 8], [64], [64], [64]],
-            outputDTypes: [.uint32, .uint32, .uint32, .uint32]
+            outputShapes: [[8, 1, 8], [8, 1, 8], [64], [64], [64]],
+            outputDTypes: [.uint32, .bfloat16, .uint32, .uint32, .uint32]
         )
         return Fold(
             indices: outs[0],
+            weights: outs[1],
             table: SwitchRouteTable(
-                rowOrder: outs[1],
-                sortedKeys: outs[2],
-                inverseOrder: outs[3]))
+                rowOrder: outs[2],
+                sortedKeys: outs[3],
+                inverseOrder: outs[4]))
     }
 }
 
@@ -3868,6 +3898,7 @@ private enum Gemma4ZipRouterV1 {
         // 8 us and the down projection 25 us, so this is the pairing that
         // pays; the selected slice then trails alone at 1.7 us.
         let topKIndices: MLXArray
+        let topKWeights: MLXArray
         let denseOut: MLXArray
         var routeTable: SwitchRouteTable? = nil
         if plan == 2 {
@@ -3877,32 +3908,34 @@ private enum Gemma4ZipRouterV1 {
                 MLX.depends(input: partition, dependencies: [activated]))
             denseOut = mlp.zipDown(
                 MLX.depends(input: activated, dependencies: [partition]))
+            topKWeights = router.zipWeights(
+                expertScores: expertScores, topKIndices: topKIndices)
         } else {
             denseOut = mlp.zipDown(activated)
-            // GLUE-FOLD: one dispatch emits the top-8 selection AND the
-            // sorted route table, so the standalone rank-scatter launch
-            // leaves the dependent chain. The fold consumes the identical
-            // fenced scores node the incumbent partition consumed, keeping
-            // the tape's ordering edges unchanged. Fail-closed onto the
-            // incumbent finalists + slice pair.
+            // GLUE-FOLD: one dispatch emits the top-8 selection, in-register
+            // float32 softmax + per-expert scaling, AND the sorted route table,
+            // so the standalone rank-scatter launch and the weight tail
+            // (takeAlong -> softmax -> perExpertScale) leave the dependent chain.
+            // The fold consumes the identical fenced scores node the incumbent
+            // partition consumed, keeping the tape's ordering edges unchanged.
+            // Fail-closed onto the incumbent finalists + slice + weight tail.
             if let fold = Gemma4RouteGlueFoldV1.apply(
                 MLX.depends(input: expertScores, dependencies: [denseOut]),
+                perExpertScale: router.perExpertScale,
                 topK: router.topK, kth: router.kth)
             {
                 topKIndices = fold.indices
+                topKWeights = fold.weights
                 routeTable = fold.table
             } else {
                 let partition = router.zipPartition(
                     MLX.depends(input: expertScores, dependencies: [denseOut]))
                 topKIndices = router.zipSelected(partition)
+                topKWeights = router.zipWeights(
+                    expertScores: expertScores, topKIndices: topKIndices)
             }
         }
 
-        // The router weight tail (takeAlong -> softmax -> per-expert scale) is
-        // off the critical path to the expert kernels and already overlaps
-        // them in the stock tape; it is emitted unchanged.
-        let topKWeights = router.zipWeights(
-            expertScores: expertScores, topKIndices: topKIndices)
         Gemma4RouterProbe.recorder?(expertScores, topKIndices)
 
         // Every expert dispatch already sits behind `topKIndices`; fencing the

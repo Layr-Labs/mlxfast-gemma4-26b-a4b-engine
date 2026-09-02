@@ -2663,8 +2663,26 @@ public final class EngineLoopV2: @unchecked Sendable {
     }
 
     // MARK: Gauges
+    // GAUGE-CADENCE state: backend byte ledgers cached between publishes
+    // (see publishGauges). ledgerStep == -1 forces the first publish to
+    // seed them.
+    private var cachedLedgerBytesInUse = 0
+    private var cachedLedgerBytesReserved = 0
+    private var ledgerStep = -1
 
     private func publishGauges() {
+        // GAUGE-CADENCE: the backend byte ledgers are O(rows x layers) walks
+        // under the backend lock, taken twice here per publish. Publish the
+        // cheap scheduler counters every step and refresh the byte ledgers
+        // every 8th step — or immediately whenever submits are in flight, so
+        // admission-relevant capacity never goes stale while a burst is
+        // deciding. The ranked cohort admits once at begin and never submits
+        // mid-window, so per-step ledger freshness is dead weight there.
+        if stepCount != ledgerStep && (stepCount % 8 == 0 || scheduler.waitingCount > 0 || ledgerStep < 0) {
+            cachedLedgerBytesInUse = backend.bytesInUse
+            cachedLedgerBytesReserved = backend.bytesReserved
+            ledgerStep = stepCount
+        }
         // kvBytesCapacity carries the ADMISSION ceiling so a runtime
         // re-slice reads back consistently between the resize point-update
         // and per-step publishes (on the paged backend the two ledgers
@@ -2679,10 +2697,10 @@ public final class EngineLoopV2: @unchecked Sendable {
             CBv2CapacitySnapshot(
                 activeRequests: scheduler.runningCount,
                 waitingRequests: scheduler.waitingCount,
-                kvBytesInUse: backend.bytesInUse,
+                kvBytesInUse: cachedLedgerBytesInUse,
                 kvBytesCapacity: capacity?.bytesCapacity ?? backend.bytesCapacity,
                 kvBytesBackendCapacity: backend.bytesCapacity,
-                kvBytesReserved: backend.bytesReserved,
+                kvBytesReserved: cachedLedgerBytesReserved,
                 activeTokens: scheduler.activeTokens,
                 stepsExecuted: stepCount))
     }

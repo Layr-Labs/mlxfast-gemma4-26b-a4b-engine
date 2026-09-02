@@ -57,7 +57,8 @@ internal func gemma4ShouldSubmitDecodeAsyncEvalLadder(
     inputLength: Int,
     layerIndex: Int
 ) -> Bool {
-    guard enabled, isCBv2, !schedulePrefill, batchSize == 8, inputLength == 1
+    guard enabled, isCBv2, !schedulePrefill, batchSize == 8,
+        inputLength == 1 || (Gemma4FusedLayerGlue.l2FastChainEnabled && inputLength == 2)
     else { return false }
 
     if let set = gemma4DecodeAsyncEvalLadderSet {
@@ -1790,7 +1791,8 @@ private class Gemma4Attention: Module {
         positionOffset: Gemma4.PositionOffset? = nil,
         v2SharedSource: (any CBv2AttendingLayerCache)? = nil,
         outputStart: Int = 0,
-        useLastQueryPrefill: Bool = false
+        useLastQueryPrefill: Bool = false,
+        ringKV: CBv2MTPDrafterRingKV? = nil
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         // ContinuousBatchingV2: the layer cache owns both the KV update and
         // the attention computation (no masks, no padding — see
@@ -1811,9 +1813,36 @@ private class Gemma4Attention: Module {
         var queries = qProj(x).reshaped(B, L, nHeads, effectiveHeadDim)
         queries = qNorm(queries)
 
+        let activePositionOffset = positionOffset ?? gemma4CapturePositionOffset(from: cache)
+        // DRAFTER-RING-ATTN: the MTP drafter's sliding layers attend the
+        // target's retained sliding ring in place through the decode ring
+        // kernel (no temporal-order copy, no stack, no mask), the same window
+        // the masked snapshot path attended.
+        if let ringKV, let shared = sharedKV {
+            var ringQueries = queries.transposed(0, 2, 1, 3)
+            ringQueries = gemma4ApplyRotaryPosition(rope, to: ringQueries, offset: activePositionOffset)
+            // The drafter carries its activations in float32; the ring kernel
+            // is a bf16 kernel (the ring is bf16), so the queries are cast for
+            // the attention and the output is widened back for the drafter.
+            let ringDType = ringQueries.dtype
+            ringQueries = ringQueries.asType(.bfloat16)
+            guard let ringOutRaw = CBv2RaggedTwoPassDecodeAttentionV1.attendRing(
+                queries: ringQueries, keys: ringKV.keys, values: ringKV.values,
+                starts: ringKV.starts, scale: scale, slidingWindowLength: ringKV.keys[0].dim(2))
+            else {
+                FileHandle.standardError.write(
+                    ("Gemma4 drafter ring attention declined: q=\(ringQueries.shape) \(ringQueries.dtype) "
+                        + "k0=\(ringKV.keys[0].shape) \(ringKV.keys[0].dtype) rows=\(ringKV.keys.count) "
+                        + "starts=\(ringKV.starts) scale=\(scale)\n").data(using: .utf8)!)
+                preconditionFailure("Gemma4 drafter ring attention declined")
+            }
+            let ringOut = ringOutRaw.dtype == ringDType ? ringOutRaw : ringOutRaw.asType(ringDType)
+            let ringOutput = ringOut.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+            return (outputProjection(ringOutput), (shared.0, shared.1), activePositionOffset)
+        }
+
         let keys: MLXArray
         let values: MLXArray
-        let activePositionOffset = positionOffset ?? gemma4CapturePositionOffset(from: cache)
 
         if let (sharedK, sharedV) = sharedKV {
             // KV-shared layers use pre-computed KV from an earlier layer
@@ -2998,11 +3027,44 @@ private enum Gemma4FusedLayerGlue {
         ensureRowContiguous: true
     )
 
+    /// GLUE-L2: admit the MTP verify rectangle `[8, 2, axis]` beside the
+    /// decode cell `[8, 1, axis]`. Every glue kernel is one threadgroup per
+    /// row and never reads the row count, so the sixteen rows take the
+    /// identical per-row reduction; only the grid and output shape widen.
+    /// `DARKBLOOM_GEMMA4_MTP_L2_FASTCHAIN=0` restores the decode-only gate
+    /// (and the L == 1 async-eval ladder gate) in the same executable.
+    static let l2FastChainEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_MTP_L2_FASTCHAIN"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+    /// GLUE-L2 receipt: `DARKBLOOM_GEMMA4_GLUE_L2_XCHECK=1` re-runs every
+    /// sixteen-row glue call column by column through the eight-row shape
+    /// and reports bitwise mismatches. Diagnostic only.
+    private static let l2CrossCheckEnabled: Bool =
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_GLUE_L2_XCHECK"] == "1"
+    private static func rowCount(_ x: MLXArray) -> Int { x.dim(0) * x.dim(1) }
+    private static func admittedColumns(_ x: MLXArray) -> Bool {
+        x.dim(1) == 1 || (l2FastChainEnabled && x.dim(1) == 2)
+    }
+    private static func crossCheck(_ name: String, wide: MLXArray, narrow: (Int) -> MLXArray?) {
+        guard l2CrossCheckEnabled, wide.dim(1) == 2 else { return }
+        var report = "GLUE-L2 xcheck \(name)"
+        for column in 0 ..< 2 {
+            guard let narrowOut = narrow(column) else { report += " col\(column)=declined"; continue }
+            let wideBits = wide[0..., column ..< (column + 1), 0...].view(dtype: .uint16)
+            let narrowBits = narrowOut.view(dtype: .uint16)
+            let mismatches = MLX.sum(MLX.notEqual(wideBits, narrowBits)).item(Int32.self)
+            report += " col\(column)_mismatch=\(mismatches)/\(narrowBits.size)"
+        }
+        FileHandle.standardError.write((report + "\n").data(using: .utf8)!)
+    }
+
     private static func admits(_ x: MLXArray, weight: MLXArray, eps: Float) -> Bool {
         enabled
             && eps == Self.eps
             && x.ndim == 3
-            && x.dim(0) == rows && x.dim(1) == 1 && x.dim(2) == axis
+            && x.dim(0) == rows && admittedColumns(x) && x.dim(2) == axis
             && x.dtype == .bfloat16
             && weight.ndim == 1 && weight.dim(0) == axis
             && weight.dtype == .bfloat16
@@ -3015,14 +3077,21 @@ private enum Gemma4FusedLayerGlue {
             residual.shape == x.shape, residual.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-norm-residual")
-        return normResidualKernel(
+        if x.dim(1) == 2 { CBv2EngageMark.once("glue-l2") }
+        let out = normResidualKernel(
             [x, residual, weight],
             template: [("T", x.dtype)],
-            grid: (rows * tgThreads, 1, 1),
+            grid: (rowCount(x) * tgThreads, 1, 1),
             threadGroup: (tgThreads, 1, 1),
-            outputShapes: [[rows, 1, axis]],
+            outputShapes: [[x.dim(0), x.dim(1), axis]],
             outputDTypes: [.bfloat16]
         )[0]
+        crossCheck("normResidual", wide: out) { c in
+            normResidual(
+                x: x[0..., c ..< (c + 1), 0...], residual: residual[0..., c ..< (c + 1), 0...],
+                weight: weight, eps: eps)
+        }
+        return out
     }
 
     struct AttentionBranchPrefix {
@@ -3097,17 +3166,23 @@ private enum Gemma4FusedLayerGlue {
         let outs = dualPreNormKernel(
             [x, w1, w2],
             template: [("T", x.dtype)],
-            grid: (rows * tgThreads, 1, 1),
+            grid: (rowCount(x) * tgThreads, 1, 1),
             threadGroup: (tgThreads, 1, 1),
             outputShapes: [
-                [rows, 1, axis],
-                [rows, 1, axis],
-                [(axis / 128) * 32 * rows],
+                [x.dim(0), x.dim(1), axis],
+                [x.dim(0), x.dim(1), axis],
+                [(axis / 128) * 32 * rowCount(x)],
             ],
             outputDTypes: [.bfloat16, .bfloat16, .float32]
         )
-        let sums = CBv2DenseMLPQMVV1.activationSums(
-            produced: outs[2], for: outs[0])
+        crossCheck("dualPreNorm.n1", wide: outs[0]) { c in
+            dualPreNorm(x: x[0..., c ..< (c + 1), 0...], w1: w1, w2: w2, eps: eps)?.0
+        }
+        crossCheck("dualPreNorm.n2", wide: outs[1]) { c in
+            dualPreNorm(x: x[0..., c ..< (c + 1), 0...], w1: w1, w2: w2, eps: eps)?.1
+        }
+        let sums = x.dim(1) == 1
+            ? CBv2DenseMLPQMVV1.activationSums(produced: outs[2], for: outs[0]) : nil
         return (outs[0], outs[1], sums)
     }
 
@@ -3341,9 +3416,9 @@ private enum Gemma4FusedLayerGlue {
                 nextInputNormWeight,
             ],
             template: [("T", mlpOut.dtype)],
-            grid: (rows * tgThreads, 1, 1),
+            grid: (rowCount(mlpOut) * tgThreads, 1, 1),
             threadGroup: (tgThreads, 1, 1),
-            outputShapes: [[rows, 1, axis], [rows, 1, axis]],
+            outputShapes: [[mlpOut.dim(0), mlpOut.dim(1), axis], [mlpOut.dim(0), mlpOut.dim(1), axis]],
             outputDTypes: [.bfloat16, .bfloat16]
         )
         return (outs[0], outs[1])
@@ -3374,9 +3449,9 @@ private enum Gemma4FusedLayerGlue {
                 expertRows.weights, residual, w1, w2, w3, layerScalar,
             ],
             template: [("T", mlpOut.dtype)],
-            grid: (rows * tgThreads, 1, 1),
+            grid: (rowCount(mlpOut) * tgThreads, 1, 1),
             threadGroup: (tgThreads, 1, 1),
-            outputShapes: [[rows, 1, axis]],
+            outputShapes: [[mlpOut.dim(0), mlpOut.dim(1), axis]],
             outputDTypes: [.bfloat16]
         )[0]
     }
@@ -3401,9 +3476,9 @@ private enum Gemma4FusedLayerGlue {
             [mlpOut, expertOut, residual, w1, w2, w3, layerScalar,
              nextInputNormWeight],
             template: [("T", mlpOut.dtype)],
-            grid: (rows * tgThreads, 1, 1),
+            grid: (rowCount(mlpOut) * tgThreads, 1, 1),
             threadGroup: (tgThreads, 1, 1),
-            outputShapes: [[rows, 1, axis], [rows, 1, axis]],
+            outputShapes: [[mlpOut.dim(0), mlpOut.dim(1), axis], [mlpOut.dim(0), mlpOut.dim(1), axis]],
             outputDTypes: [.bfloat16, .bfloat16]
         )
         return (outs[0], outs[1])
@@ -3426,12 +3501,80 @@ private enum Gemma4FusedLayerGlue {
         return selected(
             [mlpOut, expertOut, residual, w1, w2, w3, layerScalar],
             template: [("T", mlpOut.dtype)],
-            grid: (rows * tgThreads, 1, 1),
+            grid: (rowCount(mlpOut) * tgThreads, 1, 1),
             threadGroup: (tgThreads, 1, 1),
-            outputShapes: [[rows, 1, axis]],
+            outputShapes: [[mlpOut.dim(0), mlpOut.dim(1), axis]],
             outputDTypes: [.bfloat16]
         )[0]
     }
+}
+
+/// ROUTER-ROWS16. With speculation on, one decode round runs a single
+/// rectangular verify forward on `[B, 1 + k]` instead of the `[B, 1]` step. At
+/// the shipped draft depth (k = 1) the router sees `[8, 2, 2816]` -- SIXTEEN
+/// flat rows -- where the decode step sees `[8, 1, 2816]`.
+///
+/// The SELECTION stage already admits the rectangle (PREFILL-W1 mechanism 2
+/// hands `[8, L, 128]` to the same finalists network, one threadgroup per
+/// flattened row) and is per-row exact. The SCORE PRODUCER is not. `proj` is
+/// an 8-bit quantized matmul and MLX picks its arm from the row count against
+/// a DEVICE-DEPENDENT limit, `get_qmv_batch_limit(K = 2816, N = 128)`:
+///
+///   * eight rows  -> `M = 8  < limit` -> `qmv`, one threadgroup per row,
+///     one sequential K walk per output group;
+///   * sixteen rows -> `M = 16 >= limit` -> the matrix arm, and because the
+///     weights are transposed and the batch is one, `qmm_splitk`: the K range
+///     is CUT INTO PIECES, each piece accumulated separately in float, and the
+///     pieces summed by a second kernel.
+///
+/// Same products, different summation order, so the sixteen-row scores differ
+/// from the eight-row scores in the last bits. The router then takes the top
+/// eight of 128 by a total order on those bits: where two experts are within
+/// that difference of each other, the rectangle selects a DIFFERENT expert
+/// than the decode step would, and the verify column spends token budget on
+/// it. The limit is 12 on `applegpu_g16s` (this box) and 18 on the `...d`
+/// parts, so which side of it sixteen rows falls on is a property of the GPU,
+/// not of the model -- a fidelity difference that need not reproduce between
+/// the development box and the scoring box in either direction.
+///
+/// This arm pins the rectangle's projection to the eight-row arm by running it
+/// as TWO eight-row projections over the flattened rectangle's two contiguous
+/// eight-row halves, then concatenating. Each half is `[8, 2816]`, so `M = 8`
+/// and every row takes the identical `qmv` threadgroup, the identical
+/// `_batch_0` instantiation and the identical sequential K walk it takes on
+/// the decode step -- whatever the device limit is. Nothing else in the router
+/// moves: the RMS norm is one threadgroup per row, and `takeAlong`, the
+/// precise softmax and the per-expert scale are elementwise on the selected
+/// eight.
+///
+/// `DARKBLOOM_GEMMA4_ROUTER_ROWS16=0` restores the single wide projection in
+/// the same executable. The decode cell never reaches this code (the pin
+/// requires `dim(1) == 2`), takes the untouched `proj(normed)` call, and is
+/// byte-identical to the base. Engage mark: `router-rows16`.
+private enum Gemma4RouterRows16 {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ROUTER_ROWS16"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// ROUTER-ROWS16 receipt. `DARKBLOOM_GEMMA4_ROUTER_ROWS16_XCHECK=1` re-runs
+    /// every sixteen-row router call as the two eight-row decode-cell router
+    /// pipelines it must reproduce and reports the bit mismatch counts.
+    /// Synchronous and diagnostic; it adds dispatches, so it never shares a run
+    /// with a timing measurement. It runs on BOTH switch states, which is what
+    /// makes it the arm that has to move.
+    static let crossCheckEnabled: Bool =
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ROUTER_ROWS16_XCHECK"] == "1"
+
+    nonisolated(unsafe) static var crossCheckCalls = 0
+
+    static let batch = 8
+    /// The verify rectangle's column count at the shipped draft depth.
+    static let verifyColumns = 2
+    static let rows16 = 16
 }
 
 /// Expert router. Norms `x` with a learnable scale, projects to expert
@@ -3475,7 +3618,10 @@ private class Gemma4Router: Module {
             effScale = eff
         }
         let normed = MLXFast.rmsNorm(x, weight: effScale, eps: eps)
-        let expertScores = proj(normed)
+        // ROUTER-ROWS16: the MTP verify rectangle's score producer, pinned to
+        // the eight-row arm. nil for every other geometry -- the decode cell
+        // included -- and the untouched wide call stands.
+        let expertScores = rows16Scores(normed) ?? proj(normed)
 
         // ROUTE-001: single-dispatch byte-identical replacement of the chain
         // below for the B=8 decode geometry. Every other geometry, dtype, or
@@ -3512,7 +3658,118 @@ private class Gemma4Router: Module {
         // selection itself, never altering either.
         Gemma4RouterProbe.recorder?(expertScores, topKIndices)
 
+        if Gemma4RouterRows16.crossCheckEnabled {
+            rows16CrossCheck(
+                normed: normed, scores: expertScores,
+                indices: topKIndices, weights: topKWeights)
+        }
+
         return (topKIndices, topKWeights)
+    }
+
+    /// ROUTER-ROWS16: the rectangle's score producer. The flattened rectangle
+    /// is row-contiguous, so each contiguous eight-row half is a `[8, 2816]`
+    /// row-contiguous matrix and `proj` sees exactly the `M = 8` it sees on the
+    /// decode step. Returns nil for every geometry but the pinned rectangle,
+    /// and under the kill switch, so the caller keeps `proj(normed)`.
+    fileprivate func rows16Scores(_ normed: MLXArray) -> MLXArray? {
+        guard Gemma4RouterRows16.enabled,
+            normed.ndim == 3,
+            normed.dim(0) == Gemma4RouterRows16.batch,
+            normed.dim(1) == Gemma4RouterRows16.verifyColumns,
+            normed.dtype == .bfloat16
+        else { return nil }
+        let half = Gemma4RouterRows16.batch
+        let rows = Gemma4RouterRows16.rows16
+        let inDim = normed.dim(2)
+        let flat = normed.reshaped([rows, inDim])
+        let lower = proj(flat[0 ..< half])
+        let upper = proj(flat[half ..< rows])
+        guard lower.ndim == 2, upper.ndim == 2,
+            lower.dim(0) == half, upper.dim(0) == half,
+            lower.dim(1) == upper.dim(1)
+        else { return nil }
+        CBv2EngageMark.once("router-rows16")
+        return MLX.concatenated([lower, upper], axis: 0)
+            .reshaped([
+                Gemma4RouterRows16.batch, Gemma4RouterRows16.verifyColumns,
+                lower.dim(1),
+            ])
+    }
+
+    /// ROUTER-ROWS16 receipt. Re-run this sixteen-row router call as the two
+    /// EIGHT-ROW decode-cell pipelines it must reproduce -- once on the
+    /// rectangle's column-0 rows (flat rows 0, 2, ..., 14), once on its
+    /// column-1 rows -- through the identical `[8, 1, 2816]` geometry, the
+    /// identical `proj` call and the identical DECODE-CELL selection kernel
+    /// (`Gemma4RouterFinalistsV1.apply`, which is pinned to `dim(1) == 1` and
+    /// therefore cannot be re-entered from here), and report how many bit
+    /// patterns of the sixteen-row scores, expert ids and weights differ from
+    /// the eight-row products for the same rows.
+    fileprivate func rows16CrossCheck(
+        normed: MLXArray, scores: MLXArray, indices: MLXArray,
+        weights: MLXArray
+    ) {
+        let batch = Gemma4RouterRows16.batch
+        let rows = Gemma4RouterRows16.rows16
+        guard normed.ndim == 3, normed.dim(0) == batch,
+            normed.dim(1) == Gemma4RouterRows16.verifyColumns,
+            scores.ndim == 3, indices.ndim == 3, weights.ndim == 3,
+            scores.dim(0) == batch, indices.dim(0) == batch,
+            weights.dim(0) == batch
+        else { return }
+        let inDim = normed.dim(2)
+        let experts = scores.dim(2)
+        let selected = indices.dim(2)
+        let flatNormed = normed.reshaped([rows, inDim])
+        let flatScores = scores.reshaped([rows, experts])
+        let flatIndices = indices.reshaped([rows, selected])
+        let flatWeights = weights.reshaped([rows, selected])
+        var report =
+            "ROUTER-ROWS16 xcheck call=\(Gemma4RouterRows16.crossCheckCalls)"
+            + " rows16=\(Gemma4RouterRows16.enabled ? 1 : 0)"
+        for (label, start) in [("col0", 0), ("col1", 1)] {
+            let index = MLXArray((0 ..< batch).map { Int32(start + 2 * $0) })
+            let narrowNormed = flatNormed[index].reshaped([batch, 1, inDim])
+            let narrowScores = proj(narrowNormed)
+            let narrowIndices: MLXArray
+            if let sel = Gemma4RouterFinalistsV1.apply(
+                narrowScores, topK: topK, kth: kth)
+            {
+                narrowIndices = sel
+            } else {
+                report += " \(label)_SELECT_UNAVAILABLE"
+                let partition = MLX.argPartition(
+                    narrowScores, kth: kth, axis: -1)
+                narrowIndices = partition[.ellipsis, kth...]
+            }
+            var narrowWeights = MLX.takeAlong(
+                narrowScores, narrowIndices, axis: -1)
+            narrowWeights = MLX.softmax(narrowWeights, axis: -1, precise: true)
+            narrowWeights = narrowWeights * perExpertScale[narrowIndices]
+            let scoreMismatch = MLX.sum(
+                MLX.notEqual(
+                    flatScores[index].view(dtype: .uint16),
+                    narrowScores.reshaped([batch, experts]).view(
+                        dtype: .uint16))
+            ).item(Int32.self)
+            let idMismatch = MLX.sum(
+                MLX.notEqual(
+                    flatIndices[index].asType(.uint32),
+                    narrowIndices.reshaped([batch, selected]).asType(.uint32))
+            ).item(Int32.self)
+            let weightMismatch = MLX.sum(
+                MLX.notEqual(
+                    flatWeights[index].view(dtype: .uint16),
+                    narrowWeights.reshaped([batch, selected]).view(
+                        dtype: .uint16))
+            ).item(Int32.self)
+            report += " \(label)_scores=\(scoreMismatch)/\(batch * experts)"
+            report += " \(label)_ids=\(idMismatch)/\(batch * selected)"
+            report += " \(label)_wts=\(weightMismatch)/\(batch * selected)"
+        }
+        Gemma4RouterRows16.crossCheckCalls += 1
+        FileHandle.standardError.write(Data((report + "\n").utf8))
     }
 
     // MARK: ZIP-ROUTER-001 stages
@@ -3535,12 +3792,25 @@ private class Gemma4Router: Module {
     }
 
     fileprivate func zipScores(_ normed: MLXArray) -> MLXArray {
-        proj(normed)
+        // ZIP-ROUTER-ROWS16: the rectangle's projection is pinned to the
+        // eight-row `qmv` arm exactly as the unfused router pins it
+        // (ROUTER-ROWS16). nil for the decode cell, which keeps `proj`.
+        rows16Scores(normed) ?? proj(normed)
     }
 
     fileprivate func zipPartition(_ expertScores: MLXArray) -> MLXArray {
         if let selected = Gemma4RouterFinalistsV1.apply(
             expertScores, topK: topK, kth: kth)
+        {
+            return selected
+        }
+        // ZIP-ROUTER-ROWS16: `apply` is pinned to the decode cell's L == 1.
+        // The rectangle takes the identical kernel through the rectangle
+        // admission, one threadgroup per flattened row, so the ZIP chain
+        // selects with the same network the unfused rectangle selects with.
+        if Gemma4ZipRouterRows16.enabled,
+            let selected = Gemma4RouterFinalistsV1.applyPrefill(
+                expertScores, topK: topK, kth: kth)
         {
             return selected
         }
@@ -3552,7 +3822,10 @@ private class Gemma4Router: Module {
         // A depends node wrapped around it by ZIP plan2 keeps that shape and
         // remains the returned value, preserving the activated dependency.
         if topK == 8, kth == 120, partition.ndim == 3,
-            partition.dim(0) == 8, partition.dim(1) == 1,
+            partition.dim(0) == 8,
+            partition.dim(1) == 1
+                || (Gemma4ZipRouterRows16.enabled
+                    && partition.dim(1) == Gemma4RouterRows16.verifyColumns),
             partition.dim(2) == 8, partition.dtype == .uint32
         {
             return partition
@@ -3779,6 +4052,52 @@ private class Gemma4MLP: Module {
 /// it because the dense activation table (`CBv2DenseMLPQMVV1.activationSums`)
 /// returns nil there.
 // ZIP+MASK current-crown retry marker (newjordan r2); executable path retains the twice-sealed T25 schedule.
+/// ZIP-ROUTER-ROWS16. `Gemma4ZipRouterV1` emits the MoE layer's router chain
+/// and the independent dense-MLP chain INTERLEAVED, so MLX's concurrent Metal
+/// encoder pairs them into shared barrier stages: the router QMV runs beside
+/// the dense gate/up, the route selection beside the dense down projection.
+/// Its admission is a pure shape predicate pinned to `out.dim(1) == 1`, so the
+/// `[8, 2]` MTP verify rectangle walked away from it and ran the router chain
+/// and the dense chain as two SEPARATE dependent chains. On the integrated
+/// tree that is the last structural difference between the rectangle and the
+/// decode step: router + dense MLP + MoE cost 1.98x the `[8, 1]` chain, about
+/// 7 ms of a 41 ms verify forward, and the fusion is where the difference is.
+///
+/// Every stage the chain calls already admits sixteen rows on this tree --
+/// the fused pre-norms and the activation-sum table (GLUE-L2), the dense
+/// gate/up/down bodies (DMLP-ROWS16), the gather QMV (GATHER-QMV-R16) and the
+/// route table (ROUTER-ROWS16) -- so widening the admission changes WHEN the
+/// dispatches are encoded and nothing about WHAT they compute. Three call
+/// sites inside the chain were still pinned to the decode cell and are widened
+/// with it: the router projection takes the eight-row arm (ROUTER-ROWS16), the
+/// selection takes the same finalists network through the rectangle
+/// admission, and the compact-tail recogniser accepts the rectangle's shape.
+/// `MLX.depends` carries no value, so the fences the chain adds are ordering
+/// edges only.
+///
+/// `DARKBLOOM_GEMMA4_ZIP_ROUTER_ROWS16=0` restores the decline for the
+/// rectangle in the same executable; the decode cell does not read this switch
+/// and is byte-identical to the base. Engage mark: `zip-router-rows16`.
+private enum Gemma4ZipRouterRows16 {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ZIP_ROUTER_ROWS16"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// `DARKBLOOM_GEMMA4_ZIP_ROUTER_ROWS16_XCHECK=1` re-runs every admitted
+    /// rectangle BOTH ways -- through the unfused sixteen-row path the base
+    /// takes, and through the untouched EIGHT-ROW chain on each column -- and
+    /// reports the bit mismatch counts of every product the chain returns.
+    /// Synchronous and diagnostic; never shares a run with a timing draw.
+    static let crossCheckEnabled: Bool =
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ZIP_ROUTER_ROWS16_XCHECK"] == "1"
+
+    nonisolated(unsafe) static var crossCheckCalls = 0
+}
+
 private enum Gemma4ZipRouterV1 {
     static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
@@ -3849,9 +4168,13 @@ private enum Gemma4ZipRouterV1 {
         // below holds, so prefill, MTP rectangles and any other cohort walk
         // away from here without having built anything.
         guard enabled, router.zipAdmits,
-            out.ndim == 3, out.dim(0) == 8, out.dim(1) == 1,
+            out.ndim == 3, out.dim(0) == 8,
+            out.dim(1) == 1
+                || (Gemma4ZipRouterRows16.enabled
+                    && out.dim(1) == Gemma4RouterRows16.verifyColumns),
             out.dtype == .bfloat16
         else { return nil }
+        let isRectangle = out.dim(1) != 1
 
         // Stage 0, shared: the two pre-norms plus the exact dense activation
         // table. A nil here means this is not the fused-glue cell and no node
@@ -3947,12 +4270,95 @@ private enum Gemma4ZipRouterV1 {
             ? MLX.depends(input: n2, dependencies: [denseOut]) : n2
 
         CBv2EngageMark.once("zip-router")
+        if isRectangle { CBv2EngageMark.once("zip-router-rows16") }
+        if isRectangle, Gemma4ZipRouterRows16.crossCheckEnabled {
+            rows16CrossCheck(
+                router: router, mlp: mlp, out: out, w1: w1, w2: w2, eps: eps,
+                denseOut: denseOut, topKIndices: topKIndices,
+                topKWeights: topKWeights)
+        }
         return Zipped(
             denseOut: denseOut,
             expertNorm: expertNorm,
             topKIndices: topKIndices,
             topKWeights: topKWeights,
             routeTable: routeTable)
+    }
+}
+
+extension Gemma4ZipRouterV1 {
+    /// ZIP-ROUTER-ROWS16 receipt. Two references for the same rectangle:
+    ///
+    ///   * UNFUSED -- the path the base takes for `[8, 2]`: `router(out)` for
+    ///     the selection and weights, and `mlp(n1, activationSums:)` for the
+    ///     dense output, over the same fused pre-norms. Same kernels, emitted
+    ///     without the interleave and without the `MLX.depends` fences.
+    ///   * EIGHT-ROW -- this same fused chain run on the rectangle's column-0
+    ///     rows (flat 0, 2, ..., 14) and column-1 rows, each as a `[8, 1]`
+    ///     cell. Those inner calls carry `dim(1) == 1`, so they take the
+    ///     untouched decode chain and cannot re-enter this check.
+    fileprivate static func rows16CrossCheck(
+        router: Gemma4Router, mlp: Gemma4MLP, out: MLXArray,
+        w1: MLXArray, w2: MLXArray, eps: Float,
+        denseOut: MLXArray, topKIndices: MLXArray, topKWeights: MLXArray
+    ) {
+        let batch = Gemma4RouterRows16.batch
+        let rows = Gemma4RouterRows16.rows16
+        let hidden = out.dim(2)
+        let dense = denseOut.dim(2)
+        let selected = topKIndices.dim(2)
+        var report =
+            "ZIP-ROUTER-ROWS16 xcheck call=\(Gemma4ZipRouterRows16.crossCheckCalls)"
+        let flatDense = denseOut.reshaped([rows, dense])
+        let flatIdx = topKIndices.reshaped([rows, selected])
+        let flatWts = topKWeights.reshaped([rows, selected])
+
+        // (1) the unfused sixteen-row path
+        if let (n1, _, sums) = Gemma4FusedLayerGlue.dualPreNorm(
+            x: out, w1: w1, w2: w2, eps: eps)
+        {
+            let (uIdx, uWts) = router(out)
+            let uDense = mlp(n1, activationSums: sums)
+            let d = MLX.sum(MLX.notEqual(
+                flatDense.view(dtype: .uint16),
+                uDense.reshaped([rows, dense]).view(dtype: .uint16))).item(Int32.self)
+            let i = MLX.sum(MLX.notEqual(
+                flatIdx.asType(.uint32),
+                uIdx.reshaped([rows, selected]).asType(.uint32))).item(Int32.self)
+            let w = MLX.sum(MLX.notEqual(
+                flatWts.view(dtype: .uint16),
+                uWts.reshaped([rows, selected]).view(dtype: .uint16))).item(Int32.self)
+            report += " unfused_dense=\(d)/\(rows * dense)"
+            report += " unfused_ids=\(i)/\(rows * selected)"
+            report += " unfused_wts=\(w)/\(rows * selected)"
+        } else {
+            report += " unfused_UNAVAILABLE"
+        }
+
+        // (2) the untouched eight-row chain, per column
+        for (label, start) in [("col0", 0), ("col1", 1)] {
+            let index = MLXArray((0 ..< batch).map { Int32(start + 2 * $0) })
+            let narrowOut = out.reshaped([rows, hidden])[index]
+                .reshaped([batch, 1, hidden])
+            guard let z = run(
+                router: router, mlp: mlp, out: narrowOut,
+                w1: w1, w2: w2, eps: eps, prefix: nil)
+            else { report += " \(label)_UNAVAILABLE"; continue }
+            let d = MLX.sum(MLX.notEqual(
+                flatDense[index].view(dtype: .uint16),
+                z.denseOut.reshaped([batch, dense]).view(dtype: .uint16))).item(Int32.self)
+            let i = MLX.sum(MLX.notEqual(
+                flatIdx[index].asType(.uint32),
+                z.topKIndices.reshaped([batch, selected]).asType(.uint32))).item(Int32.self)
+            let w = MLX.sum(MLX.notEqual(
+                flatWts[index].view(dtype: .uint16),
+                z.topKWeights.reshaped([batch, selected]).view(dtype: .uint16))).item(Int32.self)
+            report += " \(label)_dense=\(d)/\(batch * dense)"
+            report += " \(label)_ids=\(i)/\(batch * selected)"
+            report += " \(label)_wts=\(w)/\(batch * selected)"
+        }
+        Gemma4ZipRouterRows16.crossCheckCalls += 1
+        FileHandle.standardError.write(Data((report + "\n").utf8))
     }
 }
 
@@ -4056,7 +4462,8 @@ public class Gemma4DecoderLayer: Module {
         isExpertPrefill: Bool = false,
         glueChain: Gemma4GlueChainBox? = nil,
         nextInputLayernormWeight: MLXArray? = nil,
-        enableAttentionBranchPrefix: Bool = false
+        enableAttentionBranchPrefix: Bool = false,
+        ringKV: CBv2MTPDrafterRingKV? = nil
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         // Prompt-path narrowing (CBv2 only): attention and every K/V write
         // still cover the full chunk; only the token-local work AFTER
@@ -4101,7 +4508,7 @@ public class Gemma4DecoderLayer: Module {
         let (attnOut, kvPair, attnPositionOffset) = selfAttn(
             h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset,
             v2SharedSource: v2SharedSource, outputStart: outputStart,
-            useLastQueryPrefill: useLastQueryPrefill)
+            useLastQueryPrefill: useLastQueryPrefill, ringKV: ringKV)
         // PREFIX-001: only build the joined producer when the ZIP consumer is
         // guaranteed to accept it. A nil leaves the established attention
         // residual and branch pre-norm paths untouched.
@@ -5826,6 +6233,9 @@ extension Gemma4TextModel: CBv2MTPForwardable {
         return (applyLMHead(postNorm), preNorm)
     }
 }
+
+// Ranked resample marker 2: this archive is a further ranked sample of the tree carried
+// by the preceding ranked submission of this content apart from any rotation item declared in its note.
 
 // Ranked resample marker 2: this archive is a further ranked sample of the tree carried
 // by the preceding ranked submission of this content apart from any rotation item declared in its note.

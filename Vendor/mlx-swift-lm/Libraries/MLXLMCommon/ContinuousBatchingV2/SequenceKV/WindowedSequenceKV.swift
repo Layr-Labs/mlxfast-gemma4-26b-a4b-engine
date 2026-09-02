@@ -133,6 +133,12 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// over the whole ring allocation are dead graph work. Static, read
     /// once per process like the switch it complements.
     static let q4BF16RingElideEnabled: Bool = {
+        // A speculative round stages its provisional writes from the BF16
+        // ring snapshot, and `stageSpeculativeUpdate` refuses a ring it has
+        // marked stale. Eliding the ring writes is therefore only available
+        // to the target-only policy; with speculation compiled on, the ring
+        // is a live reader and the elision must be off.
+        guard !CBv2MTPDepthController.speculationEnabled else { return false }
         guard let raw = ProcessInfo.processInfo.environment["MLX_KV_Q4_BF16_ELIDE"]
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
@@ -158,6 +164,30 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// Transaction opened by `beginSpeculativeWrite()` and closed by commit.
     /// Every intervening update stages instead of writing the ring.
     private var speculativeWriteArmed = false
+    /// SEQ-DECODE-ROAD: columns the decode road wrote IN PLACE (ring slot and
+    /// counters advanced) inside the armed transaction. Rolled back by a
+    /// counter rewind; nothing to commit.
+    private var inPlaceSpeculativeColumns = 0
+    /// SEQ-DECODE-ROAD: the drafter snapshots this row's BF16 ring at the next
+    /// round's capture, so a rolled-back column's overwrite of the evicted
+    /// slot must be undone here (the decode kernels never read that slot; the
+    /// drafter's `snapshot()` does). Set by the MTP driver on the capture
+    /// layer's rows only: eight small slice copies per round.
+    var drafterCaptureRow = false
+    private var savedEvictedSlots: [(slot: Int, keys: MLXArray, values: MLXArray)] = []
+
+    /// Called BEFORE the decode road writes column `inPlaceSpeculativeColumns`.
+    func beginInPlaceSpeculativeColumn() {
+        guard speculativeWriteArmed else { return }
+        if drafterCaptureRow, inPlaceSpeculativeColumns >= 1, let keys, let values {
+            let slot = absoluteOffset % window
+            savedEvictedSlots.append((
+                slot,
+                keys[.ellipsis, slot ..< (slot + 1), 0...] + 0,
+                values[.ellipsis, slot ..< (slot + 1), 0...] + 0))
+        }
+        inPlaceSpeculativeColumns += 1
+    }
 
     /// The accumulated speculative updates plus the absolute position the
     /// transaction started at. The ring writes
@@ -361,6 +391,8 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             "CBv2WindowedSequenceKV: beginSpeculativeWrite with a staged update pending — commit first"
         )
         speculativeWriteArmed = true
+        inPlaceSpeculativeColumns = 0
+        savedEvictedSlots.removeAll(keepingCapacity: true)
     }
 
     /// One update in the active transaction: return EXACTLY the views the
@@ -415,6 +447,8 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
 
     public func commitSpeculativeWrite() {
         speculativeWriteArmed = false
+        inPlaceSpeculativeColumns = 0
+        savedEvictedSlots.removeAll(keepingCapacity: true)
         guard let staged else { return }
         self.staged = nil
         // Confirmed range after finalize-time rollback: [basePosition,
@@ -551,6 +585,26 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
 
     public func rollback(_ n: Int) {
         precondition(n >= 0, "CBv2WindowedSequenceKV.rollback: negative n")
+        if speculativeWriteArmed, staged == nil, inPlaceSpeculativeColumns > 0 {
+            // SEQ-DECODE-ROAD: the rolled-back columns were written in place
+            // by the decode road on a FULL ring, each advancing both counters
+            // by one. Rewind both: the slots they overwrote are exactly the
+            // ones the next steps evict and never read, so the retained
+            // window is intact and the fused decode road stays admissible.
+            precondition(
+                n <= inPlaceSpeculativeColumns,
+                "CBv2WindowedSequenceKV.rollback(\(n)) exceeds in-place columns \(inPlaceSpeculativeColumns)")
+            absoluteOffset -= n
+            oldestValidPosition -= n
+            inPlaceSpeculativeColumns -= n
+            for _ in 0 ..< n {
+                guard let saved = savedEvictedSlots.popLast() else { break }
+                keys![.ellipsis, saved.slot ..< (saved.slot + 1), 0...] = saved.keys
+                values![.ellipsis, saved.slot ..< (saved.slot + 1), 0...] = saved.values
+            }
+            borrowableChunkViews = nil
+            return
+        }
         if let staged {
             // Pure counter move: the staged tokens were never written to
             // the ring, so nothing was destroyed and the retained window

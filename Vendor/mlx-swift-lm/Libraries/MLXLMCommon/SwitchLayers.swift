@@ -517,6 +517,28 @@ private let expertPrefixBoundsEnabled: Bool = {
 }()
 
 private let routeSortTile64 = 64
+
+/// GATHER-QMV-R16: admit the sixteen-row `[8, 2]` MTP verify rectangle to the
+/// same gather-QMV arms (RUN-QUAD / pair / triple / singles / down-tile) the
+/// eight-row decode cohort takes, with the SAME per-(row, expert) K loop, so
+/// each row's expert output is bit-identical to what the eight-row step
+/// produces for that row and the expert weight planes are streamed once per
+/// run instead of once per assignment. `DARKBLOOM_GEMMA4_GATHER_QMV_R16=0`
+/// restores the incumbent decline (materialised gather, stock per-assignment
+/// QMV) for the sixteen-row shape in the same executable; the eight-row path
+/// does not read this switch.
+private let gatherQmvR16Enabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_GATHER_QMV_R16"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// GATHER-QMV-R16 receipt: `DARKBLOOM_GEMMA4_GATHER_QMV_R16_XCHECK=1` also runs
+/// every sixteen-row call through the eight-row path twice (even rows, odd
+/// rows) and reports the bitwise mismatch count to stderr. Diagnostic only.
+private let gatherQmvR16CrossCheckEnabled: Bool =
+    ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_GATHER_QMV_R16_XCHECK"] == "1"
+nonisolated(unsafe) private var gatherQmvR16CrossCheckCalls = 0
 private let routeFusedScatterTopK = 8
 /// Key-space bound of the fused scatter's 256-entry counter table.
 let routeCountingSortKeyBound = 256
@@ -881,6 +903,133 @@ private let routeCsortPrefillScatterKernel: MLXFast.MLXFastKernel = MLXFast.meta
     ensureRowContiguous: true
 )
 
+/// ROUTER-ROWS16 rank-128. The exact decode cell's 64 route assignments are
+/// ranked in ONE dispatch (`mlx_lm_route_simd_rank_scatter_m8_u32_n64...`, or
+/// folded into the selection kernel by GLUE-FOLD). The MTP verify rectangle
+/// has 128 assignments -- one more than the 64-key tile the single-simdgroup
+/// kernel can broadcast -- so it falls to PREFILL-CSORT-128, which is THREE
+/// dispatches (per-block histogram, exclusive scan, scatter) on the layer's
+/// dependent chain, thirty times per verify forward.
+///
+/// 128 assignments still fit one threadgroup. This kernel stages the 128 keys
+/// in threadgroup memory and gives every assignment its own thread, which
+/// counts the keys that sort before it:
+///
+///     rank(i) = #{ j : k_j < k_i } + #{ j < i : k_j == k_i }
+///
+/// That is the definition of the stable sort position, so `row_order`,
+/// `sorted_keys` and `inverse_order` are the arrays `argSort` produces, key for
+/// key -- the same guarantee the counting sort carries, reached without the
+/// histogram/scan round trip. Only integer comparisons are performed; no
+/// floating-point value is read, produced or re-associated, and the loop bound
+/// and the write addresses do not depend on scheduling, so the outputs are a
+/// pure function of the input keys. `assignment >> 3` is the assignment's token
+/// row at top-K 8, which the pin below enforces.
+///
+/// `DARKBLOOM_GEMMA4_ROUTER_ROWS16=0` restores PREFILL-CSORT-128 for this
+/// geometry in the same executable; every other n keeps the arm it had.
+/// Engage mark: `route-rank128`.
+private let routeRank128Enabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_ROUTER_ROWS16"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// ROUTER-ROWS16 receipt: `DARKBLOOM_GEMMA4_ROUTER_ROWS16_XCHECK=1` also runs
+/// every rank-128 table through the `argSort` chain `gatherSortIndices` falls
+/// back to and reports the mismatch counts. Diagnostic only.
+private let routeRank128CrossCheckEnabled: Bool =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_ROUTER_ROWS16_XCHECK"] == "1"
+
+nonisolated(unsafe) private var routeRank128CrossCheckCalls = 0
+
+private let routeRank128Keys = 128
+
+private let routeRank128Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "mlx_lm_route_tg_rank_scatter_m8_u32_n128_v1",
+    inputNames: ["indices"],
+    outputNames: ["row_order", "sorted_keys", "inverse_order"],
+    source: """
+        const uint assignment = thread_position_in_threadgroup.x;
+        threadgroup uint tg_keys[128];
+        tg_keys[assignment] = (uint)indices[assignment];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint key = tg_keys[assignment];
+        uint rank = 0;
+        for (uint source = 0; source < 128u; ++source) {
+            const uint other = tg_keys[source];
+            rank += (other < key)
+                || (other == key && source < assignment);
+        }
+        row_order[rank] = assignment >> 3;
+        sorted_keys[rank] = key;
+        inverse_order[assignment] = rank;
+    """,
+    ensureRowContiguous: true
+)
+
+private func routeRank128CrossCheck(
+    _ indices: MLXArray,
+    m: Int,
+    table: (rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray)
+) {
+    let order = argSort(indices)
+    let refRowOrder = order.floorDivide(m).asType(.uint32)
+    let refSortedKeys = indices[order].asType(.uint32)
+    let refInverseOrder = argSort(order).asType(.uint32)
+    let n = routeRank128Keys
+    let rowMismatch = MLX.sum(
+        MLX.notEqual(table.rowOrder.asType(.uint32), refRowOrder)
+    ).item(Int32.self)
+    let keyMismatch = MLX.sum(
+        MLX.notEqual(table.sortedKeys.asType(.uint32), refSortedKeys)
+    ).item(Int32.self)
+    let invMismatch = MLX.sum(
+        MLX.notEqual(table.inverseOrder.asType(.uint32), refInverseOrder)
+    ).item(Int32.self)
+    let report =
+        "ROUTE-RANK128 xcheck call=\(routeRank128CrossCheckCalls)"
+        + " row_order=\(rowMismatch)/\(n)"
+        + " sorted_keys=\(keyMismatch)/\(n)"
+        + " inverse_order=\(invMismatch)/\(n)"
+    routeRank128CrossCheckCalls += 1
+    FileHandle.standardError.write(Data((report + "\n").utf8))
+}
+
+/// Returns nil (fail closed onto the incumbent arm) unless the geometry is
+/// exactly the sixteen-row verify rectangle's route table.
+private func routeRank128(
+    _ indices: MLXArray, m: Int, numExperts: Int
+) -> (rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray)? {
+    guard routeRank128Enabled,
+        indices.dtype == .uint32,
+        indices.ndim == 1,
+        indices.size == routeRank128Keys,
+        m == routeFusedScatterTopK,
+        numExperts > 0,
+        numExperts <= routeCountingSortKeyBound
+    else { return nil }
+    CBv2EngageMark.once("route-rank128")
+    let outputs = routeRank128Kernel(
+        [indices],
+        grid: (routeRank128Keys, 1, 1),
+        threadGroup: (routeRank128Keys, 1, 1),
+        outputShapes: [
+            [routeRank128Keys], [routeRank128Keys], [routeRank128Keys],
+        ],
+        outputDTypes: [.uint32, .uint32, .uint32]
+    )
+    let table = (
+        rowOrder: outputs[0], sortedKeys: outputs[1], inverseOrder: outputs[2]
+    )
+    if routeRank128CrossCheckEnabled {
+        routeRank128CrossCheck(indices, m: m, table: table)
+    }
+    return table
+}
+
 /// Exact stable counting sort of a flat uint32 route table. Returns nil (fail
 /// closed onto `argSort`) unless every precondition of the kernels holds.
 private func routeCountingSortPrefill(
@@ -1059,6 +1208,12 @@ public func gatherSortIndices(
             + "dtype=\(indices.dtype)"
     }
     if numExperts <= routeCountingSortKeyBound {
+        // ROUTER-ROWS16: the sixteen-row verify rectangle's 128 assignments in
+        // one threadgroup, `argSort`-identical, before PREFILL-CSORT-128's
+        // three dispatches are considered.
+        if let fused = routeRank128(indices, m: m, numExperts: numExperts) {
+            return (fused.rowOrder, fused.sortedKeys, fused.inverseOrder)
+        }
         // PREFILL-CSORT-128 owns everything wider than the retiled decode
         // cohort; ROUTE-CSORT-64 keeps the exact n = 64 geometry it was built
         // for (one threadgroup, no histogram/scan round trip).
@@ -1378,11 +1533,19 @@ public class SwitchGLU: Module {
         sortedPlane: SwitchSortedPlaneProducer? = nil,
         routeTable: SwitchRouteTable? = nil
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
-        let useLhsIndices =
+        let useEightRowLhsIndices =
             indices.size == 64 && indices.ndim == 2 && indices.shape == [8, 8]
             && x.ndim == 2 && x.shape == [8, inputDims]
+        // GATHER-QMV-R16: the sixteen-row rectangle rides the same arms; the
+        // route table comes from PREFILL-CSORT-128 (n = 128), untagged keys.
+        let useSixteenRowLhsIndices =
+            gatherQmvR16Enabled
+            && indices.size == 128 && indices.ndim == 2 && indices.shape == [16, 8]
+            && x.ndim == 2 && x.shape == [16, inputDims]
+        let useLhsIndices = useEightRowLhsIndices || useSixteenRowLhsIndices
+        if useSixteenRowLhsIndices { CBv2EngageMark.once("gather-qmv-r16") }
         let useExpertPrefixBounds =
-            expertPrefixBoundsEnabled && useLhsIndices
+            expertPrefixBoundsEnabled && useEightRowLhsIndices
             && indices.dtype == .uint32 && x.dtype == .bfloat16
             && expertPrefixBoundsProjectionsEligible
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
@@ -1572,6 +1735,35 @@ public class SwitchGLU: Module {
         return weightedExpertSum(MLX.squeezed(output, axis: -2), weights)
     }
 
+    /// GATHER-QMV-R16 receipt: run the sixteen-row call through the eight-row
+    /// path twice (even rows = verify column 0, odd rows = column 1) and count
+    /// bf16 bit patterns that differ from the sixteen-row output. Synchronous;
+    /// diagnostic only (`DARKBLOOM_GEMMA4_GATHER_QMV_R16_XCHECK=1`).
+    private func gatherQmvR16CrossCheck(
+        _ x: MLXArray, _ indices: MLXArray, weights: MLXArray
+    ) {
+        let wide = projectExperts(x, indices)
+        guard wide.sorted, let wideInverse = wide.inverseOrder else { return }
+        let wideOut = weightedExpertUnsort(
+            sortedOutputs: MLX.squeezed(wide.output, axis: -2),
+            inverseOrder: wideInverse, weights: weights)
+        var report = "GATHER-QMV-R16 xcheck call=\(gatherQmvR16CrossCheckCalls)"
+        for (label, start) in [("col0", 0), ("col1", 1)] {
+            let rows = MLXArray((0 ..< 8).map { Int32(start + 2 * $0) })
+            let narrow = projectExperts(x[rows], indices[rows])
+            guard narrow.sorted, let narrowInverse = narrow.inverseOrder else { return }
+            let narrowOut = weightedExpertUnsort(
+                sortedOutputs: MLX.squeezed(narrow.output, axis: -2),
+                inverseOrder: narrowInverse, weights: weights[rows])
+            let wideBits = wideOut[rows].view(dtype: .uint16)
+            let narrowBits = narrowOut.view(dtype: .uint16)
+            let mismatches = MLX.sum(MLX.notEqual(wideBits, narrowBits)).item(Int32.self)
+            report += " \(label)_mismatch=\(mismatches)/\(narrowBits.size)"
+        }
+        gatherQmvR16CrossCheckCalls += 1
+        FileHandle.standardError.write((report + "\n").data(using: .utf8)!)
+    }
+
     private func supportsWeightedExpertUnsort(
         _ x: MLXArray, _ indices: MLXArray, weights: MLXArray
     ) -> Bool {
@@ -1684,7 +1876,13 @@ public class SwitchGLU: Module {
         // and smaller serving cohorts remain on their established reduction.
         let isEightRowDecode =
             !isProductionPrefill && x.dim(0) == 8 && indices.size == 64
-        guard fuseSortedReduction && (isProductionPrefill || isEightRowDecode),
+        // GATHER-QMV-R16: the sixteen-row `[8, 2]` verify rectangle takes the
+        // same sorted projection and the same per-row weighted unsort fold.
+        let isSixteenRowVerify =
+            gatherQmvR16Enabled && !isProductionPrefill
+            && x.dim(0) == 16 && indices.size == 128
+        guard fuseSortedReduction
+                && (isProductionPrefill || isEightRowDecode || isSixteenRowVerify),
             supportsWeightedExpertUnsort(x, indices, weights: weights)
         else {
             return (
@@ -1694,6 +1892,9 @@ public class SwitchGLU: Module {
             )
         }
 
+        if isSixteenRowVerify && gatherQmvR16CrossCheckEnabled {
+            gatherQmvR16CrossCheck(x, indices, weights: weights)
+        }
         let projected = projectExperts(x, indices, sortedPlane: sortedPlane)
         guard projected.sorted,
             let inverseOrder = projected.inverseOrder,

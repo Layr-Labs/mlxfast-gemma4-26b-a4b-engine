@@ -5,6 +5,45 @@
 import Foundation
 import MLX
 
+/// MTP-SETUP-CACHE. Every round hands the step's `asyncEval` a list of
+/// evaluation roots for the caches the round mutated. The non-speculative
+/// `[B, 1]` decode step builds that list through
+/// `CBv2SteppableModel.compactDecodeEvaluationRoots`: the forward's own
+/// output, the one shared position-offset chain, and one ring-write fence per
+/// layer -- 32 handles for a 30-layer, 8-row bank, and the census mark
+/// `compact-decode-roots rows=8 layers=30 roots=32` is that door firing on the
+/// crown's decode road. The MTP round never took it. It called
+/// `eagerCacheInnerState` instead, which walks every layer and every row and
+/// rebuilds the FULL per-row inner state -- for this bank 25 sliding layers x
+/// (2 + 8 rows x 3 buffers) + 5 full layers x (2 + 8 rows x 2) = roughly 740
+/// `MLXArray` handles, constructed and then handed to `asyncEval`, once per
+/// round, every round.
+///
+/// This switch routes the round's decode-shaped groups through the SAME door,
+/// with the same model-side proof obligation (`forwardOutput` dominates every
+/// cache mutation it represents) and the same fail-closed guard: the compact
+/// builder returns nil unless the model affirms the contract over an
+/// all-owning, all-contiguous bank with one shared position state, and nil
+/// keeps the established full list verbatim. It is a HOST-side change only:
+/// which arrays are NAMED as roots, never a value that any of them holds.
+///
+/// `DARKBLOOM_GEMMA4_MTP_SETUP_CACHE=0` restores `eagerCacheInnerState` at
+/// every call site in the same executable.
+enum CBv2MTPSetupCache {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MTP_SETUP_CACHE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+    /// Census only. When `MLXFAST_ENGAGE_MARKS` is set the mark carries BOTH
+    /// counts, so the census is a measurement of the mechanism and not just
+    /// evidence that a branch was taken (R13): the full list is built once,
+    /// beside the compact one, purely to be counted. Never on a timing run.
+    static let marksArmed =
+        ProcessInfo.processInfo.environment["MLXFAST_ENGAGE_MARKS"] != nil
+}
+
 struct CBv2MTPRowWork {
     let rec: CBv2ScheduledRequest
     let start: Int
@@ -101,7 +140,10 @@ extension EngineLoopV2 {
                 .reshaped([decodeRows.count, 1])
             let caches = eagerCaches(rowStates: decodeRows.map { kvStates[$0.rec.id]! })
             let (logits, hidden) = mtp.model.forwardWithHidden(tokens: inputs, caches: caches)
-            cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
+            // MTP-SETUP-CACHE: this group IS the `[B, 1]` decode cell, so it
+            // takes the decode step's own compact-root door.
+            cacheInnerState.append(
+                contentsOf: mtpEvaluationRoots(caches, forwardOutput: logits))
             decodeSampled = sampler.sample(
                 logits: logits[0..., -1, 0...],
                 params: decodeRows.map(\.rec.request.sampling),
@@ -236,22 +278,44 @@ extension EngineLoopV2 {
             // `mtpFreezeCaptures` below is what actually enforces it.
             let fullRow = state[mtp.captureLayers.full]!
             let slidingRow = state[mtp.captureLayers.sliding]!
+            (slidingRow as? CBv2WindowedSequenceKV)?.drafterCaptureRow = true
             precondition(
                 fullRow.absoluteOffset == carry.kvOffset,
                 "CBv2 MTP: verify row anchor \(fullRow.absoluteOffset) != carry \(carry.kvOffset)"
             )
             let fullSnapshot = fullRow.snapshot()
-            let slidingSnapshot = slidingRow.snapshot()
-            captures.append(
-                CBv2MTPRowCapture(
-                    fullKeys: fullSnapshot.keys,
-                    fullValues: fullSnapshot.values,
-                    slidingKeys: slidingSnapshot.keys,
-                    slidingValues: slidingSnapshot.values,
-                    slidingStart: slidingRow.absoluteOffset - slidingRow.retainedCount,
-                    anchor: fullRow.absoluteOffset))
-            captured.append((fullRow, fullSnapshot.keys, fullSnapshot.values))
-            captured.append((slidingRow, slidingSnapshot.keys, slidingSnapshot.values))
+            // DRAFTER-RING-ATTN: a full sliding ring is handed to the drafter as
+            // its retained allocation + oldest slot (no temporal-order gather);
+            // the drafter's sliding layers attend it through the decode ring
+            // kernel. DARKBLOOM_GEMMA4_DRAFTER_RING_ATTN=0 restores the snapshot.
+            if Self.drafterRingAttnEnabled,
+                let ringRow = slidingRow as? CBv2WindowedSequenceKV,
+                let ring = ringRow.decodeRingView
+            {
+                CBv2EngageMark.once("drafter-ring-attn")
+                captures.append(
+                    CBv2MTPRowCapture(
+                        fullKeys: fullSnapshot.keys,
+                        fullValues: fullSnapshot.values,
+                        slidingKeys: ring.keys,
+                        slidingValues: ring.values,
+                        slidingStart: slidingRow.absoluteOffset - slidingRow.retainedCount,
+                        anchor: fullRow.absoluteOffset,
+                        slidingRing: (ring.keys, ring.values, ring.start)))
+                captured.append((fullRow, fullSnapshot.keys, fullSnapshot.values))
+            } else {
+                let slidingSnapshot = slidingRow.snapshot()
+                captures.append(
+                    CBv2MTPRowCapture(
+                        fullKeys: fullSnapshot.keys,
+                        fullValues: fullSnapshot.values,
+                        slidingKeys: slidingSnapshot.keys,
+                        slidingValues: slidingSnapshot.values,
+                        slidingStart: slidingRow.absoluteOffset - slidingRow.retainedCount,
+                        anchor: fullRow.absoluteOffset))
+                captured.append((fullRow, fullSnapshot.keys, fullSnapshot.values))
+                captured.append((slidingRow, slidingSnapshot.keys, slidingSnapshot.values))
+            }
             rowMetadata.append(
                 CBv2MTPRoundInFlight.VerifyRow(
                     id: row.rec.id, storageRows: state.compactMap { $0 }))
@@ -267,9 +331,16 @@ extension EngineLoopV2 {
         var draftHidden = concatenated(carryHiddens, axis: 0)
         var draftSteps: [MLXArray] = []
         draftSteps.reserveCapacity(k)
+        // Diagnostic split of the round into its draft and its verify forward.
+        // Armed by `DARKBLOOM_MTP1_TIMING=1`; the evals it adds are what make
+        // the split measurable, so it never shares a run with a decode-window
+        // measurement and is inert on the scored path.
+        let mtp1Timing = ProcessInfo.processInfo.environment["DARKBLOOM_MTP1_TIMING"] == "1"
+        let mtp1T0 = CFAbsoluteTimeGetCurrent()
         for _ in 0 ..< k {
             let (next, nextHidden) = mtp.drafter.draftStep(
                 tokens: draftInput, hidden: draftHidden, prepared: prepared)
+            if mtp1Timing { eval(next, nextHidden) }
             draftSteps.append(next)
             draftInput = next.reshaped([batch, 1])
             draftHidden = nextHidden
@@ -287,8 +358,15 @@ extension EngineLoopV2 {
             for sequence in metadata.storageRows { sequence.beginSpeculativeWrite() }
         }
         let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
+        let mtp1T1 = CFAbsoluteTimeGetCurrent()
         let target = mtpBuildTargetVerification(
             columns: targetColumns, rows: verifyRows, driver: mtp)
+        if mtp1Timing {
+            eval(target.argmax, target.hidden)
+            let mtp1T2 = CFAbsoluteTimeGetCurrent()
+            FileHandle.standardError.write(
+                Data("MTP1 timing: k=\(k) draft_ms=\(Int((mtp1T1 - mtp1T0) * 1000)) verify_ms=\(Int((mtp1T2 - mtp1T1) * 1000))\n".utf8))
+        }
         cacheInnerState.append(contentsOf: target.cacheInnerState)
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
@@ -303,9 +381,37 @@ extension EngineLoopV2 {
             lastHidden: target.hidden)
     }
 
+    /// MTP-SETUP-CACHE: the round's evaluation roots for one decode-shaped
+    /// group. `forwardOutput` is the root the group's own forward produced;
+    /// the compact builder is the same one the non-speculative decode step
+    /// uses and it fails closed to the established full inner state.
+    func mtpEvaluationRoots(
+        _ caches: [CBv2AttendingLayerCache], forwardOutput: MLXArray
+    ) -> [MLXArray] {
+        guard CBv2MTPSetupCache.enabled,
+            let compact = model.compactDecodeEvaluationRoots(
+                forwardOutput: forwardOutput, caches: caches)
+        else { return eagerCacheInnerState(caches) }
+        if CBv2MTPSetupCache.marksArmed {
+            CBv2EngageMark.once(
+                "mtp-setup-cache roots=\(compact.count) "
+                    + "full=\(eagerCacheInnerState(caches).count) "
+                    + "layers=\(caches.count)")
+        } else {
+            CBv2EngageMark.once("mtp-setup-cache")
+        }
+        return compact
+    }
+
     /// Freeze the round's pre-write KV captures against the in-place writes
     /// the very same graph is about to perform. See `CBv2MTPCaptureFence`
     /// for the hazard and the mechanism.
+    static let drafterRingAttnEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DRAFTER_RING_ATTN"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private func mtpFreezeCaptures(
         _ captured: [(row: CBv2SequenceKV, keys: MLXArray, values: MLXArray)]
     ) {

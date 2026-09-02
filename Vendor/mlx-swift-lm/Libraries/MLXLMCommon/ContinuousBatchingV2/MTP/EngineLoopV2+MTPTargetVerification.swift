@@ -27,9 +27,23 @@ extension EngineLoopV2 {
         let caches = eagerCaches(rowStates: rows.map { kvStates[$0.rec.id]! })
         let argmax: MLXArray
         let hidden: MLXArray
+        // MTP-SETUP-CACHE: non-nil only on the rectangular road, where the
+        // round's `[B, 1 + k]` forward is one decode-shaped graph whose logits
+        // dominate every cache mutation it made. The serial oracle evaluates
+        // each column separately and keeps the established root list.
+        var rectangularForwardOutput: MLXArray?
 
         var useRectangular = switch mtp.config.verificationMode {
-        case .serialTarget: false
+        // DARKBLOOM_GEMMA4_MTP_RECT_PROBE: under the sealed serial_target mode the
+        // round's 1+k columns are verified by ONE [B, 1+k] forward instead of
+        // 1+k serial [B, 1] forwards; `false` restores the serial oracle verbatim.
+        // The sealed mode's 1+k separate target forwards are the oracle, never a
+        // plan: they emit at most 1+k tokens for 1+k forwards, which is strictly
+        // worse than plain decode. Every column of the rectangle is computed with
+        // the canonical `L == 1` attention (`mtpSerializesRectangularAttention`),
+        // so a column's attention is the same arithmetic the serial oracle would
+        // run for it; only the weight-bound body batches across columns.
+        case .serialTarget: CBv2MTPDepthController.DARKBLOOM_GEMMA4_MTP_RECT_PROBE
         case .rectangular: true
         case .automatic:
             columns.count * columns[0].dim(0) <= mtp.config.maxAutomaticRectangularTokens
@@ -90,8 +104,15 @@ extension EngineLoopV2 {
             let output = mtp.model.forwardWithHidden(tokens: tokens, caches: caches)
             argmax = argMax(output.logits, axis: -1).asType(.int32)
             hidden = output.lastHidden
+            rectangularForwardOutput = output.logits
         }
 
-        return (argmax, hidden, eagerCacheInnerState(caches))
+        guard let rectangularForwardOutput else {
+            return (argmax, hidden, eagerCacheInnerState(caches))
+        }
+        return (
+            argmax, hidden,
+            mtpEvaluationRoots(caches, forwardOutput: rectangularForwardOutput)
+        )
     }
 }

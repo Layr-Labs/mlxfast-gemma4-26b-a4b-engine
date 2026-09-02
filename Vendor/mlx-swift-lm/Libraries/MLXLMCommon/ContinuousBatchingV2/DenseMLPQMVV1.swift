@@ -140,8 +140,72 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// DMLP-ROWS16. With speculation on, one decode round runs a single
+    /// rectangular verify forward on `[B, 1 + k]` instead of the `[B, 1]`
+    /// step. At the shipped depth (k = 1) that is `[8, 2]` -- SIXTEEN flat
+    /// rows through the same dense MLP planes. The promoted bodies decline
+    /// the rectangle on `x.dim(1) == sequence` alone and it falls to generic
+    /// MLX, so the whole verify forward costs 82 ms against the 21 ms the
+    /// eight-row step costs.
+    ///
+    /// This arm admits the rectangle to the SAME kernels at sixteen rows.
+    /// Every row keeps its own accumulators and its own K walk, textually the
+    /// walk the eight-row body runs, so each flat row's output is bit-identical
+    /// to what the eight-row step produces for that row -- the property that
+    /// lets a verify column cost zero token budget. The weight planes are read
+    /// once for sixteen rows instead of once for eight.
+    ///
+    /// `DARKBLOOM_GEMMA4_DMLP_ROWS16=0` restores the incumbent decline for the
+    /// sixteen-row shape in the same executable. The eight-row path does not
+    /// read this switch, takes kernels whose names and source text this ticket
+    /// does not touch, and is byte-identical to the base.
+    public static let rows16Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_DMLP_ROWS16"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// DMLP-ROWS16 receipt. `DARKBLOOM_GEMMA4_DMLP_ROWS16_XCHECK=1` re-runs
+    /// every sixteen-row dense MLP call through the eight-row path twice --
+    /// once on the rectangle's column-0 rows, once on its column-1 rows -- and
+    /// reports the count of bf16 bit patterns that differ. Synchronous and
+    /// diagnostic only; it adds dispatches, so it never shares a run with a
+    /// timing measurement.
+    private static let rows16CrossCheckEnabled: Bool =
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_DMLP_ROWS16_XCHECK"] == "1"
+
+    nonisolated(unsafe) private static var rows16CrossCheckCalls = 0
+
+    /// Stable FNV-1a fingerprint of a kernel's own header and source text,
+    /// emitted from INSIDE the closure that builds the text rather than beside
+    /// the branch that selects it, so the mark is evidence that this exact text
+    /// was handed to the Metal compiler. Armed by `MLXFAST_ENGAGE_MARKS`, inert
+    /// otherwise.
+    private static func sourceFingerprint(_ text: String) -> String {
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in text.utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x0000_0100_0000_01B3
+        }
+        return String(hash, radix: 16)
+    }
+
+    @inline(__always)
+    private static func markKernelSource(
+        _ tag: String, header: String, source: String
+    ) -> String {
+        CBv2EngageMark.once(
+            "\(tag) fp=\(sourceFingerprint(header + "\u{0}" + source))")
+        return source
+    }
+
     private static let batch = 8
     private static let sequence = 1
+    /// The verify rectangle's column count at the shipped draft depth.
+    private static let verifyColumns = 2
+    private static let rows16 = 16
     private static let groupSize = 64
     private static let bits = 8
     private static let rowsPerGroup = 4
@@ -156,6 +220,11 @@ public enum CBv2DenseMLPQMVV1 {
     /// whose exact B8/L1/K2816 gate also pins the table geometry.
     public struct ActivationSums {
         fileprivate let values: MLXArray
+        /// Flat row count the table was built for: 8 for the decode step, 16
+        /// for the `[8, 2]` verify rectangle. The table's row stride is this
+        /// value, so a consumer that reads it with the wrong stride reads the
+        /// wrong lane; `matmul` refuses a table whose count is not its own.
+        fileprivate let rows: Int
 
         /// ZIP-ROUTER-001 ordering handle. Read-only view of the table's own
         /// output array so a caller can name this dispatch as an
@@ -892,11 +961,13 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         header: mma8DownLaneSumHeader,
         ensureRowContiguous: true)
 
-    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_v2_unroll",
-        inputNames: ["x", "w", "scales", "biases"],
-        outputNames: ["y"],
-        source: """
+    /// The two quad-stream launch bodies, lifted out of the four
+    /// `MLXFast.metalKernel` calls that already carried them so the sixteen-row
+    /// twins can be DERIVED from them by one checked substitution instead of
+    /// transcribed. The text is character for character the promoted text; the
+    /// four eight-row kernels below still receive exactly the string they
+    /// received before, under exactly the names they had.
+    private static let quadStreamSource: String = """
             const uint3 tid = threadgroup_position_in_grid;
             const uint simd_gid = simdgroup_index_in_threadgroup;
             const uint simd_lid = thread_index_in_simdgroup;
@@ -924,41 +995,9 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
                 simd_gid,
                 simd_lid);
             return;
-            """,
-        header: kernelHeader,
-        ensureRowContiguous: true
-    )
+            """
 
-    /// One exact float sum for each `(K/128 block, simd lane, cohort row)`.
-    /// The expression is the bits==8 arm of stock `load_vector`: a float zero
-    /// followed by four ascending `sum += bf16` operations. Row is the unit-
-    /// stride dimension so one table serves both gate and up projections.
-    private static let activationSumKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_affine8_xsum_v2_unroll",
-        inputNames: ["x"],
-        outputNames: ["xSums"],
-        source: """
-            const uint lane = thread_position_in_grid.x;
-            const uint k_block = thread_position_in_grid.y;
-            const uint row = thread_position_in_grid.z;
-            const int in_vec_size = x_shape[x_ndim - 1];
-            const device T* xp =
-                x + row * in_vec_size + k_block * 128 + lane * 4;
-            float sum = 0.0f;
-            #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                sum += xp[i];
-            }
-            xSums[(k_block * 32 + lane) * 8 + row] = sum;
-            """,
-        ensureRowContiguous: true
-    )
-
-    private static let activationSumQMVKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_v2_unroll",
-        inputNames: ["x", "w", "scales", "biases", "xSums"],
-        outputNames: ["y"],
-        source: """
+    private static let quadStreamXSumSource: String = """
             const uint3 tid = threadgroup_position_in_grid;
             const uint simd_gid = simdgroup_index_in_threadgroup;
             const uint simd_lid = thread_index_in_simdgroup;
@@ -987,7 +1026,109 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
                 simd_gid,
                 simd_lid);
             return;
-            """,
+            """
+
+    /// DMLP-ROWS16: the sixteen-row launch body. One substitution -- the
+    /// x-group bound -- and nothing else. `first_m` is still `tid.x * 4`, the
+    /// four rows an x-group owns are still four adjacent flat rows at the same
+    /// stride, and the impl call, its operands, its `in_vec_size` and its
+    /// simd reductions are the promoted text. Groups 2 and 3 (`first_m` 8 and
+    /// 12) did nothing but return on the eight-row grid; here they carry the
+    /// rectangle's second half.
+    private static func rows16Source(_ source: String) -> String {
+        let old = "if (first_m >= 8) {"
+        precondition(
+            source.components(separatedBy: old).count == 2,
+            "DMLP-ROWS16 quad-stream x-group bound is missing")
+        return source.replacingOccurrences(of: old, with: "if (first_m >= 16) {")
+    }
+
+    /// DMLP-ROWS16: the activation-sum table's ROW STRIDE is the cohort row
+    /// count, so a sixteen-row table is read with a stride of sixteen. The
+    /// lane, the K block and the row a term is read from are unchanged, so the
+    /// float this body consumes for a given row is the same float the eight-row
+    /// body consumes for that row; only the address it sits at moves.
+    private static func rows16XSumHeader(_ header: String) -> String {
+        let old = "+ int(simd_lid)) * 8 + first_m"
+        precondition(
+            header.components(separatedBy: old).count == 9,
+            "DMLP-ROWS16 xsum row stride markers are missing")
+        return header.replacingOccurrences(
+            of: old, with: "+ int(simd_lid)) * 16 + first_m")
+    }
+
+    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_v2_unroll",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: markKernelSource(
+            "dmlp-fp-quad", header: kernelHeader, source: quadStreamSource),
+        header: kernelHeader,
+        ensureRowContiguous: true
+    )
+
+    /// The promoted producer body, named so its sixteen-row twin can be
+    /// derived from it by one checked substitution. Character for character
+    /// the text the promoted kernel already carried.
+    private static let activationSumSource: String = """
+            const uint lane = thread_position_in_grid.x;
+            const uint k_block = thread_position_in_grid.y;
+            const uint row = thread_position_in_grid.z;
+            const int in_vec_size = x_shape[x_ndim - 1];
+            const device T* xp =
+                x + row * in_vec_size + k_block * 128 + lane * 4;
+            float sum = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                sum += xp[i];
+            }
+            xSums[(k_block * 32 + lane) * 8 + row] = sum;
+            """
+
+    private static func rows16XSumProducerSource(_ source: String) -> String {
+        let old = "xSums[(k_block * 32 + lane) * 8 + row] = sum;"
+        precondition(
+            source.components(separatedBy: old).count == 2,
+            "DMLP-ROWS16 xsum producer store is missing")
+        return source.replacingOccurrences(
+            of: old, with: "xSums[(k_block * 32 + lane) * 16 + row] = sum;")
+    }
+
+    /// One exact float sum for each `(K/128 block, simd lane, cohort row)`.
+    /// The expression is the bits==8 arm of stock `load_vector`: a float zero
+    /// followed by four ascending `sum += bf16` operations. Row is the unit-
+    /// stride dimension so one table serves both gate and up projections.
+    private static let activationSumKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_affine8_xsum_v2_unroll",
+        inputNames: ["x"],
+        outputNames: ["xSums"],
+        source: markKernelSource(
+            "dmlp-fp-xsum-producer", header: "", source: activationSumSource),
+        ensureRowContiguous: true
+    )
+
+    /// DMLP-ROWS16 producer. The sum a row's lane accumulates is formed by the
+    /// same four ascending `sum += bf16` operations over the same four
+    /// activation values, so the float stored for a given row is bit-identical
+    /// to the eight-row table's. Only the table's ROW STRIDE moves, from eight
+    /// to sixteen, because sixteen rows now share one table.
+    private static let activationSumRows16Kernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "cbv2_b8_l2_dense_mlp_affine8_xsum_rows16_v1",
+            inputNames: ["x"],
+            outputNames: ["xSums"],
+            source: markKernelSource(
+                "dmlp-fp-xsum-producer-rows16", header: "",
+                source: rows16XSumProducerSource(activationSumSource)),
+            ensureRowContiguous: true
+        )
+
+    private static let activationSumQMVKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_v2_unroll",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["y"],
+        source: markKernelSource(
+            "dmlp-fp-quad-xsum", header: activationSumKernelHeader, source: quadStreamXSumSource),
         header: activationSumKernelHeader,
         ensureRowContiguous: true
     )
@@ -1062,35 +1203,8 @@ inline U qdot_affine8_registered_v4(
         name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_w4_v1",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
-        source: """
-            const uint3 tid = threadgroup_position_in_grid;
-            const uint simd_gid = simdgroup_index_in_threadgroup;
-            const uint simd_lid = thread_index_in_simdgroup;
-
-            const int in_vec_size = x_shape[x_ndim - 1];
-            const int out_vec_size = w_shape[0];
-            const int first_m = int(tid.x) * 4;
-            if (first_m >= 8) {
-                return;
-            }
-            qmv_affine8_g64_quad_stream_impl<T, 64, 8>(
-                w,
-                scales,
-                biases,
-                x + first_m * in_vec_size,
-                x + (first_m + 1) * in_vec_size,
-                x + (first_m + 2) * in_vec_size,
-                x + (first_m + 3) * in_vec_size,
-                y + first_m * out_vec_size,
-                y + (first_m + 1) * out_vec_size,
-                y + (first_m + 2) * out_vec_size,
-                y + (first_m + 3) * out_vec_size,
-                in_vec_size,
-                tid,
-                simd_gid,
-                simd_lid);
-            return;
-            """,
+        source: markKernelSource(
+            "dmlp-fp-quad-w4", header: w4KernelHeader, source: quadStreamSource),
         header: w4KernelHeader,
         ensureRowContiguous: true
     )
@@ -1099,39 +1213,217 @@ inline U qdot_affine8_registered_v4(
         name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_w4_v1",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["y"],
-        source: """
-            const uint3 tid = threadgroup_position_in_grid;
-            const uint simd_gid = simdgroup_index_in_threadgroup;
-            const uint simd_lid = thread_index_in_simdgroup;
-
-            const int in_vec_size = x_shape[x_ndim - 1];
-            const int out_vec_size = w_shape[0];
-            const int first_m = int(tid.x) * 4;
-            if (first_m >= 8) {
-                return;
-            }
-            qmv_affine8_g64_quad_stream_xsum_impl<T, 64, 8>(
-                w,
-                scales,
-                biases,
-                xSums,
-                x + first_m * in_vec_size,
-                x + (first_m + 1) * in_vec_size,
-                x + (first_m + 2) * in_vec_size,
-                x + (first_m + 3) * in_vec_size,
-                y + first_m * out_vec_size,
-                y + (first_m + 1) * out_vec_size,
-                y + (first_m + 2) * out_vec_size,
-                y + (first_m + 3) * out_vec_size,
-                in_vec_size,
-                tid,
-                simd_gid,
-                simd_lid);
-            return;
-            """,
+        source: markKernelSource(
+            "dmlp-fp-quad-xsum-w4", header: w4ActivationSumKernelHeader, source: quadStreamXSumSource),
         header: w4ActivationSumKernelHeader,
         ensureRowContiguous: true
     )
+
+
+    // MARK: - DMLP-ROWS16 sixteen-row twins
+    //
+    // Four gate/up launches and one down launch, one per configuration the
+    // eight-row road can be in. Each is a SEPARATE kernel with its own name, so
+    // a name-keyed compiled-kernel cache can never serve one row count's body
+    // to the other, and the eight-row kernels above keep their names and their
+    // source text unchanged.
+
+    private static let rows16XSumKernelHeader: String =
+        rows16XSumHeader(activationSumKernelHeader)
+
+    private static let w4Rows16XSumKernelHeader: String =
+        rows16XSumHeader(w4ActivationSumKernelHeader)
+
+    private static let rows16Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l2_dense_mlp_qmv_affine8_g64_quad_stream_rows16_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: markKernelSource(
+            "dmlp-fp-quad-rows16", header: kernelHeader,
+            source: rows16Source(quadStreamSource)),
+        header: kernelHeader,
+        ensureRowContiguous: true
+    )
+
+    private static let rows16ActivationSumQMVKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "cbv2_b8_l2_dense_mlp_qmv_affine8_g64_quad_stream_xsum_rows16_v1",
+            inputNames: ["x", "w", "scales", "biases", "xSums"],
+            outputNames: ["y"],
+            source: markKernelSource(
+                "dmlp-fp-quad-xsum-rows16", header: rows16XSumKernelHeader,
+                source: rows16Source(quadStreamXSumSource)),
+            header: rows16XSumKernelHeader,
+            ensureRowContiguous: true
+        )
+
+    private static let w4Rows16Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l2_dense_mlp_qmv_affine8_g64_quad_stream_w4_rows16_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: markKernelSource(
+            "dmlp-fp-quad-w4-rows16", header: w4KernelHeader,
+            source: rows16Source(quadStreamSource)),
+        header: w4KernelHeader,
+        ensureRowContiguous: true
+    )
+
+    private static let w4Rows16ActivationSumQMVKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "cbv2_b8_l2_dense_mlp_qmv_affine8_g64_quad_stream_xsum_w4_rows16_v1",
+            inputNames: ["x", "w", "scales", "biases", "xSums"],
+            outputNames: ["y"],
+            source: markKernelSource(
+                "dmlp-fp-quad-xsum-w4-rows16", header: w4Rows16XSumKernelHeader,
+                source: rows16Source(quadStreamXSumSource)),
+            header: w4Rows16XSumKernelHeader,
+            ensureRowContiguous: true
+        )
+
+    /// DMLP-ROWS16-DOWN. The down plane's matrix-unit body carries the cohort
+    /// rows on the FRAGMENT COLUMN axis: lane `(fm, fn)` reads x rows `fn` and
+    /// `fn + 1`, so one `simdgroup_float8x8` chain serves exactly eight rows.
+    /// Sixteen rows are therefore TWO M tiles, and this body runs both from one
+    /// weight fetch: the second tile's x pointers are the first tile's plus
+    /// `8 * K`, and everything else about a tile -- its own `C`, its own run
+    /// sums, its own pair of accumulators, its own half of the threadgroup
+    /// reduction slab and its own close -- is private to it.
+    ///
+    /// Bit-exactness. Tile 0's statements are the donor's, character for
+    /// character; tile 1's are the same statements over the same-shaped
+    /// operands, and the two macros it expands through differ from the donor's
+    /// only in taking the activation registers and the accumulator matrix as
+    /// parameters instead of naming them. Both tiles walk the identical `g`
+    /// range in the identical order, consume the same `wv`, `s` and `b` a
+    /// register carry already produced, and close with the identical
+    /// `acc += s * C.thread_elements()[i] + rs[i] * b`. Every output word is
+    /// therefore the float sum the eight-row kernel accumulates for that row,
+    /// in the same order, and the plane is streamed once instead of twice.
+    private static let mma8DownStaticKRows16Header: String = {
+        let marker =
+            "template <typename T, int KS>\n"
+            + "METAL_FUNC void gemma4_qmv_mma8_affine8_g64_down_k2112_impl("
+        guard let range = mma8DownStaticKHeader.range(of: marker) else {
+            preconditionFailure("DMLP-ROWS16 down donor body is missing")
+        }
+        var body = String(mma8DownStaticKHeader[range.lowerBound...])
+        func replaceExactly(_ old: String, _ new: String, _ count: Int) {
+            precondition(
+                body.components(separatedBy: old).count == count + 1,
+                "DMLP-ROWS16 down donor drift")
+            body = body.replacingOccurrences(of: old, with: new)
+        }
+        replaceExactly(
+            "gemma4_qmv_mma8_affine8_g64_down_k2112_impl(",
+            "gemma4_qmv_mma8_affine8_g64_down_k2112_m16_impl(", 1)
+        replaceExactly(
+            "  const device T* x0 = x + c.fn * K + 8 * c.fm;\n"
+                + "  const device T* x1 = x0 + K;\n",
+            "  const device T* x0 = x + c.fn * K + 8 * c.fm;\n"
+                + "  const device T* x1 = x0 + K;\n"
+                + "  const device T* x0b = x0 + 8 * K;\n"
+                + "  const device T* x1b = x1 + 8 * K;\n", 1)
+        replaceExactly(
+            "  float acc0 = 0.0f;\n  float acc1 = 0.0f;\n",
+            "  float acc0 = 0.0f;\n  float acc1 = 0.0f;\n"
+                + "  float acc0b = 0.0f;\n  float acc1b = 0.0f;\n", 1)
+        replaceExactly(
+            "    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));\n"
+                + "    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));\n",
+            "    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));\n"
+                + "    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));\n"
+                + "    const uint4 r0b = *((const device uint4*)(x0b + 64 * g));\n"
+                + "    const uint4 r1b = *((const device uint4*)(x1b + 64 * g));\n",
+            1)
+        replaceExactly(
+            "    float2 rs = float2(mma8_runsum8<T>(r0), mma8_runsum8<T>(r1));\n"
+                + "    rs += simd_shuffle_xor(rs, 2u);\n"
+                + "    rs += simd_shuffle_xor(rs, 4u);\n"
+                + "    rs += simd_shuffle_xor(rs, 16u);\n",
+            "    float2 rs = float2(mma8_runsum8<T>(r0), mma8_runsum8<T>(r1));\n"
+                + "    rs += simd_shuffle_xor(rs, 2u);\n"
+                + "    rs += simd_shuffle_xor(rs, 4u);\n"
+                + "    rs += simd_shuffle_xor(rs, 16u);\n"
+                + "    float2 rsb = float2(mma8_runsum8<T>(r0b), mma8_runsum8<T>(r1b));\n"
+                + "    rsb += simd_shuffle_xor(rsb, 2u);\n"
+                + "    rsb += simd_shuffle_xor(rsb, 4u);\n"
+                + "    rsb += simd_shuffle_xor(rsb, 16u);\n", 1)
+        replaceExactly(
+            "    acc0 += s * C.thread_elements()[0] + rs.x * b;\n"
+                + "    acc1 += s * C.thread_elements()[1] + rs.y * b;\n",
+            "    acc0 += s * C.thread_elements()[0] + rs.x * b;\n"
+                + "    acc1 += s * C.thread_elements()[1] + rs.y * b;\n"
+                + "\n"
+                + "    simdgroup_float8x8 Cb = simdgroup_float8x8(0.0f);\n"
+                + "    MMA8_SETB_M(B0, r0b, r1b, x, lo)\n"
+                + "    MMA8_STEP8_M(B0, Cb, x, z, 0)\n"
+                + "    MMA8_SETB_M(B1, r0b, r1b, x, hi)\n"
+                + "    MMA8_STEP8_M(B1, Cb, x, z, 8)\n"
+                + "    MMA8_SETB_M(B2, r0b, r1b, y, lo)\n"
+                + "    MMA8_STEP8_M(B2, Cb, x, z, 16)\n"
+                + "    MMA8_SETB_M(B3, r0b, r1b, y, hi)\n"
+                + "    MMA8_STEP8_M(B3, Cb, x, z, 24)\n"
+                + "    MMA8_SETB_M(B4, r0b, r1b, z, lo)\n"
+                + "    MMA8_STEP8_M(B4, Cb, y, w, 0)\n"
+                + "    MMA8_SETB_M(B5, r0b, r1b, z, hi)\n"
+                + "    MMA8_STEP8_M(B5, Cb, y, w, 8)\n"
+                + "    MMA8_SETB_M(B6, r0b, r1b, w, lo)\n"
+                + "    MMA8_STEP8_M(B6, Cb, y, w, 16)\n"
+                + "    MMA8_SETB_M(B7, r0b, r1b, w, hi)\n"
+                + "    MMA8_STEP8_M(B7, Cb, y, w, 24)\n"
+                + "\n"
+                + "    acc0b += s * Cb.thread_elements()[0] + rsb.x * b;\n"
+                + "    acc1b += s * Cb.thread_elements()[1] + rsb.y * b;\n", 1)
+        replaceExactly(
+            "      red[simd_lid] = float2(acc0, acc1);\n",
+            "      red[simd_lid] = float2(acc0, acc1);\n"
+                + "      red[32 + simd_lid] = float2(acc0b, acc1b);\n", 1)
+        replaceExactly(
+            "    const float2 other = red[simd_lid];\n"
+                + "    acc0 = acc0 + other.x;\n"
+                + "    acc1 = acc1 + other.y;\n",
+            "    const float2 other = red[simd_lid];\n"
+                + "    acc0 = acc0 + other.x;\n"
+                + "    acc1 = acc1 + other.y;\n"
+                + "    const float2 otherb = red[32 + simd_lid];\n"
+                + "    acc0b = acc0b + otherb.x;\n"
+                + "    acc1b = acc1b + otherb.y;\n", 1)
+        replaceExactly(
+            "  y[c.fn * N + n0 + c.fm] = static_cast<T>(acc0);\n"
+                + "  y[(c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc1);\n",
+            "  y[c.fn * N + n0 + c.fm] = static_cast<T>(acc0);\n"
+                + "  y[(c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc1);\n"
+                + "  y[(8 + c.fn) * N + n0 + c.fm] = static_cast<T>(acc0b);\n"
+                + "  y[(9 + c.fn) * N + n0 + c.fm] = static_cast<T>(acc1b);\n", 1)
+        // The donor's own two macros with the activation registers and the
+        // accumulator matrix as parameters. Expanded, tile 1's statements are
+        // the donor's statements with `r0`/`r1`/`C` renamed.
+        let macros = """
+
+#define MMA8_SETB_M(BB, RA, RB, W, HI) BB.thread_elements()[0] = mma8_##HI<T>(RA.W); BB.thread_elements()[1] = mma8_##HI<T>(RB.W);
+#define MMA8_STEP8_M(BB, CC, WLO, WHI, SH) A.thread_elements()[0] = float(extract_bits(wv.WLO, (SH), 8)); A.thread_elements()[1] = float(extract_bits(wv.WHI, (SH), 8)); simdgroup_multiply_accumulate(CC, A, BB, CC);
+
+"""
+        return mma8DownStaticKHeader + macros + body
+    }()
+
+    private static let mma8DownStaticKRows16Kernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l2_dense_mlp_mma8_affine8_g64_down_k2112_carry2_bfill_rows16_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: markKernelSource(
+            "dmlp-fp-down-rows16", header: mma8DownStaticKRows16Header,
+            source: """
+                const uint3 tid = threadgroup_position_in_grid;
+                threadgroup float2 red[64];
+                gemma4_qmv_mma8_affine8_g64_down_k2112_m16_impl<T, 2>(
+                    w, scales, biases, x, y,
+                    w_shape[0], int(tid.y) * 8, red,
+                    simdgroup_index_in_threadgroup,
+                    thread_index_in_simdgroup);
+                """),
+        header: mma8DownStaticKRows16Header,
+        ensureRowContiguous: true)
 
     @inline(__always)
     private static func liveShape(inDim: Int, outDim: Int) -> Bool {
@@ -1148,20 +1440,32 @@ inline U qdot_affine8_registered_v4(
             x.dtype == .bfloat16,
             x.ndim == 3,
             x.dim(0) == batch,
-            x.dim(1) == sequence,
             x.dim(2) == 2816,
-            x.size == batch * sequence * 2816
+            let rows = flatRows(x)
         else { return nil }
+        guard x.size == rows * 2816 else { return nil }
         let blocks = 2816 / kBlock
-        let values = activationSumKernel(
+        let values = (rows == batch ? activationSumKernel : activationSumRows16Kernel)(
             [x],
             template: [("T", x.dtype)],
-            grid: (simdWidth, blocks, batch),
+            grid: (simdWidth, blocks, rows),
             threadGroup: (simdWidth, 1, 1),
-            outputShapes: [[blocks * simdWidth * batch]],
+            outputShapes: [[blocks * simdWidth * rows]],
             outputDTypes: [.float32]
         )[0]
-        return ActivationSums(values: values)
+        return ActivationSums(values: values, rows: rows)
+    }
+
+    /// The flat row count this file will serve for `x`: `batch` for the decode
+    /// step, `batch * verifyColumns` for the MTP verify rectangle, `nil` for
+    /// every other length. The rectangle is admitted only while DMLP-ROWS16 is
+    /// on; with the switch off this returns `nil` for it and the caller keeps
+    /// the incumbent decline.
+    @inline(__always)
+    private static func flatRows(_ x: MLXArray) -> Int? {
+        if x.dim(1) == sequence { return batch }
+        if rows16Enabled && x.dim(1) == verifyColumns { return batch * verifyColumns }
+        return nil
     }
 
     /// Adopts an exact producer-emitted table for the same pinned decode
@@ -1184,7 +1488,7 @@ inline U qdot_affine8_registered_v4(
             values.ndim == 1,
             values.size == blocks * simdWidth * batch
         else { return nil }
-        return ActivationSums(values: values)
+        return ActivationSums(values: values, rows: batch)
     }
 
     /// Returns `nil` unless every production pin holds. The caller then invokes
@@ -1210,8 +1514,9 @@ inline U qdot_affine8_registered_v4(
             weight.dtype == .uint32,
             x.ndim == 3,
             x.dim(0) == batch,
-            x.dim(1) == sequence
+            let rows = flatRows(x)
         else { return nil }
+        let columns = x.dim(1)
 
         let inDim = x.dim(2)
         guard weight.ndim == 2 else { return nil }
@@ -1219,7 +1524,7 @@ inline U qdot_affine8_registered_v4(
         guard liveShape(inDim: inDim, outDim: outDim),
             inDim % Self.groupSize == 0,
             outDim % outputsPerGroup == 0,
-            x.size == batch * sequence * inDim,
+            x.size == rows * inDim,
             weight.dim(1) == inDim * Self.bits / 32,
             scales.shape == [outDim, inDim / Self.groupSize],
             biases.shape == scales.shape
@@ -1239,6 +1544,32 @@ inline U qdot_affine8_registered_v4(
         let isGateUp = inDim == 2816 && outDim == 2112
         if isGateUp ? mma8GateUpEnabled : mma8DownEnabled {
             let yTiles = outDim / outputsPerGroup
+            if rows != batch {
+                // DMLP-ROWS16-DOWN. Only the SHIPPED matrix-unit arm has a
+                // sixteen-row twin: the down plane's static-K carry body. The
+                // opt-in gate/up arm and the opt-in lane-sum arm have no
+                // sixteen-row body, so the rectangle declines here and keeps
+                // the stock path for them, exactly as it did before this
+                // ticket. Neither is the scored configuration.
+                guard !isGateUp, !mma8DownLaneSumsEnabled, mma8DownStaticKEnabled
+                else { return nil }
+                CBv2EngageMark.once("dmlp-rows16-down")
+                let wide = mma8DownStaticKRows16Kernel(
+                    [x, weight, scales, biases],
+                    template: [("T", x.dtype)],
+                    grid: (simdWidth, yTiles * simdGroups, 1),
+                    threadGroup: (simdWidth, simdGroups, 1),
+                    outputShapes: [[batch, columns, outDim]],
+                    outputDTypes: [x.dtype]
+                )[0]
+                if rows16CrossCheckEnabled {
+                    rows16CrossCheck(
+                        wide: wide, x: x, weight: weight, scales: scales,
+                        biases: biases, inDim: inDim, outDim: outDim,
+                        plane: "down-mma8")
+                }
+                return wide
+            }
             if !isGateUp && mma8DownLaneSumsEnabled {
                 let groups = inDim / Self.groupSize
                 let laneSums = mma8DownLaneSumKernel(
@@ -1270,30 +1601,101 @@ inline U qdot_affine8_registered_v4(
             )[0]
         }
 
-        let xGroups = batch / rowsPerGroup
+        let xGroups = rows / rowsPerGroup
         let yGroups = outDim / outputsPerGroup
-        let useActivationSums = activationSums != nil
+        // A table built for one row count is read with that count as its row
+        // stride, so a table whose count is not this call's is refused and the
+        // call keeps the sum-free body.
+        let useActivationSums = activationSums?.rows == rows
             && inDim == 2816
             && outDim == 2112
         if w4Enabled {
             CBv2EngageMark.once("mlp-w4-load")
         }
+        let wide = rows != batch
+        if wide {
+            CBv2EngageMark.once(
+                useActivationSums ? "dmlp-rows16-xsum" : "dmlp-rows16")
+        }
         let selected: MLXFast.MLXFastKernel
         if useActivationSums {
-            selected = w4Enabled ? w4ActivationSumQMVKernel : activationSumQMVKernel
+            if wide {
+                selected = w4Enabled
+                    ? w4Rows16ActivationSumQMVKernel : rows16ActivationSumQMVKernel
+            } else {
+                selected = w4Enabled ? w4ActivationSumQMVKernel : activationSumQMVKernel
+            }
         } else {
-            selected = w4Enabled ? w4Kernel : kernel
+            if wide {
+                selected = w4Enabled ? w4Rows16Kernel : rows16Kernel
+            } else {
+                selected = w4Enabled ? w4Kernel : kernel
+            }
         }
         let inputs = useActivationSums
             ? [x, weight, scales, biases, activationSums!.values]
             : [x, weight, scales, biases]
-        return selected(
+        let y = selected(
             inputs,
             template: [("T", x.dtype)],
             grid: (xGroups * simdWidth, yGroups * simdGroups, 1),
             threadGroup: (simdWidth, simdGroups, 1),
-            outputShapes: [[batch, sequence, outDim]],
+            outputShapes: [[batch, columns, outDim]],
             outputDTypes: [x.dtype]
         )[0]
+        if wide && rows16CrossCheckEnabled {
+            rows16CrossCheck(
+                wide: y, x: x, weight: weight, scales: scales, biases: biases,
+                inDim: inDim, outDim: outDim,
+                plane: isGateUp ? "gateup-quad" : "down-quad")
+        }
+        return y
+    }
+
+    /// DMLP-ROWS16 receipt. Re-run this sixteen-row call through the eight-row
+    /// road twice -- once on the rectangle's column-0 rows (flat rows 0, 2, ...,
+    /// 14), once on its column-1 rows -- and report how many bf16 BIT PATTERNS
+    /// of the sixteen-row output differ from the eight-row output for the same
+    /// rows. The inner calls carry `x.dim(1) == 1`, so they take the untouched
+    /// eight-row kernels and cannot re-enter this check. Synchronous and
+    /// diagnostic; it adds dispatches and never shares a run with a timing
+    /// measurement.
+    private static func rows16CrossCheck(
+        wide: MLXArray,
+        x: MLXArray,
+        weight: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray,
+        inDim: Int,
+        outDim: Int,
+        plane: String
+    ) {
+        let flatX = x.reshaped([rows16, inDim])
+        let flatY = wide.reshaped([rows16, outDim])
+        var report =
+            "DMLP-ROWS16 xcheck call=\(rows16CrossCheckCalls) plane=\(plane)"
+        for (label, start) in [("col0", 0), ("col1", 1)] {
+            let index = MLXArray((0 ..< batch).map { Int32(start + 2 * $0) })
+            let narrowX = flatX[index].reshaped([batch, sequence, inDim])
+            guard let narrowY = matmul(
+                x: narrowX,
+                weight: weight,
+                scales: scales,
+                biases: biases,
+                groupSize: groupSize,
+                bits: bits,
+                mode: .affine,
+                activationSums: activationSums(for: narrowX))
+            else {
+                report += " \(label)_UNAVAILABLE"
+                continue
+            }
+            let wideBits = flatY[index].view(dtype: .uint16)
+            let narrowBits = narrowY.reshaped([batch, outDim]).view(dtype: .uint16)
+            let mismatches = MLX.sum(MLX.notEqual(wideBits, narrowBits)).item(Int32.self)
+            report += " \(label)_mismatch=\(mismatches)/\(narrowBits.size)"
+        }
+        rows16CrossCheckCalls += 1
+        FileHandle.standardError.write(Data((report + "\n").utf8))
     }
 }

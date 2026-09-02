@@ -56,7 +56,17 @@ final class CBv2MTPDepthController {
     /// removes those rounds. Every committed token is still produced by an
     /// ordinary target decode step, so the emitted stream stays bit-identical
     /// to serial decode.
-    static let speculationEnabled = false
+    /// DARKBLOOM_GEMMA4_MTP_RECT_PROBE -- compile-time switch for the depth-1
+    /// rectangular-verify probe. `false` restores the incumbent target-only
+    /// policy verbatim: this constant and the three sites that read it (the
+    /// verify-mode switch, the forced-depth branch below and the BF16 ring
+    /// elide default) are the whole switch.
+    static let DARKBLOOM_GEMMA4_MTP_RECT_PROBE = true
+    static let speculationEnabled = DARKBLOOM_GEMMA4_MTP_RECT_PROBE
+    /// Probe policy: every eligible round drafts exactly this many tokens.
+    /// There is no adaptive fallback to depth 0 -- the sample measures the
+    /// drafter's acceptance on the ranked box, not the controller's opinion.
+    static let probeFixedDepth = 1
 
     private struct CostState {
         var samples = 0
@@ -324,6 +334,13 @@ final class CBv2MTPDepthController {
                     depth: 0, decodeRowBucket: bucket,
                     reason: maxDepth == 0 ? "max_depth_zero" : "ineligible",
                     isExploration: false),
+                mutate: mutate)
+        }
+        if Self.DARKBLOOM_GEMMA4_MTP_RECT_PROBE {
+            return finish(
+                CBv2MTPDepthDecision(
+                    depth: min(Self.probeFixedDepth, maxDepth), decodeRowBucket: bucket,
+                    reason: "probe_fixed", isExploration: false),
                 mutate: mutate)
         }
         if let fixedDepth {

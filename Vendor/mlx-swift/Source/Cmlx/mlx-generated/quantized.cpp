@@ -3909,6 +3909,21 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
 // per-assignment quantized_matmul oracle and vs the untiled arm at
 // K = 704, N = 2816, 64 assignments over 128 experts, M = 8, spans 4 and
 // 2, 3 seeds, NaN-filled outputs (parity-down-tile, 2026-08-28).
+//
+// SPAN = 2 since DOWN-QUAD-SPAN (2026-09-01). The span had only ever been
+// compared 2/4/8 under a single-shot timing; an interleaved round-robin of
+// five separate builds -- {pair, quad} election x {1, 2, 4} span, eight
+// rounds each, one process per (arm, round), GPU lock held for the whole
+// sweep -- puts span 2 at a 77.48 us median against span 4's 82.92 us over
+// 32 real B = 8 routings (-6.6%), with EVERY span-2 round faster than
+// EVERY span-4 round; the single-routing ranked case is a wash. The same
+// sweep re-measured the quad election that was promoted and reverted at
+// a1b0e62: it is 3% slower at span 1 and 46-81% slower at spans 2 and 4,
+// even though it streams 23.3% fewer weight bytes (47.95 -> 36.80 MB per
+// layer, median over 400 real routings). So the pair election stays and
+// only the walk shortens. Span moves WHEN bytes are read, never how many:
+// the survivor count falls by the span and the tiles each survivor walks
+// rises by it, so the byte count is span-invariant by construction.
 template <typename T, int group_size, int bits>
 METAL_FUNC void gather_qmv_gemma4_down_tile(
     const device uint32_t* w,
@@ -3929,7 +3944,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int gemma4_down_tile_span = 4; // sweep alternate: 2
+  constexpr int gemma4_down_tile_span = 2; // sweep alternate: 4
   if (tid.y % uint(gemma4_down_tile_span) != 0u) {
     return;
   }

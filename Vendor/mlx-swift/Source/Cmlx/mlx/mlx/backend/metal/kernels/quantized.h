@@ -3982,20 +3982,58 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     }
     return;
   }
+  // KERN-DOWN-SINGLES: the pairless tile walk streamed its weight plane
+  // through the stock `qmv_impl`, whose K-loop bound, `in_vec_size_w`,
+  // `in_vec_size_g` and block advances are all functions of a runtime
+  // `constant int&`, and whose bits == 4 arm issues each row's weight run as
+  // two adjacent `uint16_t` loads per block. This is the arm that carries the
+  // majority of the K = 704 down plane -- diverse routing leaves most of the
+  // 64 sorted assignments at run length 1 -- and it is the plane already
+  // measured moving its unique bytes at ~390 GB/s while the K = 2816 gate/up
+  // gathers reach 479-589 GB/s.
+  //
+  // `qmv_affine4_g64_singles_impl` is that same body: same two-simdgroup by
+  // four-row geometry, same `used_out_row` clamp, same per-row accumulator,
+  // same `simd_sum` and store, and its tail is `qmv_impl`'s own -- its header
+  // already names down_proj K = 704 (192 = 24 whole lane packets) as a case
+  // that fixed tail covers. KFIX = 704 folds the trip count (two whole
+  // blocks), both row strides and every block advance into compile-time
+  // constants; WVEC issues each row's weight run as ONE 32-bit load per block
+  // instead of two 16-bit loads. Only the SHAPE of the loads changes: every
+  // output element keeps the add sequence `qmv_impl` produced for it.
+  //
+  // Flip to false to restore the stock body. The two arms are bit-identical
+  // by construction and the K = 704 plane stays on this down-tile arm either
+  // way.
+  constexpr bool gemma4_down_singles = true;
   for (int t = 0; t < gemma4_down_tile_span; t++) {
     uint3 tile_tid = tid;
     tile_tid.y = tid.y + uint(t);
-    qmv_impl<T, group_size, bits>(
-        tile_w,
-        tile_scales,
-        tile_biases,
-        tile_x0,
-        tile_y0,
-        in_vec_size,
-        out_vec_size,
-        tile_tid,
-        simd_gid,
-        simd_lid);
+    if (gemma4_down_singles) {
+      qmv_affine4_g64_singles_impl<T, group_size, bits, 704, true, false>(
+          tile_w,
+          tile_scales,
+          tile_biases,
+          tile_x0,
+          tile_y0,
+          in_vec_size,
+          out_vec_size,
+          tile_tid,
+          simd_gid,
+          simd_lid);
+    } else {
+      qmv_impl<T, group_size, bits>(
+          tile_w,
+          tile_scales,
+          tile_biases,
+          tile_x0,
+          tile_y0,
+          in_vec_size,
+          out_vec_size,
+          tile_tid,
+          simd_gid,
+          simd_lid);
+    }
   }
 }
 

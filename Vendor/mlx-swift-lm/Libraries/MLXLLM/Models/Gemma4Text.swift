@@ -4486,7 +4486,7 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
     private static let eps: Float = 1e-6
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_final_rmsnorm_mma_xsum_2816_bf16_v1",
+        name: "gemma4_final_rmsnorm_mma_xsum_2816_bf16_v1_nb1",
         inputNames: ["x", "w"],
         outputNames: ["out", "xSums"],
         source: """
@@ -4508,16 +4508,13 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
                 acc += xi * xi;
             }
             acc = simd_sum(acc);
-            if (simd_group_id == 0) {
-                local_sums[simd_lane_id] = 0.0f;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
             if (simd_lane_id == 0) {
                 local_sums[simd_group_id] = acc;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (simd_group_id == 0) {
-                acc = simd_sum(local_sums[simd_lane_id]);
+                acc = simd_sum(
+                    simd_lane_id < 22 ? local_sums[simd_lane_id] : 0.0f);
                 if (simd_lane_id == 0) {
                     local_inv[0] =
                         metal::precise::rsqrt(acc / 2816.0f + 1e-06f);

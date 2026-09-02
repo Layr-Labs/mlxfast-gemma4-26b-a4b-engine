@@ -2552,7 +2552,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// over the 128 score rows; the CALLER sizes the threadgroup exactly
     /// like softmax.cpp:64-68 (32·ceil(ceil(kL/4)/32)). params[0] = kL.
     private static let softmaxKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_softmax_bf16_v1",
+        name: "cbv2_ragged8_sdpa_d512_softmax_bf16_v1_nb1",
         inputNames: ["scores", "params"],
         outputNames: ["probs"],
         source: """
@@ -2578,11 +2578,10 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                         ? static_cast<float>(in[i]) : -INFINITY;
                 }
             }
-            if (simd_group_id == 0) {
-                local_max[simd_lane_id] = -INFINITY;
-                local_normalizer[simd_lane_id] = 0.0f;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // Active simdgroups for this axis; mirrors the host-side
+            // softmaxThreads/32 formula. Lanes above sg read their identity
+            // constants directly, so no zero-fill pass is needed.
+            const int sg = ((axis_size + 3) / 4 + 31) / 32;
 
             float maxval = -3.402823466e+38F;
             for (int i = 0; i < 4; i++) {
@@ -2594,7 +2593,8 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (simd_group_id == 0) {
-                maxval = simd_max(local_max[simd_lane_id]);
+                maxval = simd_max(
+                    simd_lane_id < sg ? local_max[simd_lane_id] : -INFINITY);
                 if (simd_lane_id == 0) {
                     local_max[0] = maxval;
                 }
@@ -2614,7 +2614,8 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (simd_group_id == 0) {
-                normalizer = simd_sum(local_normalizer[simd_lane_id]);
+                normalizer = simd_sum(
+                    simd_lane_id < sg ? local_normalizer[simd_lane_id] : 0.0f);
                 if (simd_lane_id == 0) {
                     local_normalizer[0] = normalizer;
                 }
@@ -2665,12 +2666,14 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// unchanged too; only the probability rows, which are small next to the
     /// value plane and stay resident, are re-read by twice as many tiles.
     ///
-    /// `DARKBLOOM_GEMMA4_D512_AV_TILES=8` restores the incumbent geometry.
+    /// `DARKBLOOM_GEMMA4_D512_AV_TILES=8` or `=16` restores the incumbent
+    /// geometries; the default 32 tiles the dispatch at one simdgroup per
+    /// threadgroup, keeping the frozen 16 columns per simdgroup.
     private static let avColumnTiles: Int = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_D512_AV_TILES"], let value = Int(raw)
-        else { return 16 }
-        return value == 8 || value == 16 ? value : 16
+        else { return 32 }
+        return value == 8 || value == 16 || value == 32 ? value : 32
     }()
 
     /// Columns one threadgroup of dispatch 3 owns, and the simdgroups it

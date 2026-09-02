@@ -683,7 +683,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
 """
 
     private static let mma8Kernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_v1",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_v1" + CBv2TiedLMHeadQMVV1.xvSuffix,
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -798,7 +798,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     }()
 
     private static let mma8DownStaticKKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_carry2_bfill_v4",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_carry2_bfill_v4" + CBv2TiedLMHeadQMVV1.xvSuffix,
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -816,7 +816,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     /// One complete SIMD group per g64 group. Keep all lane results rather
     /// than canonicalizing row sums: the consumer reads its own lane's tree.
     private static let mma8DownLaneSumKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_down_lane_sums_v1",
+        name: "cbv2_b8_l1_dense_mlp_mma8_down_lane_sums_v1" + CBv2TiedLMHeadQMVV1.xvSuffix,
         inputNames: ["x"],
         outputNames: ["laneSums"],
         source: """
@@ -876,7 +876,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     }()
 
     private static let mma8DownLaneSumQMVKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_lane_sums_v1",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_lane_sums_v1" + CBv2TiedLMHeadQMVV1.xvSuffix,
         inputNames: ["x", "w", "scales", "biases", "laneSums"],
         outputNames: ["y"],
         source: """
@@ -893,7 +893,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         ensureRowContiguous: true)
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_v2_unroll",
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_v2_unroll" + CBv2TiedLMHeadQMVV1.xvSuffix,
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -934,7 +934,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     /// followed by four ascending `sum += bf16` operations. Row is the unit-
     /// stride dimension so one table serves both gate and up projections.
     private static let activationSumKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_affine8_xsum_v2_unroll",
+        name: "cbv2_b8_l1_dense_mlp_affine8_xsum_v2_unroll" + CBv2TiedLMHeadQMVV1.xvSuffix,
         inputNames: ["x"],
         outputNames: ["xSums"],
         source: """
@@ -955,7 +955,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     )
 
     private static let activationSumQMVKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_v2_unroll",
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_v2_unroll" + CBv2TiedLMHeadQMVV1.xvSuffix,
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["y"],
         source: """
@@ -1059,7 +1059,7 @@ inline U qdot_affine8_registered_v4(
     /// character; only the name and the header differ, so the grid, threadgroup
     /// shape, dispatch count, operands and bytes moved are all unchanged.
     private static let w4Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_w4_v1",
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_w4_v1" + CBv2TiedLMHeadQMVV1.xvSuffix,
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -1096,7 +1096,7 @@ inline U qdot_affine8_registered_v4(
     )
 
     private static let w4ActivationSumQMVKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_w4_v1",
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_w4_v1" + CBv2TiedLMHeadQMVV1.xvSuffix,
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["y"],
         source: """

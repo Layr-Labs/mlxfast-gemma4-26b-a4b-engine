@@ -954,11 +954,26 @@ public struct SwitchRouteTable {
     public let rowOrder: MLXArray
     public let sortedKeys: MLXArray
     public let inverseOrder: MLXArray
+    /// Optional decode-only carrier emitted by the monolithic Gemma router.
+    /// Each original assignment packs its sorted row and exact BF16 routing
+    /// weight for the DOWN projection's terminal reduction.
+    public let weightedDownCarrier: MLXArray?
+    /// Identity guard tying ``weightedDownCarrier`` to the weights output of
+    /// the same producer. Generic route tables leave both fields nil.
+    public let weightedDownWeights: MLXArray?
 
-    public init(rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray) {
+    public init(
+        rowOrder: MLXArray,
+        sortedKeys: MLXArray,
+        inverseOrder: MLXArray,
+        weightedDownCarrier: MLXArray? = nil,
+        weightedDownWeights: MLXArray? = nil
+    ) {
         self.rowOrder = rowOrder
         self.sortedKeys = sortedKeys
         self.inverseOrder = inverseOrder
+        self.weightedDownCarrier = weightedDownCarrier
+        self.weightedDownWeights = weightedDownWeights
     }
 }
 
@@ -1393,8 +1408,14 @@ public class SwitchGLU: Module {
     private func projectExperts(
         _ x: MLXArray, _ indices: MLXArray,
         sortedPlane: SwitchSortedPlaneProducer? = nil,
-        routeTable: SwitchRouteTable? = nil
-    ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
+        routeTable: SwitchRouteTable? = nil,
+        weightedDownWeights: MLXArray? = nil
+    ) -> (
+        output: MLXArray,
+        inverseOrder: MLXArray?,
+        sorted: Bool,
+        weightedDownReduced: Bool
+    ) {
         let useLhsIndices =
             indices.size == 64 && indices.ndim == 2 && indices.shape == [8, 8]
             && x.ndim == 2 && x.shape == [8, inputDims]
@@ -1514,14 +1535,30 @@ public class SwitchGLU: Module {
             activated = activation(xGate) * xUp
         }
 
-        // DOWN-LHS-IDENTITY: at the sorted [64] geometry the down projection
-        // gathers activation row `assignment` for assignment `assignment`;
-        // hand it that identity table instead of leaving `lhsIndices` nil,
-        // which otherwise materializes the same arange(64) on every call.
+        // DOWN-REDUCE: only the exact monolithic B=8 route producer carries
+        // the inverse row plus the already-rounded BF16 routing weight. The
+        // custom DOWN projection writes the final [8, 2816] reduction directly
+        // and leaves every other geometry on the established sorted output.
+        if useLhsIndices, !useExpertPrefixBounds,
+            weightedDownWeights != nil,
+            let table = routeTable,
+            let carrier = table.weightedDownCarrier,
+            let quantizedDown = downProj as? QuantizedSwitchLinear,
+            let reduced = quantizedDown.gemma4WeightedDownReduce(
+                activated,
+                sortedIndices: idx,
+                carrier: carrier)
+        {
+            return (reduced, nil, false, true)
+        }
+
+        // DOWN-LHS-IDENTITY remains the exact current-crown fallback whenever
+        // the fused carrier is absent or any pin above declines it.
         let downLhs: MLXArray? =
             (doSort && idx.ndim == 1 && idx.size == 64) ? switchDownIdentity64 : nil
-        x = downProj(activated, idx, lhsIndices: downLhs, sortedIndices: doSort)
-        return (x, doSort ? inverseOrder : nil, doSort)
+        x = downProj(
+            activated, idx, lhsIndices: downLhs, sortedIndices: doSort)
+        return (x, doSort ? inverseOrder : nil, doSort, false)
     }
 
     /// Cached eligibility: the projection tensors are bound at load time and
@@ -1584,7 +1621,12 @@ public class SwitchGLU: Module {
     }
 
     private func legacyWeightedReduction(
-        _ projected: (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool),
+        _ projected: (
+            output: MLXArray,
+            inverseOrder: MLXArray?,
+            sorted: Bool,
+            weightedDownReduced: Bool
+        ),
         indices: MLXArray,
         weights: MLXArray
     ) -> MLXArray {
@@ -1630,6 +1672,41 @@ public class SwitchGLU: Module {
             projected.output = scatterUnsort(
                 x: projected.output, invOrder: inverseOrder, shape: indices.shape)
         }
+        return MLX.squeezed(projected.output, axis: -2)
+    }
+
+    /// Exact B=8 decode producer that folds the inverse permutation and the
+    /// ordered top-8 routing reduction into the quantized DOWN projection.
+    /// A nil result is a complete fail-closed signal to use the promoted
+    /// deferred sorted-row path.
+    public func callAndFuseWeightedDownReduce(
+        _ x: MLXArray,
+        _ indices: MLXArray,
+        weights: MLXArray,
+        fuseSortedReduction: Bool,
+        isProductionPrefill: Bool = true,
+        routeTable: SwitchRouteTable? = nil
+    ) -> MLXArray? {
+        guard fuseSortedReduction,
+            !isProductionPrefill,
+            x.shape == [8, inputDims],
+            indices.shape == [8, 8],
+            weights.shape == [8, 8],
+            supportsWeightedExpertUnsort(x, indices, weights: weights),
+            routeTable?.weightedDownCarrier != nil,
+            routeTable?.weightedDownWeights != nil
+        else { return nil }
+
+        let projected = projectExperts(
+            x,
+            indices,
+            routeTable: routeTable,
+            weightedDownWeights: weights)
+        guard projected.weightedDownReduced,
+            projected.output.shape == [8, 1, 2816],
+            projected.output.dtype == .bfloat16
+        else { return nil }
+        weightedExpertUnsortProbe.recordEffective()
         return MLX.squeezed(projected.output, axis: -2)
     }
 
@@ -1862,5 +1939,41 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
         }
 
         return result
+    }
+
+    /// DOWN-REDUCE GPU carrier entry. The underlying gather allocation keeps
+    /// its ABI-stable 64-row logical shape, while the exact Metal arm writes
+    /// only its contiguous first eight rows as the reduced token plane. The
+    /// returned slice names precisely those initialized rows.
+    fileprivate func gemma4WeightedDownReduce(
+        _ x: MLXArray,
+        sortedIndices: MLXArray,
+        carrier: MLXArray
+    ) -> MLXArray? {
+        guard inputDims == 704, outputDims == 2816, numExperts == 128,
+            groupSize == 64, bits == 4, mode == .affine, bias == nil,
+            x.shape == [64, 1, 704], x.dtype == .bfloat16,
+            sortedIndices.shape == [64], sortedIndices.dtype == .uint32,
+            carrier.shape == [64], carrier.dtype == .uint32,
+            weight.shape == [128, 2816, 88], weight.dtype == .uint32,
+            scales.shape == [128, 2816, 11], scales.dtype == .bfloat16,
+            let biases,
+            biases.shape == [128, 2816, 11], biases.dtype == .bfloat16
+        else { return nil }
+
+        CBv2EngageMark.once("weighted-down-reduce")
+        let physical = MLX.gatherQuantizedMM(
+            x,
+            weight,
+            scales: scales,
+            biases: biases,
+            lhsIndices: carrier,
+            rhsIndices: sortedIndices,
+            transpose: true,
+            groupSize: groupSize,
+            bits: bits,
+            mode: mode,
+            sortedIndices: false)
+        return physical[..<8]
     }
 }

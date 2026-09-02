@@ -3887,6 +3887,174 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
   }
 }
 
+// DOWN-REDUCE: exact B=8 expert DOWN projection plus ordered routing reduce.
+//
+// The monolithic router packs, for every original top-8 assignment, the
+// stable sorted row (low six bits) and the already-rounded BF16 routing
+// weight (bits 8...23) into lhs_indices. The ordinary rhs_indices remain the
+// raw expert-sorted keys. One surviving threadgroup per eight output columns
+// walks the sorted plane in expert runs, retaining the incumbent up-to-four
+// row shared weight stream, stages only 64 x 8 BF16 dot results in threadgroup
+// memory, then performs the legacy BF16 multiply and slot-0...7 add chain.
+// Thus the 64 x 2816 sorted device plane and its later inverse/reduce read are
+// both absent; the ABI-stable GatherQMM allocation is untouched, and only its
+// contiguous first eight rows are initialized and exposed by the Swift slice.
+// Every other geometry lacks the carrier marker and takes KERN-DOWN-TILE.
+template <typename T, int group_size, int bits>
+METAL_FUNC void gather_qmv_gemma4_weighted_down_reduce(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    const device uint32_t* carrier,
+    const device uint32_t* sorted_indices,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const uint carrier_stride,
+    const uint rhs_stride,
+    const int64_t x_stride,
+    const int64_t w_stride,
+    const int64_t s_stride,
+    const int64_t b_stride,
+    threadgroup T* partials,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 8;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 8;
+  constexpr int max_run = 4;
+  constexpr int tile_width =
+      num_simdgroups * results_per_simdgroup;
+
+  // The frozen host still launches 64 batch threadgroups. Exactly one owns
+  // each output-column tile and performs the complete cross-assignment fold.
+  if (tid.z != 0u) {
+    return;
+  }
+
+  const int out_row = int(tid.y) * tile_width
+      + int(simd_gid) * results_per_simdgroup;
+  uint sorted_row = 0u;
+  while (sorted_row < 64u) {
+    const uint route_word = sorted_indices[sorted_row * rhs_stride];
+    const uint expert = route_word & 0xffu;
+    uint run_len = 1u;
+    while (run_len < uint(max_run) && sorted_row + run_len < 64u &&
+           (sorted_indices[(sorted_row + run_len) * rhs_stride] & 0xffu) ==
+               expert) {
+      ++run_len;
+    }
+
+    const device uint8_t* ws = (const device uint8_t*)(
+        w + expert * w_stride);
+    const device T* run_scales = scales + expert * s_stride;
+    const device T* run_biases = biases + expert * b_stride;
+    const int in_vec_size_w = in_vec_size / 2;
+    const int in_vec_size_g = in_vec_size / 64;
+
+    ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+    run_scales += out_row * in_vec_size_g
+        + simd_lid / scale_step_per_thread;
+    run_biases += out_row * in_vec_size_g
+        + simd_lid / scale_step_per_thread;
+
+    thread float result[max_run][results_per_simdgroup] = {{0}};
+    thread float x_thread[values_per_thread];
+    thread uint packed[results_per_simdgroup];
+    thread float scale_local[results_per_simdgroup];
+    thread float bias_local[results_per_simdgroup];
+
+    int k = 0;
+    for (; k <= in_vec_size - block_size; k += block_size) {
+      for (int col = 0; col < results_per_simdgroup; ++col) {
+        packed[col] = *((const device uint*)(
+            ws + col * in_vec_size_w));
+        scale_local[col] = run_scales[col * in_vec_size_g];
+        bias_local[col] = run_biases[col * in_vec_size_g];
+      }
+      for (uint r = 0u; r < run_len; ++r) {
+        const device T* xr = x
+            + (sorted_row + r) * uint(x_stride)
+            + k + simd_lid * values_per_thread;
+        const float sum = load_vector<T, float, values_per_thread, 4>(
+            xr, x_thread);
+        for (int col = 0; col < results_per_simdgroup; ++col) {
+          result[r][col] +=
+              qdot_affine4_registered_word<float, values_per_thread>(
+                  packed[col], x_thread, scale_local[col], bias_local[col], sum);
+        }
+      }
+      ws += block_size / 2;
+      run_scales += block_size / 64;
+      run_biases += block_size / 64;
+    }
+
+    const uint active_tail_lanes =
+        uint((in_vec_size - k) / values_per_thread);
+    if (simd_lid < active_tail_lanes) {
+      for (int col = 0; col < results_per_simdgroup; ++col) {
+        packed[col] = *((const device uint*)(
+            ws + col * in_vec_size_w));
+        scale_local[col] = run_scales[col * in_vec_size_g];
+        bias_local[col] = run_biases[col * in_vec_size_g];
+      }
+      for (uint r = 0u; r < run_len; ++r) {
+        const device T* xr = x
+            + (sorted_row + r) * uint(x_stride)
+            + k + simd_lid * values_per_thread;
+        const float sum = load_vector<T, float, values_per_thread, 4>(
+            xr, x_thread);
+        for (int col = 0; col < results_per_simdgroup; ++col) {
+          result[r][col] +=
+              qdot_affine4_registered_word<float, values_per_thread>(
+                  packed[col], x_thread, scale_local[col], bias_local[col], sum);
+        }
+      }
+    }
+
+    for (uint r = 0u; r < run_len; ++r) {
+      for (int col = 0; col < results_per_simdgroup; ++col) {
+        result[r][col] = simd_sum(result[r][col]);
+        if (simd_lid == 0u) {
+          partials[(sorted_row + r) * tile_width
+              + simd_gid * results_per_simdgroup + uint(col)] =
+              static_cast<T>(result[r][col]);
+        }
+      }
+    }
+    sorted_row += run_len;
+  }
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_lid == 0u) {
+    for (uint token = 0u; token < 8u; ++token) {
+      T accumulator[results_per_simdgroup] = {T(0)};
+      for (uint slot = 0u; slot < 8u; ++slot) {
+        const uint assignment = token * 8u + slot;
+        const uint word = carrier[assignment * carrier_stride];
+        const uint source_row = word & 0x3fu;
+        const T route_weight = static_cast<T>(uint16_to_bfloat16(
+            uint16_t((word >> 8) & 0xffffu)));
+        for (int col = 0; col < results_per_simdgroup; ++col) {
+          const T source = partials[source_row * tile_width
+              + simd_gid * results_per_simdgroup + uint(col)];
+          const T weighted = static_cast<T>(
+              static_cast<float>(source) * static_cast<float>(route_weight));
+          accumulator[col] = accumulator[col] + weighted;
+        }
+      }
+      for (int col = 0; col < results_per_simdgroup; ++col) {
+        y[token * uint(out_vec_size) + uint(out_row + col)] = accumulator[col];
+      }
+    }
+  }
+}
+
 // KERN-DOWN-TILE: y-tile coarsening for the K = 704 expert down gather
 // (the only pair-geometry plane at that K; out_vec_size = 2816). The
 // frozen host launches grid (1, N/8 = 352, 64), so every 64-thread group
@@ -4028,6 +4196,7 @@ template <typename T, int group_size, int bits>
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
+  threadgroup T weighted_down_partials[64 * 8];
   int M = x_shape[x_batch_ndims];
   const bool gemma4_pair_geometry =
       group_size == 64 && bits == 4 && M == 1 && batch_ndims == 1 &&
@@ -4035,6 +4204,33 @@ template <typename T, int group_size, int bits>
       ((in_vec_size == 2816 && out_vec_size == 704) ||
        (in_vec_size == 704 && out_vec_size == 2816));
   if (gemma4_pair_geometry) {
+    // DOWN-REDUCE carrier: high marker plus packed BF16 route weights. Only
+    // the exact Swift producer supplies this; ordinary lhs row indices are
+    // below 64 and therefore cannot enter the fused terminal reduction.
+    if (in_vec_size == 704 &&
+        (lhs_indices[0] & 0x80000000u) != 0u) {
+      gather_qmv_gemma4_weighted_down_reduce<T, group_size, bits>(
+          w,
+          scales,
+          biases,
+          x,
+          lhs_indices,
+          rhs_indices,
+          y,
+          in_vec_size,
+          out_vec_size,
+          (uint)lhs_strides[0],
+          (uint)rhs_strides[0],
+          x_strides[0],
+          w_strides[0],
+          s_strides[0],
+          b_strides[0],
+          weighted_down_partials,
+          tid,
+          simd_gid,
+          simd_lid);
+      return;
+    }
     // KERN-DOWN-TILE gate (strip-walk pattern): compile-time flip; ON
     // here -- the K = 704 down plane takes the y-tile-coarsened arm above.
     // Flip to false to return every plane to the incumbent per-y-group

@@ -3029,7 +3029,10 @@ private enum Gemma4RouteGlueFoldV1 {
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_route_monolithic_top8_e128_k8_bf16_v2",
         inputNames: ["scores", "pes"],
-        outputNames: ["indices", "weights", "row_order", "sorted_keys", "inverse_order"],
+        outputNames: [
+            "indices", "weights", "row_order", "sorted_keys", "inverse_order",
+            "weighted_down_carrier",
+        ],
         source: """
             const uint tid = thread_position_in_threadgroup.x;
             const uint row = tid / 128u;
@@ -3045,6 +3048,7 @@ private enum Gemma4RouteGlueFoldV1 {
                 | expert;
             threadgroup uint finalists[256];
             threadgroup uint sel[64];
+            threadgroup bfloat16_t route_weights[64];
 
             #pragma clang loop unroll(full)
             for (uint width = 2u; width <= 32u; width <<= 1) {
@@ -3099,7 +3103,9 @@ private enum Gemma4RouteGlueFoldV1 {
 
                     float weight = (sum_exp > 0.0f) ? (exp_score / sum_exp) : 0.0f;
                     float scale = float(pes[selected]);
-                    weights[out_idx] = bfloat16_t(weight * scale);
+                    const bfloat16_t route_weight = bfloat16_t(weight * scale);
+                    weights[out_idx] = route_weight;
+                    route_weights[out_idx] = route_weight;
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -3127,6 +3133,13 @@ private enum Gemma4RouteGlueFoldV1 {
                 row_order[rank] = assignment / 8;
                 sorted_keys[rank] = key;
                 inverse_order[assignment] = rank;
+                // DOWN-REDUCE: no extra packing dispatch. The high marker is
+                // consumed only by the exact B=8/K=704/N=2816 Metal arm; bits
+                // 8...23 are the already-rounded BF16 routing weight and the
+                // low six bits are this assignment's sorted row.
+                weighted_down_carrier[assignment] = 0x80000000u
+                    | (uint(bfloat16_to_uint16(route_weights[assignment])) << 8)
+                    | rank;
             }
         """,
         header: """
@@ -3166,8 +3179,10 @@ private enum Gemma4RouteGlueFoldV1 {
             [scores, perExpertScale],
             grid: (1024, 1, 1),
             threadGroup: (1024, 1, 1),
-            outputShapes: [[8, 1, 8], [8, 1, 8], [64], [64], [64]],
-            outputDTypes: [.uint32, .bfloat16, .uint32, .uint32, .uint32]
+            outputShapes: [[8, 1, 8], [8, 1, 8], [64], [64], [64], [64]],
+            outputDTypes: [
+                .uint32, .bfloat16, .uint32, .uint32, .uint32, .uint32,
+            ]
         )
         return Fold(
             indices: outs[0],
@@ -3175,7 +3190,9 @@ private enum Gemma4RouteGlueFoldV1 {
             table: SwitchRouteTable(
                 rowOrder: outs[2],
                 sortedKeys: outs[3],
-                inverseOrder: outs[4]))
+                inverseOrder: outs[4],
+                weightedDownCarrier: outs[5],
+                weightedDownWeights: outs[1]))
     }
 }
 
@@ -4239,6 +4256,30 @@ private class Gemma4Experts: Module {
             isProductionPrefill: isExpertPrefill,
             routeTable: routeTable)
     }
+
+    /// Decode-only architectural fusion: the quantized expert DOWN projection
+    /// writes the inverse-permuted, routing-weighted top-8 result directly.
+    /// Nil preserves the promoted deferred-row producer and tail consumer.
+    func fusedWeightedDownOutput(
+        _ x: MLXArray,
+        topKIndices: MLXArray,
+        topKWeights: MLXArray,
+        isExpertPrefill: Bool,
+        routeTable: SwitchRouteTable? = nil
+    ) -> MLXArray? {
+        let (B, S, H) = (x.dim(0), x.dim(1), x.dim(2))
+        let K = topKIndices.dim(-1)
+        guard routeTable?.weightedDownWeights === topKWeights else { return nil }
+        guard let reduced = switchGLU.callAndFuseWeightedDownReduce(
+            x.reshaped(B * S, H),
+            topKIndices.reshaped(B * S, K),
+            weights: topKWeights.reshaped(B * S, K),
+            fuseSortedReduction: fuseWeightedUnsort,
+            isProductionPrefill: isExpertPrefill,
+            routeTable: routeTable)
+        else { return nil }
+        return reduced.reshaped(B, S, H)
+    }
 }
 
 // MARK: - MLP
@@ -4798,6 +4839,16 @@ public class Gemma4DecoderLayer: Module {
                 deferred: DeferredWeightedExpertRows?,
                 unsortCarrier: WeightedExpertUnsortCarrier?
             ) {
+                if canFoldScalar,
+                    let reduced = experts.fusedWeightedDownOutput(
+                        input,
+                        topKIndices: indices,
+                        topKWeights: weights,
+                        isExpertPrefill: isExpertPrefill,
+                        routeTable: routeTable)
+                {
+                    return (reduced, nil, nil)
+                }
                 if canFoldScalar,
                     let deferred = experts.deferredWeightedRows(
                         input,

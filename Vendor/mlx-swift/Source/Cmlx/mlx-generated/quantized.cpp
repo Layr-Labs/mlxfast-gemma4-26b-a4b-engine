@@ -1620,10 +1620,43 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   y0 += out_row;
   y1 += out_row;
 
-  int k = 0;
-  for (; k <= in_vec_size - block_size; k += block_size) {
+  // EXPERT-PIPELINE: two-deep weight-code pipeline, the load-scheduling
+  // transform promoted on the dense down plane (DMLP-DOWN-CARRY2, "two-deep
+  // weight-code pipeline, dense down") and on the O / Q-K-V matrix-unit tiers.
+  // The packed weight words of a K-block are read TWO blocks before the block
+  // that consumes them and held in registers, so each device load has two
+  // trips of latency to land instead of none. Every address formed here is an
+  // address the incumbent forms on some trip: the look-ahead block index is
+  // clamped to the last main-loop block, so the final trips re-read a block
+  // already read and their values are discarded at loop exit. Scale and bias
+  // stay where they are -- two bytes each against the codes' four, sitting in
+  // their neighbours' cache lines, and a carried copy would cost registers for
+  // no stream (the same reason the dense-down carry left them one deep).
+  // Loads-only: the FMA order, the per-row accumulators, the simd_sum and the
+  // store are untouched, so every output element keeps the incumbent's add
+  // sequence bit for bit.
+  const int wblock_stride = block_size / 2;
+  const int nblocks = in_vec_size / block_size;
+  const device uint8_t* ws_base = ws;
+  thread uint packed_next[results_per_simdgroup];
+  thread uint packed_next2[results_per_simdgroup];
+  if (nblocks > 0) {
+    const device uint8_t* wsn1 = ws_base + min(1, nblocks - 1) * wblock_stride;
     for (int row = 0; row < results_per_simdgroup; row++) {
-      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
+      packed_next[row] = *((const device uint*)(ws_base + row * in_vec_size_w));
+      packed_next2[row] = *((const device uint*)(wsn1 + row * in_vec_size_w));
+    }
+  }
+
+  int k = 0;
+  int blk = 0;
+  for (; k <= in_vec_size - block_size; k += block_size, blk++) {
+    const device uint8_t* wsn2 =
+        ws_base + min(blk + 2, nblocks - 1) * wblock_stride;
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      packed[row] = packed_next[row];
+      packed_next[row] = packed_next2[row];
+      packed_next2[row] = *((const device uint*)(wsn2 + row * in_vec_size_w));
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }
@@ -1758,11 +1791,43 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
   y2 += out_row;
   y3 += out_row;
 
-  int k = 0;
-  for (; k <= in_vec_size - block_size; k += block_size) {
+  // EXPERT-PIPELINE: two-deep weight-code pipeline, the load-scheduling
+  // transform promoted on the dense down plane (DMLP-DOWN-CARRY2, "two-deep
+  // weight-code pipeline, dense down") and on the O / Q-K-V matrix-unit tiers.
+  // The packed weight words of a K-block are read TWO blocks before the block
+  // that consumes them and held in registers, so each device load has two
+  // trips of latency to land instead of none. Every address formed here is an
+  // address the incumbent forms on some trip: the look-ahead block index is
+  // clamped to the last main-loop block, so the final trips re-read a block
+  // already read and their values are discarded at loop exit. Scale and bias
+  // stay where they are -- two bytes each against the codes' four, sitting in
+  // their neighbours' cache lines, and a carried copy would cost registers for
+  // no stream (the same reason the dense-down carry left them one deep).
+  // Loads-only: the FMA order, the per-row accumulators, the simd_sum and the
+  // store are untouched, so every output element keeps the incumbent's add
+  // sequence bit for bit.
+  const int wblock_stride = block_size / 2;
+  const int nblocks = in_vec_size / block_size;
+  const device uint8_t* ws_base = ws;
+  thread uint packed_next[results_per_simdgroup];
+  thread uint packed_next2[results_per_simdgroup];
+  if (nblocks > 0) {
+    const device uint8_t* wsn1 = ws_base + min(1, nblocks - 1) * wblock_stride;
     for (int row = 0; row < results_per_simdgroup; row++) {
-      packed[row] =
-          *((const device uint*)(ws + row * in_vec_size_w));
+      packed_next[row] = *((const device uint*)(ws_base + row * in_vec_size_w));
+      packed_next2[row] = *((const device uint*)(wsn1 + row * in_vec_size_w));
+    }
+  }
+
+  int k = 0;
+  int blk = 0;
+  for (; k <= in_vec_size - block_size; k += block_size, blk++) {
+    const device uint8_t* wsn2 =
+        ws_base + min(blk + 2, nblocks - 1) * wblock_stride;
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      packed[row] = packed_next[row];
+      packed_next[row] = packed_next2[row];
+      packed_next2[row] = *((const device uint*)(wsn2 + row * in_vec_size_w));
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }
@@ -1900,11 +1965,43 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
   y1 += out_row;
   y2 += out_row;
 
-  int k = 0;
-  for (; k <= in_vec_size - block_size; k += block_size) {
+  // EXPERT-PIPELINE: two-deep weight-code pipeline, the load-scheduling
+  // transform promoted on the dense down plane (DMLP-DOWN-CARRY2, "two-deep
+  // weight-code pipeline, dense down") and on the O / Q-K-V matrix-unit tiers.
+  // The packed weight words of a K-block are read TWO blocks before the block
+  // that consumes them and held in registers, so each device load has two
+  // trips of latency to land instead of none. Every address formed here is an
+  // address the incumbent forms on some trip: the look-ahead block index is
+  // clamped to the last main-loop block, so the final trips re-read a block
+  // already read and their values are discarded at loop exit. Scale and bias
+  // stay where they are -- two bytes each against the codes' four, sitting in
+  // their neighbours' cache lines, and a carried copy would cost registers for
+  // no stream (the same reason the dense-down carry left them one deep).
+  // Loads-only: the FMA order, the per-row accumulators, the simd_sum and the
+  // store are untouched, so every output element keeps the incumbent's add
+  // sequence bit for bit.
+  const int wblock_stride = block_size / 2;
+  const int nblocks = in_vec_size / block_size;
+  const device uint8_t* ws_base = ws;
+  thread uint packed_next[results_per_simdgroup];
+  thread uint packed_next2[results_per_simdgroup];
+  if (nblocks > 0) {
+    const device uint8_t* wsn1 = ws_base + min(1, nblocks - 1) * wblock_stride;
     for (int row = 0; row < results_per_simdgroup; row++) {
-      packed[row] =
-          *((const device uint*)(ws + row * in_vec_size_w));
+      packed_next[row] = *((const device uint*)(ws_base + row * in_vec_size_w));
+      packed_next2[row] = *((const device uint*)(wsn1 + row * in_vec_size_w));
+    }
+  }
+
+  int k = 0;
+  int blk = 0;
+  for (; k <= in_vec_size - block_size; k += block_size, blk++) {
+    const device uint8_t* wsn2 =
+        ws_base + min(blk + 2, nblocks - 1) * wblock_stride;
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      packed[row] = packed_next[row];
+      packed_next[row] = packed_next2[row];
+      packed_next2[row] = *((const device uint*)(wsn2 + row * in_vec_size_w));
       scale_local[row] = scales[row * in_vec_size_g];
       bias_local[row] = biases[row * in_vec_size_g];
     }
@@ -3797,6 +3894,24 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
     }
   }
 
+  // EXPERT-PIPELINE (singles arm): the same two-deep weight-code pipeline on
+  // the WVEC walk, which is the arm the gemma4 gate/up gate actually
+  // instantiates (WVEC = true, PF = false). The one-deep PF arm beside it is
+  // left exactly as it stands. The block index of each look-ahead is clamped
+  // to the last block, so the final two trips re-read blocks already read and
+  // discard them; the word each trip CONSUMES is the word the incumbent WVEC
+  // walk loads for that trip, so the qdot expression, the accumulator, the
+  // simd_sum and the store are unchanged.
+  thread uint wv_next[results_per_simdgroup];
+  thread uint wv_next2[results_per_simdgroup];
+  if (WVEC && !PF && nblocks > 0) {
+    const device uint8_t* wsn1 = ws0 + min(1, nblocks - 1) * block_bytes;
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      wv_next[row] = *((const device uint*)(ws0 + row * in_vec_size_w));
+      wv_next2[row] = *((const device uint*)(wsn1 + row * in_vec_size_w));
+    }
+  }
+
   for (int blk = 0; blk < nblocks; blk++) {
     U sum = load_vector<T, U, values_per_thread, 4>(x, x_thread);
 
@@ -3812,6 +3927,17 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
       }
     }
 
+    thread uint wv_cur[results_per_simdgroup];
+    if (WVEC && !PF) {
+      const device uint8_t* wsn2 =
+          ws0 + min(blk + 2, nblocks - 1) * block_bytes;
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        wv_cur[row] = wv_next[row];
+        wv_next[row] = wv_next2[row];
+        wv_next2[row] = *((const device uint*)(wsn2 + row * in_vec_size_w));
+      }
+    }
+
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device T* sl = scales + row * in_vec_size_g;
       const device T* bl = biases + row * in_vec_size_g;
@@ -3820,8 +3946,7 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
       if (PF) {
         result[row] += qdot_affine4_g64_word(wcur[row], x_thread, s, b, sum);
       } else if (WVEC) {
-        const uint v = *((const device uint*)(ws + row * in_vec_size_w));
-        result[row] += qdot_affine4_g64_word(v, x_thread, s, b, sum);
+        result[row] += qdot_affine4_g64_word(wv_cur[row], x_thread, s, b, sum);
       } else {
         auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
         result[row] += qdot<U, values_per_thread, 4>(wl, x_thread, s, b, sum);

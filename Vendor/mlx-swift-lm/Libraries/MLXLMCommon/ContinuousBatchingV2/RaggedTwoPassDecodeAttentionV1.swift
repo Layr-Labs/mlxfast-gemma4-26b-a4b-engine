@@ -1686,13 +1686,13 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// removes only the global partial write/read and the second dispatch.
     private static let portQuantFusedWriteResidentKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_ors1_ey25",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
                 "starts", "new_keys", "new_values", "write_fence",
             ],
-            outputNames: ["out", "fence"],
+            outputNames: ["out", "fence", "rs"],
             source: """
                 typedef vec<T, 4> T4;
                 constexpr int simd_width = 32;
@@ -1718,6 +1718,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 threadgroup T local_partials[GQA * BLOCKS * D];
                 threadgroup float local_sums[GQA * BLOCKS];
                 threadgroup float local_maxs[GQA * BLOCKS];
+                threadgroup float ors_partial[BLOCKS];
 
                 const device uint32_t* mirror_w = m0;
                 switch (batch_index) {
@@ -2041,10 +2042,41 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                                 keep + simd_shuffle_xor(trade, stride);
                         }
                     }
-                    head_out[block_lane] = T(
+                    const T head_value = T(
                         sum_exp_score == 0.0f
                             ? accumulator[0]
                             : accumulator[0] / sum_exp_score);
+                    head_out[block_lane] = head_value;
+                    // ORS-IN-ATTN: this head's o_proj run-sum table entries in
+                    // cbv2_b8_rs_table_dyn_v1's order. Lanes 8k..8k+7 of a
+                    // simdgroup hold octet fm = (block & 1) * 4 + k of 64-group
+                    // (block >> 1): each quad is summed left to right in T, the
+                    // octet is (0 + float(quadA)) + float(quadB), octets pair
+                    // over lane bits 3 and 4 (fm bits 0 and 1), and the two
+                    // simdgroups of a group pair through threadgroup memory
+                    // (fm bit 2). The stored bf16 values are the operands.
+                    {
+                        const float hv = float(head_value);
+                        const T x1 = T(simd_shuffle_xor(hv, 1u));
+                        const T x2 = T(simd_shuffle_xor(hv, 2u));
+                        const T x3 = T(simd_shuffle_xor(hv, 3u));
+                        const T quad = ((head_value + x1) + x2) + x3;
+                        const float quad_f = float(quad);
+                        const float quad_b = simd_shuffle_xor(quad_f, 4u);
+                        float octet = 0.0f + quad_f;
+                        octet += quad_b;
+                        octet += simd_shuffle_xor(octet, 8u);
+                        octet += simd_shuffle_xor(octet, 16u);
+                        if (lane == 0) {
+                            ors_partial[block] = octet;
+                        }
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                        if (lane == 0 && (block & 1) == 0) {
+                            rs[(batch_head + head) * (D / 64) + (block >> 1)] =
+                                ors_partial[block] + ors_partial[block + 1];
+                        }
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                    }
                 }
             """,
             ensureRowContiguous: true
@@ -2056,14 +2088,14 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// reuse the BF16-rounded threadgroup rows.
     private static let portQuantFusedWriteResidentNormRopeKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_v1",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_v1_ors1_ey25",
             inputNames: [
                 "raw_queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
                 "starts", "raw_keys", "raw_values", "q_weight", "k_weight",
                 "position_offsets", "rope_log2_base", "write_fence",
             ],
-            outputNames: ["out", "fence", "k_out", "v_out"],
+            outputNames: ["out", "fence", "k_out", "v_out", "rs"],
             source: """
                 typedef vec<T, 4> T4;
                 constexpr int simd_width = 32;
@@ -2089,6 +2121,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 threadgroup T local_partials[GQA * BLOCKS * D];
                 threadgroup float local_sums[GQA * BLOCKS];
                 threadgroup float local_maxs[GQA * BLOCKS];
+                threadgroup float ors_partial[BLOCKS];
                 threadgroup T local_queries[GQA * D];
                 threadgroup T local_key[D];
                 threadgroup T local_value[D];
@@ -2537,10 +2570,41 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                                 keep + simd_shuffle_xor(trade, stride);
                         }
                     }
-                    head_out[block_lane] = T(
+                    const T head_value = T(
                         sum_exp_score == 0.0f
                             ? accumulator[0]
                             : accumulator[0] / sum_exp_score);
+                    head_out[block_lane] = head_value;
+                    // ORS-IN-ATTN: this head's o_proj run-sum table entries in
+                    // cbv2_b8_rs_table_dyn_v1's order. Lanes 8k..8k+7 of a
+                    // simdgroup hold octet fm = (block & 1) * 4 + k of 64-group
+                    // (block >> 1): each quad is summed left to right in T, the
+                    // octet is (0 + float(quadA)) + float(quadB), octets pair
+                    // over lane bits 3 and 4 (fm bits 0 and 1), and the two
+                    // simdgroups of a group pair through threadgroup memory
+                    // (fm bit 2). The stored bf16 values are the operands.
+                    {
+                        const float hv = float(head_value);
+                        const T x1 = T(simd_shuffle_xor(hv, 1u));
+                        const T x2 = T(simd_shuffle_xor(hv, 2u));
+                        const T x3 = T(simd_shuffle_xor(hv, 3u));
+                        const T quad = ((head_value + x1) + x2) + x3;
+                        const float quad_f = float(quad);
+                        const float quad_b = simd_shuffle_xor(quad_f, 4u);
+                        float octet = 0.0f + quad_f;
+                        octet += quad_b;
+                        octet += simd_shuffle_xor(octet, 8u);
+                        octet += simd_shuffle_xor(octet, 16u);
+                        if (lane == 0) {
+                            ors_partial[block] = octet;
+                        }
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                        if (lane == 0 && (block & 1) == 0) {
+                            rs[(batch_head + head) * (D / 64) + (block >> 1)] =
+                                ors_partial[block] + ors_partial[block + 1];
+                        }
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                    }
                 }
             """,
             ensureRowContiguous: true
@@ -2715,11 +2779,13 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         [batch, queryHeads, 1, headDim], [1],
                         [batch, kvHeads, 1, headDim],
                         [batch, kvHeads, 1, headDim],
+                        [batch, queryHeads * headDim / 64],
                     ],
                     outputDTypes: [
-                        .bfloat16, .int32, .bfloat16, .bfloat16,
+                        .bfloat16, .int32, .bfloat16, .bfloat16, .float32,
                     ]
                 )
+                CBv2AttentionOQMVV1.registerCarriedTable(source: resident[0], table: resident[4])
                 publishResidentProducts(
                     ResidentProducts(
                         runsumTable: nil,
@@ -2743,11 +2809,12 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 ],
                 grid: (kvHeads * blocks * 32, batch, 1),
                 threadGroup: (blocks * 32, 1, 1),
-                outputShapes: [[batch, queryHeads, 1, headDim], [1]],
-                outputDTypes: [.bfloat16, .int32]
+                outputShapes: [[batch, queryHeads, 1, headDim], [1], [batch, queryHeads * headDim / 64]],
+                outputDTypes: [.bfloat16, .int32, .float32]
             )
             CBv2EngageMark.once("kvq4-fused-live-write")
             CBv2EngageMark.once("kvq4-resident-merge")
+            CBv2AttentionOQMVV1.registerCarriedTable(source: resident[0], table: resident[2])
             return (resident[0], resident[1])
         }
 

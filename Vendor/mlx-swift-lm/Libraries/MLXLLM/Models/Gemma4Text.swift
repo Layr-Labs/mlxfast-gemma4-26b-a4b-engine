@@ -1766,7 +1766,7 @@ private class Gemma4Attention: Module {
     /// MMA-RS-001: the projection input's run-sum table is computed here (the
     /// o_proj plane consumes it alone); nil keeps the incumbent dispatch.
     @inline(__always)
-    private func outputProjection(_ x: MLXArray) -> MLXArray {
+    private func outputProjection(_ x: MLXArray, carried: MLXArray? = nil) -> MLXArray {
         guard let quantized = oProj as? QuantizedLinear,
             quantized.bias == nil,
             let projected = CBv2AttentionOQMVV1.matmul(
@@ -1777,7 +1777,7 @@ private class Gemma4Attention: Module {
                 groupSize: quantized.groupSize,
                 bits: quantized.bits,
                 mode: quantized.mode,
-                rsTable: CBv2AttentionOQMVV1.runsumTable(for: x))
+                rsTable: CBv2AttentionOQMVV1.runsumTable(for: x, carried: carried))
         else { return oProj(x) }
         return projected
     }
@@ -2135,6 +2135,7 @@ private class Gemma4Attention: Module {
 
         let residentProducts =
             CBv2RaggedTwoPassDecodeAttentionV1.takeResidentProducts(for: attention)
+        let carriedORS = CBv2AttentionOQMVV1.takeCarriedTable(for: attention)
         var output = attention.transposed(0, 2, 1, 3).reshaped(B, queryLength, -1)
         if lastQueryCache == nil && outputStart > 0 {
             output = output[0..., outputStart..., 0...]
@@ -2143,7 +2144,7 @@ private class Gemma4Attention: Module {
             output = output.asType(outputDType)
         }
         return (
-            outputProjection(output),
+            outputProjection(output, carried: carriedORS),
             (residentProducts?.normalizedKeys ?? k,
              residentProducts?.normalizedValues ?? v),
             captured)
@@ -3770,6 +3771,23 @@ private class Gemma4MLP: Module {
     ) -> MLXArray {
         denseProjection(upProj, x, activationSums: activationSums)
     }
+    /// GELU-EPILOGUE-DENSE: gate, up and the GeLU product in one dispatch;
+    /// nil when the tight kernel declines, so the caller keeps the incumbent
+    /// gate / up / product chain.
+    fileprivate func zipGateUpGelu(
+        _ x: MLXArray, _ activationSums: CBv2DenseMLPQMVV1.ActivationSums?
+    ) -> MLXArray? {
+        guard let gate = gateProj as? QuantizedLinear, gate.bias == nil,
+            let up = upProj as? QuantizedLinear, up.bias == nil,
+            gate.groupSize == up.groupSize, gate.bits == up.bits, gate.mode == up.mode
+        else { return nil }
+        return CBv2DenseMLPQMVV1.gateUpGeluMatmul(
+            x: x, key: ObjectIdentifier(gate),
+            gateWeight: gate.weight, gateScales: gate.scales, gateBiases: gate.biases,
+            upWeight: up.weight, upScales: up.scales, upBiases: up.biases,
+            groupSize: gate.groupSize, bits: gate.bits, mode: gate.mode,
+            activationSums: activationSums)
+    }
 
     fileprivate func zipDown(_ activated: MLXArray) -> MLXArray {
         denseProjection(downProj, activated)
@@ -3926,13 +3944,23 @@ private enum Gemma4ZipRouterV1 {
         let expertScores = router.zipScores(
             MLX.depends(input: normed, dependencies: [sums.dependencyHandle]))
         let denseIn = MLX.depends(input: n1, dependencies: [normed])
-        let gate = mlp.zipGate(denseIn, sums)
-        let up = mlp.zipUp(denseIn, sums)
+        let activated: MLXArray
+        let gateUpDeps: [MLXArray]
+        if let fusedActivation = mlp.zipGateUpGelu(denseIn, sums) {
+            // GELU-EPILOGUE-DENSE: the activation leaves the gate/up dispatch
+            // itself; the down projection still waits for the router scores.
+            activated = MLX.depends(input: fusedActivation, dependencies: [expertScores])
+            gateUpDeps = [fusedActivation]
+        } else {
+            let gate = mlp.zipGate(denseIn, sums)
+            let up = mlp.zipUp(denseIn, sums)
 
-        // Stage 3: the dense GeLU product, which the router has no partner
-        // for -- the argPartition is deliberately NOT paired with it.
-        let held = MLX.depends(inputs: [gate, up], dependencies: [expertScores])
-        let activated = gemma4GeluProduct(held[0], held[1])
+            // Stage 3: the dense GeLU product, which the router has no partner
+            // for -- the argPartition is deliberately NOT paired with it.
+            let held = MLX.depends(inputs: [gate, up], dependencies: [expertScores])
+            activated = gemma4GeluProduct(held[0], held[1])
+            gateUpDeps = [gate, up]
+        }
 
         // Stage 4: router argPartition | dense down projection. The sort is
         // 8 us and the down projection 25 us, so this is the pairing that
@@ -3943,7 +3971,7 @@ private enum Gemma4ZipRouterV1 {
         var routeTable: SwitchRouteTable? = nil
         if plan == 2 {
             let partition = router.zipPartition(
-                MLX.depends(input: expertScores, dependencies: [gate, up]))
+                MLX.depends(input: expertScores, dependencies: gateUpDeps))
             topKIndices = router.zipSelected(
                 MLX.depends(input: partition, dependencies: [activated]))
             denseOut = mlp.zipDown(

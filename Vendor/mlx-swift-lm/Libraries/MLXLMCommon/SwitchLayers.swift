@@ -813,7 +813,7 @@ private let routeCsortPrefillHistKernel: MLXFast.MLXFastKernel = MLXFast.metalKe
 )
 
 private let routeCsortPrefillScanKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "mlx_lm_route_csort128_scan_v1",
+    name: "mlx_lm_route_csort128_scan_v2",
     inputNames: ["block_hist"],
     outputNames: ["block_offset"],
     source: """
@@ -839,9 +839,16 @@ private let routeCsortPrefillScanKernel: MLXFast.MLXFastKernel = MLXFast.metalKe
         }
         running += lane_excl;
         // Exclusive scan over blocks for this expert, offset by the bin base.
-        for (uint b = 0; b < nblocks; ++b) {
-            block_offset[b * WIDTH + e] = running;
-            running += block_hist[b * WIDTH + e];
+        // Column `e` of `block_offset` is read by the scatter only as
+        // `block_offset[b * WIDTH + key]` for a key that occurs in block `b`,
+        // so a column whose global total is zero is never read and need not be
+        // written. The counter table is 256 wide while the model routes 128
+        // experts, so at minimum half the columns are unconditionally dead.
+        if (total > 0u) {
+            for (uint b = 0; b < nblocks; ++b) {
+                block_offset[b * WIDTH + e] = running;
+                running += block_hist[b * WIDTH + e];
+            }
         }
         """,
     ensureRowContiguous: true

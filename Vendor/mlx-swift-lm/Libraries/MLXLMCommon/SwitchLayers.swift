@@ -1465,6 +1465,9 @@ public class SwitchGLU: Module {
 
         let xGate: MLXArray
         let xUp: MLXArray
+        // PROMPT-GLUE (pg1): the routed-expert GeLU product computed straight
+        // off the fused gate|up plane, in place of the strided-view closure.
+        var promptActivated: MLXArray? = nil
         if let gateUpProj {
             let xGateUp = gateUpProj(
                 x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
@@ -1502,6 +1505,16 @@ public class SwitchGLU: Module {
                 )
                 xGate = xGateUp[.ellipsis, ..<hiddenDims]
                 xUp = xGateUp[.ellipsis, hiddenDims...]
+                if activationProduct == nil, isGeluActivation,
+                    let product = Gemma4PromptGlueV1.geluProductFusedPlane(
+                        xGateUp, hidden: hiddenDims)
+                {
+                    if Gemma4PromptGlueV1.xcheck {
+                        Gemma4PromptGlueV1.report(
+                            product, reference: geGLUProduct(xGate, xUp), site: "experts")
+                    }
+                    promptActivated = product
+                }
             } else {
                 xUp = upProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
                 xGate = gateProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
@@ -1509,7 +1522,9 @@ public class SwitchGLU: Module {
         }
 
         let activated: MLXArray
-        if let activationProduct {
+        if let promptActivated {
+            activated = promptActivated
+        } else if let activationProduct {
             activated = activationProduct(xGate, xUp)
         } else if isSiluActivation {
             activated = compiledSwiGLU(xGate, xUp)

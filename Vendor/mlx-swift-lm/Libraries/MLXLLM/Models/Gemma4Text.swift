@@ -3465,6 +3465,33 @@ private class Gemma4Router: Module {
         super.init()
     }
 
+    func effectiveScale() -> MLXArray {
+        if let cached = cachedEffectiveScale {
+            return cached
+        }
+        let eff = scale * rootSize
+        cachedEffectiveScale = eff
+        return eff
+    }
+
+    func callWithNormed(_ normed: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
+        let expertScores = proj(normed)
+        var topKIndices: MLXArray
+        if let selected = Gemma4RouterFinalistsV1.applyPrefill(
+            expertScores, topK: topK, kth: kth)
+        {
+            topKIndices = selected
+        } else {
+            topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
+            topKIndices = topKIndices[.ellipsis, kth...]
+        }
+
+        var topKWeights = MLX.takeAlong(expertScores, topKIndices, axis: -1)
+        topKWeights = MLX.softmax(topKWeights, axis: -1, precise: true)
+        topKWeights = topKWeights * perExpertScale[topKIndices]
+        return (topKIndices, topKWeights)
+    }
+
     func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
         let effScale: MLXArray
         if let cached = cachedEffectiveScale {
@@ -4140,7 +4167,7 @@ public class Gemma4DecoderLayer: Module {
             out = residual + postAttn
         }
 
-        let residual2 = out
+        var residual2 = out
         // GLUE-001 fuses the whole post-branch tail (postFFLN1 + postFFLN2 +
         // sum + postFFLN + residual) into one dispatch; when it engages, the
         // common tail below must not run again.
@@ -4219,7 +4246,26 @@ public class Gemma4DecoderLayer: Module {
                     weights: zipped.topKWeights,
                     routeTable: zipped.routeTable)
             } else {
-                let (topKIndices, topKWeights) = router(out)
+                let (topKIndices, topKWeights): (MLXArray, MLXArray)
+                let prefillN1: MLXArray?
+                if isExpertPrefill,
+                    Gemma4PrefillGlueV1.prenormGatherEnabled,
+                    let prefix = Gemma4PrefillGlueV1.attentionBranchPrefix(
+                        x: attnOut,
+                        residual: residual,
+                        postAttentionWeight: postAttentionLayernorm.weight,
+                        denseWeight: preFeedforwardLayernorm.weight,
+                        routerWeight: router.effectiveScale(),
+                        eps: config.rmsNormEps)
+                {
+                    out = prefix.out
+                    residual2 = prefix.out
+                    prefillN1 = prefix.denseNorm
+                    (topKIndices, topKWeights) = router.callWithNormed(prefix.routerNorm)
+                } else {
+                    prefillN1 = nil
+                    (topKIndices, topKWeights) = router(out)
+                }
 
                 if let (n1, n2, denseSums) = Gemma4FusedLayerGlue.dualPreNorm(
                     x: out,
@@ -4234,7 +4280,7 @@ public class Gemma4DecoderLayer: Module {
                         weights: topKWeights)
                 } else if isExpertPrefill,
                     Gemma4PrefillGlueV1.prenormGatherEnabled,
-                    let n1 = Gemma4PrefillGlueV1.preNorm(
+                    let n1 = prefillN1 ?? Gemma4PrefillGlueV1.preNorm(
                         x: out,
                         weight: preFeedforwardLayernorm.weight,
                         eps: config.rmsNormEps),

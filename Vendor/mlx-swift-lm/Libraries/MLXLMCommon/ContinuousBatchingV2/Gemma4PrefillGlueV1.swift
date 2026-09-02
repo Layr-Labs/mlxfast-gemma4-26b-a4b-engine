@@ -223,6 +223,87 @@ public enum Gemma4PrefillGlueV1 {
         )[0]
     }
 
+    // MARK: - attention-branch prefix (3 dispatches -> 1)
+
+    private static let attentionBranchPrefixKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_prefill_glue_attn_branch_prefix_2816_v1",
+        inputNames: ["x", "res", "w_post", "w_dense", "w_router"],
+        outputNames: ["out", "dense_norm", "router_norm"],
+        source: """
+            threadgroup float local_sums[32];
+            threadgroup float local_inv[1];
+
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+
+            const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+
+            float xv[GLUE_NREADS];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                xv[i] = static_cast<float>(x[base + i]);
+            }
+
+            const float inv1 = glue_inv_rms(
+                xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
+
+            float outv[GLUE_NREADS];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                const uint j = lid * GLUE_NREADS + i;
+                const T normed = static_cast<T>(w_post[j] * static_cast<T>(xv[i] * inv1));
+                const T res_val = res[base + i] + normed;
+                out[base + i] = res_val;
+                outv[i] = static_cast<float>(res_val);
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const float inv2 = glue_inv_rms(
+                outv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
+
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                const uint j = lid * GLUE_NREADS + i;
+                const T scaled = static_cast<T>(outv[i] * inv2);
+                dense_norm[base + i] = w_dense[j] * scaled;
+                router_norm[base + i] = w_router[j] * scaled;
+            }
+            """,
+        header: kernelHeader,
+        ensureRowContiguous: true
+    )
+
+    public static func attentionBranchPrefix(
+        x: MLXArray,
+        residual: MLXArray,
+        postAttentionWeight: MLXArray,
+        denseWeight: MLXArray,
+        routerWeight: MLXArray,
+        eps epsIn: Float
+    ) -> (out: MLXArray, denseNorm: MLXArray, routerNorm: MLXArray)? {
+        guard let rows = planeRows(x, weight: postAttentionWeight, eps: epsIn),
+            residual.shape == x.shape,
+            residual.dtype == x.dtype,
+            denseWeight.shape == postAttentionWeight.shape,
+            denseWeight.dtype == postAttentionWeight.dtype,
+            routerWeight.shape == postAttentionWeight.shape,
+            routerWeight.dtype == postAttentionWeight.dtype
+        else { return nil }
+
+        let outs = attentionBranchPrefixKernel(
+            [x, residual, postAttentionWeight, denseWeight, routerWeight],
+            template: [("T", x.dtype)],
+            grid: (threadsPerRow, rows, 1),
+            threadGroup: (threadsPerRow, 1, 1),
+            outputShapes: [x.shape, x.shape, x.shape],
+            outputDTypes: [x.dtype, x.dtype, x.dtype]
+        )
+        return (out: outs[0], denseNorm: outs[1], routerNorm: outs[2])
+    }
+
     // MARK: - dual pre-norm (2 dispatches -> 1)
 
     private static let dualPreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(

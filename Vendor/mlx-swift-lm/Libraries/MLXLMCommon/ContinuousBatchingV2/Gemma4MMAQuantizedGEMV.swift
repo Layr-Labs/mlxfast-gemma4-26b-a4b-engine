@@ -2889,6 +2889,20 @@ public enum Gemma4MMAQuantizedGEMV {
         }
     }()
 
+    /// The two stage-one records are independent planes in one uint32 output.
+    /// Packing them removes the second MLX output allocation while retaining
+    /// the incumbent vectorized reads and exact float bit patterns.
+    private static let packedArgmaxPartialsEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_HEAD_PACKED_PARTIALS"]
+        else { return true }
+        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "0", "false", "no", "off": return false
+        default: return true
+        }
+    }()
+
+
     /// The promoted version 27 with the vocabulary store replaced by an in-register top-1
     /// selection. The GEMV above is untouched, so what the reduction compares
     /// is the SAME bf16 the store would have written --- `T(acc)`, rounded
@@ -2996,6 +3010,36 @@ public enum Gemma4MMAQuantizedGEMV {
         return result
     }()
 
+    /// Stage one packed variant. The value plane stores the exact float bits
+    /// and the index plane stores the same uint records as the split outputs.
+    private static let sourceV27ArgmaxPacked: String = {
+        var result = sourceV27Argmax
+        let splitStores = """
+            pv[lid * TILES + tg] = rv;
+            pi[lid * TILES + tg] = ri;
+            """
+        let packedStores = """
+            constexpr uint PARTIALS = uint(M_ROWS) * TILES;
+            partials[lid * TILES + tg] = as_type<uint>(rv);
+            partials[PARTIALS + lid * TILES + tg] = ri;
+            """
+        let count = result.components(separatedBy: splitStores).count
+        precondition(count == 2, "sourceV27ArgmaxPacked replacement count \(count)")
+        result = result.replacingOccurrences(of: splitStores, with: packedStores)
+        precondition(!result.contains("pv[") && !result.contains("pi["))
+        return result
+    }()
+
+    private static let kernelV27ArgmaxPacked: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_affine4_qmv_m8_v27_argmax_packed",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["partials"],
+        source: sourceV27ArgmaxPacked,
+        header: "#include <metal_simdgroup_matrix>\n",
+        ensureRowContiguous: true
+    )
+
+
     private static let kernelV27Argmax: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_mma_affine4_qmv_m8_v27_argmax",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
@@ -3040,6 +3084,46 @@ public enum Gemma4MMAQuantizedGEMV {
             """,
         ensureRowContiguous: true
     )
+
+    /// Stage two for the packed records. Keeping values and indices as
+    /// separate planes preserves the incumbent float4/uint4 load pattern.
+    private static let argmaxReduceKernelPacked: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_head_argmax_reduce_v2_vec4_packed",
+        inputNames: ["partials"],
+        outputNames: ["tokens"],
+        source: """
+            constexpr uint M = 8;
+            const uint m = threadgroup_position_in_grid.x;
+            const uint lane = thread_index_in_simdgroup;
+            const device uint* packed = partials;
+            const device float4* pv4 = (const device float4*)(packed + m * uint(NT));
+            const device uint4* pi4 = (const device uint4*)(
+                packed + uint(M) * uint(NT) + m * uint(NT));
+            float rv = -INFINITY;
+            uint ri = 0xFFFFFFFFu;
+            constexpr uint NT4 = uint(NT) / 4;
+            for (uint i = lane; i < NT4; i += 32) {
+                const float4 ov = pv4[i];
+                const uint4 oi = pi4[i];
+                #pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const float v = ov[e];
+                    const uint idx = oi[e];
+                    if (v > rv || (v == rv && idx < ri)) { rv = v; ri = idx; }
+                }
+            }
+            for (ushort xm = 1; xm < 32; xm <<= 1) {
+                const float ov = simd_shuffle_xor(rv, xm);
+                const uint oi = simd_shuffle_xor(ri, xm);
+                if (ov > rv || (ov == rv && oi < ri)) { rv = ov; ri = oi; }
+            }
+            if (lane == 0) {
+                tokens[m] = int32_t(ri);
+            }
+            """,
+        ensureRowContiguous: true
+    )
+
 
     /// True when `applyArgmax` would take the fused path for this geometry.
     /// Pure host predicate over shapes, dtypes and the kill switches, so the
@@ -3114,6 +3198,26 @@ public enum Gemma4MMAQuantizedGEMV {
                 threadGroup: (sumThreads, 1, 1),
                 outputShapes: [[sumCells]],
                 outputDTypes: [.float32]
+            )[0]
+        }
+
+        if packedArgmaxPartialsEnabled {
+            CBv2EngageMark.once("head-argmax-packed-partials")
+            let packed = kernelV27ArgmaxPacked(
+                [flatX, w, scales, biases, xSums],
+                template: [("T", x.dtype), ("K", k), ("N", n)],
+                grid: (threadgroups * threadsPerThreadgroup, 1, 1),
+                threadGroup: (threadsPerThreadgroup, 1, 1),
+                outputShapes: [[mRows * threadgroups * 2]],
+                outputDTypes: [.uint32]
+            )[0]
+            return argmaxReduceKernelPacked(
+                [packed],
+                template: [("NT", threadgroups)],
+                grid: (mRows * 32, 1, 1),
+                threadGroup: (32, 1, 1),
+                outputShapes: [[mRows]],
+                outputDTypes: [.int32]
             )[0]
         }
 

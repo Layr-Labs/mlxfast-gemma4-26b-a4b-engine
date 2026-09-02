@@ -3,7 +3,11 @@ import MLX
 import MLXNN
 
 /// Identity gather table for the sorted 64-assignment decode geometry.
-nonisolated(unsafe) private let switchDownIdentity64 = MLXArray((0..<64).map { UInt32($0) })
+nonisolated(unsafe) private let switchDownIdentity64: MLXArray = {
+    let arr = MLXArray((0..<64).map { UInt32($0) })
+    eval(arr)
+    return arr
+}()
 
 // Port of https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/switch_layers.py
 
@@ -149,6 +153,55 @@ private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
     """,
     ensureRowContiguous: true
 )
+
+/// Fused split-and-GeGLU kernel for production Gemma 4 MoE gate|up activations.
+///
+/// Reads concatenated gate|up activations [rows, 1, 1408] (or [rows, 1408]) directly
+/// from a single gatherQuantizedMM pass, computes the exact tanh-approximated GeGLU
+/// activation in FP32 precision, and writes activated [rows, 1, 704] directly to memory.
+private let splitGeGLUKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "mlx_lm_split_geglu_h704_bf16_vec4_v1",
+    inputNames: ["x_gate_up"],
+    outputNames: ["activated"],
+    source: """
+        typedef vec<T, 4> T4;
+        const uint quad = thread_position_in_grid.x;
+        const uint row = thread_position_in_grid.y;
+        const uint hidden = 704u;
+        const uint quads_per_row = hidden / 4u;
+
+        if (quad >= quads_per_row) return;
+
+        const device T4* in_row_gate = reinterpret_cast<const device T4*>(
+            x_gate_up + row * (hidden * 2u));
+        const device T4* in_row_up = reinterpret_cast<const device T4*>(
+            x_gate_up + row * (hidden * 2u) + hidden);
+        device T4* out_row = reinterpret_cast<device T4*>(
+            activated + row * hidden);
+
+        const T4 gate_vec = in_row_gate[quad];
+        const T4 up_vec = in_row_up[quad];
+
+        T4 result;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 4; ++i) {
+            const float g = (float)gate_vec[i];
+            const float u = (float)up_vec[i];
+            const float inner = 0.79788456f * (g + 0.044715f * g * g * g);
+            const float gelu_g = 0.5f * g * (1.0f + metal::precise::tanh(inner));
+            result[i] = (T)(gelu_g * u);
+        }
+        out_row[quad] = result;
+    """,
+    ensureRowContiguous: true
+)
+
+private let switchMoEFusedGateUpGeGLUEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_MOE_FUSED_GATEUP_GEGLU"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
 
 /// Consume production-shaped sorted Gemma 4 expert rows through their inverse
 /// permutation and reduce original top-K slots into `[tokens, hidden]`.
@@ -1463,60 +1516,70 @@ public class SwitchGLU: Module {
             }
         }
 
-        let xGate: MLXArray
-        let xUp: MLXArray
+        let activated: MLXArray
         if let gateUpProj {
             let xGateUp = gateUpProj(
                 x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
-            xGate = xGateUp[.ellipsis, ..<hiddenDims]
-            xUp = xGateUp[.ellipsis, hiddenDims...]
+            let xGate = xGateUp[.ellipsis, ..<hiddenDims]
+            let xUp = xGateUp[.ellipsis, hiddenDims...]
+            if let activationProduct {
+                activated = activationProduct(xGate, xUp)
+            } else if isSiluActivation {
+                activated = compiledSwiGLU(xGate, xUp)
+            } else if isGeluActivation {
+                activated = geGLUProduct(xGate, xUp)
+            } else {
+                activated = activation(xGate) * xUp
+            }
         } else {
             guard let gateProj, let upProj else {
                 preconditionFailure("SwitchGLU requires gate_up_proj or gate_proj/up_proj")
             }
-            // GATEUP-FUSE-PREFILL: the sorted right-hand-side plane (the
-            // production prefill) reads its gathered activations once through
-            // one gather over the concatenated gate|up storage. Same kernel
-            // pipeline, same per-column K-chains; the halves are views. The
-            // admission mirrors the host's sorted right-hand-side selection
-            // exactly, so the split views never meet that kernel.
-            if doSort, !useLhsIndices, lhsIndices == nil,
-                x.ndim == 3, x.dim(-2) == 1, x.dim(-1) == inputDims,
-                x.dim(0) >= 16, x.dim(0) / numExperts >= 4,
-                x.dtype == .bfloat16,
+            if doSort, isGeluActivation, hiddenDims == 704,
+                x.dtype == .bfloat16, switchMoEFusedGateUpGeGLUEnabled,
                 let fused = fusedGateUpDispatch()
             {
-                CBv2EngageMark.once("prefill-gateup-fuse")
+                CBv2EngageMark.once("moe-fused-gateup-geglu")
                 let xGateUp = MLX.gatherQuantizedMM(
                     x,
                     fused.storage.weight,
                     scales: fused.storage.scales,
                     biases: fused.storage.biases,
-                    lhsIndices: nil,
+                    lhsIndices: lhsIndices,
                     rhsIndices: idx,
                     transpose: true,
                     groupSize: fused.groupSize,
                     bits: fused.bits,
                     mode: fused.mode,
-                    sortedIndices: true
+                    sortedIndices: doSort
                 )
-                xGate = xGateUp[.ellipsis, ..<hiddenDims]
-                xUp = xGateUp[.ellipsis, hiddenDims...]
+                let rows = xGateUp.dim(0)
+                let quads = 704 / 4
+                let threadsPerGroupX = 32
+                let threadGroupsX = (quads + threadsPerGroupX - 1) / threadsPerGroupX
+                var outShape = xGateUp.shape
+                outShape[outShape.count - 1] = 704
+                activated = splitGeGLUKernel(
+                    [xGateUp],
+                    template: [("T", xGateUp.dtype)],
+                    grid: (threadGroupsX * threadsPerGroupX, rows, 1),
+                    threadGroup: (threadsPerGroupX, 1, 1),
+                    outputShapes: [outShape],
+                    outputDTypes: [xGateUp.dtype]
+                )[0]
             } else {
-                xUp = upProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
-                xGate = gateProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
+                let xUp = upProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
+                let xGate = gateProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
+                if let activationProduct {
+                    activated = activationProduct(xGate, xUp)
+                } else if isSiluActivation {
+                    activated = compiledSwiGLU(xGate, xUp)
+                } else if isGeluActivation {
+                    activated = geGLUProduct(xGate, xUp)
+                } else {
+                    activated = activation(xGate) * xUp
+                }
             }
-        }
-
-        let activated: MLXArray
-        if let activationProduct {
-            activated = activationProduct(xGate, xUp)
-        } else if isSiluActivation {
-            activated = compiledSwiGLU(xGate, xUp)
-        } else if isGeluActivation {
-            activated = geGLUProduct(xGate, xUp)
-        } else {
-            activated = activation(xGate) * xUp
         }
 
         // DOWN-LHS-IDENTITY: at the sorted [64] geometry the down projection

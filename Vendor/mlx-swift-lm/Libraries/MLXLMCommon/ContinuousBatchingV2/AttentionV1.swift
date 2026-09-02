@@ -131,40 +131,6 @@ enum CBv2AttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    /// PREFILL-KV-BATCH. When EVERY row of a packed prefill chunk would
-    /// take FRESH-RING-ADOPT for it, pack all rows' q4 mirror planes in ONE
-    /// batched dispatch (8 rows x 25 sliding layers: 200 pack dispatches per
-    /// ranked prefill become 25) and hand each row its packed mirror through
-    /// the batched adopt entry. The per-(plane, head, token) arithmetic and
-    /// the per-row state transitions are the per-row path's; only the grid
-    /// decomposition carries the row index. `0`/`false`/`no`/`off` restores
-    /// the per-row commit loop, which also stays the path whenever any row
-    /// would not adopt fresh.
-    static let prefillBatchKVCommitEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_PREFILL_BATCH_KV_COMMIT"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
-    /// PREFILL-FULLKV-ADOPT. The rectangular road's per-row commit for
-    /// FULL-attention rows materializes, per row and per K/V, a zero-filled
-    /// capacity buffer plus one copy-on-write SliceUpdate into it — 32
-    /// dispatches per full layer at the ranked 8 x 1024 geometry, every one
-    /// of which reproduces bytes the caller already holds batched. When
-    /// EVERY row is a strictly fresh `CBv2FullSequenceKV`, each row's first
-    /// update can instead ADOPT its `[1, kvHeads, n, headDim]` slice of the
-    /// chunk rectangle as its storage (see `adoptFreshFullChunks` for the
-    /// state-equivalence argument). `0`/`false`/`no`/`off` restores the
-    /// per-row commit loop, which also stays the path for every input the
-    /// adoption refuses.
-    static let prefillFullKVAdoptEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_PREFILL_FULLKV_ADOPT"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
     /// Join prompt attention blocks directly into the token-major layout that
     /// the following output projection consumes. The returned value remains a
     /// head-major view, so callers keep the same typed interface while their
@@ -775,29 +741,12 @@ enum CBv2AttentionV1 {
         var cachedValues: [MLXArray] = []
         cachedKeys.reserveCapacity(B)
         cachedValues.reserveCapacity(B)
-        // PREFILL-KV-BATCH: when every row would take FRESH-RING-ADOPT for
-        // this chunk, commit all rows through one batched mirror pack (see
-        // `batchedFreshChunkAdoption`); any other composition falls through
-        // to the established per-row loop below, unchanged.
-        if let batched = batchedFreshChunkAdoption(rows: rows, keys: keys, values: values) {
-            cachedKeys = batched.keys
-            cachedValues = batched.values
-        // PREFILL-FULLKV-ADOPT: the all-rows-fresh case commits every row by
-        // adoption (zero dispatches for a row-contiguous producer). Any
-        // refusal — a non-fresh row, a non-full row, the kill switch — keeps
-        // the per-row loop below, and that loop also serves every non-fresh
-        // continuation chunk.
-        } else if let adopted = adoptFreshFullChunks(rows: rows, keys: keys, values: values) {
-            cachedKeys = adopted.keys
-            cachedValues = adopted.values
-        } else {
-            for (index, row) in rows.enumerated() {
-                let (rowKeys, rowValues) = row.update(
-                    keys: keys[index ..< (index + 1)],
-                    values: values[index ..< (index + 1)])
-                cachedKeys.append(rowKeys)
-                cachedValues.append(rowValues)
-            }
+        for (index, row) in rows.enumerated() {
+            let (rowKeys, rowValues) = row.update(
+                keys: keys[index ..< (index + 1)],
+                values: values[index ..< (index + 1)])
+            cachedKeys.append(rowKeys)
+            cachedValues.append(rowValues)
         }
 
         if let batched = batchedPackedAttention(
@@ -818,128 +767,6 @@ enum CBv2AttentionV1 {
                 sinks: effectiveSinks, softcap: softcap,
                 spanContext: spanContexts?[index])
         }
-    }
-
-    /// PREFILL-KV-BATCH: all-rows-fresh admission for the rectangular
-    /// road's commit stage. When every row is a `CBv2WindowedSequenceKV`
-    /// whose next `update` with this chunk would take FRESH-RING-ADOPT
-    /// (`canAdoptFreshFullWindowChunk` — `update`'s own gate, row for row),
-    /// pack ALL rows' mirror planes in ONE batched dispatch and adopt per
-    /// row with the pre-packed mirror. Each row ends in exactly the state
-    /// its own `update` would leave — same ring storage (the chunk slice),
-    /// same `absoluteOffset`/`oldestValidPosition` advance, same
-    /// `borrowableChunkViews` — and the mirror holds the same bytes the
-    /// per-row pack would have written (the batched packer is the per-row
-    /// kernel with a row-prefixed grid index; see
-    /// `quantPackPairChunkBatchGPU`). The returned per-row cached views are
-    /// the chunk slices themselves, identical to what the per-row loop
-    /// collects. Returns nil — leaving the per-row commit loop to run
-    /// untouched — when the gate is off, the batch exceeds the batched
-    /// packer's eight row outputs, or ANY row would not adopt fresh.
-    private static func batchedFreshChunkAdoption(
-        rows: [CBv2SequenceKV], keys: MLXArray, values: MLXArray
-    ) -> (keys: [MLXArray], values: [MLXArray])? {
-        guard prefillBatchKVCommitEnabled else { return nil }
-        let B = rows.count
-        guard B > 1, B <= 8 else { return nil }
-        guard keys.ndim == 4, values.ndim == 4,
-            keys.dim(0) == B, values.dim(0) == B,
-            keys.dim(2) == values.dim(2)
-        else { return nil }
-        let windowed = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
-        guard windowed.count == B else { return nil }
-        for (index, row) in windowed.enumerated()
-        where !row.canAdoptFreshFullWindowChunk(
-            keys: keys[index ..< (index + 1)], values: values[index ..< (index + 1)])
-        {
-            return nil
-        }
-        let mirrors = CBv2WindowedSequenceKV.quantPackPairChunkBatchGPU(
-            keys: keys, values: values)
-        var cachedKeys: [MLXArray] = []
-        var cachedValues: [MLXArray] = []
-        cachedKeys.reserveCapacity(B)
-        cachedValues.reserveCapacity(B)
-        for (index, row) in windowed.enumerated() {
-            let (rowKeys, rowValues) = row.adoptFreshFullWindowChunk(
-                keys: keys[index ..< (index + 1)],
-                values: values[index ..< (index + 1)],
-                packedMirror: mirrors[index])
-            cachedKeys.append(rowKeys)
-            cachedValues.append(rowValues)
-        }
-        CBv2EngageMark.once("prefill-batch-kv-commit")
-        return (cachedKeys, cachedValues)
-    }
-
-    /// PREFILL-FULLKV-ADOPT: the all-rows-fresh batched commit for a packed
-    /// `[B > 1, L > 1]` FULL-attention pass. Admitted only when EVERY row is
-    /// a strictly fresh `CBv2FullSequenceKV` (`canAdoptFreshChunk`: no
-    /// committed keys, no pool, offset 0 — a state a speculatively armed row
-    /// cannot present, since a full row's begin/commit are no-ops and it has
-    /// no storage to stage). Each row then ADOPTS the row-contiguous view of
-    /// its `[..., n, ...]` slice of the caller's chunk rectangle as its K/V
-    /// storage (`contiguous()` is zero-cost for the row-contiguous producers
-    /// — every fused QKV-norm output — and one copy otherwise, never more
-    /// than the per-row loop's zero-fill + SliceUpdate for the same input).
-    ///
-    /// State equivalence with the per-row loop, for every later consumer:
-    /// a fresh row's committed prefix is EXACTLY the chunk, and no view this
-    /// class ever hands out reaches past `absoluteOffset`, so the values
-    /// every reader sees are the per-row path's by construction. The per-row
-    /// `keys`/`values` buffers (shape `[1, kvHeads, capacity, headDim]`, the
-    /// committed prefix at `[0, n)`) become the adopted buffers with
-    /// `capacity == n` — identical bytes, identical `absoluteOffset`,
-    /// identical return-view shapes, `cbv2InnerState()` still exactly two
-    /// arrays, `cohortPool` still nil (the LASTQ-D512 / D512 admissions that
-    /// require `cohortPool == nil` keep passing). `capacity == offset` makes
-    /// the adopted storage read-only for its lifetime: plain appends always
-    /// exceed it and grow by `ensureCapacity`'s doubling reallocation into a
-    /// private buffer, and the fused in-place decode writers (WRITE-022 /
-    /// WRITE-016-D512) refuse rows without `dim(2) >= keyLength` headroom —
-    /// on the first decode step such a row fails closed to D512-SDPA, whose
-    /// per-row `update` performs that same growth; from the next step the
-    /// row is back on the fused path with headroom to spare. ATT-008 pool
-    /// formation reads the rows' buffers and concatenates, unchanged.
-    /// `snapshot`/`rollback`/borrow views are counter- and view-exact. The
-    /// only observable difference anywhere is WHEN the first capacity growth
-    /// happens (first append after the prompt, not `initialSlack` appends
-    /// later) and the truthful `byteCount` in between — which the contiguous
-    /// backend bills as `max(byteCount, reservation)`, so admission never
-    /// sees headroom the row does not hold.
-    ///
-    /// Returns nil — BEFORE touching any row — when any row is not a fresh
-    /// full row, the rectangles do not match the batch, or the kill switch
-    /// (`DARKBLOOM_CBV2_PREFILL_FULLKV_ADOPT=0`) is set; the caller keeps
-    /// the per-row loop.
-    private static func adoptFreshFullChunks(
-        rows: [CBv2SequenceKV], keys: MLXArray, values: MLXArray
-    ) -> (keys: [MLXArray], values: [MLXArray])? {
-        guard prefillFullKVAdoptEnabled,
-            keys.ndim == 4, values.ndim == 4,
-            keys.dim(0) == rows.count, values.dim(0) == rows.count,
-            keys.dim(2) == values.dim(2)
-        else { return nil }
-        var fullRows: [CBv2FullSequenceKV] = []
-        fullRows.reserveCapacity(rows.count)
-        for row in rows {
-            guard let full = row as? CBv2FullSequenceKV, full.canAdoptFreshChunk
-            else { return nil }
-            fullRows.append(full)
-        }
-        var adoptedKeys: [MLXArray] = []
-        var adoptedValues: [MLXArray] = []
-        adoptedKeys.reserveCapacity(rows.count)
-        adoptedValues.reserveCapacity(rows.count)
-        for (index, row) in fullRows.enumerated() {
-            let (rowKeys, rowValues) = row.adoptFreshChunk(
-                keys: contiguous(keys[index ..< (index + 1)]),
-                values: contiguous(values[index ..< (index + 1)]))
-            adoptedKeys.append(rowKeys)
-            adoptedValues.append(rowValues)
-        }
-        CBv2EngageMark.once("prefill-fullkv-adopt")
-        return (adoptedKeys, adoptedValues)
     }
 
     /// One batched SDPA for a packed `[B > 1, L > 1]` pass whose rows all hold
@@ -1160,44 +987,17 @@ enum CBv2AttentionV1 {
 
         let effectiveSinks = dispatchSinks(
             sinks, kind: kind, queries: queries, softcap: softcap)
-        // Commit every row's FULL chunk first — the byte-identical `update`
-        // calls, in the same row order, the per-row loop below has always
-        // made — so every row's cache ends in exactly the state it reached
-        // before this function existed (absoluteOffset advanced by the
-        // chunk length). Only the attends may differ, below.
-        var committed: [(keys: MLXArray, values: MLXArray)] = []
-        committed.reserveCapacity(batch)
+        var outputs: [MLXArray] = []
+        outputs.reserveCapacity(batch)
         for (index, row) in rows.enumerated() {
             let (cachedKeys, cachedValues) = row.update(
                 keys: keys[index ..< index + 1],
                 values: values[index ..< index + 1])
-            committed.append((cachedKeys, cachedValues))
-        }
-        // LASTQ-D512: when every row is a private `CBv2FullSequenceKV` in
-        // lockstep at the committed length (the scored 8×1024 prompt prefill:
-        // kL = 1024, inside the transcribed [4, 4095] window), ONE batched
-        // D512 3-dispatch chain replaces the 8 unfused per-row op graphs.
-        // Decode already runs that chain — with the same bit-exactness
-        // claim, verified at kL = 1024 — on exactly this query shape
-        // [8, 16, 1, 512] against exactly this kind of committed buffer. It
-        // performs no append of its own, so the commits above stand alone.
-        // Any admission miss fails closed to the per-row loop (kill switch:
-        // DARKBLOOM_GEMMA4_LASTQ_D512=0).
-        if let batched = CBv2RaggedComposedD512DecodeAttentionV1.attendCommitted(
-            rows: rows, kind: kind, queries: queries,
-            scale: scale, sinks: effectiveSinks, softcap: softcap)
-        {
-            CBv2EngageMark.once("lastqd512")
-            return batched
-        }
-        var outputs: [MLXArray] = []
-        outputs.reserveCapacity(batch)
-        for (index, cached) in committed.enumerated() {
             outputs.append(
                 attend(
                     queries: queries[index ..< index + 1],
-                    keys: cached.keys, values: cached.values,
-                    scale: scale, L: 1, kL: cached.keys.dim(2), window: nil,
+                    keys: cachedKeys, values: cachedValues,
+                    scale: scale, L: 1, kL: cachedKeys.dim(2), window: nil,
                     sinks: effectiveSinks, softcap: softcap))
         }
         return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 0)

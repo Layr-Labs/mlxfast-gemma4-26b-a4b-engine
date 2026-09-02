@@ -2,9 +2,6 @@ import Foundation
 import MLX
 import MLXNN
 
-/// Identity gather table for the sorted 64-assignment decode geometry.
-nonisolated(unsafe) private let switchDownIdentity64 = MLXArray((0..<64).map { UInt32($0) })
-
 // Port of https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/switch_layers.py
 
 /// Compiled SiLU-gated product (`silu(gate) * up`) for the common MoE GLU path.
@@ -581,15 +578,13 @@ private let routeFusedScatterKernelT64: MLXFast.MLXFastKernel = {
                 atomic_load_explicit(&tg_before[k], memory_order_relaxed);
             // Walk this tile's slice in input order: stability by
             // construction, exactly the stock scatter's write order.
-            if (total > 0) {
-                for (uint i = 0; i < TILE; ++i) {
-                    uint idx = t * TILE + i;
-                    if (keys[idx] == k) {
-                        row_order[off] = idx / M;
-                        sorted_keys[off] = k;
-                        inverse_order[idx] = off;
-                        ++off;
-                    }
+            for (uint i = 0; i < TILE; ++i) {
+                uint idx = t * TILE + i;
+                if (keys[idx] == k) {
+                    row_order[off] = idx / M;
+                    sorted_keys[off] = k;
+                    inverse_order[idx] = off;
+                    ++off;
                 }
             }
             """,
@@ -647,18 +642,16 @@ private let routeFusedScatterPrefixBoundsKernelT64: MLXFast.MLXFastKernel = {
             const uint expert_base = simd_base + lane_excl;
             uint off = expert_base
                 + atomic_load_explicit(&tg_before[k], memory_order_relaxed);
-            if (total > 0) {
-                for (uint i = 0; i < TILE; ++i) {
-                    uint idx = t * TILE + i;
-                    if (keys[idx] == k) {
-                        const uint run_offset = off - expert_base;
-                        const uint run_remaining = total - run_offset;
-                        row_order[off] = idx / M;
-                        sorted_keys[off] = 0x80000000u | k
-                            | (run_offset << 8) | ((run_remaining - 1) << 14);
-                        inverse_order[idx] = off;
-                        ++off;
-                    }
+            for (uint i = 0; i < TILE; ++i) {
+                uint idx = t * TILE + i;
+                if (keys[idx] == k) {
+                    const uint run_offset = off - expert_base;
+                    const uint run_remaining = total - run_offset;
+                    row_order[off] = idx / M;
+                    sorted_keys[off] = 0x80000000u | k
+                        | (run_offset << 8) | ((run_remaining - 1) << 14);
+                    inverse_order[idx] = off;
+                    ++off;
                 }
             }
             """,
@@ -816,7 +809,7 @@ private let routeCsortPrefillHistKernel: MLXFast.MLXFastKernel = MLXFast.metalKe
 )
 
 private let routeCsortPrefillScanKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "mlx_lm_route_csort128_scan_v3",
+    name: "mlx_lm_route_csort128_scan_v1",
     inputNames: ["block_hist"],
     outputNames: ["block_offset"],
     source: """
@@ -826,14 +819,8 @@ private let routeCsortPrefillScanKernel: MLXFast.MLXFastKernel = MLXFast.metalKe
         uint lane = e % 32;
         uint nblocks = (uint)block_hist_shape[0];
         uint total = 0u;
-        // Admission proves every key is below NE, so columns at or above it are
-        // zero in every block and cannot contribute to the total. Skipping the
-        // accumulation retires whole SIMD groups at once when the counter table
-        // is wider than the model's expert count.
-        if (e < (uint)NE) {
-            for (uint b = 0; b < nblocks; ++b) {
-                total += block_hist[b * WIDTH + e];
-            }
+        for (uint b = 0; b < nblocks; ++b) {
+            total += block_hist[b * WIDTH + e];
         }
         // Global bin base: exclusive prefix over the 256 expert totals.
         uint lane_excl = simd_prefix_exclusive_sum(total);
@@ -848,16 +835,9 @@ private let routeCsortPrefillScanKernel: MLXFast.MLXFastKernel = MLXFast.metalKe
         }
         running += lane_excl;
         // Exclusive scan over blocks for this expert, offset by the bin base.
-        // Column `e` of `block_offset` is read by the scatter only as
-        // `block_offset[b * WIDTH + key]` for a key that occurs in block `b`,
-        // so a column whose global total is zero is never read and need not be
-        // written. The counter table is 256 wide while the model routes 128
-        // experts, so at minimum half the columns are unconditionally dead.
-        if (total > 0u) {
-            for (uint b = 0; b < nblocks; ++b) {
-                block_offset[b * WIDTH + e] = running;
-                running += block_hist[b * WIDTH + e];
-            }
+        for (uint b = 0; b < nblocks; ++b) {
+            block_offset[b * WIDTH + e] = running;
+            running += block_hist[b * WIDTH + e];
         }
         """,
     ensureRowContiguous: true
@@ -925,7 +905,6 @@ private func routeCountingSortPrefill(
     )[0]
     let offsets = routeCsortPrefillScanKernel(
         [hist],
-        template: [("NE", numExperts)],
         grid: (width, 1, 1),
         threadGroup: (width, 1, 1),
         outputShapes: [[blocks, width]],
@@ -970,24 +949,6 @@ public struct SwitchRouteTable {
 public func gatherSort(
     x: MLXArray, indices: MLXArray, numExperts: Int = Int.max
 ) -> (MLXArray, MLXArray, MLXArray) {
-    if routeSimdRank64Enabled,
-        (indices.shape == [8, 8] || (indices.ndim == 1 && indices.size == 64)),
-        indices.dtype == .uint32
-    {
-        let flat = indices.flattened()
-        let outputs = routeSimdRank64Kernel(
-            [flat],
-            grid: (64, 1, 1),
-            threadGroup: (64, 1, 1),
-            outputShapes: [[64], [64], [64]],
-            outputDTypes: [.uint32, .uint32, .uint32]
-        )
-        return (
-            x.flattened(start: 0, end: -3)[outputs[0]],
-            outputs[1],
-            outputs[2]
-        )
-    }
     let m = indices.dim(-1)
     let indices = indices.flattened()
     routeCsortShapeLog.note {
@@ -1051,17 +1012,15 @@ public func gatherSortIndices(
     expertPrefixBounds: Bool = false
 ) -> (MLXArray, MLXArray, MLXArray) {
     if routeSimdRank64Enabled,
-        (indices.shape == [8, 8] || (indices.ndim == 1 && indices.size == 64)),
-        indices.dtype == .uint32
+        indices.ndim == 2, indices.shape == [8, 8], indices.dtype == .uint32
     {
         if expertPrefixBounds {
             CBv2EngageMark.once("expert-prefix-bounds")
         }
-        let flat = indices.flattened()
         let kernel = expertPrefixBounds
             ? routeSimdRank64PrefixBoundsKernel : routeSimdRank64Kernel
         let outputs = kernel(
-            [flat],
+            [indices],
             grid: (64, 1, 1),
             threadGroup: (64, 1, 1),
             outputShapes: [[64], [64], [64]],
@@ -1406,12 +1365,7 @@ public class SwitchGLU: Module {
         let doSort = indices.size >= 64
 
         var idx = indices
-        // ROUTE-LAZY-INVERSE-ORDER: the sentinel `MLXArray()` this variable
-        // used to hold is dead at every site -- under `doSort` a real producer
-        // overwrites it, and without it the optional return already carries
-        // nil. Holding the optional avoids one throwaway C++ array handle per
-        // layer per forward.
-        var inverseOrder: MLXArray?
+        var inverseOrder = MLXArray()
         var lhsIndices: MLXArray?
         if doSort {
             if useLhsIndices {
@@ -1519,17 +1473,8 @@ public class SwitchGLU: Module {
             activated = activation(xGate) * xUp
         }
 
-        // DOWN-LHS-IDENTITY: at the sorted [64] geometry the down projection
-        // gathers activation row `assignment` for assignment `assignment`;
-        // hand it that identity table instead of leaving `lhsIndices` nil,
-        // which otherwise materializes the same arange(64) on every call.
-        let downLhs: MLXArray? =
-            (doSort && idx.ndim == 1 && idx.size == 64) ? switchDownIdentity64 : nil
-        x = downProj(activated, idx, lhsIndices: downLhs, sortedIndices: doSort)
-        // Under `doSort` a producer above always assigned `inverseOrder`;
-        // otherwise it is still nil, which is exactly what the old
-        // `doSort ? inverseOrder : nil` produced.
-        return (x, inverseOrder, doSort)
+        x = downProj(activated, idx, sortedIndices: doSort)
+        return (x, doSort ? inverseOrder : nil, doSort)
     }
 
     /// Cached eligibility: the projection tensors are bound at load time and

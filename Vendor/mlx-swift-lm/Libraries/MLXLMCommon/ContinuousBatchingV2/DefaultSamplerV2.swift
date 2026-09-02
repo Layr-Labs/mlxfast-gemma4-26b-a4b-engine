@@ -138,35 +138,3 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
         constraintSampler.failure(for: id)
     }
 }
-
-// MARK: - Logitsless greedy head (LGH-001)
-
-/// `sample` collapses to one `argMax` exactly when every row is greedy and no
-/// stateful or shape-changing transform is armed --- the same condition
-/// `LogitsPipelineV2.process` uses for its identity fast path, evaluated on
-/// host data before the step's logits exist. The engine may then take the
-/// tokens straight from a fused head.
-extension CBv2DefaultSampler: CBv2FusedGreedySampler {
-
-    public func admitsFusedGreedy(params: [CBv2SamplingParams]) -> Bool {
-        guard !params.isEmpty else { return false }
-        return params.allSatisfy { p in
-            p.temperature < LogitsPipelineV2.greedyEpsilon
-                && p.topLogprobs == 0
-                && p.logitBias.isEmpty
-                && !(p.repetitionPenalty != 1 && p.repetitionContextSize > 0)
-                && p.frequencyPenalty == 0
-                && p.presencePenalty == 0
-        }
-    }
-
-    /// A step the sampler never saw leaves its per-row penalty counts and RNG
-    /// step indices one behind. Dropping the configured fingerprint makes the
-    /// next `sample` rebuild both from confirmed history plus the in-flight
-    /// token, which is exactly what a membership change already does --- so
-    /// the state stays a pure function of each request's own history.
-    public func noteFusedGreedySample() {
-        configuredIDs = []
-        pendingStepLogprobs = nil
-    }
-}

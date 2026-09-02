@@ -210,27 +210,3 @@ extension CBv2SteppableLanguageModelAdapter: CBv2MTPSteppableModel {
         return forwardable.cbv2ForwardWithHidden(tokens, caches: asKVCaches(caches))
     }
 }
-
-// MARK: - Logitsless greedy head (LGH-001)
-
-/// Answered at RUNTIME like the multimodal/MTP capabilities: only
-/// `CBv2ArgmaxDecodeForwardable` conformers can end a decode step in a fused
-/// top-1, and `admitsArgmaxDecode` gates every call, so a non-conforming model
-/// keeps the full-logits `forward` contract untouched.
-extension CBv2SteppableLanguageModelAdapter: CBv2ArgmaxDecodeSteppableModel {
-
-    public func admitsArgmaxDecode(tokens: MLXArray) -> Bool {
-        (model as? CBv2ArgmaxDecodeForwardable)?.cbv2AdmitsArgmaxDecode(tokens) ?? false
-    }
-
-    public func decodeArgmax(
-        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
-    ) -> MLXArray {
-        guard let forwardable = model as? CBv2ArgmaxDecodeForwardable else {
-            preconditionFailure(
-                "CBv2 argmax decode: \(type(of: model)) is not CBv2ArgmaxDecodeForwardable "
-                    + "— engine gating failed")
-        }
-        return forwardable.cbv2DecodeArgmax(tokens, caches: asKVCaches(caches))
-    }
-}

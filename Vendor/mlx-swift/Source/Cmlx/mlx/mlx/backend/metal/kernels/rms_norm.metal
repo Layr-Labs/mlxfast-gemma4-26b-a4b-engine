@@ -19,9 +19,11 @@ template <typename T, int N_READS = RMS_N_READS>
     constant uint& w_stride,
     uint gid [[threadgroup_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
+    uint lsize [[threads_per_threadgroup]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]]) {
   constexpr int SIMD_SIZE = 32;
+  typedef vec<T, 4> T4;
 
   threadgroup float local_inv_mean[1];
   threadgroup float local_sums[SIMD_SIZE];
@@ -29,27 +31,51 @@ template <typename T, int N_READS = RMS_N_READS>
   float acc = 0;
   x += gid * size_t(axis_size) + lid * N_READS;
   w += w_stride * lid * N_READS;
-  if (lid * N_READS + N_READS <= axis_size) {
+
+  // RMS-XVEC: three changes, all of which strictly REMOVE work from a kernel
+  // that is latency- and sync-bound rather than bandwidth-bound at the ranked
+  // B = 8 decode shape (704 threads moving ~45 KB).
+  //   1. XCACHE   - the stock body reads every x[i] TWICE, the second time as a
+  //      cold dependent load after the reduction barrier. Cache the packet.
+  //   2. ONE-FENCE- slot j is written by simdgroup j and by nobody above
+  //      n_simdgroups, so zeroing only the unwritten tail makes the writers
+  //      disjoint and one fence replaces two.
+  //   3. XVEC     - the four contiguous elements move as one 8-byte access.
+  //      Guarded on axis_size % 4 (row base alignment) and unit weight stride.
+  // Exactness: xr[i] is the same widened float the stock write-back computed,
+  // the reduction sees an identical lane vector, so output is bit-identical.
+  float xr[N_READS];
+  const bool full_packet = (lid * N_READS + N_READS <= axis_size);
+  const bool vec_ok = full_packet && (N_READS == 4) && ((axis_size & 3u) == 0u);
+  if (vec_ok) {
+    const T4 xv = *((const device T4*)x);
+    for (int i = 0; i < 4; i++) {
+      float xi = xv[i];
+      xr[i] = xi;
+      acc += xi * xi;
+    }
+  } else if (full_packet) {
     for (int i = 0; i < N_READS; i++) {
       float xi = x[i];
+      xr[i] = xi;
       acc += xi * xi;
     }
   } else {
     for (int i = 0; i < N_READS; i++) {
+      xr[i] = 0.0f;
       if ((lid * N_READS + i) < axis_size) {
         float xi = x[i];
+        xr[i] = xi;
         acc += xi * xi;
       }
     }
   }
   acc = simd_sum(acc);
-  //  Initialize shared memory
-  if (simd_group_id == 0) {
+
+  const uint n_simdgroups = (lsize + SIMD_SIZE - 1) / SIMD_SIZE;
+  if (simd_group_id == 0 && simd_lane_id >= n_simdgroups) {
     local_sums[simd_lane_id] = 0;
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  // Write simd accumulations into shared memory
   if (simd_lane_id == 0) {
     local_sums[simd_group_id] = acc;
   }
@@ -66,14 +92,22 @@ template <typename T, int N_READS = RMS_N_READS>
 
   // Write the outputs
   out += gid * size_t(axis_size) + lid * N_READS;
-  if (lid * N_READS + N_READS <= axis_size) {
+  const float inv_mean = local_inv_mean[0];
+  if (vec_ok && w_stride == 1) {
+    const T4 wv = *((const device T4*)w);
+    T4 ov;
+    for (int i = 0; i < 4; i++) {
+      ov[i] = wv[i] * static_cast<T>(xr[i] * inv_mean);
+    }
+    *((device T4*)out) = ov;
+  } else if (full_packet) {
     for (int i = 0; i < N_READS; i++) {
-      out[i] = w[w_stride * i] * static_cast<T>(x[i] * local_inv_mean[0]);
+      out[i] = w[w_stride * i] * static_cast<T>(xr[i] * inv_mean);
     }
   } else {
     for (int i = 0; i < N_READS; i++) {
       if ((lid * N_READS + i) < axis_size) {
-        out[i] = w[w_stride * i] * static_cast<T>(x[i] * local_inv_mean[0]);
+        out[i] = w[w_stride * i] * static_cast<T>(xr[i] * inv_mean);
       }
     }
   }

@@ -3846,7 +3846,7 @@ private enum Gemma4ZipRouterV1 {
     static let plan: Int = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_ZIP_ROUTER_PLAN"], let v = Int(raw)
-        else { return 1 }
+        else { return 3 }
         return v
     }()
 
@@ -3966,8 +3966,15 @@ private enum Gemma4ZipRouterV1 {
             // The fold consumes the identical fenced scores node the incumbent
             // partition consumed, keeping the tape's ordering edges unchanged.
             // Fail-closed onto the incumbent finalists + slice + weight tail.
+            // ZIP-PLAN3: the fold waits for the dense gate and up products
+            // (the stage the router QMV shares) instead of the dense down, so
+            // the route table and the expert gathers overlap the dense GeLU
+            // and down projection instead of trailing them. Depends edges
+            // only: every kernel keeps its operands and arithmetic.
             if let fold = Gemma4RouteGlueFoldV1.apply(
-                MLX.depends(input: expertScores, dependencies: [denseOut]),
+                MLX.depends(
+                    input: expertScores,
+                    dependencies: plan == 3 ? [gate, up] : [denseOut]),
                 perExpertScale: router.perExpertScale,
                 topK: router.topK, kth: router.kth)
             {
@@ -3990,10 +3997,10 @@ private enum Gemma4ZipRouterV1 {
         // well keeps the down projection inside the zip instead of letting the
         // reverse-BFS tape float it past the expert kernels.
         let expertNorm =
-            plan >= 1
+            (plan >= 1 && plan != 3)
             ? MLX.depends(input: n2, dependencies: [denseOut]) : n2
 
-        CBv2EngageMark.once("zip-router")
+        CBv2EngageMark.once(plan == 3 ? "zip-router-plan3" : "zip-router")
         return Zipped(
             denseOut: denseOut,
             expertNorm: expertNorm,

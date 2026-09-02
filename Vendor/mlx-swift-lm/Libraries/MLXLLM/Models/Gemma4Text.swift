@@ -3690,8 +3690,47 @@ private enum Gemma4FusedLayerGlue {
             }
     """
 
+    /// TAILVEC-001: the same legacy `weightedExpertUnsort` value formed from
+    /// 4-wide vector loads. The eight sorted rows' four features are read as
+    /// one `vec<T,4>` each (8-byte aligned: `wbase` is a multiple of four),
+    /// the eight routing weights as two `vec<T,4>` (16-byte aligned: eight
+    /// per row) and the eight row indices as two `uint4` (32-byte aligned).
+    /// The accumulation keeps feature-outer / slot-inner order over the same
+    /// T operands, so every `expertv[i]` is the scalar body's value.
+    private static let deferredExpertValuesVecSource = """
+            T expertv[4];
+            const uint assignment_base = row * 8u;
+            const uint4 sorted_rows_lo = *((const device uint4*)(inverse + assignment_base));
+            const uint4 sorted_rows_hi = *((const device uint4*)(inverse + assignment_base + 4u));
+            const vec<T, 4> routed_lo = *((const device vec<T, 4>*)(route_weights + assignment_base));
+            const vec<T, 4> routed_hi = *((const device vec<T, 4>*)(route_weights + assignment_base + 4u));
+            uint sorted_rows[8];
+            T routed_weights[8];
+            sorted_rows[0] = sorted_rows_lo.x; sorted_rows[1] = sorted_rows_lo.y;
+            sorted_rows[2] = sorted_rows_lo.z; sorted_rows[3] = sorted_rows_lo.w;
+            sorted_rows[4] = sorted_rows_hi.x; sorted_rows[5] = sorted_rows_hi.y;
+            sorted_rows[6] = sorted_rows_hi.z; sorted_rows[7] = sorted_rows_hi.w;
+            routed_weights[0] = routed_lo.x; routed_weights[1] = routed_lo.y;
+            routed_weights[2] = routed_lo.z; routed_weights[3] = routed_lo.w;
+            routed_weights[4] = routed_hi.x; routed_weights[5] = routed_hi.y;
+            routed_weights[6] = routed_hi.z; routed_weights[7] = routed_hi.w;
+            vec<T, 4> sortedv[8];
+            for (uint slot = 0u; slot < 8u; ++slot) {
+                sortedv[slot] = *((const device vec<T, 4>*)(sorted + sorted_rows[slot] * 2816u + wbase));
+            }
+            for (int i = 0; i < 4; ++i) {
+                T accumulator = static_cast<T>(0.0f);
+                for (uint slot = 0u; slot < 8u; ++slot) {
+                    const T weighted = static_cast<T>(
+                        (float)sortedv[slot][i] * (float)routed_weights[slot]);
+                    accumulator = accumulator + weighted;
+                }
+                expertv[i] = accumulator;
+            }
+    """
+
     private static let deferredTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1_nb1_vec1",
+        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1_nb1_vec1_tv1",
         inputNames: [
             "a", "sorted", "inverse", "route_weights", "res",
             "w1", "w2", "w3", "s",
@@ -3706,17 +3745,23 @@ private enum Gemma4FusedLayerGlue {
             threadgroup float local_sums[32];
             const uint base = row * 2816 + lid * 4;
             const uint wbase = lid * 4;
-        \(rmsReduce("a", into: "local_inv[0]"))
-        \(deferredExpertValuesSource)
+            const vec<T, 4> av = *((const device vec<T, 4>*)(a + base));
+            const vec<T, 4> w1v = *((const device vec<T, 4>*)(w1 + wbase));
+            const vec<T, 4> w2v = *((const device vec<T, 4>*)(w2 + wbase));
+            const vec<T, 4> w3v = *((const device vec<T, 4>*)(w3 + wbase));
+            const vec<T, 4> resv = *((const device vec<T, 4>*)(res + base));
+        \(rmsReduce("av", into: "local_inv[0]").replacingOccurrences(
+            of: "(float)av[base + i]", with: "(float)av[i]"))
+        \(deferredExpertValuesVecSource)
         \(rmsReduce("expertv", into: "local_inv[1]").replacingOccurrences(
             of: "(float)expertv[base + i]", with: "(float)expertv[i]"))
             const float inv1 = local_inv[0];
             const float inv2 = local_inv[1];
             T sv[4];
             for (int i = 0; i < 4; i++) {
-                const T h1 = w1[wbase + i]
-                    * static_cast<T>((float)a[base + i] * inv1);
-                const T h2 = w2[wbase + i]
+                const T h1 = w1v[i]
+                    * static_cast<T>((float)av[i] * inv1);
+                const T h2 = w2v[i]
                     * static_cast<T>((float)expertv[i] * inv2);
                 sv[i] = h1 + h2;
             }
@@ -3724,19 +3769,21 @@ private enum Gemma4FusedLayerGlue {
             of: "(float)sv[base + i]", with: "(float)sv[i]"))
             const float inv3 = local_inv[0];
             const T scalar = s[0];
+            vec<T, 4> outv;
             for (int i = 0; i < 4; i++) {
                 const T normed3 = static_cast<T>(
-                    w3[wbase + i] * static_cast<T>((float)sv[i] * inv3));
-                const T summed = res[base + i] + normed3;
-                out[base + i] = summed * scalar;
+                    w3v[i] * static_cast<T>((float)sv[i] * inv3));
+                const T summed = resv[i] + normed3;
+                outv[i] = summed * scalar;
             }
+            *((device vec<T, 4>*)(out + base)) = outv;
         """,
         ensureRowContiguous: true
     )
 
     private static let deferredTailChainKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1_nb1_vec1_rs1",
+            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1_nb1_vec1_rs1_tv1",
             inputNames: [
                 "a", "sorted", "inverse", "route_weights", "res",
                 "w1", "w2", "w3", "s", "wn",
@@ -3751,17 +3798,24 @@ private enum Gemma4FusedLayerGlue {
                 threadgroup float local_sums[32];
                 const uint base = row * 2816 + lid * 4;
                 const uint wbase = lid * 4;
-            \(rmsReduce("a", into: "local_inv[0]"))
-            \(deferredExpertValuesSource)
+                const vec<T, 4> av = *((const device vec<T, 4>*)(a + base));
+                const vec<T, 4> w1v = *((const device vec<T, 4>*)(w1 + wbase));
+                const vec<T, 4> w2v = *((const device vec<T, 4>*)(w2 + wbase));
+                const vec<T, 4> w3v = *((const device vec<T, 4>*)(w3 + wbase));
+                const vec<T, 4> wnv = *((const device vec<T, 4>*)(wn + wbase));
+                const vec<T, 4> resv = *((const device vec<T, 4>*)(res + base));
+            \(rmsReduce("av", into: "local_inv[0]").replacingOccurrences(
+                of: "(float)av[base + i]", with: "(float)av[i]"))
+            \(deferredExpertValuesVecSource)
             \(rmsReduce("expertv", into: "local_inv[1]").replacingOccurrences(
                 of: "(float)expertv[base + i]", with: "(float)expertv[i]"))
                 const float inv1 = local_inv[0];
                 const float inv2 = local_inv[1];
                 T sv[4];
                 for (int i = 0; i < 4; i++) {
-                    const T h1 = w1[wbase + i]
-                        * static_cast<T>((float)a[base + i] * inv1);
-                    const T h2 = w2[wbase + i]
+                    const T h1 = w1v[i]
+                        * static_cast<T>((float)av[i] * inv1);
+                    const T h2 = w2v[i]
                         * static_cast<T>((float)expertv[i] * inv2);
                     sv[i] = h1 + h2;
                 }
@@ -3769,24 +3823,24 @@ private enum Gemma4FusedLayerGlue {
                 of: "(float)sv[base + i]", with: "(float)sv[i]"))
                 const float inv3 = local_inv[0];
                 const T scalar = s[0];
-                T outv[4];
+                vec<T, 4> outv;
                 for (int i = 0; i < 4; i++) {
                     const T normed3 = static_cast<T>(
-                        w3[wbase + i]
+                        w3v[i]
                             * static_cast<T>((float)sv[i] * inv3));
-                    const T summed = res[base + i] + normed3;
+                    const T summed = resv[i] + normed3;
                     outv[i] = summed * scalar;
-                    out[base + i] = outv[i];
                 }
+                *((device vec<T, 4>*)(out + base)) = outv;
             \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
                 of: "(float)outv[base + i]", with: "(float)outv[i]"))
                 const float inv4 = local_inv[0];
-                T nq[4];
+                vec<T, 4> nq;
                 for (int i = 0; i < 4; i++) {
-                    nq[i] = wn[wbase + i]
+                    nq[i] = wnv[i]
                         * static_cast<T>((float)outv[i] * inv4);
-                    normed[base + i] = nq[i];
                 }
+                *((device vec<T, 4>*)(normed + base)) = nq;
                 // RS-CHAIN: the next layer's affine run-sum table entry for
                 // this thread's 64-wide group, in the table kernel's order:
                 // each octet is float(quadA) + float(quadB) with each quad

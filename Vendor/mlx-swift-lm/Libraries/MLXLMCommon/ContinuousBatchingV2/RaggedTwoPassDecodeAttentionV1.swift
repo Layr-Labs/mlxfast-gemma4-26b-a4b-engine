@@ -2050,68 +2050,21 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             ensureRowContiguous: true
         )
 
-    /// ORSFOLD-001. Default ON. `DARKBLOOM_CBV2_O_RS_FOLD=0` selects the
-    /// four-output resident kernel and leaves the standalone
-    /// `cbv2_b8_rs_table_dyn_v1` prepass to build the o_proj table.
-    static let oRunsumFoldEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_O_RS_FOLD"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
-    /// ORSFOLD-001 epilogue. Each combine lane already holds, in `ov`, the one
-    /// BF16 element it is about to store into `out`, and the o_proj activation
-    /// is that store read back head-major. Lane `l` owns element
-    /// `(block * 4 + l / 8) * 8 + (l % 8)`, so the eight lanes `l & ~7 ..
-    /// (l & ~7) + 7` are exactly one aligned run of eight consecutive elements,
-    /// which is the run one lane of the prepass reads as a `uint4`. Shuffling
-    /// that octet into `xt` and writing the two four-element partials as the
-    /// same two statements the prepass uses reproduces its value exactly,
-    /// including the BF16 rounding of each partial. A 64-wide group is eight
-    /// such octets, held by the four octets of block `2k` and the four of block
-    /// `2k+1`; xor 8 and xor 16 walk the octet index inside a block and give
-    /// `((v0+v1)+(v2+v3))`, the partner block gives `((v4+v5)+(v6+v7))`, and
-    /// the final add is the prepass's xor-4 stage. Same tree, same order.
-    private static let residentORunsumFold = """
-                    const ushort ow = as_type<ushort>(ov);
-                    const ushort obase = ushort(lane & ~7);
-                    thread T xt[8];
-                    #pragma clang loop unroll(full)
-                    for (int p = 0; p < 8; ++p) {
-                        xt[p] = as_type<T>(
-                            simd_shuffle(ow, ushort(obase + ushort(p))));
-                    }
-                    float rsv = 0;
-                    rsv += xt[0] + xt[1] + xt[2] + xt[3];
-                    rsv += xt[4] + xt[5] + xt[6] + xt[7];
-                    rsv += simd_shuffle_xor(rsv, 8u);
-                    rsv += simd_shuffle_xor(rsv, 16u);
-                    if (lane == 0) {
-                        local_o_rs[head * BLOCKS + block] = rsv;
-                    }
-        """
-
-    private static let residentORunsumStore = """
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                constexpr int rs_groups = D / 64;
-                const int rs_flat = block * simd_width + lane;
-                if (rs_flat < GQA * rs_groups) {
-                    const int rs_head = rs_flat / rs_groups;
-                    const int rs_group = rs_flat % rs_groups;
-                    o_rs[batch_index * (KV_HEADS * GQA * rs_groups)
-                            + (query_head + rs_head) * rs_groups + rs_group] =
-                        local_o_rs[rs_head * BLOCKS + 2 * rs_group]
-                        + local_o_rs[rs_head * BLOCKS + 2 * rs_group + 1];
-                }
-        """
-
     /// F4: exact decode Q/K/V normalization and sliding RoPE in the resident
     /// attention prologue. SIMD groups 0...3 own Q0, Q1, K, V respectively, so
     /// every raw element is normalized once; all eight resident attention groups
     /// reuse the BF16-rounded threadgroup rows.
-    private static func residentNormRopeSource(withORunsum: Bool) -> String {
-        """
+    private static let portQuantFusedWriteResidentNormRopeKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_v1",
+            inputNames: [
+                "raw_queries",
+                "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
+                "starts", "raw_keys", "raw_values", "q_weight", "k_weight",
+                "position_offsets", "rope_log2_base", "write_fence",
+            ],
+            outputNames: ["out", "fence", "k_out", "v_out"],
+            source: """
                 typedef vec<T, 4> T4;
                 constexpr int simd_width = 32;
                 constexpr int values_per_lane = D / simd_width;
@@ -2139,7 +2092,6 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 threadgroup T local_queries[GQA * D];
                 threadgroup T local_key[D];
                 threadgroup T local_value[D];
-                \(withORunsum ? "threadgroup float local_o_rs[GQA * BLOCKS];" : "")
 
                 // Transcribe gemma4_b8_qkv_rms_norm_rope_v2_vec1 one row per
                 // designated SIMD group. Each lane owns the same two four-value
@@ -2585,44 +2537,12 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                                 keep + simd_shuffle_xor(trade, stride);
                         }
                     }
-                    const T ov = T(
+                    head_out[block_lane] = T(
                         sum_exp_score == 0.0f
                             ? accumulator[0]
                             : accumulator[0] / sum_exp_score);
-                    head_out[block_lane] = ov;
-                \(withORunsum ? residentORunsumFold : "")
                 }
-                \(withORunsum ? residentORunsumStore : "")
-            """
-    }
-
-    private static let portQuantFusedWriteResidentNormRopeKernel: MLXFast.MLXFastKernel =
-        MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_v1",
-            inputNames: [
-                "raw_queries",
-                "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
-                "starts", "raw_keys", "raw_values", "q_weight", "k_weight",
-                "position_offsets", "rope_log2_base", "write_fence",
-            ],
-            outputNames: ["out", "fence", "k_out", "v_out"],
-            source: residentNormRopeSource(withORunsum: false),
-            ensureRowContiguous: true
-        )
-
-    /// ORSFOLD-001 arm: the same kernel with the o_proj run-sum table as a
-    /// fifth output, so the standalone prepass never runs on a sliding layer.
-    private static let portQuantFusedWriteResidentNormRopeORunsumKernel:
-        MLXFast.MLXFastKernel = MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_ors_v1",
-            inputNames: [
-                "raw_queries",
-                "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
-                "starts", "raw_keys", "raw_values", "q_weight", "k_weight",
-                "position_offsets", "rope_log2_base", "write_fence",
-            ],
-            outputNames: ["out", "fence", "k_out", "v_out", "o_rs"],
-            source: residentNormRopeSource(withORunsum: true),
+            """,
             ensureRowContiguous: true
         )
 
@@ -2770,7 +2690,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             if let normRope = takeResidentNormRope(
                 queries: queries, keys: newKeys, values: newValues)
             {
-                let residentInputs =
+                let resident = portQuantFusedWriteResidentNormRopeKernel(
                     [normRope.rawQueries] + mirrors + [
                         startArray,
                         normRope.rawKeys,
@@ -2780,51 +2700,29 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         normRope.positionOffsets,
                         normRope.ropeLog2Base,
                         previousWriteFence,
+                    ],
+                    template: [
+                        ("T", normRope.rawQueries.dtype),
+                        ("D", headDim),
+                        ("N", sequenceLength),
+                        ("GQA", gqa),
+                        ("KV_HEADS", kvHeads),
+                        ("BLOCKS", blocks),
+                    ],
+                    grid: (kvHeads * blocks * 32, batch, 1),
+                    threadGroup: (blocks * 32, 1, 1),
+                    outputShapes: [
+                        [batch, queryHeads, 1, headDim], [1],
+                        [batch, kvHeads, 1, headDim],
+                        [batch, kvHeads, 1, headDim],
+                    ],
+                    outputDTypes: [
+                        .bfloat16, .int32, .bfloat16, .bfloat16,
                     ]
-                let residentTemplate: [(String, any KernelTemplateArg)] = [
-                    ("T", normRope.rawQueries.dtype),
-                    ("D", headDim),
-                    ("N", sequenceLength),
-                    ("GQA", gqa),
-                    ("KV_HEADS", kvHeads),
-                    ("BLOCKS", blocks),
-                ]
-                let residentShapes = [
-                    [batch, queryHeads, 1, headDim], [1],
-                    [batch, kvHeads, 1, headDim],
-                    [batch, kvHeads, 1, headDim],
-                ]
-                let residentDTypes: [DType] = [
-                    .bfloat16, .int32, .bfloat16, .bfloat16,
-                ]
-                let resident: [MLXArray]
-                let oRunsum: MLXArray?
-                if oRunsumFoldEnabled {
-                    resident = portQuantFusedWriteResidentNormRopeORunsumKernel(
-                        residentInputs,
-                        template: residentTemplate,
-                        grid: (kvHeads * blocks * 32, batch, 1),
-                        threadGroup: (blocks * 32, 1, 1),
-                        outputShapes: residentShapes
-                            + [[batch, queryHeads * headDim / 64]],
-                        outputDTypes: residentDTypes + [.float32]
-                    )
-                    oRunsum = resident[4]
-                    CBv2EngageMark.once("o-runsum-resident-fold")
-                } else {
-                    resident = portQuantFusedWriteResidentNormRopeKernel(
-                        residentInputs,
-                        template: residentTemplate,
-                        grid: (kvHeads * blocks * 32, batch, 1),
-                        threadGroup: (blocks * 32, 1, 1),
-                        outputShapes: residentShapes,
-                        outputDTypes: residentDTypes
-                    )
-                    oRunsum = nil
-                }
+                )
                 publishResidentProducts(
                     ResidentProducts(
-                        runsumTable: oRunsum,
+                        runsumTable: nil,
                         normalizedKeys: resident[2],
                         normalizedValues: resident[3]),
                     for: resident[0])
@@ -3492,7 +3390,6 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int lid = int(thread_position_in_threadgroup.x);
             const int simd_lane_id = int(thread_index_in_simdgroup);
             const int simd_group_id = int(simdgroup_index_in_threadgroup);
-            const int num_simdgroups = (axis_size + 127) / 128;
 
             typedef vec<T, 4> T4;
             const bool row_vec4 = (axis_size & 3) == 0;
@@ -3520,6 +3417,11 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                         ? static_cast<float>(in[i]) : -INFINITY;
                 }
             }
+            if (simd_group_id == 0) {
+                local_max[simd_lane_id] = -INFINITY;
+                local_normalizer[simd_lane_id] = 0.0f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
 
             float maxval = -3.402823466e+38F;
             for (int i = 0; i < 4; i++) {
@@ -3530,12 +3432,14 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 local_max[simd_group_id] = maxval;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            maxval = -3.402823466e+38F;
-            for (int s = 0; s < num_simdgroups; ++s) {
-                const float sm = local_max[s];
-                maxval = (maxval < sm) ? sm : maxval;
+            if (simd_group_id == 0) {
+                maxval = simd_max(local_max[simd_lane_id]);
+                if (simd_lane_id == 0) {
+                    local_max[0] = maxval;
+                }
             }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            maxval = local_max[0];
 
             float normalizer = 0.0f;
             for (int i = 0; i < 4; i++) {
@@ -3548,12 +3452,14 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 local_normalizer[simd_group_id] = normalizer;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            normalizer = 0.0f;
-            for (int s = 0; s < num_simdgroups; ++s) {
-                normalizer += local_normalizer[s];
+            if (simd_group_id == 0) {
+                normalizer = simd_sum(local_normalizer[simd_lane_id]);
+                if (simd_lane_id == 0) {
+                    local_normalizer[0] = normalizer;
+                }
             }
-            const float inv_normalizer = 1.0f / normalizer;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            normalizer = 1 / local_normalizer[0];
 
             device T* out_row =
                 probs + size_t(gid) * axis_size + lid * 4;
@@ -3561,18 +3467,18 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 if (row_vec4) {
                     T4 out_vec;
                     for (int i = 0; i < 4; i++) {
-                        out_vec[i] = static_cast<T>(ld[i] * inv_normalizer);
+                        out_vec[i] = static_cast<T>(ld[i] * normalizer);
                     }
                     *reinterpret_cast<device T4*>(out_row) = out_vec;
                 } else {
                     for (int i = 0; i < 4; i++) {
-                        out_row[i] = static_cast<T>(ld[i] * inv_normalizer);
+                        out_row[i] = static_cast<T>(ld[i] * normalizer);
                     }
                 }
             } else {
                 for (int i = 0; i < 4; i++) {
                     if ((lid * 4 + i) < axis_size) {
-                        out_row[i] = static_cast<T>(ld[i] * inv_normalizer);
+                        out_row[i] = static_cast<T>(ld[i] * normalizer);
                     }
                 }
             }
@@ -4177,7 +4083,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// `new_values` rather than the cache slot the fused QK dispatch wrote,
     /// so this kernel has no read-after-in-place-write hazard at all.
     private static let fusedAvKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1",
+        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_vtile_v3_vec1",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -4191,8 +4097,8 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int key_length = int(params[0]);
 
             const int z = int(threadgroup_position_in_grid.z);
-            const int tile = z % \(avColumnTiles);
-            const int row_kv = z / \(avColumnTiles);
+            const int tile = z % 8;
+            const int row_kv = z / 8;
             const int row = row_kv / 2;
             const int kv_head = row_kv % 2;
             const int sg = int(simdgroup_index_in_threadgroup);
@@ -4221,9 +4127,9 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int thrM = lane / 4;
             const int thrN = lane % 4;
             int bm = thrM * 4;
-            const int out_col = tile * \(avTileColumns) + (4 * sg + thrN) * 4;
+            const int out_col = tile * 64 + (4 * sg + thrN) * 4;
 
-            float result[GQA * 4] = {0.0f};
+            float result[GQA][4] = {{0.0f}};
             // VTILE: the 4x4 value tile is shared by all GQA heads, the
             // probability block is not. Staging the tile costs 16 halves and
             // frees the 32-float per-head staging array. The peel keeps both
@@ -4265,7 +4171,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     for (int tm = 0; tm < 4; ++tm) {
                         float vc = p_coeff[tm];
                         for (int tn = 0; tn < 4; ++tn) {
-                            result[h * 4 + tn] += vc * v_tile[tm][tn];
+                            result[h][tn] += vc * v_tile[tm][tn];
                         }
                     }
                 }
@@ -4287,48 +4193,32 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                             prob_rows[size_t(h) * key_length + bm + tm]);
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
-                            result[h * 4 + tn] += pc * v_tile[0][tn];
+                            result[h][tn] += pc * v_tile[0][tn];
                         }
                     }
                 }
             }
-            {
-                const bool hi = (lane & 16) != 0;
+            #pragma clang loop unroll(full)
+            for (int h = 0; h < GQA; ++h) {
                 #pragma clang loop unroll(full)
-                for (int j = 0; j < 16; ++j) {
-                    const float a = result[j];
-                    const float b = result[16 + j];
-                    result[j] = (hi ? b : a)
-                        + simd_shuffle_xor(hi ? a : b, ushort(16));
+                for (int tn = 0; tn < 4; ++tn) {
+                    #pragma clang loop unroll(full)
+                    for (ushort delta = 4; delta >= 1; delta >>= 1) {
+                        result[h][tn] +=
+                            simd_shuffle_down(result[h][tn], 4 * delta);
+                    }
                 }
             }
-            {
-                const bool hi = (lane & 8) != 0;
+            if (thrM == 0) {
                 #pragma clang loop unroll(full)
-                for (int j = 0; j < 8; ++j) {
-                    const float a = result[j];
-                    const float b = result[8 + j];
-                    result[j] = (hi ? b : a)
-                        + simd_shuffle_xor(hi ? a : b, ushort(8));
-                }
-            }
-            {
-                const bool hi = (lane & 4) != 0;
-                #pragma clang loop unroll(full)
-                for (int j = 0; j < 4; ++j) {
-                    const float a = result[j];
-                    const float b = result[4 + j];
-                    result[j] = (hi ? b : a)
-                        + simd_shuffle_xor(hi ? a : b, ushort(4));
-                }
-            }
-            {
-                device T* out_ptr = out
-                    + size_t(row * 16 + kv_head * GQA + thrM) * D
-                    + out_col;
-                #pragma clang loop unroll(full)
-                for (int j = 0; j < 4; ++j) {
-                    out_ptr[j] = static_cast<T>(result[j]);
+                for (int h = 0; h < GQA; ++h) {
+                    device T* out_ptr = out
+                        + size_t(row * 16 + kv_head * GQA + h) * D
+                        + out_col;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        out_ptr[j] = static_cast<T>(result[h][j]);
+                    }
                 }
             }
         """,
@@ -4341,7 +4231,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// output allocation hands this kernel); the value-tile peel, the
     /// shuffle-down fold and every store are the promoted source verbatim.
     private static let fusedAvVecKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1_sv1",
+        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_vtile_v3_vec1_sv1",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -4356,8 +4246,8 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const bool row_vec4 = (key_length & 3) == 0;
 
             const int z = int(threadgroup_position_in_grid.z);
-            const int tile = z % \(avColumnTiles);
-            const int row_kv = z / \(avColumnTiles);
+            const int tile = z % 8;
+            const int row_kv = z / 8;
             const int row = row_kv / 2;
             const int kv_head = row_kv % 2;
             const int sg = int(simdgroup_index_in_threadgroup);
@@ -4386,9 +4276,9 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int thrM = lane / 4;
             const int thrN = lane % 4;
             int bm = thrM * 4;
-            const int out_col = tile * \(avTileColumns) + (4 * sg + thrN) * 4;
+            const int out_col = tile * 64 + (4 * sg + thrN) * 4;
 
-            float result[GQA * 4] = {0.0f};
+            float result[GQA][4] = {{0.0f}};
             // VTILE: the 4x4 value tile is shared by all GQA heads, the
             // probability block is not. Staging the tile costs 16 halves and
             // frees the 32-float per-head staging array. The peel keeps both
@@ -4439,7 +4329,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     for (int tm = 0; tm < 4; ++tm) {
                         float vc = p_coeff[tm];
                         for (int tn = 0; tn < 4; ++tn) {
-                            result[h * 4 + tn] += vc * v_tile[tm][tn];
+                            result[h][tn] += vc * v_tile[tm][tn];
                         }
                     }
                 }
@@ -4461,48 +4351,32 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                             prob_rows[size_t(h) * key_length + bm + tm]);
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
-                            result[h * 4 + tn] += pc * v_tile[0][tn];
+                            result[h][tn] += pc * v_tile[0][tn];
                         }
                     }
                 }
             }
-            {
-                const bool hi = (lane & 16) != 0;
+            #pragma clang loop unroll(full)
+            for (int h = 0; h < GQA; ++h) {
                 #pragma clang loop unroll(full)
-                for (int j = 0; j < 16; ++j) {
-                    const float a = result[j];
-                    const float b = result[16 + j];
-                    result[j] = (hi ? b : a)
-                        + simd_shuffle_xor(hi ? a : b, ushort(16));
+                for (int tn = 0; tn < 4; ++tn) {
+                    #pragma clang loop unroll(full)
+                    for (ushort delta = 4; delta >= 1; delta >>= 1) {
+                        result[h][tn] +=
+                            simd_shuffle_down(result[h][tn], 4 * delta);
+                    }
                 }
             }
-            {
-                const bool hi = (lane & 8) != 0;
+            if (thrM == 0) {
                 #pragma clang loop unroll(full)
-                for (int j = 0; j < 8; ++j) {
-                    const float a = result[j];
-                    const float b = result[8 + j];
-                    result[j] = (hi ? b : a)
-                        + simd_shuffle_xor(hi ? a : b, ushort(8));
-                }
-            }
-            {
-                const bool hi = (lane & 4) != 0;
-                #pragma clang loop unroll(full)
-                for (int j = 0; j < 4; ++j) {
-                    const float a = result[j];
-                    const float b = result[4 + j];
-                    result[j] = (hi ? b : a)
-                        + simd_shuffle_xor(hi ? a : b, ushort(4));
-                }
-            }
-            {
-                device T* out_ptr = out
-                    + size_t(row * 16 + kv_head * GQA + thrM) * D
-                    + out_col;
-                #pragma clang loop unroll(full)
-                for (int j = 0; j < 4; ++j) {
-                    out_ptr[j] = static_cast<T>(result[j]);
+                for (int h = 0; h < GQA; ++h) {
+                    device T* out_ptr = out
+                        + size_t(row * 16 + kv_head * GQA + h) * D
+                        + out_col;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        out_ptr[j] = static_cast<T>(result[h][j]);
+                    }
                 }
             }
         """,
@@ -4818,8 +4692,8 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let output = fusedAvActive(
             [probs] + valueBuffers + [paramsArray, values],
             template: template,
-            grid: (32, avSimdgroups, batch * kvHeads * avColumnTiles),
-            threadGroup: (32, avSimdgroups, 1),
+            grid: (32, 4, batch * kvHeads * 8),
+            threadGroup: (32, 4, 1),
             outputShapes: [[batch, queryHeads, 1, headDim]],
             outputDTypes: [.bfloat16]
         )[0]

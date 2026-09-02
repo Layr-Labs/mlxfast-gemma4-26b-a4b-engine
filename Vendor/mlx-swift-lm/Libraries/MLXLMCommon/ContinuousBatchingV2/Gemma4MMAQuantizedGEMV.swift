@@ -3008,26 +3008,18 @@ public enum Gemma4MMAQuantizedGEMV {
     /// Stage two. One simdgroup per activation row folds that row's `NT`
     /// threadgroup records under the same total order and emits the token id.
     private static let argmaxReduceKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_head_argmax_reduce_v2_vec4",
+        name: "gemma4_mma_head_argmax_reduce_v1",
         inputNames: ["pv", "pi"],
         outputNames: ["tokens"],
         source: """
             const uint m = threadgroup_position_in_grid.x;
             const uint lane = thread_index_in_simdgroup;
-            const device float4* pv4 = (const device float4*)(pv + m * uint(NT));
-            const device uint4* pi4 = (const device uint4*)(pi + m * uint(NT));
             float rv = -INFINITY;
             uint ri = 0xFFFFFFFFu;
-            constexpr uint NT4 = uint(NT) / 4;
-            for (uint i = lane; i < NT4; i += 32) {
-                const float4 ov = pv4[i];
-                const uint4 oi = pi4[i];
-                #pragma unroll
-                for (int e = 0; e < 4; ++e) {
-                    const float v = ov[e];
-                    const uint idx = oi[e];
-                    if (v > rv || (v == rv && idx < ri)) { rv = v; ri = idx; }
-                }
+            for (uint i = lane; i < uint(NT); i += 32) {
+                const float ov = pv[m * uint(NT) + i];
+                const uint oi = pi[m * uint(NT) + i];
+                if (ov > rv || (ov == rv && oi < ri)) { rv = ov; ri = oi; }
             }
             for (ushort xm = 1; xm < 32; xm <<= 1) {
                 const float ov = simd_shuffle_xor(rv, xm);
@@ -3080,8 +3072,7 @@ public enum Gemma4MMAQuantizedGEMV {
         scales: MLXArray,
         biases: MLXArray?,
         groupSize: Int,
-        bits: Int,
-        activationSums: ActivationSums? = nil
+        bits: Int
     ) -> MLXArray? {
         guard
             admitsArgmax(
@@ -3096,26 +3087,16 @@ public enum Gemma4MMAQuantizedGEMV {
         let threadgroups = n / (colsPerThreadgroup * 4)
 
         let sumCells = mRows * (k / groupSize)
-        let xSums: MLXArray
-        if let activationSums,
-            activationSums.values.dtype == .float32,
-            activationSums.values.ndim == 1,
-            activationSums.values.size == sumCells
-        {
-            CBv2EngageMark.once("head-norm-xsum-fold")
-            xSums = activationSums.values
-        } else {
-            let sumThreads = 128
-            let sumThreadgroups = (sumCells + sumThreads - 1) / sumThreads
-            xSums = xSumKernel(
-                [flatX],
-                template: [("T", x.dtype), ("K", k)],
-                grid: (sumThreadgroups * sumThreads, 1, 1),
-                threadGroup: (sumThreads, 1, 1),
-                outputShapes: [[sumCells]],
-                outputDTypes: [.float32]
-            )[0]
-        }
+        let sumThreads = 128
+        let sumThreadgroups = (sumCells + sumThreads - 1) / sumThreads
+        let xSums = xSumKernel(
+            [flatX],
+            template: [("T", x.dtype), ("K", k)],
+            grid: (sumThreadgroups * sumThreads, 1, 1),
+            threadGroup: (sumThreads, 1, 1),
+            outputShapes: [[sumCells]],
+            outputDTypes: [.float32]
+        )[0]
 
         let partials = kernelV27Argmax(
             [flatX, w, scales, biases, xSums],

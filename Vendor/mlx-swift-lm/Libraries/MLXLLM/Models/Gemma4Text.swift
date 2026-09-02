@@ -4129,7 +4129,7 @@ private class Gemma4Router: Module {
     }
 
     fileprivate func zipScores(_ normed: MLXArray) -> MLXArray {
-        proj(normed)
+        Gemma4PrefillDeqGEMMV1.apply(proj, normed) ?? proj(normed)
     }
 
     fileprivate func zipPartition(_ expertScores: MLXArray) -> MLXArray {

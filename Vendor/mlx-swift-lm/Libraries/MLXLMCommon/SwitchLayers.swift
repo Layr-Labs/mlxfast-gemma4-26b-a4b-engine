@@ -1406,7 +1406,7 @@ public class SwitchGLU: Module {
         let doSort = indices.size >= 64
 
         var idx = indices
-        var inverseOrder = MLXArray()
+        var inverseOrder: MLXArray? = nil
         var lhsIndices: MLXArray?
         if doSort {
             if useLhsIndices {

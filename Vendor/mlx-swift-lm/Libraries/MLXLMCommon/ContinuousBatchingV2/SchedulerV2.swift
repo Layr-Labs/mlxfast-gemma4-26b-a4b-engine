@@ -151,6 +151,17 @@ public final class SchedulerV2 {
     /// can run without any capacity model.
     let capacity: CBv2StepCapacity?
 
+    /// The chained engine branch has already proved plain decode membership,
+    /// so it can avoid rebuilding the general mixed-step plan. This switch
+    /// leaves the planner's original path available for attribution.
+    private static let chainedDecodePlanEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_CHAINED_DECODE_PLAN"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+
     /// MTP speculation hook (set by the engine loop): returns the number of
     /// EXTRA speculative draft tokens (k ≥ 0) to plan for a decode-ready
     /// RUNNING row this step, making its assignment 1 + k. Consulted ONLY
@@ -749,6 +760,83 @@ public final class SchedulerV2 {
         // admitted, the chain must break so the mixed step can run.
         if !waiting.isEmpty, running.count < config.maxConcurrentRequests { return nil }
         return ids
+    }
+
+    /// Transactional plan for the engine's already-proven chained decode
+    /// rectangle. It preserves the general planner's optimistic accounting
+    /// and capacity reservation, but does not scan waiting rows or allocate
+    /// mixed-step bookkeeping that cannot participate in this rectangle.
+    ///
+    /// A capacity implementation may reject a later row even after the
+    /// engine's aggregate headroom probe succeeded. In that case every
+    /// reservation and optimistic advance made here is undone before nil
+    /// lets the caller use `plan()`.
+    public func planChainedDecode(
+        ids: [CBv2RequestID]
+    ) -> CBv2StepPlan? {
+        guard Self.chainedDecodePlanEnabled,
+            !ids.isEmpty,
+            ids.count <= config.maxBatchedTokensPerStep,
+            ids.count <= config.maxConcurrentRequests
+        else { return nil }
+
+        var idIndex = 0
+        for rec in running {
+            if rec.cancelRequested { return nil }
+            if rec.isPaused { continue }
+            guard rec.isDecodeReady, idIndex < ids.count, rec.id == ids[idIndex]
+            else { return nil }
+            idIndex += 1
+        }
+        guard idIndex == ids.count else { return nil }
+        if !waiting.isEmpty, running.count < config.maxConcurrentRequests {
+            return nil
+        }
+
+        var advanced: [(
+            record: CBv2ScheduledRequest, tokens: Int, bytes: Int
+        )] = []
+        advanced.reserveCapacity(ids.count)
+        for id in ids {
+            guard let rec = byID[id] else {
+                for entry in advanced {
+                    entry.record.numComputedTokens -= 1
+                    capacity?.unreserve(
+                        id: entry.record.id, tokens: entry.tokens, bytes: entry.bytes)
+                }
+                return nil
+            }
+            let reservationTokens = rec.prefixReusePlan?.capacityTokensForChunk(
+                start: rec.numComputedTokens, count: 1) ?? 1
+            let reservationBytes = rec.prefixReusePlan?.capacityBytesForChunk(
+                start: rec.numComputedTokens, count: 1) ?? 0
+            do {
+                if reservationTokens > 0 || reservationBytes > 0 {
+                    try capacity?.reserve(
+                        id: rec.id,
+                        additionalTokens: reservationTokens,
+                        additionalBytes: reservationBytes)
+                }
+            } catch {
+                for entry in advanced {
+                    entry.record.numComputedTokens -= 1
+                    capacity?.unreserve(
+                        id: entry.record.id, tokens: entry.tokens, bytes: entry.bytes)
+                }
+                return nil
+            }
+            rec.numComputedTokens += 1
+            advanced.append((
+                record: rec, tokens: reservationTokens, bytes: reservationBytes))
+        }
+
+        CBv2EngageMark.once("scheduler-chained-decode-plan")
+        var assignments: [(id: CBv2RequestID, numTokens: Int)] = []
+        assignments.reserveCapacity(ids.count)
+        for id in ids {
+            assignments.append((id: id, numTokens: 1))
+        }
+        return CBv2StepPlan(assignments: assignments)
     }
 
     // MARK: Preemption internals

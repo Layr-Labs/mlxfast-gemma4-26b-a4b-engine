@@ -1131,7 +1131,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             capacity?.hasHeadroom(additionalTokens: ids.count) ?? true
         {
             beginMTPPlan()
-            let plan = scheduler.plan()
+            let plan = scheduler.planChainedDecode(ids: ids) ?? scheduler.plan()
             if isPureDecodePlan(plan, matching: ids) {
                 if CBv2StepProfiler.enabled {
                     CBv2StepProfiler.record(

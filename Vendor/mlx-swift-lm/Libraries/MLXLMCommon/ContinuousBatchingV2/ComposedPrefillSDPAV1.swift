@@ -47,6 +47,7 @@
 
 import Foundation
 import MLX
+import MLXFast
 
 enum CBv2ComposedPrefillSDPAV1 {
 
@@ -129,6 +130,26 @@ enum CBv2ComposedPrefillSDPAV1 {
         return mask
     }
 
+    /// CAUSAL-CLOAD (concept receipt: solver i34-9, submission d0ccbe3c).
+    /// When enabled, the cached bias is built over `kL + 1` key columns and
+    /// the array handed to `addMM` is the leading-`kL`-column view of that
+    /// storage. The logical operand is unchanged — still exactly `[L, kL]`,
+    /// still bfloat16 negative zero where a score is admitted and the lowest
+    /// finite bfloat16 where it is masked — only its row stride changes,
+    /// from `kL` to `kL + 1`. That stride is the signature the fused Steel
+    /// GEMM recognizes to SYNTHESIZE this operand in its epilogue instead of
+    /// loading it; any kernel branch that does not synthesize still loads
+    /// correct values through the same stride. The padding column is filled
+    /// by the same comparison rule as every other column and never read.
+    /// Kill switch: `DARKBLOOM_CBV2_PREFILL_MASK_SYNTH=0` (unpadded bias,
+    /// stride kL — the kernel signature then never fires).
+    static let maskSynthEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PREFILL_MASK_SYNTH"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// Causal mask BIAS, memoized on `(L, kL)` exactly like the boolean mask:
     /// `-0.0` where the mask admits the key, `finfo(bfloat16).min` (0xFF7F)
     /// where it does not. Same purity argument -- a read-only constant that is
@@ -144,10 +165,29 @@ enum CBv2ComposedPrefillSDPAV1 {
             return hit
         }
         maskCacheLock.unlock()
-        let bias = MLX.where(
-            causalMask(L: L, kL: kL),
-            bfloat16NegativeZeroScalar,
-            bfloat16LowestScalar)
+        let bias: MLXArray
+        if maskSynthEnabled {
+            // Padded storage, sliced view: the comparison is expressed
+            // directly over query and key index vectors (not the shared
+            // boolean-mask helper) so the inert padding column is produced
+            // by the same rule as every real column.
+            let qIndices = MLXArray(Int32(kL - L) ..< Int32(kL))
+                .expandedDimensions(axis: 1)
+            let kIndices = MLXArray(Int32(0) ..< Int32(kL + 1))
+                .expandedDimensions(axis: 0)
+            let padded = MLX.where(
+                qIndices .>= kIndices,
+                bfloat16NegativeZeroScalar,
+                bfloat16LowestScalar)
+            eval(padded)
+            bias = padded[0..., 0 ..< kL]
+            CBv2EngageMark.once("prefill-mask-synth-bias")
+        } else {
+            bias = MLX.where(
+                causalMask(L: L, kL: kL),
+                bfloat16NegativeZeroScalar,
+                bfloat16LowestScalar)
+        }
         eval(bias)
         maskCacheLock.lock()
         if maskBiasCache.count >= maxCachedMasks {
@@ -283,11 +323,246 @@ enum CBv2ComposedPrefillSDPAV1 {
             scores = MLX.where(causalMask(L: L, kL: kL), scores, bfloat16LowestScalar)
         }
 
-        scores = MLX.softmax(scores, axis: -1, precise: true)
+        if let vecScores = CBv2PrefillSoftmaxVecV1.apply(scores) {
+            scores = vecScores
+        } else {
+            scores = MLX.softmax(scores, axis: -1, precise: true)
+        }
         var output = matmul(scores, v)
         if nRepeats > 1 {
             output = output.reshaped([B, nQHeads, L, valueDim])
         }
         return output
+    }
+}
+
+/// PREFILL-SOFTMAX-VEC. A vectorized, bit-exact transcription of
+/// `softmax_single_row<bfloat16_t, float, N_READS=4>`
+/// (`Vendor/mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/softmax.h`)
+/// for the `MLX.softmax(scores, axis: -1, precise: true)` call in
+/// `CBv2ComposedPrefillSDPAV1.attend`. MLX's own dispatch
+/// (`.../backend/metal/softmax.cpp:53,64-68`) selects this exact kernel --
+/// the non-looped "block" path -- whenever `axis_size <= 4096`, sizing the
+/// threadgroup at `32 * ceil(ceil(axis_size / 4) / 32)`; this transcription
+/// mirrors both the kernel body and that sizing rule
+/// (`RaggedTwoPassDecodeAttentionV1.swift`'s `softmaxKernel` already hosts a
+/// scalar, non-vectorized transcription of the same stock kernel for the
+/// D=512 decode chain -- same values, same barrier count as the stock
+/// kernel. This is the vectorized, fewer-barrier sibling for prefill.).
+///
+/// Two changes from the stock kernel. Neither touches a value.
+///
+/// 1. VECTOR LOADS/STORES, gated on `kL % 4 == 0` at the host (`apply`
+///    below; kL % 4 != 0 keeps the stock call). Once every row's length is
+///    a multiple of 4, every row starts at an offset that is itself a
+///    multiple of 4 elements from the row-contiguous buffer's base (each
+///    row is `axis_size` elements after the previous one), so
+///    `lid * N_READS + N_READS <= axis_size` becomes EXACTLY the same
+///    predicate as `lid * N_READS < axis_size` -- the in-bounds boundary
+///    itself always sits on a 4-element multiple, so no lane can ever be
+///    PARTIALLY in bounds. That collapses the stock kernel's per-element
+///    tail ternary (`(lid*N_READS+i < axis_size) ? AccT(in[i]) :
+///    Limits<AccT>::min`, evaluated once per i) to one per-lane branch
+///    (`row_valid`) that is provably equivalent for every lane: true
+///    reproduces the stock in-bounds branch's four scalar loads verbatim,
+///    as one `vec<T, 4>` load of the same four addresses in the same
+///    order; false reproduces the stock tail branch's four
+///    `Limits<AccT>::min` (`-INFINITY` for `AccT = float`) fills verbatim,
+///    since with kL % 4 == 0 the tail branch is never PARTIALLY true. The
+///    store side is the same argument in reverse. Only the load/store
+///    WIDTH changes -- a promoted-kernel load-sharing move, not a value
+///    change.
+///
+/// 2. BARRIER COUNT: 5 becomes 2. The stock kernel zero-fills all 32
+///    `local_max`/`local_normalizer` slots (`Limits<AccT>::min` / `0`)
+///    behind a barrier so slots beyond the live simdgroup count hold a
+///    defined identity, then lets ONLY simdgroup 0 read all 32 slots and
+///    publish the combined result back to slot 0 behind two more barriers
+///    (one per array) for every other simdgroup to read. This kernel
+///    instead has EVERY simdgroup read the same 32 conceptual values
+///    directly: the just-written partial in slots `[0, num_simdgroups)`,
+///    and the literal identity substituted in a REGISTER (never read from
+///    threadgroup memory, so the stale contents of an unfilled slot are
+///    never touched) for the rest -- and each simdgroup runs its own
+///    `simd_max` / `simd_sum` over that set. Those two intrinsics are the
+///    SAME instruction sequence over the SAME per-lane operands regardless
+///    of which physical simdgroup issues them -- the reduction hierarchy
+///    is a pure function of lane index, not of which simdgroup executes
+///    it, the same "promoted-kernel invariant" this file's neighbor
+///    `RaggedTwoPassDecodeAttentionV1.swift` already relies on for its
+///    XFOLD butterfly ("the merge hierarchy is therefore the SAME for
+///    every lane ... only the left/right order at each node varies with
+///    the lane, and float addition is commutative, so every sum is
+///    bit-identical") -- so every simdgroup lands on the bit-identical
+///    scalar the stock kernel's slot-0 broadcast would have handed it,
+///    without needing to broadcast anything.
+///
+///    That removal deletes: the zero-fill write and its barrier (nothing
+///    ever reads an unfilled slot, so nothing needs the identity written
+///    there first); and both publish-back round trips and their barriers
+///    (every simdgroup already independently holds the combined answer,
+///    so nothing needs to read a value another simdgroup broadcast). The
+///    two barriers that survive are the ones ordering "every simdgroup's
+///    own partial write to `local_max` / `local_normalizer` is visible
+///    threadgroup-wide" before "every simdgroup reads that array" -- for
+///    each array, that write/read pair is the one true cross-simdgroup
+///    dependency in this kernel, and no barrier can be proven to order it
+///    away.
+///
+/// Fails closed (keeps the stock `MLX.softmax` call, byte-preserved) on:
+/// env kill-switch (default ON), a non-bfloat16 row, `kL % 4 != 0`, or
+/// `kL` outside `(0, 4096]` (the block/non-looped kernel-selection window;
+/// `kL > 4096` is `softmax_looped`, a different kernel this file does not
+/// transcribe).
+enum CBv2PrefillSoftmaxVecV1 {
+
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PREFILL_SOFTMAX_VEC"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// softmax.cpp's SOFTMAX_LOOPED_LIMIT. Only `axis_size <= 4096` takes
+    /// the non-looped "block" kernel this file transcribes.
+    private static let maxKeyLength = 4096
+
+    /// Verbatim transcription of `softmax_single_row<bfloat16_t, float, 4>`
+    /// (kernels/softmax.h) -- see the enum doc comment above for the two
+    /// load/store and barrier changes and why neither touches a value.
+    /// params[0] = axis_size (kL); params[1] = num_simdgroups
+    /// (threadgroup size / 32, computed on the host from the SAME sizing
+    /// rule softmax.cpp uses to pick the threadgroup size, so it always
+    /// equals what this dispatch's own threadGroup.x implies).
+    private static let source = """
+        const int axis_size = int(params[0]);
+        const int num_simdgroups = int(params[1]);
+
+        const int gid = int(threadgroup_position_in_grid.x);
+        const int lid = int(thread_position_in_threadgroup.x);
+        const int simd_lane_id = int(thread_index_in_simdgroup);
+        const int simd_group_id = int(simdgroup_index_in_threadgroup);
+
+        threadgroup float local_max[32];
+        threadgroup float local_normalizer[32];
+
+        typedef vec<T, 4> T4;
+
+        float ld[4];
+        const int base = lid * 4;
+        const bool row_valid = base < axis_size;
+        const device T* row_in = scores + size_t(gid) * axis_size;
+        if (row_valid) {
+            T4 raw = *reinterpret_cast<const device T4*>(row_in + base);
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                ld[i] = static_cast<float>(raw[i]);
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                ld[i] = -INFINITY;
+            }
+        }
+
+        // MAX. Phase-2 write is UNCHANGED from the stock kernel: only
+        // simdgroup_id == 0's lane owns slot 0, only simdgroup_id == 1's
+        // lane owns slot 1, and so on -- exactly the stock
+        // `local_max[simd_group_id] = maxval` write.
+        float maxval = -3.402823466e+38F;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            maxval = (maxval < ld[i]) ? ld[i] : maxval;
+        }
+        maxval = simd_max(maxval);
+        if (simd_lane_id == 0) {
+            local_max[simd_group_id] = maxval;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            // Every simdgroup reads the SAME 32 conceptual values the
+            // stock kernel's simdgroup-0-only combine read: the real
+            // partial in slots < num_simdgroups (just published above,
+            // visible threadgroup-wide after the barrier), and the
+            // literal max-identity (-INFINITY, i.e. Limits<float>::min)
+            // in the rest -- substituted here in a register instead of
+            // read back from a zero-filled slot, since no thread ever
+            // wrote a real value there. Same simd_max instruction, same
+            // per-lane operand set as the stock combine: bit-identical
+            // result in every simdgroup, no publish-back needed.
+            float slot = (simd_lane_id < num_simdgroups)
+                ? local_max[simd_lane_id] : -INFINITY;
+            maxval = simd_max(slot);
+        }
+
+        float normalizer = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            float exp_x = fast::exp(ld[i] - maxval);
+            ld[i] = exp_x;
+            normalizer += exp_x;
+        }
+        normalizer = simd_sum(normalizer);
+        if (simd_lane_id == 0) {
+            local_normalizer[simd_group_id] = normalizer;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            // Same argument as the max combine above, for the sum: the
+            // sum-identity is 0.0f (Limits<float> has no analogue here --
+            // the stock kernel zero-fills `local_normalizer` directly).
+            float slot = (simd_lane_id < num_simdgroups)
+                ? local_normalizer[simd_lane_id] : 0.0f;
+            normalizer = simd_sum(slot);
+        }
+        normalizer = 1.0f / normalizer;
+
+        if (row_valid) {
+            device T* row_out = probs + size_t(gid) * axis_size;
+            T4 result;
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                result[i] = static_cast<T>(ld[i] * normalizer);
+            }
+            *reinterpret_cast<device T4*>(row_out + base) = result;
+        }
+        """
+
+    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_prefill_sdpa_softmax_vec_bf16_v1",
+        inputNames: ["scores", "params"],
+        outputNames: ["probs"],
+        source: source,
+        ensureRowContiguous: true
+    )
+
+    /// Runs the vectorized softmax, or returns nil to keep the caller on
+    /// the stock `MLX.softmax(scores, axis: -1, precise: true)` call.
+    /// `scores` may be any contiguous rank; it is treated as a flat
+    /// `[n_rows, axis_size]` exactly like MLX's own C++ dispatch
+    /// (`n_rows = in.data_size() / axis_size`), and the output keeps
+    /// `scores`'s own shape.
+    static func apply(_ scores: MLXArray) -> MLXArray? {
+        guard enabled, scores.dtype == .bfloat16, scores.ndim >= 1 else { return nil }
+        let axisSize = scores.dim(scores.ndim - 1)
+        guard axisSize > 0, axisSize % 4 == 0, axisSize <= maxKeyLength else { return nil }
+        let totalElements = scores.shape.reduce(1, *)
+        guard totalElements > 0, totalElements % axisSize == 0 else { return nil }
+        let nRows = totalElements / axisSize
+        // softmax.cpp:64-68: 32 * ceil(ceil(axis_size / 4) / 32).
+        let threadgroupSize = ((axisSize + 3) / 4 + 31) / 32 * 32
+        guard threadgroupSize > 0, threadgroupSize <= 1024 else { return nil }
+        let numSimdgroups = threadgroupSize / 32
+        let paramsArray = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
+
+        CBv2EngageMark.once("prefill-softmax-vec")
+        return kernel(
+            [scores, paramsArray],
+            template: [("T", scores.dtype)],
+            grid: (threadgroupSize * nRows, 1, 1),
+            threadGroup: (threadgroupSize, 1, 1),
+            outputShapes: [scores.shape],
+            outputDTypes: [.bfloat16]
+        )[0]
     }
 }

@@ -102,6 +102,49 @@ void gemm_epilogue(
   });
 }
 
+// CAUSAL-CLOAD synthesized epilogue: adds the composed-prefill causal-bias
+// constants the loaded operand would have supplied, per accumulator element,
+// from the output coordinates the tile already knows. Element order, insert
+// point, and widening match gemm_epilogue's non-axpby path exactly.
+// clang-format off
+template <class NAXTile_t>
+void gemm_epilogue_causal_synth(
+    thread NAXTile_t& Dtile,
+    const int row0,
+    const int col0,
+    const int diag) { // clang-format on
+  using V = typename NAXTile_t::elem_type;
+
+  constexpr short TM = NAXTile_t::kTileRows;
+  constexpr short TN = NAXTile_t::kTileCols;
+
+  using CFrag = typename NAXTile_t::NAXFrag_t;
+
+  const short2 sc = CFrag::get_coord();
+  const V mask_add = static_cast<V>(as_type<float>(0xFF7F0000u));
+  const V pass_add = static_cast<V>(-0.0f);
+
+  const_for_loop<0, TM, 1>([&](auto mm) {
+    const_for_loop<0, TN, 1>([&](auto nn) {
+      thread auto& delems = Dtile.template frag_at<mm, nn>();
+
+      const int mbase = row0 + sc.y + int(mm) * CFrag::kFragRows;
+      const int nbase = col0 + sc.x + int(nn) * CFrag::kFragCols;
+
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < CFrag::kElemRows; i++) {
+        const int row = mbase + i * CFrag::kElemRowsJump;
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < CFrag::kElemCols; j++) {
+          const int col = nbase + j;
+          delems[i * CFrag::kElemCols + j] +=
+              (col - row <= diag) ? pass_add : mask_add;
+        }
+      }
+    });
+  });
+}
+
 // clang-format off
 template <
     typename T,
@@ -134,6 +177,11 @@ template <
     return;
   }
 
+  // CAUSAL-CLOAD eligibility (see steel_gemm_fused.h).
+  constexpr bool kCausalBiasSynthEligible =
+      !transpose_a && transpose_b && metal::is_same_v<T, bfloat16_t>;
+  bool c_bstride_zero = true;
+
   // Adjust for batch
   if (has_batch) {
     const constant auto* A_bstrides = batch_strides;
@@ -148,6 +196,9 @@ template <
     if (use_out_source) {
       const constant auto* C_bstrides = B_bstrides + params->batch_ndim;
       C += elem_to_loc(tid.z, batch_shape, C_bstrides, params->batch_ndim);
+      for (int d = 0; d < params->batch_ndim; d++) {
+        c_bstride_zero = c_bstride_zero && (C_bstrides[d] == 0);
+      }
     }
   } else {
     A += params->batch_stride_a * tid.z;
@@ -155,6 +206,7 @@ template <
 
     if (use_out_source) {
       C += addmm_params->batch_stride_c * tid.z;
+      c_bstride_zero = addmm_params->batch_stride_c == 0;
     }
   }
 
@@ -234,8 +286,24 @@ template <
             ((kAlignedM.value || sgp_sm > 0) &&
              (kAlignedN.value || sgp_sn > 0))) {
           if (use_out_source) {
-            gemm_epilogue<kAlignedM.value, kAlignedN.value>(
-                Dtile, C, params, addmm_params, sgp_sm, sgp_sn);
+            bool synthesized = false;
+            if constexpr (kCausalBiasSynthEligible) {
+              if (!do_axpby && kAlignedM.value && kAlignedN.value &&
+                  addmm_params->fdc == 1 &&
+                  addmm_params->ldc == params->N + 1 &&
+                  params->M <= params->N && c_bstride_zero) {
+                // CAUSAL-CLOAD: signature and exactness argument in
+                // steel_gemm_fused.h; the synthesized addend is bit-identical
+                // to the loaded one on every element.
+                gemm_epilogue_causal_synth(
+                    Dtile, c_row + tm, c_col + tn, params->N - params->M);
+                synthesized = true;
+              }
+            }
+            if (!synthesized) {
+              gemm_epilogue<kAlignedM.value, kAlignedN.value>(
+                  Dtile, C, params, addmm_params, sgp_sm, sgp_sn);
+            }
           }
           if constexpr (kAlignedM && kAlignedN) {
             Dtile.store(D, int(params->ldd));

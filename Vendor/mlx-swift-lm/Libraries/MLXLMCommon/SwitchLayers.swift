@@ -2,9 +2,6 @@ import Foundation
 import MLX
 import MLXNN
 
-/// Identity gather table for the sorted 64-assignment decode geometry.
-nonisolated(unsafe) private let switchDownIdentity64 = MLXArray((0..<64).map { UInt32($0) })
-
 // Port of https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/switch_layers.py
 
 /// Compiled SiLU-gated product (`silu(gate) * up`) for the common MoE GLU path.
@@ -1231,6 +1228,21 @@ public struct WeightedExpertUnsortCarrier {
     let weights: MLXArray
 }
 
+/// ROUTE-LAZY-INVERSE-ORDER: `projectExperts` historically initialized an
+/// empty `MLXArray` before knowing whether this call sorts expert assignments.
+/// The ranked MoE calls sort, so that placeholder was immediately overwritten;
+/// unsorted calls paid the same allocation and returned nil. Keep the old
+/// behavior behind the switch for rollback, but default to a nil carrier until
+/// a real sort produces one. Kill switch:
+/// `DARKBLOOM_SWITCH_LAZY_INVERSE_ORDER=0`. Engage mark:
+/// `switchglue-lazy-inverse-order`.
+private let switchLazyInverseOrderEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_SWITCH_LAZY_INVERSE_ORDER"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 public class SwitchGLU: Module {
     @ModuleInfo(key: "gate_proj") var gateProj: SwitchLinear?
     @ModuleInfo(key: "up_proj") var upProj: SwitchLinear?
@@ -1406,7 +1418,10 @@ public class SwitchGLU: Module {
         let doSort = indices.size >= 64
 
         var idx = indices
-        var inverseOrder = MLXArray()
+        var inverseOrder: MLXArray?
+        if !switchLazyInverseOrderEnabled {
+            inverseOrder = MLXArray()
+        }
         var lhsIndices: MLXArray?
         if doSort {
             if useLhsIndices {
@@ -1429,13 +1444,16 @@ public class SwitchGLU: Module {
                     table.inverseOrder.dtype == .uint32,
                     table.inverseOrder.ndim == 1, table.inverseOrder.size == 64
                 {
-                    (lhsIndices, idx, inverseOrder) = (
-                        table.rowOrder, table.sortedKeys, table.inverseOrder
-                    )
+                    lhsIndices = table.rowOrder
+                    idx = table.sortedKeys
+                    inverseOrder = table.inverseOrder
                 } else {
-                    (lhsIndices, idx, inverseOrder) = gatherSortIndices(
+                    let sorted = gatherSortIndices(
                         indices: indices, numExperts: numExperts,
                         expertPrefixBounds: useExpertPrefixBounds)
+                    lhsIndices = sorted.0
+                    idx = sorted.1
+                    inverseOrder = sorted.2
                 }
             } else if let sortedPlane {
                 // PRENORM-GATHER: the producer writes the sorted plane from
@@ -1453,8 +1471,11 @@ public class SwitchGLU: Module {
                 idx = order.sortedKeys
                 inverseOrder = order.inverseOrder
             } else {
-                (x, idx, inverseOrder) = gatherSort(
+                let sorted = gatherSort(
                     x: x, indices: indices, numExperts: numExperts)
+                x = sorted.0
+                idx = sorted.1
+                inverseOrder = sorted.2
             }
         }
 
@@ -1514,14 +1535,11 @@ public class SwitchGLU: Module {
             activated = activation(xGate) * xUp
         }
 
-        // DOWN-LHS-IDENTITY: at the sorted [64] geometry the down projection
-        // gathers activation row `assignment` for assignment `assignment`;
-        // hand it that identity table instead of leaving `lhsIndices` nil,
-        // which otherwise materializes the same arange(64) on every call.
-        let downLhs: MLXArray? =
-            (doSort && idx.ndim == 1 && idx.size == 64) ? switchDownIdentity64 : nil
-        x = downProj(activated, idx, lhsIndices: downLhs, sortedIndices: doSort)
-        return (x, doSort ? inverseOrder : nil, doSort)
+        x = downProj(activated, idx, sortedIndices: doSort)
+        if switchLazyInverseOrderEnabled, doSort {
+            CBv2EngageMark.once("switchglue-lazy-inverse-order")
+        }
+        return (x, doSort ? inverseOrder! : nil, doSort)
     }
 
     /// Cached eligibility: the projection tensors are bound at load time and

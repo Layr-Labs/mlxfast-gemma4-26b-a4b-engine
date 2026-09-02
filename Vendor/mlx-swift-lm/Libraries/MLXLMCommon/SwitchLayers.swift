@@ -2,10 +2,9 @@ import Foundation
 import MLX
 import MLXNN
 
-/// Identity gather table for the sorted 64-assignment decode geometry.
-nonisolated(unsafe) private let switchDownIdentity64 = MLXArray((0..<64).map { UInt32($0) })
-
 // Port of https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/switch_layers.py
+
+nonisolated(unsafe) private let switchDownIdentity64 = MLXArray((0..<64).map { UInt32($0) })
 
 /// Compiled SiLU-gated product (`silu(gate) * up`) for the common MoE GLU path.
 /// Fusing activation + product into one compiled, shapeless kernel cuts kernel
@@ -1475,19 +1474,26 @@ public class SwitchGLU: Module {
             // pipeline, same per-column K-chains; the halves are views. The
             // admission mirrors the host's sorted right-hand-side selection
             // exactly, so the split views never meet that kernel.
-            if doSort, !useLhsIndices, lhsIndices == nil,
-                x.ndim == 3, x.dim(-2) == 1, x.dim(-1) == inputDims,
-                x.dim(0) >= 16, x.dim(0) / numExperts >= 4,
-                x.dtype == .bfloat16,
-                let fused = fusedGateUpDispatch()
-            {
-                CBv2EngageMark.once("prefill-gateup-fuse")
+            let admitPrefill = doSort && !useLhsIndices && lhsIndices == nil
+                && x.ndim == 3 && x.dim(-2) == 1 && x.dim(-1) == inputDims
+                && x.dim(0) >= 16 && x.dim(0) / numExperts >= 4
+                && x.dtype == .bfloat16
+            let admitDecode = doSort && useLhsIndices && lhsIndices != nil
+                && x.ndim == 3 && x.dim(-2) == 1 && x.dim(-1) == inputDims
+                && x.dtype == .bfloat16
+
+            if (admitPrefill || admitDecode), let fused = fusedGateUpDispatch() {
+                if admitDecode {
+                    CBv2EngageMark.once("decode-gateup-fuse")
+                } else {
+                    CBv2EngageMark.once("prefill-gateup-fuse")
+                }
                 let xGateUp = MLX.gatherQuantizedMM(
                     x,
                     fused.storage.weight,
                     scales: fused.storage.scales,
                     biases: fused.storage.biases,
-                    lhsIndices: nil,
+                    lhsIndices: lhsIndices,
                     rhsIndices: idx,
                     transpose: true,
                     groupSize: fused.groupSize,
@@ -1514,10 +1520,6 @@ public class SwitchGLU: Module {
             activated = activation(xGate) * xUp
         }
 
-        // DOWN-LHS-IDENTITY: at the sorted [64] geometry the down projection
-        // gathers activation row `assignment` for assignment `assignment`;
-        // hand it that identity table instead of leaving `lhsIndices` nil,
-        // which otherwise materializes the same arange(64) on every call.
         let downLhs: MLXArray? =
             (doSort && idx.ndim == 1 && idx.size == 64) ? switchDownIdentity64 : nil
         x = downProj(activated, idx, lhsIndices: downLhs, sortedIndices: doSort)

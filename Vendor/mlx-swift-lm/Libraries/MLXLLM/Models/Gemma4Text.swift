@@ -2543,7 +2543,7 @@ private enum Gemma4RouteGlueFoldV1 {
     }
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_route_monolithic_top8_e128_k8_bf16_v2",
+        name: "gemma4_route_monolithic_top8_e128_k8_bf16_fast_exp_v3",
         inputNames: ["scores", "pes"],
         outputNames: ["indices", "weights", "row_order", "sorted_keys", "inverse_order"],
         source: """
@@ -2601,7 +2601,10 @@ private enum Gemma4RouteGlueFoldV1 {
                 max_score = metal::max(max_score, simd_shuffle_xor(max_score, 2));
                 max_score = metal::max(max_score, simd_shuffle_xor(max_score, 1));
 
-                float exp_score = (lane >= 24u) ? metal::precise::exp(score - max_score) : 0.0f;
+                // Routing weights are immediately rounded to BF16. Use the
+                // hardware fast exponential for this eight-element softmax;
+                // selection and all integer route-table outputs stay exact.
+                float exp_score = (lane >= 24u) ? metal::fast::exp(score - max_score) : 0.0f;
                 float sum_exp = exp_score;
                 sum_exp += simd_shuffle_xor(sum_exp, 4);
                 sum_exp += simd_shuffle_xor(sum_exp, 2);

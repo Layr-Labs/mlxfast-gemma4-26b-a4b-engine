@@ -813,7 +813,7 @@ private let routeCsortPrefillHistKernel: MLXFast.MLXFastKernel = MLXFast.metalKe
 )
 
 private let routeCsortPrefillScanKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "mlx_lm_route_csort128_scan_v1",
+    name: "mlx_lm_route_csort128_scan_v3",
     inputNames: ["block_hist"],
     outputNames: ["block_offset"],
     source: """
@@ -823,8 +823,14 @@ private let routeCsortPrefillScanKernel: MLXFast.MLXFastKernel = MLXFast.metalKe
         uint lane = e % 32;
         uint nblocks = (uint)block_hist_shape[0];
         uint total = 0u;
-        for (uint b = 0; b < nblocks; ++b) {
-            total += block_hist[b * WIDTH + e];
+        // Admission proves every key is below NE, so columns at or above it are
+        // zero in every block and cannot contribute to the total. Skipping the
+        // accumulation retires whole SIMD groups at once when the counter table
+        // is wider than the model's expert count.
+        if (e < (uint)NE) {
+            for (uint b = 0; b < nblocks; ++b) {
+                total += block_hist[b * WIDTH + e];
+            }
         }
         // Global bin base: exclusive prefix over the 256 expert totals.
         uint lane_excl = simd_prefix_exclusive_sum(total);
@@ -839,9 +845,16 @@ private let routeCsortPrefillScanKernel: MLXFast.MLXFastKernel = MLXFast.metalKe
         }
         running += lane_excl;
         // Exclusive scan over blocks for this expert, offset by the bin base.
-        for (uint b = 0; b < nblocks; ++b) {
-            block_offset[b * WIDTH + e] = running;
-            running += block_hist[b * WIDTH + e];
+        // Column `e` of `block_offset` is read by the scatter only as
+        // `block_offset[b * WIDTH + key]` for a key that occurs in block `b`,
+        // so a column whose global total is zero is never read and need not be
+        // written. The counter table is 256 wide while the model routes 128
+        // experts, so at minimum half the columns are unconditionally dead.
+        if (total > 0u) {
+            for (uint b = 0; b < nblocks; ++b) {
+                block_offset[b * WIDTH + e] = running;
+                running += block_hist[b * WIDTH + e];
+            }
         }
         """,
     ensureRowContiguous: true
@@ -909,6 +922,7 @@ private func routeCountingSortPrefill(
     )[0]
     let offsets = routeCsortPrefillScanKernel(
         [hist],
+        template: [("NE", numExperts)],
         grid: (width, 1, 1),
         threadGroup: (width, 1, 1),
         outputShapes: [[blocks, width]],
@@ -1122,11 +1136,12 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
 /// Routing. The fused right-hand side is dispatched exactly where the host
 /// would select the sorted right-hand-side kernel: a sorted plane without
 /// left-hand indices of at least `max(16, 4 * experts)` rows (512 here). The
-/// eight-row decode cohort carries left-hand indices and never qualifies;
-/// smaller sorted rectangles (speculative verification) keep the split views
-/// and their gathered vector kernels. The `gate_up_proj` module slot is
-/// deliberately NOT populated: the direct sorted reduction requires it to be
-/// nil, so the storage lives in a private, reflection-inert member.
+/// eight-row decode cohort carries left-hand indices and takes its own arm
+/// over the same storage (GATEUP-FUSE-DECODE below); smaller sorted
+/// rectangles (speculative verification) keep the split views and their
+/// gathered vector kernels. The `gate_up_proj` module slot is deliberately
+/// NOT populated: the direct sorted reduction requires it to be nil, so the
+/// storage lives in a private, reflection-inert member.
 ///
 /// Kill switch: `DARKBLOOM_GEMMA4_PREFILL_GATEUP_FUSE` set to
 /// `0`/`false`/`no`/`off` leaves the split arrays as loaded and restores the
@@ -1134,6 +1149,44 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
 public let switchGateUpFusePrefillEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_GEMMA4_PREFILL_GATEUP_FUSE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// GATEUP-FUSE-DECODE (EGU-V2). The eight-row decode cohort -- 64 sorted
+/// assignments with left-hand row indices, `x` `[8, 1, 2816]` -- dispatched
+/// its gate and up projections as two `gather_qmv` launches (N = 704 each)
+/// over the same eight activation rows and the same sorted keys. This arm
+/// issues ONE `gather_qmv` over the concatenated storage above (N = 1408) and
+/// hands the shaped GeGLU the two column halves as zero-copy views, exactly
+/// as the prefill arm does: one dispatch per routed-expert layer disappears
+/// from the decode step.
+///
+/// Exactness. `affine_gather_qmv` admits N = 1408 (K = 2816) to the identical
+/// tuned arms it elects for N = 704 -- RUN-QUAD pair / triple / quad stream
+/// and EXPERT-SINGLES -- and election depends only on the sorted run
+/// structure, which the fused dispatch shares with the split ones. Every arm
+/// derives its output rows from the grid alone (`tid.y * 8 + simd_gid * 4`)
+/// and addresses weights, scales and biases through K-derived row strides;
+/// the gate view IS rows `0..<704` of this storage at the same expert
+/// stride and the up view rows `704..<1408`. So fused column `n < 704`
+/// executes gate column `n`'s exact load sequence, qdot chain, accumulator,
+/// `simd_sum` and store, and column `n >= 704` executes up column
+/// `n - 704`'s; only the output column index space is wider, and the slices
+/// hand the consumer the identical `[64, 1, 704]` halves. The consumer (the
+/// shaped GeGLU) is a compiled element-wise kernel that reads strided views
+/// in place, so the split adds no dispatch.
+///
+/// Requires the storage the prefill arm binds at load: with
+/// `DARKBLOOM_GEMMA4_PREFILL_GATEUP_FUSE` off there is no fused storage and
+/// the decode cohort keeps its two split gathers regardless of this switch.
+///
+/// Kill switch: `DARKBLOOM_GEMMA4_DECODE_GATEUP_FUSE` set to
+/// `0`/`false`/`no`/`off` restores the two split decode gathers. Engage
+/// mark: `decode-gateup-fuse`.
+public let switchGateUpFuseDecodeEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DECODE_GATEUP_FUSE"]
     else { return true }
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
@@ -1471,6 +1524,36 @@ public class SwitchGLU: Module {
                     scales: fused.storage.scales,
                     biases: fused.storage.biases,
                     lhsIndices: nil,
+                    rhsIndices: idx,
+                    transpose: true,
+                    groupSize: fused.groupSize,
+                    bits: fused.bits,
+                    mode: fused.mode,
+                    sortedIndices: true
+                )
+                xGate = xGateUp[.ellipsis, ..<hiddenDims]
+                xUp = xGateUp[.ellipsis, hiddenDims...]
+            } else if switchGateUpFuseDecodeEnabled, doSort, useLhsIndices,
+                let lhsIndices,
+                x.dtype == .bfloat16,
+                let fused = fusedGateUpDispatch()
+            {
+                // GATEUP-FUSE-DECODE (EGU-V2): the sorted decode cohort
+                // (`useLhsIndices` pins x to `[8, 1, 2816]` and the keys to
+                // 64 sorted assignments, raw or prefix-bounds tagged) reads
+                // its eight rows once through one gather over the
+                // concatenated gate|up storage. Same gather call shape as the
+                // two split projections it replaces -- left-hand row indices,
+                // sorted rhs keys -- so `affine_gather_qmv` elects the
+                // identical tuned arm per assignment run; the halves are
+                // zero-copy column views exactly as on the prefill arm.
+                CBv2EngageMark.once("decode-gateup-fuse")
+                let xGateUp = MLX.gatherQuantizedMM(
+                    x,
+                    fused.storage.weight,
+                    scales: fused.storage.scales,
+                    biases: fused.storage.biases,
+                    lhsIndices: lhsIndices,
                     rhsIndices: idx,
                     transpose: true,
                     groupSize: fused.groupSize,

@@ -302,6 +302,73 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
         absoluteOffset += n
     }
 
+    /// PREFILL-FULLKV-ADOPT: true when this row has no committed K/V of any
+    /// kind — no private buffers, no pool, offset 0. That is exactly the
+    /// state whose first `update` would take `ensureCapacity`'s
+    /// fresh-allocation branch, so it is also exactly the state whose
+    /// committed prefix after any first update is the incoming chunk alone.
+    var canAdoptFreshChunk: Bool {
+        cohortPool == nil && keys == nil && values == nil && absoluteOffset == 0
+    }
+
+    /// PREFILL-FULLKV-ADOPT: a strictly fresh row's first update, restructured
+    /// to ADOPT the chunk tensor as the K/V storage instead of allocating a
+    /// zero-filled capacity buffer and copying the chunk into it (the full-KV
+    /// twin of `CBv2WindowedSequenceKV`'s FRESH-RING-ADOPT). A fresh row's
+    /// committed prefix is the chunk and nothing else, so the adopted buffer
+    /// holds byte-for-byte the values the incumbent path writes; the
+    /// differences are all in unobservable or self-correcting territory:
+    ///
+    /// - `capacity` is `n`, the adopted buffer's true extent (it MUST track
+    ///   the buffer: `ensureCapacity` skips growth on `needed <= capacity`,
+    ///   and slice appends index into the real dims). The incumbent path's
+    ///   `promptLength + initialSlack` headroom is gone, so the FIRST later
+    ///   append — append `n'` makes `offset + n' > capacity == offset` always
+    ///   — grows by the same doubling reallocation `ensureCapacity` always
+    ///   performs, into a fresh PRIVATE buffer. The growth mechanism, policy
+    ///   and cap are unchanged; only its first firing moves earlier.
+    /// - Because `capacity == absoluteOffset` for as long as the adopted
+    ///   buffer lives, the adopted storage is read-only by construction:
+    ///   every plain append takes the growth branch (write lands in the new
+    ///   private buffer), and every fused in-place writer (WRITE-022 /
+    ///   WRITE-016-D512) is admitted only on `dim(2) >= keyLength` headroom
+    ///   this buffer never has — the aliased chunk bytes can never be
+    ///   mutated through the row.
+    /// - `byteCount` reports the adopted buffers' `nbytes` — truthful for
+    ///   what is actually held (the caller's rectangle, kept alive by the
+    ///   eight row slices) and never smaller than what admission charged:
+    ///   the contiguous backend bills `max(byteCount, reservation)`.
+    ///
+    /// Return views, `absoluteOffset`, `retainedCount`, `snapshot`,
+    /// `rollback` and `cbv2InnerState` (still exactly two arrays) are the
+    /// incumbent path's, with identical values.
+    func adoptFreshChunk(keys newKeys: MLXArray, values newValues: MLXArray)
+        -> (MLXArray, MLXArray)
+    {
+        precondition(
+            canAdoptFreshChunk,
+            "CBv2FullSequenceKV: fresh-chunk adoption requires a strictly fresh row")
+        let n = newKeys.dim(2)
+        precondition(newKeys.dim(0) == 1 && newValues.dim(0) == 1,
+            "CBv2FullSequenceKV holds ONE sequence; got batch \(newKeys.dim(0))")
+        precondition(newKeys.dim(1) == kvHeads,
+            "CBv2FullSequenceKV: kvHeads mismatch (\(newKeys.dim(1)) != \(kvHeads))")
+        precondition(newValues.dim(2) == n,
+            "CBv2FullSequenceKV: keys/values token count mismatch")
+        precondition(
+            absoluteOffset + n <= maxLength,
+            "CBv2FullSequenceKV: append past maxLength (\(absoluteOffset) + \(n) > \(maxLength)) — admission bug"
+        )
+        keys = newKeys
+        values = newValues
+        capacity = n
+        absoluteOffset = n
+        return (
+            keys![.ellipsis, ..<absoluteOffset, 0...],
+            values![.ellipsis, ..<absoluteOffset, 0...]
+        )
+    }
+
     public func snapshot() -> (keys: MLXArray, values: MLXArray, offset: Int) {
         if let pool = cohortPool {
             let (poolKeys, poolValues) = pool.rowViews(

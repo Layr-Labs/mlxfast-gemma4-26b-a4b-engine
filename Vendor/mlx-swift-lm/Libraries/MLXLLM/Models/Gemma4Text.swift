@@ -2804,6 +2804,24 @@ private enum Gemma4FusedLayerGlue {
         """
     }
 
+    /// Starting with four already-rounded BF16 values per thread, reproduce
+    /// `mma8_runsum4` and its xor(1,2,4) tree. Adjacent tail threads own the
+    /// two four-value halves, so masks 1,2,4,8 over sixteen lanes produce the
+    /// same group-64 FP32 table entry.
+    private static func qkvRunsumEpilogue(_ values: String) -> String {
+        """
+            float qkv_sum = 0.0f;
+            qkv_sum += \(values)[0] + \(values)[1] + \(values)[2] + \(values)[3];
+            qkv_sum += simd_shuffle_xor(qkv_sum, 1u);
+            qkv_sum += simd_shuffle_xor(qkv_sum, 2u);
+            qkv_sum += simd_shuffle_xor(qkv_sum, 4u);
+            qkv_sum += simd_shuffle_xor(qkv_sum, 8u);
+            if ((lid & 15u) == 0u) {
+                qkv_rs[row * 44u + lid / 16u] = qkv_sum;
+            }
+        """
+    }
+
     /// Same independent trees as prefill's glue_inv_rms2: four ordered
     /// squares per input, the original SIMD and cross-SIMD sums, then precise
     /// rsqrt. Share three barriers instead of running two three-barrier
@@ -2887,6 +2905,35 @@ private enum Gemma4FusedLayerGlue {
         """,
         ensureRowContiguous: true
     )
+
+    /// RS0: layer zero has no predecessor tail. Fuse its input RMSNorm with
+    /// the exact QKV run-sum producer so it also avoids the standalone table
+    /// dispatch. This body is the public parity-tested F1 layer-zero kernel.
+    private static let inputNormRunsumKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_glue_input_rmsnorm_qkv_runsum_2816_bf16_v1",
+            inputNames: ["x", "w"],
+            outputNames: ["normed", "qkv_rs"],
+            source: """
+                const uint row = threadgroup_position_in_grid.x;
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint simd_lane_id = thread_index_in_simdgroup;
+                const uint simd_group_id = simdgroup_index_in_threadgroup;
+                threadgroup float local_inv[1];
+                threadgroup float local_sums[32];
+                const uint base = row * 2816 + lid * 4;
+                const uint wbase = lid * 4;
+            \(rmsReduce("x", into: "local_inv[0]"))
+                const float inv = local_inv[0];
+                T normedv[4];
+                for (int i = 0; i < 4; ++i) {
+                    normedv[i] = w[wbase + i]
+                        * static_cast<T>((float)x[base + i] * inv);
+                    normed[base + i] = normedv[i];
+                }
+            \(qkvRunsumEpilogue("normedv"))
+            """,
+            ensureRowContiguous: true)
 
     /// PREFIX-001: join the two serial normalization producers at the
     /// attention/feed-forward boundary. The first reduction reproduces
@@ -3045,6 +3092,27 @@ private enum Gemma4FusedLayerGlue {
             outputShapes: [[rows, 1, axis]],
             outputDTypes: [.bfloat16]
         )[0]
+    }
+
+    /// RS0 layer-input producer. Outside the exact B8/L1/K2816 decode cell,
+    /// return nil and preserve the incumbent input norm plus table dispatch.
+    static func inputNormWithQKVRunsum(
+        x: MLXArray, weight: MLXArray, eps: Float
+    ) -> (normed: MLXArray, qkvRunsumTable: MLXArray)? {
+        guard admits(x, weight: weight, eps: eps) else { return nil }
+        let outs = inputNormRunsumKernel(
+            [x, weight],
+            template: [("T", x.dtype)],
+            grid: (rows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: [[rows, 1, axis], [rows, axis / 64]],
+            outputDTypes: [.bfloat16, .float32]
+        )
+        guard let table = CBv2AttentionQKVMMA8V1.runsumTable(
+            produced: outs[1], for: outs[0])
+        else { return nil }
+        CBv2EngageMark.once("qkv-runsum-input-norm-fold")
+        return (outs[0], table)
     }
 
     struct AttentionBranchPrefix {
@@ -4136,6 +4204,13 @@ public class Gemma4DecoderLayer: Module {
             chain.pending = nil
             h = pending.normed
             carriedRunsum = pending.rs
+        } else if cache is any CBv2AttendingLayerCache,
+            let produced = Gemma4FusedLayerGlue.inputNormWithQKVRunsum(
+                x: x, weight: inputLayernorm.weight, eps: config.rmsNormEps)
+        {
+            glueChain?.pending = nil
+            h = produced.normed
+            carriedRunsum = produced.qkvRunsumTable
         } else {
             glueChain?.pending = nil
             h = inputLayernorm(x)

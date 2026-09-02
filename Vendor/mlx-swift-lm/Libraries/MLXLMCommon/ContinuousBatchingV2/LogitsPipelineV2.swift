@@ -72,6 +72,17 @@ public struct CBv2SamplerRow {
 /// step call `process` (pure) and, after sampling, `commit` (state update).
 public final class LogitsPipelineV2 {
 
+    /// The vocabulary-rank tensor is invariant for this pipeline. Keep the
+    /// opt-out for A/B validation without changing the default step path.
+    private static let rankCacheEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_LOGITS_RANK_CACHE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private let rankVector: MLXArray
+
     /// Temperatures below this are treated as greedy (matches vLLM).
     public static let greedyEpsilon: Float = 1e-5
 
@@ -138,6 +149,7 @@ public final class LogitsPipelineV2 {
     public init(vocabSize: Int) {
         precondition(vocabSize > 0, "vocabSize must be positive")
         self.vocabSize = vocabSize
+        self.rankVector = MLXArray(Array(0 ..< Int32(vocabSize))).reshaped([1, vocabSize])
     }
 
     // MARK: Membership change (host loops allowed here, and only here)
@@ -334,9 +346,14 @@ public final class LogitsPipelineV2 {
             x = hardMask(x)
         }
 
-        // (4) top-k / top-p / min-p via one descending sort + cumsum.
         if anyTopKPMinP, let topK, let topP, let minP {
-            x = Self.applyTopKTopPMinP(x, topK: topK, topP: topP, minP: minP)
+            if Self.rankCacheEnabled {
+                CBv2EngageMark.once("logits-rank-cache")
+                x = Self.applyTopKTopPMinP(
+                    x, topK: topK, topP: topP, minP: minP, ranks: rankVector)
+            } else {
+                x = Self.applyTopKTopPMinP(x, topK: topK, topP: topP, minP: minP, ranks: nil)
+            }
         }
 
         return Output(sampling: x, rawLogprobs: rawLogprobs)
@@ -381,7 +398,8 @@ public final class LogitsPipelineV2 {
     /// probable token of each row is kept by construction, so a fully
     /// masked row cannot exist.
     static func applyTopKTopPMinP(
-        _ logits: MLXArray, topK: MLXArray, topP: MLXArray, minP: MLXArray
+        _ logits: MLXArray, topK: MLXArray, topP: MLXArray, minP: MLXArray,
+        ranks: MLXArray?
     ) -> MLXArray {
         let vocab = logits.dim(-1)
         // Descending sort.
@@ -390,8 +408,7 @@ public final class LogitsPipelineV2 {
         let probs = softmax(sortedLogits, axis: -1)
         let cumulative = cumsum(probs, axis: -1)
 
-        // top-k: keep ranks < k (disabled rows carry k == vocab).
-        let ranks = MLXArray(Array(0 ..< Int32(vocab))).reshaped([1, vocab])
+        let ranks = ranks ?? MLXArray(Array(0 ..< Int32(vocab))).reshaped([1, vocab])
         var keep = ranks .< topK
         // top-p: keep tokens whose preceding cumulative mass is within p
         // (the first token crossing the threshold stays in). Disabled rows

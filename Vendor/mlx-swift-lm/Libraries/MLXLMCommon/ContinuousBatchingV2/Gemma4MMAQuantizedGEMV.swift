@@ -139,8 +139,10 @@ public enum Gemma4MMAQuantizedGEMV {
     /// packed-weight cursor across those tiles. Version `27` keeps that cursor
     /// and replaces the v13 `min(8u, N_GROUPS - biasBlock)` inner trip with a
     /// compile-time-8 walk plus a four-group tail `continue`, fully unrolling
-    /// the 44-group outer block walk. Versions 1...16 are shippable and
-    /// numerically validated; see each version's source for what differs.
+    /// the 44-group outer block walk. Version `28` additionally marks the
+    /// fixed eight-step MMA walk for full unrolling; its arithmetic and order
+    /// remain unchanged. Versions 1...16 are shippable and numerically
+    /// validated; see each version's source for what differs.
     /// Anything unrecognised takes the default.
     private static let version: Int = {
         guard let raw = ProcessInfo.processInfo.environment[
@@ -165,11 +167,12 @@ public enum Gemma4MMAQuantizedGEMV {
         case "16": return 16
         case "26": return 26
         case "27": return 27
+        case "28": return 28
         default: return defaultVersion
         }
     }()
 
-    private static let defaultVersion = 27
+    private static let defaultVersion = 28
 
     /// Whether the selected tied-head implementation consumes the exact
     /// per-row/per-group activation sums. The final RMSNorm uses this to avoid
@@ -2749,6 +2752,37 @@ public enum Gemma4MMAQuantizedGEMV {
         return result
     }()
 
+    /// Explicitly unrolls the fixed eight-MMA walk in v27 carry. This is
+    /// compile-time work only; runtime K and the 44-group walk stay rolled or
+    /// on their existing v27 decomposition.
+    private static let twalkEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MMA_HEAD_TWALK"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.trimmingCharacters(
+            in: .whitespacesAndNewlines).lowercased())
+    }()
+
+    private static let sourceV28Carry: String = {
+        var result = sourceV27Carry
+        let old = "for (uint t = 0; t < 8; ++t) {"
+        precondition(
+            result.components(separatedBy: old).count == 2,
+            "sourceV28Carry fixed walk is not unique")
+        result = result.replacingOccurrences(
+            of: old, with: "#pragma unroll\n                \(old)")
+        return result
+    }()
+
+    private static let kernelV28Carry: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_affine4_qmv_m8_v28_unroll_twalk_carry_fpmma_v1",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["out"],
+        source: sourceV28Carry,
+        header: "#include <metal_simdgroup_matrix>\n",
+        ensureRowContiguous: true
+    )
+
     private static let kernelV27Carry: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_carry_fpmma_v2",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
@@ -2793,7 +2827,8 @@ public enum Gemma4MMAQuantizedGEMV {
         guard k > 0, x.size == mRows * k else { return nil }
 
         let n = w.dim(0)
-        let selectedColsPerThreadgroup = version == 16 || version == 26 || version == 27
+        let selectedColsPerThreadgroup = version == 16 || version == 26
+            || version == 27 || version == 28
             ? colsPerThreadgroup * 4
             : (version == 15 ? colsPerThreadgroup * 2 : colsPerThreadgroup)
         guard n >= minOutputWidth, n % selectedColsPerThreadgroup == 0 else { return nil }
@@ -2807,7 +2842,7 @@ public enum Gemma4MMAQuantizedGEMV {
         let selected: MLXFast.MLXFastKernel
         let inputs: [MLXArray]
         switch version {
-        case 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 26, 27:
+        case 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 26, 27, 28:
             let sumCells = mRows * (k / groupSize)
             let xSums: MLXArray
             if let activationSums,
@@ -2829,6 +2864,16 @@ public enum Gemma4MMAQuantizedGEMV {
                 )[0]
             }
             switch version {
+            case 28:
+                if carryEnabled, twalkEnabled {
+                    CBv2EngageMark.once("mma-head-twalk")
+                    selected = kernelV28Carry
+                } else if carryEnabled {
+                    CBv2EngageMark.once("mma-head-carry")
+                    selected = kernelV27Carry
+                } else {
+                    selected = kernelV27
+                }
             case 27:
                 if carryEnabled {
                     CBv2EngageMark.once("mma-head-carry")

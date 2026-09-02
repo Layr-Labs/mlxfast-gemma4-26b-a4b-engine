@@ -4004,6 +4004,16 @@ private enum Gemma4FusedLayerGlue {
     }
 }
 
+/// ROUTER-PREFILL-DEQ-CACHE: default ON. Enables caching the transposed dequantized
+/// BF16 projection plane for the router scoring linear layer `router.proj` during prefill.
+/// Kill switch: `DARKBLOOM_GEMMA4_ROUTER_PREFILL_DEQ=0` (also `false`/`no`/`off`).
+private let gemma4RouterPrefillDeqEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_ROUTER_PREFILL_DEQ"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// Expert router. Norms `x` with a learnable scale, projects to expert
 /// scores, and returns top-K (indices, weights) where weights are
 /// softmax-normalized and scaled by a per-expert scalar.
@@ -4129,7 +4139,13 @@ private class Gemma4Router: Module {
     }
 
     fileprivate func zipScores(_ normed: MLXArray) -> MLXArray {
-        proj(normed)
+        if gemma4RouterPrefillDeqEnabled,
+            let cached = Gemma4PrefillDeqGEMMV1.apply(proj, normed)
+        {
+            CBv2EngageMark.once("router-prefill-deq-cache")
+            return cached
+        }
+        return proj(normed)
     }
 
     fileprivate func zipPartition(_ expertScores: MLXArray) -> MLXArray {

@@ -1475,19 +1475,26 @@ public class SwitchGLU: Module {
             // pipeline, same per-column K-chains; the halves are views. The
             // admission mirrors the host's sorted right-hand-side selection
             // exactly, so the split views never meet that kernel.
-            if doSort, !useLhsIndices, lhsIndices == nil,
-                x.ndim == 3, x.dim(-2) == 1, x.dim(-1) == inputDims,
-                x.dim(0) >= 16, x.dim(0) / numExperts >= 4,
-                x.dtype == .bfloat16,
-                let fused = fusedGateUpDispatch()
-            {
-                CBv2EngageMark.once("prefill-gateup-fuse")
+            let admitPrefill = doSort && !useLhsIndices && lhsIndices == nil
+                && x.ndim == 3 && x.dim(-2) == 1 && x.dim(-1) == inputDims
+                && x.dim(0) >= 16 && x.dim(0) / numExperts >= 4
+                && x.dtype == .bfloat16
+            let admitDecode = doSort && useLhsIndices && lhsIndices != nil
+                && x.ndim == 3 && x.dim(-2) == 1 && x.dim(-1) == inputDims
+                && x.dtype == .bfloat16
+
+            if (admitPrefill || admitDecode), let fused = fusedGateUpDispatch() {
+                if admitDecode {
+                    CBv2EngageMark.once("decode-gateup-fuse")
+                } else {
+                    CBv2EngageMark.once("prefill-gateup-fuse")
+                }
                 let xGateUp = MLX.gatherQuantizedMM(
                     x,
                     fused.storage.weight,
                     scales: fused.storage.scales,
                     biases: fused.storage.biases,
-                    lhsIndices: nil,
+                    lhsIndices: lhsIndices,
                     rhsIndices: idx,
                     transpose: true,
                     groupSize: fused.groupSize,

@@ -2907,7 +2907,7 @@ public enum Gemma4MMAQuantizedGEMV {
     /// into `pv`/`pi`: `[8, N / 128]`, 128 KB at the tied head's geometry
     /// against the 4 MB the logits store cost.
     private static let sourceV27Argmax: String = {
-        var result = sourceV27
+        var result = sourceV27Carry
 
         func replaceOnce(_ old: String, with new: String) {
             let count = result.components(separatedBy: old).count
@@ -2997,7 +2997,7 @@ public enum Gemma4MMAQuantizedGEMV {
     }()
 
     private static let kernelV27Argmax: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v27_argmax",
+        name: "gemma4_mma_affine4_qmv_m8_v27_argmax_carry_v1",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["pv", "pi"],
         source: sourceV27Argmax,

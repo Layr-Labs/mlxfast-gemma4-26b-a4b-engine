@@ -516,6 +516,16 @@ private let expertPrefixBoundsEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+/// Kill switch: `DARKBLOOM_GEMMA4_SWITCH_IDENTITY_GATHER` set to
+/// `0`/`false`/`no`/`off` restores dynamic `arange(64)` gather index allocation
+/// and redundant 4D tensor expansion on decode. Engage mark: `switch-identity-gather`.
+private let switchIdentityGatherEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_SWITCH_IDENTITY_GATHER"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 private let routeSortTile64 = 64
 private let routeFusedScatterTopK = 8
 /// Key-space bound of the fused scatter's 256-entry counter table.
@@ -1254,6 +1264,12 @@ public class SwitchGLU: Module {
         fusedGateUpResolved = false
         fusedGateUpContract = nil
     }
+    /// Pre-allocated identity gather indices for decode down projection [64].
+    /// Lazy so it is never evaluated at module load time.
+    private lazy var decodeIdentityLhsIndices64: MLXArray = {
+        MLXArray(Array(UInt32(0) ..< UInt32(64)))
+    }()
+
 
     /// Default SiLU GLU path -- uses the compiled fused (silu * up) kernel.
     public init(
@@ -1385,7 +1401,9 @@ public class SwitchGLU: Module {
             expertPrefixBoundsEnabled && useLhsIndices
             && indices.dtype == .uint32 && x.dtype == .bfloat16
             && expertPrefixBoundsProjectionsEligible
-        var x = MLX.expandedDimensions(x, axes: [-2, -3])
+        var x = (useLhsIndices && switchIdentityGatherEnabled)
+            ? x.expandedDimensions(axis: 1)
+            : MLX.expandedDimensions(x, axes: [-2, -3])
         let doSort = indices.size >= 64
 
         var idx = indices
@@ -1393,7 +1411,9 @@ public class SwitchGLU: Module {
         var lhsIndices: MLXArray?
         if doSort {
             if useLhsIndices {
-                x = x.flattened(start: 0, end: -3)
+                if !switchIdentityGatherEnabled {
+                    x = x.flattened(start: 0, end: -3)
+                }
                 // GLUE-FOLD: an upstream producer already emitted the exact
                 // route table beside the top-8 selection; consume it and the
                 // standalone `mlx_lm_route_simd_rank_scatter` dispatch never
@@ -1497,7 +1517,12 @@ public class SwitchGLU: Module {
             activated = activation(xGate) * xUp
         }
 
-        x = downProj(activated, idx, sortedIndices: doSort)
+        let downLhsIndices = (doSort && useLhsIndices && switchIdentityGatherEnabled && idx.ndim == 1 && idx.size == 64)
+            ? decodeIdentityLhsIndices64 : nil
+        if downLhsIndices != nil {
+            CBv2EngageMark.once("switch-identity-gather")
+        }
+        x = downProj(activated, idx, lhsIndices: downLhsIndices, sortedIndices: doSort)
         return (x, doSort ? inverseOrder : nil, doSort)
     }
 

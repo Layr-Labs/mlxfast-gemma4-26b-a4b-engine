@@ -1159,8 +1159,34 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             extraInputs: [], scale: scale)
     }
 
+    /// Q4 read inner walks are compile-time eight-element groups. ON by
+    /// default; setting `DARKBLOOM_CBV2_Q4_READ_UNROLL=0` selects the
+    /// byte-identical incumbent source and name.
+    private static let q4ReadUnrollEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_Q4_READ_UNROLL"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let q4ReadUnrollPragma = q4ReadUnrollEnabled
+        ? "#pragma clang loop unroll(full)"
+        : ""
+
+    private static var q4ReadEngagedKernelName: String {
+        q4ReadUnrollEnabled
+            ? "cbv2_ragged8_sdpa_ring_2pass_a_q4g64_d256_g2_port_b\(blocks)_v2"
+            : "cbv2_ragged8_sdpa_ring_2pass_a_q4g64_d256_g2_port_b\(blocks)_v1"
+    }
+
+    private static let q4ReadKernelEngageMark: Void = {
+        if q4ReadUnrollEnabled {
+            CBv2EngageMark.once("kvq8port-q4-group-unroll")
+        }
+    }()
+
     private static let portQuantReadKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_ring_2pass_a_q4g64_d256_g2_port_b\(blocks)_v1",
+        name: q4ReadEngagedKernelName,
         inputNames: [
             "queries",
             "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7", "starts",
@@ -1205,6 +1231,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
 
             thread float q[values_per_lane];
             thread float accumulator[values_per_lane];
+            \(q4ReadUnrollPragma)
             for (int element = 0; element < values_per_lane; ++element) {
                 q[element] = 1.0f * float(query[element]);
                 accumulator[element] = 0.0f;
@@ -1229,6 +1256,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 const uint32_t kw = krow_w[lane];
                 const uint32_t vw = vrow_w[lane];
                 float score = 0.0f;
+                \(q4ReadUnrollPragma)
                 for (int element = 0; element < 8; ++element) {
                     score += q[element]
                         * fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
@@ -1240,6 +1268,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 const float score_factor = fast::exp(score - new_max);
                 max_score = new_max;
                 sum_exp_score = sum_exp_score * old_factor + score_factor;
+                \(q4ReadUnrollPragma)
                 for (int element = 0; element < 8; ++element) {
                     accumulator[element] = accumulator[element] * old_factor
                         + score_factor
@@ -1254,12 +1283,14 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 sum_out[0] = sum_exp_score;
                 max_out[0] = max_score;
             }
+            \(q4ReadUnrollPragma)
             for (int element = 0; element < values_per_lane; ++element) {
                 partial[element] = T(accumulator[element]);
             }
         """,
         ensureRowContiguous: true
     )
+
 
     /// Shipped q4g64 pass-A with one live mirror-slot write. The logical new
     /// token is always consumed from the just-computed packed word, so no
@@ -1948,6 +1979,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     && $0.shape == [2, kvHeads, sequenceLength, headDim / 8 + headDim / 64]
             })
         else { return nil }
+        _ = q4ReadKernelEngageMark
 
         let startArray = MLXArray(starts.map(UInt32.init), [batch])
         let partialShape = [batch, queryHeads, 1, blocks, headDim]

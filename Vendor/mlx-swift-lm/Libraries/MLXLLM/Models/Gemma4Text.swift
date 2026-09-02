@@ -288,6 +288,17 @@ private let gemma4PrefillLastQueryEnabled: Bool = {
     else { return true }
     return gemma4TruthyFlag(raw)
 }()
+/// CBV2-MASK-TABLE-ELISION: CBv2 attention paths manage their own masking and
+/// KV updates entirely within the layer cache (`CBv2AttendingLayerCache`), so
+/// building an empty `maskByType` dictionary and performing dictionary lookups
+/// for each layer on every forward is unnecessary host overhead. Default ON.
+/// Kill switch: `DARKBLOOM_GEMMA4_CBV2_MASK_TABLE=0` restores the dictionary.
+private let gemma4CBv2MaskTableElisionEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_CBV2_MASK_TABLE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
 
 /// The final layer must own a full-attention, non-shared cache for
 /// last-query prefill to be equivalent. Sliding windows give each query a
@@ -5688,37 +5699,51 @@ public class Gemma4TextModelInner: Module {
         // Gemma4's fully bidirectional prefill by symmetrizing both global and
         // sliding causal masks. Either mode needs a materialized array; ordinary
         // text and single-token decode retain the symbolic causal fast path.
-        var maskByType = [String: MLXFast.ScaledDotProductAttentionMaskMode]()
-        if !isCBv2 {
-            let useBidirectionalVision =
-                imageTokenMask != nil && config.useBidirectionalAttention == "vision"
-                && h.dim(1) > 1
-            let useBidirectionalAll =
-                config.useBidirectionalAttention == "all" && h.dim(1) > 1
-            let forceArrayMask =
-                useBidirectionalVision || useBidirectionalAll || requestedArrayMask
-            for (i, layer) in layers.enumerated() {
-                let lt = layer.layerType
-                if maskByType[lt] == nil {
-                    var mask: MLXFast.ScaledDotProductAttentionMaskMode
-                    if lt == "sliding_attention" {
-                        mask = createAttentionMask(
-                            h: h, cache: fullCache[i], windowSize: config.slidingWindow,
-                            returnArray: forceArrayMask)
-                    } else {
-                        mask = createAttentionMask(
-                            h: h, cache: fullCache[i], windowSize: nil,
-                            returnArray: forceArrayMask)
+        // CBV2-MASK-TABLE-ELISION: CBv2 layer caches own attention and masking
+        // (CBv2Contracts.swift, `updateAndAttend`), so masks are never consulted
+        // or built on the CBv2 path. Constructing an empty dictionary and
+        // querying it across all decoder layers on every forward is dead host
+        // overhead. When `isCBv2` holds, elide the dictionary entirely.
+        // Kill switch: `DARKBLOOM_GEMMA4_CBV2_MASK_TABLE=0` restores the dictionary.
+        // Engage mark: `cbv2-mask-table-elision`.
+        let maskByType: [String: MLXFast.ScaledDotProductAttentionMaskMode]?
+        if isCBv2 && gemma4CBv2MaskTableElisionEnabled {
+            CBv2EngageMark.once("cbv2-mask-table-elision")
+            maskByType = nil
+        } else {
+            var table = [String: MLXFast.ScaledDotProductAttentionMaskMode]()
+            if !isCBv2 {
+                let useBidirectionalVision =
+                    imageTokenMask != nil && config.useBidirectionalAttention == "vision"
+                    && h.dim(1) > 1
+                let useBidirectionalAll =
+                    config.useBidirectionalAttention == "all" && h.dim(1) > 1
+                let forceArrayMask =
+                    useBidirectionalVision || useBidirectionalAll || requestedArrayMask
+                for (i, layer) in layers.enumerated() {
+                    let lt = layer.layerType
+                    if table[lt] == nil {
+                        var mask: MLXFast.ScaledDotProductAttentionMaskMode
+                        if lt == "sliding_attention" {
+                            mask = createAttentionMask(
+                                h: h, cache: fullCache[i], windowSize: config.slidingWindow,
+                                returnArray: forceArrayMask)
+                        } else {
+                            mask = createAttentionMask(
+                                h: h, cache: fullCache[i], windowSize: nil,
+                                returnArray: forceArrayMask)
+                        }
+                        if useBidirectionalVision, let imageTokenMask {
+                            mask = gemma4TextOverlayBidirectionalVision(
+                                mask, isVision: imageTokenMask)
+                        } else if useBidirectionalAll {
+                            mask = gemma4TextSymmetrizeMask(mask)
+                        }
+                        table[lt] = mask
                     }
-                    if useBidirectionalVision, let imageTokenMask {
-                        mask = gemma4TextOverlayBidirectionalVision(
-                            mask, isVision: imageTokenMask)
-                    } else if useBidirectionalAll {
-                        mask = gemma4TextSymmetrizeMask(mask)
-                    }
-                    maskByType[lt] = mask
                 }
             }
+            maskByType = table
         }
 
         // Forward through layers, tracking intermediate KV pairs for sharing
@@ -5741,7 +5766,7 @@ public class Gemma4TextModelInner: Module {
                 isCBv2 && prevIdx != idx
                 ? fullCache[prevIdx] as? (any CBv2AttendingLayerCache) : nil
 
-            let mask = maskByType[layer.layerType]
+            let mask = maskByType?[layer.layerType]
             // Prompt-path specializations, final layer only. Every earlier
             // layer runs the full chunk unchanged because later positions'
             // K/V depend on it.

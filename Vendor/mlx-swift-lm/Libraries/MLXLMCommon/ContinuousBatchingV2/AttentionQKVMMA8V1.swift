@@ -49,6 +49,16 @@ public enum CBv2AttentionQKVMMA8V1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// F1: accept the same run-sum table from the layer-input producer instead
+    /// of launching `cbv2_b8_rs_table_k2816_v1`. Default ON; disabling it
+    /// restores the crown's standalone prepass in the same executable.
+    public static let carriedRunsumEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_QKV_RS_TAIL_FOLD"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let batch = 8
     private static let sequence = 1
     private static let inputWidth = 2816
@@ -858,6 +868,27 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
             outputShapes: [[batch, inputWidth / groupSize]],
             outputDTypes: [.float32]
         )[0]
+    }
+
+    /// Adopts the table emitted beside `x` by the fused layer-input producer.
+    /// The producer has the same exact B8/L1/K2816 gate and writes the same
+    /// `[row, g64]` fp32 tree as `runsumTableKernel`; all other arrays fail
+    /// closed so the caller falls back to `runsumTable(for:)`.
+    @inline(__always)
+    public static func runsumTable(
+        produced values: MLXArray, for x: MLXArray
+    ) -> MLXArray? {
+        guard rsPrepassEnabled, carriedRunsumEnabled,
+            x.dtype == .bfloat16,
+            x.ndim == 3,
+            x.dim(0) == batch,
+            x.dim(1) == sequence,
+            x.dim(2) == inputWidth,
+            x.size == batch * sequence * inputWidth,
+            values.dtype == .float32,
+            values.shape == [batch, inputWidth / groupSize]
+        else { return nil }
+        return values
     }
 
     @inline(__always)

@@ -58,6 +58,20 @@
 // cache cannot satisfy the new request with the previously compiled body.
 // Mechanism inherited from fkiene's promoted `22154b54` (DenseMLPQMVV1).
 //
+// LMH-003 (this submission). The exact tied-head shape has eleven 256-value K
+// blocks. Its packed32 body consumes one block before issuing the loads for the
+// next, leaving only four independent packed-weight rows in flight per SIMD
+// group. The pipelined twin below carries two register banks: while it owns
+// block k, it loads block k+1's packed words, scales, and biases before doing
+// block k's arithmetic. The banks are exchanged by plain register copies.
+// Every load address, qdot call, result update, tail predicate, SIMD reduction,
+// and bf16 store is otherwise the packed32 body's own statement in the same
+// order. Only the timing of read-only loads changes. Admission pins K=2816 and
+// N=262144; all other shapes retain the promoted packed32 path.
+//
+// `DARKBLOOM_CBV2_TIED_LMHEAD_PREFETCH=0` restores the promoted packed32 path
+// byte for byte in the same executable.
+//
 // `DARKBLOOM_CBV2_TIED_LMHEAD_QMV=0` restores the stock path inside the same
 // executable.
 
@@ -81,6 +95,14 @@ public enum CBv2TiedLMHeadQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Software-pipeline the next packed-weight block at the exact live shape.
+    private static let prefetchEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_TIED_LMHEAD_PREFETCH"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// Pinned to the ruled decode cohort and this checkpoint's tower.
     private static let batch = 8
     private static let groupSize = 64
@@ -89,6 +111,8 @@ public enum CBv2TiedLMHeadQMVV1 {
     private static let simdWidth = 32
     private static let simdGroups = 2
     private static let outputsPerGroup = 8
+    private static let tiedHeadInDim = 2816
+    private static let tiedHeadOutDim = 262_144
     /// `values_per_thread * SIMD` in the kernel; the tail block needs one more.
     private static let values_per_thread_block = 256
 
@@ -527,6 +551,221 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
         return result
     }()
 
+    private static let prefetchKernelHeader = packed32KernelHeader + """
+
+template <typename T, const int group_size, const int bits>
+METAL_FUNC void qmv_affine4_g64_quad_stream_prefetch_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x0,
+    const device T* x1,
+    const device T* x2,
+    const device T* x3,
+    device T* y0,
+    device T* y1,
+    device T* y2,
+    device T* y3,
+    const int in_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 8;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int scale_step_per_thread = 8;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread float x_thread[values_per_thread];
+  thread uint packed[results_per_simdgroup];
+  thread uint packed_next[results_per_simdgroup];
+  thread float scale_local[results_per_simdgroup];
+  thread float scale_next[results_per_simdgroup];
+  thread float bias_local[results_per_simdgroup];
+  thread float bias_next[results_per_simdgroup];
+  thread float result0[results_per_simdgroup] = {0};
+  thread float result1[results_per_simdgroup] = {0};
+  thread float result2[results_per_simdgroup] = {0};
+  thread float result3[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x0 += simd_lid * values_per_thread;
+  x1 += simd_lid * values_per_thread;
+  x2 += simd_lid * values_per_thread;
+  x3 += simd_lid * values_per_thread;
+  y0 += out_row;
+  y1 += out_row;
+  y2 += out_row;
+  y3 += out_row;
+
+  // Seed the current bank with block zero. The Swift admission guarantees
+  // eleven complete 256-value blocks, so a current and a following block exist.
+  #pragma clang loop unroll(full)
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    const device uint* wl =
+        (const device uint*)(ws + row * in_vec_size_w);
+    packed[row] = *wl;
+    scale_local[row] = scales[row * in_vec_size_g];
+    bias_local[row] = biases[row * in_vec_size_g];
+  }
+
+  int k = 0;
+  for (; k < in_vec_size - 2 * block_size; k += block_size) {
+    // Issue the following block before consuming the current bank. This is the
+    // sole scheduling change from the packed32 body.
+    #pragma clang loop unroll(full)
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint* wl = (const device uint*)(
+          ws + block_size / 2 + row * in_vec_size_w);
+      packed_next[row] = *wl;
+      scale_next[row] = scales[block_size / 64 + row * in_vec_size_g];
+      bias_next[row] = biases[block_size / 64 + row * in_vec_size_g];
+    }
+
+    float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
+    #pragma clang loop unroll(full)
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
+    #pragma clang loop unroll(full)
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result1[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
+    #pragma clang loop unroll(full)
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result2[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = load_vector<T, float, values_per_thread, 4>(x3, x_thread);
+    #pragma clang loop unroll(full)
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result3[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+
+    #pragma clang loop unroll(full)
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      packed[row] = packed_next[row];
+      scale_local[row] = scale_next[row];
+      bias_local[row] = bias_next[row];
+    }
+    ws += block_size / 2;
+    scales += block_size / 64;
+    biases += block_size / 64;
+    x0 += block_size;
+    x1 += block_size;
+    x2 += block_size;
+    x3 += block_size;
+  }
+
+  // The current bank now holds the last ordinary block, k == 2304.
+  float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
+  #pragma clang loop unroll(full)
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
+        packed[row], x_thread, scale_local[row], bias_local[row], sum);
+  }
+  sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
+  #pragma clang loop unroll(full)
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result1[row] += qdot_affine4_registered_word<float, values_per_thread>(
+        packed[row], x_thread, scale_local[row], bias_local[row], sum);
+  }
+  sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
+  #pragma clang loop unroll(full)
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result2[row] += qdot_affine4_registered_word<float, values_per_thread>(
+        packed[row], x_thread, scale_local[row], bias_local[row], sum);
+  }
+  sum = load_vector<T, float, values_per_thread, 4>(x3, x_thread);
+  #pragma clang loop unroll(full)
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result3[row] += qdot_affine4_registered_word<float, values_per_thread>(
+        packed[row], x_thread, scale_local[row], bias_local[row], sum);
+  }
+
+  k += block_size;
+  ws += block_size / 2;
+  scales += block_size / 64;
+  biases += block_size / 64;
+  x0 += block_size;
+  x1 += block_size;
+  x2 += block_size;
+  x3 += block_size;
+
+  const int remaining = clamp(
+      static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
+      0,
+      values_per_thread);
+  if (remaining > 0) {
+    #pragma clang loop unroll(full)
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint* wl =
+          (const device uint*)(ws + row * in_vec_size_w);
+      packed[row] = *wl;
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    float tail_sum =
+        load_vector_safe<T, float, values_per_thread, 4>(x0, x_thread, remaining);
+    #pragma clang loop unroll(full)
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], tail_sum);
+    }
+    tail_sum =
+        load_vector_safe<T, float, values_per_thread, 4>(x1, x_thread, remaining);
+    #pragma clang loop unroll(full)
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result1[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], tail_sum);
+    }
+    tail_sum =
+        load_vector_safe<T, float, values_per_thread, 4>(x2, x_thread, remaining);
+    #pragma clang loop unroll(full)
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result2[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], tail_sum);
+    }
+    tail_sum =
+        load_vector_safe<T, float, values_per_thread, 4>(x3, x_thread, remaining);
+    #pragma clang loop unroll(full)
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result3[row] += qdot_affine4_registered_word<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], tail_sum);
+    }
+  }
+
+  #pragma clang loop unroll(full)
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result0[row] = simd_sum(result0[row]);
+    result1[row] = simd_sum(result1[row]);
+    result2[row] = simd_sum(result2[row]);
+    result3[row] = simd_sum(result3[row]);
+    if (simd_lid == 0) {
+      y0[row] = static_cast<T>(result0[row]);
+      y1[row] = static_cast<T>(result1[row]);
+      y2[row] = static_cast<T>(result2[row]);
+      y3[row] = static_cast<T>(result3[row]);
+    }
+  }
+}
+"""
+
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "cbv2_b8_tied_lmhead_qmv_affine4_g64_quad_stream_unroll_v3",
         inputNames: ["x", "w", "scales", "biases"],
@@ -603,6 +842,44 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
         ensureRowContiguous: true
     )
 
+    private static let prefetchKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_tied_lmhead_qmv_affine4_g64_quad_stream_packed32_prefetch_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+
+            const int in_vec_size = K;
+            const int out_vec_size = OUTN;
+
+            const int first_m = int(tid.x) * 4;
+            if (first_m >= 8) {
+                return;
+            }
+            qmv_affine4_g64_quad_stream_prefetch_impl<T, 64, 4>(
+                w,
+                scales,
+                biases,
+                x + first_m * in_vec_size,
+                x + (first_m + 1) * in_vec_size,
+                x + (first_m + 2) * in_vec_size,
+                x + (first_m + 3) * in_vec_size,
+                y + first_m * out_vec_size,
+                y + (first_m + 1) * out_vec_size,
+                y + (first_m + 2) * out_vec_size,
+                y + (first_m + 3) * out_vec_size,
+                in_vec_size,
+                tid,
+                simd_gid,
+                simd_lid);
+            return;
+            """,
+        header: prefetchKernelHeader,
+        ensureRowContiguous: true
+    )
+
     /// Returns `nil` unless every pin holds; the caller then keeps the stock path.
     public static func matmul(
         x: MLXArray,
@@ -641,7 +918,12 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
         let xGroups = batch / rowsPerGroup
         let yGroups = outDim / outputsPerGroup
         let selectedKernel: MLXFast.MLXFastKernel
-        if packed32Enabled {
+        if packed32Enabled && prefetchEnabled
+            && inDim == tiedHeadInDim && outDim == tiedHeadOutDim
+        {
+            CBv2EngageMark.once("tied-lmhead-packed32-prefetch")
+            selectedKernel = prefetchKernel
+        } else if packed32Enabled {
             CBv2EngageMark.once("tied-lmhead-packed32")
             selectedKernel = packed32Kernel
         } else {

@@ -1297,3 +1297,216 @@ inline U qdot_affine8_registered_v4(
         )[0]
     }
 }
+
+// MARK: - R4-PREFILL-ONLY: DENSE-GATEUP-FUSE (prompt plane only)
+
+// R4-PREFILL-ONLY: one fused 8-bit affine gate|up GEMM on the dense MLP
+// prefill plane. The decode QMV above (`CBv2DenseMLPQMVV1.matmul` and every
+// kernel it selects) is byte-for-byte untouched by this arm: the split
+// `gate_proj` / `up_proj` parameters keep the arrays the loader produced, and
+// nothing below rebinds, re-lays or slices them.
+//
+// On the batch-eight prefill plane each layer's dense MLP issues two separate
+// 8-bit quantized GEMMs -- gate then up, both K = 2816 -> N = 2112, affine,
+// group 64 -- over the same normalized activation `n1` ([8, L, 2816] bf16,
+// ~46 MB at L = 1024), so `n1` is streamed from DRAM at least twice per layer
+// (once per launch) and each layer pays two dispatches. This arm concatenates
+// the gate and up right-hand sides along the output axis AT LOAD TIME, as an
+// ADDITIONAL copy the prefill admission alone reads, and issues ONE
+// `quantizedMatmul` over the doubled N = 4224, then hands the shaped GeLU the
+// two column halves as strided views of the single output.
+//
+// Storage. `DenseGateUpFusedStorage` is a second, complete per-layer copy:
+// [4224, 704] uint32 weight + [4224, 44] bfloat16 scales and biases ~= 12.05
+// MiB per layer, ~361 MiB across the 30 dense layers of the 26B-A4B tower.
+// It is built once at load and retained for the life of the layer. The split
+// projections the decode QMV reads are NOT views of it and it is NOT a view
+// of them: two independent buffers, zero interaction.
+//
+// Exactness. Verified against the vendored dispatch
+// (mlx/backend/metal/quantized.cpp), not assumed:
+//
+// * Both roads are `quantizedMatmul(x, w, s, b, transpose: true, groupSize:
+//   64, bits: 8, .affine)` with a 2-D packed w and a row-contiguous
+//   [8, L, 2816] bf16 x, so `QuantizedMatmul::eval_gpu` collapses x to
+//   M = 8L, B = 1 (quantized.cpp:1410-1412). At the admission floor below
+//   M >= 104 while `get_qmv_batch_limit(K = 2816, N, d)` is at most 18 for
+//   either N (quantized.cpp:84-126), so both roads take the matrix path into
+//   `qmm_splitk` (quantized.cpp:1418-1425).
+// * `qmm_splitk` derives `split_k = max(1, 512 / (n_tiles * m_tiles))` from
+//   32-wide tiles (quantized.cpp:791-807), and `n_tiles` is the ONLY term
+//   that depends on N: 66 for the split N = 2112, 132 for the fused N = 4224.
+//   For small M the two depths differ (m_tiles = 1 selects 4 vs 2;
+//   m_tiles = 3 selects 2 vs 1), which reassociates the K chain; the arm
+//   therefore admits only rectangles where the mirror below resolves
+//   split_k == 1 on BOTH roads. That floor is m_tiles >= 4, i.e. M >= 97,
+//   i.e. L >= 13 at batch eight; the ranked cell L = 1024 (m_tiles = 256)
+//   sits far above it, and everything under it fails closed onto the
+//   incumbent two-GEMM road, which is exact by definition.
+// * At split_k == 1 both roads fall through to `qmm` and then `qmm_nax`
+//   (quantized.cpp:697-714; NAX available, transpose, K % 64 == 0, bf16):
+//   one and the same instantiation `affine_qmm_t_nax` with bm = bn = bk = 64
+//   and wm = wn = 2 (quantized.cpp:490-556). 2112 = 33*64 and 4224 = 66*64
+//   keep `aligned_N` true on both. Inside the kernel N enters only through
+//   the grid width and the weight/scale row each output column reads; the K
+//   chain (BK = 64 blocks, one g64 group per block, SK = 32 MMA sub-steps,
+//   fp32 accumulator tiles) is a function of K alone, so every output column
+//   owns the identical per-group dequant and the identical fp32 accumulation
+//   order the split GEMM produced for it. On non-NAX hardware both roads
+//   equally keep the 32x32 `qmm_t` with `aligned = N % 32 == 0` true for both
+//   N (quantized.cpp:716-739).
+// * The concatenation is a pure copy along the output axis: fused row j
+//   carries exactly the packed codes, scales and biases of split row
+//   j mod 2112, unperturbed.
+//
+// Consumer. The halves are returned as `[.ellipsis, ..<2112]` /
+// `[.ellipsis, 2112...]` views, exactly the split the routed-expert
+// GATEUP-FUSE arm hands its GLU. The shaped-GeLU compile cache keys on shape
+// and dtype only -- never strides (mlx/compile.cpp:327-345) -- and its
+// elementwise kernels walk strides natively, so the views reach the fused
+// activation with no materializing copy. The activation output is a fresh
+// contiguous array, and the down projection is untouched.
+//
+// Kill switch: `DARKBLOOM_GEMMA4_PREFILL_DENSE_GATEUP_FUSE` set to
+// `0`/`false`/`no`/`off` skips building the additional copy at load and
+// restores the two-GEMM road everywhere. Engage mark:
+// `prefill-dense-gateup-fuse`.
+
+/// Kill switch for R4-PREFILL-ONLY. Default on; the usual
+/// `0`/`false`/`no`/`off` spellings skip the load-time copy and restore the
+/// split two-GEMM road.
+public let denseGateUpFusePrefillEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_PREFILL_DENSE_GATEUP_FUSE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// The concatenated `[gate ; up]` affine 8-bit / group-64 right-hand side of
+/// one dense MLP layer, held as an ADDITIONAL load-time copy (~12.05 MiB per
+/// layer) that only the prefill admission reads. A plain final class (not a
+/// `Module`, not an `MLXArray` tuple) so module reflection treats it as an
+/// opaque value: never a parameter in its own right, never quantized again,
+/// never saved and never updated. Built once at load, retained for the life
+/// of the layer. The split `gate_proj` / `up_proj` parameters are never
+/// rebound to it.
+///
+/// Exact production geometry only: two packed affine 8-bit / group-64 planes
+/// of 2816 -> 2112, `[2112, 704]` uint32 with `[2112, 44]` bfloat16 scales
+/// and biases (the 26B-A4B dense MLP quantization override). Any other pair
+/// returns nil and no copy is built.
+public final class DenseGateUpFusedStorage {
+    /// [4224, 704] uint32: gate rows 0..<2112 followed by up rows 2112..<4224
+    /// of the output axis (axis 0 of [out, packed-in]).
+    public let weight: MLXArray
+    /// [4224, 44] bfloat16, same row order as `weight`.
+    public let scales: MLXArray
+    /// [4224, 44] bfloat16, same row order as `weight`.
+    public let biases: MLXArray
+    public let inputDims: Int
+    public let outputDims: Int
+    public let groupSize: Int
+    public let bits: Int
+
+    public init?(
+        gateWeight: MLXArray, gateScales: MLXArray, gateBiases: MLXArray,
+        upWeight: MLXArray, upScales: MLXArray, upBiases: MLXArray
+    ) {
+        // 2816 * 8 / 32 = 704 packed columns; 2816 / 64 = 44 groups.
+        guard gateWeight.shape == [2112, 704]
+            && gateScales.shape == [2112, 44]
+            && gateBiases.shape == [2112, 44]
+            && upWeight.shape == [2112, 704]
+            && upScales.shape == [2112, 44]
+            && upBiases.shape == [2112, 44]
+            && gateWeight.dtype == .uint32 && upWeight.dtype == .uint32
+            && gateScales.dtype == .bfloat16 && upScales.dtype == .bfloat16
+            && gateBiases.dtype == .bfloat16 && upBiases.dtype == .bfloat16
+        else { return nil }
+        // Pure new allocations along the output axis; the six loaded planes
+        // passed in stay exactly as the loader produced them.
+        self.weight = concatenated([gateWeight, upWeight], axis: 0)
+        self.scales = concatenated([gateScales, upScales], axis: 0)
+        self.biases = concatenated([gateBiases, upBiases], axis: 0)
+        self.inputDims = 2816
+        self.outputDims = 2112
+        self.groupSize = 64
+        self.bits = 8
+    }
+}
+
+public enum CBv2DenseGateUpFuseV1 {
+    /// Mirror of the vendored `qmm_splitk` selection
+    /// (mlx/backend/metal/quantized.cpp:790-807) for one (N, M, K) point:
+    /// 32-wide N and M tiles, `split_k = max(1, 512 / (n_tiles * m_tiles))`
+    /// reduced to a whole quantization-group multiple of K. Only the resolved
+    /// value matters here: 1 means the dispatch fell through to the plain
+    /// (non-split) `qmm` kernel.
+    @inline(__always)
+    private static func resolvedSplitK(N: Int, M: Int, K: Int, groupSize: Int) -> Int {
+        let nTiles = (N + 31) / 32
+        let mTiles = (M + 31) / 32
+        var splitK = max(1, 512 / (nTiles * mTiles))
+        let kAlign = max(groupSize, 32)
+        splitK = min(splitK, K / kAlign)
+        while splitK > 1 && K % (splitK * kAlign) != 0 {
+            splitK -= 1
+        }
+        return splitK
+    }
+
+    /// The exactness boundary: the fused N and the split N must select the
+    /// SAME kernel pipeline. Because the only N-dependent input to the
+    /// selection is `n_tiles`, and larger N only ever lowers `split_k`, it is
+    /// sufficient (and exact) to require that both roads resolve split_k == 1
+    /// and thereby take the identical non-split `qmm` dispatch.
+    ///
+    /// `M` must be the row count the C++ host will collapse to. The
+    /// admission below pins a row-contiguous [8, L, 2816] x whose strides
+    /// make `non_batched` true (quantized.cpp:1410), so that collapse is
+    /// M = 8*L with B == 1 -- the only layout whose dispatch reaches
+    /// `qmm_splitk`. Every other layout fails the admission before this
+    /// mirror runs and keeps the incumbent road.
+    @inline(__always)
+    public static func splitKIdentical(N: Int, fusedN: Int, M: Int, K: Int, groupSize: Int) -> Bool {
+        resolvedSplitK(N: N, M: M, K: K, groupSize: groupSize) == 1
+            && resolvedSplitK(N: fusedN, M: M, K: K, groupSize: groupSize) == 1
+    }
+
+    /// One fused gate|up projection over the dense prefill plane. Returns nil
+    /// -- and the caller keeps the incumbent two-GEMM road -- unless every
+    /// production pin holds AND the split-K boundary above is satisfied for
+    /// this rectangle. The returned halves are strided views of the single
+    /// output array, not copies.
+    public static func gateUp(
+        x: MLXArray, storage: DenseGateUpFusedStorage
+    ) -> (gate: MLXArray, up: MLXArray)? {
+        let inDims = storage.inputDims
+        let n = storage.outputDims
+        guard denseGateUpFusePrefillEnabled,
+            x.dtype == .bfloat16,
+            x.ndim == 3,
+            x.dim(0) == 8,
+            x.dim(1) >= 2,
+            x.dim(2) == inDims,
+            x.strides == [x.dim(1) * inDims, inDims, 1],
+            splitKIdentical(
+                N: n, fusedN: 2 * n, M: x.size / inDims, K: inDims,
+                groupSize: storage.groupSize)
+        else { return nil }
+        CBv2EngageMark.once("prefill-dense-gateup-fuse")
+        // Same entry point, transpose flag, group size, bits and mode as the
+        // split QuantizedLinear road; only N differs (4224 vs 2112).
+        let fused = quantizedMM(
+            x,
+            storage.weight,
+            scales: storage.scales,
+            biases: storage.biases,
+            transpose: true,
+            groupSize: storage.groupSize,
+            bits: storage.bits,
+            mode: .affine
+        )
+        return (fused[.ellipsis, ..<n], fused[.ellipsis, n...])
+    }
+}

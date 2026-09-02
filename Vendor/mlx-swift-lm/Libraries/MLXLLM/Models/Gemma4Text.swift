@@ -1716,8 +1716,12 @@ private class Gemma4Attention: Module {
     /// Exact B8/L1 Q/K/V projection: the tight-grid host for the promoted
     /// matrix-unit tier (same kernel text, grid.x = 1). Any guard failure
     /// keeps the quantized module, which reaches the tier through MLX.
+    /// MMA-RS-001: `rsTable` is the layer input's precomputed affine run-sum
+    /// table; nil keeps the incumbent in-kernel reductions.
     @inline(__always)
-    private func tierProjection(_ layer: Linear, _ x: MLXArray) -> MLXArray {
+    private func tierProjection(
+        _ layer: Linear, _ x: MLXArray, rsTable: MLXArray? = nil
+    ) -> MLXArray {
         guard let quantized = layer as? QuantizedLinear,
             quantized.bias == nil,
             let projected = CBv2AttentionQKVMMA8V1.matmul(
@@ -1727,7 +1731,8 @@ private class Gemma4Attention: Module {
                 biases: quantized.biases,
                 groupSize: quantized.groupSize,
                 bits: quantized.bits,
-                mode: quantized.mode)
+                mode: quantized.mode,
+                rsTable: rsTable)
         else { return layer(x) }
         return projected
     }
@@ -1735,8 +1740,14 @@ private class Gemma4Attention: Module {
     /// QKFUSE-001. Q and K read the same activation at decode, so their
     /// planes concatenate into one dispatch. Nil whenever the shapes, the
     /// quantization parameters or the arm's switch say otherwise.
+    /// MMA-RS-001: `rsTable` is the layer input's shared run-sum table; the
+    /// fused concatenated-N dispatch reads the same per-row, per-64-group
+    /// entries the separate Q and K dispatches would; nil keeps the
+    /// incumbent fused dispatch.
     @inline(__always)
-    private func fusedQKProjection(_ x: MLXArray) -> (MLXArray, MLXArray)? {
+    private func fusedQKProjection(
+        _ x: MLXArray, rsTable: MLXArray? = nil
+    ) -> (MLXArray, MLXArray)? {
         guard let q = qProj as? QuantizedLinear, q.bias == nil,
             let kProj, let k = kProj as? QuantizedLinear, k.bias == nil,
             q.groupSize == k.groupSize, q.bits == k.bits, q.mode == k.mode
@@ -1746,11 +1757,14 @@ private class Gemma4Attention: Module {
             qWeight: q.weight, qScales: q.scales, qBiases: q.biases,
             kWeight: k.weight, kScales: k.scales, kBiases: k.biases,
             groupSize: q.groupSize, bits: q.bits, mode: q.mode,
-            cacheKey: ObjectIdentifier(q))
+            cacheKey: ObjectIdentifier(q),
+            rsTable: rsTable)
     }
 
     /// Exact B8/L1 attention output projection. Sliding/full K widths select
     /// the tight affine4 fast-QMV replica; every other path keeps the layer.
+    /// MMA-RS-001: the projection input's run-sum table is computed here (the
+    /// o_proj plane consumes it alone); nil keeps the incumbent dispatch.
     @inline(__always)
     private func outputProjection(_ x: MLXArray) -> MLXArray {
         guard let quantized = oProj as? QuantizedLinear,
@@ -1762,7 +1776,8 @@ private class Gemma4Attention: Module {
                 biases: quantized.biases,
                 groupSize: quantized.groupSize,
                 bits: quantized.bits,
-                mode: quantized.mode)
+                mode: quantized.mode,
+                rsTable: CBv2AttentionOQMVV1.runsumTable(for: x))
         else { return oProj(x) }
         return projected
     }
@@ -1949,6 +1964,14 @@ private class Gemma4Attention: Module {
         let queryInput = lastQueryCache == nil ? x : x[0..., outputStart..., 0...]
         let queryLength = queryInput.dim(1)
 
+        // MMA-RS-001: one affine run-sum table for the layer input serves
+        // every Q/K/V projection that consumes x (at decode queryInput is x
+        // itself; the prefill paths leave the table nil because the guard
+        // requires the exact L=1 decode shape, and the incumbent dispatch
+        // runs). The table kernel is lazy: it executes only when a projection
+        // actually consumes it.
+        let qkvRunsumTable = CBv2AttentionQKVMMA8V1.runsumTable(for: x)
+
         // Keep Q/K/V on the promoted matrix-unit tier's arithmetic. At the
         // exact B=8/L=1 decode shapes the tight-grid host re-dispatches the
         // tier's own kernel text with grid.x = 1 (the frozen MLX host launches
@@ -1957,11 +1980,16 @@ private class Gemma4Attention: Module {
         // custom helper would silently bypass the winning kernel.
         // QKFUSE-001: `queryInput === x` unless last-query prefill narrowed it,
         // which is the only case where Q and K cannot share a dispatch.
+        // MMA-RS-001: the fused Q|K dispatch consumes the shared run-sum
+        // table — the table is per activation row and per 64-group of K,
+        // independent of N, so the concatenated-N dispatch reads the same
+        // entries the separate Q and K dispatches would.
         let fusedQK: (MLXArray, MLXArray)? =
             (lastQueryCache == nil && !usesSharedKV && vProj == nil)
-            ? fusedQKProjection(x) : nil
-        let queryRaw = (fusedQK?.0 ?? tierProjection(qProj, queryInput)).reshaped(
-            B, queryLength, nHeads, effectiveHeadDim)
+            ? fusedQKProjection(x, rsTable: qkvRunsumTable) : nil
+        let queryRaw = (
+            fusedQK?.0 ?? tierProjection(qProj, queryInput, rsTable: qkvRunsumTable)
+        ).reshaped(B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
             // KV-shared layer: projects queries only and borrows (K, V) from
@@ -2023,11 +2051,13 @@ private class Gemma4Attention: Module {
             lastQueryCache == nil
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
-        let kRaw = (fusedQK?.1 ?? tierProjection(kProj, x)).reshaped(
-            B, L, nKvHeads, effectiveHeadDim)
+        let kRaw = (
+            fusedQK?.1 ?? tierProjection(kProj, x, rsTable: qkvRunsumTable)
+        ).reshaped(B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
         if let vProj {
-            vRaw = tierProjection(vProj, x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            vRaw = tierProjection(vProj, x, rsTable: qkvRunsumTable)
+                .reshaped(B, L, nKvHeads, effectiveHeadDim)
         } else {
             vRaw = kRaw
         }
@@ -3631,6 +3661,70 @@ private class Gemma4MLP: Module {
         return tight
     }
 
+    /// R4-PREFILL-ONLY (DENSE-GATEUP-FUSE): the ADDITIONAL concatenated
+    /// gate|up storage built at load (nil when the layer is not the exact
+    /// production geometry or the arm is off), and its once-resolved dispatch
+    /// contract. The split `gate_proj` / `up_proj` parameters are never
+    /// rebound: the decode QMV and every fallback road keep reading the
+    /// arrays the loader produced, byte for byte.
+    private var fusedGateUpStorage: DenseGateUpFusedStorage?
+    private var fusedGateUpResolved = false
+    private var fusedGateUpEligible = false
+
+    /// Bind the additional concatenated gate|up copy. Load-time only.
+    fileprivate func bindFusedGateUpStorage(_ storage: DenseGateUpFusedStorage) {
+        fusedGateUpStorage = storage
+        fusedGateUpResolved = false
+        fusedGateUpEligible = false
+    }
+
+    /// Resolve (once) that the split projections really carry the affine-8
+    /// group-64 contract the storage was pinned to. Reads the projections'
+    /// properties only; never rebinds anything. Anything else resolves nil
+    /// forever after and the split projections keep their incumbent roads.
+    private func fusedGateUpDispatch() -> DenseGateUpFusedStorage? {
+        guard let storage = fusedGateUpStorage else { return nil }
+        if !fusedGateUpResolved {
+            fusedGateUpResolved = true
+            let n = storage.outputDims
+            if let gate = gateProj as? QuantizedLinear,
+                let up = upProj as? QuantizedLinear,
+                gate.groupSize == storage.groupSize
+                    && gate.bits == storage.bits
+                    && gate.mode == .affine && gate.bias == nil,
+                up.groupSize == storage.groupSize
+                    && up.bits == storage.bits
+                    && up.mode == .affine && up.bias == nil,
+                gate.weight.shape == [n, 704] && up.weight.shape == [n, 704],
+                storage.weight.shape == [2 * n, 704],
+                storage.scales.shape == [2 * n, 44],
+                storage.biases.shape == [2 * n, 44],
+                storage.weight.dtype == .uint32,
+                storage.scales.dtype == .bfloat16,
+                storage.biases.dtype == .bfloat16
+            {
+                fusedGateUpEligible = true
+            }
+        }
+        return fusedGateUpEligible ? storage : nil
+    }
+
+    /// R4-PREFILL-ONLY: the batch-eight prompt-plane entry. One fused
+    /// quantized GEMM over the concatenated 8-bit right-hand side replaces
+    /// the two split gate/up GEMMs, and the shaped GeLU gets the two column
+    /// halves as views (bit-exact by the dispatch analysis in
+    /// `CBv2DenseGateUpFuseV1`). Returns nil -- building no node -- for every
+    /// other rectangle, the kill switch, and any rectangle where the vendored
+    /// split-K selection would reassociate K. Decode never reaches this
+    /// entry: its only callers are the two prefill-only glue roads in
+    /// `Gemma4DecoderLayer`, both of which require L >= 2.
+    fileprivate func promptFusedDenseMLP(_ x: MLXArray) -> MLXArray? {
+        guard let storage = fusedGateUpDispatch(),
+            let (gate, up) = CBv2DenseGateUpFuseV1.gateUp(x: x, storage: storage)
+        else { return nil }
+        return denseProjection(downProj, gemma4GeluProduct(gate, up))
+    }
+
     func callAsFunction(
         _ x: MLXArray,
         activationSums producerSums: CBv2DenseMLPQMVV1.ActivationSums? = nil
@@ -4190,7 +4284,10 @@ public class Gemma4DecoderLayer: Module {
                     let expertNormWeight = preFeedforwardLayernorm2.weight
                     let expertTopK = topKIndices.dim(-1)
                     let normEps = config.rmsNormEps
-                    h1Raw = mlp(n1)
+                    // R4-PREFILL-ONLY: prefill-only road (isExpertPrefill and
+                    // the preNorm admission both require L >= 2); decode never
+                    // reaches it. Falls closed onto the incumbent call below.
+                    h1Raw = mlp.promptFusedDenseMLP(n1) ?? mlp(n1)
                     expertBranch = projectExpertBranch(
                         n2,
                         indices: topKIndices,
@@ -4209,7 +4306,10 @@ public class Gemma4DecoderLayer: Module {
                     w2: preFeedforwardLayernorm2.weight,
                     eps: config.rmsNormEps)
                 {
-                    h1Raw = mlp(n1)
+                    // R4-PREFILL-ONLY: prefill-only road (the dualPreNorm
+                    // admission requires L >= 2); decode never reaches it.
+                    // Falls closed onto the incumbent call below.
+                    h1Raw = mlp.promptFusedDenseMLP(n1) ?? mlp(n1)
                     expertBranch = projectExpertBranch(
                         n2,
                         indices: topKIndices,
@@ -5529,7 +5629,39 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             sanitized[k] = v
         }
         fuseExpertGateUpStorage(&sanitized)
+        buildDenseGateUpFusedStorage(sanitized)
         return sanitized
+    }
+
+    /// R4-PREFILL-ONLY (DENSE-GATEUP-FUSE): build the ADDITIONAL concatenated
+    /// gate|up right-hand side for every dense MLP layer at load, as a second
+    /// copy (~12.05 MiB per layer, ~361 MiB across the 30 dense layers) that
+    /// only the batch-eight prefill admission reads. The split
+    /// `gate_proj` / `up_proj` weight, scales and biases in `sanitized` are
+    /// read here and NEVER rewritten, so the bound split parameters -- and
+    /// with them the decode QMV and every fallback road -- keep the exact
+    /// arrays the loader produced. Layers or checkpoints outside the exact
+    /// production geometry, and the arm's off-state (which also skips the
+    /// memory), leave everything as loaded.
+    private func buildDenseGateUpFusedStorage(_ sanitized: [String: MLXArray]) {
+        guard denseGateUpFusePrefillEnabled else { return }
+        let gateWeightSuffix = ".mlp.gate_proj.weight"
+        for key in sanitized.keys where key.hasSuffix(gateWeightSuffix) {
+            let base = String(key.dropLast(gateWeightSuffix.count))
+            guard let layerIdx = extractLayerIdx(from: key),
+                layerIdx < model.layers.count,
+                let gateWeight = sanitized["\(base).mlp.gate_proj.weight"],
+                let gateScales = sanitized["\(base).mlp.gate_proj.scales"],
+                let gateBiases = sanitized["\(base).mlp.gate_proj.biases"],
+                let upWeight = sanitized["\(base).mlp.up_proj.weight"],
+                let upScales = sanitized["\(base).mlp.up_proj.scales"],
+                let upBiases = sanitized["\(base).mlp.up_proj.biases"],
+                let storage = DenseGateUpFusedStorage(
+                    gateWeight: gateWeight, gateScales: gateScales, gateBiases: gateBiases,
+                    upWeight: upWeight, upScales: upScales, upBiases: upBiases)
+            else { continue }
+            model.layers[layerIdx].mlp.bindFusedGateUpStorage(storage)
+        }
     }
 
     /// GATEUP-FUSE-PREFILL: make the concatenated gate|up right-hand side the

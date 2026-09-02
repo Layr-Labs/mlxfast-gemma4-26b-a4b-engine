@@ -307,6 +307,97 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
     acc1 = acc1 + other.y;
   }
 
+    y[c.fn * N + n0 + c.fm] = static_cast<T>(acc0);
+    y[(c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc1);
+}
+
+// MMA-RS-001: the o_proj matrix-unit body with the affine bias run sums read
+// from a precomputed `[8, K/64]` fp32 table. The table's (row, g) entry is the
+// value the incumbent's own runsum4 pair and 2/4/16 butterfly produce for that
+// row and group; the fragment build, weight side, accumulators and the KS = 2
+// close keep the incumbent text, so every output word is the same float sum
+// in the same order.
+template <typename T, int KS, int KFIX>
+METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    const device float* rs_table,
+    device T* y,
+    const int N,
+    const int n0,
+    threadgroup float2* red,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int K = KFIX;
+  constexpr int G = K / 64;
+  constexpr int gh = (G + 1) / 2;
+  constexpr int nGroups = (KS == 2) ? gh : G;
+  const int g0 = (KS == 2 && simd_gid == 1) ? gh : 0;
+  const mma8_coord c = mma8_lane(simd_lid);
+
+  const device uint8_t* wrow =
+      (const device uint8_t*)w + (n0 + c.fm) * (K / 2) + 4 * c.fn;
+  const device T* srow = scales + (n0 + c.fm) * G;
+  const device T* brow = biases + (n0 + c.fm) * G;
+  const device T* x0 = x + c.fn * K + 8 * c.fm;
+  const device T* x1 = x0 + K;
+
+  float acc0 = 0.0f;
+  float acc1 = 0.0f;
+  simdgroup_float8x8 A;
+  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+#pragma unroll
+  for (int gi = 0; gi < nGroups; ++gi) {
+    const int g = g0 + gi;
+    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+
+    const float2 rs = float2(
+        rs_table[c.fn * G + g], rs_table[(c.fn + 1) * G + g]);
+
+    MMA8_SETB(B0, x, lo)
+    MMA8_SETB(B1, x, hi)
+    MMA8_SETB(B2, y, lo)
+    MMA8_SETB(B3, y, hi)
+    MMA8_SETB(B4, z, lo)
+    MMA8_SETB(B5, z, hi)
+    MMA8_SETB(B6, w, lo)
+    MMA8_SETB(B7, w, hi)
+
+    const uint2 wv = *((const device uint2*)(wrow + 32 * g));
+    const float s = float(srow[g]);
+    const float b = float(brow[g]);
+
+    simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+    MMA8_STEP(B0, 0)
+    MMA8_STEP(B1, 1)
+    MMA8_STEP(B2, 2)
+    MMA8_STEP(B3, 3)
+    MMA8_STEP(B4, 4)
+    MMA8_STEP(B5, 5)
+    MMA8_STEP(B6, 6)
+    MMA8_STEP(B7, 7)
+
+    acc0 += s * C.thread_elements()[0] + rs.x * b;
+    acc1 += s * C.thread_elements()[1] + rs.y * b;
+  }
+
+  if (KS == 2) {
+    if (simd_gid == 1) {
+      red[simd_lid] = float2(acc0, acc1);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_gid == 1) {
+      return;
+    }
+    const float2 other = red[simd_lid];
+    acc0 = acc0 + other.x;
+    acc1 = acc1 + other.y;
+  }
+
   y[c.fn * N + n0 + c.fm] = static_cast<T>(acc0);
   y[(c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc1);
 }
@@ -362,6 +453,99 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
         header: kernelHeader,
         ensureRowContiguous: true)
 
+    /// MMA-RS-001 arm for the o_proj plane. Mirrors the Q/K/V host's switch
+    /// (`CBv2AttentionQKVMMA8V1.rsPrepassEnabled`) so one env off restores
+    /// both hosts' in-kernel run-sum reductions in the same executable.
+    public static let rsPrepassEnabled = CBv2AttentionQKVMMA8V1.rsPrepassEnabled
+
+    // MMA-RS-001: the run-sum prepass for the o_proj activation. Same layout
+    // and butterfly argument as the Q/K/V host's table: lane r*8+fm reads the
+    // identical aligned 16-byte run the main body's (fm, row) lane reads, and
+    // masks 1, 2, 4 walk fm bits 0, 1, 2 in the incumbent's stage order (its
+    // masks 2, 4, 16 walk the same fm bits in ITS lane layout), storing the
+    // lane-independent balanced fp32 tree every incumbent lane holds.
+    private static let runsumTableKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_rs_table_dyn_v1",
+        inputNames: ["x"],
+        outputNames: ["rs"],
+        source: """
+            const int K = int(x_shape[x_ndim - 1]);
+            const int G = K / 64;
+            const int rowQuad = int(threadgroup_position_in_grid.y) / G;
+            const int g = int(threadgroup_position_in_grid.y) % G;
+            const int lane = int(thread_position_in_threadgroup.x);
+            const int r = lane >> 3;
+            const int fm = lane & 7;
+            const uint4 run =
+                *((const device uint4*)(x + (rowQuad * 4 + r) * K + 64 * g + 8 * fm));
+            float v = mma8_runsum4<T>(run);
+            v += simd_shuffle_xor(v, 1u);
+            v += simd_shuffle_xor(v, 2u);
+            v += simd_shuffle_xor(v, 4u);
+            if (fm == 0) {
+                rs[(rowQuad * 4 + r) * G + g] = v;
+            }
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
+    /// MMA-RS-001 table for one o_proj activation tensor. nil keeps the
+    /// incumbent dispatch.
+    @inline(__always)
+    public static func runsumTable(for x: MLXArray) -> MLXArray? {
+        guard rsPrepassEnabled,
+            x.dtype == .bfloat16,
+            x.ndim == 3,
+            x.dim(0) == batch,
+            x.dim(1) == sequence,
+            liveInputWidth(x.dim(2))
+        else { return nil }
+        let inDim = x.dim(2)
+        return runsumTableKernel(
+            [x],
+            template: [("T", x.dtype)],
+            grid: (simdWidth, 2 * (inDim / groupSize), 1),
+            threadGroup: (simdWidth, 1, 1),
+            outputShapes: [[batch, inDim / groupSize]],
+            outputDTypes: [.float32]
+        )[0]
+    }
+
+    private static let mma8RspKernelK4096 = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_rsp_v1",
+        inputNames: ["x", "w", "scales", "biases", "rs_table"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            attention_o_qmv_mma8_affine4_g64_rsp<T, 2, 4096>(
+                w, scales, biases, x, rs_table, y,
+                w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
+    private static let mma8RspKernelK8192 = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp_v1",
+        inputNames: ["x", "w", "scales", "biases", "rs_table"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            attention_o_qmv_mma8_affine4_g64_rsp<T, 2, 8192>(
+                w, scales, biases, x, rs_table, y,
+                w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
     @inline(__always)
     private static func liveInputWidth(_ width: Int) -> Bool {
         width == 4096 || width == 8192
@@ -374,7 +558,8 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
         biases: MLXArray?,
         groupSize: Int,
         bits: Int,
-        mode: QuantizationMode
+        mode: QuantizationMode,
+        rsTable: MLXArray? = nil
     ) -> MLXArray? {
         guard enabled,
             groupSize == Self.groupSize,
@@ -399,12 +584,28 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
             biases.shape == scales.shape
         else { return nil }
 
+        let tableReady =
+            rsTable != nil
+            && rsTable!.dtype == .float32
+            && rsTable!.shape == [batch, inDim / Self.groupSize]
+
         if mma8Enabled {
             // One threadgroup per 8-column output tile; all eight cohort rows
             // are served from a single weight fetch, so the o_proj plane is
             // streamed once per round instead of four times. Grid is in
             // threads: (32, 2, 1) threads per group, N/8 groups along y.
             let yTiles = outputWidth / outputsPerGroup
+            if tableReady {
+                let kernel = inDim == 8192 ? mma8RspKernelK8192 : mma8RspKernelK4096
+                return kernel(
+                    [x, weight, scales, biases, rsTable!],
+                    template: [("T", x.dtype)],
+                    grid: (simdWidth, yTiles * simdGroups, 1),
+                    threadGroup: (simdWidth, simdGroups, 1),
+                    outputShapes: [[batch, sequence, outputWidth]],
+                    outputDTypes: [x.dtype]
+                )[0]
+            }
             let kernel = inDim == 8192 ? mma8KernelK8192 : mma8KernelK4096
             return kernel(
                 [x, weight, scales, biases],

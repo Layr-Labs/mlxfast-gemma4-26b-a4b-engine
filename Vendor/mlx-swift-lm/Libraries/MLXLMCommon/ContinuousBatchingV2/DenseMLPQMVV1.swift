@@ -380,9 +380,20 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
             inline void load_affine8_values(
                 const device T* x,
                 thread U* x_thread) {
-              #pragma unroll
-              for (int i = 0; i < values_per_thread; i++) {
-                x_thread[i] = x[i];
+              // DENSE-XVEC: the lane's four consecutive activations arrive as
+              // one vec<T, 4> load (row base and lane offset are multiples of
+              // four elements); element i is the value x[i] delivered.
+              if (values_per_thread == 4) {
+                const vec<T, 4> x4 = *reinterpret_cast<const device vec<T, 4>*>(x);
+                #pragma unroll
+                for (int i = 0; i < 4; i++) {
+                  x_thread[i] = x4[i];
+                }
+              } else {
+                #pragma unroll
+                for (int i = 0; i < values_per_thread; i++) {
+                  x_thread[i] = x[i];
+                }
               }
             }
 
@@ -418,29 +429,30 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
                 "float sum = load_vector<T, float, values_per_thread, 8>(x0, x_thread);",
                 """
                 load_affine8_values<T, float, values_per_thread>(x0, x_thread);
-                float sum = x_sums[
-                    ((k / block_size) * SIMD_SIZE + int(simd_lid)) * 8 + first_m];
+                // DENSE-XVEC: the four per-row activation sums of this block
+                // are consecutive floats at a 16-byte-aligned address
+                // (first_m is 0 or 4); one float4 load, consumed per row.
+                const float4 xs4 = *reinterpret_cast<const device float4*>(
+                    x_sums + ((k / block_size) * SIMD_SIZE + int(simd_lid)) * 8 + first_m);
+                float sum = xs4[0];
                 """),
             (
                 "sum = load_vector<T, float, values_per_thread, 8>(x1, x_thread);",
                 """
                 load_affine8_values<T, float, values_per_thread>(x1, x_thread);
-                sum = x_sums[
-                    ((k / block_size) * SIMD_SIZE + int(simd_lid)) * 8 + first_m + 1];
+                sum = xs4[1];
                 """),
             (
                 "sum = load_vector<T, float, values_per_thread, 8>(x2, x_thread);",
                 """
                 load_affine8_values<T, float, values_per_thread>(x2, x_thread);
-                sum = x_sums[
-                    ((k / block_size) * SIMD_SIZE + int(simd_lid)) * 8 + first_m + 2];
+                sum = xs4[2];
                 """),
             (
                 "sum = load_vector<T, float, values_per_thread, 8>(x3, x_thread);",
                 """
                 load_affine8_values<T, float, values_per_thread>(x3, x_thread);
-                sum = x_sums[
-                    ((k / block_size) * SIMD_SIZE + int(simd_lid)) * 8 + first_m + 3];
+                sum = xs4[3];
                 """),
         ]
         for (old, new) in loads {
@@ -1096,7 +1108,7 @@ inline U qdot_affine8_registered_v4(
     )
 
     private static let w4ActivationSumQMVKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_w4_v1",
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_w4_xv1",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["y"],
         source: """

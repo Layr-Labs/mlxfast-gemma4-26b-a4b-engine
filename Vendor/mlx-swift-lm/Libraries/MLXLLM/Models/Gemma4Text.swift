@@ -3221,8 +3221,50 @@ private enum Gemma4FusedLayerGlue {
             }
     """
 
+    /// PAIRED-RMS-DEFERRED: the deferred tails' two independent RMS
+    /// reductions (the mlp row `a` from device memory and the gathered
+    /// expert row `expertv` from registers) share one bank round trip.
+    /// Each reduction keeps its own tree: four ordered squares per lane, its
+    /// own `simd_sum`, its own 32-slot bank (live subtotals in lanes below
+    /// the simdgroup count, literal zero elsewhere), its own closing
+    /// `simd_sum` and `precise::rsqrt`. Only the barriers are shared, so the
+    /// two inverses are the same bits the two separate reductions produced.
+    /// The widened `a` values stay in `av[4]` for the norm step.
+    private static let pairedDeferredRmsSource = """
+            float av[4];
+            threadgroup float local_sums_b[32];
+            {
+                float acc_a = 0;
+                float acc_b = 0;
+                for (int i = 0; i < 4; i++) {
+                    av[i] = (float)a[base + i];
+                    acc_a += av[i] * av[i];
+                    float xb = (float)expertv[i];
+                    acc_b += xb * xb;
+                }
+                acc_a = simd_sum(acc_a);
+                acc_b = simd_sum(acc_b);
+                if (simd_lane_id == 0) {
+                    local_sums[simd_group_id] = acc_a;
+                    local_sums_b[simd_group_id] = acc_b;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simd_group_id == 0) {
+                    acc_a = simd_sum(
+                        simd_lane_id < 22 ? local_sums[simd_lane_id] : 0.0f);
+                    acc_b = simd_sum(
+                        simd_lane_id < 22 ? local_sums_b[simd_lane_id] : 0.0f);
+                    if (simd_lane_id == 0) {
+                        local_inv[0] = metal::precise::rsqrt(acc_a / 2816.0f + 1e-06f);
+                        local_inv[1] = metal::precise::rsqrt(acc_b / 2816.0f + 1e-06f);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        """
+
     private static let deferredTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1_nb1_vec1",
+        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1_nb1_vec1_pr1",
         inputNames: [
             "a", "sorted", "inverse", "route_weights", "res",
             "w1", "w2", "w3", "s",
@@ -3237,16 +3279,14 @@ private enum Gemma4FusedLayerGlue {
             threadgroup float local_sums[32];
             const uint base = row * 2816 + lid * 4;
             const uint wbase = lid * 4;
-        \(rmsReduce("a", into: "local_inv[0]"))
         \(deferredExpertValuesSource)
-        \(rmsReduce("expertv", into: "local_inv[1]").replacingOccurrences(
-            of: "(float)expertv[base + i]", with: "(float)expertv[i]"))
+        \(pairedDeferredRmsSource)
             const float inv1 = local_inv[0];
             const float inv2 = local_inv[1];
             T sv[4];
             for (int i = 0; i < 4; i++) {
                 const T h1 = w1[wbase + i]
-                    * static_cast<T>((float)a[base + i] * inv1);
+                    * static_cast<T>(av[i] * inv1);
                 const T h2 = w2[wbase + i]
                     * static_cast<T>((float)expertv[i] * inv2);
                 sv[i] = h1 + h2;
@@ -3267,7 +3307,7 @@ private enum Gemma4FusedLayerGlue {
 
     private static let deferredTailChainKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1_nb1_vec1_rs1",
+            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1_nb1_vec1_rs1_pr1",
             inputNames: [
                 "a", "sorted", "inverse", "route_weights", "res",
                 "w1", "w2", "w3", "s", "wn",
@@ -3282,16 +3322,14 @@ private enum Gemma4FusedLayerGlue {
                 threadgroup float local_sums[32];
                 const uint base = row * 2816 + lid * 4;
                 const uint wbase = lid * 4;
-            \(rmsReduce("a", into: "local_inv[0]"))
             \(deferredExpertValuesSource)
-            \(rmsReduce("expertv", into: "local_inv[1]").replacingOccurrences(
-                of: "(float)expertv[base + i]", with: "(float)expertv[i]"))
+            \(pairedDeferredRmsSource)
                 const float inv1 = local_inv[0];
                 const float inv2 = local_inv[1];
                 T sv[4];
                 for (int i = 0; i < 4; i++) {
                     const T h1 = w1[wbase + i]
-                        * static_cast<T>((float)a[base + i] * inv1);
+                        * static_cast<T>(av[i] * inv1);
                     const T h2 = w2[wbase + i]
                         * static_cast<T>((float)expertv[i] * inv2);
                     sv[i] = h1 + h2;

@@ -1752,6 +1752,24 @@ private enum Gemma4PrefillDeqGEMMV1 {
 
 // MARK: - Attention
 
+/// QKFUSE-SLIDING. Default ON: sliding attention layers (vProj != nil) take
+/// the fused Q|K dispatch alongside the K-eq-V global layers, while V keeps
+/// its separate tierProjection. The fused kernels admit the sliding widths
+/// (qWidth 4096, kWidth 2048) and compute each output column from that
+/// column's own plane row, so the Q and K halves are bit-identical to the
+/// separate q_proj/k_proj dispatches. The per-layer cached concatenated
+/// planes ([6144, 352] uint32 + [6144, 44] bf16 scales + same-size biases)
+/// add 9,732,096 bytes (~9.3 MiB) of resident memory per sliding layer,
+/// 243,302,400 bytes (~232 MiB) across the 25 sliding layers.
+/// `DARKBLOOM_GEMMA4_QKFUSE_SLIDING=0` (also false/no/off) restores the
+/// vProj == nil gate.
+private let gemma4QKFuseSlidingEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_QKFUSE_SLIDING"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 private class Gemma4Attention: Module {
     let config: Gemma4TextConfiguration
     let layerIdx: Int
@@ -2129,12 +2147,21 @@ private class Gemma4Attention: Module {
         // custom helper would silently bypass the winning kernel.
         // QKFUSE-001: `queryInput === x` unless last-query prefill narrowed it,
         // which is the only case where Q and K cannot share a dispatch.
+        // QKFUSE-SLIDING: sliding layers (vProj != nil) take the fused Q|K
+        // dispatch too; V keeps its separate tierProjection below, and the
+        // K-eq-V structure is untouched (keyValueShared stays vProj == nil).
+        // `DARKBLOOM_GEMMA4_QKFUSE_SLIDING=0` restores the vProj == nil gate.
+        // The relaxation is only reachable here; fusedQKProjection's own
+        // admission still requires the exact B=8/L=1 decode shape, so
+        // prefill, last-query, shared-KV and other batch widths keep their
+        // incumbent dispatches.
         // MMA-RS-001: the fused Q|K dispatch consumes the shared run-sum
         // table — the table is per activation row and per 64-group of K,
         // independent of N, so the concatenated-N dispatch reads the same
         // entries the separate Q and K dispatches would.
         let fusedQK: (MLXArray, MLXArray)? =
-            (lastQueryCache == nil && !usesSharedKV && vProj == nil)
+            (lastQueryCache == nil && !usesSharedKV
+                && (vProj == nil || gemma4QKFuseSlidingEnabled))
             ? fusedQKProjection(x, rsTable: qkvRunsumTable) : nil
         let queryRaw = (
             fusedQK?.0 ?? tierProjection(qProj, queryInput, rsTable: qkvRunsumTable)
@@ -2666,6 +2693,262 @@ private enum Gemma4RouterFinalistsV1 {
     }
 }
 
+/// ROUTER-TAIL-PREFILL: fold the prefill router's four dependent stock
+/// weight ops — `takeAlong(expertScores, topKIndices, -1)` →
+/// `softmax(..., precise: true)` → `perExpertScale[topKIndices]` gather
+/// → bf16 `multiply` (four dispatches x 30 MoE layers per prefill, plus
+/// a re-read of the whole `[8, L, 128]` score plane) — into the
+/// finalists32 selection kernel that already holds the eight winners.
+/// The selection network is the incumbent
+/// `gemma4_router_finalists32_stable_bf16_v1` verbatim; the weight tail
+/// is the decode cell's adversarially verified `Gemma4FusedRouterTop8`
+/// tail — the bit-exact transcription of
+/// `softmax_single_row<bfloat16_t, float, N_READS=4>` (softmax.h) plus
+/// the stock bf16 per-expert-scale multiply — ported onto the packed
+/// winners this kernel already holds in its group-0 lanes 24-31. The
+/// O(E^2)-per-row selection of `Gemma4FusedRouterTop8` itself stays
+/// decode-only; this kernel keeps the finalists32 selection network.
+///
+/// Exactness, op by op against the stock chain:
+/// 1. `takeAlong` is a pure gather of the bf16 scores at the selected
+///    indices (no arithmetic). The winners ride the selection network as
+///    unchanged BF16 bits inside the packed payload, so
+///    `float(uint16_to_bfloat16(bits))` is the bit-identical float32 of
+///    the bit-identical bf16 score, staged in the same ascending-rank
+///    order `takeAlong` emits (position p = rank - kth, lane 24 + p).
+/// 2. `softmax(precise: true)` on bf16 dispatches the single kernel
+///    `block_softmax_precise_bfloat16` =
+///    `softmax_single_row<bfloat16_t, float, N_READS=4>`: float32
+///    accumulation throughout, with exactly one bf16 rounding, at the
+///    output write `T(ld[i] * normalizer)`. The stock axis-8 launch is
+///    ONE 32-thread simdgroup per row; this kernel's group 0 is exactly
+///    that simdgroup (its lanes are threadgroup positions 0-31), so the
+///    transcribed lane layout (lanes 0-1 hold the 8 values, 4 reads
+///    each), the `Limits<float>::min` (-inf) padding, `fast::exp`, the
+///    `simd_max`/`simd_sum` reduction order and the `1 / normalizer`
+///    division all execute on the same lanes with the same values.
+///    Every write to the shared max/normalizer slots is gated to group
+///    0 — in the stock one-simdgroup launch only slot 0 is ever
+///    written — so slots 1-31 keep their -inf / 0 init values exactly
+///    as the stock launch leaves them, and the cross-simdgroup
+///    `simd_max(local_max[lane])` / `simd_sum(local_normalizer[lane])`
+///    combines identical operands. Groups 1-3 only meet the barriers.
+/// 3. The per-expert-scale gather is a pure bf16 copy; `pes[topi[p]]`
+///    loads the identical element of the identical vector.
+/// 4. The stock `Multiply` on bfloat16 is MSL `x * y` (binary_ops.h),
+///    so `w * pes[topi[p]]` is the same expression on the same types
+///    with the same single bf16 rounding as the stock binary kernel.
+///
+/// Fail-closed: any shape, dtype, topK, or kth outside the pinned
+/// prefill geometry, a disabled finalists stage (either of its two kill
+/// switches), or the kill switch below selects the unchanged
+/// selection-only kernel plus the stock four-op chain. Kill switch:
+/// `DARKBLOOM_GEMMA4_ROUTER_WEIGHTS32_PREFILL=0` (off = the exact
+/// incumbent chain). Engage mark: `router-weights32-prefill`.
+private enum Gemma4RouterFinalistsWeightsV1 {
+    /// Default ON; `DARKBLOOM_GEMMA4_ROUTER_WEIGHTS32_PREFILL` with
+    /// `0/false/no/off` restores the stock four-op weight chain.
+    static let prefillEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ROUTER_WEIGHTS32_PREFILL"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_router_finalists32_weights_bf16_v1",
+        inputNames: ["scores", "pes"],
+        outputNames: ["indices", "weights"],
+        source: """
+            constexpr int SIMD_SIZE = 32;
+            constexpr int N_READS = 4;
+            constexpr int K = 8;
+
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint group = simdgroup_index_in_threadgroup;
+            const uint expert = group * 32u + lane;
+            // Pack the unchanged BF16 bits and the original expert index.
+            // This is a payload, NOT an unsigned floating-point ordinal:
+            // comparisons below retain native BF16 LessThan semantics.
+            uint item = (uint(bfloat16_to_uint16(scores[row * 128u + expert])) << 7)
+                | expert;
+            threadgroup uint finalists[32];
+            threadgroup float topv[K];
+            threadgroup uint topi[K];
+            threadgroup float local_max[SIMD_SIZE];
+            threadgroup float local_normalizer[SIMD_SIZE];
+
+            for (uint width = 2u; width <= 32u; width <<= 1) {
+                for (uint stride = width >> 1; stride > 0u; stride >>= 1) {
+                    const uint other = simd_shuffle_xor(item, ushort(stride));
+                    const bool otherBefore = gemma4_finalists_before(other, item);
+                    const bool takeMinimum = ((lane & width) == 0u)
+                        == ((lane & stride) == 0u);
+                    if (takeMinimum ? otherBefore : !otherBefore) item = other;
+                }
+            }
+
+            if (lane >= 24u) {
+                finalists[group * 8u + lane - 24u] = item;
+            }
+            // All four complete SIMD groups participate in this barrier.
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (group == 0u) {
+                item = finalists[lane];
+                for (uint width = 2u; width <= 32u; width <<= 1) {
+                    for (uint stride = width >> 1; stride > 0u; stride >>= 1) {
+                        const uint other = simd_shuffle_xor(item, ushort(stride));
+                        const bool otherBefore = gemma4_finalists_before(other, item);
+                        const bool takeMinimum = ((lane & width) == 0u)
+                            == ((lane & stride) == 0u);
+                        if (takeMinimum ? otherBefore : !otherBefore) item = other;
+                    }
+                }
+                if (lane >= 24u) {
+                    indices[row * 8u + lane - 24u] = item & 127u;
+                    // Stage the winners for the weight tail in the stock
+                    // chain's ascending-rank (takeAlong) order: the
+                    // unchanged BF16 score bits and the expert id.
+                    topv[lane - 24u] = float(uint16_to_bfloat16(uint16_t(item >> 7)));
+                    topi[lane - 24u] = item & 127u;
+                }
+            }
+            // All four complete SIMD groups participate in this barrier.
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // softmax_single_row<T, float, N_READS=4> transcription
+            // (softmax.h) at axis_size = K on group 0 — the stock axis-8
+            // launch's single 32-thread simdgroup — with the stock bf16
+            // per-expert-scale multiply fused into the write (the
+            // verified decode tail of Gemma4FusedRouterTop8). Groups 1-3
+            // only meet the barriers; every shared-slot write is gated to
+            // group 0 so slots 1-31 keep their init values exactly as the
+            // stock one-simdgroup launch leaves them.
+            float ld[N_READS];
+            const int base = int(lane) * N_READS;
+            if (group == 0u) {
+                if (base + N_READS <= K) {
+                    for (int i = 0; i < N_READS; i++) {
+                        ld[i] = topv[base + i];
+                    }
+                } else {
+                    for (int i = 0; i < N_READS; i++) {
+                        ld[i] = ((base + i) < K) ? topv[base + i] : Limits<float>::min;
+                    }
+                }
+                local_max[lane] = Limits<float>::min;
+                local_normalizer[lane] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (group == 0u) {
+                float maxval = Limits<float>::finite_min;
+                for (int i = 0; i < N_READS; i++) {
+                    maxval = (maxval < ld[i]) ? ld[i] : maxval;
+                }
+                maxval = simd_max(maxval);
+                if (lane == 0u) {
+                    local_max[0] = maxval;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (group == 0u) {
+                float maxval = simd_max(local_max[lane]);
+                if (lane == 0u) {
+                    local_max[0] = maxval;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (group == 0u) {
+                const float maxval = local_max[0];
+                float normalizer = 0;
+                for (int i = 0; i < N_READS; i++) {
+                    float exp_x = fast::exp(ld[i] - maxval);
+                    ld[i] = exp_x;
+                    normalizer += exp_x;
+                }
+                normalizer = simd_sum(normalizer);
+                if (lane == 0u) {
+                    local_normalizer[0] = normalizer;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (group == 0u) {
+                float normalizer = simd_sum(local_normalizer[lane]);
+                if (lane == 0u) {
+                    local_normalizer[0] = normalizer;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (group == 0u) {
+                const float normalizer = 1 / local_normalizer[0];
+                if (base + N_READS <= K) {
+                    for (int i = 0; i < N_READS; i++) {
+                        const T w = T(ld[i] * normalizer);
+                        weights[row * 8u + uint(base + i)] = w * pes[topi[base + i]];
+                    }
+                } else {
+                    for (int i = 0; i < N_READS; i++) {
+                        if ((base + i) < K) {
+                            const T w = T(ld[i] * normalizer);
+                            weights[row * 8u + uint(base + i)]
+                                = w * pes[topi[base + i]];
+                        }
+                    }
+                }
+            }
+        """,
+        header: """
+            inline bool gemma4_finalists_before(uint a, uint b) {
+                const bfloat16_t av = uint16_to_bfloat16(uint16_t(a >> 7));
+                const bfloat16_t bv = uint16_to_bfloat16(uint16_t(b >> 7));
+                const bool an = metal::isnan(av);
+                const bool bn = metal::isnan(bv);
+                bool ab;
+                bool ba;
+                if (an | bn) {
+                    ab = (!an) & bn;
+                    ba = (!bn) & an;
+                } else {
+                    ab = av < bv;
+                    ba = bv < av;
+                }
+                return ab || (!ba && (a & 127u) < (b & 127u));
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    static func applyPrefill(
+        _ scores: MLXArray, perExpertScale: MLXArray, topK: Int, kth: Int
+    ) -> (indices: MLXArray, weights: MLXArray)? {
+        guard prefillEnabled, Gemma4RouterFinalistsV1.enabled,
+            Gemma4RouterFinalistsV1.prefillEnabled,
+            topK == 8, kth == 120,
+            scores.ndim == 3, scores.dim(0) == 8,
+            scores.dim(1) > 1, scores.dim(2) == 128,
+            scores.dtype == .bfloat16,
+            perExpertScale.ndim == 1, perExpertScale.dim(0) == 128,
+            perExpertScale.dtype == .bfloat16
+        else { return nil }
+        let b = scores.dim(0)
+        let l = scores.dim(1)
+        let rows = b * l
+        CBv2EngageMark.once("router-weights32-prefill")
+        let outs = kernel(
+            [scores, perExpertScale],
+            template: [("T", scores.dtype)],
+            grid: (rows * 128, 1, 1),
+            threadGroup: (128, 1, 1),
+            outputShapes: [[b, l, 8], [b, l, 8]],
+            outputDTypes: [.uint32, .bfloat16]
+        )
+        return (outs[0], outs[1])
+    }
+}
+
 /// GLUE-FOLD (G2): merge the two ADJACENT single-threadgroup route glue
 /// stages of the pinned B=8 decode cell into one dispatch. On the incumbent
 /// chain the router scores feed `gemma4_router_finalists32_stable_bf16_v1`
@@ -2949,6 +3232,24 @@ private enum Gemma4FusedLayerGlue {
         """
     }
 
+    /// Starting with four already-rounded BF16 values per thread, reproduce
+    /// `mma8_runsum4` and its xor(1,2,4) tree. Adjacent tail threads own the
+    /// two four-value halves, so masks 1,2,4,8 over sixteen lanes produce the
+    /// same group-64 FP32 table entry.
+    private static func qkvRunsumEpilogue(_ values: String) -> String {
+        """
+            float qkv_sum = 0.0f;
+            qkv_sum += \(values)[0] + \(values)[1] + \(values)[2] + \(values)[3];
+            qkv_sum += simd_shuffle_xor(qkv_sum, 1u);
+            qkv_sum += simd_shuffle_xor(qkv_sum, 2u);
+            qkv_sum += simd_shuffle_xor(qkv_sum, 4u);
+            qkv_sum += simd_shuffle_xor(qkv_sum, 8u);
+            if ((lid & 15u) == 0u) {
+                qkv_rs[row * 44u + lid / 16u] = qkv_sum;
+            }
+        """
+    }
+
     /// Same independent trees as prefill's glue_inv_rms2: four ordered
     /// squares per input, the original SIMD and cross-SIMD sums, then precise
     /// rsqrt. Share three barriers instead of running two three-barrier
@@ -3032,6 +3333,35 @@ private enum Gemma4FusedLayerGlue {
         """,
         ensureRowContiguous: true
     )
+
+    /// RS0: layer zero has no predecessor tail. Fuse its input RMSNorm with
+    /// the exact QKV run-sum producer so it also avoids the standalone table
+    /// dispatch. This body is the public parity-tested F1 layer-zero kernel.
+    private static let inputNormRunsumKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_glue_input_rmsnorm_qkv_runsum_2816_bf16_v1",
+            inputNames: ["x", "w"],
+            outputNames: ["normed", "qkv_rs"],
+            source: """
+                const uint row = threadgroup_position_in_grid.x;
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint simd_lane_id = thread_index_in_simdgroup;
+                const uint simd_group_id = simdgroup_index_in_threadgroup;
+                threadgroup float local_inv[1];
+                threadgroup float local_sums[32];
+                const uint base = row * 2816 + lid * 4;
+                const uint wbase = lid * 4;
+            \(rmsReduce("x", into: "local_inv[0]"))
+                const float inv = local_inv[0];
+                T normedv[4];
+                for (int i = 0; i < 4; ++i) {
+                    normedv[i] = w[wbase + i]
+                        * static_cast<T>((float)x[base + i] * inv);
+                    normed[base + i] = normedv[i];
+                }
+            \(qkvRunsumEpilogue("normedv"))
+            """,
+            ensureRowContiguous: true)
 
     /// PREFIX-001: join the two serial normalization producers at the
     /// attention/feed-forward boundary. The first reduction reproduces
@@ -3190,6 +3520,27 @@ private enum Gemma4FusedLayerGlue {
             outputShapes: [[rows, 1, axis]],
             outputDTypes: [.bfloat16]
         )[0]
+    }
+
+    /// RS0 layer-input producer. Outside the exact B8/L1/K2816 decode cell,
+    /// return nil and preserve the incumbent input norm plus table dispatch.
+    static func inputNormWithQKVRunsum(
+        x: MLXArray, weight: MLXArray, eps: Float
+    ) -> (normed: MLXArray, qkvRunsumTable: MLXArray)? {
+        guard admits(x, weight: weight, eps: eps) else { return nil }
+        let outs = inputNormRunsumKernel(
+            [x, weight],
+            template: [("T", x.dtype)],
+            grid: (rows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: [[rows, 1, axis], [rows, axis / 64]],
+            outputDTypes: [.bfloat16, .float32]
+        )
+        guard let table = CBv2AttentionQKVMMA8V1.runsumTable(
+            produced: outs[1], for: outs[0])
+        else { return nil }
+        CBv2EngageMark.once("qkv-runsum-input-norm-fold")
+        return (outs[0], table)
     }
 
     struct AttentionBranchPrefix {
@@ -3651,17 +4002,26 @@ private class Gemma4Router: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
-        let effScale: MLXArray
-        if let cached = cachedEffectiveScale {
-            effScale = cached
-        } else {
-            let eff = scale * rootSize
-            cachedEffectiveScale = eff
-            effScale = eff
-        }
-        let normed = MLXFast.rmsNorm(x, weight: effScale, eps: eps)
-        let expertScores = proj(normed)
+        routeScores(zipScores(zipNorm(x)))
+    }
 
+    /// PREFILL-PREFIX twin: route from the router norm the branch-prefix
+    /// kernel already produced over the post-attention row. The projection
+    /// consumes the identical normed array `zipNorm` would have returned, so
+    /// the shared tail sees bit-identical scores.
+    fileprivate func routePrefilledNorm(
+        _ normed: MLXArray
+    ) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
+        routeScores(zipScores(normed))
+    }
+
+    /// The selection tail both entries share: the fused top-8 on the pinned
+    /// B=8 decode cell, the finalists kernel on prompt rectangles,
+    /// argPartition otherwise, then the takeAlong -> precise softmax ->
+    /// per-expert-scale weight chain.
+    private func routeScores(
+        _ expertScores: MLXArray
+    ) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
         // ROUTE-001: single-dispatch byte-identical replacement of the chain
         // below for the B=8 decode geometry. Every other geometry, dtype, or
         // the kill switch falls through to the established chain.
@@ -3670,6 +4030,21 @@ private class Gemma4Router: Module {
         {
             Gemma4RouterProbe.recorder?(expertScores, fused.indices)
             return (fused.indices, fused.weights)
+        }
+
+        // ROUTER-TAIL-PREFILL: the finalists32 selection with the four
+        // dependent weight ops (takeAlong -> softmax(precise) ->
+        // per-expert-scale gather -> multiply) folded into the same
+        // dispatch as a second output, bit-exactly (see
+        // Gemma4RouterFinalistsWeightsV1). When it engages it subsumes
+        // the selection-only admission below; any gate, shape, dtype,
+        // topK, or kth outside the pin falls through to the unchanged
+        // stock chains.
+        if let tail = Gemma4RouterFinalistsWeightsV1.applyPrefill(
+            expertScores, perExpertScale: perExpertScale, topK: topK, kth: kth)
+        {
+            Gemma4RouterProbe.recorder?(expertScores, tail.indices)
+            return (tail.indices, tail.weights)
         }
 
         // PREFILL-W1 mechanism 2: the finalists32 selection kernel, already
@@ -4281,6 +4656,13 @@ public class Gemma4DecoderLayer: Module {
             chain.pending = nil
             h = pending.normed
             carriedRunsum = pending.rs
+        } else if cache is any CBv2AttendingLayerCache,
+            let produced = Gemma4FusedLayerGlue.inputNormWithQKVRunsum(
+                x: x, weight: inputLayernorm.weight, eps: config.rmsNormEps)
+        {
+            glueChain?.pending = nil
+            h = produced.normed
+            carriedRunsum = produced.qkvRunsumTable
         } else {
             glueChain?.pending = nil
             h = inputLayernorm(x)
@@ -4308,6 +4690,10 @@ public class Gemma4DecoderLayer: Module {
                 eps: config.rmsNormEps)
         }()
         var out: MLXArray
+        // PREFILL-PREFIX twin: when it engages, the router and the dense
+        // pre-norm consumers below read the norms it already produced
+        // instead of re-reducing the same post-attention row.
+        var prefillBranchPrefix: Gemma4PrefillGlueV1.AttentionBranchPrefix? = nil
         if let attentionBranchPrefix {
             out = attentionBranchPrefix.out
         } else if let fusedOut = Gemma4FusedLayerGlue.normResidual(
@@ -4315,6 +4701,17 @@ public class Gemma4DecoderLayer: Module {
             weight: postAttentionLayernorm.weight, eps: config.rmsNormEps)
         {
             out = fusedOut
+        } else if isMoE, let router, let preFeedforwardLayernorm2,
+            let prefix = Gemma4PrefillGlueV1.attentionBranchPrefix(
+                attn: attnOut,
+                residual: residual,
+                wPostAttn: postAttentionLayernorm.weight,
+                wDense: preFeedforwardLayernorm.weight,
+                wRouter: router.zipEffectiveScale(),
+                eps: config.rmsNormEps)
+        {
+            prefillBranchPrefix = prefix
+            out = prefix.out
         } else if let fusedOut = Gemma4PrefillGlueV1.normResidual(
             x: attnOut,
             weight: postAttentionLayernorm.weight,
@@ -4406,7 +4803,20 @@ public class Gemma4DecoderLayer: Module {
                     weights: zipped.topKWeights,
                     routeTable: zipped.routeTable)
             } else {
-                let (topKIndices, topKWeights) = router(out)
+                // PREFILL-PREFIX: the branch-prefix kernel already produced
+                // the router norm over this exact `out`; only the projection
+                // and the shared selection tail run.
+                let topKIndices: MLXArray
+                let topKWeights: MLXArray
+                if let prefix = prefillBranchPrefix {
+                    let routed = router.routePrefilledNorm(prefix.routerNorm)
+                    topKIndices = routed.topKIndices
+                    topKWeights = routed.topKWeights
+                } else {
+                    let routed = router(out)
+                    topKIndices = routed.topKIndices
+                    topKWeights = routed.topKWeights
+                }
 
                 if let (n1, n2, denseSums) = Gemma4FusedLayerGlue.dualPreNorm(
                     x: out,
@@ -4421,10 +4831,12 @@ public class Gemma4DecoderLayer: Module {
                         weights: topKWeights)
                 } else if isExpertPrefill,
                     Gemma4PrefillGlueV1.prenormGatherEnabled,
-                    let n1 = Gemma4PrefillGlueV1.preNorm(
-                        x: out,
-                        weight: preFeedforwardLayernorm.weight,
-                        eps: config.rmsNormEps),
+                    // PREFILL-PREFIX: the dense pre-norm arrived with `out`.
+                    let n1 = prefillBranchPrefix?.denseNorm
+                        ?? Gemma4PrefillGlueV1.preNorm(
+                            x: out,
+                            weight: preFeedforwardLayernorm.weight,
+                            eps: config.rmsNormEps),
                     let n2 = Gemma4PrefillGlueV1.preNorm(
                         x: out,
                         weight: preFeedforwardLayernorm2.weight,

@@ -4395,10 +4395,17 @@ private enum Gemma4ZipRouterV1 {
     /// product instead of the 25 us down projection (measured 0.02 ms/step
     /// worse and noisier). `0` drops the expert fence, which lets the tape
     /// float the dense down back behind the expert kernels.
+    /// ZIP-PLAN3-001: `3` (default from this archive) fences the fold behind
+    /// the dense gate and up products -- the stage the router QMV already
+    /// shares -- and leaves the expert branch unfenced, so the dense down
+    /// projection overlaps the expert gathers instead of preceding them and
+    /// the fold's few microseconds overlap the dense GeLU. Plans 0, 1 and 2
+    /// keep their old meanings; `DARKBLOOM_GEMMA4_ZIP_ROUTER_PLAN=1` restores
+    /// the incumbent pairing on the same binary.
     static let plan: Int = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_ZIP_ROUTER_PLAN"], let v = Int(raw)
-        else { return 1 }
+        else { return 3 }
         return v
     }()
 
@@ -4518,8 +4525,23 @@ private enum Gemma4ZipRouterV1 {
             // The fold consumes the identical fenced scores node the incumbent
             // partition consumed, keeping the tape's ordering edges unchanged.
             // Fail-closed onto the incumbent finalists + slice + weight tail.
+            // ZIP-PLAN3-001: under plan 1 the fold consumed the router
+            // scores fenced behind the DENSE DOWN projection, so the expert
+            // gathers -- the heaviest kernels of the layer -- could not start
+            // until the dense gate and up products, the dense GeLU and the
+            // dense down had all drained. The comment above records why the
+            // down projection was kept "inside the zip": at the time that
+            // pairing served the old partition-and-slice chain. That chain is
+            // gone; the fold is one small kernel and the weight tail no longer
+            // exists. Plan 3 fences the fold behind the gate and up products
+            // instead -- the stage the router QMV already shares.
+            // `MLX.depends` is an alias primitive: no dispatch, no copy, the
+            // output IS the input's buffer, so the fold reads the identical
+            // `expertScores` node either way.
             if let fold = Gemma4RouteGlueFoldV1.apply(
-                MLX.depends(input: expertScores, dependencies: [denseOut]),
+                MLX.depends(
+                    input: expertScores,
+                    dependencies: plan == 3 ? [gate, up] : [denseOut]),
                 perExpertScale: router.perExpertScale,
                 topK: router.topK, kth: router.kth)
             {
@@ -4528,7 +4550,9 @@ private enum Gemma4ZipRouterV1 {
                 routeTable = fold.table
             } else {
                 let partition = router.zipPartition(
-                    MLX.depends(input: expertScores, dependencies: [denseOut]))
+                    MLX.depends(
+                        input: expertScores,
+                        dependencies: plan == 3 ? [gate, up] : [denseOut]))
                 topKIndices = router.zipSelected(partition)
                 topKWeights = router.zipWeights(
                     expertScores: expertScores, topKIndices: topKIndices)
@@ -4541,11 +4565,20 @@ private enum Gemma4ZipRouterV1 {
         // expert branch's activation behind the dense chain's last stage as
         // well keeps the down projection inside the zip instead of letting the
         // reverse-BFS tape float it past the expert kernels.
+        // ZIP-PLAN3-001: plan 3 leaves the expert branch unfenced, so the
+        // expert gathers overlap the dense down projection (about 25 us of
+        // streaming on the box) instead of waiting behind it. Every expert
+        // dispatch still sits behind `topKIndices`, which is the ordering the
+        // arithmetic actually requires.
         let expertNorm =
-            plan >= 1
+            (plan >= 1 && plan != 3)
             ? MLX.depends(input: n2, dependencies: [denseOut]) : n2
 
+        // Plan 3 IS the zip router, so it keeps the incumbent mark and adds its
+        // own: the census then GAINS a mark and loses none, and the pairing in
+        // force is still readable from it.
         CBv2EngageMark.once("zip-router")
+        if plan == 3 { CBv2EngageMark.once("zip-router-plan3") }
         return Zipped(
             denseOut: denseOut,
             expertNorm: expertNorm,

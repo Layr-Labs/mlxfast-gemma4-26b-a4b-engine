@@ -1095,14 +1095,13 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
 /// selected. The consumer receives the identical gate / up bytes through views
 /// with the identical shapes it saw before.
 ///
-/// Routing. The fused right-hand side is dispatched exactly where the host
-/// would select the sorted right-hand-side kernel: a sorted plane without
-/// left-hand indices of at least `max(16, 4 * experts)` rows (512 here). The
-/// eight-row decode cohort carries left-hand indices and never qualifies;
-/// smaller sorted rectangles (speculative verification) keep the split views
-/// and their gathered vector kernels. The `gate_up_proj` module slot is
-/// deliberately NOT populated: the direct sorted reduction requires it to be
-/// nil, so the storage lives in a private, reflection-inert member.
+/// Routing. The fused right-hand-side is dispatched for sorted prefill planes
+/// without left-hand indices, and for the exact B=8 decode cohort with the
+/// sorted left-hand index table. Smaller sorted rectangles (speculative
+/// verification) keep the split views and their gathered vector kernels. The
+/// `gate_up_proj` module slot is deliberately NOT populated: the direct sorted
+/// reduction requires it to be nil, so the storage lives in a private,
+/// reflection-inert member.
 ///
 /// Kill switch: `DARKBLOOM_GEMMA4_PREFILL_GATEUP_FUSE` set to
 /// `0`/`false`/`no`/`off` leaves the split arrays as loaded and restores the
@@ -1110,6 +1109,16 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
 public let switchGateUpFusePrefillEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_GEMMA4_PREFILL_GATEUP_FUSE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// Decode admission is separately attributable: `DARKBLOOM_GEMMA4_DECODE_GATEUP_FUSE`
+/// set to `0`/`false`/`no`/`off` restores the two split gathers for the B=8
+/// cohort while leaving the prefill fusion unchanged.
+private let switchGateUpFuseDecodeEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DECODE_GATEUP_FUSE"]
     else { return true }
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
@@ -1434,19 +1443,26 @@ public class SwitchGLU: Module {
             // pipeline, same per-column K-chains; the halves are views. The
             // admission mirrors the host's sorted right-hand-side selection
             // exactly, so the split views never meet that kernel.
-            if doSort, !useLhsIndices, lhsIndices == nil,
-                x.ndim == 3, x.dim(-2) == 1, x.dim(-1) == inputDims,
-                x.dim(0) >= 16, x.dim(0) / numExperts >= 4,
-                x.dtype == .bfloat16,
-                let fused = fusedGateUpDispatch()
-            {
-                CBv2EngageMark.once("prefill-gateup-fuse")
+            let useGateUpFusion =
+                doSort && (lhsIndices == nil || useLhsIndices)
+                    && (
+                        (!useLhsIndices && x.dim(0) >= 16
+                            && x.dim(0) / numExperts >= 4)
+                        || (useLhsIndices && x.dim(0) == 8)
+                    )
+                    && x.ndim == 3 && x.dim(-2) == 1 && x.dim(-1) == inputDims
+                    && x.dtype == .bfloat16
+                    && (!useLhsIndices || switchGateUpFuseDecodeEnabled)
+                    && fusedGateUpDispatch() != nil
+            if useGateUpFusion, let fused = fusedGateUpDispatch() {
+                CBv2EngageMark.once(
+                    useLhsIndices ? "decode-gateup-fuse" : "prefill-gateup-fuse")
                 let xGateUp = MLX.gatherQuantizedMM(
                     x,
                     fused.storage.weight,
                     scales: fused.storage.scales,
                     biases: fused.storage.biases,
-                    lhsIndices: nil,
+                    lhsIndices: lhsIndices,
                     rhsIndices: idx,
                     transpose: true,
                     groupSize: fused.groupSize,

@@ -1958,10 +1958,15 @@ private class Gemma4Attention: Module {
     /// ORSFOLD-001: `carriedRunsum` is the table the resident attention kernel
     /// emitted for this exact activation; nil, or any table that misses the
     /// shape contract, falls through to the standalone prepass.
+    /// ORS-D512: a carried `[8, 256]` pair table (the D=512 dispatch-3
+    /// epilogue at 32-column tiles) takes the `_rsp2` o_proj body; a carried
+    /// `[8, 128]` table (64-column tiles) takes the established `_rsp` body.
     @inline(__always)
     private func outputProjection(
         _ x: MLXArray, carriedRunsum: MLXArray? = nil
     ) -> MLXArray {
+        let carriedPairs = CBv2AttentionOQMVV1.acceptRunsumPairTable(
+            carriedRunsum, for: x)
         guard let quantized = oProj as? QuantizedLinear,
             quantized.bias == nil,
             let projected = CBv2AttentionOQMVV1.matmul(
@@ -1972,9 +1977,12 @@ private class Gemma4Attention: Module {
                 groupSize: quantized.groupSize,
                 bits: quantized.bits,
                 mode: quantized.mode,
-                rsTable: CBv2AttentionOQMVV1.acceptRunsumTable(
-                    carriedRunsum, for: x)
-                    ?? CBv2AttentionOQMVV1.runsumTable(for: x))
+                rsTable: carriedPairs != nil
+                    ? nil
+                    : (CBv2AttentionOQMVV1.acceptRunsumTable(
+                        carriedRunsum, for: x)
+                        ?? CBv2AttentionOQMVV1.runsumTable(for: x)),
+                rsPairTable: carriedPairs)
         else { return Gemma4PrefillDeqGEMMV1.apply(oProj, x) ?? oProj(x) }
         return projected
     }
@@ -2324,6 +2332,17 @@ private class Gemma4Attention: Module {
                 qWeight: qNorm.weight, kWeight: kNorm.weight,
                 positionOffsets: capturedOffsets,
                 ropeLog2Base: qkvRopeParameters.log2Base,
+                eps: config.rmsNormEps, appliedRope: appliedRope)
+        } else if vProj == nil, qkvRopeParameters.usesFrequencies {
+            // NORMROPE-D512: the full layers' store dispatch takes the raw
+            // k-eq-v projections and normalizes/rotates them once itself; a
+            // miss falls back to the arrays above.
+            _ = CBv2RaggedComposedD512DecodeAttentionV1.registerFullNormRope(
+                normalizedQueries: queries, normalizedKeys: k, normalizedValues: v,
+                rawQueries: queryRaw, rawKeys: kRaw, rawValues: vRaw,
+                qWeight: qNorm.weight, kWeight: kNorm.weight,
+                positionOffsets: capturedOffsets,
+                ropeFrequencies: qkvRopeParameters.frequencies,
                 eps: config.rmsNormEps, appliedRope: appliedRope)
         }
 

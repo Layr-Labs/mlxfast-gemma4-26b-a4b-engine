@@ -3982,20 +3982,62 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     }
     return;
   }
+  // KERN-DOWN-SINGLES: the pairless span walk streams its weights through
+  // the affine-4 / g64 singles body instead of the stock `qmv_impl`. The
+  // two bodies share their whole geometry -- num_simdgroups 2,
+  // results_per_simdgroup 4, values_per_thread 8, block_size 256,
+  // scale_step_per_thread 8, in_vec_size_w = K / 2, the same out_row /
+  // used_out_row derivation and the same out_vec_size guard -- so the lane
+  // -> K mapping, the per-block `load_vector` transform, the eight-term
+  // `qdot` in its 4 + 4 grouping, the per-row accumulator, the `simd_sum`
+  // and the store are byte-for-byte what the stock arm produces for each
+  // output element. Only the SHAPE of the weight loads changes.
+  //
+  // WVEC folds the two adjacent `uint16_t` loads the bits == 4 `qdot`
+  // emits per (row, K-block) into ONE aligned 4-byte load. The K = 704
+  // packed row pitch is in_vec_size_w = 352 bytes, the lane offset is
+  // simd_lid * 4 and the block stride is 128, so every word is
+  // uint32-aligned at every block boundary on this plane exactly as it is
+  // on the K = 2816 gate/up plane the same body already serves.
+  //
+  // KFIX = 704 constant-folds the trip count (nblocks = 2) and both stride
+  // folds, and resolves the 192-value tail statically to the whole-packet
+  // arm with 24 active lanes -- the dynamic `remaining` clamp is dead at
+  // this K and compiles out. PF stays off: the singles prefetch keeps four
+  // extra weight words live for a walk that re-enters the body four times
+  // per survivor, and the K = 2816 wiring already runs WVEC-only.
+  //
+  // Flip `gemma4_down_singles` to false to return the pairless arm to the
+  // stock body; the two are bit-identical by construction.
+  constexpr bool gemma4_down_singles = true;
   for (int t = 0; t < gemma4_down_tile_span; t++) {
     uint3 tile_tid = tid;
     tile_tid.y = tid.y + uint(t);
-    qmv_impl<T, group_size, bits>(
-        tile_w,
-        tile_scales,
-        tile_biases,
-        tile_x0,
-        tile_y0,
-        in_vec_size,
-        out_vec_size,
-        tile_tid,
-        simd_gid,
-        simd_lid);
+    if (gemma4_down_singles) {
+      qmv_affine4_g64_singles_impl<T, group_size, bits, 704, true, false>(
+          tile_w,
+          tile_scales,
+          tile_biases,
+          tile_x0,
+          tile_y0,
+          in_vec_size,
+          out_vec_size,
+          tile_tid,
+          simd_gid,
+          simd_lid);
+    } else {
+      qmv_impl<T, group_size, bits>(
+          tile_w,
+          tile_scales,
+          tile_biases,
+          tile_x0,
+          tile_y0,
+          in_vec_size,
+          out_vec_size,
+          tile_tid,
+          simd_gid,
+          simd_lid);
+    }
   }
 }
 

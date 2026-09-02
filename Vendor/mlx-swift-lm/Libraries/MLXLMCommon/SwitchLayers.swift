@@ -578,13 +578,15 @@ private let routeFusedScatterKernelT64: MLXFast.MLXFastKernel = {
                 atomic_load_explicit(&tg_before[k], memory_order_relaxed);
             // Walk this tile's slice in input order: stability by
             // construction, exactly the stock scatter's write order.
-            for (uint i = 0; i < TILE; ++i) {
-                uint idx = t * TILE + i;
-                if (keys[idx] == k) {
-                    row_order[off] = idx / M;
-                    sorted_keys[off] = k;
-                    inverse_order[idx] = off;
-                    ++off;
+            if (total > 0) {
+                for (uint i = 0; i < TILE; ++i) {
+                    uint idx = t * TILE + i;
+                    if (keys[idx] == k) {
+                        row_order[off] = idx / M;
+                        sorted_keys[off] = k;
+                        inverse_order[idx] = off;
+                        ++off;
+                    }
                 }
             }
             """,
@@ -642,16 +644,18 @@ private let routeFusedScatterPrefixBoundsKernelT64: MLXFast.MLXFastKernel = {
             const uint expert_base = simd_base + lane_excl;
             uint off = expert_base
                 + atomic_load_explicit(&tg_before[k], memory_order_relaxed);
-            for (uint i = 0; i < TILE; ++i) {
-                uint idx = t * TILE + i;
-                if (keys[idx] == k) {
-                    const uint run_offset = off - expert_base;
-                    const uint run_remaining = total - run_offset;
-                    row_order[off] = idx / M;
-                    sorted_keys[off] = 0x80000000u | k
-                        | (run_offset << 8) | ((run_remaining - 1) << 14);
-                    inverse_order[idx] = off;
-                    ++off;
+            if (total > 0) {
+                for (uint i = 0; i < TILE; ++i) {
+                    uint idx = t * TILE + i;
+                    if (keys[idx] == k) {
+                        const uint run_offset = off - expert_base;
+                        const uint run_remaining = total - run_offset;
+                        row_order[off] = idx / M;
+                        sorted_keys[off] = 0x80000000u | k
+                            | (run_offset << 8) | ((run_remaining - 1) << 14);
+                        inverse_order[idx] = off;
+                        ++off;
+                    }
                 }
             }
             """,
@@ -949,6 +953,24 @@ public struct SwitchRouteTable {
 public func gatherSort(
     x: MLXArray, indices: MLXArray, numExperts: Int = Int.max
 ) -> (MLXArray, MLXArray, MLXArray) {
+    if routeSimdRank64Enabled,
+        (indices.shape == [8, 8] || (indices.ndim == 1 && indices.size == 64)),
+        indices.dtype == .uint32
+    {
+        let flat = indices.flattened()
+        let outputs = routeSimdRank64Kernel(
+            [flat],
+            grid: (64, 1, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [[64], [64], [64]],
+            outputDTypes: [.uint32, .uint32, .uint32]
+        )
+        return (
+            x.flattened(start: 0, end: -3)[outputs[0]],
+            outputs[1],
+            outputs[2]
+        )
+    }
     let m = indices.dim(-1)
     let indices = indices.flattened()
     routeCsortShapeLog.note {
@@ -1012,15 +1034,17 @@ public func gatherSortIndices(
     expertPrefixBounds: Bool = false
 ) -> (MLXArray, MLXArray, MLXArray) {
     if routeSimdRank64Enabled,
-        indices.ndim == 2, indices.shape == [8, 8], indices.dtype == .uint32
+        (indices.shape == [8, 8] || (indices.ndim == 1 && indices.size == 64)),
+        indices.dtype == .uint32
     {
         if expertPrefixBounds {
             CBv2EngageMark.once("expert-prefix-bounds")
         }
+        let flat = indices.flattened()
         let kernel = expertPrefixBounds
             ? routeSimdRank64PrefixBoundsKernel : routeSimdRank64Kernel
         let outputs = kernel(
-            [indices],
+            [flat],
             grid: (64, 1, 1),
             threadGroup: (64, 1, 1),
             outputShapes: [[64], [64], [64]],

@@ -552,6 +552,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     const device T* v = current ? new_value : values + slot * D;
                     float score_lo = 0.0f;
                     float score_hi = 0.0f;
+                    #pragma clang loop unroll(full)
                     for (int element = 0; element < values_per_lane; ++element) {
                         const float key_element = float(k[element]);
                         score_lo += q_lo[element] * key_element;
@@ -570,6 +571,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     max_hi = new_max_hi;
                     sum_lo = sum_lo * old_factor_lo + score_factor_lo;
                     sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                    #pragma clang loop unroll(full)
                     for (int element = 0; element < values_per_lane; ++element) {
                         const float value_element = float(v[element]);
                         acc_lo[element] = acc_lo[element] * old_factor_lo
@@ -1469,14 +1471,27 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     const float kb = float(as_type<half>(ushort(ktw >> 16)));
                     const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
                     const float vb = float(as_type<half>(ushort(vtw >> 16)));
-                    float score_lo = 0.0f;
-                    float score_hi = 0.0f;
-                    for (int element = 0; element < values_per_lane; ++element) {
-                        const float key_element =
-                            fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
-                        score_lo += q_lo[element] * key_element;
-                        score_hi += q_hi[element] * key_element;
-                    }
+
+                    const float4 k_nib0 = float4(
+                        float(kw & 0xfu),
+                        float((kw >> 4) & 0xfu),
+                        float((kw >> 8) & 0xfu),
+                        float((kw >> 12) & 0xfu));
+                    const float4 k_nib1 = float4(
+                        float((kw >> 16) & 0xfu),
+                        float((kw >> 20) & 0xfu),
+                        float((kw >> 24) & 0xfu),
+                        float((kw >> 28) & 0xfu));
+                    const float4 k_deq0 = fma(k_nib0, float4(ks), float4(kb));
+                    const float4 k_deq1 = fma(k_nib1, float4(ks), float4(kb));
+
+                    const float4 q_lo0 = float4(q_lo[0], q_lo[1], q_lo[2], q_lo[3]);
+                    const float4 q_lo1 = float4(q_lo[4], q_lo[5], q_lo[6], q_lo[7]);
+                    const float4 q_hi0 = float4(q_hi[0], q_hi[1], q_hi[2], q_hi[3]);
+                    const float4 q_hi1 = float4(q_hi[4], q_hi[5], q_hi[6], q_hi[7]);
+
+                    float score_lo = dot(q_lo0, k_deq0) + dot(q_lo1, k_deq1);
+                    float score_hi = dot(q_hi0, k_deq0) + dot(q_hi1, k_deq1);
                     score_lo = simd_sum(score_lo);
                     score_hi = simd_sum(score_hi);
 
@@ -1490,13 +1505,26 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     max_hi = new_max_hi;
                     sum_lo = sum_lo * old_factor_lo + score_factor_lo;
                     sum_hi = sum_hi * old_factor_hi + score_factor_hi;
-                    for (int element = 0; element < values_per_lane; ++element) {
-                        const float value_element =
-                            fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
-                        acc_lo[element] = acc_lo[element] * old_factor_lo
-                            + score_factor_lo * value_element;
-                        acc_hi[element] = acc_hi[element] * old_factor_hi
-                            + score_factor_hi * value_element;
+
+                    const float4 v_nib0 = float4(
+                        float(vw & 0xfu),
+                        float((vw >> 4) & 0xfu),
+                        float((vw >> 8) & 0xfu),
+                        float((vw >> 12) & 0xfu));
+                    const float4 v_nib1 = float4(
+                        float((vw >> 16) & 0xfu),
+                        float((vw >> 20) & 0xfu),
+                        float((vw >> 24) & 0xfu),
+                        float((vw >> 28) & 0xfu));
+                    const float4 v_deq0 = fma(v_nib0, float4(vs), float4(vb));
+                    const float4 v_deq1 = fma(v_nib1, float4(vs), float4(vb));
+
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        acc_lo[j] = acc_lo[j] * old_factor_lo + score_factor_lo * v_deq0[j];
+                        acc_lo[4 + j] = acc_lo[4 + j] * old_factor_lo + score_factor_lo * v_deq1[j];
+                        acc_hi[j] = acc_hi[j] * old_factor_hi + score_factor_hi * v_deq0[j];
+                        acc_hi[4 + j] = acc_hi[4 + j] * old_factor_hi + score_factor_hi * v_deq1[j];
                     }
 
                 }
@@ -1726,15 +1754,27 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     const float kb = float(as_type<half>(ushort(ktw >> 16)));
                     const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
                     const float vb = float(as_type<half>(ushort(vtw >> 16)));
-                    float score_lo = 0.0f;
-                    float score_hi = 0.0f;
-                    #pragma clang loop unroll(full)
-                    for (int element = 0; element < values_per_lane; ++element) {
-                        const float key_element =
-                            fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
-                        score_lo += q_lo[element] * key_element;
-                        score_hi += q_hi[element] * key_element;
-                    }
+
+                    const float4 k_nib0 = float4(
+                        float(kw & 0xfu),
+                        float((kw >> 4) & 0xfu),
+                        float((kw >> 8) & 0xfu),
+                        float((kw >> 12) & 0xfu));
+                    const float4 k_nib1 = float4(
+                        float((kw >> 16) & 0xfu),
+                        float((kw >> 20) & 0xfu),
+                        float((kw >> 24) & 0xfu),
+                        float((kw >> 28) & 0xfu));
+                    const float4 k_deq0 = fma(k_nib0, float4(ks), float4(kb));
+                    const float4 k_deq1 = fma(k_nib1, float4(ks), float4(kb));
+
+                    const float4 q_lo0 = float4(q_lo[0], q_lo[1], q_lo[2], q_lo[3]);
+                    const float4 q_lo1 = float4(q_lo[4], q_lo[5], q_lo[6], q_lo[7]);
+                    const float4 q_hi0 = float4(q_hi[0], q_hi[1], q_hi[2], q_hi[3]);
+                    const float4 q_hi1 = float4(q_hi[4], q_hi[5], q_hi[6], q_hi[7]);
+
+                    float score_lo = dot(q_lo0, k_deq0) + dot(q_lo1, k_deq1);
+                    float score_hi = dot(q_hi0, k_deq0) + dot(q_hi1, k_deq1);
                     score_lo = simd_sum(score_lo);
                     score_hi = simd_sum(score_hi);
 
@@ -1748,14 +1788,26 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     max_hi = new_max_hi;
                     sum_lo = sum_lo * old_factor_lo + score_factor_lo;
                     sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+
+                    const float4 v_nib0 = float4(
+                        float(vw & 0xfu),
+                        float((vw >> 4) & 0xfu),
+                        float((vw >> 8) & 0xfu),
+                        float((vw >> 12) & 0xfu));
+                    const float4 v_nib1 = float4(
+                        float((vw >> 16) & 0xfu),
+                        float((vw >> 20) & 0xfu),
+                        float((vw >> 24) & 0xfu),
+                        float((vw >> 28) & 0xfu));
+                    const float4 v_deq0 = fma(v_nib0, float4(vs), float4(vb));
+                    const float4 v_deq1 = fma(v_nib1, float4(vs), float4(vb));
+
                     #pragma clang loop unroll(full)
-                    for (int element = 0; element < values_per_lane; ++element) {
-                        const float value_element =
-                            fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
-                        acc_lo[element] = acc_lo[element] * old_factor_lo
-                            + score_factor_lo * value_element;
-                        acc_hi[element] = acc_hi[element] * old_factor_hi
-                            + score_factor_hi * value_element;
+                    for (int j = 0; j < 4; ++j) {
+                        acc_lo[j] = acc_lo[j] * old_factor_lo + score_factor_lo * v_deq0[j];
+                        acc_lo[4 + j] = acc_lo[4 + j] * old_factor_lo + score_factor_lo * v_deq1[j];
+                        acc_hi[j] = acc_hi[j] * old_factor_hi + score_factor_hi * v_deq0[j];
+                        acc_hi[4 + j] = acc_hi[4 + j] * old_factor_hi + score_factor_hi * v_deq1[j];
                     }
                 }
 
@@ -2417,32 +2469,25 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 // query block is not. Staging the tile costs 16 halves and
                 // frees the 32-float per-head staging array.
                 typedef vec<T, 4> T4;
-                T4 k_tile[4];
-                float q_coeff[4];
+                float4 k_tile_f[4];
                 int bn = lane * 4;
                 for (int i = 0; i < n_iter; ++i) {
                     int mat_offset = 0;
                     #pragma clang loop unroll(full)
                     for (int tm = 0; tm < 4; ++tm) {
-                        k_tile[tm] = *reinterpret_cast<const device T4*>(
+                        const T4 raw_k = *reinterpret_cast<const device T4*>(
                             mat + mat_offset + bn);
+                        k_tile_f[tm] = float4(float(raw_k[0]), float(raw_k[1]), float(raw_k[2]), float(raw_k[3]));
                         mat_offset += D;
                     }
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
                         const T4 q_raw = *reinterpret_cast<const device T4*>(
                             query + h * D + bn);
-                        #pragma clang loop unroll(full)
-                        for (int tn = 0; tn < 4; ++tn) {
-                            q_coeff[tn] = static_cast<float>(q_raw[tn]);
-                        }
+                        const float4 q_f = float4(float(q_raw[0]), float(q_raw[1]), float(q_raw[2]), float(q_raw[3]));
                         #pragma clang loop unroll(full)
                         for (int tm = 0; tm < 4; ++tm) {
-                            #pragma clang loop unroll(full)
-                            for (int tn = 0; tn < 4; ++tn) {
-                                result[h * 4 + tm] +=
-                                    k_tile[tm][tn] * q_coeff[tn];
-                            }
+                            result[h * 4 + tm] += dot(k_tile_f[tm], q_f);
                         }
                     }
                     bn += 128;
@@ -3054,7 +3099,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             // probability block is not. Staging the tile costs 16 halves and
             // frees the 32-float per-head staging array.
             typedef vec<T, 4> T4;
-            T4 v_tile[4];
+            float4 v_tile_f[4];
             float p_coeff[4];
             const int n_iter = key_length / 32;
             const int leftover = key_length - n_iter * 32;
@@ -3062,8 +3107,9 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             for (int i = 0; i < n_iter; ++i) {
                 #pragma clang loop unroll(full)
                 for (int tm = 0; tm < 4; ++tm) {
-                    v_tile[tm] = *reinterpret_cast<const device T4*>(
+                    const T4 raw_v = *reinterpret_cast<const device T4*>(
                         value_plane + size_t(bm + tm) * D + out_col);
+                    v_tile_f[tm] = float4(float(raw_v[0]), float(raw_v[1]), float(raw_v[2]), float(raw_v[3]));
                 }
                 #pragma clang loop unroll(full)
                 for (int h = 0; h < GQA; ++h) {
@@ -3083,9 +3129,10 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     }
                     #pragma clang loop unroll(full)
                     for (int tm = 0; tm < 4; ++tm) {
-                        float vc = p_coeff[tm];
+                        const float vc = p_coeff[tm];
+                        #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
-                            result[h * 4 + tn] += vc * v_tile[tm][tn];
+                            result[h * 4 + tn] += vc * v_tile_f[tm][tn];
                         }
                     }
                 }
@@ -3093,10 +3140,11 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             }
             if (leftover > 0) {
                 for (int tm = 0; tm < 4 && bm + tm < key_length; ++tm) {
+                    float4 v_tile_leftover;
                     #pragma clang loop unroll(full)
                     for (int tn = 0; tn < 4; ++tn) {
-                        v_tile[0][tn] = value_plane[
-                            size_t(bm + tm) * D + out_col + tn];
+                        v_tile_leftover[tn] = float(value_plane[
+                            size_t(bm + tm) * D + out_col + tn]);
                     }
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
@@ -3104,7 +3152,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                             prob_rows[size_t(h) * key_length + bm + tm]);
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
-                            result[h * 4 + tn] += pc * v_tile[0][tn];
+                            result[h * 4 + tn] += pc * v_tile_leftover[tn];
                         }
                     }
                 }
@@ -3157,13 +3205,16 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 }
             }
             {
-                device T* out_ptr = out
+                device T4* out_ptr = reinterpret_cast<device T4*>(
+                    out
                     + size_t(row * 16 + kv_head * GQA + thrM) * D
-                    + out_col;
+                    + out_col);
+                T4 out_vec;
                 #pragma clang loop unroll(full)
                 for (int j = 0; j < 4; ++j) {
-                    out_ptr[j] = static_cast<T>(result[j]);
+                    out_vec[j] = static_cast<T>(result[j]);
                 }
+                *out_ptr = out_vec;
             }
         """,
         ensureRowContiguous: true
@@ -3280,16 +3331,16 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 // frees the 32-float per-head staging array. The peel keeps
                 // both arms, it now only decides how the tile is filled.
                 typedef vec<T, 4> T4;
-                T4 k_tile[4];
-                float q_coeff[4];
+                float4 k_tile_f[4];
                 int bn = lane * 4;
                 for (int i = 0; i < n_iter; ++i) {
                     int mat_offset = 0;
                     if (!tile_has_new_token) {
                     #pragma clang loop unroll(full)
                     for (int tm = 0; tm < 4; ++tm) {
-                        k_tile[tm] = *reinterpret_cast<const device T4*>(
+                        const T4 raw_k = *reinterpret_cast<const device T4*>(
                             mat + mat_offset + bn);
+                        k_tile_f[tm] = float4(float(raw_k[0]), float(raw_k[1]), float(raw_k[2]), float(raw_k[3]));
                         mat_offset += D;
                     }
                     } else {
@@ -3297,11 +3348,12 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     for (int tm = 0; tm < 4; ++tm) {
                         const bool is_new_token =
                             out_row + tm == key_length - 1;
-                        k_tile[tm] = is_new_token
+                        const T4 raw_k = is_new_token
                             ? *reinterpret_cast<const device T4*>(
                                   new_key_plane + bn)
                             : *reinterpret_cast<const device T4*>(
                                   mat + mat_offset + bn);
+                        k_tile_f[tm] = float4(float(raw_k[0]), float(raw_k[1]), float(raw_k[2]), float(raw_k[3]));
                         mat_offset += D;
                     }
                     }
@@ -3309,17 +3361,10 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     for (int h = 0; h < GQA; ++h) {
                         const T4 q_raw = *reinterpret_cast<const device T4*>(
                             query + h * D + bn);
-                        #pragma clang loop unroll(full)
-                        for (int tn = 0; tn < 4; ++tn) {
-                            q_coeff[tn] = static_cast<float>(q_raw[tn]);
-                        }
+                        const float4 q_f = float4(float(q_raw[0]), float(q_raw[1]), float(q_raw[2]), float(q_raw[3]));
                         #pragma clang loop unroll(full)
                         for (int tm = 0; tm < 4; ++tm) {
-                            #pragma clang loop unroll(full)
-                            for (int tn = 0; tn < 4; ++tn) {
-                                result[h][tm] +=
-                                    k_tile[tm][tn] * q_coeff[tn];
-                            }
+                            result[h][tm] += dot(k_tile_f[tm], q_f);
                         }
                     }
                     bn += 128;
@@ -3528,7 +3573,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// output allocation hands this kernel); the value-tile peel, the
     /// shuffle-down fold and every store are the promoted source verbatim.
     private static let fusedAvVecKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_vtile_v3_vec1_sv1",
+        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_vtile_v3_t\(avColumnTiles)_vec1_sv1",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -3543,8 +3588,8 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const bool row_vec4 = (key_length & 3) == 0;
 
             const int z = int(threadgroup_position_in_grid.z);
-            const int tile = z % 8;
-            const int row_kv = z / 8;
+            const int tile = z % \(avColumnTiles);
+            const int row_kv = z / \(avColumnTiles);
             const int row = row_kv / 2;
             const int kv_head = row_kv % 2;
             const int sg = int(simdgroup_index_in_threadgroup);
@@ -3573,15 +3618,15 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int thrM = lane / 4;
             const int thrN = lane % 4;
             int bm = thrM * 4;
-            const int out_col = tile * 64 + (4 * sg + thrN) * 4;
+            const int out_col = tile * \(avTileColumns) + (4 * sg + thrN) * 4;
 
-            float result[GQA][4] = {{0.0f}};
+            float result[GQA * 4] = {0.0f};
             // VTILE: the 4x4 value tile is shared by all GQA heads, the
             // probability block is not. Staging the tile costs 16 halves and
             // frees the 32-float per-head staging array. The peel keeps both
             // arms, it now only decides how the tile is filled.
             typedef vec<T, 4> T4;
-            T4 v_tile[4];
+            float4 v_tile_f[4];
             float p_coeff[4];
             const int n_iter = key_length / 32;
             const int leftover = key_length - n_iter * 32;
@@ -3592,18 +3637,20 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 if (bm + 4 <= key_length - 1) {
                 #pragma clang loop unroll(full)
                 for (int tm = 0; tm < 4; ++tm) {
-                    v_tile[tm] = *reinterpret_cast<const device T4*>(
+                    const T4 raw_v = *reinterpret_cast<const device T4*>(
                         value_plane + size_t(bm + tm) * D + out_col);
+                    v_tile_f[tm] = float4(float(raw_v[0]), float(raw_v[1]), float(raw_v[2]), float(raw_v[3]));
                 }
                 } else {
                 #pragma clang loop unroll(full)
                 for (int tm = 0; tm < 4; ++tm) {
                     const bool is_new_token = bm + tm == key_length - 1;
-                    v_tile[tm] = is_new_token
+                    const T4 raw_v = is_new_token
                         ? *reinterpret_cast<const device T4*>(
                               new_value_plane + out_col)
                         : *reinterpret_cast<const device T4*>(
                               value_plane + size_t(bm + tm) * D + out_col);
+                    v_tile_f[tm] = float4(float(raw_v[0]), float(raw_v[1]), float(raw_v[2]), float(raw_v[3]));
                 }
                 }
                 #pragma clang loop unroll(full)
@@ -3624,9 +3671,10 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     }
                     #pragma clang loop unroll(full)
                     for (int tm = 0; tm < 4; ++tm) {
-                        float vc = p_coeff[tm];
+                        const float vc = p_coeff[tm];
+                        #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
-                            result[h][tn] += vc * v_tile[tm][tn];
+                            result[h * 4 + tn] += vc * v_tile_f[tm][tn];
                         }
                     }
                 }
@@ -3635,12 +3683,13 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             if (leftover > 0) {
                 for (int tm = 0; tm < 4 && bm + tm < key_length; ++tm) {
                     const bool is_new_token = bm + tm == key_length - 1;
+                    float4 v_tile_leftover;
                     #pragma clang loop unroll(full)
                     for (int tn = 0; tn < 4; ++tn) {
-                        v_tile[0][tn] = is_new_token
-                            ? new_value_plane[out_col + tn]
-                            : value_plane[
-                                  size_t(bm + tm) * D + out_col + tn];
+                        v_tile_leftover[tn] = is_new_token
+                            ? float(new_value_plane[out_col + tn])
+                            : float(value_plane[
+                                  size_t(bm + tm) * D + out_col + tn]);
                     }
                     #pragma clang loop unroll(full)
                     for (int h = 0; h < GQA; ++h) {
@@ -3648,33 +3697,53 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                             prob_rows[size_t(h) * key_length + bm + tm]);
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
-                            result[h][tn] += pc * v_tile[0][tn];
+                            result[h * 4 + tn] += pc * v_tile_leftover[tn];
                         }
                     }
                 }
             }
-            #pragma clang loop unroll(full)
-            for (int h = 0; h < GQA; ++h) {
+            // XFOLD: 3-step butterfly fold across the 8 thrM lanes (strides 16, 8, 4)
+            {
+                const bool hi = (lane & 16) != 0;
                 #pragma clang loop unroll(full)
-                for (int tn = 0; tn < 4; ++tn) {
-                    #pragma clang loop unroll(full)
-                    for (ushort delta = 4; delta >= 1; delta >>= 1) {
-                        result[h][tn] +=
-                            simd_shuffle_down(result[h][tn], 4 * delta);
-                    }
+                for (int j = 0; j < 16; ++j) {
+                    const float a = result[j];
+                    const float b = result[16 + j];
+                    result[j] = (hi ? b : a)
+                        + simd_shuffle_xor(hi ? a : b, ushort(16));
                 }
             }
-            if (thrM == 0) {
+            {
+                const bool hi = (lane & 8) != 0;
                 #pragma clang loop unroll(full)
-                for (int h = 0; h < GQA; ++h) {
-                    device T* out_ptr = out
-                        + size_t(row * 16 + kv_head * GQA + h) * D
-                        + out_col;
-                    #pragma clang loop unroll(full)
-                    for (int j = 0; j < 4; ++j) {
-                        out_ptr[j] = static_cast<T>(result[h][j]);
-                    }
+                for (int j = 0; j < 8; ++j) {
+                    const float a = result[j];
+                    const float b = result[8 + j];
+                    result[j] = (hi ? b : a)
+                        + simd_shuffle_xor(hi ? a : b, ushort(8));
                 }
+            }
+            {
+                const bool hi = (lane & 4) != 0;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 4; ++j) {
+                    const float a = result[j];
+                    const float b = result[4 + j];
+                    result[j] = (hi ? b : a)
+                        + simd_shuffle_xor(hi ? a : b, ushort(4));
+                }
+            }
+            {
+                device T4* out_ptr = reinterpret_cast<device T4*>(
+                    out
+                    + size_t(row * 16 + kv_head * GQA + thrM) * D
+                    + out_col);
+                T4 out_vec;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 4; ++j) {
+                    out_vec[j] = static_cast<T>(result[j]);
+                }
+                *out_ptr = out_vec;
             }
         """,
         ensureRowContiguous: true
@@ -3989,8 +4058,8 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let output = fusedAvActive(
             [probs] + valueBuffers + [paramsArray, values],
             template: template,
-            grid: (32, 4, batch * kvHeads * 8),
-            threadGroup: (32, 4, 1),
+            grid: (32, avSimdgroups, batch * kvHeads * avColumnTiles),
+            threadGroup: (32, avSimdgroups, 1),
             outputShapes: [[batch, queryHeads, 1, headDim]],
             outputDTypes: [.bfloat16]
         )[0]

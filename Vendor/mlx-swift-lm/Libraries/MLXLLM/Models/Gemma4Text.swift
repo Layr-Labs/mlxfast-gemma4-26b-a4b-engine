@@ -1749,6 +1749,28 @@ private class Gemma4Attention: Module {
             cacheKey: ObjectIdentifier(q))
     }
 
+    /// QKVFUSE-001. The sliding layers' own V projection reads the same
+    /// activation as Q and K on the same tier, so all three planes
+    /// concatenate into one dispatch. Nil whenever the shapes, the
+    /// quantization parameters or the arm's switch say otherwise.
+    @inline(__always)
+    private func fusedQKVProjection(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray)? {
+        guard let q = qProj as? QuantizedLinear, q.bias == nil,
+            let kProj, let k = kProj as? QuantizedLinear, k.bias == nil,
+            let vProj, let v = vProj as? QuantizedLinear, v.bias == nil,
+            q.groupSize == k.groupSize, q.groupSize == v.groupSize,
+            q.bits == k.bits, q.bits == v.bits,
+            q.mode == k.mode, q.mode == v.mode
+        else { return nil }
+        return CBv2AttentionQKVMMA8V1.fusedQKVMatmul(
+            x: x,
+            qWeight: q.weight, qScales: q.scales, qBiases: q.biases,
+            kWeight: k.weight, kScales: k.scales, kBiases: k.biases,
+            vWeight: v.weight, vScales: v.scales, vBiases: v.biases,
+            groupSize: q.groupSize, bits: q.bits, mode: q.mode,
+            cacheKey: ObjectIdentifier(q))
+    }
+
     /// Exact B8/L1 attention output projection. Sliding/full K widths select
     /// the tight affine4 fast-QMV replica; every other path keeps the layer.
     @inline(__always)
@@ -1957,11 +1979,18 @@ private class Gemma4Attention: Module {
         // custom helper would silently bypass the winning kernel.
         // QKFUSE-001: `queryInput === x` unless last-query prefill narrowed it,
         // which is the only case where Q and K cannot share a dispatch.
+        // QKVFUSE-001: layers with their own V plane (the sliding layers) go
+        // one step further and fuse Q|K|V; full-attention layers (V shares K)
+        // and K/V-borrowing layers stay on the Q|K road, which for a sliding
+        // layer whose QKV guards fail means the separate dispatches.
+        let fusedQKV: (MLXArray, MLXArray, MLXArray)? =
+            (lastQueryCache == nil && !usesSharedKV && vProj != nil)
+            ? fusedQKVProjection(x) : nil
         let fusedQK: (MLXArray, MLXArray)? =
             (lastQueryCache == nil && !usesSharedKV && vProj == nil)
             ? fusedQKProjection(x) : nil
-        let queryRaw = (fusedQK?.0 ?? tierProjection(qProj, queryInput)).reshaped(
-            B, queryLength, nHeads, effectiveHeadDim)
+        let queryRaw = (fusedQKV?.0 ?? fusedQK?.0 ?? tierProjection(qProj, queryInput))
+            .reshaped(B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
             // KV-shared layer: projects queries only and borrows (K, V) from
@@ -2023,11 +2052,12 @@ private class Gemma4Attention: Module {
             lastQueryCache == nil
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
-        let kRaw = (fusedQK?.1 ?? tierProjection(kProj, x)).reshaped(
+        let kRaw = (fusedQKV?.1 ?? fusedQK?.1 ?? tierProjection(kProj, x)).reshaped(
             B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
         if let vProj {
-            vRaw = tierProjection(vProj, x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            vRaw = (fusedQKV?.2 ?? tierProjection(vProj, x)).reshaped(
+                B, L, nKvHeads, effectiveHeadDim)
         } else {
             vRaw = kRaw
         }

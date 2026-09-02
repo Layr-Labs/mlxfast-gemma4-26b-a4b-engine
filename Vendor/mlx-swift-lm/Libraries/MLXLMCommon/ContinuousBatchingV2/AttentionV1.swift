@@ -1167,11 +1167,17 @@ enum CBv2AttentionV1 {
         // chunk length). Only the attends may differ, below.
         var committed: [(keys: MLXArray, values: MLXArray)] = []
         committed.reserveCapacity(batch)
-        for (index, row) in rows.enumerated() {
-            let (cachedKeys, cachedValues) = row.update(
-                keys: keys[index ..< index + 1],
-                values: values[index ..< index + 1])
-            committed.append((cachedKeys, cachedValues))
+        if let adopted = adoptFreshFullChunks(rows: rows, keys: keys, values: values) {
+            for index in 0 ..< batch {
+                committed.append((adopted.keys[index], adopted.values[index]))
+            }
+        } else {
+            for (index, row) in rows.enumerated() {
+                let (cachedKeys, cachedValues) = row.update(
+                    keys: keys[index ..< index + 1],
+                    values: values[index ..< index + 1])
+                committed.append((cachedKeys, cachedValues))
+            }
         }
         // LASTQ-D512: when every row is a private `CBv2FullSequenceKV` in
         // lockstep at the committed length (the scored 8×1024 prompt prefill:

@@ -4243,6 +4243,87 @@ private class Gemma4Experts: Module {
 
 // MARK: - MLP
 
+/// PREFILL-DENSE-GATEUP-CONCAT: merge the dense MLP's gate and up projections
+/// into a single GEMM over a concatenated, transposed BF16 dequantized weight
+/// plane during prefill passes (rows >= minRows = 1024). Eliminates one full
+/// streaming read of the activation plane per dense MLP per prefill forward.
+/// Kill switch: `DARKBLOOM_GEMMA4_PREFILL_DENSE_GATEUP_CONCAT=0`.
+/// Engage mark: `prefill-dense-gateup-concat`.
+private enum Gemma4PrefillDenseGateUpConcatV1 {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_DENSE_GATEUP_CONCAT"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var cachedTransposedPlanes: [ObjectIdentifier: MLXArray] = [:]
+
+    @inline(__always)
+    private static func plane(
+        gate: QuantizedLinear, up: QuantizedLinear,
+        gateBiases: MLXArray, upBiases: MLXArray
+    ) -> MLXArray {
+        let key = ObjectIdentifier(gate)
+        if Gemma4PrefillDeqGEMMV1.cacheEnabled {
+            lock.lock()
+            if let existing = cachedTransposedPlanes[key] {
+                lock.unlock()
+                return existing
+            }
+            lock.unlock()
+        }
+        let wConcat = concatenated([gate.weight, up.weight], axis: 0)
+        let sConcat = concatenated([gate.scales, up.scales], axis: 0)
+        let bConcat = concatenated([gateBiases, upBiases], axis: 0)
+        let p = dequantized(
+            wConcat, scales: sConcat, biases: bConcat,
+            groupSize: gate.groupSize, bits: gate.bits, mode: gate.mode
+        ).transposed()
+        if Gemma4PrefillDeqGEMMV1.cacheEnabled {
+            eval(p)
+            lock.lock()
+            cachedTransposedPlanes[key] = p
+            lock.unlock()
+        }
+        return p
+    }
+
+    @inline(__always)
+    static func apply(
+        gateLayer: Linear, upLayer: Linear, x: MLXArray
+    ) -> (MLXArray, MLXArray)? {
+        guard enabled, Gemma4PrefillDeqGEMMV1.enabled,
+            let gate = gateLayer as? QuantizedLinear,
+            let up = upLayer as? QuantizedLinear,
+            gate.bias == nil, up.bias == nil,
+            gate.mode == .affine, up.mode == .affine,
+            gate.groupSize == 64, up.groupSize == 64,
+            (gate.bits == 4 || gate.bits == 8),
+            gate.bits == up.bits,
+            x.dtype == .bfloat16, x.ndim >= 2,
+            gate.scales.dtype == .bfloat16, up.scales.dtype == .bfloat16,
+            let gateBiases = gate.biases, gateBiases.dtype == .bfloat16,
+            let upBiases = up.biases, upBiases.dtype == .bfloat16,
+            gate.weight.shape == up.weight.shape,
+            gate.scales.shape == up.scales.shape,
+            gateBiases.shape == upBiases.shape
+        else { return nil }
+        let inputDims = x.dim(-1)
+        guard inputDims > 0, x.size / inputDims >= Gemma4PrefillDeqGEMMV1.minRows else { return nil }
+        let weight = gate.weight
+        guard weight.ndim == 2, weight.dtype == .uint32,
+            weight.dim(1) * (32 / gate.bits) == inputDims
+        else { return nil }
+        CBv2EngageMark.once("prefill-dense-gateup-concat")
+        let transPlane = plane(gate: gate, up: up, gateBiases: gateBiases, upBiases: upBiases)
+        let product = MLX.matmul(x, transPlane)
+        let splits = product.split(parts: 2, axis: -1)
+        return (splits[0], splits[1])
+    }
+}
+
 private class Gemma4MLP: Module {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
@@ -4293,6 +4374,11 @@ private class Gemma4MLP: Module {
         // projections. If either projection is not the pinned affine8 cell,
         // the candidate arrays remain unevaluated and stock takes over.
         let activationSums = producerSums ?? CBv2DenseMLPQMVV1.activationSums(for: x)
+        if let (g, u) = Gemma4PrefillDenseGateUpConcatV1.apply(
+            gateLayer: gateProj, upLayer: upProj, x: x)
+        {
+            return denseProjection(downProj, gemma4GeluProduct(g, u))
+        }
         return denseProjection(
             downProj,
             gemma4GeluProduct(

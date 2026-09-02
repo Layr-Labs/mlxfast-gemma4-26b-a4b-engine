@@ -881,6 +881,109 @@ private let routeCsortPrefillScatterKernel: MLXFast.MLXFastKernel = MLXFast.meta
     ensureRowContiguous: true
 )
 
+// Gemma 4's route IDs are provably in [0, 128).  The generic prefill sort
+// keeps 256 bins for shared-model callers; this companion keeps the same
+// 256-key staging block but halves the histogram/scan surface for Gemma.
+private let routeCsortGemmaWidth = 128
+
+private let routeCsortGemmaHistKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "mlx_lm_route_csort128e_hist_v1",
+    inputNames: ["keys"], outputNames: ["block_hist"],
+    source: """
+        constexpr uint BLOCK = 256;
+        constexpr uint WIDTH = 128;
+        uint b = threadgroup_position_in_grid.x;
+        uint k = thread_position_in_threadgroup.x;
+        uint n = keys_shape[0];
+        threadgroup atomic_uint tg_count[WIDTH];
+        atomic_store_explicit(&tg_count[k], 0u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint idx = b * BLOCK + k;
+        if (idx < n) atomic_fetch_add_explicit(&tg_count[keys[idx]], 1u, memory_order_relaxed);
+        idx += WIDTH;
+        if (idx < n) atomic_fetch_add_explicit(&tg_count[keys[idx]], 1u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        block_hist[b * WIDTH + k] = atomic_load_explicit(&tg_count[k], memory_order_relaxed);
+        """,
+    ensureRowContiguous: true
+)
+
+private let routeCsortGemmaScanKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "mlx_lm_route_csort128e_scan_v1",
+    inputNames: ["block_hist"], outputNames: ["block_offset"],
+    source: """
+        constexpr uint WIDTH = 128;
+        uint e = thread_position_in_threadgroup.x;
+        uint simd_id = e / 32;
+        uint lane = e % 32;
+        uint nblocks = (uint)block_hist_shape[0];
+        uint total = 0u;
+        for (uint b = 0; b < nblocks; ++b) total += block_hist[b * WIDTH + e];
+        uint lane_excl = simd_prefix_exclusive_sum(total);
+        threadgroup uint simd_totals[4];
+        if (lane == 31) simd_totals[simd_id] = lane_excl + total;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint running = lane_excl;
+        for (uint s = 0; s < simd_id; ++s) running += simd_totals[s];
+        for (uint b = 0; b < nblocks; ++b) {
+            block_offset[b * WIDTH + e] = running;
+            running += block_hist[b * WIDTH + e];
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+private let routeCsortGemmaScatterKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "mlx_lm_route_csort128e_scatter_v1",
+    inputNames: ["keys", "block_offset"],
+    outputNames: ["row_order", "sorted_keys", "inverse_order"],
+    source: """
+        constexpr uint BLOCK = 256;
+        constexpr uint WIDTH = 128;
+        uint b = threadgroup_position_in_grid.x;
+        uint k = thread_position_in_threadgroup.x;
+        uint n = keys_shape[0];
+        uint idx = b * BLOCK + k;
+        uint key = (idx < n) ? keys[idx] : 0xffffffffu;
+        threadgroup uint tg_keys[BLOCK];
+        tg_keys[k] = key;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (idx < n) {
+            uint rank = 0u;
+            for (uint j = 0; j < k; ++j) rank += (tg_keys[j] == key) ? 1u : 0u;
+            uint pos = block_offset[b * WIDTH + key] + rank;
+            row_order[pos] = idx / (uint)M;
+            sorted_keys[pos] = key;
+            inverse_order[idx] = pos;
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+private func routeCountingSortGemma128(
+    _ indices: MLXArray, m: Int
+) -> (rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray) {
+    let n = indices.size
+    let blocks = (n + routeCsortPrefillBlock - 1) / routeCsortPrefillBlock
+    let hist = routeCsortGemmaHistKernel(
+        [indices], grid: (blocks * routeCsortGemmaWidth, 1, 1),
+        threadGroup: (routeCsortGemmaWidth, 1, 1),
+        outputShapes: [[blocks, routeCsortGemmaWidth]], outputDTypes: [.uint32]
+    )[0]
+    let offsets = routeCsortGemmaScanKernel(
+        [hist], grid: (routeCsortGemmaWidth, 1, 1),
+        threadGroup: (routeCsortGemmaWidth, 1, 1),
+        outputShapes: [[blocks, routeCsortGemmaWidth]], outputDTypes: [.uint32]
+    )[0]
+    let outputs = routeCsortGemmaScatterKernel(
+        [indices, offsets], template: [("M", m)],
+        grid: (blocks * routeCsortPrefillBlock, 1, 1),
+        threadGroup: (routeCsortPrefillBlock, 1, 1),
+        outputShapes: [[n], [n], [n]], outputDTypes: [.uint32, .uint32, .uint32]
+    )
+    return (outputs[0], outputs[1], outputs[2])
+}
+
 /// Exact stable counting sort of a flat uint32 route table. Returns nil (fail
 /// closed onto `argSort`) unless every precondition of the kernels holds.
 private func routeCountingSortPrefill(
@@ -898,6 +1001,9 @@ private func routeCountingSortPrefill(
         n <= routeCsortPrefillMaxKeys
     else { return nil }
     CBv2EngageMark.once("route-csort-prefill")
+    if numExperts == routeCsortGemmaWidth {
+        return routeCountingSortGemma128(indices, m: m)
+    }
     let blocks = (n + routeCsortPrefillBlock - 1) / routeCsortPrefillBlock
     let width = routeCsortPrefillWidth
     let hist = routeCsortPrefillHistKernel(

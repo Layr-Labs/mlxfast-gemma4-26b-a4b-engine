@@ -813,7 +813,7 @@ private let routeCsortPrefillHistKernel: MLXFast.MLXFastKernel = MLXFast.metalKe
 )
 
 private let routeCsortPrefillScanKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "mlx_lm_route_csort128_scan_v1",
+    name: "mlx_lm_route_csort128_scan_v2",
     inputNames: ["block_hist"],
     outputNames: ["block_offset"],
     source: """
@@ -823,8 +823,10 @@ private let routeCsortPrefillScanKernel: MLXFast.MLXFastKernel = MLXFast.metalKe
         uint lane = e % 32;
         uint nblocks = (uint)block_hist_shape[0];
         uint total = 0u;
-        for (uint b = 0; b < nblocks; ++b) {
-            total += block_hist[b * WIDTH + e];
+        if (e < uint(NE)) {
+            for (uint b = 0; b < nblocks; ++b) {
+                total += block_hist[b * WIDTH + e];
+            }
         }
         // Global bin base: exclusive prefix over the 256 expert totals.
         uint lane_excl = simd_prefix_exclusive_sum(total);
@@ -839,9 +841,11 @@ private let routeCsortPrefillScanKernel: MLXFast.MLXFastKernel = MLXFast.metalKe
         }
         running += lane_excl;
         // Exclusive scan over blocks for this expert, offset by the bin base.
-        for (uint b = 0; b < nblocks; ++b) {
-            block_offset[b * WIDTH + e] = running;
-            running += block_hist[b * WIDTH + e];
+        if (total > 0u) {
+            for (uint b = 0; b < nblocks; ++b) {
+                block_offset[b * WIDTH + e] = running;
+                running += block_hist[b * WIDTH + e];
+            }
         }
         """,
     ensureRowContiguous: true
@@ -909,6 +913,7 @@ private func routeCountingSortPrefill(
     )[0]
     let offsets = routeCsortPrefillScanKernel(
         [hist],
+        template: [("NE", numExperts)],
         grid: (width, 1, 1),
         threadGroup: (width, 1, 1),
         outputShapes: [[blocks, width]],

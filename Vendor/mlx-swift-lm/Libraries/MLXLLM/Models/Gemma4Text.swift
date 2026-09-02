@@ -3007,6 +3007,46 @@ private enum Gemma4FusedLayerGlue {
         return result
     }
 
+    private static let inputNormRsEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_INPUT_NORM_RS"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let inputNormRunsumKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_glue_input_norm_rs_2816_bf16_v1",
+        inputNames: ["x", "w"],
+        outputNames: ["normed", "rs"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float local_inv[1];
+            threadgroup float local_sums[32];
+            const uint base = row * 2816 + lid * 4;
+            const uint wbase = lid * 4;
+        \(rmsReduce("x", into: "local_inv[0]"))
+            const float inv = local_inv[0];
+            T nq[4];
+            for (int i = 0; i < 4; i++) {
+                nq[i] = w[wbase + i] * static_cast<T>((float)x[base + i] * inv);
+                normed[base + i] = nq[i];
+            }
+            const T nquad = ((nq[0] + nq[1]) + nq[2]) + nq[3];
+            float rsv = 0.0f + (float)nquad;
+            rsv += simd_shuffle_xor(rsv, 1u);
+            rsv += simd_shuffle_xor(rsv, 2u);
+            rsv += simd_shuffle_xor(rsv, 4u);
+            rsv += simd_shuffle_xor(rsv, 8u);
+            if ((lid & 15u) == 0u) {
+                rs[row * 44 + (lid >> 4)] = rsv;
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
     private static let normResidualKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_glue_norm_residual_2816_bf16_v1_nb1",
         inputNames: ["x", "res", "w"],
@@ -3190,6 +3230,22 @@ private enum Gemma4FusedLayerGlue {
             outputShapes: [[rows, 1, axis]],
             outputDTypes: [.bfloat16]
         )[0]
+    }
+
+    static func inputNormRunsum(
+        x: MLXArray, weight: MLXArray, eps: Float
+    ) -> (normed: MLXArray, rs: MLXArray)? {
+        guard inputNormRsEnabled, admits(x, weight: weight, eps: eps) else { return nil }
+        CBv2EngageMark.once("glue-input-norm-rs")
+        let outs = inputNormRunsumKernel(
+            [x, weight],
+            template: [("T", x.dtype)],
+            grid: (rows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: [[rows, 1, axis], [rows, axis / 64]],
+            outputDTypes: [.bfloat16, .float32]
+        )
+        return (outs[0], outs[1])
     }
 
     struct AttentionBranchPrefix {
@@ -4281,6 +4337,12 @@ public class Gemma4DecoderLayer: Module {
             chain.pending = nil
             h = pending.normed
             carriedRunsum = pending.rs
+        } else if let fused = Gemma4FusedLayerGlue.inputNormRunsum(
+            x: x, weight: inputLayernorm.weight, eps: config.rmsNormEps)
+        {
+            glueChain?.pending = nil
+            h = fused.normed
+            carriedRunsum = fused.rs
         } else {
             glueChain?.pending = nil
             h = inputLayernorm(x)

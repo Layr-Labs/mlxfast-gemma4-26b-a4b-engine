@@ -40,14 +40,33 @@ extension EngineLoopV2 {
             let rec: CBv2ScheduledRequest
             let targets: [Int]
             let accepted: Int
+            /// This row's OWN committed width for the round: its natural
+            /// target-authoritative prefix, clamped by its own remaining
+            /// length budget and its own stop tokens. Never reduced to a
+            /// neighbour's width.
+            let emitted: Int
         }
 
-        // Resolve each row's natural target-authoritative prefix, then choose
-        // one committed width for the rectangular step. This keeps subsequent
-        // quantized MoE target batches shape-identical across all rows.
+        // Resolve each row's natural target-authoritative prefix and commit
+        // exactly that. The round's DRAFT DEPTH stays step-global: every
+        // participating row drafted the same `k` columns and the verify
+        // rectangle was one `[B, 1 + k]` batch, so the next plan's target
+        // batch is the same shape for every row and the quantized MoE path
+        // sees no shape drift. What diverges is only each row's KV position,
+        // which every row-local cache already tracks per row: `rollback` and
+        // `rollbackComputed` below are per-row calls, the layer bank rebuilds
+        // its per-row `positionOffsets` from each row's own absolute offset
+        // when `eagerCompositionStale` forces recomposition, and the
+        // rectangular verify attends each row against its own KV prefix.
+        //
+        // The previous rule committed `min` over the cohort. That is a
+        // correct-but-lossy policy: a round in which seven rows accepted
+        // their draft and one did not committed one token everywhere. At
+        // depth 1 it turns a per-draft acceptance of ~0.88 into a cohort
+        // acceptance of ~0.42: the whole yield of speculation, spent on
+        // synchronization the batch shape does not actually need.
         var outcomes: [RowOutcome] = []
         outcomes.reserveCapacity(verify.rows.count)
-        var commonEmitted = targetWidth
 
         for (batchIndex, metadata) in verify.rows.enumerated() {
             let id = metadata.id
@@ -74,14 +93,14 @@ extension EngineLoopV2 {
             }) {
                 naturalEmitted = stopIndex + 1
             }
-            commonEmitted = min(commonEmitted, naturalEmitted)
             outcomes.append(
                 RowOutcome(
                     batchIndex: batchIndex,
                     metadata: metadata,
                     rec: rec,
                     targets: targets,
-                    accepted: accepted))
+                    accepted: accepted,
+                    emitted: naturalEmitted))
         }
 
         round.finalizedVerifyIDs = Set(outcomes.map { $0.metadata.id })
@@ -89,14 +108,19 @@ extension EngineLoopV2 {
             decodeRowBucket: mtp.planDecodeRowBucket,
             finalizedVerifyIDs: round.finalizedVerifyIDs)
 
-        if !outcomes.isEmpty {
-            let stepAccepted = outcomes.map { min($0.accepted, commonEmitted) }.min() ?? 0
+        // Acceptance is now a PER-ROW observation: the quantity the round
+        // commits is each row's own accept walk, so that is the quantity the
+        // depth policy must model. Under the old common-width rule the
+        // controller was shown one minimum per step, which understated the
+        // per-draft rate by the width of the cohort.
+        for outcome in outcomes {
+            let rowAccepted = min(outcome.accepted, outcome.emitted)
             let observedDrafts =
-                commonEmitted <= stepAccepted
-                ? commonEmitted : min(k, stepAccepted + 1)
+                outcome.emitted <= rowAccepted
+                ? outcome.emitted : min(k, rowAccepted + 1)
             mtp.recordStepAcceptance(
                 drafted: k,
-                accepted: stepAccepted,
+                accepted: rowAccepted,
                 observedDrafts: observedDrafts,
                 decodeRowBucket: mtp.planDecodeRowBucket)
         }
@@ -107,7 +131,7 @@ extension EngineLoopV2 {
             let id = metadata.id
             let rec = outcome.rec
             let accepted = outcome.accepted
-            let emitted = Array(outcome.targets.prefix(commonEmitted))
+            let emitted = Array(outcome.targets.prefix(outcome.emitted))
 
             // Confirm in order with the same stop and length semantics as the
             // ordinary finalize loop.

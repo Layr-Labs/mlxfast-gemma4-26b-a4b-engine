@@ -1069,14 +1069,16 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
         inputsEmbeds: MLXArray,
         sharedKV: Gemma4SharedKV,
         positionOffset: Gemma4.PositionOffset,
-        masks: Gemma4DrafterMasks
+        masks: Gemma4DrafterMasks,
+        ringKV: CBv2MTPDrafterRingKV? = nil
     ) -> (lastHidden: MLXArray, logits: MLXArray) {
         let h = preProjection(inputsEmbeds)
         return forwardProjected(
             h,
             sharedKV: sharedKV,
             positionOffset: positionOffset,
-            masks: masks)
+            masks: masks,
+            ringKV: ringKV)
     }
 
     internal func makeMasks(
@@ -1108,7 +1110,8 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
         _ projected: MLXArray,
         sharedKV: Gemma4SharedKV,
         positionOffset: Gemma4.PositionOffset,
-        masks: Gemma4DrafterMasks
+        masks: Gemma4DrafterMasks,
+        ringKV: CBv2MTPDrafterRingKV? = nil
     ) -> (lastHidden: MLXArray, logits: MLXArray) {
         let textCfg = config.textConfig
         var h = projected
@@ -1136,7 +1139,8 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
                 cache: nil,
                 perLayerInput: nil,
                 sharedKV: kv,
-                positionOffset: positionOffset
+                positionOffset: positionOffset,
+                ringKV: layerType == "sliding_attention" ? ringKV : nil
             )
             h = out
         }
@@ -1160,9 +1164,34 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
         if let lmHead {
             return lmHead(hidden)
         }
+        // DRAFTER-LMHEAD-MMA: the drafter's tied head is a 4-bit g64 affine
+        // [262144, 1024] plane read once per draft step for eight rows; the
+        // crown's batch-8 tied-head kernel (Gemma4MMAQuantizedGEMV, K-generic)
+        // takes it exactly as it takes the target's [262144, 2816] head.
+        // `DARKBLOOM_GEMMA4_DRAFTER_LMHEAD_MMA=0` restores the stock QMV.
+        if Self.drafterLMHeadMMAEnabled,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.mode == .affine,
+            let mma = Gemma4MMAQuantizedGEMV.apply(
+                x: hidden,
+                w: quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                groupSize: quantized.groupSize,
+                bits: quantized.bits)
+        {
+            CBv2EngageMark.once("drafter-lmhead-mma")
+            return mma.reshaped(Array(hidden.shape.dropLast()) + [mma.dim(-1)])
+        }
         // Tied: project hidden through the (transposed) token embedding.
         return model.embedTokens.asLinear(hidden)
     }
+
+    static let drafterLMHeadMMAEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DRAFTER_LMHEAD_MMA"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
 
     // MARK: - Weight sanitization
 

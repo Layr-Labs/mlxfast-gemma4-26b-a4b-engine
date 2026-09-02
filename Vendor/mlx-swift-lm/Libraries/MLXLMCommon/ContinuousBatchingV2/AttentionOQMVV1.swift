@@ -403,7 +403,8 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
 }
 """
 
-    private static let mma8KernelK4096 = MLXFast.metalKernel(
+    private static let mma8KernelK4096 = CBv2AttnMMA8Rows16.kernel(
+        tag: "attn-o-k4096-src",
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry_bfill_v4",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
@@ -417,10 +418,10 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
                 thread_index_in_simdgroup);
             return;
             """,
-        header: mma8KernelHeader,
-        ensureRowContiguous: true)
+        header: mma8KernelHeader)
 
-    private static let mma8KernelK8192 = MLXFast.metalKernel(
+    private static let mma8KernelK8192 = CBv2AttnMMA8Rows16.kernel(
+        tag: "attn-o-k8192-src",
         name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_carry_bfill_v4",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
@@ -434,8 +435,173 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
                 thread_index_in_simdgroup);
             return;
             """,
-        header: mma8KernelHeader,
-        ensureRowContiguous: true)
+        header: mma8KernelHeader)
+
+    /// MMA8-ROWS16 header for o_proj. `mma8KernelHeader` above is included
+    /// VERBATIM: the eight-row kernels compile the text they compiled on the
+    /// base, and only the widened kernels see the extra template.
+    ///
+    /// `attention_o_qmv_mma8_affine4_g64_rb` is
+    /// `attention_o_qmv_mma8_affine4_g64_impl` with one outer loop over RB
+    /// eight-row blocks placed INSIDE the K-group walk. The group's weight
+    /// word, scale, bias and one-deep register carry are read once and serve
+    /// every block, so the o_proj plane is still streamed once per dispatch and
+    /// the grid is unchanged. The x side is per row and is rebuilt per block.
+    /// Block `rb` touches rows `8*rb .. 8*rb+7` and nothing else, walks the
+    /// same ascending `g` range into its own accumulator with the identical
+    /// `acc += s * C.thread_elements()[i] + rs[i] * b` step, and takes the same
+    /// KS = 2 close, so it is the eight-row dispatch on those rows word for
+    /// word.
+    private static let mma8Rows16Header = mma8KernelHeader + """
+
+template <typename T, int KS, int KFIX, int RB>
+METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rb(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int N,
+    const int n0,
+    threadgroup float2* red,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int K = KFIX;
+  constexpr int G = K / 64;
+  constexpr int gh = (G + 1) / 2;
+  constexpr int nGroups = (KS == 2) ? gh : G;
+  const int g0 = (KS == 2 && simd_gid == 1) ? gh : 0;
+  const mma8_coord c = mma8_lane(simd_lid);
+
+  const device uint8_t* wrow =
+      (const device uint8_t*)w + (n0 + c.fm) * (K / 2) + 4 * c.fn;
+  const device T* srow = scales + (n0 + c.fm) * G;
+  const device T* brow = biases + (n0 + c.fm) * G;
+
+  const device T* xrow[RB];
+  thread float acc0[RB];
+  thread float acc1[RB];
+#pragma clang loop unroll(full)
+  for (int rb = 0; rb < RB; ++rb) {
+    xrow[rb] = x + (rb * 8 + c.fn) * K + 8 * c.fm;
+    acc0[rb] = 0.0f;
+    acc1[rb] = 0.0f;
+  }
+
+  simdgroup_float8x8 A;
+  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+  uint2 wv_next = *((const device uint2*)(wrow + 32 * g0));
+  T s_next = srow[g0];
+  T b_next = brow[g0];
+
+#pragma unroll
+  for (int gi = 0; gi < nGroups; ++gi) {
+    const int g = g0 + gi;
+    const uint2 wv = wv_next;
+    const float s = float(s_next);
+    const float b = float(b_next);
+    const int g_next = g0 + min(gi + 1, nGroups - 1);
+    wv_next = *((const device uint2*)(wrow + 32 * g_next));
+    s_next = srow[g_next];
+    b_next = brow[g_next];
+
+#pragma clang loop unroll(full)
+    for (int rb = 0; rb < RB; ++rb) {
+      const device T* x0 = xrow[rb];
+      const device T* x1 = x0 + K;
+      const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+      const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+
+      float2 rs = float2(mma8_runsum4<T>(r0), mma8_runsum4<T>(r1));
+      rs += simd_shuffle_xor(rs, 2u);
+      rs += simd_shuffle_xor(rs, 4u);
+      rs += simd_shuffle_xor(rs, 16u);
+
+      simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+      MMA8_SETB(B0, x, lo)
+      MMA8_STEP(B0, 0)
+      MMA8_SETB(B1, x, hi)
+      MMA8_STEP(B1, 1)
+      MMA8_SETB(B2, y, lo)
+      MMA8_STEP(B2, 2)
+      MMA8_SETB(B3, y, hi)
+      MMA8_STEP(B3, 3)
+      MMA8_SETB(B4, z, lo)
+      MMA8_STEP(B4, 4)
+      MMA8_SETB(B5, z, hi)
+      MMA8_STEP(B5, 5)
+      MMA8_SETB(B6, w, lo)
+      MMA8_STEP(B6, 6)
+      MMA8_SETB(B7, w, hi)
+      MMA8_STEP(B7, 7)
+
+      acc0[rb] += s * C.thread_elements()[0] + rs.x * b;
+      acc1[rb] += s * C.thread_elements()[1] + rs.y * b;
+    }
+  }
+
+  if (KS == 2) {
+    if (simd_gid == 1) {
+#pragma clang loop unroll(full)
+      for (int rb = 0; rb < RB; ++rb) {
+        red[rb * 32 + simd_lid] = float2(acc0[rb], acc1[rb]);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_gid == 1) {
+      return;
+    }
+#pragma clang loop unroll(full)
+    for (int rb = 0; rb < RB; ++rb) {
+      const float2 other = red[rb * 32 + simd_lid];
+      acc0[rb] = acc0[rb] + other.x;
+      acc1[rb] = acc1[rb] + other.y;
+    }
+  }
+
+#pragma clang loop unroll(full)
+  for (int rb = 0; rb < RB; ++rb) {
+    const int m0 = rb * 8 + c.fn;
+    y[m0 * N + n0 + c.fm] = static_cast<T>(acc0[rb]);
+    y[(m0 + 1) * N + n0 + c.fm] = static_cast<T>(acc1[rb]);
+  }
+}
+"""
+
+    private static let rows16KernelK4096 = CBv2AttnMMA8Rows16.kernel(
+        tag: "attn-o-r16k4096-src",
+        name: "cbv2_b8_l2_attention_o_mma8_affine4_g64_k4096_carry_rows16_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            attention_o_qmv_mma8_affine4_g64_rb<T, 2, 4096, 2>(
+                w, scales, biases, x, y,
+                w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8Rows16Header)
+
+    private static let rows16KernelK8192 = CBv2AttnMMA8Rows16.kernel(
+        tag: "attn-o-r16k8192-src",
+        name: "cbv2_b8_l2_attention_o_mma8_affine4_g64_k8192_carry_rows16_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            attention_o_qmv_mma8_affine4_g64_rb<T, 2, 8192, 2>(
+                w, scales, biases, x, y,
+                w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8Rows16Header)
 
     private static let qmvKernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_attention_o_affine4_g64_tight_v1",
@@ -551,6 +717,16 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
         width == 4096 || width == 8192
     }
 
+    /// Flat-row counts this host serves: the decode step's `[8, 1]` and the
+    /// depth-1 verify rectangle's `[8, 2]`. The widened arm rides the MMA body,
+    /// so the pair kernel's switch keeps it off as well.
+    @inline(__always)
+    private static func liveSequence(_ length: Int) -> Bool {
+        if length == sequence { return true }
+        return CBv2AttnMMA8Rows16.enabled && mma8Enabled
+            && batch * length == CBv2AttnMMA8Rows16.rows
+    }
+
     public static func matmul(
         x: MLXArray,
         weight: MLXArray,
@@ -572,17 +748,47 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
             weight.dtype == .uint32,
             x.ndim == 3,
             x.dim(0) == batch,
-            x.dim(1) == sequence,
+            liveSequence(x.dim(1)),
             weight.ndim == 2
         else { return nil }
 
+        let sequenceLength = x.dim(1)
         let inDim = x.dim(2)
         guard liveInputWidth(inDim),
-            x.size == batch * sequence * inDim,
+            x.size == batch * sequenceLength * inDim,
             weight.shape == [outputWidth, inDim * Self.bits / 32],
             scales.shape == [outputWidth, inDim / Self.groupSize],
             biases.shape == scales.shape
         else { return nil }
+
+        if sequenceLength != sequence {
+            // MMA8-ROWS16. Same grid, same one-pass weight stream, two
+            // eight-row blocks per threadgroup.
+            let yTiles = outputWidth / outputsPerGroup
+            let kernel = inDim == 8192 ? rows16KernelK8192 : rows16KernelK4096
+            let widened = kernel(
+                [x, weight, scales, biases],
+                template: [("T", x.dtype)],
+                grid: (simdWidth, yTiles * simdGroups, 1),
+                threadGroup: (simdWidth, simdGroups, 1),
+                outputShapes: [[batch, sequenceLength, outputWidth]],
+                outputDTypes: [x.dtype]
+            )[0]
+            CBv2EngageMark.once("attn-o-mma8-rows16")
+            if CBv2AttnMMA8Rows16.auditArmed {
+                CBv2AttnMMA8Rows16.audit(tag: "o", x: x, widened: [widened]) { slice in
+                    let eight = inDim == 8192 ? mma8KernelK8192 : mma8KernelK4096
+                    return eight(
+                        [slice, weight, scales, biases],
+                        template: [("T", x.dtype)],
+                        grid: (simdWidth, yTiles * simdGroups, 1),
+                        threadGroup: (simdWidth, simdGroups, 1),
+                        outputShapes: [[batch, sequence, outputWidth]],
+                        outputDTypes: [x.dtype])
+                }
+            }
+            return widened
+        }
 
         let tableReady =
             rsTable != nil

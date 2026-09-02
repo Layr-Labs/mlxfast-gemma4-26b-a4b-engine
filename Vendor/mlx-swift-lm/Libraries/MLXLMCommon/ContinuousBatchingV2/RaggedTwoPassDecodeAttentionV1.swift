@@ -13,7 +13,7 @@ import Foundation
 import MLX
 import MLXFast
 
-enum CBv2RaggedTwoPassDecodeAttentionV1 {
+public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     private static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_RAGGED_TWO_PASS_ATTENTION"]
@@ -1521,6 +1521,1034 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// accumulators through BF16 threadgroup storage. After a barrier, the same
     /// threads execute the incumbent COLS=8 pass-B mapping and xor trees. This
     /// removes only the global partial write/read and the second dispatch.
+    /// MTP-COLS2: the resident fused-write pass A over BOTH verify columns in
+    /// one dispatch (grid z = column). Column 0 is the resident kernel verbatim
+    /// (its live token written in place, its fence advanced). Column 1 walks
+    /// its own ring start (+1), takes token 0 at its slot from a register
+    /// re-pack of the same BF16 (identical bits to what column 0 stores), and
+    /// exports its own live token's packed words for the deferred store below
+    /// instead of writing them, so no threadgroup reads a slot another one
+    /// writes. Per column, the walk order and every accumulation are the
+    /// sequential decode road's.
+    /// MTP-COLS2 v2: ONE walk per (row, kv head) feeds both verify columns.
+    /// Simdgroup b walks column-0 tokens t = b, b+8, ... (slot start+t); for
+    /// column 1 those slots are tokens t-1, i.e. column-1 block (b-1) mod 8 --
+    /// the identical token set in the identical ascending order, so every
+    /// partial is bit-identical to the sequential road's. t = 0 is outside
+    /// column 1's window (skipped); t = N-1 is column 0's live token (packed by
+    /// simdgroup 7, stored in place) and column 1's prior token -- the same
+    /// words; column 1's live token is packed by simdgroup 0 (column-1 block 7),
+    /// folded last, and exported for the deferred store. Column-1 partials are
+    /// stored one block over and merged with the untouched merge.
+    private static let portQuantFusedWriteResidentCols2SharedKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_cols2_shared_v1",
+            inputNames: [
+                "queries",
+                "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
+                "starts", "new_keys", "new_values", "write_fence",
+            ],
+            outputNames: ["out", "fence", "col1_words"],
+            source: """
+                typedef vec<T, 4> T4;
+                constexpr int simd_width = 32;
+                constexpr int values_per_lane = D / simd_width;
+                constexpr int vectors_per_lane = values_per_lane / 4;
+                constexpr int payload_words = D / 8;
+                constexpr int row_words = payload_words + D / 64;
+                constexpr int current_block = (N - 1) % BLOCKS;
+                constexpr int COLS = BLOCKS;
+                constexpr int sets = simd_width / COLS;
+                constexpr int rounds = (BLOCKS + COLS - 1) / COLS;
+                static_assert(BLOCKS == 8, "resident kernel requires eight blocks");
+                static_assert(GQA == 2, "resident kernel requires GQA two");
+                static_assert(values_per_lane % 4 == 0, "lane run is four-wide");
+
+                const int kv_head = int(threadgroup_position_in_grid.x);
+                const int batch_index = int(threadgroup_position_in_grid.y);
+                const int block = int(simdgroup_index_in_threadgroup);
+                const int query_head = GQA * kv_head;
+                const int batch_head = batch_index * 16 + query_head;
+                const int lane = int(thread_index_in_simdgroup);
+
+                threadgroup T local_partials[GQA * BLOCKS * D];
+                threadgroup float local_sums[GQA * BLOCKS];
+                threadgroup float local_maxs[GQA * BLOCKS];
+                threadgroup T local_partials1[GQA * BLOCKS * D];
+                threadgroup float local_sums1[GQA * BLOCKS];
+                threadgroup float local_maxs1[GQA * BLOCKS];
+
+                const device uint32_t* mirror_w = m0;
+                switch (batch_index) {
+                    case 1: mirror_w = m1; break;
+                    case 2: mirror_w = m2; break;
+                    case 3: mirror_w = m3; break;
+                    case 4: mirror_w = m4; break;
+                    case 5: mirror_w = m5; break;
+                    case 6: mirror_w = m6; break;
+                    case 7: mirror_w = m7; break;
+                    default: break;
+                }
+                const device uint32_t* mkeys_w =
+                    mirror_w + kv_head * N * row_words;
+                const device uint32_t* mvalues_w =
+                    mirror_w + (KV_HEADS + kv_head) * N * row_words;
+                const device T* new_key = new_keys
+                    + ((batch_index * KV_HEADS + kv_head) * 2) * D
+                    + lane * values_per_lane;
+                const device T* new_value = new_values
+                    + ((batch_index * KV_HEADS + kv_head) * 2) * D
+                    + lane * values_per_lane;
+                const device T* new_key1 = new_key + D;
+                const device T* new_value1 = new_value + D;
+                const uint start = starts[batch_index];
+                const uint write_slot = (start + uint(N - 1)) % uint(N);
+
+                half khs = half(0.0f);
+                half khb = half(0.0f);
+                half vhs = half(0.0f);
+                half vhb = half(0.0f);
+                uint32_t kword = 0u;
+                uint32_t vword = 0u;
+                if (block == current_block) {
+                    float kmin = 3.402823466e+38F;
+                    float kmax = -3.402823466e+38F;
+                    float vmin = 3.402823466e+38F;
+                    float vmax = -3.402823466e+38F;
+                    float kv[values_per_lane];
+                    float vv[values_per_lane];
+                    const device T4* kvec =
+                        reinterpret_cast<const device T4*>(new_key);
+                    const device T4* vvec =
+                        reinterpret_cast<const device T4*>(new_value);
+                    #pragma unroll
+                    for (int q = 0; q < values_per_lane / 4; ++q) {
+                        const T4 kq4 = kvec[q];
+                        const T4 vq4 = vvec[q];
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            kv[q * 4 + j] = float(kq4[j]);
+                            vv[q * 4 + j] = float(vq4[j]);
+                            kmin = min(kmin, kv[q * 4 + j]);
+                            kmax = max(kmax, kv[q * 4 + j]);
+                            vmin = min(vmin, vv[q * 4 + j]);
+                            vmax = max(vmax, vv[q * 4 + j]);
+                        }
+                    }
+                    for (uint mask = 1; mask < 8; mask <<= 1) {
+                        kmin = min(kmin, simd_shuffle_xor(kmin, mask));
+                        kmax = max(kmax, simd_shuffle_xor(kmax, mask));
+                        vmin = min(vmin, simd_shuffle_xor(vmin, mask));
+                        vmax = max(vmax, simd_shuffle_xor(vmax, mask));
+                    }
+                    khs = half(max((kmax - kmin) / 15.0f, 1e-6f));
+                    khb = half(kmin);
+                    vhs = half(max((vmax - vmin) / 15.0f, 1e-6f));
+                    vhb = half(vmin);
+                    const float ks = float(khs);
+                    const float kb = float(khb);
+                    const float vs = float(vhs);
+                    const float vb = float(vhb);
+                    #pragma unroll
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        const float kq = metal::rint((kv[element] - kb) / ks);
+                        const float vq = metal::rint((vv[element] - vb) / vs);
+                        kword |= uint32_t(clamp(kq, 0.0f, 15.0f)) << (4 * element);
+                        vword |= uint32_t(clamp(vq, 0.0f, 15.0f)) << (4 * element);
+                    }
+
+                    device uint32_t* write_key =
+                        const_cast<device uint32_t*>(mkeys_w)
+                        + write_slot * row_words;
+                    device uint32_t* write_value =
+                        const_cast<device uint32_t*>(mvalues_w)
+                        + write_slot * row_words;
+                    write_key[lane] = kword;
+                    write_value[lane] = vword;
+                    if (lane % 8 == 0) {
+                        write_key[payload_words + lane / 8] =
+                            uint32_t(as_type<ushort>(khs))
+                            | (uint32_t(as_type<ushort>(khb)) << 16);
+                        write_value[payload_words + lane / 8] =
+                            uint32_t(as_type<ushort>(vhs))
+                            | (uint32_t(as_type<ushort>(vhb)) << 16);
+                    }
+                }
+                half khs1 = half(0.0f);
+                half khb1 = half(0.0f);
+                half vhs1 = half(0.0f);
+                half vhb1 = half(0.0f);
+                uint32_t kword1 = 0u;
+                uint32_t vword1 = 0u;
+                if (block == 0) {
+                    float kmin = 3.402823466e+38F;
+                    float kmax = -3.402823466e+38F;
+                    float vmin = 3.402823466e+38F;
+                    float vmax = -3.402823466e+38F;
+                    float kv[values_per_lane];
+                    float vv[values_per_lane];
+                    const device T4* kvec =
+                        reinterpret_cast<const device T4*>(new_key1);
+                    const device T4* vvec =
+                        reinterpret_cast<const device T4*>(new_value1);
+                    #pragma unroll
+                    for (int q = 0; q < values_per_lane / 4; ++q) {
+                        const T4 kq4 = kvec[q];
+                        const T4 vq4 = vvec[q];
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            kv[q * 4 + j] = float(kq4[j]);
+                            vv[q * 4 + j] = float(vq4[j]);
+                            kmin = min(kmin, kv[q * 4 + j]);
+                            kmax = max(kmax, kv[q * 4 + j]);
+                            vmin = min(vmin, vv[q * 4 + j]);
+                            vmax = max(vmax, vv[q * 4 + j]);
+                        }
+                    }
+                    for (uint mask = 1; mask < 8; mask <<= 1) {
+                        kmin = min(kmin, simd_shuffle_xor(kmin, mask));
+                        kmax = max(kmax, simd_shuffle_xor(kmax, mask));
+                        vmin = min(vmin, simd_shuffle_xor(vmin, mask));
+                        vmax = max(vmax, simd_shuffle_xor(vmax, mask));
+                    }
+                    khs1 = half(max((kmax - kmin) / 15.0f, 1e-6f));
+                    khb1 = half(kmin);
+                    vhs1 = half(max((vmax - vmin) / 15.0f, 1e-6f));
+                    vhb1 = half(vmin);
+                    const float ks = float(khs1);
+                    const float kb = float(khb1);
+                    const float vs = float(vhs1);
+                    const float vb = float(vhb1);
+                    #pragma unroll
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        const float kq = metal::rint((kv[element] - kb) / ks);
+                        const float vq = metal::rint((vv[element] - vb) / vs);
+                        kword1 |= uint32_t(clamp(kq, 0.0f, 15.0f)) << (4 * element);
+                        vword1 |= uint32_t(clamp(vq, 0.0f, 15.0f)) << (4 * element);
+                    }
+
+                    device uint32_t* export_key = col1_words
+                        + ((batch_index * KV_HEADS + kv_head) * 2) * row_words;
+                    device uint32_t* export_value = export_key + row_words;
+                    export_key[lane] = kword1;
+                    export_value[lane] = vword1;
+                    if (lane % 8 == 0) {
+                        export_key[payload_words + lane / 8] =
+                            uint32_t(as_type<ushort>(khs1))
+                            | (uint32_t(as_type<ushort>(khb1)) << 16);
+                        export_value[payload_words + lane / 8] =
+                            uint32_t(as_type<ushort>(vhs1))
+                            | (uint32_t(as_type<ushort>(vhb1)) << 16);
+                    }
+                }
+                if (batch_index == 0 && kv_head == 0
+                    && block == current_block && lane == 0) {
+                    fence[0] = write_fence[0] + 1;
+                }
+
+                const device T* query =
+                    queries + (batch_head * 2) * D + lane * values_per_lane;
+                const device T* query1 = query + D;
+                threadgroup T* partial = local_partials
+                    + block * D + lane * values_per_lane;
+                threadgroup float* sum_out = local_sums + block;
+                threadgroup float* max_out = local_maxs + block;
+
+                thread float q_lo[values_per_lane];
+                thread float q_hi[values_per_lane];
+                thread float acc_lo[values_per_lane];
+                thread float acc_hi[values_per_lane];
+                thread float q1_lo[values_per_lane];
+                thread float q1_hi[values_per_lane];
+                thread float acc1_lo[values_per_lane];
+                thread float acc1_hi[values_per_lane];
+                const device T4* qvec = reinterpret_cast<const device T4*>(query);
+                const device T4* qvec_hi = reinterpret_cast<const device T4*>(query + 2 * D);
+                const device T4* qvec1 = reinterpret_cast<const device T4*>(query1);
+                const device T4* qvec1_hi = reinterpret_cast<const device T4*>(query1 + 2 * D);
+                #pragma clang loop unroll(full)
+                for (int q = 0; q < values_per_lane / 4; ++q) {
+                    const T4 q4_lo = qvec[q];
+                    const T4 q4_hi = qvec_hi[q];
+                    const T4 q41_lo = qvec1[q];
+                    const T4 q41_hi = qvec1_hi[q];
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        q_lo[q * 4 + j] = float(q4_lo[j]);
+                        q_hi[q * 4 + j] = float(q4_hi[j]);
+                        q1_lo[q * 4 + j] = float(q41_lo[j]);
+                        q1_hi[q * 4 + j] = float(q41_hi[j]);
+                    }
+                }
+                #pragma clang loop unroll(full)
+                for (int element = 0; element < values_per_lane; ++element) {
+                    acc_lo[element] = 0.0f;
+                    acc_hi[element] = 0.0f;
+                    acc1_lo[element] = 0.0f;
+                    acc1_hi[element] = 0.0f;
+                }
+
+                float max_lo = -3.402823466e+38F;
+                float max_hi = -3.402823466e+38F;
+                float sum_lo = 0.0f;
+                float sum_hi = 0.0f;
+                float max1_lo = -3.402823466e+38F;
+                float max1_hi = -3.402823466e+38F;
+                float sum1_lo = 0.0f;
+                float sum1_hi = 0.0f;
+                uint slot = (start + uint(block)) % uint(N);
+                const bool prefetch_first = block < N - 1;
+                uint next_slot = slot + uint(BLOCKS);
+                if (next_slot >= uint(N)) next_slot -= uint(N);
+                uint32_t kw_pre = prefetch_first
+                    ? mkeys_w[slot * row_words + lane] : 0u;
+                uint32_t vw_pre = prefetch_first
+                    ? mvalues_w[slot * row_words + lane] : 0u;
+                uint32_t ktw_pre = prefetch_first
+                    ? mkeys_w[slot * row_words + payload_words + lane / 8] : 0u;
+                uint32_t vtw_pre = prefetch_first
+                    ? mvalues_w[slot * row_words + payload_words + lane / 8] : 0u;
+                for (int token = block; token < N; token += BLOCKS) {
+                    const bool current = token == N - 1;
+                    const uint32_t kw = current ? kword : kw_pre;
+                    const uint32_t vw = current ? vword : vw_pre;
+                    const uint32_t ktw = current
+                        ? (uint32_t(as_type<ushort>(khs))
+                            | (uint32_t(as_type<ushort>(khb)) << 16))
+                        : ktw_pre;
+                    const uint32_t vtw = current
+                        ? (uint32_t(as_type<ushort>(vhs))
+                            | (uint32_t(as_type<ushort>(vhb)) << 16))
+                        : vtw_pre;
+                    if (token + BLOCKS < N - 1) {
+                        kw_pre = mkeys_w[next_slot * row_words + lane];
+                        vw_pre = mvalues_w[next_slot * row_words + lane];
+                        ktw_pre =
+                            mkeys_w[next_slot * row_words + payload_words + lane / 8];
+                        vtw_pre =
+                            mvalues_w[next_slot * row_words + payload_words + lane / 8];
+                        next_slot += uint(BLOCKS);
+                        if (next_slot >= uint(N)) next_slot -= uint(N);
+                    }
+                    const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
+                    const float kb = float(as_type<half>(ushort(ktw >> 16)));
+                    const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
+                    const float vb = float(as_type<half>(ushort(vtw >> 16)));
+                    float score_lo = 0.0f;
+                    float score_hi = 0.0f;
+                    #pragma clang loop unroll(full)
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        const float key_element =
+                            fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
+                        score_lo += q_lo[element] * key_element;
+                        score_hi += q_hi[element] * key_element;
+                    }
+                    score_lo = simd_sum(score_lo);
+                    score_hi = simd_sum(score_hi);
+
+                    const float new_max_lo = max(max_lo, score_lo);
+                    const float new_max_hi = max(max_hi, score_hi);
+                    const float old_factor_lo = fast::exp(max_lo - new_max_lo);
+                    const float old_factor_hi = fast::exp(max_hi - new_max_hi);
+                    const float score_factor_lo = fast::exp(score_lo - new_max_lo);
+                    const float score_factor_hi = fast::exp(score_hi - new_max_hi);
+                    max_lo = new_max_lo;
+                    max_hi = new_max_hi;
+                    sum_lo = sum_lo * old_factor_lo + score_factor_lo;
+                    sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                    #pragma clang loop unroll(full)
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        const float value_element =
+                            fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
+                        acc_lo[element] = acc_lo[element] * old_factor_lo
+                            + score_factor_lo * value_element;
+                        acc_hi[element] = acc_hi[element] * old_factor_hi
+                            + score_factor_hi * value_element;
+                    }
+                    if (token > 0) {
+                        float score1_lo = 0.0f;
+                        float score1_hi = 0.0f;
+                        #pragma clang loop unroll(full)
+                        for (int element = 0; element < values_per_lane; ++element) {
+                            const float key_element =
+                                fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
+                            score1_lo += q1_lo[element] * key_element;
+                            score1_hi += q1_hi[element] * key_element;
+                        }
+                        score1_lo = simd_sum(score1_lo);
+                        score1_hi = simd_sum(score1_hi);
+                        const float new_max1_lo = max(max1_lo, score1_lo);
+                        const float new_max1_hi = max(max1_hi, score1_hi);
+                        const float old_factor1_lo = fast::exp(max1_lo - new_max1_lo);
+                        const float old_factor1_hi = fast::exp(max1_hi - new_max1_hi);
+                        const float score_factor1_lo = fast::exp(score1_lo - new_max1_lo);
+                        const float score_factor1_hi = fast::exp(score1_hi - new_max1_hi);
+                        max1_lo = new_max1_lo;
+                        max1_hi = new_max1_hi;
+                        sum1_lo = sum1_lo * old_factor1_lo + score_factor1_lo;
+                        sum1_hi = sum1_hi * old_factor1_hi + score_factor1_hi;
+                        #pragma clang loop unroll(full)
+                        for (int element = 0; element < values_per_lane; ++element) {
+                            const float value_element =
+                                fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
+                            acc1_lo[element] = acc1_lo[element] * old_factor1_lo
+                                + score_factor1_lo * value_element;
+                            acc1_hi[element] = acc1_hi[element] * old_factor1_hi
+                                + score_factor1_hi * value_element;
+                        }
+                    }
+                }
+
+                if (block == 0) {
+                    const float ks = float(khs1);
+                    const float kb = float(khb1);
+                    const float vs = float(vhs1);
+                    const float vb = float(vhb1);
+                    float score1_lo = 0.0f;
+                    float score1_hi = 0.0f;
+                    #pragma clang loop unroll(full)
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        const float key_element =
+                            fma(float((kword1 >> (4 * element)) & 0xfu), ks, kb);
+                        score1_lo += q1_lo[element] * key_element;
+                        score1_hi += q1_hi[element] * key_element;
+                    }
+                    score1_lo = simd_sum(score1_lo);
+                    score1_hi = simd_sum(score1_hi);
+                    const float new_max1_lo = max(max1_lo, score1_lo);
+                    const float new_max1_hi = max(max1_hi, score1_hi);
+                    const float old_factor1_lo = fast::exp(max1_lo - new_max1_lo);
+                    const float old_factor1_hi = fast::exp(max1_hi - new_max1_hi);
+                    const float score_factor1_lo = fast::exp(score1_lo - new_max1_lo);
+                    const float score_factor1_hi = fast::exp(score1_hi - new_max1_hi);
+                    max1_lo = new_max1_lo;
+                    max1_hi = new_max1_hi;
+                    sum1_lo = sum1_lo * old_factor1_lo + score_factor1_lo;
+                    sum1_hi = sum1_hi * old_factor1_hi + score_factor1_hi;
+                    #pragma clang loop unroll(full)
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        const float value_element =
+                            fma(float((vword1 >> (4 * element)) & 0xfu), vs, vb);
+                        acc1_lo[element] = acc1_lo[element] * old_factor1_lo
+                            + score_factor1_lo * value_element;
+                        acc1_hi[element] = acc1_hi[element] * old_factor1_hi
+                            + score_factor1_hi * value_element;
+                    }
+                }
+                const int block1 = (block + BLOCKS - 1) % BLOCKS;
+                threadgroup T* partial1 = local_partials1
+                    + block1 * D + lane * values_per_lane;
+                threadgroup float* sum_out1 = local_sums1 + block1;
+                threadgroup float* max_out1 = local_maxs1 + block1;
+                if (lane == 0) {
+                    sum_out1[0] = sum1_lo;
+                    max_out1[0] = max1_lo;
+                    sum_out1[BLOCKS] = sum1_hi;
+                    max_out1[BLOCKS] = max1_hi;
+                }
+                threadgroup T4* partial1_vec_lo =
+                    reinterpret_cast<threadgroup T4*>(partial1);
+                threadgroup T4* partial1_vec_hi =
+                    reinterpret_cast<threadgroup T4*>(partial1 + BLOCKS * D);
+                #pragma clang loop unroll(full)
+                for (int q = 0; q < values_per_lane / 4; ++q) {
+                    T4 p41_lo, p41_hi;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        p41_lo[j] = T(acc1_lo[q * 4 + j]);
+                        p41_hi[j] = T(acc1_hi[q * 4 + j]);
+                    }
+                    partial1_vec_lo[q] = p41_lo;
+                    partial1_vec_hi[q] = p41_hi;
+                }
+                if (lane == 0) {
+                    sum_out[0] = sum_lo;
+                    max_out[0] = max_lo;
+                    sum_out[BLOCKS] = sum_hi;
+                    max_out[BLOCKS] = max_hi;
+                }
+                threadgroup T4* partial_vec_lo =
+                    reinterpret_cast<threadgroup T4*>(partial);
+                threadgroup T4* partial_vec_hi =
+                    reinterpret_cast<threadgroup T4*>(partial + BLOCKS * D);
+                #pragma clang loop unroll(full)
+                for (int q = 0; q < values_per_lane / 4; ++q) {
+                    T4 p4_lo, p4_hi;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        p4_lo[j] = T(acc_lo[q * 4 + j]);
+                        p4_hi[j] = T(acc_hi[q * 4 + j]);
+                    }
+                    partial_vec_lo[q] = p4_lo;
+                    partial_vec_hi[q] = p4_hi;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                const int block_lane = lane % COLS;
+                const int output_group = block * sets + lane / COLS;
+                for (int col = 0; col < 2; ++col) {
+                const threadgroup T* base_partials = col == 0 ? local_partials : local_partials1;
+                const threadgroup float* base_sums = col == 0 ? local_sums : local_sums1;
+                const threadgroup float* base_maxs = col == 0 ? local_maxs : local_maxs1;
+                #pragma clang loop unroll(full)
+                for (int head = 0; head < GQA; ++head) {
+                    const threadgroup T* head_partials = base_partials
+                        + head * BLOCKS * D + output_group * values_per_lane;
+                    const threadgroup float* head_sums =
+                        base_sums + head * BLOCKS;
+                    const threadgroup float* head_maxs =
+                        base_maxs + head * BLOCKS;
+                    device T* head_out = out
+                        + ((batch_head + head) * 2 + col) * D
+                        + output_group * values_per_lane;
+
+                    thread float accumulator[values_per_lane];
+                    #pragma clang loop unroll(full)
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        accumulator[element] = 0.0f;
+                    }
+                    thread float lane_max[rounds];
+                    thread float lane_sum[rounds];
+                    thread float lane_factor[rounds];
+                    float sum_exp_score = 0.0f;
+                    float max_score = -3.402823466e+38F;
+                    #pragma clang loop unroll(full)
+                    for (int round = 0; round < rounds; ++round) {
+                        const int column = block_lane + COLS * round;
+                        const bool live = column < BLOCKS;
+                        lane_max[round] =
+                            live ? head_maxs[column] : -3.402823466e+38F;
+                        lane_sum[round] = live ? head_sums[column] : 0.0f;
+                        max_score = max(max_score, lane_max[round]);
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int stride = 1; stride < COLS; stride <<= 1) {
+                        max_score = max(
+                            max_score,
+                            simd_shuffle_xor(max_score, ushort(stride)));
+                    }
+
+                    #pragma clang loop unroll(full)
+                    for (int round = 0; round < rounds; ++round) {
+                        lane_factor[round] =
+                            fast::exp(lane_max[round] - max_score);
+                        sum_exp_score += lane_factor[round] * lane_sum[round];
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int stride = 1; stride < COLS; stride <<= 1) {
+                        sum_exp_score +=
+                            simd_shuffle_xor(sum_exp_score, ushort(stride));
+                    }
+
+                    #pragma clang loop unroll(full)
+                    for (int round = 0; round < rounds; ++round) {
+                        const int column = block_lane + COLS * round;
+                        if (column < BLOCKS) {
+                            const float factor = lane_factor[round];
+                            const threadgroup T4* partial_vectors =
+                                reinterpret_cast<const threadgroup T4*>(
+                                    head_partials + column * D);
+                            #pragma clang loop unroll(full)
+                            for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
+                                const T4 partial_vector = partial_vectors[chunk];
+                                #pragma clang loop unroll(full)
+                                for (int j = 0; j < 4; ++j) {
+                                    accumulator[chunk * 4 + j] +=
+                                        factor * float(partial_vector[j]);
+                                }
+                            }
+                        }
+                    }
+
+                    // Each step trades the half of the live slots whose
+                    // element bit matches the partner's column bit and keeps
+                    // the other half, so the live count runs 8, 4, 2, 1 and
+                    // the lane that survives for an element is the one whose
+                    // column index equals it. Every node of the addition tree
+                    // pairs the same two column subtrees the per-element
+                    // butterfly paired.
+                    #pragma clang loop unroll(full)
+                    for (int step = 0; (1 << step) < COLS; ++step) {
+                        const ushort stride = ushort(1 << step);
+                        const bool upper = (block_lane & int(stride)) != 0;
+                        const int live = values_per_lane >> step;
+                        #pragma clang loop unroll(full)
+                        for (int slot = 0; slot < live; slot += 2) {
+                            const float keep = upper
+                                ? accumulator[slot + 1]
+                                : accumulator[slot];
+                            const float trade = upper
+                                ? accumulator[slot]
+                                : accumulator[slot + 1];
+                            accumulator[slot >> 1] =
+                                keep + simd_shuffle_xor(trade, stride);
+                        }
+                    }
+                    head_out[block_lane] = T(
+                        sum_exp_score == 0.0f
+                            ? accumulator[0]
+                            : accumulator[0] / sum_exp_score);
+                }
+                }
+""",
+            ensureRowContiguous: true
+        )
+
+    private static let portQuantFusedWriteResidentCols2Kernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_cols2_v1",
+            inputNames: [
+                "queries",
+                "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
+                "starts", "new_keys", "new_values", "write_fence",
+            ],
+            outputNames: ["out", "fence", "col1_words"],
+            source: """
+                typedef vec<T, 4> T4;
+                constexpr int simd_width = 32;
+                constexpr int values_per_lane = D / simd_width;
+                constexpr int vectors_per_lane = values_per_lane / 4;
+                constexpr int payload_words = D / 8;
+                constexpr int row_words = payload_words + D / 64;
+                constexpr int current_block = (N - 1) % BLOCKS;
+                constexpr int COLS = BLOCKS;
+                constexpr int sets = simd_width / COLS;
+                constexpr int rounds = (BLOCKS + COLS - 1) / COLS;
+                static_assert(BLOCKS == 8, "resident kernel requires eight blocks");
+                static_assert(GQA == 2, "resident kernel requires GQA two");
+                static_assert(values_per_lane % 4 == 0, "lane run is four-wide");
+
+                const int kv_head = int(threadgroup_position_in_grid.x);
+                const int batch_index = int(threadgroup_position_in_grid.y);
+                const int column = int(threadgroup_position_in_grid.z);
+                const int block = int(simdgroup_index_in_threadgroup);
+                const int query_head = GQA * kv_head;
+                const int batch_head = batch_index * 16 + query_head;
+                const int lane = int(thread_index_in_simdgroup);
+
+                threadgroup T local_partials[GQA * BLOCKS * D];
+                threadgroup float local_sums[GQA * BLOCKS];
+                threadgroup float local_maxs[GQA * BLOCKS];
+
+                const device uint32_t* mirror_w = m0;
+                switch (batch_index) {
+                    case 1: mirror_w = m1; break;
+                    case 2: mirror_w = m2; break;
+                    case 3: mirror_w = m3; break;
+                    case 4: mirror_w = m4; break;
+                    case 5: mirror_w = m5; break;
+                    case 6: mirror_w = m6; break;
+                    case 7: mirror_w = m7; break;
+                    default: break;
+                }
+                const device uint32_t* mkeys_w =
+                    mirror_w + kv_head * N * row_words;
+                const device uint32_t* mvalues_w =
+                    mirror_w + (KV_HEADS + kv_head) * N * row_words;
+                const device T* new_key0 = new_keys
+                    + ((batch_index * KV_HEADS + kv_head) * 2) * D
+                    + lane * values_per_lane;
+                const device T* new_value0 = new_values
+                    + ((batch_index * KV_HEADS + kv_head) * 2) * D
+                    + lane * values_per_lane;
+                const device T* new_key = new_key0 + column * D;
+                const device T* new_value = new_value0 + column * D;
+                const uint start = (starts[batch_index] + uint(column)) % uint(N);
+                const uint write_slot = (start + uint(N - 1)) % uint(N);
+                const bool packs_live = block == current_block;
+                const bool packs_prior = column == 1 && block == (N - 2) % BLOCKS;
+
+                half khs = half(0.0f);
+                half khb = half(0.0f);
+                half vhs = half(0.0f);
+                half vhb = half(0.0f);
+                uint32_t kword = 0u;
+                uint32_t vword = 0u;
+                half khs0 = half(0.0f);
+                half khb0 = half(0.0f);
+                half vhs0 = half(0.0f);
+                half vhb0 = half(0.0f);
+                uint32_t kword0 = 0u;
+                uint32_t vword0 = 0u;
+                if (packs_live || packs_prior) {
+                    const device T* pack_key = packs_live ? new_key : new_key0;
+                    const device T* pack_value = packs_live ? new_value : new_value0;
+                    float kmin = 3.402823466e+38F;
+                    float kmax = -3.402823466e+38F;
+                    float vmin = 3.402823466e+38F;
+                    float vmax = -3.402823466e+38F;
+                    float kv[values_per_lane];
+                    float vv[values_per_lane];
+                    const device T4* kvec =
+                        reinterpret_cast<const device T4*>(pack_key);
+                    const device T4* vvec =
+                        reinterpret_cast<const device T4*>(pack_value);
+                    #pragma unroll
+                    for (int q = 0; q < values_per_lane / 4; ++q) {
+                        const T4 kq4 = kvec[q];
+                        const T4 vq4 = vvec[q];
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            kv[q * 4 + j] = float(kq4[j]);
+                            vv[q * 4 + j] = float(vq4[j]);
+                            kmin = min(kmin, kv[q * 4 + j]);
+                            kmax = max(kmax, kv[q * 4 + j]);
+                            vmin = min(vmin, vv[q * 4 + j]);
+                            vmax = max(vmax, vv[q * 4 + j]);
+                        }
+                    }
+                    for (uint mask = 1; mask < 8; mask <<= 1) {
+                        kmin = min(kmin, simd_shuffle_xor(kmin, mask));
+                        kmax = max(kmax, simd_shuffle_xor(kmax, mask));
+                        vmin = min(vmin, simd_shuffle_xor(vmin, mask));
+                        vmax = max(vmax, simd_shuffle_xor(vmax, mask));
+                    }
+                    khs = half(max((kmax - kmin) / 15.0f, 1e-6f));
+                    khb = half(kmin);
+                    vhs = half(max((vmax - vmin) / 15.0f, 1e-6f));
+                    vhb = half(vmin);
+                    const float ks = float(khs);
+                    const float kb = float(khb);
+                    const float vs = float(vhs);
+                    const float vb = float(vhb);
+                    #pragma unroll
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        const float kq = metal::rint((kv[element] - kb) / ks);
+                        const float vq = metal::rint((vv[element] - vb) / vs);
+                        kword |= uint32_t(clamp(kq, 0.0f, 15.0f)) << (4 * element);
+                        vword |= uint32_t(clamp(vq, 0.0f, 15.0f)) << (4 * element);
+                    }
+
+                    if (packs_prior) {
+                        kword0 = kword; vword0 = vword; khs0 = khs; khb0 = khb; vhs0 = vhs; vhb0 = vhb;
+                        kword = 0u; vword = 0u;
+                    } else if (column == 0) {
+                        device uint32_t* write_key =
+                            const_cast<device uint32_t*>(mkeys_w)
+                            + write_slot * row_words;
+                        device uint32_t* write_value =
+                            const_cast<device uint32_t*>(mvalues_w)
+                            + write_slot * row_words;
+                        write_key[lane] = kword;
+                        write_value[lane] = vword;
+                        if (lane % 8 == 0) {
+                            write_key[payload_words + lane / 8] =
+                                uint32_t(as_type<ushort>(khs))
+                                | (uint32_t(as_type<ushort>(khb)) << 16);
+                            write_value[payload_words + lane / 8] =
+                                uint32_t(as_type<ushort>(vhs))
+                                | (uint32_t(as_type<ushort>(vhb)) << 16);
+                        }
+                    } else {
+                        device uint32_t* export_key = col1_words
+                            + ((batch_index * KV_HEADS + kv_head) * 2) * row_words;
+                        device uint32_t* export_value = export_key + row_words;
+                        export_key[lane] = kword;
+                        export_value[lane] = vword;
+                        if (lane % 8 == 0) {
+                            export_key[payload_words + lane / 8] =
+                                uint32_t(as_type<ushort>(khs))
+                                | (uint32_t(as_type<ushort>(khb)) << 16);
+                            export_value[payload_words + lane / 8] =
+                                uint32_t(as_type<ushort>(vhs))
+                                | (uint32_t(as_type<ushort>(vhb)) << 16);
+                        }
+                    }
+                }
+                if (column == 0 && batch_index == 0 && kv_head == 0
+                    && block == current_block && lane == 0) {
+                    fence[0] = write_fence[0] + 1;
+                }
+
+                const device T* query =
+                    queries + (batch_head * 2 + column) * D + lane * values_per_lane;
+                threadgroup T* partial = local_partials
+                    + block * D + lane * values_per_lane;
+                threadgroup float* sum_out = local_sums + block;
+                threadgroup float* max_out = local_maxs + block;
+
+                thread float q_lo[values_per_lane];
+                thread float q_hi[values_per_lane];
+                thread float acc_lo[values_per_lane];
+                thread float acc_hi[values_per_lane];
+                const device T4* qvec = reinterpret_cast<const device T4*>(query);
+                const device T4* qvec_hi = reinterpret_cast<const device T4*>(query + 2 * D);
+                #pragma clang loop unroll(full)
+                for (int q = 0; q < values_per_lane / 4; ++q) {
+                    const T4 q4_lo = qvec[q];
+                    const T4 q4_hi = qvec_hi[q];
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        q_lo[q * 4 + j] = float(q4_lo[j]);
+                        q_hi[q * 4 + j] = float(q4_hi[j]);
+                    }
+                }
+                #pragma clang loop unroll(full)
+                for (int element = 0; element < values_per_lane; ++element) {
+                    acc_lo[element] = 0.0f;
+                    acc_hi[element] = 0.0f;
+                }
+
+                float max_lo = -3.402823466e+38F;
+                float max_hi = -3.402823466e+38F;
+                float sum_lo = 0.0f;
+                float sum_hi = 0.0f;
+                uint slot = (start + uint(block)) % uint(N);
+                const bool prefetch_first = block < N - 1;
+                uint next_slot = slot + uint(BLOCKS);
+                if (next_slot >= uint(N)) next_slot -= uint(N);
+                uint32_t kw_pre = prefetch_first
+                    ? mkeys_w[slot * row_words + lane] : 0u;
+                uint32_t vw_pre = prefetch_first
+                    ? mvalues_w[slot * row_words + lane] : 0u;
+                uint32_t ktw_pre = prefetch_first
+                    ? mkeys_w[slot * row_words + payload_words + lane / 8] : 0u;
+                uint32_t vtw_pre = prefetch_first
+                    ? mvalues_w[slot * row_words + payload_words + lane / 8] : 0u;
+                for (int token = block; token < N; token += BLOCKS) {
+                    const bool current = token == N - 1;
+                    const bool prior = column == 1 && token == N - 2;
+                    const uint32_t kw = current ? kword : (prior ? kword0 : kw_pre);
+                    const uint32_t vw = current ? vword : (prior ? vword0 : vw_pre);
+                    const uint32_t ktw = current
+                        ? (uint32_t(as_type<ushort>(khs))
+                            | (uint32_t(as_type<ushort>(khb)) << 16))
+                        : (prior
+                            ? (uint32_t(as_type<ushort>(khs0))
+                                | (uint32_t(as_type<ushort>(khb0)) << 16))
+                            : ktw_pre);
+                    const uint32_t vtw = current
+                        ? (uint32_t(as_type<ushort>(vhs))
+                            | (uint32_t(as_type<ushort>(vhb)) << 16))
+                        : (prior
+                            ? (uint32_t(as_type<ushort>(vhs0))
+                                | (uint32_t(as_type<ushort>(vhb0)) << 16))
+                            : vtw_pre);
+                    if (token + BLOCKS < N - 1) {
+                        kw_pre = mkeys_w[next_slot * row_words + lane];
+                        vw_pre = mvalues_w[next_slot * row_words + lane];
+                        ktw_pre =
+                            mkeys_w[next_slot * row_words + payload_words + lane / 8];
+                        vtw_pre =
+                            mvalues_w[next_slot * row_words + payload_words + lane / 8];
+                        next_slot += uint(BLOCKS);
+                        if (next_slot >= uint(N)) next_slot -= uint(N);
+                    }
+                    const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
+                    const float kb = float(as_type<half>(ushort(ktw >> 16)));
+                    const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
+                    const float vb = float(as_type<half>(ushort(vtw >> 16)));
+                    float score_lo = 0.0f;
+                    float score_hi = 0.0f;
+                    #pragma clang loop unroll(full)
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        const float key_element =
+                            fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
+                        score_lo += q_lo[element] * key_element;
+                        score_hi += q_hi[element] * key_element;
+                    }
+                    score_lo = simd_sum(score_lo);
+                    score_hi = simd_sum(score_hi);
+
+                    const float new_max_lo = max(max_lo, score_lo);
+                    const float new_max_hi = max(max_hi, score_hi);
+                    const float old_factor_lo = fast::exp(max_lo - new_max_lo);
+                    const float old_factor_hi = fast::exp(max_hi - new_max_hi);
+                    const float score_factor_lo = fast::exp(score_lo - new_max_lo);
+                    const float score_factor_hi = fast::exp(score_hi - new_max_hi);
+                    max_lo = new_max_lo;
+                    max_hi = new_max_hi;
+                    sum_lo = sum_lo * old_factor_lo + score_factor_lo;
+                    sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                    #pragma clang loop unroll(full)
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        const float value_element =
+                            fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
+                        acc_lo[element] = acc_lo[element] * old_factor_lo
+                            + score_factor_lo * value_element;
+                        acc_hi[element] = acc_hi[element] * old_factor_hi
+                            + score_factor_hi * value_element;
+                    }
+                }
+
+                if (lane == 0) {
+                    sum_out[0] = sum_lo;
+                    max_out[0] = max_lo;
+                    sum_out[BLOCKS] = sum_hi;
+                    max_out[BLOCKS] = max_hi;
+                }
+                threadgroup T4* partial_vec_lo =
+                    reinterpret_cast<threadgroup T4*>(partial);
+                threadgroup T4* partial_vec_hi =
+                    reinterpret_cast<threadgroup T4*>(partial + BLOCKS * D);
+                #pragma clang loop unroll(full)
+                for (int q = 0; q < values_per_lane / 4; ++q) {
+                    T4 p4_lo, p4_hi;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        p4_lo[j] = T(acc_lo[q * 4 + j]);
+                        p4_hi[j] = T(acc_hi[q * 4 + j]);
+                    }
+                    partial_vec_lo[q] = p4_lo;
+                    partial_vec_hi[q] = p4_hi;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                const int block_lane = lane % COLS;
+                const int output_group = block * sets + lane / COLS;
+                #pragma clang loop unroll(full)
+                for (int head = 0; head < GQA; ++head) {
+                    const threadgroup T* head_partials = local_partials
+                        + head * BLOCKS * D + output_group * values_per_lane;
+                    const threadgroup float* head_sums =
+                        local_sums + head * BLOCKS;
+                    const threadgroup float* head_maxs =
+                        local_maxs + head * BLOCKS;
+                    device T* head_out = out
+                        + ((batch_head + head) * 2 + column) * D
+                        + output_group * values_per_lane;
+
+                    thread float accumulator[values_per_lane];
+                    #pragma clang loop unroll(full)
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        accumulator[element] = 0.0f;
+                    }
+                    thread float lane_max[rounds];
+                    thread float lane_sum[rounds];
+                    thread float lane_factor[rounds];
+                    float sum_exp_score = 0.0f;
+                    float max_score = -3.402823466e+38F;
+                    #pragma clang loop unroll(full)
+                    for (int round = 0; round < rounds; ++round) {
+                        const int column = block_lane + COLS * round;
+                        const bool live = column < BLOCKS;
+                        lane_max[round] =
+                            live ? head_maxs[column] : -3.402823466e+38F;
+                        lane_sum[round] = live ? head_sums[column] : 0.0f;
+                        max_score = max(max_score, lane_max[round]);
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int stride = 1; stride < COLS; stride <<= 1) {
+                        max_score = max(
+                            max_score,
+                            simd_shuffle_xor(max_score, ushort(stride)));
+                    }
+
+                    #pragma clang loop unroll(full)
+                    for (int round = 0; round < rounds; ++round) {
+                        lane_factor[round] =
+                            fast::exp(lane_max[round] - max_score);
+                        sum_exp_score += lane_factor[round] * lane_sum[round];
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int stride = 1; stride < COLS; stride <<= 1) {
+                        sum_exp_score +=
+                            simd_shuffle_xor(sum_exp_score, ushort(stride));
+                    }
+
+                    #pragma clang loop unroll(full)
+                    for (int round = 0; round < rounds; ++round) {
+                        const int column = block_lane + COLS * round;
+                        if (column < BLOCKS) {
+                            const float factor = lane_factor[round];
+                            const threadgroup T4* partial_vectors =
+                                reinterpret_cast<const threadgroup T4*>(
+                                    head_partials + column * D);
+                            #pragma clang loop unroll(full)
+                            for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
+                                const T4 partial_vector = partial_vectors[chunk];
+                                #pragma clang loop unroll(full)
+                                for (int j = 0; j < 4; ++j) {
+                                    accumulator[chunk * 4 + j] +=
+                                        factor * float(partial_vector[j]);
+                                }
+                            }
+                        }
+                    }
+
+                    // Each step trades the half of the live slots whose
+                    // element bit matches the partner's column bit and keeps
+                    // the other half, so the live count runs 8, 4, 2, 1 and
+                    // the lane that survives for an element is the one whose
+                    // column index equals it. Every node of the addition tree
+                    // pairs the same two column subtrees the per-element
+                    // butterfly paired.
+                    #pragma clang loop unroll(full)
+                    for (int step = 0; (1 << step) < COLS; ++step) {
+                        const ushort stride = ushort(1 << step);
+                        const bool upper = (block_lane & int(stride)) != 0;
+                        const int live = values_per_lane >> step;
+                        #pragma clang loop unroll(full)
+                        for (int slot = 0; slot < live; slot += 2) {
+                            const float keep = upper
+                                ? accumulator[slot + 1]
+                                : accumulator[slot];
+                            const float trade = upper
+                                ? accumulator[slot]
+                                : accumulator[slot + 1];
+                            accumulator[slot >> 1] =
+                                keep + simd_shuffle_xor(trade, stride);
+                        }
+                    }
+                    head_out[block_lane] = T(
+                        sum_exp_score == 0.0f
+                            ? accumulator[0]
+                            : accumulator[0] / sum_exp_score);
+                }
+            """,
+            ensureRowContiguous: true
+        )
+
+    /// MTP-COLS2 deferred store: column 1's packed words into the slot the
+    /// sequential road's second pass A would have written, fence-chained
+    /// after the two-column pass A.
+    private static let portQuantCols2StoreKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "cbv2_ragged8_q4g64_d256_cols2_deferred_store_v1",
+            inputNames: [
+                "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
+                "starts", "col1_words", "write_fence",
+            ],
+            outputNames: ["fence"],
+            source: """
+                constexpr int payload_words = D / 8;
+                constexpr int row_words = payload_words + D / 64;
+                const int row_head = int(threadgroup_position_in_grid.x);
+                const int batch_index = row_head / KV_HEADS;
+                const int kv_head = row_head % KV_HEADS;
+                const int word = int(thread_position_in_threadgroup.x);
+                const device uint32_t* mirror_w = m0;
+                switch (batch_index) {
+                    case 1: mirror_w = m1; break;
+                    case 2: mirror_w = m2; break;
+                    case 3: mirror_w = m3; break;
+                    case 4: mirror_w = m4; break;
+                    case 5: mirror_w = m5; break;
+                    case 6: mirror_w = m6; break;
+                    case 7: mirror_w = m7; break;
+                    default: break;
+                }
+                const uint slot = starts[batch_index] % uint(N);
+                device uint32_t* write_key =
+                    const_cast<device uint32_t*>(mirror_w)
+                    + (kv_head * N + int(slot)) * row_words;
+                device uint32_t* write_value =
+                    const_cast<device uint32_t*>(mirror_w)
+                    + ((KV_HEADS + kv_head) * N + int(slot)) * row_words;
+                const device uint32_t* src_key = col1_words
+                    + (row_head * 2) * row_words;
+                const device uint32_t* src_value = src_key + row_words;
+                if (word < row_words) {
+                    write_key[word] = src_key[word];
+                    write_value[word] = src_value[word];
+                }
+                if (row_head == 0 && word == 0) {
+                    fence[0] = write_fence[0] + 1;
+                }
+            """,
+            ensureRowContiguous: true
+        )
+
     private static let portQuantFusedWriteResidentKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
             name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3",
@@ -1926,7 +2954,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             "[kvq4-kernel] blocks=\(blocks) maxs[0..3]=\(maxs[0..<4]) partial[0..5]=\(partial[0..<6])\n".utf8))
     }
 
-    static func attendRingQuant(
+    public static func attendRingQuant(
         queries: MLXArray,
         mirrors: [MLXArray],
         starts: [Int],
@@ -1986,6 +3014,96 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// Exact B8/D256 q4g64 ring attention which packs this step's new K/V
     /// into the live mirror from pass A. Pass B consumes the first three
     /// outputs, while the fourth output is the next step's write fence.
+    /// MTP-COLS2 v2 switch: one shared walk per (row, kv head) feeding both
+    /// columns. `DARKBLOOM_GEMMA4_MTP_COLS2_SHARED=0` keeps the v1 two-walk
+    /// kernel (same outputs, same bits, whole mirror read per column).
+    static let cols2SharedEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_MTP_COLS2_SHARED"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// MTP-COLS2 host road: both verify columns through one pass A plus the
+    /// deferred store of column 1's words. `starts` are the column-0 post-write
+    /// starts (exactly what the sequential road passes for its first column).
+    public static func attendRingQuantWritingCols2(
+        queries: MLXArray,
+        mirrors: [MLXArray],
+        starts: [Int],
+        newKeys: MLXArray,
+        newValues: MLXArray,
+        previousWriteFence: MLXArray,
+        scale: Float,
+        slidingWindowLength: Int,
+        deferStore: Bool = true
+    ) -> (output: MLXArray, nextWriteFence: MLXArray)? {
+        guard CBv2WindowedSequenceKV.q4FusedMirrorWriteEnabled,
+            CBv2WindowedSequenceKV.quantEnabled,
+            !CBv2WindowedSequenceKV.quantSimulate,
+            !CBv2WindowedSequenceKV.gpuPackCheck,
+            q4ResidentMergeEnabled, blocks == 8, combineColumns == 8, combineThreads == 256,
+            slidingWindowLength == sequenceLength,
+            starts.count == batch,
+            starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength }),
+            enabled,
+            scale == 1.0,
+            queries.dtype == .bfloat16,
+            queries.shape == [batch, queryHeads, 2, headDim],
+            newKeys.dtype == .bfloat16,
+            newKeys.shape == [batch, kvHeads, 2, headDim],
+            newValues.dtype == .bfloat16,
+            newValues.shape == newKeys.shape,
+            previousWriteFence.dtype == .int32,
+            previousWriteFence.shape == [1],
+            mirrors.count == batch,
+            mirrors.allSatisfy({
+                $0.dtype == .uint32
+                    && $0.shape == [2, kvHeads, sequenceLength, headDim / 8 + headDim / 64]
+            })
+        else { return nil }
+        let rowWords = headDim / 8 + headDim / 64
+        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let template: [(String, any KernelTemplateArg)] = [
+            ("T", queries.dtype), ("D", headDim), ("N", sequenceLength),
+            ("GQA", gqa), ("KV_HEADS", kvHeads), ("BLOCKS", blocks),
+        ]
+        let passA: [MLXArray]
+        if cols2SharedEnabled {
+            passA = portQuantFusedWriteResidentCols2SharedKernel(
+                [queries] + mirrors + [startArray, newKeys, newValues, previousWriteFence],
+                template: template,
+                grid: (kvHeads * blocks * 32, batch, 1),
+                threadGroup: (blocks * 32, 1, 1),
+                outputShapes: [[batch, queryHeads, 2, headDim], [1], [batch, kvHeads, 2, rowWords]],
+                outputDTypes: [.bfloat16, .int32, .uint32]
+            )
+            CBv2EngageMark.once("mtp-cols2-shared")
+        } else {
+            passA = portQuantFusedWriteResidentCols2Kernel(
+                [queries] + mirrors + [startArray, newKeys, newValues, previousWriteFence],
+                template: template,
+                grid: (kvHeads * blocks * 32, batch, 2),
+                threadGroup: (blocks * 32, 1, 1),
+                outputShapes: [[batch, queryHeads, 2, headDim], [1], [batch, kvHeads, 2, rowWords]],
+                outputDTypes: [.bfloat16, .int32, .uint32]
+            )
+        }
+        if !deferStore { return (passA[0], passA[1]) }
+        let storeFence = portQuantCols2StoreKernel(
+            mirrors + [startArray, passA[2], passA[1]],
+            template: [
+                ("T", queries.dtype), ("D", headDim), ("N", sequenceLength),
+                ("KV_HEADS", kvHeads),
+            ],
+            grid: (batch * kvHeads * 64, 1, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [[1]],
+            outputDTypes: [.int32]
+        )[0]
+        CBv2EngageMark.once("mtp-cols2-attn")
+        return (passA[0], storeFence)
+    }
+
     static func attendRingQuantWriting(
         queries: MLXArray,
         mirrors: [MLXArray],
@@ -2082,7 +3200,13 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         return (output, passA[3])
     }
 
-    static func attendRing(
+    /// K16: the cohort size every ring kernel in this type is compiled for.
+    /// `prepare(rows:)` asks BEFORE it chooses the ring road, so a cohort the
+    /// kernels cannot serve takes the established stacked road instead of
+    /// reaching a decline.
+    public static var ringCohortSize: Int { batch }
+
+    public static func attendRing(
         queries: MLXArray,
         keys: [MLXArray],
         values: [MLXArray],

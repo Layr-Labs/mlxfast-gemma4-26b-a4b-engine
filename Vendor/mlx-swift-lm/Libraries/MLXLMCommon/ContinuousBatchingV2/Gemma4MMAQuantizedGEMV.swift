@@ -1094,11 +1094,11 @@ public enum Gemma4MMAQuantizedGEMV {
     /// activation group. Versions 1...4 reproduce it inside every vocabulary
     /// tile. At N=262144 that repeats the same 352 sums in 8,192 threadgroups.
     /// This prepass writes those exact FP32 sums once.
-    private static let xSumKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_xsum_m8_v27_unroll",
-        inputNames: ["x"],
-        outputNames: ["xSums"],
-        source: """
+    /// Extracted from the kernel below without moving one character of it:
+    /// the closing delimiter keeps its column, so the resolved literal is the
+    /// text the eight-row activation-sum kernel has always been handed. The
+    /// sixteen-row twin is derived from THIS string by one constant.
+    private static let xSumSource = """
             constexpr uint M_ROWS = 8;
             constexpr uint GROUP = 64;
             constexpr uint N_GROUPS = K / GROUP;
@@ -1115,7 +1115,13 @@ public enum Gemma4MMAQuantizedGEMV {
                 s += xp[i + 4] + xp[i + 5] + xp[i + 6] + xp[i + 7];
             }
             xSums[cell] = s;
-            """,
+            """
+
+    private static let xSumKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_affine4_xsum_m8_v27_unroll",
+        inputNames: ["x"],
+        outputNames: ["xSums"],
+        source: xSumSource,
         ensureRowContiguous: true
     )
 
@@ -2562,6 +2568,7 @@ public enum Gemma4MMAQuantizedGEMV {
             """
         )
 
+        srcMark("mma-head-src8-", result)
         return result
     }()
 
@@ -2746,6 +2753,7 @@ public enum Gemma4MMAQuantizedGEMV {
             """
         )
 
+        srcMark("mma-head-carry-src8-", result)
         return result
     }()
 
@@ -2757,6 +2765,399 @@ public enum Gemma4MMAQuantizedGEMV {
         header: "#include <metal_simdgroup_matrix>\n",
         ensureRowContiguous: true
     )
+
+    // MARK: - Rectangular verify --- the same body, sixteen rows
+
+    /// LMHEAD-ROWS16-001. With speculation on, a decode round verifies the
+    /// `[B, 1 + k]` rectangle instead of the `[B, 1]` step, and at `k = 1` the
+    /// tied head is asked for sixteen flat rows rather than eight. The
+    /// promoted body gates on eight, so the rectangle falls off it entirely.
+    ///
+    /// The rows of this kernel are the ACTIVATION FRAGMENT's column axis. A
+    /// lane's `fragmentCol` selects which two rows of `x` its two fragment
+    /// elements carry, the K walk is a function of `g` and `n` only, and there
+    /// is no threadgroup memory and no barrier anywhere in the body. So rows
+    /// 8...15 are a SECOND M tile over the same four output columns, sharing
+    /// the weight operands the first tile already read: one activation
+    /// fragment, one accumulator set and one store per tile, appended AFTER
+    /// the statements they copy so the incumbent eight rows keep the emitted
+    /// arithmetic word for word. The vocabulary plane is read ONCE for both
+    /// tiles --- 415 MB per round at sixteen rows, not 830.
+    ///
+    /// Caveat carried from the carry ticket: statement MOTION in this body has
+    /// changed floating-point contraction before. Nothing moves here; every
+    /// edit is an append. The receipt is still bitwise, never `allclose`.
+    private static func rows16Source(_ base: String) -> String {
+        var result = base
+
+        func replaceOnce(_ old: String, with new: String) {
+            let count = result.components(separatedBy: old).count
+            precondition(
+                count == 2, "rows16Source replacement count \(count): \(old)")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+
+        replaceOnce(
+            """
+            simdgroup_matrix<float, 8, 8> acc0 = simdgroup_matrix<float, 8, 8>(0.0f);
+            simdgroup_matrix<float, 8, 8> acc1 = simdgroup_matrix<float, 8, 8>(0.0f);
+            simdgroup_matrix<float, 8, 8> acc2 = simdgroup_matrix<float, 8, 8>(0.0f);
+            simdgroup_matrix<float, 8, 8> acc3 = simdgroup_matrix<float, 8, 8>(0.0f);
+            """,
+            with: """
+            simdgroup_matrix<float, 8, 8> acc0 = simdgroup_matrix<float, 8, 8>(0.0f);
+            simdgroup_matrix<float, 8, 8> acc1 = simdgroup_matrix<float, 8, 8>(0.0f);
+            simdgroup_matrix<float, 8, 8> acc2 = simdgroup_matrix<float, 8, 8>(0.0f);
+            simdgroup_matrix<float, 8, 8> acc3 = simdgroup_matrix<float, 8, 8>(0.0f);
+            // ROWS16. Rows 8...15 of the flattened rectangle are a SECOND M tile on
+            // the same four output columns. Every statement below is appended after
+            // the incumbent one it copies, never interleaved with it, so rows 0...7
+            // keep the emitted arithmetic word for word.
+            simdgroup_matrix<float, 8, 8> accR0 = simdgroup_matrix<float, 8, 8>(0.0f);
+            simdgroup_matrix<float, 8, 8> accR1 = simdgroup_matrix<float, 8, 8>(0.0f);
+            simdgroup_matrix<float, 8, 8> accR2 = simdgroup_matrix<float, 8, 8>(0.0f);
+            simdgroup_matrix<float, 8, 8> accR3 = simdgroup_matrix<float, 8, 8>(0.0f);
+            """
+        )
+
+        replaceOnce(
+            """
+                simdgroup_matrix<float, 8, 8> accg0 =
+                    simdgroup_matrix<float, 8, 8>(0.0f);
+                simdgroup_matrix<float, 8, 8> accg1 =
+                    simdgroup_matrix<float, 8, 8>(0.0f);
+                simdgroup_matrix<float, 8, 8> accg2 =
+                    simdgroup_matrix<float, 8, 8>(0.0f);
+                simdgroup_matrix<float, 8, 8> accg3 =
+                    simdgroup_matrix<float, 8, 8>(0.0f);
+            """,
+            with: """
+                simdgroup_matrix<float, 8, 8> accg0 =
+                    simdgroup_matrix<float, 8, 8>(0.0f);
+                simdgroup_matrix<float, 8, 8> accg1 =
+                    simdgroup_matrix<float, 8, 8>(0.0f);
+                simdgroup_matrix<float, 8, 8> accg2 =
+                    simdgroup_matrix<float, 8, 8>(0.0f);
+                simdgroup_matrix<float, 8, 8> accg3 =
+                    simdgroup_matrix<float, 8, 8>(0.0f);
+                simdgroup_matrix<float, 8, 8> accgR0 =
+                    simdgroup_matrix<float, 8, 8>(0.0f);
+                simdgroup_matrix<float, 8, 8> accgR1 =
+                    simdgroup_matrix<float, 8, 8>(0.0f);
+                simdgroup_matrix<float, 8, 8> accgR2 =
+                    simdgroup_matrix<float, 8, 8>(0.0f);
+                simdgroup_matrix<float, 8, 8> accgR3 =
+                    simdgroup_matrix<float, 8, 8>(0.0f);
+            """
+        )
+
+        replaceOnce(
+            """
+                    const uint activationK = g * GROUP + t * 8 + fragmentRow;
+                    B.thread_elements()[0] =
+                        float(x[fragmentCol * K + activationK]);
+                    B.thread_elements()[1] =
+                        float(x[(fragmentCol + 1) * K + activationK]);
+                    simdgroup_multiply_accumulate(accg0, A0, B, accg0);
+                    simdgroup_multiply_accumulate(accg1, A1, B, accg1);
+                    simdgroup_multiply_accumulate(accg2, A2, B, accg2);
+                    simdgroup_multiply_accumulate(accg3, A3, B, accg3);
+            """,
+            with: """
+                    const uint activationK = g * GROUP + t * 8 + fragmentRow;
+                    B.thread_elements()[0] =
+                        float(x[fragmentCol * K + activationK]);
+                    B.thread_elements()[1] =
+                        float(x[(fragmentCol + 1) * K + activationK]);
+                    simdgroup_multiply_accumulate(accg0, A0, B, accg0);
+                    simdgroup_multiply_accumulate(accg1, A1, B, accg1);
+                    simdgroup_multiply_accumulate(accg2, A2, B, accg2);
+                    simdgroup_multiply_accumulate(accg3, A3, B, accg3);
+                    simdgroup_matrix<float, 8, 8> BR;
+                    BR.thread_elements()[0] =
+                        float(x[(fragmentCol + M_ROWS) * K + activationK]);
+                    BR.thread_elements()[1] =
+                        float(x[(fragmentCol + 1 + M_ROWS) * K + activationK]);
+                    simdgroup_multiply_accumulate(accgR0, A0, BR, accgR0);
+                    simdgroup_multiply_accumulate(accgR1, A1, BR, accgR1);
+                    simdgroup_multiply_accumulate(accgR2, A2, BR, accgR2);
+                    simdgroup_multiply_accumulate(accgR3, A3, BR, accgR3);
+            """
+        )
+
+        replaceOnce(
+            """
+            acc3.thread_elements()[0] = metal::fma(
+                rowScale3, accg3.thread_elements()[0], acc3.thread_elements()[0]);
+            acc3.thread_elements()[1] = metal::fma(
+                rowScale3, accg3.thread_elements()[1], acc3.thread_elements()[1]);
+            """,
+            with: """
+            acc3.thread_elements()[0] = metal::fma(
+                rowScale3, accg3.thread_elements()[0], acc3.thread_elements()[0]);
+            acc3.thread_elements()[1] = metal::fma(
+                rowScale3, accg3.thread_elements()[1], acc3.thread_elements()[1]);
+            accR0.thread_elements()[0] = metal::fma(
+                rowScale0, accgR0.thread_elements()[0], accR0.thread_elements()[0]);
+            accR0.thread_elements()[1] = metal::fma(
+                rowScale0, accgR0.thread_elements()[1], accR0.thread_elements()[1]);
+            accR1.thread_elements()[0] = metal::fma(
+                rowScale1, accgR1.thread_elements()[0], accR1.thread_elements()[0]);
+            accR1.thread_elements()[1] = metal::fma(
+                rowScale1, accgR1.thread_elements()[1], accR1.thread_elements()[1]);
+            accR2.thread_elements()[0] = metal::fma(
+                rowScale2, accgR2.thread_elements()[0], accR2.thread_elements()[0]);
+            accR2.thread_elements()[1] = metal::fma(
+                rowScale2, accgR2.thread_elements()[1], accR2.thread_elements()[1]);
+            accR3.thread_elements()[0] = metal::fma(
+                rowScale3, accgR3.thread_elements()[0], accR3.thread_elements()[0]);
+            accR3.thread_elements()[1] = metal::fma(
+                rowScale3, accgR3.thread_elements()[1], accR3.thread_elements()[1]);
+            """
+        )
+
+        replaceOnce(
+            """
+                    simdgroup_matrix<float, 8, 8> XBm;
+            """,
+            with: """
+                    simdgroup_matrix<float, 8, 8> XBm;
+                    simdgroup_matrix<float, 8, 8> XBmR;
+            """
+        )
+
+        replaceOnce(
+            """
+                        XBm.thread_elements()[0] =
+                            xSums[fragmentCol * N_GROUPS + biasRow];
+                        XBm.thread_elements()[1] =
+                            xSums[(fragmentCol + 1) * N_GROUPS + biasRow];
+            """,
+            with: """
+                        XBm.thread_elements()[0] =
+                            xSums[fragmentCol * N_GROUPS + biasRow];
+                        XBm.thread_elements()[1] =
+                            xSums[(fragmentCol + 1) * N_GROUPS + biasRow];
+                        XBmR.thread_elements()[0] =
+                            xSums[(fragmentCol + M_ROWS) * N_GROUPS + biasRow];
+                        XBmR.thread_elements()[1] =
+                            xSums[(fragmentCol + 1 + M_ROWS) * N_GROUPS + biasRow];
+            """
+        )
+
+        replaceOnce(
+            """
+                        XBm.thread_elements()[0] = biasRow < N_GROUPS
+                            ? xSums[fragmentCol * N_GROUPS + biasRow] : 0.0f;
+                        XBm.thread_elements()[1] = biasRow < N_GROUPS
+                            ? xSums[(fragmentCol + 1) * N_GROUPS + biasRow] : 0.0f;
+            """,
+            with: """
+                        XBm.thread_elements()[0] = biasRow < N_GROUPS
+                            ? xSums[fragmentCol * N_GROUPS + biasRow] : 0.0f;
+                        XBm.thread_elements()[1] = biasRow < N_GROUPS
+                            ? xSums[(fragmentCol + 1) * N_GROUPS + biasRow] : 0.0f;
+                        XBmR.thread_elements()[0] = biasRow < N_GROUPS
+                            ? xSums[(fragmentCol + M_ROWS) * N_GROUPS + biasRow] : 0.0f;
+                        XBmR.thread_elements()[1] = biasRow < N_GROUPS
+                            ? xSums[(fragmentCol + 1 + M_ROWS) * N_GROUPS + biasRow] : 0.0f;
+            """
+        )
+
+        replaceOnce(
+            """
+                            simdgroup_multiply_accumulate(acc0, BBm0, XBm, acc0);
+                    simdgroup_multiply_accumulate(acc1, BBm1, XBm, acc1);
+                    simdgroup_multiply_accumulate(acc2, BBm2, XBm, acc2);
+                    simdgroup_multiply_accumulate(acc3, BBm3, XBm, acc3);
+            """,
+            with: """
+                            simdgroup_multiply_accumulate(acc0, BBm0, XBm, acc0);
+                    simdgroup_multiply_accumulate(acc1, BBm1, XBm, acc1);
+                    simdgroup_multiply_accumulate(acc2, BBm2, XBm, acc2);
+                    simdgroup_multiply_accumulate(acc3, BBm3, XBm, acc3);
+                    simdgroup_multiply_accumulate(accR0, BBm0, XBmR, accR0);
+                    simdgroup_multiply_accumulate(accR1, BBm1, XBmR, accR1);
+                    simdgroup_multiply_accumulate(accR2, BBm2, XBmR, accR2);
+                    simdgroup_multiply_accumulate(accR3, BBm3, XBmR, accR3);
+            """
+        )
+
+        replaceOnce(
+            """
+            out[fragmentCol * N + outputN0] = T(acc0.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN0] = T(acc0.thread_elements()[1]);
+            out[fragmentCol * N + outputN1] = T(acc1.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN1] = T(acc1.thread_elements()[1]);
+            out[fragmentCol * N + outputN2] = T(acc2.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN2] = T(acc2.thread_elements()[1]);
+            out[fragmentCol * N + outputN3] = T(acc3.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN3] = T(acc3.thread_elements()[1]);
+            """,
+            with: """
+            out[fragmentCol * N + outputN0] = T(acc0.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN0] = T(acc0.thread_elements()[1]);
+            out[fragmentCol * N + outputN1] = T(acc1.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN1] = T(acc1.thread_elements()[1]);
+            out[fragmentCol * N + outputN2] = T(acc2.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN2] = T(acc2.thread_elements()[1]);
+            out[fragmentCol * N + outputN3] = T(acc3.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN3] = T(acc3.thread_elements()[1]);
+            out[(fragmentCol + M_ROWS) * N + outputN0] = T(accR0.thread_elements()[0]);
+            out[(fragmentCol + 1 + M_ROWS) * N + outputN0] = T(accR0.thread_elements()[1]);
+            out[(fragmentCol + M_ROWS) * N + outputN1] = T(accR1.thread_elements()[0]);
+            out[(fragmentCol + 1 + M_ROWS) * N + outputN1] = T(accR1.thread_elements()[1]);
+            out[(fragmentCol + M_ROWS) * N + outputN2] = T(accR2.thread_elements()[0]);
+            out[(fragmentCol + 1 + M_ROWS) * N + outputN2] = T(accR2.thread_elements()[1]);
+            out[(fragmentCol + M_ROWS) * N + outputN3] = T(accR3.thread_elements()[0]);
+            out[(fragmentCol + 1 + M_ROWS) * N + outputN3] = T(accR3.thread_elements()[1]);
+            """
+        )
+
+        return result
+    }
+
+    /// `false` only when `DARKBLOOM_GEMMA4_LMHEAD_ROWS16` is an explicit off
+    /// value. Off, `apply` refuses the `[8, 2, K]` rectangle exactly as the
+    /// base does, the sixteen-row kernels are never constructed, and the
+    /// eight-row road is unreachable-by-nothing: it never saw this switch.
+    private static let rows16Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_LMHEAD_ROWS16"]
+        else { return true }
+        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "0", "false", "no", "off": return false
+        default: return true
+        }
+    }()
+
+    /// Appended to the name of every kernel this ticket creates, so a
+    /// name-keyed compiled-kernel cache can never serve a sixteen-row body to
+    /// an eight-row dispatch or the other way round.
+    private static let rows16Suffix = "_rows16"
+
+    /// Diagnostics only, armed by `MLXFAST_ENGAGE_MARKS` exactly like
+    /// `CBv2EngageMark` itself. A mark beside a dispatch decision proves a
+    /// branch was taken; a mark carrying a stable fingerprint of the kernel
+    /// source string proves THIS text was handed to the compiler, and lets the
+    /// two switch arms be compared from the census alone. Swift's `hashValue`
+    /// is per-process seeded, so this is a plain FNV-1a over UTF-8.
+    private static let markArmed =
+        ProcessInfo.processInfo.environment["MLXFAST_ENGAGE_MARKS"] != nil
+
+    private static func srcMark(_ tag: String, _ text: String) {
+        guard markArmed else { return }
+        var h: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in text.utf8 {
+            h ^= UInt64(byte)
+            h = h &* 0x0000_0100_0000_01b3
+        }
+        CBv2EngageMark.once(tag + String(h, radix: 16))
+    }
+
+    private static let sourceV27CarryRows16: String = {
+        let result = rows16Source(sourceV27Carry)
+        srcMark("mma-head-carry-src16-", result)
+        return result
+    }()
+
+    private static let sourceV27Rows16: String = {
+        let result = rows16Source(sourceV27)
+        srcMark("mma-head-src16-", result)
+        return result
+    }()
+
+    private static let kernelV27CarryRows16: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_carry_fpmma_v2"
+                + rows16Suffix,
+            inputNames: ["x", "w", "scales", "biases", "xSums"],
+            outputNames: ["out"],
+            source: sourceV27CarryRows16,
+            header: "#include <metal_simdgroup_matrix>\n",
+            ensureRowContiguous: true
+        )
+
+    private static let kernelV27Rows16: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_fpmma_v1"
+                + rows16Suffix,
+            inputNames: ["x", "w", "scales", "biases", "xSums"],
+            outputNames: ["out"],
+            source: sourceV27Rows16,
+            header: "#include <metal_simdgroup_matrix>\n",
+            ensureRowContiguous: true
+        )
+
+    /// The activation-sum table at sixteen rows. `cell` is `row * N_GROUPS +
+    /// group` and the per-cell body reads only that row, so cells
+    /// `0 ..< 8 * N_GROUPS` hold exactly the values the eight-row kernel
+    /// writes, bit for bit, and the widened table is a strict extension.
+    private static let xSumSourceRows16: String = {
+        let old = "constexpr uint M_ROWS = 8;"
+        precondition(
+            xSumSource.components(separatedBy: old).count == 2,
+            "xSumSourceRows16: M_ROWS anchor not unique")
+        let result = xSumSource.replacingOccurrences(
+            of: old, with: "constexpr uint M_ROWS = 16;")
+        srcMark("mma-head-xsum-src16-", result)
+        return result
+    }()
+
+    private static let xSumKernelRows16: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_mma_affine4_xsum_m8_v27_unroll" + rows16Suffix,
+            inputNames: ["x"],
+            outputNames: ["xSums"],
+            source: xSumSourceRows16,
+            ensureRowContiguous: true
+        )
+
+    /// GATE-ONLY differential self-check, armed by
+    /// `DARKBLOOM_GEMMA4_LMHEAD_ROWS16_CHECK` and inert otherwise (the scored
+    /// runner sets no environment). For a sixteen-row dispatch it re-runs the
+    /// SHIPPED eight-row kernel twice, on rows 0...7 and rows 8...15 of the
+    /// same activation and the same slice of the same activation-sum table,
+    /// and counts the output elements whose RAW bf16 BITS differ --- `view` to
+    /// uint16 and compare, never `allclose`. One line per call on stderr.
+    private static let rows16CheckArmed =
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_LMHEAD_ROWS16_CHECK"] != nil
+
+    nonisolated(unsafe) private static var rows16CheckCalls = 0
+
+    private static func rows16SelfCheck(
+        out: MLXArray, inputs: [MLXArray], eightRow: MLXFast.MLXFastKernel,
+        k: Int, n: Int, dtype: DType, threadgroups: Int
+    ) {
+        let groups = k / 64
+        var halves: [MLXArray] = []
+        for half in 0 ..< 2 {
+            let xHalf = inputs[0][(half * mRows) ..< ((half + 1) * mRows)]
+            let sHalf = inputs[4][
+                (half * mRows * groups) ..< ((half + 1) * mRows * groups)]
+            halves.append(
+                eightRow(
+                    [xHalf, inputs[1], inputs[2], inputs[3], sHalf],
+                    template: [("T", dtype), ("K", k), ("N", n)],
+                    grid: (threadgroups * threadsPerThreadgroup, 1, 1),
+                    threadGroup: (threadsPerThreadgroup, 1, 1),
+                    outputShapes: [[mRows, n]],
+                    outputDTypes: [dtype]
+                )[0])
+        }
+        let reference = concatenated(halves, axis: 0)
+        let differing = notEqual(
+            out.view(dtype: .uint16), reference.view(dtype: .uint16))
+        let perRow = MLX.sum(differing.asType(.int32), axis: 1)
+        eval(perRow)
+        rows16CheckCalls += 1
+        let counts = perRow.asArray(Int32.self).map(String.init).joined(
+            separator: ",")
+        FileHandle.standardError.write(
+            Data("[rows16check] call \(rows16CheckCalls) bitdiff [\(counts)]\n"
+                .utf8))
+    }
 
     /// Tied-head GEMV, or `nil` when any gate above fails.
     ///
@@ -2783,14 +3184,26 @@ public enum Gemma4MMAQuantizedGEMV {
         guard w.dtype == .uint32 else { return nil }
         guard w.ndim == 2, scales.ndim == 2, biases.ndim == 2 else { return nil }
 
-        // [8, K] or [8, 1, K] ONLY -- the decode cohort's own shape, eight
-        // BATCH rows at one position. A [1, 8, K] eight-token prefill chunk
-        // has the same element count and must NOT enter: the gate is meant to
-        // claim the cohort's decode head, and prefill stays on stock.
-        guard x.ndim == 2 || (x.ndim == 3 && x.dim(1) == 1) else { return nil }
-        guard x.dim(0) == mRows else { return nil }
+        // [8, K] or [8, 1, K] -- the decode cohort's own shape, eight BATCH
+        // rows at one position. A [1, 8, K] eight-token prefill chunk has the
+        // same element count and must NOT enter: the gate is meant to claim
+        // the cohort's decode head, and prefill stays on stock.
+        //
+        // ROWS16 adds exactly one more shape: [8, 2, K], the depth-1 MTP
+        // verify rectangle, whose sixteen FLAT rows are (batch, column) in
+        // that order. The admitted set is still enumerated, not inferred from
+        // the element count, so no prefill chunk of any width can reach it.
+        let rows: Int
+        if x.ndim == 2 || (x.ndim == 3 && x.dim(1) == 1) {
+            guard x.dim(0) == mRows else { return nil }
+            rows = mRows
+        } else if rows16Enabled, x.ndim == 3, x.dim(0) == mRows, x.dim(1) == 2 {
+            rows = mRows * 2
+        } else {
+            return nil
+        }
         let k = x.dim(-1)
-        guard k > 0, x.size == mRows * k else { return nil }
+        guard k > 0, x.size == rows * k else { return nil }
 
         let n = w.dim(0)
         let selectedColsPerThreadgroup = version == 16 || version == 26 || version == 27
@@ -2802,13 +3215,16 @@ public enum Gemma4MMAQuantizedGEMV {
         guard scales.dim(0) == n, biases.dim(0) == n else { return nil }
         guard scales.dim(1) == k / groupSize, biases.dim(1) == k / groupSize else { return nil }
 
-        let flatX = x.reshaped([mRows, k])
+        // Only version 27 --- the shipped body --- has a sixteen-row twin.
+        guard rows == mRows || version == 27 else { return nil }
+
+        let flatX = x.reshaped([rows, k])
         let threadgroups = n / selectedColsPerThreadgroup
         let selected: MLXFast.MLXFastKernel
         let inputs: [MLXArray]
         switch version {
         case 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 26, 27:
-            let sumCells = mRows * (k / groupSize)
+            let sumCells = rows * (k / groupSize)
             let xSums: MLXArray
             if let activationSums,
                 activationSums.values.dtype == .float32,
@@ -2819,7 +3235,7 @@ public enum Gemma4MMAQuantizedGEMV {
             } else {
                 let sumThreads = 128
                 let sumThreadgroups = (sumCells + sumThreads - 1) / sumThreads
-                xSums = xSumKernel(
+                xSums = (rows == mRows ? xSumKernel : xSumKernelRows16)(
                     [flatX],
                     template: [("T", x.dtype), ("K", k)],
                     grid: (sumThreadgroups * sumThreads, 1, 1),
@@ -2830,11 +3246,13 @@ public enum Gemma4MMAQuantizedGEMV {
             }
             switch version {
             case 27:
+                if rows != mRows { CBv2EngageMark.once("mma-head-rows16") }
                 if carryEnabled {
                     CBv2EngageMark.once("mma-head-carry")
-                    selected = kernelV27Carry
+                    selected = rows == mRows
+                        ? kernelV27Carry : kernelV27CarryRows16
                 } else {
-                    selected = kernelV27
+                    selected = rows == mRows ? kernelV27 : kernelV27Rows16
                 }
             case 26: selected = kernelV26
             case 16: selected = kernelV16
@@ -2869,9 +3287,15 @@ public enum Gemma4MMAQuantizedGEMV {
             template: [("T", x.dtype), ("K", k), ("N", n)],
             grid: (threadgroups * threadsPerThreadgroup, 1, 1),
             threadGroup: (threadsPerThreadgroup, 1, 1),
-            outputShapes: [[mRows, n]],
+            outputShapes: [[rows, n]],
             outputDTypes: [x.dtype]
         )
+        if rows16CheckArmed, rows != mRows, inputs.count == 5 {
+            rows16SelfCheck(
+                out: outputs[0], inputs: inputs,
+                eightRow: carryEnabled ? kernelV27Carry : kernelV27,
+                k: k, n: n, dtype: x.dtype, threadgroups: threadgroups)
+        }
         return outputs[0]
     }
 }

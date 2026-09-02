@@ -101,6 +101,12 @@ public struct CBv2MTPRowCapture {
     /// KV covers positions [slidingStart, anchor)). The full capture always
     /// starts at 0.
     public var slidingStart: Int
+    /// DRAFTER-RING-ATTN: the sliding capture layer's retained ring itself
+    /// (allocation views + oldest slot), so the drafter attends the ring in
+    /// place through the decode kernels instead of a temporal-order copy.
+    public var slidingRing: (keys: MLXArray, values: MLXArray, start: Int)?
+    /// MTP-QUANT-AUTH: the sliding capture layer's q4 mirror (the drafter attends it instead of the BF16 ring).
+    public var slidingMirror: MLXArray?
     /// The round's frozen query position: absolute position of the row's
     /// newest confirmed-but-unfed token (== the row's absoluteOffset).
     public var anchor: Int
@@ -108,7 +114,9 @@ public struct CBv2MTPRowCapture {
     public init(
         fullKeys: MLXArray, fullValues: MLXArray,
         slidingKeys: MLXArray, slidingValues: MLXArray,
-        slidingStart: Int, anchor: Int
+        slidingStart: Int, anchor: Int,
+        slidingRing: (keys: MLXArray, values: MLXArray, start: Int)? = nil,
+        slidingMirror: MLXArray? = nil
     ) {
         self.fullKeys = fullKeys
         self.fullValues = fullValues
@@ -116,6 +124,8 @@ public struct CBv2MTPRowCapture {
         self.slidingValues = slidingValues
         self.slidingStart = slidingStart
         self.anchor = anchor
+        self.slidingRing = slidingRing
+        self.slidingMirror = slidingMirror
     }
 }
 
@@ -404,5 +414,17 @@ public struct CBv2MTPRoundAuditRecord: Sendable, Equatable {
         self.numComputedAfter = numComputedAfter
         self.generatedAfter = generatedAfter
         self.finishReason = finishReason
+    }
+}
+
+/// DRAFTER-RING-ATTN: per-row ring views the drafter's sliding layers attend directly.
+public struct CBv2MTPDrafterRingKV {
+    public let keys: [MLXArray]
+    public let values: [MLXArray]
+    public let starts: [Int]
+    /// MTP-QUANT-AUTH: per-row q4 mirrors; when set the drafter's sliding layers attend these.
+    public let mirrors: [MLXArray]?
+    public init(keys: [MLXArray], values: [MLXArray], starts: [Int], mirrors: [MLXArray]? = nil) {
+        self.keys = keys; self.values = values; self.starts = starts; self.mirrors = mirrors
     }
 }

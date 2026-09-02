@@ -722,6 +722,113 @@ enum CBv2AttentionV1 {
         // takes the same per-row path as a singleton chunk and attends
         // exactly its own KV. Serialized queries remain MTP-only; ordinary
         // packed prefill keeps q-blocking and optional row-local span masks.
+        // SEQ-DECODE-ROAD: attend the L verify columns as L consecutive exact
+        // decode steps on the SAME rows, each through the `L == 1` door above
+        // (fused in-place q4 ring write, fence-chained), so column j sees
+        // exactly what a serial decode step at that position sees, with the
+        // same kernels, and the staged full-ring K/V copies of the serialised
+        // road never exist. A rejected column is rolled back by a counter
+        // rewind (`CBv2WindowedSequenceKV.rollback`): the slot it overwrote is
+        // exactly the slot the next step evicts, so no live position is lost.
+        if serializeQueries, seqDecodeRoadEnabled, B > 1, L > 1,
+            spanContexts == nil, effectiveSinks == nil, softcap == nil,
+            allowFusedRingWrite, decodeRingWriteFence != nil,
+            seqDecodeRoadAdmits(rows: rows)
+        {
+            CBv2EngageMark.once("mtp-seq-decode-road")
+            // MTP-COLS2: one resident pass A over both columns (+ deferred store)
+            // when every row is a full q4 ring; bookkeeping is the two sequential
+            // columns' verbatim.
+            if L == 2, cols2Enabled, let fence = decodeRingWriteFence,
+                CBv2WindowedSequenceKV.q4FusedMirrorWriteEnabled
+            {
+                let ringRows = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
+                let preWrite = ringRows.compactMap { $0.decodeRingQuantViewBeforeWrite }
+                if ringRows.count == B, preWrite.count == B {
+                    var crossCheckOut: MLXArray? = nil
+                    let savedFence = fence.value
+                    if cols2CrossCheckEnabled {
+                        // Kernel first, store deferred OFF: its column-0 write lands the
+                        // same bits the sequential road writes next; nothing else moves.
+                        crossCheckOut = CBv2RaggedTwoPassDecodeAttentionV1.attendRingQuantWritingCols2(
+                            queries: queries, mirrors: preWrite.map(\.mirror),
+                            starts: preWrite.map(\.start), newKeys: keys, newValues: values,
+                            previousWriteFence: savedFence, scale: scale,
+                            slidingWindowLength: ringRows[0].window, deferStore: false)?.output
+                        // Force the kernel to run BEFORE the sequential road's in-place
+                        // writes: the two share the mirror only through side effects.
+                        if let crossCheckOut { eval(crossCheckOut) }
+                    } else if let fused = CBv2RaggedTwoPassDecodeAttentionV1.attendRingQuantWritingCols2(
+                        queries: queries, mirrors: preWrite.map(\.mirror),
+                        starts: preWrite.map(\.start), newKeys: keys, newValues: values,
+                        previousWriteFence: savedFence, scale: scale,
+                        slidingWindowLength: ringRows[0].window)
+                    {
+                        for column in 0 ..< 2 {
+                            let range = column ..< (column + 1)
+                            for (index, row) in ringRows.enumerated() {
+                                row.beginInPlaceSpeculativeColumn()
+                                if CBv2WindowedSequenceKV.q4BF16RingElideEnabled {
+                                    row.advanceDecodeRingAfterQuantWrite()
+                                } else {
+                                    row.decodeRingWriteBF16Only(
+                                        keys: keys[index ..< (index + 1), 0..., range, 0...],
+                                        values: values[index ..< (index + 1), 0..., range, 0...])
+                                }
+                            }
+                        }
+                        fence.value = fused.nextWriteFence
+                        return fused.output
+                    }
+                    if let crossCheckOut {
+                        var columns: [MLXArray] = []
+                        for column in 0 ..< L {
+                            let range = column ..< (column + 1)
+                            for row in rows { (row as? CBv2WindowedSequenceKV)?.beginInPlaceSpeculativeColumn() }
+                            columns.append(updateAndAttend(
+                                rows: rows, kind: kind,
+                                queries: queries[0..., 0..., range, 0...],
+                                keys: keys[0..., 0..., range, 0...],
+                                values: values[0..., 0..., range, 0...],
+                                scale: scale, sinks: sinks, softcap: softcap,
+                                spanContexts: nil, serializeQueries: false,
+                                decodeRingWriteFence: decodeRingWriteFence,
+                                allowFusedRingWrite: allowFusedRingWrite))
+                        }
+                        let seqOut = concatenated(columns, axis: 2)
+                        var report = "MTP-COLS2 xcheck call=\(cols2CrossCheckCalls)"
+                        for column in 0 ..< 2 {
+                            let a = seqOut[0..., 0..., column ..< (column + 1), 0...].view(dtype: .uint16)
+                            let b = crossCheckOut[0..., 0..., column ..< (column + 1), 0...].view(dtype: .uint16)
+                            let mismatches = MLX.sum(MLX.notEqual(a, b)).item(Int32.self)
+                            report += " col\(column)_mismatch=\(mismatches)/\(a.size)"
+                        }
+                        cols2CrossCheckCalls += 1
+                        FileHandle.standardError.write((report + "\n").data(using: .utf8)!)
+                        return seqOut
+                    }
+                }
+            }
+            var columns: [MLXArray] = []
+            columns.reserveCapacity(L)
+            for column in 0 ..< L {
+                let range = column ..< (column + 1)
+                for row in rows {
+                    (row as? CBv2WindowedSequenceKV)?.beginInPlaceSpeculativeColumn()
+                }
+                columns.append(
+                    updateAndAttend(
+                        rows: rows, kind: kind,
+                        queries: queries[0..., 0..., range, 0...],
+                        keys: keys[0..., 0..., range, 0...],
+                        values: values[0..., 0..., range, 0...],
+                        scale: scale, sinks: sinks, softcap: softcap,
+                        spanContexts: nil, serializeQueries: false,
+                        decodeRingWriteFence: decodeRingWriteFence,
+                        allowFusedRingWrite: allowFusedRingWrite))
+            }
+            return concatenated(columns, axis: 2)
+        }
         if serializeQueries {
             return packedPerRow(batch: B) { index, slice in
                 updateAndAttendRowSerialQueries(
@@ -932,6 +1039,37 @@ enum CBv2AttentionV1 {
     /// the concatenate, so a singleton call is provably the same graph it
     /// was before packing existed.
     @inline(__always)
+    /// SEQ-DECODE-ROAD (MTP verify): `DARKBLOOM_GEMMA4_MTP_SEQ_DECODE_ROAD=0`
+    /// restores the incumbent per-column serialised road (staged full-ring
+    /// K/V views + stock SDPA per column) in the same executable.
+    static let seqDecodeRoadEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_MTP_SEQ_DECODE_ROAD"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+    /// MTP-COLS2: both verify columns through one resident pass A + a deferred
+    /// store. `DARKBLOOM_GEMMA4_MTP_COLS2=0` keeps the two-dispatch sequential road.
+    static let cols2Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_MTP_COLS2"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+    /// MTP-COLS2 receipt: run the sequential road AND the two-column kernel on
+    /// the same pre-write state and report bf16 bit mismatches per column.
+    static let cols2CrossCheckEnabled: Bool =
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_MTP_COLS2_XCHECK"] == "1"
+    nonisolated(unsafe) static var cols2CrossCheckCalls = 0
+
+    /// The road admits a cohort whose rows are ALL full sliding rings with a
+    /// q4 mirror (the decode kernel's own precondition) or ALL full-attention
+    /// rows (the D512 decode chain appends in place and rolls back by count).
+    static func seqDecodeRoadAdmits(rows: [CBv2SequenceKV]) -> Bool {
+        if rows.allSatisfy({ ($0 as? CBv2WindowedSequenceKV)?.decodeRingQuantViewBeforeWrite != nil }) {
+            return true
+        }
+        return rows.allSatisfy { $0 is CBv2FullSequenceKV }
+    }
+
     static func packedPerRow(
         batch: Int, _ row: (_ index: Int, _ slice: (MLXArray) -> MLXArray) -> MLXArray
     ) -> MLXArray {

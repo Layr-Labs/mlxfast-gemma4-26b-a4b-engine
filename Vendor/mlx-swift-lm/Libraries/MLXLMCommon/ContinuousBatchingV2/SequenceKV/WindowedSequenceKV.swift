@@ -133,10 +133,46 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// over the whole ring allocation are dead graph work. Static, read
     /// once per process like the switch it complements.
     static let q4BF16RingElideEnabled: Bool = {
+        // A speculative round stages its provisional writes from the BF16
+        // ring snapshot, and `stageSpeculativeUpdate` refuses a ring it has
+        // marked stale. Eliding the ring writes is therefore only available
+        // to the target-only policy; with speculation compiled on, the ring
+        // is a live reader and the elision must be off.
+        // MTP-QUANT-AUTH: with the drafter attending the q4 mirror and the
+        // verify columns written in place by the decode road, nothing on the
+        // speculative path reads the BF16 ring any more, so the elision is
+        // available to the speculating policy too; DARKBLOOM_GEMMA4_MTP_QUANT_AUTH=0
+        // restores the BF16 companion writes under speculation.
+        if CBv2MTPDepthController.speculationEnabled && !CBv2WindowedSequenceKV.mtpQuantAuthEnabled { return false }
         guard let raw = ProcessInfo.processInfo.environment["MLX_KV_Q4_BF16_ELIDE"]
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
+
+    static let mtpQuantAuthEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_MTP_QUANT_AUTH"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// MTP-QUANT-AUTH: the live q4 mirror plus the ring start the drafter
+    /// attends (all `window` retained slots), or nil off the quant road.
+    /// The drafter's capture of this ring: the retained BF16 allocation when it
+    /// is authoritative, plus the q4 mirror when the elision made the BF16 ring
+    /// stale (the drafter then attends the mirror). nil unless the ring is full.
+    var drafterRingOrMirrorView: (keys: MLXArray, values: MLXArray, start: Int, mirror: MLXArray?)? {
+        guard staged == nil, let keys, let values, retainedCount == window else { return nil }
+        if bf16RingStale || Self.q4BF16RingElideEnabled {
+            guard let quantMirror else { return nil }
+            return (keys, values, oldestValidPosition % window, quantMirror)
+        }
+        return (keys, values, oldestValidPosition % window, nil)
+    }
+
+    var drafterMirrorView: (mirror: MLXArray, start: Int)? {
+        guard staged == nil, let quantMirror, retainedCount == window else { return nil }
+        return (quantMirror, oldestValidPosition % window)
+    }
 
     private var quantEligible: Bool {
         Self.quantEnabled && headDim == 256 && window > 0
@@ -158,6 +194,38 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// Transaction opened by `beginSpeculativeWrite()` and closed by commit.
     /// Every intervening update stages instead of writing the ring.
     private var speculativeWriteArmed = false
+    /// SEQ-DECODE-ROAD: columns the decode road wrote IN PLACE (ring slot and
+    /// counters advanced) inside the armed transaction. Rolled back by a
+    /// counter rewind; nothing to commit.
+    private var inPlaceSpeculativeColumns = 0
+    /// SEQ-DECODE-ROAD: the drafter snapshots this row's BF16 ring at the next
+    /// round's capture, so a rolled-back column's overwrite of the evicted
+    /// slot must be undone here (the decode kernels never read that slot; the
+    /// drafter's `snapshot()` does). Set by the MTP driver on the capture
+    /// layer's rows only: eight small slice copies per round.
+    var drafterCaptureRow = false
+    private var savedEvictedSlots: [(slot: Int, keys: MLXArray, values: MLXArray)] = []
+    /// MTP-QUANT-AUTH: the evicted q4 mirror slot of a capture row, restored on rollback
+    /// so the drafter's mirror read is the same after a rejected column as without it.
+    private var savedEvictedMirrorSlots: [(slot: Int, packed: MLXArray)] = []
+
+    /// Called BEFORE the decode road writes column `inPlaceSpeculativeColumns`.
+    func beginInPlaceSpeculativeColumn() {
+        guard speculativeWriteArmed else { return }
+        if drafterCaptureRow, inPlaceSpeculativeColumns >= 1 {
+            let slot = absoluteOffset % window
+            if !bf16RingStale, let keys, let values {
+                savedEvictedSlots.append((
+                    slot,
+                    keys[.ellipsis, slot ..< (slot + 1), 0...] + 0,
+                    values[.ellipsis, slot ..< (slot + 1), 0...] + 0))
+            }
+            if let quantMirror, Self.q4BF16RingElideEnabled || bf16RingStale {
+                savedEvictedMirrorSlots.append((slot, quantMirror[0..., 0..., slot ..< (slot + 1), 0...] + 0))
+            }
+        }
+        inPlaceSpeculativeColumns += 1
+    }
 
     /// The accumulated speculative updates plus the absolute position the
     /// transaction started at. The ring writes
@@ -361,6 +429,9 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             "CBv2WindowedSequenceKV: beginSpeculativeWrite with a staged update pending — commit first"
         )
         speculativeWriteArmed = true
+        inPlaceSpeculativeColumns = 0
+        savedEvictedSlots.removeAll(keepingCapacity: true)
+        savedEvictedMirrorSlots.removeAll(keepingCapacity: true)
     }
 
     /// One update in the active transaction: return EXACTLY the views the
@@ -415,6 +486,9 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
 
     public func commitSpeculativeWrite() {
         speculativeWriteArmed = false
+        inPlaceSpeculativeColumns = 0
+        savedEvictedSlots.removeAll(keepingCapacity: true)
+        savedEvictedMirrorSlots.removeAll(keepingCapacity: true)
         guard let staged else { return }
         self.staged = nil
         // Confirmed range after finalize-time rollback: [basePosition,
@@ -551,6 +625,33 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
 
     public func rollback(_ n: Int) {
         precondition(n >= 0, "CBv2WindowedSequenceKV.rollback: negative n")
+        // K16: `n <= inPlaceSpeculativeColumns` used to be a precondition. It is
+        // an admission test now: a round that rolled back more than the decode
+        // road wrote in place takes the established path below instead of
+        // trapping.
+        if speculativeWriteArmed, staged == nil, inPlaceSpeculativeColumns > 0,
+            n <= inPlaceSpeculativeColumns
+        {
+            // SEQ-DECODE-ROAD: the rolled-back columns were written in place
+            // by the decode road on a FULL ring, each advancing both counters
+            // by one. Rewind both: the slots they overwrote are exactly the
+            // ones the next steps evict and never read, so the retained
+            // window is intact and the fused decode road stays admissible.
+            absoluteOffset -= n
+            oldestValidPosition -= n
+            inPlaceSpeculativeColumns -= n
+            for _ in 0 ..< n {
+                guard let saved = savedEvictedSlots.popLast() else { break }
+                keys![.ellipsis, saved.slot ..< (saved.slot + 1), 0...] = saved.keys
+                values![.ellipsis, saved.slot ..< (saved.slot + 1), 0...] = saved.values
+            }
+            for _ in 0 ..< n {
+                guard let saved = savedEvictedMirrorSlots.popLast() else { break }
+                quantMirror![0..., 0..., saved.slot ..< (saved.slot + 1), 0...] = saved.packed
+            }
+            borrowableChunkViews = nil
+            return
+        }
         if let staged {
             // Pure counter move: the staged tokens were never written to
             // the ring, so nothing was destroyed and the retained window

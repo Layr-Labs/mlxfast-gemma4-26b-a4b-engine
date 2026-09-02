@@ -81,16 +81,20 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         /// `[anchorMin, anchorMin + windowAhead)`. May be nil if the
         /// drafter's geometry made the table empty.
         let ropeTable: DrafterRoPETable?
+        /// DRAFTER-RING-ATTN: when set, sliding layers attend these ring views.
+        let ringKV: CBv2MTPDrafterRingKV?
 
         init(
             sharedKV: Gemma4SharedKV, masks: Gemma4DrafterMasks,
             positionOffset: Gemma4.PositionOffset,
-            ropeTable: DrafterRoPETable?
+            ropeTable: DrafterRoPETable?,
+            ringKV: CBv2MTPDrafterRingKV? = nil
         ) {
             self.sharedKV = sharedKV
             self.masks = masks
             self.positionOffset = positionOffset
             self.ropeTable = ropeTable
+            self.ringKV = ringKV
         }
     }
 
@@ -153,6 +157,39 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
 
         let (fullKV, fullMask) = Self.padAndMask(
             keys: rows.map(\.fullKeys), values: rows.map(\.fullValues))
+        // DRAFTER-RING-ATTN: every row handed its retained ring -> no sliding
+        // stack, no sliding mask; the sliding layers attend the rings in place.
+        // K16: the ring kernels are compiled for one cohort width and for a
+        // full window. A hidden pool retires streams at different rounds (and
+        // per-row commit makes them retire at different rounds by
+        // construction), so a cohort of 2..7 live rows is ordinary there and
+        // never occurred in our own drives. Ask before choosing the road: if
+        // the rings cannot be served, fall through to the established stacked
+        // path below rather than reach a decline.
+        let ringCohortAdmits =
+            rows.count == CBv2RaggedTwoPassDecodeAttentionV1.ringCohortSize
+            && rows.allSatisfy { row in
+                guard let ring = row.slidingRing else { return false }
+                return ring.start >= 0 && ring.start < ring.keys.dim(2)
+            }
+        if ringCohortAdmits, rows.allSatisfy({ $0.slidingRing != nil }) {
+            let rings = rows.map { $0.slidingRing! }
+            let fullLengths = rows.map { $0.fullKeys.dim(2) }
+            let uniformFull = fullLengths.allSatisfy { $0 == fullLengths[0] }
+            return Prepared(
+                sharedKV: Gemma4SharedKV(
+                    fullAttention: fullKV,
+                    slidingAttention: (rings[0].keys, rings[0].values)),
+                masks: Gemma4DrafterMasks(
+                    full: uniformFull ? .none : .array(fullMask),
+                    sliding: .none),
+                positionOffset: positionOffset,
+                ropeTable: ropeTable,
+                ringKV: CBv2MTPDrafterRingKV(
+                    keys: rings.map(\.keys), values: rings.map(\.values),
+                    starts: rings.map(\.start),
+                    mirrors: rows.allSatisfy({ $0.slidingMirror != nil }) ? rows.map { $0.slidingMirror! } : nil))
+        }
         let (slidingKV, slidingMask) = Self.padAndMask(
             keys: rows.map(\.slidingKeys), values: rows.map(\.slidingValues))
         let absoluteSlidingMask = Self.slidingMask(
@@ -185,6 +222,11 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         // the per-step `MLXFast.RoPE` frequency compute into the single
         // `prepare(rows:)` materialization: the downstream rope module
         // no longer pays the table-build cost on every draft step.
+        // The crown's decode chain hands back `lastHidden` as `[B, D]` for a
+        // one-column step, while every drafter body below indexes a query
+        // axis. Normalize once, here, so the pre-rotation and the
+        // concatenation see the same rank the multi-column path produces.
+        let hidden = hidden.ndim == 2 ? hidden.expandedDimensions(axis: 1) : hidden
         let rotatedHidden: MLXArray
         if let table = prepared.ropeTable {
             rotatedHidden = Self.applyCachedDrafterRoPE(
@@ -200,7 +242,8 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
             inputsEmbeds: inputsEmbeds,
             sharedKV: prepared.sharedKV,
             positionOffset: prepared.positionOffset,
-            masks: prepared.masks)
+            masks: prepared.masks,
+            ringKV: prepared.ringKV)
         let next = logits.squeezed(axis: 1).argMax(axis: -1).asType(.int32)
         return (next, newHidden)
     }
@@ -383,7 +426,9 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         let bRot = a * sinB + b * cosB
         let rotatedPrefix = MLX.stacked([aRot, bRot], axis: -1)
             .reshaped(Array(prefixShape))
-            .reshaped(Array(prefixLead) + [rotaryPrefix])
+            // Keep the query axis: `tail` is `[B, L, D - rotaryPrefix]`, so the
+            // rotated prefix must be `[B, L, rotaryPrefix]` for the concat below.
+            .reshaped(leadShape + [rotaryPrefix])
         let tail = flat[.ellipsis, rotaryPrefix ..< featureDim]
         return MLX.concatenated([rotatedPrefix, tail], axis: -1)
     }

@@ -1790,7 +1790,8 @@ private class Gemma4Attention: Module {
         positionOffset: Gemma4.PositionOffset? = nil,
         v2SharedSource: (any CBv2AttendingLayerCache)? = nil,
         outputStart: Int = 0,
-        useLastQueryPrefill: Bool = false
+        useLastQueryPrefill: Bool = false,
+        carriedRunsum: MLXArray? = nil
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         // ContinuousBatchingV2: the layer cache owns both the KV update and
         // the attention computation (no masks, no padding — see
@@ -1800,7 +1801,8 @@ private class Gemma4Attention: Module {
             return forwardV2(
                 x, layerCache: layerCacheV2, source: v2SharedSource,
                 sharedKV: sharedKV, positionOffset: positionOffset,
-                outputStart: outputStart, useLastQueryPrefill: useLastQueryPrefill)
+                outputStart: outputStart, useLastQueryPrefill: useLastQueryPrefill,
+                carriedRunsum: carriedRunsum)
         }
         precondition(
             outputStart == 0 && !useLastQueryPrefill,
@@ -1939,7 +1941,8 @@ private class Gemma4Attention: Module {
         sharedKV: (MLXArray, MLXArray)?,
         positionOffset: Gemma4.PositionOffset?,
         outputStart: Int = 0,
-        useLastQueryPrefill: Bool = false
+        useLastQueryPrefill: Bool = false,
+        carriedRunsum: MLXArray? = nil
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         let (B, L) = (x.dim(0), x.dim(1))
         precondition(
@@ -1970,7 +1973,8 @@ private class Gemma4Attention: Module {
         // requires the exact L=1 decode shape, and the incumbent dispatch
         // runs). The table kernel is lazy: it executes only when a projection
         // actually consumes it.
-        let qkvRunsumTable = CBv2AttentionQKVMMA8V1.runsumTable(for: x)
+        let qkvRunsumTable = CBv2AttentionQKVMMA8V1.runsumTable(
+            for: x, carried: carriedRunsum)
 
         // Keep Q/K/V on the promoted matrix-unit tier's arithmetic. At the
         // exact B=8/L=1 decode shapes the tight-grid host re-dispatches the
@@ -2104,6 +2108,18 @@ private class Gemma4Attention: Module {
             queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: queryPositionOffset)
             k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
         }
+        // F4: let the resident decode attention kernel take the raw
+        // projections and normalize/rotate them once itself; a miss falls
+        // back to the arrays above.
+        if isSliding {
+            _ = CBv2RaggedTwoPassDecodeAttentionV1.registerResidentNormRope(
+                normalizedQueries: queries, normalizedKeys: k, normalizedValues: v,
+                rawQueries: queryRaw, rawKeys: kRaw, rawValues: vRaw,
+                qWeight: qNorm.weight, kWeight: kNorm.weight,
+                positionOffsets: capturedOffsets,
+                ropeLog2Base: qkvRopeParameters.log2Base,
+                eps: config.rmsNormEps, appliedRope: appliedRope)
+        }
 
         let outputDType = queries.dtype
         let attentionQueries =
@@ -2117,6 +2133,8 @@ private class Gemma4Attention: Module {
                 queries: attentionQueries, keys: k, values: v, scale: scale, sinks: nil)
         }
 
+        let residentProducts =
+            CBv2RaggedTwoPassDecodeAttentionV1.takeResidentProducts(for: attention)
         var output = attention.transposed(0, 2, 1, 3).reshaped(B, queryLength, -1)
         if lastQueryCache == nil && outputStart > 0 {
             output = output[0..., outputStart..., 0...]
@@ -2124,7 +2142,11 @@ private class Gemma4Attention: Module {
         if output.dtype != outputDType {
             output = output.asType(outputDType)
         }
-        return (outputProjection(output), (k, v), captured)
+        return (
+            outputProjection(output),
+            (residentProducts?.normalizedKeys ?? k,
+             residentProducts?.normalizedValues ?? v),
+            captured)
     }
 }
 
@@ -2701,7 +2723,7 @@ private enum Gemma4RouteGlueFoldV1 {
 /// identity on the source array, so any intervening transformation falls back
 /// to the stock `inputLayernorm(x)`.
 public final class Gemma4GlueChainBox {
-    var pending: (source: MLXArray, normed: MLXArray)?
+    var pending: (source: MLXArray, normed: MLXArray, rs: MLXArray?)?
     public init() {}
 }
 
@@ -3245,12 +3267,12 @@ private enum Gemma4FusedLayerGlue {
 
     private static let deferredTailChainKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1_nb1_vec1",
+            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1_nb1_vec1_rs1",
             inputNames: [
                 "a", "sorted", "inverse", "route_weights", "res",
                 "w1", "w2", "w3", "s", "wn",
             ],
-            outputNames: ["out", "normed"],
+            outputNames: ["out", "normed", "rs"],
             source: """
                 const uint row = threadgroup_position_in_grid.x;
                 const uint lid = thread_position_in_threadgroup.x;
@@ -3290,10 +3312,28 @@ private enum Gemma4FusedLayerGlue {
             \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
                 of: "(float)outv[base + i]", with: "(float)outv[i]"))
                 const float inv4 = local_inv[0];
+                T nq[4];
                 for (int i = 0; i < 4; i++) {
-                    normed[base + i] =
-                        wn[wbase + i]
-                            * static_cast<T>((float)outv[i] * inv4);
+                    nq[i] = wn[wbase + i]
+                        * static_cast<T>((float)outv[i] * inv4);
+                    normed[base + i] = nq[i];
+                }
+                // RS-CHAIN: the next layer's affine run-sum table entry for
+                // this thread's 64-wide group, in the table kernel's order:
+                // each octet is float(quadA) + float(quadB) with each quad
+                // summed left to right in T (lanes 2f and 2f+1 hold the two
+                // quads of octet f), then the same balanced xor tree over
+                // the eight octets (lane bits 1..3 here are the table
+                // kernel's fm bits 0..2). Sixteen lanes never straddle a
+                // simdgroup (704 = 22 x 32).
+                const T nquad = ((nq[0] + nq[1]) + nq[2]) + nq[3];
+                float rsv = 0.0f + (float)nquad;
+                rsv += simd_shuffle_xor(rsv, 1u);
+                rsv += simd_shuffle_xor(rsv, 2u);
+                rsv += simd_shuffle_xor(rsv, 4u);
+                rsv += simd_shuffle_xor(rsv, 8u);
+                if ((lid & 15u) == 0u) {
+                    rs[row * 44 + (lid >> 4)] = rsv;
                 }
             """,
             ensureRowContiguous: true
@@ -3321,7 +3361,7 @@ private enum Gemma4FusedLayerGlue {
         layerScalar: MLXArray,
         nextInputNormWeight: MLXArray,
         eps: Float
-    ) -> (out: MLXArray, normedNext: MLXArray)? {
+    ) -> (out: MLXArray, normedNext: MLXArray, rs: MLXArray)? {
         guard admits(mlpOut, weight: w1, eps: eps),
             admitsDeferred(expertRows),
             residual.shape == mlpOut.shape,
@@ -3343,10 +3383,10 @@ private enum Gemma4FusedLayerGlue {
             template: [("T", mlpOut.dtype)],
             grid: (rows * tgThreads, 1, 1),
             threadGroup: (tgThreads, 1, 1),
-            outputShapes: [[rows, 1, axis], [rows, 1, axis]],
-            outputDTypes: [.bfloat16, .bfloat16]
+            outputShapes: [[rows, 1, axis], [rows, 1, axis], [rows, axis / 64]],
+            outputDTypes: [.bfloat16, .bfloat16, .float32]
         )
-        return (outs[0], outs[1])
+        return (outs[0], outs[1], outs[2])
     }
 
     static func tailDeferred(
@@ -4089,11 +4129,13 @@ public class Gemma4DecoderLayer: Module {
         // produced this layer's input norm. Pointer identity on the source
         // guarantees the normed tensor was computed from exactly this input.
         let h: MLXArray
+        var carriedRunsum: MLXArray? = nil
         if let chain = glueChain, let pending = chain.pending,
             pending.source === x
         {
             chain.pending = nil
             h = pending.normed
+            carriedRunsum = pending.rs
         } else {
             glueChain?.pending = nil
             h = inputLayernorm(x)
@@ -4101,7 +4143,7 @@ public class Gemma4DecoderLayer: Module {
         let (attnOut, kvPair, attnPositionOffset) = selfAttn(
             h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset,
             v2SharedSource: v2SharedSource, outputStart: outputStart,
-            useLastQueryPrefill: useLastQueryPrefill)
+            useLastQueryPrefill: useLastQueryPrefill, carriedRunsum: carriedRunsum)
         // PREFIX-001: only build the joined producer when the ZIP consumer is
         // guaranteed to accept it. A nil leaves the established attention
         // residual and branch pre-norm paths untouched.
@@ -4298,7 +4340,7 @@ public class Gemma4DecoderLayer: Module {
                     eps: config.rmsNormEps)
             {
                 out = chained.out
-                chain.pending = (source: chained.out, normed: chained.normedNext)
+                chain.pending = (source: chained.out, normed: chained.normedNext, rs: chained.rs)
                 tailApplied = true
                 scalarFolded = true
             } else if canFoldScalar, let deferred = expertBranch.deferred,
@@ -4335,7 +4377,7 @@ public class Gemma4DecoderLayer: Module {
                         eps: config.rmsNormEps)
                 {
                     out = chained.out
-                    chain.pending = (source: chained.out, normed: chained.normedNext)
+                    chain.pending = (source: chained.out, normed: chained.normedNext, rs: nil)
                     tailApplied = true
                     scalarFolded = true
                 } else if canFoldScalar,
@@ -4365,7 +4407,7 @@ public class Gemma4DecoderLayer: Module {
                         eps: config.rmsNormEps)
                 {
                     out = chained.out
-                    chain.pending = (source: chained.out, normed: chained.normedNext)
+                    chain.pending = (source: chained.out, normed: chained.normedNext, rs: nil)
                     tailApplied = true
                     scalarFolded = true
                 } else if canFoldScalar, let chain = glueChain,
@@ -4382,7 +4424,7 @@ public class Gemma4DecoderLayer: Module {
                         eps: config.rmsNormEps)
                 {
                     out = chained.out
-                    chain.pending = (source: chained.out, normed: chained.normedNext)
+                    chain.pending = (source: chained.out, normed: chained.normedNext, rs: nil)
                     tailApplied = true
                     scalarFolded = true
                 } else if let fusedTail = Gemma4PrefillGlueV1.branchTail(
@@ -5835,3 +5877,77 @@ extension Gemma4TextModel: CBv2MTPForwardable {
 
 // Ranked resample marker 2: this archive is a further ranked sample of the tree carried
 // by the preceding ranked submission of this content apart from any rotation item declared in its note.
+
+// MARK: - LGH-001 --- logitsless greedy head
+
+/// Cross-check every fused token against the logits the stock chain would have
+/// produced. Costs a host sync per step, so it is a diagnostic, never a mode
+/// the benchmark runs in.
+private let gemma4LogitslessHeadVerify: Bool = gemma4TruthyFlag(
+    ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_LOGITSLESS_HEAD_VERIFY"])
+
+/// The tied head can answer the chained decode step with token ids alone.
+///
+/// The values the fused kernel compares are the bf16 the MMA head would have
+/// stored, and the final softcap `tanh(x / c) * c` is strictly increasing for
+/// every `c >= 0`, so the fused top-1 is the stock argmax including its
+/// first-index-wins tie rule. See `Gemma4MMAQuantizedGEMV.applyArgmax`.
+extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
+
+    public func cbv2AdmitsArgmaxDecode(_ tokens: MLXArray) -> Bool {
+        guard tokens.ndim == 2, tokens.dim(1) == 1 else { return false }
+        guard config.finalLogitSoftcapping >= 0 else { return false }
+        guard lmHead == nil,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.mode == .affine
+        else { return false }
+        return Gemma4MMAQuantizedGEMV.admitsArgmax(
+            x: [tokens.dim(0), 1, config.hiddenSize],
+            xDType: .bfloat16,
+            w: quantized.weight,
+            scales: quantized.scales,
+            biases: quantized.biases,
+            groupSize: quantized.groupSize,
+            bits: quantized.bits)
+    }
+
+    public func cbv2DecodeArgmax(_ tokens: MLXArray, caches: [KVCache]) -> MLXArray {
+        let hidden = model(tokens, cache: caches)
+        let rows = tokens.dim(0)
+        guard lmHead == nil,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.mode == .affine,
+            let fused = Gemma4MMAQuantizedGEMV.applyArgmax(
+                x: hidden,
+                w: quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                groupSize: quantized.groupSize,
+                bits: quantized.bits)
+        else {
+            return applyLMHead(hidden).argMax(axis: -1).asType(.int32).reshaped([rows])
+        }
+        CBv2EngageMark.once("logitsless-greedy-head")
+        if gemma4LogitslessHeadVerify {
+            let stock = applyLMHead(hidden).argMax(axis: -1).asType(.int32).reshaped([rows])
+            let disagreements = sum(notEqual(fused, stock)).item(Int.self)
+            // The one place the fused comparison could diverge is a softcap
+            // that maps two DISTINCT stored bf16 logits onto one float; that
+            // needs |logit| in the hundreds, so the observed peak is the
+            // margin. Reported alongside every verified step.
+            let raw = Gemma4MMAQuantizedGEMV.apply(
+                x: hidden, w: quantized.weight, scales: quantized.scales,
+                biases: quantized.biases, groupSize: quantized.groupSize,
+                bits: quantized.bits)!
+            let peak = max(abs(raw.asType(.float32))).item(Float.self)
+            let report =
+                "[lgh] verify mismatch=\(disagreements) max_abs_logit=\(peak)"
+                + (disagreements == 0
+                    ? "\n"
+                    : " fused=\(fused.asArray(Int32.self)) "
+                        + "stock=\(stock.asArray(Int32.self))\n")
+            FileHandle.standardError.write(Data(report.utf8))
+        }
+        return fused
+    }
+}

@@ -2133,9 +2133,16 @@ private class Gemma4Attention: Module {
         // table — the table is per activation row and per 64-group of K,
         // independent of N, so the concatenated-N dispatch reads the same
         // entries the separate Q and K dispatches would.
+        // QKFUSE-SLIDING-001: `vProj == nil` admitted only the five
+        // full-attention layers.  Nothing about the fused dispatch needs V to
+        // be absent -- V keeps its own `tierProjection` either way -- so the
+        // 25 sliding layers take the tree's own exact `SPLIT = 4096` twin too,
+        // one dependent dispatch fewer per sliding layer per decode step.
+        let slidingFuse = vProj != nil && CBv2AttentionQKVMMA8V1.slidingFuseEnabled
         let fusedQK: (MLXArray, MLXArray)? =
-            (lastQueryCache == nil && !usesSharedKV && vProj == nil)
+            (lastQueryCache == nil && !usesSharedKV && (vProj == nil || slidingFuse))
             ? fusedQKProjection(x, rsTable: qkvRunsumTable) : nil
+        if slidingFuse, fusedQK != nil { CBv2EngageMark.once("qkfuse-sliding") }
         let queryRaw = (
             fusedQK?.0 ?? tierProjection(qProj, queryInput, rsTable: qkvRunsumTable)
         ).reshaped(B, queryLength, nHeads, effectiveHeadDim)

@@ -674,11 +674,41 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// QKFUSE-SLIDING-001 arm. Default ON.
+    /// `DARKBLOOM_GEMMA4_QKFUSE_SLIDING=0` returns the 25 sliding layers to
+    /// their two separate Q and K dispatches in the same executable; the five
+    /// full-attention layers keep the promoted QKFUSE-001 fused dispatch on
+    /// both arms.
+    public static let slidingFuseEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_QKFUSE_SLIDING"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// R13 addendum 3: the liveness mark is emitted from the site that BUILDS
+    /// the kernel's source string, not from a dispatch decision.  Swift
+    /// initialises a `static let` on first access, so a fingerprint emitted
+    /// here fires exactly when that kernel text is first compiled and
+    /// dispatched, and stays silent for a kernel nothing reaches.  The digest
+    /// is over the source text, so the gate can prove the four fused texts are
+    /// distinct and that the switch moves WHICH text is built, not the text.
+    @inline(__always)
+    private static func fingerprinted(_ tag: String, _ source: String) -> String {
+        var h: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in source.utf8 {
+            h ^= UInt64(byte)
+            h = h &* 0x0000_0100_0000_01b3
+        }
+        CBv2EngageMark.once("qkfuse-src-\(tag)-\(String(h, radix: 16))")
+        return source
+    }
+
     private static let fusedSlidingKernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_v1",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y", "y2"],
-        source: """
+        source: fingerprinted("sliding", """
             const uint3 tid = threadgroup_position_in_grid;
             threadgroup float2 red[64];
             qkv_mma8_affine4_g64_mt<T, 2, 2, 2816, 4096>(
@@ -687,7 +717,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
                 simdgroup_index_in_threadgroup,
                 thread_index_in_simdgroup, y2);
             return;
-            """,
+            """),
         header: mma8KernelHeader,
         ensureRowContiguous: true)
 
@@ -695,7 +725,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_v1",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y", "y2"],
-        source: """
+        source: fingerprinted("full", """
             const uint3 tid = threadgroup_position_in_grid;
             threadgroup float2 red[64];
             qkv_mma8_affine4_g64_mt<T, 2, 2, 2816, 8192>(
@@ -704,7 +734,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
                 simdgroup_index_in_threadgroup,
                 thread_index_in_simdgroup, y2);
             return;
-            """,
+            """),
         header: mma8KernelHeader,
         ensureRowContiguous: true)
 
@@ -717,7 +747,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_rsp_v1",
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y", "y2"],
-        source: """
+        source: fingerprinted("sliding-rsp", """
             const uint3 tid = threadgroup_position_in_grid;
             threadgroup float2 red[64];
             qkv_mma8_affine4_g64_mt_rsp<T, 2, 2, 2816, 4096>(
@@ -726,7 +756,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
                 simdgroup_index_in_threadgroup,
                 thread_index_in_simdgroup, y2);
             return;
-            """,
+            """),
         header: mma8KernelHeader,
         ensureRowContiguous: true)
 
@@ -734,7 +764,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_rsp_v1",
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y", "y2"],
-        source: """
+        source: fingerprinted("full-rsp", """
             const uint3 tid = threadgroup_position_in_grid;
             threadgroup float2 red[64];
             qkv_mma8_affine4_g64_mt_rsp<T, 2, 2, 2816, 8192>(
@@ -743,7 +773,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
                 simdgroup_index_in_threadgroup,
                 thread_index_in_simdgroup, y2);
             return;
-            """,
+            """),
         header: mma8KernelHeader,
         ensureRowContiguous: true)
 
@@ -955,6 +985,10 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
 
         let qWidth = qWeight.dim(0)
         let kWidth = kWeight.dim(0)
+        // QKFUSE-SLIDING-001: the 4096-split twin is the sliding geometry.
+        // With the arm off it is refused here as well as at the host gate, so
+        // the kill arm cannot reach the fused sliding text by any route.
+        guard qWidth != 4096 || slidingFuseEnabled else { return nil }
         guard liveFusedSplit(qWidth), liveOutputWidth(kWidth),
             qScales.shape == [qWidth, inputWidth / Self.groupSize],
             qBiases.shape == qScales.shape,

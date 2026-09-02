@@ -71,6 +71,16 @@ public enum Gemma4PrefillGlueV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// PREFILL-PREFIX kill switch: `DARKBLOOM_GEMMA4_PREFILL_BRANCH_PREFIX=0`
+    /// restores the three-kernel chain (`normResidual`, the router's
+    /// `MLXFast.rmsNorm`, the dense `preNorm`). Default ON.
+    public static let branchPrefixEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_BRANCH_PREFIX"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// This checkpoint's hidden size, and the `rms_single_row` launch geometry
     /// the stock host derives from it (`RMS_N_READS` 4, so 2816 / 4 = 704
     /// threads, 22 simdgroups, one threadgroup per row).
@@ -221,6 +231,142 @@ public enum Gemma4PrefillGlueV1 {
             outputShapes: [x.shape],
             outputDTypes: [x.dtype]
         )[0]
+    }
+
+    // MARK: - attention-branch prefix (3 dispatches -> 1)
+
+    /// PREFILL-PREFIX: the prefill twin of the decode plane's
+    /// `gemma4_glue_attention_branch_prefix_2816_bf16_v1`. Behind the
+    /// attention/branch boundary the MoE layer walks the same post-attention
+    /// row three times: `normResidual` reduces `attnOut` to write `out`, then
+    /// the router's `MLXFast.rmsNorm(out, scale * rootSize)` and the dense
+    /// `preNorm(out, w1)` each reduce that just-written `out` again. This
+    /// kernel merges all three. The first reduction is `normResidual`'s row
+    /// verbatim; the bf16-rounded `out` values stay in registers exactly
+    /// where the stock graph stored them to memory; and ONE second reduction
+    /// over those rounded values feeds both weight vectors -- the same
+    /// one-sum-two-weights argument `dualPreNormKernel` makes, extended to
+    /// the router norm, which reduces the identical row.
+    ///
+    /// Exactness, kernel by kernel:
+    /// - `out` is `normResidualKernel`'s row unchanged: `glue_inv_rms` over
+    ///   `attnOut`, `T(w * T(x * inv))` rounding exactly where the stock
+    ///   `MLXFast.rmsNorm` stores and the stock add re-reads, and the
+    ///   `res +` add rounding once to T on the store, as the stock binary
+    ///   add does.
+    /// - `denseNorm` is `preNormKernel`'s row with `w1`: `glue_inv_rms` over
+    ///   the same rounded `out` values the stock kernel re-reads from
+    ///   memory, then `w1 * T(out * inv2)`.
+    /// - `routerNorm` is the router's `MLXFast.rmsNorm(out, scale * rootSize)`
+    ///   (built by `zipEffectiveScale`, handed in as `wRouter`): the same
+    ///   `glue_inv_rms` over the same rounded values, then
+    ///   `wRouter * T(out * inv2)` -- the identical store expression the
+    ///   decode twin uses for its router output.
+    ///
+    /// The expert pre-norm is NOT folded: on this plane it reaches the
+    /// experts through `preNormScatter` in expert-sorted order, which stays
+    /// separate. `out` is still materialized because the tail chain consumes
+    /// it as `residual2`. Engage mark: `prefill-attention-branch-prefix`.
+    public struct AttentionBranchPrefix {
+        public let out: MLXArray
+        public let denseNorm: MLXArray
+        public let routerNorm: MLXArray
+    }
+
+    private static let attentionBranchPrefixKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_prefill_glue_attention_branch_prefix_2816_unroll_v2",
+            inputNames: ["x", "w", "res", "wd", "wr"],
+            outputNames: ["out", "dense", "router"],
+            source: """
+                threadgroup float local_sums[32];
+                threadgroup float local_inv[1];
+
+                const uint row = threadgroup_position_in_grid.y;
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint simd_lane_id = thread_index_in_simdgroup;
+                const uint simd_group_id = simdgroup_index_in_threadgroup;
+
+                const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+
+                float xv[GLUE_NREADS];
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    xv[i] = static_cast<float>(x[base + i]);
+                }
+
+                const float inv = glue_inv_rms(
+                    xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
+
+                // `normResidualKernel`'s row, verbatim; the T values just
+                // stored to `out` are kept in registers instead of re-read.
+                T outv[GLUE_NREADS];
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    const uint j = lid * GLUE_NREADS + i;
+                    const T normed = static_cast<T>(w[j] * static_cast<T>(xv[i] * inv));
+                    outv[i] = res[base + i] + normed;
+                    out[base + i] = outv[i];
+                }
+
+                float ov[GLUE_NREADS];
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    ov[i] = static_cast<float>(outv[i]);
+                }
+
+                // One sum-of-squares over the rounded `out` row serves both
+                // the dense weight and the router weight: the two stock
+                // kernels reduce the identical array.
+                const float inv2 = glue_inv_rms(
+                    ov, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
+
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    const uint j = lid * GLUE_NREADS + i;
+                    const T scaled = static_cast<T>(ov[i] * inv2);
+                    dense[base + i] = wd[j] * scaled;
+                    router[base + i] = wr[j] * scaled;
+                }
+                """,
+            header: kernelHeader,
+            ensureRowContiguous: true
+        )
+
+    /// `(out, denseNorm, routerNorm)`: `normResidual(attn, wPostAttn,
+    /// residual)` plus the dense pre-norm and the router norm of that `out`,
+    /// in one dispatch. Returns `nil` off the prefill plane, with the arm
+    /// switched off, or for any mismatched weight; the caller then rebuilds
+    /// the stock three-kernel chain untouched.
+    public static func attentionBranchPrefix(
+        attn x: MLXArray,
+        residual: MLXArray,
+        wPostAttn weight: MLXArray,
+        wDense: MLXArray,
+        wRouter: MLXArray,
+        eps epsIn: Float
+    ) -> AttentionBranchPrefix? {
+        guard branchPrefixEnabled,
+            let rows = planeRows(x, weight: weight, eps: epsIn),
+            residual.shape == x.shape,
+            residual.dtype == x.dtype,
+            wDense.shape == weight.shape,
+            wDense.dtype == weight.dtype,
+            wRouter.shape == weight.shape,
+            wRouter.dtype == weight.dtype
+        else { return nil }
+
+        CBv2EngageMark.once("prefill-attention-branch-prefix")
+        let outs = attentionBranchPrefixKernel(
+            [x, weight, residual, wDense, wRouter],
+            template: [("T", x.dtype)],
+            grid: (threadsPerRow, rows, 1),
+            threadGroup: (threadsPerRow, 1, 1),
+            outputShapes: [x.shape, x.shape, x.shape],
+            outputDTypes: [x.dtype, x.dtype, x.dtype]
+        )
+        return AttentionBranchPrefix(
+            out: outs[0], denseNorm: outs[1], routerNorm: outs[2])
     }
 
     // MARK: - dual pre-norm (2 dispatches -> 1)

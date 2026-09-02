@@ -131,6 +131,22 @@ enum CBv2AttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// PREFILL-KV-BATCH. When EVERY row of a packed prefill chunk would
+    /// take FRESH-RING-ADOPT for it, pack all rows' q4 mirror planes in ONE
+    /// batched dispatch (8 rows x 25 sliding layers: 200 pack dispatches per
+    /// ranked prefill become 25) and hand each row its packed mirror through
+    /// the batched adopt entry. The per-(plane, head, token) arithmetic and
+    /// the per-row state transitions are the per-row path's; only the grid
+    /// decomposition carries the row index. `0`/`false`/`no`/`off` restores
+    /// the per-row commit loop, which also stays the path whenever any row
+    /// would not adopt fresh.
+    static let prefillBatchKVCommitEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PREFILL_BATCH_KV_COMMIT"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// Join prompt attention blocks directly into the token-major layout that
     /// the following output projection consumes. The returned value remains a
     /// head-major view, so callers keep the same typed interface while their
@@ -741,12 +757,21 @@ enum CBv2AttentionV1 {
         var cachedValues: [MLXArray] = []
         cachedKeys.reserveCapacity(B)
         cachedValues.reserveCapacity(B)
-        for (index, row) in rows.enumerated() {
-            let (rowKeys, rowValues) = row.update(
-                keys: keys[index ..< (index + 1)],
-                values: values[index ..< (index + 1)])
-            cachedKeys.append(rowKeys)
-            cachedValues.append(rowValues)
+        // PREFILL-KV-BATCH: when every row would take FRESH-RING-ADOPT for
+        // this chunk, commit all rows through one batched mirror pack (see
+        // `batchedFreshChunkAdoption`); any other composition falls through
+        // to the established per-row loop below, unchanged.
+        if let batched = batchedFreshChunkAdoption(rows: rows, keys: keys, values: values) {
+            cachedKeys = batched.keys
+            cachedValues = batched.values
+        } else {
+            for (index, row) in rows.enumerated() {
+                let (rowKeys, rowValues) = row.update(
+                    keys: keys[index ..< (index + 1)],
+                    values: values[index ..< (index + 1)])
+                cachedKeys.append(rowKeys)
+                cachedValues.append(rowValues)
+            }
         }
 
         if let batched = batchedPackedAttention(
@@ -767,6 +792,58 @@ enum CBv2AttentionV1 {
                 sinks: effectiveSinks, softcap: softcap,
                 spanContext: spanContexts?[index])
         }
+    }
+
+    /// PREFILL-KV-BATCH: all-rows-fresh admission for the rectangular
+    /// road's commit stage. When every row is a `CBv2WindowedSequenceKV`
+    /// whose next `update` with this chunk would take FRESH-RING-ADOPT
+    /// (`canAdoptFreshFullWindowChunk` — `update`'s own gate, row for row),
+    /// pack ALL rows' mirror planes in ONE batched dispatch and adopt per
+    /// row with the pre-packed mirror. Each row ends in exactly the state
+    /// its own `update` would leave — same ring storage (the chunk slice),
+    /// same `absoluteOffset`/`oldestValidPosition` advance, same
+    /// `borrowableChunkViews` — and the mirror holds the same bytes the
+    /// per-row pack would have written (the batched packer is the per-row
+    /// kernel with a row-prefixed grid index; see
+    /// `quantPackPairChunkBatchGPU`). The returned per-row cached views are
+    /// the chunk slices themselves, identical to what the per-row loop
+    /// collects. Returns nil — leaving the per-row commit loop to run
+    /// untouched — when the gate is off, the batch exceeds the batched
+    /// packer's eight row outputs, or ANY row would not adopt fresh.
+    private static func batchedFreshChunkAdoption(
+        rows: [CBv2SequenceKV], keys: MLXArray, values: MLXArray
+    ) -> (keys: [MLXArray], values: [MLXArray])? {
+        guard prefillBatchKVCommitEnabled else { return nil }
+        let B = rows.count
+        guard B > 1, B <= 8 else { return nil }
+        guard keys.ndim == 4, values.ndim == 4,
+            keys.dim(0) == B, values.dim(0) == B,
+            keys.dim(2) == values.dim(2)
+        else { return nil }
+        let windowed = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
+        guard windowed.count == B else { return nil }
+        for (index, row) in windowed.enumerated()
+        where !row.canAdoptFreshFullWindowChunk(
+            keys: keys[index ..< (index + 1)], values: values[index ..< (index + 1)])
+        {
+            return nil
+        }
+        let mirrors = CBv2WindowedSequenceKV.quantPackPairChunkBatchGPU(
+            keys: keys, values: values)
+        var cachedKeys: [MLXArray] = []
+        var cachedValues: [MLXArray] = []
+        cachedKeys.reserveCapacity(B)
+        cachedValues.reserveCapacity(B)
+        for (index, row) in windowed.enumerated() {
+            let (rowKeys, rowValues) = row.adoptFreshFullWindowChunk(
+                keys: keys[index ..< (index + 1)],
+                values: values[index ..< (index + 1)],
+                packedMirror: mirrors[index])
+            cachedKeys.append(rowKeys)
+            cachedValues.append(rowValues)
+        }
+        CBv2EngageMark.once("prefill-batch-kv-commit")
+        return (cachedKeys, cachedValues)
     }
 
     /// One batched SDPA for a packed `[B > 1, L > 1]` pass whose rows all hold
@@ -987,17 +1064,44 @@ enum CBv2AttentionV1 {
 
         let effectiveSinks = dispatchSinks(
             sinks, kind: kind, queries: queries, softcap: softcap)
-        var outputs: [MLXArray] = []
-        outputs.reserveCapacity(batch)
+        // Commit every row's FULL chunk first — the byte-identical `update`
+        // calls, in the same row order, the per-row loop below has always
+        // made — so every row's cache ends in exactly the state it reached
+        // before this function existed (absoluteOffset advanced by the
+        // chunk length). Only the attends may differ, below.
+        var committed: [(keys: MLXArray, values: MLXArray)] = []
+        committed.reserveCapacity(batch)
         for (index, row) in rows.enumerated() {
             let (cachedKeys, cachedValues) = row.update(
                 keys: keys[index ..< index + 1],
                 values: values[index ..< index + 1])
+            committed.append((cachedKeys, cachedValues))
+        }
+        // LASTQ-D512: when every row is a private `CBv2FullSequenceKV` in
+        // lockstep at the committed length (the scored 8×1024 prompt prefill:
+        // kL = 1024, inside the transcribed [4, 4095] window), ONE batched
+        // D512 3-dispatch chain replaces the 8 unfused per-row op graphs.
+        // Decode already runs that chain — with the same bit-exactness
+        // claim, verified at kL = 1024 — on exactly this query shape
+        // [8, 16, 1, 512] against exactly this kind of committed buffer. It
+        // performs no append of its own, so the commits above stand alone.
+        // Any admission miss fails closed to the per-row loop (kill switch:
+        // DARKBLOOM_GEMMA4_LASTQ_D512=0).
+        if let batched = CBv2RaggedComposedD512DecodeAttentionV1.attendCommitted(
+            rows: rows, kind: kind, queries: queries,
+            scale: scale, sinks: effectiveSinks, softcap: softcap)
+        {
+            CBv2EngageMark.once("lastqd512")
+            return batched
+        }
+        var outputs: [MLXArray] = []
+        outputs.reserveCapacity(batch)
+        for (index, cached) in committed.enumerated() {
             outputs.append(
                 attend(
                     queries: queries[index ..< index + 1],
-                    keys: cachedKeys, values: cachedValues,
-                    scale: scale, L: 1, kL: cachedKeys.dim(2), window: nil,
+                    keys: cached.keys, values: cached.values,
+                    scale: scale, L: 1, kL: cached.keys.dim(2), window: nil,
                     sinks: effectiveSinks, softcap: softcap))
         }
         return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 0)

@@ -490,6 +490,27 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
         header: mma8KernelHeader,
         ensureRowContiguous: true)
 
+    /// ORSFOLD-001. Take a table the resident attention kernel already emitted
+    /// for this exact activation instead of dispatching the prepass. The caller
+    /// owns the proof that the table belongs to `x`; this re-checks only the
+    /// shape contract the rsp bodies index against, so a table of the wrong
+    /// geometry can never reach a kernel.
+    @inline(__always)
+    public static func acceptRunsumTable(
+        _ table: MLXArray?, for x: MLXArray
+    ) -> MLXArray? {
+        guard rsPrepassEnabled, let table,
+            table.dtype == .float32,
+            x.dtype == .bfloat16,
+            x.ndim == 3,
+            x.dim(0) == batch,
+            x.dim(1) == sequence,
+            liveInputWidth(x.dim(2)),
+            table.shape == [batch, x.dim(2) / groupSize]
+        else { return nil }
+        return table
+    }
+
     /// MMA-RS-001 table for one o_proj activation tensor. nil keeps the
     /// incumbent dispatch.
     @inline(__always)

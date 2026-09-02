@@ -2050,21 +2050,68 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             ensureRowContiguous: true
         )
 
+    /// ORSFOLD-001. Default ON. `DARKBLOOM_CBV2_O_RS_FOLD=0` selects the
+    /// four-output resident kernel and leaves the standalone
+    /// `cbv2_b8_rs_table_dyn_v1` prepass to build the o_proj table.
+    static let oRunsumFoldEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_O_RS_FOLD"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// ORSFOLD-001 epilogue. Each combine lane already holds, in `ov`, the one
+    /// BF16 element it is about to store into `out`, and the o_proj activation
+    /// is that store read back head-major. Lane `l` owns element
+    /// `(block * 4 + l / 8) * 8 + (l % 8)`, so the eight lanes `l & ~7 ..
+    /// (l & ~7) + 7` are exactly one aligned run of eight consecutive elements,
+    /// which is the run one lane of the prepass reads as a `uint4`. Shuffling
+    /// that octet into `xt` and writing the two four-element partials as the
+    /// same two statements the prepass uses reproduces its value exactly,
+    /// including the BF16 rounding of each partial. A 64-wide group is eight
+    /// such octets, held by the four octets of block `2k` and the four of block
+    /// `2k+1`; xor 8 and xor 16 walk the octet index inside a block and give
+    /// `((v0+v1)+(v2+v3))`, the partner block gives `((v4+v5)+(v6+v7))`, and
+    /// the final add is the prepass's xor-4 stage. Same tree, same order.
+    private static let residentORunsumFold = """
+                    const ushort ow = as_type<ushort>(ov);
+                    const ushort obase = ushort(lane & ~7);
+                    thread T xt[8];
+                    #pragma clang loop unroll(full)
+                    for (int p = 0; p < 8; ++p) {
+                        xt[p] = as_type<T>(
+                            simd_shuffle(ow, ushort(obase + ushort(p))));
+                    }
+                    float rsv = 0;
+                    rsv += xt[0] + xt[1] + xt[2] + xt[3];
+                    rsv += xt[4] + xt[5] + xt[6] + xt[7];
+                    rsv += simd_shuffle_xor(rsv, 8u);
+                    rsv += simd_shuffle_xor(rsv, 16u);
+                    if (lane == 0) {
+                        local_o_rs[head * BLOCKS + block] = rsv;
+                    }
+        """
+
+    private static let residentORunsumStore = """
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                constexpr int rs_groups = D / 64;
+                const int rs_flat = block * simd_width + lane;
+                if (rs_flat < GQA * rs_groups) {
+                    const int rs_head = rs_flat / rs_groups;
+                    const int rs_group = rs_flat % rs_groups;
+                    o_rs[batch_index * (KV_HEADS * GQA * rs_groups)
+                            + (query_head + rs_head) * rs_groups + rs_group] =
+                        local_o_rs[rs_head * BLOCKS + 2 * rs_group]
+                        + local_o_rs[rs_head * BLOCKS + 2 * rs_group + 1];
+                }
+        """
+
     /// F4: exact decode Q/K/V normalization and sliding RoPE in the resident
     /// attention prologue. SIMD groups 0...3 own Q0, Q1, K, V respectively, so
     /// every raw element is normalized once; all eight resident attention groups
     /// reuse the BF16-rounded threadgroup rows.
-    private static let portQuantFusedWriteResidentNormRopeKernel: MLXFast.MLXFastKernel =
-        MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_v1",
-            inputNames: [
-                "raw_queries",
-                "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
-                "starts", "raw_keys", "raw_values", "q_weight", "k_weight",
-                "position_offsets", "rope_log2_base", "write_fence",
-            ],
-            outputNames: ["out", "fence", "k_out", "v_out"],
-            source: """
+    private static func residentNormRopeSource(withORunsum: Bool) -> String {
+        """
                 typedef vec<T, 4> T4;
                 constexpr int simd_width = 32;
                 constexpr int values_per_lane = D / simd_width;
@@ -2092,6 +2139,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 threadgroup T local_queries[GQA * D];
                 threadgroup T local_key[D];
                 threadgroup T local_value[D];
+                \(withORunsum ? "threadgroup float local_o_rs[GQA * BLOCKS];" : "")
 
                 // Transcribe gemma4_b8_qkv_rms_norm_rope_v2_vec1 one row per
                 // designated SIMD group. Each lane owns the same two four-value
@@ -2537,12 +2585,44 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                                 keep + simd_shuffle_xor(trade, stride);
                         }
                     }
-                    head_out[block_lane] = T(
+                    const T ov = T(
                         sum_exp_score == 0.0f
                             ? accumulator[0]
                             : accumulator[0] / sum_exp_score);
+                    head_out[block_lane] = ov;
+                \(withORunsum ? residentORunsumFold : "")
                 }
-            """,
+                \(withORunsum ? residentORunsumStore : "")
+            """
+    }
+
+    private static let portQuantFusedWriteResidentNormRopeKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_v1",
+            inputNames: [
+                "raw_queries",
+                "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
+                "starts", "raw_keys", "raw_values", "q_weight", "k_weight",
+                "position_offsets", "rope_log2_base", "write_fence",
+            ],
+            outputNames: ["out", "fence", "k_out", "v_out"],
+            source: residentNormRopeSource(withORunsum: false),
+            ensureRowContiguous: true
+        )
+
+    /// ORSFOLD-001 arm: the same kernel with the o_proj run-sum table as a
+    /// fifth output, so the standalone prepass never runs on a sliding layer.
+    private static let portQuantFusedWriteResidentNormRopeORunsumKernel:
+        MLXFast.MLXFastKernel = MLXFast.metalKernel(
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_ors_v1",
+            inputNames: [
+                "raw_queries",
+                "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
+                "starts", "raw_keys", "raw_values", "q_weight", "k_weight",
+                "position_offsets", "rope_log2_base", "write_fence",
+            ],
+            outputNames: ["out", "fence", "k_out", "v_out", "o_rs"],
+            source: residentNormRopeSource(withORunsum: true),
             ensureRowContiguous: true
         )
 
@@ -2690,7 +2770,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             if let normRope = takeResidentNormRope(
                 queries: queries, keys: newKeys, values: newValues)
             {
-                let resident = portQuantFusedWriteResidentNormRopeKernel(
+                let residentInputs =
                     [normRope.rawQueries] + mirrors + [
                         startArray,
                         normRope.rawKeys,
@@ -2700,29 +2780,51 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         normRope.positionOffsets,
                         normRope.ropeLog2Base,
                         previousWriteFence,
-                    ],
-                    template: [
-                        ("T", normRope.rawQueries.dtype),
-                        ("D", headDim),
-                        ("N", sequenceLength),
-                        ("GQA", gqa),
-                        ("KV_HEADS", kvHeads),
-                        ("BLOCKS", blocks),
-                    ],
-                    grid: (kvHeads * blocks * 32, batch, 1),
-                    threadGroup: (blocks * 32, 1, 1),
-                    outputShapes: [
-                        [batch, queryHeads, 1, headDim], [1],
-                        [batch, kvHeads, 1, headDim],
-                        [batch, kvHeads, 1, headDim],
-                    ],
-                    outputDTypes: [
-                        .bfloat16, .int32, .bfloat16, .bfloat16,
                     ]
-                )
+                let residentTemplate: [(String, any KernelTemplateArg)] = [
+                    ("T", normRope.rawQueries.dtype),
+                    ("D", headDim),
+                    ("N", sequenceLength),
+                    ("GQA", gqa),
+                    ("KV_HEADS", kvHeads),
+                    ("BLOCKS", blocks),
+                ]
+                let residentShapes = [
+                    [batch, queryHeads, 1, headDim], [1],
+                    [batch, kvHeads, 1, headDim],
+                    [batch, kvHeads, 1, headDim],
+                ]
+                let residentDTypes: [DType] = [
+                    .bfloat16, .int32, .bfloat16, .bfloat16,
+                ]
+                let resident: [MLXArray]
+                let oRunsum: MLXArray?
+                if oRunsumFoldEnabled {
+                    resident = portQuantFusedWriteResidentNormRopeORunsumKernel(
+                        residentInputs,
+                        template: residentTemplate,
+                        grid: (kvHeads * blocks * 32, batch, 1),
+                        threadGroup: (blocks * 32, 1, 1),
+                        outputShapes: residentShapes
+                            + [[batch, queryHeads * headDim / 64]],
+                        outputDTypes: residentDTypes + [.float32]
+                    )
+                    oRunsum = resident[4]
+                    CBv2EngageMark.once("o-runsum-resident-fold")
+                } else {
+                    resident = portQuantFusedWriteResidentNormRopeKernel(
+                        residentInputs,
+                        template: residentTemplate,
+                        grid: (kvHeads * blocks * 32, batch, 1),
+                        threadGroup: (blocks * 32, 1, 1),
+                        outputShapes: residentShapes,
+                        outputDTypes: residentDTypes
+                    )
+                    oRunsum = nil
+                }
                 publishResidentProducts(
                     ResidentProducts(
-                        runsumTable: nil,
+                        runsumTable: oRunsum,
                         normalizedKeys: resident[2],
                         normalizedValues: resident[3]),
                     for: resident[0])
@@ -3049,6 +3151,16 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// requires kL ≥ TM = 4.
     private static let minKeyLength = 4
     private static let maxKeyLength = 4095
+
+    /// LASTQ-D512 kill switch: `DARKBLOOM_GEMMA4_LASTQ_D512` set to
+    /// `0`/`false`/`no`/`off` restores the per-row last-query attend loop in
+    /// `CBv2AttentionV1.updateAndAttendLastQuery`. Default ON.
+    private static let lastQueryPrefillEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_LASTQ_D512"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
 
     /// Dispatch 1 — QKᵀ. Grid: (row, kv head, chunk of 4 virtual gemv
     /// threadgroups = 64 score rows) × 128 threads (4 simdgroups — exactly
@@ -4778,6 +4890,105 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             valueBuffers.append(state[1])
             params.append(UInt32(state[0].dim(2)))
         }
+        return dispatchChain(
+            queries: queries, keyBuffers: keyBuffers, valueBuffers: valueBuffers,
+            params: params, keyLength: keyLength)
+    }
+
+    /// LASTQ-D512: the attend-only twin of `updateAndAttend` for the final
+    /// layer's last-query prefill (see LastQueryPrefillV2.swift). The caller
+    /// (`CBv2AttentionV1.updateAndAttendLastQuery`) has ALREADY committed
+    /// every row's full K/V chunk — the byte-identical per-row `update`
+    /// calls in row order — so this runs the stock three-dispatch chain over
+    /// the committed buffers with kL = the rows' common committed length and
+    /// appends NOTHING of its own (a chunk can never be double-committed;
+    /// the WRITE variants are not applicable for exactly that reason).
+    ///
+    /// Admission mirrors `updateAndAttend` with the decode-only gates
+    /// translated: kL is the committed length (not `offset + 1` — nothing is
+    /// appended), there is no new-token keys/values shape to check, and
+    /// `absoluteOffset <= maxLength` is a `CBv2FullSequenceKV` invariant
+    /// rather than an append-fit gate. Fails closed (nil, NO side effects)
+    /// on any miss, exactly like `updateAndAttend`.
+    ///
+    /// Exactness: same claim and same scope as `updateAndAttend`. The
+    /// per-row graph this replaces is the SAME `attend(..., L: 1, ...)`
+    /// call — maskMode `.none` at L == 1, scale 1.0, no sinks/softcap,
+    /// same committed `[1, kvHeads, kL, headDim]` views — the decode
+    /// per-row loop makes at the same kL, and the chain is parity-verified
+    /// bit-exact against that graph at kL ∈ {1024, 1027, 1100, 1152, 1055,
+    /// 2048, 4095} (see the enum header). How the committed bytes got there
+    /// (one-token decode append vs one whole-chunk prefill append) is not
+    /// an input the kernels can observe.
+    static func attendCommitted(
+        rows: [CBv2SequenceKV], kind: CBv2LayerKind,
+        queries: MLXArray, scale: Float, sinks: MLXArray?, softcap: Float?
+    ) -> MLXArray? {
+        guard enabled,
+            lastQueryPrefillEnabled,
+            rows.count == batch,
+            scale == 1.0,
+            sinks == nil,
+            softcap == nil,
+            !kind.isBidirectional,
+            kind.queryHeads == queryHeads,
+            kind.kvHeads == kvHeads,
+            kind.headDim == headDim,
+            queries.dtype == .bfloat16,
+            queries.shape == [batch, queryHeads, 1, headDim]
+        else { return nil }
+        guard case .full = kind.attention else { return nil }
+
+        let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
+        guard fullRows.count == batch else { return nil }
+
+        // Lockstep + storage gates, ALL before any dispatch. Pooled
+        // (ATT-008) rows fail closed exactly like the decode path: their
+        // backing layout is the pool's batch axis.
+        let keyLength = fullRows[0].absoluteOffset
+        guard keyLength >= minKeyLength,
+            keyLength <= maxKeyLength,
+            fullRows.allSatisfy({ $0.cohortPool == nil }),
+            fullRows.allSatisfy({ $0.absoluteOffset == keyLength })
+        else { return nil }
+
+        var keyBuffers: [MLXArray] = []
+        var valueBuffers: [MLXArray] = []
+        keyBuffers.reserveCapacity(batch)
+        valueBuffers.reserveCapacity(batch)
+        var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
+        params.reserveCapacity(batch + 2)
+        for row in fullRows {
+            let state = row.cbv2InnerState()
+            guard state.count == 2,
+                state[0].dtype == .bfloat16,
+                state[1].dtype == .bfloat16,
+                state[0].ndim == 4,
+                state[0].dim(0) == 1,
+                state[0].dim(1) == kvHeads,
+                state[0].dim(3) == headDim,
+                state[1].shape == state[0].shape,
+                state[1].dtype == state[0].dtype,
+                state[0].dim(2) >= keyLength
+            else { return nil }
+            keyBuffers.append(state[0])
+            valueBuffers.append(state[1])
+            params.append(UInt32(state[0].dim(2)))
+        }
+        return dispatchChain(
+            queries: queries, keyBuffers: keyBuffers, valueBuffers: valueBuffers,
+            params: params, keyLength: keyLength)
+    }
+
+    /// The stock three-dispatch chain (QKᵀ → precise softmax → probs·V) over
+    /// collected committed row buffers, byte-for-byte as `updateAndAttend`
+    /// always dispatched it. `params` = [kL, D, per-row KV buffer
+    /// capacities...]. Shared by the decode append path and the last-query
+    /// attend-only path so the two cannot drift.
+    private static func dispatchChain(
+        queries: MLXArray, keyBuffers: [MLXArray], valueBuffers: [MLXArray],
+        params: [UInt32], keyLength: Int
+    ) -> MLXArray {
         let paramsArray = MLXArray(params)
 
         let template: [(String, any KernelTemplateArg)] = [

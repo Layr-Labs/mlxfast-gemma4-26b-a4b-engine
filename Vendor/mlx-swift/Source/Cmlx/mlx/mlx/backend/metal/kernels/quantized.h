@@ -4026,10 +4026,30 @@ template <typename T, int group_size, int bits>
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   int M = x_shape[x_batch_ndims];
+  // EGU-V2: the pair geometry also admits the routed-expert gate|up plane
+  // dispatched as ONE gather over the concatenated [experts, 1408, 352]
+  // storage (out_vec_size = 1408: gate rows 0..<704 followed by up rows
+  // 704..<1408, K = 2816). Every arm below -- pair / triple / quad stream,
+  // EXPERT-SINGLES and the stock qmv_impl fall-through -- derives its output
+  // rows from the grid alone (out_row = tid.y * 8 + simd_gid * 4), addresses
+  // w / scales / biases by out_row times a K-derived row stride, and reads
+  // out_vec_size only as the per-assignment y row stride and (singles /
+  // stock) the clamp min(out_vec_size - 4, out_row), which is a no-op for
+  // every N that is a multiple of 8 (704, 1408 and 2816 all are; the host
+  // grid is exactly N / 8 y-groups, so no group is ever clamped or culled).
+  // Arm election depends only on the sorted rhs run structure, which the
+  // fused dispatch shares with the two split ones. So fused column n < 704
+  // runs the identical arm, loads the identical weight, scale and bias bytes
+  // (the gate view IS rows 0..<704 of this storage at the same expert
+  // stride) against the identical x row in the identical K order, through
+  // the identical accumulator, simd_sum and store, and column n >= 704 does
+  // the same for up row n - 704. Only the y column offset
+  // (assignment * 1408 + n) is wider; the host slices it back into halves.
   const bool gemma4_pair_geometry =
       group_size == 64 && bits == 4 && M == 1 && batch_ndims == 1 &&
       batch_shape[0] == 64 && x_batch_ndims == 1 && w_batch_ndims == 1 &&
       ((in_vec_size == 2816 && out_vec_size == 704) ||
+       (in_vec_size == 2816 && out_vec_size == 1408) ||
        (in_vec_size == 704 && out_vec_size == 2816));
   if (gemma4_pair_geometry) {
     // KERN-DOWN-TILE gate (strip-walk pattern): compile-time flip; ON

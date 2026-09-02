@@ -140,6 +140,176 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// W4-XVLOAD-001. `load_affine8_values` -- the four-value activation walk
+    /// DMLP-002 substitutes for `load_vector` in the LIVE gate/up body -- read
+    /// its four activations as four separate scalar loads. They are four
+    /// adjacent elements at a naturally aligned address, so they become ONE
+    /// aligned `vec<T, 4>`. Same elements, same widening to float, same order
+    /// into `x_thread`, and the `x_sums` term the body adds beside the walk is
+    /// untouched, so every downstream `qdot`, K accumulation and simd
+    /// reduction consumes identical bits. Exact by construction: no tolerance
+    /// budget is spent.
+    ///
+    /// Alignment holds for every address the body forms, with no runtime
+    /// condition. Each x stream enters the impl as `x + (first_m + j) *
+    /// in_vec_size`, is advanced once by `simd_lid * values_per_thread` and by
+    /// `block_size` per K block, so
+    ///
+    ///     x - base = (first_m + j) * in_vec_size
+    ///              + values_per_thread * simd_lid
+    ///              + block_size * n
+    ///
+    /// with the body's own constants `values_per_thread == 4` and
+    /// `block_size == values_per_thread * SIMD_SIZE == 128`, and `in_vec_size`
+    /// pinned by `liveShape` to 2816 (= 4 * 704) or 2112 (= 4 * 528). Every
+    /// term is a multiple of four elements, i.e. eight bytes at bfloat16, so
+    /// the run is a naturally aligned `vec<T, 4>` unconditionally -- no guard,
+    /// no remainder path. The ragged tail forms the same addresses under the
+    /// `simd_lid < active_tail_lanes` predicate, which restricts WHICH lanes
+    /// load and never the address; the live gate/up shape has no tail at all
+    /// (2816 / 128 = 22 exactly). The load reads exactly `x[0 ..< 4]`, the
+    /// elements the incumbent loop read, so no new byte is touched and the
+    /// bounds are unchanged.
+    ///
+    /// `DARKBLOOM_GEMMA4_W4_XVLOAD=0` compiles the incumbent scalar walk
+    /// verbatim and drops the cache-key suffix.
+    public static let w4XvloadEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_W4_XVLOAD"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Appended to every kernel name whose source text this switch changes, so
+    /// a name-keyed compiled-kernel cache can never serve the other body.
+    static let w4xvSuffix: String = w4XvloadEnabled ? "_wx1" : ""
+
+    /// W4-XSUMS-F4-001. DMLP-002 replaced `load_vector`'s in-kernel activation
+    /// sum with a lookup into the precomputed `x_sums` table, one lookup per x
+    /// stream. The four lookups a thread performs in one K block are four
+    /// CONSECUTIVE `float32` at
+    ///
+    ///     ((k / block_size) * SIMD_SIZE + simd_lid) * 8 + first_m + {0,1,2,3}
+    ///
+    /// with `first_m` in {0, 4}. They are four separate scalar loads that are
+    /// consumed unchanged, so they become ONE `float4`.
+    ///
+    /// The index is 16-byte aligned for every address the body can form, with
+    /// no runtime condition. Write the index as `8 * q + first_m` with
+    /// `q = (k / block_size) * SIMD_SIZE + simd_lid`; `first_m = int(tid.x) * 4`
+    /// and the kernel returns for `first_m >= 8`, so `first_m` is 0 or 4 and the
+    /// index is congruent to 0 or 4 modulo 8 -- in both cases a multiple of
+    /// FOUR. The element type is `float32`, four bytes, so the byte offset from
+    /// the table base is a multiple of sixteen. `float4` requires sixteen.
+    ///
+    /// The base is at least as aligned. `x_sums` is bound from an `MLXArray`
+    /// the kernel dispatch owns end to end -- either `activationSumKernel`'s
+    /// own `outputShapes: [[blocks * simdWidth * batch]]` `.float32` output or
+    /// the produced table `activationSums(produced:for:)` admits under the same
+    /// `values.dtype == .float32, values.ndim == 1, values.size == blocks *
+    /// simdWidth * batch` pins -- a whole, contiguous, freshly allocated buffer
+    /// at offset zero, never a slice, and the kernel is declared
+    /// `ensureRowContiguous: true`. The same file's live down-plane MMA body
+    /// already reads its operand sixteen bytes at a time
+    /// (`const uint4 r0 = *((const device uint4*)(x0 + 64 * g));`) off an
+    /// `MLXArray` bound the same way, and that load is promoted and running on
+    /// every decode step, which settles the base.
+    ///
+    /// Values are bit-identical: the same four floats, in the same order, into
+    /// the same `sum` at the same four statements, with no arithmetic added,
+    /// removed or reassociated. No tolerance budget is spent.
+    ///
+    /// `DARKBLOOM_GEMMA4_W4_XSUMS_F4=0` selects the incumbent four scalar
+    /// lookups CHARACTER FOR CHARACTER -- the arms are chosen in Swift, not by
+    /// the Metal preprocessor, so the off arm's kernel source string is
+    /// byte-identical to the base's and its FNV-1a fingerprint proves it.
+    public static let w4XsumsF4Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_W4_XSUMS_F4"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Appended to every kernel name whose source text this switch changes.
+    /// Composes with `w4xvSuffix`: both switches on gives both suffixes, so a
+    /// name-keyed compiled-kernel cache can never serve one configuration's
+    /// body to another.
+    static let w4xsSuffix: String = w4XsumsF4Enabled ? "_xf4" : ""
+
+    /// W4-YSTORE-V4-001. The quad-stream close writes the four output rows a
+    /// simdgroup owns for each of the four x streams as SIXTEEN separate
+    /// scalar `T` stores, all of them issued by lane 0 of the simdgroup. For
+    /// each stream those four rows are `y[out_row .. out_row + 3]`, four
+    /// ADJACENT elements at a 4-element-aligned index, so they are one aligned
+    /// `vec<T, 4>` store per stream -- four stores instead of sixteen.
+    ///
+    /// Splitting the fused reduce-and-store loop in two is what makes the
+    /// vector store expressible: the reductions must all be complete before
+    /// the four components of a stream's vector exist. The split is exact.
+    /// `simd_sum` is a simdgroup-wide reduction executed by every lane in both
+    /// versions, in the same textual order, over the same operands, with the
+    /// four `result*` arrays written by the same statements; only the STORES
+    /// move, and lane 0 still writes the same values to the same addresses.
+    ///
+    /// Alignment holds with no runtime condition. Each stream's pointer is
+    /// `y + first_m_or_next * out_vec_size` advanced once by `out_row`, with
+    ///
+    ///     out_row = tid.y * (num_simdgroups * results_per_simdgroup)
+    ///             + simd_gid * results_per_simdgroup
+    ///             = tid.y * 8 + simd_gid * 4
+    ///
+    /// a multiple of FOUR; `first_m = int(tid.x) * 4` and the kernel returns
+    /// for `first_m >= 8`, so the four stream offsets are 0, 1, 2, 3 plus
+    /// `first_m` in {0, 4}; and `out_vec_size == 2112 == 4 * 528`, because
+    /// `matmul` admits this kernel only under `useActivationSums`, which pins
+    /// `inDim == 2816 && outDim == 2112`. Every stream base is therefore a
+    /// multiple of four ELEMENTS from `y`, and `T` is `bfloat16` (`matmul`
+    /// requires `x.dtype == .bfloat16` and the output is declared `x.dtype`),
+    /// two bytes, so the byte offset is a multiple of EIGHT. `vec<T, 4>` is
+    /// eight bytes and needs eight. `y` itself is a whole, freshly allocated
+    /// `outputShapes: [[batch, sequence, outDim]]` array at offset zero in its
+    /// own buffer of 8 * 2112 * 2 = 33792 bytes, far above the allocator's
+    /// `small_size_` heap threshold, so it comes from `device_->newBuffer` and
+    /// is page-aligned.
+    ///
+    /// `DARKBLOOM_GEMMA4_W4_YSTORE_V4=0` emits the incumbent close CHARACTER
+    /// FOR CHARACTER -- the arms are two complete replacement texts selected
+    /// in Swift, not a `#if` inside the Metal source, so the off arm's kernel
+    /// source string is byte-identical to the base's and its FNV-1a
+    /// fingerprint proves it.
+    public static let w4YstoreV4Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_W4_YSTORE_V4"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Appended to every kernel name whose source text this switch changes.
+    /// Composes with `w4xvSuffix` and `w4xsSuffix`, so a name-keyed compiled
+    /// kernel cache can never serve one configuration's body to another.
+    static let w4ysSuffix: String = w4YstoreV4Enabled ? "_yv4" : ""
+
+    /// Diagnostics only, armed by `MLXFAST_ENGAGE_MARKS` exactly like
+    /// `CBv2EngageMark` itself and inert otherwise. A mark placed beside a
+    /// dispatch decision proves only that a branch was taken; a mark whose tag
+    /// carries a stable fingerprint of the kernel source string proves that
+    /// THIS text was the text handed to the compiler, and lets the two switch
+    /// arms be compared from the census alone. Swift's `hashValue` is
+    /// per-process seeded and cannot be compared across runs, so this is a
+    /// plain FNV-1a over UTF-8.
+    private static let markArmed =
+        ProcessInfo.processInfo.environment["MLXFAST_ENGAGE_MARKS"] != nil
+
+    private static func srcMark(_ tag: String, _ text: String) {
+        guard markArmed else { return }
+        var h: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in text.utf8 {
+            h ^= UInt64(byte)
+            h = h &* 0x0000_0100_0000_01b3
+        }
+        CBv2EngageMark.once(tag + String(h, radix: 16))
+    }
+
     private static let batch = 8
     private static let sequence = 1
     private static let groupSize = 64
@@ -353,7 +523,9 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
     /// still loaded into the same register array, in the same order, and every
     /// qdot, K accumulation and simd reduction remains text-for-text identical.
     private static let activationSumKernelHeader: String = {
-        var result = kernelHeader
+        var result = (w4XvloadEnabled
+            ? "#define DB_W4_XVLOAD 1\n" : "#define DB_W4_XVLOAD 0\n")
+            + kernelHeader
 
         func replaceOnce(_ old: String, with new: String) {
             precondition(result.components(separatedBy: old).count == 2)
@@ -380,10 +552,30 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
             inline void load_affine8_values(
                 const device T* x,
                 thread U* x_thread) {
+            #if DB_W4_XVLOAD
+              // Every caller reaches this run at a multiple of four elements
+              // from a row base whose stride is itself a multiple of four, so
+              // the fetch is one naturally aligned vector load with no guard
+              // and no remainder path. Same four elements, same widening, same
+              // order into x_thread as the walk below.
+              static_assert(
+                  values_per_thread % 4 == 0,
+                  "load_affine8_values vector run needs values_per_thread % 4 == 0");
+              #pragma unroll
+              for (int i = 0; i < values_per_thread; i += 4) {
+                const vec<T, 4> xv =
+                    *reinterpret_cast<const device vec<T, 4>*>(x + i);
+                x_thread[i] = xv[0];
+                x_thread[i + 1] = xv[1];
+                x_thread[i + 2] = xv[2];
+                x_thread[i + 3] = xv[3];
+              }
+            #else
               #pragma unroll
               for (int i = 0; i < values_per_thread; i++) {
                 x_thread[i] = x[i];
               }
+            #endif
             }
 
             template <typename T, const int group_size, const int bits>
@@ -413,7 +605,45 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
             """
         )
 
-        let loads: [(String, String)] = [
+        // W4-XSUMS-F4-001. The four `x_sums` lookups a thread makes in one K
+        // block are four consecutive float32 at a 16-byte-aligned index, and
+        // they are pure loads consumed unchanged, so ON they are hoisted into
+        // one `float4` and the four `sum` assignments read its components. The
+        // arms are selected HERE, in Swift, rather than by a `#if` inside the
+        // kernel text, so the OFF arm emits the incumbent source string
+        // character for character and its fingerprint equals the base's.
+        let xsumsF4Loads: [(String, String)] = [
+            (
+                "float sum = load_vector<T, float, values_per_thread, 8>(x0, x_thread);",
+                """
+                load_affine8_values<T, float, values_per_thread>(x0, x_thread);
+                const device float* xsum_run = x_sums +
+                    ((k / block_size) * SIMD_SIZE + int(simd_lid)) * 8 + first_m;
+                const float4 xsum4 =
+                    *reinterpret_cast<const device float4*>(xsum_run);
+                float sum = xsum4[0];
+                """),
+            (
+                "sum = load_vector<T, float, values_per_thread, 8>(x1, x_thread);",
+                """
+                load_affine8_values<T, float, values_per_thread>(x1, x_thread);
+                sum = xsum4[1];
+                """),
+            (
+                "sum = load_vector<T, float, values_per_thread, 8>(x2, x_thread);",
+                """
+                load_affine8_values<T, float, values_per_thread>(x2, x_thread);
+                sum = xsum4[2];
+                """),
+            (
+                "sum = load_vector<T, float, values_per_thread, 8>(x3, x_thread);",
+                """
+                load_affine8_values<T, float, values_per_thread>(x3, x_thread);
+                sum = xsum4[3];
+                """),
+        ]
+
+        let scalarLoads: [(String, String)] = [
             (
                 "float sum = load_vector<T, float, values_per_thread, 8>(x0, x_thread);",
                 """
@@ -443,10 +673,78 @@ METAL_FUNC void qmv_affine8_g64_quad_stream_impl(
                     ((k / block_size) * SIMD_SIZE + int(simd_lid)) * 8 + first_m + 3];
                 """),
         ]
+
+        let loads = w4XsumsF4Enabled ? xsumsF4Loads : scalarLoads
         for (old, new) in loads {
             precondition(result.components(separatedBy: old).count == 3)
             result = result.replacingOccurrences(of: old, with: new)
         }
+
+        // W4-YSTORE-V4-001. The close writes four adjacent, four-element
+        // aligned `T` per stream from lane 0; ON they become one `vec<T, 4>`
+        // store per stream, which requires the fused reduce-and-store loop to
+        // be split so every row reduction is complete before a stream's vector
+        // is formed. The reductions are independent and every `simd_sum` call
+        // keeps its operand and its position, so the stored values are
+        // bit-identical. Both arms are COMPLETE replacement texts selected
+        // here, in Swift, rather than by a `#if` inside the kernel: the OFF arm
+        // is the incumbent close character for character, so the emitted source
+        // string equals the base's byte for byte.
+        let ystoreV4Close = """
+              // W4-YSTORE-V4-001. Reduce every row into registers first, then close
+              // each stream with ONE aligned vec<T, 4> store. Every simd_sum call and
+              // its operand are unchanged and still run on every lane in the same
+              // order; only the sixteen scalar stores lane 0 used to issue become four.
+              #pragma unroll
+              for (int row = 0; row < results_per_simdgroup; row++) {
+                result0[row] = simd_sum(result0[row]);
+                result1[row] = simd_sum(result1[row]);
+                result2[row] = simd_sum(result2[row]);
+                result3[row] = simd_sum(result3[row]);
+              }
+              if (simd_lid == 0) {
+                static_assert(
+                    results_per_simdgroup == 4,
+                    "W4-YSTORE-V4 closes each stream with exactly one vec<T, 4>");
+                *reinterpret_cast<device vec<T, 4>*>(y0) = vec<T, 4>(
+                    static_cast<T>(result0[0]),
+                    static_cast<T>(result0[1]),
+                    static_cast<T>(result0[2]),
+                    static_cast<T>(result0[3]));
+                *reinterpret_cast<device vec<T, 4>*>(y1) = vec<T, 4>(
+                    static_cast<T>(result1[0]),
+                    static_cast<T>(result1[1]),
+                    static_cast<T>(result1[2]),
+                    static_cast<T>(result1[3]));
+                *reinterpret_cast<device vec<T, 4>*>(y2) = vec<T, 4>(
+                    static_cast<T>(result2[0]),
+                    static_cast<T>(result2[1]),
+                    static_cast<T>(result2[2]),
+                    static_cast<T>(result2[3]));
+                *reinterpret_cast<device vec<T, 4>*>(y3) = vec<T, 4>(
+                    static_cast<T>(result3[0]),
+                    static_cast<T>(result3[1]),
+                    static_cast<T>(result3[2]),
+                    static_cast<T>(result3[3]));
+              }
+            """
+        let scalarClose = """
+              #pragma unroll
+              for (int row = 0; row < results_per_simdgroup; row++) {
+                result0[row] = simd_sum(result0[row]);
+                result1[row] = simd_sum(result1[row]);
+                result2[row] = simd_sum(result2[row]);
+                result3[row] = simd_sum(result3[row]);
+                if (simd_lid == 0) {
+                  y0[row] = static_cast<T>(result0[row]);
+                  y1[row] = static_cast<T>(result1[row]);
+                  y2[row] = static_cast<T>(result2[row]);
+                  y3[row] = static_cast<T>(result3[row]);
+                }
+              }
+            """
+        replaceLast(scalarClose, with: w4YstoreV4Enabled ? ystoreV4Close : scalarClose)
+
         return result
     }()
 
@@ -794,6 +1092,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
                 s_next = srow[g_next];
                 b_next = brow[g_next];
             """)
+        srcMark("mlp-down-src-", result)
         return result
     }()
 
@@ -955,8 +1254,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     )
 
     private static let activationSumQMVKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_v2_unroll",
-        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_v2_unroll" + w4xvSuffix + w4xsSuffix + w4ysSuffix,        inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["y"],
         source: """
             const uint3 tid = threadgroup_position_in_grid;
@@ -1052,8 +1350,20 @@ inline U qdot_affine8_registered_v4(
 
     private static let w4KernelHeader: String = w4Header(kernelHeader)
 
-    private static let w4ActivationSumKernelHeader: String =
-        w4Header(activationSumKernelHeader)
+    private static let w4ActivationSumKernelHeader: String = {
+        let text = w4Header(activationSumKernelHeader)
+        // R13 addendum 2. This closure runs exactly once, when
+        // `w4ActivationSumQMVKernel` is first constructed -- and that kernel is
+        // constructed only where `matmul` selects it and immediately
+        // dispatches it. So these marks fire from INSIDE the construction of
+        // the live gate/up kernel's source string, not beside the branch that
+        // chose it, and the fingerprint names the exact text that was compiled.
+        srcMark("mlp-gateup-src-", text)
+        if w4XvloadEnabled { CBv2EngageMark.once("mlp-w4-xvload") }
+        if w4XsumsF4Enabled { CBv2EngageMark.once("mlp-w4-xsf4") }
+        if w4YstoreV4Enabled { CBv2EngageMark.once("mlp-w4-ystore4") }
+        return text
+    }()
 
     /// The W4 twins. Source text is the promoted kernels' own, character for
     /// character; only the name and the header differ, so the grid, threadgroup
@@ -1096,8 +1406,7 @@ inline U qdot_affine8_registered_v4(
     )
 
     private static let w4ActivationSumQMVKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_w4_v1",
-        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_w4_v1" + w4xvSuffix + w4xsSuffix + w4ysSuffix,        inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["y"],
         source: """
             const uint3 tid = threadgroup_position_in_grid;

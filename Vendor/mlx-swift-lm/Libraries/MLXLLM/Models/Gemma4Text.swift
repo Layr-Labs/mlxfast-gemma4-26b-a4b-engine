@@ -2691,6 +2691,16 @@ private enum Gemma4FusedLayerGlue {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Kill switch: DARKBLOOM_GEMMA4_PREFILL_ATTN_PREFIX=0 restores the
+    /// promoted prefill road (Gemma4PrefillGlueV1.normResidual + the two
+    /// preNorm dispatches + the router's own rmsNorm). Default ON.
+    static let prefillAttnPrefixEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_ATTN_PREFIX"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let rows = 8
     private static let axis = 2816
     private static let eps: Float = 1e-6
@@ -2852,6 +2862,54 @@ private enum Gemma4FusedLayerGlue {
                     xsum += densev;
                 }
                 xSums[lid * 8 + row] = xsum;
+            """,
+            ensureRowContiguous: true
+        )
+
+    /// CUT-2: the PREFIX-001 body on the ranked PREFILL plane. The source
+    /// is the decode kernel above verbatim, minus the xSums side table
+    /// (its only consumer, the DMLP-001 QMV, admits [8, 1, 2816] alone, so
+    /// the table has no reader at L >= 2 and its `lid * 8 + row` stride is
+    /// decode-shaped anyway). The live-output text is byte-identical, so
+    /// `out`/`dense`/`expert`/`router` round exactly where the decode cell
+    /// proves they do; the dropped `xsum` accumulation fed nothing else.
+    /// Identity carries the `_pf1` suffix because the source text changed.
+    private static let attentionBranchPrefixPrefillKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_glue_attention_branch_prefix_2816_bf16_v1_pf1_nb1",
+            inputNames: ["attn", "res", "wa", "wd", "we", "wr"],
+            outputNames: ["out", "dense", "expert", "router"],
+            source: """
+                const uint row = threadgroup_position_in_grid.x;
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint simd_lane_id = thread_index_in_simdgroup;
+                const uint simd_group_id = simdgroup_index_in_threadgroup;
+                threadgroup float local_inv[1];
+                threadgroup float local_sums[32];
+                const uint base = row * 2816 + lid * 4;
+                const uint wbase = lid * 4;
+            \(rmsReduce("attn", into: "local_inv[0]"))
+                const float attn_inv = local_inv[0];
+                T outv[4];
+                for (int i = 0; i < 4; i++) {
+                    const T normed = static_cast<T>(
+                        wa[wbase + i]
+                            * static_cast<T>(
+                                (float)attn[base + i] * attn_inv));
+                    outv[i] = res[base + i] + normed;
+                    out[base + i] = outv[i];
+                }
+            \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
+                of: "(float)outv[base + i]", with: "(float)outv[i]"))
+                const float branch_inv = local_inv[0];
+                for (int i = 0; i < 4; i++) {
+                    const T nx =
+                        static_cast<T>((float)outv[i] * branch_inv);
+                    const T densev = wd[wbase + i] * nx;
+                    dense[base + i] = densev;
+                    expert[base + i] = we[wbase + i] * nx;
+                    router[base + i] = wr[wbase + i] * nx;
+                }
             """,
             ensureRowContiguous: true
         )
@@ -3025,6 +3083,69 @@ private enum Gemma4FusedLayerGlue {
             expertNorm: outs[2],
             routerNorm: outs[3],
             denseSums: denseSums)
+    }
+
+    struct PrefillAttentionBranchPrefix {
+        let out: MLXArray
+        let denseNorm: MLXArray
+        let expertNorm: MLXArray
+        let routerNorm: MLXArray
+    }
+
+    /// CUT-2 admission: the ranked prefill cell only. The caller pins
+    /// isProductionPrefill (CBv2 schedulePrefill); this gate then demands
+    /// the exact `[8, L >= 2, 2816]` bfloat16 plane, a same-shape residual,
+    /// the four `[2816]` bfloat16 norm weights and eps 1e-6. The kernel is
+    /// the decode PREFIX-001 body, whose per-row reduction and rounding
+    /// boundaries the ranked decode cell already proves; rows are reduced
+    /// independently, so `gridRows = 8 * L` inherits that proof row for
+    /// row. Every mismatch, or the kill switch, returns nil and the
+    /// promoted three-op prefill road runs unchanged.
+    static func prefillAttentionBranchPrefix(
+        attn: MLXArray,
+        residual: MLXArray,
+        postAttentionWeight: MLXArray,
+        denseWeight: MLXArray,
+        expertWeight: MLXArray,
+        routerWeight: MLXArray,
+        eps: Float
+    ) -> PrefillAttentionBranchPrefix? {
+        func admitsWeight(_ w: MLXArray) -> Bool {
+            w.ndim == 1 && w.dim(0) == axis && w.dtype == .bfloat16
+        }
+        let seq = attn.dim(1)
+        guard prefillAttnPrefixEnabled,
+            eps == Self.eps,
+            attn.ndim == 3,
+            attn.dim(0) == rows, seq >= 2, attn.dim(2) == axis,
+            attn.dtype == .bfloat16,
+            attn.size == rows * seq * axis,
+            residual.shape == attn.shape,
+            residual.dtype == .bfloat16,
+            admitsWeight(postAttentionWeight),
+            admitsWeight(denseWeight),
+            admitsWeight(expertWeight),
+            admitsWeight(routerWeight)
+        else { return nil }
+        let gridRows = rows * seq
+        guard gridRows <= Int(UInt32.max) / tgThreads else { return nil }
+        let outs = attentionBranchPrefixPrefillKernel(
+            [
+                attn, residual, postAttentionWeight, denseWeight,
+                expertWeight, routerWeight,
+            ],
+            template: [("T", attn.dtype)],
+            grid: (gridRows * tgThreads, 1, 1),
+            threadGroup: (tgThreads, 1, 1),
+            outputShapes: [attn.shape, attn.shape, attn.shape, attn.shape],
+            outputDTypes: [.bfloat16, .bfloat16, .bfloat16, .bfloat16]
+        )
+        CBv2EngageMark.once("prefill-attention-branch-prefix")
+        return PrefillAttentionBranchPrefix(
+            out: outs[0],
+            denseNorm: outs[1],
+            expertNorm: outs[2],
+            routerNorm: outs[3])
     }
 
     static func dualPreNorm(
@@ -3415,8 +3536,22 @@ private class Gemma4Router: Module {
             effScale = eff
         }
         let normed = MLXFast.rmsNorm(x, weight: effScale, eps: eps)
-        let expertScores = proj(normed)
+        return routeTopK(proj(normed))
+    }
 
+    /// CUT-2: enter the routing chain from a producer-emitted router norm
+    /// that is bit-identical to `MLXFast.rmsNorm(x, zipEffectiveScale(),
+    /// eps)` over the prefill plane. Everything from `proj` onward is
+    /// `callAsFunction`'s tail, shared verbatim.
+    func callWithPrecomputedNorm(_ normed: MLXArray) -> (
+        topKIndices: MLXArray, topKWeights: MLXArray
+    ) {
+        routeTopK(proj(normed))
+    }
+
+    private func routeTopK(_ expertScores: MLXArray) -> (
+        topKIndices: MLXArray, topKWeights: MLXArray
+    ) {
         // ROUTE-001: single-dispatch byte-identical replacement of the chain
         // below for the B=8 decode geometry. Every other geometry, dtype, or
         // the kill switch falls through to the established chain.
@@ -3993,7 +4128,8 @@ public class Gemma4DecoderLayer: Module {
         isExpertPrefill: Bool = false,
         glueChain: Gemma4GlueChainBox? = nil,
         nextInputLayernormWeight: MLXArray? = nil,
-        enableAttentionBranchPrefix: Bool = false
+        enableAttentionBranchPrefix: Bool = false,
+        enablePrefillAttentionBranchPrefix: Bool = false
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         // Prompt-path narrowing (CBv2 only): attention and every K/V write
         // still cover the full chunk; only the token-local work AFTER
@@ -4057,9 +4193,31 @@ public class Gemma4DecoderLayer: Module {
                 expertWeight: preFeedforwardLayernorm2.weight,
                 eps: config.rmsNormEps)
         }()
+        // CUT-2: the same joined producer on the ranked PREFILL plane. The
+        // caller pins isProductionPrefill (CBv2 schedulePrefill); the
+        // wrapper's cell gate admits only [8, L >= 2, 2816] bfloat16. A nil
+        // leaves the promoted prefill road untouched.
+        let prefillAttentionBranchPrefix:
+            Gemma4FusedLayerGlue.PrefillAttentionBranchPrefix? = {
+            guard enablePrefillAttentionBranchPrefix,
+                isMoE, let router, let preFeedforwardLayernorm2
+            else {
+                return nil
+            }
+            return Gemma4FusedLayerGlue.prefillAttentionBranchPrefix(
+                attn: attnOut,
+                residual: residual,
+                postAttentionWeight: postAttentionLayernorm.weight,
+                denseWeight: preFeedforwardLayernorm.weight,
+                expertWeight: preFeedforwardLayernorm2.weight,
+                routerWeight: router.zipEffectiveScale(),
+                eps: config.rmsNormEps)
+        }()
         var out: MLXArray
         if let attentionBranchPrefix {
             out = attentionBranchPrefix.out
+        } else if let prefillAttentionBranchPrefix {
+            out = prefillAttentionBranchPrefix.out
         } else if let fusedOut = Gemma4FusedLayerGlue.normResidual(
             x: attnOut, residual: residual,
             weight: postAttentionLayernorm.weight, eps: config.rmsNormEps)
@@ -4156,7 +4314,17 @@ public class Gemma4DecoderLayer: Module {
                     weights: zipped.topKWeights,
                     routeTable: zipped.routeTable)
             } else {
-                let (topKIndices, topKWeights) = router(out)
+                // CUT-2: with the prefill prefix in hand, the router consumes
+                // the producer-emitted norm instead of re-reading and re-norming
+                // the whole residual plane.
+                let routed: (topKIndices: MLXArray, topKWeights: MLXArray)
+                if let prefillAttentionBranchPrefix {
+                    routed = router.callWithPrecomputedNorm(
+                        prefillAttentionBranchPrefix.routerNorm)
+                } else {
+                    routed = router(out)
+                }
+                let (topKIndices, topKWeights) = routed
 
                 if let (n1, n2, denseSums) = Gemma4FusedLayerGlue.dualPreNorm(
                     x: out,
@@ -4171,14 +4339,16 @@ public class Gemma4DecoderLayer: Module {
                         weights: topKWeights)
                 } else if isExpertPrefill,
                     Gemma4PrefillGlueV1.prenormGatherEnabled,
-                    let n1 = Gemma4PrefillGlueV1.preNorm(
-                        x: out,
-                        weight: preFeedforwardLayernorm.weight,
-                        eps: config.rmsNormEps),
-                    let n2 = Gemma4PrefillGlueV1.preNorm(
-                        x: out,
-                        weight: preFeedforwardLayernorm2.weight,
-                        eps: config.rmsNormEps)
+                    let n1 = prefillAttentionBranchPrefix?.denseNorm
+                        ?? Gemma4PrefillGlueV1.preNorm(
+                            x: out,
+                            weight: preFeedforwardLayernorm.weight,
+                            eps: config.rmsNormEps),
+                    let n2 = prefillAttentionBranchPrefix?.expertNorm
+                        ?? Gemma4PrefillGlueV1.preNorm(
+                            x: out,
+                            weight: preFeedforwardLayernorm2.weight,
+                            eps: config.rmsNormEps)
                 {
                     // PRENORM-GATHER: the expert pre-norm is written straight
                     // into expert-sorted order by the producer below, from
@@ -5084,6 +5254,14 @@ public class Gemma4TextModelInner: Module {
                 enableAttentionBranchPrefix:
                     isCBv2 && !schedulePrefill
                     && inputBatchSize == 8 && inputLength == 1
+                    && !capturePreNorm && dFlashHiddenCapture == nil,
+                // CUT-2: the same fused attention-branch prefix on the
+                // ranked prefill rectangle. Final-layer output-tail
+                // narrowing either keeps L >= 2 (per-row exact) or falls
+                // back to the promoted road inside the wrapper's cell gate.
+                enablePrefillAttentionBranchPrefix:
+                    isCBv2 && schedulePrefill
+                    && inputBatchSize == 8 && inputLength >= 2
                     && !capturePreNorm && dFlashHiddenCapture == nil
             )
             h = out

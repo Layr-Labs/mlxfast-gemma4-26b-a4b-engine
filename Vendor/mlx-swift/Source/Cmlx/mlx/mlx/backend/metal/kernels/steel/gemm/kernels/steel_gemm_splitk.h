@@ -2,6 +2,12 @@
 
 using namespace mlx::steel;
 
+// SPLITK-ACCUM-PTRWALK: keep the partition cursor in a device pointer.
+// Build with -DDARKBLOOM_SPLITK_ACCUM_PTRWALK=0 to retain the offset loop.
+#ifndef DARKBLOOM_SPLITK_ACCUM_PTRWALK
+#define DARKBLOOM_SPLITK_ACCUM_PTRWALK 1
+#endif
+
 ///////////////////////////////////////////////////////////////////////////////
 // GEMM kernels
 ///////////////////////////////////////////////////////////////////////////////
@@ -183,10 +189,18 @@ template <
   size_t offset = 0;
   AccT out = 0;
 
+#if DARKBLOOM_SPLITK_ACCUM_PTRWALK
+  const device AccT* part = C_split;
+  for (int i = 0; i < k_partitions; i++) {
+    out += *part;
+    part += partition_stride;
+  }
+#else
   for (int i = 0; i < k_partitions; i++) {
     out += C_split[offset];
     offset += partition_stride;
   }
+#endif
 
   // Write output
   D[0] = Epilogue::apply(out);
@@ -216,10 +230,18 @@ template <
   size_t offset = 0;
   AccT out = 0;
 
+#if DARKBLOOM_SPLITK_ACCUM_PTRWALK
+  const device AccT* part = C_split;
+  for (int i = 0; i < k_partitions; i++) {
+    out += *part;
+    part += partition_stride;
+  }
+#else
   for (int i = 0; i < k_partitions; i++) {
     out += C_split[offset];
     offset += partition_stride;
   }
+#endif
 
   // Write output
   Epilogue op(alpha, beta);

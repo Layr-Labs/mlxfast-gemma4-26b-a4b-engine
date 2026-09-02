@@ -1720,9 +1720,7 @@ private enum Gemma4PrefillDeqGEMMV1 {
             weight.dim(1) * (32 / quantized.bits) == inputDims
         else { return nil }
         CBv2EngageMark.once("prefill-deq-gemm")
-        let plane = dequantized(
-            weight, scales: quantized.scales, biases: biases,
-            groupSize: quantized.groupSize, bits: quantized.bits, mode: quantized.mode)
+        let plane = Self.plane(for: quantized, biases: biases)
         let product = MLX.matmul(x, plane.transposed())
         if xcheck {
             // Local diagnostics only (never on the ranked path): evaluate the
@@ -1748,6 +1746,47 @@ private enum Gemma4PrefillDeqGEMMV1 {
     /// forces evaluation, so it is never set on a timed run).
     static let xcheck: Bool =
         ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_PREFILL_DEQ_GEMM_XCHECK"] == "1"
+
+    /// DEQ-PLANE-CACHE-001. The dequantized bf16 plane of a projection is a
+    /// pure function of the module's frozen words, scales and biases, so it
+    /// is built once per module and kept: every later prompt pass reuses the
+    /// same array instead of re-running `dequantized` (one dispatch and one
+    /// full plane write per projection per prefill). The first prompt pass
+    /// (the warm-up seed prefill) fills the cache. Kill switch:
+    /// `DARKBLOOM_GEMMA4_PREFILL_DEQ_GEMM_CACHE=0` rebuilds the plane on
+    /// every call, as before.
+    static let cacheEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_DEQ_GEMM_CACHE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+    nonisolated(unsafe) private static var planeCache: [ObjectIdentifier: MLXArray] = [:]
+    private static let planeLock = NSLock()
+    @inline(__always)
+    static func plane(for quantized: QuantizedLinear, biases: MLXArray) -> MLXArray {
+        guard cacheEnabled else {
+            return dequantized(
+                quantized.weight, scales: quantized.scales, biases: biases,
+                groupSize: quantized.groupSize, bits: quantized.bits, mode: quantized.mode)
+        }
+        let key = ObjectIdentifier(quantized)
+        planeLock.lock()
+        if let cached = planeCache[key] {
+            planeLock.unlock()
+            return cached
+        }
+        planeLock.unlock()
+        let built = dequantized(
+            quantized.weight, scales: quantized.scales, biases: biases,
+            groupSize: quantized.groupSize, bits: quantized.bits, mode: quantized.mode)
+        eval(built)
+        planeLock.lock()
+        planeCache[key] = built
+        planeLock.unlock()
+        CBv2EngageMark.once("prefill-deq-plane-cache")
+        return built
+    }
 }
 
 // MARK: - Attention

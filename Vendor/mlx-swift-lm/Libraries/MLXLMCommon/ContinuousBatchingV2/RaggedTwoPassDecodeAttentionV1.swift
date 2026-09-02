@@ -2547,6 +2547,241 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         ensureRowContiguous: true
     )
 
+    /// QREG-D512: the query block a simdgroup multiplies is invariant across
+    /// the score tiles that simdgroup owns, but the transcribed traversal
+    /// re-reads it inside every tile. One threadgroup covers a chunk of four
+    /// virtual gemv groups, so each simdgroup walks the `vtg` loop four times
+    /// and issues the same 32 four-wide query halves four times over — 96 of
+    /// the 128 query loads per simdgroup are re-reads of registers it could
+    /// still be holding. The K tile cannot be hoisted (it is what the loop
+    /// walks) and the score accumulators cannot be shared (each tile has its
+    /// own), so the query block is the only invariant in the body.
+    ///
+    /// This source stages the whole `[GQA][n_iter]` query block once, before
+    /// the tile loop, and the tile loop then issues K loads only. The staged
+    /// form is the loaded bf16 `T4`, not the widened float, so the block
+    /// costs 32 vectors of halves rather than 128 floats and the
+    /// widen-to-float still happens at the same point in the same order it
+    /// happens today.
+    ///
+    /// Exactness: LOADS ONLY, the promoted-kernel invariant this whole file
+    /// is written to (loads may be shared or reordered, adds may not move).
+    /// `query + h * D + bn` with `bn = lane * 4 + i * 128` does not mention
+    /// `vtg`, so every staged vector is the identical value the incumbent
+    /// re-reads, and the loop nest below it keeps its `h` / `tm` / `tn`
+    /// order, its `q_coeff` widening, its flat `result[GQA * 4]`
+    /// accumulator, its XFOLD butterfly and its landing store character for
+    /// character. The tile loop still bounds `vtg_hi` at `virtual_groups`,
+    /// and `vtg_lo < virtual_groups` always holds (`chunk < n_chunks` and
+    /// `virtual_groups >= 4 * chunk + 1`), so the staging is never issued
+    /// for a threadgroup that then does no work.
+    ///
+    /// WRITE-022 is preserved: this is again ONE shared constant, so the
+    /// plain and fenced objects built from it stay structurally identical
+    /// and differ only by the unused trailing fence input.
+    private static let qkQregSource: String = """
+            constexpr int D = 512;
+            constexpr int GQA = 8;
+
+            const int key_length = int(params[0]);
+            const int in_vec_size = int(params[1]);
+
+            const int n_chunks = (key_length + 63) / 64;
+            const int z = int(threadgroup_position_in_grid.z);
+            const int chunk = z % n_chunks;
+            const int row_kv = z / n_chunks;
+            const int row = row_kv / 2;
+            const int kv_head = row_kv % 2;
+            const int sg = int(simdgroup_index_in_threadgroup);
+            const int lane = int(thread_index_in_simdgroup);
+
+            const int row_capacity = int(params[2 + row]);
+
+            const device T* key_plane = k0;
+            switch (row) {
+                case 1: key_plane = k1; break;
+                case 2: key_plane = k2; break;
+                case 3: key_plane = k3; break;
+                case 4: key_plane = k4; break;
+                case 5: key_plane = k5; break;
+                case 6: key_plane = k6; break;
+                case 7: key_plane = k7; break;
+                default: break;
+            }
+            key_plane += size_t(kv_head) * size_t(row_capacity) * D;
+
+            const device T* query =
+                queries + size_t(row * 16 + kv_head * GQA) * D;
+            device T* score_rows =
+                scores + size_t(row * 16 + kv_head * GQA) * key_length;
+
+            const int virtual_groups = (key_length + 15) / 16;
+            const int vtg_lo = chunk * 4;
+            const int vtg_hi = min(vtg_lo + 4, virtual_groups);
+            constexpr int n_iter = D / 128;
+
+            // QREG: stage the tile-invariant query block once. Every vector
+            // below is the same address the tile loop used to re-read, and
+            // the loaded halves are kept as loaded.
+            typedef vec<T, 4> T4;
+            T4 q_reg[GQA][n_iter];
+            #pragma clang loop unroll(full)
+            for (int h = 0; h < GQA; ++h) {
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < n_iter; ++i) {
+                    q_reg[h][i] = *reinterpret_cast<const device T4*>(
+                        query + h * D + lane * 4 + i * 128);
+                }
+            }
+
+            for (int vtg = vtg_lo; vtg < vtg_hi; ++vtg) {
+                int out_row = vtg * 16 + sg * 4;
+                if (out_row >= key_length) continue;
+                out_row = out_row + 4 <= key_length
+                    ? out_row : key_length - 4;
+
+                const device T* mat = key_plane + size_t(out_row) * D;
+                // XFOLD: one flat accumulator over the same 32 partial sums,
+                // so the cross-lane fold below can address the whole set with
+                // compile-time indices.
+                float result[GQA * 4] = {0.0f};
+                // KTILE: the 4x4 key tile is shared by all GQA heads, the
+                // query block is not. Staging the tile costs 16 halves and
+                // frees the 32-float per-head staging array.
+                T4 k_tile[4];
+                float q_coeff[4];
+                int bn = lane * 4;
+                // The staged block is only in registers if its indices are
+                // compile-time, so this walk over the constant `n_iter`
+                // (D / 128, four here) is marked rather than left to the
+                // JIT. Same adds, same order, unrolled.
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < n_iter; ++i) {
+                    int mat_offset = 0;
+                    #pragma clang loop unroll(full)
+                    for (int tm = 0; tm < 4; ++tm) {
+                        k_tile[tm] = *reinterpret_cast<const device T4*>(
+                            mat + mat_offset + bn);
+                        mat_offset += D;
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int h = 0; h < GQA; ++h) {
+                        const T4 q_raw = q_reg[h][i];
+                        #pragma clang loop unroll(full)
+                        for (int tn = 0; tn < 4; ++tn) {
+                            q_coeff[tn] = static_cast<float>(q_raw[tn]);
+                        }
+                        #pragma clang loop unroll(full)
+                        for (int tm = 0; tm < 4; ++tm) {
+                            #pragma clang loop unroll(full)
+                            for (int tn = 0; tn < 4; ++tn) {
+                                result[h * 4 + tm] +=
+                                    k_tile[tm][tn] * q_coeff[tn];
+                            }
+                        }
+                    }
+                    bn += 128;
+                }
+                {
+                    const bool hi = (lane & 16) != 0;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 16; ++j) {
+                        const float a = result[j];
+                        const float b = result[16 + j];
+                        result[j] = (hi ? b : a)
+                            + simd_shuffle_xor(hi ? a : b, ushort(16));
+                    }
+                }
+                {
+                    const bool hi = (lane & 8) != 0;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 8; ++j) {
+                        const float a = result[j];
+                        const float b = result[8 + j];
+                        result[j] = (hi ? b : a)
+                            + simd_shuffle_xor(hi ? a : b, ushort(8));
+                    }
+                }
+                {
+                    const bool hi = (lane & 4) != 0;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        const float a = result[j];
+                        const float b = result[4 + j];
+                        result[j] = (hi ? b : a)
+                            + simd_shuffle_xor(hi ? a : b, ushort(4));
+                    }
+                }
+                {
+                    const bool hi = (lane & 2) != 0;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 2; ++j) {
+                        const float a = result[j];
+                        const float b = result[2 + j];
+                        result[j] = (hi ? b : a)
+                            + simd_shuffle_xor(hi ? a : b, ushort(2));
+                    }
+                }
+                {
+                    const bool hi = (lane & 1) != 0;
+                    const float a = result[0];
+                    const float b = result[1];
+                    result[0] = (hi ? b : a)
+                        + simd_shuffle_xor(hi ? a : b, ushort(1));
+                }
+                score_rows[size_t(lane >> 2) * key_length + out_row
+                    + (lane & 3)] = static_cast<T>(result[0]);
+            }
+        """
+
+    private static let qkQregKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_qk_bf16_g8_xfold_v3_vec1_qreg_v1",
+        inputNames: [
+            "queries",
+            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+            "params",
+        ],
+        outputNames: ["scores"],
+        source: qkQregSource,
+        ensureRowContiguous: true
+    )
+
+    private static let qkFencedQregKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name:
+                "cbv2_ragged8_sdpa_d512_qk_fenced_bf16_g8_xfold_v3_vec1"
+                + "_qreg_v1",
+            inputNames: [
+                "queries",
+                "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+                "params", "store_fence",
+            ],
+            outputNames: ["scores"],
+            source: qkQregSource,
+            ensureRowContiguous: true
+        )
+
+    /// Kill switch: `DARKBLOOM_GEMMA4_D512_QK_QREG=0` (or false/no/off)
+    /// routes both D512 QK dispatches back to `qkSource`, which stays in the
+    /// file untouched and keeps its own cached pipeline names, so the
+    /// incumbent pair is restored byte for byte in the same binary.
+    /// Default ON.
+    private static let qkQregEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_QK_QREG"]
+        else { return true }
+        let normalized = raw.lowercased()
+        return !["0", "false", "no", "off"].contains(normalized)
+    }()
+
+    private static var qkActive: MLXFast.MLXFastKernel {
+        qkQregEnabled ? qkQregKernel : qkKernel
+    }
+
+    private static var qkFencedActive: MLXFast.MLXFastKernel {
+        qkQregEnabled ? qkFencedQregKernel : qkFencedKernel
+    }
+
     /// Dispatch 2 — softmax. A verbatim transcription of
     /// `softmax_single_row` (block_softmax_precise, AccT=float, N_READS=4)
     /// over the 128 score rows; the CALLER sizes the threadgroup exactly
@@ -3846,7 +4081,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         )[0]
 
         let chunks = (keyLength + 63) / 64
-        let scores = qkFencedKernel(
+        let scores = qkFencedActive(
             [queries] + keyBuffers + [paramsArray, storeFence],
             template: template,
             grid: (32, 4, batch * kvHeads * chunks),
@@ -4083,7 +4318,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let scratchShape = [batch, queryHeads, 1, keyLength]
 
         let chunks = (keyLength + 63) / 64
-        let scores = qkKernel(
+        let scores = qkActive(
             [queries] + keyBuffers + [paramsArray],
             template: template,
             grid: (32, 4, batch * kvHeads * chunks),

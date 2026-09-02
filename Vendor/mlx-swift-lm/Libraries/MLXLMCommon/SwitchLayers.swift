@@ -925,14 +925,13 @@ private func routeCountingSortPrefill(
     return (outputs[0], outputs[1], outputs[2])
 }
 
-/// GLUE-FOLD carrier: the exact decode route table (`row_order`,
-/// `sorted_keys`, `inverse_order`, each `[64]` uint32) computed upstream by a
-/// producer that already holds the router scores, so `projectExperts` never
-/// issues its standalone route-table dispatch. The arrays must be exactly what
-/// `gatherSortIndices` would have produced for the same `[8, 8]` indices --
-/// raw (untagged) sorted expert keys included -- and any shape, dtype or
-/// switch-state mismatch declines the carrier and re-issues the incumbent
-/// chain unchanged.
+/// ROUTE-TABLE carrier: the exact stable route table (`row_order`,
+/// `sorted_keys`, `inverse_order`) computed upstream by a producer that already
+/// owns the current selection. The decode glue emits three `[64]` uint32
+/// arrays; the prefill norm/scatter glue emits the same arrays at its full
+/// assignment count. A consumer may therefore skip its standalone sort only
+/// when all three arrays are shape-, dtype-, and permutation-compatible with
+/// its current flattened indices; otherwise it re-issues the incumbent chain.
 public struct SwitchRouteTable {
     public let rowOrder: MLXArray
     public let sortedKeys: MLXArray
@@ -1420,6 +1419,27 @@ public class SwitchGLU: Module {
                         indices: indices, numExperts: numExperts,
                         expertPrefixBounds: useExpertPrefixBounds)
                 }
+            } else if let table = routeTable,
+                table.rowOrder.dtype == .uint32,
+                table.rowOrder.ndim == 1, table.rowOrder.size == indices.size,
+                table.sortedKeys.dtype == .uint32,
+                table.sortedKeys.ndim == 1, table.sortedKeys.size == indices.size,
+                table.inverseOrder.dtype == .uint32,
+                table.inverseOrder.ndim == 1, table.inverseOrder.size == indices.size
+            {
+                if let sortedPlane,
+                    let plane = sortedPlane(table.inverseOrder),
+                    plane.ndim == 3, plane.dim(0) == indices.size,
+                    plane.dim(1) == 1, plane.dim(2) == inputDims,
+                    plane.dtype == x.dtype
+                {
+                    x = plane
+                } else {
+                    x = x.flattened(start: 0, end: -3)[table.rowOrder]
+                }
+                idx = table.sortedKeys
+                inverseOrder = table.inverseOrder
+
             } else if let sortedPlane {
                 // PRENORM-GATHER: the producer writes the sorted plane from
                 // the inverse order; `x` is only read if it declines.
@@ -1676,7 +1696,8 @@ public class SwitchGLU: Module {
         weights: MLXArray,
         fuseSortedReduction: Bool,
         isProductionPrefill: Bool = true,
-        sortedPlane: SwitchSortedPlaneProducer? = nil
+        sortedPlane: SwitchSortedPlaneProducer? = nil,
+        routeTable: SwitchRouteTable? = nil
     ) -> (output: MLXArray, carrier: WeightedExpertUnsortCarrier?) {
         // At B=8 decode there are exactly 64 assignments (8 rows x top-k 8),
         // which is the sorting threshold and the minimum geometry accepted by
@@ -1687,14 +1708,20 @@ public class SwitchGLU: Module {
         guard fuseSortedReduction && (isProductionPrefill || isEightRowDecode),
             supportsWeightedExpertUnsort(x, indices, weights: weights)
         else {
+            let fallback = projectExperts(
+                x, indices, sortedPlane: sortedPlane, routeTable: routeTable)
+            var output = fallback.output
+            if let inverseOrder = fallback.inverseOrder {
+                output = scatterUnsort(
+                    x: output, invOrder: inverseOrder, shape: indices.shape)
+            }
             return (
-                weightedExpertSum(
-                    callAsFunction(x, indices, sortedPlane: sortedPlane), weights),
-                nil
-            )
+                weightedExpertSum(MLX.squeezed(output, axis: -2), weights),
+                nil)
         }
 
-        let projected = projectExperts(x, indices, sortedPlane: sortedPlane)
+        let projected = projectExperts(
+            x, indices, sortedPlane: sortedPlane, routeTable: routeTable)
         guard projected.sorted,
             let inverseOrder = projected.inverseOrder,
             projected.output.ndim == 3,

@@ -71,6 +71,15 @@ public enum Gemma4PrefillGlueV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// Kill switch for the fused dense-plus-sorted expert pre-norm. Off
+    /// restores the separate dense norm and sorted expert producer.
+    private static let dualPreNormScatterEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_DUAL_PRENORM_SCATTER"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// This checkpoint's hidden size, and the `rms_single_row` launch geometry
     /// the stock host derives from it (`RMS_N_READS` 4, so 2816 / 4 = 704
     /// threads, 22 simdgroups, one threadgroup per row).
@@ -405,6 +414,57 @@ public enum Gemma4PrefillGlueV1 {
         ensureRowContiguous: true
     )
 
+    /// One reduction emits the dense norm and the expert norm directly in
+    /// route-sorted order. The dense result replaces `preNorm`; the sorted
+    /// result replaces `preNormScatter` once the route table is available.
+    private static let dualPreNormScatterKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_prefill_glue_dual_prenorm_scatter_2816_unroll_v1",
+            inputNames: ["x", "wd", "we", "inverse"],
+            outputNames: ["dense", "sorted"],
+            source: """
+                threadgroup float local_sums[32];
+                threadgroup float local_inv[1];
+
+                const uint row = threadgroup_position_in_grid.y;
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint simd_lane_id = thread_index_in_simdgroup;
+                const uint simd_group_id = simdgroup_index_in_threadgroup;
+
+                const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+
+                float xv[GLUE_NREADS];
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    xv[i] = static_cast<float>(x[base + i]);
+                }
+
+                const float inv = glue_inv_rms(
+                    xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
+
+                T expertNorm[GLUE_NREADS];
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    const uint j = lid * GLUE_NREADS + i;
+                    const T scaled = static_cast<T>(xv[i] * inv);
+                    dense[base + i] = wd[j] * scaled;
+                    expertNorm[i] = we[j] * scaled;
+                }
+
+                const size_t assignment_base = size_t(row) * K;
+                for (int k = 0; k < K; k++) {
+                    const size_t pos = size_t(inverse[assignment_base + k]);
+                    const size_t obase = pos * GLUE_AXIS + lid * GLUE_NREADS;
+                    #pragma clang loop unroll(full)
+                    for (int i = 0; i < GLUE_NREADS; i++) {
+                        sorted[obase + i] = expertNorm[i];
+                    }
+                }
+                """,
+            header: kernelHeader,
+            ensureRowContiguous: true
+        )
+
     /// `rmsNorm(x, weight)` alone. Returns `nil` off the prefill plane or with
     /// the arm switched off.
     public static func preNorm(
@@ -450,6 +510,61 @@ public enum Gemma4PrefillGlueV1 {
             outputShapes: [[rows * topK, 1, axis]],
             outputDTypes: [x.dtype]
         )[0]
+    }
+
+    /// Fuses the two identical prefill reductions and writes the expert
+    /// branch in the route order that its projections already consume. The
+    /// route table is computed once here and handed to `SwitchGLU`, so the
+    /// consumer does not repeat the sort just to recover its inverse order.
+    public static func dualPreNormScatter(
+        x: MLXArray,
+        denseWeight: MLXArray,
+        expertWeight: MLXArray,
+        indices: MLXArray,
+        numExperts: Int,
+        eps epsIn: Float
+    ) -> (
+        denseNorm: MLXArray,
+        sortedExpertNorm: MLXArray,
+        routeTable: SwitchRouteTable
+    )? {
+        guard dualPreNormScatterEnabled,
+            let rows = planeRows(x, weight: denseWeight, eps: epsIn),
+            expertWeight.shape == denseWeight.shape,
+            expertWeight.dtype == denseWeight.dtype,
+            indices.ndim == 3,
+            indices.size >= 64,
+            indices.dim(0) == x.dim(0),
+            indices.dim(1) == x.dim(1),
+            indices.dim(2) >= 1,
+            indices.dtype == .uint32,
+            numExperts > 0
+        else { return nil }
+
+        let topK = indices.dim(-1)
+        let order = gatherSortOrder(indices: indices, numExperts: numExperts)
+        guard order.inverseOrder.ndim == 1,
+            order.inverseOrder.dtype == .uint32,
+            order.inverseOrder.size == rows * topK
+        else { return nil }
+
+        CBv2EngageMark.once("prefill-dual-prenorm-scatter")
+        let outputs = dualPreNormScatterKernel(
+            [x, denseWeight, expertWeight, order.inverseOrder],
+            template: [("T", x.dtype), ("K", topK)],
+            grid: (threadsPerRow, rows, 1),
+            threadGroup: (threadsPerRow, 1, 1),
+            outputShapes: [x.shape, [rows * topK, 1, axis]],
+            outputDTypes: [x.dtype, x.dtype]
+        )
+        return (
+            denseNorm: outputs[0],
+            sortedExpertNorm: outputs[1],
+            routeTable: SwitchRouteTable(
+                rowOrder: order.rowOrder,
+                sortedKeys: order.sortedKeys,
+                inverseOrder: order.inverseOrder)
+        )
     }
 
     // MARK: - branch tail (5 dispatches -> 1)

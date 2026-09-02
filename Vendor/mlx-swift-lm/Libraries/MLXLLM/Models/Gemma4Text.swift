@@ -3643,7 +3643,8 @@ private class Gemma4Experts: Module {
         topKIndices: MLXArray,
         topKWeights: MLXArray,
         isExpertPrefill: Bool,
-        sortedPlane: SwitchSortedPlaneProducer? = nil
+        sortedPlane: SwitchSortedPlaneProducer? = nil,
+        routeTable: SwitchRouteTable? = nil
     ) -> Output {
         // Flatten [B, S, H] and always enter SwitchGLU's combined API. It
         // selects direct sorted reduction only for the exact production
@@ -3659,7 +3660,8 @@ private class Gemma4Experts: Module {
             // Rectangular MTP verification explicitly passes false.
             isProductionPrefill: isExpertPrefill,
             // PRENORM-GATHER: the prefill producer of the sorted plane.
-            sortedPlane: sortedPlane)
+            sortedPlane: sortedPlane,
+            routeTable: routeTable)
         return Output(
             output: result.output.reshaped(B, S, H),
             unsortCarrier: result.carrier)
@@ -4237,7 +4239,8 @@ public class Gemma4DecoderLayer: Module {
                     topKIndices: indices,
                     topKWeights: weights,
                     isExpertPrefill: isExpertPrefill,
-                    sortedPlane: sortedPlane)
+                    sortedPlane: sortedPlane,
+                    routeTable: isExpertPrefill ? routeTable : nil)
                 return (result.output, nil, result.unsortCarrier)
             }
 
@@ -4274,6 +4277,36 @@ public class Gemma4DecoderLayer: Module {
                         n2,
                         indices: topKIndices,
                         weights: topKWeights)
+                } else if isExpertPrefill,
+                    Gemma4PrefillGlueV1.prenormGatherEnabled,
+                    let fused = Gemma4PrefillGlueV1.dualPreNormScatter(
+                        x: out,
+                        denseWeight: preFeedforwardLayernorm.weight,
+                        expertWeight: preFeedforwardLayernorm2.weight,
+                        indices: topKIndices,
+                        numExperts: config.numExperts ?? 0,
+                        eps: config.rmsNormEps),
+                    let fallbackExpertNorm = Gemma4PrefillGlueV1.preNorm(
+                        x: out,
+                        weight: preFeedforwardLayernorm2.weight,
+                        eps: config.rmsNormEps)
+                {
+                    // The combined kernel's dense output replaces the first
+                    // pre-norm; its expert output is already in the route
+                    // order. The fallback norm stays lazy and is only read if
+                    // the sorted-plane contract declines.
+                    h1Raw = mlp(fused.denseNorm)
+                    expertBranch = projectExpertBranch(
+                        fallbackExpertNorm,
+                        indices: topKIndices,
+                        weights: topKWeights,
+                        sortedPlane: { inverseOrder in
+                            guard inverseOrder === fused.routeTable.inverseOrder else {
+                                return nil
+                            }
+                            return fused.sortedExpertNorm
+                        },
+                        routeTable: fused.routeTable)
                 } else if isExpertPrefill,
                     Gemma4PrefillGlueV1.prenormGatherEnabled,
                     let n1 = Gemma4PrefillGlueV1.preNorm(

@@ -1597,6 +1597,7 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   constexpr int block_size = values_per_thread * SIMD_SIZE;
   constexpr int bytes_per_thread = 4;
   constexpr int scale_step_per_thread = 8;
+  constexpr bool kGemma4PairMetaBroadcast = true;
 
   const device uint8_t* ws = (const device uint8_t*)w;
   thread float x0_thread[values_per_thread];
@@ -1624,8 +1625,21 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   for (; k <= in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
-      scale_local[row] = scales[row * in_vec_size_g];
-      bias_local[row] = biases[row * in_vec_size_g];
+      if (kGemma4PairMetaBroadcast) {
+        const ushort group_lane =
+            ushort((simd_lid / scale_step_per_thread) * scale_step_per_thread);
+        float scale_value = 0.0f;
+        float bias_value = 0.0f;
+        if (simd_lid == group_lane) {
+          scale_value = scales[row * in_vec_size_g];
+          bias_value = biases[row * in_vec_size_g];
+        }
+        scale_local[row] = simd_broadcast(scale_value, group_lane);
+        bias_local[row] = simd_broadcast(bias_value, group_lane);
+      } else {
+        scale_local[row] = scales[row * in_vec_size_g];
+        bias_local[row] = biases[row * in_vec_size_g];
+      }
     }
 
     float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);

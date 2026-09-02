@@ -382,34 +382,44 @@ private func geGLUProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
 }
 // MARK: - ROUTE-SIMD-RANK-64: exact decode route table
 
-/// Stable rank sort for the exact B=8/top-K=8 decode plane. One SIMDgroup
-/// loads the 64 keys once (two keys per lane), broadcasts them to every lane,
-/// and directly emits the three routing products consumed downstream.
+/// Stable rank sort for the exact B=8/top-K=8 decode plane. One 32-lane
+/// SIMDgroup owns two assignments per lane, broadcasts the 64 keys once, and
+/// directly emits the three routing products consumed downstream. Keeping the
+/// full route table in one SIMDgroup avoids the duplicate global loads and
+/// broadcasts of the former two-SIMDgroup, one-assignment-per-thread shape.
 private let routeSimdRank64Kernel: MLXFast.MLXFastKernel =
     MLXFast.metalKernel(
-        name: "mlx_lm_route_simd_rank_scatter_m8_u32_n64_unroll_v2",
+        name: "mlx_lm_route_simd_rank_scatter_m8_u32_n64_pair_v3",
         inputNames: ["indices"],
         outputNames: ["row_order", "sorted_keys", "inverse_order"],
         source: """
-            const uint assignment = thread_position_in_grid.x;
             const uint lane = thread_index_in_simdgroup;
-            const uint key = (uint)indices[assignment];
-            const uint key_low = (uint)indices[lane];
-            const uint key_high = (uint)indices[32u + lane];
-            uint rank = 0;
+            const uint low_assignment = lane;
+            const uint high_assignment = 32u + lane;
+            const uint key_low = (uint)indices[low_assignment];
+            const uint key_high = (uint)indices[high_assignment];
+            uint low_rank = 0;
+            uint high_rank = 0;
             #pragma clang loop unroll(full)
             for (uint source = 0; source < 32; ++source) {
                 const uint other_low = simd_broadcast(key_low, ushort(source));
-                rank += (other_low < key)
-                    || (other_low == key && source < assignment);
+                low_rank += (other_low < key_low)
+                    || (other_low == key_low && source < low_assignment);
+                high_rank += (other_low < key_high)
+                    || (other_low == key_high && source < high_assignment);
                 const uint other_high = simd_broadcast(key_high, ushort(source));
-                const uint high_assignment = 32u + source;
-                rank += (other_high < key)
-                    || (other_high == key && high_assignment < assignment);
+                const uint high_source = 32u + source;
+                low_rank += (other_high < key_low)
+                    || (other_high == key_low && high_source < low_assignment);
+                high_rank += (other_high < key_high)
+                    || (other_high == key_high && high_source < high_assignment);
             }
-            row_order[rank] = assignment >> 3;
-            sorted_keys[rank] = key;
-            inverse_order[assignment] = rank;
+            row_order[low_rank] = low_assignment >> 3;
+            sorted_keys[low_rank] = key_low;
+            inverse_order[low_assignment] = low_rank;
+            row_order[high_rank] = high_assignment >> 3;
+            sorted_keys[high_rank] = key_high;
+            inverse_order[high_assignment] = high_rank;
         """,
         ensureRowContiguous: true
     )
@@ -429,37 +439,53 @@ private let routeSimdRank64Kernel: MLXFast.MLXFastKernel =
 /// whose generic `bias[indices]` lookup must continue to receive raw indices.
 private let routeSimdRank64PrefixBoundsKernel: MLXFast.MLXFastKernel =
     MLXFast.metalKernel(
-        name: "mlx_lm_route_simd_rank_bounds_scatter_m8_u32_n64_unroll_v2",
+        name: "mlx_lm_route_simd_rank_bounds_scatter_m8_u32_n64_pair_v3",
         inputNames: ["indices"],
         outputNames: ["row_order", "sorted_keys", "inverse_order"],
         source: """
-            const uint assignment = thread_position_in_grid.x;
             const uint lane = thread_index_in_simdgroup;
-            const uint key = (uint)indices[assignment];
-            const uint key_low = (uint)indices[lane];
-            const uint key_high = (uint)indices[32u + lane];
-            uint rank = 0;
-            uint run_offset = 0;
-            uint run_length = 0;
+            const uint low_assignment = lane;
+            const uint high_assignment = 32u + lane;
+            const uint key_low = (uint)indices[low_assignment];
+            const uint key_high = (uint)indices[high_assignment];
+            uint low_rank = 0;
+            uint high_rank = 0;
+            uint low_run_offset = 0;
+            uint high_run_offset = 0;
+            uint low_run_length = 0;
+            uint high_run_length = 0;
             #pragma clang loop unroll(full)
             for (uint source = 0; source < 32; ++source) {
                 const uint other_low = simd_broadcast(key_low, ushort(source));
-                rank += (other_low < key)
-                    || (other_low == key && source < assignment);
-                run_offset += other_low == key && source < assignment;
-                run_length += other_low == key;
+                low_rank += (other_low < key_low)
+                    || (other_low == key_low && source < low_assignment);
+                high_rank += (other_low < key_high)
+                    || (other_low == key_high && source < high_assignment);
+                low_run_offset += other_low == key_low && source < low_assignment;
+                high_run_offset += other_low == key_high && source < high_assignment;
+                low_run_length += other_low == key_low;
+                high_run_length += other_low == key_high;
                 const uint other_high = simd_broadcast(key_high, ushort(source));
-                const uint high_assignment = 32u + source;
-                rank += (other_high < key)
-                    || (other_high == key && high_assignment < assignment);
-                run_offset += other_high == key && high_assignment < assignment;
-                run_length += other_high == key;
+                const uint high_source = 32u + source;
+                low_rank += (other_high < key_low)
+                    || (other_high == key_low && high_source < low_assignment);
+                high_rank += (other_high < key_high)
+                    || (other_high == key_high && high_source < high_assignment);
+                low_run_offset += other_high == key_low && high_source < low_assignment;
+                high_run_offset += other_high == key_high && high_source < high_assignment;
+                low_run_length += other_high == key_low;
+                high_run_length += other_high == key_high;
             }
-            const uint run_remaining = run_length - run_offset;
-            row_order[rank] = assignment >> 3;
-            sorted_keys[rank] = 0x80000000u | key
-                | (run_offset << 8) | ((run_remaining - 1) << 14);
-            inverse_order[assignment] = rank;
+            const uint low_run_remaining = low_run_length - low_run_offset;
+            const uint high_run_remaining = high_run_length - high_run_offset;
+            row_order[low_rank] = low_assignment >> 3;
+            sorted_keys[low_rank] = 0x80000000u | key_low
+                | (low_run_offset << 8) | ((low_run_remaining - 1) << 14);
+            inverse_order[low_assignment] = low_rank;
+            row_order[high_rank] = high_assignment >> 3;
+            sorted_keys[high_rank] = 0x80000000u | key_high
+                | (high_run_offset << 8) | ((high_run_remaining - 1) << 14);
+            inverse_order[high_assignment] = high_rank;
         """,
         ensureRowContiguous: true
     )
@@ -960,8 +986,8 @@ public func gatherSort(
         let flat = indices.flattened()
         let outputs = routeSimdRank64Kernel(
             [flat],
-            grid: (64, 1, 1),
-            threadGroup: (64, 1, 1),
+            grid: (32, 1, 1),
+            threadGroup: (32, 1, 1),
             outputShapes: [[64], [64], [64]],
             outputDTypes: [.uint32, .uint32, .uint32]
         )
@@ -1045,8 +1071,8 @@ public func gatherSortIndices(
             ? routeSimdRank64PrefixBoundsKernel : routeSimdRank64Kernel
         let outputs = kernel(
             [flat],
-            grid: (64, 1, 1),
-            threadGroup: (64, 1, 1),
+            grid: (32, 1, 1),
+            threadGroup: (32, 1, 1),
             outputShapes: [[64], [64], [64]],
             outputDTypes: [.uint32, .uint32, .uint32]
         )

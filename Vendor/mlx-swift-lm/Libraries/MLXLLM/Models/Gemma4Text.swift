@@ -901,6 +901,18 @@ private let gemma4QKVNormRopeEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+/// The pinned target checkpoint stores every Q/K RMSNorm diagonal as one
+/// repeated BF16 scalar (60/60 tensors), and the pinned MTP head does the
+/// same for all four Q norms. Broadcast that scalar instead of streaming a
+/// synthetic 256/512-element diagonal once per attention row. The fallback
+/// is retained for checkpoint experiments and exact A/B attribution.
+private let gemma4QKNormScalarDiagonalEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_QK_NORM_SCALAR_DIAGONAL"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 private let gemma4QKVNormKernel = MLXFast.metalKernel(
         name: "gemma4_b8_qkv_rms_norm_rope_v2_vec1",
     inputNames: [
@@ -937,6 +949,7 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
         input += local_row * D + lid * reads;
         output_row += local_row * D;
         device T* output = output_row + lid * reads;
+        const device T* weight_base = weight;
         weight += lid * reads;
         // Keep the pointer inside the V allocation for Q rows even though
         // those rows never dereference it. K rows advance to their matching
@@ -970,7 +983,13 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (weighted) {
-            const T4 wv = *reinterpret_cast<const device T4*>(weight);
+            T4 wv;
+            if (SCALAR_DIAGONAL) {
+                const T scalar_weight = weight_base[0];
+                for (uint i = 0; i < reads; ++i) wv[i] = scalar_weight;
+            } else {
+                wv = *reinterpret_cast<const device T4*>(weight);
+            }
             if (APPLY_ROPE) {
                 for (uint i = 0; i < reads; ++i) {
                     const uint element = lid * reads + i;
@@ -1111,6 +1130,7 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
         input += lid * reads;
         device T* output_row = output;
         output += lid * reads;
+        const device T* weight_base = weight;
         weight += lid * reads;
         value_output += lid * reads;
 
@@ -1141,13 +1161,14 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
         const float inverse_rms = inv_rms[slot];
         for (uint i = 0; i < reads; ++i) {
             const T normalized = T(float(input[i]) * inverse_rms);
+            const T norm_weight = SCALAR_DIAGONAL ? weight_base[0] : weight[i];
             if (APPLY_ROPE) {
                 // Stage the weighted norm AS T first — the BF16 memory
                 // boundary the separate norm kernel's output store performed
                 // before stock RoPE read it.
-                rounded[slot][lid * reads + i] = T(weight[i] * normalized);
+                rounded[slot][lid * reads + i] = T(norm_weight * normalized);
             } else {
-                output[i] = weight[i] * normalized;
+                output[i] = norm_weight * normalized;
             }
             // K rows also carry V: same raw input, same normalizer, and
             // `RMSNormNoScale`'s own final expression.
@@ -1236,6 +1257,7 @@ private func gemma4FusedQKVNormHeadMajor(
             ("TOTAL_ROWS", rows), ("RPT", rowsPerGroup),
             ("LQ", lq), ("HQ", hq), ("LK", lk), ("HK", hk),
             ("APPLY_ROPE", fusedRope),
+            ("SCALAR_DIAGONAL", gemma4QKNormScalarDiagonalEnabled),
         ],
         grid: (groups * rowsPerGroup * rowThreads, 1, 1),
         threadGroup: (rowsPerGroup * rowThreads, 1, 1),
@@ -1316,6 +1338,7 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
         }
         device T* output_row = output;
         output += lid * reads;
+        const device T* weight_base = weight;
         weight += lid * reads;
 
         float sum = 0.0f;
@@ -1343,12 +1366,13 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
         const float inverse_rms = inv_rms[slot];
         for (uint i = 0; i < reads; ++i) {
             const T normalized = T(float(input[i]) * inverse_rms);
+            const T norm_weight = SCALAR_DIAGONAL ? weight_base[0] : weight[i];
             if (APPLY_ROPE && weighted) {
                 // The BF16 memory boundary the separate norm kernel's
                 // output store performed before stock RoPE read it.
-                rounded[slot][lid * reads + i] = T(weight[i] * normalized);
+                rounded[slot][lid * reads + i] = T(norm_weight * normalized);
             } else {
-                output[i] = weighted ? weight[i] * normalized : T(1) * normalized;
+                output[i] = weighted ? norm_weight * normalized : T(1) * normalized;
             }
         }
         if (APPLY_ROPE) {
@@ -1427,6 +1451,7 @@ private func gemma4FusedQKVNormHeadMajorSliding(
             ("K_ROWS", kRows), ("TOTAL_ROWS", rows), ("RPT", rowsPerGroup),
             ("LQ", lq), ("HQ", hq), ("LK", lk), ("HK", hk),
             ("APPLY_ROPE", fusedRope),
+            ("SCALAR_DIAGONAL", gemma4QKNormScalarDiagonalEnabled),
         ],
         grid: (groups * rowsPerGroup * rowThreads, 1, 1),
         threadGroup: (rowsPerGroup * rowThreads, 1, 1),
@@ -1477,6 +1502,7 @@ private func gemma4FusedQKVNorm(
             ("Q_HEADS", 16), ("K_HEADS", k.dim(2)),
             ("KEY_VALUE_SHARED", keyValueShared), ("APPLY_ROPE", fusedRope),
             ("USE_FREQS", ropeParameters.usesFrequencies),
+            ("SCALAR_DIAGONAL", gemma4QKNormScalarDiagonalEnabled),
         ],
         grid: (normRows * threads, 1, 1), threadGroup: (threads, 1, 1),
         outputShapes: fusedRope

@@ -2,6 +2,9 @@ import Foundation
 import MLX
 import MLXNN
 
+/// Identity gather table for the sorted 64-assignment decode geometry.
+nonisolated(unsafe) private let switchDownIdentity64 = MLXArray((0..<64).map { UInt32($0) })
+
 // Port of https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/switch_layers.py
 
 /// Compiled SiLU-gated product (`silu(gate) * up`) for the common MoE GLU path.
@@ -1511,7 +1514,13 @@ public class SwitchGLU: Module {
             activated = activation(xGate) * xUp
         }
 
-        x = downProj(activated, idx, sortedIndices: doSort)
+        // DOWN-LHS-IDENTITY: at the sorted [64] geometry the down projection
+        // gathers activation row `assignment` for assignment `assignment`;
+        // hand it that identity table instead of leaving `lhsIndices` nil,
+        // which otherwise materializes the same arange(64) on every call.
+        let downLhs: MLXArray? =
+            (doSort && idx.ndim == 1 && idx.size == 64) ? switchDownIdentity64 : nil
+        x = downProj(activated, idx, lhsIndices: downLhs, sortedIndices: doSort)
         return (x, doSort ? inverseOrder : nil, doSort)
     }
 

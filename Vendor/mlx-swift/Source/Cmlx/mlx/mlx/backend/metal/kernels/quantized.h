@@ -3884,6 +3884,38 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
   }
 }
 
+constexpr int gemma4_run_lookback_window = 7;
+
+template <int window>
+inline uint gemma4_run_lookback(
+    const device uint32_t* rhs_indices,
+    const uint rhs_stride,
+    const uint assignment,
+    const uint32_t expert) {
+  const uint depth = min(assignment, uint(window));
+  uint32_t prior_word[window > 0 ? window : 1];
+  for (int i = 0; i < window; i++) {
+    const uint prior = (uint(i) < depth) ? (assignment - 1u - uint(i)) : 0u;
+    prior_word[i] = rhs_indices[prior * rhs_stride];
+  }
+  uint run_offset = 0;
+  bool matched = true;
+  for (int i = 0; i < window; i++) {
+    matched = matched && uint(i) < depth && prior_word[i] == expert;
+    run_offset += matched ? 1u : 0u;
+  }
+  if (run_offset < uint(window)) {
+    return run_offset;
+  }
+  for (uint prior = assignment - uint(window); prior > 0; --prior) {
+    if (rhs_indices[(prior - 1) * rhs_stride] != expert) {
+      break;
+    }
+    run_offset++;
+  }
+  return run_offset;
+}
+
 // KERN-DOWN-TILE: y-tile coarsening for the K = 704 expert down gather
 // (the only pair-geometry plane at that K; out_vec_size = 2816). The
 // frozen host launches grid (1, N/8 = 352, 64), so every 64-thread group
@@ -3935,17 +3967,10 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   const bool expert_prefix_bounds = (route_word & 0x80000000u) != 0u;
   const uint32_t expert =
       expert_prefix_bounds ? (route_word & 0xffu) : route_word;
-  uint run_offset = 0;
-  if (expert_prefix_bounds) {
-    run_offset = (route_word >> 8) & 0x3fu;
-  } else {
-    for (uint prior = assignment; prior > 0; --prior) {
-      if (rhs_indices[(prior - 1) * rhs_stride] != expert) {
-        break;
-      }
-      run_offset++;
-    }
-  }
+  const uint run_offset = expert_prefix_bounds
+      ? ((route_word >> 8) & 0x3fu)
+      : gemma4_run_lookback<gemma4_run_lookback_window>(
+            rhs_indices, rhs_stride, assignment, expert);
   // Odd positions are produced by the immediately preceding pair leader.
   if ((run_offset & 1) != 0) {
     return;
@@ -4065,17 +4090,10 @@ template <typename T, int group_size, int bits>
     const bool expert_prefix_bounds = (route_word & 0x80000000u) != 0u;
     const uint32_t expert =
         expert_prefix_bounds ? (route_word & 0xffu) : route_word;
-    uint run_offset = 0;
-    if (expert_prefix_bounds) {
-      run_offset = (route_word >> 8) & 0x3fu;
-    } else {
-      for (uint prior = assignment; prior > 0; --prior) {
-        if (rhs_indices[(prior - 1) * (uint)rhs_strides[0]] != expert) {
-          break;
-        }
-        run_offset++;
-      }
-    }
+    const uint run_offset = expert_prefix_bounds
+        ? ((route_word >> 8) & 0x3fu)
+        : gemma4_run_lookback<gemma4_run_lookback_window>(
+              rhs_indices, (uint)rhs_strides[0], assignment, expert);
 
     // RUN-QUAD: leaders sit at run_offset % 4 == 0 and serve up to four
     // same-expert assignments from ONE weight stream. Positions 1..3 of each

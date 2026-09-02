@@ -1004,6 +1004,20 @@ public func gatherSort(
 public func gatherSortOrder(
     indices: MLXArray, numExperts: Int = Int.max
 ) -> (rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray) {
+    if routeSimdRank64Enabled,
+        (indices.shape == [8, 8] || (indices.ndim == 1 && indices.size == 64)),
+        indices.dtype == .uint32
+    {
+        let flat = indices.flattened()
+        let outputs = routeSimdRank64Kernel(
+            [flat],
+            grid: (64, 1, 1),
+            threadGroup: (64, 1, 1),
+            outputShapes: [[64], [64], [64]],
+            outputDTypes: [.uint32, .uint32, .uint32]
+        )
+        return (outputs[0], outputs[1], outputs[2])
+    }
     let m = indices.dim(-1)
     let indices = indices.flattened()
     routeCsortShapeLog.note {

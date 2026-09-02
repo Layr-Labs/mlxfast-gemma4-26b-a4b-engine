@@ -3008,18 +3008,26 @@ public enum Gemma4MMAQuantizedGEMV {
     /// Stage two. One simdgroup per activation row folds that row's `NT`
     /// threadgroup records under the same total order and emits the token id.
     private static let argmaxReduceKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_head_argmax_reduce_v1",
+        name: "gemma4_mma_head_argmax_reduce_v2_vec4",
         inputNames: ["pv", "pi"],
         outputNames: ["tokens"],
         source: """
             const uint m = threadgroup_position_in_grid.x;
             const uint lane = thread_index_in_simdgroup;
+            const device float4* pv4 = (const device float4*)(pv + m * uint(NT));
+            const device uint4* pi4 = (const device uint4*)(pi + m * uint(NT));
             float rv = -INFINITY;
             uint ri = 0xFFFFFFFFu;
-            for (uint i = lane; i < uint(NT); i += 32) {
-                const float ov = pv[m * uint(NT) + i];
-                const uint oi = pi[m * uint(NT) + i];
-                if (ov > rv || (ov == rv && oi < ri)) { rv = ov; ri = oi; }
+            constexpr uint NT4 = uint(NT) / 4;
+            for (uint i = lane; i < NT4; i += 32) {
+                const float4 ov = pv4[i];
+                const uint4 oi = pi4[i];
+                #pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const float v = ov[e];
+                    const uint idx = oi[e];
+                    if (v > rv || (v == rv && idx < ri)) { rv = v; ri = idx; }
+                }
             }
             for (ushort xm = 1; xm < 32; xm <<= 1) {
                 const float ov = simd_shuffle_xor(rv, xm);

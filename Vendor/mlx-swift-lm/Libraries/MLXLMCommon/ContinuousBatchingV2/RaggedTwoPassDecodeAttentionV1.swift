@@ -3492,6 +3492,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int lid = int(thread_position_in_threadgroup.x);
             const int simd_lane_id = int(thread_index_in_simdgroup);
             const int simd_group_id = int(simdgroup_index_in_threadgroup);
+            const int num_simdgroups = (axis_size + 127) / 128;
 
             typedef vec<T, 4> T4;
             const bool row_vec4 = (axis_size & 3) == 0;
@@ -3519,11 +3520,6 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                         ? static_cast<float>(in[i]) : -INFINITY;
                 }
             }
-            if (simd_group_id == 0) {
-                local_max[simd_lane_id] = -INFINITY;
-                local_normalizer[simd_lane_id] = 0.0f;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
 
             float maxval = -3.402823466e+38F;
             for (int i = 0; i < 4; i++) {
@@ -3534,14 +3530,12 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 local_max[simd_group_id] = maxval;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_group_id == 0) {
-                maxval = simd_max(local_max[simd_lane_id]);
-                if (simd_lane_id == 0) {
-                    local_max[0] = maxval;
-                }
+
+            maxval = -3.402823466e+38F;
+            for (int s = 0; s < num_simdgroups; ++s) {
+                const float sm = local_max[s];
+                maxval = (maxval < sm) ? sm : maxval;
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            maxval = local_max[0];
 
             float normalizer = 0.0f;
             for (int i = 0; i < 4; i++) {
@@ -3554,14 +3548,12 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 local_normalizer[simd_group_id] = normalizer;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_group_id == 0) {
-                normalizer = simd_sum(local_normalizer[simd_lane_id]);
-                if (simd_lane_id == 0) {
-                    local_normalizer[0] = normalizer;
-                }
+
+            normalizer = 0.0f;
+            for (int s = 0; s < num_simdgroups; ++s) {
+                normalizer += local_normalizer[s];
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            normalizer = 1 / local_normalizer[0];
+            const float inv_normalizer = 1.0f / normalizer;
 
             device T* out_row =
                 probs + size_t(gid) * axis_size + lid * 4;
@@ -3569,18 +3561,18 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 if (row_vec4) {
                     T4 out_vec;
                     for (int i = 0; i < 4; i++) {
-                        out_vec[i] = static_cast<T>(ld[i] * normalizer);
+                        out_vec[i] = static_cast<T>(ld[i] * inv_normalizer);
                     }
                     *reinterpret_cast<device T4*>(out_row) = out_vec;
                 } else {
                     for (int i = 0; i < 4; i++) {
-                        out_row[i] = static_cast<T>(ld[i] * normalizer);
+                        out_row[i] = static_cast<T>(ld[i] * inv_normalizer);
                     }
                 }
             } else {
                 for (int i = 0; i < 4; i++) {
                     if ((lid * 4 + i) < axis_size) {
-                        out_row[i] = static_cast<T>(ld[i] * normalizer);
+                        out_row[i] = static_cast<T>(ld[i] * inv_normalizer);
                     }
                 }
             }
@@ -4185,7 +4177,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// `new_values` rather than the cache slot the fused QK dispatch wrote,
     /// so this kernel has no read-after-in-place-write hazard at all.
     private static let fusedAvKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_vtile_v3_vec1",
+        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -4199,8 +4191,8 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int key_length = int(params[0]);
 
             const int z = int(threadgroup_position_in_grid.z);
-            const int tile = z % 8;
-            const int row_kv = z / 8;
+            const int tile = z % \(avColumnTiles);
+            const int row_kv = z / \(avColumnTiles);
             const int row = row_kv / 2;
             const int kv_head = row_kv % 2;
             const int sg = int(simdgroup_index_in_threadgroup);
@@ -4229,9 +4221,9 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int thrM = lane / 4;
             const int thrN = lane % 4;
             int bm = thrM * 4;
-            const int out_col = tile * 64 + (4 * sg + thrN) * 4;
+            const int out_col = tile * \(avTileColumns) + (4 * sg + thrN) * 4;
 
-            float result[GQA][4] = {{0.0f}};
+            float result[GQA * 4] = {0.0f};
             // VTILE: the 4x4 value tile is shared by all GQA heads, the
             // probability block is not. Staging the tile costs 16 halves and
             // frees the 32-float per-head staging array. The peel keeps both
@@ -4273,7 +4265,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     for (int tm = 0; tm < 4; ++tm) {
                         float vc = p_coeff[tm];
                         for (int tn = 0; tn < 4; ++tn) {
-                            result[h][tn] += vc * v_tile[tm][tn];
+                            result[h * 4 + tn] += vc * v_tile[tm][tn];
                         }
                     }
                 }
@@ -4295,32 +4287,48 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                             prob_rows[size_t(h) * key_length + bm + tm]);
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
-                            result[h][tn] += pc * v_tile[0][tn];
+                            result[h * 4 + tn] += pc * v_tile[0][tn];
                         }
                     }
                 }
             }
-            #pragma clang loop unroll(full)
-            for (int h = 0; h < GQA; ++h) {
+            {
+                const bool hi = (lane & 16) != 0;
                 #pragma clang loop unroll(full)
-                for (int tn = 0; tn < 4; ++tn) {
-                    #pragma clang loop unroll(full)
-                    for (ushort delta = 4; delta >= 1; delta >>= 1) {
-                        result[h][tn] +=
-                            simd_shuffle_down(result[h][tn], 4 * delta);
-                    }
+                for (int j = 0; j < 16; ++j) {
+                    const float a = result[j];
+                    const float b = result[16 + j];
+                    result[j] = (hi ? b : a)
+                        + simd_shuffle_xor(hi ? a : b, ushort(16));
                 }
             }
-            if (thrM == 0) {
+            {
+                const bool hi = (lane & 8) != 0;
                 #pragma clang loop unroll(full)
-                for (int h = 0; h < GQA; ++h) {
-                    device T* out_ptr = out
-                        + size_t(row * 16 + kv_head * GQA + h) * D
-                        + out_col;
-                    #pragma clang loop unroll(full)
-                    for (int j = 0; j < 4; ++j) {
-                        out_ptr[j] = static_cast<T>(result[h][j]);
-                    }
+                for (int j = 0; j < 8; ++j) {
+                    const float a = result[j];
+                    const float b = result[8 + j];
+                    result[j] = (hi ? b : a)
+                        + simd_shuffle_xor(hi ? a : b, ushort(8));
+                }
+            }
+            {
+                const bool hi = (lane & 4) != 0;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 4; ++j) {
+                    const float a = result[j];
+                    const float b = result[4 + j];
+                    result[j] = (hi ? b : a)
+                        + simd_shuffle_xor(hi ? a : b, ushort(4));
+                }
+            }
+            {
+                device T* out_ptr = out
+                    + size_t(row * 16 + kv_head * GQA + thrM) * D
+                    + out_col;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 4; ++j) {
+                    out_ptr[j] = static_cast<T>(result[j]);
                 }
             }
         """,
@@ -4333,7 +4341,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// output allocation hands this kernel); the value-tile peel, the
     /// shuffle-down fold and every store are the promoted source verbatim.
     private static let fusedAvVecKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_vtile_v3_vec1_sv1",
+        name: "cbv2_ragged8_writesdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1_sv1",
         inputNames: [
             "probs",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -4348,8 +4356,8 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const bool row_vec4 = (key_length & 3) == 0;
 
             const int z = int(threadgroup_position_in_grid.z);
-            const int tile = z % 8;
-            const int row_kv = z / 8;
+            const int tile = z % \(avColumnTiles);
+            const int row_kv = z / \(avColumnTiles);
             const int row = row_kv / 2;
             const int kv_head = row_kv % 2;
             const int sg = int(simdgroup_index_in_threadgroup);
@@ -4378,9 +4386,9 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             const int thrM = lane / 4;
             const int thrN = lane % 4;
             int bm = thrM * 4;
-            const int out_col = tile * 64 + (4 * sg + thrN) * 4;
+            const int out_col = tile * \(avTileColumns) + (4 * sg + thrN) * 4;
 
-            float result[GQA][4] = {{0.0f}};
+            float result[GQA * 4] = {0.0f};
             // VTILE: the 4x4 value tile is shared by all GQA heads, the
             // probability block is not. Staging the tile costs 16 halves and
             // frees the 32-float per-head staging array. The peel keeps both
@@ -4431,7 +4439,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     for (int tm = 0; tm < 4; ++tm) {
                         float vc = p_coeff[tm];
                         for (int tn = 0; tn < 4; ++tn) {
-                            result[h][tn] += vc * v_tile[tm][tn];
+                            result[h * 4 + tn] += vc * v_tile[tm][tn];
                         }
                     }
                 }
@@ -4453,32 +4461,48 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                             prob_rows[size_t(h) * key_length + bm + tm]);
                         #pragma clang loop unroll(full)
                         for (int tn = 0; tn < 4; ++tn) {
-                            result[h][tn] += pc * v_tile[0][tn];
+                            result[h * 4 + tn] += pc * v_tile[0][tn];
                         }
                     }
                 }
             }
-            #pragma clang loop unroll(full)
-            for (int h = 0; h < GQA; ++h) {
+            {
+                const bool hi = (lane & 16) != 0;
                 #pragma clang loop unroll(full)
-                for (int tn = 0; tn < 4; ++tn) {
-                    #pragma clang loop unroll(full)
-                    for (ushort delta = 4; delta >= 1; delta >>= 1) {
-                        result[h][tn] +=
-                            simd_shuffle_down(result[h][tn], 4 * delta);
-                    }
+                for (int j = 0; j < 16; ++j) {
+                    const float a = result[j];
+                    const float b = result[16 + j];
+                    result[j] = (hi ? b : a)
+                        + simd_shuffle_xor(hi ? a : b, ushort(16));
                 }
             }
-            if (thrM == 0) {
+            {
+                const bool hi = (lane & 8) != 0;
                 #pragma clang loop unroll(full)
-                for (int h = 0; h < GQA; ++h) {
-                    device T* out_ptr = out
-                        + size_t(row * 16 + kv_head * GQA + h) * D
-                        + out_col;
-                    #pragma clang loop unroll(full)
-                    for (int j = 0; j < 4; ++j) {
-                        out_ptr[j] = static_cast<T>(result[h][j]);
-                    }
+                for (int j = 0; j < 8; ++j) {
+                    const float a = result[j];
+                    const float b = result[8 + j];
+                    result[j] = (hi ? b : a)
+                        + simd_shuffle_xor(hi ? a : b, ushort(8));
+                }
+            }
+            {
+                const bool hi = (lane & 4) != 0;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 4; ++j) {
+                    const float a = result[j];
+                    const float b = result[4 + j];
+                    result[j] = (hi ? b : a)
+                        + simd_shuffle_xor(hi ? a : b, ushort(4));
+                }
+            }
+            {
+                device T* out_ptr = out
+                    + size_t(row * 16 + kv_head * GQA + thrM) * D
+                    + out_col;
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < 4; ++j) {
+                    out_ptr[j] = static_cast<T>(result[j]);
                 }
             }
         """,
@@ -4794,8 +4818,8 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let output = fusedAvActive(
             [probs] + valueBuffers + [paramsArray, values],
             template: template,
-            grid: (32, 4, batch * kvHeads * 8),
-            threadGroup: (32, 4, 1),
+            grid: (32, avSimdgroups, batch * kvHeads * avColumnTiles),
+            threadGroup: (32, avSimdgroups, 1),
             outputShapes: [[batch, queryHeads, 1, headDim]],
             outputDTypes: [.bfloat16]
         )[0]

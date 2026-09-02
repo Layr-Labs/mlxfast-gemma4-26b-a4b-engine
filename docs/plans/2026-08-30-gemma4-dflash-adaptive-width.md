@@ -164,7 +164,7 @@ Run from the workspace root:
 
 ```bash
 /opt/homebrew/bin/python3 bench/laguna/run_guarded.py \
-  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  --plist ~/Library/LaunchAgents/com.tea.qwen.plist \
   --lock-timeout-seconds 1800 --timeout-seconds 1800 \
   --child-timeout-seconds 1200 -- \
   /usr/bin/env GEMMA_DFLASH_DEPTH=7 \

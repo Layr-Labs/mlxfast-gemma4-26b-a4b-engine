@@ -424,8 +424,8 @@ GEMMA_DFLASH_PHYSICAL_WIDTH=1 \
 GEMMA_DFLASH_SAMPLE_COUNT=2 \
 GEMMA_DFLASH_CAPTURE_TOKENS=1 \
 /opt/homebrew/bin/python3 \
-  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
-  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  ~/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist ~/Library/LaunchAgents/com.tea.qwen.plist \
   --lock-timeout-seconds 1800 --timeout-seconds 1800 \
   --child-timeout-seconds 1200 -- \
   /opt/homebrew/bin/python3 /private/tmp/gemma_dflash_width4_mean3.py
@@ -437,8 +437,8 @@ GEMMA_DFLASH_PHYSICAL_WIDTH=4 \
 GEMMA_DFLASH_SAMPLE_COUNT=2 \
 GEMMA_DFLASH_CAPTURE_TOKENS=1 \
 /opt/homebrew/bin/python3 \
-  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
-  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  ~/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist ~/Library/LaunchAgents/com.tea.qwen.plist \
   --lock-timeout-seconds 1800 --timeout-seconds 1800 \
   --child-timeout-seconds 1200 -- \
   /opt/homebrew/bin/python3 /private/tmp/gemma_dflash_width4_mean3.py
@@ -449,8 +449,8 @@ Expected: both guards restore `mtplx-flash-next-optimized-speed`, verify port 80
 Run the one-sample fidelity check explicitly:
 
 ```bash
-gemma_c4_serial=/Users/davidtai/projects/OpenSourceWTF/.benchmark-artifacts/gemma4-swift-dflash-reference-ab/fidelity-current-serial-c4-worker-width1-mean3.json
-gemma_c4_candidate=/Users/davidtai/projects/OpenSourceWTF/.benchmark-artifacts/gemma4-swift-dflash-reference-ab/fidelity-c4-scout-width4-mean3.json
+gemma_c4_serial=~/projects/OpenSourceWTF/.benchmark-artifacts/gemma4-swift-dflash-reference-ab/fidelity-current-serial-c4-worker-width1-mean3.json
+gemma_c4_candidate=~/projects/OpenSourceWTF/.benchmark-artifacts/gemma4-swift-dflash-reference-ab/fidelity-c4-scout-width4-mean3.json
 /opt/homebrew/bin/python3 tools/gemma4_dflash_fidelity_gate.py \
   --serial "$gemma_c4_serial" \
   --candidate "$gemma_c4_candidate" \
@@ -989,7 +989,7 @@ Use the measured same-model C96 receipt as the empirical upper bound:
 
 ```bash
 jq '{peak:.final_diagnostics.mlx_peak_memory_bytes,active:.final_diagnostics.mlx_active_memory_bytes,cache:.final_diagnostics.mlx_cache_memory_bytes,ram:.final_diagnostics.peak_ram_gb}' \
-  /Users/davidtai/projects/OpenSourceWTF/.benchmark-artifacts/gemma4-swift-dflash-reference-ab/structural-c96-final-width96-mean3.json
+  ~/projects/OpenSourceWTF/.benchmark-artifacts/gemma4-swift-dflash-reference-ab/structural-c96-final-width96-mean3.json
 memory_pressure
 vm_stat
 ```
@@ -1016,8 +1016,8 @@ Run one warmup plus one retained C8 sample with `GEMMA_DFLASH_CAPTURE_TOKENS=1`,
 Apply the one-sample gate:
 
 ```bash
-gemma_c8_serial=/Users/davidtai/projects/OpenSourceWTF/.benchmark-artifacts/gemma4-swift-dflash-reference-ab/fidelity-c8-serial-width1-mean3.json
-gemma_c8_candidate=/Users/davidtai/projects/OpenSourceWTF/.benchmark-artifacts/gemma4-swift-dflash-reference-ab/fidelity-c8-scout-width8-mean3.json
+gemma_c8_serial=~/projects/OpenSourceWTF/.benchmark-artifacts/gemma4-swift-dflash-reference-ab/fidelity-c8-serial-width1-mean3.json
+gemma_c8_candidate=~/projects/OpenSourceWTF/.benchmark-artifacts/gemma4-swift-dflash-reference-ab/fidelity-c8-scout-width8-mean3.json
 /opt/homebrew/bin/python3 tools/gemma4_dflash_fidelity_gate.py \
   --serial "$gemma_c8_serial" --candidate "$gemma_c8_candidate" \
   --max-mismatches 12 --min-decode-tps 0 --required-samples 1
@@ -1034,8 +1034,8 @@ Change only the constant to 16, rebuild, run a fresh serial sample from that wor
 Apply the one-sample gate:
 
 ```bash
-gemma_c16_serial=/Users/davidtai/projects/OpenSourceWTF/.benchmark-artifacts/gemma4-swift-dflash-reference-ab/fidelity-c16-serial-width1-mean3.json
-gemma_c16_candidate=/Users/davidtai/projects/OpenSourceWTF/.benchmark-artifacts/gemma4-swift-dflash-reference-ab/fidelity-c16-scout-width16-mean3.json
+gemma_c16_serial=~/projects/OpenSourceWTF/.benchmark-artifacts/gemma4-swift-dflash-reference-ab/fidelity-c16-serial-width1-mean3.json
+gemma_c16_candidate=~/projects/OpenSourceWTF/.benchmark-artifacts/gemma4-swift-dflash-reference-ab/fidelity-c16-scout-width16-mean3.json
 /opt/homebrew/bin/python3 tools/gemma4_dflash_fidelity_gate.py \
   --serial "$gemma_c16_serial" --candidate "$gemma_c16_candidate" \
   --max-mismatches 12 --min-decode-tps 0 --required-samples 1
@@ -1048,8 +1048,8 @@ Change only the constant to 32, rebuild, run a fresh serial sample from that wor
 Apply the one-sample gate:
 
 ```bash
-gemma_c32_serial=/Users/davidtai/projects/OpenSourceWTF/.benchmark-artifacts/gemma4-swift-dflash-reference-ab/fidelity-c32-serial-width1-mean3.json
-gemma_c32_candidate=/Users/davidtai/projects/OpenSourceWTF/.benchmark-artifacts/gemma4-swift-dflash-reference-ab/fidelity-c32-scout-width32-mean3.json
+gemma_c32_serial=~/projects/OpenSourceWTF/.benchmark-artifacts/gemma4-swift-dflash-reference-ab/fidelity-c32-serial-width1-mean3.json
+gemma_c32_candidate=~/projects/OpenSourceWTF/.benchmark-artifacts/gemma4-swift-dflash-reference-ab/fidelity-c32-scout-width32-mean3.json
 /opt/homebrew/bin/python3 tools/gemma4_dflash_fidelity_gate.py \
   --serial "$gemma_c32_serial" --candidate "$gemma_c32_candidate" \
   --max-mismatches 12 --min-decode-tps 0 --required-samples 1
@@ -1068,8 +1068,8 @@ GEMMA_DFLASH_PHYSICAL_WIDTH="$gemma_retained_width" \
 GEMMA_DFLASH_SAMPLE_COUNT=4 \
 GEMMA_DFLASH_CAPTURE_TOKENS=1 \
 /opt/homebrew/bin/python3 \
-  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
-  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  ~/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist ~/Library/LaunchAgents/com.tea.qwen.plist \
   --lock-timeout-seconds 1800 --timeout-seconds 1800 \
   --child-timeout-seconds 1200 -- \
   /opt/homebrew/bin/python3 /private/tmp/gemma_dflash_width4_mean3.py
@@ -1080,8 +1080,8 @@ The assignment is changed to 16 or 32 only when that width won its preceding sco
 Run a fresh serial warmup plus one retained token-capture receipt from the identical worker SHA, then apply:
 
 ```bash
-gemma_serial_receipt=/Users/davidtai/projects/OpenSourceWTF/.benchmark-artifacts/gemma4-swift-dflash-reference-ab/fidelity-final-serial-width1-mean3.json
-gemma_candidate_receipt=/Users/davidtai/projects/OpenSourceWTF/.benchmark-artifacts/gemma4-swift-dflash-reference-ab/fidelity-final-200-width${gemma_retained_width}-mean3.json
+gemma_serial_receipt=~/projects/OpenSourceWTF/.benchmark-artifacts/gemma4-swift-dflash-reference-ab/fidelity-final-serial-width1-mean3.json
+gemma_candidate_receipt=~/projects/OpenSourceWTF/.benchmark-artifacts/gemma4-swift-dflash-reference-ab/fidelity-final-200-width${gemma_retained_width}-mean3.json
 /opt/homebrew/bin/python3 tools/gemma4_dflash_fidelity_gate.py \
   --serial "$gemma_serial_receipt" \
   --candidate "$gemma_candidate_receipt" \

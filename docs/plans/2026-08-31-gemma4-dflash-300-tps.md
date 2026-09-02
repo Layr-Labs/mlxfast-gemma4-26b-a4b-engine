@@ -464,8 +464,8 @@ GEMMA_DFLASH_DEPTH=15 \
 GEMMA_DFLASH_PHYSICAL_WIDTH=32 \
 GEMMA_DFLASH_SAMPLE_COUNT=2 \
 /opt/homebrew/bin/python3 \
-  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
-  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  ~/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist ~/Library/LaunchAgents/com.tea.qwen.plist \
   --lock-timeout-seconds 1800 \
   --timeout-seconds 1800 \
   --child-timeout-seconds 1200 \

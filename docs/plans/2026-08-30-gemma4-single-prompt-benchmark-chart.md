@@ -19,26 +19,26 @@
 
 ## File structure
 
-- `/Users/davidtai/projects/OpenSourceWTF/bench/gemma/single_prompt/Package.swift` — standalone prefix-benchmark package bound to the selected worktree.
-- `/Users/davidtai/projects/OpenSourceWTF/bench/gemma/single_prompt/Sources/PrefixBenchCore/Receipt.swift` — prompt splitting, progressive summaries, and receipt validation.
-- `/Users/davidtai/projects/OpenSourceWTF/bench/gemma/single_prompt/Sources/GemmaPrefixBench/main.swift` — direct fixed-1K suffix prefill harness, derived from the proved `/tmp/gemma-prefix-bench` harness.
-- `/Users/davidtai/projects/OpenSourceWTF/bench/gemma/single_prompt/Tests/PrefixBenchCoreTests/ReceiptTests.swift` — CPU-only prefix receipt tests.
-- `/Users/davidtai/projects/OpenSourceWTF/bench/gemma/single_prompt/gemma_decode_matrix.py` — worker-protocol serial/MTP depth and context decoder.
-- `/Users/davidtai/projects/OpenSourceWTF/bench/gemma/single_prompt/test_gemma_decode_matrix.py` — protocol and summary tests.
-- `/Users/davidtai/projects/OpenSourceWTF/bench/gemma/single_prompt/build_chart_receipt.py` — joins only complete, compatible raw receipts.
-- `/Users/davidtai/projects/OpenSourceWTF/bench/gemma/single_prompt/render_chart.py` — deterministic two-panel SVG renderer.
-- `/Users/davidtai/projects/OpenSourceWTF/bench/gemma/single_prompt/test_chart.py` — schema, data-binding, and SVG structure tests.
-- `/Users/davidtai/projects/OpenSourceWTF/benchmark-results/gemma4-single-prompt-*.json` — raw and assembled receipts.
-- `/Users/davidtai/projects/OpenSourceWTF/benchmark-results/gemma4-single-prompt-performance-20260830.svg` — canonical chart.
-- `/Users/davidtai/projects/OpenSourceWTF/benchmark-results/gemma4-single-prompt-performance-20260830.png` — optional raster rendering of the same SVG.
+- `~/projects/OpenSourceWTF/bench/gemma/single_prompt/Package.swift` — standalone prefix-benchmark package bound to the selected worktree.
+- `~/projects/OpenSourceWTF/bench/gemma/single_prompt/Sources/PrefixBenchCore/Receipt.swift` — prompt splitting, progressive summaries, and receipt validation.
+- `~/projects/OpenSourceWTF/bench/gemma/single_prompt/Sources/GemmaPrefixBench/main.swift` — direct fixed-1K suffix prefill harness, derived from the proved `/tmp/gemma-prefix-bench` harness.
+- `~/projects/OpenSourceWTF/bench/gemma/single_prompt/Tests/PrefixBenchCoreTests/ReceiptTests.swift` — CPU-only prefix receipt tests.
+- `~/projects/OpenSourceWTF/bench/gemma/single_prompt/gemma_decode_matrix.py` — worker-protocol serial/MTP depth and context decoder.
+- `~/projects/OpenSourceWTF/bench/gemma/single_prompt/test_gemma_decode_matrix.py` — protocol and summary tests.
+- `~/projects/OpenSourceWTF/bench/gemma/single_prompt/build_chart_receipt.py` — joins only complete, compatible raw receipts.
+- `~/projects/OpenSourceWTF/bench/gemma/single_prompt/render_chart.py` — deterministic two-panel SVG renderer.
+- `~/projects/OpenSourceWTF/bench/gemma/single_prompt/test_chart.py` — schema, data-binding, and SVG structure tests.
+- `~/projects/OpenSourceWTF/benchmark-results/gemma4-single-prompt-*.json` — raw and assembled receipts.
+- `~/projects/OpenSourceWTF/benchmark-results/gemma4-single-prompt-performance-20260830.svg` — canonical chart.
+- `~/projects/OpenSourceWTF/benchmark-results/gemma4-single-prompt-performance-20260830.png` — optional raster rendering of the same SVG.
 
 ### Task 1: Make the fixed-1K prefix benchmark durable and tested
 
 **Files:**
-- Create: `/Users/davidtai/projects/OpenSourceWTF/bench/gemma/single_prompt/Package.swift`
-- Create: `/Users/davidtai/projects/OpenSourceWTF/bench/gemma/single_prompt/Sources/PrefixBenchCore/Receipt.swift`
-- Create: `/Users/davidtai/projects/OpenSourceWTF/bench/gemma/single_prompt/Sources/GemmaPrefixBench/main.swift`
-- Create: `/Users/davidtai/projects/OpenSourceWTF/bench/gemma/single_prompt/Tests/PrefixBenchCoreTests/ReceiptTests.swift`
+- Create: `~/projects/OpenSourceWTF/bench/gemma/single_prompt/Package.swift`
+- Create: `~/projects/OpenSourceWTF/bench/gemma/single_prompt/Sources/PrefixBenchCore/Receipt.swift`
+- Create: `~/projects/OpenSourceWTF/bench/gemma/single_prompt/Sources/GemmaPrefixBench/main.swift`
+- Create: `~/projects/OpenSourceWTF/bench/gemma/single_prompt/Tests/PrefixBenchCoreTests/ReceiptTests.swift`
 
 **Security flag:** none
 
@@ -88,7 +88,7 @@ func incompleteOrMixedPromptRowsAreRejected() {
 - [ ] **Step 2: Run the tests and verify the package is absent**
 
 ```bash
-cd /Users/davidtai/projects/OpenSourceWTF/bench/gemma/single_prompt
+cd ~/projects/OpenSourceWTF/bench/gemma/single_prompt
 swift test
 ```
 
@@ -171,13 +171,13 @@ git add bench/gemma/single_prompt
 git commit -m 'bench: add Gemma single-prompt prefill harness'
 ```
 
-If `/Users/davidtai/projects/OpenSourceWTF` is not itself a Git worktree, record the files and hashes in the final receipt instead of creating a commit in another repository.
+If `~/projects/OpenSourceWTF` is not itself a Git worktree, record the files and hashes in the final receipt instead of creating a commit in another repository.
 
 ### Task 2: Build the matched serial/MTP decode matrix runner
 
 **Files:**
-- Create: `/Users/davidtai/projects/OpenSourceWTF/bench/gemma/single_prompt/gemma_decode_matrix.py`
-- Create: `/Users/davidtai/projects/OpenSourceWTF/bench/gemma/single_prompt/test_gemma_decode_matrix.py`
+- Create: `~/projects/OpenSourceWTF/bench/gemma/single_prompt/gemma_decode_matrix.py`
+- Create: `~/projects/OpenSourceWTF/bench/gemma/single_prompt/test_gemma_decode_matrix.py`
 
 **Security flag:** none
 
@@ -244,7 +244,7 @@ Also reject wrong `effective_spec`, non-1 batch/concurrency, fewer than 1,024 co
 - [ ] **Step 2: Run tests and verify the runner is absent**
 
 ```bash
-python3 -m unittest -v /Users/davidtai/projects/OpenSourceWTF/bench/gemma/single_prompt/test_gemma_decode_matrix.py
+python3 -m unittest -v ~/projects/OpenSourceWTF/bench/gemma/single_prompt/test_gemma_decode_matrix.py
 ```
 
 Expected: FAIL because `gemma_decode_matrix.py` does not exist.
@@ -289,9 +289,9 @@ Apply the same workspace-repository caveat from Task 1.
 ### Task 3: Validate and render the publication chart
 
 **Files:**
-- Create: `/Users/davidtai/projects/OpenSourceWTF/bench/gemma/single_prompt/build_chart_receipt.py`
-- Create: `/Users/davidtai/projects/OpenSourceWTF/bench/gemma/single_prompt/render_chart.py`
-- Create: `/Users/davidtai/projects/OpenSourceWTF/bench/gemma/single_prompt/test_chart.py`
+- Create: `~/projects/OpenSourceWTF/bench/gemma/single_prompt/build_chart_receipt.py`
+- Create: `~/projects/OpenSourceWTF/bench/gemma/single_prompt/render_chart.py`
+- Create: `~/projects/OpenSourceWTF/bench/gemma/single_prompt/test_chart.py`
 
 **Security flag:** none
 
@@ -390,11 +390,11 @@ git commit -m 'bench: render Gemma single-prompt performance chart'
 ### Task 4: Run the guarded benchmark and verify the final artifacts
 
 **Files:**
-- Create: `/Users/davidtai/projects/OpenSourceWTF/benchmark-results/gemma4-single-prompt-prefill-0-64k-128k-3x-20260830.json`
-- Create: `/Users/davidtai/projects/OpenSourceWTF/benchmark-results/gemma4-single-prompt-decode-ar-mtp-0-64k-128k-3x-20260830.json`
-- Create: `/Users/davidtai/projects/OpenSourceWTF/benchmark-results/gemma4-single-prompt-chart-receipt-20260830.json`
-- Create: `/Users/davidtai/projects/OpenSourceWTF/benchmark-results/gemma4-single-prompt-performance-20260830.svg`
-- Create if rasterization succeeds: `/Users/davidtai/projects/OpenSourceWTF/benchmark-results/gemma4-single-prompt-performance-20260830.png`
+- Create: `~/projects/OpenSourceWTF/benchmark-results/gemma4-single-prompt-prefill-0-64k-128k-3x-20260830.json`
+- Create: `~/projects/OpenSourceWTF/benchmark-results/gemma4-single-prompt-decode-ar-mtp-0-64k-128k-3x-20260830.json`
+- Create: `~/projects/OpenSourceWTF/benchmark-results/gemma4-single-prompt-chart-receipt-20260830.json`
+- Create: `~/projects/OpenSourceWTF/benchmark-results/gemma4-single-prompt-performance-20260830.svg`
+- Create if rasterization succeeds: `~/projects/OpenSourceWTF/benchmark-results/gemma4-single-prompt-performance-20260830.png`
 
 **Security flag:** none
 
@@ -427,13 +427,13 @@ Expected: zero active requests, understood background warmup state, exactly `mtp
 - [ ] **Step 5: Assemble and render**
 
 ```bash
-python3 /Users/davidtai/projects/OpenSourceWTF/bench/gemma/single_prompt/build_chart_receipt.py \
-  --prefill /Users/davidtai/projects/OpenSourceWTF/benchmark-results/gemma4-single-prompt-prefill-0-64k-128k-3x-20260830.json \
-  --decode /Users/davidtai/projects/OpenSourceWTF/benchmark-results/gemma4-single-prompt-decode-ar-mtp-0-64k-128k-3x-20260830.json \
-  --output /Users/davidtai/projects/OpenSourceWTF/benchmark-results/gemma4-single-prompt-chart-receipt-20260830.json
-python3 /Users/davidtai/projects/OpenSourceWTF/bench/gemma/single_prompt/render_chart.py \
-  --receipt /Users/davidtai/projects/OpenSourceWTF/benchmark-results/gemma4-single-prompt-chart-receipt-20260830.json \
-  --output /Users/davidtai/projects/OpenSourceWTF/benchmark-results/gemma4-single-prompt-performance-20260830.svg
+python3 ~/projects/OpenSourceWTF/bench/gemma/single_prompt/build_chart_receipt.py \
+  --prefill ~/projects/OpenSourceWTF/benchmark-results/gemma4-single-prompt-prefill-0-64k-128k-3x-20260830.json \
+  --decode ~/projects/OpenSourceWTF/benchmark-results/gemma4-single-prompt-decode-ar-mtp-0-64k-128k-3x-20260830.json \
+  --output ~/projects/OpenSourceWTF/benchmark-results/gemma4-single-prompt-chart-receipt-20260830.json
+python3 ~/projects/OpenSourceWTF/bench/gemma/single_prompt/render_chart.py \
+  --receipt ~/projects/OpenSourceWTF/benchmark-results/gemma4-single-prompt-chart-receipt-20260830.json \
+  --output ~/projects/OpenSourceWTF/benchmark-results/gemma4-single-prompt-performance-20260830.svg
 ```
 
 - [ ] **Step 6: Prove chart-data identity and inspect the rendered image**

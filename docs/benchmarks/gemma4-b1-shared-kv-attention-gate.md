@@ -44,12 +44,12 @@ memory admission for loading the Gemma model or running the real-model gate.
 
 ```bash
 /opt/homebrew/bin/python3 \
-  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
-  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  ~/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist ~/Library/LaunchAgents/com.tea.qwen.plist \
   --lock-timeout-seconds 1800 \
   --timeout-seconds 1800 \
   --child-timeout-seconds 3600 \
-  -- /bin/zsh -lc 'cd /Users/davidtai/projects/OpenSourceWTF/.worktrees/mlxfast-gemma4-mtp-depth3-tip && MLXFAST_RUN_MLX_RUNTIME_TESTS=1 MLXFAST_RUN_MLX_LONG_RUNTIME_TESTS=1 swift test --filter Gemma4B1MTPFullAttentionTests'
+  -- /bin/zsh -lc 'cd ~/projects/OpenSourceWTF/.worktrees/mlxfast-gemma4-mtp-depth3-tip && MLXFAST_RUN_MLX_RUNTIME_TESTS=1 MLXFAST_RUN_MLX_LONG_RUNTIME_TESTS=1 swift test --filter Gemma4B1MTPFullAttentionTests'
 ```
 
 The guard must acquire and retain `/tmp/mtplx-gpu-exclusive.lock` before it
@@ -98,12 +98,12 @@ model decode TPS.
 
 ```bash
 /opt/homebrew/bin/python3 \
-  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
-  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  ~/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist ~/Library/LaunchAgents/com.tea.qwen.plist \
   --lock-timeout-seconds 1800 \
   --timeout-seconds 1800 \
   --child-timeout-seconds 3600 \
-  -- /bin/zsh -lc 'cd /Users/davidtai/projects/OpenSourceWTF/.worktrees/mlxfast-gemma4-mtp-depth3-tip && MLXFAST_RUN_MLX_BENCHMARKS=1 swift test --filter Gemma4B1MTPFullAttentionTests.benchmarkSharedKVAgainstSerialWidthOneControl'
+  -- /bin/zsh -lc 'cd ~/projects/OpenSourceWTF/.worktrees/mlxfast-gemma4-mtp-depth3-tip && MLXFAST_RUN_MLX_BENCHMARKS=1 swift test --filter Gemma4B1MTPFullAttentionTests.benchmarkSharedKVAgainstSerialWidthOneControl'
 ```
 
 | Key length | C | Serial mean ms | Candidate mean ms | Serial column_tps | Candidate column_tps | Serial/candidate |

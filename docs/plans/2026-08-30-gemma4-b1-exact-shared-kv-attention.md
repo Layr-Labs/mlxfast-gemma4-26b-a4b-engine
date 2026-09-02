@@ -243,12 +243,12 @@ K/V traversal.
 
 ```bash
 /opt/homebrew/bin/python3 \
-  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
-  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  ~/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist ~/Library/LaunchAgents/com.tea.qwen.plist \
   --lock-timeout-seconds 1800 \
   --timeout-seconds 1800 \
   --child-timeout-seconds 3600 \
-  -- /bin/zsh -lc 'cd /Users/davidtai/projects/OpenSourceWTF/.worktrees/mlxfast-gemma4-mtp-depth3-tip && MLXFAST_RUN_MLX_RUNTIME_TESTS=1 MLXFAST_RUN_MLX_LONG_RUNTIME_TESTS=1 swift test --filter Gemma4B1MTPFullAttentionTests'
+  -- /bin/zsh -lc 'cd ~/projects/OpenSourceWTF/.worktrees/mlxfast-gemma4-mtp-depth3-tip && MLXFAST_RUN_MLX_RUNTIME_TESTS=1 MLXFAST_RUN_MLX_LONG_RUNTIME_TESTS=1 swift test --filter Gemma4B1MTPFullAttentionTests'
 ```
 
 Expected after implementation: every admitted length and C2-C4 is byte-exact;

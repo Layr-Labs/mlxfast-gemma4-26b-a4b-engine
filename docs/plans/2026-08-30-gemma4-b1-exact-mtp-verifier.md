@@ -63,12 +63,12 @@ Expected: three new commits; no content is copied from `mlxfast-gemma4-mtp-tip-q
 
 ```bash
 /opt/homebrew/bin/python3 \
-  /Users/davidtai/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
-  --plist /Users/davidtai/Library/LaunchAgents/com.tea.qwen.plist \
+  ~/projects/OpenSourceWTF/bench/laguna/run_guarded.py \
+  --plist ~/Library/LaunchAgents/com.tea.qwen.plist \
   --lock-timeout-seconds 1800 \
   --timeout-seconds 900 \
   --child-timeout-seconds 1800 \
-  -- /bin/zsh -lc 'cd /Users/davidtai/projects/OpenSourceWTF/.worktrees/mlxfast-gemma4-mtp-depth3-tip && swift test --filter Gemma4MTPVerifier'
+  -- /bin/zsh -lc 'cd ~/projects/OpenSourceWTF/.worktrees/mlxfast-gemma4-mtp-depth3-tip && swift test --filter Gemma4MTPVerifier'
 ```
 
 Expected: all clean B8 verifier tests pass; the guard restores `mtplx-flash-next-optimized-speed` before returning.
@@ -547,7 +547,7 @@ git commit -m 'perf: enable exact Gemma B1 MTP verification'
 
 **Files:**
 - Modify only if a measured B1 component fails: the file owning that component
-- Create: `/Users/davidtai/projects/OpenSourceWTF/benchmark-results/gemma4-b1-exact-verifier-gate-20260830.json`
+- Create: `~/projects/OpenSourceWTF/benchmark-results/gemma4-b1-exact-verifier-gate-20260830.json`
 
 **Security flag:** none
 

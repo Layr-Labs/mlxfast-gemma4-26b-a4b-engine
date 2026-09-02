@@ -56,7 +56,24 @@ final class CBv2MTPDepthController {
     /// removes those rounds. Every committed token is still produced by an
     /// ordinary target decode step, so the emitted stream stays bit-identical
     /// to serial decode.
-    static let speculationEnabled = false
+    /// Speculation is ON: rounds run a wide rectangular verify chained on
+    /// device state (see EngineLoopV2+MTPChained.swift). Kill switch
+    /// `DARKBLOOM_CBV2_MTP_SPECULATE=0` restores target-only decode.
+    static let speculationEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_MTP_SPECULATE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// PROBE SWITCH (local measurement only, inert when unset): a positive
+    /// `DARKBLOOM_CBV2_MTP_FORCE_DEPTH` pins every eligible round at that depth
+    /// (clamped to the controller ceiling) instead of the adaptive selection.
+    static let forcedDepth: Int? = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_MTP_FORCE_DEPTH"],
+            let value = Int(raw.trimmingCharacters(in: .whitespaces)), value >= 0
+        else { return nil }
+        return value
+    }()
 
     private struct CostState {
         var samples = 0
@@ -331,6 +348,13 @@ final class CBv2MTPDepthController {
                 CBv2MTPDepthDecision(
                     depth: fixedDepth, decodeRowBucket: bucket, reason: "fixed",
                     isExploration: false),
+                mutate: mutate)
+        }
+        if let forced = Self.forcedDepth {
+            return finish(
+                CBv2MTPDepthDecision(
+                    depth: min(forced, maxDepth), decodeRowBucket: bucket,
+                    reason: "forced_probe", isExploration: false),
                 mutate: mutate)
         }
 

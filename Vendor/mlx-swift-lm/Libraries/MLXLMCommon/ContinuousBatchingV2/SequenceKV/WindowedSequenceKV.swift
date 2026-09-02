@@ -13,57 +13,14 @@ import Foundation
 import MLX
 import MLXFast
 
-/// `CBv2SequenceKV` for sliding-window attention.
-///
-/// ## Temporal-order guarantee
-/// Every array this class returns (from `update` and `snapshot`) is in
-/// temporal order (oldest → newest). Unwinding the ring costs at most one
-/// concat of two slices; in the common pre-wrap decode case it is a single
-/// zero-copy slice.
-///
-/// ## Multi-token updates (prefill chunks)
-/// For `n > 1` the returned views are `retainedHistory (≤ window-1 entries)
-/// ++ the n new tokens` — i.e. up to `window - 1 + n` entries, which can
-/// exceed `retainedCount`. This is required for correctness: the FIRST token
-/// of the chunk must attend to the `window - 1` tokens before it, which the
-/// ring evicts as the chunk is written. The attention layer applies a
-/// causal∧window mask whenever the returned length exceeds `window`
-/// (a pure function of lengths — see `CBv2AttentionV1.maskMode`).
-///
-/// ## Rollback and un-wrapping
-/// `rollback(n)` moves `absoluteOffset` back by `n`. Before the ring wraps
-/// this recovers the previous state exactly. After wrapping, the speculative
-/// tokens' writes have already destroyed the `n` OLDEST in-window entries
-/// (their slots alias positions exactly `window` behind), so the retained
-/// count shrinks to `window - n` until fresh tokens refill the window. This
-/// is tracked by `oldestValidPosition`, which is monotonically non-decreasing
-/// — destroyed history can never be re-exposed, and the un-confirmed tail is
-/// structurally unreachable (all views are keyed to
-/// `[oldestValidPosition, absoluteOffset)`).
-///
-/// ## Staged speculative writes (MTP verify rounds)
-/// The post-wrap window shrink above is CORRECT but numerically divergent
-/// from a non-speculative run, which breaks the MTP acceptance gate (MTP-on
-/// must be token-exact vs MTP-off for greedy). `beginSpeculativeWrite()`
-/// therefore opens a STAGED transaction: one multi-token update or several
-/// serial one-token updates return exactly the views their plain equivalents
-/// would return and advance `absoluteOffset`, while destructive ring writes
-/// (and the `oldestValidPosition` advance) are deferred to
-/// `commitSpeculativeWrite()`. A final `rollback(m)` is a pure counter move —
-/// nothing was destroyed — so after commit the state is value-exactly what
-/// plain updates of only the confirmed tokens would have produced.
 public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV,
     CBv2InnerStateProviding
 {
 
-    /// Window size in tokens == number of physical ring slots.
     public let window: Int
 
-    /// Absolute position of the next token to be written.
     public private(set) var absoluteOffset: Int
 
-    /// Absolute position of the oldest entry that is still physically valid.
-    /// Monotonically non-decreasing (see rollback discussion above).
     private var oldestValidPosition: Int
 
     public var retainedCount: Int { absoluteOffset - oldestValidPosition }
@@ -74,64 +31,22 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     private var keys: MLXArray?
     private var values: MLXArray?
 
-    /// KVQ-001: 8-bit affine mirror of the ring, maintained ALONGSIDE the
-    /// bf16 ring (which stays the source of truth for every logical view,
-    /// borrow, staging and rollback path). Only the B=8 full-ring decode
-    /// pass-A kernels read it; halving their K/V bytes is the entire point.
-    ///
-    /// Layout: `[2, kvHeads, window, headDim + 4]` uint8 — plane 0 keys,
-    /// plane 1 values; per (plane, head, slot) the first `headDim` bytes are
-    /// the affine-quantized values and the trailing 4 bytes are the fp16
-    /// (scale, bias) pair for that slot, so one buffer per row carries
-    /// everything a kernel needs (Metal's 31-buffer limit rules out separate
-    /// scale arrays at batch 8).
-    ///
-    /// Consistency: the mirror mirrors the bf16 ring slot-for-slot and is
-    /// written at exactly the writes that mutate the ring (`writeRing`,
-    /// `writeDecodeToken`, and the fused in-kernel store). Rollback moves
-    /// counters only — both buffers keep the same bytes — so validity is
-    /// tracked by the same `oldestValidPosition`/`absoluteOffset` pair and
-    /// the mirror needs no bookkeeping of its own.
     private var quantMirror: MLXArray?
 
-    /// Q4-BF16-ELIDE: true once a fused q4 decode step advanced this row
-    /// WITHOUT writing its BF16 ring slot (the fused pass owns the mirror
-    /// write and serves the live token from the new K/V arrays). The BF16
-    /// ring contents are stale from that step on; every BF16 view refuses
-    /// loudly rather than serve wrong bytes. The q4 mirror stays
-    /// authoritative and self-consistent.
     private(set) var bf16RingStale = false
 
-    /// `MLX_KV_QUANT=0` disables the quantized-ring read path wholesale
-    /// (mirror never allocated, kernels take the established bf16 road).
-    /// Default ON. `MLX_` prefix: the worker env sanitizer only passes
-    /// that namespace through.
     static let quantEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment["MLX_KV_QUANT"]
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    /// `MLX_KV_QUANT_SIM=1` (default OFF, local only): after every ring
-    /// write, overwrite the bf16 slot with its quantize→dequantize round
-    /// trip, so the SINGLE-STREAM fallback path — the one a local
-    /// `--local-iterate` golden run exercises — sees exactly the values the
-    /// quantized kernels would reconstruct at B = 8. That turns the local
-    /// teacher-forced golden into a real end-to-end drift measurement for
-    /// this mechanism. Never set on the ranked box.
     static let quantSimulate: Bool = {
         ["1", "true", "yes", "on"].contains(
             (ProcessInfo.processInfo.environment["MLX_KV_QUANT_SIM"] ?? "")
                 .lowercased())
     }()
 
-    /// `MLX_KV_Q4_BF16_ELIDE=0` restores the per-step BF16 ring
-    /// SliceUpdates while the fused q4 pass owns the live mirror-slot
-    /// write. Default ON: on the quant-authoritative road no reader touches
-    /// the BF16 rings (the fused pass and the mirror-read road cover every
-    /// full-ring decode step), so the two per-layer-per-row SliceUpdates
-    /// over the whole ring allocation are dead graph work. Static, read
-    /// once per process like the switch it complements.
     static let q4BF16RingElideEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment["MLX_KV_Q4_BF16_ELIDE"]
         else { return true }
@@ -143,34 +58,12 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             && (window & (window - 1)) == 0
     }
 
-    /// Step-scoped PRE-EVICTION views captured by the most recent MULTI-token
-    /// `update()` (`retainedHistory ++ chunk`, up to `window - 1 + n` entries).
-    /// KV-borrowing layers (Gemma-4 cross-layer sharing) attend these instead
-    /// of the post-eviction ring, so a chunk's earliest queries still see
-    /// their full window — the ring writes have already destroyed those
-    /// entries (slot aliasing at distance `window`). nil after a decode
-    /// update, rollback, or before any update. Retaining these views keeps
-    /// the pre-write buffer alive only until the next `update()` replaces
-    /// them (bounded: one extra window-sized buffer between a chunk update
-    /// and the following update).
     private var borrowableChunkViews: (keys: MLXArray, values: MLXArray)?
 
-    /// Transaction opened by `beginSpeculativeWrite()` and closed by commit.
-    /// Every intervening update stages instead of writing the ring.
     private var speculativeWriteArmed = false
 
-    /// The accumulated speculative updates plus the absolute position the
-    /// transaction started at. The ring writes
-    /// for the still-confirmed range `[basePosition, absoluteOffset)` happen
-    /// at `commitSpeculativeWrite()`. At most one transaction per row.
     private var staged: (keys: MLXArray, values: MLXArray, basePosition: Int)?
 
-    /// - Parameters:
-    ///   - window: sliding window in tokens (> 0).
-    ///   - initialOffset: absolute position this sequence starts at. Non-zero
-    ///     when a prefix-cache hit starts finite-window replay at C. The row
-    ///     starts empty at C while owning full rows may retain immutable K/V
-    ///     through M; absolute RoPE positions therefore remain aligned.
     public init(window: Int, kvHeads: Int, headDim: Int, initialOffset: Int = 0) {
         precondition(window > 0, "CBv2WindowedSequenceKV: window must be > 0")
         precondition(initialOffset >= 0, "CBv2WindowedSequenceKV: negative initialOffset")
@@ -182,11 +75,6 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     }
 
     public var byteCount: Int {
-        // Staged tensors are physically held until commit (bounded: one
-        // 1+k-token chunk per in-flight MTP round).
-        // KVQ-001: the packed 8-bit mirror is real resident memory and must
-        // be visible to the engine's capacity accounting (the original
-        // KVQ-001 revision omitted it, under-counting ~850 MB at B=8).
         (keys?.nbytes ?? 0) + (values?.nbytes ?? 0)
             + (staged.map { $0.keys.nbytes + $0.values.nbytes } ?? 0)
             + (quantMirror?.nbytes ?? 0)
@@ -214,8 +102,6 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         allocateIfNeeded(keyTemplate: newKeys, valueTemplate: newValues)
 
         if n == 1 {
-            // Decode fast path: one modular slot write, then the retained
-            // window in temporal order (1 slice pre-wrap, 2-slice concat after).
             writeDecodeToken(keys: newKeys, values: newValues)
             return (
                 temporalOrder(keys!, from: oldestValidPosition, to: absoluteOffset),
@@ -223,9 +109,6 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             )
         }
 
-        // Prefill chunk: capture the retained history VIEWS before the ring
-        // writes evict it (the views reference the pre-write buffer contents;
-        // slice-update produces a new buffer, so they stay valid).
         let historyCount = min(retainedCount, window - 1)
         let historyFrom = absoluteOffset - historyCount
         var kParts = ringSlices(keys!, from: historyFrom, to: absoluteOffset)
@@ -235,8 +118,6 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         let returnedKeys = kParts.count == 1 ? kParts[0] : concatenated(kParts, axis: 2)
         let returnedValues = vParts.count == 1 ? vParts[0] : concatenated(vParts, axis: 2)
 
-        // Write the new tokens into the ring. Only the last `window` matter
-        // when the chunk itself exceeds the window.
         let writeCount = min(n, window)
         let firstWritten = absoluteOffset + n - writeCount
         let kTail = writeCount == n ? newKeys : newKeys[.ellipsis, (n - writeCount)..., 0...]
@@ -257,8 +138,6 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         writeDecodeToken(keys: newKeys, values: newValues)
     }
 
-    /// Preserve the incumbent BF16 SliceUpdates and counter transition while
-    /// the fused q4 attention pass owns only the live mirror-slot write.
     func decodeRingWriteBF16Only(keys newKeys: MLXArray, values newValues: MLXArray) {
         precondition(
             staged == nil && newKeys.dim(2) == 1 && newValues.dim(2) == 1
@@ -270,13 +149,6 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
     }
 
-    /// Q4-BF16-ELIDE: bookkeeping half of a fused q4 decode step. The fused
-    /// pass already stored this step's mirror slot in place and served its
-    /// live token from the new K/V arrays, and on the quant-authoritative
-    /// road no reader observes the BF16 ring, so the incumbent BF16
-    /// SliceUpdates `decodeRingWriteBF16Only` performs are dead graph work.
-    /// Advance exactly the counters that method would and write nothing.
-    /// Marks the BF16 ring stale; BF16 views refuse from here on.
     func advanceDecodeRingAfterQuantWrite() {
         precondition(
             staged == nil && keys != nil && retainedCount == window,
@@ -292,55 +164,27 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         return (keys, values, oldestValidPosition % window)
     }
 
-    /// KVQ-001: the packed 8-bit mirror for the same full-ring decode step
-    /// `decodeRingView` describes, or nil when the quantized road is off.
-    /// The same allocation serves the before-write (fused) step: the fused
-    /// quantized kernel stores the new token's mirror bytes itself, exactly
-    /// as it stores the bf16 ones.
     var decodeRingQuantView: MLXArray? {
         guard staged == nil, quantMirror != nil, retainedCount == window
         else { return nil }
         return quantMirror
     }
 
-    /// Live q4 mirror plus the logical post-write start. No mutation: the
-    /// fused pass-A owns the mirror write and consumes the new token directly.
     var decodeRingQuantViewBeforeWrite: (mirror: MLXArray, start: Int)? {
         guard staged == nil, let quantMirror, retainedCount == window else { return nil }
         return (quantMirror, (oldestValidPosition + 1) % window)
     }
 
-    /// The ring view a fused decode step should attend: the SAME allocations
-    /// and the SAME start `decodeRingView` would report AFTER this step's
-    /// one-token `decodeRingWrite`, offered before that write happens.
-    ///
-    /// Only defined on an already-full ring — the identical predicate the
-    /// separate-write path uses — where the append evicts exactly one entry,
-    /// so `oldestValidPosition` advances by one and the post-write start is
-    /// `(oldestValidPosition + 1) % window`. The physical slot that write
-    /// lands in is `absoluteOffset % window`, i.e. `(start + window - 1) %
-    /// window` — the slot the returned start has just stepped past.
     var decodeRingViewBeforeWrite: (keys: MLXArray, values: MLXArray, start: Int)? {
         guard staged == nil, !bf16RingStale, let keys, let values, retainedCount == window else { return nil }
         return (keys, values, (oldestValidPosition + 1) % window)
     }
 
-    /// Bookkeeping half of a fused decode step. The attention kernel already
-    /// stored this step's token into the ring allocation in place, so advance
-    /// exactly the counters `writeDecodeToken` would and construct no
-    /// `SliceUpdate`. Precondition mirrors `decodeRingViewBeforeWrite`, which
-    /// the caller must have consulted for the very same step.
     func advanceDecodeRingAfterFusedWrite() {
         precondition(
             staged == nil && keys != nil && retainedCount == window,
             "CBv2WindowedSequenceKV: fused ring advance outside a full-ring decode step")
         borrowableChunkViews = nil
-        // KVQ-DIAG: dispatch the quantized reader on the full ring this step
-        // just advanced past, and discard the result. WRITE-016 owns the
-        // steady-state decode write, so this is where the probe belongs.
-        // Probe 1 (the read kernel) was CLEARED on the box by submission
-        // 47dae0ea, which scored 1.96373951131358 with it dispatching. Only
-        // the write half is still unproven, so only probe 2 runs here.
         diagnosticFusedDispatch()
         absoluteOffset += 1
         oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
@@ -348,8 +192,6 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
 
     // MARK: - Speculative (MTP) staging
 
-    /// Staging always supported: the ring defers its destructive writes to
-    /// `commitSpeculativeWrite()`, so speculative rollback is value-exact.
     public var supportsSpeculativeWrites: Bool { true }
 
     public func beginSpeculativeWrite() {
@@ -363,20 +205,6 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         speculativeWriteArmed = true
     }
 
-    /// One update in the active transaction: return EXACTLY the views the
-    /// corresponding plain update would return and advance `absoluteOffset`,
-    /// but touch NEITHER the ring
-    /// buffers NOR `oldestValidPosition` — the destructive writes are
-    /// deferred to `commitSpeculativeWrite()` so a `rollback` in between is
-    /// a pure counter move.
-    ///
-    /// n == 1 equivalence with the plain decode return: plain writes the
-    /// token then returns the ring `[max(oldest, offset+1-window),
-    /// offset+1)`. `history ++ token` with `historyCount = min(retained,
-    /// window - 1)` yields the same entries — a below-full ring keeps all
-    /// history, and a full ring drops exactly the one entry (position
-    /// `offset - window`) the plain write would have destroyed. Pinned by
-    /// `CBv2MTPKVStagingTests`.
     private func stageSpeculativeUpdate(
         newKeys: MLXArray, newValues: MLXArray, count n: Int
     ) -> (MLXArray, MLXArray) {
@@ -406,9 +234,6 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             staged = (newKeys, newValues, absoluteOffset)
         }
         absoluteOffset += n
-        // KV-borrowing layers attend the SAME views this step (the ring does
-        // not hold the staged tokens yet) — set for n == 1 too, unlike the
-        // plain decode path where the post-write ring is already exact.
         borrowableChunkViews = (returnedKeys, returnedValues)
         return (returnedKeys, returnedValues)
     }
@@ -417,11 +242,6 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         speculativeWriteArmed = false
         guard let staged else { return }
         self.staged = nil
-        // Confirmed range after finalize-time rollback: [basePosition,
-        // absoluteOffset). Write it into the ring exactly as the plain
-        // multi-token path would (only the last `window` matter when the
-        // confirmed span exceeds the window); a fully rolled-back
-        // (cancelled) row writes nothing.
         let confirmed = absoluteOffset - staged.basePosition
         if confirmed > 0 {
             allocateIfNeeded(keyTemplate: staged.keys, valueTemplate: staged.values)
@@ -435,28 +255,15 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
                 firstPosition: absoluteOffset - writeCount, mirrorPlane: 1)
         }
         oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
-        // Step-scoped views die at finalize (the plain paths replace them on
-        // the next update; nothing borrows between commit and that update).
         borrowableChunkViews = nil
     }
 
-    /// Views a KV-BORROWING layer must attend against in the CURRENT step:
-    /// exactly what the most recent `update()` returned. After a multi-token
-    /// (prefill-chunk) update this is the PRE-eviction history + chunk — the
-    /// borrowing layer's chunk queries need the same `window - 1 + n` entries
-    /// the source layer attended, and the ring has already evicted the old
-    /// ones. After a decode update (or a rollback) it is the retained ring,
-    /// identical to `snapshot()`. Step-scoped: valid between the source
-    /// layer's `update()` and the next mutation; never retain across steps.
     public func borrowableViews() -> (keys: MLXArray, values: MLXArray) {
         if let views = borrowableChunkViews { return views }
         let snap = snapshot()
         return (snap.keys, snap.values)
     }
 
-    /// Decode normally borrows the retained ring snapshot. During a staged
-    /// serial MTP transaction the ring deliberately has not been written, so
-    /// the source layer's current logical post-update view is authoritative.
     func decodeBorrowableViews() -> (keys: MLXArray, values: MLXArray) {
         if staged != nil {
             precondition(
@@ -495,13 +302,6 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         )
     }
 
-    /// Value-exact snapshot while a speculative update is staged: the ring
-    /// holds `[oldestValidPosition, basePosition)` and the staged tensors
-    /// hold the confirmed tail `[basePosition, absoluteOffset)` (rollback
-    /// may have shrunk it). Transiently up to `window + n` entries — same
-    /// exposure as a plain chunk update's pre-eviction views. Never on an
-    /// engine path (windowed rows are not donated), but keeps
-    /// `borrowableViews()`'s fallback correct after a mid-staged rollback.
     private func stagedSnapshot(
         _ staged: (keys: MLXArray, values: MLXArray, basePosition: Int)
     ) -> (keys: MLXArray, values: MLXArray, offset: Int) {
@@ -530,17 +330,10 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         )
     }
 
-    /// Advance the position counter WITHOUT writing storage (contract
-    /// `CBv2SequenceKV.fastForward(to:)`). Only valid on a FRESH state, used
-    /// during prefix-cache adoption so the engine's trailing-window replay
-    /// lands at true absolute positions.
     public func fastForward(to offset: Int) {
         precondition(
             keys == nil && absoluteOffset == oldestValidPosition,
             "CBv2WindowedSequenceKV.fastForward requires a fresh state")
-        // A fully-rolled-back staged row can look "fresh" (offset back at
-        // oldestValidPosition, ring never allocated) while a commit is
-        // still owed — exclude it explicitly.
         precondition(
             !speculativeWriteArmed && staged == nil,
             "CBv2WindowedSequenceKV.fastForward with a speculative write pending")
@@ -552,10 +345,6 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     public func rollback(_ n: Int) {
         precondition(n >= 0, "CBv2WindowedSequenceKV.rollback: negative n")
         if let staged {
-            // Pure counter move: the staged tokens were never written to
-            // the ring, so nothing was destroyed and the retained window
-            // does not shrink. The engine only ever rolls back tokens from
-            // the staged round (a cancelled row may roll back ALL of them).
             precondition(
                 n <= absoluteOffset - staged.basePosition,
                 "CBv2WindowedSequenceKV.rollback(\(n)) exceeds staged range "
@@ -567,14 +356,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         precondition(
             n <= retainedCount,
             "CBv2WindowedSequenceKV.rollback(\(n)) exceeds retained \(retainedCount)")
-        // oldestValidPosition deliberately does NOT decrease: if the ring had
-        // wrapped, the rolled-back tokens' writes destroyed the oldest `n`
-        // in-window entries (slot aliasing at distance `window`), so the
-        // window shrinks until refilled. Pre-wrap, oldestValidPosition is
-        // still the initial offset and the rollback is a full recovery.
         absoluteOffset -= n
-        // Any captured pre-eviction chunk views now cover rolled-back
-        // positions — invalidate so borrowing falls back to the ring.
         borrowableChunkViews = nil
     }
 
@@ -582,12 +364,58 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         [keys, values, quantMirror].compactMap { $0 }
     }
 
+    // MARK: - MTP mirror road (see MTP/CBv2MTPMirrorOps.swift)
+
+    var mtpMirrorRoadAvailable: Bool {
+        staged == nil && !speculativeWriteArmed && quantMirror != nil
+            && retainedCount == window
+    }
+
+    var mtpQuantMirror: MLXArray? { quantMirror }
+
+    /// True when the bf16 ring is stale (the mirror is authoritative), so a
+    /// verify round must take the mirror road or not speculate at all.
+    var mtpNeedsMirrorRoad: Bool { bf16RingStale }
+
+    var mtpSlotBase: Int { absoluteOffset % window }
+
+    func mtpRollbackMirrorRoad(_ n: Int) {
+        precondition(n >= 0, "CBv2WindowedSequenceKV.mtpRollbackMirrorRoad: negative n")
+        precondition(
+            staged == nil && !speculativeWriteArmed,
+            "CBv2WindowedSequenceKV.mtpRollbackMirrorRoad on a staged row")
+        precondition(
+            n <= retainedCount,
+            "CBv2WindowedSequenceKV.mtpRollbackMirrorRoad(\(n)) exceeds retained \(retainedCount)")
+        absoluteOffset -= n
+        oldestValidPosition -= n
+        borrowableChunkViews = nil
+    }
+
+    func mtpDequantizedRetainedViews(fence: MLXArray) -> (keys: MLXArray, values: MLXArray)? {
+        guard let quantMirror, staged == nil, retainedCount > 0, headDim == 256 else { return nil }
+        return CBv2MTPMirrorOps.dequantize(
+            mirror: quantMirror, start: oldestValidPosition % window,
+            count: retainedCount, kvHeads: kvHeads, headDim: headDim, window: window,
+            fence: fence)
+    }
+
+    /// Chained rounds: the same view with the first retained slot taken from
+    /// a `[1]` int32 device value (the row's device position mod window).
+    func mtpDequantizedRetainedViews(
+        startDevice: MLXArray, fence: MLXArray
+    ) -> (keys: MLXArray, values: MLXArray)? {
+        guard let quantMirror, staged == nil, retainedCount == window, headDim == 256 else { return nil }
+        return CBv2MTPMirrorOps.dequantize(
+            mirror: quantMirror, start: startDevice,
+            count: window, kvHeads: kvHeads, headDim: headDim, window: window,
+            fence: fence)
+    }
+
     // MARK: - Ring geometry
 
     private func writeDecodeToken(keys newKeys: MLXArray, values newValues: MLXArray) {
         borrowableChunkViews = nil
-        // KVQ-PAIRWRITE: when both mirror planes go out together the ring
-        // writes carry no mirror plane of their own.
         let paired = writePairedMirror(
             keys: newKeys, values: newValues, firstPosition: absoluteOffset)
         writeRing(
@@ -600,9 +428,6 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
     }
 
-    /// Views covering absolute positions `[from, to)` in temporal order:
-    /// one slice when the modular range does not cross the wrap point,
-    /// two slices when it does. `to - from` must be ≤ `window`.
     private func ringSlices(_ array: MLXArray, from: Int, to: Int) -> [MLXArray] {
         guard to > from else { return [] }
         let count = to - from
@@ -629,14 +454,6 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         }
     }
 
-    /// Write `tokens` (≤ window of them) into their modular slots, splitting
-    /// at the wrap point when needed (at most two slice assignments).
-    ///
-    /// `mirrorPlane` (0 = keys, 1 = values) additionally keeps the KVQ-001
-    /// mirror in step when the quantized road is on, and — under
-    /// `MLX_KV_QUANT_SIM` — replaces the bf16 payload with its
-    /// quantize→dequantize round trip so the single-stream fallback sees the
-    /// mirror's numerics.
     private func writeRing(
         _ buffer: MLXArray, tokens: MLXArray, firstPosition: Int, mirrorPlane: Int? = nil
     ) {
@@ -661,11 +478,6 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
 
     // MARK: - KVQ-001 quantized mirror
 
-    /// fp16-rounded per-(head, token) affine parameters for `x`
-    /// (`[..., headDim]` over the last axis). The fp16 rounding is applied
-    /// BEFORE quantization so the host packer, the fused kernel's writer and
-    /// the sim round trip all reconstruct with the identical (scale, bias)
-    /// the mirror actually stores.
     private static func quantParams(_ f: MLXArray) -> (scale: MLXArray, bias: MLXArray) {
         let mn = f.min(axis: -1, keepDims: true)
         let mx = f.max(axis: -1, keepDims: true)
@@ -675,12 +487,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         return (scale, bias)
     }
 
-    /// `[1, kvHeads, n, headDim]` bf16 → packed mirror rows
-    /// `[kvHeads, n, headDim + 4]` uint8 (values ++ fp16 scale ++ fp16 bias).
     private static func quantPack(_ x: MLXArray) -> MLXArray {
-        // KVQ4 host twin of `cbv2_kvq4g64_pack_d256_v1`: 4-bit values in
-        // groups of 64, one fp16 (scale, bias) pair per group, packed eight
-        // nibbles to a word and four group words after the payload.
         let f = x[0].asType(.float32)
         let heads = f.dim(0), n = f.dim(1), d = f.dim(2)
         let groups = d / 64
@@ -697,61 +504,36 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         for i in 0 ..< 8 {
             payload = payload + (q[.ellipsis, i] << MLXArray(Int32(4 * i)))
         }
-        // The tail word is the fp16 pair laid out little-endian: scale in
-        // the low half, bias in the high half. Concatenating the two fp16
-        // values and viewing the pair as one uint32 reproduces exactly the
-        // bytes the kernel writes, without any per-half bit arithmetic.
         let pair = concatenated(
             [scale.asType(.float16), bias.asType(.float16)], axis: -1)
         let tail = pair.view(dtype: .uint32).reshaped([heads, n, groups])
-        // The shift operands promote the accumulator to int64; the mirror is
-        // a uint32 buffer, so narrow before the concat or the row silently
-        // doubles in width.
         return concatenated([payload.asType(.uint32), tail], axis: -1)
     }
 
-    /// KVQ-GPUPACK: `MLX_KV_QUANT_GPUPACK=0` routes mirror packing back
-    /// through the host expression above. Default ON: one kernel dispatch
-    /// replaces the ~8-op MLX expression per (plane, chunk) write, which is
-    /// the whole prefill cost of the mirror.
     static let gpuPackEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment["MLX_KV_QUANT_GPUPACK"]
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    /// KVQ-PAIRWRITE: `MLX_KV_QUANT_PAIRWRITE=0` returns a decode step's
-    /// mirror maintenance to one pack dispatch and one `SliceUpdate` PER
-    /// PLANE. Default ON: both planes of the one token share a single pack
-    /// dispatch and a single `SliceUpdate`.
     static let pairedMirrorWriteEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment["MLX_KV_QUANT_PAIRWRITE"]
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    /// `MLX_KV_Q4_FUSED_WRITE=0` restores the separate q4 pack + mirror
-    /// SliceUpdate path in the same worker binary. Default ON: exact D256,
-    /// B8 q4g64 decode packs the current token inside attention pass A.
     static let q4FusedMirrorWriteEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment["MLX_KV_Q4_FUSED_WRITE"]
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    /// `MLX_KV_QUANT_PACK_CHECK=1` (local only): compute BOTH packers on
-    /// every write and fail loudly on any byte mismatch. The GPU packer is
-    /// only legitimate while it reproduces the host packer bit for bit.
     static let gpuPackCheck: Bool = {
         ["1", "true", "yes", "on"].contains(
             (ProcessInfo.processInfo.environment["MLX_KV_QUANT_PACK_CHECK"] ?? "")
                 .lowercased())
     }()
 
-    /// One threadgroup (32 lanes) per (head, token) row: simd min/max over
-    /// the 256 payload values, the SAME fp16-rounded (scale, bias) the host
-    /// packer stores (`metal::rint` matches MLX `round`), quantized bytes
-    /// plus the fp16 tail written at the identical offsets.
     private static let quantPackKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "cbv2_kvq4g64_pack_d256_v1",
         inputNames: ["x"],
@@ -801,17 +583,6 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         """
     )
 
-    /// KVQ-PAIRWRITE: both mirror planes of ONE decode token in a single
-    /// dispatch. Rows `[0, HEADS)` are packed out of `xk`, rows
-    /// `[HEADS, 2 * HEADS)` out of `xv`, and the output rows land in that
-    /// order, which is the `[2, kvHeads, 1, row_words]` block the mirror
-    /// update wants.
-    ///
-    /// The per-row arithmetic below is a transcription of `quantPackKernel`
-    /// above, deliberately duplicated rather than shared: that packer is the
-    /// promoted prefill path and re-composing its source string would change
-    /// its text, and a Swift-hosted kernel that changes text without
-    /// changing name serves a stale cached body.
     private static let quantPackPairKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "cbv2_kvq4g64_pack_pair_d256_v1",
         inputNames: ["keys", "values"],
@@ -861,46 +632,15 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         """
     )
 
-
     // MARK: - KVQ-DIAG: compute-and-discard probe
 
-    /// KVQ-DIAG. Five box runs of the full KVQ mechanism died scoreless with
-    /// no telemetry (exit 5, accepted_pairs=0, candidate leg refused seconds
-    /// into its first timed decode dispatch) while every variant ran clean and
-    /// bit-identical on M5 Pro. Four hypotheses were eliminated one submission
-    /// at a time (graph interaction, fp16 pointer punning, uint8 buffer
-    /// binding, cold-JIT warm deadline). This submission separates the last
-    /// two possibilities without touching the token path at all.
-    ///
-    /// The mirror is maintained exactly as the mechanism maintains it, the
-    /// quantized read kernel is DISPATCHED on real ring state at the
-    /// production geometry, and its output is evaluated and then discarded.
-    /// Attention keeps using the stock bf16 path, so the emitted tokens are
-    /// bit-identical to the base tree and the composite only carries the cost
-    /// of the extra dispatch.
-    ///
-    /// Reading the result: a SCORE means these kernels dispatch and complete
-    /// on the ranked box, and the fault lives in how their output re-enters
-    /// the attention graph. A SCORELESS FAIL means the dispatch itself is
-    /// fatal there. Either way one slot buys the answer that four blind
-    /// resubmissions did not.
-    ///
-    /// `MLX_KV_QUANT_DIAG=0` disables the probe.
     static let diagEnabled: Bool = {
-        // KVQ4: the diagnostic ladder is finished and these probes still speak
-        // the 8-bit layout, so they default OFF here; one of them writes the
-        // live mirror and would corrupt 4-bit rows.
         guard let raw = ProcessInfo.processInfo.environment["MLX_KV_QUANT_DIAG"]
         else { return false }
         return ["1", "true", "yes", "on"].contains(raw.lowercased())
     }()
 
     private static let diagBlocks = 256
-    /// The probe is called once per ROW per layer, but the mechanism's real
-    /// dispatch is once per LAYER over all eight rows at once. Firing on
-    /// every call would multiply the mechanism's cost by the batch and drag
-    /// the composite far below anything the board would score. One call in
-    /// eight reproduces the production dispatch count.
     private static let diagStride = 64
     nonisolated(unsafe) private static var diagCounter = 0
     private static let diagLock = NSLock()
@@ -911,8 +651,6 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     nonisolated(unsafe) private static var diagDispatched = false
     nonisolated(unsafe) private static var diagRejected = false
 
-    /// One line each, to stderr, so the ranked log shows whether the probe
-    /// actually dispatched. A silent probe proves nothing.
     private static func diagDispatchOnce() {
         diagLock.lock(); let fresh = !diagDispatched; diagDispatched = true; diagLock.unlock()
         if fresh {
@@ -1033,10 +771,6 @@ private static let diagQuantReadKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
         ensureRowContiguous: true
     )
 
-    /// Dispatch the quantized reader over this row's mirror and discard the
-    /// result. Every row binds its own mirror into all eight slots: the
-    /// geometry, the template and the memory traffic match the mechanism's
-    /// production dispatch, and nothing observable depends on the output.
     private func diagnosticQuantDispatch() {
         guard Self.diagEnabled, let quantMirror else { return }
         guard retainedCount == window, headDim == 256, kvHeads == 8, window == 1024
@@ -1080,7 +814,6 @@ private static let diagQuantReadKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
         asyncEval(out[1])
         Self.diagDispatchOnce()
     }
-
 
 private static let diagFusedKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "cbv2_ragged8_ringwrite_sdpa_2pass_a_q8_d256_g2_diagfused_b\(diagBlocks)_v1",
@@ -1319,13 +1052,6 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
         ensureRowContiguous: true
     )
 
-    /// KVQ-DIAG-2 scratch. The fused kernel WRITES: it quantizes the step's
-    /// new token into the evicted mirror slot, and the companion writes the
-    /// exact bf16 token into the evicted ring slot. Pointing either at the
-    /// live ring would change the model function, so the probe binds
-    /// dedicated scratch buffers, one per batch slot (no aliasing, so no
-    /// artificial race the real mechanism would never have). Allocated once,
-    /// reused, never read by anything.
     nonisolated(unsafe) private static var diagScratch:
         (mirrors: [MLXArray], keys: [MLXArray], values: [MLXArray])?
 
@@ -1349,9 +1075,6 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
         return made
     }
 
-    /// Dispatch the fused read+write kernel and its bf16 companion over
-    /// scratch, discarding both. Probe 1 (`47dae0ea`) cleared the read
-    /// kernel by scoring; this clears or convicts the write half.
     private func diagnosticFusedDispatch() {
         guard Self.diagFusedEnabled, let quantMirror, retainedCount == window,
             headDim == 256, kvHeads == 8, window == 1024
@@ -1381,15 +1104,6 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
             ("KV_HEADS", kvHeads),
             ("BLOCKS", Self.diagBlocks),
         ]
-        // KVQ-DIAG-3. Probes 1 (`47dae0ea`) and 2 (`e14279c9`) both scored,
-        // so every kernel in the mechanism dispatches and completes on the
-        // box. Two differences remain between those probes and the mechanism
-        // that dies: the real one WRITES INTO LIVE, GRAPH-REFERENCED
-        // allocations, and its output is consumed by pass B. This probe
-        // takes the first: the fused kernel now writes the LIVE mirror
-        // (harmless while attention stays on the stock bf16 road, because
-        // nothing reads the mirror), with the bf16 companion still on
-        // scratch so the ring the model actually reads is untouched.
         let liveMirrors = Self.diagLiveWrite
             ? Array(repeating: quantMirror, count: batch) : scratch.mirrors
         let fused = Self.diagFusedKernel(
@@ -1422,21 +1136,13 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
         Self.diagFusedDispatchOnce()
     }
 
-    /// `MLX_KV_QUANT_DIAG_FUSED=0` disables the second probe.
     static let diagFusedEnabled: Bool = {
-        // KVQ4: the diagnostic ladder is finished and these probes still speak
-        // the 8-bit layout, so they default OFF here; one of them writes the
-        // live mirror and would corrupt 4-bit rows.
         guard let raw = ProcessInfo.processInfo.environment["MLX_KV_QUANT_DIAG_FUSED"]
         else { return false }
         return ["1", "true", "yes", "on"].contains(raw.lowercased())
     }()
 
-    /// `MLX_KV_QUANT_DIAG_LIVE=0` sends the fused write back to scratch.
     static let diagLiveWrite: Bool = {
-        // KVQ4: the diagnostic ladder is finished and these probes still speak
-        // the 8-bit layout, so they default OFF here; one of them writes the
-        // live mirror and would corrupt 4-bit rows.
         guard let raw = ProcessInfo.processInfo.environment["MLX_KV_QUANT_DIAG_LIVE"]
         else { return false }
         return ["1", "true", "yes", "on"].contains(raw.lowercased())
@@ -1454,12 +1160,6 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
         }
     }
 
-    /// KVQ-WARM: compile the pack pipeline at constructor time (see
-    /// `CBv2RaggedTwoPassDecodeAttentionV1.warmQuantPipelines`).
-    /// KVQ4 self-test (`MLX_KVQ4_SELFTEST=1`): pack a known ramp with the GPU
-    /// packer, unpack it on the host with the reader's own arithmetic, and
-    /// report the reconstruction error. Packer/reader mutual parity cannot
-    /// catch a shared layout misunderstanding; this can.
     public static func selfTestKVQ4() {
         guard ["1", "true", "yes", "on"].contains(
             (ProcessInfo.processInfo.environment["MLX_KVQ4_SELFTEST"] ?? "").lowercased())
@@ -1469,7 +1169,6 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
             .reshaped([1, 1, 1, d]).asType(.bfloat16)
         let packed = quantPackGPU(ramp)                  // [1, 1, 36] uint32
         let words = packed.reshaped([36])
-        // Reader arithmetic: value(e) = nibble(words[e/8], e%8) * s(e/64) + b(e/64)
         var recon = [Float](repeating: 0, count: d)
         let host = words.asArray(UInt32.self)
         for e in 0 ..< d {
@@ -1486,9 +1185,6 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
         FileHandle.standardError.write(Data(
             "[kvq4-selftest] max abs err \(maxErr) orig[0..3]=\(orig[0..<4]) recon[0..3]=\(recon[0..<4])\n".utf8))
 
-        // Now drive the REAL read kernel over a mirror whose every slot holds
-        // this ramp, with a one-hot query selecting element 0. The expected
-        // score for every token is then recon[0].
         let rows = 8 * 1024
         let tiled = broadcast(packed.reshaped([1, 1, 36]), to: [8, 1024, 36])
         let mirror = concatenated([tiled, tiled], axis: 0)
@@ -1512,8 +1208,6 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
         eval(quantPackPairGPU(keys: pair, values: pair))
     }
 
-    /// `[1, kvHeads, n, headDim]` -> packed `[kvHeads, n, headDim + 4]`
-    /// uint8, byte-identical to `quantPack`.
     private static func quantPackGPU(_ x: MLXArray) -> MLXArray {
         let kvHeads = x.dim(1)
         let n = x.dim(2)
@@ -1528,11 +1222,7 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
         )[0]
     }
 
-    /// The bf16 values the mirror reconstructs for `x` — the sim harness's
-    /// stand-in for the quantized kernels' dequantized reads.
     static func quantRoundTrip(_ x: MLXArray) -> MLXArray {
-        // KVQ4: the sim harness must speak the same 4-bit group-64 contract
-        // the kernels do, or the local golden measures the wrong mechanism.
         let f = x.asType(.float32)
         let d = f.dim(-1)
         let lead = Array(f.shape.dropLast())
@@ -1546,8 +1236,6 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
         return (q * scale + bias).reshaped(f.shape).asType(x.dtype)
     }
 
-    /// `[1, H, 1, D]` keys and values -> `[2, H, 1, D/8 + D/64]` uint32,
-    /// row for row what `quantPackGPU` produces for each plane separately.
     static func quantPackPairGPU(keys: MLXArray, values: MLXArray) -> MLXArray {
         let heads = keys.dim(1)
         let headDim = keys.dim(3)
@@ -1561,18 +1249,6 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
         )[0]
     }
 
-    /// KVQ-PAIRWRITE. Maintaining the mirror plane by plane builds TWO
-    /// `SliceUpdate`s over the whole mirror allocation per decode token, and
-    /// the second one takes the first one's output as its input. The mirror
-    /// is an attention input on every step of the quantized road, so neither
-    /// update can donate its buffer: depositing 520 bytes per head copies
-    /// the full ring twice.
-    ///
-    /// Both planes of a decode token are known at the same instant, so they
-    /// can share one pack dispatch and one update, which halves that copy
-    /// and takes the step's mirror dispatches from four to two. Returns
-    /// false — leaving the per-plane road to run untouched — whenever a
-    /// precondition does not hold.
     private func writePairedMirror(
         keys newKeys: MLXArray, values newValues: MLXArray, firstPosition: Int
     ) -> Bool {
@@ -1595,9 +1271,6 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
         let packedFlat: MLXArray
         if Self.gpuPackCheck {
             let gpu = Self.quantPackGPU(tokens)
-            // Both packers already emit uint32 words in the KVQ4 layout, so
-            // the comparison is direct; an extra `view` here reinterpreted
-            // one side and produced a shape mismatch instead of a check.
             let host = Self.quantPack(tokens)
             let mismatches = (gpu .!= host).sum().item(Int.self)
             if mismatches != 0 {
@@ -1614,8 +1287,6 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
         let packed = packedFlat.view(dtype: .uint32).expandedDimensions(axis: 0)
         let n = tokens.dim(2)
         let start = firstPosition % window
-        // KVQ4 in-situ check: read the row we are about to store back through
-        // the reader's arithmetic and compare with the source token.
         if Self.selfTestArmed {
             Self.diagLock.lock()
             let fresh = !Self.mirrorChecked
@@ -1656,9 +1327,6 @@ private static let diagBF16WriteKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
         if quantEligible, keyTemplate.dtype == .bfloat16,
             keyTemplate.dim(3) == headDim, valueTemplate.dim(3) == headDim
         {
-            // KVQ-U32: the mirror is allocated and BOUND as uint32 words
-            // (row = (headDim + 4) / 4 of them). Kernel bodies cast down to
-            // uint8_t* internally; byte layout is unchanged.
             Self.selfTestKVQ4()
             quantMirror = MLXArray.zeros(
                 [2, kvHeads, window, headDim / 8 + headDim / 64], dtype: .uint32)

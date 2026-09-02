@@ -68,6 +68,23 @@ final class CBv2MTPRoundInFlight {
         /// Lazy [B, 1+k, H] pre-norm hidden — the next carry is gathered
         /// from it at the finalize sync (index = accepted position).
         let lastHidden: MLXArray
+        /// Mirror road (MTP/CBv2MTPMirrorOps.swift): per sliding layer, the
+        /// eight windowed rows whose verify columns wrote the live q4 mirror
+        /// in place, with the undo log finalize restores rejected slots
+        /// from. Empty on the vendored staging path.
+        var mirrorRestore: [CBv2MTPMirrorRestoreLayer] = []
+        /// Device accept walk (`[B]` int32) when the round restored its
+        /// rejected mirror slots and rewound the position chain in-graph;
+        /// nil means the host finalize owns both.
+        var acceptedDevice: MLXArray? = nil
+        /// Chained-round hand-off (device, lazy): next seed token per row
+        /// (`[B]` int32), next carry hidden (`[B, 1, H]`), and the device
+        /// position of the next round's column 0 (`[B]` int32).
+        var seedNext: MLXArray? = nil
+        var carryHiddenNext: MLXArray? = nil
+        var nextBase: MLXArray? = nil
+        /// Row KV states in batch order, for the chained round's captures.
+        var rowStates: [[CBv2SequenceKV?]] = []
     }
 
     /// nil when this round only seeded (no row had a valid carry yet).
@@ -84,6 +101,18 @@ final class CBv2MTPRoundInFlight {
     var finalizedSeedIDs: Set<CBv2RequestID> = []
     var finalizedVerifyIDs: Set<CBv2RequestID> = []
     var claimedSeedCostNanos: UInt64 = 0
+
+    /// MLX allocator counters (bytes) at one instant; profiler-only.
+    struct MemorySnapshot {
+        let active = Memory.activeMemory
+        let cache = Memory.cacheMemory
+        let peak = Memory.peakMemory
+    }
+
+    /// Allocator state when a non-chained round was submitted, so its
+    /// finalize can report how much fresh memory the round's evaluation
+    /// pulled in. nil unless the step profiler is enabled.
+    var launchMemory: MemorySnapshot? = nil
 
     init(
         verify: Verify?,
@@ -171,7 +200,7 @@ final class CBv2MTPRoundDriver {
     /// 1. The per-arm behaviour differs. MTP adapts up to this ceiling each round.
     /// DFlash proposes a fixed block of this size, because block diffusion drafts
     /// a whole block at once. The constant you edit is the same on both arms.
-    static let submissionDraftDepth = 3
+    static let submissionDraftDepth = 2
 
     /// The effective adaptive-depth ceiling: the trusted envelope's max, bounded
     /// by the participant's `submissionDraftDepth`. Pure and static so the cap is
@@ -222,9 +251,13 @@ final class CBv2MTPRoundDriver {
         // `submissionDraftDepth`. `fixedDepth` stays `config.fixedDraftTokens`
         // (adaptive) — submissionDraftDepth is a ceiling, NEVER a fixed pin, so
         // the controller keeps choosing 0…this per round.
+        // Fixed depth at the ceiling: the accept walk is per row and the
+        // wide verify amortizes every weight plane, so the adaptive probe
+        // rounds only cost width changes (and kernel variants) for nothing.
+        let ceiling = Self.effectiveDraftCeiling(envelopeMax: config.maxDraftTokens)
         self.depthController = CBv2MTPDepthController(
-            maxDepth: Self.effectiveDraftCeiling(envelopeMax: config.maxDraftTokens),
-            fixedDepth: config.fixedDraftTokens)
+            maxDepth: ceiling,
+            fixedDepth: config.fixedDraftTokens ?? ceiling)
         self.metrics.verificationMode = config.verificationMode
         self.metrics.maxAutomaticRectangularTokens = config.maxAutomaticRectangularTokens
     }
@@ -446,6 +479,12 @@ final class CBv2MTPRoundDriver {
         metricsLock.lock()
         metrics.seedSteps += count
         metricsLock.unlock()
+    }
+
+    var roundsForProfile: Int {
+        metricsLock.lock()
+        defer { metricsLock.unlock() }
+        return metrics.rounds
     }
 
     func recordRound(

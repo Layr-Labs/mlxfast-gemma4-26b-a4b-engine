@@ -191,10 +191,27 @@ extension EngineLoopV2 {
     }
 
     private func mtpRowsCanSpeculate(_ rows: [CBv2ScheduledRequest]) -> Bool {
-        !rows.isEmpty && rows.allSatisfy { rec in
+        guard !rows.isEmpty, rows.allSatisfy({ rec in
             guard mtpBasicEligible(rec), let state = kvStates[rec.id] else { return false }
             return Self.mtpStorageEligible(state)
+        }) else { return false }
+        // A quant-authoritative sliding row (stale bf16 ring) can only be
+        // verified on the mirror road, which serves exactly eight rows with
+        // live mirrors; anything else must decode plainly rather than reach
+        // the staged path.
+        let needsMirrorRoad = rows.contains { rec in
+            kvStates[rec.id]!.contains { ($0 as? CBv2WindowedSequenceKV)?.mtpNeedsMirrorRoad ?? false }
         }
+        if needsMirrorRoad {
+            guard CBv2MTPMirrorOps.enabled, rows.count == 8 else { return false }
+            return rows.allSatisfy { rec in
+                kvStates[rec.id]!.allSatisfy { sequence in
+                    guard let windowed = sequence as? CBv2WindowedSequenceKV else { return true }
+                    return windowed.mtpMirrorRoadAvailable
+                }
+            }
+        }
+        return true
     }
 
     /// True when this scheduler plan carries seed or verify work.

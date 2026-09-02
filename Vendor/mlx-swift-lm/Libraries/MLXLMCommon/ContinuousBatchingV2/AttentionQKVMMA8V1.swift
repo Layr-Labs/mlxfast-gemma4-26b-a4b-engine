@@ -13,18 +13,6 @@
 // simdgroup operands and one run-sum reduction per K group. Same arithmetic,
 // same accumulation order, bit-identical outputs;
 // `DARKBLOOM_GEMMA4_QKV_MMA8_MULTITILE=0` restores the single-tile dispatch.
-//
-// MMA-RS-001 adds a run-sum PREPASS. The affine bias term `rs` depends only
-// on x and the group index, so its value is identical for every output tile
-// of every projection that consumes the same x; the bodies above recompute it
-// per K group per tile (or tile pair). The prepass computes each (row, group)
-// run sum once, with the identical expression tree and butterfly stage order,
-// into a `[8, K/64]` fp32 table the main bodies read instead. Same values in
-// the same accumulator steps, bit-identical outputs;
-// `DARKBLOOM_GEMMA4_MMA8_RS_PREPASS=0` restores the in-kernel reductions.
-// On QKFUSE-001 the fused Q|K dispatch reads the same table: its entries are
-// per activation row and per 64-group of K, independent of N, so the
-// concatenated-N dispatch consumes the identical floats.
 
 import Foundation
 import MLX
@@ -34,17 +22,6 @@ public enum CBv2AttentionQKVMMA8V1 {
     public static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_QKV_MMA8_TIGHT"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
-    /// MMA-RS-001 arm. Default ON. Applies to the Q/K/V host and the o_proj
-    /// host below; both read the same env so a submission runs one policy.
-    /// `DARKBLOOM_GEMMA4_MMA8_RS_PREPASS=0` restores the in-kernel run-sum
-    /// reductions byte for byte in the same executables.
-    public static let rsPrepassEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_MMA8_RS_PREPASS"]
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
@@ -247,7 +224,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_impl(
 // identical [0, gh) / [gh, G) split across the threadgroup's two simdgroups
 // and the identical simdgroup-0-adds-simdgroup-1 close, per tile. Every output
 // word is therefore the same float sum accumulated in the same order.
-template <typename T, int KS, int TILES, int KFIX, int SPLIT = 0>
+template <typename T, int KS, int TILES, int KFIX>
 METAL_FUNC void qkv_mma8_affine4_g64_mt(
     const device uint32_t* w,
     const device T* scales,
@@ -258,8 +235,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
     const int n0,
     threadgroup float2* red,
     uint simd_gid,
-    uint simd_lid,
-    device T* y2 = nullptr) {
+    uint simd_lid) {
   constexpr int K = KFIX;
   constexpr int G = K / 64;
   constexpr int gh = (G + 1) / 2;
@@ -391,38 +367,24 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
 #pragma clang loop unroll(full)
   for (int t = 0; t < TILES; ++t) {
     const int nt = n0 + t * 8;
-    if (SPLIT == 0) {
-      y[c.fn * N + nt + c.fm] = static_cast<T>(acc0[t]);
-      y[(c.fn + 1) * N + nt + c.fm] = static_cast<T>(acc1[t]);
-    } else {
-      // Fused Q||K plane: columns below SPLIT belong to Q, the rest to K.
-      // Both rows of a store pair share one column, so the branch is uniform.
-      const int col = nt + c.fm;
-      if (col < SPLIT) {
-        y[c.fn * SPLIT + col] = static_cast<T>(acc0[t]);
-        y[(c.fn + 1) * SPLIT + col] = static_cast<T>(acc1[t]);
-      } else {
-        const int n2 = N - SPLIT;
-        const int c2 = col - SPLIT;
-        y2[c.fn * n2 + c2] = static_cast<T>(acc0[t]);
-        y2[(c.fn + 1) * n2 + c2] = static_cast<T>(acc1[t]);
-      }
-    }
+    y[c.fn * N + nt + c.fm] = static_cast<T>(acc0[t]);
+    y[(c.fn + 1) * N + nt + c.fm] = static_cast<T>(acc1[t]);
   }
 }
+"""
 
-// MMA-RS-001: the single-tile body with the affine bias run sums read from a
-// precomputed `[8, G]` fp32 table instead of rebuilt per K group. The table's
-// (row, g) entry is the value the incumbent's own runsum4 pair and 2/4/16
-// butterfly produce for that row and group, so the `acc += s * C + rs[i] * b`
-// step consumes the identical float. Everything else is the incumbent text.
-template <typename T, int KS, int KFIX>
-METAL_FUNC void qkv_mma8_affine4_g64_rsp(
+    private static let mma8RowsKernelHeader = mma8KernelHeader + """
+
+// Row-tiled twin of `qkv_mma8_affine4_g64_mt` for the wide MTP verify
+// rectangle: RT eight-row tiles of activations share every weight fetch.
+// Each row tile runs the multitile body's own statements in its own order,
+// so a row's output word is the eight-row kernel's for that row.
+template <typename T, int KS, int TILES, int RT, int KFIX>
+METAL_FUNC void qkv_mma8_affine4_g64_mt_rows(
     const device uint32_t* w,
     const device T* scales,
     const device T* biases,
     const device T* x,
-    const device float* rs_table,
     device T* y,
     const int N,
     const int n0,
@@ -436,156 +398,105 @@ METAL_FUNC void qkv_mma8_affine4_g64_rsp(
   const int g0 = (KS == 2 && simd_gid == 1) ? gh : 0;
   const mma8_coord c = mma8_lane(simd_lid);
 
-  const device uint8_t* wrow =
-      (const device uint8_t*)w + (n0 + c.fm) * (K / 2) + 4 * c.fn;
-  const device T* srow = scales + (n0 + c.fm) * G;
-  const device T* brow = biases + (n0 + c.fm) * G;
-  const device T* x0 = x + c.fn * K + 8 * c.fm;
-  const device T* x1 = x0 + K;
-
-  float acc0 = 0.0f;
-  float acc1 = 0.0f;
-  simdgroup_float8x8 A;
-  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
-
-#pragma unroll
-  for (int gi = 0; gi < nGroups; ++gi) {
-    const int g = g0 + gi;
-    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
-    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
-
-    const float2 rs = float2(
-        rs_table[c.fn * G + g], rs_table[(c.fn + 1) * G + g]);
-
-    MMA8_SETB(B0, x, lo)
-    MMA8_SETB(B1, x, hi)
-    MMA8_SETB(B2, y, lo)
-    MMA8_SETB(B3, y, hi)
-    MMA8_SETB(B4, z, lo)
-    MMA8_SETB(B5, z, hi)
-    MMA8_SETB(B6, w, lo)
-    MMA8_SETB(B7, w, hi)
-
-    const uint2 wv = *((const device uint2*)(wrow + 32 * g));
-    const float s = float(srow[g]);
-    const float b = float(brow[g]);
-
-    simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
-    MMA8_STEP(B0, 0)
-    MMA8_STEP(B1, 1)
-    MMA8_STEP(B2, 2)
-    MMA8_STEP(B3, 3)
-    MMA8_STEP(B4, 4)
-    MMA8_STEP(B5, 5)
-    MMA8_STEP(B6, 6)
-    MMA8_STEP(B7, 7)
-
-    acc0 += s * C.thread_elements()[0] + rs.x * b;
-    acc1 += s * C.thread_elements()[1] + rs.y * b;
-  }
-
-  if (KS == 2) {
-    if (simd_gid == 1) {
-      red[simd_lid] = float2(acc0, acc1);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (simd_gid == 1) {
-      return;
-    }
-    const float2 other = red[simd_lid];
-    acc0 = acc0 + other.x;
-    acc1 = acc1 + other.y;
-  }
-
-  y[c.fn * N + n0 + c.fm] = static_cast<T>(acc0);
-  y[(c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc1);
-}
-
-// MMA-RS-001: the two-tile MMA-MT-001 body with the run sums read from the
-// precomputed table. One table entry pair per (K group, row pair) replaces the
-// per-group runsum4 pair and butterfly; the fragment build, the weight side,
-// the accumulators and the KS = 2 close keep the MT body's text, so every
-// output word is the same float sum in the same order.
-// QKFUSE-001 merge: the SPLIT/y2 store split mirrors the MT body's, so the
-// fused concatenated-N dispatch can consume this rsp body unchanged.
-template <typename T, int KS, int TILES, int KFIX, int SPLIT = 0>
-METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
-    const device uint32_t* w,
-    const device T* scales,
-    const device T* biases,
-    const device T* x,
-    const device float* rs_table,
-    device T* y,
-    const int N,
-    const int n0,
-    threadgroup float2* red,
-    uint simd_gid,
-    uint simd_lid,
-    device T* y2 = nullptr) {
-  constexpr int K = KFIX;
-  constexpr int G = K / 64;
-  constexpr int gh = (G + 1) / 2;
-  constexpr int nGroups = (KS == 2) ? gh : G;
-  const int g0 = (KS == 2 && simd_gid == 1) ? gh : 0;
-  const mma8_coord c = mma8_lane(simd_lid);
-
   const device uint8_t* wrow[TILES];
   const device T* srow[TILES];
   const device T* brow[TILES];
-  thread float acc0[TILES];
-  thread float acc1[TILES];
+  thread float acc0[TILES][RT];
+  thread float acc1[TILES][RT];
 #pragma clang loop unroll(full)
   for (int t = 0; t < TILES; ++t) {
     const int nt = n0 + t * 8;
     wrow[t] = (const device uint8_t*)w + (nt + c.fm) * (K / 2) + 4 * c.fn;
     srow[t] = scales + (nt + c.fm) * G;
     brow[t] = biases + (nt + c.fm) * G;
-    acc0[t] = 0.0f;
-    acc1[t] = 0.0f;
+#pragma clang loop unroll(full)
+    for (int r = 0; r < RT; ++r) {
+      acc0[t][r] = 0.0f;
+      acc1[t][r] = 0.0f;
+    }
   }
 
-  const device T* x0 = x + c.fn * K + 8 * c.fm;
-  const device T* x1 = x0 + K;
+  const device T* xbase = x + c.fn * K + 8 * c.fm;
 
   simdgroup_float8x8 A;
   simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
 
+  uint2 wv_next[TILES];
+  uint2 wv_next2[TILES];
+  T s_next[TILES];
+  T b_next[TILES];
+#pragma clang loop unroll(full)
+  for (int t = 0; t < TILES; ++t) {
+    wv_next[t] = *((const device uint2*)(wrow[t] + 32 * g0));
+    wv_next2[t] =
+        *((const device uint2*)(wrow[t] + 32 * (g0 + min(1, nGroups - 1))));
+    s_next[t] = srow[t][g0];
+    b_next[t] = brow[t][g0];
+  }
+
 #pragma unroll
   for (int gi = 0; gi < nGroups; ++gi) {
     const int g = g0 + gi;
-    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
-    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
 
-    const float2 rs = float2(
-        rs_table[c.fn * G + g], rs_table[(c.fn + 1) * G + g]);
-
-    MMA8_SETB(B0, x, lo)
-    MMA8_SETB(B1, x, hi)
-    MMA8_SETB(B2, y, lo)
-    MMA8_SETB(B3, y, hi)
-    MMA8_SETB(B4, z, lo)
-    MMA8_SETB(B5, z, hi)
-    MMA8_SETB(B6, w, lo)
-    MMA8_SETB(B7, w, hi)
-
+    uint2 wv_cur[TILES];
+    float s_cur[TILES];
+    float b_cur[TILES];
 #pragma clang loop unroll(full)
     for (int t = 0; t < TILES; ++t) {
-      const uint2 wv = *((const device uint2*)(wrow[t] + 32 * g));
-      const float s = float(srow[t][g]);
-      const float b = float(brow[t][g]);
+      wv_cur[t] = wv_next[t];
+      s_cur[t] = float(s_next[t]);
+      b_cur[t] = float(b_next[t]);
+    }
+    const int g_next = g0 + min(gi + 1, nGroups - 1);
+    const int g_next2 = g0 + min(gi + 2, nGroups - 1);
+#pragma clang loop unroll(full)
+    for (int t = 0; t < TILES; ++t) {
+      wv_next[t] = wv_next2[t];
+      wv_next2[t] = *((const device uint2*)(wrow[t] + 32 * g_next2));
+      s_next[t] = srow[t][g_next];
+      b_next[t] = brow[t][g_next];
+    }
 
-      simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
-      MMA8_STEP(B0, 0)
-      MMA8_STEP(B1, 1)
-      MMA8_STEP(B2, 2)
-      MMA8_STEP(B3, 3)
-      MMA8_STEP(B4, 4)
-      MMA8_STEP(B5, 5)
-      MMA8_STEP(B6, 6)
-      MMA8_STEP(B7, 7)
+#pragma clang loop unroll(full)
+    for (int r = 0; r < RT; ++r) {
+      const device T* x0 = xbase + (8 * r) * K;
+      const device T* x1 = x0 + K;
+      const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+      const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
 
-      acc0[t] += s * C.thread_elements()[0] + rs.x * b;
-      acc1[t] += s * C.thread_elements()[1] + rs.y * b;
+      float2 rs = float2(mma8_runsum4<T>(r0), mma8_runsum4<T>(r1));
+      rs += simd_shuffle_xor(rs, 2u);
+      rs += simd_shuffle_xor(rs, 4u);
+      rs += simd_shuffle_xor(rs, 16u);
+
+      MMA8_SETB(B0, x, lo)
+      MMA8_SETB(B1, x, hi)
+      MMA8_SETB(B2, y, lo)
+      MMA8_SETB(B3, y, hi)
+      MMA8_SETB(B4, z, lo)
+      MMA8_SETB(B5, z, hi)
+      MMA8_SETB(B6, w, lo)
+      MMA8_SETB(B7, w, hi)
+
+#pragma clang loop unroll(full)
+      for (int t = 0; t < TILES; ++t) {
+        const uint2 wv = wv_cur[t];
+        const float s = s_cur[t];
+        const float b = b_cur[t];
+
+        simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+        MMA8_STEP(B0, 0)
+        MMA8_STEP(B1, 1)
+        MMA8_STEP(B2, 2)
+        MMA8_STEP(B3, 3)
+        MMA8_STEP(B4, 4)
+        MMA8_STEP(B5, 5)
+        MMA8_STEP(B6, 6)
+        MMA8_STEP(B7, 7)
+
+        acc0[t][r] += s * C.thread_elements()[0] + rs.x * b;
+        acc1[t][r] += s * C.thread_elements()[1] + rs.y * b;
+      }
     }
   }
 
@@ -593,7 +504,10 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     if (simd_gid == 1) {
 #pragma clang loop unroll(full)
       for (int t = 0; t < TILES; ++t) {
-        red[t * 32 + simd_lid] = float2(acc0[t], acc1[t]);
+#pragma clang loop unroll(full)
+        for (int r = 0; r < RT; ++r) {
+          red[(t * RT + r) * 32 + simd_lid] = float2(acc0[t][r], acc1[t][r]);
+        }
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -602,35 +516,44 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     }
 #pragma clang loop unroll(full)
     for (int t = 0; t < TILES; ++t) {
-      const float2 other = red[t * 32 + simd_lid];
-      acc0[t] = acc0[t] + other.x;
-      acc1[t] = acc1[t] + other.y;
+#pragma clang loop unroll(full)
+      for (int r = 0; r < RT; ++r) {
+        const float2 other = red[(t * RT + r) * 32 + simd_lid];
+        acc0[t][r] = acc0[t][r] + other.x;
+        acc1[t][r] = acc1[t][r] + other.y;
+      }
     }
   }
 
 #pragma clang loop unroll(full)
   for (int t = 0; t < TILES; ++t) {
     const int nt = n0 + t * 8;
-    if (SPLIT == 0) {
-      y[c.fn * N + nt + c.fm] = static_cast<T>(acc0[t]);
-      y[(c.fn + 1) * N + nt + c.fm] = static_cast<T>(acc1[t]);
-    } else {
-      // Fused Q||K plane: columns below SPLIT belong to Q, the rest to K.
-      // Both rows of a store pair share one column, so the branch is uniform.
-      const int col = nt + c.fm;
-      if (col < SPLIT) {
-        y[c.fn * SPLIT + col] = static_cast<T>(acc0[t]);
-        y[(c.fn + 1) * SPLIT + col] = static_cast<T>(acc1[t]);
-      } else {
-        const int n2 = N - SPLIT;
-        const int c2 = col - SPLIT;
-        y2[c.fn * n2 + c2] = static_cast<T>(acc0[t]);
-        y2[(c.fn + 1) * n2 + c2] = static_cast<T>(acc1[t]);
-      }
+#pragma clang loop unroll(full)
+    for (int r = 0; r < RT; ++r) {
+      y[(8 * r + c.fn) * N + nt + c.fm] = static_cast<T>(acc0[t][r]);
+      y[(8 * r + c.fn + 1) * N + nt + c.fm] = static_cast<T>(acc1[t][r]);
     }
   }
 }
 """
+
+    /// Wide MTP verify: one dispatch for RT eight-row tiles (rows = 8 * RT).
+    private static let multiTileRowsKernel = MLXFast.metalKernel(
+        name: "cbv2_wide_qkv_mma8_affine4_g64_mt2_k2816_rows_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64 * RT];
+            qkv_mma8_affine4_g64_mt_rows<T, 2, 2, RT, 2816>(
+                w, scales, biases, x, y,
+                w_shape[0], int(tid.y) * 16, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            return;
+            """,
+        header: mma8RowsKernelHeader,
+        ensureRowContiguous: true)
 
     /// MMA-MT-001 arm. Default ON.
     /// `DARKBLOOM_GEMMA4_QKV_MMA8_MULTITILE=0` restores the promoted
@@ -665,87 +588,52 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         header: mma8KernelHeader,
         ensureRowContiguous: true)
 
-    /// QKFUSE-001 arm. Default ON.
-    /// `DARKBLOOM_GEMMA4_QKV_FUSE_QK=0` restores the two separate dispatches.
-    public static let fuseQKEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_QKV_FUSE_QK"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
+    /// Eight-row body: two eight-column tiles per simdgroup (`mt2`) or one
+    /// (`st`). Both run the same statements per tile.
+    public enum Body: String, Sendable { case mt2, st }
+    /// Wide verify mapping: `rows` folds RT row tiles into one simdgroup
+    /// pair; `ztile` gives each row tile its own threadgroup (grid.z) running
+    /// the eight-row body unchanged.
+    public enum WideRoad: String, Sendable { case rows, ztile }
 
-    private static let fusedSlidingKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_v1",
-        inputNames: ["x", "w", "scales", "biases"],
-        outputNames: ["y", "y2"],
-        source: """
-            const uint3 tid = threadgroup_position_in_grid;
-            threadgroup float2 red[64];
-            qkv_mma8_affine4_g64_mt<T, 2, 2, 2816, 4096>(
-                w, scales, biases, x, y,
-                w_shape[0], int(tid.y) * 16, red,
-                simdgroup_index_in_threadgroup,
-                thread_index_in_simdgroup, y2);
-            return;
-            """,
-        header: mma8KernelHeader,
-        ensureRowContiguous: true)
+    private static func envChoice<E: RawRepresentable>(_ name: String, _ fallback: E) -> E
+    where E.RawValue == String {
+        guard let raw = ProcessInfo.processInfo.environment[name],
+            let choice = E(rawValue: raw.trimmingCharacters(in: .whitespaces).lowercased())
+        else { return fallback }
+        return choice
+    }
 
-    private static let fusedFullKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_v1",
-        inputNames: ["x", "w", "scales", "biases"],
-        outputNames: ["y", "y2"],
-        source: """
-            const uint3 tid = threadgroup_position_in_grid;
-            threadgroup float2 red[64];
-            qkv_mma8_affine4_g64_mt<T, 2, 2, 2816, 8192>(
-                w, scales, biases, x, y,
-                w_shape[0], int(tid.y) * 16, red,
-                simdgroup_index_in_threadgroup,
-                thread_index_in_simdgroup, y2);
-            return;
-            """,
-        header: mma8KernelHeader,
-        ensureRowContiguous: true)
+    public static let defaultBody: Body = envChoice(
+        "DARKBLOOM_GEMMA4_QKV_MMA8_BODY", multiTileEnabled ? .mt2 : .st)
+    public static let defaultWideRoad: WideRoad = envChoice("DARKBLOOM_GEMMA4_QKV_MMA8_WIDE", .ztile)
 
-    // MMA-RS-001 on QKFUSE-001: the fused Q||K dispatch consumes the shared
-    // run-sum table. The table is per activation row and per 64-group of K,
-    // independent of N, so the concatenated-N rsp body reads the identical
-    // entries the separate Q and K rsp dispatches would; the SPLIT store
-    // keeps QKFUSE-001's two-buffer layout.
-    private static let fusedSlidingRspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_rsp_v1",
-        inputNames: ["x", "w", "scales", "biases", "rs_table"],
-        outputNames: ["y", "y2"],
-        source: """
-            const uint3 tid = threadgroup_position_in_grid;
-            threadgroup float2 red[64];
-            qkv_mma8_affine4_g64_mt_rsp<T, 2, 2, 2816, 4096>(
-                w, scales, biases, x, rs_table, y,
-                w_shape[0], int(tid.y) * 16, red,
-                simdgroup_index_in_threadgroup,
-                thread_index_in_simdgroup, y2);
-            return;
-            """,
-        header: mma8KernelHeader,
-        ensureRowContiguous: true)
+    private static func zTileKernel(_ name: String, body: Body) -> MLXFast.MLXFastKernel {
+        let call = body == .mt2
+            ? "threadgroup float2 red[64];\n    qkv_mma8_affine4_g64_mt<T, 2, 2, 2816>("
+            : "threadgroup float2 red[32];\n    qkv_mma8_affine4_g64_impl<T, 2, 2816>("
+        let n0 = body == .mt2 ? "int(tid.y) * 16" : "int(tid.y) * 8"
+        return MLXFast.metalKernel(
+            name: name,
+            inputNames: ["x", "w", "scales", "biases"],
+            outputNames: ["y"],
+            source: """
+                const uint3 tid = threadgroup_position_in_grid;
+                \(call)
+                    w, scales, biases, x + tid.z * (8 * 2816), y + tid.z * (8 * w_shape[0]),
+                    w_shape[0], \(n0), red,
+                    simdgroup_index_in_threadgroup,
+                    thread_index_in_simdgroup);
+                return;
+                """,
+            header: mma8KernelHeader,
+            ensureRowContiguous: true)
+    }
 
-    private static let fusedFullRspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_rsp_v1",
-        inputNames: ["x", "w", "scales", "biases", "rs_table"],
-        outputNames: ["y", "y2"],
-        source: """
-            const uint3 tid = threadgroup_position_in_grid;
-            threadgroup float2 red[64];
-            qkv_mma8_affine4_g64_mt_rsp<T, 2, 2, 2816, 8192>(
-                w, scales, biases, x, rs_table, y,
-                w_shape[0], int(tid.y) * 16, red,
-                simdgroup_index_in_threadgroup,
-                thread_index_in_simdgroup, y2);
-            return;
-            """,
-        header: mma8KernelHeader,
-        ensureRowContiguous: true)
+    private static let zTileMT2Kernel = zTileKernel(
+        "cbv2_wide_qkv_mma8_affine4_g64_mt2_k2816_ztile_v1", body: .mt2)
+    private static let zTileSTKernel = zTileKernel(
+        "cbv2_wide_qkv_mma8_affine4_g64_st_k2816_ztile_v1", body: .st)
 
     private static let mma8Kernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_carry2_bfill_v4",
@@ -764,205 +652,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         header: mma8KernelHeader,
         ensureRowContiguous: true)
 
-    // MMA-RS-001: the run-sum prepass. One threadgroup per (row quad, K
-    // group); lane r*8+fm computes `mma8_runsum4` over the same aligned
-    // 16-byte activation run the main body's lane (fm, row) reads, and the
-    // three xor butterflies (masks 1, 2, 4 over this layout's lane bits are
-    // the incumbent's masks 2, 4, 16 over ITS lane bits: both walk fm bit 0,
-    // then fm bit 1, then fm bit 2) reduce the eight fm partials in the same
-    // balanced fp32 tree. Lane fm == 0 stores the row's group total.
-    //
-    // Bit-exactness. Every lane of the incumbent ends its butterfly holding
-    // ((v0 + v1) + (v2 + v3)) + ((v4 + v5) + (v6 + v7)) for its row; float
-    // addition is commutative, so that value is lane-independent bit for bit,
-    // and this kernel stores exactly it. The table entry therefore equals the
-    // `rs` component the incumbent computes, and the rsp bodies consume the
-    // identical float in the identical accumulator step.
-    private static let runsumTableKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_rs_table_k2816_v1",
-        inputNames: ["x"],
-        outputNames: ["rs"],
-        source: """
-            constexpr int K = 2816;
-            constexpr int G = K / 64;
-            const int rowQuad = int(threadgroup_position_in_grid.y) / G;
-            const int g = int(threadgroup_position_in_grid.y) % G;
-            const int lane = int(thread_position_in_threadgroup.x);
-            const int r = lane >> 3;
-            const int fm = lane & 7;
-            const uint4 run =
-                *((const device uint4*)(x + (rowQuad * 4 + r) * K + 64 * g + 8 * fm));
-            float v = mma8_runsum4<T>(run);
-            v += simd_shuffle_xor(v, 1u);
-            v += simd_shuffle_xor(v, 2u);
-            v += simd_shuffle_xor(v, 4u);
-            if (fm == 0) {
-                rs[(rowQuad * 4 + r) * G + g] = v;
-            }
-            return;
-            """,
-        header: mma8KernelHeader,
-        ensureRowContiguous: true)
-
-    private static let multiTileRspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_rsp_v1",
-        inputNames: ["x", "w", "scales", "biases", "rs_table"],
-        outputNames: ["y"],
-        source: """
-            const uint3 tid = threadgroup_position_in_grid;
-            threadgroup float2 red[64];
-            qkv_mma8_affine4_g64_mt_rsp<T, 2, 2, 2816>(
-                w, scales, biases, x, rs_table, y,
-                w_shape[0], int(tid.y) * 16, red,
-                simdgroup_index_in_threadgroup,
-                thread_index_in_simdgroup);
-            return;
-            """,
-        header: mma8KernelHeader,
-        ensureRowContiguous: true)
-
-    private static let mma8RspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_rsp_v1",
-        inputNames: ["x", "w", "scales", "biases", "rs_table"],
-        outputNames: ["y"],
-        source: """
-            const uint3 tid = threadgroup_position_in_grid;
-            threadgroup float2 red[32];
-            qkv_mma8_affine4_g64_rsp<T, 2, 2816>(
-                w, scales, biases, x, rs_table, y,
-                w_shape[0], int(tid.y) * 8, red,
-                simdgroup_index_in_threadgroup,
-                thread_index_in_simdgroup);
-            return;
-            """,
-        header: mma8KernelHeader,
-        ensureRowContiguous: true)
-
-    /// MMA-RS-001 table for one activation tensor. Returns nil unless the
-    /// tensor matches the exact decode shape the rsp bodies admit, so a nil
-    /// table always means "use the incumbent dispatch".
     @inline(__always)
-    public static func runsumTable(for x: MLXArray) -> MLXArray? {
-        guard rsPrepassEnabled,
-            x.dtype == .bfloat16,
-            x.ndim == 3,
-            x.dim(0) == batch,
-            x.dim(1) == sequence,
-            x.dim(2) == inputWidth
-        else { return nil }
-        return runsumTableKernel(
-            [x],
-            template: [("T", x.dtype)],
-            grid: (simdWidth, 2 * (inputWidth / groupSize), 1),
-            threadGroup: (simdWidth, 1, 1),
-            outputShapes: [[batch, inputWidth / groupSize]],
-            outputDTypes: [.float32]
-        )[0]
-    }
-
-    @inline(__always)
-    private static let fusedLock = NSLock()
-    nonisolated(unsafe) private static var fusedPlanes:
-        [ObjectIdentifier: (MLXArray, MLXArray, MLXArray)] = [:]
-
-    /// QKFUSE-001. One dispatch for the layer's Q and K projections.
-    ///
-    /// Q and K read the SAME activation at decode (`queryInput === x` whenever
-    /// last-query prefill is off) and share K=2816, group size, bit width and
-    /// quantization mode, so their weight planes concatenate along the output
-    /// axis into one plane. Row r of the fused output is row r of whichever
-    /// source plane it came from: the tier accumulates each output column
-    /// independently, so this is bit-exact, not a reassociation. Threadgroup
-    /// count is unchanged (768 for 4096+2048, the same 512+256 the two
-    /// dispatches launch), so the whole saving is one encoder per layer.
-    ///
-    /// The concatenation is a pure re-layout of the shipped quantized words.
-    /// No value is re-quantized and no numerical format changes.
-    ///
-    /// MMA-RS-001 merge: `rsTable` is the activation's precomputed run-sum
-    /// table. The table is indexed by activation row and 64-group of K only —
-    /// never by N — so the concatenated-N dispatch reads the identical
-    /// entries the separate Q and K rsp dispatches would, and the rsp body's
-    /// `acc[t] += s * C + rs * b` step consumes the identical float in the
-    /// identical order per output column. Nil keeps the incumbent fused
-    /// dispatch (in-kernel run sums).
-    public static func fusedQKMatmul(
-        x: MLXArray,
-        qWeight: MLXArray, qScales: MLXArray, qBiases: MLXArray?,
-        kWeight: MLXArray, kScales: MLXArray, kBiases: MLXArray?,
-        groupSize: Int,
-        bits: Int,
-        mode: QuantizationMode,
-        cacheKey: ObjectIdentifier,
-        rsTable: MLXArray? = nil
-    ) -> (MLXArray, MLXArray)? {
-        guard enabled, fuseQKEnabled, multiTileEnabled,
-            groupSize == Self.groupSize,
-            bits == Self.bits,
-            mode == .affine,
-            let qBiases, let kBiases,
-            x.dtype == .bfloat16,
-            qScales.dtype == x.dtype, qBiases.dtype == x.dtype,
-            kScales.dtype == x.dtype, kBiases.dtype == x.dtype,
-            qWeight.dtype == .uint32, kWeight.dtype == .uint32,
-            x.ndim == 3,
-            x.dim(0) == batch, x.dim(1) == sequence, x.dim(2) == inputWidth,
-            x.size == batch * sequence * inputWidth,
-            qWeight.ndim == 2, kWeight.ndim == 2,
-            qWeight.dim(1) == inputWidth * Self.bits / 32,
-            kWeight.dim(1) == inputWidth * Self.bits / 32
-        else { return nil }
-
-        let qWidth = qWeight.dim(0)
-        let kWidth = kWeight.dim(0)
-        guard liveFusedSplit(qWidth), liveOutputWidth(kWidth),
-            qScales.shape == [qWidth, inputWidth / Self.groupSize],
-            qBiases.shape == qScales.shape,
-            kScales.shape == [kWidth, inputWidth / Self.groupSize],
-            kBiases.shape == kScales.shape
-        else { return nil }
-
-        let tableReady =
-            rsTable != nil
-            && rsTable!.dtype == .float32
-            && rsTable!.shape == [batch, inputWidth / Self.groupSize]
-
-        let kernel =
-            qWidth == 4096
-            ? (tableReady ? fusedSlidingRspKernel : fusedSlidingKernel)
-            : (tableReady ? fusedFullRspKernel : fusedFullKernel)
-        let total = qWidth + kWidth
-        let yTiles = total / outputsPerGroup
-        guard yTiles % tilesPerGroup == 0 else { return nil }
-
-        fusedLock.lock()
-        var plane = fusedPlanes[cacheKey]
-        if plane == nil {
-            let w = concatenated([qWeight, kWeight], axis: 0)
-            let s = concatenated([qScales, kScales], axis: 0)
-            let b = concatenated([qBiases, kBiases], axis: 0)
-            eval(w, s, b)
-            plane = (w, s, b)
-            fusedPlanes[cacheKey] = plane
-        }
-        fusedLock.unlock()
-        guard let (fw, fs, fb) = plane else { return nil }
-
-        let outputs = kernel(
-            tableReady ? [x, fw, fs, fb, rsTable!] : [x, fw, fs, fb],
-            template: [("T", x.dtype)],
-            grid: (simdWidth, (yTiles / tilesPerGroup) * simdGroups, 1),
-            threadGroup: (simdWidth, simdGroups, 1),
-            outputShapes: [[batch, sequence, qWidth], [batch, sequence, kWidth]],
-            outputDTypes: [x.dtype, x.dtype])
-        return (outputs[0], outputs[1])
-    }
-
-    /// Q widths the fused kernels bake as a compile-time split point.
-    private static func liveFusedSplit(_ width: Int) -> Bool {
-        width == 4096 || width == 8192
-    }
-
     private static func liveOutputWidth(_ width: Int) -> Bool {
         width == 1024 || width == 2048 || width == 4096 || width == 8192
     }
@@ -975,8 +665,11 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         groupSize: Int,
         bits: Int,
         mode: QuantizationMode,
-        rsTable: MLXArray? = nil
+        body: Body? = nil,
+        wideRoad: WideRoad? = nil
     ) -> MLXArray? {
+        let rows = x.ndim == 3 ? x.dim(0) : 0
+        let rowTiles = CBv2MTPWideVerifyContext.rowTileCount(rows: rows, tile: batch)
         guard enabled,
             groupSize == Self.groupSize,
             bits == Self.bits,
@@ -987,51 +680,49 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
             biases.dtype == x.dtype,
             weight.dtype == .uint32,
             x.ndim == 3,
-            x.dim(0) == batch,
+            rowTiles >= 1,
             x.dim(1) == sequence,
             x.dim(2) == inputWidth,
             weight.ndim == 2,
             weight.dim(1) == inputWidth * Self.bits / 32
         else { return nil }
+        let body = body ?? defaultBody
 
         let outputWidth = weight.dim(0)
         guard liveOutputWidth(outputWidth),
-            x.size == batch * sequence * inputWidth,
+            x.size == rows * sequence * inputWidth,
             scales.shape == [outputWidth, inputWidth / Self.groupSize],
             biases.shape == scales.shape
         else { return nil }
 
-        let tableReady =
-            rsTable != nil
-            && rsTable!.dtype == .float32
-            && rsTable!.shape == [batch, inputWidth / Self.groupSize]
-
         let yTiles = outputWidth / outputsPerGroup
-        if multiTileEnabled, yTiles % tilesPerGroup == 0 {
-            if tableReady {
-                return multiTileRspKernel(
-                    [x, weight, scales, biases, rsTable!],
-                    template: [("T", x.dtype)],
-                    grid: (simdWidth, (yTiles / tilesPerGroup) * simdGroups, 1),
-                    threadGroup: (simdWidth, simdGroups, 1),
-                    outputShapes: [[batch, sequence, outputWidth]],
-                    outputDTypes: [x.dtype]
-                )[0]
-            }
+        if rowTiles > 1, (wideRoad ?? defaultWideRoad) == .ztile {
+            let multiTile = body == .mt2 && yTiles % tilesPerGroup == 0
+            return (multiTile ? zTileMT2Kernel : zTileSTKernel)(
+                [x, weight, scales, biases],
+                template: [("T", x.dtype)],
+                grid: (simdWidth, (multiTile ? yTiles / tilesPerGroup : yTiles) * simdGroups, rowTiles),
+                threadGroup: (simdWidth, simdGroups, 1),
+                outputShapes: [[rows, sequence, outputWidth]],
+                outputDTypes: [x.dtype]
+            )[0]
+        }
+        if rowTiles > 1 {
+            guard multiTileEnabled, yTiles % tilesPerGroup == 0 else { return nil }
+            return multiTileRowsKernel(
+                [x, weight, scales, biases],
+                template: [("T", x.dtype), ("RT", rowTiles)],
+                grid: (simdWidth, (yTiles / tilesPerGroup) * simdGroups, 1),
+                threadGroup: (simdWidth, simdGroups, 1),
+                outputShapes: [[rows, sequence, outputWidth]],
+                outputDTypes: [x.dtype]
+            )[0]
+        }
+        if body == .mt2, yTiles % tilesPerGroup == 0 {
             return multiTileKernel(
                 [x, weight, scales, biases],
                 template: [("T", x.dtype)],
                 grid: (simdWidth, (yTiles / tilesPerGroup) * simdGroups, 1),
-                threadGroup: (simdWidth, simdGroups, 1),
-                outputShapes: [[batch, sequence, outputWidth]],
-                outputDTypes: [x.dtype]
-            )[0]
-        }
-        if tableReady {
-            return mma8RspKernel(
-                [x, weight, scales, biases, rsTable!],
-                template: [("T", x.dtype)],
-                grid: (simdWidth, yTiles * simdGroups, 1),
                 threadGroup: (simdWidth, simdGroups, 1),
                 outputShapes: [[batch, sequence, outputWidth]],
                 outputDTypes: [x.dtype]

@@ -960,6 +960,56 @@ internal struct Gemma4DrafterMasks {
     let sliding: MLXFast.ScaledDotProductAttentionMaskMode
 }
 
+/// Eight-row drafter projections ride the target's MMA quantized GEMV, which
+/// streams every weight plane once for the whole cohort; any other shape
+/// keeps the stock `quantizedMM`.
+public enum Gemma4DrafterMMARoute {
+    public static let rows = 8
+
+    /// `[rows, (1,) K] x W^T` for an affine 4-bit plane, or nil when the MMA
+    /// kernel's gate refuses the shape.
+    public static func project(
+        _ x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray?,
+        groupSize: Int, bits: Int, mode: QuantizationMode
+    ) -> MLXArray? {
+        guard mode == .affine, x.ndim >= 2, x.dim(0) == rows,
+            let projected = Gemma4MMAQuantizedGEMV.apply(
+                x: x, w: weight, scales: scales, biases: biases,
+                groupSize: groupSize, bits: bits)
+        else { return nil }
+        return projected.reshaped(Array(x.shape.dropLast()) + [projected.dim(-1)])
+    }
+}
+
+/// The drafter's quantized projection host. `Gemma4AssistantDraftModel.load`
+/// installs it where `quantize(model:)` would install a stock
+/// `QuantizedLinear`, so the target's shape-pinned projection hosts fall
+/// through to the MMA route instead of straight to `quantizedMM`.
+public final class Gemma4DrafterQuantizedLinear: QuantizedLinear {
+    public override func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if bias == nil,
+            let projected = Gemma4DrafterMMARoute.project(
+                x, weight: weight, scales: scales, biases: biases,
+                groupSize: groupSize, bits: bits, mode: mode)
+        {
+            return projected
+        }
+        return super.callAsFunction(x)
+    }
+
+    /// `quantize(model:apply:)` hook: bias-free `Linear` layers become drafter
+    /// hosts; everything else keeps the stock quantized module.
+    public static func quantize(
+        layer: Module, groupSize: Int, bits: Int, mode: QuantizationMode
+    ) -> Module? {
+        if let linear = layer as? Linear, !(linear is Quantized), linear.bias == nil {
+            return Gemma4DrafterQuantizedLinear(
+                linear, groupSize: groupSize, bits: bits, mode: mode)
+        }
+        return quantizeSingle(layer: layer, groupSize: groupSize, bits: bits, mode: mode)
+    }
+}
+
 public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
     public let config: Gemma4AssistantConfiguration
 
@@ -1161,6 +1211,14 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
             return lmHead(hidden)
         }
         // Tied: project hidden through the (transposed) token embedding.
+        if let quantized = model.embedTokens as? QuantizedEmbedding,
+            let projected = Gemma4DrafterMMARoute.project(
+                hidden, weight: quantized.weight, scales: quantized.scales,
+                biases: quantized.biases, groupSize: quantized.groupSize,
+                bits: quantized.bits, mode: quantized.mode)
+        {
+            return projected
+        }
         return model.embedTokens.asLinear(hidden)
     }
 
@@ -1272,10 +1330,13 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
         // is quantized (4-bit QAT drafter). A module is quantized iff its
         // `.scales` tensor is present. Mirrors `loadWeights` in MLXLMCommon.
         if let plq = document.baseConfiguration.perLayerQuantization {
-            quantize(model: drafter) { path, _ in
-                sanitized["\(path).scales"] != nil
-                    ? plq.quantization(layer: path)?.asTuple : nil
-            }
+            quantize(
+                model: drafter,
+                filter: { path, _ in
+                    sanitized["\(path).scales"] != nil
+                        ? plq.quantization(layer: path)?.asTuple : nil
+                },
+                apply: Gemma4DrafterQuantizedLinear.quantize(layer:groupSize:bits:mode:))
         }
 
         // Apply weights.

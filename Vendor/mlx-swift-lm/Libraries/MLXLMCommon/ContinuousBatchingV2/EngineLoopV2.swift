@@ -22,15 +22,9 @@ import MLX
 
 // MARK: - Model interface (WS-F adapters / WS-G fixtures conform)
 
-/// Minimal steppable-model surface the loop drives. `tokens` is [B, L] int32
-/// ([B, 1] decode, [1, chunk] prefill); `caches` has one entry per model
-/// layer with rows matching batch rows. Returns logits [B, L, vocab].
 public protocol CBv2SteppableModel: AnyObject {
     func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray
 
-    /// Optional decode-only proof surface. A model may return the minimal
-    /// roots that force all cache mutations represented by `forwardOutput`.
-    /// nil keeps the established full cache-inner-state evaluation.
     func compactDecodeEvaluationRoots(
         forwardOutput: MLXArray, caches: [CBv2AttendingLayerCache]
     ) -> [MLXArray]?
@@ -44,10 +38,6 @@ extension CBv2SteppableModel {
     }
 }
 
-/// CBV2-COMPACT-DECODE-ROOTS kill switch. Compaction is ON by default (the
-/// ranked runner sets no environment); `DARKBLOOM_CBV2_COMPACT_DECODE_ROOTS`
-/// set to `0`/`false`/`no`/`off` restores the full cache-inner-state root
-/// list for attribution and emergency bisection.
 @inline(__always)
 internal func resolveCBv2CompactDecodeRootsEnabled(_ raw: String?) -> Bool {
     guard let raw else { return true }
@@ -57,26 +47,18 @@ internal func resolveCBv2CompactDecodeRootsEnabled(_ raw: String?) -> Bool {
 private let cbv2CompactDecodeRootsEnabled = resolveCBv2CompactDecodeRootsEnabled(
     ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_COMPACT_DECODE_ROOTS"])
 
-/// Builds per-layer batch-facing cache views for a set of rows
-/// (`rowStates[b][layer]`, row order == batch row order). WS-A's
-/// `LayerCacheV2` conforms; see CONTRACT-ISSUES-B-scheduler.md §1.
+/// A prompt chunk's ring and mirror writes are not inputs of its logits, so
+/// the sampled tokens complete while those writes are still queued and the
+/// next step's forward waits behind them. Fencing the outputs the finalize
+/// waits on keeps that tail inside the prefill step's own wait.
+/// `DARKBLOOM_CBV2_PREFILL_WRITE_TAIL_FENCE=0` disables it.
+let cbv2PrefillWriteTailFenceEnabled = resolveCBv2CompactDecodeRootsEnabled(
+    ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_PREFILL_WRITE_TAIL_FENCE"])
+
 public protocol CBv2LayerCacheProvider: AnyObject {
     func layerCaches(rowStates: [[CBv2SequenceKV?]]) -> [CBv2AttendingLayerCache]
-    /// True when EVERY cache this provider vends honors span-mask contexts
-    /// (`CBv2SpanMaskBinding`), so vision prefill chunks can carry their
-    /// causal-plus-bidirectional-within-span masks. Fail-safe default is
-    /// false: providers that cannot vouch (paged backend, custom caches)
-    /// reject multimodal requests at submit rather than silently serving
-    /// them with plain causal masks.
     var supportsMultimodalSpans: Bool { get }
-    /// True only when EVERY layer cache this provider vends keeps rows
-    /// independent under a rectangular `[B > 1, L > 1]` prompt pass, so
-    /// equal-length text chunks may be coalesced into one layer-major
-    /// forward. Fail-safe default false (paged/custom providers).
     var supportsPackedPrefill: Bool { get }
-    /// True only when every layer cache can bind one optional span context
-    /// per rectangular row. This is stricter than single-row multimodal
-    /// support and fails closed for paged/custom providers.
     var supportsPackedMultimodalSpans: Bool { get }
 }
 
@@ -88,28 +70,7 @@ extension CBv2LayerCacheProvider {
 
 // MARK: - Sampler interface (WS-E's CBv2DefaultSampler is the production impl)
 
-/// Samples next tokens from last-position logits [B, vocab] → lazy token
-/// array [B] (int32). MUST NOT host-sync; see
-/// CONTRACT-ISSUES-B-scheduler.md §2 and CONTRACT-DECISIONS.md.
-///
-/// Stateful samplers (penalties, keyed RNG) reconfigure on membership
-/// change using `rowContext` and track per-request progress:
-///  - `params`/`requestIDs`: per-row, row order == logits row order.
-///  - `stepIndex`: global engine step (telemetry only — per-request RNG must
-///    key on per-request progress, never on this).
-///  - `pendingSampledTokens`: lazy [B] tokens sampled for exactly these rows
-///    by the still-in-flight previous step (chained decode), row-aligned;
-///    nil when every row's history is fully confirmed. A sampler that
-///    reconfigures from `rowContext` (confirmed history only) must fold
-///    these in on-device to stay exact.
-///  - `rowContext`: materializes full per-row context (id, params, prompt,
-///    CONFIRMED output tokens). Copies token arrays — only call it on
-///    membership change, never on the chained fast path.
 public protocol CBv2StepSampler: AnyObject {
-    /// True only when this sampler implements the full token-constraint
-    /// lifecycle: configure, hard-mask, confirm, failure reporting, and
-    /// request-id retirement. EngineV2 rejects constrained requests unless
-    /// the installed sampler opts in.
     var supportsTokenConstraints: Bool { get }
 
     func sample(
@@ -118,32 +79,12 @@ public protocol CBv2StepSampler: AnyObject {
         rowContext: () -> [CBv2SamplerRow]
     ) -> MLXArray
 
-    /// Consume the LAZY logprob gather built by the immediately preceding
-    /// `sample` call (raw pre-transform logprobs; contract rule), or nil when
-    /// no row of that call requested `topLogprobs > 0`. Graph-only handles:
-    /// the loop adds them to the step's `asyncEval` set and materializes them
-    /// at the finalize boundary alongside the sampled tokens — never an extra
-    /// host sync on the chained decode path. Called at most once per `sample`
-    /// (take semantics). Default: nil (samplers without logprob support).
     func takeStepLogprobs() -> CBv2StepLogprobs?
 
-    /// The request left the engine for good (finish, cancel, error). Its id
-    /// may legally be REUSED by a FUTURE request, so stateful samplers must
-    /// drop any per-request configured state: without this, a later request
-    /// whose row-id fingerprint matches the retired one exactly (e.g. the
-    /// same id resubmitted solo) would skip reconfiguration and inherit the
-    /// finished request's penalty counts and RNG step index (PR#62 review).
-    /// NOT called on preemption — a preempted request is the SAME request
-    /// and its sampler state remains a pure function of its history.
-    /// Default: no-op (stateless samplers).
     func requestDidFinish(_ id: CBv2RequestID)
 
-    /// Confirm host-materialized samples at the existing finalization
-    /// boundary. Stateful token constraints advance here; unconstrained
-    /// samplers use the no-op default.
     func confirmSampledTokens(_ tokens: [Int], requestIDs: [CBv2RequestID])
 
-    /// Typed constraint failure latched while masking or advancing a row.
     func tokenConstraintFailure(for id: CBv2RequestID) -> String?
 }
 
@@ -155,10 +96,6 @@ extension CBv2StepSampler {
     public func tokenConstraintFailure(for id: CBv2RequestID) -> String? { nil }
 }
 
-/// Greedy stub — vectorized argmax, batch-composition invariant by
-/// construction (per-row reduction, no cross-row ops). Kept as the
-/// deterministic fallback for scheduler/loop tests; production uses
-/// `CBv2DefaultSampler`.
 public final class CBv2GreedySampler: CBv2StepSampler {
     private let constraintSampler = CBv2TokenConstraintSampler()
     private var configuredIDs: [CBv2RequestID] = []
@@ -201,14 +138,9 @@ public final class CBv2GreedySampler: CBv2StepSampler {
 
 // MARK: - Detokenizer interface (WS-E conforms; null stub until then)
 
-/// Incremental per-request detokenizer with UTF-8 + stop-string holdback.
-/// See CONTRACT-ISSUES-B-scheduler.md §3.
 public protocol CBv2IncrementalDetokenizer: AnyObject {
-    /// Append confirmed tokens; returns text now safe to emit.
     func push(_ tokens: [Int]) -> String
-    /// True once a stop string has matched (engine finishes with `.stop`).
     var matchedStopString: Bool { get }
-    /// Held-back text still emittable at finish (excludes matched stop text).
     func flush() -> String
 }
 
@@ -216,8 +148,6 @@ public protocol CBv2DetokenizerFactory: AnyObject {
     func makeDetokenizer(stopStrings: [String]) -> CBv2IncrementalDetokenizer
 }
 
-/// Default until WS-E lands: deltas carry token ids with empty text, stop
-/// strings never match (stop tokens / maxTokens / deadlines still work).
 public final class CBv2NullDetokenizerFactory: CBv2DetokenizerFactory {
     final class NullDetokenizer: CBv2IncrementalDetokenizer {
         let matchedStopString = false
@@ -233,70 +163,56 @@ public final class CBv2NullDetokenizerFactory: CBv2DetokenizerFactory {
 // MARK: - Loop configuration
 
 public struct CBv2EngineLoopConfig: Sendable {
-    /// LEGACY single total-lifetime wall (seconds), used ONLY when
-    /// `useLegacyRequestTimeout` is true (the rollback kill-switch). In the
-    /// default new-lease behavior this value is inert — the monotonic
-    /// admission/prefill/decode/backpressure leases and the safety ceiling
-    /// below govern request lifetime instead. See `CBv2DeadlineLeases.swift`.
+    public static let defaultShutdownTimeout: TimeInterval = {
+        guard let cRaw = getenv("DARKBLOOM_CBV2_SHUTDOWN_TIMEOUT"),
+            let value = TimeInterval(String(cString: cRaw).trimmingCharacters(in: .whitespaces)),
+            value > 10
+        else { return 10 }
+        return value
+    }()
+
+    public static let defaultSafetyFloorTPS: Double = {
+        guard let cRaw = getenv("DARKBLOOM_CBV2_SAFETY_FLOOR_TPS"),
+            let value = Double(String(cString: cRaw).trimmingCharacters(in: .whitespaces)),
+            value > 0, value < 5
+        else { return 5 }
+        return value
+    }()
+
+    public static let defaultStepTimeout: TimeInterval = {
+        guard let cRaw = getenv("DARKBLOOM_CBV2_STEP_TIMEOUT"),
+            let value = TimeInterval(String(cString: cRaw).trimmingCharacters(in: .whitespaces)),
+            value > 30
+        else { return 30 }
+        return value
+    }()
+
     public var requestTimeout: TimeInterval
-    /// Kill-switch: when true, restore the legacy behavior — one
-    /// `requestTimeout`-second wall over the entire engine lifetime, expiring
-    /// with the original `.error("request exceeded Ns deadline")` string.
-    /// Default false = the new independent monotonic leases.
     public var useLegacyRequestTimeout: Bool
-    /// Admission-only lease (seconds): bounds time before the request begins
-    /// engine work. Ends permanently at first admission; never re-arms after
-    /// preemption. Expiry cause `.admissionTimeout`.
     public var admissionLease: TimeInterval
-    /// Prefill progress lease (seconds): expires a prompt prefill that stops
-    /// making confirmed finalized progress. Cause `.prefillStall`.
     public var prefillProgressLease: TimeInterval
-    /// Decode progress lease (seconds): expires decode that stops producing
-    /// confirmed token progress. A generation that keeps producing tokens
-    /// NEVER expires. Cause `.decodeStall`.
     public var decodeProgressLease: TimeInterval
-    /// Backpressure lease (seconds): bounds how long a request may sit paused
-    /// on downstream buffer pressure. Health-neutral. Cause
-    /// `.backpressureTimeout`.
     public var backpressureLease: TimeInterval
-    /// Conservative decode throughput floor (tokens/second) for the absolute
-    /// request-derived safety ceiling. Deliberately far below any real model
-    /// (~30–120 tok/s) so the ceiling only catches pathology, never a healthy
-    /// long generation. Cause `.safetyDeadline`.
     public var safetyCeilingDecodeFloorTPS: Double
-    /// Injectable monotonic clock. Production uses `ContinuousClock`; tests
-    /// inject a fake to drive lease expiry with no real sleeps. Never `Date`.
     public var clock: CBv2Clock
-    /// Single-step watchdog: a step (graph build + blocking eval) exceeding
-    /// this marks the engine unhealthy, terminal-finishes all live streams
-    /// with cause `.watchdog` (carrying the reconciled usage observed before
-    /// the wedge), and fires `onStepWedge`.
     public var stepTimeout: TimeInterval
-    /// Watchdog polling interval.
     public var watchdogInterval: TimeInterval
-    /// Idle re-check interval when there is no work.
     public var idleRecheckInterval: TimeInterval
-    /// Per-request event buffer before backpressure pauses scheduling.
     public var eventBufferCapacity: Int
-    /// Upper bound on a graceful drain. `shutdown()` waits for running
-    /// requests to finish naturally; if the engine queue is wedged (a step
-    /// blocked inside an eval), the drain would otherwise never complete —
-    /// after this timeout every live stream is force-finished with
-    /// `.error` and `shutdown()` returns. The wedged step may still be
-    /// executing in the background; the process-level owner decides
-    /// whether to exit.
     public var shutdownTimeout: TimeInterval
 
     public init(
-        requestTimeout: TimeInterval = 120, stepTimeout: TimeInterval = 30,
+        requestTimeout: TimeInterval = 120,
+        stepTimeout: TimeInterval = CBv2EngineLoopConfig.defaultStepTimeout,
         watchdogInterval: TimeInterval = 0.25, idleRecheckInterval: TimeInterval = 0.001,
-        eventBufferCapacity: Int = 256, shutdownTimeout: TimeInterval = 10,
+        eventBufferCapacity: Int = 256,
+        shutdownTimeout: TimeInterval = CBv2EngineLoopConfig.defaultShutdownTimeout,
         useLegacyRequestTimeout: Bool = false,
         admissionLease: TimeInterval = 120,
         prefillProgressLease: TimeInterval = 120,
         decodeProgressLease: TimeInterval = 120,
         backpressureLease: TimeInterval = 120,
-        safetyCeilingDecodeFloorTPS: Double = 5,
+        safetyCeilingDecodeFloorTPS: Double = CBv2EngineLoopConfig.defaultSafetyFloorTPS,
         clock: CBv2Clock = .continuous
     ) {
         self.requestTimeout = requestTimeout
@@ -317,45 +233,20 @@ public struct CBv2EngineLoopConfig: Sendable {
 
 // MARK: - In-flight step
 
-/// One launched-but-not-finalized step. Its sampled tokens are still lazy;
-/// finalization materializes them (the ONE host sync per step, overlapped
-/// with the next step's GPU work when chained).
 final class CBv2InFlightStep {
-    /// Every request that computed anything this step (KV release for any of
-    /// these must be deferred until finalization — see CONTRACT-ISSUES §4).
     let participants: Set<CBv2RequestID>
-    /// Rows that sampled a token, in plan order (== row order of
-    /// `sampledTokens`).
     let sampledRows: [CBv2RequestID]
-    /// Lazy [K] int32, or nil when no row sampled (all mid-prefill chunks).
     let sampledTokens: MLXArray?
-    /// Cheap handles that force evaluation of non-sampling prefill chunks.
     let evalTargets: [MLXArray]
-    /// Rows finished/cancelled AFTER launch: their sampled token is
-    /// discarded at finalization (the ≤1 wasted slot-step).
     var discard: Set<CBv2RequestID> = []
-    /// Lazy per-step logprob gathers (rows that requested topLogprobs > 0
-    /// exist in the batch). Graph-only until finalization, where they are
-    /// materialized at the SAME boundary as the sampled tokens.
     var logprobSegments: [CBv2StepLogprobs] = []
-    /// Host wall clock captured before graph construction for controller
-    /// attribution at the existing finalize boundary.
     let wallStartedNanos: UInt64
     var mtpMeasurement: CBv2MTPStepMeasurement?
-    /// KV states whose release is fenced behind this step's completion.
-    /// `rollbackOne` scrubs the wasted-token KV tail before release;
-    /// `donation` (non-nil for natural finishes with prefix caching on)
-    /// routes the retired state through the donation queue.
     fileprivate var deferredReleases:
         [(
             id: CBv2RequestID, state: [CBv2SequenceKV?], rollbackOne: Bool,
             donation: CBv2DonationIntent?
         )] = []
-    /// Non-nil marks this step as an MTP round (verify and/or seed work,
-    /// finalized by `finalizeMTPRound`). MTP rounds NEVER chain: the
-    /// chained path's finalize loop and `deferredReleases` assume exactly
-    /// one sample per row, so `engineStep` guards on this before offering
-    /// the step as a chain base.
     var mtpRound: CBv2MTPRoundInFlight?
 
     init(
@@ -373,31 +264,15 @@ final class CBv2InFlightStep {
 
 // MARK: - Prefix adoption handoff
 
-/// A prefix-cache hit prepared on the submit thread (lookup + graph-only
-/// slicing) and applied on the engine thread at enqueue. The typed plan owns
-/// M/C/R, backend support, and accounting facts. Ordinary safe layouts carry
-/// full snapshots through C; frozen-full layouts carry them through M while
-/// sliding rows begin empty at C. The lookup's in-use pin is
-/// balanced by exactly one `endAdoption(tokens:matched:)` when the adoption
-/// is consumed or abandoned.
-/// `@unchecked Sendable`: immutable value handed off exactly once, submit
-/// thread → engine queue; the MLXArray views are graph-only until adopted.
 struct CBv2PrefixAdoption: @unchecked Sendable {
-    /// Correlation identity used by the lookup that owns this pin. This is
-    /// the request's receipt id when supplied, otherwise its scheduler id.
     let requestID: CBv2RequestID
     let tokens: [Int]
     let matched: Int
     let plan: CBv2PrefixReusePlan
     let prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?]
-    /// Request-scoped salt the lookup used (TB-007); the pin release and any
-    /// fallback paths must carry the SAME salt or the pin leaks.
     let cacheSalt: String?
 }
 
-/// Submit-thread lookup result handed to the engine queue. `outcome` is
-/// provisional when `adoption != nil`; `applyAdoption` resolves it to a real
-/// hit or a precise adoption failure before usage is emitted.
 struct CBv2PrefixLookup: @unchecked Sendable {
     let adoption: CBv2PrefixAdoption?
     let outcome: CBv2PrefixCacheOutcome
@@ -421,25 +296,16 @@ struct CBv2PrefixUsage {
         boundarySplits: 0)
 }
 
-/// A request's donation intent: which exact token prefix to donate and under
-/// which salt scope (TB-007 — the entry must be indexed with the same salt
-/// its donor request carried, or a differently-salted request could hit it).
 struct CBv2DonationIntent {
     let requestID: CBv2RequestID
     let tokens: [Int]
     let cacheSalt: String?
 }
 
-/// Single-consumer cross-queue handoff of engine-owned values (KV state,
-/// donation snapshots). Safe by ownership transfer: the sender never
-/// touches the value after enqueueing.
 private struct CBv2Handoff<Value>: @unchecked Sendable {
     let value: Value
 }
 
-/// Resume-exactly-once wrapper for a drain continuation: the engine queue
-/// (natural drain completion) and the shutdown-timeout timer race to
-/// resume it; whichever wins consumes the continuation, the loser no-ops.
 private final class CBv2DrainWaiter: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<Void, Never>?
@@ -448,7 +314,6 @@ private final class CBv2DrainWaiter: @unchecked Sendable {
         self.continuation = continuation
     }
 
-    /// Resume if not already resumed; returns true when this call won.
     @discardableResult
     func resume() -> Bool {
         lock.lock()
@@ -462,11 +327,6 @@ private final class CBv2DrainWaiter: @unchecked Sendable {
 
 // MARK: - EngineLoopV2
 
-/// The engine thread. All scheduler and MLX mutations happen on
-/// `engineQueue` (serial, self-rescheduling — the EngineCore idiom that
-/// keeps the GPU pipeline full with only GCD dispatch overhead between
-/// steps). Cross-thread surface: `requestCancel`, `setPaused`, stream
-/// registration, and the watchdog — all lock-protected.
 public final class EngineLoopV2: @unchecked Sendable {
     let scheduler: SchedulerV2
     let capacity: CBv2StepCapacity?
@@ -476,11 +336,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     let sampler: CBv2StepSampler
     let detokenizerFactory: CBv2DetokenizerFactory
     let layerKinds: [CBv2LayerKind]
-    /// Non-nil only when prefix caching is active (instance supplied AND
-    /// `CBv2SchedulerConfig.enablePrefixCache`).
     let prefixCache: CBv2PrefixCache?
-    /// MTP (speculative decoding) driver state, or nil (byte-identical
-    /// plain-decode behavior). Round logic lives in EngineLoopV2+MTP.swift.
     let mtp: CBv2MTPRoundDriver?
     let config: CBv2EngineLoopConfig
     let gauges: CBv2EngineGauges
@@ -489,77 +345,27 @@ public final class EngineLoopV2: @unchecked Sendable {
         label: "com.eigen.cbv2.engine", qos: .userInitiated)
     private let watchdogQueue = DispatchQueue(
         label: "com.eigen.cbv2.watchdog", qos: .utility)
-    /// Prefix-cache donation runs here (hashing + indexing + optional device
-    /// materialization) — never on the engine step thread (invariant 6).
-    /// Safe to eval CONCURRENTLY with engine-step evals over the same paged
-    /// slabs: the snapshot views were graph-built on the engine thread, so
-    /// MLX array versioning pins them to the slab contents as of that step
-    /// (later slab writes produce new versions, never mutating pinned
-    /// ones), and the release-after-donate ordering in `retire` keeps the
-    /// donor's pages out of the pool until the donation has materialized.
     private let donationQueue = DispatchQueue(
         label: "com.eigen.cbv2.donation", qos: .utility)
-    /// Detokenization (Tokenizer.decode + UTF-8 holdback) + stream emission
-    /// for PASSTHROUGH requests (no stop strings) runs here, OFF the serial
-    /// step thread — that host string work is bounded per token but at B>1
-    /// it otherwise sits on the critical path between GPU steps for every
-    /// row (PR#62 review). A single serial queue preserves global FIFO
-    /// order, so each request's deltas + trailing flush + terminal event
-    /// stay ordered (per-request order is a subsequence of global order).
-    /// Requests WITH stop strings keep the fully synchronous engine-thread
-    /// path: their holdback scan gates the deterministic one-step-late
-    /// stop-string finish, which cannot be deferred without generating text
-    /// past the stop (contract) or breaking the parity suites.
     let detokQueue = DispatchQueue(
         label: "com.eigen.cbv2.detok", qos: .userInitiated)
 
-    // Cross-thread state (stateLock).
     private let stateLock = NSLock()
     private var streams: [CBv2RequestID: CBv2OutputStream] = [:]
     private var pendingCancels: Set<CBv2RequestID> = []
     private var stepStartedNanos: UInt64 = 0
     private var wedgeReported = false
     private var _healthy = true
-    /// Reconciled per-request usage (prompt/completion counts) snapshotted at
-    /// enqueue and refreshed at each finalize. Lock-protected so the watchdog
-    /// thread — which fires while the engine thread is wedged inside a blocking
-    /// eval and therefore cannot read engine-confined state — can attach the
-    /// usage observed before the wedge instead of injecting raw zero usage.
     private var usageSnapshots: [CBv2RequestID: CBv2Usage] = [:]
-    /// Prompt-frontier logit capture (`CBv2Engine.prefillLogitDigest`).
-    /// Installed around ONE probe request and cleared immediately after, so
-    /// every ordinary step pays a single uncontended lock read at the two
-    /// sites where a prompt chunk actually samples. It is deliberately NOT
-    /// a "digest is supported" flag: nothing reads it except the frontier
-    /// itself, and when it never fires the digest call throws rather than
-    /// reporting a capability.
     private var prefillFrontierCaptureHook: (@Sendable (CBv2RequestID, MLXArray) -> Void)?
 
-    // Engine-thread-confined state (internal, not private: the MTP round
-    // driver in EngineLoopV2+MTP.swift is part of the loop).
     var detokenizers: [CBv2RequestID: CBv2IncrementalDetokenizer] = [:]
     var kvStates: [CBv2RequestID: [CBv2SequenceKV?]] = [:]
-    /// Tokens skipped via prefix-cache adoption, reported in usage.
     private var prefixHitTokens: [CBv2RequestID: Int] = [:]
-    /// Lookup/adoption outcome carried to terminal usage.
     private var prefixUsageByID: [CBv2RequestID: CBv2PrefixUsage] = [:]
-    /// Donation work that currently owns a retired backend state. Natural
-    /// drain cannot complete until each terminal donation releases its state
-    /// back on the engine queue.
     private var pendingDonationReleaseCount = 0
-    /// Resolved vision inputs (validated spans + materialized embeddings),
-    /// keyed by request. Kept across PREEMPTION (a full re-prefill replays
-    /// the span chunks and needs the embeddings again); dropped at finish.
     var multimodalByID: [CBv2RequestID: CBv2ResolvedMultimodal] = [:]
-    /// Monotonic per-request deadline leases (admission / prefill / decode /
-    /// backpressure / safety, or the legacy single wall under the kill-switch).
-    /// Engine-thread-confined. See `CBv2DeadlineLeases.swift`.
     var leasesByID: [CBv2RequestID: CBv2RequestLeaseState] = [:]
-    /// Rollback-path preemption victims whose lease rewind (`markPreempted`)
-    /// is deferred until after the pending finalize confirms their in-flight
-    /// sample — finalization's progress refresh would otherwise flip the lease
-    /// back to `.decode` and undo the rewind (PR#82 review). Engine-thread-
-    /// confined; drained at the finalize site every step.
     var leasePreemptionsPendingFinalize: [CBv2RequestID] = []
     private var inFlight: CBv2InFlightStep?
     private var running = false
@@ -567,25 +373,6 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     // MARK: ADMIT-COALESCE-001 (bounded admission coalescing)
 
-    /// Width of the bounded admission-coalescing wait, in milliseconds, from
-    /// `DARKBLOOM_ADMIT_COALESCE_MS`. `0` disables the wait entirely, which
-    /// restores byte-identical planning to the stock loop. Values above
-    /// `admitCoalesceWindowCapMS` are clamped: the wait is a latency cost
-    /// paid by every cohort, so it must stay small and bounded by
-    /// construction, never tunable into an unbounded hold.
-    ///
-    /// Why it exists: a closed cohort is submitted as N independent
-    /// `enqueue` calls from the caller thread, each of which hops onto the
-    /// serial engine queue, while `engineStep` re-arms itself every
-    /// `idleRecheckInterval` (1 ms). The idle re-check therefore races the
-    /// tail of the submission burst and the first planned step frequently
-    /// admits a RAGGED subset (1 of 8, 2 of 8, ...). The remainder then
-    /// costs a second prefill pass over the same weights plus a mixed step
-    /// at a batch width below capacity. This wait is the scheduler-side
-    /// realisation of the closed-cohort intent already documented by the
-    /// caller ("one planned step admits every stream's whole seed",
-    /// `Gemma4RuntimeCohortDriver.swift`). It is prompt-independent,
-    /// cohort-size-independent, and hard-bounded.
     static let admitCoalesceWindowCapMS = 25
     static let admitCoalesceWindowMS: Int = {
         guard
@@ -596,45 +383,21 @@ public final class EngineLoopV2: @unchecked Sendable {
         return Swift.min(value, admitCoalesceWindowCapMS)
     }()
 
-    /// Monotonic origin of the current waiting batch: stamped by `enqueue`
-    /// when a request arrives at a COMPLETELY IDLE engine (nothing running,
-    /// nothing else waiting) and never re-stamped by the arrivals that
-    /// follow it, so the wait below is measured from the FIRST of them and
-    /// cannot be extended by a stream of late arrivals. Engine-thread
-    /// confined. `nil` means "no origin known" and disables the wait
-    /// (fail-open: an unstamped batch is never delayed).
     private var admitBatchFirstEnqueue: ContinuousClock.Instant?
 
     private var drainWaiters: [CBv2DrainWaiter] = []
-    /// True after a rejecting MTP round advanced rows OUTSIDE the eager
-    /// provider's caches' host truth: the next eager bind must be forced to
-    /// rebuild `positionOffsets` from host truth (see `eagerCaches`).
-    /// Sole writer: `mtpFinalize` in EngineLoopV2+MTPFinalize.swift.
     var eagerCompositionStale = false
 
-    /// Telemetry / test hooks.
     public private(set) var stepCount = 0
     public private(set) var chainedStepCount = 0
     public private(set) var preemptionCount = 0
-    /// Packed-prefill EXECUTION evidence (`CBv2PackedPrefillActivity`).
-    /// Incremented in `executeMixed` at the rectangular forward itself, so a
-    /// capability that is claimed but never exercised leaves both at zero.
-    /// Two plain `+=` per packed group — no allocation, no locking on the
-    /// step path. Engine-thread owned, monotonic; read at quiescent points.
     public private(set) var packedPrefillRowsExecuted = 0
     public private(set) var packedPrefillGroupsExecuted = 0
-    /// The two capability gates `executeMixed` consults before it packs —
-    /// the caches vouch for per-row independence AND the model's prompt
-    /// forward is batch-generic. Sole reader of the gates, so the flag the
-    /// engine reports and the flag it acts on cannot drift. Configuration
-    /// only: see the counters above for whether anything packed.
     var packedPrefillSupported: Bool {
         cacheProvider.supportsPackedPrefill
             && (model as? CBv2PackedPrefillSteppableModel)?.supportsPackedPrefill == true
     }
 
-    /// Capability + cumulative execution evidence, as `EngineV2` republishes
-    /// it to out-of-module callers.
     func packedPrefillActivity() -> CBv2PackedPrefillActivity {
         engineQueue.sync {
             CBv2PackedPrefillActivity(
@@ -644,19 +407,9 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
     }
 
-    /// Teacher-forced scoring EXECUTION evidence (`teacherForcedTop1`).
-    /// Incremented at the forwards themselves — the prompt's chunked
-    /// prefill and the continuation's one-token decodes — so a witness that
-    /// scored positions OUTSIDE the engine (batched offline logits, a
-    /// reference implementation) leaves them at zero while still returning
-    /// plausible argmaxes. The counters are the only proof the continuation
-    /// really travelled the engine's own caches, chunking, and masks.
-    /// Engine-thread owned, monotonic; read at quiescent points.
     private(set) var teacherForcedPrefillChunks = 0
     private(set) var teacherForcedDecodeForwards = 0
 
-    /// Cumulative teacher-forced execution evidence, as `EngineV2`
-    /// republishes it to out-of-module callers.
     func teacherForcedScoringActivity() -> CBv2TeacherForcedScoringActivity {
         engineQueue.sync {
             CBv2TeacherForcedScoringActivity(
@@ -665,25 +418,11 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
     }
 
-    /// Requests demoted back to waiting after a capacityExhausted at first
-    /// allocation (test/telemetry hook), and the per-request attempt cap.
     private(set) var capacityRequeueCount = 0
     private var capacityRequeues: [CBv2RequestID: Int] = [:]
     static let maxCapacityRequeues = 64
-    /// Steps that submitted eager layer-cache inner state (the offset chain +
-    /// KV buffers) into the step's `asyncEval` set. The DAR-325 guard:
-    /// evaluating the offset chain every eager step keeps its lazy `+ L`
-    /// advance from accumulating O(steps) of graph. Zero for caches that
-    /// vend no inner state (mocks). Test hook. (internal(set): MTP round
-    /// steps in EngineLoopV2+MTP.swift count here too.)
     public internal(set) var offsetChainEvalSteps = 0
-    /// Fired (from the watchdog thread) when a step exceeds `stepTimeout`.
     public var onStepWedge: (@Sendable (TimeInterval) -> Void)?
-    /// Test hook: artificial delay at the START of the enqueue engine block,
-    /// before the request reaches the scheduler. Widens the early-cancel race
-    /// window (a cancel arriving after `submit` registered the stream but
-    /// before enqueue ran) so the regression is deterministic. Zero in
-    /// production. Set before submitting.
     var enqueueStartDelayForTesting: TimeInterval = 0
 
     public var isHealthy: Bool {
@@ -718,12 +457,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         self.mtp = mtp
         self.config = config
         self.gauges = gauges
-        // MTP: the scheduler consults the loop for 1+k decode assignments.
-        // `unowned` is safe (and cycle-free): the loop owns the scheduler
-        // and both live exactly as long as the engine.
-        // Left nil under a target-only controller policy: the hook would
-        // return 0 for every row, so not installing it keeps the scheduler on
-        // its plain-decode path with no per-row call.
         if self.mtp?.isTargetOnlyPolicy == false {
             scheduler.speculationPlanner = { [unowned self] rec in
                 self.mtpPlanSpeculation(for: rec)
@@ -742,15 +475,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
     }
 
-    /// Graceful drain: waiting requests are cancelled, running requests
-    /// finish naturally, then the loop stops. Idempotent.
-    ///
-    /// Bounded by `config.shutdownTimeout`: the drain waits on the engine
-    /// queue, so a wedged queue (a step blocked inside an eval) would hang
-    /// it forever. The timeout runs on the watchdog queue; when it wins,
-    /// every live stream is force-finished with `.error`, live requests
-    /// are marked for cancellation (cleaned up if the loop ever resumes),
-    /// and `drain()` returns — the wedged step may still be executing.
     func drain() async {
         await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
             let waiter = CBv2DrainWaiter(c)
@@ -779,11 +503,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
     }
 
-    /// Shutdown-timeout path (watchdog queue): the engine queue is not
-    /// making progress, so touch ONLY lock-protected state and the
-    /// (thread-safe) streams — the same discipline as `watchdogTick()`.
-    /// Stream `finish` is idempotent, so a later natural finish (if the
-    /// loop ever resumes) is a harmless no-op.
     private func forceFinishStreamsOnShutdownTimeout() {
         stateLock.lock()
         let liveStreams = streams
@@ -802,11 +521,12 @@ public final class EngineLoopV2: @unchecked Sendable {
         running = false
         draining = false
         stopWatchdog()
+        if CBv2StepProfiler.enabled {
+            FileHandle.standardError.write(
+                Data(("[cbv2-step-profile]\n" + CBv2StepProfiler.summaryTable()).utf8))
+        }
     }
 
-    /// Natural shutdown barrier. Donation completion hops back to the engine
-    /// queue and calls this, so a drain with no scheduler work wakes promptly
-    /// instead of waiting for another polling step.
     private func completeDrainIfReady() {
         guard draining, !scheduler.hasWork, inFlight == nil,
             pendingDonationReleaseCount == 0
@@ -819,14 +539,6 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     // MARK: Submission (from EngineV2)
 
-    /// Register the stream for a new request. Fails (returns false, state
-    /// untouched) when a stream with the same id is still live: a duplicate
-    /// `submit` must never REPLACE the original request's stream — the
-    /// scheduler would later reject the duplicate id, and the rejection
-    /// path's `takeStream` would tear down the replacement, leaving the
-    /// FIRST request's deltas and terminal event with nowhere to go
-    /// (PR#62 review). Ids only become reusable after `takeStream` removes
-    /// the previous stream (request fully finished).
     func register(stream: CBv2OutputStream) -> Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
@@ -835,19 +547,12 @@ public final class EngineLoopV2: @unchecked Sendable {
         return true
     }
 
-    /// Submit-side unwind: remove a stream registered by `submit` whose
-    /// request never reached `enqueue` (multimodal materialization failed
-    /// after registration — PR#63 review). Only legal BEFORE `enqueue`; a
-    /// live request's stream is removed via `takeStream` at finish.
     func unregister(_ id: CBv2RequestID) {
         stateLock.lock()
         streams.removeValue(forKey: id)
         stateLock.unlock()
     }
 
-    /// Install (nil clears) the prompt-frontier logit capture. Cross-thread
-    /// safe; the loop reads it on the engine queue at the two prefill
-    /// sampling sites.
     func setPrefillFrontierCapture(
         _ capture: (@Sendable (CBv2RequestID, MLXArray) -> Void)?
     ) {
@@ -856,26 +561,16 @@ public final class EngineLoopV2: @unchecked Sendable {
         stateLock.unlock()
     }
 
-    /// Engine-queue read of the installed capture. nil on every ordinary
-    /// step.
     func prefillFrontierCapture() -> (@Sendable (CBv2RequestID, MLXArray) -> Void)? {
         stateLock.lock()
         defer { stateLock.unlock() }
         return prefillFrontierCaptureHook
     }
 
-    /// Run `body` on the engine queue, serialized against steps. Callers
-    /// holding a captured MLX handle use this so their `eval` never races a
-    /// live step's graph build on another thread. MUST NOT be called from
-    /// the engine queue itself.
     func onEngineQueueSync<T>(_ body: () throws -> T) rethrows -> T {
         try engineQueue.sync(execute: body)
     }
 
-    /// Runs on the engine queue. The stream must already be registered.
-    /// `multimodal` is the submit-thread resolution of the request's vision
-    /// input (nil for text requests) — mutually exclusive with `adoption`
-    /// (vision requests never do prefix-cache lookup).
     func enqueue(
         _ request: CBv2Request,
         prefixLookup: CBv2PrefixLookup = CBv2PrefixLookup(
@@ -906,11 +601,6 @@ public final class EngineLoopV2: @unchecked Sendable {
                         completionTokens: 0))
                 return
             }
-            // Early-cancel race: a cancel can arrive after `submit` registered
-            // the stream but BEFORE this block runs — at which point the
-            // scheduler has no record for it, so `processCancellations` cannot
-            // act. A pending cancel is remembered until this point and
-            // consumed here so the request is never started (PR#62 review).
             if consumeEarlyCancel(request.id) {
                 releaseAbandonedAdoption(prefixLookup.adoption)
                 takeStream(request.id)?.finish(
@@ -922,11 +612,6 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
             do {
                 try scheduler.enqueue(request)
-                // ADMIT-COALESCE-001: remember when a fresh waiting batch
-                // began. Only the arrival that finds the engine completely
-                // idle stamps; later arrivals of the same burst do not, so
-                // the coalescing wait in `engineStep` is anchored to the
-                // FIRST submission and is bounded from that instant.
                 if scheduler.runningCount == 0, scheduler.waitingCount == 1 {
                     admitBatchFirstEnqueue = config.clock.now()
                 }
@@ -941,8 +626,6 @@ public final class EngineLoopV2: @unchecked Sendable {
                 }
             } catch let error as CBv2SchedulerError {
                 releaseAbandonedAdoption(prefixLookup.adoption)
-                // Contract violation (duplicate live request id) — surfaced
-                // distinctly from capacity backpressure.
                 takeStream(request.id)?.finish(
                     reason: .error("scheduler rejected request: \(error)"),
                     usage: takePrefixUsage(
@@ -950,16 +633,6 @@ public final class EngineLoopV2: @unchecked Sendable {
                         completionTokens: 0))
             } catch {
                 releaseAbandonedAdoption(prefixLookup.adoption)
-                // Precise maxWaiting enforcement (the submit-side gauge check
-                // is the fast path; this is the authoritative one). The
-                // MESSAGE IS A CONTRACT: it must classify exactly like
-                // `EngineV2.submit`'s thrown queue-full sentinel
-                // (`capacityExhausted(needed: 1, available: 0)`), which the
-                // provider renders as this canonical string and maps to a
-                // retryable 429 (`MultiModelBatchSchedulerEngineError
-                // .fromSchedulerMessage` matches "queue full"). A divergent
-                // wording here classified the SAME condition as a 500
-                // (PR#62 review).
                 takeStream(request.id)?.finish(
                     reason: .error("token_budget_exhausted: request queue full"),
                     usage: takePrefixUsage(
@@ -971,10 +644,6 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     // MARK: Prefix-cache adoption (engine thread)
 
-    /// Adopt a prepared prefix hit into fresh KV state and fast-forward the
-    /// scheduler record. Best-effort: any failure (capacity, backend) falls
-    /// back to a full prefill — the request itself never fails here. Always
-    /// balances the lookup pin.
     private func applyAdoption(_ adoption: CBv2PrefixAdoption, requestID: CBv2RequestID) {
         defer {
             prefixCache?.endAdoption(
@@ -987,9 +656,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
         if let capacity {
             do {
-                // Frozen replay physically owns full K/V through M from the
-                // instant adoption publishes, even though its logical cursor
-                // starts at C. Reserving only C would understate residency.
                 try capacity.reserve(
                     id: requestID,
                     additionalTokens: adoption.plan.capacityReservationTokens,
@@ -1040,15 +706,11 @@ public final class EngineLoopV2: @unchecked Sendable {
         prefixUsageByID[requestID]?.boundarySplits = 0
     }
 
-    /// Preemption discards adopted KV and forces a full recompute. Preserve
-    /// genuine miss/policy outcomes; only an actual hit loses its credit.
     private func invalidateAdoptedPrefix(_ requestID: CBv2RequestID) {
         guard prefixUsageByID[requestID]?.outcome == .hit else { return }
         markPrefixAdoptionFailed(requestID, outcome: .adoptionFailed)
     }
 
-    /// Balance a lookup pin for an adoption that never reached
-    /// `applyAdoption` (shutdown, queue-full rejection).
     private func releaseAbandonedAdoption(_ adoption: CBv2PrefixAdoption?) {
         guard let adoption else { return }
         prefixCache?.endAdoption(
@@ -1058,9 +720,6 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     // MARK: Cancellation & backpressure (any thread)
 
-    /// O(1): marks the request; the row is dropped at the next step boundary.
-    /// Lock-based (not a queue hop) so cancellation works even while the
-    /// engine thread is blocked inside a long step.
     func requestCancel(_ id: CBv2RequestID) {
         stateLock.lock()
         pendingCancels.insert(id)
@@ -1072,16 +731,12 @@ public final class EngineLoopV2: @unchecked Sendable {
             let now = config.clock.now()
             if paused {
                 scheduler.pause(id)
-                // Arm the backpressure lease and suspend the progress lease:
-                // a request blocked on a slow consumer is not an engine stall.
                 if var lease = leasesByID[id] {
                     lease.markPaused(now: now)
                     leasesByID[id] = lease
                 }
             } else {
                 scheduler.resume(id)
-                // Clear the backpressure lease and grant a fresh progress
-                // window — the paused interval was not the engine's fault.
                 if var lease = leasesByID[id] {
                     lease.markResumed(now: now)
                     leasesByID[id] = lease
@@ -1104,28 +759,32 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
         }
 
-        // One monotonic clock read per step, reused for lease expiry, admission
-        // stamping, and the finalize-time progress refresh — so lease gaps are
-        // exactly one step apart (never widened by extra clock reads).
         let stepNow = config.clock.now()
         processCancellations()
         processLeaseExpiry(now: stepNow)
 
-        // Chained decode fast path: build step N+1 on step N's lazy tokens.
-        // MTP guards: an MTP round step is never a chain base (its finalize
-        // confirms 1+k samples per row — the chained machinery assumes
-        // exactly one), and the chain must BREAK whenever the MTP driver
-        // wants the next step (seed or round) for any candidate row —
-        // chained launches bypass hidden capture, so seeding could
-        // otherwise never start.
+        // Chained MTP round: build round n+1 on round n's lazy device
+        // hand-off, then finalize round n one round late.
+        if let previous = inFlight, let mtp,
+            let (verify, ids) = mtpChainedRoundCandidate(previous),
+            let next = launchChainedMTPRound(
+                previous: previous, verify: verify, ids: ids, driver: mtp)
+        {
+            inFlight = next
+            chainedStepCount += 1
+            stepCount += 1
+            finalize(previous, now: stepNow)
+            publishGauges()
+            scheduleNextStep()
+            return
+        }
+
         if let previous = inFlight,
             previous.mtpRound == nil,
             previous.sampledTokens != nil,
             let ids = scheduler.chainCandidateIDs(),
             ids == previous.sampledRows,
             ids.allSatisfy({ kvStates[$0] != nil }),
-            // Constraint state advances from the host-confirmed token. Do
-            // not launch N+1 from N's lazy token before that transition.
             ids.allSatisfy({ scheduler.record(for: $0)?.request.tokenConstraint == nil }),
             !mtpWantsStep(ids: ids),
             capacity?.hasHeadroom(additionalTokens: ids.count) ?? true
@@ -1141,9 +800,6 @@ public final class EngineLoopV2: @unchecked Sendable {
                 let next = launchChainedDecode(plan, feeding: previous.sampledTokens!)
                 attachMTPMeasurement(measurement, to: next, chained: true)
                 if var previousMeasurement = previous.mtpMeasurement {
-                    // The previous step's finalize-to-launch interval now
-                    // includes construction of this successor. It is no
-                    // longer an isolated depth-zero cost sample either.
                     previousMeasurement.chained = true
                     previous.mtpMeasurement = previousMeasurement
                 }
@@ -1155,29 +811,10 @@ public final class EngineLoopV2: @unchecked Sendable {
                 scheduleNextStep()
                 return
             }
-            // Defensive: chainCandidateIDs and plan() disagree (only
-            // possible when the capacity oracle's `hasHeadroom` was
-            // optimistic and `reserve` preempted mid-plan). Roll the
-            // optimistic advance back and fall through to the general path.
-            // Preemptions are NOT rolled back (the scheduler already
-            // requeued the victims), so their KV must be released here —
-            // fenced behind the still-in-flight step that references it.
-            // The victims are NOT added to `discard`: their in-flight
-            // sample must be recorded at finalization (preemption keeps
-            // generated tokens, and an unconfirmed `pendingSamples` would
-            // block their re-admission forever).
             scheduler.rollback(plan)
-            // Lease rewind is DEFERRED past the finalize below: the victims'
-            // in-flight sample is confirmed there (refreshProgressLeases would
-            // see generated > watermark and flip the lease back to .decode,
-            // undoing an earlier markPreempted — PR#82 review). The general
-            // path already has the correct order because it finalizes before
-            // planning; this defers the rollback path to match.
             leasePreemptionsPendingFinalize.append(contentsOf: plan.preemptions)
             for id in plan.preemptions {
                 preemptionCount += 1
-                // A preempted request recomputes from scratch — any adopted
-                // prefix credit no longer describes work that was skipped.
                 invalidateAdoptedPrefix(id)
                 mtp?.invalidateCarry(id)
                 guard let state = kvStates.removeValue(forKey: id) else { continue }
@@ -1192,16 +829,10 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
         }
 
-        // Chain broken (or nothing chained): finalize before re-planning so
-        // the plan sees confirmed tokens and post-stop membership.
         if let previous = inFlight {
             inFlight = nil
             finalize(previous, now: stepNow)
         }
-        // Apply the rollback path's deferred lease rewinds now that the
-        // victims' in-flight samples are confirmed: markPreempted must be the
-        // LAST lease transition of the preemption instant so the fresh
-        // prefill window and zeroed watermark survive into the re-prefill.
         if !leasePreemptionsPendingFinalize.isEmpty {
             for id in leasePreemptionsPendingFinalize {
                 if var lease = leasesByID[id] {
@@ -1213,11 +844,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
 
         guard scheduler.hasWork else {
-            // Idle: no future step will rebind the eager caches, so drop
-            // their row bindings now — otherwise the last batch's (retired)
-            // rows stay strongly retained by the provider until some future
-            // rebind, pinning dead KV on an idle engine (PR#62 review).
-            // No-op after the first call while idle.
             (cacheProvider as? CBv2CompositionInvalidating)?.releaseBoundRows()
             admitBatchFirstEnqueue = nil
             publishGauges()
@@ -1229,18 +855,6 @@ public final class EngineLoopV2: @unchecked Sendable {
             return
         }
 
-        // ADMIT-COALESCE-001: bounded admission coalescing. When the engine
-        // holds NO running work and the waiting set is still below the
-        // configured concurrency, a plan taken right now would admit only
-        // the submissions that happened to win the race against this
-        // re-check; the rest would pay a second prefill pass and a
-        // below-capacity mixed step. Re-arm the ordinary idle re-check
-        // instead, until either the waiting set reaches capacity or the
-        // bounded window since the batch's first arrival elapses --
-        // whichever comes first. The wait NEVER applies while any request is
-        // running (a live decode is never delayed by a late arrival), never
-        // exceeds `admitCoalesceWindowMS`, and never inspects the request
-        // contents or the cohort size.
         if Self.admitCoalesceWindowMS > 0,
             let batchStart = admitBatchFirstEnqueue,
             scheduler.runningCount == 0,
@@ -1255,9 +869,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         admitBatchFirstEnqueue = nil
 
         beginMTPPlan()
-        // Snapshot the waiting set BEFORE plan() so re-admissions (rows this
-        // plan moves waiting→running) are distinguishable from continuing
-        // running rows in markAdmitted below.
         let waitingBeforePlan = Set(scheduler.waiting.map(\.id))
         let plan = scheduler.plan()
         handlePreemptions(plan.preemptions)
@@ -1266,15 +877,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             scheduleIdleRecheck()
             return
         }
-        // First engine work for any newly-admitted row ends its admission lease
-        // permanently and arms the prefill progress lease; a RE-admitted row
-        // gets a fresh progress window (its demotion-time window may have
-        // expired during the stall-exempt queue wait). Idempotent for
-        // continuing rows (a preempted requeue never re-arms admission).
         markAdmitted(plan, now: stepNow, readmittedFrom: waitingBeforePlan)
-        // MTP round steps (1+k verify assignments and/or seed decodes)
-        // branch BEFORE executeMixed — its rec.tokens slicing and samples
-        // predicate are structurally wrong for speculative tokens.
         let measurement = mtpMeasurement(for: plan)
         inFlight = mtpRoundNeeded(plan) ? executeMTPRound(plan) : executeMixed(plan)
         attachMTPMeasurement(measurement, to: inFlight, chained: false)
@@ -1303,8 +906,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         return true
     }
 
-    /// Eager layer caches, with the provider's composition fingerprint
-    /// force-invalidated when an MTP round advanced rows behind its back.
     func eagerCaches(rowStates: [[CBv2SequenceKV?]]) -> [CBv2AttendingLayerCache] {
         if eagerCompositionStale {
             (cacheProvider as? CBv2CompositionInvalidating)?.invalidateBoundComposition()
@@ -1314,20 +915,24 @@ public final class EngineLoopV2: @unchecked Sendable {
         return caches
     }
 
-    /// Inner-state arrays (lazily-mutated KV buffers + the on-device
-    /// `positionOffsets` chain) of the eager layer caches, collected so the
-    /// step's `asyncEval` collapses those lazy chains every step instead of
-    /// letting `updateAndAttend`'s `+ L` offset advance accumulate O(steps)
-    /// of unevaluated graph — the DAR-325 bug class (legacy `BatchKVCache`
-    /// had exactly this). Empty for caches that vend no inner state (mocks).
+    /// Order a prompt chunk's K/V ring and mirror writes (`tail`) ahead of the
+    /// outputs the step's finalize waits on. `depends` aliases its input, so
+    /// values and every other op are unchanged.
+    func fencedOnPrefillWriteTail(
+        sampled: MLXArray?, outputs: [MLXArray], tail: [MLXArray]
+    ) -> (MLXArray?, [MLXArray]) {
+        guard cbv2PrefillWriteTailFenceEnabled, !tail.isEmpty else { return (sampled, outputs) }
+        let fencedSampled = sampled.map { MLX.depends(input: $0, dependencies: tail) }
+        let fencedOutputs =
+            outputs.isEmpty ? outputs : MLX.depends(inputs: outputs, dependencies: tail)
+        CBv2EngageMark.once("prefill-write-tail-fence")
+        return (fencedSampled, fencedOutputs)
+    }
+
     func eagerCacheInnerState(_ caches: [CBv2AttendingLayerCache]) -> [MLXArray] {
         caches.flatMap { ($0 as? KVCache)?.innerState() ?? [] }
     }
 
-    /// Decode-only counterpart to `eagerCacheInnerState`. The MODEL, not just
-    /// the cache provider, must affirm that its output graph consumes every
-    /// cache mutation. This matters because `CBv2SteppableModel` permits
-    /// custom/scripted forwards that ignore their caches entirely.
     func eagerDecodeEvaluationRoots(
         _ caches: [CBv2AttendingLayerCache], logitsRoot: MLXArray
     ) -> [MLXArray] {
@@ -1340,10 +945,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         return eagerCacheInnerState(caches)
     }
 
-    /// Last-position logits [B, vocab] for a rectangular [B, 1] decode
-    /// batch. The second tuple element is the eager caches' inner state
-    /// (offset chain + KV buffers) that must ride the step's `asyncEval`
-    /// (DAR-325).
     private func decodeLogits(
         rowStates: [[CBv2SequenceKV?]], tokens: MLXArray
     ) -> (logits: MLXArray, cacheInnerState: [MLXArray]) {
@@ -1353,15 +954,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         return (last, eagerDecodeEvaluationRoots(caches, logitsRoot: last))
     }
 
-    /// Prompt-only output seam (see PrefillOutputV2.swift). Capable models
-    /// skip the vocabulary projection for discarded prompt positions;
-    /// everything else keeps the established full-logits forward and is
-    /// sliced HERE, so the optimization is strictly opt-in and byte-neutral
-    /// for non-conforming models.
-    ///
-    /// Returns `[B, 1]` for `.evaluationOnly` (a cheap handle that still
-    /// forces the whole chunk's graph, including its KV writes) and
-    /// `[B, vocab]` for `.lastPositionLogits`.
     func prefillOutput(
         tokens: MLXArray,
         inputEmbeddings: MLXArray?,
@@ -1397,42 +989,6 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     // MARK: - Teacher-forced top-1 scoring (backend parity measurement)
 
-    /// Drive `continuation` through the engine on a private KV row and
-    /// return the ARGMAX at each continuation position.
-    ///
-    /// Free-running comparison between two engine arms is only valid up to
-    /// the FIRST disagreement: past it the arms carry different contexts and
-    /// every later position compares two unrelated conversations, so a
-    /// harness can report a first-flip index but never an agreement RATE.
-    /// Teacher forcing removes that: position `i` is always scored against
-    /// `promptTokens + continuation[0..<i]`, identically in both arms,
-    /// whatever either arm would have preferred. Agreement becomes a rate.
-    ///
-    /// The scoring row travels the ENGINE's own path, not a shortcut: the
-    /// prompt goes through `prefillOutput` in the same chunks
-    /// `SchedulerV2.plan()` would cut (`min(prefillChunkSize,
-    /// maxBatchedTokensPerStep)`), and each forced token enters as its own
-    /// `[1, 1]` forward through `eagerCaches` — byte-for-byte the decode
-    /// seam. Scoring positions outside the engine would measure the MODEL,
-    /// and the model is the one thing the two backends share.
-    ///
-    /// Deterministic by construction: `argMax` over the last-position
-    /// logits. No sampler, no temperature, no top-k, no RNG.
-    ///
-    /// Result length == `continuation.count`. `result[0]` is the argmax
-    /// after the prompt alone; `result[i]` the argmax after
-    /// `continuation[i - 1]` is forced in. Forcing the model's own greedy
-    /// continuation therefore returns that continuation unchanged.
-    ///
-    /// Runs on the engine queue, but NOT as a step: it never enters the
-    /// scheduler, the chain, or the step watchdog. It refuses while OTHER
-    /// requests are live — not for safety (the row is bound alone, so batch
-    /// composition cannot reach its arithmetic) but for comparability: a
-    /// contended pool hands the row different pages, and page order is
-    /// precisely the drift a parity harness is trying to measure. A
-    /// trailing in-flight step from a request that already finished is not
-    /// contention and does not block scoring; its rows are re-derived and
-    /// dropped around this call.
     func teacherForcedTop1(promptTokens: [Int], continuation: [Int]) throws -> [Int] {
         guard !promptTokens.isEmpty, !continuation.isEmpty else {
             throw CBv2TeacherForcingError.nothingToScore(
@@ -1443,7 +999,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
     }
 
-    /// Engine-queue body of `teacherForcedTop1`.
     private func scoreTeacherForced(
         promptTokens: [Int], continuation: [Int]
     ) throws -> [Int] {
@@ -1453,27 +1008,18 @@ public final class EngineLoopV2: @unchecked Sendable {
                 scheduledRequests: scheduler.running.count + scheduler.waiting.count)
         }
 
-        // Same allocation the loop makes for a real request of this shape.
         let state = try backend.makeSequenceState(
             layerKinds: layerKinds,
             promptLength: promptTokens.count,
             maxLength: promptTokens.count + continuation.count)
         defer {
-            // Drop the caches' strong binding to this retired row BEFORE the
-            // backend recycles its pages (PR#62), and force the next real
-            // step to rebind its own rows.
             (cacheProvider as? CBv2CompositionInvalidating)?.releaseBoundRows()
             backend.release(state)
         }
 
-        // One lazy [1] argmax per continuation position; the forwards never
-        // read them back (the next input is the FORCED token, already on the
-        // host), so the whole run needs exactly one readback at the end.
         var top1: [MLXArray] = []
         top1.reserveCapacity(continuation.count)
 
-        // Prompt: chunked prefill, cut exactly as the scheduler would for a
-        // solo row (`min(remaining, prefillChunkSize, budget)`).
         let chunkSize = max(
             1, min(scheduler.config.prefillChunkSize, scheduler.config.maxBatchedTokensPerStep))
         var index = 0
@@ -1493,17 +1039,12 @@ public final class EngineLoopV2: @unchecked Sendable {
                 top1.append(argmax)
                 toEval.append(argmax)
             } else {
-                // `.evaluationOnly` hands back a [1, 1] handle that still
-                // forces the chunk's whole graph, KV writes included.
                 toEval.append(output)
             }
             asyncEval(toEval)
             index += count
         }
 
-        // Continuation: one [1, 1] decode forward per FORCED token. The last
-        // continuation token is never fed — its logits would score a
-        // position past the end of the range being measured.
         for forced in continuation.dropLast() {
             let inputs = MLXArray([Int32(forced)]).reshaped([1, 1])
             let caches = eagerCaches(rowStates: [state])
@@ -1520,7 +1061,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         return scored.asArray(Int32.self).map(Int.init)
     }
 
-    /// Pure-decode step fed by the previous step's still-lazy tokens.
     private func launchChainedDecode(
         _ plan: CBv2StepPlan, feeding lazyTokens: MLXArray
     ) -> CBv2InFlightStep {
@@ -1534,7 +1074,6 @@ public final class EngineLoopV2: @unchecked Sendable {
 
         let inputs = lazyTokens.reshaped([ids.count, 1])
         let forwardStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-        // SOFTCAP-SKIP: declare order-only consumption for this graph build.
         let (last, cacheInnerState) = CBv2OrderOnlyLogits.withOrderOnly(params) {
             decodeLogits(rowStates: rowStates, tokens: inputs)  // [B, vocab]
         }
@@ -1542,8 +1081,6 @@ public final class EngineLoopV2: @unchecked Sendable {
             CBv2StepProfiler.record(
                 "v2.forward.build", seconds: CFAbsoluteTimeGetCurrent() - forwardStart)
         }
-        // `pendingSampledTokens` = the fed lazy tokens: each row has exactly
-        // one launched-but-unconfirmed sample here (the chain invariant).
         let samplerStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         let sampled = sampler.sample(
             logits: last, params: params, requestIDs: ids, stepIndex: stepCount,
@@ -1559,7 +1096,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         scheduler.markPendingSamples(ids: ids)
         var toEval = [sampled]
         if let stepLogprobs { toEval.append(contentsOf: stepLogprobs.evalTargets) }
-        // Collapse the eager caches' lazy offset/KV chains this step (DAR-325).
         if !cacheInnerState.isEmpty {
             toEval.append(contentsOf: cacheInnerState)
             offsetChainEvalSteps += 1
@@ -1570,6 +1106,9 @@ public final class EngineLoopV2: @unchecked Sendable {
             let now = CFAbsoluteTimeGetCurrent()
             CBv2StepProfiler.record("v2.asyncEval.submit", seconds: now - evalStart)
             CBv2StepProfiler.record("v2.launch.total", seconds: now - buildStart)
+            FileHandle.standardError.write(
+                Data(String(format: "[cbv2-plain] rows=%d build %.1f ms submit %.1f ms\n",
+                    ids.count, (evalStart - buildStart) * 1000, (now - evalStart) * 1000).utf8))
         }
         let step = CBv2InFlightStep(
             participants: Set(ids), sampledRows: ids, sampledTokens: sampled, evalTargets: [],
@@ -1578,11 +1117,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         return step
     }
 
-    /// General step: decode batch [B, 1] + per-request [1, chunk] prefills,
-    /// interleaved per the plan, ONE `asyncEval` for the whole step.
-    /// NEVER extended for MTP speculation — 1+k assignments take
-    /// `executeMTPRound` (this function's `rec.tokens` slicing and
-    /// `samples` predicate are structurally wrong for speculative tokens).
     func executeMixed(_ plan: CBv2StepPlan) -> CBv2InFlightStep? {
         let wallStartedNanos = DispatchTime.now().uptimeNanoseconds
         struct RowWork {
@@ -1599,16 +1133,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             guard let rec = scheduler.record(for: id) else { continue }
             guard ensureKVState(rec) != nil else { continue }  // error-finished
             let start = rec.numComputedTokens - n  // pre-optimistic-advance position
-            // The step samples iff it computes through the last known token.
-            // (`pendingSamples == 0` here: finalize always precedes
-            // executeMixed, so every planned token value is host-visible.)
             let samples = rec.numComputedTokens == rec.effectiveTokenCount
-            // A length-1 image span on the FINAL prompt token produces an
-            // assignment shaped exactly like a decode row (n == 1, samples,
-            // last known token) — but its placeholder token must take the
-            // embedding-splice prefill path below, not the decode batch's
-            // plain token-embedding path (PR#63 review). Genuine decode rows
-            // never trip this: their positions are past every span.
             let finalTokenIsImageSpan =
                 multimodalByID[id]?.containsSpan(at: rec.tokens.count - 1) ?? false
             let isDecode =
@@ -1618,19 +1143,15 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
         guard !work.isEmpty else { return nil }
 
-        // Lazy offset/KV chains of every eager cache touched this step; ride
-        // the step's asyncEval so the `+ L` offset advance can't accumulate
-        // O(steps) of unevaluated graph (DAR-325).
         var cacheInnerState: [MLXArray] = []
+        var prefillWriteTail: [MLXArray] = []
 
-        // Rectangular decode batch, in plan order.
         let decodeRows = work.filter(\.isDecode)
         var decodeSampled: MLXArray?
         var logprobSegments: [CBv2StepLogprobs] = []
         if !decodeRows.isEmpty {
             let inputs = MLXArray(decodeRows.map { Int32($0.rec.tokens[$0.start]) })
                 .reshaped([decodeRows.count, 1])
-            // SOFTCAP-SKIP: same declaration on the mixed-step decode rows.
             let (last, decodeInnerState) = CBv2OrderOnlyLogits.withOrderOnly(
                 decodeRows.map(\.rec.request.sampling)
             ) {
@@ -1650,12 +1171,6 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
         }
 
-        // Prompt chunks. Default shape is per-request [1, chunk]; when the
-        // model AND the cache provider both prove rectangular per-row
-        // semantics, equal-length chunks are coalesced into one layer-major
-        // [B, chunk] forward so each layer's weights are read once for the
-        // whole cohort. Span-bearing rows require the stronger model and
-        // cache capabilities for row-local embeddings and attention masks.
         var prefillSampled: [CBv2RequestID: MLXArray] = [:]
         var evalTargets: [MLXArray] = []
         var packedIDs = Set<CBv2RequestID>()
@@ -1673,9 +1188,6 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
             var groups: [PackedGroup] = []
             for row in work where !row.isDecode {
-                // A multimodal request's text-only chunks remain packable.
-                // A span-bearing chunk needs explicit rectangular embedding
-                // and row-mask capability from both model and cache provider.
                 let hasSpan =
                     multimodalByID[row.rec.id]?.chunkContext(
                         start: row.start, count: row.count) != nil
@@ -1720,11 +1232,11 @@ public final class EngineLoopV2: @unchecked Sendable {
                         tokens: inputs, inputEmbeddings: nil, caches: caches,
                         requirement: requirement)
                 }
-                cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
+                let written = eagerCacheInnerState(caches)
+                cacheInnerState.append(contentsOf: written)
+                prefillWriteTail.append(contentsOf: written)
 
                 if group.samples {
-                    // Parity seam: the frontier logits, as this backend
-                    // computed them, BEFORE the sampler touches them.
                     if let capture = prefillFrontierCapture() {
                         for (index, row) in group.rows.enumerated() {
                             capture(row.rec.id, output[index])
@@ -1744,13 +1256,9 @@ public final class EngineLoopV2: @unchecked Sendable {
                         logprobSegments.append(stepLogprobs)
                     }
                 } else {
-                    // One handle commits the whole rectangular trunk and
-                    // every participating row's KV writes.
                     evalTargets.append(output)
                 }
                 packedIDs.formUnion(group.rows.map(\.rec.id))
-                // Evidence, recorded where the rectangular forward actually
-                // happened — never at the capability gate.
                 packedPrefillRowsExecuted += group.rows.count
                 packedPrefillGroupsExecuted += 1
             }
@@ -1768,10 +1276,6 @@ public final class EngineLoopV2: @unchecked Sendable {
             if let multimodal = multimodalByID[rec.id],
                 let spanContext = multimodal.chunkContext(start: row.start, count: row.count)
             {
-                // Vision chunk (contains image spans): the NEW pinned path —
-                // spliced input embeddings + span attention masks. Chunks of
-                // the SAME request without spans fall through to the
-                // untouched text path (pure function of has-spans).
                 output = multimodalChunkForward(
                     tokens: inputs, start: row.start, count: row.count,
                     multimodal: multimodal, spanContext: spanContext, caches: caches,
@@ -1781,7 +1285,9 @@ public final class EngineLoopV2: @unchecked Sendable {
                     tokens: inputs, inputEmbeddings: nil, caches: caches,
                     requirement: requirement)
             }
-            cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
+            let written = eagerCacheInnerState(caches)
+            cacheInnerState.append(contentsOf: written)
+            prefillWriteTail.append(contentsOf: written)
             if row.samples {
                 if let capture = prefillFrontierCapture() {
                     capture(rec.id, output[0])
@@ -1797,14 +1303,10 @@ public final class EngineLoopV2: @unchecked Sendable {
                     logprobSegments.append(stepLogprobs)
                 }
             } else {
-                // Cheap handle that forces this chunk's graph (incl. KV
-                // writes) without materializing full logits on the host.
                 evalTargets.append(output)
             }
         }
 
-        // Assemble sampled tokens in plan order so a following pure-decode
-        // plan (same membership, same order) can chain off this array.
         var pieces: [MLXArray] = []
         var sampledRows: [CBv2RequestID] = []
         var decodeIdx = 0
@@ -1818,8 +1320,12 @@ public final class EngineLoopV2: @unchecked Sendable {
                 sampledRows.append(row.rec.id)
             }
         }
-        let sampledTokens: MLXArray? =
+        var sampledTokens: MLXArray? =
             pieces.isEmpty ? nil : (pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: 0))
+        if !prefillWriteTail.isEmpty {
+            (sampledTokens, evalTargets) = fencedOnPrefillWriteTail(
+                sampled: sampledTokens, outputs: evalTargets, tail: prefillWriteTail)
+        }
 
         scheduler.markPendingSamples(ids: sampledRows)
         var toEval = evalTargets
@@ -1843,22 +1349,6 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     // MARK: Vision prefill (span-containing chunks only)
 
-    /// Forward one span-containing prefill chunk: splice the request's image
-    /// embeddings over the scaled text embeddings, bind the chunk's span
-    /// mask context to every layer cache for the duration of the graph
-    /// build, and run the model's embedding forward. The context is unbound
-    /// before returning, so every other computation (decode, text chunks,
-    /// batchmates) sees nil — the mask can only ever apply to this one
-    /// request's [1, chunk] rows.
-    ///
-    /// A 1-TOKEN chunk (`count == 1`) still splices its image embedding, but
-    /// is NOT span-mask-bound: a chunk that small can only contain a
-    /// length-1 block (blocks never split across chunks), and bidirectional
-    /// attention within a single-token block is a no-op — the token attends
-    /// only itself, identical under causal. Binding would trip the
-    /// attention path's `L > 1` span precondition, so it is skipped
-    /// (PR review: reachable via a length-1 span landing in a trailing
-    /// 1-token prefill chunk).
     func multimodalChunkForward(
         tokens: MLXArray, start: Int, count: Int,
         multimodal: CBv2ResolvedMultimodal, spanContext: CBv2SpanChunkContext,
@@ -1866,8 +1356,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         requirement: CBv2PrefillRequirement
     ) -> MLXArray {
         guard let mmModel = model as? CBv2MultimodalSteppableModel else {
-            // Unreachable: EngineV2.submit gates multimodal requests on this
-            // capability before they ever reach the scheduler.
             preconditionFailure(
                 "CBv2 multimodal chunk reached a model without embedding-forward support")
         }
@@ -1884,9 +1372,6 @@ public final class EngineLoopV2: @unchecked Sendable {
             requirement: requirement)
     }
 
-    /// Rectangular counterpart of `multimodalChunkForward`. Each row keeps
-    /// its own token embeddings, image splice coordinates, KV state, and
-    /// optional span mask while the model traverses the cohort layer-major.
     func packedMultimodalChunksForward(
         tokens: MLXArray,
         starts: [Int],
@@ -1938,10 +1423,9 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     // MARK: Finalization (deferred stop detection)
 
+    private var stepLogOrigin: CFAbsoluteTime = 0
+
     private func finalize(_ step: CBv2InFlightStep, now: ContinuousClock.Instant) {
-        // THE host sync — overlapped with the successor step's GPU work when
-        // chained. All-prefill steps block on their eval targets instead so
-        // graph pipelining stays bounded at two steps.
         let readbackStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         var host: [Int32] = []
         if let tokens = step.sampledTokens {
@@ -1950,17 +1434,22 @@ public final class EngineLoopV2: @unchecked Sendable {
             eval(step.evalTargets)
         }
         if CBv2StepProfiler.enabled {
-            CBv2StepProfiler.record(
-                "v2.readback.wait", seconds: CFAbsoluteTimeGetCurrent() - readbackStart)
+            let finalizeTime = CFAbsoluteTimeGetCurrent()
+            CBv2StepProfiler.record("v2.readback.wait", seconds: finalizeTime - readbackStart)
+            if stepLogOrigin == 0 { stepLogOrigin = finalizeTime }
+            FileHandle.standardError.write(
+                Data(String(format: "[cbv2-step] t=%.0f ms k=%d sampled=%d running=%d\n",
+                    (finalizeTime - stepLogOrigin) * 1000, step.mtpRound?.verify?.k ?? -1,
+                    step.sampledRows.count, scheduler.running.count).utf8))
+            if let round = step.mtpRound, round.verify == nil, !round.seedRows.isEmpty {
+                Self.mtpSeedProfileLine("readback", seconds: finalizeTime - readbackStart)
+            }
         }
         if !step.sampledRows.isEmpty {
             sampler.confirmSampledTokens(
                 host.map(Int.init), requestIDs: step.sampledRows)
         }
 
-        // Materialize any lazy logprob gathers at this same boundary (they
-        // rode the step's asyncEval, so this reads back finished results —
-        // no extra GPU work, and only when a row asked for logprobs).
         var logprobsByID: [CBv2RequestID: CBv2TokenLogprob] = [:]
         if !step.logprobSegments.isEmpty {
             var tokenByID: [CBv2RequestID: Int] = [:]
@@ -1988,27 +1477,10 @@ public final class EngineLoopV2: @unchecked Sendable {
                 continue
             }
 
-            // A stop TOKEN's text is never emitted (OpenAI behavior: the
-            // stop token terminates the stream and its rendering is
-            // excluded from content). It still counts toward
-            // usage.completionTokens (recordSampled above) and still rides
-            // in the delta's raw `tokens` — see the CBv2Event.delta doc.
-            // Skipping the detokenizer push keeps its held-back text
-            // intact for the finish-time flush.
             let isStopToken = rec.request.stopTokens.contains(token)
             let detokenizer = detokenizers[id]
             let logprobs = logprobsByID[id].map { [$0] }
 
-            // Stop-string detection needs the holdback scan synchronously to
-            // gate the deterministic one-step-late `.stop` finish; passthrough
-            // requests can't stop on a string, so their decode + emit move
-            // OFF the step thread (finding 2 — detokQueue). The buffer slot
-            // is charged NOW, on the engine thread (`reserveEmission`), so
-            // the backpressure pause still gates this request's scheduling
-            // even though the emit itself is deferred — otherwise a slow
-            // detokenizer/consumer could not fill the bounded buffer until
-            // the queued blocks ran, and generation would run unbounded
-            // ahead of it (PR#62 review).
             var matchedStopString = false
             if rec.request.stopStrings.isEmpty {
                 let stream = stream(for: id)
@@ -2035,12 +1507,6 @@ public final class EngineLoopV2: @unchecked Sendable {
                 matchedStopString = detokenizer?.matchedStopString ?? false
             }
 
-            // Stop detection — one step late by construction. Deadlines are NO
-            // LONGER checked here: a request that just produced a token is
-            // making progress and must never be killed mid-generation. Lease
-            // expiry is evaluated centrally in `processLeaseExpiry` at the top
-            // of each step, and this confirmed token refreshes the decode lease
-            // in `refreshProgressLeases` below.
             if isStopToken {
                 finishRequest(id, reason: .stop)
             } else if matchedStopString {
@@ -2050,17 +1516,10 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
         }
 
-        // MTP round steps: seed-carry capture + the verify accept-walk run
-        // at this same host-sync boundary (their arrays rode the step's
-        // asyncEval), AFTER the plain loop above (seed bonus tokens are
-        // confirmed there) and BEFORE the fenced frees below.
         if step.mtpRound != nil {
             finalizeMTPRound(step)
         }
 
-        // Fenced frees: rows finished/cancelled while this step was in
-        // flight. Scrub the wasted-token KV tail, then retire (donate to
-        // the prefix cache when eligible, else release).
         for (_, state, rollbackOne, donation) in step.deferredReleases {
             if rollbackOne {
                 for sequence in state { sequence?.rollback(1) }
@@ -2078,26 +1537,9 @@ public final class EngineLoopV2: @unchecked Sendable {
                 claimedSeedCostNanos: step.mtpRound?.claimedSeedCostNanos ?? 0)
         }
 
-        // Refresh progress leases from CONFIRMED work this step — covers plain
-        // decode, chained decode, prefill chunks, and MTP rounds uniformly
-        // (MTP rows are `participants` and were confirmed above via
-        // `finalizeMTPRound`). This is the single point where confirmed
-        // finalized progress refreshes a lease, never optimistic planning.
-        //
-        // Read the clock FRESH here rather than reusing the caller's `now`:
-        // that instant was captured before this function's blocking host
-        // readback, so stamping progress with it backdates confirmation by
-        // the sync duration — with a stepTimeout configured above a progress
-        // lease, a healthy long readback could leave the just-refreshed lease
-        // already expired at the next boundary (PR#82 review). Progress is
-        // confirmed NOW, after the sync.
         refreshProgressLeases(step, now: config.clock.now())
     }
 
-    /// Refresh each live participant's progress lease and its reconciled usage
-    /// snapshot from CONFIRMED finalized state. A confirmed sampled/generated
-    /// token refreshes the decode lease; a confirmed prefill-chunk advance
-    /// refreshes the prefill lease.
     private func refreshProgressLeases(_ step: CBv2InFlightStep, now: ContinuousClock.Instant) {
         for id in step.participants {
             guard let rec = scheduler.record(for: id) else { continue }
@@ -2108,9 +1550,6 @@ public final class EngineLoopV2: @unchecked Sendable {
                     generatedTokens: rec.generatedTokenCount)
                 leasesByID[id] = lease
             }
-            // Publish the reconciled usage once tokens start flowing (prompt
-            // count with zero completion was already seeded at enqueue, so a
-            // still-prefilling row needs no lock traffic here).
             if rec.generatedTokenCount > 0 {
                 setUsageSnapshot(
                     id,
@@ -2124,42 +1563,23 @@ public final class EngineLoopV2: @unchecked Sendable {
     // MARK: Request completion
 
     func finishRequest(_ id: CBv2RequestID, reason: CBv2FinishReason) {
-        // Ids are legally reusable after finish: drop the per-id capacity
-        // requeue count on EVERY finish path (including the error-finish
-        // that exhausted it), or a reused id inherits the previous
-        // attempt tally and its first transient KV-capacity trip
-        // error-finishes immediately instead of requeueing (PR#62 review).
         capacityRequeues.removeValue(forKey: id)
         multimodalByID.removeValue(forKey: id)
-        // Ids are reusable after finish: drop the per-id lease and usage
-        // snapshot so a reused id starts fresh (a stale lease would otherwise
-        // expire the new request early).
         leasesByID.removeValue(forKey: id)
         clearUsageSnapshot(id)
-        // MTP: ids are reusable, so every per-id trace (carry, marks) must
-        // go on every finish path.
         mtp?.requestDidFinish(id)
         guard let rec = scheduler.finish(id: id, reason: reason) else {
-            // Unknown to the scheduler (already finished) — make sure no
-            // stream leaks regardless.
             let usage = takePrefixUsage(requestID: id, promptTokens: 0, completionTokens: 0)
             takeStream(id)?.finish(
                 reason: reason, usage: usage)
             return
         }
         capacity?.releaseAll(id: id)
-        // Retire the id from the sampler's configured fingerprint: the id is
-        // legally reusable after this finish, and a reused id with an
-        // identical row set must reconfigure, not inherit stale penalties /
-        // RNG progress (PR#62 review).
         sampler.requestDidFinish(id)
 
         if let state = kvStates.removeValue(forKey: id) {
             let donation = donationIntent(for: rec, reason: reason, state: state)
             if let inFlight, inFlight.participants.contains(id) {
-                // The in-flight step still references this state — fence the
-                // free behind its completion; roll back the wasted token iff
-                // that step sampled for this row.
                 inFlight.discard.insert(id)
                 inFlight.deferredReleases.append(
                     (
@@ -2179,9 +1599,6 @@ public final class EngineLoopV2: @unchecked Sendable {
             requestID: id, promptTokens: rec.request.promptTokens.count,
             completionTokens: rec.generatedTokenCount)
 
-        // Passthrough requests emit deltas on the detok queue; the trailing
-        // flush + terminal MUST ride the same queue so they land AFTER those
-        // deltas (FIFO ordering). Stop-string requests stay synchronous.
         if rec.request.stopStrings.isEmpty {
             detokQueue.async {
                 let trailing = detokenizer?.flush() ?? ""
@@ -2201,34 +1618,17 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     // MARK: Prefix-cache donation (engine thread → donation queue)
 
-    /// Donation intent for a finished request, or nil when donation does
-    /// not apply. Only NATURAL completions donate: their KV is a complete,
-    /// confirmed prefix. The last confirmed token was sampled but never fed
-    /// through the model, so it is dropped at donation time. The intent
-    /// carries the request's cache salt so the entry lands in the donor's
-    /// salt scope (TB-007).
     private func donationIntent(
         for rec: CBv2ScheduledRequest, reason: CBv2FinishReason, state: [CBv2SequenceKV?]
     ) -> CBv2DonationIntent? {
         guard prefixCache != nil else { return nil }
         guard rec.request.prefixCacheEnabled else { return nil }
         guard cbv2LayerKindsAllowPrefixReuse(layerKinds) else { return nil }
-        // Vision requests NEVER donate (v1 policy, enforced in BOTH
-        // directions — lookup is skipped in `EngineV2.makePrefixLookup`): the
-        // prefix cache keys on token-id chain hashes, and an image span's
-        // placeholder ids are identical for every image — a donated vision
-        // prefix would be silently served to a request with different image
-        // content. Image-digest extra keys in the block hash (vLLM-V1
-        // `extra_keys`) are the documented follow-up.
         guard rec.request.multimodal == nil else { return nil }
         switch reason {
         case .stop, .length: break
-        // A deadline/watchdog terminal aborts an incomplete request — its KV is
-        // not a confirmed, complete prefix, so it never donates.
         case .cancelled, .error, .terminal: return nil
         }
-        // Donation requires the full prompt to have been processed (at
-        // least one sampled token) — mid-prefill finishes carry partial KV.
         guard rec.generatedTokenCount >= 1, rec.tokens.count > 1 else { return nil }
         return CBv2DonationIntent(
             requestID: rec.request.prefixCacheReceiptID ?? rec.id,
@@ -2236,12 +1636,6 @@ public final class EngineLoopV2: @unchecked Sendable {
             cacheSalt: rec.request.cacheSalt)
     }
 
-    /// Retire a finished request's KV state: donate to the prefix cache
-    /// (snapshots graph-built HERE on the engine thread, so views over
-    /// shared paged slabs are consistent with in-flight writes; hashing +
-    /// indexing + optional materialization run on the donation queue), then
-    /// release the storage back on the engine queue (the paged pool is
-    /// engine-thread-affine).
     private func retire(
         state: [CBv2SequenceKV?], donating donation: CBv2DonationIntent?
     ) {
@@ -2255,18 +1649,12 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
     }
 
-    /// Build immutable-by-contract snapshot handles on the engine queue and
-    /// hand all expensive work to the serial donation queue.
     private func enqueueDonation(
         state: [CBv2SequenceKV?], intent: CBv2DonationIntent
     ) -> Bool {
         guard let prefixCache else { return false }
         let tokenCount = intent.tokens.count
         guard stateCoversDonation(state, tokenCount: tokenCount) else { return false }
-        // Opt-in sliding-row donation (`CBv2SlidingWindowDonating`). Asked
-        // BEFORE anything is built: a sliding snapshot is `windowCount ×
-        // window` positions of K/V — 200 MiB on gemma-4 — so a cache that
-        // does not persist windows must not pay for the graph at all.
         let windowDonor = prefixCache as? any CBv2SlidingWindowDonating
         let donatesWindows = windowDonor?.wantsSlidingWindowDonation ?? false
         var built: [(keys: MLXArray, values: MLXArray, offset: Int)?] = []
@@ -2281,12 +1669,6 @@ public final class EngineLoopV2: @unchecked Sendable {
                 isSliding = true
             }
             if donatesWindows {
-                // Storage-owning sliding rows only, and NEVER truncated to
-                // `tokenCount`: the ring already holds exactly the last
-                // `window` positions ending at the row's absolute offset,
-                // which is the span the sidecar persists. A KV-shared row
-                // borrows its source's storage, so donating it would
-                // double-write the same bytes.
                 sliding.append(
                     isSliding && kind.sharesKVWithLayer == nil
                         ? state[i]?.snapshot()
@@ -2312,11 +1694,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         let handoff = CBv2Handoff(
             value: (state: state, snapshots: built, sliding: sliding, intent: intent))
         pendingDonationReleaseCount += 1
-        // Strong self on purpose: the deferred release is a pending
-        // obligation of this loop — it must survive until the donation
-        // lands, or the retired state leaks its pages (the paged pool is
-        // engine-thread-affine, so the free hops back to the engine queue).
-        // No cycle: the block releases its captures once it runs.
         donationQueue.async {
             if let windowDonor, donatesWindows {
                 windowDonor.donate(
@@ -2382,8 +1759,6 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     // MARK: Sampler row context
 
-    /// Full per-row sampler context (confirmed history only; in-flight
-    /// chained samples travel separately as `pendingSampledTokens`).
     static func samplerRow(_ rec: CBv2ScheduledRequest) -> CBv2SamplerRow {
         CBv2SamplerRow(
             id: rec.id,
@@ -2401,11 +1776,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         let cancels = pendingCancels
         stateLock.unlock()
 
-        // Which cancels are fully resolved this boundary (drop from the set).
-        // A cancel with no scheduler record AND a still-registered stream is
-        // an EARLY cancel racing `enqueue` — keep it so the enqueue block
-        // refuses to start the request (PR#62 review). A cancel with neither
-        // is stale (request already finished) — drop it.
         var resolved: Set<CBv2RequestID> = []
         for id in cancels {
             if scheduler.record(for: id) != nil {
@@ -2421,17 +1791,12 @@ public final class EngineLoopV2: @unchecked Sendable {
         stateLock.unlock()
     }
 
-    /// True when a stream is still registered for `id` (used to tell a
-    /// racing pre-enqueue cancel from a stale post-finish one).
     private func hasRegisteredStream(_ id: CBv2RequestID) -> Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
         return streams[id] != nil
     }
 
-    /// Consume a remembered early cancel for `id` at enqueue time. Returns
-    /// true when the request was cancelled before it started (the caller
-    /// must finish its stream and never enqueue it).
     private func consumeEarlyCancel(_ id: CBv2RequestID) -> Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
@@ -2440,9 +1805,6 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     // MARK: Deadline leases
 
-    /// Arm the monotonic lease set for a freshly enqueued request and seed its
-    /// reconciled-usage snapshot (prompt tokens known, zero completion). Under
-    /// the kill-switch this is the legacy single total-lifetime wall.
     private func armLease(for request: CBv2Request) {
         let now = config.clock.now()
         let lease: CBv2RequestLeaseState
@@ -2469,16 +1831,6 @@ public final class EngineLoopV2: @unchecked Sendable {
             CBv2Usage(promptTokens: request.promptTokens.count, completionTokens: 0))
     }
 
-    /// End the admission lease for every row that began engine work this step,
-    /// and grant a fresh progress window to RE-admitted rows (already-admitted
-    /// rows crossing waiting→running again after preemption / capacity
-    /// requeue): their demotion-time window kept ticking through the
-    /// stall-exempt queue wait and may be pre-expired (PR#82 review).
-    /// `waitingBefore` is the waiting set snapshotted BEFORE plan() — only
-    /// rows that crossed out of it this step qualify; continuing running rows
-    /// must NOT refresh here or genuine decode stalls would be masked
-    /// (plan.assignments lists every scheduled row each step, not just
-    /// admissions). Idempotent; a preempted requeue never re-arms admission.
     private func markAdmitted(
         _ plan: CBv2StepPlan, now: ContinuousClock.Instant,
         readmittedFrom waitingBefore: Set<CBv2RequestID>
@@ -2495,11 +1847,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
     }
 
-    /// Central lease-expiry scan at the top of each step. Each expired request
-    /// finishes with its TYPED cause (or, under the kill-switch, the legacy
-    /// error string). Progress leases apply only to actively-RUNNING rows; a
-    /// preempted row awaiting re-admission is bounded only by the absolute
-    /// safety ceiling, never faulted as a stall.
     private func processLeaseExpiry(now: ContinuousClock.Instant) {
         var expired: [(CBv2RequestID, CBv2TerminalCause)] = []
         for rec in scheduler.running {
@@ -2521,13 +1868,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
     }
 
-    /// The wire finish reason for a lease cause. The legacy kill-switch keeps
-    /// the exact original `.error` string for a behavior-compatible rollback
-    /// (same single total-lifetime wall and wire terminal; timing now runs on
-    /// the monotonic clock rather than `Date`, and expiry is observed at the
-    /// central lease scan rather than the old inline checks — not literally
-    /// bit-identical timing); every new-lease cause surfaces as a typed
-    /// `.terminal`.
     private func leaseFinishReason(for cause: CBv2TerminalCause) -> CBv2FinishReason {
         switch cause {
         case .legacyRequestTimeout:
@@ -2538,26 +1878,12 @@ public final class EngineLoopV2: @unchecked Sendable {
     }
 
     private func handlePreemptions(_ ids: [CBv2RequestID]) {
-        // Preemption only happens on the non-chained path, where the
-        // previous step was finalized first — no in-flight step can
-        // reference these states, so the release is immediate. The
-        // scheduler already released the capacity reservations and requeued
-        // the victims (generated tokens kept).
         assert(inFlight == nil, "preemption with a step in flight")
         let now = config.clock.now()
         for id in ids {
             preemptionCount += 1
-            // A preempted request recomputes from scratch — any adopted
-            // prefix credit no longer describes work that was skipped, so
-            // usage.prefixCacheHitTokens must not over-credit at finish.
             invalidateAdoptedPrefix(id)
-            // A preempted row's drafter carry no longer describes its KV
-            // (the structural fingerprint would catch it; drop eagerly).
             mtp?.invalidateCarry(id)
-            // The scheduler rewound numComputedTokens to zero; reset the
-            // lease's computed watermark and grant a fresh prefill window so
-            // the re-prefill's confirmed chunks refresh the progress lease
-            // (otherwise a long re-prefill is falsely killed as a stall).
             if var lease = leasesByID[id] {
                 lease.markPreempted(now: now)
                 leasesByID[id] = lease
@@ -2568,12 +1894,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
     }
 
-    /// Create per-layer KV state on first execution. On `capacityExhausted`
-    /// (several same-step admissions racing for the last bytes/pages — the
-    /// backend's charge is atomic, so losers surface here) the request is
-    /// requeued to waiting instead of error-finished: accepted requests wait
-    /// for room. Bounded by `maxCapacityRequeues` (then error-finish) and by
-    /// the request deadline. Other failures error-finish as before.
     func ensureKVState(_ rec: CBv2ScheduledRequest) -> [CBv2SequenceKV?]? {
         if let state = kvStates[rec.id] { return state }
         do {
@@ -2590,26 +1910,12 @@ public final class EngineLoopV2: @unchecked Sendable {
                     capacityRequeues[rec.id] = attempts + 1
                     capacityRequeueCount += 1
                     mtp?.invalidateCarry(rec.id)  // preempted-style restart
-                    // Preempted-style lease reset too: requeueOnCapacity
-                    // rewound numComputedTokens to zero, so rewind the
-                    // progress watermark and grant a fresh prefill window
-                    // (admission stays permanently cleared). Without this a
-                    // capacity wait longer than the prefill lease leaves the
-                    // stale progress deadline expired and the newly
-                    // re-admitted row is killed as .prefillStall before its
-                    // first healthy chunk finalizes (PR#82 review). No
-                    // pending finalize can include this row's sample here —
-                    // it was being admitted this step, not running — so the
-                    // rollback-path deferral does not apply.
                     if var lease = leasesByID[rec.id] {
                         lease.markPreempted(now: config.clock.now())
                         leasesByID[rec.id] = lease
                     }
                     return nil
                 }
-                // Terminal capacity exhaustion is retryable (the backend is
-                // full, not broken): finish with the canonical prefix so
-                // bridges surface a capacity error, never a server error.
                 finishRequest(
                     rec.id,
                     reason: .error(
@@ -2640,8 +1946,6 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     // MARK: Reconciled-usage snapshots (watchdog-readable)
 
-    /// Publish the reconciled usage for `id` under `stateLock` so the watchdog
-    /// thread can read it while the engine thread is wedged.
     private func setUsageSnapshot(_ id: CBv2RequestID, _ usage: CBv2Usage) {
         stateLock.lock()
         usageSnapshots[id] = usage
@@ -2656,8 +1960,6 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     // MARK: Test/telemetry introspection
 
-    /// Engine-queue-synchronized snapshot of paused (backpressured) rows.
-    /// Blocks until the current step boundary; test/telemetry use only.
     func pausedIDsSnapshot() -> Set<CBv2RequestID> {
         engineQueue.sync { Set(scheduler.running.filter(\.isPaused).map(\.id)) }
     }
@@ -2665,16 +1967,6 @@ public final class EngineLoopV2: @unchecked Sendable {
     // MARK: Gauges
 
     private func publishGauges() {
-        // kvBytesCapacity carries the ADMISSION ceiling so a runtime
-        // re-slice reads back consistently between the resize point-update
-        // and per-step publishes (on the paged backend the two ledgers
-        // diverge — the pool is construction-fixed). An INSTALLED ledger is
-        // authoritative even at 0 (a legitimate zero re-slice must not be
-        // overwritten with pool truth and re-advertise capacity that
-        // admission rejects); backend truth is the fallback only for
-        // ledger-less (bare-loop test) constructions. Reserved bytes carry
-        // the backend's admission-truth promises, so "capacity − reserved"
-        // stays truthful for capacity planners.
         gauges.update(
             CBv2CapacitySnapshot(
                 activeRequests: scheduler.runningCount,
@@ -2723,11 +2015,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         watchdogTimer = nil
     }
 
-    /// Runs on the watchdog queue. The engine thread may be blocked inside a
-    /// wedged eval, so this touches ONLY lock-protected state and the
-    /// (thread-safe) streams: consumers get a timely error, every live
-    /// request is marked for cancellation (cleaned up if the loop ever
-    /// resumes), and the health signal flips for provider heartbeats.
     private func watchdogTick() {
         stateLock.lock()
         let started = stepStartedNanos
@@ -2743,17 +2030,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         wedgeReported = true
         _healthy = false
         let liveStreams = streams
-        // Snapshot the reconciled usage observed before the wedge under the
-        // SAME lock, so each terminal carries the tokens generated so far
-        // instead of raw zero usage (the engine thread is wedged and cannot
-        // reconcile now).
         let usageByID = usageSnapshots
         pendingCancels.formUnion(liveStreams.keys)
         stateLock.unlock()
 
-        // Signal BEFORE erroring the streams: a consumer woken by the
-        // terminal event must be able to observe the wedge side effects
-        // (health metric, telemetry) immediately.
         onStepWedge?(elapsed)
         let message = "engine step exceeded \(Int(config.stepTimeout))s watchdog"
         for (id, stream) in liveStreams {

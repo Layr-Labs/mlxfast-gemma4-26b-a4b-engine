@@ -16,10 +16,13 @@ public enum CBv2StepProfiler {
 
     /// Master switch. Read on hot paths; set it BEFORE the run under
     /// measurement and do not toggle mid-run (plain non-atomic Bool).
-    nonisolated(unsafe) public static var enabled: Bool =
-        ProcessInfo.processInfo.environment["CBV2_STEP_PROFILE"].map {
-            ["1", "true", "yes", "on"].contains($0.lowercased())
-        } ?? false
+    nonisolated(unsafe) public static var enabled: Bool = {
+        let environment = ProcessInfo.processInfo.environment
+        // The sandboxed worker forwards only prefixed variables, so the
+        // DARKBLOOM_ spelling is what reaches a local scored-worker probe.
+        let raw = environment["CBV2_STEP_PROFILE"] ?? environment["DARKBLOOM_CBV2_STEP_PROFILE"]
+        return raw.map { ["1", "true", "yes", "on"].contains($0.lowercased()) } ?? false
+    }()
 
     /// Independent event-counter switch. Benchmark boundaries guarantee that
     /// no engine work is in flight while this plain Bool is changed.

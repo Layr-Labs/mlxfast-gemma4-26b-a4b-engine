@@ -73,14 +73,6 @@ public enum CBv2TiedLMHeadQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    /// Packed-word loads are aligned by the fixed 4-byte lane stride.
-    private static let packed32Enabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_TIED_LMHEAD_PACKED32"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
     /// Pinned to the ruled decode cohort and this checkpoint's tower.
     private static let batch = 8
     private static let groupSize = 64
@@ -448,85 +440,6 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
 }
 """
 
-    private static let packed32KernelHeader: String = {
-        var result = kernelHeader
-        func replaceOnce(_ old: String, with new: String) {
-            precondition(result.components(separatedBy: old).count == 2)
-            result = result.replacingOccurrences(of: old, with: new)
-        }
-        replaceOnce(
-            """
-            template <typename U, int values_per_thread>
-            inline U qdot_affine4_registered(
-                const thread uint16_t* w,
-                const thread U* x_thread,
-                U scale,
-                U bias,
-                U sum) {
-              U accum = 0;
-              #pragma clang loop unroll(full)
-              for (int i = 0; i < (values_per_thread / 4); i++) {
-                accum +=
-                    (x_thread[4 * i] * (w[i] & 0x000f) +
-                     x_thread[4 * i + 1] * (w[i] & 0x00f0) +
-                     x_thread[4 * i + 2] * (w[i] & 0x0f00) +
-                     x_thread[4 * i + 3] * (w[i] & 0xf000));
-              }
-              return scale * accum + sum * bias;
-            }
-            """,
-            with: """
-            template <typename U, int values_per_thread>
-            inline U qdot_affine4_registered_word(
-                uint packed_word,
-                const thread U* x_thread,
-                U scale,
-                U bias,
-                U sum) {
-              static_assert(values_per_thread == 8, "Word load expects eight 4-bit values");
-              const uint packed0 = packed_word & 0xffffu;
-              const uint packed1 = packed_word >> 16;
-              U accum =
-                  (x_thread[0] * (packed0 & 0x000f) +
-                   x_thread[1] * (packed0 & 0x00f0) +
-                   x_thread[2] * (packed0 & 0x0f00) +
-                   x_thread[3] * (packed0 & 0xf000));
-              accum +=
-                  (x_thread[4] * (packed1 & 0x000f) +
-                   x_thread[5] * (packed1 & 0x00f0) +
-                   x_thread[6] * (packed1 & 0x0f00) +
-                   x_thread[7] * (packed1 & 0xf000));
-              return scale * accum + sum * bias;
-            }
-            """
-        )
-        replaceOnce(
-            "thread uint16_t packed[results_per_simdgroup][uint16_per_thread];",
-            with: "thread uint packed[results_per_simdgroup];"
-        )
-        let loadBlock = """
-              const device uint16_t* wl =
-                  (const device uint16_t*)(ws + row * in_vec_size_w);
-              #pragma clang loop unroll(full)
-              for (int i = 0; i < uint16_per_thread; i++) {
-                packed[row][i] = wl[i];
-              }
-            """
-        precondition(result.components(separatedBy: loadBlock).count == 3)
-        result = result.replacingOccurrences(
-            of: loadBlock,
-            with: """
-              const device uint* wl =
-                  (const device uint*)(ws + row * in_vec_size_w);
-              packed[row] = *wl;
-            """
-        )
-        result = result.replacingOccurrences(
-            of: "qdot_affine4_registered<float, values_per_thread>(",
-            with: "qdot_affine4_registered_word<float, values_per_thread>(")
-        return result
-    }()
-
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "cbv2_b8_tied_lmhead_qmv_affine4_g64_quad_stream_unroll_v3",
         inputNames: ["x", "w", "scales", "biases"],
@@ -565,44 +478,6 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
         ensureRowContiguous: true
     )
 
-    private static let packed32Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_tied_lmhead_qmv_affine4_g64_quad_stream_packed32_v1",
-        inputNames: ["x", "w", "scales", "biases"],
-        outputNames: ["y"],
-        source: """
-            const uint3 tid = threadgroup_position_in_grid;
-            const uint simd_gid = simdgroup_index_in_threadgroup;
-            const uint simd_lid = thread_index_in_simdgroup;
-
-            const int in_vec_size = K;
-            const int out_vec_size = OUTN;
-
-            const int first_m = int(tid.x) * 4;
-            if (first_m >= 8) {
-                return;
-            }
-            qmv_affine4_g64_quad_stream_impl<T, 64, 4>(
-                w,
-                scales,
-                biases,
-                x + first_m * in_vec_size,
-                x + (first_m + 1) * in_vec_size,
-                x + (first_m + 2) * in_vec_size,
-                x + (first_m + 3) * in_vec_size,
-                y + first_m * out_vec_size,
-                y + (first_m + 1) * out_vec_size,
-                y + (first_m + 2) * out_vec_size,
-                y + (first_m + 3) * out_vec_size,
-                in_vec_size,
-                tid,
-                simd_gid,
-                simd_lid);
-            return;
-            """,
-        header: packed32KernelHeader,
-        ensureRowContiguous: true
-    )
-
     /// Returns `nil` unless every pin holds; the caller then keeps the stock path.
     public static func matmul(
         x: MLXArray,
@@ -612,6 +487,16 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
         inDim: Int,
         outDim: Int
     ) -> MLXArray? {
+        // Wide MTP verify: eight-row tiles through this exact body.
+        if x.ndim == 3, x.dim(1) == 1, x.dim(0) > batch,
+            let tiled = CBv2MTPWideVerifyContext.rowTiles(x, tile: batch, {
+                matmul(
+                    x: $0, weight: weight, scales: scales, biases: biases,
+                    inDim: inDim, outDim: outDim)
+            })
+        {
+            return tiled
+        }
         // Every dimension is validated against every other, so the gate is a
         // full shape pin at runtime even though the tower's hidden size is not
         // written as a literal here.
@@ -640,14 +525,7 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
 
         let xGroups = batch / rowsPerGroup
         let yGroups = outDim / outputsPerGroup
-        let selectedKernel: MLXFast.MLXFastKernel
-        if packed32Enabled {
-            CBv2EngageMark.once("tied-lmhead-packed32")
-            selectedKernel = packed32Kernel
-        } else {
-            selectedKernel = kernel
-        }
-        return selectedKernel(
+        return kernel(
             [x, weight, scales, biases],
             template: [
                 ("T", x.dtype),

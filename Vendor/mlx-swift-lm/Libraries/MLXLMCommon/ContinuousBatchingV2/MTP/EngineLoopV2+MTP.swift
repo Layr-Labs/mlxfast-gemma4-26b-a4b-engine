@@ -27,7 +27,8 @@ extension EngineLoopV2 {
             mtp.recordControllerFallback("step_reservation_race")
         }
 
-        let buildStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        let profile = CBv2StepProfiler.enabled
+        let buildStart = profile ? CFAbsoluteTimeGetCurrent() : 0
         let work = mtpPrepareRoundWork(
             plan, driver: mtp, demoteAllRounds: demoteAllRounds)
         guard !work.isEmpty else {
@@ -36,8 +37,10 @@ extension EngineLoopV2 {
             scheduler.rollback(plan)
             return nil
         }
+        let workEnd = profile ? CFAbsoluteTimeGetCurrent() : 0
 
         let graph = mtpBuildRoundGraph(work, driver: mtp)
+        let graphEnd = profile ? CFAbsoluteTimeGetCurrent() : 0
         scheduler.markPendingSamples(ids: graph.sampledRows)
         if let verify = graph.verify {
             scheduler.markPendingSamples(
@@ -45,10 +48,22 @@ extension EngineLoopV2 {
         }
         mtp.recordSeedSteps(graph.seedRows.count)
 
+        let launchMemory: CBv2MTPRoundInFlight.MemorySnapshot? =
+            profile ? CBv2MTPRoundInFlight.MemorySnapshot() : nil
         asyncEval(graph.asyncEvalTargets)
-        if CBv2StepProfiler.enabled {
-            CBv2StepProfiler.record(
-                "v2.mtp.launch.total", seconds: CFAbsoluteTimeGetCurrent() - buildStart)
+        if profile {
+            let now = CFAbsoluteTimeGetCurrent()
+            CBv2StepProfiler.record("v2.mtp.launch.total", seconds: now - buildStart)
+            if graph.verify == nil, !graph.seedRows.isEmpty {
+                Self.mtpSeedProfileLine("plan-work", seconds: workEnd - buildStart)
+                Self.mtpSeedProfileLine("graph-build", seconds: graphEnd - workEnd)
+                Self.mtpSeedProfileLine("submit", seconds: now - graphEnd)
+                Self.mtpSeedProfileLine("launch-total", seconds: now - buildStart)
+            } else if graph.verify != nil {
+                FileHandle.standardError.write(
+                    Data(String(format: "[mtp-round] first launch %.1f ms submit %.1f ms\n",
+                        (now - buildStart) * 1000, (now - graphEnd) * 1000).utf8))
+            }
         }
 
         let step = CBv2InFlightStep(
@@ -59,10 +74,12 @@ extension EngineLoopV2 {
             wallStartedNanos: wallStartedNanos)
         step.logprobSegments = graph.logprobSegments
         if graph.verify != nil || !graph.seedRows.isEmpty {
-            step.mtpRound = CBv2MTPRoundInFlight(
+            let round = CBv2MTPRoundInFlight(
                 verify: graph.verify,
                 seedRows: graph.seedRows,
                 seedHidden: graph.seedHidden)
+            round.launchMemory = launchMemory
+            step.mtpRound = round
         }
         return step
     }

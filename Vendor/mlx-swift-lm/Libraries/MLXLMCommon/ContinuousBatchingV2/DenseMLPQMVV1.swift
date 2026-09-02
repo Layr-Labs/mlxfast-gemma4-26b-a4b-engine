@@ -797,6 +797,172 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         return result
     }()
 
+    private static let mma8DownRowsHeader = mma8KernelHeader + """
+
+// Row-tiled twin of the dense down-projection matrix-unit body (static
+// K = 2112, two-deep weight carry) for the wide MTP verify rectangle: RT
+// eight-row activation tiles share every weight fetch; each tile runs the
+// eight-row body's statements in its own order.
+template <typename T, int KS, int RT>
+METAL_FUNC void gemma4_qmv_mma8_affine8_g64_down_k2112_rows_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int N,
+    const int n0,
+    threadgroup float2* red,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int K = 2112;
+  constexpr int G = K / 64;
+  constexpr int gh = (G + 1) / 2;
+  constexpr int nGroups = (KS == 2) ? gh : G;
+  const int g0 = (KS == 2 && simd_gid == 1) ? gh : 0;
+  const mma8_coord c = mma8_lane(simd_lid);
+
+  const device uint8_t* wrow =
+      (const device uint8_t*)w + (n0 + c.fm) * K + 8 * c.fn;
+  const device T* srow = scales + (n0 + c.fm) * G;
+  const device T* brow = biases + (n0 + c.fm) * G;
+  const device T* xbase = x + c.fn * K + 8 * c.fm;
+
+  thread float acc0[RT];
+  thread float acc1[RT];
+#pragma clang loop unroll(full)
+  for (int r = 0; r < RT; ++r) {
+    acc0[r] = 0.0f;
+    acc1[r] = 0.0f;
+  }
+  simdgroup_float8x8 A;
+  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+  uint4 wv_next = *((const device uint4*)(wrow + 64 * g0));
+  uint4 wv_next2 =
+      *((const device uint4*)(wrow + 64 * min(g0 + 1, G - 1)));
+  T s_next = srow[g0];
+  T b_next = brow[g0];
+
+  #pragma unroll
+  for (int gi = 0; gi < nGroups; ++gi) {
+    const int g = g0 + gi;
+    if (g >= G) continue;
+    const uint4 wv = wv_next;
+    const float s = float(s_next);
+    const float b = float(b_next);
+    const int g_next = min(g + 1, G - 1);
+    wv_next = wv_next2;
+    wv_next2 = *((const device uint4*)(wrow + 64 * min(g + 2, G - 1)));
+    s_next = srow[g_next];
+    b_next = brow[g_next];
+
+#pragma clang loop unroll(full)
+    for (int r = 0; r < RT; ++r) {
+      const device T* x0 = xbase + (8 * r) * K;
+      const device T* x1 = x0 + K;
+      const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+      const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+
+      float2 rs = float2(mma8_runsum8<T>(r0), mma8_runsum8<T>(r1));
+      rs += simd_shuffle_xor(rs, 2u);
+      rs += simd_shuffle_xor(rs, 4u);
+      rs += simd_shuffle_xor(rs, 16u);
+
+      simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+      MMA8_SETB(B0, x, lo)
+      MMA8_STEP8(B0, x, z, 0)
+      MMA8_SETB(B1, x, hi)
+      MMA8_STEP8(B1, x, z, 8)
+      MMA8_SETB(B2, y, lo)
+      MMA8_STEP8(B2, x, z, 16)
+      MMA8_SETB(B3, y, hi)
+      MMA8_STEP8(B3, x, z, 24)
+      MMA8_SETB(B4, z, lo)
+      MMA8_STEP8(B4, y, w, 0)
+      MMA8_SETB(B5, z, hi)
+      MMA8_STEP8(B5, y, w, 8)
+      MMA8_SETB(B6, w, lo)
+      MMA8_STEP8(B6, y, w, 16)
+      MMA8_SETB(B7, w, hi)
+      MMA8_STEP8(B7, y, w, 24)
+
+      acc0[r] += s * C.thread_elements()[0] + rs.x * b;
+      acc1[r] += s * C.thread_elements()[1] + rs.y * b;
+    }
+  }
+
+  if (KS == 2) {
+    if (simd_gid == 1) {
+#pragma clang loop unroll(full)
+      for (int r = 0; r < RT; ++r) {
+        red[r * 32 + simd_lid] = float2(acc0[r], acc1[r]);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_gid == 1) {
+      return;
+    }
+#pragma clang loop unroll(full)
+    for (int r = 0; r < RT; ++r) {
+      const float2 other = red[r * 32 + simd_lid];
+      acc0[r] = acc0[r] + other.x;
+      acc1[r] = acc1[r] + other.y;
+    }
+  }
+
+#pragma clang loop unroll(full)
+  for (int r = 0; r < RT; ++r) {
+    y[(8 * r + c.fn) * N + n0 + c.fm] = static_cast<T>(acc0[r]);
+    y[(8 * r + c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc1[r]);
+  }
+}
+"""
+
+    private static let mma8DownRowsKernel = MLXFast.metalKernel(
+        name: "cbv2_wide_dense_mlp_mma8_affine8_g64_down_k2112_rows_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32 * RT];
+            gemma4_qmv_mma8_affine8_g64_down_k2112_rows_impl<T, 2, RT>(
+                w, scales, biases, x, y,
+                w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            """,
+        header: mma8DownRowsHeader,
+        ensureRowContiguous: true)
+
+    /// Wide verify mapping for the down plane: `rows` folds RT row tiles
+    /// into one simdgroup pair; `ztile` gives each row tile its own
+    /// threadgroup (grid.z) running the eight-row body unchanged.
+    public enum WideRoad: String, Sendable { case rows, ztile }
+
+    public static let defaultWideRoad: WideRoad = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_MLP_DOWN_WIDE"],
+            let choice = WideRoad(rawValue: raw.trimmingCharacters(in: .whitespaces).lowercased())
+        else { return .ztile }
+        return choice
+    }()
+
+    private static let mma8DownZTileKernel = MLXFast.metalKernel(
+        name: "cbv2_wide_dense_mlp_mma8_affine8_g64_down_k2112_ztile_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            gemma4_qmv_mma8_affine8_g64_down_k2112_impl<T, 2>(
+                w, scales, biases, x + tid.z * (8 * 2112), y + tid.z * (8 * w_shape[0]),
+                w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            """,
+        header: mma8DownStaticKHeader,
+        ensureRowContiguous: true)
+
     private static let mma8DownStaticKKernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_carry2_bfill_v4",
         inputNames: ["x", "w", "scales", "biases"],
@@ -1095,6 +1261,46 @@ inline U qdot_affine8_registered_v4(
         ensureRowContiguous: true
     )
 
+    /// Wide MTP verify: the W4 quad-stream body over `rows` activation rows
+    /// (four per x-group, one weight walk per group). Same per-row text as
+    /// `w4Kernel`; only the x-group bound comes from the input shape.
+    private static let w4RowsKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_wide_dense_mlp_qmv_affine8_g64_quad_stream_w4_rows_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+
+            const int in_vec_size = x_shape[x_ndim - 1];
+            const int out_vec_size = w_shape[0];
+            const int first_m = int(tid.x) * 4;
+            if (first_m >= x_shape[0]) {
+                return;
+            }
+            qmv_affine8_g64_quad_stream_impl<T, 64, 8>(
+                w,
+                scales,
+                biases,
+                x + first_m * in_vec_size,
+                x + (first_m + 1) * in_vec_size,
+                x + (first_m + 2) * in_vec_size,
+                x + (first_m + 3) * in_vec_size,
+                y + first_m * out_vec_size,
+                y + (first_m + 1) * out_vec_size,
+                y + (first_m + 2) * out_vec_size,
+                y + (first_m + 3) * out_vec_size,
+                in_vec_size,
+                tid,
+                simd_gid,
+                simd_lid);
+            return;
+            """,
+        header: w4KernelHeader,
+        ensureRowContiguous: true
+    )
+
     private static let w4ActivationSumQMVKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_w4_v1",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
@@ -1142,23 +1348,32 @@ inline U qdot_affine8_registered_v4(
     /// Builds the shared gate/up table only for the exact dense decode input.
     /// Returning an opaque value prevents callers from fabricating a table with
     /// a plausible shape; all other inputs keep DMLP-001 unchanged.
+    /// Rows an activation-sum table covers: the pinned decode cohort, or a
+    /// wide MTP verify rectangle's `8 * (1+k)` single-token rows (the table
+    /// is per row; the widened grid touches no other row).
+    private static func sumRows(_ x: MLXArray) -> Int? {
+        guard x.ndim == 3, x.dim(1) == sequence, x.dim(2) == 2816 else { return nil }
+        if x.dim(0) == batch { return batch }
+        if CBv2MTPWideVerifyContext.active, x.dim(0) > batch, x.dim(0) % batch == 0 {
+            return x.dim(0)
+        }
+        return nil
+    }
+
     public static func activationSums(for x: MLXArray) -> ActivationSums? {
         guard enabled,
             activationSumsEnabled,
             x.dtype == .bfloat16,
-            x.ndim == 3,
-            x.dim(0) == batch,
-            x.dim(1) == sequence,
-            x.dim(2) == 2816,
-            x.size == batch * sequence * 2816
+            let rows = sumRows(x),
+            x.size == rows * sequence * 2816
         else { return nil }
         let blocks = 2816 / kBlock
         let values = activationSumKernel(
             [x],
             template: [("T", x.dtype)],
-            grid: (simdWidth, blocks, batch),
+            grid: (simdWidth, blocks, rows),
             threadGroup: (simdWidth, 1, 1),
-            outputShapes: [[blocks * simdWidth * batch]],
+            outputShapes: [[blocks * simdWidth * rows]],
             outputDTypes: [.float32]
         )[0]
         return ActivationSums(values: values)
@@ -1175,14 +1390,11 @@ inline U qdot_affine8_registered_v4(
         guard enabled,
             activationSumsEnabled,
             x.dtype == .bfloat16,
-            x.ndim == 3,
-            x.dim(0) == batch,
-            x.dim(1) == sequence,
-            x.dim(2) == 2816,
-            x.size == batch * sequence * 2816,
+            let rows = sumRows(x),
+            x.size == rows * sequence * 2816,
             values.dtype == .float32,
             values.ndim == 1,
-            values.size == blocks * simdWidth * batch
+            values.size == blocks * simdWidth * rows
         else { return nil }
         return ActivationSums(values: values)
     }
@@ -1197,8 +1409,11 @@ inline U qdot_affine8_registered_v4(
         groupSize: Int,
         bits: Int,
         mode: QuantizationMode,
-        activationSums: ActivationSums? = nil
+        activationSums: ActivationSums? = nil,
+        wideRoad: WideRoad? = nil
     ) -> MLXArray? {
+        let rows = x.ndim == 3 ? x.dim(0) : 0
+        let rowTiles = CBv2MTPWideVerifyContext.rowTileCount(rows: rows, tile: batch)
         guard enabled,
             groupSize == Self.groupSize,
             bits == Self.bits,
@@ -1209,7 +1424,7 @@ inline U qdot_affine8_registered_v4(
             biases.dtype == x.dtype,
             weight.dtype == .uint32,
             x.ndim == 3,
-            x.dim(0) == batch,
+            rowTiles >= 1,
             x.dim(1) == sequence
         else { return nil }
 
@@ -1219,7 +1434,7 @@ inline U qdot_affine8_registered_v4(
         guard liveShape(inDim: inDim, outDim: outDim),
             inDim % Self.groupSize == 0,
             outDim % outputsPerGroup == 0,
-            x.size == batch * sequence * inDim,
+            x.size == rows * sequence * inDim,
             weight.dim(1) == inDim * Self.bits / 32,
             scales.shape == [outDim, inDim / Self.groupSize],
             biases.shape == scales.shape
@@ -1237,6 +1452,38 @@ inline U qdot_affine8_registered_v4(
         // table is still built and consumed for the gate/up plane exactly as on
         // the tip -- the fall-through below is the promoted path unchanged.
         let isGateUp = inDim == 2816 && outDim == 2112
+        if rowTiles > 1 {
+            if isGateUp {
+                guard w4Enabled else { return nil }
+                return w4RowsKernel(
+                    [x, weight, scales, biases],
+                    template: [("T", x.dtype)],
+                    grid: ((rows / rowsPerGroup) * simdWidth, (outDim / outputsPerGroup) * simdGroups, 1),
+                    threadGroup: (simdWidth, simdGroups, 1),
+                    outputShapes: [[rows, sequence, outDim]],
+                    outputDTypes: [x.dtype]
+                )[0]
+            }
+            guard mma8DownEnabled, mma8DownStaticKEnabled, !mma8DownLaneSumsEnabled else { return nil }
+            if (wideRoad ?? defaultWideRoad) == .ztile {
+                return mma8DownZTileKernel(
+                    [x, weight, scales, biases],
+                    template: [("T", x.dtype)],
+                    grid: (simdWidth, (outDim / outputsPerGroup) * simdGroups, rowTiles),
+                    threadGroup: (simdWidth, simdGroups, 1),
+                    outputShapes: [[rows, sequence, outDim]],
+                    outputDTypes: [x.dtype]
+                )[0]
+            }
+            return mma8DownRowsKernel(
+                [x, weight, scales, biases],
+                template: [("T", x.dtype), ("RT", rowTiles)],
+                grid: (simdWidth, (outDim / outputsPerGroup) * simdGroups, 1),
+                threadGroup: (simdWidth, simdGroups, 1),
+                outputShapes: [[rows, sequence, outDim]],
+                outputDTypes: [x.dtype]
+            )[0]
+        }
         if isGateUp ? mma8GateUpEnabled : mma8DownEnabled {
             let yTiles = outDim / outputsPerGroup
             if !isGateUp && mma8DownLaneSumsEnabled {

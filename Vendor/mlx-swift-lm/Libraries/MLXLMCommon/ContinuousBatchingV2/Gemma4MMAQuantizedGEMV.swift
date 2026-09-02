@@ -4,144 +4,29 @@ import Foundation
 import MLX
 import MLXFast
 
-/// MMA-001 --- simdgroup-matrix affine-4/8 quantized GEMV for the tied LM head.
-///
-/// WHY. Gemma 4 26B A4B ties its embedding to the LM head, so `applyLMHead` is
-/// one `quantizedMM` against a `[262144, 2816]` affine group-64 plane. At the
-/// ranked cohort geometry the activation is `[8, 1, 2816]`, i.e. M = 8. Stock
-/// `quantizedMM` routes that to ordinary `affine_qmv` (K = 2816 is not a
-/// multiple of 512, so `qmv_fast` never launches), and the promoted tree
-/// further routes N >= 8192 to `qmv_affine4_g64_quad_stream_impl`. That quad
-/// serves FOUR activation rows per weight fetch, so an M = 8 head streams the
-/// whole 369 MB vocab plane TWICE. The plane is the single largest contiguous
-/// read in a decode step; halving its traffic is the entire mechanism here.
-///
-/// WHAT. One `MLXFast.metalKernel` that serves all EIGHT rows from a single
-/// weight fetch by handing the unpacked codes to the simdgroup matrix units:
-///
-///   * a threadgroup is 4 simdgroups x 32 lanes = 128 threads and owns 32
-///     output columns; each simdgroup owns 8 columns, i.e. one 8x8 `float`
-///     accumulator tile whose rows are the eight activation rows;
-///   * per affine group of 64 the simdgroup unpacks its 8 weight rows into
-///     threadgroup memory ALREADY MULTIPLIED BY THE GROUP SCALE, and the
-///     8-row activation tile is staged alongside it;
-///   * nine `simdgroup_multiply_accumulate` calls consume the group: eight for
-///     the 64 weight columns, and a ninth that carries the affine bias term as
-///     a single extra K slot (see the algebra below), so the bias needs no
-///     second accumulator and no separate reduction.
-///
-/// THE ALGEBRA. Affine quantization dequantizes as `w_k = s_g * q_k + b_g`, so
-///
-///     sum_k x_k * w_k == s_g * (sum_k x_k * q_k) + b_g * (sum_k x_k)
-///
-/// which is exactly how stock `qdot` closes (`scale * accum + sum * bias`).
-/// This kernel folds `s_g` into the staged code (`s_g * q_k`, see EXACTNESS)
-/// and appends `(sum_k x_k, b_g)` as K slot 64 of the same tile, so one MMA
-/// chain produces both terms.
-///
-/// EXACTNESS. This is NOT bit-identical to stock and is not claimed to be.
-/// Two properties are nevertheless held deliberately:
-///
-///   1. `s_g * q_k` is computed in `float` and is EXACT. `s_g` is bf16 (8-bit
-///      significand) and `q_k` is an integer in 0...15 (4 bits), so the product
-///      needs at most 12 significand bits and is exactly representable in
-///      `float`. Folding the scale into the staged weight therefore introduces
-///      no rounding that stock does not also have.
-///   2. The `sum_k x_k` term reproduces stock `load_vector`'s BF16 QUAD-SUM
-///      QUIRK verbatim. Stock sums each aligned group of four activations at
-///      the ACTIVATION dtype before widening to `float`
-///      (`sum += x[i] + x[i+1] + x[i+2] + x[i+3]`, `sum` a `float`), which is
-///      measurably off exact math. The bias term is a first-class part of the
-///      logit, so matching stock's answer -- not exact math -- is what keeps
-///      greedy argmax aligned with the golden tape. The staging code below
-///      writes that expression in stock's exact form and types.
-///
-/// What genuinely differs is FLOAT ACCUMULATION ORDER: the matrix units reduce
-/// a tile as a tree, stock accumulates sequentially per lane and closes with a
-/// `simd_sum` over 64 lanes. Both are float sums of the same terms.
-///
-/// FAIL-CLOSED. `apply` returns `nil` -- and every caller falls back to stock
-/// `asLinear`/`quantizedMM` -- unless every one of these holds:
-///
-///   * `DARKBLOOM_GEMMA4_MMA_HEAD` is not one of `0`/`false`/`no`/`off`;
-///   * the activation is bf16 and shaped `[8, K]` or `[8, 1, K]` -- eight
-///     BATCH rows at one position, never an eight-token prefill chunk;
-///   * affine group size 64, bits 4 (the tied head's quantization);
-///   * K % 64 == 0 (whole affine groups) and K % 8 == 0 (whole uint32 words);
-///   * N % 32 == 0 (whole threadgroups) and N >= 8192; version 15 additionally
-///     requires N % 64 == 0, while the default four-tile version requires
-///     N % 128 == 0.
-///
-/// The N >= 8192 floor is load-bearing and must NOT be widened. A threadgroup
-/// here claims only 32 output columns, so narrow planes (q/k/v/o, the dense
-/// MLP) cannot fill the machine and measured SLOWER than ordinary pair/quad
-/// QMV in isolation. Only the tied vocab plane is meant to enter.
 public enum Gemma4MMAQuantizedGEMV {
 
-    /// Exact affine activation sums emitted by the final RMSNorm producer.
-    /// The initializer stays private so callers cannot fabricate a table that
-    /// merely has the right shape.
     public struct ActivationSums {
         fileprivate let values: MLXArray
     }
 
-    /// Rows the accumulator tile carries --- the ranked cohort's batch.
     private static let mRows = 8
-    /// Output columns one simdgroup owns (one 8x8 tile).
     private static let colsPerSimdgroup = 8
-    /// Simdgroups per threadgroup.
     private static let simdgroupsPerThreadgroup = 4
-    /// Output columns one threadgroup owns in versions 1...14.
     private static let colsPerThreadgroup = colsPerSimdgroup * simdgroupsPerThreadgroup
-    /// Threads per threadgroup (one Apple simdgroup is 32 lanes).
     private static let threadsPerThreadgroup = simdgroupsPerThreadgroup * 32
-    /// Narrowest plane allowed to enter. See FAIL-CLOSED above.
     private static let minOutputWidth = 8192
 
-    /// `false` only when `DARKBLOOM_GEMMA4_MMA_HEAD` is an explicit off value.
-    /// Resolved once; the kill switch is a process-level decision.
-    private static let enabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_MMA_HEAD"]
-        else { return true }
+    private static func environmentFlag(_ name: String) -> Bool {
+        guard let raw = ProcessInfo.processInfo.environment[name] else { return true }
         switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
         case "0", "false", "no", "off": return false
         default: return true
         }
-    }()
+    }
 
-    /// Which staging/MMA formulation runs. `DARKBLOOM_GEMMA4_MMA_HEAD_VERSION`
-    /// is `1` for the fp32 scale-folded kernel, `2` for the bf16-operand kernel
-    /// with a per-group diagonal rescale, and `3` for the bf16-operand kernel
-    /// with a two-deep weight pipeline and the affine bias batched eight groups
-    /// at a time, and `4` for the same arithmetic with the weight matrix built
-    /// directly in each SIMD fragment instead of round-tripping through
-    /// threadgroup memory. Version `5` computes the activation group sums once
-    /// in a tiny prepass rather than once per vocabulary tile and preloads each
-    /// aligned packed-weight group as two vectors. Version `6` applies each
-    /// group's row scale directly to the result fragment instead of forming a
-    /// diagonal matrix. Version `7` stores each lane's two final fragment
-    /// elements directly to the output. Version `8` issues each aligned packed
-    /// weight load before the activation staging interval. Version `9` also
-    /// issues the activation cache loads before the opening barrier and holds
-    /// their four BF16 values in registers. Version `10` builds activation and
-    /// affine operands directly in SIMD fragments, removing the remaining
-    /// threadgroup tiles and barriers. Version `11` loads each row scale at
-    /// the start of its own group and removes the long-lived metadata pipeline.
-    /// Version `12` reads the fragment row's scale directly in all four owning
-    /// lanes, deleting the scale shuffle. Version `13` nests the group loop in
-    /// eight-group affine blocks, preserving accumulation order while removing
-    /// modulo and bias-branch work from the hot inner loop. Version `14` gives
-    /// the five full affine blocks an unguarded operand path while retaining
-    /// the guarded four-group tail. Version `15` gives every SIMD group two
-    /// adjacent output tiles, reusing each activation fragment across both and
-    /// doubling one threadgroup's output width. Version `16` extends the same
-    /// reuse to four output tiles per SIMD group. Version `26` probes one reused
-    /// packed-weight cursor across those tiles. Version `27` keeps that cursor
-    /// and replaces the v13 `min(8u, N_GROUPS - biasBlock)` inner trip with a
-    /// compile-time-8 walk plus a four-group tail `continue`, fully unrolling
-    /// the 44-group outer block walk. Versions 1...16 are shippable and
-    /// numerically validated; see each version's source for what differs.
-    /// Anything unrecognised takes the default.
+    private static let enabled = environmentFlag("DARKBLOOM_GEMMA4_MMA_HEAD")
+
     private static let version: Int = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_MMA_HEAD_VERSION"]
@@ -171,10 +56,6 @@ public enum Gemma4MMAQuantizedGEMV {
 
     private static let defaultVersion = 27
 
-    /// Whether the selected tied-head implementation consumes the exact
-    /// per-row/per-group activation sums. The final RMSNorm uses this to avoid
-    /// producing a sidecar when the head is disabled or a legacy formulation
-    /// was explicitly selected.
     public static var consumesActivationSums: Bool {
         guard enabled else { return false }
         switch version {
@@ -185,9 +66,6 @@ public enum Gemma4MMAQuantizedGEMV {
         }
     }
 
-    /// Adopt a producer-emitted table only for the exact ranked head input.
-    /// The table layout is `[row * (K / 64) + group]`, identical to
-    /// `xSumKernel`.
     public static func activationSums(
         produced values: MLXArray, for x: MLXArray
     ) -> ActivationSums? {
@@ -205,21 +83,6 @@ public enum Gemma4MMAQuantizedGEMV {
         return ActivationSums(values: values)
     }
 
-    /// Kernel source. `T` is the activation/scale dtype, `K` the contraction
-    /// length, `N` the output width; all three arrive as template constants so
-    /// the loop trip counts and the threadgroup allocation are compile-time.
-    ///
-    /// Layout notes for the two staging buffers:
-    ///
-    ///   * `Xs[m * A_STRIDE + j]` --- activation tile. `j` in 0..<64 is the
-    ///     group's activations, `j == 64` is the bf16-quad `sum_k x_k` that
-    ///     multiplies the affine bias, `j` in 65..<72 is zero padding so the
-    ///     ninth 8-wide MMA slice contributes only the bias term.
-    ///   * `Ws[sg][j * 8 + n]` --- staged weight tile for simdgroup `sg`, same
-    ///     `j` convention: scaled codes, then the bias, then zeros.
-    ///
-    /// The pad slots are written once before the group loop and never touched
-    /// again, so the loop stages exactly 64 + 1 slots per group.
     private static let source = """
         constexpr uint M_ROWS = 8;
         constexpr uint GROUP = 64;
@@ -403,56 +266,6 @@ public enum Gemma4MMAQuantizedGEMV {
 
     // MARK: - Version 2 --- bf16 operands on the matrix units
 
-    /// Version 2. Same geometry, same gates, same answer to one ULP --- what
-    /// changes is WHICH ARITHMETIC UNITS DO THE WORK.
-    ///
-    /// Version 1 hands `simdgroup_multiply_accumulate` three fp32 matrices.
-    /// Apple's matrix units accelerate 16-bit operands; an fp32 MMA falls back
-    /// to ordinary FMA rate, so v1's 396 fp32 MMAs per simdgroup bought tile
-    /// syntax and no matrix throughput. Metal's MMA is fully mixed-precision
-    /// (`d:R, a:T, b:U, c:V`, independently typed, the only constraint being
-    /// that each is floating point), so the accumulator can stay fp32 while
-    /// BOTH OPERANDS drop to bf16.
-    ///
-    /// Both operands are bf16 WITHOUT LOSING ANYTHING:
-    ///
-    ///   * A is the activation, which is ALREADY bf16 --- staging it as bf16
-    ///     is the identity, where v1 widened every value to float;
-    ///   * B is the RAW 4-bit code, an integer in 0...15, which needs four
-    ///     significand bits and is therefore EXACT in bf16's eight.
-    ///
-    /// The products are exact in fp32 (8 + 8 significand bits) and the
-    /// accumulator is fp32, so the group dot product is exact. v1 instead
-    /// folded the group scale into the staged weight (`s_g * q_k`, also exact,
-    /// but fp32-wide). The scale has to be reapplied somewhere; v2 does it
-    /// AFTER the group's dot product, which is also closer to stock's own
-    /// `scale * accum + sum * bias` close than v1's per-element fold.
-    ///
-    /// Reapplying a PER-COLUMN scale to an accumulator tile has no cheap
-    /// elementwise form --- `thread_elements()` lane mapping is not contracted
-    /// --- so v2 uses the identity `accg * diag(s) == accg scaled by column`:
-    /// one fp32 MMA against a diagonal matrix. The affine bias rides a second
-    /// fp32 MMA of a rank-1 pair (a column of `sum_k x_k`, a row of `b_g`).
-    /// That is 2 fp32 MMAs per group against 8 bf16 ones, i.e. 88 fp32 + 352
-    /// bf16 per simdgroup where v1 ran 396 fp32.
-    ///
-    /// Three consequences beyond the matrix units, all of which favour v2:
-    ///
-    ///   * the weight staging buffer halves (bf16, not fp32), which is the
-    ///     kernel's dominant threadgroup store;
-    ///   * threadgroup memory drops ~14 KB -> ~10.6 KB per threadgroup, so
-    ///     more threadgroups stay resident --- v1 measured only ~71 GB/s on a
-    ///     ~273 GB/s part, i.e. it was occupancy/latency bound, not bandwidth
-    ///     bound, and this is the direct lever on that;
-    ///   * staging loses a multiply per weight element (no scale fold).
-    ///
-    /// `W_STRIDE` is 74, which is `2 (mod 4)` ON PURPOSE. Banks are 4-byte
-    /// words, so a bf16 element's bank is `(byte/4) % 32`. A stride of 74
-    /// makes the per-n word stride 37 --- ODD --- and the store bank
-    /// `(5n + 4u + b/2) % 32`. Because `5n mod 4 == n mod 4`, two lanes
-    /// collide only if `5(n - n') == 4(u' - u)`, which needs `n == n' (mod 4)`
-    /// and then `u - u' == 5`: impossible for `u` in 0...3. So all 32 lanes of
-    /// a simdgroup hit 32 distinct bank words, elementwise, with no packing.
     private static let sourceV2 = """
         constexpr uint M_ROWS = 8;
         constexpr uint GROUP = 64;
@@ -629,73 +442,6 @@ public enum Gemma4MMAQuantizedGEMV {
 
     // MARK: - Version 3 --- deeper weight pipeline, batched affine bias
 
-    /// Version 3. Same arithmetic as version 2 --- bf16 operands, fp32
-    /// accumulator, exact group dot product, the scale reapplied through
-    /// `accg * diag(s)`. What changes is HOW MUCH MEMORY IS IN FLIGHT and how
-    /// often the fp32 units are asked to do rank-1 work.
-    ///
-    /// WHY V2 STALLS. At 4.461 ms over 415 MB v2 runs ~93 GB/s on a ~273 GB/s
-    /// part, so it is not bandwidth bound; it is bound by how little it has
-    /// outstanding. Each lane demands exactly TWO uint32 of weight per group,
-    /// so a whole threadgroup demands ~1 KB per barrier interval and then
-    /// stops at the barrier. With ~10.4 KB of threadgroup memory capping
-    /// residency near six threadgroups per core, the machine has on the order
-    /// of 100 KB in flight against a latency-bandwidth product that wants
-    /// appreciably more. Both changes below attack that number.
-    ///
-    /// 1. TWO-DEEP WEIGHT PIPELINE. v2 requested group `g+1` before the
-    ///    staging barrier and consumed it after the MMAs -- one group of loads
-    ///    in flight. v3 keeps TWO groups in flight (`g+1` and `g+2` are both
-    ///    outstanding while `g` is being multiplied), which doubles the bytes
-    ///    a threadgroup has demanded at any instant. This costs four registers
-    ///    per lane and NOT ONE BYTE of threadgroup memory, so unlike widening
-    ///    the tile it buys memory-level parallelism without trading away the
-    ///    residency that also feeds it.
-    ///
-    /// 2. THE AFFINE BIAS IS BATCHED EIGHT GROUPS AT A TIME. The bias term is
-    ///    `sum_g xsum[m][g] * b_g[n]`. v2 spent one fp32 rank-1 MMA per group
-    ///    on it -- 44 per simdgroup -- which is a wasteful shape, since a
-    ///    rank-1 product uses one of eight available K slots. v3 accumulates
-    ///    eight groups into the tile's eight K slots (`XbB[m][gg]`,
-    ///    `BbB[gg][n]`) and fires ONE MMA per eight groups: **44 -> 6**. Total
-    ///    fp32 MMAs per simdgroup fall from 88 to 50 while the bf16 count is
-    ///    unchanged at 352.
-    ///
-    ///    `N_GROUPS` is 44 = 5*8 + 4, so the final block is partial. Rather
-    ///    than clear both tiles per block -- which would race the same phase's
-    ///    writes -- the LAST group zeroes only the K slots above its own, using
-    ///    the same lanes that write the live slot, so no two threads touch one
-    ///    address. Full blocks overwrite all eight slots and need no clearing.
-    ///
-    /// 3. THE OUTPUT TILE ALIASES THE DIAGONAL BUFFER. `Sd` is dead once the
-    ///    group loop ends, and the result staging wants exactly its shape and
-    ///    size, so `simdgroup_store` targets `Sd` directly. Threadgroup memory
-    ///    per threadgroup: ~10.4 KB -> ~9.4 KB.
-    ///
-    /// Everything numeric is bit-for-bit version 2's formulation: the same
-    /// exact bf16 products, the same fp32 accumulation, the same stock bf16
-    /// quad-sum feeding the bias. Batching the bias changes only the ORDER in
-    /// which the rank-1 terms are summed -- eight added inside one MMA's K
-    /// reduction rather than eight separate accumulations into `acc`.
-    ///
-    /// 4. THE TRANSPOSED TILE LOAD IS GONE, BY COMPUTING THE TRANSPOSE. A
-    ///    packed uint32 yields eight consecutive K for ONE output column, so
-    ///    the weight staging buffer is naturally `[n][j]` -- while `out = X W`
-    ///    wants that tile as `[j][n]`. v2 reconciled the two with
-    ///    `simdgroup_load(..., transpose: true)` on the kernel's hottest load,
-    ///    352 of them per simdgroup. MEASURED COST OF THAT FLAG ALONE: ratio
-    ///    0.6910 -> 0.6519 (0.24 ms) on an otherwise identical kernel.
-    ///
-    ///    v3 accumulates the TRANSPOSED product `outT = W X^T` instead, so the
-    ///    weight tile is the LEFT operand and loads in exactly the layout it
-    ///    was stored in, untransposed. The price is transposing the activation
-    ///    -- 512 elements per group against the weights' 2048, and paid at the
-    ///    store, where the addresses are ours to choose. The rescales transpose
-    ///    with it: a per-COLUMN scale on `out` is a per-ROW scale on `outT`, so
-    ///    the diagonal moves to the left operand (`diag(s) * accgT`) and the
-    ///    bias pair swaps to `BbT * XbT`. The output loop reads the result tile
-    ///    back with its indices exchanged. Transposing a product changes no
-    ///    individual term, so this is numerically inert.
     private static let sourceV3 = """
         constexpr uint M_ROWS = 8;
         constexpr uint GROUP = 64;
@@ -907,14 +653,6 @@ public enum Gemma4MMAQuantizedGEMV {
 
     // MARK: - Version 4 --- direct weight-fragment construction
 
-    /// Version 4 keeps version 3's arithmetic, transposed product, scale close,
-    /// and batched affine bias, but deletes the 4,736-byte threadgroup weight
-    /// tile and the register pipeline that fed it. The 8x8
-    /// simdgroup-matrix fragment layout is two adjacent row-major elements per
-    /// lane. The four lanes that own one output row read the same packed word;
-    /// the GPU's memory coalescer can merge that identical address while each
-    /// lane extracts its own nibble pair. This avoids both the staging round
-    /// trip and a per-tile SIMD shuffle while nearly halving threadgroup memory.
     private static let sourceV4: String = {
         var result = sourceV3
 
@@ -1090,38 +828,49 @@ public enum Gemma4MMAQuantizedGEMV {
 
     // MARK: - Version 5 --- one activation-sum prepass
 
-    /// The affine bias uses stock QMV's BF16 quad-sum of each 64-wide
-    /// activation group. Versions 1...4 reproduce it inside every vocabulary
-    /// tile. At N=262144 that repeats the same 352 sums in 8,192 threadgroups.
-    /// This prepass writes those exact FP32 sums once.
+    private static let xSumSource = """
+        constexpr uint M_ROWS = 8;
+        constexpr uint GROUP = 64;
+        constexpr uint N_GROUPS = K / GROUP;
+        const uint cell = thread_position_in_grid.x;
+        if (cell >= M_ROWS * N_GROUPS) return;
+
+        const device T* xp =
+            x + (cell / N_GROUPS) * K + (cell % N_GROUPS) * GROUP;
+        float s = 0.0f;
+        #pragma unroll
+        for (uint c = 0; c < GROUP / 8; ++c) {
+            const uint i = c * 8;
+            s += xp[i + 0] + xp[i + 1] + xp[i + 2] + xp[i + 3];
+            s += xp[i + 4] + xp[i + 5] + xp[i + 6] + xp[i + 7];
+        }
+        xSums[cell] = s;
+        """
+
     private static let xSumKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_mma_affine4_xsum_m8_v27_unroll",
         inputNames: ["x"],
         outputNames: ["xSums"],
-        source: """
-            constexpr uint M_ROWS = 8;
-            constexpr uint GROUP = 64;
-            constexpr uint N_GROUPS = K / GROUP;
-            const uint cell = thread_position_in_grid.x;
-            if (cell >= M_ROWS * N_GROUPS) return;
-
-            const device T* xp =
-                x + (cell / N_GROUPS) * K + (cell % N_GROUPS) * GROUP;
-            float s = 0.0f;
-            #pragma unroll
-            for (uint c = 0; c < GROUP / 8; ++c) {
-                const uint i = c * 8;
-                s += xp[i + 0] + xp[i + 1] + xp[i + 2] + xp[i + 3];
-                s += xp[i + 4] + xp[i + 5] + xp[i + 6] + xp[i + 7];
-            }
-            xSums[cell] = s;
-            """,
+        source: xSumSource,
         ensureRowContiguous: true
     )
 
-    /// Version 5 consumes the precomputed sums and exposes the eight packed
-    /// weight words for each group through two aligned vector loads. Activation,
-    /// scale, bias, accumulation, and output statement order remain version 4's.
+    private static let xSumRowsSource: String = {
+        let marker = "constexpr uint M_ROWS = 8;"
+        let count = xSumSource.components(separatedBy: marker).count
+        precondition(count == 2, "xSumRowsSource replacement count \(count): \(marker)")
+        return xSumSource.replacingOccurrences(
+            of: marker, with: "constexpr uint M_ROWS = 8 * RT;")
+    }()
+
+    private static let xSumRowsKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_affine4_xsum_m8_rows_v1",
+        inputNames: ["x"],
+        outputNames: ["xSums"],
+        source: xSumRowsSource,
+        ensureRowContiguous: true
+    )
+
     private static let sourceV5: String = {
         var result = sourceV4
 
@@ -1194,10 +943,6 @@ public enum Gemma4MMAQuantizedGEMV {
 
     // MARK: - Version 6 --- direct result-fragment rescale
 
-    /// Every lane owns two adjacent elements from one output row, so its row's
-    /// scale can be broadcast from the first eight lanes and applied with the
-    /// same FP32 fused multiply-add represented by the diagonal matrix product.
-    /// This removes one FP32 matrix operation per quantization group.
     private static let sourceV6: String = {
         var result = sourceV5
 
@@ -1255,10 +1000,6 @@ public enum Gemma4MMAQuantizedGEMV {
 
     // MARK: - Version 7 --- direct result-fragment output
 
-    /// The output fragment has the same two-elements-per-lane layout already
-    /// used to construct the weight fragment. Store those elements at their
-    /// transposed output coordinates instead of round-tripping the completed
-    /// tile through threadgroup memory and two closing barriers.
     private static let sourceV7: String = {
         var result = sourceV6
 
@@ -1306,10 +1047,6 @@ public enum Gemma4MMAQuantizedGEMV {
 
     // MARK: - Version 8 --- early aligned weight loads
 
-    /// Version 7 requests each group's weights only after the activation tile
-    /// is staged and synchronized. Move the same two uint4 loads above that
-    /// interval so their latency overlaps the fixed activation and metadata
-    /// work; fragment contents and arithmetic are unchanged.
     private static let sourceV8: String = {
         var result = sourceV7
 
@@ -1400,9 +1137,6 @@ public enum Gemma4MMAQuantizedGEMV {
 
     // MARK: - Version 9 --- early activation cache loads
 
-    /// Load each lane's four activation values before the barrier that protects
-    /// the reusable activation tile, then publish the register values after it.
-    /// Device reads overlap the barrier while shared-memory ordering is intact.
     private static let sourceV9: String = {
         var result = sourceV8
 
@@ -1468,10 +1202,6 @@ public enum Gemma4MMAQuantizedGEMV {
 
     // MARK: - Version 10 --- direct activation and affine fragments
 
-    /// Build the activation and batched-affine operands directly in each SIMD
-    /// fragment. This removes the last threadgroup tiles and every barrier;
-    /// the extra activation and x-sum reads hit the shared device cache. Matrix
-    /// shapes, operand values, and accumulation order remain version 9's.
     private static let sourceV10: String = {
         var result = sourceV9
 
@@ -1600,9 +1330,6 @@ public enum Gemma4MMAQuantizedGEMV {
 
     // MARK: - Version 11 --- just-in-time row-scale loads
 
-    /// Load each row scale at the start of its own group. Eight matrix slices
-    /// separate that read from the result-fragment FMA, so the prior two-group
-    /// metadata pipeline can be removed along with its long-lived registers.
     private static let sourceV11: String = {
         var result = sourceV10
 
@@ -1679,9 +1406,6 @@ public enum Gemma4MMAQuantizedGEMV {
 
     // MARK: - Version 12 --- direct fragment-row scales
 
-    /// Each of the four lanes that owns an output row reads that row's scale
-    /// directly. The cache/coalescer merges the repeated address, while the
-    /// result fragment no longer needs a lane predicate or SIMD shuffle.
     private static let sourceV12: String = {
         var result = sourceV11
 
@@ -1741,9 +1465,6 @@ public enum Gemma4MMAQuantizedGEMV {
 
     // MARK: - Version 13 --- exact eight-group block loop
 
-    /// Nest the 44 scaled-code groups under six affine blocks. Bias MMAs remain
-    /// at exactly the same points in the FP32 accumulation, while `% 8`, the
-    /// last-group test, and the per-group bias branch leave the hot inner loop.
     private static let sourceV13: String = {
         var result = sourceV12
 
@@ -1791,9 +1512,6 @@ public enum Gemma4MMAQuantizedGEMV {
 
     // MARK: - Version 14 --- full affine-block fast path
 
-    /// Five of the six affine blocks are entirely in bounds. Use one uniform
-    /// block test so their four fragment loads avoid per-lane tail predicates;
-    /// the final four-group block retains version 13's guarded assignments.
     private static let sourceV14: String = {
         var result = sourceV13
 
@@ -1854,10 +1572,6 @@ public enum Gemma4MMAQuantizedGEMV {
 
     // MARK: - Version 15 --- two output tiles per SIMD group
 
-    /// Each SIMD group owns sixteen output rows through two independent 8x8
-    /// accumulators. The two tiles reuse every activation fragment while their
-    /// packed weights, scales, affine biases, and output coordinates remain
-    /// exactly version 14's. A threadgroup therefore covers 64 output rows.
     private static let sourceV15: String = {
         var result = sourceV14
 
@@ -2092,9 +1806,6 @@ public enum Gemma4MMAQuantizedGEMV {
 
     // MARK: - Version 16 --- four output tiles per SIMD group
 
-    /// Extends version 15's activation reuse from two to four independent 8x8
-    /// output tiles. The reduced activation-fragment construction and grid
-    /// size outweigh the additional accumulator register footprint.
     private static let sourceV16: String = {
         var result = sourceV15
 
@@ -2445,9 +2156,6 @@ public enum Gemma4MMAQuantizedGEMV {
 
     // MARK: - Version 26 --- reused packed-weight cursor
 
-    /// Removes four long-lived weight-row pointers and reuses one transient
-    /// packed cursor while loading each tile. The same eight uint4 values are
-    /// loaded in the same tile order as version 16.
     private static let sourceV26: String = {
         var result = sourceV16
 
@@ -2530,12 +2238,6 @@ public enum Gemma4MMAQuantizedGEMV {
 
     // MARK: - Version 27 --- compile-time affine-block inner trip
 
-    /// Version 26 still inherits v13's `min(8u, N_GROUPS - biasBlock)` inner
-    /// bound, a runtime trip count the compiler cannot unroll. K=2816 makes
-    /// N_GROUPS a constexpr 44, so the outer walk is six blocks and the last
-    /// block has four groups. Iterate `gg < 8`, `continue` the four-group
-    /// tail, and fully unroll both loops. The named metallib key changes so a
-    /// stale v26 body cannot keep serving the runtime-bounded trip.
     private static let sourceV27: String = {
         var result = sourceV26
 
@@ -2576,47 +2278,8 @@ public enum Gemma4MMAQuantizedGEMV {
 
     // MARK: - Version 27 carry --- weight-operand register carry
 
-    /// `false` only when `DARKBLOOM_GEMMA4_MMA_HEAD_CARRY` is an explicit off
-    /// value. Resolved once; the kill switch is a process-level decision. Off
-    /// restores `kernelV27` and its source byte for byte.
-    private static let carryEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_MMA_HEAD_CARRY"]
-        else { return true }
-        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
-        case "0", "false", "no", "off": return false
-        default: return true
-        }
-    }()
+    private static let carryEnabled = environmentFlag("DARKBLOOM_GEMMA4_MMA_HEAD_CARRY")
 
-    /// MMA-HEAD-CARRY-013. The weight-operand register carry the frontier
-    /// applied to the two attention matrix-unit tiers and to the dense down
-    /// plane, now on the tied language head --- the last matrix-unit body in
-    /// the tree without it, and the one leaning hardest on DRAM: roughly
-    /// 415 MB of packed vocabulary plane per decode step, one dispatch per
-    /// step, the largest per-dispatch cost in the decode window.
-    ///
-    /// Every address in this body is a function of the group index alone, so
-    /// one group's four packed code pairs and four group scales are read a
-    /// whole iteration ahead and stay resident in registers while the current
-    /// group's thirty-two matrix-unit steps run. `gNext` is clamped to the
-    /// last valid group, so the final look-ahead re-reads a group already read
-    /// and its value is discarded at loop exit. The `g >= N_GROUPS` trips of
-    /// the unrolled tail block neither consume nor advance the carry.
-    ///
-    /// The read stays at the statement the incumbent load already occupied.
-    /// Moving it to the top of the body instead perturbs the close's
-    /// floating-point contraction and stops the output matching version 27
-    /// bit for bit; keeping it here leaves the emitted arithmetic word for
-    /// word what version 27 emits. Nothing else moves: the same eight `uint4`
-    /// values reach the same `A0...A3` fragments in the same tile order, the
-    /// `accg` chain, the `metal::fma` scale close, the batched affine-bias MMA
-    /// and the store are untouched, and no dtype changes. Output is
-    /// bit-identical to version 27's.
-    ///
-    /// The affine bias is NOT carried. Version 13 batched it out of the group
-    /// walk into one rank-8 MMA per eight groups, so there is no per-group
-    /// bias read left in this body to move.
     private static let sourceV27Carry: String = {
         var result = sourceV27
 
@@ -2758,14 +2421,308 @@ public enum Gemma4MMAQuantizedGEMV {
         ensureRowContiguous: true
     )
 
-    /// Tied-head GEMV, or `nil` when any gate above fails.
-    ///
-    /// - Parameters:
-    ///   - x: activation, `[8, K]` or anything that flattens to it, bf16.
-    ///   - w: packed affine codes, `[N, K * bits / 32]` uint32.
-    ///   - scales: `[N, K / groupSize]`, same dtype as `x`.
-    ///   - biases: `[N, K / groupSize]`, same dtype as `x`.
-    /// - Returns: `[8, N]` in `x`'s dtype, or `nil`.
+    // MARK: - Version 27 rows --- RT eight-row tiles share one weight fetch
+
+    private static let rowsEnabled = environmentFlag("DARKBLOOM_GEMMA4_MMA_HEAD_ROWS")
+
+    // Every row tile runs the eight-row body's statements in the eight-row
+    // order on the same dequantized operands; only the B fragment, the sums
+    // and the stores are indexed by the tile. The activation arrives as
+    // [K][pair][RT][2] so a lane's RT bf16 pairs are one contiguous run and
+    // a simdgroup's B fragment loads coalesce; the unpack is the exact
+    // bf16 -> float widening the eight-row body performs.
+    private static let sourceV27Rows: String = {
+        var result = sourceV27Carry
+
+        func replaceOnce(_ old: String, with new: String) {
+            let count = result.components(separatedBy: old).count
+            precondition(count == 2, "sourceV27Rows replacement count \(count): \(old)")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+
+        replaceOnce(
+            """
+            simdgroup_matrix<float, 8, 8> acc0 = simdgroup_matrix<float, 8, 8>(0.0f);
+            simdgroup_matrix<float, 8, 8> acc1 = simdgroup_matrix<float, 8, 8>(0.0f);
+            simdgroup_matrix<float, 8, 8> acc2 = simdgroup_matrix<float, 8, 8>(0.0f);
+            simdgroup_matrix<float, 8, 8> acc3 = simdgroup_matrix<float, 8, 8>(0.0f);
+            """,
+            with: """
+            const device uint* xPairs = reinterpret_cast<const device uint*>(x);
+            simdgroup_matrix<float, 8, 8> acc0[RT];
+            simdgroup_matrix<float, 8, 8> acc1[RT];
+            simdgroup_matrix<float, 8, 8> acc2[RT];
+            simdgroup_matrix<float, 8, 8> acc3[RT];
+            #pragma clang loop unroll(full)
+            for (int r = 0; r < RT; ++r) {
+                acc0[r] = simdgroup_matrix<float, 8, 8>(0.0f);
+                acc1[r] = simdgroup_matrix<float, 8, 8>(0.0f);
+                acc2[r] = simdgroup_matrix<float, 8, 8>(0.0f);
+                acc3[r] = simdgroup_matrix<float, 8, 8>(0.0f);
+            }
+            """
+        )
+
+        replaceOnce(
+            """
+                simdgroup_matrix<float, 8, 8> accg0 =
+                    simdgroup_matrix<float, 8, 8>(0.0f);
+                simdgroup_matrix<float, 8, 8> accg1 =
+                    simdgroup_matrix<float, 8, 8>(0.0f);
+                simdgroup_matrix<float, 8, 8> accg2 =
+                    simdgroup_matrix<float, 8, 8>(0.0f);
+                simdgroup_matrix<float, 8, 8> accg3 =
+                    simdgroup_matrix<float, 8, 8>(0.0f);
+            """,
+            with: """
+                simdgroup_matrix<float, 8, 8> accg0[RT];
+                simdgroup_matrix<float, 8, 8> accg1[RT];
+                simdgroup_matrix<float, 8, 8> accg2[RT];
+                simdgroup_matrix<float, 8, 8> accg3[RT];
+                #pragma clang loop unroll(full)
+                for (int r = 0; r < RT; ++r) {
+                    accg0[r] = simdgroup_matrix<float, 8, 8>(0.0f);
+                    accg1[r] = simdgroup_matrix<float, 8, 8>(0.0f);
+                    accg2[r] = simdgroup_matrix<float, 8, 8>(0.0f);
+                    accg3[r] = simdgroup_matrix<float, 8, 8>(0.0f);
+                }
+            """
+        )
+
+        replaceOnce("        simdgroup_matrix<float, 8, 8> B;\n", with: "")
+
+        replaceOnce(
+            """
+                    const uint activationK = g * GROUP + t * 8 + fragmentRow;
+                    B.thread_elements()[0] =
+                        float(x[fragmentCol * K + activationK]);
+                    B.thread_elements()[1] =
+                        float(x[(fragmentCol + 1) * K + activationK]);
+                    simdgroup_multiply_accumulate(accg0, A0, B, accg0);
+                    simdgroup_multiply_accumulate(accg1, A1, B, accg1);
+                    simdgroup_multiply_accumulate(accg2, A2, B, accg2);
+                    simdgroup_multiply_accumulate(accg3, A3, B, accg3);
+            """,
+            with: """
+                    const uint activationK = g * GROUP + t * 8 + fragmentRow;
+                    const device uint* activationPairs =
+                        xPairs + (activationK * 4 + (fragmentCol >> 1)) * RT;
+                    #pragma clang loop unroll(full)
+                    for (int r = 0; r < RT; ++r) {
+                        const uint pair = activationPairs[r];
+                        simdgroup_matrix<float, 8, 8> B;
+                        B.thread_elements()[0] = as_type<float>(pair << 16);
+                        B.thread_elements()[1] = as_type<float>(pair & 0xFFFF0000u);
+                        simdgroup_multiply_accumulate(accg0[r], A0, B, accg0[r]);
+                        simdgroup_multiply_accumulate(accg1[r], A1, B, accg1[r]);
+                        simdgroup_multiply_accumulate(accg2[r], A2, B, accg2[r]);
+                        simdgroup_multiply_accumulate(accg3[r], A3, B, accg3[r]);
+                    }
+            """
+        )
+
+        replaceOnce(
+            """
+            acc0.thread_elements()[0] = metal::fma(
+                rowScale0, accg0.thread_elements()[0], acc0.thread_elements()[0]);
+            acc0.thread_elements()[1] = metal::fma(
+                rowScale0, accg0.thread_elements()[1], acc0.thread_elements()[1]);
+            acc1.thread_elements()[0] = metal::fma(
+                rowScale1, accg1.thread_elements()[0], acc1.thread_elements()[0]);
+            acc1.thread_elements()[1] = metal::fma(
+                rowScale1, accg1.thread_elements()[1], acc1.thread_elements()[1]);
+            acc2.thread_elements()[0] = metal::fma(
+                rowScale2, accg2.thread_elements()[0], acc2.thread_elements()[0]);
+            acc2.thread_elements()[1] = metal::fma(
+                rowScale2, accg2.thread_elements()[1], acc2.thread_elements()[1]);
+            acc3.thread_elements()[0] = metal::fma(
+                rowScale3, accg3.thread_elements()[0], acc3.thread_elements()[0]);
+            acc3.thread_elements()[1] = metal::fma(
+                rowScale3, accg3.thread_elements()[1], acc3.thread_elements()[1]);
+            """,
+            with: """
+            #pragma clang loop unroll(full)
+            for (int r = 0; r < RT; ++r) {
+                acc0[r].thread_elements()[0] = metal::fma(
+                    rowScale0, accg0[r].thread_elements()[0], acc0[r].thread_elements()[0]);
+                acc0[r].thread_elements()[1] = metal::fma(
+                    rowScale0, accg0[r].thread_elements()[1], acc0[r].thread_elements()[1]);
+                acc1[r].thread_elements()[0] = metal::fma(
+                    rowScale1, accg1[r].thread_elements()[0], acc1[r].thread_elements()[0]);
+                acc1[r].thread_elements()[1] = metal::fma(
+                    rowScale1, accg1[r].thread_elements()[1], acc1[r].thread_elements()[1]);
+                acc2[r].thread_elements()[0] = metal::fma(
+                    rowScale2, accg2[r].thread_elements()[0], acc2[r].thread_elements()[0]);
+                acc2[r].thread_elements()[1] = metal::fma(
+                    rowScale2, accg2[r].thread_elements()[1], acc2[r].thread_elements()[1]);
+                acc3[r].thread_elements()[0] = metal::fma(
+                    rowScale3, accg3[r].thread_elements()[0], acc3[r].thread_elements()[0]);
+                acc3[r].thread_elements()[1] = metal::fma(
+                    rowScale3, accg3[r].thread_elements()[1], acc3[r].thread_elements()[1]);
+            }
+            """
+        )
+
+        replaceOnce(
+            """
+                        XBm.thread_elements()[0] =
+                            xSums[fragmentCol * N_GROUPS + biasRow];
+                        XBm.thread_elements()[1] =
+                            xSums[(fragmentCol + 1) * N_GROUPS + biasRow];
+                    } else {
+            """,
+            with: """
+                    } else {
+            """
+        )
+
+        replaceOnce(
+            """
+                        XBm.thread_elements()[0] = biasRow < N_GROUPS
+                            ? xSums[fragmentCol * N_GROUPS + biasRow] : 0.0f;
+                        XBm.thread_elements()[1] = biasRow < N_GROUPS
+                            ? xSums[(fragmentCol + 1) * N_GROUPS + biasRow] : 0.0f;
+                    }
+                            simdgroup_multiply_accumulate(acc0, BBm0, XBm, acc0);
+                    simdgroup_multiply_accumulate(acc1, BBm1, XBm, acc1);
+                    simdgroup_multiply_accumulate(acc2, BBm2, XBm, acc2);
+                    simdgroup_multiply_accumulate(acc3, BBm3, XBm, acc3);
+            """,
+            with: """
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int r = 0; r < RT; ++r) {
+                        const uint sumM = uint(r) * 8u + fragmentCol;
+                        XBm.thread_elements()[0] = biasRow < N_GROUPS
+                            ? xSums[sumM * N_GROUPS + biasRow] : 0.0f;
+                        XBm.thread_elements()[1] = biasRow < N_GROUPS
+                            ? xSums[(sumM + 1) * N_GROUPS + biasRow] : 0.0f;
+                        simdgroup_multiply_accumulate(acc0[r], BBm0, XBm, acc0[r]);
+                        simdgroup_multiply_accumulate(acc1[r], BBm1, XBm, acc1[r]);
+                        simdgroup_multiply_accumulate(acc2[r], BBm2, XBm, acc2[r]);
+                        simdgroup_multiply_accumulate(acc3[r], BBm3, XBm, acc3[r]);
+                    }
+            """
+        )
+
+        replaceOnce(
+            """
+            out[fragmentCol * N + outputN0] = T(acc0.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN0] = T(acc0.thread_elements()[1]);
+            out[fragmentCol * N + outputN1] = T(acc1.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN1] = T(acc1.thread_elements()[1]);
+            out[fragmentCol * N + outputN2] = T(acc2.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN2] = T(acc2.thread_elements()[1]);
+            out[fragmentCol * N + outputN3] = T(acc3.thread_elements()[0]);
+            out[(fragmentCol + 1) * N + outputN3] = T(acc3.thread_elements()[1]);
+            """,
+            with: """
+            #pragma clang loop unroll(full)
+            for (int r = 0; r < RT; ++r) {
+                const uint outputM = uint(r) * 8u + fragmentCol;
+                out[outputM * N + outputN0] = T(acc0[r].thread_elements()[0]);
+                out[(outputM + 1) * N + outputN0] = T(acc0[r].thread_elements()[1]);
+                out[outputM * N + outputN1] = T(acc1[r].thread_elements()[0]);
+                out[(outputM + 1) * N + outputN1] = T(acc1[r].thread_elements()[1]);
+                out[outputM * N + outputN2] = T(acc2[r].thread_elements()[0]);
+                out[(outputM + 1) * N + outputN2] = T(acc2[r].thread_elements()[1]);
+                out[outputM * N + outputN3] = T(acc3[r].thread_elements()[0]);
+                out[(outputM + 1) * N + outputN3] = T(acc3[r].thread_elements()[1]);
+            }
+            """
+        )
+
+        return result
+    }()
+
+    private static let kernelV27Rows: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_carry_fpmma_rows_v2",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["out"],
+        source: sourceV27Rows,
+        header: "#include <metal_simdgroup_matrix>\n",
+        ensureRowContiguous: true
+    )
+
+    private static func admittedShape(
+        x: MLXArray, w: MLXArray, scales: MLXArray, biases: MLXArray,
+        rows: Int, colsPerThreadgroup selectedColsPerThreadgroup: Int,
+        groupSize: Int, bits: Int
+    ) -> (k: Int, n: Int)? {
+        guard groupSize == 64, bits == 4 else { return nil }
+        guard x.dtype == .bfloat16, scales.dtype == .bfloat16, biases.dtype == .bfloat16
+        else { return nil }
+        guard w.dtype == .uint32 else { return nil }
+        guard w.ndim == 2, scales.ndim == 2, biases.ndim == 2 else { return nil }
+
+        guard x.ndim == 2 || (x.ndim == 3 && x.dim(1) == 1) else { return nil }
+        guard x.dim(0) == rows else { return nil }
+        let k = x.dim(-1)
+        guard k > 0, x.size == rows * k else { return nil }
+
+        let n = w.dim(0)
+        guard n >= minOutputWidth, n % selectedColsPerThreadgroup == 0 else { return nil }
+        guard k % groupSize == 0, k % 8 == 0 else { return nil }
+        guard w.dim(1) == k * bits / 32 else { return nil }
+        guard scales.dim(0) == n, biases.dim(0) == n else { return nil }
+        guard scales.dim(1) == k / groupSize, biases.dim(1) == k / groupSize else { return nil }
+        return (k, n)
+    }
+
+    private static func activationSumCells(
+        _ kernel: MLXFast.MLXFastKernel, flatX: MLXArray, cells: Int,
+        template: [(String, any KernelTemplateArg)]
+    ) -> MLXArray {
+        let sumThreads = 128
+        let sumThreadgroups = (cells + sumThreads - 1) / sumThreads
+        return kernel(
+            [flatX],
+            template: template,
+            grid: (sumThreadgroups * sumThreads, 1, 1),
+            threadGroup: (sumThreads, 1, 1),
+            outputShapes: [[cells]],
+            outputDTypes: [.float32]
+        )[0]
+    }
+
+    /// One dispatch for a wide MTP verify rectangle of 16/24/32 rows; nil
+    /// whenever the eight-row kernel would not be the selected path.
+    public static func applyRows(
+        x: MLXArray,
+        w: MLXArray,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int
+    ) -> MLXArray? {
+        guard enabled, rowsEnabled, version == 27, let biases, x.ndim >= 2 else { return nil }
+        let rows = x.dim(0)
+        let rowTiles = CBv2MTPWideVerifyContext.rowTileCount(rows: rows, tile: mRows)
+        let selectedColsPerThreadgroup = colsPerThreadgroup * 4
+        guard rowTiles > 1,
+            case let (k, n)? = admittedShape(
+                x: x, w: w, scales: scales, biases: biases, rows: rows,
+                colsPerThreadgroup: selectedColsPerThreadgroup,
+                groupSize: groupSize, bits: bits)
+        else { return nil }
+
+        let flatX = x.reshaped([rows, k])
+        let xSums = activationSumCells(
+            xSumRowsKernel, flatX: flatX, cells: rows * (k / groupSize),
+            template: [("T", x.dtype), ("K", k), ("RT", rowTiles)])
+        let pairedX = flatX.reshaped([rowTiles, 4, 2, k]).transposed(3, 1, 0, 2)
+        CBv2EngageMark.once("mma-head-rows")
+        let threadgroups = n / selectedColsPerThreadgroup
+        return kernelV27Rows(
+            [pairedX, w, scales, biases, xSums],
+            template: [("T", x.dtype), ("K", k), ("N", n), ("RT", rowTiles)],
+            grid: (threadgroups * threadsPerThreadgroup, 1, 1),
+            threadGroup: (threadsPerThreadgroup, 1, 1),
+            outputShapes: [[rows, n]],
+            outputDTypes: [x.dtype]
+        )[0]
+    }
+
     public static func apply(
         x: MLXArray,
         w: MLXArray,
@@ -2776,31 +2733,29 @@ public enum Gemma4MMAQuantizedGEMV {
         activationSums: ActivationSums? = nil
     ) -> MLXArray? {
         guard enabled else { return nil }
-        guard let biases else { return nil }
-        guard groupSize == 64, bits == 4 else { return nil }
-        guard x.dtype == .bfloat16, scales.dtype == .bfloat16, biases.dtype == .bfloat16
-        else { return nil }
-        guard w.dtype == .uint32 else { return nil }
-        guard w.ndim == 2, scales.ndim == 2, biases.ndim == 2 else { return nil }
-
-        // [8, K] or [8, 1, K] ONLY -- the decode cohort's own shape, eight
-        // BATCH rows at one position. A [1, 8, K] eight-token prefill chunk
-        // has the same element count and must NOT enter: the gate is meant to
-        // claim the cohort's decode head, and prefill stays on stock.
-        guard x.ndim == 2 || (x.ndim == 3 && x.dim(1) == 1) else { return nil }
-        guard x.dim(0) == mRows else { return nil }
-        let k = x.dim(-1)
-        guard k > 0, x.size == mRows * k else { return nil }
-
-        let n = w.dim(0)
+        if let wide = applyRows(
+            x: x, w: w, scales: scales, biases: biases, groupSize: groupSize, bits: bits)
+        {
+            return wide
+        }
+        if (x.ndim == 2 || (x.ndim == 3 && x.dim(1) == 1)), x.dim(0) > mRows,
+            let tiled = CBv2MTPWideVerifyContext.rowTiles(x, tile: mRows, {
+                apply(
+                    x: $0, w: w, scales: scales, biases: biases,
+                    groupSize: groupSize, bits: bits, activationSums: nil)
+            })
+        {
+            return tiled
+        }
         let selectedColsPerThreadgroup = version == 16 || version == 26 || version == 27
             ? colsPerThreadgroup * 4
             : (version == 15 ? colsPerThreadgroup * 2 : colsPerThreadgroup)
-        guard n >= minOutputWidth, n % selectedColsPerThreadgroup == 0 else { return nil }
-        guard k % groupSize == 0, k % 8 == 0 else { return nil }
-        guard w.dim(1) == k * bits / 32 else { return nil }
-        guard scales.dim(0) == n, biases.dim(0) == n else { return nil }
-        guard scales.dim(1) == k / groupSize, biases.dim(1) == k / groupSize else { return nil }
+        guard let biases,
+            case let (k, n)? = admittedShape(
+                x: x, w: w, scales: scales, biases: biases, rows: mRows,
+                colsPerThreadgroup: selectedColsPerThreadgroup,
+                groupSize: groupSize, bits: bits)
+        else { return nil }
 
         let flatX = x.reshaped([mRows, k])
         let threadgroups = n / selectedColsPerThreadgroup
@@ -2817,16 +2772,9 @@ public enum Gemma4MMAQuantizedGEMV {
             {
                 xSums = activationSums.values
             } else {
-                let sumThreads = 128
-                let sumThreadgroups = (sumCells + sumThreads - 1) / sumThreads
-                xSums = xSumKernel(
-                    [flatX],
-                    template: [("T", x.dtype), ("K", k)],
-                    grid: (sumThreadgroups * sumThreads, 1, 1),
-                    threadGroup: (sumThreads, 1, 1),
-                    outputShapes: [[sumCells]],
-                    outputDTypes: [.float32]
-                )[0]
+                xSums = activationSumCells(
+                    xSumKernel, flatX: flatX, cells: sumCells,
+                    template: [("T", x.dtype), ("K", k)])
             }
             switch version {
             case 27:

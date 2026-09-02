@@ -1246,6 +1246,55 @@ public class SwitchGLU: Module {
     private var fusedGateUpStorage: SwitchGateUpFusedStorage?
     private var fusedGateUpResolved = false
     private var fusedGateUpContract: (groupSize: Int, bits: Int, mode: QuantizationMode)?
+    /// SORTED-DOWN-IDENTITY: the production decode down projection receives
+    /// 64 already-sorted activation rows. MLX otherwise creates an `arange`
+    /// identity lhs table for every gather call.
+    private static let sortedDownIdentityLhsEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_SORTED_DOWN_IDENTITY_LHS"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    nonisolated(unsafe) private static let sortedDownIdentityLhs: MLXArray =
+        MLXArray(Array(0 ..< 64).map { UInt32($0) })
+
+    /// Resolve the exact production down-projection contract once. The lazy
+    /// boundary matters because quantization replaces the module after model
+    /// construction, before the first scored forward.
+    private lazy var sortedDownIdentityEligible: Bool = {
+        guard inputDims == 2816, hiddenDims == 704, numExperts == 128,
+            let down = downProj as? QuantizedSwitchLinear,
+            down.inputDims == 704, down.outputDims == 2816,
+            down.numExperts == 128,
+            down.groupSize == 64, down.bits == 4, down.mode == .affine,
+            down.bias == nil,
+            down.weight.dtype == .uint32,
+            down.weight.shape == [128, 2816, 88],
+            down.scales.dtype == .bfloat16,
+            down.scales.shape == [128, 2816, 11],
+            let biases = down.biases,
+            biases.dtype == .bfloat16,
+            biases.shape == down.scales.shape
+        else { return false }
+        return true
+    }()
+
+    @inline(__always)
+    private func sortedDownIdentityLhs(
+        activated: MLXArray, sortedKeys: MLXArray, sorted: Bool
+    ) -> MLXArray? {
+        guard Self.sortedDownIdentityLhsEnabled, sorted,
+            sortedDownIdentityEligible,
+            activated.dtype == .bfloat16,
+            activated.ndim == 3,
+            activated.shape == [64, 1, hiddenDims],
+            sortedKeys.dtype == .uint32,
+            sortedKeys.ndim == 1, sortedKeys.size == 64
+        else { return nil }
+        CBv2EngageMark.once("sorted-down-identity-lhs")
+        return Self.sortedDownIdentityLhs
+    }
 
     /// Bind the concatenated gate|up storage whose slices the split
     /// projections were (or will be) loaded with. Load-time only.
@@ -1497,7 +1546,10 @@ public class SwitchGLU: Module {
             activated = activation(xGate) * xUp
         }
 
-        x = downProj(activated, idx, sortedIndices: doSort)
+        let downLhsIndices = sortedDownIdentityLhs(
+            activated: activated, sortedKeys: idx, sorted: doSort)
+        x = downProj(
+            activated, idx, lhsIndices: downLhsIndices, sortedIndices: doSort)
         return (x, doSort ? inverseOrder : nil, doSort)
     }
 

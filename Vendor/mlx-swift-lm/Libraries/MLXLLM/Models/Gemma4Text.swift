@@ -42,6 +42,20 @@ private let gemma4DecodeAsyncEvalLadderEnabled =
         ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_DECODE_ASYNC_EVAL_LADDER"])
 
+/// Command-buffer-aware boundary ladder. Default ON; setting
+/// `DARKBLOOM_GEMMA4_DECODE_ASYNC_EVAL_LADDER_V2=0` restores the promoted
+/// `{0, 1, 2, 3}` boundary set below.
+@inline(__always)
+internal func resolveGemma4DecodeAsyncEvalLadderV2Enabled(_ raw: String?) -> Bool {
+    guard let raw else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}
+
+private let gemma4DecodeAsyncEvalLadderV2Enabled =
+    resolveGemma4DecodeAsyncEvalLadderV2Enabled(
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_DECODE_ASYNC_EVAL_LADDER_V2"])
+
 /// Pure, fail-closed policy for the Gemma 4 decode submission ladder.
 ///
 /// Layer indices name boundaries AFTER a complete decoder layer. In
@@ -62,6 +76,20 @@ internal func gemma4ShouldSubmitDecodeAsyncEvalLadder(
 
     if let set = gemma4DecodeAsyncEvalLadderSet {
         return set.contains(layerIndex)
+    }
+    if gemma4DecodeAsyncEvalLadderV2Enabled {
+        // With the ranked worker's 512-operation command-buffer cap, the
+        // promoted decode road fits layers 1...18 in one buffer even under
+        // the audited worst-case per-layer dispatch count. Boundary 0 keeps
+        // the early CPU/GPU overlap; boundary 18 avoids the three tiny
+        // fragments created by the promoted {0,1,2,3} schedule and leaves
+        // the terminal layers for one final submission.
+        switch layerIndex {
+        case 0, 18:
+            return true
+        default:
+            return false
+        }
     }
     // Only the two EARLY boundaries pay. Submitting after layers 0 and 1
     // starts GPU work while the host is still building the remaining 28

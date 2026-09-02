@@ -896,7 +896,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// separate for the same reason `quantPackPairKernel` is: a Swift-hosted
     /// kernel that changes text without changing name serves a stale body.
     private static let quantPackPairChunkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_kvq4g64_pack_pair_chunk_d256_v1",
+        name: "cbv2_kvq4g64_pack_pair_chunk_d256_v1_ld1",
         inputNames: ["keys", "values"],
         outputNames: ["packed_w"],
         source: """
@@ -914,12 +914,17 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             const device T* src = (plane == 0 ? keys : values) + local * D;
             device uint32_t* out = packed_w + row * row_words;
 
+            // single load: the lane's eight values are read once and reused for
+            // the range and the quantization (same values, same operations)
+            float vals[per_lane];
+            for (int i = 0; i < per_lane; ++i) {
+                vals[i] = float(src[lane * per_lane + i]);
+            }
             float vmin = 3.402823466e+38F;
             float vmax = -3.402823466e+38F;
             for (int i = 0; i < per_lane; ++i) {
-                const float v = float(src[lane * per_lane + i]);
-                vmin = min(vmin, v);
-                vmax = max(vmax, v);
+                vmin = min(vmin, vals[i]);
+                vmax = max(vmax, vals[i]);
             }
             for (uint m = 1; m < 8; m <<= 1) {
                 vmin = min(vmin, simd_shuffle_xor(vmin, m));
@@ -933,7 +938,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
 
             uint32_t word = 0u;
             for (int i = 0; i < per_lane; ++i) {
-                const float q = metal::rint((float(src[lane * per_lane + i]) - b) / s);
+                const float q = metal::rint((vals[i] - b) / s);
                 word |= uint32_t(clamp(q, 0.0f, 15.0f)) << (4 * i);
             }
             out[lane] = word;

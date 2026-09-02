@@ -338,7 +338,14 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
   y3 += out_row;
 
   int k = 0;
-  for (; k < in_vec_size - block_size; k += block_size) {
+  // RESTORE-LE-TIED: the strict `<` stops one full block short of a
+  // block-multiple in_vec_size, so at the pinned K = 2816 = 11 x 256 the
+  // whole last block falls to the bounds-checked load_vector_safe tail on
+  // every threadgroup. `k + block_size <= in_vec_size` admits that block into
+  // the full-rate loop; identical body, identical sequential k order, and the
+  // tail's clamp then computes remaining == 0 and skips. Non-multiple
+  // in_vec_size keeps the exact incumbent iteration set.
+  for (; k + block_size <= in_vec_size; k += block_size) {
     #pragma clang loop unroll(full)
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint16_t* wl =

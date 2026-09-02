@@ -30,6 +30,16 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
+    /// Metadata words are shared by each eight-lane quantization group.
+    /// Broadcast one group's scale/bias pair instead of issuing the same
+    /// device read from all eight lanes.
+    private static let q4MetadataBroadcastEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_Q4_METADATA_BROADCAST"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
 
     private static let batch = 8
     private static let queryHeads = 16
@@ -1523,7 +1533,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// removes only the global partial write/read and the second dispatch.
     private static let portQuantFusedWriteResidentKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c4_metabcast",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -1696,10 +1706,17 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     ? mkeys_w[slot * row_words + lane] : 0u;
                 uint32_t vw_pre = prefetch_first
                     ? mvalues_w[slot * row_words + lane] : 0u;
-                uint32_t ktw_pre = prefetch_first
+                const uint group_lane = uint(lane & ~7);
+                const bool metadata_lane = (lane & 7) == 0;
+                const uint32_t ktw_seed = metadata_lane
                     ? mkeys_w[slot * row_words + payload_words + lane / 8] : 0u;
-                uint32_t vtw_pre = prefetch_first
+                const uint32_t vtw_seed = metadata_lane
                     ? mvalues_w[slot * row_words + payload_words + lane / 8] : 0u;
+                uint32_t ktw_pre = prefetch_first
+                    ? simd_shuffle(ktw_seed, ushort(group_lane)) : 0u;
+                uint32_t vtw_pre = prefetch_first
+                    ? simd_shuffle(vtw_seed, ushort(group_lane)) : 0u;
+
                 for (int token = block; token < N; token += BLOCKS) {
                     const bool current = token == N - 1;
                     const uint32_t kw = current ? kword : kw_pre;
@@ -1715,13 +1732,22 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     if (token + BLOCKS < N - 1) {
                         kw_pre = mkeys_w[next_slot * row_words + lane];
                         vw_pre = mvalues_w[next_slot * row_words + lane];
-                        ktw_pre =
-                            mkeys_w[next_slot * row_words + payload_words + lane / 8];
-                        vtw_pre =
-                            mvalues_w[next_slot * row_words + payload_words + lane / 8];
+                        const uint32_t ktw_next_seed = metadata_lane
+                            ? mkeys_w[
+                                next_slot * row_words + payload_words + lane / 8]
+                            : 0u;
+                        const uint32_t vtw_next_seed = metadata_lane
+                            ? mvalues_w[
+                                next_slot * row_words + payload_words + lane / 8]
+                            : 0u;
+                        ktw_pre = simd_shuffle(
+                            ktw_next_seed, ushort(group_lane));
+                        vtw_pre = simd_shuffle(
+                            vtw_next_seed, ushort(group_lane));
                         next_slot += uint(BLOCKS);
                         if (next_slot >= uint(N)) next_slot -= uint(N);
                     }
+
                     const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
                     const float kb = float(as_type<half>(ushort(ktw >> 16)));
                     const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
@@ -2024,6 +2050,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         let inputs = [queries] + mirrors
             + [startArray, newKeys, newValues, previousWriteFence]
         if q4ResidentMergeEnabled,
+            q4MetadataBroadcastEnabled,
             blocks == 8,
             combineColumns == 8,
             combineThreads == 256
@@ -2045,6 +2072,7 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             )
             CBv2EngageMark.once("kvq4-fused-live-write")
             CBv2EngageMark.once("kvq4-resident-merge")
+            CBv2EngageMark.once("kvq4-metadata-broadcast")
             return (resident[0], resident[1])
         }
 

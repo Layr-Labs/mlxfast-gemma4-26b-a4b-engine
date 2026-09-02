@@ -14,6 +14,12 @@ import MLXLMCommon
 // benchmark type with no caller, and the engine measures through benchd, not
 // through this round's internal phase split. The accept/reject arithmetic,
 // the draft-cache trim, the verify shape and the rollback are unchanged.
+//
+// ENGINE ADDITION (2026-09-02), also not in the fork: the optional
+// `proposal:` argument documented on `runDFlashGreedyRound` below. It swaps
+// the DRAFT SOURCE and nothing else — the verify input, the accept walk, the
+// emit clamp and the rollback are the same lines running on the same
+// rectangle.
 
 /// PUBLIC in this vendored copy (the fork keeps it `internal`). The engine's
 /// runtime worker drives DFlash rounds itself rather than through
@@ -37,6 +43,43 @@ private let dFlashCPUAcceptWalk: Bool = {
     }
 }()
 
+/// Run one greedy DFlash round.
+///
+/// `proposal` is the ALTERNATE DRAFT SOURCE (engine addition, 2026-09-02, not
+/// in the fork). When it is nil the round is exactly the ported one: the
+/// neural drafter proposes `blockSize - 1` tokens. When it is non-nil those
+/// tokens ARE the block, `drafter.draftBlock` is not called, and everything
+/// downstream — the verify input, the rectangular target forward, the accept
+/// walk, the emit clamp and the KV rollback — is byte-for-byte the same code.
+/// A proposal is therefore not a fidelity change of any kind: every emitted
+/// token is still the TARGET's own greedy argmax at that position, and a
+/// wrong proposal costs exactly what a wrong drafter block costs, the
+/// rejected tail of one round.
+///
+/// DRAFTER-CACHE ALIGNMENT, the one thing a caller must get right. The
+/// drafter's KV cache does not hold the block it proposes — look at
+/// `DFlashAttention.callAsFunction`: it caches keys/values of the CONTEXT
+/// (the projected `targetHidden`) and merely concatenates the proposal's own
+/// keys for that one forward. So one `draftBlock` call advances the draft
+/// cache by `targetHidden.dim(1)` — the number of tokens the previous round
+/// COMMITTED — and never by `blockSize`. That is what makes the trim below a
+/// no-op in steady state: after `draftBlock`, `draftCache.offset` already
+/// equals `promptTokenCount + generatedTokenCount - 1`.
+///
+/// A round that skips `draftBlock` therefore leaves the draft cache SHORT by
+/// this round's committed tokens — the trim can only remove context, so it
+/// cannot repair that, and it correctly does nothing (the delta is negative).
+/// The caller closes the gap instead, and the seam for it is already in this
+/// signature: `targetHidden` is a whole `[1, L, targetHidden]` context, not a
+/// single row. A caller that skips the drafter for some rounds must ACCUMULATE
+/// each skipped round's returned `targetHidden` and pass the concatenation on
+/// the next drafter round. The drafter then caches exactly the same context
+/// vectors, at exactly the same RoPE positions, that a run of ordinary rounds
+/// would have cached — `contextKeys` is roped at `cache.offset`, which is
+/// where those tokens actually live — so the cache is not "resynchronised
+/// approximately", it is identical, and the bonus column stays consistent
+/// because `bonus` is the last committed token either way.
+/// `RuntimeWorkerDFlashFreeRunSession` is the reference caller.
 public func runDFlashGreedyRound(
     target: any DFlashTargetModel,
     drafter: DFlashDraftModel,
@@ -47,7 +90,8 @@ public func runDFlashGreedyRound(
     promptTokenCount: Int,
     generatedTokenCount: Int,
     blockSize: Int,
-    maxEmitCount: Int
+    maxEmitCount: Int,
+    proposal: [Int]? = nil
 ) throws -> DFlashGreedyRoundResult {
     guard blockSize >= 2 else {
         throw DFlashError.invalidBlockSize(blockSize)
@@ -58,14 +102,35 @@ public func runDFlashGreedyRound(
         rollbackProvider?.makeDFlashCacheRollbackState(cache: targetCache)
         ?? target.makeDefaultDFlashCacheRollbackState(cache: targetCache)
 
-    let draftTokens = try drafter.draftBlock(
-        bonus: bonus,
-        targetHidden: targetHidden,
-        cache: draftCache,
-        blockSize: blockSize
-    )
+    let draftTokens: MLXArray
+    if let proposal {
+        // The block the caller supplied IS the draft. Refuse a length that
+        // disagrees with `blockSize` rather than silently verifying a
+        // different rectangle than the caller budgeted for: every counter
+        // downstream (`proposedCount`, `maxEmitCount`) is derived from
+        // `blockSize`. The reported size is the block the proposal implies,
+        // which is the honest half of the mismatch.
+        guard proposal.count == blockSize - 1 else {
+            throw DFlashError.invalidBlockSize(proposal.count + 1)
+        }
+        draftTokens = MLXArray(proposal.map(Int32.init))[.newAxis, .ellipsis]
+    } else {
+        draftTokens = try drafter.draftBlock(
+            bonus: bonus,
+            targetHidden: targetHidden,
+            cache: draftCache,
+            blockSize: blockSize
+        )
+    }
     asyncEval(draftTokens)
 
+    // Steady state this is a no-op (see the alignment note above): a
+    // `draftBlock` call has just advanced the draft cache to exactly this
+    // frontier. It bites only when the drafter ran ahead of the committed
+    // chain. On a `proposal` round the delta is NEGATIVE — the cache is
+    // behind, not ahead — and the guard below correctly declines to act,
+    // because trimming can only remove context; the caller re-feeds the
+    // missing context on its next drafter round.
     let committedDraftOffset = Swift.max(0, promptTokenCount + generatedTokenCount - 1)
     if let draftOffset = draftCache.first?.offset {
         let extraDraftContext = draftOffset - committedDraftOffset

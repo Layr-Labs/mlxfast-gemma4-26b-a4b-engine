@@ -109,8 +109,17 @@ public final class Gemma4A4BRuntimeWeightCache {
                    startupEnvironment["DARKBLOOM_QWEN_MTP_POST_WIRE_COMMAND_BUFFER"]
            )
         {
-            setenv("MLX_MAX_MB_PER_BUFFER", "512", 1)
-            setenv("MLX_MAX_OPS_PER_BUFFER", "512", 1)
+            // CBUF-001: 4096 MiB / 4096 ops (was 512 / 512). A batch-eight
+            // decode step references about 0.9 GB of weights and q4 KV and
+            // several hundred ops, so the 512 MiB referenced-byte budget
+            // forced MLX to commit and re-open the command buffer inside every
+            // step, on top of the explicit async-eval ladder. Each forced
+            // commit drains the GPU and refills it. Raising both caps lets one
+            // buffer carry the whole span between ladder points; the ladder
+            // stays the outer boundary. Pure host-side scheduling: kernel
+            // selection, arithmetic and the emitted tokens are unchanged.
+            setenv("MLX_MAX_MB_PER_BUFFER", "4096", 1)
+            setenv("MLX_MAX_OPS_PER_BUFFER", "4096", 1)
             Memory.cacheLimit = 32 << 30
         }
 

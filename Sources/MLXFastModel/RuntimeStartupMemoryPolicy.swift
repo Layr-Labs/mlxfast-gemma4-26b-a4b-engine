@@ -102,8 +102,10 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
         // stock 50 MiB MLX default. overwrite=0 left that in place and the
         // 512 MiB post-wire budget never landed. overwrite=1 makes the
         // promoted Laguna M5-Max command-buffer profile actually apply.
-        setenv("MLX_MAX_MB_PER_BUFFER", "512", 1)
-        setenv("MLX_MAX_OPS_PER_BUFFER", "512", 1)
+        // CBUF-001: both caps raised to 4096 in step with the serial-path
+        // seam in Gemma4A4BRuntimeWeightCache.init (see the note there).
+        setenv("MLX_MAX_MB_PER_BUFFER", "4096", 1)
+        setenv("MLX_MAX_OPS_PER_BUFFER", "4096", 1)
     }
 
     public static func resolve(

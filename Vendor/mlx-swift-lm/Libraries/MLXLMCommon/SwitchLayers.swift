@@ -1402,15 +1402,16 @@ public class SwitchGLU: Module {
             expertPrefixBoundsEnabled && useLhsIndices
             && indices.dtype == .uint32 && x.dtype == .bfloat16
             && expertPrefixBoundsProjectionsEligible
-        var x = MLX.expandedDimensions(x, axes: [-2, -3])
         let doSort = indices.size >= 64
+        var x = (doSort && useLhsIndices)
+            ? x.expandedDimensions(axis: 1)
+            : MLX.expandedDimensions(x, axes: [-2, -3])
 
         var idx = indices
-        var inverseOrder = MLXArray()
+        var inverseOrder: MLXArray?
         var lhsIndices: MLXArray?
         if doSort {
             if useLhsIndices {
-                x = x.flattened(start: 0, end: -3)
                 // GLUE-FOLD: an upstream producer already emitted the exact
                 // route table beside the top-8 selection; consume it and the
                 // standalone `mlx_lm_route_simd_rank_scatter` dispatch never

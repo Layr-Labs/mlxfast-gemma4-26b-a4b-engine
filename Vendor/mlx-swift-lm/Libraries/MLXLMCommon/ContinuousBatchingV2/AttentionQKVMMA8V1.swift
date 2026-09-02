@@ -747,6 +747,94 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         header: mma8KernelHeader,
         ensureRowContiguous: true)
 
+    /// QKTILE1-001 arm. Default ON.
+    ///
+    /// The fused Q||K dispatch runs the same bodies with one eight-column
+    /// output tile per simdgroup instead of two. Every per-tile quantity in
+    /// those templates is an array of `TILES`, so `TILES = 1` halves the live
+    /// weight look-ahead, the scale and bias carry, the row pointers and the
+    /// accumulator pair, and doubles the threadgroup count. What it gives up
+    /// is the x-side amortisation: the eight simdgroup operand fills are
+    /// rebuilt once per output tile instead of once per two.
+    ///
+    /// `DARKBLOOM_GEMMA4_QKV_FUSE_QK_TILES1=0` restores the two-tile dispatch.
+    public static let fusedSingleTileEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_QKV_FUSE_QK_TILES1"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let fusedSlidingKernelT1 = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt1_k2816_carry2_qk6144_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y", "y2"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            qkv_mma8_affine4_g64_mt<T, 2, 1, 2816, 4096>(
+                w, scales, biases, x, y,
+                w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup, y2);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
+    private static let fusedFullKernelT1 = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt1_k2816_carry2_qk9216_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y", "y2"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            qkv_mma8_affine4_g64_mt<T, 2, 1, 2816, 8192>(
+                w, scales, biases, x, y,
+                w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup, y2);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
+    private static let fusedSlidingRspKernelT1 = MLXFast.metalKernel(
+        name:
+            "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt1_k2816_carry2_qk6144_rsp_v1",
+        inputNames: ["x", "w", "scales", "biases", "rs_table"],
+        outputNames: ["y", "y2"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            qkv_mma8_affine4_g64_mt_rsp<T, 2, 1, 2816, 4096>(
+                w, scales, biases, x, rs_table, y,
+                w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup, y2);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
+    private static let fusedFullRspKernelT1 = MLXFast.metalKernel(
+        name:
+            "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt1_k2816_carry2_qk9216_rsp_v1",
+        inputNames: ["x", "w", "scales", "biases", "rs_table"],
+        outputNames: ["y", "y2"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            qkv_mma8_affine4_g64_mt_rsp<T, 2, 1, 2816, 8192>(
+                w, scales, biases, x, rs_table, y,
+                w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup, y2);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
     private static let mma8Kernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_carry2_bfill_v4",
         inputNames: ["x", "w", "scales", "biases"],
@@ -927,13 +1015,22 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
             && rsTable!.dtype == .float32
             && rsTable!.shape == [batch, inputWidth / Self.groupSize]
 
-        let kernel =
-            qWidth == 4096
-            ? (tableReady ? fusedSlidingRspKernel : fusedSlidingKernel)
-            : (tableReady ? fusedFullRspKernel : fusedFullKernel)
+        let kernel: MLXFast.MLXFastKernel
+        if fusedSingleTileEnabled {
+            kernel =
+                qWidth == 4096
+                ? (tableReady ? fusedSlidingRspKernelT1 : fusedSlidingKernelT1)
+                : (tableReady ? fusedFullRspKernelT1 : fusedFullKernelT1)
+        } else {
+            kernel =
+                qWidth == 4096
+                ? (tableReady ? fusedSlidingRspKernel : fusedSlidingKernel)
+                : (tableReady ? fusedFullRspKernel : fusedFullKernel)
+        }
         let total = qWidth + kWidth
         let yTiles = total / outputsPerGroup
-        guard yTiles % tilesPerGroup == 0 else { return nil }
+        let tiles = fusedSingleTileEnabled ? 1 : tilesPerGroup
+        guard yTiles % tiles == 0 else { return nil }
 
         fusedLock.lock()
         var plane = fusedPlanes[cacheKey]
@@ -951,7 +1048,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         let outputs = kernel(
             tableReady ? [x, fw, fs, fb, rsTable!] : [x, fw, fs, fb],
             template: [("T", x.dtype)],
-            grid: (simdWidth, (yTiles / tilesPerGroup) * simdGroups, 1),
+            grid: (simdWidth, (yTiles / tiles) * simdGroups, 1),
             threadGroup: (simdWidth, simdGroups, 1),
             outputShapes: [[batch, sequence, qWidth], [batch, sequence, kWidth]],
             outputDTypes: [x.dtype, x.dtype])

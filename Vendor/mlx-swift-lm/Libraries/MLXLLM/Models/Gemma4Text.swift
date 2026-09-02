@@ -3345,7 +3345,7 @@ private enum Gemma4FusedLayerGlue {
 // T28 second sample marker (r2): content identical to ranked 32f5d19f apart from this comment.
     private static let attentionBranchPrefixKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_glue_attention_branch_prefix_2816_bf16_v1_nb1",
+            name: "gemma4_glue_attention_branch_prefix_2816_bf16_v1_nb1_pv1",
             inputNames: ["attn", "res", "wa", "wd", "we", "wr"],
             outputNames: ["out", "dense", "expert", "router", "xSums"],
             source: """
@@ -3357,30 +3357,45 @@ private enum Gemma4FusedLayerGlue {
                 threadgroup float local_sums[32];
                 const uint base = row * 2816 + lid * 4;
                 const uint wbase = lid * 4;
-            \(rmsReduce("attn", into: "local_inv[0]"))
+                // PREFIXVEC-001: the thread's operands as 4-wide vectors
+                // (8-byte aligned: base and wbase are multiples of four).
+                const vec<T, 4> attnv = *((const device vec<T, 4>*)(attn + base));
+                const vec<T, 4> resv = *((const device vec<T, 4>*)(res + base));
+                const vec<T, 4> wav = *((const device vec<T, 4>*)(wa + wbase));
+                const vec<T, 4> wdv = *((const device vec<T, 4>*)(wd + wbase));
+                const vec<T, 4> wev = *((const device vec<T, 4>*)(we + wbase));
+                const vec<T, 4> wrv = *((const device vec<T, 4>*)(wr + wbase));
+            \(rmsReduce("attnv", into: "local_inv[0]").replacingOccurrences(
+                of: "(float)attnv[base + i]", with: "(float)attnv[i]"))
                 const float attn_inv = local_inv[0];
-                T outv[4];
+                vec<T, 4> outv;
                 for (int i = 0; i < 4; i++) {
                     const T normed = static_cast<T>(
-                        wa[wbase + i]
+                        wav[i]
                             * static_cast<T>(
-                                (float)attn[base + i] * attn_inv));
-                    outv[i] = res[base + i] + normed;
-                    out[base + i] = outv[i];
+                                (float)attnv[i] * attn_inv));
+                    outv[i] = resv[i] + normed;
                 }
+                *((device vec<T, 4>*)(out + base)) = outv;
             \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
                 of: "(float)outv[base + i]", with: "(float)outv[i]"))
                 const float branch_inv = local_inv[0];
                 float xsum = 0.0f;
+                vec<T, 4> densevv;
+                vec<T, 4> expertvv;
+                vec<T, 4> routervv;
                 for (int i = 0; i < 4; i++) {
                     const T nx =
                         static_cast<T>((float)outv[i] * branch_inv);
-                    const T densev = wd[wbase + i] * nx;
-                    dense[base + i] = densev;
-                    expert[base + i] = we[wbase + i] * nx;
-                    router[base + i] = wr[wbase + i] * nx;
+                    const T densev = wdv[i] * nx;
+                    densevv[i] = densev;
+                    expertvv[i] = wev[i] * nx;
+                    routervv[i] = wrv[i] * nx;
                     xsum += densev;
                 }
+                *((device vec<T, 4>*)(dense + base)) = densevv;
+                *((device vec<T, 4>*)(expert + base)) = expertvv;
+                *((device vec<T, 4>*)(router + base)) = routervv;
                 xSums[lid * 8 + row] = xsum;
             """,
             ensureRowContiguous: true

@@ -2050,13 +2050,15 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             ensureRowContiguous: true
         )
 
-    /// ORSFOLD-001. Default ON. `DARKBLOOM_CBV2_O_RS_FOLD=0` selects the
-    /// four-output resident kernel and leaves the standalone
-    /// `cbv2_b8_rs_table_dyn_v1` prepass to build the o_proj table.
+    /// ORSFOLD-001, now following its only consumer. ORSNIL-001 retires the
+    /// o_proj run-sum table, so producing a fifth resident output no one reads
+    /// would be pure register and store pressure on the hottest decode kernel.
+    /// The default tracks `CBv2AttentionOQMVV1.oProjRunsumEnabled`, and an
+    /// explicit `DARKBLOOM_CBV2_O_RS_FOLD` still picks the arm by hand.
     static let oRunsumFoldEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_O_RS_FOLD"]
-        else { return true }
+        else { return CBv2AttentionOQMVV1.oProjRunsumEnabled }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 

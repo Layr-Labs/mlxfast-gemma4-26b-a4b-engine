@@ -458,6 +458,22 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
     /// both hosts' in-kernel run-sum reductions in the same executable.
     public static let rsPrepassEnabled = CBv2AttentionQKVMMA8V1.rsPrepassEnabled
 
+    /// ORSNIL-001. The o_proj activation is the run-sum table's only consumer,
+    /// and the `_rsp` body reads the same `x` words the incumbent body already
+    /// loads for its matrix fragments, so the table buys three shuffles and two
+    /// `mma8_runsum4` calls per group per lane and costs a whole table wherever
+    /// nothing hands one over for free. The Q/K/V host keeps its table: every
+    /// decode layer receives that one carried out of a kernel that was running
+    /// anyway. Default OFF; `DARKBLOOM_GEMMA4_ATTN_O_RS_PREPASS=1` restores the
+    /// promoted table road (production and consumption together).
+    public static let oProjRunsumEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ATTN_O_RS_PREPASS"]
+        else { return false }
+        return ["1", "true", "yes", "on"].contains(
+            raw.trimmingCharacters(in: .whitespaces).lowercased())
+    }()
+
     // MMA-RS-001: the run-sum prepass for the o_proj activation. Same layout
     // and butterfly argument as the Q/K/V host's table: lane r*8+fm reads the
     // identical aligned 16-byte run the main body's (fm, row) lane reads, and
@@ -499,7 +515,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
     public static func acceptRunsumTable(
         _ table: MLXArray?, for x: MLXArray
     ) -> MLXArray? {
-        guard rsPrepassEnabled, let table,
+        guard oProjRunsumEnabled, rsPrepassEnabled, let table,
             table.dtype == .float32,
             x.dtype == .bfloat16,
             x.ndim == 3,
@@ -515,7 +531,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
     /// incumbent dispatch.
     @inline(__always)
     public static func runsumTable(for x: MLXArray) -> MLXArray? {
-        guard rsPrepassEnabled,
+        guard oProjRunsumEnabled, rsPrepassEnabled,
             x.dtype == .bfloat16,
             x.ndim == 3,
             x.dim(0) == batch,

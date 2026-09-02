@@ -1985,7 +1985,7 @@ private class Gemma4Attention: Module {
         // independent of N, so the concatenated-N dispatch reads the same
         // entries the separate Q and K dispatches would.
         let fusedQK: (MLXArray, MLXArray)? =
-            (lastQueryCache == nil && !usesSharedKV && vProj == nil)
+            (lastQueryCache == nil && !usesSharedKV)
             ? fusedQKProjection(x, rsTable: qkvRunsumTable) : nil
         let queryRaw = (
             fusedQK?.0 ?? tierProjection(qProj, queryInput, rsTable: qkvRunsumTable)

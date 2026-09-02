@@ -1765,8 +1765,13 @@ private class Gemma4Attention: Module {
     /// the tight affine4 fast-QMV replica; every other path keeps the layer.
     /// MMA-RS-001: the projection input's run-sum table is computed here (the
     /// o_proj plane consumes it alone); nil keeps the incumbent dispatch.
+    /// ORSFOLD-001: `carriedRunsum` is the table the resident attention kernel
+    /// emitted for this exact activation; nil, or any table that misses the
+    /// shape contract, falls through to the standalone prepass.
     @inline(__always)
-    private func outputProjection(_ x: MLXArray) -> MLXArray {
+    private func outputProjection(
+        _ x: MLXArray, carriedRunsum: MLXArray? = nil
+    ) -> MLXArray {
         guard let quantized = oProj as? QuantizedLinear,
             quantized.bias == nil,
             let projected = CBv2AttentionOQMVV1.matmul(
@@ -1777,7 +1782,9 @@ private class Gemma4Attention: Module {
                 groupSize: quantized.groupSize,
                 bits: quantized.bits,
                 mode: quantized.mode,
-                rsTable: CBv2AttentionOQMVV1.runsumTable(for: x))
+                rsTable: CBv2AttentionOQMVV1.acceptRunsumTable(
+                    carriedRunsum, for: x)
+                    ?? CBv2AttentionOQMVV1.runsumTable(for: x))
         else { return oProj(x) }
         return projected
     }
@@ -2143,7 +2150,7 @@ private class Gemma4Attention: Module {
             output = output.asType(outputDType)
         }
         return (
-            outputProjection(output),
+            outputProjection(output, carriedRunsum: residentProducts?.runsumTable),
             (residentProducts?.normalizedKeys ?? k,
              residentProducts?.normalizedValues ?? v),
             captured)
@@ -5886,6 +5893,19 @@ extension Gemma4TextModel: CBv2MTPForwardable {
 private let gemma4LogitslessHeadVerify: Bool = gemma4TruthyFlag(
     ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_LOGITSLESS_HEAD_VERIFY"])
 
+/// Off only on an explicit off value, so the fold is the default road and the
+/// switch restores the stock final norm plus the standalone sum prepass.
+private let gemma4DecodeHeadNormXSumFoldEnabled: Bool = {
+    guard
+        let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_DECODE_HEAD_NORM_XSUM_FOLD"]
+    else { return true }
+    switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+    case "0", "false", "no", "off": return false
+    default: return true
+    }
+}()
+
 /// The tied head can answer the chained decode step with token ids alone.
 ///
 /// The values the fused kernel compares are the bf16 the MMA head would have
@@ -5912,7 +5932,31 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
     }
 
     public func cbv2DecodeArgmax(_ tokens: MLXArray, caches: [KVCache]) -> MLXArray {
-        let hidden = model(tokens, cache: caches)
+        // The greedy road's serial tail is final RMSNorm, the head's affine
+        // activation-sum prepass, the fused head+argmax, then the reduce. The
+        // tree already carries a producer that emits the first two together
+        // and the logits entry point already takes it at this exact geometry;
+        // only this path was still paying for both dispatches.
+        let hidden: MLXArray
+        let carriedSums: Gemma4MMAQuantizedGEMV.ActivationSums?
+        if gemma4DecodeHeadNormXSumFoldEnabled,
+            lmHead == nil,
+            tokens.ndim == 2,
+            tokens.dim(0) == 8,
+            tokens.dim(1) == 1,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.mode == .affine,
+            quantized.groupSize == 64,
+            quantized.bits == 4,
+            Gemma4MMAQuantizedGEMV.consumesActivationSums
+        {
+            let produced = model.callWithMMAHeadSums(tokens, cache: caches)
+            hidden = produced.postNorm
+            carriedSums = produced.activationSums
+        } else {
+            hidden = model(tokens, cache: caches)
+            carriedSums = nil
+        }
         let rows = tokens.dim(0)
         guard lmHead == nil,
             let quantized = model.embedTokens as? QuantizedEmbedding,
@@ -5923,7 +5967,8 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
                 scales: quantized.scales,
                 biases: quantized.biases,
                 groupSize: quantized.groupSize,
-                bits: quantized.bits)
+                bits: quantized.bits,
+                activationSums: carriedSums)
         else {
             return applyLMHead(hidden).argMax(axis: -1).asType(.int32).reshaped([rows])
         }

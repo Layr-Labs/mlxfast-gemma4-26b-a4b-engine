@@ -3072,7 +3072,8 @@ public enum Gemma4MMAQuantizedGEMV {
         scales: MLXArray,
         biases: MLXArray?,
         groupSize: Int,
-        bits: Int
+        bits: Int,
+        activationSums: ActivationSums? = nil
     ) -> MLXArray? {
         guard
             admitsArgmax(
@@ -3087,16 +3088,26 @@ public enum Gemma4MMAQuantizedGEMV {
         let threadgroups = n / (colsPerThreadgroup * 4)
 
         let sumCells = mRows * (k / groupSize)
-        let sumThreads = 128
-        let sumThreadgroups = (sumCells + sumThreads - 1) / sumThreads
-        let xSums = xSumKernel(
-            [flatX],
-            template: [("T", x.dtype), ("K", k)],
-            grid: (sumThreadgroups * sumThreads, 1, 1),
-            threadGroup: (sumThreads, 1, 1),
-            outputShapes: [[sumCells]],
-            outputDTypes: [.float32]
-        )[0]
+        let xSums: MLXArray
+        if let activationSums,
+            activationSums.values.dtype == .float32,
+            activationSums.values.ndim == 1,
+            activationSums.values.size == sumCells
+        {
+            CBv2EngageMark.once("head-norm-xsum-fold")
+            xSums = activationSums.values
+        } else {
+            let sumThreads = 128
+            let sumThreadgroups = (sumCells + sumThreads - 1) / sumThreads
+            xSums = xSumKernel(
+                [flatX],
+                template: [("T", x.dtype), ("K", k)],
+                grid: (sumThreadgroups * sumThreads, 1, 1),
+                threadGroup: (sumThreads, 1, 1),
+                outputShapes: [[sumCells]],
+                outputDTypes: [.float32]
+            )[0]
+        }
 
         let partials = kernelV27Argmax(
             [flatX, w, scales, biases, xSums],

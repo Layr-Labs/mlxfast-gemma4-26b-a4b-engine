@@ -2105,6 +2105,28 @@ private class Gemma4Attention: Module {
             k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
         }
 
+        // NORMFOLD-001: on the sliding layers' batch-eight decode cell, hand
+        // the attention road the RAW projections plus the norm weights and
+        // RoPE inputs so the resident q4 attention kernel can reproduce the
+        // fused norm + RoPE in its prologue. `appliedRope` here means the
+        // decode norm kernel above admitted this exact cell (bf16 [8,1,16,256]
+        // / [8,1,8,256], eps 1e-6, int32 [8] offsets, float32 log2 base); the
+        // sliding layers use the base-route RoPE with no frequency table.
+        // The normalized `queries`/`k`/`v` above stay lazy: on the folded road
+        // nothing evaluates them, and every fail-closed path consumes them
+        // exactly as before.
+        let normFold: CBv2DecodeQKVNormFold? =
+            (CBv2DecodeQKVNormFold.enabled && appliedRope && lastQueryCache == nil
+                && isSliding && vProj != nil && !qkvRopeParameters.usesFrequencies
+                && effectiveHeadDim == 256 && B == 8 && L == 1
+                && queryRaw.dtype == .bfloat16 && config.rmsNormEps == 1.0e-6)
+            ? CBv2DecodeQKVNormFold(
+                rawQ: queryRaw, rawK: kRaw, rawV: vRaw,
+                qWeight: qNorm.weight, kWeight: kNorm.weight,
+                positionOffsets: capturedOffsets,
+                ropeLog2Base: qkvRopeParameters.log2Base)
+            : nil
+
         let outputDType = queries.dtype
         let attentionQueries =
             outputDType == .float16 ? queries.asType(.float32) : queries
@@ -2114,7 +2136,8 @@ private class Gemma4Attention: Module {
                 queries: attentionQueries, keys: k, values: v, scale: scale, sinks: nil)
         } else {
             attention = layerCache.updateAndAttend(
-                queries: attentionQueries, keys: k, values: v, scale: scale, sinks: nil)
+                queries: attentionQueries, keys: k, values: v, scale: scale, sinks: nil,
+                normFold: normFold)
         }
 
         var output = attention.transposed(0, 2, 1, 3).reshaped(B, queryLength, -1)

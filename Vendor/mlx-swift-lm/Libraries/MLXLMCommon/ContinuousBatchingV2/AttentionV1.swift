@@ -430,7 +430,8 @@ enum CBv2AttentionV1 {
         spanContexts: [CBv2SpanChunkContext?]? = nil,
         serializeQueries: Bool = false,
         decodeRingWriteFence: CBv2DecodeRingWriteFence? = nil,
-        allowFusedRingWrite: Bool = false
+        allowFusedRingWrite: Bool = false,
+        normFold: CBv2DecodeQKVNormFold? = nil
     ) -> MLXArray {
         let B = queries.dim(0)
         let L = queries.dim(2)
@@ -496,7 +497,8 @@ enum CBv2AttentionV1 {
                                     newKeys: keys, newValues: values,
                                     previousWriteFence: decodeRingWriteFence.value,
                                     scale: scale,
-                                    slidingWindowLength: ringRows[0].window)
+                                    slidingWindowLength: ringRows[0].window,
+                                    normFold: normFold)
                         {
                             // Q4-BF16-ELIDE: the fused pass already stored
                             // the mirror slot and served this step's live

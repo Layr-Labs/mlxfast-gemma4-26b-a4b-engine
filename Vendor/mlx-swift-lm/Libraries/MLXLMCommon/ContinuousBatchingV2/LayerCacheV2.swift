@@ -185,6 +185,17 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?
     ) -> MLXArray {
+        updateAndAttend(
+            queries: queries, keys: keys, values: values,
+            scale: scale, sinks: sinks, normFold: nil)
+    }
+
+    /// NORMFOLD-001: the unified bank threads the folded-norm descriptor to
+    /// the decode attention road; every other shape ignores it.
+    public func updateAndAttend(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?, normFold: CBv2DecodeQKVNormFold?
+    ) -> MLXArray {
         precondition(
             kind.sharesKVWithLayer == nil,
             "CBv2LayerCache: KV-shared layer \(layerIndex) must use attendBorrowing")
@@ -195,7 +206,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             spanContexts: boundSpanContexts,
             serializeQueries: mtpSerializesRectangularAttention,
             decodeRingWriteFence: decodeRingWriteFence,
-            allowFusedRingWrite: !retainsChunkForBorrowers)
+            allowFusedRingWrite: !retainsChunkForBorrowers,
+            normFold: normFold)
         // Advance offsets ON-DEVICE. A unified bank elects exactly one owning
         // cache; Gemma snapshots the shared pre-step value before this call.
         if advancesPositionOffsets {

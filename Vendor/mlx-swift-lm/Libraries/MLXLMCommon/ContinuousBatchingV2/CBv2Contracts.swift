@@ -526,12 +526,31 @@ public protocol CBv2AttendingLayerCache: AnyObject {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?
     ) -> MLXArray
+    /// NORMFOLD-001: `updateAndAttend` plus an optional folded-norm
+    /// descriptor for the decode cell. Caches without a folded road take the
+    /// default below, which ignores the descriptor and attends on the
+    /// normalized arrays exactly as before.
+    func updateAndAttend(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?, normFold: CBv2DecodeQKVNormFold?
+    ) -> MLXArray
     /// Borrow the source layer's K/V for Gemma-style KV-shared layers.
     /// Only valid when `kind.sharesKVWithLayer != nil`.
     func attendBorrowing(
         source: CBv2AttendingLayerCache,
         queries: MLXArray, scale: Float, sinks: MLXArray?
     ) -> MLXArray
+}
+
+extension CBv2AttendingLayerCache {
+    /// NORMFOLD-001 default: no folded road; the descriptor is ignored.
+    public func updateAndAttend(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?, normFold: CBv2DecodeQKVNormFold?
+    ) -> MLXArray {
+        updateAndAttend(
+            queries: queries, keys: keys, values: values, scale: scale, sinks: sinks)
+    }
 }
 
 // MARK: - Scheduler plan (vLLM-V1 style: no phases)

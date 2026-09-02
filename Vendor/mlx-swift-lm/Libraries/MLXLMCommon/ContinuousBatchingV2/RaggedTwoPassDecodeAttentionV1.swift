@@ -13,6 +13,71 @@ import Foundation
 import MLX
 import MLXFast
 
+/// NORMFOLD-001: the decode QKV RMS-norm + RoPE stage, folded into the
+/// sliding-layer attention kernel's prologue.
+///
+/// At the batch-eight length-one decode cell every sliding layer ran
+/// `gemma4_b8_qkv_rms_norm_rope_v2_vec1` (one tiny dispatch: 256 rows of
+/// 256 values) between the fused Q|K|V projection and the q4 resident-merge
+/// attention kernel. Nothing else runs concurrently at that point of the
+/// layer, so the dispatch is a true serialization point: the projection
+/// drains, the norm launches and runs, the norm drains, attention launches.
+/// This descriptor carries the RAW projections plus everything the norm
+/// kernel consumed (weights, positions, RoPE base) so the attention kernel
+/// can reproduce the norm kernel's arithmetic in registers instead:
+/// same per-thread four-element square sums in the same order, same
+/// `simd_sum` lane layout for both reduction levels, same
+/// `precise::rsqrt`, same BF16 rounding boundaries, same `fast::cos/sin`
+/// RoPE expressions, same final BF16 store rounding (reproduced by a
+/// `float(T(x))` round trip). Every product and every reduction sees the
+/// same operands in the same order, so the attention kernel consumes the
+/// identical BF16 values the separate kernel would have written.
+///
+/// The normalized arrays are still built lazily alongside this descriptor;
+/// when the folded kernel is taken they are never evaluated, and when any
+/// guard fails the incumbent road consumes them exactly as before.
+///
+/// Kill switch: `DARKBLOOM_CBV2_DECODE_QKV_NORM_FOLD=0` (also `false`, `no`,
+/// `off`) restores the separate norm dispatch in the same binary.
+public struct CBv2DecodeQKVNormFold {
+    public static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_DECODE_QKV_NORM_FOLD"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// `[8, 1, 16, 256]` bf16, the raw query projection (token-major; L = 1
+    /// makes it the same bytes as head-major).
+    public let rawQ: MLXArray
+    /// `[8, 1, 8, 256]` bf16, the raw key projection.
+    public let rawK: MLXArray
+    /// `[8, 1, 8, 256]` bf16, the raw value projection.
+    public let rawV: MLXArray
+    /// `[256]` bf16 query-norm weight.
+    public let qWeight: MLXArray
+    /// `[256]` bf16 key-norm weight.
+    public let kWeight: MLXArray
+    /// `[8]` int32 pre-step position offsets (the RoPE position per row).
+    public let positionOffsets: MLXArray
+    /// `[1]` float32 `log2(rope theta)` for the base-route RoPE.
+    public let ropeLog2Base: MLXArray
+
+    public init(
+        rawQ: MLXArray, rawK: MLXArray, rawV: MLXArray,
+        qWeight: MLXArray, kWeight: MLXArray,
+        positionOffsets: MLXArray, ropeLog2Base: MLXArray
+    ) {
+        self.rawQ = rawQ
+        self.rawK = rawK
+        self.rawV = rawV
+        self.qWeight = qWeight
+        self.kWeight = kWeight
+        self.positionOffsets = positionOffsets
+        self.ropeLog2Base = ropeLog2Base
+    }
+}
+
 enum CBv2RaggedTwoPassDecodeAttentionV1 {
     private static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
@@ -1886,6 +1951,504 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             """,
             ensureRowContiguous: true
         )
+    /// NORMFOLD-001: the resident kernel with the decode QKV norm + RoPE
+    /// stage folded into its prologue (see `CBv2DecodeQKVNormFold`). Every
+    /// line after the prologue is the resident kernel's text verbatim; the
+    /// prologue produces the same `q_lo`/`q_hi`/`kv`/`vv` floats the resident
+    /// kernel loads from the norm kernel's outputs.
+    private static let portQuantFusedWriteResidentNormFoldKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_normfold_v1",
+            inputNames: [
+                "raw_q",
+                "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
+                "starts", "raw_k", "raw_v", "write_fence",
+                "q_weight", "k_weight", "position_offsets", "rope_log2_base",
+            ],
+            outputNames: ["out", "fence"],
+            source: """
+                typedef vec<T, 4> T4;
+                constexpr int simd_width = 32;
+                constexpr int values_per_lane = D / simd_width;
+                constexpr int vectors_per_lane = values_per_lane / 4;
+                constexpr int payload_words = D / 8;
+                constexpr int row_words = payload_words + D / 64;
+                constexpr int current_block = (N - 1) % BLOCKS;
+                constexpr int COLS = BLOCKS;
+                constexpr int sets = simd_width / COLS;
+                constexpr int rounds = (BLOCKS + COLS - 1) / COLS;
+                static_assert(BLOCKS == 8, "resident kernel requires eight blocks");
+                static_assert(GQA == 2, "resident kernel requires GQA two");
+                static_assert(values_per_lane % 4 == 0, "lane run is four-wide");
+
+                const int kv_head = int(threadgroup_position_in_grid.x);
+                const int batch_index = int(threadgroup_position_in_grid.y);
+                const int block = int(simdgroup_index_in_threadgroup);
+                const int query_head = GQA * kv_head;
+                const int batch_head = batch_index * 16 + query_head;
+                const int lane = int(thread_index_in_simdgroup);
+
+                threadgroup T local_partials[GQA * BLOCKS * D];
+                threadgroup float local_sums[GQA * BLOCKS];
+                threadgroup float local_maxs[GQA * BLOCKS];
+
+                const device uint32_t* mirror_w = m0;
+                switch (batch_index) {
+                    case 1: mirror_w = m1; break;
+                    case 2: mirror_w = m2; break;
+                    case 3: mirror_w = m3; break;
+                    case 4: mirror_w = m4; break;
+                    case 5: mirror_w = m5; break;
+                    case 6: mirror_w = m6; break;
+                    case 7: mirror_w = m7; break;
+                    default: break;
+                }
+                const device uint32_t* mkeys_w =
+                    mirror_w + kv_head * N * row_words;
+                const device uint32_t* mvalues_w =
+                    mirror_w + (KV_HEADS + kv_head) * N * row_words;
+                // NORMFOLD-001: raw K/V rows for this KV head and the row's
+                // RoPE position, consumed by the norm prologue below.
+                const device T* raw_k_row = raw_k
+                    + (batch_index * KV_HEADS + kv_head) * D;
+                const device T* raw_v_row = raw_v
+                    + (batch_index * KV_HEADS + kv_head) * D;
+                const float rope_L = static_cast<float>(position_offsets[batch_index]);
+                // MLX binds size-one inputs in the constant address space; read
+                // the base once as a value (the norm kernel reads the same float).
+                const float rope_log2_base_value = rope_log2_base[0];
+                const uint start = starts[batch_index];
+                const uint write_slot = (start + uint(N - 1)) % uint(N);
+
+                half khs = half(0.0f);
+                half khb = half(0.0f);
+                half vhs = half(0.0f);
+                half vhb = half(0.0f);
+                uint32_t kword = 0u;
+                uint32_t vword = 0u;
+                if (block == current_block) {
+                    float kmin = 3.402823466e+38F;
+                    float kmax = -3.402823466e+38F;
+                    float vmin = 3.402823466e+38F;
+                    float vmax = -3.402823466e+38F;
+                    float kv[values_per_lane];
+                    float vv[values_per_lane];
+                    // NORMFOLD-001: K = weighted norm + RoPE, V = plain norm,
+                    // each reproduced from the raw projection on this
+                    // simdgroup, then re-laid out to this kernel's lane
+                    // ownership (lane owns values lane*8 .. lane*8+7).
+                    {
+                        float4 n_lo;
+                        float4 n_hi;
+                        cbv2_normfold_row_d256<T, true>(
+                            raw_k_row, k_weight, rope_L, rope_log2_base_value,
+                            uint(lane), n_lo, n_hi);
+                        cbv2_normfold_relayout(n_lo, n_hi, uint(lane), kv);
+                        cbv2_normfold_row_d256<T, false>(
+                            raw_v_row, k_weight, rope_L, rope_log2_base_value,
+                            uint(lane), n_lo, n_hi);
+                        cbv2_normfold_relayout(n_lo, n_hi, uint(lane), vv);
+                    }
+                    #pragma unroll
+                    for (int q = 0; q < values_per_lane / 4; ++q) {
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            kmin = min(kmin, kv[q * 4 + j]);
+                            kmax = max(kmax, kv[q * 4 + j]);
+                            vmin = min(vmin, vv[q * 4 + j]);
+                            vmax = max(vmax, vv[q * 4 + j]);
+                        }
+                    }
+                    for (uint mask = 1; mask < 8; mask <<= 1) {
+                        kmin = min(kmin, simd_shuffle_xor(kmin, mask));
+                        kmax = max(kmax, simd_shuffle_xor(kmax, mask));
+                        vmin = min(vmin, simd_shuffle_xor(vmin, mask));
+                        vmax = max(vmax, simd_shuffle_xor(vmax, mask));
+                    }
+                    khs = half(max((kmax - kmin) / 15.0f, 1e-6f));
+                    khb = half(kmin);
+                    vhs = half(max((vmax - vmin) / 15.0f, 1e-6f));
+                    vhb = half(vmin);
+                    const float ks = float(khs);
+                    const float kb = float(khb);
+                    const float vs = float(vhs);
+                    const float vb = float(vhb);
+                    #pragma unroll
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        const float kq = metal::rint((kv[element] - kb) / ks);
+                        const float vq = metal::rint((vv[element] - vb) / vs);
+                        kword |= uint32_t(clamp(kq, 0.0f, 15.0f)) << (4 * element);
+                        vword |= uint32_t(clamp(vq, 0.0f, 15.0f)) << (4 * element);
+                    }
+
+                    device uint32_t* write_key =
+                        const_cast<device uint32_t*>(mkeys_w)
+                        + write_slot * row_words;
+                    device uint32_t* write_value =
+                        const_cast<device uint32_t*>(mvalues_w)
+                        + write_slot * row_words;
+                    write_key[lane] = kword;
+                    write_value[lane] = vword;
+                    if (lane % 8 == 0) {
+                        write_key[payload_words + lane / 8] =
+                            uint32_t(as_type<ushort>(khs))
+                            | (uint32_t(as_type<ushort>(khb)) << 16);
+                        write_value[payload_words + lane / 8] =
+                            uint32_t(as_type<ushort>(vhs))
+                            | (uint32_t(as_type<ushort>(vhb)) << 16);
+                    }
+                }
+                if (batch_index == 0 && kv_head == 0
+                    && block == current_block && lane == 0) {
+                    fence[0] = write_fence[0] + 1;
+                }
+
+                const device T* raw_q_row = raw_q + batch_head * D;
+                threadgroup T* partial = local_partials
+                    + block * D + lane * values_per_lane;
+                threadgroup float* sum_out = local_sums + block;
+                threadgroup float* max_out = local_maxs + block;
+
+                thread float q_lo[values_per_lane];
+                thread float q_hi[values_per_lane];
+                thread float acc_lo[values_per_lane];
+                thread float acc_hi[values_per_lane];
+                // NORMFOLD-001: both GQA query heads, weighted norm + RoPE,
+                // reproduced on every block (identical instructions on
+                // identical operands give identical bits; no barrier needed).
+                {
+                    float4 n_lo;
+                    float4 n_hi;
+                    cbv2_normfold_row_d256<T, true>(
+                        raw_q_row, q_weight, rope_L, rope_log2_base_value,
+                        uint(lane), n_lo, n_hi);
+                    cbv2_normfold_relayout(n_lo, n_hi, uint(lane), q_lo);
+                    cbv2_normfold_row_d256<T, true>(
+                        raw_q_row + D, q_weight, rope_L, rope_log2_base_value,
+                        uint(lane), n_lo, n_hi);
+                    cbv2_normfold_relayout(n_lo, n_hi, uint(lane), q_hi);
+                }
+                #pragma clang loop unroll(full)
+                for (int element = 0; element < values_per_lane; ++element) {
+                    acc_lo[element] = 0.0f;
+                    acc_hi[element] = 0.0f;
+                }
+
+                float max_lo = -3.402823466e+38F;
+                float max_hi = -3.402823466e+38F;
+                float sum_lo = 0.0f;
+                float sum_hi = 0.0f;
+                uint slot = (start + uint(block)) % uint(N);
+                const bool prefetch_first = block < N - 1;
+                uint next_slot = slot + uint(BLOCKS);
+                if (next_slot >= uint(N)) next_slot -= uint(N);
+                uint32_t kw_pre = prefetch_first
+                    ? mkeys_w[slot * row_words + lane] : 0u;
+                uint32_t vw_pre = prefetch_first
+                    ? mvalues_w[slot * row_words + lane] : 0u;
+                uint32_t ktw_pre = prefetch_first
+                    ? mkeys_w[slot * row_words + payload_words + lane / 8] : 0u;
+                uint32_t vtw_pre = prefetch_first
+                    ? mvalues_w[slot * row_words + payload_words + lane / 8] : 0u;
+                for (int token = block; token < N; token += BLOCKS) {
+                    const bool current = token == N - 1;
+                    const uint32_t kw = current ? kword : kw_pre;
+                    const uint32_t vw = current ? vword : vw_pre;
+                    const uint32_t ktw = current
+                        ? (uint32_t(as_type<ushort>(khs))
+                            | (uint32_t(as_type<ushort>(khb)) << 16))
+                        : ktw_pre;
+                    const uint32_t vtw = current
+                        ? (uint32_t(as_type<ushort>(vhs))
+                            | (uint32_t(as_type<ushort>(vhb)) << 16))
+                        : vtw_pre;
+                    if (token + BLOCKS < N - 1) {
+                        kw_pre = mkeys_w[next_slot * row_words + lane];
+                        vw_pre = mvalues_w[next_slot * row_words + lane];
+                        ktw_pre =
+                            mkeys_w[next_slot * row_words + payload_words + lane / 8];
+                        vtw_pre =
+                            mvalues_w[next_slot * row_words + payload_words + lane / 8];
+                        next_slot += uint(BLOCKS);
+                        if (next_slot >= uint(N)) next_slot -= uint(N);
+                    }
+                    const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
+                    const float kb = float(as_type<half>(ushort(ktw >> 16)));
+                    const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
+                    const float vb = float(as_type<half>(ushort(vtw >> 16)));
+                    float score_lo = 0.0f;
+                    float score_hi = 0.0f;
+                    #pragma clang loop unroll(full)
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        const float key_element =
+                            fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
+                        score_lo += q_lo[element] * key_element;
+                        score_hi += q_hi[element] * key_element;
+                    }
+                    score_lo = simd_sum(score_lo);
+                    score_hi = simd_sum(score_hi);
+
+                    const float new_max_lo = max(max_lo, score_lo);
+                    const float new_max_hi = max(max_hi, score_hi);
+                    const float old_factor_lo = fast::exp(max_lo - new_max_lo);
+                    const float old_factor_hi = fast::exp(max_hi - new_max_hi);
+                    const float score_factor_lo = fast::exp(score_lo - new_max_lo);
+                    const float score_factor_hi = fast::exp(score_hi - new_max_hi);
+                    max_lo = new_max_lo;
+                    max_hi = new_max_hi;
+                    sum_lo = sum_lo * old_factor_lo + score_factor_lo;
+                    sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                    #pragma clang loop unroll(full)
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        const float value_element =
+                            fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
+                        acc_lo[element] = acc_lo[element] * old_factor_lo
+                            + score_factor_lo * value_element;
+                        acc_hi[element] = acc_hi[element] * old_factor_hi
+                            + score_factor_hi * value_element;
+                    }
+                }
+
+                if (lane == 0) {
+                    sum_out[0] = sum_lo;
+                    max_out[0] = max_lo;
+                    sum_out[BLOCKS] = sum_hi;
+                    max_out[BLOCKS] = max_hi;
+                }
+                threadgroup T4* partial_vec_lo =
+                    reinterpret_cast<threadgroup T4*>(partial);
+                threadgroup T4* partial_vec_hi =
+                    reinterpret_cast<threadgroup T4*>(partial + BLOCKS * D);
+                #pragma clang loop unroll(full)
+                for (int q = 0; q < values_per_lane / 4; ++q) {
+                    T4 p4_lo, p4_hi;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        p4_lo[j] = T(acc_lo[q * 4 + j]);
+                        p4_hi[j] = T(acc_hi[q * 4 + j]);
+                    }
+                    partial_vec_lo[q] = p4_lo;
+                    partial_vec_hi[q] = p4_hi;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                const int block_lane = lane % COLS;
+                const int output_group = block * sets + lane / COLS;
+                #pragma clang loop unroll(full)
+                for (int head = 0; head < GQA; ++head) {
+                    const threadgroup T* head_partials = local_partials
+                        + head * BLOCKS * D + output_group * values_per_lane;
+                    const threadgroup float* head_sums =
+                        local_sums + head * BLOCKS;
+                    const threadgroup float* head_maxs =
+                        local_maxs + head * BLOCKS;
+                    device T* head_out = out
+                        + (batch_head + head) * D
+                        + output_group * values_per_lane;
+
+                    thread float accumulator[values_per_lane];
+                    #pragma clang loop unroll(full)
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        accumulator[element] = 0.0f;
+                    }
+                    thread float lane_max[rounds];
+                    thread float lane_sum[rounds];
+                    thread float lane_factor[rounds];
+                    float sum_exp_score = 0.0f;
+                    float max_score = -3.402823466e+38F;
+                    #pragma clang loop unroll(full)
+                    for (int round = 0; round < rounds; ++round) {
+                        const int column = block_lane + COLS * round;
+                        const bool live = column < BLOCKS;
+                        lane_max[round] =
+                            live ? head_maxs[column] : -3.402823466e+38F;
+                        lane_sum[round] = live ? head_sums[column] : 0.0f;
+                        max_score = max(max_score, lane_max[round]);
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int stride = 1; stride < COLS; stride <<= 1) {
+                        max_score = max(
+                            max_score,
+                            simd_shuffle_xor(max_score, ushort(stride)));
+                    }
+
+                    #pragma clang loop unroll(full)
+                    for (int round = 0; round < rounds; ++round) {
+                        lane_factor[round] =
+                            fast::exp(lane_max[round] - max_score);
+                        sum_exp_score += lane_factor[round] * lane_sum[round];
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int stride = 1; stride < COLS; stride <<= 1) {
+                        sum_exp_score +=
+                            simd_shuffle_xor(sum_exp_score, ushort(stride));
+                    }
+
+                    #pragma clang loop unroll(full)
+                    for (int round = 0; round < rounds; ++round) {
+                        const int column = block_lane + COLS * round;
+                        if (column < BLOCKS) {
+                            const float factor = lane_factor[round];
+                            const threadgroup T4* partial_vectors =
+                                reinterpret_cast<const threadgroup T4*>(
+                                    head_partials + column * D);
+                            #pragma clang loop unroll(full)
+                            for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
+                                const T4 partial_vector = partial_vectors[chunk];
+                                #pragma clang loop unroll(full)
+                                for (int j = 0; j < 4; ++j) {
+                                    accumulator[chunk * 4 + j] +=
+                                        factor * float(partial_vector[j]);
+                                }
+                            }
+                        }
+                    }
+
+                    // Each step trades the half of the live slots whose
+                    // element bit matches the partner's column bit and keeps
+                    // the other half, so the live count runs 8, 4, 2, 1 and
+                    // the lane that survives for an element is the one whose
+                    // column index equals it. Every node of the addition tree
+                    // pairs the same two column subtrees the per-element
+                    // butterfly paired.
+                    #pragma clang loop unroll(full)
+                    for (int step = 0; (1 << step) < COLS; ++step) {
+                        const ushort stride = ushort(1 << step);
+                        const bool upper = (block_lane & int(stride)) != 0;
+                        const int live = values_per_lane >> step;
+                        #pragma clang loop unroll(full)
+                        for (int slot = 0; slot < live; slot += 2) {
+                            const float keep = upper
+                                ? accumulator[slot + 1]
+                                : accumulator[slot];
+                            const float trade = upper
+                                ? accumulator[slot]
+                                : accumulator[slot + 1];
+                            accumulator[slot >> 1] =
+                                keep + simd_shuffle_xor(trade, stride);
+                        }
+                    }
+                    head_out[block_lane] = T(
+                        sum_exp_score == 0.0f
+                            ? accumulator[0]
+                            : accumulator[0] / sum_exp_score);
+                }
+            """,
+            header: """
+                // NORMFOLD-001 helpers. `cbv2_normfold_row_d256` is one
+                // simdgroup's transcription of gemma4_b8_qkv_rms_norm_rope_v2_vec1
+                // for one 256-wide row. That kernel runs 64 threads per row in
+                // two simdgroups; thread `lid` owns values lid*4 .. lid*4+3, so
+                // simdgroup 0 covers values 0..127 and simdgroup 1 covers
+                // 128..255. Here lane `l` plays thread `l` (values 4l..4l+3) AND
+                // thread 32+l (values 128+4l..): the two four-element square sums
+                // are accumulated in the same order, each half is reduced by
+                // `simd_sum` over the same 32-lane layout, and the two partials
+                // are reduced exactly as the norm kernel reduces its
+                // `partials[32]` (lane 0 holds half 0, lane 1 half 1, every other
+                // lane 0.0f). The normalize, weight, BF16 rounding, RoPE
+                // rotation and final BF16 store rounding are the norm kernel's
+                // expressions verbatim on the same operands.
+                template <typename T, bool WEIGHTED>
+                inline void cbv2_normfold_row_d256(
+                    const device T* raw_row,
+                    const device T* weight,
+                    const float L,
+                    const float log2_base,
+                    const uint lane,
+                    thread float4& out_lo,
+                    thread float4& out_hi) {
+                    typedef vec<T, 4> T4;
+                    constexpr uint reads = 4;
+                    constexpr uint D = 256;
+                    const T4 vin_lo =
+                        *reinterpret_cast<const device T4*>(raw_row + lane * reads);
+                    const T4 vin_hi = *reinterpret_cast<const device T4*>(
+                        raw_row + D / 2 + lane * reads);
+                    float sum_lo = 0.0f;
+                    for (uint i = 0; i < reads; ++i) {
+                        const float value = float(vin_lo[i]);
+                        sum_lo += value * value;
+                    }
+                    float sum_hi = 0.0f;
+                    for (uint i = 0; i < reads; ++i) {
+                        const float value = float(vin_hi[i]);
+                        sum_hi += value * value;
+                    }
+                    sum_lo = simd_sum(sum_lo);
+                    sum_hi = simd_sum(sum_hi);
+                    const float partial = lane == 0 ? sum_lo : (lane == 1 ? sum_hi : 0.0f);
+                    const float sum = simd_sum(partial);
+                    const float inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+                    if (WEIGHTED) {
+                        const T4 wv_lo =
+                            *reinterpret_cast<const device T4*>(weight + lane * reads);
+                        const T4 wv_hi = *reinterpret_cast<const device T4*>(
+                            weight + D / 2 + lane * reads);
+                        T rounded_lo[reads];
+                        T rounded_hi[reads];
+                        for (uint i = 0; i < reads; ++i) {
+                            const T normalized = T(float(vin_lo[i]) * inverse_rms);
+                            rounded_lo[i] = T(wv_lo[i] * normalized);
+                        }
+                        for (uint i = 0; i < reads; ++i) {
+                            const T normalized = T(float(vin_hi[i]) * inverse_rms);
+                            rounded_hi[i] = T(wv_hi[i] * normalized);
+                        }
+                        for (uint i = 0; i < reads; ++i) {
+                            const uint pair = lane * reads + i;
+                            const float d = static_cast<float>(pair) / static_cast<float>(D / 2);
+                            const float inv_freq = metal::exp2(-d * log2_base);
+                            const float theta = L * inv_freq;
+                            const float costheta = metal::fast::cos(theta);
+                            const float sintheta = metal::fast::sin(theta);
+                            const float x1 = static_cast<float>(rounded_lo[i]);
+                            const float x2 = static_cast<float>(rounded_hi[i]);
+                            const float rx1 = x1 * costheta - x2 * sintheta;
+                            const float rx2 = x1 * sintheta + x2 * costheta;
+                            out_lo[i] = float(static_cast<T>(rx1));
+                            out_hi[i] = float(static_cast<T>(rx2));
+                        }
+                    } else {
+                        for (uint i = 0; i < reads; ++i) {
+                            const T normalized = T(float(vin_lo[i]) * inverse_rms);
+                            out_lo[i] = float(T(1) * normalized);
+                        }
+                        for (uint i = 0; i < reads; ++i) {
+                            const T normalized = T(float(vin_hi[i]) * inverse_rms);
+                            out_hi[i] = float(T(1) * normalized);
+                        }
+                    }
+                }
+
+                // Re-lay the norm layout (lane l: values 4l..4l+3 in `out_lo`,
+                // 128+4l..128+4l+3 in `out_hi`) onto the attention layout (lane l:
+                // values 8l..8l+7). Pure permutation of already-rounded floats.
+                inline void cbv2_normfold_relayout(
+                    const float4 out_lo,
+                    const float4 out_hi,
+                    const uint lane,
+                    thread float* dst) {
+                    const ushort src_a = ushort(lane < 16u ? 2u * lane : 2u * (lane - 16u));
+                    const ushort src_b = ushort(src_a + 1u);
+                    const float4 lo_a = simd_shuffle(out_lo, src_a);
+                    const float4 lo_b = simd_shuffle(out_lo, src_b);
+                    const float4 hi_a = simd_shuffle(out_hi, src_a);
+                    const float4 hi_b = simd_shuffle(out_hi, src_b);
+                    const float4 a = lane < 16u ? lo_a : hi_a;
+                    const float4 b = lane < 16u ? lo_b : hi_b;
+                    dst[0] = a[0];
+                    dst[1] = a[1];
+                    dst[2] = a[2];
+                    dst[3] = a[3];
+                    dst[4] = b[0];
+                    dst[5] = b[1];
+                    dst[6] = b[2];
+                    dst[7] = b[3];
+                }
+            """,
+            ensureRowContiguous: true
+        )
 
     /// KVQ-PORT: `attendRing` reading the packed 8-bit mirror instead of the
     /// bf16 ring, with the result CONSUMED by pass B exactly as the stock
@@ -1994,7 +2557,8 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
         newValues: MLXArray,
         previousWriteFence: MLXArray,
         scale: Float,
-        slidingWindowLength: Int
+        slidingWindowLength: Int,
+        normFold: CBv2DecodeQKVNormFold? = nil
     ) -> (output: MLXArray, nextWriteFence: MLXArray)? {
         guard CBv2WindowedSequenceKV.q4FusedMirrorWriteEnabled,
             CBv2WindowedSequenceKV.quantEnabled,
@@ -2028,6 +2592,47 @@ enum CBv2RaggedTwoPassDecodeAttentionV1 {
             combineColumns == 8,
             combineThreads == 256
         {
+            // NORMFOLD-001: consume the raw projections and reproduce the
+            // norm + RoPE in the kernel prologue; the normalized `queries`,
+            // `newKeys` and `newValues` stay lazy and are never evaluated on
+            // this road. Fail-closed to the incumbent resident dispatch.
+            if CBv2DecodeQKVNormFold.enabled, let fold = normFold,
+                fold.rawQ.dtype == .bfloat16,
+                fold.rawQ.shape == [batch, 1, queryHeads, headDim],
+                fold.rawK.dtype == .bfloat16,
+                fold.rawK.shape == [batch, 1, kvHeads, headDim],
+                fold.rawV.dtype == .bfloat16,
+                fold.rawV.shape == fold.rawK.shape,
+                fold.qWeight.dtype == .bfloat16, fold.qWeight.shape == [headDim],
+                fold.kWeight.dtype == .bfloat16, fold.kWeight.shape == [headDim],
+                fold.positionOffsets.dtype == .int32,
+                fold.positionOffsets.shape == [batch],
+                fold.ropeLog2Base.dtype == .float32, fold.ropeLog2Base.size == 1
+            {
+                let folded = portQuantFusedWriteResidentNormFoldKernel(
+                    [fold.rawQ] + mirrors + [
+                        startArray, fold.rawK, fold.rawV, previousWriteFence,
+                        fold.qWeight, fold.kWeight, fold.positionOffsets,
+                        fold.ropeLog2Base,
+                    ],
+                    template: [
+                        ("T", fold.rawQ.dtype),
+                        ("D", headDim),
+                        ("N", sequenceLength),
+                        ("GQA", gqa),
+                        ("KV_HEADS", kvHeads),
+                        ("BLOCKS", blocks),
+                    ],
+                    grid: (kvHeads * blocks * 32, batch, 1),
+                    threadGroup: (blocks * 32, 1, 1),
+                    outputShapes: [[batch, queryHeads, 1, headDim], [1]],
+                    outputDTypes: [.bfloat16, .int32]
+                )
+                CBv2EngageMark.once("kvq4-fused-live-write")
+                CBv2EngageMark.once("kvq4-resident-merge")
+                CBv2EngageMark.once("decode-qkv-norm-fold")
+                return (folded[0], folded[1])
+            }
             let resident = portQuantFusedWriteResidentKernel(
                 inputs,
                 template: [

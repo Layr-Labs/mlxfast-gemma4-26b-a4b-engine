@@ -990,7 +990,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// per-row mirror outputs; every value computed and every address it is
     /// stored to within that row's mirror is the per-row kernel's.
     private static let quantPackPairChunkBatchKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_kvq4g64_pack_pair_chunk_batch_d256_v1",
+        name: "cbv2_kvq4g64_pack_pair_chunk_batch_d256_v2",
         inputNames: ["keys", "values"],
         outputNames: ["m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7"],
         source: """
@@ -1024,12 +1024,18 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
             }
             out += rem * row_words;
 
+            // single load: the lane's eight values are read once and reused
+            // for the range and the quantization (same values, same operations;
+            // mirrors the per-row _ld1 twin's vals cache)
+            float vals[per_lane];
+            for (int i = 0; i < per_lane; ++i) {
+                vals[i] = float(src[lane * per_lane + i]);
+            }
             float vmin = 3.402823466e+38F;
             float vmax = -3.402823466e+38F;
             for (int i = 0; i < per_lane; ++i) {
-                const float v = float(src[lane * per_lane + i]);
-                vmin = min(vmin, v);
-                vmax = max(vmax, v);
+                vmin = min(vmin, vals[i]);
+                vmax = max(vmax, vals[i]);
             }
             for (uint m = 1; m < 8; m <<= 1) {
                 vmin = min(vmin, simd_shuffle_xor(vmin, m));
@@ -1043,7 +1049,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
 
             uint32_t word = 0u;
             for (int i = 0; i < per_lane; ++i) {
-                const float q = metal::rint((float(src[lane * per_lane + i]) - b) / s);
+                const float q = metal::rint((vals[i] - b) / s);
                 word |= uint32_t(clamp(q, 0.0f, 15.0f)) << (4 * i);
             }
             out[lane] = word;

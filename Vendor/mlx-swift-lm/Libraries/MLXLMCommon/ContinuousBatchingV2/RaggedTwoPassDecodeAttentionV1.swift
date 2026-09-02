@@ -13,6 +13,76 @@ import Foundation
 import MLX
 import MLXFast
 
+/// DECODE-META-MEMO-001. Every decode step each of the 25 sliding layers
+/// rebuilt the same `[8]` UInt32 ring-start table on the host and uploaded it
+/// as a fresh `MLXArray` in front of its attention dispatch, and each of the 5
+/// full-attention layers rebuilt the same `[10]` UInt32 params table. Within a
+/// step all sliding copies are value-identical -- every row's ring start
+/// advances in lockstep -- and all full copies are value-identical, because
+/// `keyLength` is shared across the cohort. One value-keyed slot per kind turns
+/// 30 uploads, allocations and graph nodes per step into 2.
+///
+/// The cached array holds exactly the bytes a fresh construction would hold and
+/// the kernels consume it read-only, so this is a bit-identical change. An
+/// alternating value sequence only lowers the hit rate; it can never serve a
+/// stale table, because the key is the full value tuple and is compared before
+/// every reuse. The tree already memoizes prefill SDPA masks on `(L, kL)` under
+/// the same argument, and the promoted `switchDownIdentity64` table is the same
+/// pattern with a constant key.
+///
+/// Scaffolding is deliberately minimal: one static switch read on the fast
+/// path, one lock, one small value compare, and one mark that fires only on a
+/// store. `DARKBLOOM_CBV2_DECODE_META_MEMO=0` restores a fresh `MLXArray` at
+/// every site in the same executable.
+private enum CBv2DecodeMetaMemo {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_DECODE_META_MEMO"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var ringKey: [UInt32] = []
+    nonisolated(unsafe) private static var ringValue: MLXArray?
+    nonisolated(unsafe) private static var paramKey: [UInt32] = []
+    nonisolated(unsafe) private static var paramValue: MLXArray?
+
+    /// The sliding path's `[batch]` ring-start table.
+    @inline(__always)
+    static func ringStarts(_ values: [UInt32], _ shape: [Int]) -> MLXArray {
+        guard enabled else { return MLXArray(values, shape) }
+        lock.lock()
+        if let cached = ringValue, ringKey == values {
+            lock.unlock()
+            return cached
+        }
+        let made = MLXArray(values, shape)
+        ringKey = values
+        ringValue = made
+        lock.unlock()
+        CBv2EngageMark.once("decode-meta-memo")
+        return made
+    }
+
+    /// The D512 chain's `[kL, D, per-row capacities...]` params table.
+    @inline(__always)
+    static func params(_ values: [UInt32]) -> MLXArray {
+        guard enabled else { return MLXArray(values) }
+        lock.lock()
+        if let cached = paramValue, paramKey == values {
+            lock.unlock()
+            return cached
+        }
+        let made = MLXArray(values)
+        paramKey = values
+        paramValue = made
+        lock.unlock()
+        CBv2EngageMark.once("decode-meta-memo")
+        return made
+    }
+}
+
 public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     private static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
@@ -2688,7 +2758,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             })
         else { return nil }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = CBv2DecodeMetaMemo.ringStarts(starts.map(UInt32.init), [batch])
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let passA = portQuantReadKernel(
@@ -2759,7 +2829,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             })
         else { return nil }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = CBv2DecodeMetaMemo.ringStarts(starts.map(UInt32.init), [batch])
         let inputs = [queries] + mirrors
             + [startArray, newKeys, newValues, previousWriteFence]
         if q4ResidentMergeEnabled,
@@ -2899,7 +2969,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             starts.count == batch,
             starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength })
         else { return nil }
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = CBv2DecodeMetaMemo.ringStarts(starts.map(UInt32.init), [batch])
         return attend(
             passAKernel: ringPassAKernel, queries: queries, keys: keys, values: values,
             extraInputs: [startArray], scale: scale)
@@ -2952,7 +3022,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             else { return nil }
         }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = CBv2DecodeMetaMemo.ringStarts(starts.map(UInt32.init), [batch])
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let paired = gqaPairedPassAEnabled && gqa == 2
@@ -4667,7 +4737,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             valueBuffers.append(state[1])
             params.append(UInt32(state[0].dim(2)))
         }
-        let paramsArray = MLXArray(params)
+        let paramsArray = CBv2DecodeMetaMemo.params(params)
 
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)
@@ -4795,7 +4865,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             valueBuffers.append(state[1])
             params.append(UInt32(state[0].dim(2)))
         }
-        let paramsArray = MLXArray(params)
+        let paramsArray = CBv2DecodeMetaMemo.params(params)
 
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)
@@ -5013,7 +5083,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         queries: MLXArray, keyBuffers: [MLXArray], valueBuffers: [MLXArray],
         params: [UInt32], keyLength: Int
     ) -> MLXArray {
-        let paramsArray = MLXArray(params)
+        let paramsArray = CBv2DecodeMetaMemo.params(params)
 
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)

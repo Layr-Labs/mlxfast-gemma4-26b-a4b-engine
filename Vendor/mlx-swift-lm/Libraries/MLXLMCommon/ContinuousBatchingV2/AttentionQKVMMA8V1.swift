@@ -267,17 +267,20 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
   const int g0 = (KS == 2 && simd_gid == 1) ? gh : 0;
   const mma8_coord c = mma8_lane(simd_lid);
 
-  const device uint8_t* wrow[TILES];
-  const device T* srow[TILES];
-  const device T* brow[TILES];
+  // BASEPTR-001: all output tiles are separated by compile-time strides.
+  // Keep one base per plane instead of three arrays of device pointers.
+  // The tile loop is fully unrolled, so t*stride becomes the same constant
+  // address each former wrow[t]/srow[t]/brow[t] held.
+  constexpr int W_TILE_STRIDE = 8 * (K / 2);
+  constexpr int SB_TILE_STRIDE = 8 * G;
+  const device uint8_t* wbase =
+      (const device uint8_t*)w + (n0 + c.fm) * (K / 2) + 4 * c.fn;
+  const device T* sbase = scales + (n0 + c.fm) * G;
+  const device T* bbase = biases + (n0 + c.fm) * G;
   thread float acc0[TILES];
   thread float acc1[TILES];
 #pragma clang loop unroll(full)
   for (int t = 0; t < TILES; ++t) {
-    const int nt = n0 + t * 8;
-    wrow[t] = (const device uint8_t*)w + (nt + c.fm) * (K / 2) + 4 * c.fn;
-    srow[t] = scales + (nt + c.fm) * G;
-    brow[t] = biases + (nt + c.fm) * G;
     acc0[t] = 0.0f;
     acc1[t] = 0.0f;
   }
@@ -301,11 +304,13 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
   T b_next[TILES];
 #pragma clang loop unroll(full)
   for (int t = 0; t < TILES; ++t) {
-    wv_next[t] = *((const device uint2*)(wrow[t] + 32 * g0));
+    wv_next[t] = *((const device uint2*)(
+        wbase + t * W_TILE_STRIDE + 32 * g0));
     wv_next2[t] =
-        *((const device uint2*)(wrow[t] + 32 * (g0 + min(1, nGroups - 1))));
-    s_next[t] = srow[t][g0];
-    b_next[t] = brow[t][g0];
+        *((const device uint2*)(wbase + t * W_TILE_STRIDE
+            + 32 * (g0 + min(1, nGroups - 1))));
+    s_next[t] = sbase[t * SB_TILE_STRIDE + g0];
+    b_next[t] = bbase[t * SB_TILE_STRIDE + g0];
   }
 
 #pragma unroll
@@ -326,9 +331,10 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
 #pragma clang loop unroll(full)
     for (int t = 0; t < TILES; ++t) {
       wv_next[t] = wv_next2[t];
-      wv_next2[t] = *((const device uint2*)(wrow[t] + 32 * g_next2));
-      s_next[t] = srow[t][g_next];
-      b_next[t] = brow[t][g_next];
+      wv_next2[t] = *((const device uint2*)(
+          wbase + t * W_TILE_STRIDE + 32 * g_next2));
+      s_next[t] = sbase[t * SB_TILE_STRIDE + g_next];
+      b_next[t] = bbase[t * SB_TILE_STRIDE + g_next];
     }
 
     const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
@@ -529,17 +535,18 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
   const int g0 = (KS == 2 && simd_gid == 1) ? gh : 0;
   const mma8_coord c = mma8_lane(simd_lid);
 
-  const device uint8_t* wrow[TILES];
-  const device T* srow[TILES];
-  const device T* brow[TILES];
+  // BASEPTR-001 mirrors the carried MT body above: one scalar base for each
+  // plane plus compile-time tile strides replaces three pointer arrays.
+  constexpr int W_TILE_STRIDE = 8 * (K / 2);
+  constexpr int SB_TILE_STRIDE = 8 * G;
+  const device uint8_t* wbase =
+      (const device uint8_t*)w + (n0 + c.fm) * (K / 2) + 4 * c.fn;
+  const device T* sbase = scales + (n0 + c.fm) * G;
+  const device T* bbase = biases + (n0 + c.fm) * G;
   thread float acc0[TILES];
   thread float acc1[TILES];
 #pragma clang loop unroll(full)
   for (int t = 0; t < TILES; ++t) {
-    const int nt = n0 + t * 8;
-    wrow[t] = (const device uint8_t*)w + (nt + c.fm) * (K / 2) + 4 * c.fn;
-    srow[t] = scales + (nt + c.fm) * G;
-    brow[t] = biases + (nt + c.fm) * G;
     acc0[t] = 0.0f;
     acc1[t] = 0.0f;
   }
@@ -570,9 +577,10 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
 
 #pragma clang loop unroll(full)
     for (int t = 0; t < TILES; ++t) {
-      const uint2 wv = *((const device uint2*)(wrow[t] + 32 * g));
-      const float s = float(srow[t][g]);
-      const float b = float(brow[t][g]);
+      const uint2 wv = *((const device uint2*)(
+          wbase + t * W_TILE_STRIDE + 32 * g));
+      const float s = float(sbase[t * SB_TILE_STRIDE + g]);
+      const float b = float(bbase[t * SB_TILE_STRIDE + g]);
 
       simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
       MMA8_STEP(B0, 0)
@@ -649,7 +657,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     private static let tilesPerGroup = 2
 
     private static let multiTileKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_v4",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_baseptr_v5",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -675,7 +683,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     }()
 
     private static let fusedSlidingKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_baseptr_v2",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y", "y2"],
         source: """
@@ -692,7 +700,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         ensureRowContiguous: true)
 
     private static let fusedFullKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_baseptr_v2",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y", "y2"],
         source: """
@@ -714,7 +722,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     // entries the separate Q and K rsp dispatches would; the SPLIT store
     // keeps QKFUSE-001's two-buffer layout.
     private static let fusedSlidingRspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_rsp_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_rsp_baseptr_v2",
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y", "y2"],
         source: """
@@ -731,7 +739,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         ensureRowContiguous: true)
 
     private static let fusedFullRspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_rsp_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_rsp_baseptr_v2",
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y", "y2"],
         source: """
@@ -805,7 +813,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         ensureRowContiguous: true)
 
     private static let multiTileRspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_rsp_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_rsp_baseptr_v2",
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """

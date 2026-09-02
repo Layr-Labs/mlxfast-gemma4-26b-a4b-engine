@@ -3964,13 +3964,14 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 }
             }
             {
-                device T* out_ptr = out
-                    + size_t(row * 16 + kv_head * GQA + thrM) * D
-                    + out_col;
+                device T4* out_ptr4 = reinterpret_cast<device T4*>(
+                    out + size_t(row * 16 + kv_head * GQA + thrM) * D + out_col);
+                T4 out_vec;
                 #pragma clang loop unroll(full)
                 for (int j = 0; j < 4; ++j) {
-                    out_ptr[j] = static_cast<T>(result[j]);
+                    out_vec[j] = static_cast<T>(result[j]);
                 }
+                out_ptr4[0] = out_vec;
             }
         """,
         ensureRowContiguous: true
@@ -4507,13 +4508,14 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 }
             }
             {
-                device T* out_ptr = out
-                    + size_t(row * 16 + kv_head * GQA + thrM) * D
-                    + out_col;
+                device T4* out_ptr4 = reinterpret_cast<device T4*>(
+                    out + size_t(row * 16 + kv_head * GQA + thrM) * D + out_col);
+                T4 out_vec;
                 #pragma clang loop unroll(full)
                 for (int j = 0; j < 4; ++j) {
-                    out_ptr[j] = static_cast<T>(result[j]);
+                    out_vec[j] = static_cast<T>(result[j]);
                 }
+                out_ptr4[0] = out_vec;
             }
         """,
         ensureRowContiguous: true

@@ -1697,7 +1697,7 @@ private enum Gemma4PrefillDeqGEMMV1 {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_PREFILL_DEQ_GEMM_MIN_ROWS"],
             let value = Int(raw), value > 0
-        else { return 1024 }
+        else { return 512 }
         return value
     }()
 

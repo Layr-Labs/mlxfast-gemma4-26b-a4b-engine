@@ -902,14 +902,13 @@ private let gemma4QKVNormRopeEnabled: Bool = {
 }()
 
 private let gemma4QKVNormKernel = MLXFast.metalKernel(
-        name: "gemma4_b8_qkv_rms_norm_rope_v2_vec1",
+    name: "gemma4_b8_qkv_rms_norm_rope_v2",
     inputNames: [
         "q", "k", "v", "q_weight", "k_weight",
         "position_offsets", "rope_log2_base", "rope_freqs",
     ],
     outputNames: ["q_out", "k_out", "v_out"],
     source: """
-        typedef vec<T, 4> T4;
         constexpr uint reads = 4;
         const uint row = threadgroup_position_in_grid.x;
         const uint lid = thread_position_in_threadgroup.x;
@@ -946,10 +945,9 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
             shared_value_output += local_row * D + lid * reads;
         }
 
-        const T4 vin = *reinterpret_cast<const device T4*>(input);
         float sum = 0.0f;
         for (uint i = 0; i < reads; ++i) {
-            const float value = float(vin[i]);
+            const float value = float(input[i]);
             sum += value * value;
         }
         sum = simd_sum(sum);
@@ -969,23 +967,15 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (weighted) {
-            const T4 wv = *reinterpret_cast<const device T4*>(weight);
-            if (APPLY_ROPE) {
-                for (uint i = 0; i < reads; ++i) {
-                    const uint element = lid * reads + i;
-                    const T normalized = T(float(vin[i]) * inverse_rms);
-                    // Reproduce the separate norm kernel's BF16 output-store
-                    // boundary before any RoPE arithmetic reads the value.
-                    rounded[element] = T(wv[i] * normalized);
-                }
+        for (uint i = 0; i < reads; ++i) {
+            const uint element = lid * reads + i;
+            const T normalized = T(float(input[i]) * inverse_rms);
+            if (APPLY_ROPE && weighted) {
+                // Reproduce the separate norm kernel's BF16 output-store
+                // boundary before any RoPE arithmetic reads the value.
+                rounded[element] = T(weight[i] * normalized);
             } else {
-                T4 outv;
-                for (uint i = 0; i < reads; ++i) {
-                    const T normalized = T(float(vin[i]) * inverse_rms);
-                    outv[i] = wv[i] * normalized;
-                }
-                *reinterpret_cast<device T4*>(output) = outv;
+                output[i] = weighted ? weight[i] * normalized : T(1) * normalized;
             }
             // Gemma's full-attention K-eq-V layers feed the same raw key
             // projection to K RMSNorm and V RMSNormNoScale. The reduction
@@ -993,20 +983,8 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
             // output's established final expression, but write V while the
             // exact normalizer and input value are live.
             if (KEY_VALUE_SHARED && is_key) {
-                T4 sharedv;
-                for (uint i = 0; i < reads; ++i) {
-                    const T normalized = T(float(vin[i]) * inverse_rms);
-                    sharedv[i] = T(1) * normalized;
-                }
-                *reinterpret_cast<device T4*>(shared_value_output) = sharedv;
+                shared_value_output[i] = T(1) * normalized;
             }
-        } else {
-            T4 outv;
-            for (uint i = 0; i < reads; ++i) {
-                const T normalized = T(float(vin[i]) * inverse_rms);
-                outv[i] = T(1) * normalized;
-            }
-            *reinterpret_cast<device T4*>(output) = outv;
         }
         if (APPLY_ROPE) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1732,23 +1710,6 @@ private class Gemma4Attention: Module {
         return projected
     }
 
-    /// QKFUSE-001. Q and K read the same activation at decode, so their
-    /// planes concatenate into one dispatch. Nil whenever the shapes, the
-    /// quantization parameters or the arm's switch say otherwise.
-    @inline(__always)
-    private func fusedQKProjection(_ x: MLXArray) -> (MLXArray, MLXArray)? {
-        guard let q = qProj as? QuantizedLinear, q.bias == nil,
-            let kProj, let k = kProj as? QuantizedLinear, k.bias == nil,
-            q.groupSize == k.groupSize, q.bits == k.bits, q.mode == k.mode
-        else { return nil }
-        return CBv2AttentionQKVMMA8V1.fusedQKMatmul(
-            x: x,
-            qWeight: q.weight, qScales: q.scales, qBiases: q.biases,
-            kWeight: k.weight, kScales: k.scales, kBiases: k.biases,
-            groupSize: q.groupSize, bits: q.bits, mode: q.mode,
-            cacheKey: ObjectIdentifier(q))
-    }
-
     /// Exact B8/L1 attention output projection. Sliding/full K widths select
     /// the tight affine4 fast-QMV replica; every other path keeps the layer.
     @inline(__always)
@@ -1955,12 +1916,7 @@ private class Gemma4Attention: Module {
         // 8 x-groups and the tier returns from 7 of them); every other shape
         // keeps the module's affine_qmv road. Routing Q or K through the older
         // custom helper would silently bypass the winning kernel.
-        // QKFUSE-001: `queryInput === x` unless last-query prefill narrowed it,
-        // which is the only case where Q and K cannot share a dispatch.
-        let fusedQK: (MLXArray, MLXArray)? =
-            (lastQueryCache == nil && !usesSharedKV && vProj == nil)
-            ? fusedQKProjection(x) : nil
-        let queryRaw = (fusedQK?.0 ?? tierProjection(qProj, queryInput)).reshaped(
+        let queryRaw = tierProjection(qProj, queryInput).reshaped(
             B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
@@ -2023,8 +1979,7 @@ private class Gemma4Attention: Module {
             lastQueryCache == nil
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
-        let kRaw = (fusedQK?.1 ?? tierProjection(kProj, x)).reshaped(
-            B, L, nKvHeads, effectiveHeadDim)
+        let kRaw = tierProjection(kProj, x).reshaped(B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
         if let vProj {
             vRaw = tierProjection(vProj, x).reshaped(B, L, nKvHeads, effectiveHeadDim)
@@ -2425,48 +2380,6 @@ private enum Gemma4RouterFinalistsV1 {
             outputDTypes: [.uint32]
         )[0]
     }
-
-    /// PREFILL-W1 mechanism 2: admits the identical finalists32 selection
-    /// kernel above to prompt-rectangle shapes `[8, L, 128]` with `L > 1`,
-    /// which `apply` above never reaches (it is pinned to the decode cell's
-    /// `L == 1`). The kernel body is untouched: each threadgroup already
-    /// processes exactly one flattened row of 128 scores addressed by
-    /// `threadgroup_position_in_grid.x`, so a `[B, L, E]` row-major buffer
-    /// flattens to `B*L` such rows the same way `[B, 1, E]` flattens to `B`
-    /// of them, and the `[B, L, 8]` output flattens identically on the
-    /// output side. Nothing about the selection arithmetic depends on how
-    /// the row count was produced.
-    ///
-    /// Fail-closed: any shape, dtype, topK, or kth outside the pin falls
-    /// through to the caller's stock `argPartition` chain. Independent kill
-    /// switch `DARKBLOOM_GEMMA4_ROUTER_FINALISTS32_PREFILL=0` so the prefill
-    /// admission can be disabled without touching the decode path's own
-    /// switch above. Engage mark: `router-finalists32-prefill`.
-    static let prefillEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_ROUTER_FINALISTS32_PREFILL"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
-    static func applyPrefill(_ scores: MLXArray, topK: Int, kth: Int) -> MLXArray? {
-        guard prefillEnabled, topK == 8, kth == 120,
-            scores.ndim == 3, scores.dim(0) == 8,
-            scores.dim(1) > 1, scores.dim(2) == 128,
-            scores.dtype == .bfloat16
-        else { return nil }
-        let b = scores.dim(0)
-        let l = scores.dim(1)
-        let rows = b * l
-        CBv2EngageMark.once("router-finalists32-prefill")
-        return kernel(
-            [scores],
-            grid: (rows * 128, 1, 1),
-            threadGroup: (128, 1, 1),
-            outputShapes: [[b, l, 8]],
-            outputDTypes: [.uint32]
-        )[0]
-    }
 }
 
 /// GLUE-FOLD (G2): merge the two ADJACENT single-threadgroup route glue
@@ -2708,11 +2621,12 @@ private enum Gemma4FusedLayerGlue {
                     acc += xi * xi;
                 }
                 acc = simd_sum(acc);
+                if (simd_group_id == 0) local_sums[simd_lane_id] = 0;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
                 if (simd_lane_id == 0) local_sums[simd_group_id] = acc;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 if (simd_group_id == 0) {
-                    acc = simd_sum(
-                        simd_lane_id < 22 ? local_sums[simd_lane_id] : 0.0f);
+                    acc = simd_sum(local_sums[simd_lane_id]);
                     if (simd_lane_id == 0) {
                         \(slot) = metal::precise::rsqrt(acc / 2816.0f + 1e-06f);
                     }
@@ -2741,16 +2655,19 @@ private enum Gemma4FusedLayerGlue {
             }
             acc_a = simd_sum(acc_a);
             acc_b = simd_sum(acc_b);
+            if (simd_group_id == 0) {
+                local_sums[simd_lane_id] = 0;
+                local_sums_b[simd_lane_id] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
             if (simd_lane_id == 0) {
                 local_sums[simd_group_id] = acc_a;
                 local_sums_b[simd_group_id] = acc_b;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (simd_group_id == 0) {
-                acc_a = simd_sum(
-                    simd_lane_id < 22 ? local_sums[simd_lane_id] : 0.0f);
-                acc_b = simd_sum(
-                    simd_lane_id < 22 ? local_sums_b[simd_lane_id] : 0.0f);
+                acc_a = simd_sum(local_sums[simd_lane_id]);
+                acc_b = simd_sum(local_sums_b[simd_lane_id]);
                 if (simd_lane_id == 0) {
                     local_inv[0] = metal::precise::rsqrt(acc_a / 2816.0f + 1e-06f);
                     local_inv[1] = metal::precise::rsqrt(acc_b / 2816.0f + 1e-06f);
@@ -2781,7 +2698,7 @@ private enum Gemma4FusedLayerGlue {
     }
 
     private static let normResidualKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_norm_residual_2816_bf16_v1_nb1",
+        name: "gemma4_glue_norm_residual_2816_bf16_v1",
         inputNames: ["x", "res", "w"],
         outputNames: ["out"],
         source: """
@@ -2815,7 +2732,7 @@ private enum Gemma4FusedLayerGlue {
 // T28 second sample marker (r2): content identical to ranked 32f5d19f apart from this comment.
     private static let attentionBranchPrefixKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_glue_attention_branch_prefix_2816_bf16_v1_nb1",
+            name: "gemma4_glue_attention_branch_prefix_2816_bf16_v1",
             inputNames: ["attn", "res", "wa", "wd", "we", "wr"],
             outputNames: ["out", "dense", "expert", "router", "xSums"],
             source: """
@@ -2857,7 +2774,7 @@ private enum Gemma4FusedLayerGlue {
         )
 
     private static let dualPreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_dual_prenorm_xsum_2816_bf16_v2_nb1",
+        name: "gemma4_glue_dual_prenorm_xsum_2816_bf16_v2",
         inputNames: ["x", "w1", "w2"],
         outputNames: ["out1", "out2", "xSums"],
         source: """
@@ -2923,7 +2840,7 @@ private enum Gemma4FusedLayerGlue {
         """
 
     private static let tailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_2816_bf16_v2_nb1",
+        name: "gemma4_glue_tail_2816_bf16_v2",
         inputNames: ["a", "b", "res", "w1", "w2", "w3", "s"],
         outputNames: ["out"],
         source: tailSource,
@@ -2931,7 +2848,7 @@ private enum Gemma4FusedLayerGlue {
     )
 
     private static let pairedTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_paired_rms_2816_bf16_v1_nb1",
+        name: "gemma4_glue_tail_paired_rms_2816_bf16_v1",
         inputNames: ["a", "b", "res", "w1", "w2", "w3", "s"],
         outputNames: ["out"],
         source: pairedRmsTailSource(tailSource),
@@ -3098,7 +3015,7 @@ private enum Gemma4FusedLayerGlue {
         """
 
     private static let tailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_chain_2816_bf16_v1_nb1",
+        name: "gemma4_glue_tail_chain_2816_bf16_v1",
         inputNames: ["a", "b", "res", "w1", "w2", "w3", "s", "wn"],
         outputNames: ["out", "normed"],
         source: tailChainSource,
@@ -3106,7 +3023,7 @@ private enum Gemma4FusedLayerGlue {
     )
 
     private static let pairedTailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_tail_chain_paired_rms_2816_bf16_v1_nb1",
+        name: "gemma4_glue_tail_chain_paired_rms_2816_bf16_v1",
         inputNames: ["a", "b", "res", "w1", "w2", "w3", "s", "wn"],
         outputNames: ["out", "normed"],
         source: pairedRmsTailSource(tailChainSource),
@@ -3120,19 +3037,14 @@ private enum Gemma4FusedLayerGlue {
     private static let deferredExpertValuesSource = """
             T expertv[4];
             const uint assignment_base = row * 8u;
-            uint sorted_rows[8];
-            T routed_weights[8];
-            for (uint slot = 0u; slot < 8u; ++slot) {
-                const uint assignment = assignment_base + slot;
-                sorted_rows[slot] = (uint)inverse[assignment];
-                routed_weights[slot] = route_weights[assignment];
-            }
             for (int i = 0; i < 4; ++i) {
                 T accumulator = static_cast<T>(0.0f);
                 for (uint slot = 0u; slot < 8u; ++slot) {
+                    const uint assignment = assignment_base + slot;
+                    const uint sorted_row = (uint)inverse[assignment];
                     const T weighted = static_cast<T>(
-                        (float)sorted[sorted_rows[slot] * 2816u + wbase + (uint)i]
-                        * (float)routed_weights[slot]);
+                        (float)sorted[sorted_row * 2816u + wbase + (uint)i]
+                        * (float)route_weights[assignment]);
                     accumulator = accumulator + weighted;
                 }
                 expertv[i] = accumulator;
@@ -3140,7 +3052,7 @@ private enum Gemma4FusedLayerGlue {
     """
 
     private static let deferredTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1_nb1_vec1",
+        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1",
         inputNames: [
             "a", "sorted", "inverse", "route_weights", "res",
             "w1", "w2", "w3", "s",
@@ -3185,7 +3097,7 @@ private enum Gemma4FusedLayerGlue {
 
     private static let deferredTailChainKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1_nb1_vec1",
+            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1",
             inputNames: [
                 "a", "sorted", "inverse", "route_weights", "res",
                 "w1", "w2", "w3", "s", "wn",
@@ -3427,21 +3339,8 @@ private class Gemma4Router: Module {
             return (fused.indices, fused.weights)
         }
 
-        // PREFILL-W1 mechanism 2: the finalists32 selection kernel, already
-        // bit-identical to the stock `argPartition` + slice pair on the
-        // decode cell, admitted here to prompt-rectangle shapes as well.
-        // Selection only -- the weight tail below (takeAlong, precise
-        // softmax, per-expert scale) stays the identical stock chain on
-        // whichever indices were produced.
-        var topKIndices: MLXArray
-        if let selected = Gemma4RouterFinalistsV1.applyPrefill(
-            expertScores, topK: topK, kth: kth)
-        {
-            topKIndices = selected
-        } else {
-            topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
-            topKIndices = topKIndices[.ellipsis, kth...]
-        }
+        var topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
+        topKIndices = topKIndices[.ellipsis, kth...]
 
         var topKWeights = MLX.takeAlong(expertScores, topKIndices, axis: -1)
         topKWeights = MLX.softmax(topKWeights, axis: -1, precise: true)
@@ -4429,24 +4328,14 @@ public class Gemma4DecoderLayer: Module {
 ///
 /// ## Gating (PLE-GLUE-028 lesson)
 ///
-/// The kernel is geometry-agnostic: `words_per_row` and `row` are read off
-/// the launched grid, not off a compile-time or host-passed `L`, so nothing
-/// in its body assumes a prefill-sized rectangle. It was nonetheless
-/// admitted for the PREFILL rectangle only (`L > 1`) at first, on the
-/// PLE-GLUE-028 lesson that at `[B, 1]` the whole chain produces only 22,528
-/// values and a custom-kernel launch is not reliably cheaper than the five
-/// small dispatches it replaces — the same trap `Gemma4FusedRouterTop8` fell
-/// into.
-///
-/// The decode cell (`L == 1`) is admitted as well below, behind its own
-/// independent switch, since the argument above is a dispatch-count
-/// tradeoff, not a correctness one: the same two-boundary exactness argument
-/// applies unchanged regardless of `L`.
+/// Admitted for the PREFILL rectangle only (`L > 1`). At `[B, 1]` the whole
+/// chain produces 22,528 values and a custom-kernel launch is not reliably
+/// cheaper than the five small dispatches it replaces — the same trap
+/// PLE-GLUE-028 and `Gemma4FusedRouterTop8` fell into. Decode keeps the stock
+/// chain byte-identically.
 ///
 /// Kill switch: `DARKBLOOM_GEMMA4_SCALED_EMBEDDING=0` (also `false`/`no`/`off`)
-/// restores the stock expression on the same binary for every geometry.
-/// `DARKBLOOM_GEMMA4_SCALED_EMBEDDING_DECODE=0` restores the stock expression
-/// for the decode cell only, leaving the prefill admission untouched.
+/// restores the stock expression on the same binary.
 ///
 /// Internal rather than file-private only so the local full-vocabulary parity
 /// test can drive this exact kernel instead of a transcription of it.
@@ -4455,16 +4344,6 @@ enum Gemma4FusedScaledEmbedding {
     static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_SCALED_EMBEDDING"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
-    /// DEFAULT ON for the `[B, 1]` decode cell, independent of `enabled`
-    /// above so either admission can be disabled without touching the
-    /// other.
-    static let decodeEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_SCALED_EMBEDDING_DECODE"]
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
@@ -4526,9 +4405,8 @@ enum Gemma4FusedScaledEmbedding {
         guard enabled,
             tokens.ndim == 2,
             tokens.dtype == .int32,
-            // Prefill rectangle admits unconditionally; the [B, 1] decode
-            // cell admits behind its own independent switch.
-            tokens.dim(1) > 1 || decodeEnabled,
+            // Prefill rectangle only; [B, 1] decode keeps the stock chain.
+            tokens.dim(1) > 1,
             let quantized = embedding as? QuantizedEmbedding,
             quantized.mode == .affine,
             quantized.bits == bits,
@@ -4555,7 +4433,7 @@ enum Gemma4FusedScaledEmbedding {
         let length = tokens.dim(1)
         let wordsPerRow = weight.dim(1)
 
-        CBv2EngageMark.once(length > 1 ? "scaled-embedding" : "scaled-embedding-decode")
+        CBv2EngageMark.once("scaled-embedding")
         return kernel(
             // `asMLXArray(dtype:)` is the exact conversion the stock
             // `MLXArray * Float` overload performs on the scalar.

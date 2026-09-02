@@ -440,6 +440,247 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
 }
 """
 
+    /// LMH-VECX-001 (this submission). The streamed quad body reads the four
+    /// cohort activation rows through `load_vector<T, float, 8, 4>`, whose
+    /// bits==4 branch dereferences `x[0] ... x[7]` as eight separate
+    /// two-byte device loads. Per thread per 256-wide K block the body issues
+    /// eight packed-weight loads, eight scale/bias loads and thirty-two of
+    /// those activation loads, and the tied head is the widest dispatch of
+    /// the decode step: 65536 threadgroups over 262144 output rows. The
+    /// activation half of that issue stream is pure addressing overhead --
+    /// `x0 ... x3` advance by `block_size` and start at
+    /// `simd_lid * values_per_thread`, so every one of the eight values a
+    /// stream wants in an iteration is sixteen contiguous, sixteen-byte
+    /// aligned bytes.
+    ///
+    /// This body reads each stream's eight values as one `uint4` and splits
+    /// the halves with the same `as_type<T>(ushort)` reinterpretation the
+    /// promoted matrix-unit tier already uses, so the four streams cost four
+    /// loads instead of thirty-two and the block's issue count falls from
+    /// forty-eight to twenty. The unpacked values keep type `T`, the two
+    /// partial sums accumulate in their original order, and the `x_thread`
+    /// stores keep their original divisors and their original positions
+    /// relative to those sums, so every expression the accumulator sees is
+    /// character-identical to the branch it replaces and the logits stay
+    /// bitwise equal.
+    ///
+    /// The K tail is untouched: `remaining` is a runtime bound, so it keeps
+    /// `load_vector_safe` and its rolled walk. Weight and scale/bias loads
+    /// are untouched -- the four rows are strided by `in_vec_size_w` and
+    /// `in_vec_size_g` and cannot join one load.
+    ///
+    /// `kernelHeader` above is spliced verbatim by `AttentionOQMVV1` and
+    /// `DenseMLPQMVV1`, so it is left byte for byte as promoted and this
+    /// body is appended file-locally under its own name.
+    /// `DARKBLOOM_CBV2_TIED_LMHEAD_VECX=0` restores the promoted
+    /// `..._quad_stream_unroll_v3` dispatch inside the same executable.
+    private static let vectorKernelHeader = kernelHeader + """
+
+template <typename T, typename U>
+inline U cbv2_lmh_load_vector_a4_v8(const device T* x, thread U* x_thread) {
+  static_assert(
+      sizeof(T) == 2, "Template undefined for value widths other than two");
+
+  const uint4 raw = *((const device uint4*)x);
+  const T v0 = as_type<T>(ushort(raw.x & 0x0000ffffu));
+  const T v1 = as_type<T>(ushort(raw.x >> 16));
+  const T v2 = as_type<T>(ushort(raw.y & 0x0000ffffu));
+  const T v3 = as_type<T>(ushort(raw.y >> 16));
+  const T v4 = as_type<T>(ushort(raw.z & 0x0000ffffu));
+  const T v5 = as_type<T>(ushort(raw.z >> 16));
+  const T v6 = as_type<T>(ushort(raw.w & 0x0000ffffu));
+  const T v7 = as_type<T>(ushort(raw.w >> 16));
+
+  U sum = 0;
+
+  sum += v0 + v1 + v2 + v3;
+  x_thread[0] = v0;
+  x_thread[1] = v1 / 16.0f;
+  x_thread[2] = v2 / 256.0f;
+  x_thread[3] = v3 / 4096.0f;
+
+  sum += v4 + v5 + v6 + v7;
+  x_thread[4] = v4;
+  x_thread[5] = v5 / 16.0f;
+  x_thread[6] = v6 / 256.0f;
+  x_thread[7] = v7 / 4096.0f;
+
+  return sum;
+}
+
+template <typename T, const int group_size, const int bits>
+METAL_FUNC void qmv_affine4_g64_quad_stream_vecx_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x0,
+    const device T* x1,
+    const device T* x2,
+    const device T* x3,
+    device T* y0,
+    device T* y1,
+    device T* y2,
+    device T* y3,
+    const int in_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int values_per_thread = 8;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int bytes_per_thread = 4;
+  constexpr int uint16_per_thread = bytes_per_thread / 2;
+  constexpr int scale_step_per_thread = 8;
+  static_assert(
+      values_per_thread == 8, "The vector activation load is fixed at eight");
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread float x_thread[values_per_thread];
+  thread uint16_t packed[results_per_simdgroup][uint16_per_thread];
+  thread float scale_local[results_per_simdgroup];
+  thread float bias_local[results_per_simdgroup];
+  thread float result0[results_per_simdgroup] = {0};
+  thread float result1[results_per_simdgroup] = {0};
+  thread float result2[results_per_simdgroup] = {0};
+  thread float result3[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size / 2;
+  const int in_vec_size_g = in_vec_size / 64;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x0 += simd_lid * values_per_thread;
+  x1 += simd_lid * values_per_thread;
+  x2 += simd_lid * values_per_thread;
+  x3 += simd_lid * values_per_thread;
+  y0 += out_row;
+  y1 += out_row;
+  y2 += out_row;
+  y3 += out_row;
+
+  int k = 0;
+  for (; k < in_vec_size - block_size; k += block_size) {
+    #pragma clang loop unroll(full)
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint16_t* wl =
+          (const device uint16_t*)(ws + row * in_vec_size_w);
+      #pragma clang loop unroll(full)
+      for (int i = 0; i < uint16_per_thread; i++) {
+        packed[row][i] = wl[i];
+      }
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    float sum = cbv2_lmh_load_vector_a4_v8<T, float>(x0, x_thread);
+    #pragma clang loop unroll(full)
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine4_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = cbv2_lmh_load_vector_a4_v8<T, float>(x1, x_thread);
+    #pragma clang loop unroll(full)
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result1[row] += qdot_affine4_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = cbv2_lmh_load_vector_a4_v8<T, float>(x2, x_thread);
+    #pragma clang loop unroll(full)
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result2[row] += qdot_affine4_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum = cbv2_lmh_load_vector_a4_v8<T, float>(x3, x_thread);
+    #pragma clang loop unroll(full)
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result3[row] += qdot_affine4_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+
+    ws += block_size / 2;
+    scales += block_size / 64;
+    biases += block_size / 64;
+    x0 += block_size;
+    x1 += block_size;
+    x2 += block_size;
+    x3 += block_size;
+  }
+
+  const int remaining = clamp(
+      static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
+      0,
+      values_per_thread);
+  if (remaining > 0) {
+    #pragma clang loop unroll(full)
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      const device uint16_t* wl =
+          (const device uint16_t*)(ws + row * in_vec_size_w);
+      #pragma clang loop unroll(full)
+      for (int i = 0; i < uint16_per_thread; i++) {
+        packed[row][i] = wl[i];
+      }
+      scale_local[row] = scales[row * in_vec_size_g];
+      bias_local[row] = biases[row * in_vec_size_g];
+    }
+
+    float sum =
+        load_vector_safe<T, float, values_per_thread, 4>(x0, x_thread, remaining);
+    #pragma clang loop unroll(full)
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result0[row] += qdot_affine4_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum =
+        load_vector_safe<T, float, values_per_thread, 4>(x1, x_thread, remaining);
+    #pragma clang loop unroll(full)
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result1[row] += qdot_affine4_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum =
+        load_vector_safe<T, float, values_per_thread, 4>(x2, x_thread, remaining);
+    #pragma clang loop unroll(full)
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result2[row] += qdot_affine4_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+    sum =
+        load_vector_safe<T, float, values_per_thread, 4>(x3, x_thread, remaining);
+    #pragma clang loop unroll(full)
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result3[row] += qdot_affine4_registered<float, values_per_thread>(
+          packed[row], x_thread, scale_local[row], bias_local[row], sum);
+    }
+  }
+
+  #pragma clang loop unroll(full)
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result0[row] = simd_sum(result0[row]);
+    result1[row] = simd_sum(result1[row]);
+    result2[row] = simd_sum(result2[row]);
+    result3[row] = simd_sum(result3[row]);
+    if (simd_lid == 0) {
+      y0[row] = static_cast<T>(result0[row]);
+      y1[row] = static_cast<T>(result1[row]);
+      y2[row] = static_cast<T>(result2[row]);
+      y3[row] = static_cast<T>(result3[row]);
+    }
+  }
+}
+"""
+
+    /// LMH-VECX-001 arm. Default ON.
+    private static let vectorLoadEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_TIED_LMHEAD_VECX"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "cbv2_b8_tied_lmhead_qmv_affine4_g64_quad_stream_unroll_v3",
         inputNames: ["x", "w", "scales", "biases"],
@@ -475,6 +716,44 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
             return;
             """,
         header: kernelHeader,
+        ensureRowContiguous: true
+    )
+
+    private static let vectorKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_tied_lmhead_qmv_affine4_g64_quad_stream_vecx_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+
+            const int in_vec_size = K;
+            const int out_vec_size = OUTN;
+
+            const int first_m = int(tid.x) * 4;
+            if (first_m >= 8) {
+                return;
+            }
+            qmv_affine4_g64_quad_stream_vecx_impl<T, 64, 4>(
+                w,
+                scales,
+                biases,
+                x + first_m * in_vec_size,
+                x + (first_m + 1) * in_vec_size,
+                x + (first_m + 2) * in_vec_size,
+                x + (first_m + 3) * in_vec_size,
+                y + first_m * out_vec_size,
+                y + (first_m + 1) * out_vec_size,
+                y + (first_m + 2) * out_vec_size,
+                y + (first_m + 3) * out_vec_size,
+                in_vec_size,
+                tid,
+                simd_gid,
+                simd_lid);
+            return;
+            """,
+        header: vectorKernelHeader,
         ensureRowContiguous: true
     )
 
@@ -515,7 +794,16 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
 
         let xGroups = batch / rowsPerGroup
         let yGroups = outDim / outputsPerGroup
-        return kernel(
+        // The vector activation load reads sixteen bytes per stream per K
+        // block from `x + row * inDim + simd_lid * 8`. `inDim % groupSize`
+        // above already pins `inDim` to a multiple of sixty-four, so every
+        // one of those addresses is sixteen-byte aligned, and
+        // `ensureRowContiguous` pins the storage the addresses assume.
+        let selected = vectorLoadEnabled ? vectorKernel : kernel
+        if vectorLoadEnabled {
+            CBv2EngageMark.once("tied-lmhead-vector-activation-load")
+        }
+        return selected(
             [x, weight, scales, biases],
             template: [
                 ("T", x.dtype),

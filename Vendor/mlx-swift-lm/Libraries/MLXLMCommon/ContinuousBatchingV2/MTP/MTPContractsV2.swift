@@ -91,12 +91,14 @@ extension CBv2MTPSteppableModel {
 public struct CBv2MTPRowCapture {
     /// Full-attention capture layer: [1, kvHeads, Tfull, headDim], temporal
     /// order, post-RoPE (captured from storage the target attended).
-    public var fullKeys: MLXArray
-    public var fullValues: MLXArray
+    public let full: CBv2MTPLazyKV
+    public var fullKeys: MLXArray { full.value.keys }
+    public var fullValues: MLXArray { full.value.values }
     /// Sliding-attention capture layer: [1, kvHeads, Tslide, headDim],
     /// temporal order. Window-limited by storage eviction.
-    public var slidingKeys: MLXArray
-    public var slidingValues: MLXArray
+    public let sliding: CBv2MTPLazyKV
+    public var slidingKeys: MLXArray { sliding.value.keys }
+    public var slidingValues: MLXArray { sliding.value.values }
     /// Absolute position of the FIRST retained sliding entry (the sliding
     /// KV covers positions [slidingStart, anchor)). The full capture always
     /// starts at 0.
@@ -104,18 +106,93 @@ public struct CBv2MTPRowCapture {
     /// The round's frozen query position: absolute position of the row's
     /// newest confirmed-but-unfed token (== the row's absoluteOffset).
     public var anchor: Int
+    /// The row's live q4 sliding mirror `[2, kvHeads, window, words]` when
+    /// the round runs the mirror road, so a drafter can attend it in place
+    /// instead of the dequantized `slidingKeys`/`slidingValues`.
+    public var slidingMirror: MLXArray?
 
     public init(
         fullKeys: MLXArray, fullValues: MLXArray,
         slidingKeys: MLXArray, slidingValues: MLXArray,
-        slidingStart: Int, anchor: Int
+        slidingStart: Int, anchor: Int, slidingMirror: MLXArray? = nil
     ) {
-        self.fullKeys = fullKeys
-        self.fullValues = fullValues
-        self.slidingKeys = slidingKeys
-        self.slidingValues = slidingValues
+        self.init(
+            full: CBv2MTPLazyKV(keys: fullKeys, values: fullValues),
+            sliding: CBv2MTPLazyKV(keys: slidingKeys, values: slidingValues),
+            slidingStart: slidingStart, anchor: anchor, slidingMirror: slidingMirror)
+    }
+
+    public init(
+        full: CBv2MTPLazyKV, sliding: CBv2MTPLazyKV,
+        slidingStart: Int, anchor: Int, slidingMirror: MLXArray? = nil
+    ) {
+        self.full = full
+        self.sliding = sliding
         self.slidingStart = slidingStart
         self.anchor = anchor
+        self.slidingMirror = slidingMirror
+    }
+}
+
+/// A capture's view pair, built on first read. A round whose drafter reads
+/// the pooled full plane and the q4 mirror in place never reads it, so the
+/// dequantize and slice nodes behind it are never added to the graph.
+public final class CBv2MTPLazyKV {
+    private let make: () -> (keys: MLXArray, values: MLXArray)
+    private var built: (keys: MLXArray, values: MLXArray)?
+
+    public init(_ make: @escaping () -> (keys: MLXArray, values: MLXArray)) {
+        self.make = make
+    }
+
+    public init(keys: MLXArray, values: MLXArray) {
+        make = { (keys, values) }
+        built = (keys, values)
+    }
+
+    public var isBuilt: Bool { built != nil }
+
+    public var value: (keys: MLXArray, values: MLXArray) {
+        if let built { return built }
+        let views = make()
+        built = views
+        return views
+    }
+}
+
+/// Batch-wide device geometry of a chained round, whose host counters lag
+/// the device truth by the previous round's unconfirmed columns. Built once
+/// from the round's `[B]` device base so every anchor, length and mask stays
+/// on device; the per-row host fields only bound the captured views.
+public struct CBv2MTPCohortCapture {
+    /// `[B]` int32: each row's anchor (column 0's position).
+    public var anchors: MLXArray
+    /// `[B]` int32: each row's first retained sliding position.
+    public var slidingStarts: MLXArray
+    /// `[B]` int32: each row's true full-capture length (its `fullKeys`
+    /// view may extend past it and is masked).
+    public var fullLengths: MLXArray
+    /// Zero-copy `[B, kvHeads, Tmax, headDim]` views of the full-attention
+    /// pool every row is bound to, in row order; nil when the rows are not
+    /// pooled and the drafter stacks the per-row views itself.
+    public var pooledFull: (keys: MLXArray, values: MLXArray)?
+    /// `[B]` int32: each row's sliding-mirror boundary slot (anchor mod
+    /// window) when the rows carry `slidingMirror`.
+    public var slidingMirrorSlotBases: MLXArray?
+    /// The sliding capture layer's write fence a mirror read must follow.
+    public var slidingMirrorFence: MLXArray?
+
+    public init(
+        anchors: MLXArray, slidingStarts: MLXArray, fullLengths: MLXArray,
+        pooledFull: (keys: MLXArray, values: MLXArray)? = nil,
+        slidingMirrorSlotBases: MLXArray? = nil, slidingMirrorFence: MLXArray? = nil
+    ) {
+        self.anchors = anchors
+        self.slidingStarts = slidingStarts
+        self.fullLengths = fullLengths
+        self.pooledFull = pooledFull
+        self.slidingMirrorSlotBases = slidingMirrorSlotBases
+        self.slidingMirrorFence = slidingMirrorFence
     }
 }
 
@@ -136,6 +213,11 @@ public protocol CBv2MTPDrafter: AnyObject {
     /// Build round-scoped batch state from per-row captures. `rows` order
     /// == the round's speculating-row order.
     func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture
+    /// The chained-round twin: `cohort` carries the batch-wide device
+    /// geometry (and the pooled full KV when the rows share one pool). nil
+    /// means the host fields are exact and `prepare(rows:)` applies.
+    func prepare(rows: [CBv2MTPRowCapture], cohort: CBv2MTPCohortCapture?)
+        -> CBv2MTPPreparedCapture
     /// One draft-chain step over all speculating rows.
     ///  - tokens: [B, 1] int32 (lazy) — seed tokens (round start: each
     ///    row's newest confirmed token; later steps: previous draft).
@@ -151,6 +233,12 @@ public protocol CBv2MTPDrafter: AnyObject {
 
 extension CBv2MTPDrafter {
     public var mtpTargetIdentity: ObjectIdentifier? { nil }
+
+    public func prepare(rows: [CBv2MTPRowCapture], cohort: CBv2MTPCohortCapture?)
+        -> CBv2MTPPreparedCapture
+    {
+        prepare(rows: rows)
+    }
 }
 
 // MARK: - Config

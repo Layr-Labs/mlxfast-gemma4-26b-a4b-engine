@@ -1,12 +1,6 @@
 import Foundation
 import MLXFastCore
 
-/// Gemma 4 tied-embedding packed13 sidecar generator. Invoked only on the
-/// `.gemma4` transform family path -- Laguna's `lm_head` is a separate
-/// quantized tensor (untied), so there is no tied vocabulary head to pack,
-/// and the Laguna weight contract forbids metadata sidecars entirely. The
-/// production-shape gate below ([262144, 672] packed embedding) is
-/// Gemma-4-specific on purpose.
 enum TiedHeadMetadataCoding {
     static let shardName = "mlxfast-tied-head-metadata.safetensors"
     static let weightName = "language_model.model.embed_tokens.weight"
@@ -38,8 +32,6 @@ enum TiedHeadMetadataCoding {
             index: index,
             sourceHeaders: sourceHeaders
         )
-        // Tiny synthetic fixtures and unquantized checkpoints are not eligible
-        // for this production-shape optimization.
         guard weightInfo.dtype == TensorDType.u32.rawValue,
               weightInfo.shape == [rowCount, 672]
         else {

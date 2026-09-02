@@ -27,24 +27,80 @@ import Foundation
 import MLX
 import MLXLMCommon
 
-/// Pre-computed (cos, sin) pair covering `windowAhead` consecutive rotary
-/// positions for the drafter's `rope_theta` and head dim. Built once per
-/// `prepare(rows:)` round and reused by every per-step call into the
-/// drafter, so the per-round cos/sin table is materialized in a single
-/// pass instead of being recomputed on every step's RoPE call.
+enum Gemma4MTPWarmRetirement {
+    static let timeoutSeconds = 120
+    static let engineShutdownTimeoutSeconds = timeoutSeconds + 5
+
+    enum Stage: String, Equatable, Sendable {
+        case drain
+        case shutdown
+    }
+
+    enum State: Equatable, Sendable {
+        case waitingForDrain
+        case waitingForShutdown
+        case retired
+        case failed(Stage)
+    }
+
+    enum Event: Sendable {
+        case completed
+        case deadlineExpired
+    }
+
+    static func transition(_ state: State, on event: Event) -> State {
+        switch (state, event) {
+        case (.waitingForDrain, .completed):
+            return .waitingForShutdown
+        case (.waitingForDrain, .deadlineExpired):
+            return .failed(.drain)
+        case (.waitingForShutdown, .completed):
+            return .retired
+        case (.waitingForShutdown, .deadlineExpired):
+            return .failed(.shutdown)
+        case (.retired, _), (.failed, _):
+            return state
+        }
+    }
+
+    struct Failure: LocalizedError, Equatable, Sendable {
+        let stage: Stage
+
+        var errorDescription: String? {
+            "Gemma 4 MTP warm engine \(stage.rawValue) did not complete within "
+                + "\(timeoutSeconds) seconds; worker startup refused."
+        }
+    }
+
+    static func wait(
+        drainAlreadyCompleted: Bool,
+        drained: DispatchSemaphore,
+        stopped: DispatchSemaphore,
+        deadline: DispatchTime
+    ) -> State {
+        var state: State = drainAlreadyCompleted ? .waitingForShutdown : .waitingForDrain
+        if state == .waitingForDrain {
+            state = transition(
+                state,
+                on: drained.wait(timeout: deadline) == .success
+                    ? .completed : .deadlineExpired)
+        }
+        if state == .waitingForShutdown {
+            state = transition(
+                state,
+                on: stopped.wait(timeout: deadline) == .success
+                    ? .completed : .deadlineExpired)
+        }
+        return state
+    }
+}
+
 public struct DrafterRoPETable: @unchecked Sendable {
-    /// `[windowAhead, dims/2]` cosines for positions
-    /// `[startPosition, startPosition + windowAhead)`.
     public let cos: MLXArray
-    /// `[windowAhead, dims/2]` sines for the same positions.
     public let sin: MLXArray
-    /// The rotary dimension the table was built for (== `cos.shape[1] * 2`).
     public let dims: Int
-    /// First absolute position covered by the table.
     public let startPosition: Int
-    /// Number of consecutive positions covered.
     public let windowAhead: Int
-    /// RoPE base the table was built for (full-attention theta).
     public let base: Float
 
     public init(
@@ -60,63 +116,194 @@ public struct DrafterRoPETable: @unchecked Sendable {
     }
 }
 
-/// CBv2 engine drafter for Gemma 4 MTP. Construct once per (drafter, target)
-/// pair; `init` binds the drafter to the target so compatibility validation
-/// errors surface at construction, not mid-round.
 public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
 
-    /// Default rotary-lookahead window for the drafter's pre-computed RoPE
-    /// table. One full speculative block + a margin; matches the
-    /// `blockSize <= 16` contract in `Gemma4MTPError.invalidBlockSize`.
     public static let defaultRoPEWindowAhead = 16
 
-    /// Round-scoped state built by `prepare(rows:)`: the padded/stacked
-    /// shared KV, the per-row padding masks, and the constant anchor
-    /// positions for the round.
     private final class Prepared: CBv2MTPPreparedCapture {
         let sharedKV: Gemma4SharedKV
         let masks: Gemma4DrafterMasks
         let positionOffset: Gemma4.PositionOffset
-        /// Pre-computed drafter cos/sin covering this round's
-        /// `[anchorMin, anchorMin + windowAhead)`. May be nil if the
-        /// drafter's geometry made the table empty.
         let ropeTable: DrafterRoPETable?
+        let mirror: Gemma4DrafterMirrorAttention.Context?
 
         init(
             sharedKV: Gemma4SharedKV, masks: Gemma4DrafterMasks,
             positionOffset: Gemma4.PositionOffset,
-            ropeTable: DrafterRoPETable?
+            ropeTable: DrafterRoPETable?,
+            mirror: Gemma4DrafterMirrorAttention.Context? = nil
         ) {
             self.sharedKV = sharedKV
             self.masks = masks
             self.positionOffset = positionOffset
             self.ropeTable = ropeTable
+            self.mirror = mirror
         }
     }
 
     private let drafter: Gemma4AssistantDraftModel
     private let target: any Gemma4MTPTarget
 
-    /// Round-cached RoPE table. Written by `prepare(rows:)` and consumed
-    /// by `draftStep(...)`. A fresh drafter instance has no table.
     private var cachedRoPETable: DrafterRoPETable?
 
-    /// Binds `drafter` to `target` (idempotent on the same target) so
-    /// drafter/target compatibility validation runs here.
     public init(drafter: Gemma4AssistantDraftModel, target: any Gemma4MTPTarget) throws {
         try drafter.bind(target: target)
         self.drafter = drafter
         self.target = target
+        if let model = target as? Gemma4TextModel {
+            try warmSpeculativeCohort(model: model)
+        }
+    }
+
+    private func warmSpeculativeCohort(model: Gemma4TextModel) throws {
+        let warmupEnabled: Bool = {
+            guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_MTP_WARM"]
+            else { return true }
+            return !["0", "false", "no", "off"].contains(raw.lowercased())
+        }()
+        let gateApplies = model.expertQMMGeometryEligible
+        let shouldWarm = gateApplies
+            ? CBv2MTPDeviceGate.beginWarmup(warmupEnabled: warmupEnabled)
+            : warmupEnabled && CBv2MTPSpeculationPolicy.speculationEnabled
+        defer {
+            if gateApplies {
+                if CBv2MTPDeviceGate.mode == .auto,
+                    !CBv2MTPDeviceGate.automaticMeasurementFinished
+                {
+                    CBv2MTPDeviceGate.failAutomaticMeasurement("measurement incomplete")
+                }
+                if let line = CBv2MTPDeviceGate.takeStderrLine() {
+                    FileHandle.standardError.write(Data(line.utf8))
+                }
+            }
+        }
+        guard shouldWarm, CBv2MTPSpeculationPolicy.speculationEnabled else { return }
+        let batch = 8
+        let seedCount = 1024
+        let depth = CBv2MTPSpeculationPolicy.draftDepth
+        if gateApplies, CBv2MTPDeviceGate.mode == .auto,
+            (depth != 2 || !CBv2MTPWideVerifyContext.enabled)
+        {
+            CBv2MTPDeviceGate.failAutomaticMeasurement("depth-2 wide path unavailable")
+            return
+        }
+        let warmTokens = 4 * (depth + 1)
+        let measuring = gateApplies && CBv2MTPDeviceGate.mode == .auto
+        do {
+            let caches = try model.newCacheV2 { index, kind in
+                CBv2LayerCache(layerIndex: index, kind: kind)
+            }
+            let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 4 << 30))
+            let engine = EngineV2(
+                model: CBv2SteppableLanguageModelAdapter(model),
+                layerKinds: model.cbv2LayerKinds,
+                backend: backend,
+                cacheProvider: CBv2LayerCacheBank(caches: caches),
+                sampler: CBv2DefaultSampler(),
+                schedulerConfig: CBv2SchedulerConfig(
+                    maxConcurrentRequests: batch,
+                    maxBatchedTokensPerStep: Swift.max(2048, batch * seedCount),
+                    prefillChunkSize: Swift.max(512, seedCount),
+                    maxWaiting: batch,
+                    enablePrefixCache: false),
+                loopConfig: CBv2EngineLoopConfig(
+                    shutdownTimeout:
+                        TimeInterval(Gemma4MTPWarmRetirement.engineShutdownTimeoutSeconds)),
+                mtpDrafter: self,
+                mtpConfig: CBv2MTPConfig(
+                    enabled: true,
+                    maxDraftTokens: depth,
+                    maxSpeculativeBatch: batch,
+                    fixedDraftTokens: depth,
+                    verificationMode: .automatic,
+                    maxAutomaticRectangularTokens: 32))
+            let drained = DispatchSemaphore(value: 0)
+            let progress = WarmProgress(slots: batch, target: warmTokens)
+            let consumer = Task {
+                await withTaskGroup(of: Void.self) { group in
+                    for slot in 0 ..< batch {
+                        var seeds = Array(repeating: 2, count: seedCount)
+                        for i in stride(from: 1, to: seedCount, by: 1) {
+                            seeds[i] = 1000 + ((i * 7919 + slot * 104729) % 20000)
+                        }
+                        guard let stream = try? engine.submit(
+                            CBv2Request(
+                                id: CBv2RequestID(UInt64(slot)),
+                                promptTokens: seeds,
+                                sampling: CBv2SamplingParams(temperature: 0),
+                                maxTokens: 4096,
+                                stopTokens: [],
+                                prefixCacheEnabled: false))
+                        else { continue }
+                        group.addTask {
+                            for await event in stream {
+                                if case .delta(_, let ids, _) = event {
+                                    let finished = measuring
+                                        ? CBv2MTPDeviceGate.automaticMeasurementFinished
+                                        : progress.record(slot: slot, count: ids.count)
+                                    if finished {
+                                        for other in 0 ..< batch {
+                                            engine.cancel(CBv2RequestID(UInt64(other)))
+                                        }
+                                    }
+                                }
+                                if case .finished = event { break }
+                            }
+                        }
+                    }
+                    await group.waitForAll()
+                }
+                drained.signal()
+            }
+            let retirementDeadline = DispatchTime.now()
+                + .seconds(Gemma4MTPWarmRetirement.timeoutSeconds)
+            let drainAlreadyCompleted = drained.wait(timeout: .now() + 15) == .success
+            if !drainAlreadyCompleted {
+                consumer.cancel()
+                for slot in 0 ..< batch { engine.cancel(CBv2RequestID(UInt64(slot))) }
+            }
+            let stopped = DispatchSemaphore(value: 0)
+            Task {
+                await engine.shutdownSynchronously()
+                stopped.signal()
+            }
+            let retirement = Gemma4MTPWarmRetirement.wait(
+                drainAlreadyCompleted: drainAlreadyCompleted,
+                drained: drained, stopped: stopped, deadline: retirementDeadline)
+            if case .failed(let stage) = retirement {
+                let failure = Gemma4MTPWarmRetirement.Failure(stage: stage)
+                if measuring {
+                    CBv2MTPDeviceGate.failAutomaticMeasurement(
+                        "warm engine \(stage.rawValue) timeout")
+                }
+                throw failure
+            }
+            Memory.clearCache()
+            CBv2EngageMark.once("mtp-warm-cohort")
+        } catch let failure as Gemma4MTPWarmRetirement.Failure {
+            throw failure
+        } catch {
+            if measuring {
+                CBv2MTPDeviceGate.failAutomaticMeasurement("warm-up error")
+            }
+        }
     }
 
     // MARK: - CBv2MTPDrafter
 
     public var mtpTargetIdentity: ObjectIdentifier? { ObjectIdentifier(target) }
 
-    /// The drafter's currently cached RoPE table, or nil if `prepare(rows:)`
-    /// has not run yet. Exposed for tests and for the drafter model to
-    /// consume without rebuilding per-step.
     public var currentRoPETable: DrafterRoPETable? { cachedRoPETable }
+
+    public func prepare(
+        rows: [CBv2MTPRowCapture], cohort: CBv2MTPCohortCapture?
+    ) -> CBv2MTPPreparedCapture {
+        guard let cohort else { return prepare(rows: rows) }
+        precondition(
+            rows.count == cohort.anchors.dim(0),
+            "Gemma4CBv2MTPDrafter.prepare: \(rows.count) rows but \(cohort.anchors.dim(0)) anchors")
+        return prepareDevice(rows: rows, cohort: cohort)
+    }
 
     public func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture {
         precondition(!rows.isEmpty, "Gemma4CBv2MTPDrafter.prepare: rows must be non-empty")
@@ -124,10 +311,6 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
             MLXArray(rows.map { Int32($0.anchor) }))
 
         let slidingWindow = drafter.config.textConfig.slidingWindow
-        // Materialize the round's cos/sin table once. Anchor the table at
-        // the minimum anchor across the batch so a per-row query position
-        // anywhere inside `[anchorMin, anchorMin + windowAhead)` indexes
-        // into the table with a non-negative step.
         let anchorMin = rows.map(\.anchor).min() ?? 0
         let ropeTable = Self.materializeDrafterRoPETable(
             drafterConfig: drafter.config.textConfig,
@@ -175,16 +358,7 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
                 "Gemma4CBv2MTPDrafter.draftStep: prepared capture "
                     + "\(type(of: prepared)) was not built by prepare(rows:)")
         }
-        // If the round has a cached RoPE table, pre-rotate the drafter's
-        // carried hidden along its rotary prefix using the cached
-        // (cos, sin) for the per-step query position. The drafter's
-        // `preProjection` is a Linear, so pre-rotation of the input is
-        // a real, distinct transformation from the drafter's downstream
-        // RoPE on Q/K. The pre-rotation is intentionally cheap (one
-        // per-round table lookup + an `a*cos-b*sin` slice) and amortizes
-        // the per-step `MLXFast.RoPE` frequency compute into the single
-        // `prepare(rows:)` materialization: the downstream rope module
-        // no longer pays the table-build cost on every draft step.
+        let hidden = hidden.ndim == 2 ? hidden.expandedDimensions(axis: 1) : hidden
         let rotatedHidden: MLXArray
         if let table = prepared.ropeTable {
             rotatedHidden = Self.applyCachedDrafterRoPE(
@@ -192,26 +366,101 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         } else {
             rotatedHidden = hidden
         }
-        // Mirror runGemma4MTPGreedyRound: seed = concat(target embedding of
-        // the token, carried hidden) along the feature axis.
         let inputsEmbeds = concatenated(
             [target.embedTokensForDrafter(tokens), rotatedHidden], axis: -1)
-        let (newHidden, logits) = drafter(
-            inputsEmbeds: inputsEmbeds,
-            sharedKV: prepared.sharedKV,
-            positionOffset: prepared.positionOffset,
-            masks: prepared.masks)
+        let (newHidden, logits) = Gemma4DrafterMirrorAttention.with(prepared.mirror) {
+            drafter(
+                inputsEmbeds: inputsEmbeds,
+                sharedKV: prepared.sharedKV,
+                positionOffset: prepared.positionOffset,
+                masks: prepared.masks)
+        }
         let next = logits.squeezed(axis: 1).argMax(axis: -1).asType(.int32)
         return (next, newHidden)
     }
 
+    private final class WarmProgress: @unchecked Sendable {
+        private let lock = NSLock()
+        private var counts: [Int]
+        private let target: Int
+        private var fired = false
+        init(slots: Int, target: Int) {
+            counts = Array(repeating: 0, count: slots)
+            self.target = target
+        }
+        func record(slot: Int, count: Int) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            counts[slot] += count
+            guard !fired, counts.allSatisfy({ $0 >= target }) else { return false }
+            fired = true
+            return true
+        }
+    }
+
+    // MARK: - Device geometry (chained rounds)
+
+    private func prepareDevice(
+        rows: [CBv2MTPRowCapture], cohort: CBv2MTPCohortCapture
+    ) -> CBv2MTPPreparedCapture {
+        cachedRoPETable = nil
+        let fullKV = cohort.pooledFull.map { ($0.keys, $0.values) }
+            ?? Self.padStack(rows.map(\.fullKeys), rows.map(\.fullValues))
+        let fullMask = Self.lengthMask(
+            tMax: fullKV.0.dim(2), lengths: cohort.fullLengths, dtype: fullKV.0.dtype)
+
+        let slidingWindow = drafter.config.textConfig.slidingWindow
+        let slidingKV: (MLXArray, MLXArray)
+        let slidingMask: MLXFast.ScaledDotProductAttentionMaskMode
+        let mirror = Gemma4DrafterMirrorAttention.context(
+            rows: rows, cohort: cohort, window: slidingWindow)
+        if mirror != nil {
+            let empty = MLXArray.zeros(
+                [1, drafter.config.textConfig.numKeyValueHeads, 0, drafter.config.textConfig.headDim],
+                dtype: fullKV.0.dtype)
+            slidingKV = (empty, empty)
+            slidingMask = .none
+        } else {
+            slidingKV = Self.padStack(rows.map(\.slidingKeys), rows.map(\.slidingValues))
+            slidingMask = .array(
+                Self.slidingMaskDevice(
+                    tMax: slidingKV.0.dim(2),
+                    lengths: MLXArray(rows.map { Int32($0.slidingKeys.dim(2)) }),
+                    starts: cohort.slidingStarts, anchors: cohort.anchors,
+                    window: slidingWindow, dtype: slidingKV.0.dtype))
+        }
+        return Prepared(
+            sharedKV: Gemma4SharedKV(fullAttention: fullKV, slidingAttention: slidingKV),
+            masks: Gemma4DrafterMasks(full: .array(fullMask), sliding: slidingMask),
+            positionOffset: .batch(cohort.anchors),
+            ropeTable: nil,
+            mirror: mirror)
+    }
+
+    private static func lengthMask(tMax: Int, lengths: MLXArray, dtype: DType) -> MLXArray {
+        let positions = MLXArray(Int32(0) ..< Int32(tMax)).reshaped([1, 1, 1, tMax])
+        let valid = positions .< lengths.reshaped([-1, 1, 1, 1])
+        let zero = MLXArray(0.0).asType(dtype)
+        let negInf = MLXArray(-Float.infinity).asType(dtype)
+        return MLX.where(valid, zero, negInf)
+    }
+
+    private static func slidingMaskDevice(
+        tMax: Int, lengths: MLXArray, starts: MLXArray, anchors: MLXArray,
+        window: Int, dtype: DType
+    ) -> MLXArray {
+        let positions = MLXArray(Int32(0) ..< Int32(tMax)).reshaped([1, 1, 1, tMax])
+        let insideLength = positions .< lengths.reshaped([-1, 1, 1, 1])
+        let insideWindow =
+            (positions + starts.reshaped([-1, 1, 1, 1])) .> (anchors - Int32(window)).reshaped([-1, 1, 1, 1])
+        let valid = MLX.logicalAnd(insideLength, insideWindow)
+        let zero = MLXArray(0.0).asType(dtype)
+        let negInf = MLXArray(-Float.infinity).asType(dtype)
+        return MLX.where(valid, zero, negInf)
+    }
+
     // MARK: - Padding + masks (B > 1)
 
-    /// Right-pad per-row `[1, kvHeads, T_r, headDim]` captures to
-    /// `[B, kvHeads, Tmax, headDim]` and build the additive padding mask
-    /// `[B, 1, 1, Tmax]` — 0 for valid entries, `-inf` for the padded tail
-    /// (`Gemma4DrafterMaskBuilder`'s convention). All lengths are host ints
-    /// from array metadata; the tensors stay lazy.
     private static func padAndMask(
         keys: [MLXArray], values: [MLXArray]
     ) -> (kv: (MLXArray, MLXArray), mask: MLXArray) {
@@ -219,7 +468,7 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         let tMax = lengths.max() ?? 0
         precondition(tMax > 0, "Gemma4CBv2MTPDrafter: empty KV capture")
 
-        let padded = (padStack(keys, to: tMax), padStack(values, to: tMax))
+        let padded = padStack(keys, values)
 
         let positions = MLXArray(Int32(0) ..< Int32(tMax)).reshaped([1, 1, 1, tMax])
         let valid = positions .< MLXArray(lengths.map { Int32($0) }).reshaped([-1, 1, 1, 1])
@@ -229,10 +478,6 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         return (padded, MLX.where(valid, zero, negInf))
     }
 
-    /// Additive `[B, 1, 1, Tmax]` mask for CBv2 sliding captures. Returns nil
-    /// only when every retained position is strictly inside its row's window
-    /// and no padding exists. Internal so the absolute boundary is pinned by
-    /// weight-free tests without exposing it as product API.
     static func slidingMask(
         rows: [CBv2MTPRowCapture], tMax: Int, window: Int, dtype: DType
     ) -> MLXArray? {
@@ -255,6 +500,11 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         return MLX.where(valid, zero, negInf)
     }
 
+    private static func padStack(_ keys: [MLXArray], _ values: [MLXArray]) -> (MLXArray, MLXArray) {
+        let tMax = keys.map { $0.dim(2) }.max() ?? 0
+        return (padStack(keys, to: tMax), padStack(values, to: tMax))
+    }
+
     private static func padStack(_ rows: [MLXArray], to tMax: Int) -> MLXArray {
         if rows.allSatisfy({ $0.dim(2) == tMax }) {
             return concatenated(rows, axis: 0)
@@ -269,16 +519,6 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
 
     // MARK: - Drafter RoPE table (per-round precompute)
 
-    /// Materialize a cos/sin pair covering `windowAhead` consecutive
-    /// rotary positions for the drafter's full-attention rope base and the
-    /// sliding head dim. Built once per `prepare(rows:)` round; consumed
-    /// by every `draftStep(...)` call within the same round.
-    ///
-    /// The drafter's full-attention rope is `ProportionalRoPE` (the
-    /// `globalPartialRotaryFactor` field). The proportional factor splits
-    /// the head dim into a rotated prefix of `2 * floor(factor * dims/2)`
-    /// and a pass-through tail. We materialize the table at the rotary
-    /// dim, so `applyCachedDrafterRoPE(...)` can index it directly.
     static func materializeDrafterRoPETable(
         drafterConfig: Gemma4TextConfiguration,
         startPosition: Int,
@@ -286,10 +526,6 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
     ) -> DrafterRoPETable? {
         precondition(
             windowAhead > 0, "windowAhead must be positive")
-        // The drafter attends with the sliding head dim. The rotary
-        // prefix is `2 * floor(proportional_factor * dims/2)`; with
-        // Gemma 4's defaults (`globalPartialRotaryFactor = 0.25`,
-        // `headDim = 256`) that is 128, the rotary pair count.
         let fullDim = drafterConfig.headDim
         let factor = drafterConfig.globalPartialRotaryFactor
         let rotatedDims = 2 * Int((factor * Float(fullDim) / 2.0).rounded(.down))
@@ -297,21 +533,17 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         let halfDim = rotatedDims / 2
         let base = drafterConfig.fullRopeTheta
 
-        // Frequency vector: `base^(-2i / rotatedDims)` for i in
-        // `[0, halfDim)`, matches `ProportionalRoPE._freqs` layout.
         let indices = MLXArray(stride(
             from: 0, to: halfDim, by: 1
         )).asType(.float32)
         let exponent = indices * (-2.0 / Float(rotatedDims))
         let freqs = MLX.pow(MLXArray(base), exponent)  // [halfDim]
 
-        // Position vector: positions `[startPosition, startPosition + windowAhead)`.
         let positions = MLXArray(
             stride(from: startPosition, to: startPosition + windowAhead, by: 1)
         ).asType(.float32)
             .reshaped([windowAhead, 1])               // [windowAhead, 1]
 
-        // Outer product gives `[windowAhead, halfDim]` angles.
         let angles = positions * freqs
         let cos = MLX.cos(angles)
         let sin = MLX.sin(angles)
@@ -323,13 +555,6 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
             base: base)
     }
 
-    /// Rotate `hidden`'s rotary prefix using the cached `table` at the
-    /// per-step position read from `positionOffset`. The non-rotary tail
-    /// passes through unchanged. The pre-rotation is a real, distinct
-    /// transformation from the drafter's downstream rope on Q/K (the
-    /// downstream rope sees the post-`preProjection` activations, not
-    /// the carried hidden), and exists so the per-round cos/sin table
-    /// is exercised on every step rather than left unreferenced.
     static func applyCachedDrafterRoPE(
         hidden: MLXArray, table: DrafterRoPETable,
         positionOffset: Gemma4.PositionOffset
@@ -341,10 +566,6 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         }
         let halfDim = rotaryPrefix / 2
 
-        // Read the per-row query position from the position offset. The
-        // round is a drafter step (B rows, query length 1) so the offset
-        // resolves to a `[B]` int32 array; `.batch` and `.graphArray`
-        // share that layout.
         let perRow: [Int32]
         switch positionOffset {
         case .scalar(let v):
@@ -355,36 +576,71 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
             perRow = arr.asArray(Int32.self)
         }
 
-        // Build the index into the pre-computed cos/sin rows.
         let steps = perRow.map { Int32($0) - Int32(table.startPosition) }
         let inRange = steps.allSatisfy { $0 >= 0 && $0 < Int32(table.windowAhead) }
         guard inRange else { return hidden }
 
-        let indices = MLXArray(steps, [perRow.count, 1])
-        let cosRows = table.cos[indices]  // [B, halfDim]
-        let sinRows = table.sin[indices]  // [B, halfDim]
+        let indices = MLXArray(steps, [perRow.count])
+        let leadShape = Array(hidden.shape.dropLast())  // [B] or [B, 1]
+        let broadcastShape =
+            [perRow.count] + Array(repeating: 1, count: max(0, leadShape.count - 1))
+            + [halfDim]
+        let cosB = table.cos[indices].reshaped(broadcastShape)  // [B, (1,) halfDim]
+        let sinB = table.sin[indices].reshaped(broadcastShape)
 
-        // Reshape hidden so the rotary prefix is `[B, L, 1, halfDim, 2]`.
-        let leadShape = Array(hidden.shape.dropLast())
-        let flat = hidden.reshaped(leadShape + [featureDim])
-        let prefixLead = leadShape.dropLast()
-        let prefixShape = Array(prefixLead) + [1, halfDim, 2]
-        let pairs = flat[.ellipsis, 0 ..< rotaryPrefix]
-            .reshaped(Array(prefixShape))
-        let a = pairs[.ellipsis, 0]  // [.., halfDim]
-        let b = pairs[.ellipsis, 1]  // [.., halfDim]
-
-        // Broadcast cos/sin to the query/head axes.
-        let cosBroadcastShape = Array(prefixLead) + [1, halfDim]
-        let sinBroadcastShape = Array(prefixLead) + [1, halfDim]
-        let cosB = cosRows.reshaped(cosBroadcastShape)
-        let sinB = sinRows.reshaped(sinBroadcastShape)
+        let prefix = hidden[.ellipsis, 0 ..< rotaryPrefix]
+        let pairs = prefix.reshaped(leadShape + [halfDim, 2])
+        let a = pairs[.ellipsis, 0]  // [..., halfDim]
+        let b = pairs[.ellipsis, 1]
         let aRot = a * cosB - b * sinB
         let bRot = a * sinB + b * cosB
         let rotatedPrefix = MLX.stacked([aRot, bRot], axis: -1)
-            .reshaped(Array(prefixShape))
-            .reshaped(Array(prefixLead) + [rotaryPrefix])
-        let tail = flat[.ellipsis, rotaryPrefix ..< featureDim]
+            .reshaped(leadShape + [rotaryPrefix])
+        let tail = hidden[.ellipsis, rotaryPrefix ..< featureDim]
         return MLX.concatenated([rotatedPrefix, tail], axis: -1)
+    }
+}
+
+enum Gemma4DrafterMirrorAttention {
+    struct Context {
+        let mirrors: [MLXArray]
+        let slotBases: MLXArray
+        let fence: MLXArray
+        let window: Int
+    }
+
+    nonisolated(unsafe) private(set) static var current: Context?
+
+    static func context(
+        rows: [CBv2MTPRowCapture], cohort: CBv2MTPCohortCapture, window: Int
+    ) -> Context? {
+        guard rows.count == 8,
+            let slotBases = cohort.slidingMirrorSlotBases,
+            let fence = cohort.slidingMirrorFence
+        else { return nil }
+        let mirrors = rows.compactMap(\.slidingMirror)
+        guard mirrors.count == rows.count else { return nil }
+        return Context(
+            mirrors: mirrors, slotBases: slotBases.asType(.uint32), fence: fence, window: window)
+    }
+
+    static func with<T>(_ context: Context?, _ body: () -> T) -> T {
+        let previous = current
+        current = context
+        defer { current = previous }
+        return body()
+    }
+
+    static func attend(queries: MLXArray, isSliding: Bool) -> MLXArray? {
+        guard isSliding, let current else { return nil }
+        guard let output = CBv2MTPMirrorAttention.attend(
+                queries: queries, mirrors: current.mirrors, slotBases: current.slotBases,
+                fence: current.fence, window: current.window)
+        else {
+            preconditionFailure(
+                "Gemma4DrafterMirrorAttention: the q4 mirror kernel refused queries "
+                    + "\(queries.shape) \(queries.dtype)")
+        }
+        return output
     }
 }

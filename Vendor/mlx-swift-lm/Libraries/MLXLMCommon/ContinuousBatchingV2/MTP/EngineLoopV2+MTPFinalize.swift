@@ -7,12 +7,9 @@ import MLX
 
 extension EngineLoopV2 {
 
-    /// Runs at the step's existing host-sync boundary after ordinary sampled
-    /// rows finalize and before deferred KV releases.
     func finalizeMTPRound(_ step: CBv2InFlightStep) {
         guard let mtp, let round = step.mtpRound else { return }
 
-        // The ordinary finalize loop has confirmed each seed row's bonus.
         if let seedHidden = round.seedHidden {
             for (id, decodeIndex) in round.seedRows {
                 guard !step.discard.contains(id),
@@ -26,10 +23,30 @@ extension EngineLoopV2 {
                 round.finalizedSeedIDs.insert(id)
             }
         }
+        if CBv2StepProfiler.enabled, let launch = round.launchMemory {
+            let now = CBv2MTPRoundInFlight.MemorySnapshot()
+            let mb = 1.0 / Double(1 << 20)
+            FileHandle.standardError.write(
+                Data(String(
+                    format: "[%@] alloc active %+.1f MB cache %+.1f MB peak %+.1f MB\n",
+                    round.verify == nil ? "mtp-seed" : "mtp-round",
+                    Double(now.active - launch.active) * mb,
+                    Double(now.cache - launch.cache) * mb,
+                    Double(now.peak - launch.peak) * mb).utf8))
+        }
 
         guard let verify = round.verify else { return }
         let k = verify.k
+        let waitStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         let host = verify.acceptancePacket.asArray(Int32.self)
+        if CBv2MTPDeviceGate.measurementActive, step.launchedByChain {
+            step.gateFencedNanos = DispatchTime.now().uptimeNanoseconds
+        }
+        if CBv2StepProfiler.enabled {
+            FileHandle.standardError.write(
+                Data(String(format: "[mtp-round] readback wait %.1f ms\n",
+                    (CFAbsoluteTimeGetCurrent() - waitStart) * 1000).utf8))
+        }
         let draftCount = verify.rows.count * k
         let targetWidth = 1 + k
         var anyRejected = false
@@ -40,19 +57,15 @@ extension EngineLoopV2 {
             let rec: CBv2ScheduledRequest
             let targets: [Int]
             let accepted: Int
+            let naturalEmitted: Int
         }
 
-        // Resolve each row's natural target-authoritative prefix, then choose
-        // one committed width for the rectangular step. This keeps subsequent
-        // quantized MoE target batches shape-identical across all rows.
         var outcomes: [RowOutcome] = []
         outcomes.reserveCapacity(verify.rows.count)
         var commonEmitted = targetWidth
 
         for (batchIndex, metadata) in verify.rows.enumerated() {
             let id = metadata.id
-            // A departed row is fenced by deferred release. Its device offset
-            // is stale, so force the next eager composition to rebuild.
             if step.discard.contains(id) || scheduler.record(for: id) == nil {
                 anyRejected = true
                 continue
@@ -81,25 +94,30 @@ extension EngineLoopV2 {
                     metadata: metadata,
                     rec: rec,
                     targets: targets,
-                    accepted: accepted))
+                    accepted: accepted,
+                    naturalEmitted: naturalEmitted))
         }
+        let mirrorRoadRows = Set(
+            verify.mirrorRestore.flatMap { $0.rows.map(ObjectIdentifier.init) })
+        var confirmedByBatchIndex = [Int](repeating: targetWidth, count: verify.rows.count)
 
         round.finalizedVerifyIDs = Set(outcomes.map { $0.metadata.id })
         round.claimedSeedCostNanos = mtp.claimPendingSeedCost(
             decodeRowBucket: mtp.planDecodeRowBucket,
             finalizedVerifyIDs: round.finalizedVerifyIDs)
 
-        if !outcomes.isEmpty {
-            let stepAccepted = outcomes.map { min($0.accepted, commonEmitted) }.min() ?? 0
+        for outcome in outcomes {
+            let rowAccepted = min(outcome.accepted, outcome.naturalEmitted)
             let observedDrafts =
-                commonEmitted <= stepAccepted
-                ? commonEmitted : min(k, stepAccepted + 1)
+                outcome.naturalEmitted <= rowAccepted
+                ? outcome.naturalEmitted : min(k, rowAccepted + 1)
             mtp.recordStepAcceptance(
                 drafted: k,
-                accepted: stepAccepted,
+                accepted: rowAccepted,
                 observedDrafts: observedDrafts,
                 decodeRowBucket: mtp.planDecodeRowBucket)
         }
+        _ = commonEmitted
 
         for outcome in outcomes {
             let batchIndex = outcome.batchIndex
@@ -107,10 +125,8 @@ extension EngineLoopV2 {
             let id = metadata.id
             let rec = outcome.rec
             let accepted = outcome.accepted
-            let emitted = Array(outcome.targets.prefix(commonEmitted))
+            let emitted = Array(outcome.targets.prefix(outcome.naturalEmitted))
 
-            // Confirm in order with the same stop and length semantics as the
-            // ordinary finalize loop.
             let detokenizer = detokenizers[id]
             let hasStopStrings = !rec.request.stopStrings.isEmpty
             var kept: [Int] = []
@@ -136,11 +152,19 @@ extension EngineLoopV2 {
                 }
             }
 
-            // Correct KV and scheduler state before any terminal release.
             let confirmed = kept.count
             let rejected = (1 + k) - confirmed
+            confirmedByBatchIndex[batchIndex] = confirmed
             if rejected > 0 {
-                for sequence in metadata.storageRows { sequence.rollback(rejected) }
+                for sequence in metadata.storageRows {
+                    if let windowed = sequence as? CBv2WindowedSequenceKV,
+                        mirrorRoadRows.contains(ObjectIdentifier(windowed))
+                    {
+                        windowed.mtpRollbackMirrorRoad(rejected)
+                    } else {
+                        sequence.rollback(rejected)
+                    }
+                }
                 anyRejected = true
             }
             for sequence in metadata.storageRows { sequence.commitSpeculativeWrite() }
@@ -167,12 +191,6 @@ extension EngineLoopV2 {
             }
 
             let committedAccepted = min(accepted, confirmed)
-            // Acceptance/rollback audit record (observability, 2026-08-25):
-            // every value is already on the host at this boundary. The
-            // scheduler fields are read AFTER recordSampled/rollbackComputed
-            // above, so the record states the row's post-round accounting —
-            // the boundary invariant a consumer checks is
-            // `numComputedAfter == tokensCountAfter - 1`.
             mtp.recordRound(
                 drafted: k, accepted: committedAccepted, emitted: confirmed,
                 audit: CBv2MTPRoundAuditRecord(
@@ -192,12 +210,6 @@ extension EngineLoopV2 {
             if let finishReason {
                 finishRequest(id, reason: finishReason)
             } else {
-                // No inline deadline check: an MTP row that just confirmed
-                // tokens is making progress and its decode lease is refreshed
-                // in `refreshProgressLeases` (run at the end of the enclosing
-                // `finalize`, after this round). Lease expiry is evaluated
-                // centrally in `processLeaseExpiry` — identical typed-terminal
-                // semantics to the ordinary decode path.
                 let hiddenColumn = CBv2MTPHiddenIndex.carryColumn(
                     targetOutputIndex: confirmed - 1, draftDepth: k)
                 mtp.storeCarry(
@@ -210,9 +222,28 @@ extension EngineLoopV2 {
             }
         }
 
-        // Rejected suffixes advanced eager device offsets past host truth.
-        if anyRejected {
+        if verify.acceptedDevice == nil {
+            for layer in verify.mirrorRestore {
+                var firstRestored = [Int](repeating: k + 1, count: layer.rows.count)
+                for outcome in outcomes where outcome.batchIndex < firstRestored.count {
+                    firstRestored[outcome.batchIndex] = confirmedByBatchIndex[outcome.batchIndex] + 1
+                }
+                guard firstRestored.contains(where: { $0 <= k }) else { continue }
+                layer.cache.mtpWriteFence = CBv2MTPMirrorOps.restore(
+                    mirrors: layer.mirrors, undo: layer.undo, slotBases: layer.slotBases,
+                    firstRestored: MLXArray(firstRestored.map { Int32($0) }), depth: k,
+                    kvHeads: layer.kvHeads, headDim: layer.headDim, window: layer.window,
+                    fence: layer.cache.mtpWriteFence)
+            }
+        }
+
+        if anyRejected, verify.acceptedDevice == nil {
             eagerCompositionStale = true
+        }
+        if CBv2StepProfiler.enabled, mtp.roundsForProfile % 16 == 0 {
+            FileHandle.standardError.write(
+                Data(("[cbv2-step-profile] rounds=\(mtp.roundsForProfile)\n"
+                    + CBv2StepProfiler.summaryTable()).utf8))
         }
     }
 }

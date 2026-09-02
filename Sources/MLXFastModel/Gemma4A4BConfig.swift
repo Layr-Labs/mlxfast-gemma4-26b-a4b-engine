@@ -2,22 +2,14 @@ import CoreFoundation
 import Foundation
 import MLXFastCore
 
-/// Attention kind of one decoder layer, as spelled in `layer_types`.
 public enum Gemma4A4BLayerType: String, Equatable, Sendable {
     case sliding = "sliding_attention"
     case full = "full_attention"
 }
 
-/// Per-layer-type RoPE spec. Gemma 4 has NO single top-level RoPE block: the
-/// two attention kinds carry independent parameters, and the full-attention
-/// entry additionally carries a partial rotary factor the sliding one omits.
-/// Modelling this as one spec with an optional partial factor (the shape the
-/// Qwen tower used) would silently accept a config that specified the wrong
-/// theta for one of the two kinds.
 public struct Gemma4A4BRopeSpec: Equatable, Sendable {
     public let theta: Double
     public let type: String
-    /// Present on `full_attention` only; `nil` on `sliding_attention`.
     public let partialRotaryFactor: Double?
 
     public init(theta: Double, type: String, partialRotaryFactor: Double?) {
@@ -27,7 +19,6 @@ public struct Gemma4A4BRopeSpec: Equatable, Sendable {
     }
 }
 
-/// One resolved quantization setting.
 public struct Gemma4A4BQuantizationSpec: Equatable, Sendable {
     public let groupSize: Int
     public let bits: Int
@@ -38,32 +29,9 @@ public struct Gemma4A4BQuantizationSpec: Equatable, Sendable {
     }
 }
 
-/// The checkpoint's quantization contract: a fallback spec plus the per-tensor
-/// overrides that promote specific paths to a different width.
-///
-/// WHY THIS TYPE EXISTS, and it is the single most important thing in this
-/// file. The pinned checkpoint's `quantization` block is NOT the three-key
-/// object every previous target in this repository carried. It is affine
-/// 4-bit / group-64 PLUS 120 per-tensor overrides promoting four projection
-/// families to 8 bits on every one of the 30 layers.
-///
-/// The Qwen-era contract (`Qwen35Config.qwenQuantization`) read exactly
-/// `{group_size, bits, mode}` and ignored every other key. Against this
-/// checkpoint that parse SUCCEEDS and silently discards all 120 overrides,
-/// after which the runtime quantizes 120 tensors at 4 bits that were written
-/// at 8. Nothing downstream catches it: the tensor names are right, the shapes
-/// are right, and only the numerics are wrong. That is why the overrides are
-/// modelled as data here rather than validated away, and why
-/// `Gemma4A4BRuntimeWeightCache` resolves the width PER PATH instead of
-/// passing one triple to `quantize(model:)`.
 public struct Gemma4A4BQuantization: Equatable, Sendable {
-    /// Applies to any path not named in `overrides`.
     public let fallback: Gemma4A4BQuantizationSpec
-    /// Quantization mode; affine for this checkpoint. Overrides do not carry a
-    /// mode of their own, so this applies to fallback and overrides alike.
     public let mode: String
-    /// Tensor path -> width. Keys are checkpoint paths as they appear in the
-    /// source config, e.g. `language_model.model.layers.0.mlp.gate_proj`.
     public let overrides: [String: Gemma4A4BQuantizationSpec]
 
     public init(
@@ -76,22 +44,11 @@ public struct Gemma4A4BQuantization: Equatable, Sendable {
         self.overrides = overrides
     }
 
-    /// Resolve the width for one checkpoint path.
     public func spec(forPath path: String) -> Gemma4A4BQuantizationSpec {
         overrides[path] ?? fallback
     }
 }
 
-/// Frozen text-tower contract for
-/// `mlx-community/gemma-4-26B-A4B-it-qat-4bit@0e3cbab38ce568cf6e23543010d08d03b731910c`.
-///
-/// The transformed `weights/config.json` is the source checkpoint's
-/// `text_config` flattened to the top level plus the checkpoint-wide
-/// `quantization` block, so this type parses the flattened schema. The
-/// `Gemma4A4B` prefix is deliberate: the bare `Gemma4*` names belong to the
-/// vendored reference implementation and must not be shadowed, and the
-/// transform still carries a separate legacy `.gemma4` family for the archived
-/// dense 31B multimodal layout.
 public struct Gemma4A4BConfig: Equatable, Sendable {
     public let modelType: String
     public let vocabSize: Int
@@ -132,32 +89,14 @@ public struct Gemma4A4BConfig: Equatable, Sendable {
     public let fullRope: Gemma4A4BRopeSpec
     public let quantization: Gemma4A4BQuantization
 
-    /// The pinned layer schedule: 30 layers on a six-layer repeat, the LAST
-    /// layer of each group global. Indices 5, 11, 17, 23, 29.
     public static let expectedLayerTypes: [Gemma4A4BLayerType] =
         (0..<MLXFastConstants.numHiddenLayers).map {
             $0 % MLXFastConstants.fullAttentionInterval
                 == MLXFastConstants.fullAttentionInterval - 1 ? .full : .sliding
         }
 
-    /// Every key the transformed config must carry, non-null. Read off the
-    /// pinned revision's own `text_config`, which has exactly these 36 and no
-    /// null values.
-    ///
-    /// SINGLE-SOURCED from `MLXFastCore.Gemma4A4BConfigKeys.required` (rather
-    /// than restated here) so this loader and the trusted runtime-worker
-    /// pinned-configuration gate -- which cannot import this module, see that
-    /// gate's own doc comment -- cannot silently diverge on which keys this
-    /// target's config carries.
     static let requiredKeys: Set<String> = Gemma4A4BConfigKeys.required
 
-    /// Keys that must be ABSENT or null. `moe_router_logit_softcapping` is the
-    /// Gemma-family knob that would change router numerics if it ever appeared;
-    /// `qkv_bias` and `query_pre_attn_scalar` likewise change attention.
-    /// Carrying the check forward from the Laguna/Qwen contract shape: a key
-    /// that silently appears is exactly as dangerous as one that disappears.
-    /// Single-sourced from `MLXFastCore.Gemma4A4BConfigKeys.forbidden`, same
-    /// reason as `requiredKeys` above.
     static let forbiddenKeys: [String] = Gemma4A4BConfigKeys.forbidden
 
     public init(
@@ -225,18 +164,6 @@ public struct Gemma4A4BConfig: Equatable, Sendable {
         return try load(data: try Data(contentsOf: path))
     }
 
-    /// Data-based entry point, single-sourced with `load(from:)` above.
-    ///
-    /// The runtime worker's pinned-configuration gate
-    /// (`validateRuntimeWorkerPinnedConfigurationData` in both
-    /// `Sources/MLXFastHarness/Gemma4RuntimeWorker.swift` and its
-    /// `Sources/MLXFastTrustedHarness` twin) calls this directly instead of
-    /// re-encoding a second, hand-maintained key/value list: the exact
-    /// key-set check, the frozen invariant check, and the structural sanity
-    /// check below are the ONLY copy of this target's config contract, so the
-    /// worker gate and this loader cannot silently drift apart the way the
-    /// pre-port Qwen-shaped gate drifted from the Gemma 4 artifact it was
-    /// actually being handed.
     public static func load(data: Data) throws -> Gemma4A4BConfig {
         let object = try JSONSerialization.jsonObject(with: data)
         guard let root = object as? [String: Any] else {
@@ -248,7 +175,6 @@ public struct Gemma4A4BConfig: Equatable, Sendable {
         let ropeObject = try gemmaObject("rope_parameters", in: root)
         let quantization = try gemmaQuantization(in: root)
 
-        // Reject an unsafe layer count before parsing the layer array.
         let numHiddenLayers = try gemmaInt("num_hidden_layers", in: root)
         guard numHiddenLayers == MLXFastConstants.numHiddenLayers else {
             throw MLXFastError.invalidInput(
@@ -309,15 +235,6 @@ public struct Gemma4A4BConfig: Equatable, Sendable {
         return config
     }
 
-    /// Exact key-set discipline on the flattened config: every required key
-    /// present and non-null, no forbidden key present, and no UNKNOWN key.
-    ///
-    /// The unknown-key rejection is the half that matters most on this target.
-    /// The vendored `Gemma4TextConfiguration` decodes with
-    /// `decodeIfPresent` for most fields, so a config carrying an unexpected
-    /// knob loads silently with that knob active in the vendored model and
-    /// invisible to this contract. Rejecting unknowns makes a checkpoint
-    /// respin that adds a field a loud failure instead of a numerics change.
     static func validateKeyPresence(in root: [String: Any]) throws {
         var errors: [String] = []
 
@@ -377,9 +294,6 @@ public struct Gemma4A4BConfig: Equatable, Sendable {
         expect(
             "num_global_key_value_heads", numGlobalKeyValueHeads,
             MLXFastConstants.numGlobalKeyValueHeads)
-        // 0 on this checkpoint: no layer borrows KV from an earlier one. The
-        // vendored `sanitize` drops k/v/k_norm/v_norm for shared-KV layers, so
-        // a non-zero value here would change which tensors the loader expects.
         expect("num_kv_shared_layers", numKvSharedLayers, 0)
         expect("head_dim", headDim, MLXFastConstants.headDim)
         expect("global_head_dim", globalHeadDim, MLXFastConstants.globalHeadDim)
@@ -389,8 +303,6 @@ public struct Gemma4A4BConfig: Equatable, Sendable {
         expect("max_position_embeddings", maxPositionEmbeddings, 262_144)
         expect("attention_bias", attentionBias, false)
         expect("attention_dropout", attentionDropout, 0)
-        // TRUE, and it is a tensor-inventory fact as much as a numerics one:
-        // the five full-attention layers ship NO v_proj at all.
         expect("attention_k_eq_v", attentionKeqV, true)
         expect(
             "final_logit_softcapping", finalLogitSoftcapping,
@@ -453,12 +365,6 @@ public struct Gemma4A4BConfig: Equatable, Sendable {
         }
     }
 
-    /// The override table is pinned by CONSTRUCTION, not by count.
-    ///
-    /// A count check would pass on 120 overrides naming the wrong paths. This
-    /// builds the exact expected key set — four projection families on every
-    /// layer — and requires set equality plus a uniform 8-bit/group-64 width,
-    /// so both a missing promotion and an unexpected extra one are caught.
     func quantizationOverrideErrors() -> [String] {
         var expected: Set<String> = []
         for layer in 0..<numHiddenLayers {
@@ -556,9 +462,6 @@ public struct Gemma4A4BConfig: Equatable, Sendable {
                 }
             }
         }
-        // Divisibility is checked against EVERY width the checkpoint actually
-        // uses, not just the fallback: an 8-bit override on a path whose width
-        // is not a multiple of its group size is as broken as a bad fallback.
         var widths = Set([quantization.fallback.groupSize])
         for spec in quantization.overrides.values {
             widths.insert(spec.groupSize)
@@ -609,13 +512,6 @@ private func gemmaObject(
     return result
 }
 
-/// Parse one per-attention-kind RoPE entry with EXACT key-set equality.
-///
-/// The two entries have different key sets by design — `full_attention`
-/// carries `partial_rotary_factor` and `sliding_attention` does not — so the
-/// allowed set is computed per kind rather than shared. An entry that grows a
-/// key, or that gains a partial factor on the sliding side, is rejected here
-/// rather than silently ignored.
 private func gemmaRope(
     _ key: String, in ropeParameters: [String: Any]
 ) throws -> Gemma4A4BRopeSpec {
@@ -641,18 +537,6 @@ private func gemmaRope(
     )
 }
 
-/// Parse the mixed-precision quantization block.
-///
-/// Shape: three scalar keys (`group_size`, `bits`, `mode`) that form the
-/// fallback, plus any number of tensor-path keys mapping to a `{group_size,
-/// bits}` object. Anything else in the block is rejected: a scalar key that is
-/// not one of the three, or an override object carrying an unknown key, both
-/// mean the checkpoint is describing something this contract does not model.
-///
-/// `quantization_config` is deliberately NOT read here. The transform emits a
-/// single canonical `quantization` block and removes the duplicate, so a
-/// transformed config carrying both would have failed the key-set check above
-/// before reaching this function.
 private func gemmaQuantization(
     in root: [String: Any]
 ) throws -> Gemma4A4BQuantization {

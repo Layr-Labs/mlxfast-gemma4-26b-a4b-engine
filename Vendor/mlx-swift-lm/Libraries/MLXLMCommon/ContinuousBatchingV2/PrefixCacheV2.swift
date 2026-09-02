@@ -67,22 +67,10 @@ import MLX
 // MARK: - Config
 
 public struct CBv2PrefixCacheConfig: Sendable, Equatable {
-    /// Tokens per hash block. Must stay consistent for the cache lifetime.
     public var blockSize: Int
-    /// Prompt-contract identity folded into every block hash.
     public var promptContractID: String
-    /// Authenticated cache scope folded into every block hash.
     public var scopeID: String
-    /// Byte budget enforced automatically after each donation.
-    /// nil ⇒ unbounded; the owner calls `evict(toFit:)` explicitly.
     public var maxBytes: Int?
-    /// Materialize (device-eval) donated snapshot arrays before indexing
-    /// them. REQUIRED for the paged backend: donated views reference the
-    /// live slabs, whose pages are recycled once the donor state is
-    /// released. Not a host readback — device materialization only, and
-    /// donation already runs off the engine step thread. ON by default
-    /// (safe for every backend; contiguous deployments whose snapshot views
-    /// own their buffers via ARC may opt out to skip the ~free eval).
     public var materializeOnDonate: Bool
 
     public init(
@@ -114,26 +102,15 @@ public struct CBv2PrefixCacheStats: Sendable, Equatable {
 
 public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
 
-    /// One donated whole-block prefix. `snapshots` holds the donated arrays
-    /// as-is (zero-copy; they may extend past `tokenCount` — the tail is
-    /// sliced off lazily at lookup). Windowed / KV-sharing layers are nil.
     private final class Entry {
         let id: UInt64
         let blockCount: Int
         let tokenCount: Int
-        /// h_1 … h_blockCount. Every whole-block boundary of this entry is
-        /// indexed, so shorter prefixes of a long donation still hit.
         let chainHashes: [Data]
         let snapshots: [(keys: MLXArray, values: MLXArray, offset: Int)?]
-        /// Bytes physically retained (the FULL donated arrays, including any
-        /// partial tail — truthful accounting of what this entry pins).
         let bytes: Int
         var lastAccess: UInt64
-        /// Adoptions in flight (lookup → endAdoption). Pinned entries are
-        /// never evicted and never lose index keys to repointing.
         var refInUse: Int = 0
-        /// Index keys currently resolving to this entry (≤ blockCount; keys
-        /// can be lost to a longer donation while the entry is unpinned).
         var liveKeys: Int = 0
 
         init(
@@ -156,10 +133,8 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
 
     private let lock = NSLock()
     private var entries: [UInt64: Entry] = [:]
-    /// chainHash → entry id. Multiple keys may resolve to one entry.
     private var index: [Data: UInt64] = [:]
     private var nextEntryID: UInt64 = 0
-    /// Monotonic access clock (deterministic LRU; no wall-clock ties).
     private var tick: UInt64 = 0
     private var _bytesInUse = 0
 
@@ -176,12 +151,6 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
         )
     }
 
-    /// Hasher for a request-scoped salt (TB-007). A non-nil request salt
-    /// REPLACES the cache-level salt in the first block hash — the chain
-    /// then propagates the scope to every later block — so entries donated
-    /// under different salts can never resolve each other. nil falls back
-    /// to the configured cache-level hasher (byte-identical hash vectors to
-    /// the pre-salt behavior).
     func hasher(cacheSalt: String?) -> CBv2BlockHasher {
         guard let cacheSalt else { return hasher }
         return CBv2BlockHasher(
@@ -209,14 +178,8 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
-        // Longest match wins. Scan longest → shortest: eviction can remove a
-        // SHORT diverging entry that once held a shared early key, so the
-        // indexed boundary set is not guaranteed downward-closed and a
-        // left-to-right stop-at-first-miss scan could miss a longer hit.
         for k in stride(from: hashes.count, through: 1, by: -1) {
             guard let id = index[hashes[k - 1]], let entry = entries[id] else { continue }
-            // Defensive: a stored entry must describe the same layer layout
-            // the caller is adopting into.
             guard entry.snapshots.count == layerKinds.count else { continue }
 
             let matched = k * hasher.blockSize
@@ -234,15 +197,11 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
         return nil
     }
 
-    /// Lazily slice the stored per-layer arrays down to `matched` tokens.
-    /// Pure graph construction — no eval, no host sync.
     private func slicedPrefix(
         entry: Entry, matched: Int, layerKinds: [CBv2LayerKind]
     ) -> [(keys: MLXArray, values: MLXArray, offset: Int)?] {
         (0 ..< layerKinds.count).map { i in
             guard let snap = entry.snapshots[i] else { return nil }
-            // Honor the CALLER's layer kinds too: never hand a snapshot to a
-            // windowed or KV-sharing layer (report 10 invariant 6).
             guard Self.isCacheable(layerKinds[i]) else { return nil }
             if snap.offset == matched {
                 return (keys: snap.keys, values: snap.values, offset: matched)
@@ -261,16 +220,11 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
         donate(tokens: tokens, state: state, layerKinds: layerKinds, cacheSalt: nil)
     }
 
-    /// Salted state-based donation (concrete-type convenience; the engine
-    /// path uses the pre-snapshotted protocol overload).
     public func donate(
         tokens: [Int], state: [CBv2SequenceKV?], layerKinds: [CBv2LayerKind],
         cacheSalt: String?
     ) {
         guard state.count == layerKinds.count else { return }
-        // Snapshot the full-attention storage-owning layers. Windowed layers
-        // must not enter full-history prefix reuse (report 10 invariant 6);
-        // KV-sharing layers own no storage. Both stay nil.
         var snapshots: [(keys: MLXArray, values: MLXArray, offset: Int)?] = []
         snapshots.reserveCapacity(layerKinds.count)
         for (i, kind) in layerKinds.enumerated() {
@@ -283,10 +237,6 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
         donate(tokens: tokens, snapshots: snapshots, layerKinds: layerKinds, cacheSalt: cacheSalt)
     }
 
-    /// Pre-snapshotted donation (the engine-integration path): the per-layer
-    /// snapshots are built ON the engine thread (graph-only, so views over
-    /// shared slabs are consistent with in-flight writes) and handed here
-    /// from the donation queue. Windowed / KV-sharing layers must be nil.
     public func donate(
         tokens: [Int],
         snapshots: [(keys: MLXArray, values: MLXArray, offset: Int)?],
@@ -314,8 +264,6 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
                 snapshots.append(nil)
                 continue
             }
-            // A cacheable layer with missing or too-short state cannot cover
-            // the prefix — the donation as a whole is unusable.
             guard let snap = rawSnapshots[i],
                 snap.offset >= prefixTokens,
                 snap.keys.ndim == 4, snap.keys.dim(2) >= prefixTokens
@@ -323,7 +271,6 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
             snapshots.append(snap)
             cacheableLayers += 1
         }
-        // All-windowed/all-shared model: an entry would carry no KV at all.
         guard cacheableLayers > 0 else { return }
 
         if config.materializeOnDonate {
@@ -345,12 +292,6 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
-        // Dedup: this exact whole-block prefix is already represented (the
-        // entry holding its terminal hash covers at least these blocks).
-        // Re-register any missing intermediate block keys while we're here:
-        // an intermediate key can be lost when a shorter entry that owned
-        // it (a pinned entry survives repointing) is later evicted — after
-        // which shorter prefixes of this donation stopped hitting.
         if let existingID = index[hashes[blockCount - 1]], let existing = entries[existingID] {
             tick += 1
             existing.lastAccess = tick
@@ -369,10 +310,6 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
             chainHashes: hashes, snapshots: snapshots, bytes: bytes, lastAccess: tick
         )
 
-        // Register every whole-block boundary. On a key contest, prefer the
-        // LONGER entry (dropping a fully-shadowed shorter one frees its
-        // duplicate storage) — but never steal keys from a pinned entry, so
-        // in-flight adoptions stay resolvable by hash.
         for hash in hashes {
             if let oldID = index[hash], oldID != entry.id {
                 guard let old = entries[oldID] else {
@@ -401,13 +338,6 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
 
     // MARK: - Adoption lifecycle
 
-    /// Release the in-use pin taken by a successful `lookup`. `matched` is
-    /// the matched token count that lookup returned for these `tokens`.
-    ///
-    /// NOTE: the frozen `CBv2PrefixCache` protocol has no adoption-release
-    /// hook, so this lives on the concrete type (see
-    /// docs/engine-v2/CONTRACT-ISSUES-D-prefix-cache.md). Pinned entries
-    /// always keep their index keys, so resolving by hash here is exact.
     public func endAdoption(tokens: [Int], matched: Int) {
         endAdoption(tokens: tokens, matched: matched, cacheSalt: nil)
     }
@@ -424,8 +354,6 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
         defer { lock.unlock() }
         guard let id = index[hashes[blocks - 1]], let entry = entries[id] else { return }
         entry.refInUse = max(0, entry.refInUse - 1)
-        // A pinned entry that lost relevance keeps its keys until released,
-        // so no keyless-entry sweep is needed here; eviction handles LRU.
         if let budget = config.maxBytes, _bytesInUse > budget {
             evictLocked(toFit: budget)
         }
@@ -450,16 +378,6 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
     }
 
     private func removeLocked(_ entry: Entry) {
-        // Before dropping a key, hand it to a resident HEIR that shares this
-        // exact chain-hash boundary (Codex P2): a longer donation that
-        // arrived while `entry` was PINNED could not repoint `entry`'s
-        // boundary hashes (a pinned entry's in-flight adoption must keep
-        // resolving by hash), so it registered only its own extra blocks.
-        // Without this, evicting the (now unpinned) shorter entry would
-        // delete a boundary that the longer entry still physically covers,
-        // and lookups for the shorter prefix would miss forever even though
-        // the KV is resident. Repointing to the longest such heir preserves
-        // the shorter prefix as a slice of the longer entry.
         for (blockIndex, hash) in entry.chainHashes.enumerated() where index[hash] == entry.id {
             if let heir = longestHeirLocked(forHash: hash, blockIndex: blockIndex, excluding: entry.id)
             {
@@ -475,11 +393,6 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
         }
     }
 
-    /// The longest resident entry (other than `excluding`) whose chain hash
-    /// at `blockIndex` equals `hash` — i.e. one that shares this whole-block
-    /// boundary and can serve the shorter prefix as a slice. Chain hashing
-    /// makes a shared boundary hash imply an identical token prefix through
-    /// that block, so any such entry is a valid owner of the key.
     private func longestHeirLocked(
         forHash hash: Data, blockIndex: Int, excluding excludedID: UInt64
     ) -> Entry? {
@@ -501,14 +414,6 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
         return _bytesInUse
     }
 
-    /// NOT a `CBv2PrefixCache` requirement, and live despite appearances:
-    /// five test files read this through `cache.stats().<field>`, so the
-    /// return type is obtained by INFERENCE and the name
-    /// `CBv2PrefixCacheStats` appears at no use site. Grepping either the
-    /// type name or the protocol surface reports it dead; it is not.
-    /// Readers: CBv2PrefixCacheTests (all five fields), CBv2EndToEndTests,
-    /// CBv2FrozenReplayTests, CBv2MTPEngineMixedTests, CBv2MultimodalTests.
-    /// Grep `.stats()`, not the type.
     public func stats() -> CBv2PrefixCacheStats {
         lock.lock()
         defer { lock.unlock() }
@@ -520,23 +425,14 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
 
     // MARK: - Windowed-layer policy
 
-    /// Conservative finite-window replay length R after matching M. Frozen
-    /// hybrid plans retain owning full K/V through M while this replay runs.
-    /// Delegates to the contract-level free function
-    /// `cbv2RequiredRecompute` (pure model-shape logic, shared by all
-    /// backends); see its derivation for why the span scales with the
-    /// number of stacked windowed layers.
     public static func requiredRecompute(layerKinds: [CBv2LayerKind], matched: Int) -> Int {
         cbv2RequiredRecompute(layerKinds: layerKinds, matched: matched)
     }
 
-    /// Instance convenience for callers holding the cache.
     public func requiredRecompute(layerKinds: [CBv2LayerKind], matched: Int) -> Int {
         cbv2RequiredRecompute(layerKinds: layerKinds, matched: matched)
     }
 
-    /// A layer's KV enters the prefix cache only when it is full-attention
-    /// AND owns its storage (KV-sharing layers borrow the source layer's).
     static func isCacheable(_ kind: CBv2LayerKind) -> Bool {
         guard kind.sharesKVWithLayer == nil else { return false }
         if case .slidingWindow = kind.attention { return false }

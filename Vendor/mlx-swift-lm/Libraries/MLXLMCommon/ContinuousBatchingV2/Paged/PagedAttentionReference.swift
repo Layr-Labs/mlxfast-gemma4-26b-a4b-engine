@@ -17,16 +17,6 @@ import MLX
 
 public enum PagedAttentionReference {
 
-    /// Composed attention.
-    ///
-    /// - Parameters:
-    ///   - queries: `[B, queryHeads, L, headDim]`
-    ///   - keys/values: `[B, kvHeads, T, headDim]`
-    ///   - scale: query scale
-    ///   - boolMask: optional `[L, T]`-broadcastable bool mask, true = attend
-    ///   - sinks: optional `[queryHeads]` sink logits (denominator-only)
-    ///   - softcap: optional logit soft cap: `cap * tanh(qk / cap)`
-    /// - Returns: `[B, queryHeads, L, headDim]` in the query dtype.
     public static func composedAttention(
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, boolMask: MLXArray? = nil,
@@ -41,7 +31,6 @@ public enum PagedAttentionReference {
         var k = keys.asType(.float32)
         var v = values.asType(.float32)
         if gqa > 1 {
-            // Query head h attends kv head h / gqa — element-wise repeat.
             k = repeated(k, count: gqa, axis: 1)
             v = repeated(v, count: gqa, axis: 1)
         }
@@ -55,8 +44,6 @@ public enum PagedAttentionReference {
         }
 
         if let sinks {
-            // Denominator-only: softmax over [scores, sink], then drop the
-            // sink column before the value matmul.
             let sinkColumn = broadcast(
                 sinks.asType(.float32).reshaped([1, queryHeads, 1, 1]),
                 to: [scores.dim(0), queryHeads, scores.dim(2), 1])

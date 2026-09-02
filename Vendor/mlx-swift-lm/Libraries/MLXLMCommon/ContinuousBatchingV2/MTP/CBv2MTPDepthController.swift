@@ -8,6 +8,258 @@
 
 import Foundation
 
+public enum CBv2MTPDeviceGate {
+    public enum Mode: String, Sendable {
+        case on
+        case off
+        case auto
+    }
+
+    public enum WarmStep: Sendable {
+        case chainedWideRound(depth: Int, rows: Int)
+        case chainedPlain(rows: Int)
+    }
+
+    public struct Result: Sendable {
+        public let plainMilliseconds: Double?
+        public let roundMilliseconds: Double?
+        public let prior: Double
+        public let margin: Double
+        public let speculationEnabled: Bool
+        public let reason: String
+    }
+
+    private enum Phase {
+        case idle
+        case warmingRounds
+        case measuringRounds
+        case warmingPlain
+        case measuringPlain
+        case complete
+    }
+
+    public static let mode: Mode = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_MTP_GATE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        else { return .auto }
+        return Mode(rawValue: raw) ?? .auto
+    }()
+
+    public static let prior: Double = positiveEnvironmentValue(
+        "DARKBLOOM_CBV2_MTP_GATE_PRIOR", default: 2.0)
+    public static let margin: Double = nonnegativeEnvironmentValue(
+        "DARKBLOOM_CBV2_MTP_GATE_MARGIN", default: 0.10)
+
+    nonisolated(unsafe) public private(set) static var speculationEnabled =
+        mode != .off && legacySpeculationEnabled
+    nonisolated(unsafe) public private(set) static var measurementActive = false
+
+    private static let sampleCount = 12
+    private static let warmSampleCount = 4
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var phase: Phase = .idle
+    nonisolated(unsafe) private static var phaseSamples = 0
+    nonisolated(unsafe) private static var roundSamples: [Double] = []
+    nonisolated(unsafe) private static var plainSamples: [Double] = []
+    nonisolated(unsafe) private static var result: Result?
+    nonisolated(unsafe) private static var lineTaken = false
+
+    private static let legacySpeculationEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_MTP_SPECULATE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    public static func beginWarmup(warmupEnabled: Bool) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if result != nil { return mode == .on && warmupEnabled }
+
+        guard legacySpeculationEnabled else {
+            speculationEnabled = false
+            phase = .complete
+            result = Result(
+                plainMilliseconds: nil, roundMilliseconds: nil,
+                prior: prior, margin: margin, speculationEnabled: false,
+                reason: "legacy override off")
+            return false
+        }
+        switch mode {
+        case .on:
+            speculationEnabled = true
+            phase = .complete
+            result = Result(
+                plainMilliseconds: nil, roundMilliseconds: nil,
+                prior: prior, margin: margin, speculationEnabled: true,
+                reason: "override on")
+            return warmupEnabled
+        case .off:
+            speculationEnabled = false
+            phase = .complete
+            result = Result(
+                plainMilliseconds: nil, roundMilliseconds: nil,
+                prior: prior, margin: margin, speculationEnabled: false,
+                reason: "override off")
+            return false
+        case .auto:
+            guard warmupEnabled else {
+                speculationEnabled = false
+                phase = .complete
+                result = Result(
+                    plainMilliseconds: nil, roundMilliseconds: nil,
+                    prior: prior, margin: margin, speculationEnabled: false,
+                    reason: "warm-up disabled")
+                return false
+            }
+            phase = .warmingRounds
+            phaseSamples = 0
+            roundSamples.removeAll(keepingCapacity: true)
+            plainSamples.removeAll(keepingCapacity: true)
+            speculationEnabled = true
+            measurementActive = true
+            return true
+        }
+    }
+
+    @discardableResult
+    public static func recordWarmStep(_ step: WarmStep, wallTimeNanos: UInt64) -> Bool {
+        guard measurementActive, wallTimeNanos > 0 else { return false }
+        lock.lock()
+        defer { lock.unlock() }
+        guard measurementActive else { return false }
+        let milliseconds = Double(wallTimeNanos) / 1_000_000
+
+        switch (phase, step) {
+        case (.warmingRounds, .chainedWideRound(depth: 2, rows: 8)):
+            phaseSamples += 1
+            if phaseSamples >= warmSampleCount {
+                phase = .measuringRounds
+                phaseSamples = 0
+            }
+        case (.measuringRounds, .chainedWideRound(depth: 2, rows: 8)):
+            roundSamples.append(milliseconds)
+            if roundSamples.count >= sampleCount {
+                phase = .warmingPlain
+                phaseSamples = 0
+                speculationEnabled = false
+                return true
+            }
+        case (.warmingPlain, .chainedPlain(rows: 8)):
+            phaseSamples += 1
+            if phaseSamples >= warmSampleCount {
+                phase = .measuringPlain
+                phaseSamples = 0
+            }
+        case (.measuringPlain, .chainedPlain(rows: 8)):
+            plainSamples.append(milliseconds)
+            if plainSamples.count >= sampleCount {
+                let plain = median(plainSamples)
+                let round = median(roundSamples)
+                let enabled = shouldEnable(
+                    plainMilliseconds: plain, roundMilliseconds: round,
+                    prior: prior, margin: margin)
+                speculationEnabled = enabled
+                measurementActive = false
+                phase = .complete
+                result = Result(
+                    plainMilliseconds: plain, roundMilliseconds: round,
+                    prior: prior, margin: margin, speculationEnabled: enabled,
+                    reason: "auto")
+            }
+        default:
+            break
+        }
+        return false
+    }
+
+    public static func failAutomaticMeasurement(_ reason: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard mode == .auto, result == nil else { return }
+        speculationEnabled = false
+        measurementActive = false
+        phase = .complete
+        result = Result(
+            plainMilliseconds: plainSamples.isEmpty ? nil : median(plainSamples),
+            roundMilliseconds: roundSamples.isEmpty ? nil : median(roundSamples),
+            prior: prior, margin: margin, speculationEnabled: false,
+            reason: reason)
+    }
+
+    public static var automaticMeasurementFinished: Bool {
+        guard mode == .auto else { return false }
+        lock.lock()
+        defer { lock.unlock() }
+        return result != nil
+    }
+
+    public static func takeStderrLine() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !lineTaken, let result else { return nil }
+        lineTaken = true
+        return stderrLine(for: result)
+    }
+
+    static func stderrLine(for result: Result) -> String {
+        let state = result.speculationEnabled ? "on" : "off"
+        if result.reason == "auto",
+            let plain = result.plainMilliseconds, let round = result.roundMilliseconds
+        {
+            return String(
+                format: "[mtp-gate] plain %.1f ms round %.1f ms prior %.1f margin %.2f -> speculation %@\n",
+                plain, round, result.prior, result.margin, state)
+        }
+        let plain = result.plainMilliseconds.map { String(format: "%.1f ms", $0) } ?? "n/a"
+        let round = result.roundMilliseconds.map { String(format: "%.1f ms", $0) } ?? "n/a"
+        return String(
+            format: "[mtp-gate] plain %@ round %@ prior %.1f margin %.2f %@ -> speculation %@\n",
+            plain, round, result.prior, result.margin, result.reason, state)
+    }
+
+    public static func shouldEnable(
+        plainMilliseconds: Double, roundMilliseconds: Double,
+        prior: Double = 2.0, margin: Double = 0.10
+    ) -> Bool {
+        guard plainMilliseconds.isFinite, roundMilliseconds.isFinite,
+            prior.isFinite, margin.isFinite,
+            plainMilliseconds > 0, roundMilliseconds > 0,
+            prior > 0, margin >= 0
+        else { return false }
+        let acceptedWork = plainMilliseconds * prior
+        let guardedRound = roundMilliseconds * (1 + margin)
+        guard acceptedWork.isFinite, guardedRound.isFinite else { return false }
+        return acceptedWork >= guardedRound
+    }
+
+    private static func median(_ values: [Double]) -> Double {
+        let sorted = values.sorted()
+        let middle = sorted.count / 2
+        if sorted.count.isMultiple(of: 2) {
+            return (sorted[middle - 1] + sorted[middle]) / 2
+        }
+        return sorted[middle]
+    }
+
+    private static func positiveEnvironmentValue(_ name: String, default fallback: Double) -> Double {
+        guard let raw = ProcessInfo.processInfo.environment[name],
+            let value = Double(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+            value.isFinite, value > 0
+        else { return fallback }
+        return value
+    }
+
+    private static func nonnegativeEnvironmentValue(
+        _ name: String, default fallback: Double
+    ) -> Double {
+        guard let raw = ProcessInfo.processInfo.environment[name],
+            let value = Double(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+            value.isFinite, value >= 0
+        else { return fallback }
+        return value
+    }
+}
+
 struct CBv2MTPDepthDecision: Equatable {
     let depth: Int
     let decodeRowBucket: Int
@@ -22,14 +274,10 @@ struct CBv2MTPControllerSnapshot {
     let costInputs: [CBv2MTPCostInput]
 }
 
-/// Cost attribution attached to one launched engine step. The timestamp is
-/// host-only; observing it at finalize adds no MLX synchronization.
 struct CBv2MTPStepMeasurement {
     let decision: CBv2MTPDepthDecision
     let actualDepth: Int
     let costEligible: Bool
-    /// True when this interval overlaps either predecessor finalization or
-    /// successor construction because the step participated in a chain.
     var chained: Bool
     let seedOnly: Bool
 }
@@ -43,20 +291,14 @@ final class CBv2MTPDepthController {
     private static let baseProbeInterval = 8
     private static let maxProbeInterval = 256
 
-    /// PARTICIPANT POLICY LEVER (editable; the participant contract names
-    /// this controller as the adaptive policy a submission may change).
-    ///
-    /// This submission runs TARGET-ONLY: the controller never selects a
-    /// positive draft depth, so no seed step, no verify step, and no cost
-    /// probe is ever planned. The sealed verification mode for this track is
-    /// `.serialTarget`, where a depth-k round costs 1+k FULL target forwards;
-    /// the adaptive policy therefore converges to depth 0 on its own, but it
-    /// keeps re-proving that at every probe cadence (a seed step plus a
-    /// 1+k verify step) — pure loss on this arm. Pinning the policy at 0
-    /// removes those rounds. Every committed token is still produced by an
-    /// ordinary target decode step, so the emitted stream stays bit-identical
-    /// to serial decode.
-    static let speculationEnabled = false
+    static var speculationEnabled: Bool { CBv2MTPDeviceGate.speculationEnabled }
+
+    static let forcedDepth: Int? = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_MTP_FORCE_DEPTH"],
+            let value = Int(raw.trimmingCharacters(in: .whitespaces)), value >= 0
+        else { return nil }
+        return value
+    }()
 
     private struct CostState {
         var samples = 0
@@ -83,7 +325,6 @@ final class CBv2MTPDepthController {
     }
 
     private struct AcceptanceState {
-        /// Index zero is unused so the draft-position math is 1-based.
         var rates: [Double] = [0]
         var seen: [Int] = [0]
 
@@ -210,23 +451,12 @@ final class CBv2MTPDepthController {
         buckets[decodeRowBucket] = state
     }
 
-    /// A depth-zero baseline is only comparable with verify steps when it is
-    /// finalized before another graph is constructed. One such probe is
-    /// required per bucket; ordinary target-only steps may keep chaining
-    /// after the baseline exists.
     func requiresNonChainedDepthZeroProbe(_ decision: CBv2MTPDepthDecision) -> Bool {
-        // Target-only policy: the baseline this probe would establish is only
-        // ever compared against a verify step that can never be selected.
         guard Self.speculationEnabled else { return false }
         guard decision.depth == 0, decision.decodeRowBucket > 0 else { return false }
         return buckets[decision.decodeRowBucket]?.costs[0] == nil
     }
 
-    /// Commit one completed controller sample. Positive depths require a
-    /// finalized verification at exactly the requested depth. Chained
-    /// depth-zero work advances normal-round cadence but never contributes a
-    /// wall-cost sample because its elapsed interval overlaps neighboring
-    /// graph construction/finalization.
     @discardableResult
     func recordFinalizedStep(
         decision: CBv2MTPDepthDecision,
@@ -249,9 +479,6 @@ final class CBv2MTPDepthController {
             guard finalizedPlainWork else { return false }
             if chained {
                 var state = buckets[decision.decodeRowBucket] ?? BucketState()
-                // A warmup baseline must be measured non-chained. Once it
-                // exists, completed chained target work may drive the bounded
-                // exploration cadence without polluting the cost curve.
                 guard state.costs[0] != nil, !decision.isExploration else { return false }
                 complete(decision, state: &state)
                 buckets[decision.decodeRowBucket] = state
@@ -331,6 +558,13 @@ final class CBv2MTPDepthController {
                 CBv2MTPDepthDecision(
                     depth: fixedDepth, decodeRowBucket: bucket, reason: "fixed",
                     isExploration: false),
+                mutate: mutate)
+        }
+        if let forced = Self.forcedDepth {
+            return finish(
+                CBv2MTPDepthDecision(
+                    depth: min(forced, maxDepth), decodeRowBucket: bucket,
+                    reason: "forced_probe", isExploration: false),
                 mutate: mutate)
         }
 

@@ -32,22 +32,12 @@ import MLX
 
 // MARK: - Row description (membership-change input)
 
-/// Everything the sampling stage needs to know about one batch row.
-/// Handed to `LogitsPipelineV2.setRows` / `SamplerV2.setRows` whenever batch
-/// membership changes (a request joins, leaves, or is preempted/resumed).
-/// Row order MUST match the batch row order of the logits tensors.
 public struct CBv2SamplerRow {
     public var id: CBv2RequestID
     public var params: CBv2SamplingParams
-    /// Prompt tokens (used to seed the repetition-penalty window).
     public var promptTokens: [Int]
-    /// Tokens generated so far (non-empty when a mid-flight request is
-    /// re-vectorized after a membership change or preemption resume).
     public var outputTokens: [Int]
-    /// Optional row-local inference constraint. The ordinary path is nil.
     public var tokenConstraint: (any CBv2TokenConstraint)?
-    /// Request output ceiling, used by the constraint runtime to reserve
-    /// enough tokens to close the grammar before the engine length stop.
     public var maxTokens: Int
 
     public init(
@@ -67,39 +57,21 @@ public struct CBv2SamplerRow {
 
 // MARK: - Pipeline
 
-/// Vectorized [B, vocab] logits pipeline. One instance per engine; rebuild
-/// per-row tensors with `setRows` at every batch-membership change, then per
-/// step call `process` (pure) and, after sampling, `commit` (state update).
 public final class LogitsPipelineV2 {
 
-    /// Temperatures below this are treated as greedy (matches vLLM).
     public static let greedyEpsilon: Float = 1e-5
 
     public struct Output {
-        /// Fully transformed logits [B, vocab] (float32), ready for
-        /// greedy argmax or Gumbel-max sampling. Masked tokens are -inf.
         public let sampling: MLXArray
-        /// log_softmax of the RAW logits [B, vocab], present only when at
-        /// least one row requested logprobs. Consumers gather top-k lazily
-        /// via `CBv2Logprobs`.
         public let rawLogprobs: MLXArray?
     }
 
     public let vocabSize: Int
 
-    /// True when every row is greedy (temperature < `greedyEpsilon`).
-    /// `SamplerV2` uses this for the single-argmax fast path.
     public private(set) var allGreedy = true
-    /// True when at least one row requested logprobs.
     public private(set) var wantsLogprobs = false
-    /// Count of `process` calls that built logprob graph nodes (the raw
-    /// log_softmax capture). Telemetry/test hook: batches where no row
-    /// requests logprobs must keep this at zero — logprob capture is the
-    /// ONLY extra tensor work the logprobs feature adds to the step path.
     public private(set) var logprobBuildCount = 0
 
-    // Per-batch flags, fixed between membership changes so the graph shape
-    // is stable step to step (numerically pinned path per composition).
     private var rowCount = 0
     private var anyBias = false
     private var anyRepetition = false
@@ -107,8 +79,6 @@ public final class LogitsPipelineV2 {
     private var anyTemperature = false
     private var anyTopKPMinP = false
 
-    // Per-row parameter tensors, [B, 1] float32 unless noted. Built once in
-    // `setRows`; never touched in the step path.
     private var temperature: MLXArray?  // greedy rows pinned to 1.0
     private var repetitionPenalty: MLXArray?
     private var frequencyPenalty: MLXArray?
@@ -118,21 +88,11 @@ public final class LogitsPipelineV2 {
     private var minP: MLXArray?  // [B, 1]; disabled rows = 0.0
     private var biasMatrix: MLXArray?  // [B, vocab] float32
 
-    // Penalty state (incrementally maintained; see `commit`).
-    /// Counts of every generated token per row [B, vocab] float32
-    /// (frequency/presence penalties — output only, unwindowed).
     private var outputCounts: MLXArray?
-    /// Counts of tokens inside the repetition window per row [B, vocab].
     private var repWindowCounts: MLXArray?
-    /// Ring buffer of the window's token ids [B, W] int32; -1 = empty slot.
-    /// W = max over rows of repetitionContextSize. Rows with a smaller
-    /// window only ever use their first `windowSize` slots.
     private var repWindow: MLXArray?
-    /// Next ring slot to overwrite per row [B] int32.
     private var ringPos: MLXArray?
-    /// Per-row window capacity [B] int32 (≥ 1).
     private var windowSizes: MLXArray?
-    /// Cached arange(B) int32 for scatter-add row indices.
     private var rowIndices: MLXArray?
 
     public init(vocabSize: Int) {
@@ -142,8 +102,6 @@ public final class LogitsPipelineV2 {
 
     // MARK: Membership change (host loops allowed here, and only here)
 
-    /// Rebuild all per-row tensors for a new batch composition. Row order
-    /// must match the logits row order used in `process`/`commit`.
     public func setRows(_ rows: [CBv2SamplerRow]) {
         rowCount = rows.count
         guard !rows.isEmpty else {
@@ -176,8 +134,6 @@ public final class LogitsPipelineV2 {
                 allGreedy = false
                 temps[i] = p.temperature
                 if p.temperature != 1 { anyTemperature = true }
-                // Filtering transforms are argmax-invariant, so they only
-                // matter for non-greedy rows.
                 if p.topK > 0, p.topK < vocabSize {
                     topKs[i] = Int32(p.topK)
                     anyTopKPMinP = true
@@ -186,7 +142,6 @@ public final class LogitsPipelineV2 {
                     topPs[i] = p.topP
                     anyTopKPMinP = true
                 } else if p.topP <= 0 {
-                    // top_p == 0 keeps only the most probable token.
                     topPs[i] = 0
                     anyTopKPMinP = true
                 }
@@ -271,8 +226,6 @@ public final class LogitsPipelineV2 {
 
     // MARK: Step path — graph-build only, no host syncs, no per-row loops
 
-    /// Apply the ordered transform pipeline to raw logits [B, vocab].
-    /// Pure: does not mutate pipeline state.
     public func process(
         _ logits: MLXArray,
         rawLogprobsFrom rawLogits: MLXArray? = nil,
@@ -289,12 +242,8 @@ public final class LogitsPipelineV2 {
             return Output(sampling: logits, rawLogprobs: nil)
         }
 
-        // Work in float32 for numerically stable softmax/cumsum (vLLM does
-        // the same). f16→f32 is exact, so greedy argmax is unaffected.
         var x = logits.asType(.float32)
 
-        // (0) Raw logprobs BEFORE any transform. (The counter is a telemetry
-        // side effect only; the transform pipeline itself stays pure.)
         let rawLogprobs: MLXArray?
         if wantsLogprobs {
             logprobBuildCount += 1
@@ -304,12 +253,10 @@ public final class LogitsPipelineV2 {
             rawLogprobs = nil
         }
 
-        // (1) Logit bias.
         if let biasMatrix {
             x = x + biasMatrix
         }
 
-        // (2) Penalties.
         if let repetitionPenalty, let repWindowCounts {
             let present = repWindowCounts .> 0
             let penalized = which(x .> 0, x / repetitionPenalty, x * repetitionPenalty)
@@ -320,21 +267,14 @@ public final class LogitsPipelineV2 {
             x = x - presencePenalty * (outputCounts .> 0).asType(.float32)
         }
 
-        // (3) Temperature (greedy rows pinned to 1.0 in the tensor).
         if let temperature {
             x = x / temperature
         }
 
-        // Arithmetic transforms above can turn a forbidden -infinity into a
-        // finite/+infinity value for malformed-but-decodable parameters
-        // (for example a negative repetition penalty or temperature). Restore
-        // hard language constraints before probability filtering so top-k/p
-        // never discard every legal token in favor of a resurrected one.
         if let hardMask {
             x = hardMask(x)
         }
 
-        // (4) top-k / top-p / min-p via one descending sort + cumsum.
         if anyTopKPMinP, let topK, let topP, let minP {
             x = Self.applyTopKTopPMinP(x, topK: topK, topP: topP, minP: minP)
         }
@@ -342,9 +282,6 @@ public final class LogitsPipelineV2 {
         return Output(sampling: x, rawLogprobs: rawLogprobs)
     }
 
-    /// Fold this step's sampled tokens [B] into the incremental penalty
-    /// state (scatter-add; never re-binned). Call exactly once per sampled
-    /// step, after `process`. Device-only: `sampledTokens` stays on device.
     public func commit(sampledTokens: MLXArray) {
         guard rowCount > 0, anyRepetition || anyFrequencyPresence else { return }
         precondition(
@@ -361,7 +298,6 @@ public final class LogitsPipelineV2 {
             let counts = repWindowCounts
         {
             let slot = positions.expandedDimensions(axis: 1)  // [B, 1]
-            // Read the token this write evicts BEFORE overwriting it.
             let evicted = takeAlong(window, slot, axis: 1).squeezed(axis: 1)  // [B]
             let valid = (evicted .>= 0).asType(.float32)  // [B]
             let evictedIndex = maximum(evicted, MLXArray(Int32(0)))
@@ -376,35 +312,23 @@ public final class LogitsPipelineV2 {
 
     // MARK: - Vectorized top-k/top-p/min-p
 
-    /// Single-sort implementation of stage (4). All three filters share one
-    /// descending sort and one cumsum (vLLM's native path). The most
-    /// probable token of each row is kept by construction, so a fully
-    /// masked row cannot exist.
     static func applyTopKTopPMinP(
         _ logits: MLXArray, topK: MLXArray, topP: MLXArray, minP: MLXArray
     ) -> MLXArray {
         let vocab = logits.dim(-1)
-        // Descending sort.
         let sortedIndices = argSort(-logits, axis: -1)
         let sortedLogits = takeAlong(logits, sortedIndices, axis: -1)
         let probs = softmax(sortedLogits, axis: -1)
         let cumulative = cumsum(probs, axis: -1)
 
-        // top-k: keep ranks < k (disabled rows carry k == vocab).
         let ranks = MLXArray(Array(0 ..< Int32(vocab))).reshaped([1, vocab])
         var keep = ranks .< topK
-        // top-p: keep tokens whose preceding cumulative mass is within p
-        // (the first token crossing the threshold stays in). Disabled rows
-        // carry the sentinel 2.0, which keeps everything.
         keep = keep .&& ((cumulative - probs) .<= topP)
-        // min-p: drop tokens below minP × max prob (column 0 after the
-        // descending sort). Disabled rows carry 0.
         let maxProb = probs[0..., ..<1]
         keep = keep .&& (probs .>= (minP * maxProb))
 
         let masked = which(keep, sortedLogits, MLXArray(-Float.infinity))
 
-        // Scatter back to original token order via the inverse permutation.
         let inverse = putAlong(
             MLXArray.zeros(like: sortedIndices),
             sortedIndices,
@@ -432,8 +356,6 @@ public final class LogitsPipelineV2 {
         return zeros.at[MLXArray(rowIdx), MLXArray(colIdx)].add(MLXArray(values))
     }
 
-    /// Bin an arbitrary token list per row into [B, vocab] float32 counts.
-    /// Membership-change only (one scatter-add over all rows' tokens).
     private static func buildCounts(tokenLists: [[Int]], vocabSize: Int) -> MLXArray {
         var rowIdx = [Int32]()
         var colIdx = [Int32]()
@@ -448,11 +370,6 @@ public final class LogitsPipelineV2 {
         return zeros.at[MLXArray(rowIdx), MLXArray(colIdx)].add(Float(1))
     }
 
-    /// Seed the repetition ring buffer with the most recent
-    /// min(windowSize, |history|) tokens of prompt ∪ output. When the
-    /// window is full the oldest token sits at the row's ring position, so
-    /// the next write evicts it; when partially filled, writes land on -1
-    /// (empty) slots first.
     private static func buildRepetitionWindow(
         rows: [CBv2SamplerRow], windows: [Int32]
     ) -> (window: MLXArray, ringPos: MLXArray) {
@@ -475,24 +392,14 @@ public final class LogitsPipelineV2 {
 
 // MARK: - Lazy logprob gather
 
-/// Lazy top-k gather over the raw logprobs captured by the pipeline.
-/// `gather` builds graph nodes only (safe on the engine thread);
-/// `assemble` materializes host values and MUST run off the engine step
-/// thread (it synchronizes).
 public enum CBv2Logprobs {
 
     public struct Gathered {
-        /// Logprob of the sampled token per row [B].
         public let chosen: MLXArray
-        /// Top-k logprob values per row [B, k], descending.
         public let topValues: MLXArray
-        /// Token ids matching `topValues` [B, k].
         public let topIndices: MLXArray
     }
 
-    /// Gather the sampled token's logprob and the top-k alternatives from
-    /// `rawLogprobs` [B, vocab]. `k` should be the max `topLogprobs` across
-    /// rows; per-row truncation happens in `assemble`.
     public static func gather(
         rawLogprobs: MLXArray, sampledTokens: MLXArray, k: Int
     ) -> Gathered {
@@ -510,12 +417,6 @@ public enum CBv2Logprobs {
             chosen: chosen, topValues: sortedValues, topIndices: sortedIndices.asType(.int32))
     }
 
-    /// Turn a materialized `Gathered` plus host token ids into per-row
-    /// `CBv2TokenLogprob`s. Rows whose `topLogprobs` is 0 get nil.
-    /// Synchronizes on the arrays — only call at a sanctioned readback
-    /// boundary: the engine calls this at step FINALIZATION, right where
-    /// the sampled tokens are read back (the arrays rode the step's
-    /// `asyncEval`, so no extra GPU work is forced), never mid graph-build.
     public static func assemble(
         _ gathered: Gathered, sampledTokens: [Int], topLogprobsPerRow: [Int]
     ) -> [CBv2TokenLogprob?] {
@@ -546,16 +447,8 @@ public enum CBv2Logprobs {
 
 // MARK: - Per-step logprob handoff (sampler → engine loop)
 
-/// One `sample` call's LAZY logprob gather, handed from the sampler to the
-/// engine loop (`CBv2StepSampler.takeStepLogprobs`). `gathered` holds
-/// graph-only handles over the RAW (pre-transform) logprobs; the loop adds
-/// `evalTargets` to the step's `asyncEval` set and materializes the values
-/// at the finalize boundary — one step late, alongside the sampled tokens,
-/// matching the engine's readback discipline.
 public struct CBv2StepLogprobs {
-    /// Row ids in the gather's row order (== the `sample` call's row order).
     public let rows: [CBv2RequestID]
-    /// Each row's requested `topLogprobs` (0 ⇒ that row reports nothing).
     public let topLogprobsPerRow: [Int]
     public let gathered: CBv2Logprobs.Gathered
 
@@ -567,8 +460,6 @@ public struct CBv2StepLogprobs {
         self.gathered = gathered
     }
 
-    /// Arrays the engine adds to the step's `asyncEval` so finalization's
-    /// readback finds them already computed.
     public var evalTargets: [MLXArray] {
         [gathered.chosen, gathered.topValues, gathered.topIndices]
     }
@@ -576,33 +467,13 @@ public struct CBv2StepLogprobs {
 
 // MARK: - Order-only logits (SOFTCAP-SKIP) [r2]
 
-/// A step whose logits are consumed for their ORDER ALONE — every row greedy,
-/// no logprobs, no bias, no penalties — never observes a strictly increasing
-/// map applied to the whole vocabulary axis. Gemma's final-logit softcap
-/// (`tanh(x / 30) * 30`) is exactly such a map, so on those steps the softcap
-/// cannot change the emitted token and the model may skip it.
-///
-/// The engine sets this around the forward that builds the step's logits and
-/// clears it immediately afterwards, so no other consumer can observe an
-/// uncapped tensor. Graph BUILD is what reads the flag (MLX evaluates later),
-/// and the build is synchronous with the forward call, so the bracket is exact.
-///
-/// Filtering transforms (top-k/top-p/min-p) are not part of the predicate
-/// because `LogitsPipelineV2.setRows` only arms them for NON-greedy rows;
-/// `allGreedy` therefore already implies they are inactive. A hard grammar
-/// mask stays safe on its own terms: it sends forbidden ids to `-infinity` in
-/// both worlds and leaves the remaining order untouched.
 public enum CBv2OrderOnlyLogits {
     nonisolated(unsafe) private static var flag = false
 
-    /// Read by the model while it builds the logits graph.
     public static var engaged: Bool { flag }
 
     public static func set(_ value: Bool) { flag = value }
 
-    /// The value-transform set of `LogitsPipelineV2.process`, mirrored on the
-    /// raw params so the engine can decide BEFORE the forward. Any row that
-    /// would take a value-sensitive branch disqualifies the whole step.
     public static func orderOnly(_ params: [CBv2SamplingParams]) -> Bool {
         guard !params.isEmpty else { return false }
         return params.allSatisfy { p in
@@ -615,7 +486,6 @@ public enum CBv2OrderOnlyLogits {
         }
     }
 
-    /// Engage for the duration of one graph build, then clear unconditionally.
     public static func withOrderOnly<T>(
         _ params: [CBv2SamplingParams], _ build: () -> T
     ) -> T {

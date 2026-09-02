@@ -2,65 +2,23 @@ import CoreFoundation
 import Foundation
 import MLXFastCore
 
-/// Quantization expectations parsed from the pinned Qwen 3.6 checkpoint's
-/// `quantization` / `quantization_config` blocks. The intended checkpoint is
-/// exactly MLX affine 4-bit group-64, with no per-tensor overrides.
 struct Qwen35TransformQuantizationSpec: Equatable {
     let groupSize: Int
     let bits: Int
     let mode: String
 }
 
-/// Transform-side structural validation of the Qwen 3.6 text-tower tensor set
-/// against `docs/qwen3.6-weight-contract.md`.
-///
-/// The source checkpoint (`mlx-community/Qwen3.6-27B-4bit`) is already MLX
-/// affine-quantized, so the transform passes tensors through unchanged. This
-/// pass fails fast -- before the ~15 GB copy -- when the set it would copy
-/// cannot satisfy the runtime loader (`Qwen35WeightLoader`):
-///
-/// - the selected `language_model.*` namespace must be EXACTLY the public
-///   1,847-tensor inventory, tensor for tensor, at the exact dtype and shape;
-/// - every quantized projection stored as packed U32 codes must ship BF16
-///   `.scales` AND BF16 `.biases` (affine needs both; the Laguna NVFP4
-///   contract forbids `.biases`, which is why the two validators cannot share
-///   one rule) with matching leading dimensions;
-/// - each packed width must match the group size and bit width the emitted
-///   config.json declares (affine 4-bit group-64): `in / 8` U32 columns and
-///   `in / 64` scale/bias columns;
-/// - compressed-tensors aliases, global-scale tensors, and FP8 KV scales are
-///   rejected outright;
-/// - no `mtp.*` tensor may appear. The MTP head is a separately pinned
-///   artifact (`mlx-community/Qwen3.6-27B-MTP-4bit`) and the pinned backbone
-///   revision contains none; a checkpoint that smuggles one in would produce
-///   a `weights/` tree the eager baseline cannot load.
-///
-/// Unquantized tensors (the norms and the gated-delta `A_log`/`dt_bias`/
-/// `conv1d` state) are covered by the exact-inventory pass rather than by a
-/// packing rule; the runtime re-validates their full geometry against
-/// `Qwen35Config` before the first forward.
-///
-/// This is deliberately independent of shard placement: the public fixture
-/// `fixtures/qwen3_6_27b_tensor_inventory.json` pins placement and header
-/// digests, while this pass pins the complete tensor namespace, dtype, and
-/// shape.
 enum Qwen35CheckpointValidation {
     struct ExpectedTensorMetadata: Equatable {
         let dtype: String
         let shape: [Int]
     }
 
-    /// Frozen geometry of the pinned `qwen3_5_text` tower. Kept as literals
-    /// rather than read from the config under validation: a validator that
-    /// derives its expectations from the artifact it is checking cannot
-    /// detect a changed artifact.
     enum PinnedGeometry {
         static let vocabSize = 248_320
         static let hiddenSize = 5_120
         static let intermediateSize = 17_408
         static let layerCount = 64
-        /// Every 4th layer (index % 4 == 3) is full attention; the other
-        /// three are gated-delta linear attention.
         static let fullAttentionInterval = 4
         static let attentionHeads = 24
         static let keyValueHeads = 4
@@ -75,22 +33,12 @@ enum Qwen35CheckpointValidation {
         static let quantizationMode = "affine"
     }
 
-    /// Total tensors in the transformed text-tower artifact: 7 top level plus
-    /// 48 linear-attention layers of 30 and 16 full-attention layers of 25.
     static let expectedTensorCount = 1_847
 
     static let textTowerPrefix = "language_model."
 
     private static let layerPrefix = "language_model.model.layers."
 
-    /// Parses the checkpoint's quantization block(s).
-    ///
-    /// The pinned artifact publishes the SAME spec twice, as `quantization`
-    /// and `quantization_config`; `Transform.makeRuntimeConfigData` accepts
-    /// either form and requires them to agree when both are present, so this
-    /// validator applies exactly that policy rather than a stricter one -- a
-    /// transform that emits a config must not reject the checkpoint that
-    /// config came from.
     static func quantizationSpec(
         fromConfigRoot root: [String: Any]
     ) throws -> Qwen35TransformQuantizationSpec {
@@ -150,9 +98,6 @@ enum Qwen35CheckpointValidation {
         return spec
     }
 
-    /// Exact metadata contract of the transformed text tower, extracted from
-    /// the public three-shard `mlx-community/Qwen3.6-27B-4bit` artifact at
-    /// revision `c000ac2c2057d94be3fa931000c31723aac53282`.
     static func expectedTensorInventory() -> [String: ExpectedTensorMetadata] {
         let hidden = PinnedGeometry.hiddenSize
         let intermediate = PinnedGeometry.intermediateSize
@@ -165,8 +110,6 @@ enum Qwen35CheckpointValidation {
             precondition(inventory[name] == nil, "duplicate expected Qwen3.6 tensor \(name)")
             inventory[name] = ExpectedTensorMetadata(dtype: dtype.rawValue, shape: shape)
         }
-        /// One affine-quantized 2D projection: packed U32 codes plus the BF16
-        /// scale and bias companions the affine scheme requires.
         func addAffine(_ stem: String, outFeatures: Int, inFeatures: Int) {
             add("\(stem).weight", .u32, [outFeatures, inFeatures * bits / 32])
             add("\(stem).scales", .bf16, [outFeatures, inFeatures / groupSize])
@@ -184,8 +127,6 @@ enum Qwen35CheckpointValidation {
         let linearKeySize = PinnedGeometry.linearKeyHeads * PinnedGeometry.linearKeyHeadDim
         let linearValueSize = PinnedGeometry.linearValueHeads * PinnedGeometry.linearValueHeadDim
         let linearConvSize = linearKeySize * 2 + linearValueSize
-        // The full-attention query projection carries the per-head output
-        // gate in the same matrix, hence the factor of two.
         let fullQuerySize = PinnedGeometry.attentionHeads * PinnedGeometry.headDim * 2
         let fullKeyValueSize = PinnedGeometry.keyValueHeads * PinnedGeometry.headDim
         let fullOutputSize = PinnedGeometry.attentionHeads * PinnedGeometry.headDim
@@ -275,8 +216,6 @@ enum Qwen35CheckpointValidation {
         headers: [String: SafetensorsHeader],
         quantization: Qwen35TransformQuantizationSpec
     ) throws {
-        // Affine quantization legitimately ships `.biases`, so unlike the
-        // Laguna NVFP4 contract that suffix is NOT forbidden here.
         let forbiddenSuffixes = [
             ".weight_packed",
             ".input_global_scale",
@@ -369,11 +308,6 @@ enum Qwen35CheckpointValidation {
     ) throws {
         let expected = expectedTensorInventory()
         let expectedNames = Set(expected.keys)
-        // The public checkpoint also carries the `vision_tower.*` namespace,
-        // which the transform never selects, so -- unlike the Laguna
-        // validator -- the index and header name sets are supersets rather
-        // than equal. Constrain them where it matters: every selected name
-        // must be indexed exactly once and present in exactly one header.
         let headerNameList = headers.values.flatMap { $0.tensors.keys }
         let headerNames = Set(headerNameList)
 

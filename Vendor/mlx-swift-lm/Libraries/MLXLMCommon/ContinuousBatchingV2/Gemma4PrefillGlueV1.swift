@@ -71,17 +71,11 @@ public enum Gemma4PrefillGlueV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    /// This checkpoint's hidden size, and the `rms_single_row` launch geometry
-    /// the stock host derives from it (`RMS_N_READS` 4, so 2816 / 4 = 704
-    /// threads, 22 simdgroups, one threadgroup per row).
     static let axis = 2816
     private static let nReads = 4
     private static let threadsPerRow = 704
     private static let eps: Float = 1e-6
 
-    /// `rms_single_row`'s reduction, reproduced so the fused kernels see the
-    /// same accumulation order, the same cross-simd combine and the same
-    /// `precise::rsqrt` the stock kernel uses.
     static let kernelHeader = """
         constant constexpr const int GLUE_AXIS = 2816;
         constant constexpr const int GLUE_NREADS = 4;
@@ -204,7 +198,6 @@ public enum Gemma4PrefillGlueV1 {
         ensureRowContiguous: true
     )
 
-    /// `residual + rmsNorm(x, weight)`. Returns `nil` off the prefill plane.
     public static func normResidual(
         x: MLXArray, weight: MLXArray, residual: MLXArray, eps epsIn: Float
     ) -> MLXArray? {
@@ -263,7 +256,6 @@ public enum Gemma4PrefillGlueV1 {
         ensureRowContiguous: true
     )
 
-    /// `(rmsNorm(x, w1), rmsNorm(x, w2))`. Returns `nil` off the prefill plane.
     public static func dualPreNorm(
         x: MLXArray, w1: MLXArray, w2: MLXArray, eps epsIn: Float
     ) -> (MLXArray, MLXArray)? {
@@ -285,26 +277,6 @@ public enum Gemma4PrefillGlueV1 {
 
     // MARK: - PRENORM-GATHER: the expert pre-norm emits the sorted plane
 
-    /// PRENORM-GATHER. On the prefill plane the routed-expert branch consumed
-    /// its pre-norm through a standalone sorted gather: `dualPreNorm` wrote
-    /// the expert-normed rows to device memory, the counting sort produced
-    /// the row order, and one gather dispatch read every token row once per
-    /// assignment (top-k rows each, in expert order, so with no locality) and
-    /// wrote the `[rows * topK, 1, 2816]` plane the gathered projections
-    /// consume. The un-sorted expert norm had no other reader. This arm
-    /// deletes it: `preNorm` emits the dense-branch norm alone, and
-    /// `preNormScatter` reads each residual row exactly once, reduces it with
-    /// the identical `rms_single_row` tree, and writes the expert-normed row
-    /// straight to its `topK` sorted positions, which the counting sort's
-    /// inverse order names. Same values, same dtype, same positions as the
-    /// gathered plane: `plane[inverseOrder[t * topK + k]] = normed(t)` is
-    /// exactly `normed[rowOrder]` because the inverse order is the inverse
-    /// permutation of the row order, and the inverse order is a permutation,
-    /// so every plane row is written exactly once.
-    ///
-    /// Kill switch: `DARKBLOOM_GEMMA4_PREFILL_PRENORM_GATHER` set to
-    /// `0`/`false`/`no`/`off` restores `dualPreNorm` and the standalone
-    /// gather. Engage mark: `prefill-prenorm-gather`.
     public static let prenormGatherEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_PREFILL_PRENORM_GATHER"]
@@ -312,8 +284,6 @@ public enum Gemma4PrefillGlueV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    /// `dualPreNorm` with its second output removed: the same reduction, the
-    /// same `w * T(x * inv)` store, one weight.
     private static let preNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_prefill_glue_prenorm_2816_unroll_v2",
         inputNames: ["x", "w"],
@@ -349,10 +319,6 @@ public enum Gemma4PrefillGlueV1 {
         ensureRowContiguous: true
     )
 
-    /// `dualPreNorm`'s second output written straight into expert-sorted
-    /// order. One threadgroup per token row, as before; the row's normed
-    /// values are computed once into registers and stored to each of the
-    /// row's K sorted positions.
     private static let preNormScatterKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_prefill_glue_prenorm_scatter_2816_unroll_v2",
         inputNames: ["x", "w", "inverse"],
@@ -405,8 +371,6 @@ public enum Gemma4PrefillGlueV1 {
         ensureRowContiguous: true
     )
 
-    /// `rmsNorm(x, weight)` alone. Returns `nil` off the prefill plane or with
-    /// the arm switched off.
     public static func preNorm(
         x: MLXArray, weight: MLXArray, eps epsIn: Float
     ) -> MLXArray? {
@@ -424,11 +388,6 @@ public enum Gemma4PrefillGlueV1 {
         )[0]
     }
 
-    /// `rmsNorm(x, weight)` written straight into expert-sorted order: row
-    /// `inverseOrder[t * topK + k]` of the returned `[rows * topK, 1, 2816]`
-    /// plane is the normed row `t`. Returns `nil` off the prefill plane, with
-    /// the arm switched off, or for an inverse order that is not exactly one
-    /// `uint32` per assignment.
     public static func preNormScatter(
         x: MLXArray, weight: MLXArray, inverseOrder: MLXArray, topK: Int,
         eps epsIn: Float
@@ -509,8 +468,6 @@ public enum Gemma4PrefillGlueV1 {
         ensureRowContiguous: true
     )
 
-    /// `res2 + rmsNorm(rmsNorm(h1, w1) + rmsNorm(h2, w2), w3)`.
-    /// Returns `nil` off the prefill plane.
     public static func branchTail(
         h1: MLXArray, h2: MLXArray, w1: MLXArray, w2: MLXArray, w3: MLXArray,
         residual2: MLXArray, eps epsIn: Float
@@ -534,16 +491,6 @@ public enum Gemma4PrefillGlueV1 {
 
     // MARK: - branch tail, chained (7 dispatches -> 1)
 
-    /// The tail above stops at the stored `out` row, leaving two more
-    /// full-width serial passes behind it: the terminal layer-scalar multiply,
-    /// and the NEXT layer's `inputLayernorm(out)`. On the decode cohort those
-    /// two are already folded in (`Gemma4FusedLayerGlue.tailChained`), but that
-    /// gate pins `dim(1) == 1`, so on the prefill plane both still run as
-    /// standalone dispatches over `[B, chunk, 2816]`.
-    ///
-    /// The threadgroup already holds the finished row in registers when it
-    /// stores `out`, so both cost one extra in-kernel reduction rather than a
-    /// re-read of the row plus two launches.
     private static let tailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_prefill_glue_tail_chain_2816_unroll_v2",
         inputNames: ["h1", "h2", "w1", "w2", "w3", "res2", "s", "wn"],
@@ -616,8 +563,6 @@ public enum Gemma4PrefillGlueV1 {
         ensureRowContiguous: true
     )
 
-    /// `branchTail`, plus the terminal `* layerScalar`, plus the next layer's
-    /// `rmsNorm(out, nextInputNormWeight)`. Returns `nil` off the prefill plane.
     public static func branchTailChained(
         h1: MLXArray, h2: MLXArray, w1: MLXArray, w2: MLXArray, w3: MLXArray,
         residual2: MLXArray, layerScalar: MLXArray, nextInputNormWeight: MLXArray,
@@ -646,9 +591,6 @@ public enum Gemma4PrefillGlueV1 {
 
     // MARK: - sorted expert reduction + chained branch tail (2 dispatches -> 1)
 
-    /// The sorted expert reducer and chained prefill tail both traverse the
-    /// same `[tokens, hidden]` expert result. Produce each reduced expert value
-    /// in the tail thread that consumes it, removing the intermediate tensor.
     private static let expertTailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_prefill_expert_unsort_tail_chain_2816_unroll_v2",
         inputNames: [
@@ -786,22 +728,6 @@ public enum Gemma4PrefillGlueV1 {
 
     // MARK: - plane gate
 
-    /// The prefill plane. `dim(1) >= 2` is the load-bearing condition: it keeps
-    /// this off the batch-eight decode cohort (`[8, 1, 2816]`) and off any
-    /// single-row rectangle, so the decode chain is untouched.
-    ///
-    /// The leading dimension is deliberately NOT pinned to 1. CBv2 coalesces
-    /// equal-length prompt chunks into one layer-major `[B, chunk]` forward
-    /// when the model and the cache provider both prove rectangular per-row
-    /// semantics (`EngineLoopV2`, the `packedPrefillSupported` branch), and
-    /// `Gemma4TextModel.cbv2SupportsPackedPrefill` is `true`. So the scored
-    /// eight-stream cohort presents `[8, chunk, 2816]` here, not
-    /// `[1, chunk, 2816]`. A single-stream local run presents the latter, which
-    /// makes this the exact shape a local-only check cannot see.
-    ///
-    /// Rows are the product of the two leading dimensions. Every input is
-    /// `ensureRowContiguous`, and each row is reduced independently, so the
-    /// kernels do not care how those rows are grouped.
     private static func planeRows(_ x: MLXArray, weight: MLXArray, eps epsIn: Float) -> Int? {
         guard enabled,
             epsIn == eps,

@@ -37,18 +37,14 @@ public struct PagedDecodeProfiler {
 
     // MARK: - Config
 
-    /// GPT-OSS-20B attention shape.
     public static let gptossQueryHeads = 64
     public static let gptossKVHeads = 8
     public static let gptossHeadDim = 64
     public static let gptossWindow = 128
 
     public enum StepMode: String, CaseIterable, Sendable {
-        /// KV writes + kernel dispatch (the real decode step).
         case writeAndDispatch = "write+dispatch"
-        /// Kernel dispatch only (state frozen at the prefilled context).
         case dispatchOnly = "dispatch-only"
-        /// KV writes only (forces the slab write chain, no attention).
         case writeOnly = "write-only"
     }
 
@@ -60,11 +56,7 @@ public struct PagedDecodeProfiler {
         public var layers: Int
         public var slabGiB: Double
         public var msPerStep: Double
-        /// Peak MLX active memory during the timed steps, minus the active
-        /// memory at their start — approximately the transient allocations
-        /// one step makes (slab-sized spikes betray full-slab copies).
         public var stepPeakGiB: Double = 0
-        /// Wall time of each timed step (ms) — reveals growth across steps.
         public var stepTimesMs: [Double] = []
 
         public var markdownRow: String {
@@ -92,8 +84,6 @@ public struct PagedDecodeProfiler {
 
     // MARK: - Scenario harness
 
-    /// Layer kinds: GPT-OSS structure (alternating sliding-window/full,
-    /// sinks everywhere) truncated/repeated to `count` layers.
     static func gptossLayerKinds(count: Int) -> [CBv2LayerKind] {
         (0 ..< count).map { i in
             CBv2LayerKind(
@@ -103,8 +93,6 @@ public struct PagedDecodeProfiler {
         }
     }
 
-    /// Measure one paged scenario. All layers share one slab group (same
-    /// (kvHeads, headDim)), like real GPT-OSS.
     func measurePaged(
         label: String,
         layerCount: Int,
@@ -137,7 +125,6 @@ public struct PagedDecodeProfiler {
         let scale = Float(1.0 / Double(d).squareRoot())
         let sinks = MLXRandom.normal([qh], dtype: .float32)
 
-        // Prefill every layer's rows to `context` tokens.
         for layer in 0 ..< layerCount {
             let rows = states.map { $0[layer]! as! PagedSequenceKV }
             for row in rows {
@@ -153,12 +140,8 @@ public struct PagedDecodeProfiler {
             caches[layer].setRows(rows)
         }
         let group = backend.pool.group(PagedKVGroupKey(kinds[0]))
-        // Force the prefill write chain (in-place writes ride the fence).
         eval([group.writeFence])
 
-        // Pre-generate per-layer tiles; the carry threads a value
-        // dependency through the step so the tape interleaves writes and
-        // dispatches like a real model forward.
         let qBase = (0 ..< layerCount).map { _ in
             MLXRandom.normal([batch, qh, 1, d], dtype: .float16)
         }
@@ -189,10 +172,6 @@ public struct PagedDecodeProfiler {
                     }
                     carry = k[0, 0, 0, 0] * zero
                 case .dispatchOnly:
-                    // `decodeTableLength`, via the row's own builder — this
-                    // site used to pass `table.count`, which is the same
-                    // number only while a row's physical table is as long
-                    // as its ring.
                     let (seqinfo, maxAttend) = PagedAttentionKernel.seqinfo(
                         rows.map { $0.seqInfoRow(attending: $0.decodeAttendRange) })
                     let (out, _) = PagedAttentionKernel.decode(
@@ -213,7 +192,6 @@ public struct PagedDecodeProfiler {
             }
             switch mode {
             case .writeOnly:
-                // Nothing consumes the writes; force the fence chain.
                 eval([group.writeFence])
             case .writeAndDispatch, .dispatchOnly:
                 eval(carry)
@@ -229,9 +207,6 @@ public struct PagedDecodeProfiler {
             stepPeakGiB: peak, stepTimesMs: stepTimes)
     }
 
-    /// Per-row contiguous SDPA emulation of the same layer structure — the
-    /// reference the paged path competes with (v1-style storage, window
-    /// handled by attending the trailing `min(len, window)` tokens).
     func measureContiguousSDPA(
         label: String, layerCount: Int, batch: Int, context: Int
     ) -> Result {
@@ -243,7 +218,6 @@ public struct PagedDecodeProfiler {
         let scale = Float(1.0 / Double(d).squareRoot())
         let sinks = MLXRandom.normal([qh], dtype: .float16)
 
-        // [layer][row] contiguous caches.
         var ks: [[MLXArray]] = []
         var vs: [[MLXArray]] = []
         for _ in 0 ..< layerCount {
@@ -337,8 +311,6 @@ public struct PagedDecodeProfiler {
 
     // MARK: - Suites
 
-    /// Ablation 1+2: slab-size sweep x step-mode at the GPT-OSS shape,
-    /// single layer, B=1 — the minimal reproducer for any O(slab) term.
     public func slabScalingSuite(
         capacitiesBytes: [Int] = [64 << 20, 512 << 20, 2 << 30, 8 << 30],
         context: Int = 512
@@ -357,11 +329,6 @@ public struct PagedDecodeProfiler {
         return results
     }
 
-    /// Ablation 2b: layer-count sweep at a FIXED slab size. The full-slab
-    /// copy theory predicts ms/step linear in layer count with slope
-    /// ~ 2 * slabBytes / bandwidth, and a step-peak of many slab sizes;
-    /// a dispatch/encode overhead theory predicts a much smaller slope and
-    /// flat memory.
     public func layerScalingSuite(
         capacityBytes: Int = 2 << 30,
         layerCounts: [Int] = [1, 2, 4, 8, 16, 24],
@@ -382,8 +349,6 @@ public struct PagedDecodeProfiler {
         return results
     }
 
-    /// Ablation 3: 24-layer GPT-OSS emulation at the real-run pool size
-    /// (BenchCBv2 default 16 GiB), paged vs per-row contiguous SDPA.
     public func gptossEmulationSuite(
         capacityBytes: Int = 16 << 30, context: Int = 512, batches: [Int] = [1, 4]
     ) throws -> [Result] {
@@ -403,9 +368,6 @@ public struct PagedDecodeProfiler {
         return results
     }
 
-    /// Ablation 4: dispatch-overhead probe — tiny context and slab, so the
-    /// kernels do near-zero work; ms/step is pure per-layer encode+submit
-    /// overhead (24 dispatch pairs per eval vs 1 per eval).
     public func dispatchOverheadSuite() throws -> [Result] {
         var results: [Result] = []
         for layers in [1, 24] {
@@ -420,18 +382,7 @@ public struct PagedDecodeProfiler {
     }
 
     // MARK: - MTP verify-round attribution (gemma-4 26B geometry)
-    //
-    // Root-causes the paged-specific MTP penalty: a paged verify round costs
-    // ~16.4 ms against contiguous ~14.2 ms (+15.5%) at identical step counts
-    // and acceptance. The model body is backend-independent, so the whole
-    // delta has to live in the KV layer. These ablations run ONLY the KV
-    // layer, at the real layer geometry, on both backends.
 
-    /// gemma-4-26B-A4B text stack: 30 layers, `layer_types` alternating five
-    /// `sliding_attention` then one `full_attention`, sliding layers at
-    /// `head_dim` 256 / 8 KV heads, full layers at `global_head_dim` 512 /
-    /// 2 KV heads, 16 query heads throughout, window 1,024, no sinks, no
-    /// KV sharing (`num_kv_shared_layers: 0`).
     public static func gemma4LayerKinds() -> [CBv2LayerKind] {
         (0 ..< 30).map { i in
             i % 6 == 5
@@ -443,9 +394,6 @@ public struct PagedDecodeProfiler {
         }
     }
 
-    /// The two layers `Gemma4TextModel.cbv2MTPCaptureLayers` hands the
-    /// drafter: the last non-shared full layer and the last non-shared
-    /// sliding layer.
     static func gemma4CaptureLayers(_ kinds: [CBv2LayerKind]) -> (full: Int, sliding: Int) {
         let full = kinds.lastIndex { $0.attention == .full && $0.sharesKVWithLayer == nil }!
         let sliding = kinds.lastIndex {
@@ -455,25 +403,13 @@ public struct PagedDecodeProfiler {
         return (full, sliding)
     }
 
-    /// What one MTP round's KV-layer work is made of.
     public enum MTPRoundPhase: String, CaseIterable, Sendable {
-        /// `1 + k` verify columns through the production rectangular path
-        /// (`mtpSerializesRectangularAttention`), wrapped in the row-level
-        /// speculative transaction the engine opens.
         case verify = "verify-1+k"
-        /// The MTP-OFF equivalent: `1 + k` ordinary `L == 1` decode calls,
-        /// which emit the same `1 + k` tokens at 100% acceptance.
         case decodeSerial = "decode-x(1+k)"
-        /// The round's drafter captures: `snapshot()` on the two capture
-        /// layers, plus whatever fence the backend publishes.
         case capture = "capture+fence"
-        /// `capture` with the paged fence reduced from a full-tensor
-        /// `sum()` to the one-element probe `PagedKVPool.gather` already
-        /// publishes. Identical on contiguous (nothing to reduce).
         case captureProbeFence = "capture+probe"
     }
 
-    /// One MTP-round phase on the paged bank.
     func measurePagedMTPRound(
         label: String, k: Int, context: Int, phase: MTPRoundPhase,
         capacityBytes: Int = 8 << 30
@@ -566,8 +502,6 @@ public struct PagedDecodeProfiler {
             stepPeakGiB: peak, stepTimesMs: stepTimes)
     }
 
-    /// The same phase on the contiguous bank — the reference the paged round
-    /// competes with. Same layer geometry, same transaction discipline.
     func measureContiguousMTPRound(
         label: String, k: Int, context: Int, phase: MTPRoundPhase
     ) throws -> Result {
@@ -602,9 +536,6 @@ public struct PagedDecodeProfiler {
         let step: () -> Void = {
             switch phase {
             case .capture, .captureProbeFence:
-                // Contiguous captures are slice views and the fence is a
-                // no-op (`requiresMaterializedSnapshots == false`), so both
-                // capture phases are the same work: what the drafter reads.
                 var probes: [MLXArray] = []
                 for layer in [capture.full, capture.sliding] {
                     let snap = rows[layer].snapshot()
@@ -647,8 +578,6 @@ public struct PagedDecodeProfiler {
             stepPeakGiB: peak, stepTimesMs: stepTimes)
     }
 
-    /// Per-layer `[1, *, columns, *]` Q/K/V tiles, pre-generated so the
-    /// timed step measures the KV layer and not RNG.
     private static func roundTiles(
         kinds: [CBv2LayerKind], columns: Int
     ) -> (q: [MLXArray], k: [MLXArray], v: [MLXArray]) {
@@ -665,10 +594,6 @@ public struct PagedDecodeProfiler {
         return (q, k, v)
     }
 
-    /// Host cost of the per-column `seqinfo` upload `PagedLayerCache
-    /// .dispatchDecode` performs: one fresh `[B, 8]` int32 device array per
-    /// column per layer, `(1 + k) * layers` of them per round, against the
-    /// `layers` a plain decode step needs.
     public func mtpSeqinfoUploadCost(k: Int, layers: Int = 30) -> [Result] {
         func measure(_ label: String, uploads: Int) -> Result {
             let step: () -> Void = {
@@ -691,8 +616,6 @@ public struct PagedDecodeProfiler {
         ]
     }
 
-    /// The full attribution table: both backends, every phase, at gemma-4
-    /// geometry.
     public func mtpRoundSuite(k: Int = 3, context: Int = 1024) throws -> [Result] {
         var results: [Result] = []
         for phase in MTPRoundPhase.allCases {

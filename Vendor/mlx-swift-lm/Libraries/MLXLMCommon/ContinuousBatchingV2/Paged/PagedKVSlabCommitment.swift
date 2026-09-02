@@ -132,73 +132,20 @@
 import Foundation
 import MLX
 
-/// When a paged pool's slabs are evaluated into real Metal residency.
 public enum PagedKVSlabCommitment: String, Sendable, Equatable, CaseIterable {
-    /// Wire the slabs during `PagedKVBackend.init`. First-token latency never
-    /// pays the allocation, at the cost of an idle pool occupying unified
-    /// memory that a co-resident model's headroom measurement will see. Use
-    /// for microbenchmarks and profilers that want allocation out of the
-    /// timed region, and for single-slot deployments that will never share a
-    /// box.
     case atConstruction
 
-    /// Wire the slabs at the pool's first admission — the moment it stops
-    /// being idle. The production default: an unused pool contributes zero
-    /// bytes to a co-resident model's post-load headroom measurement, exactly
-    /// as an unused contiguous grant does.
     case atFirstAdmission
 }
 
 extension PagedKVBackend {
-    /// Bytes the slabs have ACTUALLY committed to MLX right now: zero until
-    /// the pool's first admission under `.atFirstAdmission`, `bytesPhysical`
-    /// once wired, and the honest resident amount in the (transient)
-    /// partially-committed state between a failed commit and its retry.
-    ///
-    /// TIME-VARYING BY CONSTRUCTION. Diagnostics and telemetry only — never
-    /// an admission input, never a sizing input, never a wired-limit input.
-    /// Anything that must not move under this backend's feet wants
-    /// `bytesCapacity` (the budgeted, admission-relevant figure) or
-    /// `bytesPhysical` (the allocation ceiling), both of which are fixed at
-    /// pool construction.
     public var bytesWired: Int { pool.bytesMaterialized }
 
-    /// Evaluate every group's slabs, making the pool's pages physically
-    /// resident. Idempotent after success: once wired this is a bool test,
-    /// so the admission path can call it unconditionally.
-    ///
-    /// REFUSES rather than traps when the box can no longer take the pool:
-    /// throws `CBv2KVError.capacityExhausted` — the engine's retryable
-    /// capacity class — and leaves the pool unwired so a later admission
-    /// retries the commit.
-    ///
-    /// The capacity test is the ALLOCATION ATTEMPT itself — there is
-    /// deliberately no headroom pre-check here. Nothing the engine can
-    /// read predicts the allocator: `MetalAllocator::malloc` throws only
-    /// on per-buffer `maxBufferLength` (already enforced per-slab at
-    /// `PagedKVPool.init`), the Metal resource-count limit, or the OS
-    /// refusing the buffer — never on `Memory.memoryLimit`, whose real
-    /// semantics are a work-serializing THROTTLE that the embedding
-    /// provider deliberately pins low (`MLXMemoryGuard`: throttle instead
-    /// of jetsam; capacity enforcement lives in the provider's admission
-    /// layer). Rejecting on `activeMemory + demand > memoryLimit` refused
-    /// serveable pools in exactly that deployment. See the file header.
-    ///
-    /// An already-materialized pool (`pool.materializeSlabs()` called
-    /// directly, as the profiler does) commits for free regardless of any
-    /// memory condition: nothing is left to eval, so the pool is simply
-    /// marked wired.
-    ///
-    /// Thread-affinity is the pool's: the engine loop thread, no locking.
     public func commitSlabs() throws {
         guard !slabsAreWired else { return }
         do {
             try pool.materializeSlabs()
         } catch {
-            // `needed` is what is STILL missing after the partial progress
-            // this attempt made; `available` is a diagnostic-only reading
-            // of the throttle limit's remaining headroom (it is NOT what
-            // admission decided on — the failed attempt is).
             throw CBv2KVError.capacityExhausted(
                 needed: pool.bytesUnmaterialized,
                 available: max(0, Memory.memoryLimit - Memory.activeMemory))

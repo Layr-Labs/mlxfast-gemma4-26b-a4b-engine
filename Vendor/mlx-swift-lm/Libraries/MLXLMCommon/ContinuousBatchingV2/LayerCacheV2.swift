@@ -204,6 +204,27 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         return output
     }
 
+    /// Wide MTP verify, row-major rectangle (see
+    /// `CBv2AttentionV1.updateAndAttendColumns`). Advances the unified
+    /// position chain by the column count on success; nil = not available.
+    public func updateAndAttendColumns(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        columns: Int, scale: Float, sinks: MLXArray?
+    ) -> MLXArray? {
+        guard kind.sharesKVWithLayer == nil, boundSpanContexts == nil else { return nil }
+        guard let output = CBv2AttentionV1.updateAndAttendColumns(
+            rows: rows, kind: kind,
+            queries: queries, keys: keys, values: values,
+            columns: columns, scale: scale, sinks: sinks, softcap: attentionSoftcap,
+            decodeRingWriteFence: decodeRingWriteFence,
+            allowFusedRingWrite: !retainsChunkForBorrowers)
+        else { return nil }
+        if advancesPositionOffsets {
+            positionOffsetsState.value = positionOffsetsState.value + Int32(columns)
+        }
+        return output
+    }
+
     /// Final-layer prompt specialization (see LastQueryPrefillV2.swift):
     /// commit the whole chunk's K/V, attend only its newest query row.
     /// Offsets advance by the K/V length, NOT the query length — the chunk
@@ -253,6 +274,26 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         CBv2CoreInstrumentation.recordPositionOffsetsHostRebuild()
         positionOffsetsState.rebuild(from: rows)
     }
+
+    // MARK: - MTP mirror road fence plumbing (see MTP/CBv2MTPMirrorOps.swift)
+
+    /// The layer's live write fence. The MTP round reads it to chain its
+    /// finalize-time restore dispatch and writes the restore's output back
+    /// so the next in-place ring store waits on the restore.
+    var mtpWriteFence: MLXArray {
+        get { decodeRingWriteFence.value }
+        set { decodeRingWriteFence.value = newValue }
+    }
+
+    /// Rewind the ON-DEVICE position chain by `delta` (int32 `[B]`) without a
+    /// host rebuild: a verify round advanced it by the full rectangle width
+    /// and the accept walk committed fewer columns on some rows. Only the
+    /// cache that owns the unified chain applies it.
+    func mtpRewindPositionOffsets(by delta: MLXArray) {
+        guard advancesPositionOffsets else { return }
+        positionOffsetsState.value = positionOffsetsState.value - delta
+    }
+
 }
 
 // MARK: - Borrower retention (fused ring-write eligibility)

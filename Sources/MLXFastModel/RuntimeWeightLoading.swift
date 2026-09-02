@@ -2,12 +2,6 @@ import Foundation
 import MLX
 import MLXFastCore
 
-// Model-agnostic transformed-weight loading helpers shared by the runtime
-// weight caches. Everything here is keyed only on the
-// safetensors index/shard structure and the `language_model.` text-tower
-// prefix convention -- nothing is specific to one architecture, so the
-// model-specific loaders can come and go without touching this file.
-
 func loadRuntimeWeightArrays(
     denseStore: DenseTensorStore
 ) throws -> [String: MLXArray] {
@@ -17,11 +11,6 @@ func loadRuntimeWeightArrays(
     }
 }
 
-/// Materializes runtime weights one tensor at a time. `DenseTensorStore`
-/// drains the source buffer's autorelease pool before visiting the next
-/// tensor; only the detached value returned by `makeValue` remains resident.
-/// The production value is an `MLXArray`, whose Data initializer copies the
-/// bytes into MLX-owned storage.
 func loadRuntimeWeightValues<Value>(
     denseStore: DenseTensorStore,
     makeValue: (MaterializedTensor) throws -> Value
@@ -111,11 +100,6 @@ func validateRuntimeShardInventory(
 }
 
 struct RuntimeWeightNameTracker {
-    /// Checkpoint tensors carry this prefix; runtime module paths do not.
-    /// Internal rather than private because the per-path quantization lookup
-    /// in `Gemma4A4BRuntimeWeightCache` has to restore it to map a runtime
-    /// module path back to the checkpoint path the config's override table is
-    /// keyed by. Single-sourced here so the strip and the restore cannot drift.
     static let languageModelPrefix = "language_model."
     private var originalNames: Set<String> = []
     private var runtimeNames: Set<String> = []

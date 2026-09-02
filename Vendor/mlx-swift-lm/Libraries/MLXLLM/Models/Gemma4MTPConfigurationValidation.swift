@@ -3,14 +3,10 @@
 import Foundation
 import MLXLMCommon
 
-/// The small set of derived dimensions needed to construct an assistant only
-/// after its untrusted configuration has passed validation.
 struct Gemma4AssistantValidatedGeometry {
     let preProjectionInputSize: Int
 }
 
-/// A safe preflight for the one part of `Gemma4TextConfiguration` decoding
-/// that can itself allocate: deriving `layer_types` from a repeated pattern.
 struct Gemma4AssistantTextConfigurationPreflight: Decodable {
     let numHiddenLayers: Int
     let slidingWindowPattern: Int
@@ -29,9 +25,6 @@ struct Gemma4AssistantTextConfigurationPreflight: Decodable {
     }
 }
 
-/// Pure validation shared by direct construction and local/catalog-backed
-/// loading. It deliberately stays internal: callers load a drafter rather
-/// than depending on the validation representation.
 enum Gemma4AssistantConfigurationValidator {
     static let supportedModelType = "gemma4_assistant"
     static let supportedTextModelType = "gemma4_text"
@@ -51,10 +44,6 @@ enum Gemma4AssistantConfigurationValidator {
         static let hiddenSizePerLayerInput = 4_096
         static let slidingWindow = 1_048_576
         static let positionEmbeddings = 4_194_304
-        // The quantization-declaration bounds this validator used to hold
-        // (group size, per-layer entry count, layer path length) now live in
-        // `MLXLMCommon.QuantizationGeometry`, shared with the DFlash drafter's
-        // loader. See `validateQuantization` below.
         static let tensorElements = 536_870_912
         static let totalRepeatedElements = 1_610_612_736
     }
@@ -218,9 +207,6 @@ enum Gemma4AssistantConfigurationValidator {
                     "textConfig.numGlobalKeyValueHeads",
                     "is required when full attention uses K=V")
             }
-            // Mirrors Gemma4Attention.init: full layers honor
-            // num_global_key_value_heads whenever present, independent of
-            // attention_k_eq_v (k_eq_v only elides v_proj).
             let fullKVHeads = text.numGlobalKeyValueHeads ?? text.numKeyValueHeads
             try divides(
                 fullKVHeads,
@@ -268,8 +254,6 @@ enum Gemma4AssistantConfigurationValidator {
                 field: "textConfig.slidingAttention")
         }
         if hasFull {
-            // Full layers honor num_global_key_value_heads whenever present,
-            // independent of attention_k_eq_v (mirrors Gemma4Attention.init).
             let fullKVHeads = text.numGlobalKeyValueHeads ?? text.numKeyValueHeads
             try validateAttentionProducts(
                 heads: text.numAttentionHeads,
@@ -365,14 +349,6 @@ enum Gemma4AssistantConfigurationValidator {
         }
     }
 
-    /// Bound the head's declared quantization.
-    ///
-    /// The bounds and their wording live in `MLXLMCommon.QuantizationGeometry`
-    /// because the DFlash drafter's loader (Libraries/MLXSpeculative) reads the
-    /// same kind of declaration off its own head's `config.json` and must bound
-    /// it identically. The field paths and reasons this raises are unchanged —
-    /// `QuantizationGeometry.Violation` reports the suffix and the reason, and
-    /// this arm keeps raising `Gemma4MTPError.invalidConfiguration` from them.
     private static func validateQuantization(
         _ quantization: BaseConfiguration.PerLayerQuantization?
     ) throws {
@@ -421,9 +397,6 @@ enum Gemma4AssistantConfigurationValidator {
         }
     }
 
-    /// `ProportionalRoPE` converts this product to `Int` during module
-    /// construction. Validate the complete derived shape before that
-    /// non-throwing initializer so hostile-but-finite configs fail open.
     private static func rotaryFactor(
         _ value: Float, dimensions: Int, field: String
     ) throws {
@@ -475,9 +448,6 @@ enum Gemma4AssistantConfigurationValidator {
     }
 }
 
-/// One bounded parser for both local directories and downloader-populated
-/// catalog directories. The same bytes produce both the model config and its
-/// per-layer quantization policy.
 struct Gemma4AssistantConfigurationDocument {
     let config: Gemma4AssistantConfiguration
     let baseConfiguration: BaseConfiguration
@@ -516,7 +486,6 @@ struct Gemma4AssistantConfigurationDocument {
     }
 }
 
-/// Pure bind-time comparison of the target tensors an assistant will consume.
 enum Gemma4MTPCompatibilityValidator {
     private enum AttentionType: String, CaseIterable {
         case sliding = "sliding_attention"
@@ -570,9 +539,6 @@ enum Gemma4MTPCompatibilityValidator {
                     drafterText.attentionKeqV,
                     target.attentionKeqV,
                     field: "fullAttention.attentionKeqV")
-                // The gated `numGlobalKeyValueHeads` equality check was
-                // removed with the k_eq_v-gated head rule: full-layer KV
-                // geometry is now compared unconditionally right below.
                 try equal(
                     effectiveFullKVHeads(drafterText),
                     effectiveFullKVHeads(target),
@@ -594,9 +560,6 @@ enum Gemma4MTPCompatibilityValidator {
     }
 
     private static func effectiveFullKVHeads(_ config: Gemma4TextConfiguration) -> Int {
-        // Mirrors Gemma4Attention.init: full layers honor
-        // num_global_key_value_heads whenever present, independent of
-        // attention_k_eq_v (k_eq_v only elides v_proj).
         config.numGlobalKeyValueHeads ?? config.numKeyValueHeads
     }
 

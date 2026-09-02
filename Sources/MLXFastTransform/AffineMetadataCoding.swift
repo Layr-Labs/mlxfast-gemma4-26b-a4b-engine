@@ -14,12 +14,6 @@ struct GeneratedAffineMetadataReport {
     }
 }
 
-/// Gemma 4 (dense, tied-head) projection metadata sidecar generator. Invoked
-/// only on the `.gemma4` transform family path: the Laguna weight contract
-/// (`docs/laguna-weight-contract.md`) forbids derived
-/// metadata sidecars, and its stem inventory (MoE routers, SwitchGLU
-/// stacked experts, shared experts, per-head gates) is validated by
-/// `LagunaCheckpointValidation` instead.
 enum AffineMetadataCoding {
     static let shardName = "mlxfast-projection-metadata.safetensors"
 
@@ -69,10 +63,6 @@ enum AffineMetadataCoding {
             let scalesName = "\(stem).scales"
             let biasesName = "\(stem).biases"
             guard selectedKeys.contains(scalesName), selectedKeys.contains(biasesName) else {
-                // Some valid non-production/synthetic checkpoints expose an
-                // unquantized attention projection with no affine companions.
-                // It is not eligible for indexed routing. MLP projections are
-                // fixed quantized invariants and remain fail-closed.
                 if stem.contains(".self_attn.") {
                     continue
                 }

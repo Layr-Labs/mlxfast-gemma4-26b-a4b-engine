@@ -49,8 +49,6 @@ final class CBv2TokenConstraintSampler {
         }
     }
 
-    /// Apply a per-row boolean mask to `[B, vocab]` logits. The common path
-    /// returns the original array without allocating a mask.
     func mask(_ logits: MLXArray, requestIDs: [CBv2RequestID]) -> MLXArray {
         guard requestIDs.contains(where: { rows[$0] != nil }) else { return logits }
 

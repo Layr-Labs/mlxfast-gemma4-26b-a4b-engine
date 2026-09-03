@@ -4312,8 +4312,60 @@ private final class Gemma4DenseGateUpStorage {
         self.upWeight = weight[n...]
         self.upScales = scales[n...]
         self.upBiases = biases[n...]
+
+        // The guard above pins the affine 8-bit, group-size-64 geometry
+        // exactly: 704 uint32 words per row over 2816 inputs is 8 bits, and 44
+        // groups over 2816 inputs is group size 64. Build the prompt plane here
+        // rather than on first admission, so the dequantization is charged to
+        // model binding and no measured window can be the first consumer.
+        if gemma4DenseGateUpJoinEnabled, gemma4DenseGateUpPrefillJoinEnabled,
+            Gemma4PrefillDeqGEMMV1.enabled, Gemma4PrefillDeqGEMMV1.cacheEnabled
+        {
+            _ = transposedPlane(groupSize: 64, bits: 8, mode: .affine)
+        }
+    }
+
+    private let planeLock = NSLock()
+    private var cachedTransposedPlane: MLXArray?
+
+    /// One dequantized `[2816, 4224]` transposed plane covering both halves,
+    /// kept for the model lifetime. Built and evaluated with no lock held, then
+    /// inserted, matching the per-projection table in `Gemma4PrefillDeqGEMMV1`.
+    func transposedPlane(groupSize: Int, bits: Int, mode: QuantizationMode) -> MLXArray {
+        planeLock.lock()
+        let existing = cachedTransposedPlane
+        planeLock.unlock()
+        if let existing { return existing }
+        let p = dequantized(
+            weight, scales: scales, biases: biases,
+            groupSize: groupSize, bits: bits, mode: mode
+        ).transposed()
+        eval(p)
+        planeLock.lock()
+        if let raced = cachedTransposedPlane {
+            planeLock.unlock()
+            return raced
+        }
+        cachedTransposedPlane = p
+        planeLock.unlock()
+        return p
     }
 }
+
+/// DENSE-GATEUP-JOIN-PREFILL. Default ON: the prompt pass takes one dequantized
+/// GEMM over the joined `gate|up` plane instead of two, reusing the storage the
+/// decode join already binds. `DARKBLOOM_GEMMA4_DENSE_GATEUP_JOIN_PREFILL=0`
+/// restores the split pair.
+private let gemma4DenseGateUpPrefillJoinEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DENSE_GATEUP_JOIN_PREFILL"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+private let gemma4DenseGateUpPrefillJoinXcheck: Bool =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DENSE_GATEUP_JOIN_PREFILL_XCHECK"] == "1"
 
 private let gemma4DenseGateUpJoinEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
@@ -4373,6 +4425,10 @@ private class Gemma4MLP: Module {
         _ x: MLXArray,
         activationSums producerSums: CBv2DenseMLPQMVV1.ActivationSums? = nil
     ) -> MLXArray {
+        if let joined = zipGateUpPrefill(x) {
+            return denseProjection(
+                downProj, gemma4GeluProduct(joined.gate, joined.up))
+        }
         // DMLP-002: one exact activation-sum prepass feeds both fallback
         // projections. If either projection is not the pinned affine8 cell,
         // the candidate arrays remain unevaluated and stock takes over.
@@ -4437,6 +4493,54 @@ private class Gemma4MLP: Module {
             joined[.ellipsis, ..<2112],
             joined[.ellipsis, 2112...]
         )
+    }
+
+    /// One prompt-pass GEMM over the joined gate|up plane. Same storage the
+    /// decode join binds, dequantized once into a `[2816, 4224]` transposed
+    /// plane, so the prompt reads one plane and issues one matmul per layer
+    /// where the frontier issues two.
+    fileprivate func zipGateUpPrefill(
+        _ x: MLXArray
+    ) -> (gate: MLXArray, up: MLXArray)? {
+        guard gemma4DenseGateUpJoinEnabled,
+            gemma4DenseGateUpPrefillJoinEnabled,
+            Gemma4PrefillDeqGEMMV1.enabled,
+            Gemma4PrefillDeqGEMMV1.cacheEnabled,
+            let storage = fusedGateUpStorage,
+            let gate = gateProj as? QuantizedLinear,
+            let up = upProj as? QuantizedLinear,
+            gate.bias == nil, up.bias == nil,
+            gate.groupSize == 64, up.groupSize == gate.groupSize,
+            gate.bits == 8, up.bits == gate.bits,
+            gate.mode == .affine, up.mode == gate.mode,
+            gate.scales.dtype == .bfloat16, up.scales.dtype == .bfloat16,
+            x.dtype == .bfloat16, x.ndim >= 2, x.dim(-1) == 2816,
+            x.size / 2816 >= Gemma4PrefillDeqGEMMV1.minRows
+        else { return nil }
+        CBv2EngageMark.once("dense-gateup-join-prefill")
+        let plane = storage.transposedPlane(
+            groupSize: gate.groupSize, bits: gate.bits, mode: gate.mode)
+        let joined = MLX.matmul(x, plane)
+        let halves = (joined[.ellipsis, ..<2112], joined[.ellipsis, 2112...])
+        if gemma4DenseGateUpPrefillJoinXcheck {
+            // Local diagnostics only (never on the ranked path): run the
+            // incumbent split pair beside this road on the identical operands
+            // and count differing bf16 words on each half.
+            let incumbentGate = denseProjection(gateProj, x)
+            let incumbentUp = denseProjection(upProj, x)
+            let differing = MLX.sum(
+                halves.0.view(dtype: .uint16) .!= incumbentGate.view(dtype: .uint16),
+                stream: .default)
+                + MLX.sum(
+                    halves.1.view(dtype: .uint16) .!= incumbentUp.view(dtype: .uint16),
+                    stream: .default)
+            eval(halves.0, halves.1, incumbentGate, incumbentUp, differing)
+            FileHandle.standardError.write(
+                Data(
+                    ("[xcheck] dense-gateup-join-prefill rows \(x.size / 2816) "
+                        + "differing \(differing.item(Int32.self))\n").utf8))
+        }
+        return halves
     }
 
     fileprivate func zipDown(_ activated: MLXArray) -> MLXArray {

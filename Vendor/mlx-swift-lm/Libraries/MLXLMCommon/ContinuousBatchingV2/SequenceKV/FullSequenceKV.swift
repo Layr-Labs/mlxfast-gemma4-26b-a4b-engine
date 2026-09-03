@@ -9,6 +9,7 @@
 
 import Foundation
 import MLX
+import MLXFast
 
 /// Counters for the v2 core runtime's own host-interaction points.
 ///
@@ -206,6 +207,26 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
     private var values: MLXArray?
     private var capacity: Int
 
+    /// DARKBLOOM_CBV2_D512_Q4_MIRROR: Gate / Opt-in kill switch for Full-Attention
+    /// D=512 quantized Q4 mirror. Default ON.
+    public static let q4MirrorEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_D512_Q4_MIRROR"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private var quantEligible: Bool {
+        Self.q4MirrorEnabled && headDim == 512 && kvHeads == 2
+    }
+
+    private var quantMirror: MLXArray?
+
+    public var quantMirrorView: MLXArray? {
+        guard cohortPool == nil else { return nil }
+        return quantMirror
+    }
+
     /// ATT-008 cohort pooling (nil until `cohortPool(binding:)` migrates this
     /// row). While bound, `keys`/`values` are nil and the pool's row
     /// `cohortIndex` is the storage.
@@ -236,7 +257,7 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
             // truthful after migration.
             return pool.nbytes / pool.rowCount
         }
-        return (keys?.nbytes ?? 0) + (values?.nbytes ?? 0)
+        return (keys?.nbytes ?? 0) + (values?.nbytes ?? 0) + (quantMirror?.nbytes ?? 0)
     }
 
     /// WRITE-016-D512: the `update()` bookkeeping advance without the two
@@ -282,6 +303,10 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
 
         keys![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newKeys
         values![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newValues
+        if quantEligible, quantMirror != nil {
+            let packed = Self.quantPackPairD512(keys: newKeys, values: newValues)
+            quantMirror![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = packed
+        }
         absoluteOffset += n
 
         return (
@@ -363,6 +388,9 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
         values = newValues
         capacity = n
         absoluteOffset = n
+        if quantEligible {
+            quantMirror = Self.quantPackPairD512(keys: newKeys, values: newValues)
+        }
         return (
             keys![.ellipsis, ..<absoluteOffset, 0...],
             values![.ellipsis, ..<absoluteOffset, 0...]
@@ -412,7 +440,7 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
         if let pool = cohortPool {
             return [pool.keys, pool.values]
         }
-        return [keys, values].compactMap { $0 }
+        return [keys, values, quantMirror].compactMap { $0 }
     }
 
     // MARK: - ATT-008 cohort pooling
@@ -487,6 +515,10 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
                 [1, kvHeads, capacity, keyTemplate.dim(3)], dtype: keyTemplate.dtype)
             values = MLXArray.zeros(
                 [1, kvHeads, capacity, valueTemplate.dim(3)], dtype: valueTemplate.dtype)
+            if quantEligible {
+                quantMirror = MLXArray.zeros(
+                    [2, kvHeads, capacity, 72], dtype: .uint32)
+            }
             return
         }
         guard needed > capacity else { return }
@@ -501,6 +533,140 @@ public final class CBv2FullSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV
         values = concatenated(
             [values!, MLXArray.zeros([1, kvHeads, growth, values!.dim(3)], dtype: values!.dtype)],
             axis: 2)
+        if quantEligible {
+            if let existingMirror = quantMirror {
+                quantMirror = concatenated(
+                    [existingMirror, MLXArray.zeros([2, kvHeads, growth, 72], dtype: .uint32)],
+                    axis: 2)
+            } else {
+                quantMirror = MLXArray.zeros(
+                    [2, kvHeads, newCapacity, 72], dtype: .uint32)
+            }
+        }
         capacity = newCapacity
+    }
+
+    // MARK: - Quantized Q4 Mirror Support
+
+    public static let gpuPackEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_KV_QUANT_GPUPACK"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Host MLX expression for affine-quantizing [heads, n, 512] bf16 -> [heads, n, 72] uint32
+    public static func quantPackD512(_ x: MLXArray) -> MLXArray {
+        let f = (x.ndim == 4 ? x[0] : x).asType(.float32)
+        let heads = f.dim(0), n = f.dim(1), d = f.dim(2)
+        precondition(d == 512, "CBv2FullSequenceKV.quantPackD512: headDim must be 512")
+        let groups = 8
+        let grouped = f.reshaped([heads, n, groups, 64])
+        let mn = grouped.min(axis: -1, keepDims: true)
+        let mx = grouped.max(axis: -1, keepDims: true)
+        let scale = maximum((mx - mn) / 15, MLXArray(Float(1e-6)))
+            .asType(.float16).asType(.float32)
+        let bias = mn.asType(.float16).asType(.float32)
+        let q = clip(round((grouped - bias) / scale), min: 0, max: 15)
+            .asType(.uint32)
+            .reshaped([heads, n, 64, 8])
+        var payload = MLXArray.zeros([heads, n, 64], dtype: .uint32)
+        for i in 0 ..< 8 {
+            payload = payload + (q[.ellipsis, i] << MLXArray(Int32(4 * i)))
+        }
+        let pair = concatenated(
+            [scale.asType(.float16), bias.asType(.float16)], axis: -1)
+        let tail = pair.view(dtype: .uint32).reshaped([heads, n, groups])
+        return concatenated([payload.asType(.uint32), tail], axis: -1)
+    }
+
+    /// GPU-accelerated pairwise pack kernel for [1, kvHeads, n, 512] keys and values
+    /// into [2, kvHeads, n, 72] uint32 mirror rows.
+    private static let quantPackPairChunkD512Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_kvq4g64_pack_pair_chunk_d512_v1",
+        inputNames: ["keys", "values"],
+        outputNames: ["packed_w"],
+        source: """
+            constexpr int D = 512;
+            constexpr int simd_width = 32;
+            constexpr int per_lane = D / simd_width;      // 16 values
+            constexpr int group_size = 64;
+            constexpr int payload_words = D / 8;          // 64
+            constexpr int groups = D / group_size;        // 8
+            constexpr int row_words = payload_words + groups; // 72
+
+            const int row = int(threadgroup_position_in_grid.x);
+            const int plane = row / (HEADS * N);
+            const int local = row - plane * (HEADS * N);
+            const int lane = int(thread_position_in_threadgroup.x);
+            const device T* src = (plane == 0 ? keys : values) + local * D;
+            device uint32_t* out = packed_w + row * row_words;
+
+            float vals[per_lane];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < per_lane; ++i) {
+                vals[i] = float(src[lane * per_lane + i]);
+            }
+            float vmin = 3.402823466e+38F;
+            float vmax = -3.402823466e+38F;
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < per_lane; ++i) {
+                vmin = min(vmin, vals[i]);
+                vmax = max(vmax, vals[i]);
+            }
+            vmin = min(vmin, simd_shuffle_xor(vmin, 1u));
+            vmax = max(vmax, simd_shuffle_xor(vmax, 1u));
+            vmin = min(vmin, simd_shuffle_xor(vmin, 2u));
+            vmax = max(vmax, simd_shuffle_xor(vmax, 2u));
+
+            const half hs = half(max((vmax - vmin) / 15.0f, 1e-6f));
+            const half hb = half(vmin);
+            const float s = float(hs);
+            const float b = float(hb);
+
+            uint32_t word0 = 0u;
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 8; ++i) {
+                const float q = metal::rint((vals[i] - b) / s);
+                word0 |= uint32_t(clamp(q, 0.0f, 15.0f)) << (4 * i);
+            }
+            out[lane * 2] = word0;
+
+            uint32_t word1 = 0u;
+            #pragma clang loop unroll(full)
+            for (int i = 8; i < 16; ++i) {
+                const float q = metal::rint((vals[i] - b) / s);
+                word1 |= uint32_t(clamp(q, 0.0f, 15.0f)) << (4 * (i - 8));
+            }
+            out[lane * 2 + 1] = word1;
+
+            if ((lane & 3) == 0) {
+                const int group_idx = lane / 4;
+                out[payload_words + group_idx] =
+                    uint32_t(as_type<ushort>(hs)) | (uint32_t(as_type<ushort>(hb)) << 16);
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    public static func quantPackPairD512(keys: MLXArray, values: MLXArray) -> MLXArray {
+        let fKeys = (keys.ndim == 4 ? keys[0] : keys)
+        let fValues = (values.ndim == 4 ? values[0] : values)
+        let heads = fKeys.dim(0)
+        let n = fKeys.dim(1)
+        let words = 72
+        if gpuPackEnabled {
+            return quantPackPairChunkD512Kernel(
+                [fKeys, fValues],
+                template: [("T", fKeys.dtype), ("HEADS", heads), ("N", n)],
+                grid: (2 * heads * n * 32, 1, 1),
+                threadGroup: (32, 1, 1),
+                outputShapes: [[2, heads, n, words]],
+                outputDTypes: [.uint32]
+            )[0]
+        } else {
+            let pk = quantPackD512(fKeys)
+            let pv = quantPackD512(fValues)
+            return concatenated([pk.reshaped([1, heads, n, words]), pv.reshaped([1, heads, n, words])], axis: 0)
+        }
     }
 }

@@ -56,6 +56,19 @@ internal func resolveCBv2CompactDecodeRootsEnabled(_ raw: String?) -> Bool {
 
 private let cbv2CompactDecodeRootsEnabled = resolveCBv2CompactDecodeRootsEnabled(
     ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_COMPACT_DECODE_ROOTS"])
+/// CBV2-UNCHAINED-DECODE-FASTPATH kill switch. The direct all-decode
+/// executor is ON by default; `0`/`false`/`no`/`off` restores executeMixed's
+/// general bookkeeping path for attribution and emergency bisection.
+@inline(__always)
+internal func resolveCBv2UnchainedDecodeFastPathEnabled(_ raw: String?) -> Bool {
+    guard let raw else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}
+
+private let cbv2UnchainedDecodeFastPathEnabled =
+    resolveCBv2UnchainedDecodeFastPathEnabled(
+        ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_UNCHAINED_DECODE_FASTPATH"])
+
 
 /// Builds per-layer batch-facing cache views for a set of rows
 /// (`rowStates[b][layer]`, row order == batch row order). WS-A's
@@ -1613,6 +1626,63 @@ public final class EngineLoopV2: @unchecked Sendable {
         return step
     }
 
+    private func admitsUnchainedDecode(_ plan: CBv2StepPlan) -> Bool {
+        guard plan.preemptions.isEmpty, !plan.assignments.isEmpty else { return false }
+        return plan.assignments.allSatisfy { assignment in
+            guard assignment.numTokens == 1,
+                let rec = scheduler.record(for: assignment.id),
+                !rec.tokens.isEmpty,
+                kvStates[assignment.id] != nil,
+                rec.numComputedTokens == rec.effectiveTokenCount,
+                rec.numComputedTokens == rec.tokens.count
+            else { return false }
+            return !(multimodalByID[assignment.id]?.containsSpan(
+                at: rec.tokens.count - 1) ?? false)
+        }
+    }
+
+    /// Direct executor for a non-chained plan whose every row is an ordinary
+    /// one-token decode. This keeps mixed-prefill bookkeeping off that path.
+    private func launchUnchainedDecode(
+        _ plan: CBv2StepPlan, wallStartedNanos: UInt64
+    ) -> CBv2InFlightStep {
+        let ids = plan.assignments.map(\.id)
+        let records = ids.map { scheduler.record(for: $0)! }
+        let rowStates = ids.map { kvStates[$0]! }
+        let params = records.map(\.request.sampling)
+        let inputs = MLXArray(
+            records.map { Int32($0.tokens[$0.tokens.count - 1]) }
+        ).reshaped([ids.count, 1])
+
+        CBv2EngageMark.once("cbv2-unchained-decode-fastpath")
+        let (last, cacheInnerState) = CBv2OrderOnlyLogits.withOrderOnly(params) {
+            decodeLogits(rowStates: rowStates, tokens: inputs)
+        }
+        let sampled = sampler.sample(
+            logits: last,
+            params: params,
+            requestIDs: ids,
+            stepIndex: stepCount,
+            pendingSampledTokens: nil,
+            rowContext: { records.map { Self.samplerRow($0) } })
+        let stepLogprobs = sampler.takeStepLogprobs()
+
+        scheduler.markPendingSamples(ids: ids)
+        var toEval = [sampled]
+        if let stepLogprobs { toEval.append(contentsOf: stepLogprobs.evalTargets) }
+        if !cacheInnerState.isEmpty {
+            toEval.append(contentsOf: cacheInnerState)
+            offsetChainEvalSteps += 1
+        }
+        asyncEval(toEval)
+
+        let step = CBv2InFlightStep(
+            participants: Set(ids), sampledRows: ids, sampledTokens: sampled, evalTargets: [],
+            wallStartedNanos: wallStartedNanos)
+        if let stepLogprobs { step.logprobSegments = [stepLogprobs] }
+        return step
+    }
+
     /// General step: decode batch [B, 1] + per-request [1, chunk] prefills,
     /// interleaved per the plan, ONE `asyncEval` for the whole step.
     /// NEVER extended for MTP speculation — 1+k assignments take
@@ -1620,6 +1690,14 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// `samples` predicate are structurally wrong for speculative tokens).
     func executeMixed(_ plan: CBv2StepPlan) -> CBv2InFlightStep? {
         let wallStartedNanos = DispatchTime.now().uptimeNanoseconds
+        // CBV2-UNCHAINED-DECODE-FASTPATH: the general executor below is a
+        // mixed decode/prefill path. Admit only fully materialized ordinary
+        // decodes so its prefill dictionaries and sampled-piece assembly
+        // never exist for the decode-only plan.
+        if cbv2UnchainedDecodeFastPathEnabled, admitsUnchainedDecode(plan) {
+            return launchUnchainedDecode(plan, wallStartedNanos: wallStartedNanos)
+        }
+
         struct RowWork {
             let rec: CBv2ScheduledRequest
             let start: Int

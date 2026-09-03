@@ -1052,6 +1052,59 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// PROMPT-OB3: the cross-simdgroup rms combine, in the one-barrier form the
+/// pack `pg2` kernel below already ships.
+///
+/// The incumbent form fills 32 threadgroup floats with zero, publishes one
+/// partial per simdgroup, reduces them on simdgroup 0 alone, writes the
+/// reciprocal back to threadgroup memory and barriers again so the other
+/// simdgroups can read it. Three barriers, a 32-float store and a round trip
+/// through threadgroup memory per row.
+///
+/// The replacement lets every simdgroup of the row run the same 32-lane
+/// combine: lanes below `row_simds` take the published partials, the rest
+/// substitute the `0.0f` the zero-fill would have handed them, from a
+/// register. `simd_sum` therefore sees the identical 32 operands in the
+/// identical lane positions and each simdgroup lands on the bit-identical
+/// reciprocal with no publish-back.
+private enum Gemma4PromptOB3 {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_PROMPT_OB3"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespaces).lowercased())
+    }()
+
+    static let key: String = enabled ? "_ob3" : ""
+
+    /// The `inv_rms` staging row exists only for the incumbent's publish-back.
+    static let scratch: String = enabled ? "" : "threadgroup float inv_rms[RPT];"
+
+    /// Both forms leave `inverse_rms` holding the same float in every thread.
+    static let combine: String =
+        enabled
+        ? """
+        if (lane == 0) partials[slot][row_simd] = sum;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                sum = simd_sum(lane < row_simds ? partials[slot][lane] : 0.0f);
+                const float inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+        """
+        : """
+        if (row_simd == 0) partials[slot][lane] = 0.0f;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (lane == 0) partials[slot][row_simd] = sum;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (row_simd == 0) {
+                    sum = simd_sum(partials[slot][lane]);
+                    if (lane == 0) {
+                        inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                const float inverse_rms = inv_rms[slot];
+        """
+}
+
 /// QKVNORM-PREFILL-001: the prefill twin of `gemma4_b8_qkv_rms_norm_v1`.
 ///
 /// Same per-row arithmetic, three differences in the plumbing.
@@ -1070,7 +1123,7 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
 /// threadgroup, and each row keeps its own 64 threads and its own two
 /// simdgroups, so the reduction tree is the stock one row for row.
 private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
-    name: "gemma4_qkv_rms_norm_head_major_v2",
+    name: "gemma4_qkv_rms_norm_head_major_v2\(Gemma4PromptOB3.key)",
     inputNames: [
         "q", "k", "q_weight", "k_weight",
         "position_offsets", "rope_freqs",
@@ -1079,6 +1132,7 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
     source: """
         constexpr uint reads = 4;
         constexpr uint row_threads = D / reads;
+        constexpr uint row_simds = row_threads / 32;
         const uint tid = thread_position_in_threadgroup.x;
         const uint slot = tid / row_threads;
         const uint lid = tid - slot * row_threads;
@@ -1087,7 +1141,7 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
         const uint row_simd = lid / 32;
 
         threadgroup float partials[RPT][32];
-        threadgroup float inv_rms[RPT];
+        \(Gemma4PromptOB3.scratch)
         threadgroup T rounded[RPT][D];
         threadgroup uint row_position[RPT];
 
@@ -1138,22 +1192,12 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
         }
         sum = simd_sum(sum);
 
-        // Slots 2..31 stay exactly zero, so the 32-lane combine returns the
-        // two simdgroup partials' sum whatever order the tree adds them in.
-        if (row_simd == 0) partials[slot][lane] = 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (lane == 0) partials[slot][row_simd] = sum;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (row_simd == 0) {
-            sum = simd_sum(partials[slot][lane]);
-            if (lane == 0) {
-                inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Lanes at or above `row_simds` contribute exactly zero, so the
+        // 32-lane combine returns the simdgroup partials' sum whatever order
+        // the tree adds them in.
+        \(Gemma4PromptOB3.combine)
 
         if (row >= TOTAL_ROWS) return;
-        const float inverse_rms = inv_rms[slot];
         for (uint i = 0; i < reads; ++i) {
             const T normalized = T(float(input[i]) * inverse_rms);
             if (APPLY_ROPE) {
@@ -1270,7 +1314,7 @@ private func gemma4FusedQKVNormHeadMajor(
 /// staging boundary. Structure extends the head-major twin; rotation is a
 /// line-for-line transcription of rope.metal's base path.
 private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
-    name: "gemma4_qkv_rms_norm_head_major_sliding_v1",
+    name: "gemma4_qkv_rms_norm_head_major_sliding_v1\(Gemma4PromptOB3.key)",
     inputNames: [
         "q", "k", "v", "q_weight", "k_weight",
         "position_offsets", "rope_log2_base",
@@ -1279,6 +1323,7 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
     source: """
         constexpr uint reads = 4;
         constexpr uint row_threads = D / reads;
+        constexpr uint row_simds = row_threads / 32;
         const uint tid = thread_position_in_threadgroup.x;
         const uint slot = tid / row_threads;
         const uint lid = tid - slot * row_threads;
@@ -1287,7 +1332,7 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
         const uint row_simd = lid / 32;
 
         threadgroup float partials[RPT][32];
-        threadgroup float inv_rms[RPT];
+        \(Gemma4PromptOB3.scratch)
         threadgroup T rounded[RPT][D];
         threadgroup uint row_position[RPT];
 
@@ -1342,20 +1387,9 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
         }
         sum = simd_sum(sum);
 
-        if (row_simd == 0) partials[slot][lane] = 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (lane == 0) partials[slot][row_simd] = sum;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (row_simd == 0) {
-            sum = simd_sum(partials[slot][lane]);
-            if (lane == 0) {
-                inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        \(Gemma4PromptOB3.combine)
 
         if (row >= TOTAL_ROWS) return;
-        const float inverse_rms = inv_rms[slot];
         for (uint i = 0; i < reads; ++i) {
             const T normalized = T(float(input[i]) * inverse_rms);
             if (APPLY_ROPE && weighted) {
@@ -1410,7 +1444,7 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
 /// allocation. The mirror is therefore the pack kernel's output byte for
 /// byte, computed without re-reading the 67 MB of K/V it packs.
 private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
-    name: "gemma4_qkv_rms_norm_head_major_sliding_pack_pg1",
+    name: "gemma4_qkv_rms_norm_head_major_sliding_pack_pg1\(Gemma4PromptOB3.key)",
     inputNames: [
         "q", "k", "v", "q_weight", "k_weight",
         "position_offsets", "rope_log2_base",
@@ -1419,6 +1453,7 @@ private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
     source: """
         constexpr uint reads = 4;
         constexpr uint row_threads = D / reads;
+        constexpr uint row_simds = row_threads / 32;
         constexpr uint mirror_row_words = D / 8 + D / 64;
         const uint tid = thread_position_in_threadgroup.x;
         const uint slot = tid / row_threads;
@@ -1428,7 +1463,7 @@ private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
         const uint row_simd = lid / 32;
 
         threadgroup float partials[RPT][32];
-        threadgroup float inv_rms[RPT];
+        \(Gemma4PromptOB3.scratch)
         threadgroup T rounded[RPT][D];
         threadgroup uint row_position[RPT];
         threadgroup T final_vals[RPT][D];
@@ -1491,20 +1526,9 @@ private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
         }
         sum = simd_sum(sum);
 
-        if (row_simd == 0) partials[slot][lane] = 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (lane == 0) partials[slot][row_simd] = sum;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (row_simd == 0) {
-            sum = simd_sum(partials[slot][lane]);
-            if (lane == 0) {
-                inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        \(Gemma4PromptOB3.combine)
 
         if (valid) {
-            const float inverse_rms = inv_rms[slot];
             for (uint i = 0; i < reads; ++i) {
                 const T normalized = T(float(input[i]) * inverse_rms);
                 if (APPLY_ROPE && weighted) {

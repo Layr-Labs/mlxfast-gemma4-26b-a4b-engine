@@ -5567,6 +5567,62 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         """,
         ensureRowContiguous: true)
 
+    /// D512-OB3: the one-barrier cross-simdgroup rms combine, carried onto the
+    /// last kernel on this track that still runs the zero-fill publish-back
+    /// form. The prompt pack kernel and the standalone decode QKV norm already
+    /// ship it.
+    ///
+    /// The incumbent zero-fills 32 threadgroup floats, publishes one partial
+    /// per simdgroup, reduces them on simdgroup 0 alone, writes the reciprocal
+    /// to a threadgroup scalar and barriers a third time so the other three
+    /// simdgroups can read it. The replacement lets every simdgroup run the
+    /// same 32-lane combine in registers: lanes below `d512_row_simds` take the
+    /// published partials, the rest contribute the same `0.0f` the zero-fill
+    /// would have left. `simd_sum` therefore sees the identical 32 operands in
+    /// the identical lane positions, so the reciprocal is bit-identical and no
+    /// reassociation is introduced.
+    private enum D512OB3 {
+        static let enabled: Bool = {
+            guard let raw = ProcessInfo.processInfo.environment[
+                "DARKBLOOM_GEMMA4_D512_OB3"]
+            else { return true }
+            return !["0", "false", "no", "off"].contains(
+                raw.trimmingCharacters(in: .whitespaces).lowercased())
+        }()
+
+        static let key: String = enabled ? "_ob3s" : ""
+
+        /// Both forms leave `inverse_rms` holding the same float in every
+        /// thread of the threadgroup.
+        static let combine: String =
+            enabled
+            ? """
+            threadgroup float partials[32];
+                        threadgroup T rounded[D];
+                        constexpr int d512_row_simds = (D / reads) / 32;
+                        if (lane == 0) partials[simd_group] = sum;
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                        sum = simd_sum(lane < d512_row_simds ? partials[lane] : 0.0f);
+                        const float inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+            """
+            : """
+            threadgroup float partials[32];
+                        threadgroup float inverse_rms;
+                        threadgroup T rounded[D];
+                        if (simd_group == 0) partials[lane] = 0.0f;
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                        if (lane == 0) partials[simd_group] = sum;
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                        if (simd_group == 0) {
+                            sum = simd_sum(partials[lane]);
+                            if (lane == 0) {
+                                inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+                            }
+                        }
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+            """
+    }
+
     /// NORMROPE-D512: the WRITE-022 store dispatch with the full layers' Q/K
     /// RMSNorm + RoPE folded in, so the standalone
     /// `gemma4_b8_qkv_rms_norm_rope_v2_vec1` dispatch leaves the chain.
@@ -5592,7 +5648,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// slot receives the K row the standalone kernel would have handed the
     /// incumbent store, so dispatches 1...3 read identical bytes.
     private static let ringStoreNormRopeKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_d512_ringstore_normrope_freqs_bf16_v1_vec1",
+        name: "cbv2_ragged8_d512_ringstore_normrope_freqs_bf16_v1_vec1\(D512OB3.key)",
         inputNames: [
             "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
             "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
@@ -5664,20 +5720,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             }
             sum = simd_sum(sum);
 
-            threadgroup float partials[32];
-            threadgroup float inverse_rms;
-            threadgroup T rounded[D];
-            if (simd_group == 0) partials[lane] = 0.0f;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (lane == 0) partials[simd_group] = sum;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_group == 0) {
-                sum = simd_sum(partials[lane]);
-                if (lane == 0) {
-                    inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            \(D512OB3.combine)
 
             const T4 wv = *reinterpret_cast<const device T4*>(weight);
             for (int i = 0; i < reads; ++i) {

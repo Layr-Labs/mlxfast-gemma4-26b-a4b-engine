@@ -1777,6 +1777,82 @@ private enum Gemma4PrefillDeqGEMMV1 {
         return product
     }
 
+    /// Dense Gate+Up prefill fusion arm.
+    /// `DARKBLOOM_GEMMA4_PREFILL_DENSE_GATEUP_FUSE=0` restores the separate gate and up GEMMs.
+    static let denseGateUpFuseEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_DENSE_GATEUP_FUSE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let fusedPlaneLock = NSLock()
+    nonisolated(unsafe) private static var cachedFusedGateUpPlanes: [ObjectIdentifier: MLXArray] = [:]
+
+    @inline(__always)
+    static func applyFusedGateUp(
+        gate: Linear,
+        up: Linear,
+        _ x: MLXArray
+    ) -> (gate: MLXArray, up: MLXArray)? {
+        guard enabled, denseGateUpFuseEnabled,
+            let qGate = gate as? QuantizedLinear,
+            let qUp = up as? QuantizedLinear,
+            qGate.bias == nil, qUp.bias == nil,
+            qGate.mode == .affine, qUp.mode == .affine,
+            qGate.groupSize == 64, qUp.groupSize == 64,
+            qGate.bits == qUp.bits,
+            qGate.bits == 4 || qGate.bits == 8,
+            x.dtype == .bfloat16, x.ndim >= 2,
+            qGate.scales.dtype == .bfloat16, qUp.scales.dtype == .bfloat16,
+            let gateBiases = qGate.biases, gateBiases.dtype == .bfloat16,
+            let upBiases = qUp.biases, upBiases.dtype == .bfloat16
+        else { return nil }
+
+        let inputDims = x.dim(-1)
+        guard inputDims > 0, x.size / inputDims >= minRows else { return nil }
+
+        let gateWeight = qGate.weight
+        let upWeight = qUp.weight
+        guard gateWeight.ndim == 2, gateWeight.dtype == .uint32,
+            upWeight.ndim == 2, upWeight.dtype == .uint32,
+            gateWeight.dim(1) == upWeight.dim(1),
+            gateWeight.dim(1) * (32 / qGate.bits) == inputDims
+        else { return nil }
+
+        let gateN = gateWeight.dim(0)
+
+        let fusedPlane: MLXArray
+        if cacheEnabled {
+            let key = ObjectIdentifier(qGate)
+            fusedPlaneLock.lock()
+            if let existing = cachedFusedGateUpPlanes[key] {
+                fusedPlaneLock.unlock()
+                fusedPlane = existing
+            } else {
+                fusedPlaneLock.unlock()
+                let pGate = plane(for: qGate, biases: gateBiases)
+                let pUp = plane(for: qUp, biases: upBiases)
+                let p = concatenated([pGate, pUp], axis: 1)
+                eval(p)
+                fusedPlaneLock.lock()
+                cachedFusedGateUpPlanes[key] = p
+                fusedPlaneLock.unlock()
+                fusedPlane = p
+            }
+        } else {
+            let pGate = plane(for: qGate, biases: gateBiases)
+            let pUp = plane(for: qUp, biases: upBiases)
+            fusedPlane = concatenated([pGate, pUp], axis: 1)
+        }
+
+        CBv2EngageMark.once("prefill-dense-gateup-fuse")
+        let gateUp = MLX.matmul(x, fusedPlane)
+        let gateOut = gateUp[.ellipsis, ..<gateN]
+        let upOut = gateUp[.ellipsis, gateN...]
+        return (gateOut, upOut)
+    }
+
     /// `DARKBLOOM_GEMMA4_PREFILL_DEQ_GEMM_XCHECK=1`: bitwise cross-check of
     /// every admitted projection against the incumbent dispatch (diagnostic;
     /// forces evaluation, so it is never set on a timed run).
@@ -4298,11 +4374,18 @@ private class Gemma4MLP: Module {
         // projections. If either projection is not the pinned affine8 cell,
         // the candidate arrays remain unevaluated and stock takes over.
         let activationSums = producerSums ?? CBv2DenseMLPQMVV1.activationSums(for: x)
+        let gateVal: MLXArray
+        let upVal: MLXArray
+        if let fused = Gemma4PrefillDeqGEMMV1.applyFusedGateUp(gate: gateProj, up: upProj, x) {
+            gateVal = fused.gate
+            upVal = fused.up
+        } else {
+            gateVal = denseProjection(gateProj, x, activationSums: activationSums)
+            upVal = denseProjection(upProj, x, activationSums: activationSums)
+        }
         return denseProjection(
             downProj,
-            gemma4GeluProduct(
-                denseProjection(gateProj, x, activationSums: activationSums),
-                denseProjection(upProj, x, activationSums: activationSums)))
+            gemma4GeluProduct(gateVal, upVal))
     }
 
     // MARK: ZIP-ROUTER-001 stages

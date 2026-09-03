@@ -193,7 +193,7 @@ public struct RuntimeStartupMemoryPolicy: Equatable, Sendable {
             // submission 0cd0a6b4-b539-4705-a1c7-cb271c1f9d3b; the prose here
             // still said 320 afterwards, which is what this line fixes.)
             maxMegabytesPerCommandBuffer: 512,
-            maxOperationsPerCommandBuffer: 50,
+            maxOperationsPerCommandBuffer: 512,
             clearAllocatorCacheAfterWarmup: false,
             environmentOverrides: [:]
         )

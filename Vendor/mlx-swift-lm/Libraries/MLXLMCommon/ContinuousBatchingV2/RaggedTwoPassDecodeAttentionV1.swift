@@ -2235,6 +2235,48 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             : "_spd2")
         : ""
 
+    /// SLIDE-KVHD-048. Materialise a 4-bit KV code as a float by writing it
+    /// into the mantissa of a half that already sits in the binade beginning
+    /// at 1024, then subtracting the offset, instead of running an integer to
+    /// float convert. `0x6400` is `1024.0h` with a zero mantissa, and the
+    /// binade `[1024, 2048)` has a unit ULP in half, so `0x6400 | code` is
+    /// exactly `1024 + code` for every code below 1024 and the subtraction is
+    /// exact. A 4-bit code is far inside that bound. Bit-identical output.
+    ///
+    /// The same construction measured **+0.18% decode** on the three MMA8
+    /// planes (o_proj, Q/K/V, dense MLP) and **-0.42%** on the tied vocabulary
+    /// head, so its sign is plane-dependent and this plane is a fresh
+    /// measurement, not a re-run.
+    ///
+    /// Set `DARKBLOOM_GEMMA4_SLIDE_KV_HALF_DEQUANT=0` to restore the promoted
+    /// bodies and their registration keys byte for byte.
+    private static let kvHalfDequantEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_SLIDE_KV_HALF_DEQUANT"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespaces).lowercased())
+    }()
+
+    private static let kvHalfDequantKey: String = kvHalfDequantEnabled ? "_kvhd1" : ""
+
+    private static let kvHalfDequantPattern: NSRegularExpression? =
+        try? NSRegularExpression(pattern: #"float\((.+?) & 0xfu\)"#)
+
+    /// Applied to a FINISHED body, after every walk literal has already been
+    /// interpolated, so no anchor string anywhere in the derivation chain can
+    /// be disturbed by it. A nil regex or a zero-match body returns the
+    /// incumbent text untouched rather than trapping inside a lazy static.
+    private static func withKvHalfDequant(_ body: String) -> String {
+        guard kvHalfDequantEnabled, let re = kvHalfDequantPattern else { return body }
+        let range = NSRange(body.startIndex..<body.endIndex, in: body)
+        guard re.numberOfMatches(in: body, range: range) > 0 else { return body }
+        return re.stringByReplacingMatches(
+            in: body,
+            range: range,
+            withTemplate: "float(as_type<half>(ushort(0x6400u | ($1 & 0xfu))) - 1024.0h)")
+    }
+
     /// The shipped depth-one ring walk, verbatim.
     private static let residentSlidingWalkDepth1 = """
             uint slot = (start + uint(block)) % uint(N);
@@ -3178,7 +3220,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
 
     private static let portQuantFusedWriteResidentNormRopeKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_v1_ey29_ey32_yp3_ey51_yrp1\(slidingPrefetchKey)",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_v1_ey29_ey32_yp3_ey51_yrp1\(slidingPrefetchKey)\(kvHalfDequantKey)",
             inputNames: [
                 "raw_queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -3186,7 +3228,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 "position_offsets", "rope_log2_base", "write_fence",
             ],
             outputNames: ["out", "fence", "k_out", "v_out"],
-            source: residentNormRopeSource(withORunsum: false),
+            source: withKvHalfDequant(residentNormRopeSource(withORunsum: false)),
             ensureRowContiguous: true
         )
 
@@ -3194,7 +3236,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// fifth output, so the standalone prepass never runs on a sliding layer.
     private static let portQuantFusedWriteResidentNormRopeORunsumKernel:
         MLXFast.MLXFastKernel = MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_ors_v1_ey29_ey32_yp3_ey51_yrp1\(slidingPrefetchKey)",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_ors_v1_ey29_ey32_yp3_ey51_yrp1\(slidingPrefetchKey)\(kvHalfDequantKey)",
             inputNames: [
                 "raw_queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -3202,7 +3244,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 "position_offsets", "rope_log2_base", "write_fence",
             ],
             outputNames: ["out", "fence", "k_out", "v_out", "o_rs"],
-            source: residentNormRopeSource(withORunsum: true),
+            source: withKvHalfDequant(residentNormRopeSource(withORunsum: true)),
             ensureRowContiguous: true
         )
 

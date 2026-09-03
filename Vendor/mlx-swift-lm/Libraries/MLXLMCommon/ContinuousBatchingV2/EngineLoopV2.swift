@@ -317,13 +317,55 @@ public struct CBv2EngineLoopConfig: Sendable {
 
 // MARK: - In-flight step
 
+/// Participant membership for one in-flight step.
+///
+/// The chained decode launch derives its participants from
+/// `plan.assignments`, which assigns each live row exactly once, so the
+/// sequence is already duplicate-free and is already held as an array for
+/// `sampledRows`. `compact` reuses that array value; the hash table the old
+/// code built served only `contains` and `forEach` on a batch-eight cohort.
+/// Every other launch site keeps `hashed`, because it maps a collection that
+/// carries no such uniqueness guarantee.
+enum CBv2ParticipantIndex {
+    case compact([CBv2RequestID])
+    case hashed(Set<CBv2RequestID>)
+
+    /// Default-on. Off restores the `Set(ids)` construction at the chained
+    /// launch site as a same-binary control.
+    static let compactEnabled: Bool = {
+        guard
+            let raw = ProcessInfo.processInfo.environment[
+                "DARKBLOOM_CBV2_COMPACT_INFLIGHT_PARTICIPANTS"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    static func forChainedDecode(_ ids: [CBv2RequestID]) -> CBv2ParticipantIndex {
+        compactEnabled ? .compact(ids) : .hashed(Set(ids))
+    }
+
+    func contains(_ id: CBv2RequestID) -> Bool {
+        switch self {
+        case .compact(let ids): return ids.contains(id)
+        case .hashed(let ids): return ids.contains(id)
+        }
+    }
+
+    func forEach(_ body: (CBv2RequestID) -> Void) {
+        switch self {
+        case .compact(let ids): for id in ids { body(id) }
+        case .hashed(let ids): for id in ids { body(id) }
+        }
+    }
+}
+
 /// One launched-but-not-finalized step. Its sampled tokens are still lazy;
 /// finalization materializes them (the ONE host sync per step, overlapped
 /// with the next step's GPU work when chained).
 final class CBv2InFlightStep {
     /// Every request that computed anything this step (KV release for any of
     /// these must be deferred until finalization — see CONTRACT-ISSUES §4).
-    let participants: Set<CBv2RequestID>
+    let participants: CBv2ParticipantIndex
     /// Rows that sampled a token, in plan order (== row order of
     /// `sampledTokens`).
     let sampledRows: [CBv2RequestID]
@@ -358,8 +400,19 @@ final class CBv2InFlightStep {
     /// the step as a chain base.
     var mtpRound: CBv2MTPRoundInFlight?
 
-    init(
+    convenience init(
         participants: Set<CBv2RequestID>, sampledRows: [CBv2RequestID],
+        sampledTokens: MLXArray?, evalTargets: [MLXArray],
+        wallStartedNanos: UInt64
+    ) {
+        self.init(
+            participants: .hashed(participants), sampledRows: sampledRows,
+            sampledTokens: sampledTokens, evalTargets: evalTargets,
+            wallStartedNanos: wallStartedNanos)
+    }
+
+    init(
+        participants: CBv2ParticipantIndex, sampledRows: [CBv2RequestID],
         sampledTokens: MLXArray?, evalTargets: [MLXArray],
         wallStartedNanos: UInt64
     ) {
@@ -1607,7 +1660,8 @@ public final class EngineLoopV2: @unchecked Sendable {
             CBv2StepProfiler.record("v2.launch.total", seconds: now - buildStart)
         }
         let step = CBv2InFlightStep(
-            participants: Set(ids), sampledRows: ids, sampledTokens: sampled, evalTargets: [],
+            participants: CBv2ParticipantIndex.forChainedDecode(ids), sampledRows: ids,
+            sampledTokens: sampled, evalTargets: [],
             wallStartedNanos: wallStartedNanos)
         if let stepLogprobs { step.logprobSegments = [stepLogprobs] }
         return step
@@ -2134,8 +2188,8 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// token refreshes the decode lease; a confirmed prefill-chunk advance
     /// refreshes the prefill lease.
     private func refreshProgressLeases(_ step: CBv2InFlightStep, now: ContinuousClock.Instant) {
-        for id in step.participants {
-            guard let rec = scheduler.record(for: id) else { continue }
+        step.participants.forEach { id in
+            guard let rec = scheduler.record(for: id) else { return }
             if var lease = leasesByID[id] {
                 lease.recordProgress(
                     now: now,

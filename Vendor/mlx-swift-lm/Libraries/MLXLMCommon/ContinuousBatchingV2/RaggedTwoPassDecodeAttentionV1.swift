@@ -2667,6 +2667,38 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             "[kvq4-kernel] blocks=\(blocks) maxs[0..3]=\(maxs[0..<4]) partial[0..5]=\(partial[0..<6])\n".utf8))
     }
 
+    // Precomputed uniform start vectors for the ranked cohort geometry.
+    // At batch-8 all streams advance in lockstep, so every decode step passes
+    // starts == [s]*8 with 0 <= s < sequenceLength (1024). The table holds one
+    // evaluated [8] UInt32 array per s: immutable after init, lock-free,
+    // zero-alloc on the hot path. Non-uniform starts (never observed in cohort
+    // decode; possible under MTP rectangular probes) fall back to a fresh
+    // allocation, exactly as stock. Keyed on offsets only, never on tokens.
+    nonisolated(unsafe) private static let uniformStarts8: [MLXArray?] = {
+        var table = [MLXArray?](repeating: nil, count: sequenceLength)
+        var toEval: [MLXArray] = []
+        toEval.reserveCapacity(sequenceLength)
+        for s in 0..<sequenceLength {
+            let arr = MLXArray(
+                Array(repeating: UInt32(s), count: batch), [batch])
+            table[s] = arr
+            toEval.append(arr)
+        }
+        eval(toEval)
+        return table
+    }()
+
+    private static func getStartArray(starts: [Int], batch batchParam: Int) -> MLXArray {
+        if batchParam == batch, starts.count == batch,
+            let s0 = starts.first, starts.allSatisfy({ $0 == s0 }),
+            s0 >= 0, s0 < uniformStarts8.count,
+            let hit = uniformStarts8[s0]
+        {
+            return hit
+        }
+        return MLXArray(starts.map(UInt32.init), [batchParam])
+    }
+
     static func attendRingQuant(
         queries: MLXArray,
         mirrors: [MLXArray],
@@ -2690,7 +2722,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             })
         else { return nil }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = getStartArray(starts: starts, batch: batch)
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let passA = portQuantReadKernel(
@@ -2761,7 +2793,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             })
         else { return nil }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = getStartArray(starts: starts, batch: batch)
         let inputs = [queries] + mirrors
             + [startArray, newKeys, newValues, previousWriteFence]
         if q4ResidentMergeEnabled,
@@ -2901,7 +2933,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             starts.count == batch,
             starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength })
         else { return nil }
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = getStartArray(starts: starts, batch: batch)
         return attend(
             passAKernel: ringPassAKernel, queries: queries, keys: keys, values: values,
             extraInputs: [startArray], scale: scale)
@@ -2954,7 +2986,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             else { return nil }
         }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = getStartArray(starts: starts, batch: batch)
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let paired = gqaPairedPassAEnabled && gqa == 2
@@ -5127,6 +5159,27 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    private struct CachedD512Params {
+        var params: [UInt32] = []
+        var array: MLXArray?
+    }
+    nonisolated(unsafe) private static var cachedD512Params = CachedD512Params()
+    private static let d512ParamsLock = NSLock()
+
+    private static func getD512ParamsArray(params: [UInt32]) -> MLXArray {
+        d512ParamsLock.lock()
+        if cachedD512Params.params == params, let arr = cachedD512Params.array {
+            d512ParamsLock.unlock()
+            return arr
+        }
+        d512ParamsLock.unlock()
+        let arr = MLXArray(params)
+        d512ParamsLock.lock()
+        cachedD512Params = CachedD512Params(params: params, array: arr)
+        d512ParamsLock.unlock()
+        return arr
+    }
+
     /// WRITE-022: the fused append as its own 32 KiB dispatch placed before
     /// the STOCK three-kernel chain (byte-for-byte dispatch 1-3), fence-
     /// ordered. Removes the same 80 copy-on-write appends as the v2 fold
@@ -5194,7 +5247,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             valueBuffers.append(state[1])
             params.append(UInt32(state[0].dim(2)))
         }
-        let paramsArray = MLXArray(params)
+        let paramsArray = getD512ParamsArray(params: params)
 
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)

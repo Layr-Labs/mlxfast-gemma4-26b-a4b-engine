@@ -6616,3 +6616,5 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
 
 // Ranked resample marker 3: this archive is a further ranked sample of the tree carried
 // by the preceding ranked submission of this content apart from any rotation item declared in its note.
+// Candidate EXP-002: decode attention strided walk loop-peeling and branch elimination
+

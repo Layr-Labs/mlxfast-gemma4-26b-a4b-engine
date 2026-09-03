@@ -536,21 +536,27 @@ enum CBv2PrefillSoftmaxVecV1 {
         ensureRowContiguous: true
     )
 
-    nonisolated(unsafe) private static var memoizedParams: [Int: MLXArray] = [:]
-    private static let paramsLock = NSLock()
+    nonisolated(unsafe) private static let precomputedParams: [Int: MLXArray] = {
+        var dict: [Int: MLXArray] = [:]
+        for size in stride(from: 4, through: maxKeyLength, by: 4) {
+            let tg = ((size + 3) / 4 + 31) / 32 * 32
+            if tg > 0 && tg <= 1024 {
+                let numSimdgroups = tg / 32
+                let arr = MLXArray([UInt32(size), UInt32(numSimdgroups)])
+                eval(arr)
+                dict[size] = arr
+            }
+        }
+        return dict
+    }()
 
+    @inline(__always)
     private static func getParams(axisSize: Int, numSimdgroups: Int) -> MLXArray {
-        paramsLock.lock()
-        if let hit = memoizedParams[axisSize] {
-            paramsLock.unlock()
+        if let hit = precomputedParams[axisSize] {
             return hit
         }
-        paramsLock.unlock()
         let arr = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
         eval(arr)
-        paramsLock.lock()
-        memoizedParams[axisSize] = arr
-        paramsLock.unlock()
         return arr
     }
 

@@ -1067,16 +1067,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         stateLock.unlock()
     }
 
-    /// Mark EVERY live request for cancellation, applied at the next step
-    /// boundary exactly like `requestCancel`. Used by the fast-ack shutdown
-    /// so a detached drain retires at the next boundary instead of running
-    /// a still-live cohort to its token ceiling or to `shutdownTimeout`.
-    func requestCancelAllLive() {
-        stateLock.lock()
-        pendingCancels.formUnion(streams.keys)
-        stateLock.unlock()
-    }
-
     func setPaused(_ id: CBv2RequestID, _ paused: Bool) {
         engineQueue.async { [self] in
             let now = config.clock.now()

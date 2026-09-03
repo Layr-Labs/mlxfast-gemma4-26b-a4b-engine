@@ -1960,6 +1960,36 @@ private class Gemma4Attention: Module {
             rsTable: rsTable)
     }
 
+    /// QKV-VJOIN. Q, K and V read the same activation at decode, so all
+    /// three planes concatenate into one dispatch (sliding layers only —
+    /// full-attention layers are k_eq_v and ship no v_proj). Nil whenever
+    /// the shapes, the quantization parameters or the arm's switch say
+    /// otherwise; the caller then keeps the fused Q|K dispatch plus the
+    /// separate V tierProjection.
+    /// MMA-RS-001: `rsTable` is the layer input's shared run-sum table,
+    /// indexed by activation row and 64-group of K only — never by N — so
+    /// the joined dispatch reads the same entries the separate dispatches
+    /// would.
+    @inline(__always)
+    private func fusedQKVProjection(
+        _ x: MLXArray, rsTable: MLXArray? = nil
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard let q = qProj as? QuantizedLinear, q.bias == nil,
+            let kProj, let k = kProj as? QuantizedLinear, k.bias == nil,
+            let vProj, let v = vProj as? QuantizedLinear, v.bias == nil,
+            q.groupSize == k.groupSize, q.bits == k.bits, q.mode == k.mode,
+            k.groupSize == v.groupSize, k.bits == v.bits, k.mode == v.mode
+        else { return nil }
+        return CBv2AttentionQKVMMA8V1.fusedQKVMatmul(
+            x: x,
+            qWeight: q.weight, qScales: q.scales, qBiases: q.biases,
+            kWeight: k.weight, kScales: k.scales, kBiases: k.biases,
+            vWeight: v.weight, vScales: v.scales, vBiases: v.biases,
+            groupSize: q.groupSize, bits: q.bits, mode: q.mode,
+            cacheKey: ObjectIdentifier(q),
+            rsTable: rsTable)
+    }
+
     /// Exact B8/L1 attention output projection. Sliding/full K widths select
     /// the tight affine4 fast-QMV replica; every other path keeps the layer.
     /// MMA-RS-001: the projection input's run-sum table is computed here (the
@@ -2199,23 +2229,33 @@ private class Gemma4Attention: Module {
         // QKFUSE-001: `queryInput === x` unless last-query prefill narrowed it,
         // which is the only case where Q and K cannot share a dispatch.
         // QKFUSE-SLIDING: sliding layers (vProj != nil) take the fused Q|K
-        // dispatch too; V keeps its separate tierProjection below, and the
-        // K-eq-V structure is untouched (keyValueShared stays vProj == nil).
-        // `DARKBLOOM_GEMMA4_QKFUSE_SLIDING=0` restores the vProj == nil gate.
-        // The relaxation is only reachable here; fusedQKProjection's own
-        // admission still requires the exact B=8/L=1 decode shape, so
-        // prefill, last-query, shared-KV and other batch widths keep their
-        // incumbent dispatches.
-        // MMA-RS-001: the fused Q|K dispatch consumes the shared run-sum
+        // dispatch too, and the K-eq-V structure is untouched (keyValueShared
+        // stays vProj == nil). `DARKBLOOM_GEMMA4_QKFUSE_SLIDING=0` restores
+        // the vProj == nil gate.
+        // QKV-VJOIN: sliding layers with a vProj join V into the same fused
+        // dispatch (one encoder instead of two per layer). The kernel admits
+        // only the exact sliding decode geometry and computes each output
+        // column from that column's own plane row, so the three halves are
+        // bit-identical to the separate dispatches.
+        // `DARKBLOOM_GEMMA4_QKV_VJOIN=0` restores the fused Q|K dispatch plus
+        // the separate V tierProjection; either arm off, or any guard miss,
+        // falls back to the arm below. Prefill, last-query, shared-KV and
+        // other batch widths keep their incumbent dispatches.
+        // MMA-RS-001: the fused dispatches consume the shared run-sum
         // table — the table is per activation row and per 64-group of K,
         // independent of N, so the concatenated-N dispatch reads the same
-        // entries the separate Q and K dispatches would.
+        // entries the separate Q, K and V dispatches would.
+        let fusedQKV: (MLXArray, MLXArray, MLXArray)? =
+            (lastQueryCache == nil && !usesSharedKV && vProj != nil
+                && gemma4QKFuseSlidingEnabled)
+                ? fusedQKVProjection(x, rsTable: qkvRunsumTable) : nil
         let fusedQK: (MLXArray, MLXArray)? =
-            (lastQueryCache == nil && !usesSharedKV
+            (fusedQKV == nil && lastQueryCache == nil && !usesSharedKV
                 && (vProj == nil || gemma4QKFuseSlidingEnabled))
-            ? fusedQKProjection(x, rsTable: qkvRunsumTable) : nil
+                ? fusedQKProjection(x, rsTable: qkvRunsumTable) : nil
         let queryRaw = (
-            fusedQK?.0 ?? tierProjection(qProj, queryInput, rsTable: qkvRunsumTable)
+            fusedQKV?.0 ?? fusedQK?.0
+                ?? tierProjection(qProj, queryInput, rsTable: qkvRunsumTable)
         ).reshaped(B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
@@ -2279,11 +2319,13 @@ private class Gemma4Attention: Module {
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
         let kRaw = (
-            fusedQK?.1 ?? tierProjection(kProj, x, rsTable: qkvRunsumTable)
+            fusedQKV?.1 ?? fusedQK?.1
+                ?? tierProjection(kProj, x, rsTable: qkvRunsumTable)
         ).reshaped(B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
         if let vProj {
-            vRaw = tierProjection(vProj, x, rsTable: qkvRunsumTable)
+            vRaw = (fusedQKV?.2
+                ?? tierProjection(vProj, x, rsTable: qkvRunsumTable))
                 .reshaped(B, L, nKvHeads, effectiveHeadDim)
         } else {
             vRaw = kRaw
@@ -4276,10 +4318,57 @@ private class Gemma4Experts: Module {
 
 // MARK: - MLP
 
+/// Primary joined storage for the dense MLP's two affine-8 input projections.
+/// The bound gate/up parameters are zero-copy row slices, while the pinned B8
+/// decode path can submit the full 4,224-column plane in one QMV dispatch.
+private final class Gemma4DenseGateUpStorage {
+    let weight: MLXArray
+    let scales: MLXArray
+    let biases: MLXArray
+    let gateWeight: MLXArray
+    let gateScales: MLXArray
+    let gateBiases: MLXArray
+    let upWeight: MLXArray
+    let upScales: MLXArray
+    let upBiases: MLXArray
+
+    init?(
+        gateWeight: MLXArray, gateScales: MLXArray, gateBiases: MLXArray,
+        upWeight: MLXArray, upScales: MLXArray, upBiases: MLXArray
+    ) {
+        let n = 2112
+        guard gateWeight.shape == [n, 704], upWeight.shape == [n, 704],
+            gateScales.shape == [n, 44], upScales.shape == [n, 44],
+            gateBiases.shape == [n, 44], upBiases.shape == [n, 44],
+            gateWeight.dtype == .uint32, upWeight.dtype == .uint32,
+            gateScales.dtype == .bfloat16, upScales.dtype == .bfloat16,
+            gateBiases.dtype == .bfloat16, upBiases.dtype == .bfloat16
+        else { return nil }
+
+        weight = concatenated([gateWeight, upWeight], axis: 0)
+        scales = concatenated([gateScales, upScales], axis: 0)
+        biases = concatenated([gateBiases, upBiases], axis: 0)
+        self.gateWeight = weight[..<n]
+        self.gateScales = scales[..<n]
+        self.gateBiases = biases[..<n]
+        self.upWeight = weight[n...]
+        self.upScales = scales[n...]
+        self.upBiases = biases[n...]
+    }
+}
+
+private let gemma4DenseGateUpJoinEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DENSE_GATEUP_JOIN"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 private class Gemma4MLP: Module {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
+    private var fusedGateUpStorage: Gemma4DenseGateUpStorage?
 
     init(_ config: Gemma4TextConfiguration, layerIdx: Int) {
         let isKvSharedLayer = config.layerUsesSharedKV(layerIdx: layerIdx)
@@ -4291,6 +4380,10 @@ private class Gemma4MLP: Module {
         self._upProj.wrappedValue = Linear(config.hiddenSize, intermediateSize, bias: false)
 
         super.init()
+    }
+
+    fileprivate func bindFusedGateUpStorage(_ storage: Gemma4DenseGateUpStorage) {
+        fusedGateUpStorage = storage
     }
 
     /// DMLP-001: route only the pinned batch-eight/decode-one affine-8 dense
@@ -4356,6 +4449,36 @@ private class Gemma4MLP: Module {
         _ x: MLXArray, _ activationSums: CBv2DenseMLPQMVV1.ActivationSums?
     ) -> MLXArray {
         denseProjection(upProj, x, activationSums: activationSums)
+    }
+
+    /// One decode QMV over the joined gate|up plane. The returned halves are
+    /// views with the exact shapes and bytes produced by the two split calls.
+    fileprivate func zipGateUp(
+        _ x: MLXArray, _ activationSums: CBv2DenseMLPQMVV1.ActivationSums?
+    ) -> (gate: MLXArray, up: MLXArray)? {
+        guard gemma4DenseGateUpJoinEnabled,
+            let storage = fusedGateUpStorage,
+            let gate = gateProj as? QuantizedLinear,
+            let up = upProj as? QuantizedLinear,
+            gate.bias == nil, up.bias == nil,
+            gate.groupSize == 64, up.groupSize == gate.groupSize,
+            gate.bits == 8, up.bits == gate.bits,
+            gate.mode == .affine, up.mode == gate.mode,
+            let joined = CBv2DenseMLPQMVV1.matmul(
+                x: x,
+                weight: storage.weight,
+                scales: storage.scales,
+                biases: storage.biases,
+                groupSize: gate.groupSize,
+                bits: gate.bits,
+                mode: gate.mode,
+                activationSums: activationSums)
+        else { return nil }
+        CBv2EngageMark.once("dense-gateup-join")
+        return (
+            joined[.ellipsis, ..<2112],
+            joined[.ellipsis, 2112...]
+        )
     }
 
     fileprivate func zipDown(_ activated: MLXArray) -> MLXArray {
@@ -4513,8 +4636,14 @@ private enum Gemma4ZipRouterV1 {
         let expertScores = router.zipScores(
             MLX.depends(input: normed, dependencies: [sums.dependencyHandle]))
         let denseIn = MLX.depends(input: n1, dependencies: [normed])
-        let gate = mlp.zipGate(denseIn, sums)
-        let up = mlp.zipUp(denseIn, sums)
+        let gate: MLXArray
+        let up: MLXArray
+        if let joined = mlp.zipGateUp(denseIn, sums) {
+            (gate, up) = joined
+        } else {
+            gate = mlp.zipGate(denseIn, sums)
+            up = mlp.zipUp(denseIn, sums)
+        }
 
         // Stage 3: the dense GeLU product, which the router has no partner
         // for -- the argPartition is deliberately NOT paired with it.
@@ -6257,8 +6386,41 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
             sanitized[k] = v
         }
+        fuseDenseGateUpStorage(&sanitized)
         fuseExpertGateUpStorage(&sanitized)
         return sanitized
+    }
+
+    /// Make each dense layer's joined gate|up plane its primary storage.
+    /// Split module parameters remain zero-copy row views, while the exact B8
+    /// decode path can issue one 4,224-column QMV instead of two 2,112-column
+    /// launches. Any shape or dtype mismatch leaves that layer untouched.
+    private func fuseDenseGateUpStorage(_ sanitized: inout [String: MLXArray]) {
+        guard gemma4DenseGateUpJoinEnabled else { return }
+        let gateWeightSuffix = ".mlp.gate_proj.weight"
+        for key in sanitized.keys where key.hasSuffix(gateWeightSuffix) {
+            let base = String(key.dropLast(gateWeightSuffix.count))
+            guard let layerIdx = extractLayerIdx(from: key),
+                layerIdx < model.layers.count,
+                let gateWeight = sanitized["\(base).mlp.gate_proj.weight"],
+                let gateScales = sanitized["\(base).mlp.gate_proj.scales"],
+                let gateBiases = sanitized["\(base).mlp.gate_proj.biases"],
+                let upWeight = sanitized["\(base).mlp.up_proj.weight"],
+                let upScales = sanitized["\(base).mlp.up_proj.scales"],
+                let upBiases = sanitized["\(base).mlp.up_proj.biases"],
+                let storage = Gemma4DenseGateUpStorage(
+                    gateWeight: gateWeight, gateScales: gateScales,
+                    gateBiases: gateBiases, upWeight: upWeight,
+                    upScales: upScales, upBiases: upBiases)
+            else { continue }
+            sanitized["\(base).mlp.gate_proj.weight"] = storage.gateWeight
+            sanitized["\(base).mlp.gate_proj.scales"] = storage.gateScales
+            sanitized["\(base).mlp.gate_proj.biases"] = storage.gateBiases
+            sanitized["\(base).mlp.up_proj.weight"] = storage.upWeight
+            sanitized["\(base).mlp.up_proj.scales"] = storage.upScales
+            sanitized["\(base).mlp.up_proj.biases"] = storage.upBiases
+            model.layers[layerIdx].mlp.bindFusedGateUpStorage(storage)
+        }
     }
 
     /// GATEUP-FUSE-PREFILL: make the concatenated gate|up right-hand side the

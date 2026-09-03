@@ -9,6 +9,8 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+// Yukon executable-equivalent frontier sample: delordemm1 / e8f / de1.
+
 // MARK: - vMLX decode hot-path helpers (ported from osaurus/main Gemma4Text)
 //
 // File-private, self-contained compiled fusions. They do NOT depend on the

@@ -198,6 +198,93 @@ enum CBv2ComposedPrefillSDPAV1 {
         return bias
     }
 
+    /// PREFILL-MASK-EAGER-025. The bias table above is memoized, but every
+    /// miss pays TWO synchronous flushes of its own -- `eval(padded)` and
+    /// `eval(bias)` -- and a prompt chunk misses once per q-block, so the
+    /// first attention call of a run walks the whole `(L, kL)` ladder one
+    /// stall at a time INSIDE the timed prefill window. The ladder is a pure
+    /// function of the block geometry, which the caller already computes
+    /// before its block loop starts, so the whole ladder can be built with
+    /// two flushes instead of two per rung.
+    ///
+    /// Nothing about a cached entry changes. Each rung is built by exactly
+    /// the statements `causalMaskBias` runs for it, in the same order, and
+    /// the same padded-storage-sliced view is stored under the same key, so a
+    /// later `causalMaskBias(L:kL:)` returns an identical array and the
+    /// `kL + 1` row stride the fused GEMM keys on is preserved. Rungs already
+    /// present are skipped and the lazy path stays exactly as it is for
+    /// anything this does not cover.
+    ///
+    /// Kill switch: `DARKBLOOM_CBV2_PREFILL_MASK_EAGER=0`.
+    static let maskEagerEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PREFILL_MASK_EAGER"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    static func warmCausalMaskBias(_ pairs: [(L: Int, kL: Int)]) {
+        guard enabled, maskFuseEnabled, maskEagerEnabled, !pairs.isEmpty
+        else { return }
+        var wanted: [(key: Int, L: Int, kL: Int)] = []
+        var seen = Set<Int>()
+        maskCacheLock.lock()
+        let held = maskBiasCache.count
+        for pair in pairs {
+            // Same admission the composed path itself applies: a block it
+            // would refuse must not seed the table.
+            guard pair.L > 8, pair.kL >= pair.L else { continue }
+            let key = pair.L &* 1_000_003 &+ pair.kL
+            guard maskBiasCache[key] == nil, seen.insert(key).inserted else {
+                continue
+            }
+            wanted.append((key, pair.L, pair.kL))
+        }
+        maskCacheLock.unlock()
+        // An unusual geometry that would trip the table's wholesale-drop
+        // bound is left to the lazy path rather than evicting live entries.
+        guard !wanted.isEmpty, held + wanted.count < maxCachedMasks else {
+            return
+        }
+
+        var padded: [MLXArray] = []
+        padded.reserveCapacity(wanted.count)
+        for rung in wanted {
+            if maskSynthEnabled {
+                let qIndices = MLXArray(Int32(rung.kL - rung.L) ..< Int32(rung.kL))
+                    .expandedDimensions(axis: 1)
+                let kIndices = MLXArray(Int32(0) ..< Int32(rung.kL + 1))
+                    .expandedDimensions(axis: 0)
+                padded.append(
+                    MLX.where(
+                        qIndices .>= kIndices,
+                        bfloat16NegativeZeroScalar,
+                        bfloat16LowestScalar))
+            } else {
+                padded.append(
+                    MLX.where(
+                        causalMask(L: rung.L, kL: rung.kL),
+                        bfloat16NegativeZeroScalar,
+                        bfloat16LowestScalar))
+            }
+        }
+        eval(padded)
+        var biases: [MLXArray] = []
+        biases.reserveCapacity(wanted.count)
+        for (index, rung) in wanted.enumerated() {
+            biases.append(
+                maskSynthEnabled ? padded[index][0..., 0 ..< rung.kL] : padded[index])
+        }
+        eval(biases)
+        if maskSynthEnabled { CBv2EngageMark.once("prefill-mask-synth-bias") }
+        CBv2EngageMark.once("prefill-mask-eager")
+        maskCacheLock.lock()
+        for (index, rung) in wanted.enumerated() {
+            maskBiasCache[rung.key] = biases[index]
+        }
+        maskCacheLock.unlock()
+    }
+
     /// Head dims for which MLX has a fused kernel; those calls must keep
     /// taking it, because the fused kernel is NOT the fallback graph.
     @inline(__always)

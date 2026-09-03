@@ -1624,6 +1624,25 @@ enum CBv2AttentionV1 {
                 queries: queries, keys: keys, values: values,
                 scale: scale, sinks: sinks, softcap: softcap)
             : nil
+        // PREFILL-MASK-EAGER-025: the loop below asks for one causal mask
+        // bias per q-block and every miss stalls the window twice. The whole
+        // ladder is already determined here by the same bounds the loop
+        // uses, so hand it over and let the table be built in one pass.
+        // Span blocks take `attendSpanSlice`, which never reads this table.
+        if queryPlane != nil, spanContext == nil {
+            var ladder: [(L: Int, kL: Int)] = []
+            ladder.reserveCapacity((newTokenCount + blockSize - 1) / blockSize)
+            var probe = 0
+            while probe < newTokenCount {
+                let count = min(blockSize, newTokenCount - probe)
+                let bounds = queryBlockBounds(
+                    historyCount: historyCount, offset: probe, count: count,
+                    window: window)
+                ladder.append((L: count, kL: bounds.visibleEnd - bounds.visibleStart))
+                probe += count
+            }
+            CBv2ComposedPrefillSDPAV1.warmCausalMaskBias(ladder)
+        }
         var offset = 0
         while offset < newTokenCount {
             let count = min(blockSize, newTokenCount - offset)

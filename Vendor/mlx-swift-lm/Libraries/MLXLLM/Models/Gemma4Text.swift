@@ -6261,12 +6261,10 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         return sanitized
     }
 
-    /// GATEUP-FUSE-PREFILL: make the concatenated gate|up right-hand side the
-    /// primary storage of every routed-expert layer at load. The layer's
-    /// `gate_proj` / `up_proj` weight, scales and biases become zero-copy row
-    /// slices of that storage (see ``SwitchGateUpFusedStorage``), so the bound
-    /// split parameters read the identical bytes with no second copy, and the
-    /// sorted prefill plane dispatches one gather over the whole storage.
+    /// GATEUP-GEGLU-PREFILL: build the paired gate/up right-hand side used by
+    /// the sorted prefill gather. The split projection arrays remain bound for
+    /// decode and speculative verification; the opaque fused storage supplies
+    /// the additional paired copy whose gathered-QMM store closes GeGLU.
     /// Layers or checkpoints outside the exact production geometry, and the
     /// arm's off-state, leave the loaded split arrays untouched.
     private func fuseExpertGateUpStorage(_ sanitized: inout [String: MLXArray]) {

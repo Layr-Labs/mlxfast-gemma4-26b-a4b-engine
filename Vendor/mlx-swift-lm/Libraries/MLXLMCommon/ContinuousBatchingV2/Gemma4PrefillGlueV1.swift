@@ -796,7 +796,7 @@ public enum Gemma4PrefillGlueV1 {
     /// same `[tokens, hidden]` expert result. Produce each reduced expert value
     /// in the tail thread that consumes it, removing the intermediate tensor.
     private static let expertTailChainKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_prefill_expert_unsort_tail_chain_2816_unroll_v2",
+        name: "gemma4_prefill_expert_unsort_tail_chain_2816_tg8_vec4_v4",
         inputNames: [
             "sorted", "inverse_order", "route_weights", "h1",
             "w1", "w2", "w3", "res2", "s", "wn",
@@ -806,6 +806,8 @@ public enum Gemma4PrefillGlueV1 {
             threadgroup float local_sums_a[32];
             threadgroup float local_sums_b[32];
             threadgroup float local_inv2[2];
+            threadgroup uint tg_inv_orders[8];
+            threadgroup float tg_r_weights[8];
 
             const uint row = threadgroup_position_in_grid.y;
             const uint lid = thread_position_in_threadgroup.x;
@@ -814,22 +816,36 @@ public enum Gemma4PrefillGlueV1 {
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
             const uint assignment_base = row * 8;
 
+            if (lid < 8) {
+                tg_inv_orders[lid] = (uint)inverse_order[assignment_base + lid];
+                tg_r_weights[lid] = (float)route_weights[assignment_base + lid];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
             float av[GLUE_NREADS];
             float bv[GLUE_NREADS];
+            const vec<T, 4> h1_v0 = *((const device vec<T, 4>*)(h1 + base));
+            const vec<T, 4> h1_v1 = *((const device vec<T, 4>*)(h1 + base + 4));
             #pragma clang loop unroll(full)
-            for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint feature = lid * GLUE_NREADS + i;
-                av[i] = static_cast<float>(h1[base + i]);
-                T accumulator = (T)0;
-                for (uint slot = 0; slot < 8; ++slot) {
-                    const uint assignment = assignment_base + slot;
-                    const uint sorted_row = (uint)inverse_order[assignment];
-                    const T weighted = (T)(
-                        (float)sorted[size_t(sorted_row) * GLUE_AXIS + feature]
-                        * (float)route_weights[assignment]);
-                    accumulator = accumulator + weighted;
+            for (int i = 0; i < 4; i++) {
+                av[i] = static_cast<float>(h1_v0[i]);
+                av[i + 4] = static_cast<float>(h1_v1[i]);
+                bv[i] = 0.0f;
+                bv[i + 4] = 0.0f;
+            }
+
+            #pragma clang loop unroll(full)
+            for (uint slot = 0; slot < 8; ++slot) {
+                const uint sorted_row = tg_inv_orders[slot];
+                const float rw = tg_r_weights[slot];
+                const size_t s_base = size_t(sorted_row) * GLUE_AXIS + lid * GLUE_NREADS;
+                const vec<T, 4> s_v0 = *((const device vec<T, 4>*)(sorted + s_base));
+                const vec<T, 4> s_v1 = *((const device vec<T, 4>*)(sorted + s_base + 4));
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < 4; i++) {
+                    bv[i] += static_cast<float>(s_v0[i]) * rw;
+                    bv[i + 4] += static_cast<float>(s_v1[i]) * rw;
                 }
-                bv[i] = static_cast<float>(accumulator);
             }
 
             float inv_a = 0;

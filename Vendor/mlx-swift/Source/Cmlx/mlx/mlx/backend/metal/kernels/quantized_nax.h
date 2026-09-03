@@ -483,9 +483,9 @@ qouter(const thread uint8_t* w, U x, U scale, U bias, thread U* result) {
   }
 }
 
-template <typename U, int N, int bits>
+template <typename U, int N, int bits, typename DstU>
 inline void
-dequantize(const device uint8_t* w, U scale, U bias, threadgroup U* w_local) {
+dequantize(const device uint8_t* w, U scale, U bias, DstU w_local) {
   static_assert(
       bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
           bits == 8,
@@ -671,6 +671,79 @@ struct QuantizedBlockLoader {
     }
   }
 
+  // -- Software-pipeline producer helpers (double-buffered staging) -------
+  // Stage 1 (prefetch_*): read and dequantize a tile into per-thread
+  // registers. Touches only device memory and thread-local storage, so it
+  // runs overlapped with the consumer (MMA) phase without any barrier. The
+  // dequantize expressions and their per-element order match load_unsafe /
+  // load_safe exactly, so the staged values are bit-identical.
+  MLX_MTL_CONST short kRegsPerThread = n_reads * pack_factor;
+
+  thread T regs[kRegsPerThread];
+
+  void prefetch_unsafe() {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+
+    T scale = *scales;
+    T bias = *biases;
+    for (int i = 0; i < n_reads; i++) {
+      dequantize<T, pack_factor, bits>(
+          src + i * bytes_per_pack, scale, bias, regs + i * pack_factor);
+    }
+  }
+
+  void prefetch_safe(short2 src_tile_dim) {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+
+    if (reduction_dim == 1 && bi >= src_tile_dim.x) {
+      for (int i = 0; i < n_reads * pack_factor; i++) {
+        regs[i] = T(0);
+      }
+      return;
+    }
+
+    if (reduction_dim == 0 && bi >= src_tile_dim.y) {
+      for (int i = 0; i < n_reads * pack_factor; i++) {
+        regs[i] = T(0);
+      }
+      return;
+    }
+
+    T scale = *scales;
+    T bias = *biases;
+    for (int i = 0; i < n_reads; i++) {
+      dequantize<T, pack_factor, bits>(
+          src + i * bytes_per_pack, scale, bias, regs + i * pack_factor);
+    }
+  }
+
+  // Stage 2 (store_regs): copy the staged tile from registers into the
+  // threadgroup staging buffer. Must run strictly between two
+  // threadgroup_barriers -- the frontier single-buffer kernel's store
+  // placement: after every consumer has finished its MMA reads of the
+  // target buffer (two iterations earlier) and before any consumer starts
+  // reading the freshly staged values. Writes exactly the cells
+  // load_unsafe / load_safe would write, with identical values.
+  void store_regs() {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+    for (int i = 0; i < n_reads * pack_factor; i++) {
+      dst[i] = regs[i];
+    }
+  }
+
+  // Retarget the threadgroup destination by delta elements. Used by the
+  // software-pipelined kernels to alternate the staging buffer between
+  // tiles; the device-side source walk is unaffected.
+  void shift_dst(const int delta) {
+    dst += delta;
+  }
+
   void next() {
     src += tile_stride;
     if (reduction_dim == 1) {
@@ -811,6 +884,82 @@ struct QuantizedBlockLoader<
     }
   }
 
+  // -- Software-pipeline producer helpers (double-buffered staging) -------
+  // Stage 1 (prefetch_*): read and dequantize a tile into per-thread
+  // registers. Touches only device memory and thread-local storage, so it
+  // runs overlapped with the consumer (MMA) phase without any barrier. The
+  // dequantize expressions and their per-element order match load_unsafe /
+  // load_safe exactly, so the staged values are bit-identical.
+  MLX_MTL_CONST short kRegsPerThread = n_reads * pack_factor;
+
+  thread T regs[kRegsPerThread];
+
+  void prefetch_unsafe() {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+
+    T scale = *scales;
+    T bias = *biases;
+    for (int i = 0; i < n_reads; i++) {
+      dequantize<T, pack_factor, bits>(
+          src + i * bytes_per_pack, scale, bias, regs + i * pack_factor);
+    }
+  }
+
+  void prefetch_safe(short2 src_tile_dim) {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+
+    if (reduction_dim == 1 && bi >= src_tile_dim.x) {
+      for (int i = 0; i < n_reads * pack_factor; i++) {
+        regs[i] = T(0);
+      }
+      return;
+    }
+
+    if (reduction_dim == 0 && bi >= src_tile_dim.y) {
+      for (int i = 0; i < n_reads * pack_factor; i++) {
+        regs[i] = T(0);
+      }
+      return;
+    }
+
+    T scale = *scales;
+    T bias = *biases;
+    for (int i = 0; i < n_reads; i++) {
+      dequantize<T, pack_factor, bits>(
+          (device uint8_t*)(src + i * bytes_per_pack),
+          scale,
+          bias,
+          regs + i * pack_factor);
+    }
+  }
+
+  // Stage 2 (store_regs): copy the staged tile from registers into the
+  // threadgroup staging buffer. Must run strictly between two
+  // threadgroup_barriers -- the frontier single-buffer kernel's store
+  // placement: after every consumer has finished its MMA reads of the
+  // target buffer (two iterations earlier) and before any consumer starts
+  // reading the freshly staged values. Writes exactly the cells
+  // load_unsafe / load_safe would write, with identical values.
+  void store_regs() {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+    for (int i = 0; i < n_reads * pack_factor; i++) {
+      dst[i] = regs[i];
+    }
+  }
+
+  // Retarget the threadgroup destination by delta elements. Used by the
+  // software-pipelined kernels to alternate the staging buffer between
+  // tiles; the device-side source walk is unaffected.
+  void shift_dst(const int delta) {
+    dst += delta;
+  }
+
   void next() {
     src += tile_stride;
     if (reduction_dim == 1) {
@@ -925,38 +1074,6 @@ METAL_FUNC void adjust_matrix_offsets(
   y += tid.z * output_stride;
 }
 
-// DARKBLOOM GEMMA4 NAX QMM-T ROW-STRIP TILING.
-// qmm_t_nax_tgp_impl covers a BM x BN output tile with WM x WN simdgroups.
-// The launch shape is fixed by the host (32, WN, WM) and the host is not
-// editable, so the threadgroup is always 4 simdgroups over a 64 x 64 tile.
-// Stock splits that tile 2 x 2, so each simdgroup owns 32 rows x 32 cols and
-// the two simdgroups that share a row band each fetch the SAME 32 rows of the
-// activation operand from device memory: A is read twice per threadgroup per
-// K step. This constant instead lays the same 4 simdgroups out as 4 row
-// strips of 16 rows x 64 cols. The strips are disjoint in M, so every A
-// fragment is fetched exactly once, and the B operand -- which already lives
-// in threadgroup memory as Ws -- is read wider instead.
-//
-// Nothing about the K loop moves. BK, SK and TK are untouched, the k and kk1
-// loops keep their bounds and their order, and every output element still
-// accumulates over exactly the same k values in exactly the same sequence.
-// Only which simdgroup owns an element, and how the owner's fragments are
-// shaped, change. The MMA op count per threadgroup is invariant as well:
-// stock issues WM*WN * (TM * TN/2 * TK) = 4 * (2 * 1 * 2) = 16 ops per kk1
-// step, the strip layout issues 4 * (1 * 2 * 2) = 16. Both shapes enter the
-// same TN-even branch of tile_matmad_nax, so the per-element fragment
-// accumulation chain is instruction-for-instruction the same.
-//
-// The kernel's template parameters, and therefore every kernel-name string
-// the host builds, are untouched: BM, BN, BK, WM and WN all keep their
-// values and only the interior mapping is re-derived from them.
-//
-// Kill switch: build with -DDARKBLOOM_GEMMA4_NAX_TILING=0 and SGM/SGN fold
-// back to WM/WN, which reproduces the shipped expressions byte for byte.
-#ifndef DARKBLOOM_GEMMA4_NAX_TILING
-#define DARKBLOOM_GEMMA4_NAX_TILING 1
-#endif
-
 template <
     typename T,
     const int group_size,
@@ -1018,29 +1135,16 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
   // Make the weight loader
   loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
 
-  // Simdgroup grid over the BM x BN tile. Stock is WM x WN; the row-strip
-  // layout stacks the same WM*WN simdgroups in the row direction only, so
-  // no two of them share a row band. See the note on the enable above.
-  constexpr int SGM = (DARKBLOOM_GEMMA4_NAX_TILING != 0) ? (WM * WN) : WM;
-  constexpr int SGN = (DARKBLOOM_GEMMA4_NAX_TILING != 0) ? 1 : WN;
-  static_assert(SGM * SGN == WM * WN, "simdgroup count must be preserved");
-  static_assert(BM % (SGM * 16) == 0, "row strip must be a fragment multiple");
-  static_assert(BN % (SGN * 16) == 0, "col strip must be a fragment multiple");
-
-  constexpr short SM = BM / SGM;
-  constexpr short SN = BN / SGN;
+  constexpr short SM = BM / WM;
+  constexpr short SN = BN / WN;
   constexpr short SK = 32;
 
   constexpr short TM = SM / 16;
   constexpr short TN = SN / 16;
   constexpr short TK = SK / 16;
 
-  // tile_matmad_nax has no branch for an odd TN greater than one; it would
-  // silently emit no MMA at all. Refuse to compile such a layout.
-  static_assert(TN == 1 || TN % 2 == 0, "TN must be 1 or even for NAX MMA");
-
-  const short tm = SM * (simd_gid / SGN);
-  const short tn = SN * (simd_gid % SGN);
+  const short tm = SM * (simd_gid / WN);
+  const short tn = SN * (simd_gid % WN);
 
   constexpr bool transpose_a = false;
   constexpr bool transpose_b = true;
@@ -1062,15 +1166,44 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
 
   dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
     dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
-      for (int k = 0; k < K; k += BK) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+      // Software-pipelined (double-buffered) weight staging. Each weight
+      // tile is staged in two phases: (1) a per-thread device read +
+      // dequantize into registers (prefetch_*: no threadgroup traffic, so
+      // it overlaps the consumer MMA below without a barrier), then (2) a
+      // threadgroup copy (store_regs) placed strictly between two
+      // threadgroup_barriers -- exactly the frontier single-buffer
+      // kernel's store placement. Every buffer has one barrier per phase
+      // transition: writer -> reader is the barrier after the store,
+      // reader -> writer (two iterations later) is the barrier after the
+      // MMA. The MMA accumulation (Dtile/Atile/Btile sequence below) and
+      // the dequantize arithmetic are byte-for-byte the frontier kernel;
+      // only the staging destination and the schedule differ.
+      constexpr int Ws_tile = BN * BK_padded;
+
+      if (K > 0) {
         if constexpr (kAlignedN.value) {
           loader_w.load_unsafe();
         } else {
           loader_w.load_safe(short2(BK, tgp_bn));
         }
+        loader_w.next();
+        loader_w.shift_dst(Ws_tile);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+      short cur = 0;
+      for (int k = 0; k < K; k += BK) {
+        // Producer stage 1: stage tile k+1's weights into registers while
+        // the MMA below is in flight. Purely per-thread work.
+        if (k + BK < K) {
+          if constexpr (kAlignedN.value) {
+            loader_w.prefetch_unsafe();
+          } else {
+            loader_w.prefetch_safe(short2(BK, tgp_bn));
+          }
+        }
+
+        const threadgroup T* Wk = Ws + cur * Ws_tile;
 
         STEEL_PRAGMA_NO_UNROLL
         for (int kk1 = 0; kk1 < BK; kk1 += SK) {
@@ -1085,7 +1218,7 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
             Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
           }
 
-          Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+          Btile.template load<T, BK_padded, 1>(Wk + tn * BK_padded + kk1);
 
           tile_matmad_nax(
               Dtile,
@@ -1098,7 +1231,26 @@ METAL_FUNC void qmm_t_nax_tgp_impl(
         }
 
         x += BK;
+
+        // Reader -> writer transition for buffer `1-cur`: every thread has
+        // finished the MMA reads of buffer `cur` above before any thread
+        // starts writing buffer `1-cur`.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Producer stage 2: copy the staged tile k+1 into the other
+        // threadgroup half. Strictly between two barriers.
+        if (k + BK < K) {
+          loader_w.store_regs();
+        }
+
+        // Writer -> reader transition for buffer `1-cur`: the stores of
+        // tile k+1 are visible to every thread before the next iteration's
+        // MMA reads them.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
         loader_w.next();
+        loader_w.shift_dst(cur ? Ws_tile : -Ws_tile);
+        cur ^= 1;
       }
 
       // Store results to device memory
@@ -1272,7 +1424,7 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  threadgroup T Ws[BN * BK_padded];
+  threadgroup T Ws[2 * BN * BK_padded];
 
   if (batched) {
     adjust_matrix_offsets<T>(
@@ -1397,7 +1549,7 @@ template <
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  threadgroup T Ws[BN * BK_padded];
+  threadgroup T Ws[2 * BN * BK_padded];
 
   adjust_matrix_offsets<T>(
       x,
@@ -1557,50 +1709,6 @@ METAL_FUNC void gather_rhs_mma_frag_row(
   }
 }
 
-// DARKBLOOM GEMMA4 NAX GATHER-RHS ROW-STRIP TILING.
-// affine_gather_qmm_rhs_nax covers a BM x BN output tile with WM x WN
-// simdgroups. The launch shape is fixed by the host (32, WN, WM) and the host
-// is not editable, so the threadgroup is always 4 simdgroups over a 64 x 64
-// tile. Stock splits that tile 2 x 2, so each simdgroup owns 32 rows x 32
-// cols and the two simdgroups that share a row band each fetch the SAME 32
-// rows of the activation operand from device memory: A is read twice per
-// threadgroup per K step. This constant instead lays the same 4 simdgroups
-// out as 4 row strips of 16 rows x 64 cols. The strips are disjoint in M, so
-// every A fragment is fetched exactly once, and the B operand -- which
-// already lives in threadgroup memory as Ws -- is read wider instead.
-//
-// Nothing about the K loop moves. BK, SK and TK are untouched, the k, kk1 and
-// k_remain loops keep their bounds and their order, and every output element
-// still accumulates over exactly the same k values in exactly the same
-// sequence. Only which simdgroup owns an element, and how the owner's
-// fragments are shaped, change.
-//
-// COMPOSITION WITH THE SEGMENT ELISION ON THIS KERNEL. The elision is
-// expressed at Dtile.kFragRows (16 row) granularity and stays at exactly that
-// granularity here: stock gives a simdgroup TM = 2 fragment rows of a 32 row
-// band, the strip layout gives TM = 1 fragment row of a 16 row band, and the
-// union over the 4 simdgroups is the same 64 rows either way. The live-band
-// guard fr < seg_hi && fr + kFragRows > seg_lo tests fr and seg_lo/seg_hi in
-// the same tm-relative frame in both layouts, so it decides the same
-// intersection of absolute rows against the same segment. offset and
-// offset_next stay threadgroup uniform, seg_lo/seg_hi stay simdgroup uniform,
-// and gather_rhs_mma_frag_row keeps issuing exactly the TN-even op sequence
-// of the shared helper, so the partial-band path and the full path still
-// agree op for op. Narrowing the band from 32 rows to 16 can only move a band
-// from partial to whole or to empty; it can never make a whole band partial,
-// so the elision's own correctness argument is unweakened.
-//
-// The kernel's template parameters, and therefore every kernel-name string
-// the host builds, are untouched: BM, BN, BK, WM and WN all keep their values
-// and only the interior mapping is re-derived from them.
-//
-// Kill switch: build with -DDARKBLOOM_GEMMA4_NAX_GATHER_TILING=0 and SGM/SGN
-// fold back to WM/WN, reproducing the shipped expressions byte for byte.
-// Independent of the qmm-t family's switch.
-#ifndef DARKBLOOM_GEMMA4_NAX_GATHER_TILING
-#define DARKBLOOM_GEMMA4_NAX_GATHER_TILING 1
-#endif
-
 template <
     typename T,
     int group_size,
@@ -1671,31 +1779,16 @@ template <
   scales += transpose ? y_col_long * K_g : y_col / group_size;
   biases += transpose ? y_col_long * K_g : y_col / group_size;
 
-  // Simdgroup grid over the BM x BN tile. Stock is WM x WN; the row-strip
-  // layout stacks the same WM*WN simdgroups in the row direction only, so no
-  // two of them share a row band. See the note on the enable above, including
-  // why this leaves the segment elision's granularity and guard unchanged.
-  constexpr int SGM =
-      (DARKBLOOM_GEMMA4_NAX_GATHER_TILING != 0) ? (WM * WN) : WM;
-  constexpr int SGN = (DARKBLOOM_GEMMA4_NAX_GATHER_TILING != 0) ? 1 : WN;
-  static_assert(SGM * SGN == WM * WN, "simdgroup count must be preserved");
-  static_assert(BM % (SGM * 16) == 0, "row strip must be a fragment multiple");
-  static_assert(BN % (SGN * 16) == 0, "col strip must be a fragment multiple");
-
-  constexpr short SM = BM / SGM;
-  constexpr short SN = BN / SGN;
+  constexpr short SM = BM / WM;
+  constexpr short SN = BN / WN;
   constexpr short SK = 32;
 
   constexpr short TM = SM / 16;
   constexpr short TN = SN / 16;
   constexpr short TK = SK / 16;
 
-  // gather_rhs_mma_frag_row issues the shared helper's TN-even op sequence and
-  // has no branch for an odd TN; an odd TN would silently emit no arithmetic.
-  static_assert(TN % 2 == 0, "gather segment elision requires an even TN");
-
-  const short tm = SM * (simd_group_id / SGN);
-  const short tn = SN * (simd_group_id % SGN);
+  const short tm = SM * (simd_group_id / WN);
+  const short tn = SN * (simd_group_id % WN);
 
   const short sgp_sm =
       align_M ? SM : min(SM, short(max(0, (M - (y_row + tm)))));

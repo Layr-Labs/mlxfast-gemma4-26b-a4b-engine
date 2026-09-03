@@ -13,6 +13,34 @@ import Foundation
 import MLX
 import MLXFast
 
+nonisolated(unsafe) private var lastStartsKey: [Int]?
+nonisolated(unsafe) private var lastStartsArray: MLXArray?
+
+@inline(__always)
+fileprivate func memoizedDecodeStarts(_ starts: [Int], batch: Int) -> MLXArray {
+    if let cached = lastStartsArray, lastStartsKey == starts {
+        return cached
+    }
+    let arr = MLXArray(starts.map(UInt32.init), [batch])
+    lastStartsKey = starts
+    lastStartsArray = arr
+    return arr
+}
+
+nonisolated(unsafe) private var lastParamsKey: [UInt32]?
+nonisolated(unsafe) private var lastParamsArray: MLXArray?
+
+@inline(__always)
+fileprivate func memoizedDecodeParams(_ params: [UInt32]) -> MLXArray {
+    if let cached = lastParamsArray, lastParamsKey == params {
+        return cached
+    }
+    let arr = MLXArray(params)
+    lastParamsKey = params
+    lastParamsArray = arr
+    return arr
+}
+
 public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     private static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
@@ -1688,7 +1716,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// removes only the global partial write/read and the second dispatch.
     private static let portQuantFusedWriteResidentKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_ey29_ey32_yp3_ey51_yrp1",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_ey29_ey32_yp3_ey51_yrp1_sb1",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -2600,7 +2628,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
 
     private static let portQuantFusedWriteResidentNormRopeKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_v1_ey29_ey32_yp3_ey51_yrp1",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_v1_ey29_ey32_yp3_ey51_yrp1_sb1",
             inputNames: [
                 "raw_queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -2616,7 +2644,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// fifth output, so the standalone prepass never runs on a sliding layer.
     private static let portQuantFusedWriteResidentNormRopeORunsumKernel:
         MLXFast.MLXFastKernel = MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_ors_v1_ey29_ey32_yp3_ey51_yrp1",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_ors_v1_ey29_ey32_yp3_ey51_yrp1_sb1",
             inputNames: [
                 "raw_queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -2690,7 +2718,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             })
         else { return nil }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = memoizedDecodeStarts(starts, batch: batch)
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let passA = portQuantReadKernel(
@@ -2761,7 +2789,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             })
         else { return nil }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = memoizedDecodeStarts(starts, batch: batch)
         let inputs = [queries] + mirrors
             + [startArray, newKeys, newValues, previousWriteFence]
         if q4ResidentMergeEnabled,
@@ -2901,7 +2929,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             starts.count == batch,
             starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength })
         else { return nil }
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = memoizedDecodeStarts(starts, batch: batch)
         return attend(
             passAKernel: ringPassAKernel, queries: queries, keys: keys, values: values,
             extraInputs: [startArray], scale: scale)
@@ -2954,7 +2982,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             else { return nil }
         }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = memoizedDecodeStarts(starts, batch: batch)
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let paired = gqaPairedPassAEnabled && gqa == 2
@@ -5194,7 +5222,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             valueBuffers.append(state[1])
             params.append(UInt32(state[0].dim(2)))
         }
-        let paramsArray = MLXArray(params)
+        let paramsArray = memoizedDecodeParams(params)
 
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)
@@ -5397,7 +5425,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             valueBuffers.append(state[1])
             params.append(UInt32(state[0].dim(2)))
         }
-        let paramsArray = MLXArray(params)
+        let paramsArray = memoizedDecodeParams(params)
 
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)
@@ -5615,7 +5643,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         queries: MLXArray, keyBuffers: [MLXArray], valueBuffers: [MLXArray],
         params: [UInt32], keyLength: Int
     ) -> MLXArray {
-        let paramsArray = MLXArray(params)
+        let paramsArray = memoizedDecodeParams(params)
 
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)

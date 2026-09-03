@@ -111,6 +111,15 @@ private func gemma4TruthyFlag(_ raw: String?) -> Bool {
     return ["1", "true", "yes", "on"].contains(raw.lowercased())
 }
 
+/// Avoid materializing one per-layer optional-array carrier when PLE is active.
+/// `DARKBLOOM_GEMMA4_PLE_TENSOR_CARRIER=0` restores the array fallback.
+private let gemma4PLETensorCarrierEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_PLE_TENSOR_CARRIER"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// Submit intermediate Gemma 4 prefill graphs while Swift continues to build
 /// later layers. This changes only when already-built work is queued; the
 /// operations and results are unchanged. Single-token decode is excluded.
@@ -6375,7 +6384,8 @@ public class Gemma4TextModelInner: Module {
         }
 
         // Compute per-layer inputs (PLE)
-        var perLayerInputs: [MLXArray?]
+        let perLayerInputTensor: MLXArray?
+        let perLayerInputs: [MLXArray?]?
         if hiddenSizePerLayerInput > 0,
             let embedPerLayer = embedTokensPerLayer,
             let modelProj = perLayerModelProjection,
@@ -6400,11 +6410,21 @@ public class Gemma4TextModelInner: Module {
             // Combine: (model_proj + token_embed) * 2^{-0.5}
             let perLayerInputScale = pow(Float(2.0), -0.5)
             let combined = (normedModelPLE + reshapedTokenPLE) * perLayerInputScale
-
-            perLayerInputs = (0 ..< config.numHiddenLayers).map { i in
-                combined[.ellipsis, i, 0...]
+            if gemma4PLETensorCarrierEnabled {
+                // PLE-TENSOR-CARRIER-001: retain the rank-4 result and slice
+                // each layer at its consumer, eliminating the 30-element
+                // optional-array allocation on the decode path.
+                CBv2EngageMark.once("gemma4-ple-tensor-carrier")
+                perLayerInputTensor = combined
+                perLayerInputs = nil
+            } else {
+                perLayerInputTensor = nil
+                perLayerInputs = (0 ..< config.numHiddenLayers).map { i in
+                    combined[.ellipsis, i, 0...]
+                }
             }
         } else {
+            perLayerInputTensor = nil
             perLayerInputs = Array(repeating: nil, count: config.numHiddenLayers)
         }
 
@@ -6512,16 +6532,23 @@ public class Gemma4TextModelInner: Module {
                 sequenceLength: h.dim(1),
                 outputTailRows: outputTailRows,
                 hasCapableCache: fullCache[idx] is any CBv2LastQueryPrefillLayerCache)
+            let perLayerInput: MLXArray?
+            if let tensor = perLayerInputTensor {
+                perLayerInput = tensor[.ellipsis, idx, 0...]
+            } else if let perLayerInputs {
+                perLayerInput = perLayerInputs[idx]
+            } else {
+                perLayerInput = nil
+            }
             let (out, kvPair, positionOffset) = layer(
                 h,
                 mask: mask,
                 cache: fullCache[idx],
-                perLayerInput: perLayerInputs[idx],
                 sharedKV: sharedKV,
                 positionOffset: unifiedCBv2PositionOffset ?? sharedPositionOffset,
                 v2SharedSource: v2SharedSource,
                 outputTailRows: outputTailRows,
-                useLastQueryPrefill: useLastQueryPrefill,
+                perLayerInput: perLayerInput,
                 // The retained pair is a CBv2 production-prefill optimization.
                 // Ordinary direct forwards keep the established reduction;
                 // enabling it there regressed the raw-prefill control without

@@ -143,6 +143,68 @@ template <
   // Prepare threadgroup mma operation
   thread mma_t mma_op(simd_group_id, simd_lane_id);
 
+  // DENSE-GEGLU-EPILOGUE: uniform admission inside the editable kernel
+  // replaces the unavailable host-side function constant. Only the exact
+  // dense-MLP prefill geometry (the paired gate|up dequantized plane fed by
+  // Gemma4Text.swift) can reach the compact GeGLU close. Every other matmul,
+  // including every decode and verify rectangle, keeps the incumbent stores.
+  // The WN term folds at compile time: every dispatch arm that can produce
+  // this geometry runs WN == 2, so every simdgroup's column base stays below
+  // 16 and each thread's even/odd fragments hold a matching gate/up pair.
+  const bool gemma4_dense_geglu =
+      !transpose_a && transpose_b && metal::is_same_v<T, bfloat16_t> &&
+      !use_out_source && WN == 2 && params->M >= 512 &&
+      params->N == 4224 && params->K == 2816;
+
+  // The admitted plane interleaves 16 gate columns with their 16 up columns
+  // (period 32). The thread's even/odd Ctile fragments then hold the gate and
+  // up 8-column blocks of the same 8 logical units, so GeGLU closes in
+  // registers and the compact N/2-wide plane occupies the physical prefix of
+  // the ordinary N-wide output allocation.
+  auto store_geglu = [&](bool safe, short2 dst_tile_dims) {
+    // The synthesis below touches tape members that only the real-typed
+    // specialization has; constexpr-gate it so ineligible element types
+    // (complex64) never instantiate the branch. The admission predicate
+    // already excludes them at runtime.
+    if constexpr (metal::is_same_v<T, bfloat16_t>) {
+      using c_tile_t = decltype(mma_op.Ctile);
+      using frag_t = typename c_tile_t::MMAFrag_t;
+      constexpr short CTM = c_tile_t::kTileRows;
+      constexpr short CTN = c_tile_t::kTileCols;
+      static_assert(CTN % 2 == 0, "GeGLU epilogue requires paired fragments");
+      mlx::steel::MMATile<AccumType, CTM, CTN / 2, frag_t> Otile;
+      STEEL_PRAGMA_UNROLL
+      for (short mm = 0; mm < CTM; ++mm) {
+        STEEL_PRAGMA_UNROLL
+        for (short nn = 0; nn < CTN / 2; ++nn) {
+          thread auto& gate = mma_op.Ctile.frag_at(mm, 2 * nn);
+          thread auto& up = mma_op.Ctile.frag_at(mm, 2 * nn + 1);
+          thread auto& out = Otile.frag_at(mm, nn);
+          STEEL_PRAGMA_UNROLL
+          for (short i = 0; i < c_tile_t::kElemsPerFrag; ++i) {
+            const T g = static_cast<T>(gate[i]);
+            const T u = static_cast<T>(up[i]);
+            out[i] = float(gemma4_dense_geglu_compiled_tape(g, u));
+          }
+        }
+      }
+      device T* compact_d =
+          D - c_row_long * params->ldd - c_col_long +
+          c_row_long * size_t(params->N / 2) + c_col_long / 2;
+      compact_d += mma_op.sm * (params->N / 2) + mma_op.sn;
+      if (!safe) {
+        Otile.template store<T, WM, WN>(compact_d, params->N / 2);
+      } else {
+        dst_tile_dims -= short2(mma_op.sn, mma_op.sm);
+        if (dst_tile_dims.x <= 0 || dst_tile_dims.y <= 0) {
+          return;
+        }
+        Otile.template store_safe<T, WM, WN>(
+            compact_d, params->N / 2, dst_tile_dims);
+      }
+    }
+  };
+
   // Prepare threadgroup loading operations
   thread loader_a_t loader_a(A, params->lda, As, simd_group_id, simd_lane_id);
   thread loader_b_t loader_b(B, params->ldb, Bs, simd_group_id, simd_lane_id);
@@ -323,6 +385,10 @@ template <
     }
 
     // Store results to device memory
+    if (gemma4_dense_geglu) {
+      store_geglu(false, short2(0, 0));
+      return;
+    }
     return mma_op.store_result(D, params->ldd);
 
   }
@@ -357,6 +423,10 @@ template <
       }
 
       // Store results to device memory
+      if (gemma4_dense_geglu) {
+        store_geglu(false, short2(0, 0));
+        return;
+      }
       return mma_op.store_result(D, params->ldd);
 
     } else if (align_N || tgp_bn == BN) {
@@ -392,6 +462,10 @@ template <
       }
 
       // Store results to device memory
+      if (gemma4_dense_geglu) {
+        store_geglu(true, short2(tgp_bn / 2, tgp_bm));
+        return;
+      }
       return mma_op.store_result_safe(D, params->ldd, short2(tgp_bn, tgp_bm));
 
     } else if (align_M || tgp_bm == BM) {
@@ -427,6 +501,10 @@ template <
       }
 
       // Store results to device memory
+      if (gemma4_dense_geglu) {
+        store_geglu(true, short2(tgp_bn / 2, tgp_bm));
+        return;
+      }
       return mma_op.store_result_safe(D, params->ldd, short2(tgp_bn, tgp_bm));
 
     } else {
@@ -462,6 +540,10 @@ template <
       }
 
       // Store results to device memory
+      if (gemma4_dense_geglu) {
+        store_geglu(true, short2(tgp_bn / 2, tgp_bm));
+        return;
+      }
       return mma_op.store_result_safe(D, params->ldd, short2(tgp_bn, tgp_bm));
     }
   }

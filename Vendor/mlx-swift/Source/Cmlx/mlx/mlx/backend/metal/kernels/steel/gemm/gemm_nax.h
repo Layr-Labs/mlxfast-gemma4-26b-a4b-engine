@@ -9,6 +9,24 @@
 
 using namespace metal;
 
+// Match the Compiled primitive's typed tape exactly. Swift converts every
+// scalar literal to the array dtype, and each primitive writes a bfloat16
+// temporary before the next primitive reads it.
+template <typename T>
+inline T gemma4_dense_geglu_compiled_tape(T gate, T up) {
+  const T cubic_0 = static_cast<T>(static_cast<T>(0.044715f) * gate);
+  const T cubic_1 = static_cast<T>(cubic_0 * gate);
+  const T cubic_2 = static_cast<T>(cubic_1 * gate);
+  const T inner = static_cast<T>(gate + cubic_2);
+  const T scaled =
+      static_cast<T>(static_cast<T>(0.7978845608028654f) * inner);
+  const T curved = metal::precise::tanh(scaled);
+  const T shifted = static_cast<T>(static_cast<T>(1.0f) + curved);
+  const T half_gate = static_cast<T>(static_cast<T>(0.5f) * gate);
+  const T gelu = static_cast<T>(half_gate * shifted);
+  return static_cast<T>(gelu * up);
+}
+
 namespace mlx::steel {
 
 template <

@@ -151,7 +151,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_impl(
   float acc0 = 0.0f;
   float acc1 = 0.0f;
   simdgroup_float8x8 A;
-  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+  simdgroup_float8x8 B;
 
   uint2 wv_next = *((const device uint2*)(wrow + 32 * g0));
   uint2 wv_next2 =
@@ -186,22 +186,22 @@ METAL_FUNC void qkv_mma8_affine4_g64_impl(
     // the eight steps keep their order into `C`. The multitile body keeps
     // its hoisted fills: there one fill set serves both tiles.
     simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
-    MMA8_SETB(B0, x, lo)
-    MMA8_STEP(B0, 0)
-    MMA8_SETB(B1, x, hi)
-    MMA8_STEP(B1, 1)
-    MMA8_SETB(B2, y, lo)
-    MMA8_STEP(B2, 2)
-    MMA8_SETB(B3, y, hi)
-    MMA8_STEP(B3, 3)
-    MMA8_SETB(B4, z, lo)
-    MMA8_STEP(B4, 4)
-    MMA8_SETB(B5, z, hi)
-    MMA8_STEP(B5, 5)
-    MMA8_SETB(B6, w, lo)
-    MMA8_STEP(B6, 6)
-    MMA8_SETB(B7, w, hi)
-    MMA8_STEP(B7, 7)
+    MMA8_SETB(B, x, lo)
+    MMA8_STEP(B, 0)
+    MMA8_SETB(B, x, hi)
+    MMA8_STEP(B, 1)
+    MMA8_SETB(B, y, lo)
+    MMA8_STEP(B, 2)
+    MMA8_SETB(B, y, hi)
+    MMA8_STEP(B, 3)
+    MMA8_SETB(B, z, lo)
+    MMA8_STEP(B, 4)
+    MMA8_SETB(B, z, hi)
+    MMA8_STEP(B, 5)
+    MMA8_SETB(B, w, lo)
+    MMA8_STEP(B, 6)
+    MMA8_SETB(B, w, hi)
+    MMA8_STEP(B, 7)
 
     acc0 += s * C.thread_elements()[0] + rs.x * b;
     acc1 += s * C.thread_elements()[1] + rs.y * b;
@@ -286,7 +286,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
   const device T* x1 = x0 + K;
 
   simdgroup_float8x8 A;
-  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+  simdgroup_float8x8 B;
 
   // The per-group weight operands are carried in registers: group g0's
   // packed word, scale and bias are read before the walk, and each trip
@@ -339,33 +339,35 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt(
     rs += simd_shuffle_xor(rs, 4u);
     rs += simd_shuffle_xor(rs, 16u);
 
-    MMA8_SETB(B0, x, lo)
-    MMA8_SETB(B1, x, hi)
-    MMA8_SETB(B2, y, lo)
-    MMA8_SETB(B3, y, hi)
-    MMA8_SETB(B4, z, lo)
-    MMA8_SETB(B5, z, hi)
-    MMA8_SETB(B6, w, lo)
-    MMA8_SETB(B7, w, hi)
+    simdgroup_float8x8 C[TILES];
+#pragma clang loop unroll(full)
+    for (int t = 0; t < TILES; ++t) {
+      C[t] = simdgroup_float8x8(0.0f);
+    }
+
+#define MMA8_MT_STEP(BB, J, KREG, HALF) \
+    MMA8_SETB(BB, KREG, HALF) \
+    _Pragma("clang loop unroll(full)") \
+    for (int t = 0; t < TILES; ++t) { \
+      A.thread_elements()[0] = float(extract_bits(wv_cur[t].x, 4 * (J), 4)); \
+      A.thread_elements()[1] = float(extract_bits(wv_cur[t].y, 4 * (J), 4)); \
+      simdgroup_multiply_accumulate(C[t], A, BB, C[t]); \
+    }
+
+    MMA8_MT_STEP(B, 0, x, lo)
+    MMA8_MT_STEP(B, 1, x, hi)
+    MMA8_MT_STEP(B, 2, y, lo)
+    MMA8_MT_STEP(B, 3, y, hi)
+    MMA8_MT_STEP(B, 4, z, lo)
+    MMA8_MT_STEP(B, 5, z, hi)
+    MMA8_MT_STEP(B, 6, w, lo)
+    MMA8_MT_STEP(B, 7, w, hi)
+#undef MMA8_MT_STEP
 
 #pragma clang loop unroll(full)
     for (int t = 0; t < TILES; ++t) {
-      const uint2 wv = wv_cur[t];
-      const float s = s_cur[t];
-      const float b = b_cur[t];
-
-      simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
-      MMA8_STEP(B0, 0)
-      MMA8_STEP(B1, 1)
-      MMA8_STEP(B2, 2)
-      MMA8_STEP(B3, 3)
-      MMA8_STEP(B4, 4)
-      MMA8_STEP(B5, 5)
-      MMA8_STEP(B6, 6)
-      MMA8_STEP(B7, 7)
-
-      acc0[t] += s * C.thread_elements()[0] + rs.x * b;
-      acc1[t] += s * C.thread_elements()[1] + rs.y * b;
+      acc0[t] += s_cur[t] * C[t].thread_elements()[0] + rs.x * b_cur[t];
+      acc1[t] += s_cur[t] * C[t].thread_elements()[1] + rs.y * b_cur[t];
     }
   }
 
@@ -446,7 +448,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_rsp(
   float acc0 = 0.0f;
   float acc1 = 0.0f;
   simdgroup_float8x8 A;
-  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+  simdgroup_float8x8 B;
 
 #pragma unroll
   for (int gi = 0; gi < nGroups; ++gi) {
@@ -457,28 +459,27 @@ METAL_FUNC void qkv_mma8_affine4_g64_rsp(
     const float2 rs = float2(
         rs_table[c.fn * G + g], rs_table[(c.fn + 1) * G + g]);
 
-    MMA8_SETB(B0, x, lo)
-    MMA8_SETB(B1, x, hi)
-    MMA8_SETB(B2, y, lo)
-    MMA8_SETB(B3, y, hi)
-    MMA8_SETB(B4, z, lo)
-    MMA8_SETB(B5, z, hi)
-    MMA8_SETB(B6, w, lo)
-    MMA8_SETB(B7, w, hi)
-
     const uint2 wv = *((const device uint2*)(wrow + 32 * g));
     const float s = float(srow[g]);
     const float b = float(brow[g]);
 
     simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
-    MMA8_STEP(B0, 0)
-    MMA8_STEP(B1, 1)
-    MMA8_STEP(B2, 2)
-    MMA8_STEP(B3, 3)
-    MMA8_STEP(B4, 4)
-    MMA8_STEP(B5, 5)
-    MMA8_STEP(B6, 6)
-    MMA8_STEP(B7, 7)
+    MMA8_SETB(B, x, lo)
+    MMA8_STEP(B, 0)
+    MMA8_SETB(B, x, hi)
+    MMA8_STEP(B, 1)
+    MMA8_SETB(B, y, lo)
+    MMA8_STEP(B, 2)
+    MMA8_SETB(B, y, hi)
+    MMA8_STEP(B, 3)
+    MMA8_SETB(B, z, lo)
+    MMA8_STEP(B, 4)
+    MMA8_SETB(B, z, hi)
+    MMA8_STEP(B, 5)
+    MMA8_SETB(B, w, lo)
+    MMA8_STEP(B, 6)
+    MMA8_SETB(B, w, hi)
+    MMA8_STEP(B, 7)
 
     acc0 += s * C.thread_elements()[0] + rs.x * b;
     acc1 += s * C.thread_elements()[1] + rs.y * b;
@@ -548,7 +549,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
   const device T* x1 = x0 + K;
 
   simdgroup_float8x8 A;
-  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+  simdgroup_float8x8 B;
 
 #pragma unroll
   for (int gi = 0; gi < nGroups; ++gi) {
@@ -559,33 +560,41 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     const float2 rs = float2(
         rs_table[c.fn * G + g], rs_table[(c.fn + 1) * G + g]);
 
-    MMA8_SETB(B0, x, lo)
-    MMA8_SETB(B1, x, hi)
-    MMA8_SETB(B2, y, lo)
-    MMA8_SETB(B3, y, hi)
-    MMA8_SETB(B4, z, lo)
-    MMA8_SETB(B5, z, hi)
-    MMA8_SETB(B6, w, lo)
-    MMA8_SETB(B7, w, hi)
+    uint2 wv_cur[TILES];
+    float s_cur[TILES];
+    float b_cur[TILES];
+    simdgroup_float8x8 C[TILES];
+#pragma clang loop unroll(full)
+    for (int t = 0; t < TILES; ++t) {
+      wv_cur[t] = *((const device uint2*)(wrow[t] + 32 * g));
+      s_cur[t] = float(srow[t][g]);
+      b_cur[t] = float(brow[t][g]);
+      C[t] = simdgroup_float8x8(0.0f);
+    }
+
+#define MMA8_MT_STEP(BB, J, KREG, HALF) \
+    MMA8_SETB(BB, KREG, HALF) \
+    _Pragma("clang loop unroll(full)") \
+    for (int t = 0; t < TILES; ++t) { \
+      A.thread_elements()[0] = float(extract_bits(wv_cur[t].x, 4 * (J), 4)); \
+      A.thread_elements()[1] = float(extract_bits(wv_cur[t].y, 4 * (J), 4)); \
+      simdgroup_multiply_accumulate(C[t], A, BB, C[t]); \
+    }
+
+    MMA8_MT_STEP(B, 0, x, lo)
+    MMA8_MT_STEP(B, 1, x, hi)
+    MMA8_MT_STEP(B, 2, y, lo)
+    MMA8_MT_STEP(B, 3, y, hi)
+    MMA8_MT_STEP(B, 4, z, lo)
+    MMA8_MT_STEP(B, 5, z, hi)
+    MMA8_MT_STEP(B, 6, w, lo)
+    MMA8_MT_STEP(B, 7, w, hi)
+#undef MMA8_MT_STEP
 
 #pragma clang loop unroll(full)
     for (int t = 0; t < TILES; ++t) {
-      const uint2 wv = *((const device uint2*)(wrow[t] + 32 * g));
-      const float s = float(srow[t][g]);
-      const float b = float(brow[t][g]);
-
-      simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
-      MMA8_STEP(B0, 0)
-      MMA8_STEP(B1, 1)
-      MMA8_STEP(B2, 2)
-      MMA8_STEP(B3, 3)
-      MMA8_STEP(B4, 4)
-      MMA8_STEP(B5, 5)
-      MMA8_STEP(B6, 6)
-      MMA8_STEP(B7, 7)
-
-      acc0[t] += s * C.thread_elements()[0] + rs.x * b;
-      acc1[t] += s * C.thread_elements()[1] + rs.y * b;
+      acc0[t] += s_cur[t] * C[t].thread_elements()[0] + rs.x * b_cur[t];
+      acc1[t] += s_cur[t] * C[t].thread_elements()[1] + rs.y * b_cur[t];
     }
   }
 
@@ -649,7 +658,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     private static let tilesPerGroup = 2
 
     private static let multiTileKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_v4",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_v5",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -675,7 +684,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     }()
 
     private static let fusedSlidingKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_v2",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y", "y2"],
         source: """
@@ -692,7 +701,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         ensureRowContiguous: true)
 
     private static let fusedFullKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_v2",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y", "y2"],
         source: """
@@ -714,7 +723,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     // entries the separate Q and K rsp dispatches would; the SPLIT store
     // keeps QKFUSE-001's two-buffer layout.
     private static let fusedSlidingRspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_rsp_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_rsp_v2",
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y", "y2"],
         source: """
@@ -731,7 +740,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         ensureRowContiguous: true)
 
     private static let fusedFullRspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_rsp_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_rsp_v2",
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y", "y2"],
         source: """
@@ -748,7 +757,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         ensureRowContiguous: true)
 
     private static let mma8Kernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_carry2_bfill_v4",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_carry2_bfill_v5",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -805,7 +814,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         ensureRowContiguous: true)
 
     private static let multiTileRspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_rsp_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_rsp_v2",
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -822,7 +831,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         ensureRowContiguous: true)
 
     private static let mma8RspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_rsp_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_rsp_v2",
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """

@@ -3818,6 +3818,62 @@ private enum Gemma4FusedLayerGlue {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// NORM-TB1: halve the threadgroup barriers inside the four glue
+    /// kernels that actually dispatch on the ranked B=8/L=1 decode cell.
+    ///
+    /// Each `rmsReduce` tree currently costs TWO threadgroup barriers: one to
+    /// publish the 22 per-simdgroup partials, and a second one whose only job
+    /// is to broadcast the single resulting normalizer back out of threadgroup
+    /// memory. This switch selects the emission that keeps the first and
+    /// deletes the second by having every simdgroup recompute the identical
+    /// cross-simd `simd_sum` itself (see `rmsReduce` below for why that is
+    /// bit-identical, not merely equal to rounding).
+    ///
+    /// It removes 2 of 4 barriers in the attention-branch prefix, 4 of 8 in
+    /// the deferred expert tail chain, 3 of 6 in the deferred expert tail, and
+    /// 1 of 2 in the layer-zero input norm. It changes NO dispatch, NO barrier
+    /// stage, and NO reduction tree.
+    ///
+    /// `DARKBLOOM_GEMMA4_NORM_TG_BARRIER_HALVE=0` restores the incumbent
+    /// kernels: every helper below returns the incumbent text and the
+    /// incumbent name, so the off state is the incumbent emission verbatim.
+    private static let tgBarrierHalveEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_NORM_TG_BARRIER_HALVE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// NORM-TB1 scratch plane for a kernel's i-th reduction, or nil (the
+    /// incumbent two-barrier emission) when the switch is off. Consecutive
+    /// reductions alternate; see `rmsReduce` for the ordering argument.
+    private static func tbPlane(_ i: Int) -> String? {
+        guard tgBarrierHalveEnabled else { return nil }
+        return i % 2 == 0 ? "local_sums" : "local_sums_tb"
+    }
+
+    /// NORM-TB1: `local_inv` moves from threadgroup memory to a per-thread
+    /// register array, because every thread now holds the normalizer it
+    /// computed instead of reading back the one lane 0 stored. Every
+    /// downstream `local_inv[k]` read is unchanged and now reads that thread's
+    /// own copy, which is the same float in every thread.
+    private static func tbInvDecl(_ n: Int) -> String {
+        (tgBarrierHalveEnabled ? "float" : "threadgroup float")
+            + " local_inv[\(n)];"
+    }
+
+    /// NORM-TB1 alternate scratch plane, declared only by the kernels that
+    /// run more than one reduction.
+    private static let tbSecondPlane: String =
+        tgBarrierHalveEnabled
+        ? "\n            threadgroup float local_sums_tb[32];" : ""
+
+    /// NORM-TB1 rekey. `CustomKernel::eval_gpu` caches compiled pipelines by
+    /// name (backend/metal/custom_kernel.cpp:56-70) and calls
+    /// `clear_library(name_)` on a name/source mismatch, so the two emissions
+    /// must never share a name.
+    private static let tbSuffix: String = tgBarrierHalveEnabled ? "_tb1" : ""
+
     private static let rows = 8
     private static let axis = 2816
     private static let eps: Float = 1e-6
@@ -3826,8 +3882,54 @@ private enum Gemma4FusedLayerGlue {
 
     /// Shared reduction preamble: the exact rms_single_row tree at 704x4.
     /// `PREFIX` names the array to reduce; `SLOT` the shared slot written.
-    private static func rmsReduce(_ src: String, into slot: String) -> String {
-        """
+    ///
+    /// NORM-TB1 (`plane != nil`) selects the one-barrier emission. The
+    /// REDUCTION TREE IS UNCHANGED: the same four squares accumulated in
+    /// thread-read order, the same `simd_sum`, the same 22-slot cross-simd
+    /// `simd_sum`, the same `metal::precise::rsqrt(acc / 2816 + 1e-6)`, in
+    /// that order. Only the BROADCAST differs. The incumbent has simdgroup 0
+    /// run the cross-simd combine, lane 0 store the normalizer to threadgroup
+    /// memory, and a second threadgroup barrier so the other 21 simdgroups can
+    /// read it back. This form has every simdgroup run that same combine over
+    /// the same published `plane[0..21]` and keep the result in a register.
+    ///
+    /// That is bit-identical, not just numerically close: `simd_sum` returns
+    /// one value to every lane of the simdgroup and is a deterministic
+    /// function of its input vector, and every simdgroup runs it after the
+    /// publish barrier and therefore over byte-identical `plane[0..21]`
+    /// (slots 22..31 are never read -- the `< 22` predicate substitutes an
+    /// exact `0.0f`). The float that reaches the norm body is the float the
+    /// broadcast used to deliver. Nothing is reassociated, which matters
+    /// because `setFastMathEnabled(false)` (backend/metal/device.cpp:631)
+    /// means the compiler will not reassociate on our behalf either.
+    ///
+    /// Ordering: dropping the second barrier means reduction k's READERS of
+    /// `plane` are no longer ordered against reduction k+1's WRITERS of it, so
+    /// callers alternate two planes. Reduction k+2 may reuse reduction k's
+    /// plane, because every thread's read in reduction k precedes its arrival
+    /// at reduction k+1's publish barrier, and every thread's write in
+    /// reduction k+2 follows its departure from that same barrier.
+    private static func rmsReduce(
+        _ src: String, into slot: String, plane: String? = nil
+    ) -> String {
+        if let plane {
+            return """
+                {
+                    float acc = 0;
+                    for (int i = 0; i < 4; i++) {
+                        float xi = (float)\(src)[base + i];
+                        acc += xi * xi;
+                    }
+                    acc = simd_sum(acc);
+                    if (simd_lane_id == 0) \(plane)[simd_group_id] = acc;
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    acc = simd_sum(
+                        simd_lane_id < 22 ? \(plane)[simd_lane_id] : 0.0f);
+                    \(slot) = metal::precise::rsqrt(acc / 2816.0f + 1e-06f);
+                }
+            """
+        }
+        return """
             {
                 float acc = 0;
                 for (int i = 0; i < 4; i++) {
@@ -3956,7 +4058,8 @@ private enum Gemma4FusedLayerGlue {
     /// dispatch. This body is the public parity-tested F1 layer-zero kernel.
     private static let inputNormRunsumKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_glue_input_rmsnorm_qkv_runsum_2816_bf16_v1",
+            name: "gemma4_glue_input_rmsnorm_qkv_runsum_2816_bf16_v1"
+                + tbSuffix,
             inputNames: ["x", "w"],
             outputNames: ["normed", "qkv_rs"],
             source: """
@@ -3964,11 +4067,11 @@ private enum Gemma4FusedLayerGlue {
                 const uint lid = thread_position_in_threadgroup.x;
                 const uint simd_lane_id = thread_index_in_simdgroup;
                 const uint simd_group_id = simdgroup_index_in_threadgroup;
-                threadgroup float local_inv[1];
+                \(tbInvDecl(1))
                 threadgroup float local_sums[32];
                 const uint base = row * 2816 + lid * 4;
                 const uint wbase = lid * 4;
-            \(rmsReduce("x", into: "local_inv[0]"))
+            \(rmsReduce("x", into: "local_inv[0]", plane: tbPlane(0)))
                 const float inv = local_inv[0];
                 T normedv[4];
                 for (int i = 0; i < 4; ++i) {
@@ -4032,7 +4135,8 @@ private enum Gemma4FusedLayerGlue {
 
     private static let attentionBranchPrefixKernelV2: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_glue_attention_branch_prefix_2816_bf16_v2_nb1",
+            name: "gemma4_glue_attention_branch_prefix_2816_bf16_v2_nb1"
+                + tbSuffix,
             inputNames: ["attn", "res", "wa", "wd", "we", "wr"],
             outputNames: ["out", "dense", "expert", "router"],
             source: """
@@ -4040,11 +4144,11 @@ private enum Gemma4FusedLayerGlue {
                 const uint lid = thread_position_in_threadgroup.x;
                 const uint simd_lane_id = thread_index_in_simdgroup;
                 const uint simd_group_id = simdgroup_index_in_threadgroup;
-                threadgroup float local_inv[1];
-                threadgroup float local_sums[32];
+                \(tbInvDecl(1))
+                threadgroup float local_sums[32];\(tbSecondPlane)
                 const uint base = row * 2816 + lid * 4;
                 const uint wbase = lid * 4;
-            \(rmsReduce("attn", into: "local_inv[0]"))
+            \(rmsReduce("attn", into: "local_inv[0]", plane: tbPlane(0)))
                 const float attn_inv = local_inv[0];
                 T outv[4];
                 for (int i = 0; i < 4; i++) {
@@ -4055,8 +4159,9 @@ private enum Gemma4FusedLayerGlue {
                     outv[i] = res[base + i] + normed;
                     out[base + i] = outv[i];
                 }
-            \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
-                of: "(float)outv[base + i]", with: "(float)outv[i]"))
+            \(rmsReduce("outv", into: "local_inv[0]", plane: tbPlane(1))
+                .replacingOccurrences(
+                    of: "(float)outv[base + i]", with: "(float)outv[i]"))
                 const float branch_inv = local_inv[0];
                 for (int i = 0; i < 4; i++) {
                     const T nx =
@@ -4402,7 +4507,8 @@ private enum Gemma4FusedLayerGlue {
     """
 
     private static let deferredTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1_nb1_vec1",
+        name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1_nb1_vec1"
+            + tbSuffix,
         inputNames: [
             "a", "sorted", "inverse", "route_weights", "res",
             "w1", "w2", "w3", "s",
@@ -4413,14 +4519,15 @@ private enum Gemma4FusedLayerGlue {
             const uint lid = thread_position_in_threadgroup.x;
             const uint simd_lane_id = thread_index_in_simdgroup;
             const uint simd_group_id = simdgroup_index_in_threadgroup;
-            threadgroup float local_inv[2];
-            threadgroup float local_sums[32];
+            \(tbInvDecl(2))
+            threadgroup float local_sums[32];\(tbSecondPlane)
             const uint base = row * 2816 + lid * 4;
             const uint wbase = lid * 4;
-        \(rmsReduce("a", into: "local_inv[0]"))
+        \(rmsReduce("a", into: "local_inv[0]", plane: tbPlane(0)))
         \(deferredExpertValuesSource)
-        \(rmsReduce("expertv", into: "local_inv[1]").replacingOccurrences(
-            of: "(float)expertv[base + i]", with: "(float)expertv[i]"))
+        \(rmsReduce("expertv", into: "local_inv[1]", plane: tbPlane(1))
+            .replacingOccurrences(
+                of: "(float)expertv[base + i]", with: "(float)expertv[i]"))
             const float inv1 = local_inv[0];
             const float inv2 = local_inv[1];
             T sv[4];
@@ -4431,8 +4538,9 @@ private enum Gemma4FusedLayerGlue {
                     * static_cast<T>((float)expertv[i] * inv2);
                 sv[i] = h1 + h2;
             }
-        \(rmsReduce("sv", into: "local_inv[0]").replacingOccurrences(
-            of: "(float)sv[base + i]", with: "(float)sv[i]"))
+        \(rmsReduce("sv", into: "local_inv[0]", plane: tbPlane(2))
+            .replacingOccurrences(
+                of: "(float)sv[base + i]", with: "(float)sv[i]"))
             const float inv3 = local_inv[0];
             const T scalar = s[0];
             for (int i = 0; i < 4; i++) {
@@ -4447,7 +4555,9 @@ private enum Gemma4FusedLayerGlue {
 
     private static let deferredTailChainKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1_nb1_vec1_rs1",
+            name:
+                "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1_nb1_vec1_rs1"
+                + tbSuffix,
             inputNames: [
                 "a", "sorted", "inverse", "route_weights", "res",
                 "w1", "w2", "w3", "s", "wn",
@@ -4458,14 +4568,15 @@ private enum Gemma4FusedLayerGlue {
                 const uint lid = thread_position_in_threadgroup.x;
                 const uint simd_lane_id = thread_index_in_simdgroup;
                 const uint simd_group_id = simdgroup_index_in_threadgroup;
-                threadgroup float local_inv[2];
-                threadgroup float local_sums[32];
+                \(tbInvDecl(2))
+                threadgroup float local_sums[32];\(tbSecondPlane)
                 const uint base = row * 2816 + lid * 4;
                 const uint wbase = lid * 4;
-            \(rmsReduce("a", into: "local_inv[0]"))
+            \(rmsReduce("a", into: "local_inv[0]", plane: tbPlane(0)))
             \(deferredExpertValuesSource)
-            \(rmsReduce("expertv", into: "local_inv[1]").replacingOccurrences(
-                of: "(float)expertv[base + i]", with: "(float)expertv[i]"))
+            \(rmsReduce("expertv", into: "local_inv[1]", plane: tbPlane(1))
+                .replacingOccurrences(
+                    of: "(float)expertv[base + i]", with: "(float)expertv[i]"))
                 const float inv1 = local_inv[0];
                 const float inv2 = local_inv[1];
                 T sv[4];
@@ -4476,8 +4587,9 @@ private enum Gemma4FusedLayerGlue {
                         * static_cast<T>((float)expertv[i] * inv2);
                     sv[i] = h1 + h2;
                 }
-            \(rmsReduce("sv", into: "local_inv[0]").replacingOccurrences(
-                of: "(float)sv[base + i]", with: "(float)sv[i]"))
+            \(rmsReduce("sv", into: "local_inv[0]", plane: tbPlane(2))
+                .replacingOccurrences(
+                    of: "(float)sv[base + i]", with: "(float)sv[i]"))
                 const float inv3 = local_inv[0];
                 const T scalar = s[0];
                 T outv[4];
@@ -4489,8 +4601,9 @@ private enum Gemma4FusedLayerGlue {
                     outv[i] = summed * scalar;
                     out[base + i] = outv[i];
                 }
-            \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
-                of: "(float)outv[base + i]", with: "(float)outv[i]"))
+            \(rmsReduce("outv", into: "local_inv[0]", plane: tbPlane(3))
+                .replacingOccurrences(
+                    of: "(float)outv[base + i]", with: "(float)outv[i]"))
                 const float inv4 = local_inv[0];
                 T nq[4];
                 for (int i = 0; i < 4; i++) {
@@ -7382,6 +7495,3 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
 
 // Ranked resample marker 39: this archive is a further ranked sample of the tree carried
 // by the preceding ranked submission of this content apart from any rotation item declared in its note.
-
-
-

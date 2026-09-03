@@ -474,6 +474,18 @@ private let routeSimdRank64Enabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+/// The direct decode route path already has its activation in the required
+/// `[8, 2816]` shape. Keep that view instead of creating the rank-3 wrapper
+/// and immediately flattening it again.
+/// `DARKBLOOM_SWITCH_DIRECT_X_INPUT_VIEW=0` restores the incumbent views.
+private let switchDirectXInputViewEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_SWITCH_DIRECT_X_INPUT_VIEW"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+
 // MARK: - ROUTE-CSORT-64: fused counting-sort route table (donor port)
 
 /// Stable counting sort for the flattened B=8 decode route table (64 uint32
@@ -1504,7 +1516,12 @@ public class SwitchGLU: Module {
             expertPrefixBoundsEnabled && useLhsIndices
             && indices.dtype == .uint32 && x.dtype == .bfloat16
             && expertPrefixBoundsProjectionsEligible
-        var x = MLX.expandedDimensions(x, axes: [-2, -3])
+        if switchDirectXInputViewEnabled && useLhsIndices {
+            CBv2EngageMark.once("switch-direct-x-input-view")
+        }
+        var x = switchDirectXInputViewEnabled && useLhsIndices
+            ? MLX.expandedDimensions(x, axes: [-2])
+            : MLX.expandedDimensions(x, axes: [-2, -3])
         let doSort = indices.size >= 64
 
         var idx = indices
@@ -1517,7 +1534,6 @@ public class SwitchGLU: Module {
         var lhsIndices: MLXArray?
         if doSort {
             if useLhsIndices {
-                x = x.flattened(start: 0, end: -3)
                 // GLUE-FOLD: an upstream producer already emitted the exact
                 // route table beside the top-8 selection; consume it and the
                 // standalone `mlx_lm_route_simd_rank_scatter` dispatch never

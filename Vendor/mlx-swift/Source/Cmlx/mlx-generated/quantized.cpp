@@ -22,24 +22,6 @@ constant bool align_K [[function_constant(202)]];
 
 using namespace metal;
 
-// Match the Compiled primitive's typed tape exactly. Swift converts every
-// scalar literal to the array dtype, and each primitive writes a bfloat16
-// temporary before the next primitive reads it.
-template <typename T>
-inline T gemma4_geglu_compiled_tape(T gate, T up) {
-  const T cubic_0 = static_cast<T>(static_cast<T>(0.044715f) * gate);
-  const T cubic_1 = static_cast<T>(cubic_0 * gate);
-  const T cubic_2 = static_cast<T>(cubic_1 * gate);
-  const T inner = static_cast<T>(gate + cubic_2);
-  const T scaled =
-      static_cast<T>(static_cast<T>(0.7978845608028654f) * inner);
-  const T curved = metal::precise::tanh(scaled);
-  const T shifted = static_cast<T>(static_cast<T>(1.0f) + curved);
-  const T half_gate = static_cast<T>(static_cast<T>(0.5f) * gate);
-  const T gelu = static_cast<T>(half_gate * shifted);
-  return static_cast<T>(gelu * up);
-}
-
 #define MLX_MTL_CONST static constant constexpr const
 
 MLX_MTL_CONST int SIMD_SIZE = 32;
@@ -3030,19 +3012,9 @@ template <typename T, int group_size, int bits, bool batched>
               tid, simd_gid, simd_lid);
           return;
         case 8:
-          // 3+3+2, not 4+4. M = 8 is the only hot width whose EVEN split needs
-          // two simultaneous vec<float,4> accumulators in every active worker;
-          // M = 9 uses three-lane vectors and profiles CHEAPER despite more work
-          // (319 / 437 / 216 us for M = 7 / 8 / 9 in the public cross-row study)
-          // — a register cliff, not work scaling.
-          // Exact: these lanes carry INDEPENDENT input rows and are never reduced
-          // across (simd_sum reduces along K WITHIN a row), so moving a row from
-          // lane 3 of a four-wide vector to lane 0 of a two-wide one cannot
-          // reorder its scalar chain. Template admits it: M in [3,9], 8 % 3 == 2
-          // (no one-row tail), IPG 3 inside the wide helper's [2,4].
-          // Receipts: 85d5bca3 2.91143, yzxoi 2.92675.
-          // SYNERGY with the streak gate above, which is why they ship together:
-          // gate 2 reaches the width-8 verify SOONER, so this kernel fires MORE.
+          // 4+4: two weight streams, receipted on this benchmark (scored
+          // 3.195804751396457 as a promoted submission) before a later
+          // stale-base REPLACE overlay reverted it; restored here.
           qmv_fast_crossrow_affine4_g64_m<T, 8, 4, true>(
               w, scales, biases, x, y, in_vec_size, out_vec_size,
               tid, simd_gid, simd_lid);
@@ -4559,12 +4531,6 @@ template <
   const int K_it = K / BK;
   const size_t stride_w = transpose ? N * K_w : K * N_w;
   const size_t stride_s = transpose ? N * K_g : K * N_g;
-  // Uniform admission inside the editable kernel replaces the unavailable
-  // host-side function constant. Only the exact target prefill geometry can
-  // consume the paired gate/up storage and emit a compact GeGLU plane.
-  const bool gemma4_gather_rhs_geglu =
-      transpose && metal::is_same_v<T, bfloat> && group_size == 64 &&
-      bits == 4 && M >= 512 && N == 1408 && K == 2816;
   const int y_row = tid.y * BM;
   const int y_col = tid.x * BN;
   const size_t y_row_long = size_t(y_row);
@@ -4611,40 +4577,6 @@ template <
     // Prepare threadgroup mma operation
     thread mma_t mma_op(simd_group_id, simd_lane_id);
 
-    auto store_geglu = [&](short2 start, short2 stop) {
-      using c_tile_t = decltype(mma_op.Ctile);
-      using frag_t = typename c_tile_t::MMAFrag_t;
-      constexpr short CTM = c_tile_t::kTileRows;
-      constexpr short CTN = c_tile_t::kTileCols;
-      static_assert(CTN % 2 == 0, "GeGLU epilogue requires paired fragments");
-      mlx::steel::MMATile<float, CTM, CTN / 2, frag_t> Otile;
-      STEEL_PRAGMA_UNROLL
-      for (short mm = 0; mm < CTM; ++mm) {
-        STEEL_PRAGMA_UNROLL
-        for (short nn = 0; nn < CTN / 2; ++nn) {
-          thread auto& gate = mma_op.Ctile.frag_at(mm, 2 * nn);
-          thread auto& up = mma_op.Ctile.frag_at(mm, 2 * nn + 1);
-          thread auto& out = Otile.frag_at(mm, nn);
-          STEEL_PRAGMA_UNROLL
-          for (short i = 0; i < c_tile_t::kElemsPerFrag; ++i) {
-            const T g = static_cast<T>(gate[i]);
-            const T u = static_cast<T>(up[i]);
-            out[i] = float(gemma4_geglu_compiled_tape(g, u));
-          }
-        }
-      }
-      device T* compact_y =
-          y - y_row_long * N - y_col_long +
-          y_row_long * (N / 2) + size_t(tid.x) * (BN / 2) +
-          mma_op.sm * (N / 2) + mma_op.sn;
-      start -= short2(mma_op.sn, mma_op.sm);
-      stop -= short2(mma_op.sn, mma_op.sm);
-      if (stop.y > 0 && stop.x > 0) {
-        Otile.template store_slice<T, 1, 1>(
-            compact_y, N / 2, start, stop);
-      }
-    };
-
     // Prepare threadgroup loading operations
     thread loader_x_t loader_x(x, K, Xs, simd_group_id, simd_lane_id);
     thread loader_w_t loader_w(
@@ -4665,9 +4597,7 @@ template <
       }
 
       // Store results to device memory
-      if (gemma4_gather_rhs_geglu) {
-        store_geglu(short2(0, offset), short2(BN / 2, offset_next));
-      } else if (offset_next - offset == BM) {
+      if (offset_next - offset == BM) {
         mma_op.store_result(y, N);
       } else {
         mma_op.store_result_slice(
@@ -4684,9 +4614,7 @@ template <
         }
 
         // Store results to device memory
-        if (gemma4_gather_rhs_geglu) {
-          store_geglu(short2(0, offset), short2(BN / 2, offset_next));
-        } else if (offset_next - offset == BM) {
+        if (offset_next - offset == BM) {
           mma_op.store_result(y, N);
         } else {
           mma_op.store_result_slice(
@@ -4703,12 +4631,8 @@ template <
           gemm_loop_finalize(
               Xs, Ws, mma_op, loader_x, loader_w, tile_x, tile_w);
         }
-        if (gemma4_gather_rhs_geglu) {
-          store_geglu(short2(0, offset), short2(BN / 2, offset_next));
-        } else {
-          mma_op.store_result_slice(
-              y, N, short2(0, offset), short2(BN, offset_next));
-        }
+        mma_op.store_result_slice(
+            y, N, short2(0, offset), short2(BN, offset_next));
       }
 
       // Tile partially aligned check cols
@@ -4720,13 +4644,8 @@ template <
           gemm_loop_finalize(
               Xs, Ws, mma_op, loader_x, loader_w, tile_x, tile_w);
         }
-        if (gemma4_gather_rhs_geglu) {
-          store_geglu(
-              short2(0, offset), short2(tgp_bn / 2, offset_next));
-        } else {
-          mma_op.store_result_slice(
-              y, N, short2(0, offset), short2(tgp_bn, offset_next));
-        }
+        mma_op.store_result_slice(
+            y, N, short2(0, offset), short2(tgp_bn, offset_next));
       }
 
       // Nothing aligned so check both rows and cols
@@ -4738,13 +4657,8 @@ template <
           gemm_loop_finalize(
               Xs, Ws, mma_op, loader_x, loader_w, tile_x, tile_w);
         }
-        if (gemma4_gather_rhs_geglu) {
-          store_geglu(
-              short2(0, offset), short2(tgp_bn / 2, offset_next));
-        } else {
-          mma_op.store_result_slice(
-              y, N, short2(0, offset), short2(tgp_bn, offset_next));
-        }
+        mma_op.store_result_slice(
+            y, N, short2(0, offset), short2(tgp_bn, offset_next));
       }
     }
   }

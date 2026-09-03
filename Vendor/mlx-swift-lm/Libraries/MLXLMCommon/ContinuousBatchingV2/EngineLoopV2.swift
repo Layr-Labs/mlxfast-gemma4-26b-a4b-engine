@@ -317,13 +317,42 @@ public struct CBv2EngineLoopConfig: Sendable {
 
 // MARK: - In-flight step
 
+/// Immutable metadata for a stable chained-decode cohort. Chaining already
+/// requires identical ordered membership, so these host values remain valid
+/// until the chain breaks.
+fileprivate struct CBv2ChainedDecodeContext {
+    let rowStates: [[CBv2SequenceKV?]]
+    let params: [CBv2SamplingParams]
+}
+
+fileprivate enum CBv2ParticipantIndex {
+    case compact([CBv2RequestID])
+    case hashed(Set<CBv2RequestID>)
+
+    @inline(__always)
+    func contains(_ id: CBv2RequestID) -> Bool {
+        switch self {
+        case .compact(let ids): ids.contains(id)
+        case .hashed(let ids): ids.contains(id)
+        }
+    }
+
+    @inline(__always)
+    func forEach(_ body: (CBv2RequestID) -> Void) {
+        switch self {
+        case .compact(let ids): ids.forEach(body)
+        case .hashed(let ids): ids.forEach(body)
+        }
+    }
+}
+
 /// One launched-but-not-finalized step. Its sampled tokens are still lazy;
 /// finalization materializes them (the ONE host sync per step, overlapped
 /// with the next step's GPU work when chained).
 final class CBv2InFlightStep {
     /// Every request that computed anything this step (KV release for any of
     /// these must be deferred until finalization — see CONTRACT-ISSUES §4).
-    let participants: Set<CBv2RequestID>
+    private let participantIndex: CBv2ParticipantIndex
     /// Rows that sampled a token, in plan order (== row order of
     /// `sampledTokens`).
     let sampledRows: [CBv2RequestID]
@@ -357,17 +386,40 @@ final class CBv2InFlightStep {
     /// one sample per row, so `engineStep` guards on this before offering
     /// the step as a chain base.
     var mtpRound: CBv2MTPRoundInFlight?
+    fileprivate var chainedDecodeContext: CBv2ChainedDecodeContext?
 
     init(
         participants: Set<CBv2RequestID>, sampledRows: [CBv2RequestID],
         sampledTokens: MLXArray?, evalTargets: [MLXArray],
         wallStartedNanos: UInt64
     ) {
-        self.participants = participants
+        self.participantIndex = .hashed(participants)
         self.sampledRows = sampledRows
         self.sampledTokens = sampledTokens
         self.evalTargets = evalTargets
         self.wallStartedNanos = wallStartedNanos
+    }
+
+    init(
+        compactParticipants: [CBv2RequestID], sampledRows: [CBv2RequestID],
+        sampledTokens: MLXArray?, evalTargets: [MLXArray],
+        wallStartedNanos: UInt64
+    ) {
+        self.participantIndex = .compact(compactParticipants)
+        self.sampledRows = sampledRows
+        self.sampledTokens = sampledTokens
+        self.evalTargets = evalTargets
+        self.wallStartedNanos = wallStartedNanos
+    }
+
+    @inline(__always)
+    func containsParticipant(_ id: CBv2RequestID) -> Bool {
+        participantIndex.contains(id)
+    }
+
+    @inline(__always)
+    func forEachParticipant(_ body: (CBv2RequestID) -> Void) {
+        participantIndex.forEach(body)
     }
 }
 
@@ -1131,15 +1183,17 @@ public final class EngineLoopV2: @unchecked Sendable {
         if let previous = inFlight,
             previous.mtpRound == nil,
             previous.sampledTokens != nil,
-            let ids = scheduler.chainCandidateIDs(),
-            ids == previous.sampledRows,
-            ids.allSatisfy({ kvStates[$0] != nil }),
+            scheduler.canChain(matching: previous.sampledRows),
+            previous.sampledRows.allSatisfy({ kvStates[$0] != nil }),
             // Constraint state advances from the host-confirmed token. Do
             // not launch N+1 from N's lazy token before that transition.
-            ids.allSatisfy({ scheduler.record(for: $0)?.request.tokenConstraint == nil }),
-            !mtpWantsStep(ids: ids),
-            capacity?.hasHeadroom(additionalTokens: ids.count) ?? true
+            previous.sampledRows.allSatisfy({
+                scheduler.record(for: $0)?.request.tokenConstraint == nil
+            }),
+            !mtpWantsStep(ids: previous.sampledRows),
+            capacity?.hasHeadroom(additionalTokens: previous.sampledRows.count) ?? true
         {
+            let ids = previous.sampledRows
             beginMTPPlan()
             let plan = scheduler.plan()
             if isPureDecodePlan(plan, matching: ids) {
@@ -1148,7 +1202,9 @@ public final class EngineLoopV2: @unchecked Sendable {
                         "v2.boundary", seconds: CFAbsoluteTimeGetCurrent() - stepStart)
                 }
                 let measurement = mtpMeasurement(for: plan)
-                let next = launchChainedDecode(plan, feeding: previous.sampledTokens!)
+                let next = launchChainedDecode(
+                    feeding: previous.sampledTokens!, ids: ids,
+                    previousContext: previous.chainedDecodeContext)
                 attachMTPMeasurement(measurement, to: next, chained: true)
                 if var previousMeasurement = previous.mtpMeasurement {
                     // The previous step's finalize-to-launch interval now
@@ -1191,7 +1247,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 invalidateAdoptedPrefix(id)
                 mtp?.invalidateCarry(id)
                 guard let state = kvStates.removeValue(forKey: id) else { continue }
-                if previous.participants.contains(id) {
+                if previous.containsParticipant(id) {
                     previous.deferredReleases.append(
                         (
                             id: id, state: state, rollbackOne: false, donation: nil
@@ -1532,15 +1588,21 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     /// Pure-decode step fed by the previous step's still-lazy tokens.
     private func launchChainedDecode(
-        _ plan: CBv2StepPlan, feeding lazyTokens: MLXArray
+        feeding lazyTokens: MLXArray, ids: [CBv2RequestID],
+        previousContext: CBv2ChainedDecodeContext?
     ) -> CBv2InFlightStep {
         let wallStartedNanos = DispatchTime.now().uptimeNanoseconds
         let buildStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-        let ids = plan.assignments.map(\.id)
-        let rowStates = ids.map { kvStates[$0]! }  // presence pre-checked
-        var params: [CBv2SamplingParams] = []
-        params.reserveCapacity(ids.count)
-        for id in ids { params.append(scheduler.record(for: id)!.request.sampling) }
+        let context: CBv2ChainedDecodeContext
+        if let previousContext {
+            context = previousContext
+        } else {
+            let rowStates = ids.map { kvStates[$0]! }  // presence pre-checked
+            var params: [CBv2SamplingParams] = []
+            params.reserveCapacity(ids.count)
+            for id in ids { params.append(scheduler.record(for: id)!.request.sampling) }
+            context = CBv2ChainedDecodeContext(rowStates: rowStates, params: params)
+        }
 
         let inputs = lazyTokens.reshaped([ids.count, 1])
         let forwardStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
@@ -1553,10 +1615,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         let stepLogprobs: CBv2StepLogprobs?
         if let fusedSampler = sampler as? CBv2FusedGreedySampler,
             let fusedModel = model as? CBv2ArgmaxDecodeSteppableModel,
-            fusedSampler.admitsFusedGreedy(params: params),
+            fusedSampler.admitsFusedGreedy(params: context.params),
             fusedModel.admitsArgmaxDecode(tokens: inputs)
         {
-            let caches = eagerCaches(rowStates: rowStates)
+            let caches = eagerCaches(rowStates: context.rowStates)
             sampled = fusedModel.decodeArgmax(tokens: inputs, caches: caches)
             cacheInnerState = eagerCacheInnerState(caches)
             stepLogprobs = nil
@@ -1568,8 +1630,8 @@ public final class EngineLoopV2: @unchecked Sendable {
         } else {
             // Preserve the promoted SOFTCAP-SKIP fallback: callers that need
             // the ordinary logits plane still declare its order-only use.
-            let (last, innerState) = CBv2OrderOnlyLogits.withOrderOnly(params) {
-                decodeLogits(rowStates: rowStates, tokens: inputs)  // [B, vocab]
+            let (last, innerState) = CBv2OrderOnlyLogits.withOrderOnly(context.params) {
+                decodeLogits(rowStates: context.rowStates, tokens: inputs)  // [B, vocab]
             }
             cacheInnerState = innerState
             if CBv2StepProfiler.enabled {
@@ -1580,7 +1642,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             // one launched-but-unconfirmed sample here (the chain invariant).
             let samplerStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
             sampled = sampler.sample(
-                logits: last, params: params, requestIDs: ids, stepIndex: stepCount,
+                logits: last, params: context.params, requestIDs: ids, stepIndex: stepCount,
                 pendingSampledTokens: lazyTokens,
                 rowContext: { [scheduler] in
                     ids.map { Self.samplerRow(scheduler.record(for: $0)!) }
@@ -1607,8 +1669,9 @@ public final class EngineLoopV2: @unchecked Sendable {
             CBv2StepProfiler.record("v2.launch.total", seconds: now - buildStart)
         }
         let step = CBv2InFlightStep(
-            participants: Set(ids), sampledRows: ids, sampledTokens: sampled, evalTargets: [],
+            compactParticipants: ids, sampledRows: ids, sampledTokens: sampled, evalTargets: [],
             wallStartedNanos: wallStartedNanos)
+        step.chainedDecodeContext = context
         if let stepLogprobs { step.logprobSegments = [stepLogprobs] }
         return step
     }
@@ -2134,8 +2197,8 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// token refreshes the decode lease; a confirmed prefill-chunk advance
     /// refreshes the prefill lease.
     private func refreshProgressLeases(_ step: CBv2InFlightStep, now: ContinuousClock.Instant) {
-        for id in step.participants {
-            guard let rec = scheduler.record(for: id) else { continue }
+        step.forEachParticipant { id in
+            guard let rec = scheduler.record(for: id) else { return }
             if var lease = leasesByID[id] {
                 lease.recordProgress(
                     now: now,
@@ -2191,7 +2254,7 @@ public final class EngineLoopV2: @unchecked Sendable {
 
         if let state = kvStates.removeValue(forKey: id) {
             let donation = donationIntent(for: rec, reason: reason, state: state)
-            if let inFlight, inFlight.participants.contains(id) {
+            if let inFlight, inFlight.containsParticipant(id) {
                 // The in-flight step still references this state — fence the
                 // free behind its completion; roll back the wasted token iff
                 // that step sampled for this row.

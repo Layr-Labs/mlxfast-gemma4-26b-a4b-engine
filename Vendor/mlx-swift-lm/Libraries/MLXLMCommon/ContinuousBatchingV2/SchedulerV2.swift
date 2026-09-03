@@ -751,6 +751,29 @@ public final class SchedulerV2 {
         return ids
     }
 
+    /// Allocation-free form of `chainCandidateIDs()` for the steady chained
+    /// path. The prior in-flight step already owns the exact ordered cohort;
+    /// validate the scheduler against it rather than rebuilding the same
+    /// small array on every token.
+    public func canChain(matching expected: [CBv2RequestID]) -> Bool {
+        guard !running.isEmpty, !expected.isEmpty,
+            expected.count <= config.maxBatchedTokensPerStep
+        else { return false }
+
+        var index = 0
+        for rec in running {
+            if rec.cancelRequested { return false }
+            if rec.isPaused { continue }
+            guard rec.isDecodeReady, index < expected.count,
+                rec.id == expected[index]
+            else { return false }
+            index += 1
+        }
+        guard index == expected.count else { return false }
+        if !waiting.isEmpty, running.count < config.maxConcurrentRequests { return false }
+        return true
+    }
+
     // MARK: Preemption internals
 
     /// Victim = LOWEST priority; tie → YOUNGEST (largest arrivalSeq).

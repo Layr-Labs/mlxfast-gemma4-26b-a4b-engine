@@ -22,24 +22,6 @@ constant bool align_K [[function_constant(202)]];
 
 using namespace metal;
 
-// Match the Compiled primitive's typed tape exactly. Swift converts every
-// scalar literal to the array dtype, and each primitive writes a bfloat16
-// temporary before the next primitive reads it.
-template <typename T>
-inline T gemma4_geglu_compiled_tape(T gate, T up) {
-  const T cubic_0 = static_cast<T>(static_cast<T>(0.044715f) * gate);
-  const T cubic_1 = static_cast<T>(cubic_0 * gate);
-  const T cubic_2 = static_cast<T>(cubic_1 * gate);
-  const T inner = static_cast<T>(gate + cubic_2);
-  const T scaled =
-      static_cast<T>(static_cast<T>(0.7978845608028654f) * inner);
-  const T curved = metal::precise::tanh(scaled);
-  const T shifted = static_cast<T>(static_cast<T>(1.0f) + curved);
-  const T half_gate = static_cast<T>(static_cast<T>(0.5f) * gate);
-  const T gelu = static_cast<T>(half_gate * shifted);
-  return static_cast<T>(gelu * up);
-}
-
 #define MLX_MTL_CONST static constant constexpr const
 
 MLX_MTL_CONST int SIMD_SIZE = 32;
@@ -3947,7 +3929,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int gemma4_down_tile_span = 4; // sweep alternate: 2
+  constexpr int gemma4_down_tile_span = 2; // retry on singles baseline: cheaper tiles shift occupancy optimum
   if (tid.y % uint(gemma4_down_tile_span) != 0u) {
     return;
   }
@@ -4006,7 +3988,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   for (int t = 0; t < gemma4_down_tile_span; t++) {
     uint3 tile_tid = tid;
     tile_tid.y = tid.y + uint(t);
-    qmv_impl<T, group_size, bits>(
+    qmv_affine4_g64_singles_impl<T, group_size, bits, 704, true, false>(
         tile_w,
         tile_scales,
         tile_biases,
@@ -4549,12 +4531,6 @@ template <
   const int K_it = K / BK;
   const size_t stride_w = transpose ? N * K_w : K * N_w;
   const size_t stride_s = transpose ? N * K_g : K * N_g;
-  // Uniform admission inside the editable kernel replaces the unavailable
-  // host-side function constant. Only the exact target prefill geometry can
-  // consume the paired gate/up storage and emit a compact GeGLU plane.
-  const bool gemma4_gather_rhs_geglu =
-      transpose && metal::is_same_v<T, bfloat> && group_size == 64 &&
-      bits == 4 && M >= 512 && N == 1408 && K == 2816;
   const int y_row = tid.y * BM;
   const int y_col = tid.x * BN;
   const size_t y_row_long = size_t(y_row);
@@ -4601,40 +4577,6 @@ template <
     // Prepare threadgroup mma operation
     thread mma_t mma_op(simd_group_id, simd_lane_id);
 
-    auto store_geglu = [&](short2 start, short2 stop) {
-      using c_tile_t = decltype(mma_op.Ctile);
-      using frag_t = typename c_tile_t::MMAFrag_t;
-      constexpr short CTM = c_tile_t::kTileRows;
-      constexpr short CTN = c_tile_t::kTileCols;
-      static_assert(CTN % 2 == 0, "GeGLU epilogue requires paired fragments");
-      mlx::steel::MMATile<float, CTM, CTN / 2, frag_t> Otile;
-      STEEL_PRAGMA_UNROLL
-      for (short mm = 0; mm < CTM; ++mm) {
-        STEEL_PRAGMA_UNROLL
-        for (short nn = 0; nn < CTN / 2; ++nn) {
-          thread auto& gate = mma_op.Ctile.frag_at(mm, 2 * nn);
-          thread auto& up = mma_op.Ctile.frag_at(mm, 2 * nn + 1);
-          thread auto& out = Otile.frag_at(mm, nn);
-          STEEL_PRAGMA_UNROLL
-          for (short i = 0; i < c_tile_t::kElemsPerFrag; ++i) {
-            const T g = static_cast<T>(gate[i]);
-            const T u = static_cast<T>(up[i]);
-            out[i] = float(gemma4_geglu_compiled_tape(g, u));
-          }
-        }
-      }
-      device T* compact_y =
-          y - y_row_long * N - y_col_long +
-          y_row_long * (N / 2) + size_t(tid.x) * (BN / 2) +
-          mma_op.sm * (N / 2) + mma_op.sn;
-      start -= short2(mma_op.sn, mma_op.sm);
-      stop -= short2(mma_op.sn, mma_op.sm);
-      if (stop.y > 0 && stop.x > 0) {
-        Otile.template store_slice<T, 1, 1>(
-            compact_y, N / 2, start, stop);
-      }
-    };
-
     // Prepare threadgroup loading operations
     thread loader_x_t loader_x(x, K, Xs, simd_group_id, simd_lane_id);
     thread loader_w_t loader_w(
@@ -4655,9 +4597,7 @@ template <
       }
 
       // Store results to device memory
-      if (gemma4_gather_rhs_geglu) {
-        store_geglu(short2(0, offset), short2(BN / 2, offset_next));
-      } else if (offset_next - offset == BM) {
+      if (offset_next - offset == BM) {
         mma_op.store_result(y, N);
       } else {
         mma_op.store_result_slice(
@@ -4674,9 +4614,7 @@ template <
         }
 
         // Store results to device memory
-        if (gemma4_gather_rhs_geglu) {
-          store_geglu(short2(0, offset), short2(BN / 2, offset_next));
-        } else if (offset_next - offset == BM) {
+        if (offset_next - offset == BM) {
           mma_op.store_result(y, N);
         } else {
           mma_op.store_result_slice(
@@ -4693,12 +4631,8 @@ template <
           gemm_loop_finalize(
               Xs, Ws, mma_op, loader_x, loader_w, tile_x, tile_w);
         }
-        if (gemma4_gather_rhs_geglu) {
-          store_geglu(short2(0, offset), short2(BN / 2, offset_next));
-        } else {
-          mma_op.store_result_slice(
-              y, N, short2(0, offset), short2(BN, offset_next));
-        }
+        mma_op.store_result_slice(
+            y, N, short2(0, offset), short2(BN, offset_next));
       }
 
       // Tile partially aligned check cols
@@ -4710,13 +4644,8 @@ template <
           gemm_loop_finalize(
               Xs, Ws, mma_op, loader_x, loader_w, tile_x, tile_w);
         }
-        if (gemma4_gather_rhs_geglu) {
-          store_geglu(
-              short2(0, offset), short2(tgp_bn / 2, offset_next));
-        } else {
-          mma_op.store_result_slice(
-              y, N, short2(0, offset), short2(tgp_bn, offset_next));
-        }
+        mma_op.store_result_slice(
+            y, N, short2(0, offset), short2(tgp_bn, offset_next));
       }
 
       // Nothing aligned so check both rows and cols
@@ -4728,13 +4657,8 @@ template <
           gemm_loop_finalize(
               Xs, Ws, mma_op, loader_x, loader_w, tile_x, tile_w);
         }
-        if (gemma4_gather_rhs_geglu) {
-          store_geglu(
-              short2(0, offset), short2(tgp_bn / 2, offset_next));
-        } else {
-          mma_op.store_result_slice(
-              y, N, short2(0, offset), short2(tgp_bn, offset_next));
-        }
+        mma_op.store_result_slice(
+            y, N, short2(0, offset), short2(tgp_bn, offset_next));
       }
     }
   }

@@ -2206,15 +2206,16 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     const float kb = float(as_type<half>(ushort(ktw >> 16)));
                     const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
                     const float vb = float(as_type<half>(ushort(vtw >> 16)));
-                    float score_lo = 0.0f;
-                    float score_hi = 0.0f;
+                    float qdot_lo = 0.0f;
+                    float qdot_hi = 0.0f;
                     #pragma clang loop unroll(full)
                     for (int element = 0; element < values_per_lane; ++element) {
-                        const float key_element =
-                            fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
-                        score_lo += q_lo[element] * key_element;
-                        score_hi += q_hi[element] * key_element;
+                        const float code = float((kw >> (4 * element)) & 0xfu);
+                        qdot_lo += q_lo[element] * code;
+                        qdot_hi += q_hi[element] * code;
                     }
+                    float score_lo = fma(qdot_lo, ks, kb * q_sum_lo);
+                    float score_hi = fma(qdot_hi, ks, kb * q_sum_hi);
                     score_lo = simd_sum(score_lo);
                     score_hi = simd_sum(score_hi);
 
@@ -2228,14 +2229,15 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     max_hi = new_max_hi;
                     sum_lo = sum_lo * old_factor_lo + score_factor_lo;
                     sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                    const float s_factor_v_lo = score_factor_lo * vs;
+                    const float b_factor_v_lo = score_factor_lo * vb;
+                    const float s_factor_v_hi = score_factor_hi * vs;
+                    const float b_factor_v_hi = score_factor_hi * vb;
                     #pragma clang loop unroll(full)
                     for (int element = 0; element < values_per_lane; ++element) {
-                        const float value_element =
-                            fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
-                        acc_lo[element] = acc_lo[element] * old_factor_lo
-                            + score_factor_lo * value_element;
-                        acc_hi[element] = acc_hi[element] * old_factor_hi
-                            + score_factor_hi * value_element;
+                        const float code = float((vw >> (4 * element)) & 0xfu);
+                        acc_lo[element] = fma(acc_lo[element], old_factor_lo, fma(code, s_factor_v_lo, b_factor_v_lo));
+                        acc_hi[element] = fma(acc_hi[element], old_factor_hi, fma(code, s_factor_v_hi, b_factor_v_hi));
                     }
                 }
             """
@@ -2314,15 +2316,16 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         const float kb = float(as_type<half>(ushort(ktw >> 16)));
                         const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
                         const float vb = float(as_type<half>(ushort(vtw >> 16)));
-                        float score_lo = 0.0f;
-                        float score_hi = 0.0f;
+                        float qdot_lo = 0.0f;
+                        float qdot_hi = 0.0f;
                         #pragma clang loop unroll(full)
                         for (int element = 0; element < values_per_lane; ++element) {
-                            const float key_element =
-                                fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
-                            score_lo += q_lo[element] * key_element;
-                            score_hi += q_hi[element] * key_element;
+                            const float code = float((kw >> (4 * element)) & 0xfu);
+                            qdot_lo += q_lo[element] * code;
+                            qdot_hi += q_hi[element] * code;
                         }
+                        float score_lo = fma(qdot_lo, ks, kb * q_sum_lo);
+                        float score_hi = fma(qdot_hi, ks, kb * q_sum_hi);
                         score_lo = simd_sum(score_lo);
                         score_hi = simd_sum(score_hi);
 
@@ -2336,14 +2339,15 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         max_hi = new_max_hi;
                         sum_lo = sum_lo * old_factor_lo + score_factor_lo;
                         sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                        const float s_factor_v_lo = score_factor_lo * vs;
+                        const float b_factor_v_lo = score_factor_lo * vb;
+                        const float s_factor_v_hi = score_factor_hi * vs;
+                        const float b_factor_v_hi = score_factor_hi * vb;
                         #pragma clang loop unroll(full)
                         for (int element = 0; element < values_per_lane; ++element) {
-                            const float value_element =
-                                fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
-                            acc_lo[element] = acc_lo[element] * old_factor_lo
-                                + score_factor_lo * value_element;
-                            acc_hi[element] = acc_hi[element] * old_factor_hi
-                                + score_factor_hi * value_element;
+                            const float code = float((vw >> (4 * element)) & 0xfu);
+                            acc_lo[element] = fma(acc_lo[element], old_factor_lo, fma(code, s_factor_v_lo, b_factor_v_lo));
+                            acc_hi[element] = fma(acc_hi[element], old_factor_hi, fma(code, s_factor_v_hi, b_factor_v_hi));
                         }
                     }
                 }
@@ -2633,6 +2637,13 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         q_hi[q * 4 + j] = float(q4_hi[j]);
                     }
                 }
+                float q_sum_lo = 0.0f;
+                float q_sum_hi = 0.0f;
+                #pragma clang loop unroll(full)
+                for (int element = 0; element < values_per_lane; ++element) {
+                    q_sum_lo += q_lo[element];
+                    q_sum_hi += q_hi[element];
+                }
                 #pragma clang loop unroll(full)
                 for (int element = 0; element < values_per_lane; ++element) {
                     acc_lo[element] = 0.0f;
@@ -2777,7 +2788,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
 
     private static let portQuantFusedWriteResidentNormRopeKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_v1_ey29_ey32_yp3_ey51_yrp1_p1\(slidingPrefetchKey)",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_v1_ey29_ey32_yp3_ey51_yrp1_p2\(slidingPrefetchKey)",
             inputNames: [
                 "raw_queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -2793,7 +2804,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// fifth output, so the standalone prepass never runs on a sliding layer.
     private static let portQuantFusedWriteResidentNormRopeORunsumKernel:
         MLXFast.MLXFastKernel = MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_ors_v1_ey29_ey32_yp3_ey51_yrp1_p1\(slidingPrefetchKey)",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_ors_v1_ey29_ey32_yp3_ey51_yrp1_p2\(slidingPrefetchKey)",
             inputNames: [
                 "raw_queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",

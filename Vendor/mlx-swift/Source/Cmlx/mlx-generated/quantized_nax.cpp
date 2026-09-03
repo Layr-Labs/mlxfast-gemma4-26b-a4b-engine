@@ -1551,11 +1551,21 @@ METAL_FUNC void gather_rhs_mma_frag_row(
     thread BTile& B,
     metal::bool_constant<transpose_b> tb) {
   constexpr short TN = CTile::kTileCols;
-  constexpr short TK = transpose_b ? BTile::kTileCols : BTile::kTileRows;
   constexpr auto ta = metal::bool_constant<false>{};
   static_assert(TN % 2 == 0, "Segment elision expects even TN");
   STEEL_PRAGMA_UNROLL
   for (short nn = 0; nn < TN; nn += 2) {
+#if DARKBLOOM_GEMMA4_NAX_ACC_HOIST
+    // NAX-ACC-HOIST. With TM = 1, TN = 4, TK = 4 this fragment row issues 8
+    // mma calls per K block and the stock helper marshals the fp32
+    // accumulator into and out of a fresh destination cooperative tensor on
+    // every one of them. The kk chain for a fixed nn accumulates into the
+    // same two C fragments, so the destination is hoisted across it: the
+    // accumulator is copied in once, all TK matmul2d ops run against it in
+    // the same order on the same operands, and it is copied out once.
+    nax_mma_k_resident_n(C, A, ta, B, tb, mm, nn);
+#else
+    constexpr short TK = transpose_b ? BTile::kTileCols : BTile::kTileRows;
     STEEL_PRAGMA_UNROLL
     for (short kk = 0; kk < TK; ++kk) {
       CTile::NAXFrag_t::mma(
@@ -1567,6 +1577,7 @@ METAL_FUNC void gather_rhs_mma_frag_row(
           B.frag_at(kk, nn + 1, tb),
           tb);
     }
+#endif
   }
 }
 

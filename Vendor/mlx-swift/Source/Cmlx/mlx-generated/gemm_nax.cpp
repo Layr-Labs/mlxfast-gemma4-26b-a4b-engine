@@ -1038,6 +1038,238 @@ struct NAXTile {
   }
 };
 
+///////////////////////////////////////////////////////////////////////////////
+// DARKBLOOM GEMMA4 NAX ACCUMULATOR HOIST.
+//
+// BaseNAXFrag::mma constructs ct_a, ct_b AND ct_c fresh on every call, copies
+// the live fp32 accumulator into ct_c, runs a single matmul2d, then copies it
+// straight back out. Every consumer calls it from the innermost step of a K
+// reduction, so a TK-long reduction pays TK accumulator copy-ins and TK
+// copy-outs where one of each would do. Apple's SDK header states that a
+// cooperative tensor's thread-private storage is allocated at construction of
+// the cooperative_tensor and deallocated when it goes out of scope, and the
+// canonical matmul example in that header creates the destination tensor once,
+// outside the reduction loop.
+//
+// The two helpers below run a whole TK reduction with the destination
+// cooperative tensor resident: copy the accumulator in once, issue every
+// matmul2d against it, copy out once. ct_a and ct_b are hoisted alongside it;
+// both are fully overwritten before every run, so reusing them is a pure
+// lifetime change with no dataflow of its own.
+//
+// BIT EXACTNESS. The matmul2d op is created from a byte-identical descriptor
+// (16, 32, 16, transpose_a, transpose_b, relaxed_precision = true,
+// mode::multiply_accumulate), and the same TK runs are issued against the same
+// operand fragments in the same order. ct_c's element type is CType, the same
+// fp32 type as the dtype_frag_t<CType> accumulator, so each copy-out/copy-in
+// pair that disappears between two consecutive runs was an exact float to
+// float round trip of the very same values. Only where the running partial
+// sums live between MMAs changes; the count, the order and the rounding of the
+// reductions are untouched.
+//
+// Kill switch: build with -DDARKBLOOM_GEMMA4_NAX_ACC_HOIST=0 and every
+// consumer falls back to the shipped per-step BaseNAXFrag::mma call sequence,
+// reproducing the incumbent source byte for byte.
+#ifndef DARKBLOOM_GEMMA4_NAX_ACC_HOIST
+#define DARKBLOOM_GEMMA4_NAX_ACC_HOIST 1
+#endif
+
+#if DARKBLOOM_GEMMA4_NAX_ACC_HOIST
+
+// C[mm, nn .. nn + 1] += sum_kk A[mm, kk] * B[kk, nn .. nn + 1].
+// Same operand shape as BaseNAXFrag::mma's one-A-fragment / two-B-fragment
+// overload, run TK times against a resident destination.
+template <
+    class CTile,
+    class ATile,
+    class BTile,
+    bool transpose_a,
+    bool transpose_b>
+METAL_FUNC void nax_mma_k_resident_n(
+    thread CTile& C,
+    thread ATile& A,
+    metal::bool_constant<transpose_a> ta,
+    thread BTile& B,
+    metal::bool_constant<transpose_b> tb,
+    const short mm,
+    const short nn) {
+  using NAXFrag_t = typename CTile::NAXFrag_t;
+  using AFrag = typename ATile::frag_type;
+  using BFrag = typename BTile::frag_type;
+  using CFrag = typename CTile::frag_type;
+
+  constexpr short kEPF = NAXFrag_t::kElemsPerFrag;
+  constexpr short TK = transpose_b ? BTile::kTileCols : BTile::kTileRows;
+
+  constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+      16,
+      32,
+      16,
+      transpose_a,
+      transpose_b,
+      true,
+      mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+
+  // Create matmul op
+  mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> gemm_op;
+
+  // Create matmul operands in registers, once for the whole reduction
+  auto ct_a =
+      gemm_op.template get_left_input_cooperative_tensor<
+          typename ATile::elem_type,
+          typename BTile::elem_type,
+          typename CTile::elem_type>();
+  auto ct_b =
+      gemm_op.template get_right_input_cooperative_tensor<
+          typename ATile::elem_type,
+          typename BTile::elem_type,
+          typename CTile::elem_type>();
+
+  // Create matmul output in register, resident across the whole reduction
+  auto ct_c = gemm_op.template get_destination_cooperative_tensor<
+      decltype(ct_a),
+      decltype(ct_b),
+      typename CTile::elem_type>();
+
+  thread CFrag& Cn0 = C.frag_at(mm, nn);
+  thread CFrag& Cn1 = C.frag_at(mm, nn + 1);
+
+  // Load C into output registers ONCE (op handles accumulation)
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < kEPF; i++) {
+    ct_c[i] = Cn0[i];
+    ct_c[kEPF + i] = Cn1[i];
+  }
+
+  STEEL_PRAGMA_UNROLL
+  for (short kk = 0; kk < TK; kk++) {
+    const thread AFrag& Af = A.frag_at(mm, kk, ta);
+    const thread BFrag& Bn0 = B.frag_at(kk, nn, tb);
+    const thread BFrag& Bn1 = B.frag_at(kk, nn + 1, tb);
+
+    // Load A in to left operand registers
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kEPF; i++) {
+      ct_a[i] = Af[i];
+    }
+
+    // Load B into right operand registers
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kEPF; i++) {
+      ct_b[i] = Bn0[i];
+      ct_b[kEPF + i] = Bn1[i];
+    }
+
+    // Do matmul
+    gemm_op.run(ct_a, ct_b, ct_c);
+  }
+
+  // Copy out results ONCE
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < kEPF; i++) {
+    Cn0[i] = ct_c[i];
+    Cn1[i] = ct_c[kEPF + i];
+  }
+}
+
+// C[mm .. mm + 1, nn] += sum_kk A[mm .. mm + 1, kk] * B[kk, nn].
+// Same operand shape as BaseNAXFrag::mma's two-A-fragment / one-B-fragment
+// overload, run TK times against a resident destination.
+template <
+    class CTile,
+    class ATile,
+    class BTile,
+    bool transpose_a,
+    bool transpose_b>
+METAL_FUNC void nax_mma_k_resident_m(
+    thread CTile& C,
+    thread ATile& A,
+    metal::bool_constant<transpose_a> ta,
+    thread BTile& B,
+    metal::bool_constant<transpose_b> tb,
+    const short mm,
+    const short nn) {
+  using NAXFrag_t = typename CTile::NAXFrag_t;
+  using AFrag = typename ATile::frag_type;
+  using BFrag = typename BTile::frag_type;
+  using CFrag = typename CTile::frag_type;
+
+  constexpr short kEPF = NAXFrag_t::kElemsPerFrag;
+  constexpr short TK = transpose_b ? BTile::kTileCols : BTile::kTileRows;
+
+  constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+      16,
+      32,
+      16,
+      transpose_a,
+      transpose_b,
+      true,
+      mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+
+  // Create matmul op
+  mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> gemm_op;
+
+  // Create matmul operands in registers, once for the whole reduction
+  auto ct_a =
+      gemm_op.template get_left_input_cooperative_tensor<
+          typename ATile::elem_type,
+          typename BTile::elem_type,
+          typename CTile::elem_type>();
+  auto ct_b =
+      gemm_op.template get_right_input_cooperative_tensor<
+          typename ATile::elem_type,
+          typename BTile::elem_type,
+          typename CTile::elem_type>();
+
+  // Create matmul output in register, resident across the whole reduction
+  auto ct_c = gemm_op.template get_destination_cooperative_tensor<
+      decltype(ct_a),
+      decltype(ct_b),
+      typename CTile::elem_type>();
+
+  thread CFrag& Cm0 = C.frag_at(mm, nn);
+  thread CFrag& Cm1 = C.frag_at(mm + 1, nn);
+
+  // Load C into output registers ONCE (op handles accumulation)
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < kEPF; i++) {
+    ct_c[i] = Cm0[i];
+    ct_c[kEPF + i] = Cm1[i];
+  }
+
+  STEEL_PRAGMA_UNROLL
+  for (short kk = 0; kk < TK; kk++) {
+    const thread AFrag& Am0 = A.frag_at(mm, kk, ta);
+    const thread AFrag& Am1 = A.frag_at(mm + 1, kk, ta);
+    const thread BFrag& Bf = B.frag_at(kk, nn, tb);
+
+    // Load A in to left operand registers
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kEPF; i++) {
+      ct_a[i] = Am0[i];
+      ct_a[kEPF + i] = Am1[i];
+    }
+
+    // Load B into right operand registers
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kEPF; i++) {
+      ct_b[i] = Bf[i];
+    }
+
+    // Do matmul
+    gemm_op.run(ct_a, ct_b, ct_c);
+  }
+
+  // Copy out results ONCE
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < kEPF; i++) {
+    Cm0[i] = ct_c[i];
+    Cm1[i] = ct_c[kEPF + i];
+  }
+}
+
+#endif // DARKBLOOM_GEMMA4_NAX_ACC_HOIST
+
 template <
     class CTile,
     class ATile,
@@ -1071,6 +1303,11 @@ METAL_FUNC void tile_matmad_nax(
     for (short mm = 0; mm < TM; mm += 2) {
       STEEL_PRAGMA_UNROLL
       for (short nn = 0; nn < TN; ++nn) {
+#if DARKBLOOM_GEMMA4_NAX_ACC_HOIST
+        // Same TK matmul2d ops on the same operands, run against a resident
+        // destination cooperative tensor instead of one per k step.
+        nax_mma_k_resident_m(C, A, ta, B, tb, mm, nn);
+#else
         STEEL_PRAGMA_UNROLL
         for (short kk = 0; kk < TK; ++kk) {
           CTile::NAXFrag_t::mma(
@@ -1082,6 +1319,7 @@ METAL_FUNC void tile_matmad_nax(
               B.frag_at(kk, nn, tb),
               metal::bool_constant<transpose_b>{});
         }
+#endif
       }
     }
   } else if constexpr (TN % 2 == 0) {
@@ -1089,6 +1327,11 @@ METAL_FUNC void tile_matmad_nax(
     for (short mm = 0; mm < TM; ++mm) {
       STEEL_PRAGMA_UNROLL
       for (short nn = 0; nn < TN; nn += 2) {
+#if DARKBLOOM_GEMMA4_NAX_ACC_HOIST
+        // Same TK matmul2d ops on the same operands, run against a resident
+        // destination cooperative tensor instead of one per k step.
+        nax_mma_k_resident_n(C, A, ta, B, tb, mm, nn);
+#else
         STEEL_PRAGMA_UNROLL
         for (short kk = 0; kk < TK; ++kk) {
           CTile::NAXFrag_t::mma(
@@ -1100,6 +1343,7 @@ METAL_FUNC void tile_matmad_nax(
               B.frag_at(kk, nn + 1, tb),
               metal::bool_constant<transpose_b>{});
         }
+#endif
       }
     }
   }

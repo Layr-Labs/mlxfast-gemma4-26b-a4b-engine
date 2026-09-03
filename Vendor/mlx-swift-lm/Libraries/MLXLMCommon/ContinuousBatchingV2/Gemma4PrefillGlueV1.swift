@@ -111,16 +111,12 @@ public enum Gemma4PrefillGlueV1 {
             acc += xv[i] * xv[i];
           }
           acc = simd_sum(acc);
-          if (simd_group_id == 0) {
-            local_sums[simd_lane_id] = 0;
-          }
-          threadgroup_barrier(mem_flags::mem_threadgroup);
           if (simd_lane_id == 0) {
             local_sums[simd_group_id] = acc;
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
           if (simd_group_id == 0) {
-            acc = simd_sum(local_sums[simd_lane_id]);
+            acc = simd_sum(simd_lane_id < 22 ? local_sums[simd_lane_id] : 0.0f);
             if (simd_lane_id == 0) {
               local_inv[0] = metal::precise::rsqrt(acc / GLUE_AXIS + eps);
             }
@@ -151,19 +147,14 @@ public enum Gemma4PrefillGlueV1 {
           }
           acc_a = simd_sum(acc_a);
           acc_b = simd_sum(acc_b);
-          if (simd_group_id == 0) {
-            local_sums_a[simd_lane_id] = 0;
-            local_sums_b[simd_lane_id] = 0;
-          }
-          threadgroup_barrier(mem_flags::mem_threadgroup);
           if (simd_lane_id == 0) {
             local_sums_a[simd_group_id] = acc_a;
             local_sums_b[simd_group_id] = acc_b;
           }
           threadgroup_barrier(mem_flags::mem_threadgroup);
           if (simd_group_id == 0) {
-            acc_a = simd_sum(local_sums_a[simd_lane_id]);
-            acc_b = simd_sum(local_sums_b[simd_lane_id]);
+            acc_a = simd_sum(simd_lane_id < 22 ? local_sums_a[simd_lane_id] : 0.0f);
+            acc_b = simd_sum(simd_lane_id < 22 ? local_sums_b[simd_lane_id] : 0.0f);
             if (simd_lane_id == 0) {
               local_inv2[0] = metal::precise::rsqrt(acc_a / GLUE_AXIS + eps);
               local_inv2[1] = metal::precise::rsqrt(acc_b / GLUE_AXIS + eps);

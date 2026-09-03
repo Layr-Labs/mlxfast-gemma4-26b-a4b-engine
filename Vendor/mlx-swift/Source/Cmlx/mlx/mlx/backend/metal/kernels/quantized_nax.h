@@ -12,6 +12,24 @@ constant bool align_K [[function_constant(202)]];
 
 using namespace metal;
 
+// Match the Compiled primitive's typed tape exactly. Swift converts every
+// scalar literal to the array dtype, and each primitive writes a bfloat16
+// temporary before the next primitive reads it.
+template <typename T>
+inline T gemma4_geglu_compiled_tape(T gate, T up) {
+  const T cubic_0 = static_cast<T>(static_cast<T>(0.044715f) * gate);
+  const T cubic_1 = static_cast<T>(cubic_0 * gate);
+  const T cubic_2 = static_cast<T>(cubic_1 * gate);
+  const T inner = static_cast<T>(gate + cubic_2);
+  const T scaled =
+      static_cast<T>(static_cast<T>(0.7978845608028654f) * inner);
+  const T curved = metal::precise::tanh(scaled);
+  const T shifted = static_cast<T>(static_cast<T>(1.0f) + curved);
+  const T half_gate = static_cast<T>(static_cast<T>(0.5f) * gate);
+  const T gelu = static_cast<T>(half_gate * shifted);
+  return static_cast<T>(gelu * up);
+}
+
 #define MLX_MTL_CONST static constant constexpr const
 
 MLX_MTL_CONST int SIMD_SIZE = 32;
@@ -1649,6 +1667,12 @@ template <
   const int K_it = K / BK;
   const size_t stride_w = transpose ? N * K_w : K * N_w;
   const size_t stride_s = transpose ? N * K_g : K * N_g;
+  // The host dispatch surface is trusted and not editable, so admission is a
+  // uniform runtime predicate inside the kernel. All template terms fold at
+  // compile time; only the exact target geometry reaches the compact close.
+  const bool gemma4_gather_rhs_geglu =
+      transpose && metal::is_same_v<T, bfloat> && group_size == 64 &&
+      bits == 4 && M >= 512 && N == 1408 && K == 2816;
   const int y_row = tid.y * BM;
   const int y_col = tid.x * BN;
   const size_t y_row_long = size_t(y_row);
@@ -1895,22 +1919,61 @@ template <
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Store results to device memory. seg_lo/seg_hi are the stock
-        // m_lo_lim/m_hi_lim, hoisted ahead of the K-loop.
-        if (!seg_empty) {
-          if constexpr (kAlignedN.value) {
+        // The exact production arm lays this 64-column tile out as adjacent
+        // 16-column gate/up pairs. Round both GEMM closes to T, then reproduce
+        // every bfloat16 temporary of the compiled GeGLU tape. Compact rows
+        // occupy the physical prefix of the ordinary 1408-wide allocation.
+        if (gemma4_gather_rhs_geglu) {
+          static_assert(TN % 2 == 0, "GeGLU epilogue requires paired fragments");
+          NAXTile<AccumType, TM, TN / 2> Otile;
+          const_for_loop<0, TM, 1>([&](auto mm) {
+            const_for_loop<0, TN / 2, 1>([&](auto nn) {
+              thread auto& gate =
+                  Dtile.frag_at(short(mm), short(nn) * 2);
+              thread auto& up =
+                  Dtile.frag_at(short(mm), short(nn) * 2 + 1);
+              thread auto& out = Otile.frag_at(short(mm), short(nn));
+              STEEL_PRAGMA_UNROLL
+              for (short i = 0; i < Dtile.kElemsPerFrag; ++i) {
+                const T g = static_cast<T>(gate[i]);
+                const T u = static_cast<T>(up[i]);
+                out[i] = float(gemma4_geglu_compiled_tape(g, u));
+              }
+            });
+          });
+          if (!seg_empty) {
+            device T* compact_y =
+                y - y_row_long * N - y_col_long +
+                y_row_long * (N / 2) + size_t(tid.x) * (BN / 2) +
+                tm * (N / 2) + tn / 2;
             if (seg_lo == 0 && seg_hi == SM) {
-              Dtile.store(y + tm * N + tn, N);
+              Otile.store(compact_y, N / 2);
+            } else {
+              Otile.store_slice(
+                  compact_y,
+                  N / 2,
+                  short2(0, seg_lo),
+                  short2(SN / 2, seg_hi));
+            }
+          }
+        } else {
+          // Store results to device memory. seg_lo/seg_hi are the stock
+          // m_lo_lim/m_hi_lim, hoisted ahead of the K-loop.
+          if (!seg_empty) {
+            if constexpr (kAlignedN.value) {
+              if (seg_lo == 0 && seg_hi == SM) {
+                Dtile.store(y + tm * N + tn, N);
+              } else {
+                Dtile.store_slice(
+                    y + tm * N + tn, N, short2(0, seg_lo), short2(SN, seg_hi));
+              }
             } else {
               Dtile.store_slice(
-                  y + tm * N + tn, N, short2(0, seg_lo), short2(SN, seg_hi));
+                  y + tm * N + tn,
+                  N,
+                  short2(0, seg_lo),
+                  short2(sgp_sn, seg_hi));
             }
-          } else {
-            Dtile.store_slice(
-                y + tm * N + tn,
-                N,
-                short2(0, seg_lo),
-                short2(sgp_sn, seg_hi));
           }
         }
       });

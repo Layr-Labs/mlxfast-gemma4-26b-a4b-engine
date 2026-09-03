@@ -415,6 +415,36 @@ jobs:
             sleep 15
             waited=$((waited + 15))
             if [[ "${waited}" -ge 900 ]]; then
+              # OBSERVATION ONLY, and deliberately so. The refusal above is the
+              # design and the no-reap omission is ruled permanent, so nothing
+              # here kills a process, asks for sudo or waits a second longer:
+              # this reads the process table, prints what it saw, and then the
+              # same refusal fires with the same exit code. What it buys is the
+              # one fact the trace never carried -- the ceiling told us the box
+              # was busy and never told us BY WHAT, so every quiescence timeout
+              # looked alike and no one could name the hog after the fact.
+              top="$(ps -Ameo pid,pcpu,rss,etime,command -r | head -15 || true)"
+              lingering="$(pgrep -fl 'mlxfast-runtime-worker|benchctl|mlxfast-swift' || true)"
+              [[ -n "${lingering}" ]] || lingering="(none found)"
+              echo "gemma4-ranked: top processes by CPU at the quiescence ceiling:"
+              printf '%s\n' "${top}"
+              echo "gemma4-ranked: lingering benchmark processes (mlxfast-runtime-worker|benchctl|mlxfast-swift):"
+              printf '%s\n' "${lingering}"
+              {
+                echo "### Quiescence ceiling reached"
+                echo
+                echo "The machine did not reach quiescence within 900s: \`load=${load}\` \`gpu_util=${util}\` (thresholds: load < 2.0, gpu_util < 0.10)."
+                echo
+                echo "Top processes by CPU:"
+                echo '```'
+                printf '%s\n' "${top}"
+                echo '```'
+                echo
+                echo "Lingering benchmark processes (mlxfast-runtime-worker|benchctl|mlxfast-swift):"
+                echo '```'
+                printf '%s\n' "${lingering}"
+                echo '```'
+              } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
               echo "::error::machine did not reach quiescence within 900s (load=${load} gpu_util=${util})" >&2
               exit 1
             fi
@@ -446,12 +476,34 @@ jobs:
 
       - name: Upload score artifact
         # Matches benchmark.json scoreArtifact `benchmark-results-<run_id>/score.json`.
-        # `if: always()` so a failure after a written score still publishes it,
-        # and `if-no-files-found: error` so a refused run is loud and artifact-less
-        # instead of quietly uploading nothing.
-        if: always()
+        # `always()` so a failure AFTER a written score still publishes it, and
+        # `if-no-files-found: error` still guards the upload itself.
+        #
+        # THE hashFiles GUARD IS REPORTING, NOT POLICY. The two invariants are
+        # unchanged: a written score is always published, and a "successful" run
+        # with no score is loud. What changed is who says so. Under a bare
+        # `always()` this step also ran on every REFUSED run -- where there is
+        # correctly no score to upload -- and stamped a second, misleading
+        # `##[error]No files were found with the provided path: score.json` on
+        # top of the real cause, so every refusal read as an artifact fault.
+        # The step now stands down when there is no file, and the guard step
+        # below carries the "no score" refusal for the only case where a missing
+        # score is a defect: a run that otherwise succeeded.
+        if: ${{ always() && hashFiles('score.json') != '' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: benchmark-results-${{ github.run_id }}
           path: score.json
           if-no-files-found: error
+
+      - name: Refuse a successful run that wrote no score
+        # The other half of the split above, and the only case the old
+        # `if-no-files-found: error` was actually there to catch: every prior
+        # step passed, so the score seam -- measure-job -> emit-gemma4-score.sh
+        # -> score.json -- silently produced nothing. That is a defect and it
+        # stays loud. A refused run does not reach here (`success()` is false),
+        # which is exactly the double-error this removes.
+        if: ${{ success() && hashFiles('score.json') == '' }}
+        run: |
+          echo "::error::gemma4-ranked: the run succeeded but wrote no score.json; the score seam is broken"
+          exit 1

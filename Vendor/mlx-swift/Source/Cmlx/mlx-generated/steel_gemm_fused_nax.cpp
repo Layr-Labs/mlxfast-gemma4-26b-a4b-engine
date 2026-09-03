@@ -51,7 +51,7 @@ constant bool align_K [[function_constant(202)]];
 // Kill switch: build with -DDARKBLOOM_GEMMA4_NAX_SKIP_EMPTY=0 and both guards
 // fold to the incumbent unconditional form.
 #ifndef DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY
-#define DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY 1
+#define DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY 0
 #endif
 
 // clang-format off
@@ -201,6 +201,17 @@ template <
   constexpr bool kSoftmaxLoaderEligible =
       !transpose_a && !transpose_b && metal::is_same_v<T, bfloat16_t>;
   bool softmax_loader = false;
+
+  // DENSE-GEGLU-EPILOGUE (see steel_gemm_fused.h): uniform admission inside
+  // the editable kernel. Only the exact dense-MLP prefill geometry fed by the
+  // paired gate|up dequantized plane reaches the compact GeGLU close.
+  // The BN/WN term folds at compile time: the nax dispatch's 32-column
+  // simdgroup slice is exactly one gate16+up16 period, so every slice's
+  // even/odd 16-column fragments hold a matching gate/up pair.
+  const bool gemma4_dense_geglu =
+      !transpose_a && transpose_b && metal::is_same_v<T, bfloat16_t> &&
+      !use_out_source && (BN / WN) % 32 == 0 && params->M >= 512 &&
+      params->N == 4224 && params->K == 2816;
 
   // Adjust for batch
   if (has_batch) {
@@ -369,7 +380,49 @@ template <
                   Dtile, C, params, addmm_params, sgp_sm, sgp_sn);
             }
           }
-          if constexpr (kAlignedM && kAlignedN) {
+          // DENSE-GEGLU-EPILOGUE: the admitted plane interleaves 16 gate
+          // columns with their 16 up columns (period 32), so this simdgroup's
+          // 32-column slice owns complete pairs and the even/odd 16-column
+          // fragments hold the gate and up blocks of the same 16 logical
+          // units. GeGLU closes in registers from the rounded accumulators
+          // and the compact N/2-wide plane occupies the physical prefix of
+          // the ordinary N-wide output allocation.
+          if (gemma4_dense_geglu) {
+            // Constexpr-gate the tape members so ineligible element types
+            // (complex64) never instantiate the branch; the admission
+            // predicate already excludes them at runtime.
+            if constexpr (metal::is_same_v<T, bfloat16_t>) {
+              static_assert(TN % 2 == 0, "GeGLU epilogue requires paired fragments");
+              NAXTile<AccumType, TM, TN / 2> Otile;
+              const_for_loop<0, TM, 1>([&](auto mm) {
+                const_for_loop<0, TN / 2, 1>([&](auto nn) {
+                  thread auto& gate =
+                      Dtile.frag_at(short(mm.value), short(nn.value) * 2);
+                  thread auto& up =
+                      Dtile.frag_at(short(mm.value), short(nn.value) * 2 + 1);
+                  thread auto& out =
+                      Otile.frag_at(short(mm.value), short(nn.value));
+                  STEEL_PRAGMA_UNROLL
+                  for (short i = 0; i < Dtile.kElemsPerFrag; ++i) {
+                    const T g = static_cast<T>(gate[i]);
+                    const T u = static_cast<T>(up[i]);
+                    out[i] = float(gemma4_dense_geglu_compiled_tape(g, u));
+                  }
+                });
+              });
+              device T* compact_d =
+                  D - (c_row_long + size_t(tm)) * params->ldd -
+                  (c_col_long + size_t(tn)) +
+                  (c_row_long + size_t(tm)) * size_t(params->N / 2) +
+                  (c_col_long + size_t(tn)) / 2;
+              if constexpr (kAlignedM && kAlignedN) {
+                Otile.store(compact_d, int(params->N / 2));
+              } else {
+                Otile.store_safe(
+                    compact_d, int(params->N / 2), short2(sgp_sn / 2, sgp_sm));
+              }
+            }
+          } else if constexpr (kAlignedM && kAlignedN) {
             Dtile.store(D, int(params->ldd));
           } else {
             Dtile.store_safe(D, int(params->ldd), short2(sgp_sn, sgp_sm));

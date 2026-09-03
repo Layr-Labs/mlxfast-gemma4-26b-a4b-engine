@@ -323,12 +323,20 @@ enum CBv2ComposedPrefillSDPAV1 {
             scores = MLX.where(causalMask(L: L, kL: kL), scores, bfloat16LowestScalar)
         }
 
-        if let vecScores = CBv2PrefillSoftmaxVecV1.apply(scores) {
-            scores = vecScores
+        var output: MLXArray
+        if let fused = CBv2PrefillAttnTrafficV1.attend(scores: scores, values: v) {
+            // PREFILL-ATTN-TRAFFIC (at1): the softmax is applied by the P.V
+            // GEMM's own A loader from a per-row statistics pre-pass; the
+            // probability rectangle is never written or read.
+            output = fused
         } else {
-            scores = MLX.softmax(scores, axis: -1, precise: true)
+            if let vecScores = CBv2PrefillSoftmaxVecV1.apply(scores) {
+                scores = vecScores
+            } else {
+                scores = MLX.softmax(scores, axis: -1, precise: true)
+            }
+            output = matmul(scores, v)
         }
-        var output = matmul(scores, v)
         if nRepeats > 1 {
             output = output.reshaped([B, nQHeads, L, valueDim])
         }
@@ -536,6 +544,145 @@ enum CBv2PrefillSoftmaxVecV1 {
         ensureRowContiguous: true
     )
 
+    /// PROMPT-GLUE2 (pg2): the transcription above with `RPT` rows per
+    /// threadgroup. One row per threadgroup leaves 16384 threadgroups of
+    /// 32..256 threads per query block and the dispatch bound by
+    /// threadgroup residency rather than by its bytes. Here `RPT` rows
+    /// share a threadgroup of `RPT * threadgroupSize` threads: thread
+    /// `tid` serves row `row_slot = tid / row_threads` with the incumbent's
+    /// `lid`, `simd_lane_id` and row-local `simd_group_id` (row_threads is
+    /// a multiple of 32, so a row's simdgroups are whole simdgroups), and
+    /// each row reduces through its own slot of the shared arrays. The
+    /// per-lane loads, the max and sum trees, the exp and the store are
+    /// the incumbent's text over the same lanes and the same operands; the
+    /// two barriers order the same write/read pairs, now for every row of
+    /// the threadgroup at once. A trailing partial threadgroup (when the
+    /// row count is not a multiple of `RPT`) holds whole rows, since the
+    /// grid is a multiple of the row width.
+    /// Internal (not private): `CBv2PrefillAttnTrafficV1` derives its
+    /// row-statistics twin from this exact text.
+    static let sourcePg2 = """
+        const int axis_size = int(params[0]);
+        const int num_simdgroups = int(params[1]);
+
+        // PROMPT-GLUE2 (pg2): RPT rows share one threadgroup. `row_slot` is
+        // this thread's row within the threadgroup; `gid`, `lid`, `simd_lane_id`
+        // and `simd_group_id` are the incumbent's values for that row (row_threads
+        // is a multiple of 32, so a row's simdgroups are whole simdgroups), and
+        // the body below is the incumbent's text over the same lanes and the same
+        // operands, indexing the row's own slot of the shared arrays.
+        const int row_threads = num_simdgroups * 32;
+        const int tid = int(thread_position_in_threadgroup.x);
+        const int row_slot = tid / row_threads;
+        const int gid = int(threadgroup_position_in_grid.x) * RPT + row_slot;
+        const int lid = tid - row_slot * row_threads;
+        const int simd_lane_id = int(thread_index_in_simdgroup);
+        const int simd_group_id = int(simdgroup_index_in_threadgroup) - row_slot * num_simdgroups;
+
+        threadgroup float local_max[RPT][32];
+        threadgroup float local_normalizer[RPT][32];
+
+        typedef vec<T, 4> T4;
+
+        float ld[4];
+        const int base = lid * 4;
+        const bool row_valid = base < axis_size;
+        const device T* row_in = scores + size_t(gid) * axis_size;
+        if (row_valid) {
+            T4 raw = *reinterpret_cast<const device T4*>(row_in + base);
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                ld[i] = static_cast<float>(raw[i]);
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                ld[i] = -INFINITY;
+            }
+        }
+
+        // MAX. Phase-2 write is UNCHANGED from the stock kernel: only
+        // simdgroup_id == 0's lane owns slot 0, only simdgroup_id == 1's
+        // lane owns slot 1, and so on -- exactly the stock
+        // `local_max[row_slot][simd_group_id] = maxval` write.
+        float maxval = -3.402823466e+38F;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            maxval = (maxval < ld[i]) ? ld[i] : maxval;
+        }
+        maxval = simd_max(maxval);
+        if (simd_lane_id == 0) {
+            local_max[row_slot][simd_group_id] = maxval;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            // Every simdgroup reads the SAME 32 conceptual values the
+            // stock kernel's simdgroup-0-only combine read: the real
+            // partial in slots < num_simdgroups (just published above,
+            // visible threadgroup-wide after the barrier), and the
+            // literal max-identity (-INFINITY, i.e. Limits<float>::min)
+            // in the rest -- substituted here in a register instead of
+            // read back from a zero-filled slot, since no thread ever
+            // wrote a real value there. Same simd_max instruction, same
+            // per-lane operand set as the stock combine: bit-identical
+            // result in every simdgroup, no publish-back needed.
+            float slot = (simd_lane_id < num_simdgroups)
+                ? local_max[row_slot][simd_lane_id] : -INFINITY;
+            maxval = simd_max(slot);
+        }
+
+        float normalizer = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            float exp_x = fast::exp(ld[i] - maxval);
+            ld[i] = exp_x;
+            normalizer += exp_x;
+        }
+        normalizer = simd_sum(normalizer);
+        if (simd_lane_id == 0) {
+            local_normalizer[row_slot][simd_group_id] = normalizer;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            // Same argument as the max combine above, for the sum: the
+            // sum-identity is 0.0f (Limits<float> has no analogue here --
+            // the stock kernel zero-fills `local_normalizer` directly).
+            float slot = (simd_lane_id < num_simdgroups)
+                ? local_normalizer[row_slot][simd_lane_id] : 0.0f;
+            normalizer = simd_sum(slot);
+        }
+        normalizer = 1.0f / normalizer;
+
+        if (row_valid) {
+            device T* row_out = probs + size_t(gid) * axis_size;
+            T4 result;
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                result[i] = static_cast<T>(ld[i] * normalizer);
+            }
+            *reinterpret_cast<device T4*>(row_out + base) = result;
+        }
+        """
+
+    private static let kernelPg2: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_prefill_sdpa_softmax_vec_bf16_pg2",
+        inputNames: ["scores", "params"],
+        outputNames: ["probs"],
+        source: sourcePg2,
+        ensureRowContiguous: true
+    )
+
+    /// Rows per threadgroup for the pg2 twin, by key length: the measured
+    /// optimum of the ranked geometry (any value is exact); other lengths
+    /// take about 640 threads per threadgroup.
+    static func rowsPerThreadgroup(axisSize: Int, threadgroupSize: Int) -> Int {
+        let table: [Int: Int] = [
+            1024: 2, 896: 2, 768: 3, 640: 4, 512: 6, 384: 6, 256: 10, 128: 16,
+        ]
+        if let rows = table[axisSize] { return rows }
+        return max(1, min(640 / threadgroupSize, 1024 / threadgroupSize))
+    }
+
     /// Runs the vectorized softmax, or returns nil to keep the caller on
     /// the stock `MLX.softmax(scores, axis: -1, precise: true)` call.
     /// `scores` may be any contiguous rank; it is treated as a flat
@@ -555,6 +702,39 @@ enum CBv2PrefillSoftmaxVecV1 {
         let numSimdgroups = threadgroupSize / 32
         let paramsArray = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
 
+        // PROMPT-GLUE2 (pg2): prompt-width score rectangles take the
+        // rows-per-threadgroup twin; the incumbent computes the identical
+        // words for every other rectangle.
+        if Gemma4PromptGlue2V1.enabled, nRows >= Gemma4PromptGlue2V1.minRows {
+            let rows = rowsPerThreadgroup(axisSize: axisSize, threadgroupSize: threadgroupSize)
+            if rows > 1, rows * threadgroupSize <= 1024 {
+                CBv2EngageMark.once("prefill-softmax-vec")
+                Gemma4PromptGlue2V1.mark()
+                let probs = kernelPg2(
+                    [scores, paramsArray],
+                    template: [("T", scores.dtype), ("RPT", rows)],
+                    grid: (threadgroupSize * nRows, 1, 1),
+                    threadGroup: (threadgroupSize * rows, 1, 1),
+                    outputShapes: [scores.shape],
+                    outputDTypes: [.bfloat16]
+                )[0]
+                if Gemma4PromptGlue2V1.xcheck {
+                    let reference = kernel(
+                        [scores, paramsArray],
+                        template: [("T", scores.dtype)],
+                        grid: (threadgroupSize * nRows, 1, 1),
+                        threadGroup: (threadgroupSize, 1, 1),
+                        outputShapes: [scores.shape],
+                        outputDTypes: [.bfloat16]
+                    )[0]
+                    Gemma4PromptGlue2V1.report(
+                        probs, reference: reference,
+                        site: "softmax kL=\(axisSize) rows/tg=\(rows)")
+                }
+                return probs
+            }
+        }
+
         CBv2EngageMark.once("prefill-softmax-vec")
         return kernel(
             [scores, paramsArray],
@@ -564,5 +744,199 @@ enum CBv2PrefillSoftmaxVecV1 {
             outputShapes: [scores.shape],
             outputDTypes: [.bfloat16]
         )[0]
+    }
+}
+
+/// PREFILL-ATTN-TRAFFIC (at1). The composed prompt attention's probability
+/// rectangle `P = softmax(S)` is never materialized. Today each query block
+/// runs QK^T -> S (bf16), softmax reads S and writes P, and the P.V GEMM reads
+/// P: four passes over the score rectangle, ~17.5 GB per ranked prefill. Here
+/// the softmax kernel is split in two:
+///
+///   1. `cbv2_prefill_sdpa_softmax_stats_bf16_at1`: the pg2 softmax
+///      transcription, text for text, with the probability store replaced by
+///      a store of the row's `maxval` and `normalizer` (`1.0f / sum`) -- the
+///      two scalars every lane of the row holds after the same two
+///      reduction trees -- as fp32 bit patterns in four bf16 words per row
+///      (`[.., L, 4]`, 8 bytes a row against 2 kL bytes of probabilities).
+///   2. The P.V product is issued as `addMM(stats[.., 0..<1], S, V,
+///      alpha: 1, beta: -0.0)`: the out-source operand is the column view of
+///      the carrier, broadcast over the output columns (row stride 4,
+///      column stride 0). The steel fused GEMM twins (non-nax and nax, the
+///      `.h` sources and their mlx-generated JIT strings) recognize exactly
+///      that signature on a bf16 NN addmm and, instead of adding the
+///      operand in the epilogue, have their A loader stage
+///      `T(fast::exp(float(s) - maxval) * normalizer)` for every score it
+///      loads, then store the accumulator as the plain `matmul(P, V)` does.
+///
+/// EXACTNESS. The prompt softmax kernel writes, per element,
+/// `static_cast<T>(fast::exp(float(raw) - maxval) * normalizer)` with
+/// `normalizer = 1.0f / sum`; the loader evaluates the same five operations
+/// (bf16->fp32 widen, fp32 subtract, `fast::exp`, fp32 multiply, fp32->bf16
+/// round) on the same three operands, in the same kernel environment (MLX's
+/// utils preamble, fast-math off, the same `bfloat16_t`), so every staged P
+/// word is the word the softmax kernel would have stored. `maxval` and
+/// `normalizer` are transported bit for bit (the carrier holds their fp32
+/// patterns, never a rounding). The GEMM then consumes identical P words
+/// through identical tiles, K order and accumulators (the loaded bytes, the
+/// threadgroup layout and the MMA are untouched), and its epilogue is the
+/// plain store, so the output rectangle is bit-identical to
+/// `matmul(softmax(S), V)`. Rows always own their diagonal score, so every
+/// row's statistics are finite.
+///
+/// Prompt width only (`minRows` token rows and up, the composed path's own
+/// `L > 8` guard beneath it); tiles are MN-aligned for every steel tile by
+/// the `L % 128 == 0 && D % 128 == 0` guard, and the K tail (nax `bk` = 256
+/// against kL = 128..1024) is served by the loader's bound-checked twin.
+/// Kill switch: `DARKBLOOM_GEMMA4_PREFILL_ATTN_TRAFFIC=0` (incumbent softmax
+/// + matmul dispatches, byte for byte). Engage mark: `prefill-attn-traffic`.
+/// `DARKBLOOM_GEMMA4_PREFILL_ATTN_TRAFFIC_XCHECK=1` evaluates the incumbent
+/// pair beside every fused call and counts differing output words
+/// (diagnostic only; forces evaluation).
+enum CBv2PrefillAttnTrafficV1 {
+
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_ATTN_TRAFFIC"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    static let xcheck: Bool =
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_PREFILL_ATTN_TRAFFIC_XCHECK"]
+        == "1"
+
+    /// softmax.cpp's SOFTMAX_LOOPED_LIMIT: the transcribed block kernel.
+    private static let maxKeyLength = 4096
+
+    /// The out-source `beta` the steel GEMM twins recognize: fp32 negative
+    /// zero (bits 0x80000000). It makes MLX select the `do_axpby` epilogue
+    /// (`beta != 1`), which the twins replace by the loader transform on this
+    /// signature; no other addmm passes a negative-zero beta.
+    private static let loaderBeta: Float = Float(bitPattern: 0x8000_0000)
+
+    /// The pg2 softmax text with its probability store replaced by the row
+    /// statistics store. Everything above the store -- loads, the max and sum
+    /// trees, `fast::exp`, `1.0f / normalizer` -- is the pg2 kernel's own.
+    /// nil (twin disabled, incumbent pair kept) if the donor text ever
+    /// drifts: a soft gate, never a trap inside a lazy static.
+    private static let statsSource: String? = {
+        let text = CBv2PrefillSoftmaxVecV1.sourcePg2
+        let store = [
+            "if (row_valid) {",
+            "    device T* row_out = probs + size_t(gid) * axis_size;",
+            "    T4 result;",
+            "    #pragma unroll",
+            "    for (int i = 0; i < 4; i++) {",
+            "        result[i] = static_cast<T>(ld[i] * normalizer);",
+            "    }",
+            "    *reinterpret_cast<device T4*>(row_out + base) = result;",
+            "}",
+        ].joined(separator: "\n")
+        let statsStore = [
+            "// PREFILL-ATTN-TRAFFIC (at1): the row's statistics instead of its",
+            "// probabilities -- the maxval and normalizer every lane of the row",
+            "// holds here, as fp32 bit patterns in the row's four bf16 words.",
+            "if (lid == 0) {",
+            "    *reinterpret_cast<device uint2*>(stats + size_t(gid) * 4) =",
+            "        uint2(as_type<uint>(maxval), as_type<uint>(normalizer));",
+            "}",
+        ].joined(separator: "\n")
+        guard text.components(separatedBy: store).count == 2 else {
+            FileHandle.standardError.write(
+                Data("[prefill-attn-traffic] pg2 softmax text drifted; twin disabled\n".utf8))
+            return nil
+        }
+        return text.replacingOccurrences(of: store, with: statsStore)
+    }()
+
+    private static let statsKernel: MLXFast.MLXFastKernel? = statsSource.map { source in
+        MLXFast.metalKernel(
+            name: "cbv2_prefill_sdpa_softmax_stats_bf16_at1",
+            inputNames: ["scores", "params"],
+            outputNames: ["stats"],
+            source: source,
+            ensureRowContiguous: true
+        )
+    }
+
+    /// `matmul(softmax(scores, axis: -1, precise: true), values)` with the
+    /// probabilities never materialized, or nil to keep the incumbent pair.
+    /// `scores` is the row-contiguous `[.., L, kL]` score rectangle of one
+    /// query block, `values` the `[.., kL, D]` operand the incumbent
+    /// `matmul` takes.
+    static func attend(scores: MLXArray, values: MLXArray) -> MLXArray? {
+        guard enabled, CBv2PrefillSoftmaxVecV1.enabled, let statsKernel else { return nil }
+        guard scores.dtype == .bfloat16, values.dtype == .bfloat16 else { return nil }
+        guard scores.ndim >= 2, values.ndim == scores.ndim else { return nil }
+        let axisSize = scores.dim(scores.ndim - 1)
+        guard axisSize > 0, axisSize % 4 == 0, axisSize <= maxKeyLength else { return nil }
+        let L = scores.dim(scores.ndim - 2)
+        let D = values.dim(values.ndim - 1)
+        guard values.dim(values.ndim - 2) == axisSize else { return nil }
+        // Every steel tile (bm, bn in 32/64/128) divides these, so the GEMM
+        // takes its MN-aligned path, the only one carrying the loader twin.
+        guard L % 128 == 0, D % 128 == 0 else { return nil }
+        let totalElements = scores.shape.reduce(1, *)
+        guard totalElements > 0, totalElements % axisSize == 0 else { return nil }
+        let nRows = totalElements / axisSize
+        guard nRows >= Gemma4PromptGlue2V1.minRows else { return nil }
+        // softmax.cpp:64-68: 32 * ceil(ceil(axis_size / 4) / 32).
+        let threadgroupSize = ((axisSize + 3) / 4 + 31) / 32 * 32
+        guard threadgroupSize > 0, threadgroupSize <= 1024 else { return nil }
+        let numSimdgroups = threadgroupSize / 32
+        let rows = CBv2PrefillSoftmaxVecV1.rowsPerThreadgroup(
+            axisSize: axisSize, threadgroupSize: threadgroupSize)
+        guard rows >= 1, rows * threadgroupSize <= 1024 else { return nil }
+        let paramsArray = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
+        var statsShape = scores.shape
+        statsShape[statsShape.count - 1] = 4
+
+        CBv2EngageMark.once("prefill-attn-traffic")
+        let stats = statsKernel(
+            [scores, paramsArray],
+            template: [("T", scores.dtype), ("RPT", rows)],
+            grid: (threadgroupSize * nRows, 1, 1),
+            threadGroup: (threadgroupSize * rows, 1, 1),
+            outputShapes: [statsShape],
+            outputDTypes: [.bfloat16]
+        )[0]
+        // The column view of the carrier: row stride 4, column stride 0 once
+        // addmm broadcasts it over the D output columns -- the signature.
+        let carrier = stats[.ellipsis, 0 ..< 1]
+        let output = addMM(carrier, scores, values, alpha: 1.0, beta: loaderBeta)
+
+        if xcheck {
+            let probabilities =
+                CBv2PrefillSoftmaxVecV1.apply(scores)
+                ?? MLX.softmax(scores, axis: -1, precise: true)
+            let reference = matmul(probabilities, values)
+            report(
+                output, reference: reference,
+                site: "P.V kL=\(axisSize) D=\(D) rows=\(nRows)")
+        }
+        return output
+    }
+
+    // MARK: - diagnostics (never on a timed run)
+
+    /// Counts words that differ between the fused output and the incumbent
+    /// pair's, evaluating both.
+    private static func report(_ candidate: MLXArray, reference: MLXArray, site: String) {
+        guard candidate.shape == reference.shape, candidate.dtype == reference.dtype else {
+            FileHandle.standardError.write(
+                Data(
+                    ("[xcheck] prefill-attn-traffic \(site): shape/dtype mismatch "
+                        + "\(candidate.shape) \(candidate.dtype) vs "
+                        + "\(reference.shape) \(reference.dtype)\n").utf8))
+            return
+        }
+        let differs = candidate.view(dtype: .uint16) .!= reference.view(dtype: .uint16)
+        let differing = MLX.sum(differs, stream: .default)
+        eval(candidate, reference, differing)
+        FileHandle.standardError.write(
+            Data(
+                ("[xcheck] prefill-attn-traffic \(site) shape \(candidate.shape) "
+                    + "words \(candidate.size) differing \(differing.item(Int32.self))\n").utf8))
     }
 }

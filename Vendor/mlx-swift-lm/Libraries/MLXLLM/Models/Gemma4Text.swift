@@ -1786,6 +1786,117 @@ private enum Gemma4PrefillDeqGEMMV1 {
         return product
     }
 
+    private static let fusedPlaneLock = NSLock()
+    nonisolated(unsafe) private static var cachedFusedPlanes: [ObjectIdentifier: MLXArray] = [:]
+
+    @inline(__always)
+    static func applyFusedGateUp(gate: Linear, up: Linear, _ x: MLXArray) -> (MLXArray, MLXArray)? {
+        guard enabled,
+            let qGate = gate as? QuantizedLinear, qGate.bias == nil,
+            qGate.mode == .affine, qGate.groupSize == 64,
+            qGate.bits == 4 || qGate.bits == 8,
+            qGate.scales.dtype == .bfloat16,
+            let gateBiases = qGate.biases, gateBiases.dtype == .bfloat16,
+            let qUp = up as? QuantizedLinear, qUp.bias == nil,
+            qUp.mode == .affine, qUp.groupSize == 64,
+            qUp.bits == qGate.bits,
+            qUp.scales.dtype == .bfloat16,
+            let upBiases = qUp.biases, upBiases.dtype == .bfloat16,
+            x.dtype == .bfloat16, x.ndim >= 2
+        else { return nil }
+        let inputDims = x.dim(-1)
+        guard inputDims > 0, x.size / inputDims >= minRows else { return nil }
+        let weightGate = qGate.weight
+        let weightUp = qUp.weight
+        guard weightGate.ndim == 2, weightGate.dtype == .uint32,
+            weightGate.dim(1) * (32 / qGate.bits) == inputDims,
+            weightUp.ndim == 2, weightUp.dtype == .uint32,
+            weightUp.dim(1) * (32 / qUp.bits) == inputDims
+        else { return nil }
+        CBv2EngageMark.once("prefill-deq-gemm-gateup")
+        let key = ObjectIdentifier(qGate)
+        let fusedPlane: MLXArray
+        fusedPlaneLock.lock()
+        if let existing = cachedFusedPlanes[key] {
+            fusedPlaneLock.unlock()
+            fusedPlane = existing
+        } else {
+            fusedPlaneLock.unlock()
+            let pGate = plane(for: qGate, biases: gateBiases)
+            let pUp = plane(for: qUp, biases: upBiases)
+            let p = MLX.concatenated([pGate, pUp], axis: -1)
+            eval(p)
+            fusedPlaneLock.lock()
+            if let raced = cachedFusedPlanes[key] {
+                fusedPlaneLock.unlock()
+                fusedPlane = raced
+            } else {
+                cachedFusedPlanes[key] = p
+                fusedPlaneLock.unlock()
+                fusedPlane = p
+            }
+        }
+        let product = MLX.matmul(x, fusedPlane)
+        let gateN = weightGate.dim(0)
+        let gateOut = product[0..., 0..., 0 ..< gateN]
+        let upOut = product[0..., 0..., gateN...]
+        return (gateOut, upOut)
+    }
+
+    @inline(__always)
+    static func applyFusedQK(q: Linear, k: Linear, _ x: MLXArray) -> (MLXArray, MLXArray)? {
+        guard enabled,
+            let qQuant = q as? QuantizedLinear, qQuant.bias == nil,
+            qQuant.mode == .affine, qQuant.groupSize == 64,
+            qQuant.bits == 4 || qQuant.bits == 8,
+            qQuant.scales.dtype == .bfloat16,
+            let qBiases = qQuant.biases, qBiases.dtype == .bfloat16,
+            let kQuant = k as? QuantizedLinear, kQuant.bias == nil,
+            kQuant.mode == .affine, kQuant.groupSize == 64,
+            kQuant.bits == qQuant.bits,
+            kQuant.scales.dtype == .bfloat16,
+            let kBiases = kQuant.biases, kBiases.dtype == .bfloat16,
+            x.dtype == .bfloat16, x.ndim >= 2
+        else { return nil }
+        let inputDims = x.dim(-1)
+        guard inputDims > 0, x.size / inputDims >= minRows else { return nil }
+        let weightQ = qQuant.weight
+        let weightK = kQuant.weight
+        guard weightQ.ndim == 2, weightQ.dtype == .uint32,
+            weightQ.dim(1) * (32 / qQuant.bits) == inputDims,
+            weightK.ndim == 2, weightK.dtype == .uint32,
+            weightK.dim(1) * (32 / kQuant.bits) == inputDims
+        else { return nil }
+        CBv2EngageMark.once("prefill-deq-gemm-qk")
+        let key = ObjectIdentifier(qQuant)
+        let fusedPlane: MLXArray
+        fusedPlaneLock.lock()
+        if let existing = cachedFusedPlanes[key] {
+            fusedPlaneLock.unlock()
+            fusedPlane = existing
+        } else {
+            fusedPlaneLock.unlock()
+            let pQ = plane(for: qQuant, biases: qBiases)
+            let pK = plane(for: kQuant, biases: kBiases)
+            let p = MLX.concatenated([pQ, pK], axis: -1)
+            eval(p)
+            fusedPlaneLock.lock()
+            if let raced = cachedFusedPlanes[key] {
+                fusedPlaneLock.unlock()
+                fusedPlane = raced
+            } else {
+                cachedFusedPlanes[key] = p
+                fusedPlaneLock.unlock()
+                fusedPlane = p
+            }
+        }
+        let product = MLX.matmul(x, fusedPlane)
+        let qN = weightQ.dim(0)
+        let qOut = product[0..., 0..., 0 ..< qN]
+        let kOut = product[0..., 0..., qN...]
+        return (qOut, kOut)
+    }
+
     /// `DARKBLOOM_GEMMA4_PREFILL_DEQ_GEMM_XCHECK=1`: bitwise cross-check of
     /// every admitted projection against the incumbent dispatch (diagnostic;
     /// forces evaluation, so it is never set on a timed run).
@@ -2214,8 +2325,10 @@ private class Gemma4Attention: Module {
             (lastQueryCache == nil && !usesSharedKV
                 && (vProj == nil || gemma4QKFuseSlidingEnabled))
             ? fusedQKProjection(x, rsTable: qkvRunsumTable) : nil
+        let prefillFusedQK = (lastQueryCache == nil && !usesSharedKV)
+            ? Gemma4PrefillDeqGEMMV1.applyFusedQK(q: qProj, k: kProj, queryInput) : nil
         let queryRaw = (
-            fusedQK?.0 ?? tierProjection(qProj, queryInput, rsTable: qkvRunsumTable)
+            prefillFusedQK?.0 ?? fusedQK?.0 ?? tierProjection(qProj, queryInput, rsTable: qkvRunsumTable)
         ).reshaped(B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
@@ -2279,7 +2392,7 @@ private class Gemma4Attention: Module {
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
         let kRaw = (
-            fusedQK?.1 ?? tierProjection(kProj, x, rsTable: qkvRunsumTable)
+            prefillFusedQK?.1 ?? fusedQK?.1 ?? tierProjection(kProj, x, rsTable: qkvRunsumTable)
         ).reshaped(B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
         if let vProj {
@@ -4322,6 +4435,9 @@ private class Gemma4MLP: Module {
         _ x: MLXArray,
         activationSums producerSums: CBv2DenseMLPQMVV1.ActivationSums? = nil
     ) -> MLXArray {
+        if let (gateOut, upOut) = Gemma4PrefillDeqGEMMV1.applyFusedGateUp(gate: gateProj, up: upProj, x) {
+            return denseProjection(downProj, gemma4GeluProduct(gateOut, upOut))
+        }
         // DMLP-002: one exact activation-sum prepass feeds both fallback
         // projections. If either projection is not the pinned affine8 cell,
         // the candidate arrays remain unevaluated and stock takes over.

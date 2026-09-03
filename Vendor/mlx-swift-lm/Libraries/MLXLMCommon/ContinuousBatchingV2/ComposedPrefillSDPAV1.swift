@@ -435,8 +435,8 @@ enum CBv2PrefillSoftmaxVecV1 {
     /// rule softmax.cpp uses to pick the threadgroup size, so it always
     /// equals what this dispatch's own threadGroup.x implies).
     private static let source = """
-        const int axis_size = int(params[0]);
-        const int num_simdgroups = int(params[1]);
+        constexpr int axis_size = AXIS_SIZE;
+        constexpr int num_simdgroups = NUM_SIMDGROUPS;
 
         const int gid = int(threadgroup_position_in_grid.x);
         const int lid = int(thread_position_in_threadgroup.x);
@@ -529,30 +529,12 @@ enum CBv2PrefillSoftmaxVecV1 {
         """
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_prefill_sdpa_softmax_vec_bf16_v1",
-        inputNames: ["scores", "params"],
+        name: "cbv2_prefill_sdpa_softmax_vec_bf16_v2",
+        inputNames: ["scores"],
         outputNames: ["probs"],
         source: source,
         ensureRowContiguous: true
     )
-
-    nonisolated(unsafe) private static var memoizedParams: [Int: MLXArray] = [:]
-    private static let paramsLock = NSLock()
-
-    private static func getParams(axisSize: Int, numSimdgroups: Int) -> MLXArray {
-        paramsLock.lock()
-        if let hit = memoizedParams[axisSize] {
-            paramsLock.unlock()
-            return hit
-        }
-        paramsLock.unlock()
-        let arr = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
-        eval(arr)
-        paramsLock.lock()
-        memoizedParams[axisSize] = arr
-        paramsLock.unlock()
-        return arr
-    }
 
     /// Runs the vectorized softmax, or returns nil to keep the caller on
     /// the stock `MLX.softmax(scores, axis: -1, precise: true)` call.
@@ -571,12 +553,15 @@ enum CBv2PrefillSoftmaxVecV1 {
         let threadgroupSize = ((axisSize + 3) / 4 + 31) / 32 * 32
         guard threadgroupSize > 0, threadgroupSize <= 1024 else { return nil }
         let numSimdgroups = threadgroupSize / 32
-        let paramsArray = getParams(axisSize: axisSize, numSimdgroups: numSimdgroups)
 
         CBv2EngageMark.once("prefill-softmax-vec")
         return kernel(
-            [scores, paramsArray],
-            template: [("T", scores.dtype)],
+            [scores],
+            template: [
+                ("T", scores.dtype),
+                ("AXIS_SIZE", axisSize),
+                ("NUM_SIMDGROUPS", numSimdgroups),
+            ],
             grid: (threadgroupSize * nRows, 1, 1),
             threadGroup: (threadgroupSize, 1, 1),
             outputShapes: [scores.shape],

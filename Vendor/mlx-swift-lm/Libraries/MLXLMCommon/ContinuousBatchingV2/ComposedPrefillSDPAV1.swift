@@ -198,6 +198,16 @@ enum CBv2ComposedPrefillSDPAV1 {
         return bias
     }
 
+    /// Populate the eight standard 128-row prompt masks together on first use.
+    /// This preserves the existing memoized values while avoiding repeated
+    /// first-use materialization across the scored prompt-block walk.
+    private static let warmupCommonMasksOnce: Void = {
+        guard enabled, maskFuseEnabled else { return }
+        for kL in stride(from: 128, through: 1024, by: 128) {
+            _ = causalMaskBias(L: 128, kL: kL)
+        }
+    }()
+
     /// Head dims for which MLX has a fused kernel; those calls must keep
     /// taking it, because the fused kernel is NOT the fallback graph.
     @inline(__always)
@@ -222,6 +232,7 @@ enum CBv2ComposedPrefillSDPAV1 {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?, softcap: Float?
     ) -> MLXArray? {
+        _ = warmupCommonMasksOnce
         guard enabled, scale == 1.0, sinks == nil, softcap == nil else { return nil }
         guard queries.ndim == 4, keys.ndim == 4, values.ndim == 4 else { return nil }
         guard queries.dtype == .bfloat16, keys.dtype == .bfloat16,

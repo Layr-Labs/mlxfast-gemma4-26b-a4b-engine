@@ -2889,8 +2889,10 @@ public enum Gemma4MMAQuantizedGEMV {
         }
     }()
 
-    /// The promoted version 27 with the vocabulary store replaced by an in-register top-1
-    /// selection. The GEMV above is untouched, so what the reduction compares
+    /// Rewrite a version 27 head body's vocabulary store into an in-register
+    /// top-1 selection. `base` is the GEMV body to transform --- the plain
+    /// version 27 for the incumbent twin, the carried version 27 for the twin
+    /// below. The GEMV above is untouched, so what the reduction compares
     /// is the SAME bf16 the store would have written --- `T(acc)`, rounded
     /// once, exactly as `out[...] = T(acc.thread_elements()[i])` rounds it.
     /// Argmax over the final softcap is argmax over its argument
@@ -2906,12 +2908,12 @@ public enum Gemma4MMAQuantizedGEMV {
     /// Each threadgroup emits one `(float, uint)` record per activation row
     /// into `pv`/`pi`: `[8, N / 128]`, 128 KB at the tied head's geometry
     /// against the 4 MB the logits store cost.
-    private static let sourceV27Argmax: String = {
-        var result = sourceV27
+    private static func argmaxHeadSource(_ base: String, label: String) -> String {
+        var result = base
 
         func replaceOnce(_ old: String, with new: String) {
             let count = result.components(separatedBy: old).count
-            precondition(count == 2, "sourceV27Argmax replacement count \(count): \(old)")
+            precondition(count == 2, "\(label) replacement count \(count): \(old)")
             result = result.replacingOccurrences(of: old, with: new)
         }
 
@@ -2992,15 +2994,56 @@ public enum Gemma4MMAQuantizedGEMV {
             }
             """
         )
-        precondition(!result.contains("out["), "sourceV27Argmax still stores logits")
+        precondition(!result.contains("out["), "\(label) still stores logits")
         return result
-    }()
+    }
+
+    /// The incumbent twin. Byte for byte what the closure above produced.
+    private static let sourceV27Argmax: String =
+        argmaxHeadSource(sourceV27, label: "sourceV27Argmax")
+
+    /// MMA-HEAD-ARGMAX-CARRY-001. The same epilogue on the CARRIED body.
+    ///
+    /// MMA-HEAD-CARRY-013 reaches `kernelV27Carry`, and `kernelV27Carry` is
+    /// selected only by `apply`, the logits entry point. The scored greedy
+    /// decode window does not go through `apply`: `cbv2DecodeArgmax` calls
+    /// `applyArgmax`, which dispatches `kernelV27Argmax`, built from the
+    /// UNCARRIED body. The promoted carry therefore never touches a scored
+    /// token. This twin closes that gap and nothing else.
+    ///
+    /// The two transforms are textually disjoint. The carry rewrites the
+    /// `acc0...acc3` declaration block and the per-group packed-operand load;
+    /// the argmax epilogue rewrites the `outputN0...outputN3` store block.
+    /// The carry body introduces no `out[`, so this composition's own
+    /// `count == 2` and `!contains("out[")` preconditions hold exactly as they
+    /// do on the uncarried base.
+    ///
+    /// Bit-exactness follows by construction: the composition replaces only
+    /// text BELOW the accumulator close, so every `acc0...acc3` value the
+    /// reduction reads is the value `sourceV27Carry` produces, in the same
+    /// order, and the reduction compares `T(acc)` --- the same bf16 the store
+    /// would have written. The twin is bit-identical to `sourceV27Argmax`
+    /// exactly insofar as `sourceV27Carry` is bit-identical to `sourceV27`.
+    private static let sourceV27ArgmaxCarry: String =
+        argmaxHeadSource(sourceV27Carry, label: "sourceV27ArgmaxCarry")
 
     private static let kernelV27Argmax: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_mma_affine4_qmv_m8_v27_argmax",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["pv", "pi"],
         source: sourceV27Argmax,
+        header: "#include <metal_simdgroup_matrix>\n",
+        ensureRowContiguous: true
+    )
+
+    /// A DISTINCT registration name. `MLXFast.metalKernel` keys its compiled
+    /// library on `name`, so a changed body under a reused name can serve a
+    /// stale pipeline.
+    private static let kernelV27ArgmaxCarry: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_affine4_qmv_m8_v27_argmax_carry_v1",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["pv", "pi"],
+        source: sourceV27ArgmaxCarry,
         header: "#include <metal_simdgroup_matrix>\n",
         ensureRowContiguous: true
     )
@@ -3117,7 +3160,17 @@ public enum Gemma4MMAQuantizedGEMV {
             )[0]
         }
 
-        let partials = kernelV27Argmax(
+        // Same kill switch as the logits twin: `DARKBLOOM_GEMMA4_MMA_HEAD_CARRY`
+        // off restores `kernelV27Argmax` and its source byte for byte.
+        let head: MLXFast.MLXFastKernel
+        if carryEnabled {
+            CBv2EngageMark.once("mma-head-argmax-carry")
+            head = kernelV27ArgmaxCarry
+        } else {
+            head = kernelV27Argmax
+        }
+
+        let partials = head(
             [flatX, w, scales, biases, xSums],
             template: [("T", x.dtype), ("K", k), ("N", n)],
             grid: (threadgroups * threadsPerThreadgroup, 1, 1),

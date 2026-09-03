@@ -147,6 +147,37 @@ template <
   thread loader_a_t loader_a(A, params->lda, As, simd_group_id, simd_lane_id);
   thread loader_b_t loader_b(B, params->ldb, Bs, simd_group_id, simd_lane_id);
 
+  // PREFILL-ATTN-TRAFFIC (at1): softmax-in-loader signature, template facts
+  // only. The composed prompt attention hands its P.V product to addmm as
+  //   addmm(stats_view, S, V, alpha = 1, beta = -0.0)
+  // with the out-source operand a [.., L, 1] column view (fdc == 0) of a
+  // [.., L, 4] bf16 carrier of row statistics (ldc == 4) broadcast over the
+  // output columns: per row, bf16 word pairs (0,1) and (2,3) hold the fp32
+  // bit patterns of the prompt softmax's maxval and of its normalizer
+  // (1.0f / sum). On that signature the A loader stages
+  // T(fast::exp(float(s) - maxval) * normalizer) for every score it loads --
+  // the softmax kernel's own per-element expression over the same operands
+  // -- and the epilogue adds nothing, so the stored tile is the plain
+  // matmul(P, V) tile over identical P words with P never written or read.
+  // A beta of negative zero with a column-broadcast bf16 source of row stride
+  // 4 is not a combination any other addmm of the declared shape produces;
+  // every other out-source keeps the loaded-operand epilogue untouched.
+  constexpr bool kSoftmaxLoaderEligible =
+      !transpose_a && !transpose_b && metal::is_same_v<T, bfloat16_t>;
+  bool softmax_loader = false;
+  float sm_rmax[loader_a_t::n_rows];
+  float sm_rinv[loader_a_t::n_rows];
+  if constexpr (kSoftmaxLoaderEligible) {
+    if (use_out_source) {
+      if (do_axpby && addmm_params->fdc == 0 && addmm_params->ldc == 4 &&
+          addmm_params->alpha == 1.0f &&
+          as_type<uint>(addmm_params->beta) == 0x80000000u) {
+        softmax_loader = true;
+        loader_a.load_softmax_stats(C, sm_rmax, sm_rinv);
+      }
+    }
+  }
+
   // Prepare threadgroup bounds
   const short tgp_bm = align_M ? BM : short(min(BM, params->M - c_row));
   const short tgp_bn = align_N ? BN : short(min(BN, params->N - c_col));
@@ -173,7 +204,15 @@ template <
     const short2 tile_dims_B =
         transpose_b ? short2(k_remain, tgp_bn) : short2(tgp_bn, k_remain);
 
-    loader_a.load_safe(tile_dims_A);
+    if constexpr (kSoftmaxLoaderEligible) {
+      if (softmax_loader) {
+        loader_a.load_safe_softmax(tile_dims_A, sm_rmax, sm_rinv);
+      } else {
+        loader_a.load_safe(tile_dims_A);
+      }
+    } else {
+      loader_a.load_safe(tile_dims_A);
+    }
     loader_b.load_safe(tile_dims_B);
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -198,7 +237,15 @@ template <
     for (int k = 0; k < gemm_k_iterations; k++) {
       threadgroup_barrier(mem_flags::mem_threadgroup);
       // Load elements into threadgroup
-      loader_a.load_unsafe();
+      if constexpr (kSoftmaxLoaderEligible) {
+        if (softmax_loader) {
+          loader_a.load_unsafe_softmax(sm_rmax, sm_rinv);
+        } else {
+          loader_a.load_unsafe();
+        }
+      } else {
+        loader_a.load_unsafe();
+      }
       loader_b.load_unsafe();
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -216,8 +263,14 @@ template <
     // Do epilogue
     if (use_out_source) {
       if (do_axpby) {
-        mma_op.apply_epilogue(
-            C, addmm_params->ldc, addmm_params->fdc, epilogue_op_axpby);
+        if (softmax_loader) {
+          // PREFILL-ATTN-TRAFFIC (at1): the out-source operand carried the
+          // row statistics and was consumed by the loader; the accumulator
+          // is stored exactly as the plain matmul stores it.
+        } else {
+          mma_op.apply_epilogue(
+              C, addmm_params->ldc, addmm_params->fdc, epilogue_op_axpby);
+        }
       } else {
         // The synthesis touches BlockMMA members that only the real-typed
         // specialization has; constexpr-gate it so ineligible element types

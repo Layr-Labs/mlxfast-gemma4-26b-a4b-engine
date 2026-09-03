@@ -303,6 +303,13 @@ public final class Gemma4A4BRuntimeWeightCache {
         )
         eval(model(prefillTokens, cache: caches))
         eval(model(MLXArray([bosToken], [1, 1]), cache: caches))
+        // HEAD-METADATA-TRANSPOSE. Derive the tied head's group-major
+        // quantization metadata HERE, in the constructor, so neither the
+        // 46 MB transpose nor the `_mdt1` pipeline's first compile can land
+        // inside a measured window. It must precede `warmCohortShapes`: that
+        // warm is what drives the batch-8 decode head, and it is the run that
+        // compiles the pipeline this prime selects.
+        model.primeTiedHeadMetadata()
         warmCohortShapes(model, config: config)
         // Retire the warm's own buffers HERE, unscored: the trusted
         // phase-start clearCache runs inside the charged window, so any

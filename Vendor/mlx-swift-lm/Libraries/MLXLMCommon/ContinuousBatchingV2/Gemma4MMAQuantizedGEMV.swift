@@ -3041,6 +3041,172 @@ public enum Gemma4MMAQuantizedGEMV {
         ensureRowContiguous: true
     )
 
+    // MARK: - HEAD-METADATA-TRANSPOSE --- group-major quantization metadata
+
+    /// `false` only when `DARKBLOOM_GEMMA4_HEAD_MDT` is an explicit off value.
+    /// Resolved once; the kill switch is a process-level decision. Off leaves
+    /// `applyArgmax` emitting `kernelV27Argmax` against the shipped row-major
+    /// pair, byte for byte, and builds no derived plane at all.
+    private static let metadataTransposeEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_HEAD_MDT"]
+        else { return true }
+        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "0", "false", "no", "off": return false
+        default: return true
+        }
+    }()
+
+    /// HMT-001. The tied head's `scales` and `biases` ship ROW-MAJOR,
+    /// `[N, K / GROUP]`: a row's 44 group entries are contiguous and the
+    /// GROUP index sits on the fast axis. This body's outer walk is the
+    /// group walk, so at one group a threadgroup wants 128 different ROWS of
+    /// the same group --- 128 addresses at an 88-byte stride, i.e. 128
+    /// distinct cache lines delivering 256 useful bytes. The other 31 values
+    /// each line carries belong to the same row's LATER groups, which this
+    /// threadgroup will not read for another whole iteration, behind the
+    /// 4 KB of packed codes that iteration streams.
+    ///
+    /// Store the metadata GROUP-MAJOR, `[K / GROUP, N]`. Element `(g, n)`
+    /// then lives at `g * N + n`, so the eight fragment rows a simdgroup
+    /// owns across its four tiles are THIRTY-TWO ADJACENT bf16 --- one
+    /// 64-byte line, fully consumed inside the iteration that fetched it.
+    /// A threadgroup's scale reads collapse from 128 line touches per group
+    /// to four, and the affine-bias block's from 32 per block to eight.
+    /// The packed weights are untouched: they are already at streaming
+    /// ceiling and their layout does not move.
+    ///
+    /// This is a PURE RE-INDEXING of the shipped bf16 words. The same scalar
+    /// reaches the same fragment element in the same order; the `accg`
+    /// chain, the `metal::fma` scale close, the batched affine-bias MMA, the
+    /// grid and the argmax reduction are untouched, and no dtype changes.
+    /// Output is bit-identical to `sourceV27Argmax` --- not "within a ULP",
+    /// identical.
+    ///
+    /// `fragmentSRow{i}` and `fragmentBRow{i}` keep their names but now
+    /// address the lane's own OUTPUT COLUMN in group 0, and the subscript
+    /// carries the `N` group stride. `G_ROW`, the row-major row stride, has
+    /// no reader left and is dropped.
+    private static let sourceV27ArgmaxMDT: String = {
+        var result = sourceV27Argmax
+
+        func replaceEach(_ old: String, with new: String, occurrences: Int) {
+            let count = result.components(separatedBy: old).count - 1
+            precondition(
+                count == occurrences,
+                "sourceV27ArgmaxMDT count \(count) != \(occurrences): \(old)")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+
+        for tile in 0..<4 {
+            let offset = tile == 0 ? "" : (tile == 1 ? "N_PSG + " : "N_PSG * \(tile) + ")
+            replaceEach(
+                "scales + (sgN0 + \(offset)fragmentRow) * G_ROW;",
+                with: "scales + (sgN0 + \(offset)fragmentRow);",
+                occurrences: 1)
+            replaceEach(
+                "biases + (sgN0 + \(offset)fragmentRow) * G_ROW;",
+                with: "biases + (sgN0 + \(offset)fragmentRow);",
+                occurrences: 1)
+            replaceEach(
+                "fragmentSRow\(tile)[g]",
+                with: "fragmentSRow\(tile)[g * uint(N)]",
+                occurrences: 1)
+            replaceEach(
+                "fragmentBRow\(tile)[biasCol0]",
+                with: "fragmentBRow\(tile)[biasCol0 * uint(N)]",
+                occurrences: 2)
+            replaceEach(
+                "fragmentBRow\(tile)[biasCol1]",
+                with: "fragmentBRow\(tile)[biasCol1 * uint(N)]",
+                occurrences: 2)
+        }
+        replaceEach("constexpr uint G_ROW = K / GROUP;\n", with: "", occurrences: 1)
+        precondition(
+            !result.contains("G_ROW"),
+            "sourceV27ArgmaxMDT still reads a row-major row stride")
+        precondition(
+            !result.contains("out["), "sourceV27ArgmaxMDT stores logits")
+        return result
+    }()
+
+    /// REKEY. `CustomKernel::eval_gpu` caches compiled libraries BY NAME and
+    /// calls `clear_library(name_)` when a name maps to a different source,
+    /// so a changed body under the incumbent key would thrash the cache.
+    /// `_mdt1` is a new key; `kernelV27Argmax` above keeps its own.
+    private static let kernelV27ArgmaxMDT: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_mma_affine4_qmv_m8_v27_argmax_mdt1",
+        inputNames: ["x", "w", "scales", "biases", "xSums"],
+        outputNames: ["pv", "pi"],
+        source: sourceV27ArgmaxMDT,
+        header: "#include <metal_simdgroup_matrix>\n",
+        ensureRowContiguous: true
+    )
+
+    /// The group-major twin of one row-major metadata pair, built ONCE per
+    /// plane and held for the process lifetime.
+    ///
+    /// SIZE. Two bf16 arrays of exactly the source's element count. At the
+    /// tied head's geometry that is `262144 * 44 * 2` = 23,068,672 B each,
+    /// 46,137,344 B for the pair. It is DERIVED METADATA ONLY: the plane's
+    /// 369,098,752 B of packed codes are neither copied nor referenced, and
+    /// nothing is re-quantized or re-represented --- the same bf16 words are
+    /// written to different offsets.
+    ///
+    /// BUILD SITE. `primeMetadataTranspose` runs from the model
+    /// constructor's warm (`Gemma4TextModel.primeTiedHeadMetadata`, called
+    /// by `Gemma4A4BRuntimeWeights.warmLibraryModel`), which is outside
+    /// every measured window. The lazy build here is only the fallback for a
+    /// caller that never primed: it is correct, but it would land the
+    /// transpose on a measured clock, so the prime is not optional in
+    /// practice.
+    private static let metadataLock = NSLock()
+    nonisolated(unsafe) private static var metadataPlanes:
+        [ObjectIdentifier: (MLXArray, MLXArray)?] = [:]
+
+    /// Build the group-major twin ahead of any measured window. Returns
+    /// whether the transposed pair is live for this plane.
+    @discardableResult
+    public static func primeMetadataTranspose(
+        scales: MLXArray, biases: MLXArray
+    ) -> Bool {
+        transposedMetadata(scales: scales, biases: biases) != nil
+    }
+
+    /// The memoized group-major pair for `scales`/`biases`, or `nil` when the
+    /// kill switch is off or the pair is not the shape this rewrite is
+    /// defined for. A `nil` here is a clean fallback to the shipped kernel
+    /// and the shipped buffers.
+    private static func transposedMetadata(
+        scales: MLXArray, biases: MLXArray
+    ) -> (MLXArray, MLXArray)? {
+        guard metadataTransposeEnabled else { return nil }
+        guard scales.ndim == 2, biases.ndim == 2,
+            scales.dtype == .bfloat16, biases.dtype == .bfloat16,
+            scales.shape == biases.shape
+        else { return nil }
+        let key = ObjectIdentifier(scales)
+        metadataLock.lock()
+        defer { metadataLock.unlock() }
+        if let cached = metadataPlanes[key] { return cached }
+        let n = scales.dim(0)
+        let groups = scales.dim(1)
+        let sT = scales.transposed(1, 0).contiguous()
+        let bT = biases.transposed(1, 0).contiguous()
+        eval(sT, bT)
+        // A strided view reaching the kernel would make `ensureRowContiguous`
+        // copy 23 MB per dispatch INSIDE the measured window --- the exact
+        // cost this change exists to remove. Refuse rather than ship that.
+        let ok =
+            sT.shape == [groups, n] && bT.shape == [groups, n]
+            && sT.strides == [n, 1] && bT.strides == [n, 1]
+        let pair: (MLXArray, MLXArray)? = ok ? (sT, bT) : nil
+        // `updateValue` and not `metadataPlanes[key] = pair`: the value type
+        // is itself Optional, and a subscript assignment of `nil` REMOVES the
+        // key instead of memoizing the refusal.
+        metadataPlanes.updateValue(pair, forKey: key)
+        return pair
+    }
+
     /// True when `applyArgmax` would take the fused path for this geometry.
     /// Pure host predicate over shapes, dtypes and the kill switches, so the
     /// engine can choose the seam BEFORE it builds the forward graph.
@@ -3117,8 +3283,31 @@ public enum Gemma4MMAQuantizedGEMV {
             )[0]
         }
 
-        let partials = kernelV27Argmax(
-            [flatX, w, scales, biases, xSums],
+        // HEAD-METADATA-TRANSPOSE. `admitsArgmax` above ran against the
+        // SHIPPED row-major pair and is untouched by this change: a
+        // `[K / GROUP, N]` array would fail its `scales.dim(1) == k /
+        // groupSize` clause, so the transposed pair is substituted only
+        // AFTER admission, never presented to it. `head-metadata-transpose`
+        // is the engage tag that proves the substitution actually happened;
+        // its absence with the switch on is a bug, not a fallback.
+        let headKernel: MLXFast.MLXFastKernel
+        let headScales: MLXArray
+        let headBiases: MLXArray
+        if let (groupMajorScales, groupMajorBiases) = transposedMetadata(
+            scales: scales, biases: biases)
+        {
+            CBv2EngageMark.once("head-metadata-transpose")
+            headKernel = kernelV27ArgmaxMDT
+            headScales = groupMajorScales
+            headBiases = groupMajorBiases
+        } else {
+            headKernel = kernelV27Argmax
+            headScales = scales
+            headBiases = biases
+        }
+
+        let partials = headKernel(
+            [flatX, w, headScales, headBiases, xSums],
             template: [("T", x.dtype), ("K", k), ("N", n)],
             grid: (threadgroups * threadsPerThreadgroup, 1, 1),
             threadGroup: (threadsPerThreadgroup, 1, 1),

@@ -7302,6 +7302,29 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
             bits: quantized.bits)
     }
 
+    /// HEAD-METADATA-TRANSPOSE. Build the tied head's group-major
+    /// `scales`/`biases` twin, once, from the constructor's warm.
+    ///
+    /// The transpose is a 46 MB derived-metadata copy of words that are
+    /// already resident, so it is cheap in absolute terms and free of any
+    /// numerical consequence --- but it is 46 MB of copy, and it must not
+    /// land on a measured clock. Calling this before `warmCohortShapes`
+    /// also puts the `_mdt1` pipeline's first compile inside the warm,
+    /// where every other cohort-width pipeline is already compiled.
+    ///
+    /// Best-effort and total: any model that is not the tied affine head
+    /// returns without doing anything, and the head keeps its shipped
+    /// row-major kernel.
+    public func primeTiedHeadMetadata() {
+        guard lmHead == nil,
+            let quantized = model.embedTokens as? QuantizedEmbedding,
+            quantized.mode == .affine,
+            let biases = quantized.biases
+        else { return }
+        Gemma4MMAQuantizedGEMV.primeMetadataTranspose(
+            scales: quantized.scales, biases: biases)
+    }
+
     public func cbv2DecodeArgmax(_ tokens: MLXArray, caches: [KVCache]) -> MLXArray {
         // The greedy road's serial tail is final RMSNorm, the head's affine
         // activation-sum prepass, the fused head+argmax, then the reduce. The

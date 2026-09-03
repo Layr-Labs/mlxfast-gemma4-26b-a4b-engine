@@ -80,8 +80,11 @@ enum CBv2ComposedPrefillSDPAV1 {
     /// fallback pays nothing for the same constant because `array(double,
     /// bfloat16)` is a host construction there. A constant scalar is safe to
     /// share across graphs: it is an input, never a mutated output.
-    nonisolated(unsafe) private static let bfloat16LowestScalar: MLXArray =
-        MLXArray(Float(bitPattern: 0xFF7F_0000), dtype: .bfloat16)
+    nonisolated(unsafe) private static let bfloat16LowestScalar: MLXArray = {
+        let arr = MLXArray(Float(bitPattern: 0xFF7F_0000), dtype: .bfloat16)
+        eval(arr)
+        return arr
+    }()
 
     /// bfloat16 NEGATIVE zero (bits 0x8000) -- the additive identity the
     /// fused-mask bias carries on every UNMASKED score.
@@ -93,8 +96,11 @@ enum CBv2ComposedPrefillSDPAV1 {
     /// With `-0.0` the GEMM epilogue is the exact identity on the fp32
     /// accumulator, so an unmasked entry rounds to the same bfloat16 word the
     /// plain `matmul` would have stored.
-    nonisolated(unsafe) private static let bfloat16NegativeZeroScalar: MLXArray =
-        MLXArray(Float(bitPattern: 0x8000_0000), dtype: .bfloat16)
+    nonisolated(unsafe) private static let bfloat16NegativeZeroScalar: MLXArray = {
+        let arr = MLXArray(Float(bitPattern: 0x8000_0000), dtype: .bfloat16)
+        eval(arr)
+        return arr
+    }()
 
     /// Causal masks, memoized on `(L, kL)`.
     ///
@@ -198,6 +204,13 @@ enum CBv2ComposedPrefillSDPAV1 {
         return bias
     }
 
+    private static let warmupCommonMasksOnce: Void = {
+        guard enabled, maskFuseEnabled else { return }
+        for kL in stride(from: 128, through: 1024, by: 128) {
+            _ = causalMaskBias(L: 128, kL: kL)
+        }
+    }()
+
     /// Head dims for which MLX has a fused kernel; those calls must keep
     /// taking it, because the fused kernel is NOT the fallback graph.
     @inline(__always)
@@ -222,6 +235,7 @@ enum CBv2ComposedPrefillSDPAV1 {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?, softcap: Float?
     ) -> MLXArray? {
+        _ = warmupCommonMasksOnce
         guard enabled, scale == 1.0, sinks == nil, softcap == nil else { return nil }
         guard queries.ndim == 4, keys.ndim == 4, values.ndim == 4 else { return nil }
         guard queries.dtype == .bfloat16, keys.dtype == .bfloat16,

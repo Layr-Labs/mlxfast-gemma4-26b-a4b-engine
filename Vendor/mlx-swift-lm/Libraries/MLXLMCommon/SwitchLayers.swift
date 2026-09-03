@@ -3,7 +3,21 @@ import MLX
 import MLXNN
 
 /// Identity gather table for the sorted 64-assignment decode geometry.
-nonisolated(unsafe) private let switchDownIdentity64 = MLXArray((0..<64).map { UInt32($0) })
+nonisolated(unsafe) private let switchDownIdentity64: MLXArray = {
+    let arr = MLXArray((0..<64).map { UInt32($0) })
+    eval(arr)
+    return arr
+}()
+
+/// ROUTE-ORDER-FUSED: admit the existing fused SIMD rank and counting-sort kernels
+/// in gatherSortOrder, matching gatherSort and gatherSortIndices.
+/// `DARKBLOOM_ROUTE_ORDER_FUSED=0` restores the unadmitted prefill-only check.
+private let routeOrderFusedEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_ROUTE_ORDER_FUSED"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
 
 // Port of https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/switch_layers.py
 
@@ -1021,6 +1035,10 @@ public func gatherSort(
 public func gatherSortOrder(
     indices: MLXArray, numExperts: Int = Int.max
 ) -> (rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray) {
+    if routeOrderFusedEnabled {
+        CBv2EngageMark.once("route-order-fused")
+        return gatherSortIndices(indices: indices, numExperts: numExperts)
+    }
     let m = indices.dim(-1)
     let indices = indices.flattened()
     routeCsortShapeLog.note {

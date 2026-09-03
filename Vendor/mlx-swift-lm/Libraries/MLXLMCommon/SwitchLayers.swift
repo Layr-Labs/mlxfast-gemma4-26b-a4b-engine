@@ -515,7 +515,7 @@ private let routeCountingSort64Enabled: Bool = {
 private let expertPrefixBoundsEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_GEMMA4_EXPERT_PREFIX_BOUNDS"]
-    else { return false }
+    else { return true }
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 

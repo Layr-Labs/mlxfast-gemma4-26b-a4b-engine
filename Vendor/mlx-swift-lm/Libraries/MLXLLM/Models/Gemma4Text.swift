@@ -5288,13 +5288,102 @@ enum Gemma4FusedScaledEmbedding {
         return kernel(
             // `asMLXArray(dtype:)` is the exact conversion the stock
             // `MLXArray * Float` overload performs on the scalar.
-            [tokens, weight, scales, biases, embedScale.asMLXArray(dtype: .bfloat16)],
+            [tokens, weight, scales, biases,
+             Gemma4ConstantScalarMemoV1.scalar(embedScale, dtype: .bfloat16)],
             template: [("T", DType.bfloat16)],
             grid: (wordsPerRow, batch * length, 1),
             threadGroup: (32, 8, 1),
             outputShapes: [[batch, length, hiddenSize]],
             outputDTypes: [.bfloat16]
         )[0]
+    }
+}
+
+
+/// CONST-SCALAR-MEMO-001. Memoizes the constant bfloat16 scalar operands the
+/// scored forward rebuilds on every call.
+///
+/// `MLXArray(Float, dtype: .bfloat16)` is not a host-side construction. The
+/// mlx-swift initializer routes it through `init(bfloat16:)`, whose body is
+/// `mlx_array_new_float` followed by `mlx_astype` -- a real one-element
+/// conversion node that becomes its own dispatch when the graph is evaluated.
+/// `Float.asMLXArray(dtype:)` reaches the same initializer, and so does the
+/// `MLXArray * Float` operator, which is defined as
+/// `lhs * rhs.asMLXArray(dtype: lhs.dtype)`.
+///
+/// The scalars this holds are pure functions of the checkpoint config -- the
+/// embedding scale and the per-layer-input scale -- so their value is fixed for
+/// the life of the process while the node that produces them is rebuilt once
+/// per forward call. Memoizing on `(bit pattern, dtype)` returns the same
+/// evaluated array instead, and the node disappears.
+///
+/// Exactness: the cached array is produced by calling the same
+/// `asMLXArray(dtype:)` the incumbent calls, on the same `Float`, for the same
+/// dtype, so it is bit-identical to the array the incumbent would have built;
+/// the consuming `mlx_multiply` and kernel dispatch then see the same operand
+/// values. A cached entry is a read-only INPUT and is never a mutated output,
+/// which is why sharing one across graphs and across steps is safe -- the same
+/// argument the tree already relies on for
+/// `CBv2ComposedPrefillSDPAV1.bfloat16LowestScalar` and its causal-mask tables.
+///
+/// Thread safety: the table is guarded by an explicit lock, and the build is
+/// performed with no lock held so a concurrent prompt pass is never stalled
+/// behind an evaluation. A pass that built the same scalar concurrently keeps
+/// the first entry -- the same value from the same operation.
+///
+/// Bounded: the table is dropped wholesale if it ever exceeds `maxEntries`, so
+/// an unexpected scalar stream cannot grow it without limit.
+///
+/// `DARKBLOOM_GEMMA4_CONST_SCALAR_MEMO=0` restores the incumbent per-call
+/// construction at every site below.
+enum Gemma4ConstantScalarMemoV1 {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_CONST_SCALAR_MEMO"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let maxEntries = 64
+
+    private struct Key: Hashable {
+        let bits: UInt32
+        let dtype: DType
+    }
+
+    nonisolated(unsafe) private static var cache: [Key: MLXArray] = [:]
+    private static let cacheLock = NSLock()
+
+    /// The incumbent's own `value.asMLXArray(dtype:)`, built at most once per
+    /// distinct `(value, dtype)`.
+    static func scalar(_ value: Float, dtype: DType) -> MLXArray {
+        guard enabled else { return value.asMLXArray(dtype: dtype) }
+        CBv2EngageMark.once("const-scalar-memo")
+        let key = Key(bits: value.bitPattern, dtype: dtype)
+        cacheLock.lock()
+        let hit = cache[key]
+        cacheLock.unlock()
+        if let hit { return hit }
+        let built = value.asMLXArray(dtype: dtype)
+        eval(built)
+        cacheLock.lock()
+        if let raced = cache[key] {
+            cacheLock.unlock()
+            return raced
+        }
+        if cache.count >= maxEntries { cache.removeAll(keepingCapacity: true) }
+        cache[key] = built
+        cacheLock.unlock()
+        return built
+    }
+
+    /// `lhs * value` with the scalar operand taken from the table. The operator
+    /// this replaces is defined as `lhs * value.asMLXArray(dtype: lhs.dtype)`,
+    /// so the dtype passed here is the operator's own choice.
+    @inline(__always)
+    static func scaled(_ lhs: MLXArray, by value: Float) -> MLXArray {
+        guard enabled else { return lhs * value }
+        return lhs * scalar(value, dtype: lhs.dtype)
     }
 }
 
@@ -5661,9 +5750,9 @@ public class Gemma4TextModelInner: Module {
             let projNorm = perLayerProjectionNorm
         {
             // Token-based PLE
-            let tokenPLE =
-                embedPerLayer(inputs)
-                * Float(config.hiddenSizePerLayerInput).squareRoot()
+            let tokenPLE = Gemma4ConstantScalarMemoV1.scaled(
+                embedPerLayer(inputs),
+                by: Float(config.hiddenSizePerLayerInput).squareRoot())
 
             // [B, L, numLayers * hiddenSizePerLayerInput] -> [B, L, numLayers, hiddenSizePerLayerInput]
             let reshapedTokenPLE = tokenPLE.reshaped(
@@ -6173,7 +6262,8 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     /// Used by `Gemma4AssistantDraftModel` as the "target embedding" input
     /// when building its drafter-step input `[target_embed(last_token), last_hidden]`.
     public func embedTokensForDrafter(_ tokens: MLXArray) -> MLXArray {
-        model.embedTokens(tokens) * Float(config.hiddenSize).squareRoot()
+        Gemma4ConstantScalarMemoV1.scaled(
+            model.embedTokens(tokens), by: Float(config.hiddenSize).squareRoot())
     }
 
     /// Width-probe diagnostic forward (exactness round three): full logits
@@ -6615,4 +6705,7 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
 }
 
 // Ranked resample marker 3: this archive is a further ranked sample of the tree carried
+// by the preceding ranked submission of this content apart from any rotation item declared in its note.
+
+// Ranked resample marker 8: this archive is a further ranked sample of the tree carried
 // by the preceding ranked submission of this content apart from any rotation item declared in its note.

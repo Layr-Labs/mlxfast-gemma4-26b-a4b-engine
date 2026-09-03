@@ -115,7 +115,7 @@ public enum CBv2DenseMLPQMVV1 {
     private static let mma8DownLaneSumsEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_MLP_MMA8_DOWN_LANE_SUMS"]
-        else { return false }
+        else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 

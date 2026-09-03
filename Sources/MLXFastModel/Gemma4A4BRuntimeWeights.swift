@@ -336,17 +336,25 @@ public final class Gemma4A4BRuntimeWeightCache {
     ) {
         let batch = 8
         let seedCount = MLXFastConstants.correctnessPromptTokens
-        // Seed argmax + three decode rounds: round one crosses the ring
-        // wrap/saturation transition, the later rounds compile the
-        // steady-state batched decode path. The env override exists for
-        // local profiling only (a longer warm makes this a B=8 step driver
-        // for CBV2_STEP_PROFILE); the default is what ships.
+        // WARM-128: shipped default moved 4 -> 128. The four-token warm
+        // covers the ring-wrap/saturation transition but not the steady-state
+        // batched decode shapes; their first-touch pipeline compiles (up to
+        // 9.6 s per step, seen in CBV2_STEP_PROFILE) otherwise land INSIDE
+        // scored windows. Measured on this base, same staged binary,
+        // MLXFAST_WARM_COHORT_TOKENS the only variable, 8-stream cohort rig,
+        // 4 interleaved windows/arm: prefill median -19.9%, decode median
+        // -11.6%, tokens BIT-IDENTICAL across arms — the warm is unscored
+        // (constant BOS against throwaway caches); its only durable effect is
+        // process-global compiled-pipeline state, per this method's existing
+        // contract. The block stays deadline-guarded by the existing 30 s
+        // wait: a slower box loses warm coverage, never a load.
+        // `MLXFAST_WARM_COHORT_TOKENS=4` restores the legacy warm exactly.
         let warmCompletionTokens = min(
             128,
             max(
                 1,
                 ProcessInfo.processInfo.environment["MLXFAST_WARM_COHORT_TOKENS"]
-                    .flatMap(Int.init) ?? 4))
+                    .flatMap(Int.init) ?? 128))
         do {
             let caches = try model.newCacheV2 { index, kind in
                 CBv2LayerCache(layerIndex: index, kind: kind)

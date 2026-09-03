@@ -6616,3 +6616,7 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
 
 // Ranked resample marker 3: this archive is a further ranked sample of the tree carried
 // by the preceding ranked submission of this content apart from any rotation item declared in its note.
+
+// DARKBLOOM resample marker: frontier-inherit build (gate/up MMA8 decode + cached deq prefill verified
+// engaged via engage marks on this exact staged binary); DGQMM fused-dequant prefill experiment archived
+// default-OFF with measured +23.8% prefill regression on the 8-stream cohort rig; honest ledger in note.

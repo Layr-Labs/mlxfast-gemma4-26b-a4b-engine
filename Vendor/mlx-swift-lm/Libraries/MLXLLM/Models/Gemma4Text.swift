@@ -9,8 +9,6 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
-// Yukon executable-equivalent frontier sample: delordemm1 / e8f / de1.
-
 // MARK: - vMLX decode hot-path helpers (ported from osaurus/main Gemma4Text)
 //
 // File-private, self-contained compiled fusions. They do NOT depend on the
@@ -7369,7 +7367,4 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
 }
 
 // Ranked resample marker 3: this archive is a further ranked sample of the tree carried
-// by the preceding ranked submission of this content apart from any rotation item declared in its note.
-
-// Ranked resample marker 36: this archive is a further ranked sample of the tree carried
 // by the preceding ranked submission of this content apart from any rotation item declared in its note.

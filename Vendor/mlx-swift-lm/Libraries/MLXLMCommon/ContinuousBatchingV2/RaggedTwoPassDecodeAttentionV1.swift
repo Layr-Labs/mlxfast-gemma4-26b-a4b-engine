@@ -203,6 +203,48 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     private static let headDim = 256
     private static let sequenceLength = 1024
 
+    /// HOST-ALLOC-TABLES kill switch: `DARKBLOOM_GEMMA4_HOST_ALLOC_TABLES` set
+    /// to `0`/`false`/`no`/`off` builds the ring-start vector and the D512
+    /// params vector fresh on every call (the shipped constructors below are
+    /// the fallback branch either way). Default ON.
+    static let hostAllocTablesEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_HOST_ALLOC_TABLES"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    // Precomputed uniform start vectors for the ranked cohort geometry.
+    // All batch-8 streams advance in lockstep, so every decode step passes
+    // starts == [s]*8 with 0 <= s < sequenceLength. One evaluated [8]
+    // UInt32 array per s: immutable after init, lock-free, zero-alloc on
+    // the hot path. Anything else falls back to a fresh allocation.
+    // Keyed on ring offsets only, never on tokens.
+    nonisolated(unsafe) private static let uniformStarts8: [MLXArray?] = {
+        var table = [MLXArray?](repeating: nil, count: sequenceLength)
+        var toEval: [MLXArray] = []
+        toEval.reserveCapacity(sequenceLength)
+        for s in 0..<sequenceLength {
+            let arr = MLXArray(
+                Array(repeating: UInt32(s), count: batch), [batch])
+            table[s] = arr
+            toEval.append(arr)
+        }
+        eval(toEval)
+        return table
+    }()
+
+    private static func getStartArray(starts: [Int], batch batchParam: Int) -> MLXArray {
+        if hostAllocTablesEnabled, batchParam == batch, starts.count == batch,
+            let s0 = starts.first, starts.allSatisfy({ $0 == s0 }),
+            s0 >= 0, s0 < uniformStarts8.count,
+            let hit = uniformStarts8[s0]
+        {
+            return hit
+        }
+        return MLXArray(starts.map(UInt32.init), [batchParam])
+    }
+
     /// PARTITION-001: the stock partition count, sized for ONE row.
     ///
     /// `sdpa_vector_2pass` picks `blocks` from the architecture letter, the key
@@ -1688,7 +1730,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// removes only the global partial write/read and the second dispatch.
     private static let portQuantFusedWriteResidentKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_ey29_ey32_yp3_ey51_yrp1_p1_ey67",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_ey29_ey32_yp3_ey51_yrp1_ey74",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -2354,6 +2396,579 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             ? residentSlidingWalkDepth2 : residentSlidingWalkDepth1
     }
 
+    /// SLIDING-SPLIT (SS1). Default ON.
+    ///
+    /// The resident sliding kernel launches `kvHeads * batch = 64`
+    /// threadgroups of eight SIMD groups, one threadgroup per (row, kv head)
+    /// walk. A threadgroup cannot straddle cores, so on a 40-core part the
+    /// per-step critical path is the 24 cores that hold two walks while 16
+    /// hold one: the dispatch finishes when two full walks have been issued
+    /// on one core, although the average core carries 1.6. Halving the walk
+    /// does not help: 128 half-walks on 40 cores still leaves eight cores
+    /// with four halves, which is the same two walks. The granule has to be
+    /// fine enough that `ceil(64 / (40 g)) * g` approaches 1.6 walks; at one
+    /// SIMD group per threadgroup (`g = 1/8`) the heaviest core carries 13
+    /// eighths, 1.625 walks, against the incumbent's 2.0. On a 32-core part
+    /// both forms balance (2 and 16 per core), so a local A/B prices only the
+    /// cost of the split, never the gain.
+    ///
+    /// So this dispatch is `BLOCKS * kvHeads * batch = 512` threadgroups of
+    /// ONE SIMD group each. The group with grid index `block` walks exactly
+    /// the token sequence the incumbent's SIMD group `block` walked, with the
+    /// same prefetch, the same current-token substitution and the same
+    /// online-softmax statements, so its BF16 partition and its fp32 sum and
+    /// maximum are the incumbent's words. The F4 prologue runs one row per
+    /// pass of the single group instead of one row per group; every row is
+    /// the same lanes running the same statements, and the K/V rows, the q4
+    /// pack, the ring write, the fence and the k_out/v_out stores belong to
+    /// the group that owns the current token (`current_block`), exactly one
+    /// per walk.
+    ///
+    /// The merge is the incumbent's column reduction with the partitions in
+    /// device scratch instead of threadgroup memory: each group stores its
+    /// BF16 partition, fp32 sum and maximum into the slot the incumbent's
+    /// `local_partials` / `local_sums` / `local_maxs` gave its block,
+    /// publishes them with a device-scope release fence, and takes a ticket
+    /// from the walk's arrival counter. The eighth arrival acquires and
+    /// merges: lane `g` owns output group `g` (eight consecutive elements,
+    /// the incumbent's octet `g % 4` of block `g / 4`), loads its run of every
+    /// column's partition, and forms per element the incumbent's leaves
+    /// `0 + factor * partial` and the incumbent's addition tree
+    /// `((c0+c1)+(c2+c3))+((c4+c5)+(c6+c7))` over the eight columns, with the
+    /// column maxima, the `fast::exp` factors, the sum of exponents, the
+    /// division and the BF16 store as the incumbent's statements; the o_proj
+    /// run-sum fold takes the lane's own run as the octet and walks the four
+    /// octets of a block with xor 1 and xor 2 where the incumbent walked its
+    /// four octets with xor 8 and xor 16 (the same `(o0+o1)+(o2+o3)` tree).
+    /// The incumbent's per-element butterfly only moved column products into
+    /// the lane that owned the element; here the owner already holds every
+    /// column's run, so the merge does no lane exchange at all, which is what
+    /// keeps a one-group merge short. Nothing spins: the first seven arrivals
+    /// exit. The counter is reset by the merging group and the scratch is
+    /// reused by the next dispatch, which MLX orders after this one through
+    /// the attention output's consumers.
+    ///
+    /// `DARKBLOOM_GEMMA4_SLIDING_SPLIT=0` restores the incumbent dispatch and
+    /// the incumbent kernel names byte for byte.
+    /// `DARKBLOOM_GEMMA4_SLIDING_SPLIT_XCHECK=1` also runs the incumbent
+    /// kernel on the same inputs and reports differing words and the largest
+    /// relative difference of every output (diagnostic only).
+    static let slidingSplitEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_SLIDING_SPLIT"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    static let slidingSplitXcheck: Bool =
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_SLIDING_SPLIT_XCHECK"]
+        == "1"
+
+    private static let slidingSplitKey = slidingSplitEnabled ? "_ss1" : ""
+
+    /// Device scratch words per walk: the `GQA * BLOCKS * D` BF16 partitions
+    /// (2048 words), the `GQA * BLOCKS` fp32 sums and maxima (32 words) and
+    /// the arrival counter on its own 128-byte line. Allocated once, zero
+    /// (every counter idle), and reused by every sliding dispatch.
+    private static let slidingSplitScratchWords = gqa * 8 * headDim / 2 + 64
+
+    nonisolated(unsafe) private static let slidingSplitScratch: MLXArray = {
+        let scratch = MLXArray.zeros(
+            [batch * kvHeads * slidingSplitScratchWords], dtype: .uint32)
+        eval(scratch)
+        return scratch
+    }()
+
+    private static func residentSplitSource(withORunsum: Bool) -> String {
+        """
+                typedef vec<T, 4> T4;
+                constexpr int simd_width = 32;
+                constexpr int values_per_lane = D / simd_width;
+                constexpr int vectors_per_lane = values_per_lane / 4;
+                constexpr int payload_words = D / 8;
+                constexpr int row_words = payload_words + D / 64;
+                constexpr int current_block = (N - 1) % BLOCKS;
+                constexpr int COLS = BLOCKS;
+                constexpr int sets = simd_width / COLS;
+                constexpr int ss_partial_words = GQA * BLOCKS * D / 2;
+                constexpr int ss_sums_word = ss_partial_words;
+                constexpr int ss_maxs_word = ss_sums_word + GQA * BLOCKS;
+                constexpr int ss_counter_word = ss_partial_words + 32;
+                constexpr int ss_words = ss_partial_words + 64;
+                static_assert(BLOCKS == 8, "resident kernel requires eight blocks");
+                static_assert(GQA == 2, "resident kernel requires GQA two");
+                static_assert(sets * COLS == simd_width,
+                    "four output groups per block role");
+                static_assert(values_per_lane % 4 == 0, "lane run is four-wide");
+                static_assert(ss_maxs_word + GQA * BLOCKS <= ss_counter_word,
+                    "scratch summaries overlap the arrival counter");
+
+                const int block = int(threadgroup_position_in_grid.x);
+                const int kv_head = int(threadgroup_position_in_grid.y);
+                const int batch_index = int(threadgroup_position_in_grid.z);
+                const int query_head = GQA * kv_head;
+                const int batch_head = batch_index * 16 + query_head;
+                const int lane = int(thread_index_in_simdgroup);
+                const int walk = batch_index * KV_HEADS + kv_head;
+
+                threadgroup T local_queries[GQA * D];
+                threadgroup T local_key[D];
+                threadgroup T local_value[D];
+                \(withORunsum ? "threadgroup float local_o_rs[GQA * BLOCKS];" : "")
+
+                // F4 prologue, transcribed from gemma4_b8_qkv_rms_norm_rope_v2_vec1
+                // one row per pass of this single SIMD group. The incumbent's
+                // groups 0...3 each normalized one of Q0, Q1, K, V; here the same
+                // lanes run the same statements over each row in turn. K and V
+                // are needed only by the group that packs the current token.
+                const int prologue_rows = block == current_block ? GQA + 2 : GQA;
+                for (int row_index = 0; row_index < prologue_rows; ++row_index) {
+                    const device T* raw_row = raw_queries;
+                    const device T* weight_row = q_weight;
+                    threadgroup T* normalized_row = local_queries;
+                    bool weighted = true;
+                    if (row_index < GQA) {
+                        raw_row += (batch_head + row_index) * D;
+                        normalized_row += row_index * D;
+                    } else if (row_index == GQA) {
+                        raw_row = raw_keys
+                            + (batch_index * KV_HEADS + kv_head) * D;
+                        weight_row = k_weight;
+                        normalized_row = local_key;
+                    } else {
+                        raw_row = raw_values
+                            + (batch_index * KV_HEADS + kv_head) * D;
+                        normalized_row = local_value;
+                        weighted = false;
+                    }
+
+                    const device T4* raw_vectors =
+                        reinterpret_cast<const device T4*>(raw_row);
+                    const device T4* weight_vectors =
+                        reinterpret_cast<const device T4*>(weight_row);
+                    const T4 vin_first = raw_vectors[lane];
+                    const T4 vin_second = raw_vectors[lane + simd_width];
+                    float sum_first = 0.0f;
+                    float sum_second = 0.0f;
+                    #pragma clang loop unroll(full)
+                    for (int i = 0; i < 4; ++i) {
+                        const float first = float(vin_first[i]);
+                        const float second = float(vin_second[i]);
+                        sum_first += first * first;
+                        sum_second += second * second;
+                    }
+                    sum_first = simd_sum(sum_first);
+                    sum_second = simd_sum(sum_second);
+
+                    // Same second 32-lane tree as partials[0], partials[1],
+                    // partials[2...31] = 0 in the standalone kernel.
+                    float sum = lane == 0 ? sum_first
+                        : (lane == 1 ? sum_second : 0.0f);
+                    sum = simd_sum(sum);
+                    float inverse_rms = 0.0f;
+                    if (lane == 0) {
+                        inverse_rms = metal::precise::rsqrt(
+                            sum / float(D) + 1.0e-6f);
+                    }
+                    inverse_rms = simd_shuffle(inverse_rms, ushort(0));
+
+                    const T4 weight_first = weight_vectors[lane];
+                    const T4 weight_second = weight_vectors[lane + simd_width];
+                    threadgroup T4* normalized_vectors =
+                        reinterpret_cast<threadgroup T4*>(normalized_row);
+                    T4 rounded_first;
+                    T4 rounded_second;
+                    #pragma clang loop unroll(full)
+                    for (int i = 0; i < 4; ++i) {
+                        const T normalized_first =
+                            T(float(vin_first[i]) * inverse_rms);
+                        const T normalized_second =
+                            T(float(vin_second[i]) * inverse_rms);
+                        rounded_first[i] = weighted
+                            ? T(weight_first[i] * normalized_first)
+                            : T(1) * normalized_first;
+                        rounded_second[i] = weighted
+                            ? T(weight_second[i] * normalized_second)
+                            : T(1) * normalized_second;
+                    }
+                    normalized_vectors[lane] = rounded_first;
+                    normalized_vectors[lane + simd_width] = rounded_second;
+
+                    if (row_index == GQA + 1) {
+                        device T4* value_vectors =
+                            reinterpret_cast<device T4*>(
+                                v_out + (batch_index * KV_HEADS + kv_head) * D);
+                        value_vectors[lane] = rounded_first;
+                        value_vectors[lane + simd_width] = rounded_second;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                // Q and K preserve the standalone norm kernel's BF16 store
+                // boundary before applying the base-route sliding RoPE.
+                const int rope_rows = block == current_block ? GQA + 1 : GQA;
+                for (int row_index = 0; row_index < rope_rows; ++row_index) {
+                    threadgroup T* normalized_row = row_index < GQA
+                        ? local_queries + row_index * D : local_key;
+                    device T* key_output =
+                        k_out + (batch_index * KV_HEADS + kv_head) * D;
+                    const float L = static_cast<float>(
+                        position_offsets[batch_index]);
+                    #pragma clang loop unroll(full)
+                    for (int i = 0; i < 4; ++i) {
+                        const int pair = lane * 4 + i;
+                        const float d = static_cast<float>(pair)
+                            / static_cast<float>(D / 2);
+                        const float inv_freq =
+                            metal::exp2(-d * rope_log2_base[0]);
+                        const float theta = L * inv_freq;
+                        const float costheta = metal::fast::cos(theta);
+                        const float sintheta = metal::fast::sin(theta);
+                        const float x1 =
+                            static_cast<float>(normalized_row[pair]);
+                        const float x2 =
+                            static_cast<float>(normalized_row[pair + D / 2]);
+                        const T rx1 = static_cast<T>(
+                            x1 * costheta - x2 * sintheta);
+                        const T rx2 = static_cast<T>(
+                            x1 * sintheta + x2 * costheta);
+                        normalized_row[pair] = rx1;
+                        normalized_row[pair + D / 2] = rx2;
+                        if (row_index == GQA) {
+                            key_output[pair] = rx1;
+                            key_output[pair + D / 2] = rx2;
+                        }
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                const device uint32_t* mirror_w = m0;
+                switch (batch_index) {
+                    case 1: mirror_w = m1; break;
+                    case 2: mirror_w = m2; break;
+                    case 3: mirror_w = m3; break;
+                    case 4: mirror_w = m4; break;
+                    case 5: mirror_w = m5; break;
+                    case 6: mirror_w = m6; break;
+                    case 7: mirror_w = m7; break;
+                    default: break;
+                }
+                const device uint32_t* mkeys_w =
+                    mirror_w + kv_head * N * row_words;
+                const device uint32_t* mvalues_w =
+                    mirror_w + (KV_HEADS + kv_head) * N * row_words;
+                const threadgroup T* new_key =
+                    local_key + lane * values_per_lane;
+                const threadgroup T* new_value =
+                    local_value + lane * values_per_lane;
+                const uint start = starts[batch_index];
+                const uint write_slot = (start + uint(N - 1)) % uint(N);
+
+                half khs = half(0.0f);
+                half khb = half(0.0f);
+                half vhs = half(0.0f);
+                half vhb = half(0.0f);
+                uint32_t kword = 0u;
+                uint32_t vword = 0u;
+                if (block == current_block) {
+                    float kmin = 3.402823466e+38F;
+                    float kmax = -3.402823466e+38F;
+                    float vmin = 3.402823466e+38F;
+                    float vmax = -3.402823466e+38F;
+                    float kv[values_per_lane];
+                    float vv[values_per_lane];
+                    const threadgroup T4* kvec =
+                        reinterpret_cast<const threadgroup T4*>(new_key);
+                    const threadgroup T4* vvec =
+                        reinterpret_cast<const threadgroup T4*>(new_value);
+                    #pragma unroll
+                    for (int q = 0; q < values_per_lane / 4; ++q) {
+                        const T4 kq4 = kvec[q];
+                        const T4 vq4 = vvec[q];
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            kv[q * 4 + j] = float(kq4[j]);
+                            vv[q * 4 + j] = float(vq4[j]);
+                            kmin = min(kmin, kv[q * 4 + j]);
+                            kmax = max(kmax, kv[q * 4 + j]);
+                            vmin = min(vmin, vv[q * 4 + j]);
+                            vmax = max(vmax, vv[q * 4 + j]);
+                        }
+                    }
+                    for (uint mask = 1; mask < 8; mask <<= 1) {
+                        kmin = min(kmin, simd_shuffle_xor(kmin, mask));
+                        kmax = max(kmax, simd_shuffle_xor(kmax, mask));
+                        vmin = min(vmin, simd_shuffle_xor(vmin, mask));
+                        vmax = max(vmax, simd_shuffle_xor(vmax, mask));
+                    }
+                    khs = half(max((kmax - kmin) / 15.0f, 1e-6f));
+                    khb = half(kmin);
+                    vhs = half(max((vmax - vmin) / 15.0f, 1e-6f));
+                    vhb = half(vmin);
+                    const float ks = float(khs);
+                    const float kb = float(khb);
+                    const float vs = float(vhs);
+                    const float vb = float(vhb);
+                    #pragma unroll
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        const float kq = metal::rint((kv[element] - kb) / ks);
+                        const float vq = metal::rint((vv[element] - vb) / vs);
+                        kword |= uint32_t(clamp(kq, 0.0f, 15.0f)) << (4 * element);
+                        vword |= uint32_t(clamp(vq, 0.0f, 15.0f)) << (4 * element);
+                    }
+
+                    device uint32_t* write_key =
+                        const_cast<device uint32_t*>(mkeys_w)
+                        + write_slot * row_words;
+                    device uint32_t* write_value =
+                        const_cast<device uint32_t*>(mvalues_w)
+                        + write_slot * row_words;
+                    write_key[lane] = kword;
+                    write_value[lane] = vword;
+                    if (lane % 8 == 0) {
+                        write_key[payload_words + lane / 8] =
+                            uint32_t(as_type<ushort>(khs))
+                            | (uint32_t(as_type<ushort>(khb)) << 16);
+                        write_value[payload_words + lane / 8] =
+                            uint32_t(as_type<ushort>(vhs))
+                            | (uint32_t(as_type<ushort>(vhb)) << 16);
+                    }
+                }
+                if (batch_index == 0 && kv_head == 0
+                    && block == current_block && lane == 0) {
+                    fence[0] = write_fence[0] + 1;
+                }
+
+                const threadgroup T* query =
+                    local_queries + lane * values_per_lane;
+
+                thread float q_lo[values_per_lane];
+                thread float q_hi[values_per_lane];
+                thread float acc_lo[values_per_lane];
+                thread float acc_hi[values_per_lane];
+                const threadgroup T4* qvec =
+                    reinterpret_cast<const threadgroup T4*>(query);
+                const threadgroup T4* qvec_hi =
+                    reinterpret_cast<const threadgroup T4*>(query + D);
+                #pragma clang loop unroll(full)
+                for (int q = 0; q < values_per_lane / 4; ++q) {
+                    const T4 q4_lo = qvec[q];
+                    const T4 q4_hi = qvec_hi[q];
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        q_lo[q * 4 + j] = float(q4_lo[j]);
+                        q_hi[q * 4 + j] = float(q4_hi[j]);
+                    }
+                }
+                #pragma clang loop unroll(full)
+                for (int element = 0; element < values_per_lane; ++element) {
+                    acc_lo[element] = 0.0f;
+                    acc_hi[element] = 0.0f;
+                }
+
+                float max_lo = -3.402823466e+38F;
+                float max_hi = -3.402823466e+38F;
+                float sum_lo = 0.0f;
+                float sum_hi = 0.0f;
+                \(residentSlidingWalk)
+
+                // SLIDING-SPLIT: this group's partition goes to the walk's device
+                // scratch, in the incumbent's BF16 form and in the slot the
+                // incumbent's `local_partials` / `local_sums` / `local_maxs` gave
+                // block `block` (head-major, then block, then element).
+                device uint32_t* scratch_words =
+                    const_cast<device uint32_t*>(ss_scratch) + walk * ss_words;
+                device coherent(device) T* scratch_partials =
+                    reinterpret_cast<device coherent(device) T*>(scratch_words);
+                device coherent(device) float* scratch_sums =
+                    reinterpret_cast<device coherent(device) float*>(
+                        scratch_words + ss_sums_word);
+                device coherent(device) float* scratch_maxs =
+                    reinterpret_cast<device coherent(device) float*>(
+                        scratch_words + ss_maxs_word);
+                device atomic_uint* scratch_counter =
+                    reinterpret_cast<device atomic_uint*>(
+                        scratch_words + ss_counter_word);
+
+                if (lane == 0) {
+                    scratch_sums[block] = sum_lo;
+                    scratch_maxs[block] = max_lo;
+                    scratch_sums[BLOCKS + block] = sum_hi;
+                    scratch_maxs[BLOCKS + block] = max_hi;
+                }
+                device coherent(device) T4* partial_vec_lo =
+                    reinterpret_cast<device coherent(device) T4*>(
+                        scratch_partials + block * D + lane * values_per_lane);
+                device coherent(device) T4* partial_vec_hi =
+                    reinterpret_cast<device coherent(device) T4*>(
+                        scratch_partials + BLOCKS * D + block * D
+                        + lane * values_per_lane);
+                #pragma clang loop unroll(full)
+                for (int q = 0; q < values_per_lane / 4; ++q) {
+                    T4 p4_lo, p4_hi;
+                    #pragma clang loop unroll(full)
+                    for (int j = 0; j < 4; ++j) {
+                        p4_lo[j] = T(acc_lo[q * 4 + j]);
+                        p4_hi[j] = T(acc_hi[q * 4 + j]);
+                    }
+                    partial_vec_lo[q] = p4_lo;
+                    partial_vec_hi[q] = p4_hi;
+                }
+
+                // Publish, then take a ticket. The eighth arrival owns the
+                // merge; the first seven are done. Nothing waits on anything.
+                threadgroup_barrier(mem_flags::mem_device);
+                atomic_thread_fence(
+                    mem_flags::mem_device, memory_order_seq_cst,
+                    thread_scope_device);
+                uint ticket = 0u;
+                if (lane == 0) {
+                    ticket = atomic_fetch_add_explicit(
+                        scratch_counter, 1u, memory_order_relaxed);
+                }
+                ticket = simd_shuffle(ticket, ushort(0));
+                if (ticket != uint(BLOCKS - 1)) {
+                    return;
+                }
+                atomic_thread_fence(
+                    mem_flags::mem_device, memory_order_seq_cst,
+                    thread_scope_device);
+                if (lane == 0) {
+                    atomic_store_explicit(
+                        scratch_counter, 0u, memory_order_relaxed);
+                }
+
+                // Direct merge. Lane `group` owns output group `group`: the eight
+                // consecutive elements `group * 8 ... group * 8 + 7` of both heads,
+                // which are the incumbent's octet `group % 4` of block `group / 4`.
+                // For every column the lane loads its run of that column's
+                // partition, forms the incumbent's leaf `0 + factor * partial`
+                // per element, and adds the eight leaves in the incumbent's tree
+                // ((c0+c1)+(c2+c3))+((c4+c5)+(c6+c7)); the column maxima, the
+                // factors and the sum-of-exponents are the same statements over
+                // the same eight columns. No lane exchange is needed: the
+                // incumbent's per-element butterfly only moved column products
+                // into the lane that owned the element, and here the owner
+                // already holds every column's run.
+                const int group = lane;
+                #pragma clang loop unroll(full)
+                for (int head = 0; head < GQA; ++head) {
+                    const device coherent(device) T* head_partials =
+                        scratch_partials + head * BLOCKS * D;
+                    const device coherent(device) float* head_sums =
+                        scratch_sums + head * BLOCKS;
+                    const device coherent(device) float* head_maxs =
+                        scratch_maxs + head * BLOCKS;
+
+                    thread T4 runs[BLOCKS][vectors_per_lane];
+                    #pragma clang loop unroll(full)
+                    for (int column = 0; column < BLOCKS; ++column) {
+                        const device coherent(device) T4* partial_vectors =
+                            reinterpret_cast<const device coherent(device) T4*>(
+                                head_partials + column * D + group * values_per_lane);
+                        #pragma clang loop unroll(full)
+                        for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
+                            runs[column][chunk] = partial_vectors[chunk];
+                        }
+                    }
+
+                    thread float column_max[BLOCKS];
+                    thread float column_sum[BLOCKS];
+                    float max_score = -3.402823466e+38F;
+                    #pragma clang loop unroll(full)
+                    for (int column = 0; column < BLOCKS; ++column) {
+                        column_max[column] = head_maxs[column];
+                        column_sum[column] = head_sums[column];
+                        max_score = max(max_score, column_max[column]);
+                    }
+                    thread float column_factor[BLOCKS];
+                    thread float column_term[BLOCKS];
+                    #pragma clang loop unroll(full)
+                    for (int column = 0; column < BLOCKS; ++column) {
+                        column_factor[column] =
+                            fast::exp(column_max[column] - max_score);
+                        float term = 0.0f;
+                        term += column_factor[column] * column_sum[column];
+                        column_term[column] = term;
+                    }
+                    const float sum_exp_score =
+                        ((column_term[0] + column_term[1])
+                            + (column_term[2] + column_term[3]))
+                        + ((column_term[4] + column_term[5])
+                            + (column_term[6] + column_term[7]));
+
+                    thread T ov[values_per_lane];
+                    #pragma clang loop unroll(full)
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        thread float leaf[BLOCKS];
+                        #pragma clang loop unroll(full)
+                        for (int column = 0; column < BLOCKS; ++column) {
+                            float accumulator = 0.0f;
+                            accumulator += column_factor[column]
+                                * float(runs[column][element / 4][element % 4]);
+                            leaf[column] = accumulator;
+                        }
+                        const float total =
+                            ((leaf[0] + leaf[1]) + (leaf[2] + leaf[3]))
+                            + ((leaf[4] + leaf[5]) + (leaf[6] + leaf[7]));
+                        ov[element] = T(
+                            sum_exp_score == 0.0f ? total : total / sum_exp_score);
+                    }
+
+                    device T4* out_vectors = reinterpret_cast<device T4*>(
+                        out + (batch_head + head) * D + group * values_per_lane);
+                    #pragma clang loop unroll(full)
+                    for (int chunk = 0; chunk < vectors_per_lane; ++chunk) {
+                        T4 out_vector;
+                        #pragma clang loop unroll(full)
+                        for (int j = 0; j < 4; ++j) {
+                            out_vector[j] = ov[chunk * 4 + j];
+                        }
+                        out_vectors[chunk] = out_vector;
+                    }
+                \(withORunsum ? residentSplitORunsumFold : "")
+                }
+                \(withORunsum ? residentSplitORunsumStore : "")
+            """
+    }
+
+    /// ORSFOLD-001 epilogue inside the split merge. The octet is this lane's
+    /// own run, so the incumbent's octet gather is a register copy, and the
+    /// four octets of a block are lanes `4b ... 4b + 3`, so xor 1 and xor 2
+    /// walk the tree the incumbent's xor 8 and xor 16 walked, in the same
+    /// order: `(o0 + o1) + (o2 + o3)`.
+    private static let residentSplitORunsumFold = """
+                    thread T xt[8];
+                    #pragma clang loop unroll(full)
+                    for (int p = 0; p < 8; ++p) {
+                        xt[p] = ov[p];
+                    }
+                    float rsv = 0;
+                    rsv += xt[0] + xt[1] + xt[2] + xt[3];
+                    rsv += xt[4] + xt[5] + xt[6] + xt[7];
+                    rsv += simd_shuffle_xor(rsv, 1u);
+                    rsv += simd_shuffle_xor(rsv, 2u);
+                    if ((lane & 3) == 0) {
+                        local_o_rs[head * BLOCKS + group / sets] = rsv;
+                    }
+        """
+
+    /// The incumbent's run-sum store; the merging group is the only group, so
+    /// its lanes 0...7 are the incumbent's `rs_flat` 0...7.
+    private static let residentSplitORunsumStore = """
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                constexpr int rs_groups = D / 64;
+                const int rs_flat = lane;
+                if (rs_flat < GQA * rs_groups) {
+                    const int rs_head = rs_flat / rs_groups;
+                    const int rs_group = rs_flat % rs_groups;
+                    o_rs[batch_index * (KV_HEADS * GQA * rs_groups)
+                            + (query_head + rs_head) * rs_groups + rs_group] =
+                        local_o_rs[rs_head * BLOCKS + 2 * rs_group]
+                        + local_o_rs[rs_head * BLOCKS + 2 * rs_group + 1];
+                }
+        """
+
     /// F4: exact decode Q/K/V normalization and sliding RoPE in the resident
     /// attention prologue. SIMD groups 0...3 own Q0, Q1, K, V respectively, so
     /// every raw element is normalized once; all eight resident attention groups
@@ -2777,7 +3392,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
 
     private static let portQuantFusedWriteResidentNormRopeKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_v1_ey29_ey32_yp3_ey51_yrp1_p1\(slidingPrefetchKey)",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_v1_ey29_ey32_yp3_ey51_yrp1\(slidingPrefetchKey)",
             inputNames: [
                 "raw_queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -2793,7 +3408,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// fifth output, so the standalone prepass never runs on a sliding layer.
     private static let portQuantFusedWriteResidentNormRopeORunsumKernel:
         MLXFast.MLXFastKernel = MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_ors_v1_ey29_ey32_yp3_ey51_yrp1_p1\(slidingPrefetchKey)",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_ors_v1_ey29_ey32_yp3_ey51_yrp1\(slidingPrefetchKey)",
             inputNames: [
                 "raw_queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -2804,6 +3419,72 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             source: residentNormRopeSource(withORunsum: true),
             ensureRowContiguous: true
         )
+
+    /// SLIDING-SPLIT twins of the two F4 resident kernels: one SIMD group per
+    /// threadgroup, the walk's device scratch as an eighteenth input.
+    private static let residentSplitKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_v1_ey29_ey32_yp3_ey51_yrp1\(slidingPrefetchKey)\(slidingSplitKey)",
+            inputNames: [
+                "raw_queries",
+                "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
+                "starts", "raw_keys", "raw_values", "q_weight", "k_weight",
+                "position_offsets", "rope_log2_base", "write_fence", "ss_scratch",
+            ],
+            outputNames: ["out", "fence", "k_out", "v_out"],
+            source: residentSplitSource(withORunsum: false),
+            ensureRowContiguous: true
+        )
+
+    private static let residentSplitORunsumKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_ors_v1_ey29_ey32_yp3_ey51_yrp1\(slidingPrefetchKey)\(slidingSplitKey)",
+            inputNames: [
+                "raw_queries",
+                "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
+                "starts", "raw_keys", "raw_values", "q_weight", "k_weight",
+                "position_offsets", "rope_log2_base", "write_fence", "ss_scratch",
+            ],
+            outputNames: ["out", "fence", "k_out", "v_out", "o_rs"],
+            source: residentSplitSource(withORunsum: true),
+            ensureRowContiguous: true
+        )
+
+    /// `DARKBLOOM_GEMMA4_SLIDING_SPLIT_XCHECK=1`: word-level comparison of the
+    /// split dispatch's outputs against the incumbent resident kernel run on
+    /// the same inputs (diagnostic only; evaluates both).
+    nonisolated(unsafe) private static var slidingSplitXcheckCalls = 0
+    private static func slidingSplitCrossCheck(
+        split: [MLXArray], reference: [MLXArray], names: [String]
+    ) {
+        eval(split + reference)
+        slidingSplitXcheckCalls += 1
+        var report = "[xcheck] sliding-split call \(slidingSplitXcheckCalls):"
+        for (index, name) in names.enumerated() {
+            let candidate = split[index]
+            let incumbent = reference[index]
+            guard candidate.shape == incumbent.shape,
+                candidate.dtype == incumbent.dtype
+            else {
+                report += " \(name) shape/dtype mismatch;"
+                continue
+            }
+            let wordType: DType = candidate.dtype == .bfloat16 ? .uint16 : .uint32
+            let differing = MLX.sum(
+                candidate.view(dtype: wordType) .!= incumbent.view(dtype: wordType))
+            let candidateFloat = candidate.asType(.float32)
+            let incumbentFloat = incumbent.asType(.float32)
+            let absolute = MLX.abs(candidateFloat - incumbentFloat)
+            let relative = absolute / MLX.maximum(MLX.abs(incumbentFloat), MLXArray(Float(1.0e-6)))
+            let maxAbsolute = absolute.max()
+            let maxRelative = relative.max()
+            eval(differing, maxAbsolute, maxRelative)
+            report +=
+                " \(name) words \(candidate.size) differing \(differing.item(Int32.self))"
+                + " max|d| \(maxAbsolute.item(Float.self)) maxrel \(maxRelative.item(Float.self));"
+        }
+        FileHandle.standardError.write(Data((report + "\n").utf8))
+    }
 
     /// KVQ-PORT: `attendRing` reading the packed 8-bit mirror instead of the
     /// bf16 ring, with the result CONSUMED by pass B exactly as the stock
@@ -2867,7 +3548,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             })
         else { return nil }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = getStartArray(starts: starts, batch: batch)
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let passA = portQuantReadKernel(
@@ -2938,7 +3619,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             })
         else { return nil }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = getStartArray(starts: starts, batch: batch)
         let inputs = [queries] + mirrors
             + [startArray, newKeys, newValues, previousWriteFence]
         if q4ResidentMergeEnabled,
@@ -2978,7 +3659,62 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 ]
                 let resident: [MLXArray]
                 let oRunsum: MLXArray?
-                if oRunsumFoldEnabled {
+                if slidingSplitEnabled {
+                    // SLIDING-SPLIT: one SIMD group per threadgroup, the
+                    // walk's device scratch appended.
+                    let splitInputs = residentInputs + [slidingSplitScratch]
+                    if oRunsumFoldEnabled {
+                        resident = residentSplitORunsumKernel(
+                            splitInputs,
+                            template: residentTemplate,
+                            grid: (blocks * 32, kvHeads, batch),
+                            threadGroup: (32, 1, 1),
+                            outputShapes: residentShapes
+                                + [[batch, queryHeads * headDim / 64]],
+                            outputDTypes: residentDTypes + [.float32]
+                        )
+                        oRunsum = resident[4]
+                        CBv2EngageMark.once("o-runsum-resident-fold")
+                    } else {
+                        resident = residentSplitKernel(
+                            splitInputs,
+                            template: residentTemplate,
+                            grid: (blocks * 32, kvHeads, batch),
+                            threadGroup: (32, 1, 1),
+                            outputShapes: residentShapes,
+                            outputDTypes: residentDTypes
+                        )
+                        oRunsum = nil
+                    }
+                    CBv2EngageMark.once("sliding-split")
+                    if slidingSplitXcheck {
+                        let reference: [MLXArray]
+                        if oRunsumFoldEnabled {
+                            reference = portQuantFusedWriteResidentNormRopeORunsumKernel(
+                                residentInputs,
+                                template: residentTemplate,
+                                grid: (kvHeads * blocks * 32, batch, 1),
+                                threadGroup: (blocks * 32, 1, 1),
+                                outputShapes: residentShapes
+                                    + [[batch, queryHeads * headDim / 64]],
+                                outputDTypes: residentDTypes + [.float32]
+                            )
+                        } else {
+                            reference = portQuantFusedWriteResidentNormRopeKernel(
+                                residentInputs,
+                                template: residentTemplate,
+                                grid: (kvHeads * blocks * 32, batch, 1),
+                                threadGroup: (blocks * 32, 1, 1),
+                                outputShapes: residentShapes,
+                                outputDTypes: residentDTypes
+                            )
+                        }
+                        let names = ["out", "fence", "k_out", "v_out", "o_rs"]
+                        slidingSplitCrossCheck(
+                            split: resident, reference: reference,
+                            names: Array(names.prefix(resident.count)))
+                    }
+                } else if oRunsumFoldEnabled {
                     resident = portQuantFusedWriteResidentNormRopeORunsumKernel(
                         residentInputs,
                         template: residentTemplate,
@@ -3078,7 +3814,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             starts.count == batch,
             starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength })
         else { return nil }
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = getStartArray(starts: starts, batch: batch)
         return attend(
             passAKernel: ringPassAKernel, queries: queries, keys: keys, values: values,
             extraInputs: [startArray], scale: scale)
@@ -3131,7 +3867,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             else { return nil }
         }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = getStartArray(starts: starts, batch: batch)
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let paired = gqaPairedPassAEnabled && gqa == 2
@@ -3330,6 +4066,34 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// requires kL ≥ TM = 4.
     private static let minKeyLength = 4
     private static let maxKeyLength = 4095
+
+    // Single-entry params cache for the shared [kL, D, per-row caps...]
+    // layout. All full-attention rows share one offset per step, so the
+    // layers of a step hit one entry; guarded by a lock, hit logic
+    // otherwise identical to a fresh allocation.
+    private struct CachedD512Params {
+        var params: [UInt32] = []
+        var array: MLXArray?
+    }
+    nonisolated(unsafe) private static var cachedD512Params = CachedD512Params()
+    private static let d512ParamsLock = NSLock()
+
+    private static func getD512ParamsArray(params: [UInt32]) -> MLXArray {
+        guard CBv2RaggedTwoPassDecodeAttentionV1.hostAllocTablesEnabled else {
+            return MLXArray(params)
+        }
+        d512ParamsLock.lock()
+        if cachedD512Params.params == params, let arr = cachedD512Params.array {
+            d512ParamsLock.unlock()
+            return arr
+        }
+        d512ParamsLock.unlock()
+        let arr = MLXArray(params)
+        d512ParamsLock.lock()
+        cachedD512Params = CachedD512Params(params: params, array: arr)
+        d512ParamsLock.unlock()
+        return arr
+    }
 
     // MARK: NORMROPE-D512 / ORS-D512
 
@@ -5371,7 +6135,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             valueBuffers.append(state[1])
             params.append(UInt32(state[0].dim(2)))
         }
-        let paramsArray = MLXArray(params)
+        let paramsArray = getD512ParamsArray(params: params)
 
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)
@@ -5574,7 +6338,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             valueBuffers.append(state[1])
             params.append(UInt32(state[0].dim(2)))
         }
-        let paramsArray = MLXArray(params)
+        let paramsArray = getD512ParamsArray(params: params)
 
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)
@@ -5792,7 +6556,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         queries: MLXArray, keyBuffers: [MLXArray], valueBuffers: [MLXArray],
         params: [UInt32], keyLength: Int
     ) -> MLXArray {
-        let paramsArray = MLXArray(params)
+        let paramsArray = getD512ParamsArray(params: params)
 
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)

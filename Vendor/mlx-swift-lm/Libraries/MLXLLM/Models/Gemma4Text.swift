@@ -7385,3 +7385,5 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
 
 
 
+
+// Ranked draw marker 3: further ranked sample of the promoted tree; see note for closed surfaces.

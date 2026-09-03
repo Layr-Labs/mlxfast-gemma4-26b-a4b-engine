@@ -3263,6 +3263,20 @@ private enum Gemma4FusedLayerGlue {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// DENSE-XSUM-ELIDE: With MMA-GATEUP-DEFAULT-001 promoted, the dense MLP gate/up
+    /// projection runs the matrix-unit body and never consumes the DMLP-002
+    /// activation-sum table. This elides the dead 5,632-element float32 buffer
+    /// allocation and its writes from the attention branch prefix kernel, removes
+    /// the unconsumed dependency edge in Gemma4ZipRouterV1, and skips the
+    /// standalone activationSumKernel dispatch.
+    /// `DARKBLOOM_GEMMA4_DENSE_XSUM_ELIDE=0` restores the unconsumed table and its edge.
+    static let denseXSumElideEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_DENSE_XSUM_ELIDE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let rows = 8
     private static let axis = 2816
     private static let eps: Float = 1e-6
@@ -3475,6 +3489,45 @@ private enum Gemma4FusedLayerGlue {
             ensureRowContiguous: true
         )
 
+    private static let attentionBranchPrefixKernelV2: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_glue_attention_branch_prefix_2816_bf16_v2_nb1",
+            inputNames: ["attn", "res", "wa", "wd", "we", "wr"],
+            outputNames: ["out", "dense", "expert", "router"],
+            source: """
+                const uint row = threadgroup_position_in_grid.x;
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint simd_lane_id = thread_index_in_simdgroup;
+                const uint simd_group_id = simdgroup_index_in_threadgroup;
+                threadgroup float local_inv[1];
+                threadgroup float local_sums[32];
+                const uint base = row * 2816 + lid * 4;
+                const uint wbase = lid * 4;
+            \(rmsReduce("attn", into: "local_inv[0]"))
+                const float attn_inv = local_inv[0];
+                T outv[4];
+                for (int i = 0; i < 4; i++) {
+                    const T normed = static_cast<T>(
+                        wa[wbase + i]
+                            * static_cast<T>(
+                                (float)attn[base + i] * attn_inv));
+                    outv[i] = res[base + i] + normed;
+                    out[base + i] = outv[i];
+                }
+            \(rmsReduce("outv", into: "local_inv[0]").replacingOccurrences(
+                of: "(float)outv[base + i]", with: "(float)outv[i]"))
+                const float branch_inv = local_inv[0];
+                for (int i = 0; i < 4; i++) {
+                    const T nx =
+                        static_cast<T>((float)outv[i] * branch_inv);
+                    dense[base + i] = wd[wbase + i] * nx;
+                    expert[base + i] = we[wbase + i] * nx;
+                    router[base + i] = wr[wbase + i] * nx;
+                }
+            """,
+            ensureRowContiguous: true
+        )
+
     private static let dualPreNormKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_glue_dual_prenorm_xsum_2816_bf16_v2_nb1",
         inputNames: ["x", "w1", "w2"],
@@ -3610,7 +3663,7 @@ private enum Gemma4FusedLayerGlue {
         let denseNorm: MLXArray
         let expertNorm: MLXArray
         let routerNorm: MLXArray
-        let denseSums: CBv2DenseMLPQMVV1.ActivationSums
+        let denseSums: CBv2DenseMLPQMVV1.ActivationSums?
     }
 
     /// PREFIX-001. The returned `out` is still materialized because the layer
@@ -3626,7 +3679,7 @@ private enum Gemma4FusedLayerGlue {
         eps: Float
     ) -> AttentionBranchPrefix? {
         guard CBv2DenseMLPQMVV1.enabled,
-            CBv2DenseMLPQMVV1.activationSumsEnabled,
+            (CBv2DenseMLPQMVV1.activationSumsEnabled || denseXSumElideEnabled),
             admits(attn, weight: postAttentionWeight, eps: eps),
             residual.shape == attn.shape, residual.dtype == .bfloat16,
             denseWeight.ndim == 1, denseWeight.dim(0) == axis,
@@ -3636,6 +3689,34 @@ private enum Gemma4FusedLayerGlue {
             routerWeight.ndim == 1, routerWeight.dim(0) == axis,
             routerWeight.dtype == .bfloat16
         else { return nil }
+        if denseXSumElideEnabled {
+            CBv2EngageMark.once("dense-xsum-elide")
+            let outs = attentionBranchPrefixKernelV2(
+                [
+                    attn, residual, postAttentionWeight, denseWeight,
+                    expertWeight, routerWeight,
+                ],
+                template: [("T", attn.dtype)],
+                grid: (rows * tgThreads, 1, 1),
+                threadGroup: (tgThreads, 1, 1),
+                outputShapes: [
+                    [rows, 1, axis],
+                    [rows, 1, axis],
+                    [rows, 1, axis],
+                    [rows, 1, axis],
+                ],
+                outputDTypes: [
+                    .bfloat16, .bfloat16, .bfloat16, .bfloat16,
+                ]
+            )
+            CBv2EngageMark.once("attention-branch-prefix")
+            return AttentionBranchPrefix(
+                out: outs[0],
+                denseNorm: outs[1],
+                expertNorm: outs[2],
+                routerNorm: outs[3],
+                denseSums: nil)
+        }
         let outs = attentionBranchPrefixKernel(
             [
                 attn, residual, postAttentionWeight, denseWeight,
@@ -4506,15 +4587,25 @@ private enum Gemma4ZipRouterV1 {
         // fallback for a disabled or mismatched carrier. A nil leaves the
         // dual pre-norm arrays unreferenced, so MLX never evaluates them and
         // the caller's stock path rebuilds the identical pair.
-        guard let sums = producerSums ?? mlp.zipActivationSums(n1) else { return nil }
         let normed = carriedRouterNorm ?? router.zipNorm(out)
 
         // Stage 2: router QMV | dense gate + up.
-        let expertScores = router.zipScores(
-            MLX.depends(input: normed, dependencies: [sums.dependencyHandle]))
-        let denseIn = MLX.depends(input: n1, dependencies: [normed])
-        let gate = mlp.zipGate(denseIn, sums)
-        let up = mlp.zipUp(denseIn, sums)
+        let expertScores: MLXArray
+        let gate: MLXArray
+        let up: MLXArray
+        if Gemma4FusedLayerGlue.denseXSumElideEnabled {
+            expertScores = router.zipScores(normed)
+            let denseIn = MLX.depends(input: n1, dependencies: [normed])
+            gate = mlp.zipGate(denseIn, nil)
+            up = mlp.zipUp(denseIn, nil)
+        } else {
+            guard let sums = producerSums ?? mlp.zipActivationSums(n1) else { return nil }
+            expertScores = router.zipScores(
+                MLX.depends(input: normed, dependencies: [sums.dependencyHandle]))
+            let denseIn = MLX.depends(input: n1, dependencies: [normed])
+            gate = mlp.zipGate(denseIn, sums)
+            up = mlp.zipUp(denseIn, sums)
+        }
 
         // Stage 3: the dense GeLU product, which the router has no partner
         // for -- the argPartition is deliberately NOT paired with it.

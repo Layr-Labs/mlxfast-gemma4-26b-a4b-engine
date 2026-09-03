@@ -1480,7 +1480,25 @@ public class SwitchGLU: Module {
             // pipeline, same per-column K-chains; the halves are views. The
             // admission mirrors the host's sorted right-hand-side selection
             // exactly, so the split views never meet that kernel.
-            if doSort, !useLhsIndices, lhsIndices == nil,
+            // MOE-MMA8-001: at the batch-8 decode geometry with RAW sorted
+            // keys, gate and up leave the scalar gather QMV for the
+            // matrix-unit gather tier (one launch, both planes, run leaders
+            // serve every same-expert row from one weight pass). Any other
+            // geometry, a tagged prefix-bounds key carrier, a non-affine-4
+            // plane or the kill switch falls through to the incumbent
+            // gathers unchanged. See `Gemma4MoEGatherMMA8V1`.
+            if useLhsIndices, !useExpertPrefixBounds, let lhsIndices,
+                let fused = fusedGateUpDispatch(),
+                let mma = Gemma4MoEGatherMMA8V1.gateUp(
+                    x: x, rowOrder: lhsIndices, sortedKeys: idx,
+                    fusedWeight: fused.storage.weight,
+                    fusedScales: fused.storage.scales,
+                    fusedBiases: fused.storage.biases,
+                    groupSize: fused.groupSize, bits: fused.bits, mode: fused.mode)
+            {
+                xGate = mma.gate
+                xUp = mma.up
+            } else if doSort, !useLhsIndices, lhsIndices == nil,
                 x.ndim == 3, x.dim(-2) == 1, x.dim(-1) == inputDims,
                 x.dim(0) >= 16, x.dim(0) / numExperts >= 4,
                 x.dtype == .bfloat16,
@@ -1525,7 +1543,17 @@ public class SwitchGLU: Module {
         // which otherwise materializes the same arange(64) on every call.
         let downLhs: MLXArray? =
             (doSort && idx.ndim == 1 && idx.size == 64) ? switchDownIdentity64 : nil
-        x = downProj(activated, idx, lhsIndices: downLhs, sortedIndices: doSort)
+        // MOE-MMA8-001 (down plane): same admission as the gate|up tier
+        // above; the identity source table is built inside the tier.
+        if useLhsIndices, !useExpertPrefixBounds,
+            let downQ = downProj as? QuantizedSwitchLinear,
+            let mma = Gemma4MoEGatherMMA8V1.down(
+                activated: activated, sortedKeys: idx, proj: downQ)
+        {
+            x = mma
+        } else {
+            x = downProj(activated, idx, lhsIndices: downLhs, sortedIndices: doSort)
+        }
         // Under `doSort` a producer above always assigned `inverseOrder`;
         // otherwise it is still nil, which is exactly what the old
         // `doSort ? inverseOrder : nil` produced.

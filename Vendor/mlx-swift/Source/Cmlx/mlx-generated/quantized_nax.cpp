@@ -1588,6 +1588,373 @@ METAL_FUNC void gather_rhs_mma_frag_row(
   }
 }
 
+///////////////////////////////////////////////////////////////////////////////
+// DARKBLOOM GEMMA4 NAX-EXACT (NAXEXACT-001): the exact-codes decode form of
+// affine_gather_qmm_rhs_nax.
+//
+// The stock body dequantizes every weight tile to T through
+// QuantizedBlockLoader (`scale * code + bias`, rounded to T) before the
+// tensor op. The B=8 decode projections reach this kernel through the
+// pseudo-expert gather road (the activation rows laid out once per view,
+// M <= 16 rows, one row tile). For that shape the body below runs instead:
+// the integer codes enter the tensor op as exactly representable T operands
+// (0 .. 2^bits - 1), the products of one K group accumulate in fp32, and the
+// group's scale and bias are applied in fp32 afterwards,
+//
+//     y[m][n] = sum_g ( s[n][g] * sum_{k in g} code[n][k] * x[m][k]
+//                     + b[n][g] * rs[m][g] ),
+//
+// with rs the activation run sum in the form every quantized kernel of this
+// tree (and upstream's load_vector) uses: for 2- and 4-bit, aligned 4-chunks
+// of x summed in T with the chunk values accumulated in fp32; for 8-bit, the
+// elements added to the fp32 sum one by one. This is the arithmetic of the tree's
+// custom decode projections (integer codes, fp32 fold per group). No weight
+// value is rounded to T anywhere.
+//
+// Structure: the K groups are split across the WM*WN simdgroups; each
+// simdgroup streams its own weight words straight from device memory into
+// the B fragments (one tile prefetched), so the K loop has no threadgroup
+// staging and no barrier; the group's scales and biases travel by simd
+// shuffle; the fp32 partial tiles of the simdgroups are summed through Ws
+// once per expert segment and stored. Every other dispatch (M > 16, N or K
+// not tile aligned, an instantiation outside {transpose, bits 2/4/8,
+// group_size a multiple of BK}) runs the stock body unchanged; the prompt
+// pass's expert projections have M >= 512 rows and never enter.
+//
+// Kill switch: -DDARKBLOOM_GEMMA4_NAX_EXACT_CODES=0 compiles the stock body
+// alone. The Swift hosts' DARKBLOOM_GEMMA4_NAX_*=0 switches keep the road
+// from being dispatched in the first place.
+///////////////////////////////////////////////////////////////////////////////
+#ifndef DARKBLOOM_GEMMA4_NAX_EXACT_CODES
+#define DARKBLOOM_GEMMA4_NAX_EXACT_CODES 1
+#endif
+
+// The machine word holding four consecutive codes of one weight row.
+template <int bits>
+struct gather_rhs_exact_word {};
+template <>
+struct gather_rhs_exact_word<8> {
+  using type = uint32_t;
+};
+template <>
+struct gather_rhs_exact_word<4> {
+  using type = uint16_t;
+};
+template <>
+struct gather_rhs_exact_word<2> {
+  using type = uint8_t;
+};
+
+// One tile's weight words for this lane: word ((step * TK + kk) * TN + nn)
+// * 2 + i holds the codes k = step * SK + kk * 16 + fn .. + 3 of tile row
+// nn * 16 + fm + 8 * i, which is exactly the B fragment element layout of
+// BaseNAXFrag (rows fm, fm + 8; columns fn .. fn + 3).
+template <
+    typename word_t,
+    int pack_factor,
+    int BK,
+    int SK,
+    int TK,
+    int TN,
+    int kSteps>
+METAL_FUNC void gather_rhs_exact_load_words(
+    thread word_t* dst,
+    const device uint8_t* wseg,
+    const int K_w,
+    const int tile,
+    const short fm,
+    const short fn) {
+  STEEL_PRAGMA_UNROLL
+  for (short step = 0; step < kSteps; ++step) {
+    STEEL_PRAGMA_UNROLL
+    for (short kk = 0; kk < TK; ++kk) {
+      const int kbyte = (tile * BK + step * SK + kk * 16 + fn) / pack_factor;
+      STEEL_PRAGMA_UNROLL
+      for (short nn = 0; nn < TN; ++nn) {
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < 2; ++i) {
+          const int row = nn * 16 + fm + i * 8;
+          dst[((step * TK + kk) * TN + nn) * 2 + i] =
+              *reinterpret_cast<const device word_t*>(
+                  wseg + row * K_w + kbyte);
+        }
+      }
+    }
+  }
+}
+
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int BM,
+    int BN,
+    int BK,
+    int WM,
+    int WN>
+METAL_FUNC void affine_gather_qmm_rhs_nax_exact_decode(
+    const device T* x,
+    const device uint8_t* wl,
+    const device T* scales,
+    const device T* biases,
+    const device uint32_t* indices,
+    device T* y,
+    const int M,
+    const int N,
+    const int K,
+    threadgroup T* Ws,
+    const uint simd_group_id,
+    const uint simd_lane_id) {
+  constexpr int kSimdgroups = WM * WN;
+  static_assert(kSimdgroups == 4, "the partial-tile reduction sums 4 simdgroups");
+  constexpr int pack_factor = 8 / bits;
+  constexpr int kTilesPerGroup = group_size / BK;
+  constexpr short kFrag = 16;
+  constexpr short SK = 32;
+  constexpr short TK = SK / kFrag;
+  constexpr short TN = BN / kFrag;
+  constexpr short kSteps = BK / SK;
+  constexpr short kWords = kSteps * TK * TN * 2;
+  constexpr int kRedStride = kFrag * 4 + 4;
+  constexpr int kRedTile = kFrag * kRedStride;
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  static_assert(
+      2 * kRedTile * sizeof(float) <= BN * BK_padded * sizeof(T),
+      "the reduction scratch must fit inside Ws");
+  using word_t = typename gather_rhs_exact_word<bits>::type;
+  constexpr uint32_t kCodeMask = (1u << bits) - 1u;
+  using acc_tile_t = NAXTile<float, 1, TN>;
+  using a_tile_t = NAXTile<T, 1, TK>;
+  using b_frag_t = typename BaseNAXFrag::dtype_frag_t<T>;
+  using acc_frag_t = typename BaseNAXFrag::dtype_frag_t<float>;
+
+  const int K_w = K / pack_factor;
+  const int K_g = K / group_size;
+  const size_t stride_w = size_t(N) * size_t(K_w);
+  const size_t stride_s = size_t(N) * size_t(K_g);
+
+  // Lane coordinates inside a 16 x 16 fragment (BaseNAXFrag::get_coord).
+  const short qid = short(simd_lane_id >> 2);
+  const short fm = short((qid & 4) | ((simd_lane_id >> 1) & 3));
+  const short fn = short(((qid & 2) | (simd_lane_id & 1)) * 4);
+  // This simdgroup's K groups (whole groups, contiguous), as tiles.
+  const int G = K_g;
+  const int t_lo = ((G * int(simd_group_id)) / kSimdgroups) * kTilesPerGroup;
+  const int t_hi =
+      ((G * (int(simd_group_id) + 1)) / kSimdgroups) * kTilesPerGroup;
+  // Lane l carries the scale and bias of tile columns 2l and 2l + 1.
+  const int sc0 = 2 * int(simd_lane_id);
+
+  threadgroup float* red = (threadgroup float*)Ws;
+
+  uint32_t index;
+  short offset;
+  uint32_t index_next = indices[0];
+  short offset_next = 0;
+  int n = 0;
+  while (n < M) {
+    n++;
+    offset = offset_next;
+    index = index_next;
+    offset_next = short(M);
+    for (; n < M; n++) {
+      if (indices[n] != index) {
+        offset_next = short(n);
+        index_next = indices[n];
+        break;
+      }
+    }
+
+    const device uint8_t* wseg = wl + index * stride_w;
+    const device T* sseg = scales + index * stride_s;
+    const device T* bseg = biases + index * stride_s;
+
+    acc_tile_t Acc;
+    Acc.clear();
+    acc_tile_t D;
+    D.clear();
+    float rsp0 = 0.0f;
+    float rsp1 = 0.0f;
+
+    word_t wcur[kWords];
+    word_t wnxt[kWords];
+    T s_cur0 = T(0);
+    T s_cur1 = T(0);
+    T b_cur0 = T(0);
+    T b_cur1 = T(0);
+    T s_nxt0 = T(0);
+    T s_nxt1 = T(0);
+    T b_nxt0 = T(0);
+    T b_nxt1 = T(0);
+
+    if (t_lo < t_hi) {
+      gather_rhs_exact_load_words<word_t, pack_factor, BK, SK, TK, TN, kSteps>(
+          wcur, wseg, K_w, t_lo, fm, fn);
+      const int g0 = t_lo / kTilesPerGroup;
+      s_cur0 = sseg[sc0 * K_g + g0];
+      s_cur1 = sseg[(sc0 + 1) * K_g + g0];
+      b_cur0 = bseg[sc0 * K_g + g0];
+      b_cur1 = bseg[(sc0 + 1) * K_g + g0];
+    }
+
+    for (int t = t_lo; t < t_hi; ++t) {
+      const bool group_end = ((t + 1) % kTilesPerGroup) == 0;
+      const bool has_next = (t + 1) < t_hi;
+      if (has_next) {
+        gather_rhs_exact_load_words<word_t, pack_factor, BK, SK, TK, TN, kSteps>(
+            wnxt, wseg, K_w, t + 1, fm, fn);
+        if (group_end) {
+          const int g1 = (t + 1) / kTilesPerGroup;
+          s_nxt0 = sseg[sc0 * K_g + g1];
+          s_nxt1 = sseg[(sc0 + 1) * K_g + g1];
+          b_nxt0 = bseg[sc0 * K_g + g1];
+          b_nxt1 = bseg[(sc0 + 1) * K_g + g1];
+        }
+      }
+
+      STEEL_PRAGMA_UNROLL
+      for (short step = 0; step < kSteps; ++step) {
+        a_tile_t A;
+        A.load_rows(x + t * BK + step * SK, K, short(M));
+        // Activation run sums in the incumbents' form (upstream load_vector,
+        // the decode kernels' mma8_runsum4 / mma8_runsum8): for 2- and 4-bit
+        // each aligned 4-chunk of x is summed in T (`xt[0] + xt[1] + xt[2] +
+        // xt[3]`, T-typed additions) and the chunk values accumulate in
+        // fp32; for 8-bit every element is added to the fp32 sum directly.
+        // A lane's four fragment columns are one aligned chunk
+        // (k = 16 kk + fn .. + 3, fn a multiple of 4).
+        STEEL_PRAGMA_UNROLL
+        for (short kk = 0; kk < TK; ++kk) {
+          thread const b_frag_t& a = A.frag_at(0, kk);
+          thread T xt[8];
+          STEEL_PRAGMA_UNROLL
+          for (short e = 0; e < 8; ++e) {
+            xt[e] = a[e];
+          }
+          if constexpr (bits == 8) {
+            STEEL_PRAGMA_UNROLL
+            for (short e = 0; e < 4; ++e) {
+              rsp0 += xt[e];
+              rsp1 += xt[4 + e];
+            }
+          } else {
+            rsp0 += xt[0] + xt[1] + xt[2] + xt[3];
+            rsp1 += xt[4] + xt[5] + xt[6] + xt[7];
+          }
+        }
+        STEEL_PRAGMA_UNROLL
+        for (short kk = 0; kk < TK; ++kk) {
+          STEEL_PRAGMA_UNROLL
+          for (short nn = 0; nn < TN; nn += 2) {
+            b_frag_t B0;
+            b_frag_t B1;
+            STEEL_PRAGMA_UNROLL
+            for (short i = 0; i < 2; ++i) {
+              const uint32_t w0 =
+                  uint32_t(wcur[((step * TK + kk) * TN + nn) * 2 + i]);
+              const uint32_t w1 =
+                  uint32_t(wcur[((step * TK + kk) * TN + nn + 1) * 2 + i]);
+              STEEL_PRAGMA_UNROLL
+              for (short j = 0; j < 4; ++j) {
+                B0[i * 4 + j] =
+                    static_cast<T>(float((w0 >> (bits * j)) & kCodeMask));
+                B1[i * 4 + j] =
+                    static_cast<T>(float((w1 >> (bits * j)) & kCodeMask));
+              }
+            }
+            BaseNAXFrag::mma(
+                D.frag_at(0, nn),
+                D.frag_at(0, nn + 1),
+                A.frag_at(0, kk),
+                metal::bool_constant<false>{},
+                B0,
+                B1,
+                metal::bool_constant<true>{});
+          }
+        }
+      }
+
+      if (group_end) {
+        float rs0 = rsp0;
+        float rs1 = rsp1;
+        rs0 += simd_shuffle_xor(rs0, ushort(1));
+        rs0 += simd_shuffle_xor(rs0, ushort(8));
+        rs1 += simd_shuffle_xor(rs1, ushort(1));
+        rs1 += simd_shuffle_xor(rs1, ushort(8));
+        const float2 sl = float2(float(s_cur0), float(s_cur1));
+        const float2 bl = float2(float(b_cur0), float(b_cur1));
+        STEEL_PRAGMA_UNROLL
+        for (short nn = 0; nn < TN; ++nn) {
+          const ushort src = ushort((nn * kFrag + fn) >> 1);
+          const float2 sA = simd_shuffle(sl, src);
+          const float2 sB = simd_shuffle(sl, ushort(src + 1));
+          const float2 bA = simd_shuffle(bl, src);
+          const float2 bB = simd_shuffle(bl, ushort(src + 1));
+          const float4 s4 = float4(sA, sB);
+          const float4 b4 = float4(bA, bB);
+          thread acc_frag_t& acc = Acc.frag_at(0, nn);
+          thread const acc_frag_t& d = D.frag_at(0, nn);
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < 4; ++j) {
+            acc[j] += s4[j] * d[j] + rs0 * b4[j];
+            acc[4 + j] += s4[j] * d[4 + j] + rs1 * b4[j];
+          }
+        }
+        D.clear();
+        rsp0 = 0.0f;
+        rsp1 = 0.0f;
+        s_cur0 = s_nxt0;
+        s_cur1 = s_nxt1;
+        b_cur0 = b_nxt0;
+        b_cur1 = b_nxt1;
+      }
+      if (has_next) {
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < kWords; ++i) {
+          wcur[i] = wnxt[i];
+        }
+      }
+    }
+
+    // Sum the simdgroups' fp32 partial tiles through Ws (two scratch tiles,
+    // pairwise), then simdgroup 0 stores the segment's rows.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id >= 2) {
+      Acc.template store<float, kRedStride, 1>(
+          red + (simd_group_id - 2) * kRedTile);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id < 2) {
+      acc_tile_t P;
+      P.template load<float, kRedStride, 1>(red + simd_group_id * kRedTile);
+      STEEL_PRAGMA_UNROLL
+      for (short f = 0; f < TN; ++f) {
+        STEEL_PRAGMA_UNROLL
+        for (short e = 0; e < 8; ++e) {
+          Acc.frag_at(0, f)[e] += P.frag_at(0, f)[e];
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 1) {
+      Acc.template store<float, kRedStride, 1>(red);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) {
+      acc_tile_t P;
+      P.template load<float, kRedStride, 1>(red);
+      STEEL_PRAGMA_UNROLL
+      for (short f = 0; f < TN; ++f) {
+        STEEL_PRAGMA_UNROLL
+        for (short e = 0; e < 8; ++e) {
+          Acc.frag_at(0, f)[e] += P.frag_at(0, f)[e];
+        }
+      }
+      Acc.store_slice(y, N, short2(0, offset), short2(BN, offset_next));
+    }
+  }
+}
+
 // DARKBLOOM GEMMA4 NAX GATHER-RHS ROW-STRIP TILING.
 // affine_gather_qmm_rhs_nax covers a BM x BN output tile with WM x WN
 // simdgroups. The launch shape is fixed by the host (32, WN, WM) and the host
@@ -1707,6 +2074,32 @@ template <
   wl += transpose ? y_col_long * K_w : y_col * bytes_per_pack / pack_factor;
   scales += transpose ? y_col_long * K_g : y_col / group_size;
   biases += transpose ? y_col_long * K_g : y_col / group_size;
+
+  // NAXEXACT-001: the decode shape (one row tile of at most 16 activation
+  // rows, tile-aligned N and K) takes the exact-codes body; everything else
+  // continues into the stock body below unchanged.
+  constexpr bool kExactCodesEligible = (DARKBLOOM_GEMMA4_NAX_EXACT_CODES != 0) &&
+      transpose && (bits == 2 || bits == 4 || bits == 8) &&
+      (group_size % BK == 0) && (BM == 64) && (BN == 64) && (BK == 64) &&
+      (WM * WN == 4);
+  if constexpr (kExactCodesEligible) {
+    if (M <= 16 && (N % BN) == 0 && (K % BK) == 0) {
+      affine_gather_qmm_rhs_nax_exact_decode<T, group_size, bits, BM, BN, BK, WM, WN>(
+          x,
+          wl,
+          scales,
+          biases,
+          indices + y_row,
+          y,
+          M,
+          N,
+          K,
+          Ws,
+          simd_group_id,
+          simd_lane_id);
+      return;
+    }
+  }
 
   // Simdgroup grid over the BM x BN tile. Stock is WM x WN; the row-strip
   // layout stacks the same WM*WN simdgroups in the row direction only, so no

@@ -4486,6 +4486,207 @@ template <
       w, scales, biases, x, y, Xs, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
+///////////////////////////////////////////////////////////////////////////////
+// DARKBLOOM GEMMA4 NAX-EXACT (NAXEXACT-001): the exact-codes decode form of
+// affine_gather_qmm_rhs, the steel twin of affine_gather_qmm_rhs_nax that a
+// part without the tensor-op kernels dispatches. Same arithmetic as the nax
+// twin's decode body: the integer codes are staged to Ws as exactly
+// representable T values (no scale, no bias), BlockMMA accumulates one K
+// group's products in fp32, and the group's scale and bias are folded in
+// fp32,
+//     y[m][n] = sum_g ( s[n][g] * sum_{k in g} code[n][k] * x[m][k]
+//                     + b[n][g] * rs[m][g] ),
+// rs being the activation run sum in the tree's form (2-/4-bit: aligned
+// 4-chunks of x summed in T, chunk values accumulated in fp32; 8-bit: the
+// elements added to the fp32 sum one by one).
+// Dispatched for M <= BM (one row tile), tile-aligned N and K, transpose,
+// bits 2/4/8, group_size a multiple of BK; every other dispatch and
+// instantiation keeps the stock body unchanged.
+// Kill switch: -DDARKBLOOM_GEMMA4_NAX_EXACT_CODES=0.
+///////////////////////////////////////////////////////////////////////////////
+#ifndef DARKBLOOM_GEMMA4_NAX_EXACT_CODES
+#define DARKBLOOM_GEMMA4_NAX_EXACT_CODES 1
+#endif
+
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int BM,
+    int BN,
+    int BK,
+    int WM,
+    int WN>
+METAL_FUNC void affine_gather_qmm_rhs_exact_decode(
+    const device T* x,
+    const device uint8_t* wl,
+    const device T* scales,
+    const device T* biases,
+    const device uint32_t* indices,
+    device T* y,
+    const int M,
+    const int N,
+    const int K,
+    threadgroup T* Xs,
+    threadgroup T* Ws,
+    threadgroup float* Ss,
+    threadgroup float* Bs,
+    threadgroup float* Rs,
+    const uint simd_group_id,
+    const uint simd_lane_id) {
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  constexpr int kThreads = WM * WN * SIMD_SIZE;
+  constexpr int pack_factor = 8 / bits;
+  constexpr int kRowBytes = BK / pack_factor;
+  constexpr int kBytesPerThread = (BN * kRowBytes) / kThreads;
+  constexpr int kThreadsPerRow = kRowBytes / kBytesPerThread;
+  constexpr int kWordsPerThread = kBytesPerThread / 4;
+  constexpr int kCodesPerWord = 32 / bits;
+  constexpr int kTilesPerGroup = group_size / BK;
+  constexpr uint32_t kCodeMask = (1u << bits) - 1u;
+  static_assert(
+      kBytesPerThread * kThreadsPerRow == kRowBytes,
+      "the weight tile must split evenly across the threadgroup");
+  static_assert(kBytesPerThread % 4 == 0, "whole 32-bit words per thread");
+
+  using mma_t = mlx::steel::BlockMMA<
+      T,
+      T,
+      BM,
+      BN,
+      BK,
+      WM,
+      WN,
+      false,
+      true,
+      BK_padded,
+      BK_padded>;
+  using loader_x_t =
+      mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, kThreads>;
+  constexpr short TM = mma_t::TM;
+  constexpr short TN = mma_t::TN;
+  using acc_tile_t = mlx::steel::MMATile<float, TM, TN>;
+  constexpr short kElems = acc_tile_t::kElemsPerFrag;
+
+  const int thread_idx = int(simd_group_id) * SIMD_SIZE + int(simd_lane_id);
+  const int wrow = thread_idx / kThreadsPerRow;
+  const int wcol = thread_idx % kThreadsPerRow;
+  const int K_w = K / pack_factor;
+  const int K_g = K / group_size;
+  const size_t stride_w = size_t(N) * size_t(K_w);
+  const size_t stride_s = size_t(N) * size_t(K_g);
+  const int K_it = K / BK;
+
+  uint32_t index;
+  short offset;
+  uint32_t index_next = indices[0];
+  short offset_next = 0;
+  int n = 0;
+  while (n < M) {
+    n++;
+    offset = offset_next;
+    index = index_next;
+    offset_next = short(M);
+    for (; n < M; n++) {
+      if (indices[n] != index) {
+        offset_next = short(n);
+        index_next = indices[n];
+        break;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_none);
+
+    const device uint8_t* wseg = wl + index * stride_w;
+    const device T* sseg = scales + index * stride_s;
+    const device T* bseg = biases + index * stride_s;
+
+    thread mma_t mma_op(simd_group_id, simd_lane_id);
+    acc_tile_t Acc;
+    Acc.clear();
+    thread loader_x_t loader_x(x, K, Xs, simd_group_id, simd_lane_id);
+    const device uint8_t* wthr = wseg + wrow * K_w + wcol * kBytesPerThread;
+    const device T* sthr = sseg + wrow * K_g;
+    const device T* bthr = bseg + wrow * K_g;
+    threadgroup T* wdst =
+        Ws + wrow * BK_padded + wcol * (kBytesPerThread * pack_factor);
+    float rsp = 0.0f;
+
+    for (int t = 0; t < K_it; ++t) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      loader_x.load_safe(short2(BK, M));
+      const device uint32_t* wp =
+          reinterpret_cast<const device uint32_t*>(wthr + t * kRowBytes);
+      STEEL_PRAGMA_UNROLL
+      for (short wi = 0; wi < kWordsPerThread; ++wi) {
+        const uint32_t word = wp[wi];
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < kCodesPerWord; ++j) {
+          wdst[wi * kCodesPerWord + j] =
+              static_cast<T>(float((word >> (bits * j)) & kCodeMask));
+        }
+      }
+      if (wcol == 0 && (t % kTilesPerGroup) == 0) {
+        const int g = t / kTilesPerGroup;
+        Ss[wrow] = float(sthr[g]);
+        Bs[wrow] = float(bthr[g]);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      mma_op.mma(Xs, Ws);
+      if (thread_idx < BM) {
+        // Activation run sums in the incumbents' form (upstream load_vector,
+        // the decode kernels' mma8_runsum4 / mma8_runsum8): for 2- and 4-bit
+        // aligned 4-chunks summed in T, the chunk values accumulated in
+        // fp32; for 8-bit every element added to the fp32 sum directly.
+        const threadgroup T* xrow = Xs + thread_idx * BK_padded;
+        for (short k = 0; k < BK; k += 4) {
+          thread T xt[4];
+          xt[0] = xrow[k];
+          xt[1] = xrow[k + 1];
+          xt[2] = xrow[k + 2];
+          xt[3] = xrow[k + 3];
+          if constexpr (bits == 8) {
+            rsp += xt[0];
+            rsp += xt[1];
+            rsp += xt[2];
+            rsp += xt[3];
+          } else {
+            rsp += xt[0] + xt[1] + xt[2] + xt[3];
+          }
+        }
+      }
+      loader_x.next();
+      if (((t + 1) % kTilesPerGroup) == 0) {
+        if (thread_idx < BM) {
+          Rs[thread_idx] = rsp;
+        }
+        rsp = 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < TM; ++i) {
+          const int row = mma_op.sm + i * mma_t::TM_stride;
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < TN; ++j) {
+            const int col = mma_op.sn + j * mma_t::TN_stride;
+            STEEL_PRAGMA_UNROLL
+            for (short e = 0; e < kElems; ++e) {
+              Acc.frag_at(i, j)[e] += Ss[col + e] * mma_op.Ctile.frag_at(i, j)[e] +
+                  Rs[row] * Bs[col + e];
+            }
+          }
+        }
+        mma_op.Ctile.clear();
+      }
+    }
+
+    device T* D = y + mma_op.sm * N + mma_op.sn;
+    const short2 start = short2(0, offset) - short2(mma_op.sn, mma_op.sm);
+    const short2 stop = short2(BN, offset_next) - short2(mma_op.sn, mma_op.sm);
+    if (!(stop.y <= 0 || stop.x <= 0)) {
+      Acc.template store_slice<T, WM, WN>(D, N, start, stop);
+    }
+  }
+}
+
 template <
     typename T,
     int group_size,
@@ -4540,6 +4741,9 @@ template <
 
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[transpose ? BN * BK_padded : BK * BN_padded];
+  // NAXEXACT-001: the exact-codes decode body's per-group scale, bias and
+  // activation run-sum tables.
+  threadgroup float exact_tables[2 * BN + BM];
 
   // Compute the block
   const int K_w = K * bytes_per_pack / pack_factor;
@@ -4577,6 +4781,35 @@ template <
   wl += transpose ? y_col_long * K_w : y_col * bytes_per_pack / pack_factor;
   scales += transpose ? y_col_long * K_g : y_col / group_size;
   biases += transpose ? y_col_long * K_g : y_col / group_size;
+
+  // NAXEXACT-001: the decode shape (one row tile, tile-aligned N and K)
+  // takes the exact-codes body; everything else continues into the stock
+  // body below unchanged.
+  constexpr bool kExactCodesEligible = (DARKBLOOM_GEMMA4_NAX_EXACT_CODES != 0) &&
+      transpose && (bits == 2 || bits == 4 || bits == 8) &&
+      (group_size % BK == 0) && (BM % 8 == 0) && (BN % 8 == 0);
+  if constexpr (kExactCodesEligible) {
+    if (M <= BM && (N % BN) == 0 && (K % BK) == 0) {
+      affine_gather_qmm_rhs_exact_decode<T, group_size, bits, BM, BN, BK, WM, WN>(
+          x,
+          wl,
+          scales,
+          biases,
+          indices + y_row,
+          y,
+          M,
+          N,
+          K,
+          Xs,
+          Ws,
+          exact_tables,
+          exact_tables + BN,
+          exact_tables + 2 * BN,
+          simd_group_id,
+          simd_lane_id);
+      return;
+    }
+  }
 
   // Do as many matmuls as necessary
   uint32_t index;

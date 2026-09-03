@@ -2346,6 +2346,76 @@ private let gemma4QKFuseSlidingEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+/// NAXEXACT (shared by the q/k/v and dense roads). The constant sixteen-entry
+/// index table of zeros that selects the one view of a pseudo-expert plane,
+/// the plane builder, the gather call and the word-level cross-check report.
+private enum Gemma4NaxExact {
+    static let rows = 8
+    static let gatherEntries = 16
+    nonisolated(unsafe) private static var zeroIndices: MLXArray?
+    static func zeroIndexTable() -> MLXArray {
+        if let table = zeroIndices { return table }
+        let table = MLXArray([UInt32](repeating: 0, count: gatherEntries))
+        eval(table)
+        zeroIndices = table
+        return table
+    }
+
+    /// Bias-free affine `QuantizedLinear` at the given width, bf16 scales
+    /// and biases, uint32 codes, a 2-D plane with a 64-row multiple.
+    static func admits(_ layer: QuantizedLinear, bits: Int) -> Bool {
+        layer.bias == nil && layer.mode == .affine && layer.groupSize == 64
+            && layer.bits == bits && layer.biases != nil
+            && layer.weight.dtype == .uint32 && layer.weight.ndim == 2
+            && layer.scales.dtype == .bfloat16 && layer.biases!.dtype == .bfloat16
+            && layer.weight.dim(0) % 64 == 0
+    }
+
+    /// The layers' planes concatenated by rows (one plane: a reshape of the
+    /// same bytes) and viewed as one pseudo-expert `[1, N, cols]`.
+    static func planes(_ layers: [QuantizedLinear]) -> (weight: MLXArray, scales: MLXArray, biases: MLXArray) {
+        let w = layers.count == 1 ? layers[0].weight : concatenated(layers.map { $0.weight }, axis: 0)
+        let s = layers.count == 1 ? layers[0].scales : concatenated(layers.map { $0.scales }, axis: 0)
+        let b = layers.count == 1 ? layers[0].biases! : concatenated(layers.map { $0.biases! }, axis: 0)
+        let planes = (
+            weight: w.reshaped(1, w.dim(0), w.dim(1)),
+            scales: s.reshaped(1, s.dim(0), s.dim(1)),
+            biases: b.reshaped(1, b.dim(0), b.dim(1))
+        )
+        eval(planes.weight, planes.scales, planes.biases)
+        return planes
+    }
+
+    /// The eight rows laid out twice against the one view; the first eight
+    /// rows of the `[16, 1, N]` result are the projection.
+    static func project(
+        _ x: MLXArray, planes: (weight: MLXArray, scales: MLXArray, biases: MLXArray),
+        groupSize: Int, bits: Int
+    ) -> MLXArray {
+        let laid = concatenated([x, x], axis: 0)
+        return gatherQuantizedMM(
+            laid, planes.weight, scales: planes.scales, biases: planes.biases,
+            lhsIndices: nil, rhsIndices: zeroIndexTable(),
+            transpose: true, groupSize: groupSize, bits: bits,
+            mode: .affine, sortedIndices: true)[0 ..< rows]
+    }
+
+    static func xcheckPair(_ tag: String, road: MLXArray, incumbent: MLXArray) {
+        let a = road.asType(.float32)
+        let b = incumbent.asType(.float32)
+        let floor = MLXArray(Float(1e-30))
+        let differing = MLX.sum((road .!= incumbent).asType(.int32))
+        let meanRel = MLX.sum(abs(a - b)) / maximum(MLX.sum(abs(b)), floor)
+        let maxScaled = MLX.max(abs(a - b)) / maximum(MLX.max(abs(b)), floor)
+        eval(differing, meanRel, maxScaled)
+        FileHandle.standardError.write(
+            Data(
+                ("[xcheck] \(tag) words \(road.size) differing \(differing.item(Int32.self)) "
+                    + String(format: "mean_rel %.3e max_scaled %.3e\n", meanRel.item(Float.self), maxScaled.item(Float.self)))
+                    .utf8))
+    }
+}
+
 private class Gemma4Attention: Module {
     let config: Gemma4TextConfiguration
     let layerIdx: Int
@@ -2503,8 +2573,392 @@ private class Gemma4Attention: Module {
     /// ORS-D512: a carried `[8, 256]` pair table (the D=512 dispatch-3
     /// epilogue at 32-column tiles) takes the `_rsp2` o_proj body; a carried
     /// `[8, 128]` table (64-column tiles) takes the established `_rsp` body.
+    /// NAXEXACT-001 (o_proj). The decode o_proj served by MLX's gathered
+    /// quantized matmul over a one-view pseudo-expert plane, so that a part
+    /// with the tensor-op kernels dispatches `affine_gather_qmm_rhs_nax_nt`
+    /// (its steel twin `affine_gather_qmm_rhs_nt` elsewhere), whose decode
+    /// body carries the exact-codes scheme: the 4-bit integer codes enter
+    /// the MMA as exact operands, each 64-wide K group's products accumulate
+    /// in fp32, and the group's scale and bias fold in fp32 afterwards -- the
+    /// incumbent projection's arithmetic, differing only in fp32 summation
+    /// order. The plane `[N, K/8]` is viewed as `[1, N, K/8]` (a reshape of
+    /// the same bytes, cached with its scales and biases); the eight cohort
+    /// rows are laid out twice (`[16, 1, K]`) because the gather-rhs road
+    /// wants at least sixteen gathered entries and reads one activation row
+    /// per entry; a constant sixteen-entry index table of zeros selects the
+    /// one view; the first eight rows of the `[16, 1, N]` result are the
+    /// projection. Kill switch: `DARKBLOOM_GEMMA4_NAX_OPROJ=0` (also
+    /// false/no/off) keeps the incumbent `CBv2AttentionOQMVV1` dispatch byte
+    /// for byte. `DARKBLOOM_GEMMA4_NAX_OPROJ_XCHECK=1` runs the incumbent and
+    /// an fp32 reference beside the road and reports the differences
+    /// (diagnostic; forces evaluation). Engage mark `nax-oproj`.
+    private static let naxOProjEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_NAX_OPROJ"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+    private static let naxOProjXcheck: Bool =
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_NAX_OPROJ_XCHECK"] == "1"
+    fileprivate static let naxRows = 8
+    fileprivate static let naxGatherEntries = 16
+    nonisolated(unsafe) private static var naxZeroIndices: MLXArray?
+    fileprivate static func naxZeroIndexTable() -> MLXArray {
+        if let table = naxZeroIndices { return table }
+        let table = MLXArray([UInt32](repeating: 0, count: naxGatherEntries))
+        eval(table)
+        naxZeroIndices = table
+        return table
+    }
+    nonisolated(unsafe) private var naxOProjPlanes:
+        (weight: MLXArray, scales: MLXArray, biases: MLXArray)?
+    private func naxExactOProjection(_ x: MLXArray, _ quantized: QuantizedLinear) -> MLXArray? {
+        guard Self.naxOProjEnabled,
+            quantized.mode == .affine,
+            quantized.groupSize == 64,
+            quantized.bits == 4,
+            let biases = quantized.biases,
+            x.dtype == .bfloat16,
+            quantized.scales.dtype == .bfloat16,
+            biases.dtype == .bfloat16,
+            quantized.weight.dtype == .uint32,
+            x.ndim == 3,
+            x.dim(0) == Self.naxRows,
+            x.dim(1) == 1,
+            quantized.weight.ndim == 2,
+            quantized.weight.dim(0) % 64 == 0,
+            x.dim(2) % 64 == 0,
+            quantized.weight.dim(1) * 8 == x.dim(2)
+        else { return nil }
+        let outputWidth = quantized.weight.dim(0)
+        let planes: (weight: MLXArray, scales: MLXArray, biases: MLXArray)
+        if let cached = naxOProjPlanes {
+            planes = cached
+        } else {
+            planes = (
+                weight: quantized.weight.reshaped(1, outputWidth, quantized.weight.dim(1)),
+                scales: quantized.scales.reshaped(1, outputWidth, quantized.scales.dim(1)),
+                biases: biases.reshaped(1, outputWidth, biases.dim(1))
+            )
+            eval(planes.weight, planes.scales, planes.biases)
+            naxOProjPlanes = planes
+        }
+        let rows = concatenated([x, x], axis: 0)
+        let gathered = gatherQuantizedMM(
+            rows, planes.weight, scales: planes.scales, biases: planes.biases,
+            lhsIndices: nil, rhsIndices: Self.naxZeroIndexTable(),
+            transpose: true, groupSize: quantized.groupSize, bits: quantized.bits,
+            mode: quantized.mode, sortedIndices: true)
+        CBv2EngageMark.once("nax-oproj")
+        return gathered[0 ..< Self.naxRows]
+    }
+
+    /// NAXEXACT-002 (q/k/v). The layer's q, k (and v) planes concatenated
+    /// once by rows into one `[N, 352]` 4-bit plane (N = 4096 + 2048 + 2048
+    /// on sliding layers, 8192 + 1024 on the k-eq-v full layers), viewed as
+    /// one pseudo-expert and served by the same gathered quantized matmul
+    /// and exact-codes decode body as the o_proj road; one split dispatch
+    /// (`cbv2_b8_nax_qkv_split_v1` / `cbv2_b8_nax_qk_split_v1`) copies the
+    /// `[8, N]` result's column ranges into the contiguous q, k and v arrays
+    /// the norm/RoPE consumers take. Kill switch: `DARKBLOOM_GEMMA4_NAX_QKV=0`
+    /// keeps the fused Q|K tier and the V tier dispatches byte for byte;
+    /// `DARKBLOOM_GEMMA4_NAX_QKV_XCHECK=1` runs them beside the road and
+    /// reports the word-level differences (diagnostic). Engage mark `nax-qkv`.
+    private static let naxQKVEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_NAX_QKV"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+    fileprivate static let naxQKVXcheck: Bool =
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_NAX_QKV_XCHECK"] == "1"
+    nonisolated(unsafe) private var naxQKVPlanes:
+        (weight: MLXArray, scales: MLXArray, biases: MLXArray, widths: [Int])?
+    private static let naxQKVSplitKernel3 = MLXFast.metalKernel(
+        name: "cbv2_b8_nax_qkv_split_v1",
+        inputNames: ["joined"],
+        outputNames: ["q", "k", "v"],
+        source: """
+            const uint i = thread_position_in_grid.x;
+            const uint n = uint(joined_shape[1]);
+            const uint n8 = n / 8;
+            const uint row = i / n8;
+            const uint col = (i % n8) * 8;
+            if (row >= uint(joined_shape[0])) {
+                return;
+            }
+            const uint4 word = *((const device uint4*)(joined + row * n + col));
+            if (col < uint(QW)) {
+                *((device uint4*)(q + row * uint(QW) + col)) = word;
+            } else if (col < uint(QW + KW)) {
+                *((device uint4*)(k + row * uint(KW) + (col - uint(QW)))) = word;
+            } else {
+                *((device uint4*)(v + row * uint(VW) + (col - uint(QW + KW)))) = word;
+            }
+            return;
+            """,
+        ensureRowContiguous: true)
+    private static let naxQKVSplitKernel2 = MLXFast.metalKernel(
+        name: "cbv2_b8_nax_qk_split_v1",
+        inputNames: ["joined"],
+        outputNames: ["q", "k"],
+        source: """
+            const uint i = thread_position_in_grid.x;
+            const uint n = uint(joined_shape[1]);
+            const uint n8 = n / 8;
+            const uint row = i / n8;
+            const uint col = (i % n8) * 8;
+            if (row >= uint(joined_shape[0])) {
+                return;
+            }
+            const uint4 word = *((const device uint4*)(joined + row * n + col));
+            if (col < uint(QW)) {
+                *((device uint4*)(q + row * uint(QW) + col)) = word;
+            } else {
+                *((device uint4*)(k + row * uint(KW) + (col - uint(QW)))) = word;
+            }
+            return;
+            """,
+        ensureRowContiguous: true)
+    private func naxExactQKVProjection(_ x: MLXArray) -> (q: MLXArray, k: MLXArray, v: MLXArray?)? {
+        guard Self.naxQKVEnabled,
+            x.dtype == .bfloat16,
+            x.ndim == 3,
+            x.dim(0) == Gemma4NaxExact.rows,
+            x.dim(1) == 1,
+            let q = qProj as? QuantizedLinear, Gemma4NaxExact.admits(q, bits: 4),
+            let kProj, let k = kProj as? QuantizedLinear, Gemma4NaxExact.admits(k, bits: 4),
+            k.weight.dim(1) == q.weight.dim(1),
+            q.weight.dim(1) * 8 == x.dim(2),
+            x.dim(2) % 64 == 0
+        else { return nil }
+        var layers: [QuantizedLinear] = [q, k]
+        if let vProj {
+            guard let v = vProj as? QuantizedLinear, Gemma4NaxExact.admits(v, bits: 4),
+                v.weight.dim(1) == q.weight.dim(1)
+            else { return nil }
+            layers.append(v)
+        }
+        let widths = layers.map { $0.weight.dim(0) }
+        let total = widths.reduce(0, +)
+        guard total % 64 == 0, widths.allSatisfy({ $0 % 8 == 0 }) else { return nil }
+        let planes: (weight: MLXArray, scales: MLXArray, biases: MLXArray, widths: [Int])
+        if let cached = naxQKVPlanes, cached.widths == widths {
+            planes = cached
+        } else {
+            let built = Gemma4NaxExact.planes(layers)
+            planes = (built.weight, built.scales, built.biases, widths)
+            naxQKVPlanes = planes
+        }
+        let joined = Gemma4NaxExact.project(
+            x, planes: (planes.weight, planes.scales, planes.biases), groupSize: 64, bits: 4
+        ).reshaped(Gemma4NaxExact.rows, total)
+        let threads = Gemma4NaxExact.rows * (total / 8)
+        let group = min(256, threads)
+        let outputs: [MLXArray]
+        if widths.count == 3 {
+            outputs = Self.naxQKVSplitKernel3(
+                [joined],
+                template: [("T", x.dtype), ("QW", widths[0]), ("KW", widths[1]), ("VW", widths[2])],
+                grid: (threads, 1, 1),
+                threadGroup: (group, 1, 1),
+                outputShapes: [
+                    [Gemma4NaxExact.rows, 1, widths[0]], [Gemma4NaxExact.rows, 1, widths[1]],
+                    [Gemma4NaxExact.rows, 1, widths[2]],
+                ],
+                outputDTypes: [x.dtype, x.dtype, x.dtype])
+        } else {
+            outputs = Self.naxQKVSplitKernel2(
+                [joined],
+                template: [("T", x.dtype), ("QW", widths[0]), ("KW", widths[1])],
+                grid: (threads, 1, 1),
+                threadGroup: (group, 1, 1),
+                outputShapes: [[Gemma4NaxExact.rows, 1, widths[0]], [Gemma4NaxExact.rows, 1, widths[1]]],
+                outputDTypes: [x.dtype, x.dtype])
+        }
+        CBv2EngageMark.once("nax-qkv")
+        return (q: outputs[0], k: outputs[1], v: widths.count == 3 ? outputs[2] : nil)
+    }
+
+    /// NAXEXACT xcheck (diagnostic). `road` and `incumbent` are the bf16
+    /// projections; the fp32 reference dequantizes the plane exactly in fp32
+    /// (`scale * code + bias`) and multiplies in fp32; the road is also run
+    /// with fp32 activations (the same exact-codes body instantiated for
+    /// float, no final bf16 rounding) so its arithmetic can be read against
+    /// the reference below the bf16 ulp.
+    nonisolated(unsafe) fileprivate static var naxXcheckDumped = false
+    nonisolated(unsafe) fileprivate static var naxXcheckSynthDone = false
+    fileprivate static func naxXcheckReport(
+        tag: String, x: MLXArray, road: MLXArray, incumbent: MLXArray,
+        weight: MLXArray, scales: MLXArray, biases: MLXArray, groupSize: Int, bits: Int
+    ) {
+        let rowsCount = x.dim(0)
+        let inDim = x.dim(2)
+        let outDim = weight.dim(0)
+        if let dir = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_NAX_OPROJ_XCHECK_DUMP"],
+            !naxXcheckDumped
+        {
+            naxXcheckDumped = true
+            let base = URL(fileURLWithPath: dir)
+            try? save(array: x.asType(.float32).reshaped(rowsCount, inDim), url: base.appendingPathComponent("x.npy"))
+            try? save(array: weight, url: base.appendingPathComponent("w.npy"))
+            try? save(array: scales.asType(.float32), url: base.appendingPathComponent("s.npy"))
+            try? save(array: biases.asType(.float32), url: base.appendingPathComponent("b.npy"))
+            try? save(array: road.asType(.float32).reshaped(rowsCount, outDim), url: base.appendingPathComponent("road.npy"))
+            try? save(array: incumbent.asType(.float32).reshaped(rowsCount, outDim), url: base.appendingPathComponent("incumbent.npy"))
+            FileHandle.standardError.write(Data("[xcheck] dumped \(tag) to \(dir)\n".utf8))
+        }
+        if ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_NAX_OPROJ_XCHECK_SYNTH"] == "1",
+            !naxXcheckSynthDone
+        {
+            naxXcheckSynthDone = true
+            let wPlane = weight.reshaped(1, outDim, weight.dim(1))
+            let sPlane = scales.reshaped(1, outDim, scales.dim(1))
+            let bPlane = biases.reshaped(1, outDim, biases.dim(1))
+            let plane32 = dequantized(
+                weight, scales: scales.asType(.float32), biases: biases.asType(.float32),
+                groupSize: groupSize, bits: bits, dtype: .float32)
+            func probe(_ name: String, _ xs: MLXArray) {
+                let inc = CBv2AttentionOQMVV1.matmul(
+                    x: xs, weight: weight, scales: scales, biases: biases,
+                    groupSize: groupSize, bits: bits, mode: .affine)!
+                let rd = gatherQuantizedMM(
+                    concatenated([xs, xs], axis: 0), wPlane, scales: sPlane, biases: bPlane,
+                    lhsIndices: nil, rhsIndices: naxZeroIndexTable(),
+                    transpose: true, groupSize: groupSize, bits: bits,
+                    mode: .affine, sortedIndices: true)[0 ..< rowsCount]
+                let rf = matmul(xs.asType(.float32).reshaped(rowsCount, inDim), plane32.transposed())
+                let i32 = inc.asType(.float32).reshaped(rowsCount, outDim)
+                let r32 = rd.asType(.float32).reshaped(rowsCount, outDim)
+                let cols = [0, 1, 2, 3, 100, 777]
+                var line = "[xcheck-synth] \(name):"
+                let ia = i32[0].asArray(Float.self)
+                let ra = r32[0].asArray(Float.self)
+                let fa = rf[0].asArray(Float.self)
+                for c in cols {
+                    line += String(format: " n%d inc=%.6g road=%.6g ref=%.6g |", c, ia[c], ra[c], fa[c])
+                }
+                // No-GEMM reference: per-column elementwise product + reduce.
+                var lineE = "[xcheck-synth-elem] \(name):"
+                let xf = xs.asType(.float32).reshaped(rowsCount, inDim)
+                for c in cols {
+                    let col = MLX.sum(plane32[c] * xf[0])
+                    eval(col)
+                    lineE += String(format: " n%d elem=%.6g", c, col.item(Float.self))
+                }
+                FileHandle.standardError.write(Data((lineE + "\n").utf8))
+                let floor = MLXArray(Float(1e-30))
+                let mr = MLX.sum(abs(i32 - rf)) / maximum(MLX.sum(abs(rf)), floor)
+                let mrr = MLX.sum(abs(r32 - rf)) / maximum(MLX.sum(abs(rf)), floor)
+                eval(mr, mrr)
+                line += String(format: " mean_rel(inc~ref)=%.3e mean_rel(road~ref)=%.3e\n", mr.item(Float.self), mrr.item(Float.self))
+                FileHandle.standardError.write(Data(line.utf8))
+            }
+            var oneHot = [Float](repeating: 0, count: rowsCount * inDim)
+            for r in 0 ..< rowsCount { oneHot[r * inDim + 0] = 1 }
+            probe("onehot_k0", MLXArray(oneHot, [rowsCount, 1, inDim]).asType(.bfloat16))
+            var oneHot5 = [Float](repeating: 0, count: rowsCount * inDim)
+            for r in 0 ..< rowsCount { oneHot5[r * inDim + 5] = 1 }
+            probe("onehot_k5", MLXArray(oneHot5, [rowsCount, 1, inDim]).asType(.bfloat16))
+            var oneHot70 = [Float](repeating: 0, count: rowsCount * inDim)
+            for r in 0 ..< rowsCount { oneHot70[r * inDim + 70] = 1 }
+            probe("onehot_k70", MLXArray(oneHot70, [rowsCount, 1, inDim]).asType(.bfloat16))
+            probe("ones", MLXArray.ones([rowsCount, 1, inDim], dtype: .bfloat16))
+            var rnd = [Float](repeating: 0, count: rowsCount * inDim)
+            var seed: UInt32 = 12345
+            for i in 0 ..< rnd.count {
+                seed = seed &* 1664525 &+ 1013904223
+                rnd[i] = Float(Int32(bitPattern: seed >> 8) % 2001) / 1000.0
+            }
+            probe("random", MLXArray(rnd, [rowsCount, 1, inDim]).asType(.bfloat16))
+            probe("actual_x", x)
+        }
+        let a = road.asType(.float32).reshaped(rowsCount, outDim)
+        let b = incumbent.asType(.float32).reshaped(rowsCount, outDim)
+        let plane = dequantized(
+            weight, scales: scales.asType(.float32), biases: biases.asType(.float32),
+            groupSize: groupSize, bits: bits, dtype: .float32)
+        let reference = matmul(x.asType(.float32).reshaped(rowsCount, inDim), plane.transposed())
+        let roadF32 = gatherQuantizedMM(
+            concatenated([x.asType(.float32), x.asType(.float32)], axis: 0),
+            weight.reshaped(1, outDim, weight.dim(1)),
+            scales: scales.reshaped(1, outDim, scales.dim(1)).asType(.float32),
+            biases: biases.reshaped(1, outDim, biases.dim(1)).asType(.float32),
+            lhsIndices: nil, rhsIndices: naxZeroIndexTable(),
+            transpose: true, groupSize: groupSize, bits: bits,
+            mode: .affine, sortedIndices: true)[0 ..< rowsCount].reshaped(rowsCount, outDim)
+        let stock = quantizedMM(
+            x.reshaped(rowsCount, inDim), weight, scales: scales, biases: biases,
+            transpose: true, groupSize: groupSize, bits: bits, mode: .affine)
+        let c = stock.asType(.float32)
+        func pair(_ p: MLXArray, _ q: MLXArray) -> (MLXArray, MLXArray) {
+            let floor = MLXArray(Float(1e-30))
+            let meanRel = MLX.sum(abs(p - q)) / maximum(MLX.sum(abs(q)), floor)
+            let maxScaled = MLX.max(abs(p - q)) / maximum(MLX.max(abs(q)), floor)
+            return (meanRel, maxScaled)
+        }
+        // Apple's stock qmv (M = 1 keeps every row below the tree's B=8
+        // tier): an implementation independent of both sides.
+        let x2 = x.reshaped(rowsCount, inDim)
+        var rowwise: [MLXArray] = []
+        for r in 0 ..< rowsCount {
+            rowwise.append(
+                quantizedMM(
+                    x2[r ..< (r + 1)], weight, scales: scales, biases: biases,
+                    transpose: true, groupSize: groupSize, bits: bits, mode: .affine))
+        }
+        let single = concatenated(rowwise, axis: 0)
+        let d = single.asType(.float32)
+        let differingSI = MLX.sum((single .!= incumbent.reshaped(rowsCount, outDim)).asType(.int32))
+        let differingSR = MLX.sum((single .!= road.reshaped(rowsCount, outDim)).asType(.int32))
+        let si = pair(d, b)
+        let sroad = pair(d, a)
+        let sref = pair(d, reference)
+        let differingRI = MLX.sum((road .!= incumbent).asType(.int32))
+        let differingRS = MLX.sum((road.reshaped(rowsCount, outDim) .!= stock).asType(.int32))
+        let differingIS = MLX.sum((incumbent.reshaped(rowsCount, outDim) .!= stock).asType(.int32))
+        let ri = pair(a, b)
+        let rs = pair(a, c)
+        let ic = pair(b, c)
+        let fr = pair(roadF32, reference)
+        let sr = pair(c, reference)
+        eval(differingRI, differingRS, differingIS, ri.0, ri.1, rs.0, rs.1, ic.0, ic.1, fr.0, fr.1, sr.0, sr.1,
+             differingSI, differingSR, si.0, si.1, sroad.0, sroad.1, sref.0, sref.1)
+        func f(_ v: MLXArray) -> String { String(format: "%.3e", v.item(Float.self)) }
+        FileHandle.standardError.write(
+            Data(
+                ("[xcheck] \(tag) words \(rowsCount * outDim)"
+                    + " road~incumbent differing \(differingRI.item(Int32.self)) mean_rel \(f(ri.0)) max_scaled \(f(ri.1))"
+                    + " | road~stockqmm differing \(differingRS.item(Int32.self)) mean_rel \(f(rs.0)) max_scaled \(f(rs.1))"
+                    + " | incumbent~stockqmm differing \(differingIS.item(Int32.self)) mean_rel \(f(ic.0)) max_scaled \(f(ic.1))"
+                    + " | roadf32~ref32 mean_rel \(f(fr.0)) max_scaled \(f(fr.1))"
+                    + " | stockqmm~ref32 mean_rel \(f(sr.0)) max_scaled \(f(sr.1))"
+                    + " | M1qmv~incumbent differing \(differingSI.item(Int32.self)) mean_rel \(f(si.0)) max_scaled \(f(si.1))"
+                    + " | M1qmv~road differing \(differingSR.item(Int32.self)) mean_rel \(f(sroad.0)) max_scaled \(f(sroad.1))"
+                    + " | M1qmv~ref32 mean_rel \(f(sref.0)) max_scaled \(f(sref.1))\n")
+                    .utf8))
+    }
+
     @inline(__always)
     private func outputProjection(
+        _ x: MLXArray, carriedRunsum: MLXArray? = nil
+    ) -> MLXArray {
+        if let quantized = oProj as? QuantizedLinear, quantized.bias == nil,
+            let road = naxExactOProjection(x, quantized)
+        {
+            if Self.naxOProjXcheck {
+                Self.naxXcheckReport(
+                    tag: "nax-oproj layer \(layerIdx) K \(x.dim(2))", x: x, road: road,
+                    incumbent: incumbentOutputProjection(x, carriedRunsum: carriedRunsum),
+                    weight: quantized.weight, scales: quantized.scales,
+                    biases: quantized.biases!, groupSize: quantized.groupSize,
+                    bits: quantized.bits)
+            }
+            return road
+        }
+        return incumbentOutputProjection(x, carriedRunsum: carriedRunsum)
+    }
+
+    @inline(__always)
+    private func incumbentOutputProjection(
         _ x: MLXArray, carriedRunsum: MLXArray? = nil
     ) -> MLXArray {
         let carriedPairs = CBv2AttentionOQMVV1.acceptRunsumPairTable(
@@ -2720,8 +3174,29 @@ private class Gemma4Attention: Module {
         // requires the exact L=1 decode shape, and the incumbent dispatch
         // runs). The table kernel is lazy: it executes only when a projection
         // actually consumes it.
-        let qkvRunsumTable = CBv2AttentionQKVMMA8V1.runsumTable(
-            for: x, carried: carriedRunsum)
+        // NAXEXACT-002: the q/k/v road; nil keeps the tiers below. The
+        // run-sum table is built only when a tier consumes it (or the xcheck
+        // runs the tiers beside the road).
+        let naxQKV: (q: MLXArray, k: MLXArray, v: MLXArray?)? =
+            (lastQueryCache == nil && !usesSharedKV) ? naxExactQKVProjection(x) : nil
+        let qkvRunsumTable: MLXArray? =
+            (naxQKV != nil && !Self.naxQKVXcheck)
+            ? nil
+            : CBv2AttentionQKVMMA8V1.runsumTable(
+                for: x, carried: carriedRunsum)
+        if let naxQKV, Self.naxQKVXcheck {
+            if let incumbent = fusedQKProjection(x, rsTable: qkvRunsumTable) {
+                Gemma4NaxExact.xcheckPair(
+                    "nax-qkv layer \(layerIdx) q", road: naxQKV.q, incumbent: incumbent.0)
+                Gemma4NaxExact.xcheckPair(
+                    "nax-qkv layer \(layerIdx) k", road: naxQKV.k, incumbent: incumbent.1)
+            }
+            if let vProj, let v = naxQKV.v {
+                Gemma4NaxExact.xcheckPair(
+                    "nax-qkv layer \(layerIdx) v", road: v,
+                    incumbent: tierProjection(vProj, x, rsTable: qkvRunsumTable))
+            }
+        }
 
         // Keep Q/K/V on the promoted matrix-unit tier's arithmetic. At the
         // exact B=8/L=1 decode shapes the tight-grid host re-dispatches the
@@ -2744,11 +3219,11 @@ private class Gemma4Attention: Module {
         // independent of N, so the concatenated-N dispatch reads the same
         // entries the separate Q and K dispatches would.
         let fusedQK: (MLXArray, MLXArray)? =
-            (lastQueryCache == nil && !usesSharedKV
+            (naxQKV == nil && lastQueryCache == nil && !usesSharedKV
                 && (vProj == nil || gemma4QKFuseSlidingEnabled))
             ? fusedQKProjection(x, rsTable: qkvRunsumTable) : nil
         let queryRaw = (
-            fusedQK?.0 ?? tierProjection(qProj, queryInput, rsTable: qkvRunsumTable)
+            naxQKV?.q ?? fusedQK?.0 ?? tierProjection(qProj, queryInput, rsTable: qkvRunsumTable)
         ).reshaped(B, queryLength, nHeads, effectiveHeadDim)
 
         if usesSharedKV {
@@ -2812,11 +3287,11 @@ private class Gemma4Attention: Module {
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
         let kRaw = (
-            fusedQK?.1 ?? tierProjection(kProj, x, rsTable: qkvRunsumTable)
+            naxQKV?.k ?? fusedQK?.1 ?? tierProjection(kProj, x, rsTable: qkvRunsumTable)
         ).reshaped(B, L, nKvHeads, effectiveHeadDim)
         let vRaw: MLXArray
         if let vProj {
-            vRaw = tierProjection(vProj, x, rsTable: qkvRunsumTable)
+            vRaw = (naxQKV?.v ?? tierProjection(vProj, x, rsTable: qkvRunsumTable))
                 .reshaped(B, L, nKvHeads, effectiveHeadDim)
         } else {
             vRaw = kRaw
@@ -5029,9 +5504,100 @@ private class Gemma4MLP: Module {
         denseProjection(upProj, x, activationSums: activationSums)
     }
 
+    /// NAXEXACT-003 (dense MLP). The joined gate|up plane (`[4224, 704]`
+    /// 8-bit, from `Gemma4DenseGateUpStorage` or concatenated here once) and
+    /// the down plane (`[2816, 528]` 8-bit) served as one-view pseudo-expert
+    /// gathers through the same exact-codes decode body (8-bit form: the
+    /// codes 0..255 enter the MMA exactly, the activation run sums add every
+    /// element to the fp32 sum as `mma8_runsum8` does). The gate|up result's
+    /// column views are the operands the GeLU product takes today. Kill
+    /// switch: `DARKBLOOM_GEMMA4_NAX_DENSE=0` keeps the `CBv2DenseMLPQMVV1`
+    /// dispatches byte for byte; `DARKBLOOM_GEMMA4_NAX_DENSE_XCHECK=1` runs
+    /// them beside the roads and reports the word-level differences
+    /// (diagnostic). Engage marks `nax-dense-gateup`, `nax-dense-down`.
+    private static let naxDenseEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_NAX_DENSE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+    private static let naxDenseXcheck: Bool =
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_NAX_DENSE_XCHECK"] == "1"
+    nonisolated(unsafe) private var naxGateUpPlanes: (weight: MLXArray, scales: MLXArray, biases: MLXArray)?
+    nonisolated(unsafe) private var naxDownPlanes: (weight: MLXArray, scales: MLXArray, biases: MLXArray)?
+    private func naxExactGateUp(_ x: MLXArray) -> (gate: MLXArray, up: MLXArray)? {
+        guard Self.naxDenseEnabled,
+            x.dtype == .bfloat16,
+            x.ndim == 3,
+            x.dim(0) == Gemma4NaxExact.rows,
+            x.dim(1) == 1,
+            let gate = gateProj as? QuantizedLinear, Gemma4NaxExact.admits(gate, bits: 8),
+            let up = upProj as? QuantizedLinear, Gemma4NaxExact.admits(up, bits: 8),
+            gate.weight.dim(1) == up.weight.dim(1),
+            gate.weight.dim(1) * 4 == x.dim(2),
+            x.dim(2) % 64 == 0
+        else { return nil }
+        let gateWidth = gate.weight.dim(0)
+        let planes: (weight: MLXArray, scales: MLXArray, biases: MLXArray)
+        if let cached = naxGateUpPlanes {
+            planes = cached
+        } else if let storage = fusedGateUpStorage,
+            storage.weight.shape == [gateWidth + up.weight.dim(0), gate.weight.dim(1)]
+        {
+            planes = (
+                weight: storage.weight.reshaped(1, storage.weight.dim(0), storage.weight.dim(1)),
+                scales: storage.scales.reshaped(1, storage.scales.dim(0), storage.scales.dim(1)),
+                biases: storage.biases.reshaped(1, storage.biases.dim(0), storage.biases.dim(1))
+            )
+            eval(planes.weight, planes.scales, planes.biases)
+            naxGateUpPlanes = planes
+        } else {
+            planes = Gemma4NaxExact.planes([gate, up])
+            naxGateUpPlanes = planes
+        }
+        let joined = Gemma4NaxExact.project(x, planes: planes, groupSize: 64, bits: 8)
+        CBv2EngageMark.once("nax-dense-gateup")
+        return (joined[.ellipsis, ..<gateWidth], joined[.ellipsis, gateWidth...])
+    }
+    private func naxExactDown(_ x: MLXArray) -> MLXArray? {
+        guard Self.naxDenseEnabled,
+            x.dtype == .bfloat16,
+            x.ndim == 3,
+            x.dim(0) == Gemma4NaxExact.rows,
+            x.dim(1) == 1,
+            let down = downProj as? QuantizedLinear, Gemma4NaxExact.admits(down, bits: 8),
+            down.weight.dim(1) * 4 == x.dim(2),
+            x.dim(2) % 64 == 0
+        else { return nil }
+        let planes: (weight: MLXArray, scales: MLXArray, biases: MLXArray)
+        if let cached = naxDownPlanes {
+            planes = cached
+        } else {
+            planes = Gemma4NaxExact.planes([down])
+            naxDownPlanes = planes
+        }
+        let projected = Gemma4NaxExact.project(x, planes: planes, groupSize: 64, bits: 8)
+        CBv2EngageMark.once("nax-dense-down")
+        return projected
+    }
+
     /// One decode QMV over the joined gate|up plane. The returned halves are
     /// views with the exact shapes and bytes produced by the two split calls.
     fileprivate func zipGateUp(
+        _ x: MLXArray, _ activationSums: CBv2DenseMLPQMVV1.ActivationSums?
+    ) -> (gate: MLXArray, up: MLXArray)? {
+        if let road = naxExactGateUp(x) {
+            if Self.naxDenseXcheck {
+                let incumbent = incumbentZipGateUp(x, activationSums)
+                    ?? (zipGate(x, activationSums), zipUp(x, activationSums))
+                Gemma4NaxExact.xcheckPair("nax-dense gate", road: road.gate, incumbent: incumbent.gate)
+                Gemma4NaxExact.xcheckPair("nax-dense up", road: road.up, incumbent: incumbent.up)
+            }
+            return road
+        }
+        return incumbentZipGateUp(x, activationSums)
+    }
+
+    fileprivate func incumbentZipGateUp(
         _ x: MLXArray, _ activationSums: CBv2DenseMLPQMVV1.ActivationSums?
     ) -> (gate: MLXArray, up: MLXArray)? {
         guard gemma4DenseGateUpJoinEnabled,
@@ -5060,7 +5626,14 @@ private class Gemma4MLP: Module {
     }
 
     fileprivate func zipDown(_ activated: MLXArray) -> MLXArray {
-        denseProjection(downProj, activated)
+        if let road = naxExactDown(activated) {
+            if Self.naxDenseXcheck {
+                Gemma4NaxExact.xcheckPair(
+                    "nax-dense down", road: road, incumbent: denseProjection(downProj, activated))
+            }
+            return road
+        }
+        return denseProjection(downProj, activated)
     }
 }
 

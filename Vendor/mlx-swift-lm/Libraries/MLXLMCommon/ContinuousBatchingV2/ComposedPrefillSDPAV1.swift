@@ -537,20 +537,20 @@ enum CBv2PrefillSoftmaxVecV1 {
     )
 
     nonisolated(unsafe) private static var memoizedParams: [Int: MLXArray] = [:]
-    private static let paramsLock = NSLock()
+    nonisolated(unsafe) private static var paramsLock = os_unfair_lock()
 
     private static func getParams(axisSize: Int, numSimdgroups: Int) -> MLXArray {
-        paramsLock.lock()
+        os_unfair_lock_lock(&paramsLock)
         if let hit = memoizedParams[axisSize] {
-            paramsLock.unlock()
+            os_unfair_lock_unlock(&paramsLock)
             return hit
         }
-        paramsLock.unlock()
+        os_unfair_lock_unlock(&paramsLock)
         let arr = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
         eval(arr)
-        paramsLock.lock()
+        os_unfair_lock_lock(&paramsLock)
         memoizedParams[axisSize] = arr
-        paramsLock.unlock()
+        os_unfair_lock_unlock(&paramsLock)
         return arr
     }
 

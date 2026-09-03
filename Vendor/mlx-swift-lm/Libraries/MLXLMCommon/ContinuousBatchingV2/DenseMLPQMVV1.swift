@@ -128,6 +128,25 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// GATEUP-STATIC-K-022. The gate/up twin of DMLP-STATIC-K-018, which was
+    /// written while the matrix-unit gate/up arm was still opt-in and is
+    /// therefore gated `!isGateUp`. That arm now defaults on, so the K = 2816
+    /// plane -- 60 dispatches and 7.4 % of the decode round -- walks its groups
+    /// against a runtime `K` while its sibling walks a `constexpr` one.
+    ///
+    /// K = 2816 gives G = 44, which is EVEN, so `gh` is 22 and the KS = 2 split
+    /// is 22 + 22 with no skip iteration. Down's G = 33 needs the 17 + 16
+    /// asymmetry its own comment records; this plane does not, so the guard
+    /// `g >= G` is dead here and the compiler folds it away.
+    ///
+    /// `DARKBLOOM_GEMMA4_MLP_GATEUP_STATIC_K=0` restores the runtime-K body.
+    private static let mma8GateUpStaticKEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MLP_GATEUP_STATIC_K"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// W4-LOAD (engage mark `mlp-w4-load`). The four packed affine-8 codes a
     /// lane owns for one output row are four CONTIGUOUS bytes at a 4-byte
     /// aligned address, so they can be fetched as ONE aligned 32-bit load
@@ -836,6 +855,101 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         header: mma8DownStaticKHeader,
         ensureRowContiguous: true)
 
+    // GATEUP-STATIC-K-022: the same substitution chain DMLP-STATIC-K-018 and
+    // DMLP-DOWN-CARRY2-021 apply to the down plane, at K = 2816. G = 44 is even,
+    // so `nGroups` is 22 on both simdgroups and `g` runs 0..21 and 22..43 --
+    // byte for byte the ranges `g_begin`/`g_end` produce for this K. The
+    // `g >= G` guard can never fire at an even G; it is retained so the two
+    // headers stay a diff of two constants apart.
+    private static let mma8GateUpStaticKHeader: String = {
+        var result = mma8KernelHeader
+        func replaceOnce(_ old: String, with new: String) {
+            precondition(result.components(separatedBy: old).count == 2)
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        replaceOnce(
+            "gemma4_qmv_mma8_affine8_g64_impl(",
+            with: "gemma4_qmv_mma8_affine8_g64_gateup_k2816_impl(")
+        replaceOnce(
+            """
+                device T* y,
+                const int K,
+                const int N,
+            """,
+            with: """
+                device T* y,
+                const int N,
+            """)
+        replaceOnce(
+            """
+              const int G = K / 64;
+              const int gh = (G + 1) / 2;
+              const int g_begin = (KS == 2 && simd_gid == 1) ? gh : 0;
+              const int g_end = (KS == 2 && simd_gid == 0) ? gh : G;
+            """,
+            with: """
+              constexpr int K = 2816;
+              constexpr int G = K / 64;
+              constexpr int gh = (G + 1) / 2;
+              constexpr int nGroups = (KS == 2) ? gh : G;
+              const int g0 = (KS == 2 && simd_gid == 1) ? gh : 0;
+            """)
+        replaceOnce(
+            "  for (int g = g_begin; g < g_end; ++g) {",
+            with: """
+              #pragma unroll
+              for (int gi = 0; gi < nGroups; ++gi) {
+                const int g = g0 + gi;
+                if (g >= G) continue;
+            """)
+        replaceOnce(
+            """
+              simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+            """,
+            with: """
+              simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+              uint4 wv_next = *((const device uint4*)(wrow + 64 * g0));
+              uint4 wv_next2 =
+                  *((const device uint4*)(wrow + 64 * min(g0 + 1, G - 1)));
+              T s_next = srow[g0];
+              T b_next = brow[g0];
+            """)
+        replaceOnce(
+            """
+                const uint4 wv = *((const device uint4*)(wrow + 64 * g));
+                const float s = float(srow[g]);
+                const float b = float(brow[g]);
+            """,
+            with: """
+                const uint4 wv = wv_next;
+                const float s = float(s_next);
+                const float b = float(b_next);
+                const int g_next = min(g + 1, G - 1);
+                wv_next = wv_next2;
+                wv_next2 = *((const device uint4*)(wrow + 64 * min(g + 2, G - 1)));
+                s_next = srow[g_next];
+                b_next = brow[g_next];
+            """)
+        return result
+    }()
+
+    private static let mma8GateUpStaticKKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_gateup_k2816_carry2_bfill_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            gemma4_qmv_mma8_affine8_g64_gateup_k2816_impl<T, 2>(
+                w, scales, biases, x, y,
+                w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            """,
+        header: mma8GateUpStaticKHeader,
+        ensureRowContiguous: true)
+
     /// One complete SIMD group per g64 group. Keep all lane results rather
     /// than canonicalizing row sums: the consumer reads its own lane's tree.
     private static let mma8DownLaneSumKernel = MLXFast.metalKernel(
@@ -1286,8 +1400,12 @@ inline U qdot_affine8_registered_v4(
                     outputDTypes: [x.dtype]
                 )[0]
             }
-            let selectedMMA = !isGateUp && mma8DownStaticKEnabled
-                ? mma8DownStaticKKernel : mma8Kernel
+            let useGateUpStaticK = isGateUp && mma8GateUpStaticKEnabled
+            if useGateUpStaticK { CBv2EngageMark.once("mlp-gateup-static-k") }
+            let selectedMMA = useGateUpStaticK
+                ? mma8GateUpStaticKKernel
+                : (!isGateUp && mma8DownStaticKEnabled
+                    ? mma8DownStaticKKernel : mma8Kernel)
             return selectedMMA(
                 [x, weight, scales, biases],
                 template: [("T", x.dtype)],

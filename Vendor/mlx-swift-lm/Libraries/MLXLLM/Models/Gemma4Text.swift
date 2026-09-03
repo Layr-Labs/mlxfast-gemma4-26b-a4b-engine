@@ -26,6 +26,20 @@ private let gemma4CompiledDecodeSupported: Bool = {
     return true
 }()
 
+// CBV2-DIRECT-CACHE-001: the production CBv2 bank has one attending cache
+// per model layer, including KV-shared borrowers. In that exact topology the
+// optional cache expansion below is dead host scaffolding.
+@inline(__always)
+internal func resolveGemma4CBv2DirectCacheEnabled(_ raw: String?) -> Bool {
+    guard let raw else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}
+
+private let gemma4CBv2DirectCacheEnabled =
+    resolveGemma4CBv2DirectCacheEnabled(
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_CBv2_DIRECT_CACHE"])
+
+
 // MARK: - CBv2 B=8 decode graph-submission ladder
 
 /// Earlier graph submission is ON by default for the one scored decode
@@ -5774,30 +5788,56 @@ public class Gemma4TextModelInner: Module {
             perLayerInputs = Array(repeating: nil, count: config.numHiddenLayers)
         }
 
-        // Extend cache array for shared layers (which get nil caches)
-        var fullCache: [KVCache?]
-        if let cache {
-            fullCache = cache.map { Optional($0) }
-            while fullCache.count < config.numHiddenLayers {
-                fullCache.append(nil)
+        // CBv2 owns one cache object per model layer, including KV-shared
+        // borrowers. Keep the legacy optional expansion for mixed/legacy
+        // callers, but do not allocate it for the exact CBv2 bank topology.
+        let directCBv2Cache =
+            gemma4CBv2DirectCacheEnabled
+            && cache?.count == config.numHiddenLayers
+            && cache?.allSatisfy {
+                ($0 as? (any CBv2AttendingLayerCache)) != nil
+            } == true
+        let isCBv2 =
+            directCBv2Cache
+            || cache?.contains {
+                ($0 as? (any CBv2AttendingLayerCache)) != nil
+            } == true
+        var fullCache: [KVCache?] = []
+        if !directCBv2Cache {
+            if let cache {
+                fullCache = cache.map { Optional($0) }
+                while fullCache.count < config.numHiddenLayers {
+                    fullCache.append(nil)
+                }
+            } else {
+                fullCache = Array(repeating: nil, count: config.numHiddenLayers)
             }
         } else {
-            fullCache = Array(repeating: nil, count: config.numHiddenLayers)
+            CBv2EngageMark.once("gemma4-cbv2-direct-cache")
         }
 
-        // ContinuousBatchingV2 detection: v2 layer caches own attention AND
-        // masking, so the trunk builds no masks at all on that path (there is
-        // no padding and no shared frontier to mask). In v2 mode every layer
-        // (including KV-shared ones) has a cache object.
-        let isCBv2 = fullCache.contains { ($0 as? (any CBv2AttendingLayerCache)) != nil }
+        // Resolve a layer cache without manufacturing [KVCache?] on a complete
+        // CBv2 bank. This helper is non-escaping and is inlined by Swift.
+        func cacheForLayer(_ index: Int) -> KVCache? {
+            directCBv2Cache ? cache![index] : fullCache[index]
+        }
+
         // All-contiguous banks expose one position chain. Snapshot it before
         // the first layer advances the chain, then reuse that same lazy array
         // for every Q/K RoPE call in this forward.
         let unifiedCBv2PositionOffset: Gemma4.PositionOffset? = {
             guard isCBv2 else { return nil }
-            for case let entry? in fullCache {
-                if let offsets = (entry as? CBv2LayerCache)?.unifiedPositionOffsets {
-                    return .batch(offsets + 0)
+            if directCBv2Cache, let cache {
+                for entry in cache {
+                    if let offsets = (entry as? CBv2LayerCache)?.unifiedPositionOffsets {
+                        return .batch(offsets + 0)
+                    }
+                }
+            } else {
+                for case let entry? in fullCache {
+                    if let offsets = (entry as? CBv2LayerCache)?.unifiedPositionOffsets {
+                        return .batch(offsets + 0)
+                    }
                 }
             }
             return nil
@@ -5823,11 +5863,11 @@ public class Gemma4TextModelInner: Module {
                     var mask: MLXFast.ScaledDotProductAttentionMaskMode
                     if lt == "sliding_attention" {
                         mask = createAttentionMask(
-                            h: h, cache: fullCache[i], windowSize: config.slidingWindow,
+                            h: h, cache: cacheForLayer(i), windowSize: config.slidingWindow,
                             returnArray: forceArrayMask)
                     } else {
                         mask = createAttentionMask(
-                            h: h, cache: fullCache[i], windowSize: nil,
+                            h: h, cache: cacheForLayer(i), windowSize: nil,
                             returnArray: forceArrayMask)
                     }
                     if useBidirectionalVision, let imageTokenMask {
@@ -5859,7 +5899,7 @@ public class Gemma4TextModelInner: Module {
             // captured (pre-update) position offsets.
             let v2SharedSource: (any CBv2AttendingLayerCache)? =
                 isCBv2 && prevIdx != idx
-                ? fullCache[prevIdx] as? (any CBv2AttendingLayerCache) : nil
+                ? cacheForLayer(prevIdx) as? (any CBv2AttendingLayerCache) : nil
 
             let mask = maskByType[layer.layerType]
             // Prompt-path specializations, final layer only. Every earlier
@@ -5877,11 +5917,11 @@ public class Gemma4TextModelInner: Module {
                 batchSize: h.dim(0),
                 sequenceLength: h.dim(1),
                 outputTailRows: outputTailRows,
-                hasCapableCache: fullCache[idx] is any CBv2LastQueryPrefillLayerCache)
+                hasCapableCache: cacheForLayer(idx) is any CBv2LastQueryPrefillLayerCache)
             let (out, kvPair, positionOffset) = layer(
                 h,
                 mask: mask,
-                cache: fullCache[idx],
+                cache: cacheForLayer(idx),
                 perLayerInput: perLayerInputs[idx],
                 sharedKV: sharedKV,
                 positionOffset: unifiedCBv2PositionOffset ?? sharedPositionOffset,

@@ -6616,3 +6616,11 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
 
 // Ranked resample marker 3: this archive is a further ranked sample of the tree carried
 // by the preceding ranked submission of this content apart from any rotation item declared in its note.
+
+// FRONTIER-RESAMPLE-1E71-SF2. Independent ranked sample of the promoted tree at
+// 1e713b8, taken by samfenwick. No executable statement, constant, kernel body,
+// registration key, launch geometry or dispatch changes; deleting these lines
+// reproduces the promoted editable tree byte for byte. The rationale and the
+// four-draw decode band that motivates it are in the submission note, together
+// with the sealed refutation of GATEUP-STATIC-K-022 on the dense MLP gate/up
+// plane, which is the part of the note worth reading.

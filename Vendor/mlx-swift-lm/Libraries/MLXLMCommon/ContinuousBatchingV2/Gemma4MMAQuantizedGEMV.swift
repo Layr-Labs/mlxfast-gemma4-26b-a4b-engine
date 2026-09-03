@@ -2528,6 +2528,39 @@ public enum Gemma4MMAQuantizedGEMV {
         ensureRowContiguous: true
     )
 
+    // MARK: - HEAD-HALFDEQ --- the nibble's float built from a half bit pattern
+
+    /// `false` only when `DARKBLOOM_GEMMA4_MMA_HEAD_HALF_DEQUANT` is an
+    /// explicit off value. Off restores every affected body and every affected
+    /// kernel key byte for byte, in the same executable.
+    private static let halfDequantEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MMA_HEAD_HALF_DEQUANT"]
+        else { return true }
+        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "0", "false", "no", "off": return false
+        default: return true
+        }
+    }()
+
+    private static let halfDequantKey: String = halfDequantEnabled ? "_hd1" : ""
+
+    private static let halfDequantPattern: NSRegularExpression? =
+        try? NSRegularExpression(pattern: #"float\((.+?) & 0xFu?\)"#)
+
+    /// Applied to a FINISHED body, after every `replaceOnce` derivation has
+    /// matched, so no anchor string can be disturbed by it. A nil regex or a
+    /// zero-match body leaves the incumbent text untouched.
+    private static func withHalfDequant(_ body: String) -> String {
+        guard halfDequantEnabled, let re = halfDequantPattern else { return body }
+        let range = NSRange(body.startIndex..<body.endIndex, in: body)
+        guard re.numberOfMatches(in: body, range: range) > 0 else { return body }
+        return re.stringByReplacingMatches(
+            in: body,
+            range: range,
+            withTemplate: "float(as_type<half>(ushort(0x6400u | ($1 & 0xFu))) - 1024.0h)")
+    }
+
     // MARK: - Version 27 --- compile-time affine-block inner trip
 
     /// Version 26 still inherits v13's `min(8u, N_GROUPS - biasBlock)` inner
@@ -2566,10 +2599,10 @@ public enum Gemma4MMAQuantizedGEMV {
     }()
 
     private static let kernelV27: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_fpmma_v1",
+        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_fpmma_v1\(halfDequantKey)",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["out"],
-        source: sourceV27,
+        source: withHalfDequant(sourceV27),
         header: "#include <metal_simdgroup_matrix>\n",
         ensureRowContiguous: true
     )
@@ -2750,10 +2783,10 @@ public enum Gemma4MMAQuantizedGEMV {
     }()
 
     private static let kernelV27Carry: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_carry_fpmma_v2",
+        name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_carry_fpmma_v2\(halfDequantKey)",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["out"],
-        source: sourceV27Carry,
+        source: withHalfDequant(sourceV27Carry),
         header: "#include <metal_simdgroup_matrix>\n",
         ensureRowContiguous: true
     )
@@ -3139,24 +3172,24 @@ public enum Gemma4MMAQuantizedGEMV {
 
         return RelayoutKernels(
             logits: MLXFast.metalKernel(
-                name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_fpmma_v1_rl1",
+                name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_fpmma_v1_rl1\(halfDequantKey)",
                 inputNames: ["x", "w", "scales", "biases", "xSums"],
                 outputNames: ["out"],
-                source: logits,
+                source: withHalfDequant(logits),
                 header: "#include <metal_simdgroup_matrix>\n",
                 ensureRowContiguous: true),
             carry: MLXFast.metalKernel(
-                name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_carry_fpmma_v2_rl1",
+                name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_carry_fpmma_v2_rl1\(halfDequantKey)",
                 inputNames: ["x", "w", "scales", "biases", "xSums"],
                 outputNames: ["out"],
-                source: carry,
+                source: withHalfDequant(carry),
                 header: "#include <metal_simdgroup_matrix>\n",
                 ensureRowContiguous: true),
             argmax: MLXFast.metalKernel(
-                name: "gemma4_mma_affine4_qmv_m8_v27_argmax_rl1",
+                name: "gemma4_mma_affine4_qmv_m8_v27_argmax_rl1\(halfDequantKey)",
                 inputNames: ["x", "w", "scales", "biases", "xSums"],
                 outputNames: ["pv", "pi"],
-                source: argmax,
+                source: withHalfDequant(argmax),
                 header: "#include <metal_simdgroup_matrix>\n",
                 ensureRowContiguous: true))
     }()
@@ -3464,10 +3497,10 @@ public enum Gemma4MMAQuantizedGEMV {
     }()
 
     private static let kernelV27Argmax: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_mma_affine4_qmv_m8_v27_argmax",
+        name: "gemma4_mma_affine4_qmv_m8_v27_argmax\(halfDequantKey)",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["pv", "pi"],
-        source: sourceV27Argmax,
+        source: withHalfDequant(sourceV27Argmax),
         header: "#include <metal_simdgroup_matrix>\n",
         ensureRowContiguous: true
     )

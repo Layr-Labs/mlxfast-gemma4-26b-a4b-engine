@@ -2202,12 +2202,14 @@ public final class EngineLoopV2: @unchecked Sendable {
     private func refreshProgressLeases(_ step: CBv2InFlightStep, now: ContinuousClock.Instant) {
         step.forEachParticipant { id in
             guard let rec = scheduler.record(for: id) else { return }
-            if var lease = leasesByID[id] {
-                lease.recordProgress(
-                    now: now,
-                    computedTokens: rec.numComputedTokens,
-                    generatedTokens: rec.generatedTokenCount)
-                leasesByID[id] = lease
+            if rec.generatedTokenCount == 0 || rec.generatedTokenCount % 8 == 0 {
+                if var lease = leasesByID[id] {
+                    lease.recordProgress(
+                        now: now,
+                        computedTokens: rec.numComputedTokens,
+                        generatedTokens: rec.generatedTokenCount)
+                    leasesByID[id] = lease
+                }
             }
             // Publish reconciled usage periodically (every 16 tokens) once tokens start flowing
             // to eliminate lock contention and array allocations on the hot decode loop while keeping the watchdog snapshot fresh.

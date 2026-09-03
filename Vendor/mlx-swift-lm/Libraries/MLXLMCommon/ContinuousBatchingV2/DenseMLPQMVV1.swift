@@ -60,46 +60,23 @@ public enum CBv2DenseMLPQMVV1 {
     /// byte, so a ranked rejection can be bisected post hoc without a rebuild
     /// pair.
     ///
-    /// GATE/UP (K = 2816, N = 2112) NOW DEFAULTS ON, and this commit is that
-    /// change. It had been opt-in since 2026-08-29 on a reason recorded in this
-    /// comment, and the reason was wrong. The old text read: the arm "moves one
-    /// stream from zero mismatches to a divergence at row 1 ... exactly the
-    /// class the cohort tolerance gate refuses outright rather than pricing
-    /// against its budget". Both halves of that are refuted.
-    ///
-    /// (1) The gate does not refuse a first-row divergence. It is a per-stream
-    /// token-tolerance gate with a 10 % budget, and it reads `sequential_argmax`
-    /// only; a divergence is priced against the budget, not rejected on sight.
-    /// (2) The instrument that produced "zero mismatches" was a static width-1
-    /// tape, which is anchored to the reference's own token chain and therefore
-    /// compares the wrong contexts after the first legitimate divergence. Under
-    /// the frozen `cohort_reference_replay` predicate -- the reference
-    /// teacher-forced on the CANDIDATE's own committed journal, which is what
-    /// the ranked benchmarker does -- this tree WITH THE ARM OFF already
-    /// diverges at row 1 on one stream. "Zero mismatches" was an artefact of
-    /// the tape, not a property of the arm.
-    ///
-    /// Measured on this base, same binary, arm the only variable, eight diverse
-    /// cohort tapes, 128 steps, 8 streams:
-    ///
-    ///     arm OFF (this tree vs itself) : worst stream 46 / 1000, ACCEPT
-    ///     arm ON  (vs the arm-off tree) : worst stream 69 / 1000, ACCEPT
-    ///     budget 100 / 1000             : headroom 54 -> 31
-    ///
-    /// Every mismatch the arm adds is a near-tie; the non-near-tie count is 2
-    /// on both sides and on the same two streams, so the arm adds no confident
-    /// mismatch. Wall, same binary, four interleaved reps: 16.968 -> 16.625 ms
-    /// warm step p50, -2.02 %, ranges fully disjoint, peak footprint unchanged.
-    ///
-    /// `DARKBLOOM_GEMMA4_MLP_MMA8_GATEUP=0` restores the promoted
-    /// DMLP-001/DMLP-002 tight quad-stream kernel and its W4 load for this
-    /// plane byte for byte, the same polarity as the DOWN arm, so a ranked
-    /// rejection can be bisected post hoc without a rebuild pair.
+    /// GATE/UP (K = 2816, N = 2112) defaults OFF and is OPT-IN, which is the
+    /// opposite polarity of every other switch in this family and is deliberate.
+    /// Both arms are the same one-ulp class against the per-row M = 1 road, but
+    /// on the local eight-tape cohort probe -- packed admission, deterministic
+    /// draw, so the only variable is the arm -- the gate/up arm moves one stream
+    /// from zero mismatches to a divergence at row 1, while the down arm
+    /// introduces no new early divergence at all. A first-row flip is a token
+    /// the trusted oracle did not rank near the top, i.e. exactly the class the
+    /// cohort tolerance gate refuses outright rather than pricing against its
+    /// budget. Until that arm has a ranked result of its own it stays behind an
+    /// explicit `DARKBLOOM_GEMMA4_MLP_MMA8_GATEUP=1`, and the gate/up plane runs
+    /// the promoted DMLP-001/DMLP-002 tight kernel exactly as on the tip.
     public static let mma8GateUpEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_MLP_MMA8_GATEUP"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(
+        else { return false }
+        return ["1", "true", "yes", "on"].contains(
             raw.trimmingCharacters(in: .whitespaces).lowercased())
     }()
 
@@ -1261,11 +1238,6 @@ inline U qdot_affine8_registered_v4(
         // the tip -- the fall-through below is the promoted path unchanged.
         let isGateUp = inDim == 2816 && outDim == 2112
         if isGateUp ? mma8GateUpEnabled : mma8DownEnabled {
-            // The census statement for this ticket is a SUBSTITUTION, not an
-            // addition: with the gate/up arm on, this plane leaves the W4
-            // quad-stream body, so `mlp-mma8-gateup` appears exactly where
-            // `mlp-w4-load` disappears and the total is unchanged.
-            if isGateUp { CBv2EngageMark.once("mlp-mma8-gateup") }
             let yTiles = outDim / outputsPerGroup
             if !isGateUp && mma8DownLaneSumsEnabled {
                 let groups = inDim / Self.groupSize

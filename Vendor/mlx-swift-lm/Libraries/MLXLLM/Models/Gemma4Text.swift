@@ -6585,6 +6585,3 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
         return fused
     }
 }
-
-// Ranked resample marker 3: this archive is a further ranked sample of the tree carried
-// by the preceding ranked submission of this content apart from any rotation item declared in its note.

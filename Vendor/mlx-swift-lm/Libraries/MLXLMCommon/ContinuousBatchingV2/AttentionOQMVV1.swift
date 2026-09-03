@@ -32,6 +32,41 @@ public enum CBv2AttentionOQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// OPROJ-UNROLL-COUNT-8. `#pragma unroll` is a request, and on the two
+    /// run-sum-table group loops the Apple AIR -> AGX unroller declines it: the
+    /// bodies compile to the `unroll_count(1)` machine code byte for byte
+    /// (`__text` 1,210 B, 36 registers, measured on a serialized
+    /// `MTLBinaryArchive`). `unroll_count(8)` is taken, because the loop's trip
+    /// count is `nGroups = (K / 64 + 1) / 2`, which is 32 at K = 4096 and 64 at
+    /// K = 8192 — both exact multiples of 8, so the unroller never has to build
+    /// a remainder epilogue. The same pragma is a no-op on the Q/K/V tier for
+    /// exactly that reason: its trip count is 22.
+    ///
+    /// The change is arithmetically inert. The loop is a straight accumulation
+    /// over `gi`; unrolling replicates whole iterations in their original
+    /// order, reassociates nothing, and moves no float add across another.
+    /// Verified on hardware at fp32 resolution against a reassociation control.
+    ///
+    /// `DARKBLOOM_GEMMA4_OPROJ_UNROLL8=0` restores the incumbent pragma text
+    /// AND the incumbent registration names, so the off state emits the
+    /// incumbent kernel source byte for byte.
+    public static let unroll8Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_OPROJ_UNROLL8"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// The pragma spliced into the `_rsp` and `_rsp2` group loops. Off is the
+    /// incumbent literal.
+    private static let groupLoopPragma =
+        unroll8Enabled ? "#pragma clang loop unroll_count(8)" : "#pragma unroll"
+
+    /// Rekey suffix for every registration whose source text this switch can
+    /// change. `MLXFast.metalKernel` keys a compiled library by name, so a name
+    /// must never outlive a body. Off is the empty string.
+    private static let unroll8Key = unroll8Enabled ? "_ur8" : ""
+
     private static let batch = 8
     private static let sequence = 1
     private static let outputWidth = 2816
@@ -349,7 +384,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
   simdgroup_float8x8 A;
   simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
 
-#pragma unroll
+\(groupLoopPragma)
   for (int gi = 0; gi < nGroups; ++gi) {
     const int g = g0 + gi;
     const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
@@ -404,7 +439,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
 """
 
     private static let mma8KernelK4096 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry_bfill_v4",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry_bfill_v4\(unroll8Key)",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -421,7 +456,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
         ensureRowContiguous: true)
 
     private static let mma8KernelK8192 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_carry_bfill_v4",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_carry_bfill_v4\(unroll8Key)",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -465,7 +500,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
     // masks 2, 4, 16 walk the same fm bits in ITS lane layout), storing the
     // lane-independent balanced fp32 tree every incumbent lane holds.
     private static let runsumTableKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_rs_table_dyn_v1",
+        name: "cbv2_b8_rs_table_dyn_v1\(unroll8Key)",
         inputNames: ["x"],
         outputNames: ["rs"],
         source: """
@@ -556,7 +591,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
     }
 
     private static let mma8RspKernelK4096 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_rsp_v1",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_rsp_v1\(unroll8Key)",
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -573,7 +608,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
         ensureRowContiguous: true)
 
     private static let mma8RspKernelK8192 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp_v1",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp_v1\(unroll8Key)",
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -632,7 +667,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
   simdgroup_float8x8 A;
   simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
 
-#pragma unroll
+\(groupLoopPragma)
   for (int gi = 0; gi < nGroups; ++gi) {
     const int g = g0 + gi;
     const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
@@ -687,7 +722,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
 """
 
     private static let mma8Rsp2KernelK8192 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp2_v1",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp2_v1\(unroll8Key)",
         inputNames: ["x", "w", "scales", "biases", "rs_pairs"],
         outputNames: ["y"],
         source: """

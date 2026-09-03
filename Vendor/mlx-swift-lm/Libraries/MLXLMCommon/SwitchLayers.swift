@@ -1502,6 +1502,26 @@ public class SwitchGLU: Module {
                 )
                 xGate = xGateUp[.ellipsis, ..<hiddenDims]
                 xUp = xGateUp[.ellipsis, hiddenDims...]
+            } else if doSort, useLhsIndices, lhsIndices != nil,
+                x.dtype == .bfloat16,
+                let fused = fusedGateUpDispatch()
+            {
+                CBv2EngageMark.once("decode-gateup-fuse")
+                let xGateUp = MLX.gatherQuantizedMM(
+                    x,
+                    fused.storage.weight,
+                    scales: fused.storage.scales,
+                    biases: fused.storage.biases,
+                    lhsIndices: lhsIndices,
+                    rhsIndices: idx,
+                    transpose: true,
+                    groupSize: fused.groupSize,
+                    bits: fused.bits,
+                    mode: fused.mode,
+                    sortedIndices: true
+                )
+                xGate = xGateUp[.ellipsis, ..<hiddenDims]
+                xUp = xGateUp[.ellipsis, hiddenDims...]
             } else {
                 xUp = upProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
                 xGate = gateProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)

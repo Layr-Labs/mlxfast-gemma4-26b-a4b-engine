@@ -56,6 +56,19 @@ internal func resolveCBv2CompactDecodeRootsEnabled(_ raw: String?) -> Bool {
 
 private let cbv2CompactDecodeRootsEnabled = resolveCBv2CompactDecodeRootsEnabled(
     ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_COMPACT_DECODE_ROOTS"])
+/// CBV2-UNCHAINED-DECODE-FUSED kill switch. Existing fused greedy decode is
+/// admitted only for a complete ordinary-decode plan; false spellings restore
+/// the logits-and-sampler path for attribution and emergency bisection.
+@inline(__always)
+internal func resolveCBv2UnchainedDecodeFusedEnabled(_ raw: String?) -> Bool {
+    guard let raw else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}
+
+private let cbv2UnchainedDecodeFusedEnabled =
+    resolveCBv2UnchainedDecodeFusedEnabled(
+        ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_UNCHAINED_DECODE_FUSED"])
+
 
 /// Builds per-layer batch-facing cache views for a set of rows
 /// (`rowStates[b][layer]`, row order == batch row order). WS-A's
@@ -1663,25 +1676,42 @@ public final class EngineLoopV2: @unchecked Sendable {
         var decodeSampled: MLXArray?
         var logprobSegments: [CBv2StepLogprobs] = []
         if !decodeRows.isEmpty {
+            let ids = decodeRows.map(\.rec.id)
+            let params = decodeRows.map(\.rec.request.sampling)
+            let rowStates = decodeRows.map { kvStates[$0.rec.id]! }
             let inputs = MLXArray(decodeRows.map { Int32($0.rec.tokens[$0.start]) })
                 .reshaped([decodeRows.count, 1])
-            // SOFTCAP-SKIP: same declaration on the mixed-step decode rows.
-            let (last, decodeInnerState) = CBv2OrderOnlyLogits.withOrderOnly(
-                decodeRows.map(\.rec.request.sampling)
-            ) {
-                decodeLogits(
-                    rowStates: decodeRows.map { kvStates[$0.rec.id]! }, tokens: inputs)
-            }
-            cacheInnerState.append(contentsOf: decodeInnerState)
-            decodeSampled = sampler.sample(
-                logits: last,
-                params: decodeRows.map(\.rec.request.sampling),
-                requestIDs: decodeRows.map(\.rec.id),
-                stepIndex: stepCount,
-                pendingSampledTokens: nil,  // finalize preceded: all confirmed
-                rowContext: { decodeRows.map { Self.samplerRow($0.rec) } })
-            if let stepLogprobs = sampler.takeStepLogprobs() {
-                logprobSegments.append(stepLogprobs)
+            let ordinaryDecodePlan =
+                decodeRows.count == work.count
+                && decodeRows.allSatisfy { $0.rec.request.tokenConstraint == nil }
+            if cbv2UnchainedDecodeFusedEnabled,
+                ordinaryDecodePlan,
+                let fusedSampler = sampler as? CBv2FusedGreedySampler,
+                let fusedModel = model as? CBv2ArgmaxDecodeSteppableModel,
+                fusedSampler.admitsFusedGreedy(params: params),
+                fusedModel.admitsArgmaxDecode(tokens: inputs)
+            {
+                let caches = eagerCaches(rowStates: rowStates)
+                decodeSampled = fusedModel.decodeArgmax(tokens: inputs, caches: caches)
+                cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
+                fusedSampler.noteFusedGreedySample()
+                CBv2EngageMark.once("cbv2-unchained-decode-fused")
+            } else {
+                // SOFTCAP-SKIP: same declaration on the mixed-step decode rows.
+                let (last, decodeInnerState) = CBv2OrderOnlyLogits.withOrderOnly(params) {
+                    decodeLogits(rowStates: rowStates, tokens: inputs)
+                }
+                cacheInnerState.append(contentsOf: decodeInnerState)
+                decodeSampled = sampler.sample(
+                    logits: last,
+                    params: params,
+                    requestIDs: ids,
+                    stepIndex: stepCount,
+                    pendingSampledTokens: nil,  // finalize preceded: all confirmed
+                    rowContext: { decodeRows.map { Self.samplerRow($0.rec) } })
+                if let stepLogprobs = sampler.takeStepLogprobs() {
+                    logprobSegments.append(stepLogprobs)
+                }
             }
         }
 

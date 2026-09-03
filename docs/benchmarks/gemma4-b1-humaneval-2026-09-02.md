@@ -104,17 +104,28 @@ HumanEval output does not loop, which is why sections 2 and 3 are the real measu
 
 ## 5. Open issues
 
-1. **`untrimmableCache` abort in the DFlash free run.** Once the drafter's
-   `RotatingKVCache(maxSize: slidingWindow - 1)` is full and a round needs a trim, the round
-   throws and the whole free run dies (`DFlashGreedyRound.swift`). This is the dominant failure:
-   3 problems at depth 1, 10 at depth 15, all of them long. Root cause under investigation. Until
-   it is fixed no DFlash run on this branch can complete HumanEval-164, so no full-164 DFlash
-   pass@1 exists.
-2. **HumanEval driver, two bugs.** The stop-before-N re-run is off by one (HumanEval/112 asked
-   for `N=453` and committed the stop token at position 452), and the attempt loop ends in an
-   assertion -- `dflash attempt loop exhausted without a verdict` -- that aborts the entire eval
-   instead of recording one problem as failed and moving on. The second bug is what cost the
-   last 21 problems of the depth-15 run.
+1. **`untrimmableCache` abort in the DFlash free run -- root cause found, fix on the DFlash
+   branch, present on main.** The drafter is not the cause (its own ring is 2047 wide and its
+   cache stays on the frontier). The target's 25 sliding layers cache into
+   `RotatingKVCache(maxSize: 1024)`, whose `isTrimmable` is `offset < maxSize`.
+   `DFlashTarget.swift` decides whether to snapshot the cache for rollback *before* the verify
+   writes its `[1, blockSize]` rectangle, then re-checks trimmability *after* the write. The one
+   round that starts inside the ring and ends past it gets no snapshot and cannot trim, so the
+   first rejected token in that round throws. Every failure in both receipts is that round
+   (depth 1: 3 of the 11 runs that reached the ring rejected in it; depth 15: 10 of 10). The file
+   is byte-identical on main, so stock main's DFlash route fails the same way on any generation
+   that crosses 1024 tokens with a rejection in the crossing round. Fix (branch
+   `perf/gemma4-dflash-cycle-proposals`, commit f9ae9d0): the snapshot decision takes the round's
+   planned write count, and a short trim falls through to the snapshot instead of throwing; 10
+   CPU tests pin the predicate and replay the failing round shapes. GPU re-measurement pending.
+2. **HumanEval driver, two bugs -- fixed on the DFlash branch (d499eae), not in this PR's copy.**
+   The stop-before-N re-run assumed the stop position never moves (HumanEval/112 asked for
+   `N=453` and the re-run committed the stop at 452: block reshaping moved a near-tie argmax),
+   and the attempt loop ended in `AssertionError: dflash attempt loop exhausted without a
+   verdict`, aborting the entire eval instead of recording one problem as failed. That cost the
+   last 21 problems of the depth-15 run. The fixed driver iterates stop re-runs at never-repeated
+   counts, retries other engine errors once after a worker restart, adds `--task-ids`, and never
+   raises out of the per-problem loop (30 unit tests).
 3. **Main's runtime worker exits with SIGSEGV at shutdown** after a serial free run. Receipts are
    written and intact before the crash, so no measurement is affected, but the exit status is
    not clean.

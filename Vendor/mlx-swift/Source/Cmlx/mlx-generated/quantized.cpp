@@ -3947,7 +3947,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int gemma4_down_tile_span = 4; // sweep alternate: 2
+  constexpr int gemma4_down_tile_span = 8; // sweep alternate: 2, 4
   if (tid.y % uint(gemma4_down_tile_span) != 0u) {
     return;
   }
@@ -4196,7 +4196,7 @@ template <typename T, int group_size, int bits>
     device T* single_y = y + assignment * (uint)out_vec_size;
     if (in_vec_size == 2816) {
       qmv_affine4_g64_singles_impl<
-          T, group_size, bits, 2816, true, false>(
+          T, group_size, bits, 2816, true, true>(
           single_w, single_scales, single_biases, single_x, single_y,
           in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
     } else {

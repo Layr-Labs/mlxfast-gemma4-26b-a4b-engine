@@ -6156,7 +6156,6 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
             const uint lid = thread_position_in_threadgroup.x;
             const uint simd_lane_id = thread_index_in_simdgroup;
             const uint simd_group_id = simdgroup_index_in_threadgroup;
-            threadgroup float local_inv[1];
             threadgroup float local_sums[32];
             threadgroup float quad_sums[704];
 
@@ -6170,28 +6169,18 @@ private enum Gemma4FinalNormMMAHeadSumsV1 {
                 acc += xi * xi;
             }
             acc = simd_sum(acc);
-            if (simd_group_id == 0) {
-                local_sums[simd_lane_id] = 0.0f;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
             if (simd_lane_id == 0) {
                 local_sums[simd_group_id] = acc;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_group_id == 0) {
-                acc = simd_sum(local_sums[simd_lane_id]);
-                if (simd_lane_id == 0) {
-                    local_inv[0] =
-                        metal::precise::rsqrt(acc / 2816.0f + 1e-06f);
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            acc = simd_sum(simd_lane_id < 22 ? local_sums[simd_lane_id] : 0.0f);
+            const float inv = metal::precise::rsqrt(acc / 2816.0f + 1e-06f);
 
             T outv[4];
             for (int i = 0; i < 4; ++i) {
                 // Preserve the stock RMSNorm's BF16 boundary exactly.
                 outv[i] = w[wbase + i]
-                    * static_cast<T>((float)x[base + i] * local_inv[0]);
+                    * static_cast<T>((float)x[base + i] * inv);
                 out[base + i] = outv[i];
             }
 

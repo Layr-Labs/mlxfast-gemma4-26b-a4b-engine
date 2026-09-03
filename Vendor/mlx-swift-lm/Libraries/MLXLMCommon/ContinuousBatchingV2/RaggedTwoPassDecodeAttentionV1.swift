@@ -3751,15 +3751,12 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             return MLXArray(params)
         }
         d512ParamsLock.lock()
+        defer { d512ParamsLock.unlock() }
         if cachedD512Params.params == params, let arr = cachedD512Params.array {
-            d512ParamsLock.unlock()
             return arr
         }
-        d512ParamsLock.unlock()
         let arr = MLXArray(params)
-        d512ParamsLock.lock()
         cachedD512Params = CachedD512Params(params: params, array: arr)
-        d512ParamsLock.unlock()
         return arr
     }
 

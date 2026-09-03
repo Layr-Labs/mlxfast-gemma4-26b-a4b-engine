@@ -97,10 +97,21 @@ public func runDFlashGreedyRound(
         throw DFlashError.invalidBlockSize(blockSize)
     }
 
+    // The verify below writes `[1, blockSize]` into the target cache — one
+    // bonus column plus `blockSize - 1` draft positions — and the rollback runs
+    // AFTER that write. The snapshot decision therefore has to be taken against
+    // the offset the round will END at, not the one it starts at: a round that
+    // starts one position short of a rotating cache's ring and ends past it is
+    // trimmable when this line runs and untrimmable when the rollback needs it.
+    // Passing the width is what keeps that round from failing the whole run
+    // with `untrimmableCache` on its first rejected token.
+    let plannedTargetWriteCount = blockSize
     let rollbackProvider = target as? any DFlashTargetCacheRollbackProvider
     let targetRollbackState =
-        rollbackProvider?.makeDFlashCacheRollbackState(cache: targetCache)
-        ?? target.makeDefaultDFlashCacheRollbackState(cache: targetCache)
+        rollbackProvider?.makeDFlashCacheRollbackState(
+            cache: targetCache, plannedWriteCount: plannedTargetWriteCount)
+        ?? target.makeDefaultDFlashCacheRollbackState(
+            cache: targetCache, plannedWriteCount: plannedTargetWriteCount)
 
     let draftTokens: MLXArray
     if let proposal {
@@ -131,6 +142,18 @@ public func runDFlashGreedyRound(
     // behind, not ahead — and the guard below correctly declines to act,
     // because trimming can only remove context; the caller re-feeds the
     // missing context on its next drafter round.
+    //
+    // NOT THE SEAM (2026-09-03). This guard is NOT the one that failed the
+    // 2026-09-02 HumanEval-164 dflash run with `untrimmableCache`; that was the
+    // TARGET rollback's ring seam, fixed at the snapshot decision above. Both
+    // sites throw a case spelled `untrimmableCache` (one `DFlashError`, one
+    // `DFlashTargetError`), which is what makes a receipt ambiguous between
+    // them. This one cannot fire for either in-tree caller: `draftBlock`
+    // advances the draft cache by exactly the context length it is handed, and
+    // both callers hand it exactly the committed tokens the drafter has not
+    // cached yet, so the delta is 0 on a drafter round and negative on a cycle
+    // round — independent of how far past the drafter's own rotating window the
+    // run has gone.
     let committedDraftOffset = Swift.max(0, promptTokenCount + generatedTokenCount - 1)
     if let draftOffset = draftCache.first?.offset {
         let extraDraftContext = draftOffset - committedDraftOffset

@@ -305,10 +305,13 @@ private let switchGeluShapedFuseEnabled: Bool =
 @inline(__always)
 private func geGLUClaimsPinnedDecode(_ gate: MLXArray, _ up: MLXArray) -> Bool {
     guard switchGeluShapedFuseEnabled,
-        gate.dtype == .bfloat16, up.dtype == .bfloat16,
-        gate.shape == up.shape
+        gate.dtype == .bfloat16, up.dtype == .bfloat16
     else { return false }
-    let s = gate.shape
+    // Read each operand shape once (legacy compared the shapes, then re-read
+    // `gate.shape` below). Pure host reads; no behavior change.
+    let gateShape = gate.shape
+    guard gateShape == up.shape else { return false }
+    let s = gateShape
     if s.count == 3, s[0] == 64, s[1] == 1 { return true }
     if s.count == 2, s[0] == 64 { return true }
     return false
@@ -518,6 +521,33 @@ private let expertPrefixBoundsEnabled: Bool = {
     else { return false }
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
+
+// MARK: - MOE-DESC-HOIST: shared decode descriptors + cached eligibility
+
+/// Host-side decode-path micro-cache for the MoE routing plane. When enabled
+/// (`DARKBLOOM_GEMMA4_MOE_DESC_HOIST=1`), per-`SwitchGLU` module-geometry
+/// eligibility is evaluated once per module instead of on every layer-round
+/// (30x per decode token at B=8). Unset or `0`/`false`/`no`/`off` restores
+/// the legacy inline comparisons exactly. Dynamic per-call tensor checks
+/// (ndim/shape/dtype/size) always still run; only the immutable
+/// module-geometry half is cached, and `SwitchGLU` is shared with other
+/// architectures, so the cache is per-instance (`lazy var`), never
+/// file-global. No graph, numeric, or kernel change.
+private let moeDescHoistEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_MOE_DESC_HOIST"]
+    else { return false }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// Shared launch descriptors for the exact B=8 decode route table (n = 64
+/// assignments). These tuple/array literals were rebuilt on every routing
+/// call (30x per decode token, at two call sites); the values are constant,
+/// so sharing them removes the host allocs with no behavior change.
+private let routeSimdRank64Grid = (64, 1, 1)
+private let routeSimdRank64ThreadGroup = (64, 1, 1)
+private let routeSimdRank64OutputShapes = [[64], [64], [64]]
+private let routeSimdRank64OutputDTypes: [DType] = [.uint32, .uint32, .uint32]
 
 private let routeSortTile64 = 64
 private let routeFusedScatterTopK = 8
@@ -1084,10 +1114,10 @@ public func gatherSort(
         let flat = indices.flattened()
         let outputs = routeSimdRank64Kernel(
             [flat],
-            grid: (64, 1, 1),
-            threadGroup: (64, 1, 1),
-            outputShapes: [[64], [64], [64]],
-            outputDTypes: [.uint32, .uint32, .uint32]
+            grid: routeSimdRank64Grid,
+            threadGroup: routeSimdRank64ThreadGroup,
+            outputShapes: routeSimdRank64OutputShapes,
+            outputDTypes: routeSimdRank64OutputDTypes
         )
         return (
             x.flattened(start: 0, end: -3)[outputs[0]],
@@ -1169,10 +1199,10 @@ public func gatherSortIndices(
             ? routeSimdRank64PrefixBoundsKernel : routeSimdRank64Kernel
         let outputs = kernel(
             [flat],
-            grid: (64, 1, 1),
-            threadGroup: (64, 1, 1),
-            outputShapes: [[64], [64], [64]],
-            outputDTypes: [.uint32, .uint32, .uint32]
+            grid: routeSimdRank64Grid,
+            threadGroup: routeSimdRank64ThreadGroup,
+            outputShapes: routeSimdRank64OutputShapes,
+            outputDTypes: routeSimdRank64OutputDTypes
         )
         return (outputs[0], outputs[1], outputs[2])
     }
@@ -1497,15 +1527,19 @@ public class SwitchGLU: Module {
         sortedPlane: SwitchSortedPlaneProducer? = nil,
         routeTable: SwitchRouteTable? = nil
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
+        // `indices.size` is a pure host read; evaluate once and reuse for the
+        // sort threshold below (legacy read it twice per call). No graph,
+        // numeric, or branching change.
+        let routedAssignmentCount = indices.size
         let useLhsIndices =
-            indices.size == 64 && indices.ndim == 2 && indices.shape == [8, 8]
+            routedAssignmentCount == 64 && indices.ndim == 2 && indices.shape == [8, 8]
             && x.ndim == 2 && x.shape == [8, inputDims]
         let useExpertPrefixBounds =
             expertPrefixBoundsEnabled && useLhsIndices
             && indices.dtype == .uint32 && x.dtype == .bfloat16
             && expertPrefixBoundsProjectionsEligible
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
-        let doSort = indices.size >= 64
+        let doSort = routedAssignmentCount >= 64
 
         var idx = indices
         // ROUTE-LAZY-INVERSE-ORDER: the sentinel `MLXArray()` this variable
@@ -1719,6 +1753,21 @@ public class SwitchGLU: Module {
         return weightedExpertSum(MLX.squeezed(output, axis: -2), weights)
     }
 
+    /// MOE-DESC-HOIST: per-module static half of
+    /// `supportsWeightedExpertUnsort` (module geometry bound at init, never
+    /// changing per forward). Per-instance, never file-global: `SwitchGLU`
+    /// is shared with other architectures/geometries. Read only when
+    /// `moeDescHoistEnabled`; the OFF path keeps the legacy inline
+    /// comparisons. Same lazy pattern as
+    /// `expertPrefixBoundsProjectionsEligible`.
+    private lazy var staticUnsortGeometryEligible: Bool =
+        inputDims == 2816
+        && hiddenDims == 704
+        && numExperts == 128
+        && gateUpProj == nil
+        && activationProduct == nil
+        && isGeluActivation
+
     private func supportsWeightedExpertUnsort(
         _ x: MLXArray, _ indices: MLXArray, weights: MLXArray
     ) -> Bool {
@@ -1726,13 +1775,18 @@ public class SwitchGLU: Module {
         // profile keeps generic SwitchGLU/custom activations on the established
         // implementation.
         guard weightedReductionProfile == .gemma4ProductionGeGLU else { return false }
-        return inputDims == 2816
-            && hiddenDims == 704
-            && numExperts == 128
-            && gateUpProj == nil
-            && activationProduct == nil
-            && isGeluActivation
-            && x.ndim == 2
+        if moeDescHoistEnabled {
+            guard staticUnsortGeometryEligible else { return false }
+        } else {
+            guard inputDims == 2816
+                && hiddenDims == 704
+                && numExperts == 128
+                && gateUpProj == nil
+                && activationProduct == nil
+                && isGeluActivation
+            else { return false }
+        }
+        return x.ndim == 2
             && x.dim(1) == 2816
             && x.dtype == .bfloat16
             && indices.ndim == 2

@@ -57,6 +57,18 @@ internal func resolveCBv2CompactDecodeRootsEnabled(_ raw: String?) -> Bool {
 private let cbv2CompactDecodeRootsEnabled = resolveCBv2CompactDecodeRootsEnabled(
     ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_COMPACT_DECODE_ROOTS"])
 
+/// CHAIN-TRIPLE-CACHE kill switch. Host-side chained-decode metadata memo,
+/// OFF by default (opt-in): unset or `0`/`false`/`no`/`off` keeps the legacy
+/// per-step rebuild of the launch triple; `MLXFAST_CHAIN_TRIPLE_CACHE=1`
+/// reuses the previous step's triple on an exact hit. A hit never skips
+/// `scheduler.plan()`, `isPureDecodePlan`, reserves, or ledger updates —
+/// those all still run in the caller. See `chainedDecodeMetadata(ids:)`.
+private let chainTripleCacheEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["MLXFAST_CHAIN_TRIPLE_CACHE"]
+    else { return false }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// Builds per-layer batch-facing cache views for a set of rows
 /// (`rowStates[b][layer]`, row order == batch row order). WS-A's
 /// `LayerCacheV2` conforms; see CONTRACT-ISSUES-B-scheduler.md §1.
@@ -564,6 +576,22 @@ public final class EngineLoopV2: @unchecked Sendable {
     private var inFlight: CBv2InFlightStep?
     private var running = false
     private var draining = false
+
+    /// CHAIN-TRIPLE-CACHE: single-step memo of the chained-decode launch
+    /// triple (ordered ids, row KV states, sampling params) plus the KV
+    /// identity fingerprint the hit check verifies. Engine-thread-confined
+    /// like `inFlight`/`kvStates` (only touched on the engine queue), so no
+    /// new synchronization. Holds one extra set of KV references for at most
+    /// one step; any membership, KV-identity, constraint, or MTP change
+    /// misses (fail closed) and the legacy rebuild runs instead.
+    private struct CBv2ChainedTripleMemo {
+        var ids: [CBv2RequestID] = []
+        var rowStates: [[CBv2SequenceKV?]] = []
+        var params: [CBv2SamplingParams] = []
+        var kvIdentities: [[ObjectIdentifier?]] = []
+        var valid = false
+    }
+    private var chainedTripleMemo = CBv2ChainedTripleMemo()
 
     // MARK: ADMIT-COALESCE-001 (bounded admission coalescing)
 
@@ -1204,6 +1232,9 @@ public final class EngineLoopV2: @unchecked Sendable {
 
         // Chain broken (or nothing chained): finalize before re-planning so
         // the plan sees confirmed tokens and post-stop membership.
+        // CHAIN-TRIPLE-CACHE: membership may change below, so the single-step
+        // memo ends here (unread when the flag is off; fail closed otherwise).
+        chainedTripleMemo.valid = false
         if let previous = inFlight {
             inFlight = nil
             finalize(previous, now: stepNow)
@@ -1530,6 +1561,72 @@ public final class EngineLoopV2: @unchecked Sendable {
         return scored.asArray(Int32.self).map(Int.init)
     }
 
+    /// CHAIN-TRIPLE-CACHE: resolve the chained-launch triple (row KV states
+    /// + sampling params) for already-validated `ids`, reusing the previous
+    /// step's memo on an exact hit. The caller still runs `scheduler.plan()`,
+    /// `isPureDecodePlan`, capacity reserves, and `markPendingSamples`, so
+    /// ledger/MTP/pending semantics are unchanged; this only avoids
+    /// rebuilding identical host arrays and re-reading immutable params.
+    /// A hit requires ALL of: flag enabled, memo valid, ordered ids equal,
+    /// MTP nil-or-target-only, every row's KV slots still the identical
+    /// objects (preemption/adoption/donation/rollback/id-reuse all change
+    /// identities and miss), and presence re-verified. Sampling params and
+    /// token constraints are immutable post-submit; the chain guard already
+    /// re-checked constraint-nil and `mtpWantsStep` this step before launch.
+    /// Anything ambiguous misses and the legacy rebuild below runs.
+    private func chainedDecodeMetadata(ids: [CBv2RequestID]) -> (
+        rowStates: [[CBv2SequenceKV?]], params: [CBv2SamplingParams]
+    ) {
+        if chainTripleCacheEnabled, chainedTripleMemo.valid,
+            chainedTripleMemo.ids == ids,
+            (mtp?.isTargetOnlyPolicy ?? true),
+            let hit = chainedTripleHit(ids: ids)
+        {
+            return hit
+        }
+        // Legacy rebuild (also the flag-OFF path, verbatim).
+        let rowStates = ids.map { kvStates[$0]! }  // presence pre-checked
+        var params: [CBv2SamplingParams] = []
+        params.reserveCapacity(ids.count)
+        for id in ids { params.append(scheduler.record(for: id)!.request.sampling) }
+        if chainTripleCacheEnabled {
+            chainedTripleMemo = CBv2ChainedTripleMemo(
+                ids: ids, rowStates: rowStates, params: params,
+                kvIdentities: chainedTripleFingerprint(rowStates), valid: true)
+        }
+        return (rowStates, params)
+    }
+
+    /// Verify the memo against live `kvStates` without rebuilding params.
+    /// Returns the memoized triple on an exact identity match, else nil.
+    private func chainedTripleHit(ids: [CBv2RequestID]) -> (
+        rowStates: [[CBv2SequenceKV?]], params: [CBv2SamplingParams]
+    )? {
+        let memo = chainedTripleMemo
+        var current: [[CBv2SequenceKV?]] = []
+        current.reserveCapacity(ids.count)
+        for id in ids {
+            guard let rows = kvStates[id] else { return nil }
+            current.append(rows)
+        }
+        guard current.count == memo.kvIdentities.count else { return nil }
+        for (rows, want) in zip(current, memo.kvIdentities) {
+            guard rows.count == want.count else { return nil }
+            for (slot, fingerprint) in zip(rows, want) {
+                guard slot.map(ObjectIdentifier.init) == fingerprint else { return nil }
+            }
+        }
+        // Identities match, so these are the same objects the memo holds.
+        return (memo.rowStates, memo.params)
+    }
+
+    @inline(__always)
+    private func chainedTripleFingerprint(_ rowStates: [[CBv2SequenceKV?]])
+        -> [[ObjectIdentifier?]]
+    {
+        rowStates.map { $0.map { $0.map(ObjectIdentifier.init) } }
+    }
+
     /// Pure-decode step fed by the previous step's still-lazy tokens.
     private func launchChainedDecode(
         _ plan: CBv2StepPlan, feeding lazyTokens: MLXArray
@@ -1537,10 +1634,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         let wallStartedNanos = DispatchTime.now().uptimeNanoseconds
         let buildStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         let ids = plan.assignments.map(\.id)
-        let rowStates = ids.map { kvStates[$0]! }  // presence pre-checked
-        var params: [CBv2SamplingParams] = []
-        params.reserveCapacity(ids.count)
-        for id in ids { params.append(scheduler.record(for: id)!.request.sampling) }
+        let (rowStates, params) = chainedDecodeMetadata(ids: ids)
 
         let inputs = lazyTokens.reshaped([ids.count, 1])
         let forwardStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
@@ -2159,6 +2253,10 @@ public final class EngineLoopV2: @unchecked Sendable {
     // MARK: Request completion
 
     func finishRequest(_ id: CBv2RequestID, reason: CBv2FinishReason) {
+        // CHAIN-TRIPLE-CACHE: the cohort changed; end the single-step memo
+        // (the next step's ordered-ids compare would miss anyway — this just
+        // closes the id-reuse window explicitly).
+        chainedTripleMemo.valid = false
         // Ids are legally reusable after finish: drop the per-id capacity
         // requeue count on EVERY finish path (including the error-finish
         // that exhausted it), or a reused id inherits the previous

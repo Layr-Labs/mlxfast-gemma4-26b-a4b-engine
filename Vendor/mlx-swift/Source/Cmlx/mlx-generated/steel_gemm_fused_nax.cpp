@@ -179,6 +179,7 @@ template <
     const constant int* batch_shape [[buffer(6), function_constant(has_batch)]],
     const constant int64_t* batch_strides [[buffer(7), function_constant(has_batch)]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint tid_in_tg [[thread_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]]) { // clang-format on
   // Find block
   const int tid_y = ((tid.y) << params->swizzle_log) +
@@ -237,6 +238,32 @@ template <
   A += transpose_a ? c_row_long : c_row_long * params->lda;
   B += transpose_b ? c_col_long * params->ldb : c_col_long;
   D += c_row_long * params->ldd + c_col_long;
+
+  // DARKBLOOM CAUSAL TILE ELISION:
+  // When an entire threadgroup tile lies strictly above the causal diagonal,
+  // every element evaluates to the masked bias (0xFF7F = finfo(bf16).min).
+  // Skip the A and B loads and the entire K-loop matrix multiplication,
+  // store 0xFF7F directly to D and return.
+  if constexpr (kCausalBiasSynthEligible) {
+    if (!do_axpby && align_M && align_N &&
+        addmm_params->fdc == 1 &&
+        addmm_params->ldc == params->N + 1 &&
+        params->M <= params->N && c_bstride_zero) {
+      const int diag = params->N - params->M;
+      if (c_col - (c_row + BM - 1) > diag) {
+        constexpr short total_threads = WM * WN * 32;
+        constexpr short total_elements = BM * BN;
+        const T mask_val = static_cast<T>(as_type<float>(0xFF7F0000u));
+        STEEL_PRAGMA_UNROLL
+        for (short idx = tid_in_tg; idx < total_elements; idx += total_threads) {
+          const short r = idx / BN;
+          const short c = idx % BN;
+          D[r * params->ldd + c] = mask_val;
+        }
+        return;
+      }
+    }
+  }
 
   if (use_out_source) {
     C += c_row_long * addmm_params->ldc + c_col_long * addmm_params->fdc;

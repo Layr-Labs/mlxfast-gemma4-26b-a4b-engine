@@ -282,16 +282,15 @@ enum CBv2ComposedPrefillSDPAV1 {
         var k = keys
         var v = values
         if nRepeats > 1 {
-            // STRICT: without the hoisted plane the GQA split would have to
-            // `reshape` a strided q-block, which copies -- trading the deleted
-            // identity multiply for a copy of the same size instead of
-            // deleting it. Refuse rather than break even.
-            guard let plane = queryPlaneSlice,
+            if let plane = queryPlaneSlice,
                 plane.ndim == 5, plane.dim(0) == B, plane.dim(1) == nKVHeads,
                 plane.dim(2) == nRepeats, plane.dim(3) == L, plane.dim(4) == queryDim,
                 plane.dtype == queries.dtype
-            else { return nil }
-            q = plane
+            {
+                q = plane
+            } else {
+                q = contiguous(queries).reshaped([B, nKVHeads, nRepeats, L, queryDim])
+            }
             k = expandedDimensions(k, axis: 2)
             v = expandedDimensions(v, axis: 2)
         }

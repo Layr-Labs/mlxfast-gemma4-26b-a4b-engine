@@ -317,13 +317,51 @@ public struct CBv2EngineLoopConfig: Sendable {
 
 // MARK: - In-flight step
 
+private let cbv2CompactInflightParticipantsEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_CBV2_COMPACT_INFLIGHT_PARTICIPANTS"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+private enum CBv2ParticipantIndex {
+    case compact([CBv2RequestID])
+    case hashed(Set<CBv2RequestID>)
+
+    func contains(_ id: CBv2RequestID) -> Bool {
+        switch self {
+        case .compact(let ids):
+            return ids.contains(id)
+        case .hashed(let ids):
+            return ids.contains(id)
+        }
+    }
+
+    func forEach(_ body: (CBv2RequestID) -> Void) {
+        switch self {
+        case .compact(let ids):
+            ids.forEach(body)
+        case .hashed(let ids):
+            ids.forEach(body)
+        }
+    }
+}
+
 /// One launched-but-not-finalized step. Its sampled tokens are still lazy;
 /// finalization materializes them (the ONE host sync per step, overlapped
 /// with the next step's GPU work when chained).
 final class CBv2InFlightStep {
     /// Every request that computed anything this step (KV release for any of
     /// these must be deferred until finalization — see CONTRACT-ISSUES §4).
-    let participants: Set<CBv2RequestID>
+    private let participantIndex: CBv2ParticipantIndex
+    var participants: Set<CBv2RequestID> {
+        switch participantIndex {
+        case .compact(let ids):
+            return Set(ids)
+        case .hashed(let set):
+            return set
+        }
+    }
     /// Rows that sampled a token, in plan order (== row order of
     /// `sampledTokens`).
     let sampledRows: [CBv2RequestID]
@@ -363,11 +401,31 @@ final class CBv2InFlightStep {
         sampledTokens: MLXArray?, evalTargets: [MLXArray],
         wallStartedNanos: UInt64
     ) {
-        self.participants = participants
+        self.participantIndex = .hashed(participants)
         self.sampledRows = sampledRows
         self.sampledTokens = sampledTokens
         self.evalTargets = evalTargets
         self.wallStartedNanos = wallStartedNanos
+    }
+
+    init(
+        compactParticipants: [CBv2RequestID], sampledRows: [CBv2RequestID],
+        sampledTokens: MLXArray?, evalTargets: [MLXArray],
+        wallStartedNanos: UInt64
+    ) {
+        self.participantIndex = .compact(compactParticipants)
+        self.sampledRows = sampledRows
+        self.sampledTokens = sampledTokens
+        self.evalTargets = evalTargets
+        self.wallStartedNanos = wallStartedNanos
+    }
+
+    func containsParticipant(_ id: CBv2RequestID) -> Bool {
+        participantIndex.contains(id)
+    }
+
+    func forEachParticipant(_ body: (CBv2RequestID) -> Void) {
+        participantIndex.forEach(body)
     }
 }
 
@@ -1191,7 +1249,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 invalidateAdoptedPrefix(id)
                 mtp?.invalidateCarry(id)
                 guard let state = kvStates.removeValue(forKey: id) else { continue }
-                if previous.participants.contains(id) {
+                if previous.containsParticipant(id) {
                     previous.deferredReleases.append(
                         (
                             id: id, state: state, rollbackOne: false, donation: nil
@@ -1606,9 +1664,17 @@ public final class EngineLoopV2: @unchecked Sendable {
             CBv2StepProfiler.record("v2.asyncEval.submit", seconds: now - evalStart)
             CBv2StepProfiler.record("v2.launch.total", seconds: now - buildStart)
         }
-        let step = CBv2InFlightStep(
-            participants: Set(ids), sampledRows: ids, sampledTokens: sampled, evalTargets: [],
-            wallStartedNanos: wallStartedNanos)
+        let step: CBv2InFlightStep
+        if cbv2CompactInflightParticipantsEnabled {
+            CBv2EngageMark.once("compact-inflight-participants")
+            step = CBv2InFlightStep(
+                compactParticipants: ids, sampledRows: ids, sampledTokens: sampled,
+                evalTargets: [], wallStartedNanos: wallStartedNanos)
+        } else {
+            step = CBv2InFlightStep(
+                participants: Set(ids), sampledRows: ids, sampledTokens: sampled,
+                evalTargets: [], wallStartedNanos: wallStartedNanos)
+        }
         if let stepLogprobs { step.logprobSegments = [stepLogprobs] }
         return step
     }
@@ -2134,8 +2200,8 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// token refreshes the decode lease; a confirmed prefill-chunk advance
     /// refreshes the prefill lease.
     private func refreshProgressLeases(_ step: CBv2InFlightStep, now: ContinuousClock.Instant) {
-        for id in step.participants {
-            guard let rec = scheduler.record(for: id) else { continue }
+        step.forEachParticipant { id in
+            guard let rec = scheduler.record(for: id) else { return }
             if var lease = leasesByID[id] {
                 lease.recordProgress(
                     now: now,
@@ -2191,7 +2257,7 @@ public final class EngineLoopV2: @unchecked Sendable {
 
         if let state = kvStates.removeValue(forKey: id) {
             let donation = donationIntent(for: rec, reason: reason, state: state)
-            if let inFlight, inFlight.participants.contains(id) {
+            if let inFlight, inFlight.containsParticipant(id) {
                 // The in-flight step still references this state — fence the
                 // free behind its completion; roll back the wasted token iff
                 // that step sampled for this row.

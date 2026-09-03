@@ -863,6 +863,82 @@ private let routeCsortPrefillScanKernel: MLXFast.MLXFastKernel = MLXFast.metalKe
     ensureRowContiguous: true
 )
 
+/// PROMPT-GLUE2 (pg2): `mlx_lm_route_csort128_scan_v3` from one 1024-thread
+/// threadgroup, eight block ranges wide. The incumbent's one threadgroup of
+/// 256 threads walks every block twice in sequence per expert column; here
+/// the block loop is split into eight ranges of `nblocks / 8`, one part per
+/// 128-column slice of the threadgroup. Every quantity is an unsigned
+/// integer sum, so the range partials combined in range order are the
+/// incumbent's totals word for word, the expert prefix is the same
+/// `simd_prefix_exclusive_sum` over the same lanes (each part's simdgroups
+/// hold the same totals; part 0 publishes the simdgroup totals), and each
+/// part's running offset starts at the bin base plus the earlier ranges'
+/// counts, which is exactly the incumbent's running value at that block.
+/// Columns with a zero total are left unwritten, as the incumbent leaves
+/// them. Admitted for 128 experts, the 256-wide table and a block count
+/// divisible by eight.
+private let routeCsortPrefillScanKernelPg2: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "mlx_lm_route_csort128_scan_pg2",
+    inputNames: ["block_hist"],
+    outputNames: ["block_offset"],
+    source: """
+        constexpr uint WIDTH = \(routeCsortPrefillWidth);
+        constexpr uint PARTS = 8;
+        constexpr uint COLS = (uint)NE;
+        // PROMPT-GLUE2 (pg2): 1024 threads = PARTS block ranges x COLS expert
+        // columns. Every sum below is an unsigned integer sum, so the split of
+        // the block loop into PARTS ranges combined in range order yields the
+        // incumbent's totals and running offsets word for word.
+        const uint t = thread_position_in_threadgroup.x;
+        const uint e = t % COLS;
+        const uint part = t / COLS;
+        const uint nblocks = (uint)block_hist_shape[0];
+        const uint per = nblocks / PARTS;
+        const uint b0 = part * per;
+        threadgroup uint part_sum[PARTS][COLS];
+        threadgroup uint simd_totals[COLS / 32];
+        uint partial = 0u;
+        for (uint b = b0; b < b0 + per; ++b) {
+            partial += block_hist[b * WIDTH + e];
+        }
+        part_sum[part][e] = partial;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint total = 0u;
+        for (uint p = 0; p < PARTS; ++p) {
+            total += part_sum[p][e];
+        }
+        // Global bin base: exclusive prefix over the expert totals. Each part's
+        // simdgroups hold the same totals in the same lanes, so every part
+        // computes the same prefix; part 0 publishes the simdgroup totals.
+        const uint lane = e % 32;
+        const uint simd_id = e / 32;
+        const uint lane_excl = simd_prefix_exclusive_sum(total);
+        if (part == 0 && lane == 31) {
+            simd_totals[simd_id] = lane_excl + total;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint running = 0u;
+        for (uint s = 0; s < simd_id; ++s) {
+            running += simd_totals[s];
+        }
+        running += lane_excl;
+        for (uint p = 0; p < part; ++p) {
+            running += part_sum[p][e];
+        }
+        // Exclusive scan over this part's blocks for the column, offset by the
+        // bin base plus the earlier parts' counts; columns with a zero total are
+        // never read by the scatter and are left unwritten, as the incumbent
+        // leaves them.
+        if (total > 0u) {
+            for (uint b = b0; b < b0 + per; ++b) {
+                block_offset[b * WIDTH + e] = running;
+                running += block_hist[b * WIDTH + e];
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
 private let routeCsortPrefillScatterKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
     name: "mlx_lm_route_csort128_scatter_v1",
     inputNames: ["keys", "block_offset"],
@@ -923,14 +999,45 @@ private func routeCountingSortPrefill(
         outputShapes: [[blocks, width]],
         outputDTypes: [.uint32]
     )[0]
-    let offsets = routeCsortPrefillScanKernel(
-        [hist],
-        template: [("NE", numExperts)],
-        grid: (width, 1, 1),
-        threadGroup: (width, 1, 1),
-        outputShapes: [[blocks, width]],
-        outputDTypes: [.uint32]
-    )[0]
+    let offsets: MLXArray
+    // PROMPT-GLUE2 (pg2): the prompt plane's key table takes the eight-part
+    // scan; every other table keeps the incumbent dispatch.
+    if Gemma4PromptGlue2V1.enabled, numExperts == 128, width == 256,
+        blocks >= 8, blocks % 8 == 0, n / m >= Gemma4PromptGlue2V1.minRows
+    {
+        offsets = routeCsortPrefillScanKernelPg2(
+            [hist],
+            template: [("NE", numExperts)],
+            grid: (1024, 1, 1),
+            threadGroup: (1024, 1, 1),
+            outputShapes: [[blocks, width]],
+            outputDTypes: [.uint32]
+        )[0]
+        if Gemma4PromptGlue2V1.xcheck {
+            let reference = routeCsortPrefillScanKernel(
+                [hist],
+                template: [("NE", numExperts)],
+                grid: (width, 1, 1),
+                threadGroup: (width, 1, 1),
+                outputShapes: [[blocks, width]],
+                outputDTypes: [.uint32]
+            )[0]
+            // Only columns with a nonzero total are written by either kernel.
+            let written = hist.sum(axis: 0) .> UInt32(0)
+            Gemma4PromptGlue2V1.report(
+                offsets, reference: reference, site: "route-csort scan", mask: written)
+        }
+        Gemma4PromptGlue2V1.mark()
+    } else {
+        offsets = routeCsortPrefillScanKernel(
+            [hist],
+            template: [("NE", numExperts)],
+            grid: (width, 1, 1),
+            threadGroup: (width, 1, 1),
+            outputShapes: [[blocks, width]],
+            outputDTypes: [.uint32]
+        )[0]
+    }
     let outputs = routeCsortPrefillScatterKernel(
         [indices, offsets],
         template: [("M", m)],
@@ -1465,6 +1572,9 @@ public class SwitchGLU: Module {
 
         let xGate: MLXArray
         let xUp: MLXArray
+        // PROMPT-GLUE (pg1): the routed-expert GeLU product computed straight
+        // off the fused gate|up plane, in place of the strided-view closure.
+        var promptActivated: MLXArray? = nil
         if let gateUpProj {
             let xGateUp = gateUpProj(
                 x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
@@ -1502,6 +1612,16 @@ public class SwitchGLU: Module {
                 )
                 xGate = xGateUp[.ellipsis, ..<hiddenDims]
                 xUp = xGateUp[.ellipsis, hiddenDims...]
+                if activationProduct == nil, isGeluActivation,
+                    let product = Gemma4PromptGlueV1.geluProductFusedPlane(
+                        xGateUp, hidden: hiddenDims)
+                {
+                    if Gemma4PromptGlueV1.xcheck {
+                        Gemma4PromptGlueV1.report(
+                            product, reference: geGLUProduct(xGate, xUp), site: "experts")
+                    }
+                    promptActivated = product
+                }
             } else {
                 xUp = upProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
                 xGate = gateProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
@@ -1509,7 +1629,9 @@ public class SwitchGLU: Module {
         }
 
         let activated: MLXArray
-        if let activationProduct {
+        if let promptActivated {
+            activated = promptActivated
+        } else if let activationProduct {
             activated = activationProduct(xGate, xUp)
         } else if isSiluActivation {
             activated = compiledSwiGLU(xGate, xUp)

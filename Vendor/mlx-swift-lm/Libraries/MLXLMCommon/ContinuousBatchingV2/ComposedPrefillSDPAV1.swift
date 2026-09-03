@@ -110,8 +110,25 @@ enum CBv2ComposedPrefillSDPAV1 {
     nonisolated(unsafe) private static var maskCache: [Int: MLXArray] = [:]
     private static let maskCacheLock = NSLock()
 
+    nonisolated(unsafe) private static let precomputedMasks: [Int: MLXArray] = {
+        var table: [Int: MLXArray] = [:]
+        let L = 128
+        for kL in [128, 256, 384, 512, 640, 768, 896, 1024] {
+            let key = L &* 1_000_003 &+ kL
+            let qIndices = MLXArray(Int32(kL - L) ..< Int32(kL)).expandedDimensions(axis: 1)
+            let kIndices = MLXArray(Int32(0) ..< Int32(kL)).expandedDimensions(axis: 0)
+            let mask = qIndices .>= kIndices
+            eval(mask)
+            table[key] = mask
+        }
+        return table
+    }()
+
     private static func causalMask(L: Int, kL: Int) -> MLXArray {
         let key = L &* 1_000_003 &+ kL
+        if let hit = precomputedMasks[key] {
+            return hit
+        }
         maskCacheLock.lock()
         if let hit = maskCache[key] {
             maskCacheLock.unlock()
@@ -157,8 +174,42 @@ enum CBv2ComposedPrefillSDPAV1 {
     /// 1024-token chunk -- and the same bounded table.
     nonisolated(unsafe) private static var maskBiasCache: [Int: MLXArray] = [:]
 
+    nonisolated(unsafe) private static let precomputedBiases: [Int: MLXArray] = {
+        var table: [Int: MLXArray] = [:]
+        let L = 128
+        for kL in [128, 256, 384, 512, 640, 768, 896, 1024] {
+            let key = L &* 1_000_003 &+ kL
+            let bias: MLXArray
+            if maskSynthEnabled {
+                let qIndices = MLXArray(Int32(kL - L) ..< Int32(kL)).expandedDimensions(axis: 1)
+                let kIndices = MLXArray(Int32(0) ..< Int32(kL + 1)).expandedDimensions(axis: 0)
+                let padded = MLX.where(
+                    qIndices .>= kIndices,
+                    bfloat16NegativeZeroScalar,
+                    bfloat16LowestScalar)
+                eval(padded)
+                bias = padded[0..., 0 ..< kL]
+            } else {
+                let qIndices = MLXArray(Int32(kL - L) ..< Int32(kL)).expandedDimensions(axis: 1)
+                let kIndices = MLXArray(Int32(0) ..< Int32(kL)).expandedDimensions(axis: 0)
+                let mask = qIndices .>= kIndices
+                eval(mask)
+                bias = MLX.where(
+                    mask,
+                    bfloat16NegativeZeroScalar,
+                    bfloat16LowestScalar)
+            }
+            eval(bias)
+            table[key] = bias
+        }
+        return table
+    }()
+
     private static func causalMaskBias(L: Int, kL: Int) -> MLXArray {
         let key = L &* 1_000_003 &+ kL
+        if let hit = precomputedBiases[key] {
+            return hit
+        }
         maskCacheLock.lock()
         if let hit = maskBiasCache[key] {
             maskCacheLock.unlock()

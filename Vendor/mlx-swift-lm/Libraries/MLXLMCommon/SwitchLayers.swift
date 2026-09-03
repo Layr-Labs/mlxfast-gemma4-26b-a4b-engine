@@ -474,6 +474,16 @@ private let routeSimdRank64Enabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+/// The rank-64 route kernel indexes the contiguous pointer linearly, so its
+/// accepted `[8, 8]` input does not need a separate flattened view.
+/// `DARKBLOOM_ROUTE_SIMD_RANK64_DIRECT_INPUT=0` restores that view.
+private let routeSimdRank64DirectInputEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_ROUTE_SIMD_RANK64_DIRECT_INPUT"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 // MARK: - ROUTE-CSORT-64: fused counting-sort route table (donor port)
 
 /// Stable counting sort for the flattened B=8 decode route table (64 uint32
@@ -1081,7 +1091,12 @@ public func gatherSort(
         (indices.shape == [8, 8] || (indices.ndim == 1 && indices.size == 64)),
         indices.dtype == .uint32
     {
-        let flat = indices.flattened()
+        if routeSimdRank64DirectInputEnabled {
+            CBv2EngageMark.once("route-simd-direct-input")
+        }
+        let flat: MLXArray = routeSimdRank64DirectInputEnabled
+            ? indices
+            : indices.flattened()
         let outputs = routeSimdRank64Kernel(
             [flat],
             grid: (64, 1, 1),
@@ -1164,7 +1179,12 @@ public func gatherSortIndices(
         if expertPrefixBounds {
             CBv2EngageMark.once("expert-prefix-bounds")
         }
-        let flat = indices.flattened()
+        if routeSimdRank64DirectInputEnabled {
+            CBv2EngageMark.once("route-simd-direct-input")
+        }
+        let flat: MLXArray = routeSimdRank64DirectInputEnabled
+            ? indices
+            : indices.flattened()
         let kernel = expertPrefixBounds
             ? routeSimdRank64PrefixBoundsKernel : routeSimdRank64Kernel
         let outputs = kernel(

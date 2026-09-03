@@ -82,7 +82,7 @@ internal func gemma4ShouldSubmitDecodeAsyncEvalLadder(
     // The empty-set row is the control that matters: this is not "fewer is
     // always better", it is "the early pair carries all of the overlap".
     switch layerIndex {
-    case 0, 1:
+    case 0, 1, 2, 3:
         return true
     default:
         return false
@@ -7487,4 +7487,4 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
 // Ranked resample marker 36: this archive is a further ranked sample of the tree carried
 // by the preceding ranked submission of this content apart from any rotation item declared in its note.
 
-// Candidate EXP-019: decode ladder optimal {0,1} + prefill chunk eval 6-layer repeat cycle + HEAD-RELAYOUT rebase + lock-free precomputed prefill softmax + compact participants + periodic telemetry.
+// Candidate EXP-020: fast-path lock-free relaid plane cache + optimistic D512 params cache + 4-layer early GPU buffer {0,1,2,3} + 6-layer prefill repeat cadence + attention pipeline refresh yrp7.

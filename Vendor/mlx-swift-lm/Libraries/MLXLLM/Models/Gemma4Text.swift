@@ -426,7 +426,20 @@ func geluFusionClaimsPrefill(_ gate: MLXArray, _ up: MLXArray) -> Bool {
 /// one-kernel trace.
 @inline(__always)
 func gemma4GeluProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
-    if geluFusionClaimsPinnedDecode(gate, up) || geluFusionClaimsPrefill(gate, up) {
+    if geluFusionClaimsPinnedDecode(gate, up) {
+        return gemma4SafeGeluProductShaped(gate, up)
+    }
+    // PROMPT-GLUE (pg1): prompt-width rectangles take the vector kernel; the
+    // decode signatures were matched above and never reach it.
+    if let product = Gemma4PromptGlueV1.geluProduct(gate: gate, up: up) {
+        if Gemma4PromptGlueV1.xcheck {
+            Gemma4PromptGlueV1.exhaustiveCheck(stock: gemma4SafeGeluProductShaped)
+            Gemma4PromptGlueV1.report(
+                product, reference: gemma4SafeGeluProductShaped(gate, up), site: "dense")
+        }
+        return product
+    }
+    if geluFusionClaimsPrefill(gate, up) {
         return gemma4SafeGeluProductShaped(gate, up)
     }
     return gemma4SafeGeluProduct(gate, up)
@@ -1380,10 +1393,467 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
+/// PROMPT-GLUE (pg1) PACK-IN-NORMROPE: `gemma4_qkv_rms_norm_head_major_sliding_v1`
+/// with the prompt q4 KV mirror pack folded in. The norm and RoPE text is
+/// the incumbent's statement for statement (the early return is a predicate
+/// so every thread reaches every barrier); each K row's rotated values and
+/// each V row's normalized values are additionally staged, as the very T
+/// words stored to `k_out`/`v_out`, in `final_vals`, and after one barrier
+/// the row's first simdgroup runs `cbv2_kvq4g64_pack_pair_chunk_batch_d256_v1`'s
+/// per-lane body over them: lane `l` owns values `8l..8l+7` (the pack
+/// kernel's `per_lane` mapping), the serial min/max over those eight in the
+/// same order, the same `simd_shuffle_xor` 1/2/4 combine across the same
+/// eight lanes, `half` scale/bias, `rint` codes, and the same word layout at
+/// the same `(plane, head, token) * 36` offset of the same per-row mirror
+/// allocation. The mirror is therefore the pack kernel's output byte for
+/// byte, computed without re-reading the 67 MB of K/V it packs.
+private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
+    name: "gemma4_qkv_rms_norm_head_major_sliding_pack_pg1",
+    inputNames: [
+        "q", "k", "v", "q_weight", "k_weight",
+        "position_offsets", "rope_log2_base",
+    ],
+    outputNames: ["q_out", "k_out", "v_out", "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7"],
+    source: """
+        constexpr uint reads = 4;
+        constexpr uint row_threads = D / reads;
+        constexpr uint mirror_row_words = D / 8 + D / 64;
+        const uint tid = thread_position_in_threadgroup.x;
+        const uint slot = tid / row_threads;
+        const uint lid = tid - slot * row_threads;
+        const uint row = threadgroup_position_in_grid.x * RPT + slot;
+        const uint lane = thread_index_in_simdgroup;
+        const uint row_simd = lid / 32;
+
+        threadgroup float partials[RPT][32];
+        threadgroup float inv_rms[RPT];
+        threadgroup T rounded[RPT][D];
+        threadgroup uint row_position[RPT];
+        threadgroup T final_vals[RPT][D];
+
+        // Clean per-bank input row pointers: flat [B, L, H, D] rows.
+        const device T* input = q;
+        const device T* weight = q_weight;
+        device T* output = q_out;
+        uint local_row = row;
+        bool weighted = true;
+        if (row >= Q_ROWS + K_ROWS) {
+            input = v;
+            output = v_out;
+            local_row = row - Q_ROWS - K_ROWS;
+            weighted = false;
+        } else if (row >= Q_ROWS) {
+            input = k;
+            weight = k_weight;
+            output = k_out;
+            local_row = row - Q_ROWS;
+        }
+
+        const bool valid = row < TOTAL_ROWS;
+        uint mirror_b = 0;
+        uint mirror_h = 0;
+        uint mirror_l = 0;
+        if (valid) {
+            // Flat input rows -> head-major [B, H, L, D] output slots; each
+            // bank carries its own head count and length.
+            const uint h_count = row < Q_ROWS ? HQ : HK;
+            const uint l_count = row < Q_ROWS ? LQ : LK;
+            const uint b = local_row / (l_count * h_count);
+            const uint rem = local_row - b * (l_count * h_count);
+            const uint l = rem / h_count;
+            const uint h = rem - l * h_count;
+            row_position[slot] = l;
+            output += (((size_t)b * h_count + h) * l_count + l) * D;
+            mirror_b = b;
+            mirror_h = h;
+            mirror_l = l;
+        }
+
+        if (row < Q_ROWS) {
+            input = q + (size_t)row * D + lid * reads;
+        } else if (row < Q_ROWS + K_ROWS) {
+            input = k + (size_t)local_row * D + lid * reads;
+        } else {
+            input = v + (size_t)local_row * D + lid * reads;
+        }
+        device T* output_row = output;
+        output += lid * reads;
+        weight += lid * reads;
+
+        float sum = 0.0f;
+        if (valid) {
+            for (uint i = 0; i < reads; ++i) {
+                const float value = float(input[i]);
+                sum += value * value;
+            }
+        }
+        sum = simd_sum(sum);
+
+        if (row_simd == 0) partials[slot][lane] = 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) partials[slot][row_simd] = sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (row_simd == 0) {
+            sum = simd_sum(partials[slot][lane]);
+            if (lane == 0) {
+                inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (valid) {
+            const float inverse_rms = inv_rms[slot];
+            for (uint i = 0; i < reads; ++i) {
+                const T normalized = T(float(input[i]) * inverse_rms);
+                if (APPLY_ROPE && weighted) {
+                    // The BF16 memory boundary the separate norm kernel's
+                    // output store performed before stock RoPE read it.
+                    rounded[slot][lid * reads + i] = T(weight[i] * normalized);
+                } else {
+                    const T stored = weighted ? weight[i] * normalized : T(1) * normalized;
+                    output[i] = stored;
+                    final_vals[slot][lid * reads + i] = stored;
+                }
+            }
+        }
+        if (APPLY_ROPE) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (APPLY_ROPE && valid && weighted && lid * reads < D / 2) {
+            const uint h_count = row < Q_ROWS ? HQ : HK;
+            const uint l_count = row < Q_ROWS ? LQ : LK;
+            const uint b = local_row / (l_count * h_count);
+            const float L =
+                static_cast<float>(row_position[slot] + position_offsets[b]);
+            for (uint i = 0; i < reads; ++i) {
+                const uint pair = lid * reads + i;
+                const float d = static_cast<float>(pair) / static_cast<float>(D / 2);
+                const float inv_freq = metal::exp2(-d * rope_log2_base[0]);
+                const float theta = L * inv_freq;
+                const float costheta = metal::fast::cos(theta);
+                const float sintheta = metal::fast::sin(theta);
+                const float x1 = static_cast<float>(rounded[slot][pair]);
+                const float x2 = static_cast<float>(rounded[slot][pair + D / 2]);
+                const float rx1 = x1 * costheta - x2 * sintheta;
+                const float rx2 = x1 * sintheta + x2 * costheta;
+                const T o1 = static_cast<T>(rx1);
+                const T o2 = static_cast<T>(rx2);
+                output_row[pair] = o1;
+                output_row[pair + D / 2] = o2;
+                final_vals[slot][pair] = o1;
+                final_vals[slot][pair + D / 2] = o2;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // The pack kernel's body over this row's stored K (rotated) or V
+        // values: one 32-lane simdgroup per (plane, head, token) row.
+        if (valid && row >= Q_ROWS && lid < 32) {
+            const uint plane = weighted ? 0u : 1u;
+            device uint32_t* mout;
+            switch (mirror_b) {
+                case 0: mout = m0; break;
+                case 1: mout = m1; break;
+                case 2: mout = m2; break;
+                case 3: mout = m3; break;
+                case 4: mout = m4; break;
+                case 5: mout = m5; break;
+                case 6: mout = m6; break;
+                case 7: mout = m7; break;
+                default: return;
+            }
+            mout += (plane * (HK * LK) + mirror_h * LK + mirror_l) * mirror_row_words;
+            const threadgroup T* src = final_vals[slot];
+
+            float vmin = 3.402823466e+38F;
+            float vmax = -3.402823466e+38F;
+            for (int i = 0; i < 8; ++i) {
+                const float value = float(src[lane * 8 + i]);
+                vmin = min(vmin, value);
+                vmax = max(vmax, value);
+            }
+            for (uint m = 1; m < 8; m <<= 1) {
+                vmin = min(vmin, simd_shuffle_xor(vmin, m));
+                vmax = max(vmax, simd_shuffle_xor(vmax, m));
+            }
+
+            const half hs = half(max((vmax - vmin) / 15.0f, 1e-6f));
+            const half hb = half(vmin);
+            const float s = float(hs);
+            const float b = float(hb);
+
+            uint32_t word = 0u;
+            for (int i = 0; i < 8; ++i) {
+                const float qv = metal::rint((float(src[lane * 8 + i]) - b) / s);
+                word |= uint32_t(clamp(qv, 0.0f, 15.0f)) << (4 * i);
+            }
+            mout[lane] = word;
+            if (lane % 8 == 0) {
+                mout[D / 8 + lane / 8] =
+                    uint32_t(as_type<ushort>(hs)) | (uint32_t(as_type<ushort>(hb)) << 16);
+            }
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+/// PROMPT-GLUE2 (pg2): `gemma4_qkv_rms_norm_head_major_sliding_pack_pg1` in
+/// vector-access form. The norm, RoPE and pack arithmetic is the pg1 text
+/// statement for statement -- the same float products in the same order,
+/// the same `T` roundings at the same points, the same `simd_sum` tree over
+/// the same per-lane operands, the same pack lane mapping and min/max
+/// order. What changes is how the words move:
+/// - each thread's four input words are one 8-byte load held in registers
+///   for the reduction and the normalize (pg1 loads them twice, scalar);
+/// - the four output words of a thread are one 8-byte store, for the
+///   normalized banks and for each half of a rotated row;
+/// - the row's cross-simdgroup combine is run by every simdgroup of the
+///   row over the same 32 operands the first simdgroup combined (the
+///   partials in lanes below the simdgroup count, the zero-fill's 0.0f in
+///   a register elsewhere), so each holds the bit-identical inverse rms
+///   without the zero-fill and publish-back barriers;
+/// - one 8-byte-aligned staging array per row replaces `rounded` and
+///   `final_vals`: it holds the rounded words before the rotation and the
+///   rotated words after it (each pair is read and rewritten by the one
+///   thread that owns it), and the pack reads the very words stored to
+///   the output, as before. Q rows, which are never packed, stage only
+///   for the rotation.
+/// Every thread reaches every barrier (all row work is predicated), so the
+/// row count need not divide the rows per threadgroup.
+private let gemma4QKVNormPrefillSlidingPackKernelPg2 = MLXFast.metalKernel(
+    name: "gemma4_qkv_rms_norm_head_major_sliding_pack_pg2",
+    inputNames: [
+        "q", "k", "v", "q_weight", "k_weight",
+        "position_offsets", "rope_log2_base",
+    ],
+    outputNames: ["q_out", "k_out", "v_out", "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7"],
+    source: """
+        constexpr uint reads = 4;
+        constexpr uint row_threads = D / reads;
+        constexpr uint row_simds = row_threads / 32;
+        constexpr uint mirror_row_words = D / 8 + D / 64;
+        typedef vec<T, 4> T4;
+        const uint tid = thread_position_in_threadgroup.x;
+        const uint slot = tid / row_threads;
+        const uint lid = tid - slot * row_threads;
+        const uint row = threadgroup_position_in_grid.x * RPT + slot;
+        const uint lane = thread_index_in_simdgroup;
+        const uint row_simd = lid / 32;
+
+        threadgroup float partials[RPT][32];
+        // PROMPT-GLUE2 (pg2): one 8-byte-aligned staging array per row serves
+        // the RoPE pair exchange and the pack. It holds, as the very T words
+        // stored to the output, the rounded values before the rotation and the
+        // rotated values after it; each pair is read and rewritten by the one
+        // thread that owns it.
+        threadgroup T4 staged4[RPT][D / 4];
+        threadgroup uint row_position[RPT];
+
+        // Clean per-bank input row pointers: flat [B, L, H, D] rows.
+        const device T* input = q;
+        const device T* weight = q_weight;
+        device T* output = q_out;
+        uint local_row = row;
+        bool weighted = true;
+        if (row >= Q_ROWS + K_ROWS) {
+            input = v;
+            output = v_out;
+            local_row = row - Q_ROWS - K_ROWS;
+            weighted = false;
+        } else if (row >= Q_ROWS) {
+            input = k;
+            weight = k_weight;
+            output = k_out;
+            local_row = row - Q_ROWS;
+        }
+
+        const bool valid = row < TOTAL_ROWS;
+        uint mirror_b = 0;
+        uint mirror_h = 0;
+        uint mirror_l = 0;
+        if (valid) {
+            // Flat input rows -> head-major [B, H, L, D] output slots; each
+            // bank carries its own head count and length.
+            const uint h_count = row < Q_ROWS ? HQ : HK;
+            const uint l_count = row < Q_ROWS ? LQ : LK;
+            const uint b = local_row / (l_count * h_count);
+            const uint rem = local_row - b * (l_count * h_count);
+            const uint l = rem / h_count;
+            const uint h = rem - l * h_count;
+            row_position[slot] = l;
+            output += (((size_t)b * h_count + h) * l_count + l) * D;
+            mirror_b = b;
+            mirror_h = h;
+            mirror_l = l;
+        }
+
+        if (row < Q_ROWS) {
+            input = q + (size_t)row * D + lid * reads;
+        } else if (row < Q_ROWS + K_ROWS) {
+            input = k + (size_t)local_row * D + lid * reads;
+        } else {
+            input = v + (size_t)local_row * D + lid * reads;
+        }
+        device T* output_row = output;
+        output += lid * reads;
+        weight += lid * reads;
+        threadgroup T* stg = reinterpret_cast<threadgroup T*>(&staged4[slot][0]);
+
+        // The thread's four input words as one 8-byte load, kept in registers
+        // for the reduction and the normalize (the incumbent re-reads them).
+        T4 in4 = T4(0);
+        if (valid) {
+            in4 = *reinterpret_cast<const device T4*>(input);
+        }
+        float sum = 0.0f;
+        if (valid) {
+            for (uint i = 0; i < reads; ++i) {
+                const float value = float(in4[i]);
+                sum += value * value;
+            }
+        }
+        sum = simd_sum(sum);
+
+        if (lane == 0) partials[slot][row_simd] = sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Every simdgroup of the row combines the same 32 operands the
+        // incumbent's first simdgroup combined -- the partials in lanes below
+        // row_simds, the zero-fill's 0.0f in a register elsewhere -- so each
+        // holds the bit-identical inverse rms with no publish-back barrier.
+        sum = simd_sum(lane < row_simds ? partials[slot][lane] : 0.0f);
+        const float inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+
+        if (valid) {
+            if (APPLY_ROPE && weighted) {
+                const T4 w4 = *reinterpret_cast<const device T4*>(weight);
+                T4 r4;
+                for (uint i = 0; i < reads; ++i) {
+                    const T normalized = T(float(in4[i]) * inverse_rms);
+                    // The BF16 memory boundary the separate norm kernel's
+                    // output store performed before stock RoPE read it.
+                    r4[i] = T(w4[i] * normalized);
+                }
+                staged4[slot][lid] = r4;
+            } else {
+                T4 s4;
+                if (weighted) {
+                    const T4 w4 = *reinterpret_cast<const device T4*>(weight);
+                    for (uint i = 0; i < reads; ++i) {
+                        const T normalized = T(float(in4[i]) * inverse_rms);
+                        s4[i] = w4[i] * normalized;
+                    }
+                } else {
+                    for (uint i = 0; i < reads; ++i) {
+                        const T normalized = T(float(in4[i]) * inverse_rms);
+                        s4[i] = T(1) * normalized;
+                    }
+                }
+                *reinterpret_cast<device T4*>(output) = s4;
+                if (row >= Q_ROWS) {
+                    staged4[slot][lid] = s4;
+                }
+            }
+        }
+        if (APPLY_ROPE) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (APPLY_ROPE && valid && weighted && lid * reads < D / 2) {
+            const uint h_count = row < Q_ROWS ? HQ : HK;
+            const uint l_count = row < Q_ROWS ? LQ : LK;
+            const uint b = local_row / (l_count * h_count);
+            const float L =
+                static_cast<float>(row_position[slot] + position_offsets[b]);
+            T4 o1;
+            T4 o2;
+            for (uint i = 0; i < reads; ++i) {
+                const uint pair = lid * reads + i;
+                const float d = static_cast<float>(pair) / static_cast<float>(D / 2);
+                const float inv_freq = metal::exp2(-d * rope_log2_base[0]);
+                const float theta = L * inv_freq;
+                const float costheta = metal::fast::cos(theta);
+                const float sintheta = metal::fast::sin(theta);
+                const float x1 = static_cast<float>(stg[pair]);
+                const float x2 = static_cast<float>(stg[pair + D / 2]);
+                const float rx1 = x1 * costheta - x2 * sintheta;
+                const float rx2 = x1 * sintheta + x2 * costheta;
+                o1[i] = static_cast<T>(rx1);
+                o2[i] = static_cast<T>(rx2);
+            }
+            *reinterpret_cast<device T4*>(output_row + lid * reads) = o1;
+            *reinterpret_cast<device T4*>(output_row + lid * reads + D / 2) = o2;
+            if (row >= Q_ROWS) {
+                // K rows: the rotated words replace the pairs this thread alone
+                // read, for the pack below.
+                staged4[slot][lid] = o1;
+                staged4[slot][lid + D / 8] = o2;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // The pack kernel's body over this row's stored K (rotated) or V
+        // values: one 32-lane simdgroup per (plane, head, token) row.
+        if (valid && row >= Q_ROWS && lid < 32) {
+            const uint plane = weighted ? 0u : 1u;
+            device uint32_t* mout;
+            switch (mirror_b) {
+                case 0: mout = m0; break;
+                case 1: mout = m1; break;
+                case 2: mout = m2; break;
+                case 3: mout = m3; break;
+                case 4: mout = m4; break;
+                case 5: mout = m5; break;
+                case 6: mout = m6; break;
+                case 7: mout = m7; break;
+                default: return;
+            }
+            mout += (plane * (HK * LK) + mirror_h * LK + mirror_l) * mirror_row_words;
+            const threadgroup T* src = stg;
+
+            float vmin = 3.402823466e+38F;
+            float vmax = -3.402823466e+38F;
+            for (int i = 0; i < 8; ++i) {
+                const float value = float(src[lane * 8 + i]);
+                vmin = min(vmin, value);
+                vmax = max(vmax, value);
+            }
+            for (uint m = 1; m < 8; m <<= 1) {
+                vmin = min(vmin, simd_shuffle_xor(vmin, m));
+                vmax = max(vmax, simd_shuffle_xor(vmax, m));
+            }
+
+            const half hs = half(max((vmax - vmin) / 15.0f, 1e-6f));
+            const half hb = half(vmin);
+            const float s = float(hs);
+            const float b = float(hb);
+
+            uint32_t word = 0u;
+            for (int i = 0; i < 8; ++i) {
+                const float qv = metal::rint((float(src[lane * 8 + i]) - b) / s);
+                word |= uint32_t(clamp(qv, 0.0f, 15.0f)) << (4 * i);
+            }
+            mout[lane] = word;
+            if (lane % 8 == 0) {
+                mout[D / 8 + lane / 8] =
+                    uint32_t(as_type<ushort>(hs)) | (uint32_t(as_type<ushort>(hb)) << 16);
+            }
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+/// Rows per threadgroup of the pg2 twin (384 threads at D = 256; any value
+/// is exact).
+private let gemma4QKVNormPrefillSlidingPackRowsPerGroupPg2 = 6
+
 /// The sliding twin of `gemma4FusedQKVNormHeadMajor`: three banks, base-route
 /// RoPE, same guards and same fallback discipline. Returns `nil` off the
 /// plane (non-sliding geometry, small rectangles, guard failures) and the
 /// caller keeps the stock three-norm chain plus separate RoPE.
+/// PROMPT-GLUE (pg1): `packMirrors` asks for the pack-folded twin; when it
+/// engages, `mirrors` carries one `[2, HK, LK, 36]` uint32 plane per batch
+/// row (the q4 mirror the prompt commit would otherwise pack from `k`/`v`).
 private func gemma4FusedQKVNormHeadMajorSliding(
     q: MLXArray,
     k: MLXArray,
@@ -1392,8 +1862,9 @@ private func gemma4FusedQKVNormHeadMajorSliding(
     kWeight: MLXArray,
     eps: Float,
     positionOffsets: MLXArray,
-    ropeParameters: Gemma4QKVRopeParameters, applyRope: Bool
-) -> (q: MLXArray, k: MLXArray, v: MLXArray, appliedRope: Bool)? {
+    ropeParameters: Gemma4QKVRopeParameters, applyRope: Bool,
+    packMirrors: Bool = false
+) -> (q: MLXArray, k: MLXArray, v: MLXArray, appliedRope: Bool, mirrors: [MLXArray]?)? {
     guard gemma4QKVNormPrefillEnabled, eps == 1.0e-6,
         positionOffsets.dtype == .int32,
         positionOffsets.size == q.dim(0),
@@ -1420,14 +1891,76 @@ private func gemma4FusedQKVNormHeadMajorSliding(
     let rowsPerGroup = 512 / rowThreads
     let groups = (rows + rowsPerGroup - 1) / rowsPerGroup
     let fusedRope = gemma4QKVNormRopeEnabled && applyRope
+    let template: [(String, any KernelTemplateArg)] = [
+        ("T", q.dtype), ("D", dimension), ("Q_ROWS", qRows),
+        ("K_ROWS", kRows), ("TOTAL_ROWS", rows), ("RPT", rowsPerGroup),
+        ("LQ", lq), ("HQ", hq), ("LK", lk), ("HK", hk),
+        ("APPLY_ROPE", fusedRope),
+    ]
+    // PROMPT-GLUE (pg1): the pack fold needs the rotated K values in the
+    // kernel (fusedRope) and one mirror output per batch row (<= 8).
+    if packMirrors, fusedRope, Gemma4PromptGlueV1.packEnabled,
+        batch <= 8, rows % rowsPerGroup == 0
+    {
+        let words = dimension / 8 + dimension / 64
+        let outputShapes: [[Int]] = [
+            [batch, hq, lq, dimension], [batch, hk, lk, dimension],
+            [batch, hk, lk, dimension],
+        ] + (0 ..< 8).map { $0 < batch ? [2, hk, lk, words] : [1] }
+        let outputDTypes = [q.dtype, q.dtype, q.dtype]
+            + Array(repeating: DType.uint32, count: 8)
+        // PROMPT-GLUE2 (pg2): the prompt plane takes the vector-access twin
+        // at its own rows per threadgroup; pg1 stays for everything else.
+        if Gemma4PromptGlue2V1.enabled, batch * max(lq, lk) >= Gemma4PromptGlue2V1.minRows {
+            let rowsPerGroup2 = gemma4QKVNormPrefillSlidingPackRowsPerGroupPg2
+            let groups2 = (rows + rowsPerGroup2 - 1) / rowsPerGroup2
+            let template2: [(String, any KernelTemplateArg)] = [
+                ("T", q.dtype), ("D", dimension), ("Q_ROWS", qRows),
+                ("K_ROWS", kRows), ("TOTAL_ROWS", rows), ("RPT", rowsPerGroup2),
+                ("LQ", lq), ("HQ", hq), ("LK", lk), ("HK", hk),
+                ("APPLY_ROPE", fusedRope),
+            ]
+            let outputs = gemma4QKVNormPrefillSlidingPackKernelPg2(
+                [q, k, v, qWeight, kWeight, positionOffsets, ropeParameters.log2Base],
+                template: template2,
+                grid: (groups2 * rowsPerGroup2 * rowThreads, 1, 1),
+                threadGroup: (rowsPerGroup2 * rowThreads, 1, 1),
+                outputShapes: outputShapes,
+                outputDTypes: outputDTypes
+            )
+            if Gemma4PromptGlue2V1.xcheck {
+                let reference = gemma4QKVNormPrefillSlidingPackKernel(
+                    [q, k, v, qWeight, kWeight, positionOffsets, ropeParameters.log2Base],
+                    template: template,
+                    grid: (groups * rowsPerGroup * rowThreads, 1, 1),
+                    threadGroup: (rowsPerGroup * rowThreads, 1, 1),
+                    outputShapes: outputShapes,
+                    outputDTypes: outputDTypes
+                )
+                for index in 0 ..< (3 + batch) {
+                    Gemma4PromptGlue2V1.report(
+                        outputs[index], reference: reference[index],
+                        site: "qkv-norm-rope-pack output \(index)")
+                }
+            }
+            CBv2EngageMark.once("qkv-norm-rope-prefill-sliding")
+            Gemma4PromptGlue2V1.mark()
+            return (outputs[0], outputs[1], outputs[2], true, Array(outputs[3 ..< (3 + batch)]))
+        }
+        let outputs = gemma4QKVNormPrefillSlidingPackKernel(
+            [q, k, v, qWeight, kWeight, positionOffsets, ropeParameters.log2Base],
+            template: template,
+            grid: (groups * rowsPerGroup * rowThreads, 1, 1),
+            threadGroup: (rowsPerGroup * rowThreads, 1, 1),
+            outputShapes: outputShapes,
+            outputDTypes: outputDTypes
+        )
+        CBv2EngageMark.once("qkv-norm-rope-prefill-sliding")
+        return (outputs[0], outputs[1], outputs[2], true, Array(outputs[3 ..< (3 + batch)]))
+    }
     let outputs = gemma4QKVNormPrefillSlidingKernel(
         [q, k, v, qWeight, kWeight, positionOffsets, ropeParameters.log2Base],
-        template: [
-            ("T", q.dtype), ("D", dimension), ("Q_ROWS", qRows),
-            ("K_ROWS", kRows), ("TOTAL_ROWS", rows), ("RPT", rowsPerGroup),
-            ("LQ", lq), ("HQ", hq), ("LK", lk), ("HK", hk),
-            ("APPLY_ROPE", fusedRope),
-        ],
+        template: template,
         grid: (groups * rowsPerGroup * rowThreads, 1, 1),
         threadGroup: (rowsPerGroup * rowThreads, 1, 1),
         outputShapes: [
@@ -1437,7 +1970,7 @@ private func gemma4FusedQKVNormHeadMajorSliding(
         outputDTypes: [q.dtype, q.dtype, q.dtype]
     )
     if fusedRope { CBv2EngageMark.once("qkv-norm-rope-prefill-sliding") }
-    return (outputs[0], outputs[1], outputs[2], fusedRope)
+    return (outputs[0], outputs[1], outputs[2], fusedRope, nil)
 }
 
 private func gemma4FusedQKVNorm(
@@ -1723,15 +2256,24 @@ private enum Gemma4PrefillDeqGEMMV1 {
         }
         let key = ObjectIdentifier(quantized)
         planeLock.lock()
-        if let existing = cachedTransposedPlanes[key] {
-            planeLock.unlock()
-            return existing
-        }
+        let existing = cachedTransposedPlanes[key]
+        planeLock.unlock()
+        if let existing { return existing }
+        // DEQ-PLANE-LOCK-001: the plane is built and evaluated with no lock
+        // held (an evaluation under the table lock stalls any other prompt
+        // pass that reaches the table meanwhile); the table is then taken
+        // only to insert. A pass that built the same plane concurrently
+        // keeps the first entry — the same values from the same operation.
         let p = dequantized(
             quantized.weight, scales: quantized.scales, biases: biases,
             groupSize: quantized.groupSize, bits: quantized.bits, mode: quantized.mode
         ).transposed()
         eval(p)
+        planeLock.lock()
+        if let raced = cachedTransposedPlanes[key] {
+            planeLock.unlock()
+            return raced
+        }
         cachedTransposedPlanes[key] = p
         planeLock.unlock()
         return p
@@ -1958,10 +2500,15 @@ private class Gemma4Attention: Module {
     /// ORSFOLD-001: `carriedRunsum` is the table the resident attention kernel
     /// emitted for this exact activation; nil, or any table that misses the
     /// shape contract, falls through to the standalone prepass.
+    /// ORS-D512: a carried `[8, 256]` pair table (the D=512 dispatch-3
+    /// epilogue at 32-column tiles) takes the `_rsp2` o_proj body; a carried
+    /// `[8, 128]` table (64-column tiles) takes the established `_rsp` body.
     @inline(__always)
     private func outputProjection(
         _ x: MLXArray, carriedRunsum: MLXArray? = nil
     ) -> MLXArray {
+        let carriedPairs = CBv2AttentionOQMVV1.acceptRunsumPairTable(
+            carriedRunsum, for: x)
         guard let quantized = oProj as? QuantizedLinear,
             quantized.bias == nil,
             let projected = CBv2AttentionOQMVV1.matmul(
@@ -1972,9 +2519,12 @@ private class Gemma4Attention: Module {
                 groupSize: quantized.groupSize,
                 bits: quantized.bits,
                 mode: quantized.mode,
-                rsTable: CBv2AttentionOQMVV1.acceptRunsumTable(
-                    carriedRunsum, for: x)
-                    ?? CBv2AttentionOQMVV1.runsumTable(for: x))
+                rsTable: carriedPairs != nil
+                    ? nil
+                    : (CBv2AttentionOQMVV1.acceptRunsumTable(
+                        carriedRunsum, for: x)
+                        ?? CBv2AttentionOQMVV1.runsumTable(for: x)),
+                rsPairTable: carriedPairs)
         else { return Gemma4PrefillDeqGEMMV1.apply(oProj, x) ?? oProj(x) }
         return projected
     }
@@ -2299,11 +2849,17 @@ private class Gemma4Attention: Module {
             q: queryRaw, k: kRaw, v: vRaw,
             qWeight: qNorm.weight, kWeight: kNorm.weight, eps: config.rmsNormEps,
             positionOffsets: capturedOffsets,
-            ropeParameters: qkvRopeParameters, applyRope: lastQueryCache == nil)
+            ropeParameters: qkvRopeParameters, applyRope: lastQueryCache == nil,
+            packMirrors: lastQueryCache == nil)
         {
             // Sliding twin: also written head-major, with base-route RoPE.
             (queries, k, v) = (sliding.q, sliding.k, sliding.v)
             appliedRope = sliding.appliedRope
+            // PROMPT-GLUE (pg1): the mirrors packed beside these exact K/V
+            // arrays; the prompt commit takes them by identity.
+            if let mirrors = sliding.mirrors {
+                Gemma4PromptGlueV1.registerPackedMirrors(keys: k, values: v, mirrors: mirrors)
+            }
         } else {
             queries = qNorm(queryRaw).transposed(0, 2, 1, 3)
             k = kNorm(kRaw).transposed(0, 2, 1, 3)
@@ -2324,6 +2880,17 @@ private class Gemma4Attention: Module {
                 qWeight: qNorm.weight, kWeight: kNorm.weight,
                 positionOffsets: capturedOffsets,
                 ropeLog2Base: qkvRopeParameters.log2Base,
+                eps: config.rmsNormEps, appliedRope: appliedRope)
+        } else if vProj == nil, qkvRopeParameters.usesFrequencies {
+            // NORMROPE-D512: the full layers' store dispatch takes the raw
+            // k-eq-v projections and normalizes/rotates them once itself; a
+            // miss falls back to the arrays above.
+            _ = CBv2RaggedComposedD512DecodeAttentionV1.registerFullNormRope(
+                normalizedQueries: queries, normalizedKeys: k, normalizedValues: v,
+                rawQueries: queryRaw, rawKeys: kRaw, rawValues: vRaw,
+                qWeight: qNorm.weight, kWeight: kNorm.weight,
+                positionOffsets: capturedOffsets,
+                ropeFrequencies: qkvRopeParameters.frequencies,
                 eps: config.rmsNormEps, appliedRope: appliedRope)
         }
 

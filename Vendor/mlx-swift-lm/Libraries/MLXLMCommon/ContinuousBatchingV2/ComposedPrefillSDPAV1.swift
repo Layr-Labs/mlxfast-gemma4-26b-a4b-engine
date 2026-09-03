@@ -536,6 +536,143 @@ enum CBv2PrefillSoftmaxVecV1 {
         ensureRowContiguous: true
     )
 
+    /// PROMPT-GLUE2 (pg2): the transcription above with `RPT` rows per
+    /// threadgroup. One row per threadgroup leaves 16384 threadgroups of
+    /// 32..256 threads per query block and the dispatch bound by
+    /// threadgroup residency rather than by its bytes. Here `RPT` rows
+    /// share a threadgroup of `RPT * threadgroupSize` threads: thread
+    /// `tid` serves row `row_slot = tid / row_threads` with the incumbent's
+    /// `lid`, `simd_lane_id` and row-local `simd_group_id` (row_threads is
+    /// a multiple of 32, so a row's simdgroups are whole simdgroups), and
+    /// each row reduces through its own slot of the shared arrays. The
+    /// per-lane loads, the max and sum trees, the exp and the store are
+    /// the incumbent's text over the same lanes and the same operands; the
+    /// two barriers order the same write/read pairs, now for every row of
+    /// the threadgroup at once. A trailing partial threadgroup (when the
+    /// row count is not a multiple of `RPT`) holds whole rows, since the
+    /// grid is a multiple of the row width.
+    private static let sourcePg2 = """
+        const int axis_size = int(params[0]);
+        const int num_simdgroups = int(params[1]);
+
+        // PROMPT-GLUE2 (pg2): RPT rows share one threadgroup. `row_slot` is
+        // this thread's row within the threadgroup; `gid`, `lid`, `simd_lane_id`
+        // and `simd_group_id` are the incumbent's values for that row (row_threads
+        // is a multiple of 32, so a row's simdgroups are whole simdgroups), and
+        // the body below is the incumbent's text over the same lanes and the same
+        // operands, indexing the row's own slot of the shared arrays.
+        const int row_threads = num_simdgroups * 32;
+        const int tid = int(thread_position_in_threadgroup.x);
+        const int row_slot = tid / row_threads;
+        const int gid = int(threadgroup_position_in_grid.x) * RPT + row_slot;
+        const int lid = tid - row_slot * row_threads;
+        const int simd_lane_id = int(thread_index_in_simdgroup);
+        const int simd_group_id = int(simdgroup_index_in_threadgroup) - row_slot * num_simdgroups;
+
+        threadgroup float local_max[RPT][32];
+        threadgroup float local_normalizer[RPT][32];
+
+        typedef vec<T, 4> T4;
+
+        float ld[4];
+        const int base = lid * 4;
+        const bool row_valid = base < axis_size;
+        const device T* row_in = scores + size_t(gid) * axis_size;
+        if (row_valid) {
+            T4 raw = *reinterpret_cast<const device T4*>(row_in + base);
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                ld[i] = static_cast<float>(raw[i]);
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                ld[i] = -INFINITY;
+            }
+        }
+
+        // MAX. Phase-2 write is UNCHANGED from the stock kernel: only
+        // simdgroup_id == 0's lane owns slot 0, only simdgroup_id == 1's
+        // lane owns slot 1, and so on -- exactly the stock
+        // `local_max[row_slot][simd_group_id] = maxval` write.
+        float maxval = -3.402823466e+38F;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            maxval = (maxval < ld[i]) ? ld[i] : maxval;
+        }
+        maxval = simd_max(maxval);
+        if (simd_lane_id == 0) {
+            local_max[row_slot][simd_group_id] = maxval;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            // Every simdgroup reads the SAME 32 conceptual values the
+            // stock kernel's simdgroup-0-only combine read: the real
+            // partial in slots < num_simdgroups (just published above,
+            // visible threadgroup-wide after the barrier), and the
+            // literal max-identity (-INFINITY, i.e. Limits<float>::min)
+            // in the rest -- substituted here in a register instead of
+            // read back from a zero-filled slot, since no thread ever
+            // wrote a real value there. Same simd_max instruction, same
+            // per-lane operand set as the stock combine: bit-identical
+            // result in every simdgroup, no publish-back needed.
+            float slot = (simd_lane_id < num_simdgroups)
+                ? local_max[row_slot][simd_lane_id] : -INFINITY;
+            maxval = simd_max(slot);
+        }
+
+        float normalizer = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            float exp_x = fast::exp(ld[i] - maxval);
+            ld[i] = exp_x;
+            normalizer += exp_x;
+        }
+        normalizer = simd_sum(normalizer);
+        if (simd_lane_id == 0) {
+            local_normalizer[row_slot][simd_group_id] = normalizer;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            // Same argument as the max combine above, for the sum: the
+            // sum-identity is 0.0f (Limits<float> has no analogue here --
+            // the stock kernel zero-fills `local_normalizer` directly).
+            float slot = (simd_lane_id < num_simdgroups)
+                ? local_normalizer[row_slot][simd_lane_id] : 0.0f;
+            normalizer = simd_sum(slot);
+        }
+        normalizer = 1.0f / normalizer;
+
+        if (row_valid) {
+            device T* row_out = probs + size_t(gid) * axis_size;
+            T4 result;
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                result[i] = static_cast<T>(ld[i] * normalizer);
+            }
+            *reinterpret_cast<device T4*>(row_out + base) = result;
+        }
+        """
+
+    private static let kernelPg2: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_prefill_sdpa_softmax_vec_bf16_pg2",
+        inputNames: ["scores", "params"],
+        outputNames: ["probs"],
+        source: sourcePg2,
+        ensureRowContiguous: true
+    )
+
+    /// Rows per threadgroup for the pg2 twin, by key length: the measured
+    /// optimum of the ranked geometry (any value is exact); other lengths
+    /// take about 640 threads per threadgroup.
+    static func rowsPerThreadgroup(axisSize: Int, threadgroupSize: Int) -> Int {
+        let table: [Int: Int] = [
+            1024: 2, 896: 2, 768: 3, 640: 4, 512: 6, 384: 6, 256: 10, 128: 16,
+        ]
+        if let rows = table[axisSize] { return rows }
+        return max(1, min(640 / threadgroupSize, 1024 / threadgroupSize))
+    }
+
     /// Runs the vectorized softmax, or returns nil to keep the caller on
     /// the stock `MLX.softmax(scores, axis: -1, precise: true)` call.
     /// `scores` may be any contiguous rank; it is treated as a flat
@@ -554,6 +691,39 @@ enum CBv2PrefillSoftmaxVecV1 {
         guard threadgroupSize > 0, threadgroupSize <= 1024 else { return nil }
         let numSimdgroups = threadgroupSize / 32
         let paramsArray = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
+
+        // PROMPT-GLUE2 (pg2): prompt-width score rectangles take the
+        // rows-per-threadgroup twin; the incumbent computes the identical
+        // words for every other rectangle.
+        if Gemma4PromptGlue2V1.enabled, nRows >= Gemma4PromptGlue2V1.minRows {
+            let rows = rowsPerThreadgroup(axisSize: axisSize, threadgroupSize: threadgroupSize)
+            if rows > 1, rows * threadgroupSize <= 1024 {
+                CBv2EngageMark.once("prefill-softmax-vec")
+                Gemma4PromptGlue2V1.mark()
+                let probs = kernelPg2(
+                    [scores, paramsArray],
+                    template: [("T", scores.dtype), ("RPT", rows)],
+                    grid: (threadgroupSize * nRows, 1, 1),
+                    threadGroup: (threadgroupSize * rows, 1, 1),
+                    outputShapes: [scores.shape],
+                    outputDTypes: [.bfloat16]
+                )[0]
+                if Gemma4PromptGlue2V1.xcheck {
+                    let reference = kernel(
+                        [scores, paramsArray],
+                        template: [("T", scores.dtype)],
+                        grid: (threadgroupSize * nRows, 1, 1),
+                        threadGroup: (threadgroupSize, 1, 1),
+                        outputShapes: [scores.shape],
+                        outputDTypes: [.bfloat16]
+                    )[0]
+                    Gemma4PromptGlue2V1.report(
+                        probs, reference: reference,
+                        site: "softmax kL=\(axisSize) rows/tg=\(rows)")
+                }
+                return probs
+            }
+        }
 
         CBv2EngageMark.once("prefill-softmax-vec")
         return kernel(

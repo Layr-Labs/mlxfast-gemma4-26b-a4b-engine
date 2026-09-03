@@ -10,6 +10,7 @@ import MLXLMCommon
 import MLXNN
 
 // Yukon executable-equivalent frontier sample: delordemm1 / e8f / de1.
+// Yukon final bounded frontier sample: delordemm1 / 326547c / de2.
 
 // MARK: - vMLX decode hot-path helpers (ported from osaurus/main Gemma4Text)
 //

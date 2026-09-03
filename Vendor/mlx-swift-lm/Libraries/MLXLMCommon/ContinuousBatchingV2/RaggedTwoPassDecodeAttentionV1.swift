@@ -13,6 +13,98 @@ import Foundation
 import MLX
 import MLXFast
 
+    /// DECODE-META-MEMO. The decode round rebuilds the same small constant
+    /// tables once per layer per step: the ring start positions
+    /// (`MLXArray(starts.map(UInt32.init), [batch])` at every sliding-layer
+    /// entry point) and the D512 chain's dimension/capacity `params` vector
+    /// (`MLXArray(params)` at every full-attention entry point). The values
+    /// are pure functions of internal ring state that every layer of a step
+    /// shares, so each table is built once per distinct value vector instead
+    /// of once per layer, replacing thousands of per-round host allocations
+    /// and graph leaves with one build and per-layer table hits.
+    ///
+    /// Exactness: a cached array is produced by the incumbent's own
+    /// expression from the same values, so it is bit-identical to the array
+    /// the incumbent would have built, and the consuming kernels see the
+    /// same operand words. A cached entry is a read-only INPUT and is never
+    /// a mutated output, which is why sharing one across graphs and steps is
+    /// safe -- the same argument the composed-SDPA causal-mask caches rely
+    /// on. Keys are internal ring positions and buffer dimensions; no
+    /// request token ever enters a key.
+    ///
+    /// Bounded: a table is dropped wholesale at `decodeMetaMemoMaxEntries`,
+    /// so a pathological value stream cannot grow it without limit.
+    ///
+    /// `DARKBLOOM_CBV2_DECODE_META_MEMO=0` restores the per-call
+    /// construction at every site below.
+let decodeMetaMemoEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_CBV2_DECODE_META_MEMO"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+let decodeMetaMemoMaxEntries = 128
+
+let decodeMetaMemoLock = NSLock()
+nonisolated(unsafe) var decodeMetaStartsMemo: [[Int]: MLXArray] = [:]
+nonisolated(unsafe) var decodeMetaParamsMemo: [[UInt32]: MLXArray] = [:]
+
+/// The incumbent's own `MLXArray(starts.map(UInt32.init), [batch])`,
+/// built at most once per distinct start-position vector.
+func decodeMetaStartsArray(_ starts: [Int], batch: Int) -> MLXArray {
+    guard decodeMetaMemoEnabled else {
+        return MLXArray(starts.map(UInt32.init), [batch])
+    }
+    CBv2EngageMark.once("decode-meta-memo")
+    decodeMetaMemoLock.lock()
+    if let hit = decodeMetaStartsMemo[starts] {
+        decodeMetaMemoLock.unlock()
+        return hit
+    }
+    decodeMetaMemoLock.unlock()
+    let built = MLXArray(starts.map(UInt32.init), [batch])
+    eval(built)
+    decodeMetaMemoLock.lock()
+    if let raced = decodeMetaStartsMemo[starts] {
+        decodeMetaMemoLock.unlock()
+        return raced
+    }
+    if decodeMetaStartsMemo.count >= decodeMetaMemoMaxEntries {
+        decodeMetaStartsMemo.removeAll(keepingCapacity: true)
+    }
+    decodeMetaStartsMemo[starts] = built
+    decodeMetaMemoLock.unlock()
+    return built
+}
+
+/// The incumbent's own `MLXArray(params)`, built at most once per distinct
+/// dimension/capacity vector.
+func decodeMetaParamsArray(_ params: [UInt32]) -> MLXArray {
+    guard decodeMetaMemoEnabled else {
+        return MLXArray(params)
+    }
+    CBv2EngageMark.once("decode-meta-memo")
+    decodeMetaMemoLock.lock()
+    if let hit = decodeMetaParamsMemo[params] {
+        decodeMetaMemoLock.unlock()
+        return hit
+    }
+    decodeMetaMemoLock.unlock()
+    let built = MLXArray(params)
+    eval(built)
+    decodeMetaMemoLock.lock()
+    if let raced = decodeMetaParamsMemo[params] {
+        decodeMetaMemoLock.unlock()
+        return raced
+    }
+    if decodeMetaParamsMemo.count >= decodeMetaMemoMaxEntries {
+        decodeMetaParamsMemo.removeAll(keepingCapacity: true)
+    }
+    decodeMetaParamsMemo[params] = built
+    decodeMetaMemoLock.unlock()
+    return built
+}
 public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     private static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
@@ -2867,7 +2959,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             })
         else { return nil }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = decodeMetaStartsArray(starts, batch: batch)
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let passA = portQuantReadKernel(
@@ -2938,7 +3030,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             })
         else { return nil }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = decodeMetaStartsArray(starts, batch: batch)
         let inputs = [queries] + mirrors
             + [startArray, newKeys, newValues, previousWriteFence]
         if q4ResidentMergeEnabled,
@@ -3078,7 +3170,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             starts.count == batch,
             starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength })
         else { return nil }
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = decodeMetaStartsArray(starts, batch: batch)
         return attend(
             passAKernel: ringPassAKernel, queries: queries, keys: keys, values: values,
             extraInputs: [startArray], scale: scale)
@@ -3131,7 +3223,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             else { return nil }
         }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = decodeMetaStartsArray(starts, batch: batch)
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let paired = gqaPairedPassAEnabled && gqa == 2
@@ -5371,7 +5463,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             valueBuffers.append(state[1])
             params.append(UInt32(state[0].dim(2)))
         }
-        let paramsArray = MLXArray(params)
+        let paramsArray = decodeMetaParamsArray(params)
 
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)
@@ -5574,7 +5666,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             valueBuffers.append(state[1])
             params.append(UInt32(state[0].dim(2)))
         }
-        let paramsArray = MLXArray(params)
+        let paramsArray = decodeMetaParamsArray(params)
 
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)
@@ -5792,7 +5884,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         queries: MLXArray, keyBuffers: [MLXArray], valueBuffers: [MLXArray],
         params: [UInt32], keyLength: Int
     ) -> MLXArray {
-        let paramsArray = MLXArray(params)
+        let paramsArray = decodeMetaParamsArray(params)
 
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)

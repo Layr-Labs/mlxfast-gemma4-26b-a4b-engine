@@ -45,21 +45,21 @@
 // the prior parity receipts on this track used, and the local runtime parity
 // test pins it bitwise.) Only the grid differs from the stock road.
 //
-// LMH-002 (this submission). The header's short walks whose trip counts are
-// already compile-time constants -- the affine-4 registered dot's lane walk
-// (values_per_thread / 4), load_vector's fixed-count value walk, the
-// four-row cohort walks (results_per_simdgroup), the packed uint16 walk
-// (uint16_per_thread), and the final four-row SIMD reduction -- now carry
-// `#pragma clang loop unroll(full)`. The K traversal is NOT annotated: its
-// trip count comes from the live input shape. No address, predicate,
-// accumulation order, or arithmetic expression is changed, so the bitwise
-// parity this file pins is unaffected; only loop-control codegen differs.
-// The kernel name is versioned to `..._unroll_v3` so the named MLX kernel
-// cache cannot satisfy the new request with the previously compiled body.
-// Mechanism inherited from fkiene's promoted `22154b54` (DenseMLPQMVV1).
+// LMH-002 (this submission). The affine-4 K walk previously stopped at a
+// strict-less-than boundary, leaving a fully aligned terminal block for the
+// safe remainder path. At the pinned K=2816, block_size=256 geometry, that
+// path made every lane perform a clamped tail classification and four
+// bounds-aware loads even though every lane owned eight valid values. The
+// walk now admits `k == in_vec_size - block_size`; the residual path uses the
+// group-aligned active-lane count and ordinary loads. The guard requires
+// `inDim % 64 == 0`, so the residual is always a whole number of eight-value
+// lanes. Arithmetic and accumulation order are unchanged. Kernel names are
+// versioned so the MLX cache cannot return the old body.
 //
 // `DARKBLOOM_CBV2_TIED_LMHEAD_QMV=0` restores the stock path inside the same
-// executable.
+// executable. `DARKBLOOM_CBV2_TIED_LMHEAD_ALIGNED_FINAL_BLOCK=0` also
+// restores the stock path, bypassing this custom kernel.
+//
 
 import Foundation
 import MLX
@@ -77,6 +77,15 @@ public enum CBv2TiedLMHeadQMVV1 {
     private static let packed32Enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_TIED_LMHEAD_PACKED32"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+    /// The aligned tied-head K walk admits its terminal full block in the
+    /// ordinary load path instead of sending it through the safe tail.
+    /// `DARKBLOOM_CBV2_TIED_LMHEAD_ALIGNED_FINAL_BLOCK=0` restores stock.
+    private static let alignedFinalBlockEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_TIED_LMHEAD_ALIGNED_FINAL_BLOCK"]
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
@@ -338,7 +347,7 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
   y3 += out_row;
 
   int k = 0;
-  for (; k < in_vec_size - block_size; k += block_size) {
+  for (; k <= in_vec_size - block_size; k += block_size) {
     #pragma clang loop unroll(full)
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint16_t* wl =
@@ -385,11 +394,8 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     x3 += block_size;
   }
 
-  const int remaining = clamp(
-      static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
-      0,
-      values_per_thread);
-  if (remaining > 0) {
+  const uint active_tail_lanes = uint((in_vec_size - k) / values_per_thread);
+  if (simd_lid < active_tail_lanes) {
     #pragma clang loop unroll(full)
     for (int row = 0; row < results_per_simdgroup; row++) {
       const device uint16_t* wl =
@@ -402,47 +408,29 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
       bias_local[row] = biases[row * in_vec_size_g];
     }
 
-    float sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x0, x_thread, remaining);
+    float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
     #pragma clang loop unroll(full)
     for (int row = 0; row < results_per_simdgroup; row++) {
       result0[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
-    sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x1, x_thread, remaining);
+    sum = load_vector<T, float, values_per_thread, 4>(x1, x_thread);
     #pragma clang loop unroll(full)
     for (int row = 0; row < results_per_simdgroup; row++) {
       result1[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
-    sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x2, x_thread, remaining);
+    sum = load_vector<T, float, values_per_thread, 4>(x2, x_thread);
     #pragma clang loop unroll(full)
     for (int row = 0; row < results_per_simdgroup; row++) {
       result2[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
-    sum =
-        load_vector_safe<T, float, values_per_thread, 4>(x3, x_thread, remaining);
+    sum = load_vector<T, float, values_per_thread, 4>(x3, x_thread);
     #pragma clang loop unroll(full)
     for (int row = 0; row < results_per_simdgroup; row++) {
       result3[row] += qdot_affine4_registered<float, values_per_thread>(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
-    }
-  }
-
-  #pragma clang loop unroll(full)
-  for (int row = 0; row < results_per_simdgroup; row++) {
-    result0[row] = simd_sum(result0[row]);
-    result1[row] = simd_sum(result1[row]);
-    result2[row] = simd_sum(result2[row]);
-    result3[row] = simd_sum(result3[row]);
-    if (simd_lid == 0) {
-      y0[row] = static_cast<T>(result0[row]);
-      y1[row] = static_cast<T>(result1[row]);
-      y2[row] = static_cast<T>(result2[row]);
-      y3[row] = static_cast<T>(result3[row]);
     }
   }
 }
@@ -528,7 +516,7 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     }()
 
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_tied_lmhead_qmv_affine4_g64_quad_stream_unroll_v3",
+        name: "cbv2_b8_tied_lmhead_qmv_affine4_g64_quad_stream_unroll_v4",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -566,7 +554,7 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
     )
 
     private static let packed32Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_tied_lmhead_qmv_affine4_g64_quad_stream_packed32_v1",
+        name: "cbv2_b8_tied_lmhead_qmv_affine4_g64_quad_stream_packed32_v2",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -615,7 +603,7 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
         // Every dimension is validated against every other, so the gate is a
         // full shape pin at runtime even though the tower's hidden size is not
         // written as a literal here.
-        guard enabled,
+        guard enabled, alignedFinalBlockEnabled,
             let biases,
             x.dtype == .bfloat16,
             scales.dtype == x.dtype,
@@ -640,6 +628,7 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
 
         let xGroups = batch / rowsPerGroup
         let yGroups = outDim / outputsPerGroup
+        CBv2EngageMark.once("tied-lmhead-aligned-final-block")
         let selectedKernel: MLXFast.MLXFastKernel
         if packed32Enabled {
             CBv2EngageMark.once("tied-lmhead-packed32")

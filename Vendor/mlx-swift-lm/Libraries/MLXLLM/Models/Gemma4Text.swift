@@ -1079,6 +1079,7 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
     source: """
         constexpr uint reads = 4;
         constexpr uint row_threads = D / reads;
+        constexpr uint row_simds = row_threads / 32;
         const uint tid = thread_position_in_threadgroup.x;
         const uint slot = tid / row_threads;
         const uint lid = tid - slot * row_threads;
@@ -1087,7 +1088,6 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
         const uint row_simd = lid / 32;
 
         threadgroup float partials[RPT][32];
-        threadgroup float inv_rms[RPT];
         threadgroup T rounded[RPT][D];
         threadgroup uint row_position[RPT];
 
@@ -1138,22 +1138,22 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
         }
         sum = simd_sum(sum);
 
-        // Slots 2..31 stay exactly zero, so the 32-lane combine returns the
-        // two simdgroup partials' sum whatever order the tree adds them in.
-        if (row_simd == 0) partials[slot][lane] = 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Lanes at or above row_simds contribute exactly zero, so the 32-lane
+        // combine returns the simdgroup partials' sum whatever order the tree
+        // adds them in.
         if (lane == 0) partials[slot][row_simd] = sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (row_simd == 0) {
-            sum = simd_sum(partials[slot][lane]);
-            if (lane == 0) {
-                inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // pg2's combine. Every simdgroup of the row reduces the same
+        // thirty-two operands the incumbent's first simdgroup reduced: the
+        // partials below row_simds, and the zero-fill's 0.0f from a register
+        // above it. Each therefore holds the bit-identical inverse rms with
+        // no zero-fill pass and no publish-back barrier.
+        sum = simd_sum(lane < row_simds ? partials[slot][lane] : 0.0f);
+        const float row_inverse_rms =
+            metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
 
         if (row >= TOTAL_ROWS) return;
-        const float inverse_rms = inv_rms[slot];
+        const float inverse_rms = row_inverse_rms;
         for (uint i = 0; i < reads; ++i) {
             const T normalized = T(float(input[i]) * inverse_rms);
             if (APPLY_ROPE) {
@@ -1279,6 +1279,7 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
     source: """
         constexpr uint reads = 4;
         constexpr uint row_threads = D / reads;
+        constexpr uint row_simds = row_threads / 32;
         const uint tid = thread_position_in_threadgroup.x;
         const uint slot = tid / row_threads;
         const uint lid = tid - slot * row_threads;
@@ -1287,7 +1288,6 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
         const uint row_simd = lid / 32;
 
         threadgroup float partials[RPT][32];
-        threadgroup float inv_rms[RPT];
         threadgroup T rounded[RPT][D];
         threadgroup uint row_position[RPT];
 
@@ -1342,20 +1342,19 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
         }
         sum = simd_sum(sum);
 
-        if (row_simd == 0) partials[slot][lane] = 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (lane == 0) partials[slot][row_simd] = sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (row_simd == 0) {
-            sum = simd_sum(partials[slot][lane]);
-            if (lane == 0) {
-                inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // pg2's combine. Every simdgroup of the row reduces the same
+        // thirty-two operands the incumbent's first simdgroup reduced: the
+        // partials below row_simds, and the zero-fill's 0.0f from a register
+        // above it. Each therefore holds the bit-identical inverse rms with
+        // no zero-fill pass and no publish-back barrier.
+        sum = simd_sum(lane < row_simds ? partials[slot][lane] : 0.0f);
+        const float row_inverse_rms =
+            metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
 
         if (row >= TOTAL_ROWS) return;
-        const float inverse_rms = inv_rms[slot];
+        const float inverse_rms = row_inverse_rms;
         for (uint i = 0; i < reads; ++i) {
             const T normalized = T(float(input[i]) * inverse_rms);
             if (APPLY_ROPE && weighted) {
@@ -1419,6 +1418,7 @@ private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
     source: """
         constexpr uint reads = 4;
         constexpr uint row_threads = D / reads;
+        constexpr uint row_simds = row_threads / 32;
         constexpr uint mirror_row_words = D / 8 + D / 64;
         const uint tid = thread_position_in_threadgroup.x;
         const uint slot = tid / row_threads;
@@ -1428,7 +1428,6 @@ private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
         const uint row_simd = lid / 32;
 
         threadgroup float partials[RPT][32];
-        threadgroup float inv_rms[RPT];
         threadgroup T rounded[RPT][D];
         threadgroup uint row_position[RPT];
         threadgroup T final_vals[RPT][D];
@@ -1491,20 +1490,19 @@ private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
         }
         sum = simd_sum(sum);
 
-        if (row_simd == 0) partials[slot][lane] = 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         if (lane == 0) partials[slot][row_simd] = sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (row_simd == 0) {
-            sum = simd_sum(partials[slot][lane]);
-            if (lane == 0) {
-                inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // pg2's combine. Every simdgroup of the row reduces the same
+        // thirty-two operands the incumbent's first simdgroup reduced: the
+        // partials below row_simds, and the zero-fill's 0.0f from a register
+        // above it. Each therefore holds the bit-identical inverse rms with
+        // no zero-fill pass and no publish-back barrier.
+        sum = simd_sum(lane < row_simds ? partials[slot][lane] : 0.0f);
+        const float row_inverse_rms =
+            metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
 
         if (valid) {
-            const float inverse_rms = inv_rms[slot];
+            const float inverse_rms = row_inverse_rms;
             for (uint i = 0; i < reads; ++i) {
                 const T normalized = T(float(input[i]) * inverse_rms);
                 if (APPLY_ROPE && weighted) {
@@ -5057,6 +5055,46 @@ private let gemma4DenseGateUpJoinEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+/// DENSE-GEGLU-EPILOGUE. Fold the dense MLP's GeGLU into the store epilogue
+/// of the single prefill GEMM over the paired gate|up dequantized plane.
+///
+/// Mechanism. On the prefill road the dense gate/up projections are two
+/// `Gemma4PrefillDeqGEMMV1` dispatches over separately cached transposed bf16
+/// planes, followed by the shaped GeGLU product. This arm builds ONE
+/// 16-gate/16-up interleaved `[2816, 4224]` plane (a pure permutation of the
+/// same dequantized bytes; no weight is re-quantized or re-represented), runs
+/// one `MLX.matmul`, and the specialized kernel epilogue in
+/// `steel_gemm_fused[_nax]` closes GeGLU from the paired MMA fragments and
+/// stores the compact `[rows, 2112]` plane in the physical prefix of the
+/// ordinary `[rows, 4224]` allocation. The second GEMM dispatch, the standalone
+/// GeGLU dispatch, and one full read of the activation plane all disappear.
+///
+/// Exactness. The paired plane is a transposed view of a contiguous
+/// `[4224, 2816]` row-major matrix, exactly like the split planes, so the
+/// dispatch stays the same transpose_b steel GEMM with the same tile
+/// parameters (they depend on dtype/transposes, never on N; 4224 keeps every
+/// alignment predicate 2112 satisfies), and every output column's K-chain is
+/// bit-identical. The epilogue rounds each accumulator to bfloat16 at the same
+/// boundary as the two split stores, then reproduces the compiled GeGLU tape
+/// (`gemma4_dense_geglu_compiled_tape`, a dedicated copy of the promoted
+/// expert-path function) before storing the compact plane.
+///
+/// Admission mirrors the kernel-side uniform predicate exactly: nt bf16
+/// matmul, per-slice `M >= 512`, `N == 4224`, `K == 2816`, on the deq-GEMM
+/// road only (`x.size / 2816 >= Gemma4PrefillDeqGEMMV1.minRows`). Decode,
+/// verify, MTP rectangles and sub-floor chunks keep the incumbent paths.
+///
+/// Kill switch: `DARKBLOOM_GEMMA4_DENSE_GEGLU_EPILOGUE=0` (also false/no/off)
+/// never builds the paired plane, so the kernel predicate can never observe
+/// its geometry and the incumbent path runs exactly as before.
+/// Engage mark: `dense-geglu-epilogue-prefill`.
+private let gemma4DenseGeGLUEpilogueEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DENSE_GEGLU_EPILOGUE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 private class Gemma4MLP: Module {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
@@ -5077,6 +5115,122 @@ private class Gemma4MLP: Module {
 
     fileprivate func bindFusedGateUpStorage(_ storage: Gemma4DenseGateUpStorage) {
         fusedGateUpStorage = storage
+    }
+
+    // MARK: DENSE-GEGLU-EPILOGUE (prefill)
+
+    private static let pairedPlaneLock = NSLock()
+    nonisolated(unsafe) private static var cachedPairedGateUpPlanes:
+        [ObjectIdentifier: MLXArray] = [:]
+
+    /// Drop only the dequantized paired planes retained by the prompt-only
+    /// GeGLU path. The caller invokes this after a completed prompt graph and
+    /// before the first short target forward; no MLX-wide allocator cache is
+    /// touched, and a later prompt rebuilds the planes normally.
+    fileprivate static func releaseCachedPairedGateUpPlanes() -> Int {
+        pairedPlaneLock.lock()
+        let retired = cachedPairedGateUpPlanes
+        cachedPairedGateUpPlanes = [:]
+        pairedPlaneLock.unlock()
+        return retired.count
+    }
+
+    /// Build the `[2816, 4224]` bf16 plane whose columns interleave one
+    /// 16-column gate block with the matching 16-column up block, as a
+    /// transposed view of a contiguous `[4224, 2816]` row-major matrix so the
+    /// matmul keeps the split planes' transpose_b dispatch. A pure
+    /// permutation of the same `dequantized` bytes the split planes hold; no
+    /// weight is re-quantized or re-represented.
+    private static func buildPairedGateUpPlane(
+        gate: QuantizedLinear, gateBiases: MLXArray,
+        up: QuantizedLinear, upBiases: MLXArray
+    ) -> MLXArray? {
+        guard gate.weight.shape == [2112, 704], up.weight.shape == [2112, 704],
+            gate.scales.shape == [2112, 44], up.scales.shape == [2112, 44],
+            gateBiases.shape == [2112, 44], upBiases.shape == [2112, 44]
+        else { return nil }
+        let gateDQ = dequantized(
+            gate.weight, scales: gate.scales, biases: gateBiases,
+            groupSize: gate.groupSize, bits: gate.bits, mode: gate.mode)
+        let upDQ = dequantized(
+            up.weight, scales: up.scales, biases: upBiases,
+            groupSize: up.groupSize, bits: up.bits, mode: up.mode)
+        let paired = MLX.stacked(
+            [
+                gateDQ.reshaped(132, 16, 2816),
+                upDQ.reshaped(132, 16, 2816),
+            ], axis: 1
+        ).reshaped(4224, 2816).transposed()
+        eval(paired)
+        return paired
+    }
+
+    /// Per-layer cache under the same DEQ-PLANE-LOCK-001 discipline as the
+    /// split planes; `DARKBLOOM_GEMMA4_PREFILL_DEQ_CACHE=0` restores a
+    /// dynamic build on every call.
+    private static func pairedGateUpPlane(
+        gate: QuantizedLinear, gateBiases: MLXArray,
+        up: QuantizedLinear, upBiases: MLXArray
+    ) -> MLXArray? {
+        guard Gemma4PrefillDeqGEMMV1.cacheEnabled else {
+            return buildPairedGateUpPlane(
+                gate: gate, gateBiases: gateBiases, up: up, upBiases: upBiases)
+        }
+        let key = ObjectIdentifier(gate)
+        pairedPlaneLock.lock()
+        let existing = cachedPairedGateUpPlanes[key]
+        pairedPlaneLock.unlock()
+        if let existing { return existing }
+        guard let paired = buildPairedGateUpPlane(
+            gate: gate, gateBiases: gateBiases, up: up, upBiases: upBiases)
+        else { return nil }
+        pairedPlaneLock.lock()
+        if let raced = cachedPairedGateUpPlanes[key] {
+            pairedPlaneLock.unlock()
+            return raced
+        }
+        cachedPairedGateUpPlanes[key] = paired
+        pairedPlaneLock.unlock()
+        return paired
+    }
+
+    /// One prefill GEMM over the paired gate|up plane whose kernel epilogue
+    /// closes GeGLU and stores the compact `[.., 2112]` activated plane in the
+    /// physical prefix of the ordinary `[.., 4224]` output allocation. The
+    /// Swift admission mirrors the kernel-side uniform predicate exactly;
+    /// a nil keeps the incumbent split road untouched.
+    fileprivate func zipPrefillGateUpGeGLU(_ x: MLXArray) -> MLXArray? {
+        guard gemma4DenseGeGLUEpilogueEnabled,
+            Gemma4PrefillDeqGEMMV1.enabled,
+            let gate = gateProj as? QuantizedLinear,
+            let up = upProj as? QuantizedLinear,
+            gate.bias == nil, up.bias == nil,
+            gate.groupSize == 64, up.groupSize == gate.groupSize,
+            gate.bits == 8, up.bits == gate.bits,
+            gate.mode == .affine, up.mode == gate.mode,
+            gate.weight.dtype == .uint32, up.weight.dtype == .uint32,
+            gate.weight.shape == [2112, 704], up.weight.shape == [2112, 704],
+            gate.scales.dtype == .bfloat16, up.scales.dtype == .bfloat16,
+            gate.scales.shape == [2112, 44], up.scales.shape == [2112, 44],
+            let gateBiases = gate.biases, gateBiases.dtype == .bfloat16,
+            gateBiases.shape == [2112, 44],
+            let upBiases = up.biases, upBiases.dtype == .bfloat16,
+            upBiases.shape == [2112, 44],
+            x.dtype == .bfloat16, x.ndim >= 2,
+            x.dim(-1) == 2816, x.dim(-2) >= 512,
+            x.size / 2816 >= Gemma4PrefillDeqGEMMV1.minRows,
+            let plane = Self.pairedGateUpPlane(
+                gate: gate, gateBiases: gateBiases, up: up, upBiases: upBiases)
+        else { return nil }
+        let joined = MLX.matmul(x, plane)
+        CBv2EngageMark.once("dense-geglu-epilogue-prefill")
+        // The specialized store writes the compact plane densely into the
+        // first physical half of the ordinary N=4224 allocation. Preserve
+        // that physical row stride when exposing the logical N=2112 result;
+        // slicing the last axis would retain the allocation's 4224 stride.
+        var activatedShape = x.shape
+        activatedShape[activatedShape.count - 1] = 2112
+        return joined.flattened()[..<(joined.size / 2)].reshaped(activatedShape)
     }
 
     /// DMLP-001: route only the pinned batch-eight/decode-one affine-8 dense
@@ -5108,6 +5262,11 @@ private class Gemma4MLP: Module {
         _ x: MLXArray,
         activationSums producerSums: CBv2DenseMLPQMVV1.ActivationSums? = nil
     ) -> MLXArray {
+        // DENSE-GEGLU-EPILOGUE: the exact prefill geometry closes GeGLU inside
+        // the single paired GEMM; every other rectangle falls through.
+        if let activated = zipPrefillGateUpGeGLU(x) {
+            return denseProjection(downProj, activated)
+        }
         // DMLP-002: one exact activation-sum prepass feeds both fallback
         // projections. If either projection is not the pinned affine8 cell,
         // the candidate arrays remain unevaluated and stock takes over.
@@ -6276,6 +6435,13 @@ public class Gemma4TextModelInner: Module {
     let lastFullAttentionNonSharedIdx: Int
     let lastSlidingAttentionNonSharedIdx: Int
 
+    /// Constructor warmup intentionally leaves the prompt-only paired dense
+    /// planes resident so a phase's first large prefill does not rebuild them.
+    /// Once startup is complete, the first short target forward retires those
+    /// planes after the preceding prompt graph has been host-confirmed.
+    private var denseGeGLUStartupWarmupComplete = false
+    private var denseGeGLUPrefillCacheMayBeLive = false
+
     public init(
         _ config: Gemma4TextConfiguration, forceSharedKV: Bool = false,
         fuseWeightedUnsort: Bool = false
@@ -6337,6 +6503,11 @@ public class Gemma4TextModelInner: Module {
         self.lastSlidingAttentionNonSharedIdx = lastSliding
 
         super.init()
+    }
+
+    fileprivate func armDenseGeGLUPrefillCacheRetirement() {
+        denseGeGLUStartupWarmupComplete = true
+        denseGeGLUPrefillCacheMayBeLive = true
     }
     public func callAsFunction(
         _ inputs: MLXArray,
@@ -6467,6 +6638,23 @@ public class Gemma4TextModelInner: Module {
         // policy check while the host is building the decode graph.
         let inputBatchSize = inputs.dim(0)
         let inputLength = inputs.dim(1)
+
+        // DENSE-GEGLU-LIFETIME-001: the paired BF16 planes serve only large
+        // prompt GEMMs. Constructor warmup is outside every scored window and
+        // deliberately keeps them resident through the following seed prefill.
+        // The first short target forward occurs only after that seed graph has
+        // been finalized, so retire the prompt-only strong references here
+        // without flushing MLX's global allocator or pipeline caches.
+        if denseGeGLUStartupWarmupComplete,
+            denseGeGLUPrefillCacheMayBeLive,
+            inputLength < 512
+        {
+            let released = Gemma4MLP.releaseCachedPairedGateUpPlanes()
+            denseGeGLUPrefillCacheMayBeLive = false
+            if released > 0 {
+                CBv2EngageMark.once("dense-geglu-prefill-cache-retired")
+            }
+        }
 
         // Vision prefill (mirrors the inline VLM twin `TextModel.callAsFunction`):
         // `inputEmbedding` — the scaled text embeddings with image soft-token
@@ -6698,6 +6886,12 @@ public class Gemma4TextModelInner: Module {
             postNorm = norm(h)
             mmaHeadSums = nil
         }
+        if denseGeGLUStartupWarmupComplete,
+            inputLength >= 512,
+            inputBatchSize * inputLength >= Gemma4PrefillDeqGEMMV1.minRows
+        {
+            denseGeGLUPrefillCacheMayBeLive = true
+        }
         return (postNorm, capturePreNorm ? h : nil, mmaHeadSums)
     }
 }
@@ -6842,6 +7036,13 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         if !config.tieWordEmbeddings {
             self._lmHead.wrappedValue = Linear(config.hiddenSize, config.vocabSize, bias: false)
         }
+    }
+
+    /// Mark the end of prompt-independent constructor warmup. A later
+    /// prompt-to-decode transition may then retire prompt-only paired planes;
+    /// warmup itself remains fully cached and byte-identical.
+    public func armDenseGeGLUPrefillCacheRetirement() {
+        model.armDenseGeGLUPrefillCacheRetirement()
     }
 
     public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws

@@ -304,6 +304,12 @@ public final class Gemma4A4BRuntimeWeightCache {
         eval(model(prefillTokens, cache: caches))
         eval(model(MLXArray([bosToken], [1, 1]), cache: caches))
         warmCohortShapes(model, config: config)
+        // The scored prompt-only dense GeGLU path may retain its paired BF16
+        // planes after this constructor warm. Keep them through the next real
+        // seed prefill, then let the model retire only those strong references
+        // at the first short target forward. This preserves compiled pipelines
+        // and avoids a broad allocator-cache clear during measured decode.
+        model.armDenseGeGLUPrefillCacheRetirement()
         // Retire the warm's own buffers HERE, unscored: the trusted
         // phase-start clearCache runs inside the charged window, so any
         // free buffers the warm leaves behind would be deallocated on the

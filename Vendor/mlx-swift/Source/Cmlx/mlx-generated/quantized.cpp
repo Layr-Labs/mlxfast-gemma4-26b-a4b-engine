@@ -3909,6 +3909,76 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
 // per-assignment quantized_matmul oracle and vs the untiled arm at
 // K = 704, N = 2816, 64 assignments over 128 experts, M = 8, spans 4 and
 // 2, 3 seeds, NaN-filled outputs (parity-down-tile, 2026-08-28).
+// DOWN-TILE-SPLIT: byte deduplication across the two down-plane leaders of an
+// aligned run-quad, WITHOUT touching the leader election.
+//
+// The election below keeps arity two -- `run_offset % 2 == 0` -- exactly as
+// shipped, so the number of threadgroups that survive it is unchanged and the
+// register footprint stays pair-sized. What changes is only WHICH y-tiles a
+// surviving leader owns.
+//
+// Today, when a same-expert run holds three or four assignments, the run has
+// TWO down leaders (run_offset 0 and 2 within each aligned quad) and each of
+// them strip-walks ALL 352 y-tiles of the expert plane. That plane is
+// 352 * 8 rows * (704/2 weight bytes + 704/64 * 2 * 2 scale/bias bytes) =
+// 1,115,136 B, so DRAM streams it TWICE per quad, once per leader.
+//
+// Under the split each leader keeps its own half of the tile space and serves
+// ALL of the quad's up-to-four assignments over that half:
+//
+//   DARKBLOOM_GEMMA4_DOWN_TILE_SPLIT == 1 (default, tile-half):
+//     the leader at run_offset % 4 == 0 walks t in [0, span/2), the leader at
+//     run_offset % 4 == 2 walks t in [span/2, span). Both leaders still
+//     survive at EVERY span-aligned y-group, so the surviving-threadgroup
+//     count, the launch geometry and the per-leader call count (span/2 tiles
+//     * 2 calls == span calls, matching the incumbent's span tiles * 1 call)
+//     are all exactly the incumbent's. Only the per-leader DRAM footprint
+//     halves, from span tiles to span/2.
+//
+//   DARKBLOOM_GEMMA4_DOWN_TILE_SPLIT == 2 (quartet-parity):
+//     the leader at run_offset % 4 == 0 owns the quartets whose (tid.y / span)
+//     is even, the leader at run_offset % 4 == 2 the odd ones, each walking
+//     all span tiles of its quartet. Same byte ledger, but it HALVES the
+//     surviving-threadgroup count -- the mechanism that cost DOWN-RUN-QUAD
+//     -3.67% on this board. Kept only as a bisect arm.
+//
+// Either way DRAM sees each expert byte ONCE per quad instead of twice.
+//
+// BIT-EXACTNESS. Every (output_row, input_row) product keeps its own
+// accumulator, its own K-loop order and the same qdot sequence, because the
+// split changes nothing inside the impls: the incumbent's calls are REISSUED
+// verbatim, with the same `tile_tid`, the same `simd_gid` / `simd_lid`, the
+// same weight/scale/bias pointers and the same x/y pointers -- only the
+// threadgroup that issues them differs, and `qmv_affine4_g64_pair_impl` and
+// `qmv_impl` read no other thread state. The pairing is preserved too: a quad
+// of four issues pair(a0,a1) and pair(a2,a3); a quad of three issues
+// pair(a0,a1) and the single-stream `qmv_impl(a2)` -- precisely the arms the
+// incumbent's `has_pair` selects for those same two leaders. Tile ownership is
+// a partition (proof at the loop bounds below), so each output element is
+// written exactly once, by the same store in the same impl.
+//
+// GUARD / FAIL-CLOSED. Only aligned run-quads of THREE or FOUR reach this
+// path. A quad of one or two has a single leader, nothing to deduplicate, and
+// falls through to the incumbent body verbatim. Runs longer than four split
+// per aligned quad, so a run of six is quad{0..3} (split) plus quad{4,5}
+// (incumbent) -- the same quad alignment the gate/up RUN-QUAD election uses.
+// The quad length is read from the tagged route word's run_remaining field
+// when expertPrefixBounds is on and from a forward scan of the raw route table
+// when it is off, so the path does NOT depend on the tagged route.
+//
+// KILL SWITCH: build with -DDARKBLOOM_GEMMA4_DOWN_TILE_SPLIT=0 and the block
+// folds away entirely, restoring the shipped strip-walk byte for byte. This is
+// a Metal preprocessor macro inside the JIT source string, the same idiom as
+// DARKBLOOM_GEMMA4_NAX_TILING in quantized_nax.h.
+//
+// SWEEP ALTERNATE (not coded): if the Metal register allocator fuses the two
+// inlined pair bodies inside one `t` iteration and pushes the live accumulator
+// count to sixteen, split them into two consecutive `t` loops instead; the
+// second loop re-reads only span/2 * 3,168 B, which is L1-resident.
+#ifndef DARKBLOOM_GEMMA4_DOWN_TILE_SPLIT
+#define DARKBLOOM_GEMMA4_DOWN_TILE_SPLIT 1
+#endif
+
 template <typename T, int group_size, int bits>
 METAL_FUNC void gather_qmv_gemma4_down_tile(
     const device uint32_t* w,
@@ -3956,6 +4026,127 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   const device uint32_t* tile_w = w + expert * w_stride;
   const device T* tile_scales = scales + expert * s_stride;
   const device T* tile_biases = biases + expert * b_stride;
+
+  // DOWN-TILE-SPLIT (see the block comment above this function). Placed before
+  // the incumbent's x/y pointer setup so that every quad this does not claim
+  // reaches the fall-through arm below byte-identically.
+  constexpr int down_tile_split = DARKBLOOM_GEMMA4_DOWN_TILE_SPLIT;
+  if (down_tile_split != 0 && gemma4_down_tile_span >= 2 &&
+      (gemma4_down_tile_span % 2) == 0) {
+    // Leaders sit at even run_offset, so quad_lane is 0 or 2.
+    const uint quad_lane = run_offset & 3u;
+    const uint quad_base = assignment - quad_lane;
+    uint quad_len;
+    if (expert_prefix_bounds) {
+      // Bits 14..19 hold run_remaining - 1, the count of assignments from THIS
+      // one to the end of the run inclusive, so the quad's length measured
+      // from quad_base is run_remaining + quad_lane, clamped to the quad.
+      quad_len = min(4u, (((route_word >> 14) & 0x3fu) + 1u) + quad_lane);
+    } else {
+      // Raw route table: quad_base..assignment already share the expert by
+      // construction of run_offset, so only scan forward from assignment + 1.
+      quad_len = quad_lane + 1u;
+      while (quad_len < 4u && quad_base + quad_len < 64u &&
+             rhs_indices[(quad_base + quad_len) * rhs_stride] == expert) {
+        quad_len++;
+      }
+    }
+    if (quad_len >= 3u) {
+      // `half` is a reserved Metal type name; `tile_half` selects the
+      // leader's half of the tile space (0 for run_offset % 4 == 0).
+      const uint tile_half = quad_lane >> 1;
+      int tile_lo = 0;
+      int tile_hi = gemma4_down_tile_span;
+      if (down_tile_split == 2) {
+        // Quartet-parity arm: whole quartets, alternating between the two
+        // leaders. Halves the surviving threadgroup count -- bisect only.
+        if (((tid.y / uint(gemma4_down_tile_span)) & 1u) != tile_half) {
+          return;
+        }
+      } else {
+        // Tile-half arm (default). PARTITION PROOF: for a fixed tid.y, half 0
+        // covers t in [0, span/2) and half 1 covers t in [span/2, span). The
+        // two ranges are disjoint and their union is [0, span), which is
+        // exactly the incumbent leader's walk. No tile is dropped and none is
+        // computed twice, for either of the quad's up-to-four assignments.
+        tile_lo = int(tile_half) * (gemma4_down_tile_span / 2);
+        tile_hi = tile_lo + (gemma4_down_tile_span / 2);
+      }
+      const device T* quad_x0 =
+          x + lhs_indices[quad_base * lhs_stride] * x_stride;
+      const device T* quad_x1 =
+          x + lhs_indices[(quad_base + 1u) * lhs_stride] * x_stride;
+      const device T* quad_x2 =
+          x + lhs_indices[(quad_base + 2u) * lhs_stride] * x_stride;
+      device T* quad_y0 = y + quad_base * out_vec_size;
+      device T* quad_y1 = y + (quad_base + 1u) * out_vec_size;
+      device T* quad_y2 = y + (quad_base + 2u) * out_vec_size;
+      if (quad_len == 4u) {
+        const device T* quad_x3 =
+            x + lhs_indices[(quad_base + 3u) * lhs_stride] * x_stride;
+        device T* quad_y3 = y + (quad_base + 3u) * out_vec_size;
+        for (int t = tile_lo; t < tile_hi; t++) {
+          uint3 tile_tid = tid;
+          tile_tid.y = tid.y + uint(t);
+          qmv_affine4_g64_pair_impl<T, group_size, bits>(
+              tile_w,
+              tile_scales,
+              tile_biases,
+              quad_x0,
+              quad_x1,
+              quad_y0,
+              quad_y1,
+              in_vec_size,
+              tile_tid,
+              simd_gid,
+              simd_lid);
+          qmv_affine4_g64_pair_impl<T, group_size, bits>(
+              tile_w,
+              tile_scales,
+              tile_biases,
+              quad_x2,
+              quad_x3,
+              quad_y2,
+              quad_y3,
+              in_vec_size,
+              tile_tid,
+              simd_gid,
+              simd_lid);
+        }
+        return;
+      }
+      // quad_len == 3: the trailing assignment has no partner, so it takes the
+      // same single-stream qmv_impl the incumbent's pairless arm gives it.
+      for (int t = tile_lo; t < tile_hi; t++) {
+        uint3 tile_tid = tid;
+        tile_tid.y = tid.y + uint(t);
+        qmv_affine4_g64_pair_impl<T, group_size, bits>(
+            tile_w,
+            tile_scales,
+            tile_biases,
+            quad_x0,
+            quad_x1,
+            quad_y0,
+            quad_y1,
+            in_vec_size,
+            tile_tid,
+            simd_gid,
+            simd_lid);
+        qmv_impl<T, group_size, bits>(
+            tile_w,
+            tile_scales,
+            tile_biases,
+            quad_x2,
+            quad_y2,
+            in_vec_size,
+            out_vec_size,
+            tile_tid,
+            simd_gid,
+            simd_lid);
+      }
+      return;
+    }
+  }
   const device T* tile_x0 =
       x + lhs_indices[assignment * lhs_stride] * x_stride;
   device T* tile_y0 = y + assignment * out_vec_size;

@@ -511,28 +511,6 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
         return table
     }
 
-    /// ORS-D512. Take the `[8, 2 * K/64]` fp32 pair table the D=512 dispatch-3
-    /// kernel emitted for this exact activation: entries `2g` and `2g + 1`
-    /// are the two half-group partials of the prepass's octet tree, and the
-    /// `_rsp2` body adds them as the prepass's own final xor-4 stage. The
-    /// caller owns the proof that the table belongs to `x`; this re-checks
-    /// only the shape contract the `_rsp2` body indexes against.
-    @inline(__always)
-    public static func acceptRunsumPairTable(
-        _ table: MLXArray?, for x: MLXArray
-    ) -> MLXArray? {
-        guard rsPrepassEnabled, mma8Enabled, let table,
-            table.dtype == .float32,
-            x.dtype == .bfloat16,
-            x.ndim == 3,
-            x.dim(0) == batch,
-            x.dim(1) == sequence,
-            x.dim(2) == 8192,
-            table.shape == [batch, 2 * (x.dim(2) / groupSize)]
-        else { return nil }
-        return table
-    }
-
     /// MMA-RS-001 table for one o_proj activation tensor. nil keeps the
     /// incumbent dispatch.
     @inline(__always)
@@ -589,120 +567,6 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
         header: mma8KernelHeader,
         ensureRowContiguous: true)
 
-    /// ORS-D512: the `_rsp` body with the run sums read as PAIRS of
-    /// half-group partials. `pairs[row][2g] + pairs[row][2g + 1]` is the
-    /// prepass's final `v += simd_shuffle_xor(v, 4)` node — the same two
-    /// float subtrees, and float addition is commutative — so the value
-    /// entering `acc += s * C + rs * b` is the `[8, G]` table's own. The
-    /// header is the MMA-RS-001 header plus this one body; the shipped
-    /// kernels keep their own header text and names.
-    private static let mma8Rsp2KernelHeader = mma8KernelHeader + """
-
-template <typename T, int KS, int KFIX>
-METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
-    const device uint32_t* w,
-    const device T* scales,
-    const device T* biases,
-    const device T* x,
-    const device float* rs_pairs,
-    device T* y,
-    const int N,
-    const int n0,
-    threadgroup float2* red,
-    uint simd_gid,
-    uint simd_lid) {
-  constexpr int K = KFIX;
-  constexpr int G = K / 64;
-  constexpr int gh = (G + 1) / 2;
-  constexpr int nGroups = (KS == 2) ? gh : G;
-  const int g0 = (KS == 2 && simd_gid == 1) ? gh : 0;
-  const mma8_coord c = mma8_lane(simd_lid);
-
-  const device uint8_t* wrow =
-      (const device uint8_t*)w + (n0 + c.fm) * (K / 2) + 4 * c.fn;
-  const device T* srow = scales + (n0 + c.fm) * G;
-  const device T* brow = biases + (n0 + c.fm) * G;
-  const device T* x0 = x + c.fn * K + 8 * c.fm;
-  const device T* x1 = x0 + K;
-  const device float* p0 = rs_pairs + c.fn * (2 * G);
-  const device float* p1 = p0 + 2 * G;
-
-  float acc0 = 0.0f;
-  float acc1 = 0.0f;
-  simdgroup_float8x8 A;
-  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
-
-#pragma unroll
-  for (int gi = 0; gi < nGroups; ++gi) {
-    const int g = g0 + gi;
-    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
-    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
-
-    const float2 rs = float2(
-        p0[2 * g] + p0[2 * g + 1], p1[2 * g] + p1[2 * g + 1]);
-
-    MMA8_SETB(B0, x, lo)
-    MMA8_SETB(B1, x, hi)
-    MMA8_SETB(B2, y, lo)
-    MMA8_SETB(B3, y, hi)
-    MMA8_SETB(B4, z, lo)
-    MMA8_SETB(B5, z, hi)
-    MMA8_SETB(B6, w, lo)
-    MMA8_SETB(B7, w, hi)
-
-    const uint2 wv = *((const device uint2*)(wrow + 32 * g));
-    const float s = float(srow[g]);
-    const float b = float(brow[g]);
-
-    simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
-    MMA8_STEP(B0, 0)
-    MMA8_STEP(B1, 1)
-    MMA8_STEP(B2, 2)
-    MMA8_STEP(B3, 3)
-    MMA8_STEP(B4, 4)
-    MMA8_STEP(B5, 5)
-    MMA8_STEP(B6, 6)
-    MMA8_STEP(B7, 7)
-
-    acc0 += s * C.thread_elements()[0] + rs.x * b;
-    acc1 += s * C.thread_elements()[1] + rs.y * b;
-  }
-
-  if (KS == 2) {
-    if (simd_gid == 1) {
-      red[simd_lid] = float2(acc0, acc1);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (simd_gid == 1) {
-      return;
-    }
-    const float2 other = red[simd_lid];
-    acc0 = acc0 + other.x;
-    acc1 = acc1 + other.y;
-  }
-
-  y[c.fn * N + n0 + c.fm] = static_cast<T>(acc0);
-  y[(c.fn + 1) * N + n0 + c.fm] = static_cast<T>(acc1);
-}
-"""
-
-    private static let mma8Rsp2KernelK8192 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp2_v1",
-        inputNames: ["x", "w", "scales", "biases", "rs_pairs"],
-        outputNames: ["y"],
-        source: """
-            const uint3 tid = threadgroup_position_in_grid;
-            threadgroup float2 red[32];
-            attention_o_qmv_mma8_affine4_g64_rsp2<T, 2, 8192>(
-                w, scales, biases, x, rs_pairs, y,
-                w_shape[0], int(tid.y) * 8, red,
-                simdgroup_index_in_threadgroup,
-                thread_index_in_simdgroup);
-            return;
-            """,
-        header: mma8Rsp2KernelHeader,
-        ensureRowContiguous: true)
-
     @inline(__always)
     private static func liveInputWidth(_ width: Int) -> Bool {
         width == 4096 || width == 8192
@@ -716,8 +580,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
         groupSize: Int,
         bits: Int,
         mode: QuantizationMode,
-        rsTable: MLXArray? = nil,
-        rsPairTable: MLXArray? = nil
+        rsTable: MLXArray? = nil
     ) -> MLXArray? {
         guard enabled,
             groupSize == Self.groupSize,
@@ -746,12 +609,6 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
             rsTable != nil
             && rsTable!.dtype == .float32
             && rsTable!.shape == [batch, inDim / Self.groupSize]
-        // ORS-D512: the pair table is only defined for the full layers' K.
-        let pairsReady =
-            inDim == 8192
-            && rsPairTable != nil
-            && rsPairTable!.dtype == .float32
-            && rsPairTable!.shape == [batch, 2 * (inDim / Self.groupSize)]
 
         if mma8Enabled {
             // One threadgroup per 8-column output tile; all eight cohort rows
@@ -759,17 +616,6 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
             // streamed once per round instead of four times. Grid is in
             // threads: (32, 2, 1) threads per group, N/8 groups along y.
             let yTiles = outputWidth / outputsPerGroup
-            if pairsReady {
-                CBv2EngageMark.once("d512-ors-oproj-pairs")
-                return mma8Rsp2KernelK8192(
-                    [x, weight, scales, biases, rsPairTable!],
-                    template: [("T", x.dtype)],
-                    grid: (simdWidth, yTiles * simdGroups, 1),
-                    threadGroup: (simdWidth, simdGroups, 1),
-                    outputShapes: [[batch, sequence, outputWidth]],
-                    outputDTypes: [x.dtype]
-                )[0]
-            }
             if tableReady {
                 let kernel = inDim == 8192 ? mma8RspKernelK8192 : mma8RspKernelK4096
                 return kernel(

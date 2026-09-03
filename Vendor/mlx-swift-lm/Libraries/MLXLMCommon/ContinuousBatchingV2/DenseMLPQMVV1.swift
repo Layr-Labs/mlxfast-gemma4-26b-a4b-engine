@@ -119,6 +119,22 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// GATEUP-LANESUMS-023. The same lane-sum reuse on the gate/up plane,
+    /// where nothing competes for it: the static-K walk is DOWN-only, so the
+    /// gate/up body still recomputes `mma8_runsum8` plus its three-step xor
+    /// butterfly in every one of the 264 output-tile threadgroups, for a
+    /// quantity that depends on `(group, lane)` alone and is therefore the
+    /// same value in all of them. K = 2816 gives G = 44, an even split, so
+    /// both simdgroups walk 22 groups and the odd-G close the down plane
+    /// needs never arises here. Kill switch:
+    /// `DARKBLOOM_GEMMA4_MLP_MMA8_GATEUP_LANE_SUMS=0`.
+    private static let mma8GateUpLaneSumsEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MLP_MMA8_GATEUP_LANE_SUMS"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// Down-only compile-time K/group walk; the odd 33-group split remains
     /// 17+16. The lane-sum opt-in and gate/up paths retain their old kernels.
     private static let mma8DownStaticKEnabled: Bool = {
@@ -179,6 +195,11 @@ public enum CBv2DenseMLPQMVV1 {
     /// whose exact B8/L1/K2816 gate also pins the table geometry.
     public struct ActivationSums {
         fileprivate let values: MLXArray
+
+        /// GATEUP-LANESUMS-023 table for the same `x`, carried here so gate
+        /// and up share one producer dispatch per layer. Unevaluated until a
+        /// consumer reads it, so an arm that declines costs nothing.
+        fileprivate var gateUpLaneSums: MLXArray?
 
         /// ZIP-ROUTER-001 ordering handle. Read-only view of the table's own
         /// output array so a caller can name this dispatch as an
@@ -1162,6 +1183,34 @@ inline U qdot_affine8_registered_v4(
             || (inDim == 2112 && outDim == 2816)
     }
 
+    /// GATEUP-LANESUMS-023 producer. One threadgroup per g64 group, one lane
+    /// per consumer lane, running the consumer's own reduction tree on the
+    /// consumer's own two `uint4` loads. The table is a pure function of
+    /// `(group, lane)`, which is why all 264 output-tile threadgroups of a
+    /// gate/up dispatch can read it instead of each rebuilding it.
+    @inline(__always)
+    private static func gateUpLaneSumTable(for x: MLXArray) -> MLXArray? {
+        guard enabled,
+            mma8GateUpEnabled,
+            mma8GateUpLaneSumsEnabled,
+            x.dtype == .bfloat16,
+            x.ndim == 3,
+            x.dim(0) == batch,
+            x.dim(1) == sequence,
+            x.dim(2) == 2816,
+            x.size == batch * sequence * 2816
+        else { return nil }
+        let groups = 2816 / Self.groupSize
+        return mma8DownLaneSumKernel(
+            [x],
+            template: [("T", x.dtype)],
+            grid: (simdWidth, groups, 1),
+            threadGroup: (simdWidth, 1, 1),
+            outputShapes: [[groups, simdWidth, 2]],
+            outputDTypes: [.float32]
+        )[0]
+    }
+
     /// Builds the shared gate/up table only for the exact dense decode input.
     /// Returning an opaque value prevents callers from fabricating a table with
     /// a plausible shape; all other inputs keep DMLP-001 unchanged.
@@ -1184,7 +1233,8 @@ inline U qdot_affine8_registered_v4(
             outputShapes: [[blocks * simdWidth * batch]],
             outputDTypes: [.float32]
         )[0]
-        return ActivationSums(values: values)
+        return ActivationSums(
+            values: values, gateUpLaneSums: gateUpLaneSumTable(for: x))
     }
 
     /// Adopts an exact producer-emitted table for the same pinned decode
@@ -1207,7 +1257,8 @@ inline U qdot_affine8_registered_v4(
             values.ndim == 1,
             values.size == blocks * simdWidth * batch
         else { return nil }
-        return ActivationSums(values: values)
+        return ActivationSums(
+            values: values, gateUpLaneSums: gateUpLaneSumTable(for: x))
     }
 
     /// Returns `nil` unless every production pin holds. The caller then invokes
@@ -1267,6 +1318,20 @@ inline U qdot_affine8_registered_v4(
             // `mlp-w4-load` disappears and the total is unchanged.
             if isGateUp { CBv2EngageMark.once("mlp-mma8-gateup") }
             let yTiles = outDim / outputsPerGroup
+            if isGateUp, mma8GateUpLaneSumsEnabled,
+                let laneSums = activationSums?.gateUpLaneSums
+                    ?? gateUpLaneSumTable(for: x)
+            {
+                CBv2EngageMark.once("mlp-mma8-gateup-lane-sums")
+                return mma8DownLaneSumQMVKernel(
+                    [x, weight, scales, biases, laneSums],
+                    template: [("T", x.dtype)],
+                    grid: (simdWidth, yTiles * simdGroups, 1),
+                    threadGroup: (simdWidth, simdGroups, 1),
+                    outputShapes: [[batch, sequence, outDim]],
+                    outputDTypes: [x.dtype]
+                )[0]
+            }
             if !isGateUp && mma8DownLaneSumsEnabled {
                 let groups = inDim / Self.groupSize
                 let laneSums = mma8DownLaneSumKernel(

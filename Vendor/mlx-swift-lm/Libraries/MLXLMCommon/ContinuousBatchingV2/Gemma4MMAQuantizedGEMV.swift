@@ -2758,6 +2758,455 @@ public enum Gemma4MMAQuantizedGEMV {
         ensureRowContiguous: true
     )
 
+
+    // MARK: - HEAD-RELAYOUT --- the packed plane permuted once for the fragment loads
+
+    /// HEAD-RELAYOUT. Every v27 body builds its weight fragments from the packed
+    /// row's eight uint32 words: lane `lane` owns `A[fragmentRow][fragmentCol]`
+    /// and `A[fragmentRow][fragmentCol + 1]` of each 8-wide K slice `t`, i.e.
+    /// nibbles `fragmentCol` and `fragmentCol + 1` of word `t` --- sixteen
+    /// nibbles, byte `fragmentCol / 2` of every word --- while the four lanes
+    /// that share a fragment row each read the whole 32-byte row group
+    /// (two `uint4`) per tile to take their quarter of it.
+    ///
+    /// `relayoutKernel` permutes the plane ONCE, at first use, into the order
+    /// the fragments consume. The 32 rows a simdgroup owns are blocked per
+    /// affine group, so one group of one simdgroup is a single contiguous
+    /// 1 KB run (`tile * N_GROUPS * 256 + g * 256` words, `tile = sgN0 / 32`),
+    /// and inside the block lane `lane` owns bytes `[lane * 32, lane * 32 + 32)`:
+    /// for tile `a` in 0...3 the eight bytes `byte fragmentCol / 2 of word 0
+    /// ... word 7` of row `sgN0 + a * 8 + fragmentRow`, at `+ a * 8`. The `_rl1`
+    /// twins read that as two `uint4` per lane per group and take slice `t`'s
+    /// two operands from byte `t` of tile `a`'s quarter (`>> 8 * (t & 3)` of
+    /// word `t / 4`, low then high nibble). Every fragment slot receives the
+    /// nibble the incumbent extracted for it; the activation fragments, the
+    /// `simdgroup_multiply_accumulate` chain, the scale close, the batched
+    /// bias MMA and the store or top-1 fold are the incumbent's statements,
+    /// so the output is bit-identical.
+    ///
+    /// Scales, biases and the activation sums are read exactly as before. The
+    /// original plane is untouched for every other consumer; the relaid copy
+    /// is a second array of the plane's size, cached per source array.
+    ///
+    /// `DARKBLOOM_GEMMA4_HEAD_RELAYOUT=0` restores the incumbent kernels, names
+    /// and plane byte for byte. `DARKBLOOM_GEMMA4_HEAD_RELAYOUT_XCHECK=1` also
+    /// runs the incumbent on the same inputs and reports differing words per
+    /// dispatch (diagnostic only).
+    private static let relayoutEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_HEAD_RELAYOUT"]
+        else { return true }
+        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "0", "false", "no", "off": return false
+        default: return true
+        }
+    }()
+
+    private static let relayoutXCheck: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_HEAD_RELAYOUT_XCHECK"]
+        else { return false }
+        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "", "0", "false", "no", "off": return false
+        default: return true
+        }
+    }()
+
+    /// The rewrite pairs, applied in order. Each `old` must occur exactly once
+    /// in the body it is applied to; otherwise the relayout stays off (soft
+    /// gate: a failed derivation must never trap inside a lazy static).
+    private static let relayoutLanePairs: [(String, String)] = [
+        (
+            """
+                const uint packedWord0 =
+                    (sgN0 + fragmentRow) * W_ROW_U32 + g * (GROUP / 8);
+                const uint packedTileStride = N_PSG * W_ROW_U32;
+                const device uint4* packedGroup =
+                    reinterpret_cast<const device uint4*>(w + packedWord0);
+                const uint4 packedLo0 = packedGroup[0];
+                const uint4 packedHi0 = packedGroup[1];
+                packedGroup = reinterpret_cast<const device uint4*>(
+                    w + packedWord0 + packedTileStride);
+                const uint4 packedLo1 = packedGroup[0];
+                const uint4 packedHi1 = packedGroup[1];
+                packedGroup = reinterpret_cast<const device uint4*>(
+                    w + packedWord0 + packedTileStride * 2);
+                const uint4 packedLo2 = packedGroup[0];
+                const uint4 packedHi2 = packedGroup[1];
+                packedGroup = reinterpret_cast<const device uint4*>(
+                    w + packedWord0 + packedTileStride * 3);
+                const uint4 packedLo3 = packedGroup[0];
+                const uint4 packedHi3 = packedGroup[1];
+            """,
+            """
+                const uint laneBlock =
+                    (sgN0 / 32u) * (N_GROUPS * 256u) + g * 256u + lane * 8u;
+                const device uint4* packedGroup =
+                    reinterpret_cast<const device uint4*>(w + laneBlock);
+                const uint4 packedA = packedGroup[0];
+                const uint4 packedB = packedGroup[1];
+                const uint2 packedQ0 = packedA.xy;
+                const uint2 packedQ1 = packedA.zw;
+                const uint2 packedQ2 = packedB.xy;
+                const uint2 packedQ3 = packedB.zw;
+            """
+        ),
+        (
+            """
+                    const uint packed0 = t < 4 ? packedLo0[t] : packedHi0[t - 4];
+                    const uint packed1 = t < 4 ? packedLo1[t] : packedHi1[t - 4];
+                    const uint packed2 = t < 4 ? packedLo2[t] : packedHi2[t - 4];
+                    const uint packed3 = t < 4 ? packedLo3[t] : packedHi3[t - 4];
+                    A0.thread_elements()[0] =
+                        float((packed0 >> (4 * fragmentCol)) & 0xFu);
+                    A0.thread_elements()[1] =
+                        float((packed0 >> (4 * (fragmentCol + 1))) & 0xFu);
+                    A1.thread_elements()[0] =
+                        float((packed1 >> (4 * fragmentCol)) & 0xFu);
+                    A1.thread_elements()[1] =
+                        float((packed1 >> (4 * (fragmentCol + 1))) & 0xFu);
+                    A2.thread_elements()[0] =
+                        float((packed2 >> (4 * fragmentCol)) & 0xFu);
+                    A2.thread_elements()[1] =
+                        float((packed2 >> (4 * (fragmentCol + 1))) & 0xFu);
+                    A3.thread_elements()[0] =
+                        float((packed3 >> (4 * fragmentCol)) & 0xFu);
+                    A3.thread_elements()[1] =
+                        float((packed3 >> (4 * (fragmentCol + 1))) & 0xFu);
+            """,
+            """
+                    // Byte t of the lane's quarter holds nibbles fragmentCol and
+                    // fragmentCol + 1 of word t: the incumbent's two operands.
+                    const uint packed0 = t < 4 ? packedQ0.x : packedQ0.y;
+                    const uint packed1 = t < 4 ? packedQ1.x : packedQ1.y;
+                    const uint packed2 = t < 4 ? packedQ2.x : packedQ2.y;
+                    const uint packed3 = t < 4 ? packedQ3.x : packedQ3.y;
+                    const uint nibbleShift = 8u * (t & 3u);
+                    A0.thread_elements()[0] =
+                        float((packed0 >> nibbleShift) & 0xFu);
+                    A0.thread_elements()[1] =
+                        float((packed0 >> (nibbleShift + 4u)) & 0xFu);
+                    A1.thread_elements()[0] =
+                        float((packed1 >> nibbleShift) & 0xFu);
+                    A1.thread_elements()[1] =
+                        float((packed1 >> (nibbleShift + 4u)) & 0xFu);
+                    A2.thread_elements()[0] =
+                        float((packed2 >> nibbleShift) & 0xFu);
+                    A2.thread_elements()[1] =
+                        float((packed2 >> (nibbleShift + 4u)) & 0xFu);
+                    A3.thread_elements()[0] =
+                        float((packed3 >> nibbleShift) & 0xFu);
+                    A3.thread_elements()[1] =
+                        float((packed3 >> (nibbleShift + 4u)) & 0xFu);
+            """
+        ),
+    ]
+
+    private static let relayoutCarryLanePairs: [(String, String)] = [
+        (
+            """
+            const uint carryWordBase = (sgN0 + fragmentRow) * W_ROW_U32;
+            """,
+            """
+            const uint carryWordBase =
+                (sgN0 / 32u) * (N_GROUPS * 256u) + lane * 8u;
+            """
+        ),
+        (
+            """
+            uint4 carryLo0;
+            uint4 carryHi0;
+            uint4 carryLo1;
+            uint4 carryHi1;
+            uint4 carryLo2;
+            uint4 carryHi2;
+            uint4 carryLo3;
+            uint4 carryHi3;
+            """,
+            """
+            uint4 carryA;
+            uint4 carryB;
+            """
+        ),
+        (
+            """
+                const device uint4* carryGroup =
+                    reinterpret_cast<const device uint4*>(w + carryWordBase);
+                carryLo0 = carryGroup[0];
+                carryHi0 = carryGroup[1];
+                carryGroup = reinterpret_cast<const device uint4*>(
+                    w + carryWordBase + carryTileStride);
+                carryLo1 = carryGroup[0];
+                carryHi1 = carryGroup[1];
+                carryGroup = reinterpret_cast<const device uint4*>(
+                    w + carryWordBase + carryTileStride * 2);
+                carryLo2 = carryGroup[0];
+                carryHi2 = carryGroup[1];
+                carryGroup = reinterpret_cast<const device uint4*>(
+                    w + carryWordBase + carryTileStride * 3);
+                carryLo3 = carryGroup[0];
+                carryHi3 = carryGroup[1];
+            """,
+            """
+                const device uint4* carryGroup =
+                    reinterpret_cast<const device uint4*>(w + carryWordBase);
+                carryA = carryGroup[0];
+                carryB = carryGroup[1];
+            """
+        ),
+        (
+            """
+                const uint4 packedLo0 = carryLo0;
+                const uint4 packedHi0 = carryHi0;
+                const uint4 packedLo1 = carryLo1;
+                const uint4 packedHi1 = carryHi1;
+                const uint4 packedLo2 = carryLo2;
+                const uint4 packedHi2 = carryHi2;
+                const uint4 packedLo3 = carryLo3;
+                const uint4 packedHi3 = carryHi3;
+            """,
+            """
+                const uint2 packedQ0 = carryA.xy;
+                const uint2 packedQ1 = carryA.zw;
+                const uint2 packedQ2 = carryB.xy;
+                const uint2 packedQ3 = carryB.zw;
+            """
+        ),
+        (
+            """
+                const uint packedWordNext = carryWordBase + gNext * (GROUP / 8);
+            """,
+            """
+                const uint packedWordNext = carryWordBase + gNext * 256u;
+            """
+        ),
+        (
+            """
+                const device uint4* packedGroup =
+                    reinterpret_cast<const device uint4*>(w + packedWordNext);
+                carryLo0 = packedGroup[0];
+                carryHi0 = packedGroup[1];
+                packedGroup = reinterpret_cast<const device uint4*>(
+                    w + packedWordNext + carryTileStride);
+                carryLo1 = packedGroup[0];
+                carryHi1 = packedGroup[1];
+                packedGroup = reinterpret_cast<const device uint4*>(
+                    w + packedWordNext + carryTileStride * 2);
+                carryLo2 = packedGroup[0];
+                carryHi2 = packedGroup[1];
+                packedGroup = reinterpret_cast<const device uint4*>(
+                    w + packedWordNext + carryTileStride * 3);
+                carryLo3 = packedGroup[0];
+                carryHi3 = packedGroup[1];
+            """,
+            """
+                const device uint4* packedGroup =
+                    reinterpret_cast<const device uint4*>(w + packedWordNext);
+                carryA = packedGroup[0];
+                carryB = packedGroup[1];
+            """
+        ),
+        (
+            """
+                    const uint packed0 = t < 4 ? packedLo0[t] : packedHi0[t - 4];
+                    const uint packed1 = t < 4 ? packedLo1[t] : packedHi1[t - 4];
+                    const uint packed2 = t < 4 ? packedLo2[t] : packedHi2[t - 4];
+                    const uint packed3 = t < 4 ? packedLo3[t] : packedHi3[t - 4];
+                    A0.thread_elements()[0] =
+                        float((packed0 >> (4 * fragmentCol)) & 0xFu);
+                    A0.thread_elements()[1] =
+                        float((packed0 >> (4 * (fragmentCol + 1))) & 0xFu);
+                    A1.thread_elements()[0] =
+                        float((packed1 >> (4 * fragmentCol)) & 0xFu);
+                    A1.thread_elements()[1] =
+                        float((packed1 >> (4 * (fragmentCol + 1))) & 0xFu);
+                    A2.thread_elements()[0] =
+                        float((packed2 >> (4 * fragmentCol)) & 0xFu);
+                    A2.thread_elements()[1] =
+                        float((packed2 >> (4 * (fragmentCol + 1))) & 0xFu);
+                    A3.thread_elements()[0] =
+                        float((packed3 >> (4 * fragmentCol)) & 0xFu);
+                    A3.thread_elements()[1] =
+                        float((packed3 >> (4 * (fragmentCol + 1))) & 0xFu);
+            """,
+            """
+                    // Byte t of the lane's quarter holds nibbles fragmentCol and
+                    // fragmentCol + 1 of word t: the incumbent's two operands.
+                    const uint packed0 = t < 4 ? packedQ0.x : packedQ0.y;
+                    const uint packed1 = t < 4 ? packedQ1.x : packedQ1.y;
+                    const uint packed2 = t < 4 ? packedQ2.x : packedQ2.y;
+                    const uint packed3 = t < 4 ? packedQ3.x : packedQ3.y;
+                    const uint nibbleShift = 8u * (t & 3u);
+                    A0.thread_elements()[0] =
+                        float((packed0 >> nibbleShift) & 0xFu);
+                    A0.thread_elements()[1] =
+                        float((packed0 >> (nibbleShift + 4u)) & 0xFu);
+                    A1.thread_elements()[0] =
+                        float((packed1 >> nibbleShift) & 0xFu);
+                    A1.thread_elements()[1] =
+                        float((packed1 >> (nibbleShift + 4u)) & 0xFu);
+                    A2.thread_elements()[0] =
+                        float((packed2 >> nibbleShift) & 0xFu);
+                    A2.thread_elements()[1] =
+                        float((packed2 >> (nibbleShift + 4u)) & 0xFu);
+                    A3.thread_elements()[0] =
+                        float((packed3 >> nibbleShift) & 0xFu);
+                    A3.thread_elements()[1] =
+                        float((packed3 >> (nibbleShift + 4u)) & 0xFu);
+            """
+        ),
+    ]
+
+
+    private static func relayoutRewrite(
+        _ source: String, _ pairs: [(String, String)]
+    ) -> String? {
+        var result = source
+        for (old, new) in pairs {
+            guard result.components(separatedBy: old).count == 2 else { return nil }
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        for leftover in ["packedLo", "packedHi", "carryLo", "carryHi"] {
+            guard !result.contains(leftover) else { return nil }
+        }
+        return result
+    }
+
+    /// One-shot permutation of the packed plane into the order above. One
+    /// thread per 32-byte row group `(n, g)`: the eight words are read, byte
+    /// `q` of word `t` is placed at byte `q * 8 + t` (word `2q + t / 4`), and
+    /// the four quarters go to their lanes' slots in the tile block.
+    private static let relayoutKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_head_relayout_lane_rl1",
+        inputNames: ["w"],
+        outputNames: ["wr"],
+        source: """
+            constexpr uint GROUP = 64;
+            constexpr uint N_GROUPS = K / GROUP;
+            constexpr uint W_ROW_U32 = K / 8;
+            const uint cell = thread_position_in_grid.x;
+            if (cell >= uint(N) * N_GROUPS) return;
+            const uint n = cell / N_GROUPS;
+            const uint g = cell % N_GROUPS;
+            const device uint32_t* src = w + n * W_ROW_U32 + g * (GROUP / 8);
+            uint32_t words[8];
+            for (uint t = 0; t < 8; ++t) {
+                words[t] = src[t];
+            }
+            uint32_t quarter[8];
+            for (uint j = 0; j < 8; ++j) {
+                const uint q = j >> 1;
+                const uint t0 = 4 * (j & 1);
+                uint32_t v = 0;
+                for (uint i = 0; i < 4; ++i) {
+                    v |= ((words[t0 + i] >> (8 * q)) & 0xFFu) << (8 * i);
+                }
+                quarter[j] = v;
+            }
+            const uint tile = n / 32;
+            const uint acc = (n % 32) / 8;
+            const uint r = n % 8;
+            const uint blockBase = tile * (N_GROUPS * 256) + g * 256;
+            for (uint q = 0; q < 4; ++q) {
+                const uint lane =
+                    ((r & 3u) << 1u) | ((r >> 2u) << 4u) | (q & 1u) | ((q >> 1u) << 3u);
+                device uint32_t* dst = wr + blockBase + lane * 8 + acc * 2;
+                dst[0] = quarter[2 * q];
+                dst[1] = quarter[2 * q + 1];
+            }
+            """,
+        ensureRowContiguous: true
+    )
+
+    private struct RelayoutKernels {
+        let logits: MLXFast.MLXFastKernel
+        let carry: MLXFast.MLXFastKernel
+        let argmax: MLXFast.MLXFastKernel
+    }
+
+    /// The three `_rl1` twins, or nil when the switch is off or a derivation
+    /// did not match (then every caller keeps the incumbent).
+    private static let relayoutKernels: RelayoutKernels? = {
+        guard relayoutEnabled else { return nil }
+        guard let logits = relayoutRewrite(sourceV27, relayoutLanePairs),
+            let carry = relayoutRewrite(sourceV27Carry, relayoutCarryLanePairs),
+            let argmax = relayoutRewrite(sourceV27Argmax, relayoutLanePairs)
+        else {
+            FileHandle.standardError.write(
+                Data("[head-relayout] derivation mismatch; incumbent kept\n".utf8))
+            return nil
+        }
+
+        return RelayoutKernels(
+            logits: MLXFast.metalKernel(
+                name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_fpmma_v1_rl1",
+                inputNames: ["x", "w", "scales", "biases", "xSums"],
+                outputNames: ["out"],
+                source: logits,
+                header: "#include <metal_simdgroup_matrix>\n",
+                ensureRowContiguous: true),
+            carry: MLXFast.metalKernel(
+                name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_carry_fpmma_v2_rl1",
+                inputNames: ["x", "w", "scales", "biases", "xSums"],
+                outputNames: ["out"],
+                source: carry,
+                header: "#include <metal_simdgroup_matrix>\n",
+                ensureRowContiguous: true),
+            argmax: MLXFast.metalKernel(
+                name: "gemma4_mma_affine4_qmv_m8_v27_argmax_rl1",
+                inputNames: ["x", "w", "scales", "biases", "xSums"],
+                outputNames: ["pv", "pi"],
+                source: argmax,
+                header: "#include <metal_simdgroup_matrix>\n",
+                ensureRowContiguous: true))
+    }()
+
+    private static let relayoutLock = NSLock()
+    nonisolated(unsafe) private static var relayoutPlanes:
+        [ObjectIdentifier: (source: MLXArray, plane: MLXArray)] = [:]
+
+    /// The relaid twin of `w`, built and evaluated once per source array.
+    private static func relayoutPlane(for w: MLXArray, k: Int, n: Int) -> MLXArray {
+        let key = ObjectIdentifier(w)
+        relayoutLock.lock()
+        defer { relayoutLock.unlock() }
+        if let cached = relayoutPlanes[key], cached.source === w,
+            cached.plane.shape == w.shape
+        {
+            return cached.plane
+        }
+        let cells = n * (k / 64)
+        let threads = 256
+        let plane = relayoutKernel(
+            [w],
+            template: [("K", k), ("N", n)],
+            grid: (((cells + threads - 1) / threads) * threads, 1, 1),
+            threadGroup: (threads, 1, 1),
+            outputShapes: [w.shape],
+            outputDTypes: [.uint32]
+        )[0]
+        eval(plane)
+        relayoutPlanes[key] = (w, plane)
+        return plane
+    }
+
+    private static func relayoutReport(
+        _ tag: String, candidate: MLXArray, incumbent: MLXArray
+    ) {
+        let wordType: DType = candidate.dtype == .bfloat16 ? .uint16 : .uint32
+        let differing = sum(
+            notEqual(candidate.view(dtype: wordType), incumbent.view(dtype: wordType))
+        ).item(Int.self)
+        var line = "[head-relayout xcheck] \(tag): differing words \(differing)/\(candidate.size)"
+        if candidate.dtype == .bfloat16 || candidate.dtype == .float32 {
+            let a = candidate.asType(.float32)
+            let b = incumbent.asType(.float32)
+            let rel = max(abs(a - b) / maximum(abs(b), MLXArray(Float(1e-6)))).item(Float.self)
+            line += " max rel \(rel)"
+        }
+        FileHandle.standardError.write(Data((line + "\n").utf8))
+    }
+
     /// Tied-head GEMV, or `nil` when any gate above fails.
     ///
     /// - Parameters:
@@ -2832,9 +3281,9 @@ public enum Gemma4MMAQuantizedGEMV {
             case 27:
                 if carryEnabled {
                     CBv2EngageMark.once("mma-head-carry")
-                    selected = kernelV27Carry
+                    selected = relayoutKernels?.carry ?? kernelV27Carry
                 } else {
-                    selected = kernelV27
+                    selected = relayoutKernels?.logits ?? kernelV27
                 }
             case 26: selected = kernelV26
             case 16: selected = kernelV16
@@ -2850,7 +3299,12 @@ public enum Gemma4MMAQuantizedGEMV {
             case 6: selected = kernelV6
             default: selected = kernelV5
             }
-            inputs = [flatX, w, scales, biases, xSums]
+            if version == 27, relayoutKernels != nil {
+                CBv2EngageMark.once("head-relayout")
+                inputs = [flatX, relayoutPlane(for: w, k: k, n: n), scales, biases, xSums]
+            } else {
+                inputs = [flatX, w, scales, biases, xSums]
+            }
         case 4:
             selected = kernelV4
             inputs = [flatX, w, scales, biases]
@@ -2872,6 +3326,19 @@ public enum Gemma4MMAQuantizedGEMV {
             outputShapes: [[mRows, n]],
             outputDTypes: [x.dtype]
         )
+        if version == 27, relayoutKernels != nil, relayoutXCheck {
+            var reference = inputs
+            reference[1] = w
+            let incumbent = (carryEnabled ? kernelV27Carry : kernelV27)(
+                reference,
+                template: [("T", x.dtype), ("K", k), ("N", n)],
+                grid: (threadgroups * threadsPerThreadgroup, 1, 1),
+                threadGroup: (threadsPerThreadgroup, 1, 1),
+                outputShapes: [[mRows, n]],
+                outputDTypes: [x.dtype]
+            )[0]
+            relayoutReport("logits", candidate: outputs[0], incumbent: incumbent)
+        }
         return outputs[0]
     }
 
@@ -3117,14 +3584,36 @@ public enum Gemma4MMAQuantizedGEMV {
             )[0]
         }
 
-        let partials = kernelV27Argmax(
-            [flatX, w, scales, biases, xSums],
+        let headKernel: MLXFast.MLXFastKernel
+        let plane: MLXArray
+        if let relaid = relayoutKernels {
+            CBv2EngageMark.once("head-relayout")
+            headKernel = relaid.argmax
+            plane = relayoutPlane(for: w, k: k, n: n)
+        } else {
+            headKernel = kernelV27Argmax
+            plane = w
+        }
+        let partials = headKernel(
+            [flatX, plane, scales, biases, xSums],
             template: [("T", x.dtype), ("K", k), ("N", n)],
             grid: (threadgroups * threadsPerThreadgroup, 1, 1),
             threadGroup: (threadsPerThreadgroup, 1, 1),
             outputShapes: [[mRows * threadgroups], [mRows * threadgroups]],
             outputDTypes: [.float32, .uint32]
         )
+        if relayoutKernels != nil, relayoutXCheck {
+            let reference = kernelV27Argmax(
+                [flatX, w, scales, biases, xSums],
+                template: [("T", x.dtype), ("K", k), ("N", n)],
+                grid: (threadgroups * threadsPerThreadgroup, 1, 1),
+                threadGroup: (threadsPerThreadgroup, 1, 1),
+                outputShapes: [[mRows * threadgroups], [mRows * threadgroups]],
+                outputDTypes: [.float32, .uint32]
+            )
+            relayoutReport("argmax pv", candidate: partials[0], incumbent: reference[0])
+            relayoutReport("argmax pi", candidate: partials[1], incumbent: reference[1])
+        }
 
         return argmaxReduceKernel(
             [partials[0], partials[1]],

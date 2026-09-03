@@ -2245,8 +2245,65 @@ private enum Gemma4PrefillDeqGEMMV1 {
         return value
     }()
 
+    /// PLANE-EVICT-033. Default ON: the dequantized prompt planes are read by
+    /// the prompt pass and by nothing else — every decode and verify rectangle
+    /// is 8..32 rows and falls below `minRows`, so the table is dead weight for
+    /// the whole timed decode window. This releases it on the first
+    /// decode-shaped forward, then hands the freed buffers back through
+    /// `Memory.clearCache()`. A later prompt rebuilds the same planes from the
+    /// same packed codes, so no value changes either way.
+    /// `DARKBLOOM_GEMMA4_PREFILL_DEQ_RELEASE=0` keeps the table resident.
+    static let releaseAfterPrompt: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_DEQ_RELEASE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// PLANE-EVICT-033 hysteresis. The table is only released once a run of
+    /// this many consecutive decode-shaped forwards has gone by, so a phase
+    /// that prompts and then takes a single token never pays a rebuild. A
+    /// timed decode window is hundreds of steps, so the delay costs nothing
+    /// there.
+    static let releaseAfterSteps: Int = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_DEQ_RELEASE_AFTER"],
+            let value = Int(raw), value > 0
+        else { return 8 }
+        return value
+    }()
+
     private static let planeLock = NSLock()
     nonisolated(unsafe) private static var cachedTransposedPlanes: [ObjectIdentifier: MLXArray] = [:]
+    nonisolated(unsafe) private static var decodeRunLength = 0
+
+    /// PLANE-EVICT-033. Drop the prompt plane table and return its buffers.
+    /// Called once per decode-shaped trunk entry; after the release the table
+    /// is empty and the lock is uncontended, so the steady-state cost is one
+    /// uncontended `NSLock` round trip per decode step (not per layer).
+    static func releasePlanesAfterPrompt() {
+        guard releaseAfterPrompt, cacheEnabled else { return }
+        planeLock.lock()
+        if cachedTransposedPlanes.isEmpty {
+            planeLock.unlock()
+            return
+        }
+        decodeRunLength += 1
+        guard decodeRunLength >= releaseAfterSteps else {
+            planeLock.unlock()
+            return
+        }
+        let released = cachedTransposedPlanes.count
+        cachedTransposedPlanes.removeAll(keepingCapacity: true)
+        decodeRunLength = 0
+        planeLock.unlock()
+        CBv2EngageMark.once("prefill-deq-plane-evict")
+        MLX.Memory.clearCache()
+        if xcheck {
+            FileHandle.standardError.write(
+                Data("[xcheck] prefill-deq-plane-evict released \(released)\n".utf8))
+        }
+    }
 
     @inline(__always)
     private static func plane(for quantized: QuantizedLinear, biases: MLXArray) -> MLXArray {
@@ -6354,6 +6411,14 @@ public class Gemma4TextModelInner: Module {
         // policy check while the host is building the decode graph.
         let inputBatchSize = inputs.dim(0)
         let inputLength = inputs.dim(1)
+
+        // PLANE-EVICT-033: a rectangle below the prompt row floor means the
+        // prompt pass is behind us, and the dequantized prompt planes are
+        // roughly 3.2 GB of bf16 that no decode dispatch reads. Release them
+        // here so the timed decode window runs without that residency.
+        if inputBatchSize * inputLength < Gemma4PrefillDeqGEMMV1.minRows {
+            Gemma4PrefillDeqGEMMV1.releasePlanesAfterPrompt()
+        }
 
         // Vision prefill (mirrors the inline VLM twin `TextModel.callAsFunction`):
         // `inputEmbedding` — the scaled text embeddings with image soft-token

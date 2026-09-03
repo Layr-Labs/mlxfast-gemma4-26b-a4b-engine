@@ -1155,6 +1155,16 @@ public let switchGateUpFusePrefillEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+/// Kill switch: `DARKBLOOM_GEMMA4_DECODE_GATEUP_FUSE` set to
+/// `0`/`false`/`no`/`off` restores the two split gathers on decode MoE layers.
+/// Engage mark: `decode-gateup-fuse`.
+public let switchGateUpFuseDecodeEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DECODE_GATEUP_FUSE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// The concatenated `[gate ; up]` affine 4-bit right-hand side of one expert
 /// layer plus the two zero-copy views the split projections are bound to. A
 /// plain final class (not a `Module`, not an `MLXArray` tuple) so the module
@@ -1499,6 +1509,27 @@ public class SwitchGLU: Module {
                     bits: fused.bits,
                     mode: fused.mode,
                     sortedIndices: true
+                )
+                xGate = xGateUp[.ellipsis, ..<hiddenDims]
+                xUp = xGateUp[.ellipsis, hiddenDims...]
+            } else if doSort, useLhsIndices, let lhsIndices,
+                x.dtype == .bfloat16,
+                switchGateUpFuseDecodeEnabled,
+                let fused = fusedGateUpDispatch()
+            {
+                CBv2EngageMark.once("decode-gateup-fuse")
+                let xGateUp = MLX.gatherQuantizedMM(
+                    x,
+                    fused.storage.weight,
+                    scales: fused.storage.scales,
+                    biases: fused.storage.biases,
+                    lhsIndices: lhsIndices,
+                    rhsIndices: idx,
+                    transpose: true,
+                    groupSize: fused.groupSize,
+                    bits: fused.bits,
+                    mode: fused.mode,
+                    sortedIndices: doSort
                 )
                 xGate = xGateUp[.ellipsis, ..<hiddenDims]
                 xUp = xGateUp[.ellipsis, hiddenDims...]

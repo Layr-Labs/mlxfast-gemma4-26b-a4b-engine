@@ -1639,9 +1639,23 @@ enum CBv2AttentionV1 {
                 queries: queries, keys: keys, values: values,
                 scale: scale, sinks: sinks, softcap: softcap)
             : nil
-        var offset = 0
-        while offset < newTokenCount {
-            let count = min(blockSize, newTokenCount - offset)
+        // PREFILL-JOIN-FOLD (jf1): admitted ahead of the loop, block by block,
+        // so every block's P.V product is stored into the chunk's token-major
+        // rectangle and the join dispatch below is not issued. nil keeps the
+        // established calls and joins, byte for byte.
+        let fold: CBv2PrefillJoinFoldContext? = queryPlane.flatMap { plane in
+            Gemma4PrefillJoinFoldV1.admit(
+                queries: queries, keys: keys, values: values, queryPlane: plane,
+                newTokenCount: newTokenCount, blockSize: blockSize,
+                historyCount: historyCount, window: window,
+                hasSpanContext: spanContext != nil)
+        }
+
+        /// One query block's attention -- the loop body, unchanged; `fold`
+        /// non-nil asks the composed path for the folded product.
+        func attendBlock(
+            offset: Int, count: Int, fold: CBv2PrefillJoinFoldContext?
+        ) -> MLXArray {
             let bounds = queryBlockBounds(
                 historyCount: historyCount, offset: offset, count: count, window: window)
             var visibleStart = bounds.visibleStart
@@ -1674,27 +1688,70 @@ enum CBv2AttentionV1 {
                 let qStart = queryAbsoluteStart,
                 let kStart = keyAbsoluteStart
             {
-                outputs.append(
-                    attendSpanSlice(
-                        queries: querySlice, keys: keySlice, values: valueSlice,
-                        scale: scale, queryAbsoluteStart: qStart,
-                        keyAbsoluteStart: kStart + visibleStart,
-                        window: window, blocks: blocks,
-                        sinks: sinks, softcap: softcap))
-            } else {
-                let planeSlice = queryPlane.map {
-                    $0[0..., 0..., 0..., offset ..< (offset + count), 0...]
-                }
-                outputs.append(
-                    attend(
-                        queries: querySlice, keys: keySlice, values: valueSlice,
-                        scale: scale, L: count, kL: visibleEnd - visibleStart,
-                        window: window, sinks: sinks, softcap: softcap,
-                        queryPlaneSlice: planeSlice))
+                return attendSpanSlice(
+                    queries: querySlice, keys: keySlice, values: valueSlice,
+                    scale: scale, queryAbsoluteStart: qStart,
+                    keyAbsoluteStart: kStart + visibleStart,
+                    window: window, blocks: blocks,
+                    sinks: sinks, softcap: softcap)
+            }
+            let planeSlice = queryPlane.map {
+                $0[0..., 0..., 0..., offset ..< (offset + count), 0...]
+            }
+            return attend(
+                queries: querySlice, keys: keySlice, values: valueSlice,
+                scale: scale, L: count, kL: visibleEnd - visibleStart,
+                window: window, sinks: sinks, softcap: softcap,
+                queryPlaneSlice: planeSlice, fold: fold)
+        }
+
+        var offset = 0
+        while offset < newTokenCount {
+            let count = min(blockSize, newTokenCount - offset)
+            outputs.append(attendBlock(offset: offset, count: count, fold: fold))
+            // A block that did not take the folded call breaks the chain; the
+            // remaining blocks and the joins below then run as established.
+            if let fold, !fold.broken, fold.delivered != outputs.count {
+                fold.broken = true
             }
             offset += count
         }
         if outputs.count == 1 { return outputs[0] }
+        // PREFILL-JOIN-FOLD (jf1): the rectangle is already assembled; the
+        // fence is the array it is read through. Same `[B, H, L, D]` contract
+        // as the joins below.
+        if let fold, let rectangle = Gemma4PrefillJoinFoldV1.finish(fold, blockOutputs: outputs) {
+            if Gemma4PrefillJoinFoldV1.xcheck {
+                // The incumbent blocks and join beside the folded chunk.
+                var reference: [MLXArray] = []
+                var referenceOffset = 0
+                while referenceOffset < newTokenCount {
+                    let count = min(blockSize, newTokenCount - referenceOffset)
+                    reference.append(
+                        attendBlock(offset: referenceOffset, count: count, fold: nil))
+                    referenceOffset += count
+                }
+                let joinedReference =
+                    joinTokenMajor(reference)
+                    ?? concatenated(reference.map { $0.transposed(0, 2, 1, 3) }, axis: 1)
+                Gemma4PrefillJoinFoldV1.report(
+                    rectangle, reference: joinedReference,
+                    site: "chunk L=\(newTokenCount) blocks=\(outputs.count) D=\(fold.D)")
+            }
+            return rectangle.transposed(0, 2, 1, 3)
+        }
+        if let fold, fold.broken {
+            // Defensive only (no admitted block can leave the chain): the
+            // products delivered before the break are strided views of the
+            // carrier; give the joins below the established block layout.
+            outputs = outputs.map { block in
+                block.ndim == 5
+                    ? block.reshaped([
+                        block.dim(0), block.dim(1) * block.dim(2), block.dim(3), block.dim(4),
+                    ])
+                    : block
+            }
+        }
         // PREFILL-JOIN-KERNEL: the token-major rectangle in one dispatch.
         // Same prompt-plane guard as the join below; the returned view keeps
         // this function's `[B, H, L, D]` contract exactly as that join does.
@@ -1747,7 +1804,8 @@ enum CBv2AttentionV1 {
     private static func attend(
         queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float,
         L: Int, kL: Int, window: Int?, sinks: MLXArray?, softcap: Float?,
-        bidirectional: Bool = false, queryPlaneSlice: MLXArray? = nil
+        bidirectional: Bool = false, queryPlaneSlice: MLXArray? = nil,
+        fold: CBv2PrefillJoinFoldContext? = nil
     ) -> MLXArray {
         // A model may widen Q for safer attention math while retaining compact
         // K/V storage. SDPA requires one dtype, so widen only these views.
@@ -1771,7 +1829,7 @@ enum CBv2AttentionV1 {
                 queries: queries, keys: attentionKeys, values: attentionValues,
                 scale: scale, L: L, kL: kL, window: window,
                 bidirectional: bidirectional, sinks: sinks,
-                queryPlaneSlice: queryPlaneSlice)
+                queryPlaneSlice: queryPlaneSlice, fold: fold)
             {
                 return composed
             }

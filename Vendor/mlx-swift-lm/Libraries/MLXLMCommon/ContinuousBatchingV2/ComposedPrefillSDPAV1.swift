@@ -250,7 +250,8 @@ enum CBv2ComposedPrefillSDPAV1 {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, L: Int, kL: Int, window: Int?,
         bidirectional: Bool, sinks: MLXArray?,
-        queryPlaneSlice: MLXArray? = nil
+        queryPlaneSlice: MLXArray? = nil,
+        fold: CBv2PrefillJoinFoldContext? = nil
     ) -> MLXArray? {
         guard enabled, scale == 1.0, sinks == nil, !bidirectional else { return nil }
         // Decode (L == 1) and every MTP verify width (L in 2...8) keep the
@@ -324,11 +325,19 @@ enum CBv2ComposedPrefillSDPAV1 {
         }
 
         var output: MLXArray
-        if let fused = CBv2PrefillAttnTrafficV1.attend(scores: scores, values: v) {
+        let deliveredBefore = fold?.delivered ?? 0
+        if let fused = CBv2PrefillAttnTrafficV1.attend(scores: scores, values: v, fold: fold) {
             // PREFILL-ATTN-TRAFFIC (at1): the softmax is applied by the P.V
             // GEMM's own A loader from a per-row statistics pre-pass; the
             // probability rectangle is never written or read.
             output = fused
+            // PREFILL-JOIN-FOLD (jf1): a folded product is the strided view
+            // of its rows of the chunk's rectangle. The block loop reads the
+            // rectangle through the fence, never this view, so it keeps its
+            // declared rank; reshaping it would copy the rows back out.
+            if let fold, !fold.broken, fold.delivered == deliveredBefore + 1 {
+                return output
+            }
         } else {
             if let vecScores = CBv2PrefillSoftmaxVecV1.apply(scores) {
                 scores = vecScores
@@ -860,12 +869,135 @@ enum CBv2PrefillAttnTrafficV1 {
         )
     }
 
+    // MARK: - PREFILL-JOIN-FOLD (jf1)
+
+    /// The at1 statistics text with the row's store offset by `params[2]`,
+    /// the block's slot in the fold carrier (`Gemma4PrefillJoinFoldV1`).
+    /// Everything else -- loads, both reduction trees, `fast::exp`,
+    /// `1.0f / normalizer`, the two words stored -- is the at1 kernel's own.
+    /// nil (fold refused) if the at1 text ever drifts.
+    private static let statsSourceJf1: String? = {
+        guard let text = statsSource else { return nil }
+        let store = "stats + size_t(gid) * 4"
+        let slotStore = "stats + size_t(params[2]) + size_t(gid) * 4"
+        guard text.components(separatedBy: store).count == 2 else {
+            FileHandle.standardError.write(
+                Data("[prefill-join-fold] at1 stats text drifted; fold disabled\n".utf8))
+            return nil
+        }
+        return text.replacingOccurrences(of: store, with: slotStore)
+    }()
+
+    /// Block 0's statistics kernel: its output IS the chunk's carrier
+    /// (statistics slots followed by the rectangle), freshly allocated.
+    private static let statsKernelJf1First: MLXFast.MLXFastKernel? = statsSourceJf1.map {
+        MLXFast.metalKernel(
+            name: "cbv2_prefill_sdpa_softmax_stats_bf16_jf1_first",
+            inputNames: ["scores", "params"],
+            outputNames: ["stats"],
+            source: $0,
+            ensureRowContiguous: true
+        )
+    }
+
+    /// Every later block's statistics kernel: the same text, its output
+    /// aliasing the previous block's carrier (`_aliaslast_`, the last input),
+    /// so the slot is written in place and the chain carries the dependency.
+    private static let statsKernelJf1Next: MLXFast.MLXFastKernel? = statsSourceJf1.map {
+        MLXFast.metalKernel(
+            name: "cbv2_prefill_sdpa_softmax_stats_bf16_jf1_aliaslast_next",
+            inputNames: ["scores", "params", "prev"],
+            outputNames: ["stats"],
+            source: $0,
+            ensureRowContiguous: true
+        )
+    }
+
+    /// Whether the fold can be taken at all (the at1 road and both jf1
+    /// kernels are available).
+    static var foldCapable: Bool {
+        enabled && CBv2PrefillSoftmaxVecV1.enabled && statsKernel != nil
+            && statsKernelJf1First != nil && statsKernelJf1Next != nil
+    }
+
+    /// `attend`'s own key-length admissions, for the fold's block-by-block
+    /// pre-check: the vectorized row, the block kernel window, and the
+    /// threadgroup sizing of the pg2 twin.
+    static func admitsKeyLength(_ axisSize: Int) -> Bool {
+        guard axisSize > 0, axisSize % 4 == 0, axisSize <= maxKeyLength else { return false }
+        let threadgroupSize = ((axisSize + 3) / 4 + 31) / 32 * 32
+        guard threadgroupSize > 0, threadgroupSize <= 1024 else { return false }
+        let rows = CBv2PrefillSoftmaxVecV1.rowsPerThreadgroup(
+            axisSize: axisSize, threadgroupSize: threadgroupSize)
+        return rows >= 1 && rows * threadgroupSize <= 1024
+    }
+
+    /// The folded P.V product of block `fold.delivered`: its statistics into
+    /// the carrier's slot, its product into its rows of the rectangle. Returns
+    /// the strided view the graph declares for the product, or nil (the
+    /// caller then marks the fold broken and keeps the at1 call).
+    private static func attendFolded(
+        scores: MLXArray, values: MLXArray, fold: CBv2PrefillJoinFoldContext,
+        axisSize: Int, numSimdgroups: Int, rows: Int, nRows: Int, threadgroupSize: Int
+    ) -> MLXArray? {
+        guard let first = statsKernelJf1First, let next = statsKernelJf1Next else { return nil }
+        let block = fold.delivered
+        guard block < fold.nBlocks, scores.ndim == 5, values.ndim == 5,
+            scores.dim(0) == fold.B, scores.dim(1) == fold.nKV, scores.dim(2) == fold.rep,
+            scores.dim(3) == fold.BS, scores.dim(4) == axisSize,
+            values.dim(0) == fold.B, values.dim(1) == fold.nKV, values.dim(2) == 1,
+            values.dim(3) == axisSize, values.dim(4) == fold.D,
+            nRows == fold.B * fold.H * fold.BS,
+            (block == 0) == (fold.carrier == nil)
+        else { return nil }
+        let slotOffset = fold.slotOffset(block: block)
+        guard slotOffset + fold.slotElems <= fold.statsElems, slotOffset < (1 << 32) else {
+            return nil
+        }
+        let paramsArray = MLXArray([
+            UInt32(axisSize), UInt32(numSimdgroups), UInt32(slotOffset),
+        ])
+        let carrier: MLXArray
+        if let prev = fold.carrier {
+            carrier = next(
+                [scores, paramsArray, prev],
+                template: [("T", scores.dtype), ("RPT", rows)],
+                grid: (threadgroupSize * nRows, 1, 1),
+                threadGroup: (threadgroupSize * rows, 1, 1),
+                outputShapes: [[fold.totalElems]],
+                outputDTypes: [.bfloat16]
+            )[0]
+        } else {
+            carrier = first(
+                [scores, paramsArray],
+                template: [("T", scores.dtype), ("RPT", rows)],
+                grid: (threadgroupSize * nRows, 1, 1),
+                threadGroup: (threadgroupSize * rows, 1, 1),
+                outputShapes: [[fold.totalElems]],
+                outputDTypes: [.bfloat16]
+            )[0]
+        }
+        // The slot's column view: the at1 carrier signature (row stride 4,
+        // column stride 0 once addmm broadcasts it) at the slot's offset, which
+        // names the block to the host.
+        let column = carrier[slotOffset ..< (slotOffset + fold.slotElems)]
+            .reshaped([fold.B, fold.nKV, fold.rep, fold.BS, 4])[.ellipsis, 0 ..< 1]
+        // alpha = -L beside the loader beta: the host binds the output to the
+        // block's rows of the rectangle and hands the kernel the at1 scalars.
+        let output = addMM(column, scores, values, alpha: -Float(fold.L), beta: loaderBeta)
+        fold.carrier = carrier
+        fold.delivered = block + 1
+        return output
+    }
+
     /// `matmul(softmax(scores, axis: -1, precise: true), values)` with the
     /// probabilities never materialized, or nil to keep the incumbent pair.
     /// `scores` is the row-contiguous `[.., L, kL]` score rectangle of one
     /// query block, `values` the `[.., kL, D]` operand the incumbent
     /// `matmul` takes.
-    static func attend(scores: MLXArray, values: MLXArray) -> MLXArray? {
+    static func attend(
+        scores: MLXArray, values: MLXArray, fold: CBv2PrefillJoinFoldContext? = nil
+    ) -> MLXArray? {
         guard enabled, CBv2PrefillSoftmaxVecV1.enabled, let statsKernel else { return nil }
         guard scores.dtype == .bfloat16, values.dtype == .bfloat16 else { return nil }
         guard scores.ndim >= 2, values.ndim == scores.ndim else { return nil }
@@ -893,6 +1025,19 @@ enum CBv2PrefillAttnTrafficV1 {
         statsShape[statsShape.count - 1] = 4
 
         CBv2EngageMark.once("prefill-attn-traffic")
+        // PREFILL-JOIN-FOLD (jf1): the same statistics and the same GEMM,
+        // stored into the chunk's carrier and rectangle. A refusal here marks
+        // the fold broken and keeps this block on the at1 call below.
+        if let fold, !fold.broken {
+            if let folded = attendFolded(
+                scores: scores, values: values, fold: fold,
+                axisSize: axisSize, numSimdgroups: numSimdgroups, rows: rows,
+                nRows: nRows, threadgroupSize: threadgroupSize)
+            {
+                return folded
+            }
+            fold.broken = true
+        }
         let stats = statsKernel(
             [scores, paramsArray],
             template: [("T", scores.dtype), ("RPT", rows)],

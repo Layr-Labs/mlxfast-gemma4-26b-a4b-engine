@@ -3522,6 +3522,184 @@ private enum Gemma4RouterFinalistsWeightsV1 {
         ensureRowContiguous: true
     )
 
+    /// PROMPT-GLUE3 (pg3): `gemma4_router_finalists32_weights_bf16_v1` with
+    /// the same selection networks and the same softmax tail, in the form
+    /// the dispatch's cost structure asks for. The incumbent is bound by the
+    /// instruction count of its compare-exchange step (two bf16 decodes,
+    /// two NaN tests, a branch and two compares per step, 30 steps per row),
+    /// not by bytes, barriers or threadgroup count.
+    ///
+    /// 1. KEYED COMPARE. Each item is, once at load, the score mapped to a
+    ///    monotone unsigned key packed above the expert index
+    ///    (`gemma4_finalists_key_pg3`): NaN -- classified by the incumbent's
+    ///    own `metal::isnan` -- to one pattern above +inf; a score that the
+    ///    incumbent's own `bfloat <` operator places neither below nor
+    ///    above zero (+0, -0, and every denormal on a compare unit that
+    ///    flushes them, since the classification runs that very operator
+    ///    on the value) to +0; the rest sign-magnitude flipped. For two
+    ///    distinct experts `gemma4_finalists_before(a, b)` is then exactly
+    ///    `key_a < key_b`: `av < bv` on non-NaN values is the flipped
+    ///    sign-magnitude integer order, the incumbent's tie (`av < bv` and
+    ///    `bv < av` both false: equal values, +0 against -0, and the
+    ///    compare unit's zero-likes) falls to the index in both, NaN is
+    ///    after everything and NaN against NaN falls to the index in both.
+    ///    Every compare-exchange therefore takes the incumbent's branch and
+    ///    every lane holds the incumbent's item after every step.
+    /// 2. ONE SIMDGROUP PER ROW. The incumbent runs the four 32-item group
+    ///    networks on four simdgroups and exchanges the finalists through
+    ///    threadgroup memory; here lane `l` holds group `g`'s lane-`l` item
+    ///    in `it[g]` and the four networks run interleaved, each step of
+    ///    each being the incumbent's step for that (group, lane). The
+    ///    finalists are then laid out as the incumbent's
+    ///    `finalists[group * 8 + lane - 24]` by shuffle (lane `l` takes
+    ///    group `l / 8`'s lane `24 + l % 8`), and the second network is the
+    ///    incumbent's second network over the incumbent's 32 items.
+    /// 3. THE TAIL reads the incumbent's operands from registers: the
+    ///    winners' unchanged score bits re-read from the row by the winner's
+    ///    index (a pure copy of the word the incumbent packed into its
+    ///    item), `float(uint16_to_bfloat16(bits))` in the same
+    ///    ascending-rank order, the `Limits<float>::min` padding, the same
+    ///    `simd_max` and `simd_sum` over the same lanes, and the incumbent's
+    ///    cross-slot combines run over the same 32 operands
+    ///    (`[value, identity x 31]`) in registers instead of through the
+    ///    zero-filled slots; then `1 / normalizer`, `T(ld * normalizer)`
+    ///    and the bf16 `* pes[index]` multiply, statement for statement.
+    /// No threadgroup memory, no barrier. `RPT` rows (simdgroups) per
+    /// threadgroup; a simdgroup past the last row returns as a whole.
+    private static let kernelPg3: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_router_finalists32_weights_bf16_pg3",
+        inputNames: ["scores", "pes"],
+        outputNames: ["indices", "weights"],
+        source: """
+            constexpr int N_READS = 4;
+            constexpr int K = 8;
+
+            const uint row = threadgroup_position_in_grid.x * uint(RPT)
+                + simdgroup_index_in_threadgroup;
+            if (row >= uint(ROWS)) {
+                return;
+            }
+            const uint lane = thread_index_in_simdgroup;
+            const device T* srow = scores + row * 128u;
+
+            // PROMPT-GLUE3 (pg3): the four group networks of the incumbent on
+            // one simdgroup, keyed items (see gemma4_finalists_key_pg3).
+            uint it[4];
+            for (uint g = 0u; g < 4u; ++g) {
+                const uint expert = g * 32u + lane;
+                it[g] = (gemma4_finalists_key_pg3(bfloat16_to_uint16(srow[expert])) << 7)
+                    | expert;
+            }
+            for (uint width = 2u; width <= 32u; width <<= 1) {
+                for (uint stride = width >> 1; stride > 0u; stride >>= 1) {
+                    const bool takeMinimum = ((lane & width) == 0u)
+                        == ((lane & stride) == 0u);
+                    for (uint g = 0u; g < 4u; ++g) {
+                        const uint other = simd_shuffle_xor(it[g], ushort(stride));
+                        const bool otherBefore = other < it[g];
+                        if (takeMinimum ? otherBefore : !otherBefore) it[g] = other;
+                    }
+                }
+            }
+
+            // The incumbent's finalists layout: lane l of the second network
+            // takes group (l / 8)'s lane (24 + l % 8).
+            const ushort src = ushort(24u + (lane & 7u));
+            const uint c0 = simd_shuffle(it[0], src);
+            const uint c1 = simd_shuffle(it[1], src);
+            const uint c2 = simd_shuffle(it[2], src);
+            const uint c3 = simd_shuffle(it[3], src);
+            uint item = (lane < 8u) ? c0 : (lane < 16u) ? c1 : (lane < 24u) ? c2 : c3;
+            for (uint width = 2u; width <= 32u; width <<= 1) {
+                for (uint stride = width >> 1; stride > 0u; stride >>= 1) {
+                    const uint other = simd_shuffle_xor(item, ushort(stride));
+                    const bool otherBefore = other < item;
+                    const bool takeMinimum = ((lane & width) == 0u)
+                        == ((lane & stride) == 0u);
+                    if (takeMinimum ? otherBefore : !otherBefore) item = other;
+                }
+            }
+            const uint widx = item & 127u;
+            // The winners (lanes 24..31, ascending rank): the index, and the
+            // unchanged score bits re-read from the row for the tail.
+            uint wbits = 0u;
+            if (lane >= 24u) {
+                indices[row * 8u + lane - 24u] = widx;
+                wbits = uint(bfloat16_to_uint16(srow[widx]));
+            }
+
+            // softmax_single_row<T, float, N_READS=4> transcription at
+            // axis_size = K on this simdgroup, the incumbent's operands
+            // staged by shuffle: position p is lane (24 + p)'s winner.
+            float ld[N_READS];
+            uint ti[N_READS];
+            const int base = int(lane) * N_READS;
+            for (int i = 0; i < N_READS; i++) {
+                const int p = base + i;
+                const uint s = (p < K) ? uint(24 + p) : 31u;
+                const uint wb = simd_shuffle(wbits, ushort(s));
+                const uint wi = simd_shuffle(widx, ushort(s));
+                ld[i] = (p < K) ? float(uint16_to_bfloat16(uint16_t(wb))) : Limits<float>::min;
+                ti[i] = wi;
+            }
+
+            float maxval = Limits<float>::finite_min;
+            for (int i = 0; i < N_READS; i++) {
+                maxval = (maxval < ld[i]) ? ld[i] : maxval;
+            }
+            maxval = simd_max(maxval);
+            // The incumbent's cross-slot combine: slot 0 holds the value,
+            // slots 1-31 their Limits<float>::min init -- in registers.
+            maxval = simd_max(lane == 0u ? maxval : Limits<float>::min);
+
+            float normalizer = 0;
+            for (int i = 0; i < N_READS; i++) {
+                float exp_x = fast::exp(ld[i] - maxval);
+                ld[i] = exp_x;
+                normalizer += exp_x;
+            }
+            normalizer = simd_sum(normalizer);
+            // The incumbent's cross-slot combine: slot 0 holds the value,
+            // slots 1-31 their 0 init -- in registers.
+            normalizer = simd_sum(lane == 0u ? normalizer : 0.0f);
+            const float inv_normalizer = 1 / normalizer;
+            if (base + N_READS <= K) {
+                for (int i = 0; i < N_READS; i++) {
+                    const T w = T(ld[i] * inv_normalizer);
+                    weights[row * 8u + uint(base + i)] = w * pes[ti[i]];
+                }
+            } else {
+                for (int i = 0; i < N_READS; i++) {
+                    if ((base + i) < K) {
+                        const T w = T(ld[i] * inv_normalizer);
+                        weights[row * 8u + uint(base + i)] = w * pes[ti[i]];
+                    }
+                }
+            }
+        """,
+        header: """
+            // PROMPT-GLUE3 (pg3): the score's monotone unsigned key. NaN by
+            // the incumbent's `metal::isnan`; zero-like by the incumbent's
+            // own `bfloat <` operator against zero (so its flushing of
+            // denormals, if any, is reproduced rather than assumed); then
+            // the sign-magnitude flip that makes `<` on the keys the IEEE
+            // order on the values.
+            inline uint gemma4_finalists_key_pg3(uint16_t u) {
+                const bfloat16_t av = uint16_to_bfloat16(u);
+                const bfloat16_t zero = uint16_to_bfloat16(uint16_t(0u));
+                const bool an = metal::isnan(av);
+                const bool zl = (!an) && !(av < zero) && !(zero < av);
+                const uint16_t w = an ? uint16_t(0x7FC0u) : (zl ? uint16_t(0u) : u);
+                return (w & 0x8000u) ? (~uint(w) & 0xFFFFu) : (uint(w) | 0x8000u);
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    /// Rows (simdgroups) per threadgroup of the pg3 twin (128 threads; any
+    /// value is exact).
+    private static let rowsPerGroupPg3 = 4
+
     static func applyPrefill(
         _ scores: MLXArray, perExpertScale: MLXArray, topK: Int, kth: Int
     ) -> (indices: MLXArray, weights: MLXArray)? {
@@ -3538,6 +3716,37 @@ private enum Gemma4RouterFinalistsWeightsV1 {
         let l = scores.dim(1)
         let rows = b * l
         CBv2EngageMark.once("router-weights32-prefill")
+        // PROMPT-GLUE3 (pg3): the prompt plane's score rectangle takes the
+        // keyed one-simdgroup twin; every other rectangle keeps the
+        // incumbent dispatch.
+        if Gemma4PromptGlue3V1.enabled, rows >= Gemma4PromptGlue3V1.minRows {
+            let rpt = rowsPerGroupPg3
+            let groups = (rows + rpt - 1) / rpt
+            let outs = kernelPg3(
+                [scores, perExpertScale],
+                template: [("T", scores.dtype), ("RPT", rpt), ("ROWS", rows)],
+                grid: (groups * rpt * 32, 1, 1),
+                threadGroup: (rpt * 32, 1, 1),
+                outputShapes: [[b, l, 8], [b, l, 8]],
+                outputDTypes: [.uint32, .bfloat16]
+            )
+            if Gemma4PromptGlue3V1.xcheck {
+                let reference = kernel(
+                    [scores, perExpertScale],
+                    template: [("T", scores.dtype)],
+                    grid: (rows * 128, 1, 1),
+                    threadGroup: (128, 1, 1),
+                    outputShapes: [[b, l, 8], [b, l, 8]],
+                    outputDTypes: [.uint32, .bfloat16]
+                )
+                Gemma4PromptGlue3V1.report(
+                    outs[0], reference: reference[0], site: "router finalists32 indices")
+                Gemma4PromptGlue3V1.report(
+                    outs[1], reference: reference[1], site: "router finalists32 weights")
+            }
+            Gemma4PromptGlue3V1.mark()
+            return (outs[0], outs[1])
+        }
         let outs = kernel(
             [scores, perExpertScale],
             template: [("T", scores.dtype)],

@@ -217,7 +217,18 @@ template <
     }
   }
 
-  D += params->batch_stride_d * tid.z;
+  // PREFILL-JOIN-FOLD (jf1): a NEGATIVE batch_stride_d selects per-dimension
+  // output batch strides, carried in batch_strides after the operand strides
+  // (A, B and, when present, C). Every other dispatch keeps the linear
+  // per-batch output stride. Only the store ADDRESSES change; the stored
+  // words are the tile the accumulator holds either way.
+  if (has_batch && params->batch_stride_d < 0) {
+    const constant auto* D_bstrides =
+        batch_strides + (use_out_source ? 3 : 2) * params->batch_ndim;
+    D += elem_to_loc(tid.z, batch_shape, D_bstrides, params->batch_ndim);
+  } else {
+    D += params->batch_stride_d * tid.z;
+  }
 
   // Prepare threadgroup memory
   threadgroup_barrier(mem_flags::mem_none);

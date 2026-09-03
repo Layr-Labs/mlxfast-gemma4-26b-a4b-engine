@@ -3552,39 +3552,80 @@ private enum Gemma4RouterFinalistsWeightsV1 {
     }
 }
 
-/// GLUE-FOLD (G2): merge the two ADJACENT single-threadgroup route glue
-/// stages of the pinned B=8 decode cell into one dispatch. On the incumbent
-/// chain the router scores feed `gemma4_router_finalists32_stable_bf16_v1`
-/// (top-8 selection, one 128-thread group per row) and its `[8, 8]` output
-/// then feeds the strictly-serial `mlx_lm_route_simd_rank_scatter_m8_u32_n64`
-/// launch inside `SwitchGLU.projectExperts` (the sorted route table). Both are
-/// launch-drain stages on the layer's DEPENDENT chain: the expert gathers
-/// cannot start until the rank scatter has drained. This kernel runs the
-/// identical selection network and the identical rank scatter back to back in
-/// ONE 1024-thread threadgroup (8 rows x 128 threads; the 64 selected keys
-/// are staged through threadgroup memory instead of a device round trip), so
-/// one whole dispatch and its barrier stage leave the dependent chain in every
-/// MoE layer of every decode step (x30/step).
+/// GLUE-FOLD (G2): merge the ADJACENT single-threadgroup route glue stages of
+/// the pinned B=8 decode cell into one dispatch. On the incumbent chain the
+/// router scores feed `gemma4_router_finalists32_stable_bf16_v1` (top-8
+/// selection, one 128-thread group per row); its `[8, 8]` output then feeds
+/// the strictly-serial `mlx_lm_route_simd_rank_scatter_m8_u32_n64` launch
+/// inside `SwitchGLU.projectExperts` (the sorted route table), and separately
+/// the weight tail in `Gemma4Router.zipWeights`. All of these are launch-drain
+/// stages on the layer's DEPENDENT chain: the expert gathers cannot start
+/// until the rank scatter has drained. This kernel runs the selection network,
+/// the weight tail and the rank scatter back to back in ONE 1024-thread
+/// threadgroup (8 rows x 128 threads; the 64 selected keys are staged through
+/// threadgroup memory instead of a device round trip). Measured by dispatch
+/// census on this geometry: the incumbent chain issues SIX dispatches per MoE
+/// layer per decode step where this kernel issues one.
 ///
-/// Exactness by construction: every operation in both phases is integer or
-/// raw-bit work -- the comparator reads the unchanged BF16 score bits as a
-/// packed word exactly like the incumbent finalists kernel, the selection
-/// bitonic and the rank loop are copied verbatim (only the threadgroup-memory
-/// indexing gains a `row` offset), and no floating-point value is produced,
-/// re-associated or re-rounded anywhere. There is no accumulation and no
-/// reduction-tree change to reason about: outputs are bit-identical to the
-/// incumbent pair of kernels for every input. The staged `sel` array holds
-/// exactly the values the incumbent chain would have written to the `[8, 8]`
-/// indices buffer, and phase 2 reads them at the same flattened positions.
+/// NUMERICS. With EXACT-TAIL on, which is the default, every phase is
+/// bit-identical to the incumbent chain.
 ///
-/// Fail-closed: any geometry other than the pinned decode cell, a disabled
-/// finalists stage, plan != 1, or the kill switch selects the incumbent
-/// two-dispatch chain unchanged. `DARKBLOOM_GEMMA4_GLUE_FOLD=0` is the kill
-/// switch (off = exact incumbent chain). Engage mark: `glue-fold`.
+/// Phases 1 and 2 (selection, rank scatter) are bit-identical by construction.
+/// Every operation in them is integer or raw-bit work: the comparator reads
+/// the unchanged BF16 score bits as a packed word exactly like the incumbent
+/// finalists kernel, and the selection bitonic and the rank loop are copied
+/// verbatim (only the threadgroup-memory indexing gains a `row` offset). The
+/// staged `sel` array holds exactly the values the incumbent chain would have
+/// written to the `[8, 8]` indices buffer, and phase 2 reads them at the same
+/// flattened positions. WHICH eight experts are selected, and the route table
+/// over them, therefore cannot differ from the incumbent chain: the winners
+/// are fixed as bits before any floating-point arithmetic runs, so no routing
+/// flip is reachable here.
+///
+/// The group-0 weight tail, and why it needs saying. v1 of this type
+/// (`gemma4_route_finalists_rank_gluefold_v1`) took only `scores`, emitted
+/// only `indices` and the route table, and contained no floating-point
+/// arithmetic anywhere -- which is what the exactness paragraph that used to
+/// stand here was written about. `50b0480a` added a float32 softmax tail, the
+/// `pes` input and the `weights` output, renamed the kernel `..._v2`, and left
+/// that paragraph in place above arithmetic it did not describe: the v2 tail
+/// is NOT bit-identical to the stock
+/// `takeAlong -> softmax(precise:) -> gather -> multiply` chain.
+///
+/// EXACT-TAIL (`..._v3_exacttail`, default ON) replaces the v2 tail with a
+/// verbatim transcription of `softmax_single_row<bfloat16_t, float,
+/// N_READS=4>` (softmax.h) plus the stock bf16 per-expert-scale multiply, so
+/// `weights` is bit-identical to the stock chain's output for every input.
+/// The transcription is `Gemma4RouterFinalistsWeightsV1`'s, whose doc carries
+/// the op-by-op exactness argument against the stock chain; the only edits are
+/// a `row *` offset on each threadgroup slice and simdgroup barriers in place
+/// of threadgroup barriers, which is legal and free here because every
+/// producer and consumer of those slices for a row lives in that row's
+/// group-0 simdgroup and `group` is simdgroup-uniform.
+///
+/// Kill switches, both fail-closed onto strictly more incumbent behaviour:
+/// `DARKBLOOM_GEMMA4_GLUE_FOLD_EXACT_TAIL=0` restores the `..._v2` tail
+/// exactly -- its source literal is duplicated below rather than factored into
+/// shared fragments precisely so that "restores it exactly" is a property of
+/// the diff rather than of a string concatenation -- and
+/// `DARKBLOOM_GEMMA4_GLUE_FOLD=0` selects the incumbent multi-dispatch chain
+/// unchanged. Any geometry other than the pinned decode cell, a disabled
+/// finalists stage, or plan != 1 also selects the incumbent chain. Engage
+/// marks: `glue-fold`, plus `glue-fold-exact-tail` when the exact tail is
+/// active.
 private enum Gemma4RouteGlueFoldV1 {
     static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_GLUE_FOLD"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// EXACT-TAIL: default ON. `0/false/no/off` restores the inherited
+    /// float32 softmax tail (`..._v2`) exactly, and nothing else changes.
+    static let exactTailEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_GLUE_FOLD_EXACT_TAIL"]
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
@@ -3595,11 +3636,329 @@ private enum Gemma4RouteGlueFoldV1 {
         let table: SwitchRouteTable
     }
 
-    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "gemma4_route_monolithic_top8_e128_k8_bf16_v2",
-        inputNames: ["scores", "pes"],
-        outputNames: ["indices", "weights", "row_order", "sorted_keys", "inverse_order"],
-        source: """
+    // MARK: - ROUTE-A2-042 --- the rank predicate as one unsigned compare
+
+    /// `false` only when `DARKBLOOM_GEMMA4_ROUTE_RANK_COMPOSITE` is an
+    /// explicit off value. Off restores the incumbent predicate, its source
+    /// and its name byte for byte.
+    private static let routeA2Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ROUTE_RANK_COMPOSITE"]
+        else { return true }
+        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "0", "false", "no", "off": return false
+        default: return true
+        }
+    }()
+
+    /// ROUTE-A2-042. The phase-2 rank scatter asks, 64 times per body, whether
+    /// another finalist sorts before this one:
+    ///
+    ///     (other < key) || (other == key && other_assignment < assignment)
+    ///
+    /// That is **lexicographic order on the pair `(key, assignment)`**, and a
+    /// lexicographic order on a pair of bounded unsigned fields is exactly one
+    /// unsigned compare over the fields packed into a single word.
+    ///
+    /// The widths, which the original ticket did not check and got wrong (it
+    /// said a 13-bit composite; it is 29):
+    ///
+    /// * `assignment = tid` indexes 8 rows x top-8 = **[0, 64)** --- 6 bits.
+    ///   The two "other" indices are `source` in `[0, 32)` and
+    ///   `32 + source` in `[32, 64)`, so both are in range as well.
+    /// * `key = sel[assignment]` holds an `item`, built upstream as
+    ///   `(bfloat16_to_uint16(score) << 7) | expert` with `expert < 128`, so
+    ///   `key <= (65535 << 7) | 127 = 8,388,607 < 2^23` --- **23 bits**.
+    /// * composite = `23 + 6 = 29` bits, so `(key << 6) | assignment` cannot
+    ///   overflow a `uint` and no field can bleed into another.
+    ///
+    /// Exactness, by cases and complete. Write `A = (a << 6) | ia` and
+    /// `K = (k << 6) | ik` with `ia, ik < 64`. If `a < k` then
+    /// `A <= (k - 1) << 6 | 63 = (k << 6) - 1 < K`. If `a > k` the same
+    /// argument reversed gives `A > K`. If `a == k` then `A < K` iff
+    /// `ia < ik`. So `A < K` holds exactly when the incumbent predicate holds,
+    /// for every input --- including the self-comparison, where `a == k` and
+    /// `ia == ik` give `A == K` and neither predicate fires.
+    ///
+    /// **No floating point is read, produced, compared or re-rounded
+    /// anywhere in this transform.** It is integer packing over values the
+    /// incumbent already had in registers, so it cannot spend a token of the
+    /// per-stream tolerance budget and needs no fidelity argument at all.
+    /// The `simd_broadcast` pattern, the loop bounds, the unroll pragma and
+    /// the three stores are the incumbent's, unmoved.
+    ///
+    /// Soft-gated: a derivation mismatch leaves the promoted source and name
+    /// in place rather than trapping inside a lazy static.
+    /// GOLD-GATE 2026-09-03. Was a closure over `incumbentSource` alone. Taking
+    /// the base as a parameter is what lets the exact-tail body -- a deliberate
+    /// duplicate of the incumbent literal -- receive the identical derivation
+    /// instead of silently keeping the incumbent predicate.
+    private static func routeA2Rewrite(_ base: String) -> String? {
+        var result = base
+        func replaceOnce(_ old: String, with new: String) -> Bool {
+            guard result.components(separatedBy: old).count == 2 else { return false }
+            result = result.replacingOccurrences(of: old, with: new)
+            return true
+        }
+        guard replaceOnce(
+            """
+                    const uint key = sel[assignment];
+                    const uint key_low = sel[lane];
+                    const uint key_high = sel[32u + lane];
+                    uint rank = 0;
+            """,
+            with: """
+                    const uint key = sel[assignment];
+                    // ROUTE-A2: (key, assignment) packed into one word.
+                    // assignment < 64 (6 bits); key < 2^23; 29 bits total.
+                    const uint self_composite = (key << 6) | assignment;
+                    const uint composite_low = (sel[lane] << 6) | lane;
+                    const uint composite_high =
+                        (sel[32u + lane] << 6) | (32u + lane);
+                    uint rank = 0;
+            """
+        ) else { return nil }
+        guard replaceOnce(
+            """
+                    for (uint source = 0; source < 32; ++source) {
+                        const uint other_low = simd_broadcast(key_low, ushort(source));
+                        rank += (other_low < key)
+                            || (other_low == key && source < assignment);
+                        const uint other_high = simd_broadcast(key_high, ushort(source));
+                        const uint high_assignment = 32u + source;
+                        rank += (other_high < key)
+                            || (other_high == key && high_assignment < assignment);
+                    }
+            """,
+            with: """
+                    for (uint source = 0; source < 32; ++source) {
+                        rank += simd_broadcast(composite_low, ushort(source))
+                            < self_composite;
+                        rank += simd_broadcast(composite_high, ushort(source))
+                            < self_composite;
+                    }
+            """
+        ) else { return nil }
+        return result
+    }
+
+    private static let routeA2Source: String? = routeA2Rewrite(incumbentSource)
+
+    /// The same derivation over the exact-tail body. Independently gated: if
+    /// either rewrite fails its `replaceOnce` check, that kernel alone keeps the
+    /// incumbent predicate under the incumbent name.
+    private static let exactTailA2Source: String? =
+        routeA2Rewrite(exactTailIncumbentSource)
+
+    private static let activeSource: String =
+        (routeA2Enabled ? routeA2Source : nil) ?? incumbentSource
+
+    private static let exactTailActiveSource: String =
+        (routeA2Enabled ? exactTailA2Source : nil) ?? exactTailIncumbentSource
+
+    /// Cumulative append: MLX caches pipelines by name and fires
+    /// `clear_library` on a name/source mismatch, so a changed body takes a
+    /// changed name.
+    private static let routeA2Key: String =
+        (routeA2Enabled && routeA2Source != nil) ? "_a2" : ""
+
+    private static let exactTailA2Key: String =
+        (routeA2Enabled && exactTailA2Source != nil) ? "_a2" : ""
+
+    /// GOLD-GATE 2026-09-03. The exact-tail body, lifted verbatim out of the
+    /// `metalKernel` argument list -- the closing delimiter keeps its column,
+    /// so the string Swift produces is unchanged -- so that ROUTE-A2 can be
+    /// derived from it by the SAME checked rewrite that derives it from
+    /// `incumbentSource`.
+    private static let exactTailIncumbentSource: String = """
+            const uint tid = thread_position_in_threadgroup.x;
+            const uint row = tid / 128u;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint group = sg % 4u;
+            const uint expert = group * 32u + lane;
+            // Phase 1 -- the incumbent finalists32 selection, verbatim, with
+            // the per-row threadgroup slices offset by `row`. Pack the
+            // unchanged BF16 bits and the original expert index; comparisons
+            // retain native BF16 LessThan semantics.
+            uint item = (uint(bfloat16_to_uint16(scores[row * 128u + expert])) << 7)
+                | expert;
+            threadgroup uint finalists[256];
+            threadgroup uint sel[64];
+            // EXACT-TAIL only: the stock softmax's per-row staging slices.
+            // 8 rows x (8 floats + 8 uints + 32 floats + 32 floats) = 2560 B on
+            // top of the 1280 B above, against a 32 KB threadgroup limit, on a
+            // kernel that launches exactly one threadgroup.
+            threadgroup float topv[64];
+            threadgroup uint topi[64];
+            threadgroup float local_max[256];
+            threadgroup float local_normalizer[256];
+
+            #pragma clang loop unroll(full)
+            for (uint width = 2u; width <= 32u; width <<= 1) {
+                #pragma clang loop unroll(full)
+                for (uint stride = width >> 1; stride > 0u; stride >>= 1) {
+                    const uint other = simd_shuffle_xor(item, ushort(stride));
+                    const bool otherBefore = gemma4_finalists_before(other, item);
+                    const bool takeMinimum = ((lane & width) == 0u)
+                        == ((lane & stride) == 0u);
+                    if (takeMinimum ? otherBefore : !otherBefore) item = other;
+                }
+            }
+
+            if (lane >= 24u) {
+                finalists[row * 32u + group * 8u + lane - 24u] = item;
+            }
+            // All thirty-two complete SIMD groups participate in this barrier.
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Group 0 reduces 32 finalists to top 8, then runs the STOCK
+            // softmax + per-expert-scale tail transcribed verbatim.
+            if (group == 0u) {
+                item = finalists[row * 32u + lane];
+                #pragma clang loop unroll(full)
+                for (uint width = 2u; width <= 32u; width <<= 1) {
+                    #pragma clang loop unroll(full)
+                    for (uint stride = width >> 1; stride > 0u; stride >>= 1) {
+                        const uint other = simd_shuffle_xor(item, ushort(stride));
+                        const bool otherBefore = gemma4_finalists_before(other, item);
+                        const bool takeMinimum = ((lane & width) == 0u)
+                            == ((lane & stride) == 0u);
+                        if (takeMinimum ? otherBefore : !otherBefore) item = other;
+                    }
+                }
+
+                // Stage the eight winners in the stock chain's ascending-rank
+                // (takeAlong) order, then run
+                // softmax_single_row<bfloat16_t, float, N_READS=4> (softmax.h)
+                // VERBATIM on this row's group-0 simdgroup -- which is exactly
+                // the single 32-thread simdgroup the stock axis-8 launch uses
+                // -- with the stock bf16 per-expert-scale multiply fused into
+                // the write. Transcribed from Gemma4RouterFinalistsWeightsV1,
+                // whose own doc carries the op-by-op exactness argument; the
+                // only edit is a `row *` offset on every threadgroup slice.
+                //
+                // The stock kernel's threadgroup barriers become SIMDGROUP
+                // barriers here. Every producer and consumer of topv/topi/
+                // local_max/local_normalizer for a row lives in that row's
+                // group-0 simdgroup, and `group` is simdgroup-uniform
+                // (group = sg % 4), so the ordering guarantee is identical,
+                // the other 31 simdgroups pay nothing, and no arithmetic
+                // changes. A threadgroup_barrier inside this branch would be
+                // non-uniform and illegal.
+                if (lane >= 24u) {
+                    const uint selected = item & 127u;
+                    const uint out_idx = row * 8u + (lane - 24u);
+                    indices[out_idx] = selected;
+                    sel[out_idx] = selected;
+                    topv[out_idx] = float(uint16_to_bfloat16(uint16_t(item >> 7)));
+                    topi[out_idx] = selected;
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+
+                float ld[4];
+                const int base = int(lane) * 4;
+                if (base + 4 <= 8) {
+                    for (int i = 0; i < 4; i++) {
+                        ld[i] = topv[row * 8u + uint(base + i)];
+                    }
+                } else {
+                    for (int i = 0; i < 4; i++) {
+                        ld[i] = ((base + i) < 8)
+                            ? topv[row * 8u + uint(base + i)]
+                            : Limits<float>::min;
+                    }
+                }
+                local_max[row * 32u + lane] = Limits<float>::min;
+                local_normalizer[row * 32u + lane] = 0;
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+
+                {
+                    float maxval = Limits<float>::finite_min;
+                    for (int i = 0; i < 4; i++) {
+                        maxval = (maxval < ld[i]) ? ld[i] : maxval;
+                    }
+                    maxval = simd_max(maxval);
+                    if (lane == 0u) {
+                        local_max[row * 32u] = maxval;
+                    }
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                {
+                    float maxval = simd_max(local_max[row * 32u + lane]);
+                    if (lane == 0u) {
+                        local_max[row * 32u] = maxval;
+                    }
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                {
+                    const float maxval = local_max[row * 32u];
+                    float normalizer = 0;
+                    for (int i = 0; i < 4; i++) {
+                        float exp_x = fast::exp(ld[i] - maxval);
+                        ld[i] = exp_x;
+                        normalizer += exp_x;
+                    }
+                    normalizer = simd_sum(normalizer);
+                    if (lane == 0u) {
+                        local_normalizer[row * 32u] = normalizer;
+                    }
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                {
+                    float normalizer = simd_sum(local_normalizer[row * 32u + lane]);
+                    if (lane == 0u) {
+                        local_normalizer[row * 32u] = normalizer;
+                    }
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                {
+                    const float normalizer = 1 / local_normalizer[row * 32u];
+                    if (base + 4 <= 8) {
+                        for (int i = 0; i < 4; i++) {
+                            const bfloat16_t w = bfloat16_t(ld[i] * normalizer);
+                            weights[row * 8u + uint(base + i)]
+                                = w * pes[topi[row * 8u + uint(base + i)]];
+                        }
+                    } else {
+                        for (int i = 0; i < 4; i++) {
+                            if ((base + i) < 8) {
+                                const bfloat16_t w = bfloat16_t(ld[i] * normalizer);
+                                weights[row * 8u + uint(base + i)]
+                                    = w * pes[topi[row * 8u + uint(base + i)]];
+                            }
+                        }
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Phase 2 -- the incumbent simd-rank scatter, verbatim, over the
+            // staged 64 keys. Threads 0..63 are exactly the two complete
+            // SIMD groups the standalone kernel launched; `assignment` and
+            // `lane` reproduce its coordinates.
+            if (tid < 64u) {
+                const uint assignment = tid;
+                const uint key = sel[assignment];
+                const uint key_low = sel[lane];
+                const uint key_high = sel[32u + lane];
+                uint rank = 0;
+                #pragma clang loop unroll(full)
+                for (uint source = 0; source < 32; ++source) {
+                    const uint other_low = simd_broadcast(key_low, ushort(source));
+                    rank += (other_low < key)
+                        || (other_low == key && source < assignment);
+                    const uint other_high = simd_broadcast(key_high, ushort(source));
+                    const uint high_assignment = 32u + source;
+                    rank += (other_high < key)
+                        || (other_high == key && high_assignment < assignment);
+                }
+                row_order[rank] = assignment / 8;
+                sorted_keys[rank] = key;
+                inverse_order[assignment] = rank;
+            }
+        """
+    private static let incumbentSource: String = """
             const uint tid = thread_position_in_threadgroup.x;
             const uint row = tid / 128u;
             const uint lane = thread_index_in_simdgroup;
@@ -3697,7 +4056,54 @@ private enum Gemma4RouteGlueFoldV1 {
                 sorted_keys[rank] = key;
                 inverse_order[assignment] = rank;
             }
+        """
+
+    private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_route_monolithic_top8_e128_k8_bf16_v2" + routeA2Key,
+        inputNames: ["scores", "pes"],
+        outputNames: ["indices", "weights", "row_order", "sorted_keys", "inverse_order"],
+        source: activeSource,
+        header: """
+            inline bool gemma4_finalists_before(uint a, uint b) {
+                const bfloat16_t av = uint16_to_bfloat16(uint16_t(a >> 7));
+                const bfloat16_t bv = uint16_to_bfloat16(uint16_t(b >> 7));
+                const bool an = metal::isnan(av);
+                const bool bn = metal::isnan(bv);
+                bool ab;
+                bool ba;
+                if (an | bn) {
+                    ab = (!an) & bn;
+                    ba = (!bn) & an;
+                } else {
+                    ab = av < bv;
+                    ba = bv < av;
+                }
+                return ab || (!ba && (a & 127u) < (b & 127u));
+            }
         """,
+        ensureRowContiguous: true
+    )
+
+    /// EXACT-TAIL (2026-09-03). `DARKBLOOM_GEMMA4_GLUE_FOLD_EXACT_TAIL=0`
+    /// selects the kernel above instead, byte for byte -- which is why that
+    /// kernel's source literal is duplicated below rather than factored into
+    /// shared fragments. The duplication is deliberate: it makes "the kill
+    /// switch restores the incumbent exactly" a property of the diff (those
+    /// lines are untouched) rather than of a string concatenation.
+    ///
+    /// Phases 1 and 2 are character-identical to the kernel above. The only
+    /// difference is the group-0 weight tail, which is replaced by a verbatim
+    /// transcription of `softmax_single_row<bfloat16_t, float, N_READS=4>`
+    /// plus the stock bf16 per-expert-scale multiply, so the `weights` output
+    /// becomes bit-identical to the stock
+    /// `takeAlong -> softmax(precise:) -> gather -> multiply` chain for every
+    /// input. `indices` and the route table are unchanged either way.
+    private static let kernelExactTail: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_route_monolithic_top8_e128_k8_bf16_v3_exacttail"
+            + exactTailA2Key,
+        inputNames: ["scores", "pes"],
+        outputNames: ["indices", "weights", "row_order", "sorted_keys", "inverse_order"],
+        source: exactTailActiveSource,
         header: """
             inline bool gemma4_finalists_before(uint a, uint b) {
                 const bfloat16_t av = uint16_to_bfloat16(uint16_t(a >> 7));
@@ -3731,7 +4137,8 @@ private enum Gemma4RouteGlueFoldV1 {
             perExpertScale.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-fold")
-        let outs = kernel(
+        if exactTailEnabled { CBv2EngageMark.once("glue-fold-exact-tail") }
+        let outs = (exactTailEnabled ? kernelExactTail : kernel)(
             [scores, perExpertScale],
             grid: (1024, 1, 1),
             threadGroup: (1024, 1, 1),
@@ -4484,7 +4891,7 @@ private enum Gemma4FusedLayerGlue {
     /// features owned by this tail thread. The value remains in registers and
     /// feeds the expert RMS directly, deleting only the reduced `[8, 2816]`
     /// materialization and its standalone dispatch.
-    private static let deferredExpertValuesSource = """
+    private static let deferredExpertValuesIncumbent = """
             T expertv[4];
             const uint assignment_base = row * 8u;
             uint sorted_rows[8];
@@ -4506,9 +4913,93 @@ private enum Gemma4FusedLayerGlue {
             }
     """
 
+    /// `false` only when `DARKBLOOM_GEMMA4_EXPERT_TAIL_GATHER_VEC` is an
+    /// explicit off value. Off restores the incumbent gather, and with it the
+    /// incumbent names, byte for byte in the same executable.
+    private static let expertGatherVecEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_EXPERT_TAIL_GATHER_VEC"]
+        else { return true }
+        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "0", "false", "no", "off": return false
+        default: return true
+        }
+    }()
+
+    /// GLUE-C1-039. The incumbent walks `i` (the four contiguous features this
+    /// thread owns) outside and `slot` (the top-8 expert assignment) inside,
+    /// so the row read is a scalar at stride 1 and the gather costs 32 scalar
+    /// bf16 device loads per thread. Interchanged --- `slot` outside, the four
+    /// features held in four accumulators --- the four addresses per slot are
+    /// contiguous and become ONE aligned `vec<T, 4>`: 8 vector loads for the
+    /// same 32 elements. That gather is the single dominant term in this
+    /// kernel's traffic (64 %: the `sorted` plane is read exactly once per
+    /// dispatch, 64 x 2816 x 2 B = 360,448 B of ~565,000 B total).
+    ///
+    /// Exactness: this is NOT a reassociation. Projected onto any one output
+    /// feature `i`, the additions into its accumulator still arrive in slot
+    /// order 0...7; the interchange only interleaves four DISJOINT chains. The
+    /// summands are unchanged --- `(float)sorted[...] * (float)routed_weights[slot]`
+    /// rounded to T, per (i, slot), with no cross-feature dependency --- and
+    /// the loaded bf16 bits are the same whether fetched scalar or as lane `i`
+    /// of a vector over the same four contiguous addresses. MLX builds every
+    /// `MLXFast.metalKernel` with fast math OFF, so the written order is the
+    /// executed order in both forms.
+    ///
+    /// This is the shape the tree's own reference already ships: the legacy
+    /// `weighted_expert_unsort_vec8_v3` in `SwitchLayers.swift` is written
+    /// slot-outer over a vector accumulator, and reads this same `sorted`
+    /// buffer through this same `ensureRowContiguous` path with a SIXTEEN-byte
+    /// `vec<T, 8>` load. The scalar `i`-outer form here is the deviation; this
+    /// restores the reference form at half that alignment requirement.
+    ///
+    /// Alignment: the row stride is the literal 2816 = 4 x 704, so
+    /// `sorted_rows[slot] * 2816 = 0 (mod 4)`; `wbase = lid * 4 = 0 (mod 4)`;
+    /// so the element index is a multiple of 4 and the byte offset a multiple
+    /// of 8. `wbase + 3 <= 2815 < 2816`, so no vector straddles a row.
+    private static let deferredExpertValuesVec = """
+            T expertv[4];
+            const uint assignment_base = row * 8u;
+            uint sorted_rows[8];
+            T routed_weights[8];
+            for (uint slot = 0u; slot < 8u; ++slot) {
+                const uint assignment = assignment_base + slot;
+                sorted_rows[slot] = (uint)inverse[assignment];
+                routed_weights[slot] = route_weights[assignment];
+            }
+            {
+                T acc0 = static_cast<T>(0.0f);
+                T acc1 = static_cast<T>(0.0f);
+                T acc2 = static_cast<T>(0.0f);
+                T acc3 = static_cast<T>(0.0f);
+                for (uint slot = 0u; slot < 8u; ++slot) {
+                    const vec<T, 4> source =
+                        *reinterpret_cast<const device vec<T, 4>*>(
+                            sorted + sorted_rows[slot] * 2816u + wbase);
+                    const float weight = (float)routed_weights[slot];
+                    acc0 = acc0 + static_cast<T>((float)source[0] * weight);
+                    acc1 = acc1 + static_cast<T>((float)source[1] * weight);
+                    acc2 = acc2 + static_cast<T>((float)source[2] * weight);
+                    acc3 = acc3 + static_cast<T>((float)source[3] * weight);
+                }
+                expertv[0] = acc0;
+                expertv[1] = acc1;
+                expertv[2] = acc2;
+                expertv[3] = acc3;
+            }
+    """
+
+    private static let deferredExpertValuesSource =
+        expertGatherVecEnabled ? deferredExpertValuesVec : deferredExpertValuesIncumbent
+
+    /// Cumulative append, per this file's own `tbSuffix` precedent: MLX caches
+    /// pipelines by name and calls `clear_library` on a name/source mismatch,
+    /// so a changed body must take a changed name.
+    private static let gatherSuffix: String = expertGatherVecEnabled ? "_c1" : ""
+
     private static let deferredTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1_nb1_vec1"
-            + tbSuffix,
+            + tbSuffix + gatherSuffix,
         inputNames: [
             "a", "sorted", "inverse", "route_weights", "res",
             "w1", "w2", "w3", "s",
@@ -4557,7 +5048,7 @@ private enum Gemma4FusedLayerGlue {
         MLXFast.metalKernel(
             name:
                 "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1_nb1_vec1_rs1"
-                + tbSuffix,
+                + tbSuffix + gatherSuffix,
             inputNames: [
                 "a", "sorted", "inverse", "route_weights", "res",
                 "w1", "w2", "w3", "s", "wn",
@@ -5148,7 +5639,7 @@ private class Gemma4MLP: Module {
     /// views with the exact shapes and bytes produced by the two split calls.
     fileprivate func zipGateUp(
         _ x: MLXArray, _ activationSums: CBv2DenseMLPQMVV1.ActivationSums?
-    ) -> (gate: MLXArray, up: MLXArray)? {
+    ) -> (gate: MLXArray, up: MLXArray, plane: MLXArray)? {
         guard gemma4DenseGateUpJoinEnabled,
             let storage = fusedGateUpStorage,
             let gate = gateProj as? QuantizedLinear,
@@ -5168,9 +5659,14 @@ private class Gemma4MLP: Module {
                 activationSums: activationSums)
         else { return nil }
         CBv2EngageMark.once("dense-gateup-join")
+        // GEGLU-PG1-DECODE also needs the UNSLICED plane: the fused-plane
+        // GeGLU reads both halves off one contiguous buffer with PITCH and
+        // UP_OFF, which is what makes it a contiguous vec4 read instead of
+        // two strided ones. The two views are byte-identical to before.
         return (
             joined[.ellipsis, ..<2112],
-            joined[.ellipsis, 2112...]
+            joined[.ellipsis, 2112...],
+            joined
         )
     }
 
@@ -5328,11 +5824,16 @@ private enum Gemma4ZipRouterV1 {
         let expertScores: MLXArray
         let gate: MLXArray
         let up: MLXArray
+        // GEGLU-PG1-DECODE: nil unless the joined gate|up QMV produced the
+        // single contiguous plane; the split-projection fallback below keeps
+        // the incumbent closure.
+        var gateUpPlane: MLXArray? = nil
         if Gemma4FusedLayerGlue.denseXSumElideEnabled {
             expertScores = router.zipScores(normed)
             let denseIn = MLX.depends(input: n1, dependencies: [normed])
             if let joined = mlp.zipGateUp(denseIn, nil) {
-                (gate, up) = joined
+                (gate, up) = (joined.gate, joined.up)
+                gateUpPlane = joined.plane
             } else {
                 gate = mlp.zipGate(denseIn, nil)
                 up = mlp.zipUp(denseIn, nil)
@@ -5343,7 +5844,8 @@ private enum Gemma4ZipRouterV1 {
                 MLX.depends(input: normed, dependencies: [sums.dependencyHandle]))
             let denseIn = MLX.depends(input: n1, dependencies: [normed])
             if let joined = mlp.zipGateUp(denseIn, sums) {
-                (gate, up) = joined
+                (gate, up) = (joined.gate, joined.up)
+                gateUpPlane = joined.plane
             } else {
                 gate = mlp.zipGate(denseIn, sums)
                 up = mlp.zipUp(denseIn, sums)
@@ -5352,8 +5854,22 @@ private enum Gemma4ZipRouterV1 {
 
         // Stage 3: the dense GeLU product, which the router has no partner
         // for -- the argPartition is deliberately NOT paired with it.
-        let held = MLX.depends(inputs: [gate, up], dependencies: [expertScores])
-        let activated = gemma4GeluProduct(held[0], held[1])
+        // GEGLU-PG1-DECODE. The dependency edge is unchanged: gate and up are
+        // views of `plane`, so ordering `plane` after `expertScores` orders
+        // both, exactly as the incumbent's two-input `depends` did. When the
+        // plane is absent or the switch is off, the incumbent runs verbatim.
+        let activated: MLXArray
+        if let plane = gateUpPlane,
+            let fused = Gemma4PromptGlueV1.geluProductFusedPlaneDecode(
+                MLX.depends(inputs: [plane], dependencies: [expertScores])[0],
+                hidden: gate.dim(-1))
+        {
+            activated = fused
+        } else {
+            let held = MLX.depends(
+                inputs: [gate, up], dependencies: [expertScores])
+            activated = gemma4GeluProduct(held[0], held[1])
+        }
 
         // Stage 4: router argPartition | dense down projection. The sort is
         // 8 us and the down projection 25 us, so this is the pairing that

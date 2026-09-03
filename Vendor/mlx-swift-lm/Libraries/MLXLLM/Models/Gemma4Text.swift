@@ -3,6 +3,7 @@
 //  mlx-swift-lm
 //
 //  Port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/gemma4_text.py
+// Ranked frontier calibration sample de1; executable source remains unchanged.
 
 import Foundation
 import MLX

@@ -101,7 +101,7 @@ extension EngineLoopV2 {
                 .reshaped([decodeRows.count, 1])
             let caches = eagerCaches(rowStates: decodeRows.map { kvStates[$0.rec.id]! })
             let (logits, hidden) = mtp.model.forwardWithHidden(tokens: inputs, caches: caches)
-            cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
+            cacheInnerState.append(contentsOf: eagerDecodeEvaluationRoots(caches, logitsRoot: logits))
             decodeSampled = sampler.sample(
                 logits: logits[0..., -1, 0...],
                 params: decodeRows.map(\.rec.request.sampling),

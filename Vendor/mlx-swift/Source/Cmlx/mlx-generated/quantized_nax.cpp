@@ -1784,6 +1784,27 @@ template <
 
     dispatch_bool(align_M || !is_unaligned_sm, [&](auto kAlignedM) {
       dispatch_bool(align_N || !is_unaligned_bn, [&](auto kAlignedN) {
+        // PREFILL-A-PIPE: the A operand (activations) is read straight from
+        // device into registers inside the kk1 loop and consumed by the very
+        // next matrix op, twice per k-step, with a compiler barrier between
+        // steps -- so every A fetch's latency is exposed. Rotate two A tiles
+        // instead: while step kk1 runs its MMA on one tile, the fetch for the
+        // next SK step (or the next k-step's first half) is already in flight
+        // into the other. Same addresses, same values, same MMA order; only
+        // the issue point of the loads moves. Costs one extra A tile of
+        // registers (TM x TK fragments). Only the full-band path rotates; the
+        // partial-band and !align_K tail paths are untouched.
+        NAXTile<T, TM, TK> Apipe0;
+        NAXTile<T, TM, TK> Apipe1;
+        const bool a_pipe = !seg_empty && !(seg_partial && kAlignedM.value);
+        if (a_pipe && K_it > 0) {
+          if constexpr (kAlignedM.value) {
+            Apipe0.load(xn, K);
+          } else {
+            Apipe0.load_safe(xn, K, short2(SK, sgp_sm));
+          }
+        }
+
         for (int k = 0; k < K_it; k++) {
           threadgroup_barrier(mem_flags::mem_threadgroup);
           if constexpr (kAlignedN.value) {
@@ -1831,30 +1852,64 @@ template <
               (void)compiler_barrier;
             }
           } else if (!seg_empty) {
-            STEEL_PRAGMA_NO_UNROLL
-            for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-              NAXTile<T, TM, TK> Atile;
+            static_assert(BK == 2 * SK, "PREFILL-A-PIPE assumes two SK steps per BK");
+            // Half 0 (kk1 = 0): consume Apipe0; the fetch for kk1 = SK goes
+            // into Apipe1 ahead of this half's MMA.
+            {
               NAXTile<T, BR, BC> Btile;
 
               volatile int compiler_barrier;
 
               if constexpr (kAlignedM.value) {
-                Atile.load(xn + kk1, K);
+                Apipe1.load(xn + SK, K);
               } else {
-                Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+                Apipe1.load_safe(xn + SK, K, short2(SK, sgp_sm));
               }
 
               if constexpr (transpose) {
                 Btile.template load<T, BK_padded, 1>(
-                    Ws + tn * BK_padded + kk1);
+                    Ws + tn * BK_padded + 0);
               } else {
                 Btile.template load<T, BN_padded, 1>(
-                    Ws + tn + kk1 * BN_padded);
+                    Ws + tn + 0 * BN_padded);
               }
 
               tile_matmad_nax(
                   Dtile,
-                  Atile,
+                  Apipe0,
+                  metal::bool_constant<false>{},
+                  Btile,
+                  metal::bool_constant<transpose>{});
+
+              (void)compiler_barrier;
+            }
+            // Half 1 (kk1 = SK): consume Apipe1; the fetch for the NEXT
+            // k-step's first half goes into Apipe0 ahead of this half's MMA.
+            // Guarded so the last k-step reads nothing past this row's K.
+            {
+              NAXTile<T, BR, BC> Btile;
+
+              volatile int compiler_barrier;
+
+              if (k + 1 < K_it) {
+                if constexpr (kAlignedM.value) {
+                  Apipe0.load(xn + BK, K);
+                } else {
+                  Apipe0.load_safe(xn + BK, K, short2(SK, sgp_sm));
+                }
+              }
+
+              if constexpr (transpose) {
+                Btile.template load<T, BK_padded, 1>(
+                    Ws + tn * BK_padded + SK);
+              } else {
+                Btile.template load<T, BN_padded, 1>(
+                    Ws + tn + SK * BN_padded);
+              }
+
+              tile_matmad_nax(
+                  Dtile,
+                  Apipe1,
                   metal::bool_constant<false>{},
                   Btile,
                   metal::bool_constant<transpose>{});

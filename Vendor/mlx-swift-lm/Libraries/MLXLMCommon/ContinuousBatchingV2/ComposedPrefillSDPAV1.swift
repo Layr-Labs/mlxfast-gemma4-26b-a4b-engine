@@ -423,6 +423,29 @@ enum CBv2PrefillSoftmaxVecV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    public static let memoEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PREFILL_SOFTMAX_MEMO"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let paramsLock = NSLock()
+    nonisolated(unsafe) private static var paramsCache: [Int: MLXArray] = [:]
+
+    private static func getParams(axisSize: Int, numSimdgroups: Int) -> MLXArray {
+        paramsLock.lock()
+        if let hit = paramsCache[axisSize] {
+            paramsLock.unlock()
+            return hit
+        }
+        let arr = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
+        eval(arr)
+        paramsCache[axisSize] = arr
+        paramsLock.unlock()
+        return arr
+    }
+
     /// softmax.cpp's SOFTMAX_LOOPED_LIMIT. Only `axis_size <= 4096` takes
     /// the non-looped "block" kernel this file transcribes.
     private static let maxKeyLength = 4096
@@ -553,7 +576,13 @@ enum CBv2PrefillSoftmaxVecV1 {
         let threadgroupSize = ((axisSize + 3) / 4 + 31) / 32 * 32
         guard threadgroupSize > 0, threadgroupSize <= 1024 else { return nil }
         let numSimdgroups = threadgroupSize / 32
-        let paramsArray = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
+        let paramsArray: MLXArray
+        if memoEnabled {
+            CBv2EngageMark.once("prefill-softmax-memo")
+            paramsArray = getParams(axisSize: axisSize, numSimdgroups: numSimdgroups)
+        } else {
+            paramsArray = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
+        }
 
         CBv2EngageMark.once("prefill-softmax-vec")
         return kernel(

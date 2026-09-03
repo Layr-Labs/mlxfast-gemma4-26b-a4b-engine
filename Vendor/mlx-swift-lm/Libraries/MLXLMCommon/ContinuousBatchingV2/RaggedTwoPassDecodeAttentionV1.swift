@@ -13,6 +13,50 @@ import Foundation
 import MLX
 import MLXFast
 
+private let decodeMetaMemoEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_CBV2_DECODE_META_MEMO"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+private let decodeMetaMemoLock = NSLock()
+nonisolated(unsafe) private var ringStartsKey: [UInt32]?
+nonisolated(unsafe) private var ringStartsValue: MLXArray?
+
+fileprivate func memoizedRingStarts(_ values: [UInt32], _ shape: [Int]) -> MLXArray {
+    guard decodeMetaMemoEnabled else { return MLXArray(values, shape) }
+    decodeMetaMemoLock.lock()
+    defer { decodeMetaMemoLock.unlock() }
+    if let cached = ringStartsValue, ringStartsKey == values {
+        return cached
+    }
+    let made = MLXArray(values, shape)
+    eval(made)
+    ringStartsKey = values
+    ringStartsValue = made
+    CBv2EngageMark.once("decode-meta-memo")
+    return made
+}
+
+nonisolated(unsafe) private var paramsKey: [UInt32]?
+nonisolated(unsafe) private var paramsValue: MLXArray?
+
+fileprivate func memoizedParams(_ values: [UInt32]) -> MLXArray {
+    guard decodeMetaMemoEnabled else { return MLXArray(values) }
+    decodeMetaMemoLock.lock()
+    defer { decodeMetaMemoLock.unlock() }
+    if let cached = paramsValue, paramsKey == values {
+        return cached
+    }
+    let made = MLXArray(values)
+    eval(made)
+    paramsKey = values
+    paramsValue = made
+    CBv2EngageMark.once("decode-meta-memo")
+    return made
+}
+
 public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     private static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
@@ -2688,7 +2732,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             })
         else { return nil }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = memoizedRingStarts(starts.map(UInt32.init), [batch])
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let passA = portQuantReadKernel(
@@ -2759,7 +2803,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             })
         else { return nil }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = memoizedRingStarts(starts.map(UInt32.init), [batch])
         let inputs = [queries] + mirrors
             + [startArray, newKeys, newValues, previousWriteFence]
         if q4ResidentMergeEnabled,
@@ -2899,7 +2943,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             starts.count == batch,
             starts.allSatisfy({ 0 <= $0 && $0 < sequenceLength })
         else { return nil }
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = memoizedRingStarts(starts.map(UInt32.init), [batch])
         return attend(
             passAKernel: ringPassAKernel, queries: queries, keys: keys, values: values,
             extraInputs: [startArray], scale: scale)
@@ -2952,7 +2996,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             else { return nil }
         }
 
-        let startArray = MLXArray(starts.map(UInt32.init), [batch])
+        let startArray = memoizedRingStarts(starts.map(UInt32.init), [batch])
         let partialShape = [batch, queryHeads, 1, blocks, headDim]
         let summaryShape = [batch, queryHeads, 1, blocks]
         let paired = gqaPairedPassAEnabled && gqa == 2
@@ -4667,7 +4711,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             valueBuffers.append(state[1])
             params.append(UInt32(state[0].dim(2)))
         }
-        let paramsArray = MLXArray(params)
+        let paramsArray = memoizedParams(params)
 
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)
@@ -4795,7 +4839,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             valueBuffers.append(state[1])
             params.append(UInt32(state[0].dim(2)))
         }
-        let paramsArray = MLXArray(params)
+        let paramsArray = memoizedParams(params)
 
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)
@@ -5013,7 +5057,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         queries: MLXArray, keyBuffers: [MLXArray], valueBuffers: [MLXArray],
         params: [UInt32], keyLength: Int
     ) -> MLXArray {
-        let paramsArray = MLXArray(params)
+        let paramsArray = memoizedParams(params)
 
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)

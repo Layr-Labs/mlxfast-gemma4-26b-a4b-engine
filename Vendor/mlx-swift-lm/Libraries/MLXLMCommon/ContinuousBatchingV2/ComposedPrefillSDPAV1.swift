@@ -687,18 +687,16 @@ enum CBv2PrefillSoftmaxVecV1 {
         var table: [Int: MLXArray] = [:]
         for axis in [128, 256, 384, 512, 640, 768, 896, 1024] {
             let tg = ((axis + 3) / 4 + 31) / 32 * 32
-            let numSimdgroups = tg / 32
-            let arr = MLXArray([UInt32(axis), UInt32(numSimdgroups)])
-            eval(arr)
-            table[axis] = arr
+            let num = tg / 32
+            table[axis] = MLXArray([UInt32(axis), UInt32(num)])
         }
         return table
     }()
 
     @inline(__always)
     private static func getParams(axisSize: Int, numSimdgroups: Int) -> MLXArray {
-        if let hit = precomputedParams[axisSize] {
-            return hit
+        if let arr = precomputedParams[axisSize] {
+            return arr
         }
         return MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
     }

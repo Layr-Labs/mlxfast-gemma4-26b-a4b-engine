@@ -2159,12 +2159,40 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
         return value >= 2
     }()
 
+    /// WALK-INSTR reduction level inside the depth-two walk. The walk is per
+    /// core ISSUE bound, not bandwidth bound, at every dispatch shape that
+    /// leaves the memory system headroom, so instructions there convert to
+    /// time at close to one for one. Measured on an M3 Pro at the isolated
+    /// two unit per core point, ABBA paired, 6 estimates over 3 processes,
+    /// against a byte-identical null control that read -0.03% +- 0.33%:
+    ///
+    ///     level 1  -2.25% +- 0.17%   (183.0 -> 176.0 instructions per token)
+    ///     level 2  -2.93% +- 0.16%   (183.0 -> 173.0)
+    ///
+    ///   0  the shipped depth-two walk, byte for byte
+    ///   1  RING-MASK and CURRENT-INJECT, register neutral
+    ///   2  and BASE-FOLD, two more pointer registers   (default)
+    ///
+    /// `DARKBLOOM_CBV2_WALK_INSTR` picks the level; it is clamped to 0...2, so
+    /// the whole ladder is bisectable from the environment with no code change
+    /// and `=0` restores the promoted SPD2 artifact exactly.
+    static let walkInstrLevel: Int = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_WALK_INSTR"], let value = Int(raw)
+        else { return 2 }
+        return min(max(value, 0), 2)
+    }()
+
     /// MLX keys its custom-kernel library cache by kernel NAME and re-JITs a
     /// name whose generated source changed (`backend/metal/custom_kernel.cpp`
     /// `:56-70`, `device.cpp:770-796`), so a changed body takes a changed
     /// name. Empty on the depth-one arm, which therefore keeps the incumbent
-    /// registrations character for character.
-    private static let slidingPrefetchKey = slidingPrefetchDepth2 ? "_spd2" : ""
+    /// registrations character for character, and plain `_spd2` at
+    /// `walkInstrLevel == 0`, which keeps the promoted ones.
+    private static let slidingPrefetchKey: String = {
+        guard slidingPrefetchDepth2 else { return "" }
+        return walkInstrLevel > 0 ? "_spd2_wi\(walkInstrLevel)" : "_spd2"
+    }()
 
     /// The shipped depth-one ring walk, verbatim.
     private static let residentSlidingWalkDepth1 = """
@@ -2349,9 +2377,201 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 }
             """
 
+    /// WALK-INSTR. Three instruction-schedule reductions inside the depth-two
+    /// token walk. None of them moves a byte, adds a barrier, shares anything
+    /// across threadgroups, or changes an arithmetic operation or its operand
+    /// order: the same ring slots are loaded, in the same order, exactly once,
+    /// and every token consumes the same word it consumed before.
+    ///
+    /// RING-MASK. Both wrap sites hold `slot < N` on entry and `BLOCKS <= N`,
+    /// so `slot + BLOCKS < 2N` and the shipped conditional subtract is exactly
+    /// a mask when N is a power of two: two ALU ops instead of
+    /// add / compare / add / select. The general arm is kept verbatim.
+    ///
+    /// CURRENT-INJECT. The current token is served from registers, so its
+    /// phase register is simply never reloaded and the shipped walk selects it
+    /// back in at every token. Writing it instead at the point the reload
+    /// WOULD have been issued -- the `else` of the re-issue guard, reached once
+    /// per phase in the whole walk -- retires the per-token `tok == N - 1` test
+    /// and its four selects from the steady state into a cold branch.
+    /// `static_assert(PF * BLOCKS <= N - 1)` is what makes the seed unable to
+    /// be the current token, so every consumed phase register is still defined
+    /// exactly where it was.
+    ///
+    /// BASE-FOLD (level 2). The per-lane displacements are loop invariant, so
+    /// folding them into four base pointers leaves `slot * row_words` as the
+    /// only value the walk computes per token: two adds and one 32-to-64 bit
+    /// widening go away. It costs two more pointer registers.
+    ///
+    /// Executed AIR instructions per token in the steady state, and `__text`
+    /// on `applegpu_g18p` under `-fno-fast-math` (which is what MLX compiles
+    /// with, `device.cpp:631`):
+    ///
+    ///     level 0 (shipped)  183.0   16,774 B
+    ///     level 1            176.0   16,680 B
+    ///     level 2            173.0   16,672 B
+    ///
+    /// The body does not grow; it shrinks. Nothing here goes near the
+    /// instruction-cache wall that made prefetch depth six slower than no
+    /// prefetch at all.
+    private static func residentSlidingWalkInstr(baseFold: Bool) -> String {
+        let kData = baseFold ? "kdat" : "mkeys_w"
+        let vData = baseFold ? "vdat" : "mvalues_w"
+        let kTable = baseFold ? "ktab" : "mkeys_w"
+        let vTable = baseFold ? "vtab" : "mvalues_w"
+        let dataOffset = baseFold ? "" : " + lane"
+        let tableOffset = baseFold ? "" : " + payload_words + lane / 8"
+        // The literal below is indentation-stripped to the column of its
+        // closing delimiter; these lines are not, so they carry the stripped
+        // indentation directly.
+        let bases = baseFold ? [
+            "    const device uint32_t* kdat = mkeys_w + lane;",
+            "    const device uint32_t* vdat = mvalues_w + lane;",
+            "    const device uint32_t* ktab =",
+            "        mkeys_w + payload_words + lane / 8;",
+            "    const device uint32_t* vtab =",
+            "        mvalues_w + payload_words + lane / 8;",
+            "",
+        ].joined(separator: "\n") : ""
+        return bases + """
+            uint slot = (start + uint(block)) % uint(N);
+                // SLIDING-PREFETCH-DEPTH. `PF` iterations of the walk are outstanding
+                // instead of one. `kw_pre[u]` is a PHASE register, not a stage of a copy
+                // chain: the inner loop is fully unrolled at compile time, so the word
+                // loaded into `kw_pre[u]` on one outer step is consumed by that same
+                // `kw_pre[u]` PF token steps later with no register move in between. A
+                // rotating `A = B` pair would resolve B's load one step early and buy no
+                // latency cover at all.
+                //
+                // `block` is `simdgroup_index_in_threadgroup` over a `BLOCKS * 32` thread
+                // group, so `0 <= block < BLOCKS`; with `N % (PF * BLOCKS) == 0` the outer
+                // loop runs `N / (PF * BLOCKS)` times and the inner phase never steps past
+                // the ring, exactly as the one-stage walk did.
+                //
+                // A position `t` is walked, and is not the current token, precisely when
+                // `t < N - 1`. That one predicate is the seed guard, the re-issue guard,
+                // and the shipped `token + BLOCKS < N - 1` alike. The current token is
+                // served from `kword`/`vword` and its slot is the one this kernel stores
+                // into, so no address formed here is a slot the one-stage walk did not
+                // also read, in the same order, exactly once.
+                constexpr int PF = 2;
+                // RING-MASK. Both wrap sites keep the invariant `slot < N`, and
+                // `BLOCKS < N`, so `slot + BLOCKS < 2N` and the conditional
+                // subtract is exactly a mask whenever N is a power of two --
+                // two ALU ops in place of add/compare/add/select. The general
+                // arm is retained verbatim for a non-power-of-two ring.
+                constexpr bool ring_pow2 = (N & (N - 1)) == 0;
+                static_assert(N % (PF * BLOCKS) == 0,
+                    "depth-two walk needs an even number of token steps");
+                static_assert(PF * BLOCKS <= N - 1,
+                    "current-inject needs the seed window below the current token");
+                uint pf_slot = slot;
+                thread uint32_t kw_pre[PF];
+                thread uint32_t vw_pre[PF];
+                thread uint32_t ktw_pre[PF];
+                thread uint32_t vtw_pre[PF];
+                #pragma clang loop unroll(full)
+                for (int u = 0; u < PF; ++u) {
+                    const bool prefetch_first = block + u * BLOCKS < N - 1;
+                    kw_pre[u] = prefetch_first
+                        ? \(kData)[pf_slot * row_words\(dataOffset)] : 0u;
+                    vw_pre[u] = prefetch_first
+                        ? \(vData)[pf_slot * row_words\(dataOffset)] : 0u;
+                    ktw_pre[u] = prefetch_first
+                        ? \(kTable)[pf_slot * row_words\(tableOffset)] : 0u;
+                    vtw_pre[u] = prefetch_first
+                        ? \(vTable)[pf_slot * row_words\(tableOffset)] : 0u;
+                    if (ring_pow2) {
+                        pf_slot = (pf_slot + uint(BLOCKS)) & uint(N - 1);
+                    } else {
+                        pf_slot += uint(BLOCKS);
+                        if (pf_slot >= uint(N)) pf_slot -= uint(N);
+                    }
+                }
+                uint next_slot = pf_slot;
+                for (int token = block; token < N; token += PF * BLOCKS) {
+                    #pragma clang loop unroll(full)
+                    for (int u = 0; u < PF; ++u) {
+                        const int tok = token + u * BLOCKS;
+                        // CURRENT-INJECT. The current token is served from
+                        // registers, so its phase register is simply never
+                        // reloaded. Writing it at the point the reload WOULD
+                        // have been issued -- the already-existing `else` of the
+                        // re-issue guard, taken once per phase in the whole walk
+                        // -- retires the per-token `tok == N - 1` test and its
+                        // four selects from the steady state. The seed cannot be
+                        // the current token (static_assert below), so every
+                        // consumed phase register is defined exactly as before.
+                        const uint32_t kw = kw_pre[u];
+                        const uint32_t vw = vw_pre[u];
+                        const uint32_t ktw = ktw_pre[u];
+                        const uint32_t vtw = vtw_pre[u];
+                        if (tok + PF * BLOCKS < N - 1) {
+                            kw_pre[u] = \(kData)[next_slot * row_words\(dataOffset)];
+                            vw_pre[u] = \(vData)[next_slot * row_words\(dataOffset)];
+                            ktw_pre[u] =
+                                \(kTable)[next_slot * row_words\(tableOffset)];
+                            vtw_pre[u] =
+                                \(vTable)[next_slot * row_words\(tableOffset)];
+                            if (ring_pow2) {
+                                next_slot = (next_slot + uint(BLOCKS)) & uint(N - 1);
+                            } else {
+                                next_slot += uint(BLOCKS);
+                                if (next_slot >= uint(N)) next_slot -= uint(N);
+                            }
+                        } else if (tok + PF * BLOCKS == N - 1) {
+                            kw_pre[u] = kword;
+                            vw_pre[u] = vword;
+                            ktw_pre[u] = uint32_t(as_type<ushort>(khs))
+                                | (uint32_t(as_type<ushort>(khb)) << 16);
+                            vtw_pre[u] = uint32_t(as_type<ushort>(vhs))
+                                | (uint32_t(as_type<ushort>(vhb)) << 16);
+                        }
+                        const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
+                        const float kb = float(as_type<half>(ushort(ktw >> 16)));
+                        const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
+                        const float vb = float(as_type<half>(ushort(vtw >> 16)));
+                        float score_lo = 0.0f;
+                        float score_hi = 0.0f;
+                        #pragma clang loop unroll(full)
+                        for (int element = 0; element < values_per_lane; ++element) {
+                            const float key_element =
+                                fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
+                            score_lo += q_lo[element] * key_element;
+                            score_hi += q_hi[element] * key_element;
+                        }
+                        score_lo = simd_sum(score_lo);
+                        score_hi = simd_sum(score_hi);
+
+                        const float new_max_lo = max(max_lo, score_lo);
+                        const float new_max_hi = max(max_hi, score_hi);
+                        const float old_factor_lo = fast::exp(max_lo - new_max_lo);
+                        const float old_factor_hi = fast::exp(max_hi - new_max_hi);
+                        const float score_factor_lo = fast::exp(score_lo - new_max_lo);
+                        const float score_factor_hi = fast::exp(score_hi - new_max_hi);
+                        max_lo = new_max_lo;
+                        max_hi = new_max_hi;
+                        sum_lo = sum_lo * old_factor_lo + score_factor_lo;
+                        sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                        #pragma clang loop unroll(full)
+                        for (int element = 0; element < values_per_lane; ++element) {
+                            const float value_element =
+                                fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
+                            acc_lo[element] = acc_lo[element] * old_factor_lo
+                                + score_factor_lo * value_element;
+                            acc_hi[element] = acc_hi[element] * old_factor_hi
+                                + score_factor_hi * value_element;
+                        }
+                    }
+                }
+            """
+    }
+
     private static var residentSlidingWalk: String {
-        slidingPrefetchDepth2
-            ? residentSlidingWalkDepth2 : residentSlidingWalkDepth1
+        guard slidingPrefetchDepth2 else { return residentSlidingWalkDepth1 }
+        return walkInstrLevel > 0
+            ? residentSlidingWalkInstr(baseFold: walkInstrLevel >= 2)
+            : residentSlidingWalkDepth2
     }
 
     /// F4: exact decode Q/K/V normalization and sliding RoPE in the resident

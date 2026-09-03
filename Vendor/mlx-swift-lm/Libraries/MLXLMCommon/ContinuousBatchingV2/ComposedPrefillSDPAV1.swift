@@ -49,6 +49,53 @@ import Foundation
 import MLX
 import MLXFast
 
+// RESTORE-5EEF22C (PREFILL-SOFTMAX-PARAMS-MEMO). The promoted submission
+// 5eef22c4 memoized this file's softmax params array
+// (`MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])`, a pure function of
+// the axis length) behind a lock-guarded table, erasing one host
+// construction + graph leaf per vectorized-softmax dispatch. The 19a6ab5
+// whole-file replacement dropped it; this restores the same table and routes
+// BOTH surviving construction sites through it -- the vectorized softmax's
+// own and PREFILL-ATTN-TRAFFIC's statistics dispatch, which builds the
+// identical array for the identical kernel-input purpose.
+//
+// Exactness: a cached array is produced by the incumbent's own expression
+// from the same two UInt32 values, so it is bit-identical to what the
+// per-call construction builds; it is a read-only kernel INPUT, never a
+// mutated output, which is what makes sharing it across graphs and steps
+// safe -- the same argument this file's mask caches rely on. The key is the
+// axis length: a shape, never an input value.
+//
+// Kill switch: `DARKBLOOM_CBV2_PREFILL_SOFTMAX_PARAMS_MEMO=0` restores the
+// per-call construction at every site below.
+let prefillSoftmaxParamsMemoEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_CBV2_PREFILL_SOFTMAX_PARAMS_MEMO"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+nonisolated(unsafe) var prefillSoftmaxParamsMemo: [Int: MLXArray] = [:]
+let prefillSoftmaxParamsLock = NSLock()
+
+func prefillSoftmaxGetParams(axisSize: Int, numSimdgroups: Int) -> MLXArray {
+    guard prefillSoftmaxParamsMemoEnabled else {
+        return MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
+    }
+    prefillSoftmaxParamsLock.lock()
+    if let hit = prefillSoftmaxParamsMemo[axisSize] {
+        prefillSoftmaxParamsLock.unlock()
+        return hit
+    }
+    prefillSoftmaxParamsLock.unlock()
+    let built = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
+    eval(built)
+    prefillSoftmaxParamsLock.lock()
+    prefillSoftmaxParamsMemo[axisSize] = built
+    prefillSoftmaxParamsLock.unlock()
+    return built
+}
+
 enum CBv2ComposedPrefillSDPAV1 {
 
     static let enabled: Bool = {
@@ -700,7 +747,7 @@ enum CBv2PrefillSoftmaxVecV1 {
         let threadgroupSize = ((axisSize + 3) / 4 + 31) / 32 * 32
         guard threadgroupSize > 0, threadgroupSize <= 1024 else { return nil }
         let numSimdgroups = threadgroupSize / 32
-        let paramsArray = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
+        let paramsArray = prefillSoftmaxGetParams(axisSize: axisSize, numSimdgroups: numSimdgroups)
 
         // PROMPT-GLUE2 (pg2): prompt-width score rectangles take the
         // rows-per-threadgroup twin; the incumbent computes the identical
@@ -887,8 +934,7 @@ enum CBv2PrefillAttnTrafficV1 {
         let numSimdgroups = threadgroupSize / 32
         let rows = CBv2PrefillSoftmaxVecV1.rowsPerThreadgroup(
             axisSize: axisSize, threadgroupSize: threadgroupSize)
-        guard rows >= 1, rows * threadgroupSize <= 1024 else { return nil }
-        let paramsArray = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
+        let paramsArray = prefillSoftmaxGetParams(axisSize: axisSize, numSimdgroups: numSimdgroups)
         var statsShape = scores.shape
         statsShape[statsShape.count - 1] = 4
 

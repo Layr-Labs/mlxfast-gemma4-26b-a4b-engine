@@ -140,6 +140,38 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// DMLP-SG1 (engage mark `mlp-sg1`). The gate/up quad-stream dispatch runs
+    /// one simdgroup per threadgroup instead of two.
+    ///
+    /// `qmv_affine8_g64_quad_stream_impl` allocates no threadgroup memory,
+    /// executes no barrier and performs no cross-simdgroup exchange. Every
+    /// accumulator is a `thread` scalar, the only reduction is `simd_sum`, and
+    /// each simdgroup owns `results_per_simdgroup` output rows disjoint from
+    /// the other's by the `out_row` formula. The two simdgroups in a
+    /// threadgroup are therefore already independent programs that happen to
+    /// share a dispatch slot, so splitting them into separate threadgroups
+    /// cannot change any value: with `num_simdgroups == 1` and one simdgroup
+    /// per threadgroup, `simd_gid` is 0 and
+    /// `out_row == tid.y * results_per_simdgroup`, which enumerates the same
+    /// rows over twice as many `tid.y` values. Row r is still computed by 32
+    /// lanes walking K in the same order with the same partial sums and the
+    /// same `simd_sum` close.
+    ///
+    /// What it buys is scheduling granularity on the only decode dispatch in
+    /// this file that is latency bound rather than bandwidth bound: the
+    /// gate/up plane is 5.95 MB against a step that moves gigabytes, so the
+    /// arm is not waiting on memory, and 264 y-threadgroups of 64 threads is a
+    /// coarser unit for the dispatcher to balance than 528 of 32.
+    ///
+    /// `DARKBLOOM_GEMMA4_MLP_SG1=0` restores the promoted two-simdgroup
+    /// threadgroup and the promoted kernel names in the same binary.
+    public static let sg1Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MLP_SG1"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     private static let batch = 8
     private static let sequence = 1
     private static let groupSize = 64
@@ -148,6 +180,7 @@ public enum CBv2DenseMLPQMVV1 {
     private static let simdWidth = 32
     private static let simdGroups = 2
     private static let outputsPerGroup = 8
+    private static let resultsPerSimdgroup = 4
     private static let valuesPerLane = 4
     private static let kBlock = simdWidth * valuesPerLane
 
@@ -892,39 +925,75 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         header: mma8DownLaneSumHeader,
         ensureRowContiguous: true)
 
+    /// The promoted quad-stream entry bodies, hoisted verbatim so the W4 and
+    /// SG1 twins are the same characters by construction rather than by
+    /// inspection. Neither string changed when it was hoisted.
+    private static let quadStreamKernelSource = """
+        const uint3 tid = threadgroup_position_in_grid;
+        const uint simd_gid = simdgroup_index_in_threadgroup;
+        const uint simd_lid = thread_index_in_simdgroup;
+
+        const int in_vec_size = x_shape[x_ndim - 1];
+        const int out_vec_size = w_shape[0];
+        const int first_m = int(tid.x) * 4;
+        if (first_m >= 8) {
+            return;
+        }
+        qmv_affine8_g64_quad_stream_impl<T, 64, 8>(
+            w,
+            scales,
+            biases,
+            x + first_m * in_vec_size,
+            x + (first_m + 1) * in_vec_size,
+            x + (first_m + 2) * in_vec_size,
+            x + (first_m + 3) * in_vec_size,
+            y + first_m * out_vec_size,
+            y + (first_m + 1) * out_vec_size,
+            y + (first_m + 2) * out_vec_size,
+            y + (first_m + 3) * out_vec_size,
+            in_vec_size,
+            tid,
+            simd_gid,
+            simd_lid);
+        return;
+        """
+
+    private static let quadStreamXsumKernelSource = """
+        const uint3 tid = threadgroup_position_in_grid;
+        const uint simd_gid = simdgroup_index_in_threadgroup;
+        const uint simd_lid = thread_index_in_simdgroup;
+
+        const int in_vec_size = x_shape[x_ndim - 1];
+        const int out_vec_size = w_shape[0];
+        const int first_m = int(tid.x) * 4;
+        if (first_m >= 8) {
+            return;
+        }
+        qmv_affine8_g64_quad_stream_xsum_impl<T, 64, 8>(
+            w,
+            scales,
+            biases,
+            xSums,
+            x + first_m * in_vec_size,
+            x + (first_m + 1) * in_vec_size,
+            x + (first_m + 2) * in_vec_size,
+            x + (first_m + 3) * in_vec_size,
+            y + first_m * out_vec_size,
+            y + (first_m + 1) * out_vec_size,
+            y + (first_m + 2) * out_vec_size,
+            y + (first_m + 3) * out_vec_size,
+            in_vec_size,
+            tid,
+            simd_gid,
+            simd_lid);
+        return;
+        """
+
     private static let kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_v2_unroll",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
-        source: """
-            const uint3 tid = threadgroup_position_in_grid;
-            const uint simd_gid = simdgroup_index_in_threadgroup;
-            const uint simd_lid = thread_index_in_simdgroup;
-
-            const int in_vec_size = x_shape[x_ndim - 1];
-            const int out_vec_size = w_shape[0];
-            const int first_m = int(tid.x) * 4;
-            if (first_m >= 8) {
-                return;
-            }
-            qmv_affine8_g64_quad_stream_impl<T, 64, 8>(
-                w,
-                scales,
-                biases,
-                x + first_m * in_vec_size,
-                x + (first_m + 1) * in_vec_size,
-                x + (first_m + 2) * in_vec_size,
-                x + (first_m + 3) * in_vec_size,
-                y + first_m * out_vec_size,
-                y + (first_m + 1) * out_vec_size,
-                y + (first_m + 2) * out_vec_size,
-                y + (first_m + 3) * out_vec_size,
-                in_vec_size,
-                tid,
-                simd_gid,
-                simd_lid);
-            return;
-            """,
+        source: quadStreamKernelSource,
         header: kernelHeader,
         ensureRowContiguous: true
     )
@@ -958,36 +1027,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_v2_unroll",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["y"],
-        source: """
-            const uint3 tid = threadgroup_position_in_grid;
-            const uint simd_gid = simdgroup_index_in_threadgroup;
-            const uint simd_lid = thread_index_in_simdgroup;
-
-            const int in_vec_size = x_shape[x_ndim - 1];
-            const int out_vec_size = w_shape[0];
-            const int first_m = int(tid.x) * 4;
-            if (first_m >= 8) {
-                return;
-            }
-            qmv_affine8_g64_quad_stream_xsum_impl<T, 64, 8>(
-                w,
-                scales,
-                biases,
-                xSums,
-                x + first_m * in_vec_size,
-                x + (first_m + 1) * in_vec_size,
-                x + (first_m + 2) * in_vec_size,
-                x + (first_m + 3) * in_vec_size,
-                y + first_m * out_vec_size,
-                y + (first_m + 1) * out_vec_size,
-                y + (first_m + 2) * out_vec_size,
-                y + (first_m + 3) * out_vec_size,
-                in_vec_size,
-                tid,
-                simd_gid,
-                simd_lid);
-            return;
-            """,
+        source: quadStreamXsumKernelSource,
         header: activationSumKernelHeader,
         ensureRowContiguous: true
     )
@@ -1062,35 +1102,7 @@ inline U qdot_affine8_registered_v4(
         name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_w4_v1",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
-        source: """
-            const uint3 tid = threadgroup_position_in_grid;
-            const uint simd_gid = simdgroup_index_in_threadgroup;
-            const uint simd_lid = thread_index_in_simdgroup;
-
-            const int in_vec_size = x_shape[x_ndim - 1];
-            const int out_vec_size = w_shape[0];
-            const int first_m = int(tid.x) * 4;
-            if (first_m >= 8) {
-                return;
-            }
-            qmv_affine8_g64_quad_stream_impl<T, 64, 8>(
-                w,
-                scales,
-                biases,
-                x + first_m * in_vec_size,
-                x + (first_m + 1) * in_vec_size,
-                x + (first_m + 2) * in_vec_size,
-                x + (first_m + 3) * in_vec_size,
-                y + first_m * out_vec_size,
-                y + (first_m + 1) * out_vec_size,
-                y + (first_m + 2) * out_vec_size,
-                y + (first_m + 3) * out_vec_size,
-                in_vec_size,
-                tid,
-                simd_gid,
-                simd_lid);
-            return;
-            """,
+        source: quadStreamKernelSource,
         header: w4KernelHeader,
         ensureRowContiguous: true
     )
@@ -1099,39 +1111,92 @@ inline U qdot_affine8_registered_v4(
         name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_w4_v1",
         inputNames: ["x", "w", "scales", "biases", "xSums"],
         outputNames: ["y"],
-        source: """
-            const uint3 tid = threadgroup_position_in_grid;
-            const uint simd_gid = simdgroup_index_in_threadgroup;
-            const uint simd_lid = thread_index_in_simdgroup;
-
-            const int in_vec_size = x_shape[x_ndim - 1];
-            const int out_vec_size = w_shape[0];
-            const int first_m = int(tid.x) * 4;
-            if (first_m >= 8) {
-                return;
-            }
-            qmv_affine8_g64_quad_stream_xsum_impl<T, 64, 8>(
-                w,
-                scales,
-                biases,
-                xSums,
-                x + first_m * in_vec_size,
-                x + (first_m + 1) * in_vec_size,
-                x + (first_m + 2) * in_vec_size,
-                x + (first_m + 3) * in_vec_size,
-                y + first_m * out_vec_size,
-                y + (first_m + 1) * out_vec_size,
-                y + (first_m + 2) * out_vec_size,
-                y + (first_m + 3) * out_vec_size,
-                in_vec_size,
-                tid,
-                simd_gid,
-                simd_lid);
-            return;
-            """,
+        source: quadStreamXsumKernelSource,
         header: w4ActivationSumKernelHeader,
         ensureRowContiguous: true
     )
+
+    /// DMLP-SG1's single substitution. The quad-stream body's own
+    /// `num_simdgroups` becomes 1, which is the value it actually has when the
+    /// threadgroup is one simdgroup wide. Nothing else in the body changes:
+    /// the constant is read only by
+    ///
+    ///     out_row = tid.y * (num_simdgroups * results_per_simdgroup)
+    ///             + simd_gid * results_per_simdgroup
+    ///
+    /// and with one simdgroup per threadgroup `simd_gid` is 0, so the formula
+    /// collapses to `tid.y * results_per_simdgroup` over a doubled y extent.
+    /// The union of rows is identical and no row is visited twice.
+    ///
+    /// The tied-head prefix carries its own `num_simdgroups` and DMLP's
+    /// affine8 helper is appended after that prefix, so replace the final
+    /// occurrence, exactly as `activationSumKernelHeader` does for the same
+    /// reason.
+    private static func sg1Header(_ source: String) -> String {
+        let marker = "  constexpr int num_simdgroups = 2;"
+        precondition(
+            source.components(separatedBy: marker).count == 3,
+            "DMLP-SG1 expects the tied-head and DMLP simdgroup constants only")
+        guard let range = source.range(of: marker, options: .backwards) else {
+            preconditionFailure("DMLP-SG1 kernel transform marker is missing")
+        }
+        var text = source
+        text.replaceSubrange(
+            range, with: "  constexpr int num_simdgroups = 1;")
+        return text
+    }
+
+    private static let sg1KernelHeader: String = sg1Header(kernelHeader)
+
+    private static let sg1ActivationSumKernelHeader: String =
+        sg1Header(activationSumKernelHeader)
+
+    private static let sg1W4KernelHeader: String = sg1Header(w4KernelHeader)
+
+    private static let sg1W4ActivationSumKernelHeader: String =
+        sg1Header(w4ActivationSumKernelHeader)
+
+    /// The SG1 twins. Source text is the corresponding promoted kernel's own,
+    /// character for character; only the name and the header differ. The
+    /// operands, the bytes moved and the total thread count are unchanged, and
+    /// the launch differs only in how those threads are grouped.
+    private static let sg1Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_sg1_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: quadStreamKernelSource,
+        header: sg1KernelHeader,
+        ensureRowContiguous: true
+    )
+
+    private static let sg1ActivationSumQMVKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_sg1_v1",
+            inputNames: ["x", "w", "scales", "biases", "xSums"],
+            outputNames: ["y"],
+            source: quadStreamXsumKernelSource,
+            header: sg1ActivationSumKernelHeader,
+            ensureRowContiguous: true
+        )
+
+    private static let sg1W4Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_w4_sg1_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: quadStreamKernelSource,
+        header: sg1W4KernelHeader,
+        ensureRowContiguous: true
+    )
+
+    private static let sg1W4ActivationSumQMVKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "cbv2_b8_l1_dense_mlp_qmv_affine8_g64_quad_stream_xsum_w4_sg1_v1",
+            inputNames: ["x", "w", "scales", "biases", "xSums"],
+            outputNames: ["y"],
+            source: quadStreamXsumKernelSource,
+            header: sg1W4ActivationSumKernelHeader,
+            ensureRowContiguous: true
+        )
 
     @inline(__always)
     private static func liveShape(inDim: Int, outDim: Int) -> Bool {
@@ -1278,20 +1343,42 @@ inline U qdot_affine8_registered_v4(
         if w4Enabled {
             CBv2EngageMark.once("mlp-w4-load")
         }
+        // DMLP-SG1. Gate/up only: the down plane reaches this fall-through only
+        // when its MMA8 arm is switched off, and that configuration stays on
+        // the promoted launch so a bisect against it means what it did before.
+        let useSG1 = sg1Enabled && isGateUp
+        if useSG1 {
+            CBv2EngageMark.once("mlp-sg1")
+        }
         let selected: MLXFast.MLXFastKernel
         if useActivationSums {
-            selected = w4Enabled ? w4ActivationSumQMVKernel : activationSumQMVKernel
+            if useSG1 {
+                selected = w4Enabled
+                    ? sg1W4ActivationSumQMVKernel : sg1ActivationSumQMVKernel
+            } else {
+                selected = w4Enabled ? w4ActivationSumQMVKernel : activationSumQMVKernel
+            }
         } else {
-            selected = w4Enabled ? w4Kernel : kernel
+            if useSG1 {
+                selected = w4Enabled ? sg1W4Kernel : sg1Kernel
+            } else {
+                selected = w4Enabled ? w4Kernel : kernel
+            }
         }
         let inputs = useActivationSums
             ? [x, weight, scales, biases, activationSums!.values]
             : [x, weight, scales, biases]
+        // The same `xGroups * yGroups * simdGroups` simdgroups either way. SG1
+        // spends one threadgroup on each instead of pairing them, so the y
+        // extent doubles to `outDim / resultsPerSimdgroup` and the threadgroup
+        // narrows to a single simdgroup.
+        let gridY = useSG1
+            ? outDim / resultsPerSimdgroup : yGroups * simdGroups
         return selected(
             inputs,
             template: [("T", x.dtype)],
-            grid: (xGroups * simdWidth, yGroups * simdGroups, 1),
-            threadGroup: (simdWidth, simdGroups, 1),
+            grid: (xGroups * simdWidth, gridY, 1),
+            threadGroup: (simdWidth, useSG1 ? 1 : simdGroups, 1),
             outputShapes: [[batch, sequence, outDim]],
             outputDTypes: [x.dtype]
         )[0]

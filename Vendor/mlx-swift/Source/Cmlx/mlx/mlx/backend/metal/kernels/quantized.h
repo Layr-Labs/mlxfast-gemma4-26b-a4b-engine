@@ -3899,13 +3899,18 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
 // at loop step u % span and by no other group, so every output row keeps
 // the IDENTICAL qdot sequence, accumulator, simd_sum and store the
 // untiled arm produces for it: loads-only rescheduling, registers stay
-// pair-sized. 352 divides by both spans, so no ragged tail. The pairless
+// pair-sized. 352 divides by 8, 4 and 2, so no ragged tail at any span.
+// The pairless
 // arm is tile-walked HERE because the stock fall-through derives out_row
 // from tid.y inside qmv_impl -- follower tiles of a pairless assignment
 // would otherwise never be written. Verified uint16-exact vs the
 // per-assignment quantized_matmul oracle and vs the untiled arm at
-// K = 704, N = 2816, 64 assignments over 128 experts, M = 8, spans 4 and
-// 2, 3 seeds, NaN-filled outputs (parity-down-tile, 2026-08-28).
+// K = 704, N = 2816, 64 assignments over 128 experts, M = 8, spans 8, 4
+// and 2, 3 seeds, NaN-filled outputs (parity-down-tile, 2026-09-03).
+// The span is 8 here: the run_offset scan, the route_word load, the
+// has_pair test and the five base-pointer computations are per-survivor
+// and identical across the span, so doubling the span from 4 halves that
+// preamble again (88 survivors per assignment become 44).
 template <typename T, int group_size, int bits>
 METAL_FUNC void gather_qmv_gemma4_down_tile(
     const device uint32_t* w,
@@ -3926,7 +3931,7 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     uint3 tid,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int gemma4_down_tile_span = 4; // sweep alternate: 2
+  constexpr int gemma4_down_tile_span = 8; // sweep alternates: 4, 2
   if (tid.y % uint(gemma4_down_tile_span) != 0u) {
     return;
   }

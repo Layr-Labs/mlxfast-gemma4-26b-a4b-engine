@@ -3750,10 +3750,16 @@ inline float qdot_affine4_g64_word(
 //          simd_lid * 4, block stride 128), and `ws[0]` / `ws[1]` are the
 //          low / high half-words of that word, so the four nibble masks
 //          and their two 4-term sums are unchanged.
-//   PF   : software prefetch of the NEXT block's four weight words. One
-//          x row is live in the singleton arm, so the +13..+40% extra
+//   PF   : software prefetch of the NEXT block's four weight words. Loads
+//          only: wcur[row] is bit-identical to the WVEC load at the same
+//          block and feeds the same qdot_affine4_g64_word, so values,
+//          accumulation order and every output byte are unchanged; the
+//          last block clamps nextblk to blk and re-reads its own word.
+//          One x row is live in the singleton arm, so the +13..+40% extra
 //          live state that sank PF on the 4-row quad_stream body does not
-//          apply here.
+//          apply here. ARMED for the gate/up K = 2816 instantiation below
+//          (KFIX = 2816 folds nblocks to 11 and the tail to 0, and keeps
+//          the 128-byte block stride a constant).
 //   KFIX : in_vec_size as a compile-time constant. The gemma4 gate has
 //          already proven in_vec_size is 2816 (gate/up) or 704 (down), so
 //          the K-loop trip count and every stride fold constant-fold.
@@ -3914,8 +3920,10 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
 // unique bytes at 479-589 GB/s. Here only every span-th y-group survives
 // (the rest return before the scan); the survivor elects ONCE and then
 // walks its span consecutive 8-row y-tiles serially through the verbatim
-// pair impl -- or, for a pairless run position, the verbatim stock
-// qmv_impl -- with tid.y rewritten to the tile index (a strip-walk
+// pair impl -- or, for a pairless run position, the EXPERT-SINGLES
+// loads-only rescheduling of the stock qmv_impl, bit-exact by the
+// qmv_affine4_g64_singles_impl construction -- with tid.y rewritten to the
+// tile index (a strip-walk
 // pattern). Tile u is served by survivor (u / span) * span
 // at loop step u % span and by no other group, so every output row keeps
 // the IDENTICAL qdot sequence, accumulator, simd_sum and store the
@@ -4003,10 +4011,17 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
     }
     return;
   }
+  // Pairless (singleton) run position: the EXPERT-SINGLES loads-only
+  // rescheduling of the stock qmv_impl (see qmv_affine4_g64_singles_impl:
+  // identical lane -> K mapping, qdot, accumulator, simd_sum, store; only
+  // the load shape changes). Down plane K = 704 = 2 * 256 + 192: the
+  // whole-packet tail arm covers the final 192 values, packed row stride
+  // 352 bytes stays uint32-aligned at every block and tail lane, and the
+  // 11 quantization groups need no even parity. KFIX = 704.
   for (int t = 0; t < gemma4_down_tile_span; t++) {
     uint3 tile_tid = tid;
     tile_tid.y = tid.y + uint(t);
-    qmv_impl<T, group_size, bits>(
+    qmv_affine4_g64_singles_impl<T, group_size, bits, 704, true, false>(
         tile_w,
         tile_scales,
         tile_biases,
@@ -4196,7 +4211,7 @@ template <typename T, int group_size, int bits>
     device T* single_y = y + assignment * (uint)out_vec_size;
     if (in_vec_size == 2816) {
       qmv_affine4_g64_singles_impl<
-          T, group_size, bits, 2816, true, false>(
+          T, group_size, bits, 2816, true, true>(
           single_w, single_scales, single_biases, single_x, single_y,
           in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
     } else {

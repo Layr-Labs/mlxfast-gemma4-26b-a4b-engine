@@ -1712,6 +1712,9 @@ private enum Gemma4PrefillDeqGEMMV1 {
 
     private static let planeLock = NSLock()
     nonisolated(unsafe) private static var cachedTransposedPlanes: [ObjectIdentifier: MLXArray] = [:]
+    nonisolated(unsafe) private static var cachedFusedGateUpPlanes: [
+        ObjectIdentifier: (plane: MLXArray, intermediateSize: Int)
+    ] = [:]
 
     @inline(__always)
     private static func plane(for quantized: QuantizedLinear, biases: MLXArray) -> MLXArray {
@@ -1775,6 +1778,75 @@ private enum Gemma4PrefillDeqGEMMV1 {
                         + "differing \(differing.item(Int32.self))\n").utf8))
         }
         return product
+    }
+
+    /// Combines the two dense-MLP prompt projections into one wide GEMM. The
+    /// cache lookup and publication use `planeLock`, but plane construction is
+    /// intentionally outside that lock. Only the concatenated plane is
+    /// evaluated and retained; separate gate/up planes would be redundant once
+    /// this branch intercepts both prompt projections.
+    @inline(__always)
+    static func fusedGateUpPlane(
+        gate: Linear,
+        up: Linear,
+        mlpKey: AnyObject,
+        x: MLXArray
+    ) -> (plane: MLXArray, intermediateSize: Int)? {
+        guard enabled, cacheEnabled,
+            let qGate = gate as? QuantizedLinear,
+            let qUp = up as? QuantizedLinear,
+            qGate.bias == nil, qUp.bias == nil,
+            qGate.mode == .affine, qUp.mode == .affine,
+            qGate.groupSize == 64, qUp.groupSize == 64,
+            qGate.bits == qUp.bits,
+            qGate.bits == 4 || qGate.bits == 8,
+            x.dtype == .bfloat16, x.ndim >= 2,
+            qGate.scales.dtype == .bfloat16,
+            qUp.scales.dtype == .bfloat16,
+            let gateBiases = qGate.biases, gateBiases.dtype == .bfloat16,
+            let upBiases = qUp.biases, upBiases.dtype == .bfloat16
+        else { return nil }
+
+        let inputDims = x.dim(-1)
+        guard inputDims > 0, x.size / inputDims >= minRows else { return nil }
+        let gateWeight = qGate.weight
+        let upWeight = qUp.weight
+        guard gateWeight.ndim == 2, gateWeight.dtype == .uint32,
+            upWeight.ndim == 2, upWeight.dtype == .uint32,
+            gateWeight.dim(1) * (32 / qGate.bits) == inputDims,
+            upWeight.dim(1) * (32 / qUp.bits) == inputDims,
+            gateWeight.dim(0) == upWeight.dim(0)
+        else { return nil }
+
+        let key = ObjectIdentifier(mlpKey)
+        planeLock.lock()
+        let existing = cachedFusedGateUpPlanes[key]
+        planeLock.unlock()
+        if let existing { return existing }
+
+        let gatePlane = dequantized(
+            qGate.weight, scales: qGate.scales, biases: gateBiases,
+            groupSize: qGate.groupSize, bits: qGate.bits, mode: qGate.mode
+        ).transposed()
+        let upPlane = dequantized(
+            qUp.weight, scales: qUp.scales, biases: upBiases,
+            groupSize: qUp.groupSize, bits: qUp.bits, mode: qUp.mode
+        ).transposed()
+        let fusedPlane = concatenated([gatePlane, upPlane], axis: 1)
+        eval(fusedPlane)
+        let candidate = (
+            plane: fusedPlane,
+            intermediateSize: gateWeight.dim(0)
+        )
+
+        planeLock.lock()
+        if let raced = cachedFusedGateUpPlanes[key] {
+            planeLock.unlock()
+            return raced
+        }
+        cachedFusedGateUpPlanes[key] = candidate
+        planeLock.unlock()
+        return candidate
     }
 
     /// `DARKBLOOM_GEMMA4_PREFILL_DEQ_GEMM_XCHECK=1`: bitwise cross-check of
@@ -4294,6 +4366,15 @@ private class Gemma4MLP: Module {
         _ x: MLXArray,
         activationSums producerSums: CBv2DenseMLPQMVV1.ActivationSums? = nil
     ) -> MLXArray {
+        if let fused = Gemma4PrefillDeqGEMMV1.fusedGateUpPlane(
+            gate: gateProj, up: upProj, mlpKey: self, x: x)
+        {
+            CBv2EngageMark.once("dense-prefill-gateup-fuse-fixed-r2")
+            let gateUp = MLX.matmul(x, fused.plane)
+            let gate = gateUp[.ellipsis, ..<fused.intermediateSize]
+            let up = gateUp[.ellipsis, fused.intermediateSize...]
+            return denseProjection(downProj, gemma4GeluProduct(gate, up))
+        }
         // DMLP-002: one exact activation-sum prepass feeds both fallback
         // projections. If either projection is not the pinned affine8 cell,
         // the candidate arrays remain unevaluated and stock takes over.

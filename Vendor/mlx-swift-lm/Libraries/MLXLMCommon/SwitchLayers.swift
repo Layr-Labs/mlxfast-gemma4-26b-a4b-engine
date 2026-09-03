@@ -5,6 +5,17 @@ import MLXNN
 /// Identity gather table for the sorted 64-assignment decode geometry.
 nonisolated(unsafe) private let switchDownIdentity64 = MLXArray((0..<64).map { UInt32($0) })
 
+/// The sorted B=8 decode consumer accepts its original rank-2 activation.
+/// `DARKBLOOM_SWITCH_DECODE_DIRECT_LHS_SHAPE=0` restores the two incumbent
+/// reshape nodes for attribution and emergency rollback.
+private let switchDecodeDirectLhsShapeEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_SWITCH_DECODE_DIRECT_LHS_SHAPE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+
 // Port of https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/switch_layers.py
 
 /// Compiled SiLU-gated product (`silu(gate) * up`) for the common MoE GLU path.
@@ -1393,11 +1404,14 @@ public class SwitchGLU: Module {
         let useLhsIndices =
             indices.size == 64 && indices.ndim == 2 && indices.shape == [8, 8]
             && x.ndim == 2 && x.shape == [8, inputDims]
-        let useExpertPrefixBounds =
-            expertPrefixBoundsEnabled && useLhsIndices
-            && indices.dtype == .uint32 && x.dtype == .bfloat16
-            && expertPrefixBoundsProjectionsEligible
-        var x = MLX.expandedDimensions(x, axes: [-2, -3])
+        let useDirectLhsDecodeShape =
+            switchDecodeDirectLhsShapeEnabled && useLhsIndices
+        if useDirectLhsDecodeShape {
+            CBv2EngageMark.once("switch-decode-direct-lhs-shape")
+        }
+        let input = x
+        var x = useDirectLhsDecodeShape
+            ? input : MLX.expandedDimensions(input, axes: [-2, -3])
         let doSort = indices.size >= 64
 
         var idx = indices
@@ -1410,7 +1424,9 @@ public class SwitchGLU: Module {
         var lhsIndices: MLXArray?
         if doSort {
             if useLhsIndices {
-                x = x.flattened(start: 0, end: -3)
+                if !useDirectLhsDecodeShape {
+                    x = x.flattened(start: 0, end: -3)
+                }
                 // GLUE-FOLD: an upstream producer already emitted the exact
                 // route table beside the top-8 selection; consume it and the
                 // standalone `mlx_lm_route_simd_rank_scatter` dispatch never

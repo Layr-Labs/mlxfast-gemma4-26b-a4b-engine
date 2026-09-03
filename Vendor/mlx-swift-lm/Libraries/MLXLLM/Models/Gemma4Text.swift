@@ -7383,5 +7383,4 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
 // Ranked resample marker 39: this archive is a further ranked sample of the tree carried
 // by the preceding ranked submission of this content apart from any rotation item declared in its note.
 
-
-
+// ROOT-TOPOLOGY-CACHE archive marker: executable changes are confined to the CBv2 cache adapter.

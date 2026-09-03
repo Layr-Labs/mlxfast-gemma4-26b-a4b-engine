@@ -31,9 +31,47 @@ private let cbv2CompactDecodeRootMarksArmed =
 public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
 
     private let model: any LanguageModel
+    private let supportsCompactDecodeRoots: Bool
+
+    private struct KVCachesTopology {
+        let identities: [ObjectIdentifier]
+        let values: [KVCache]
+
+        func matches(_ caches: [CBv2AttendingLayerCache]) -> Bool {
+            guard identities.count == caches.count else { return false }
+            for index in caches.indices {
+                if identities[index] != ObjectIdentifier(caches[index]) { return false }
+            }
+            return true
+        }
+    }
+
+    private struct CompactDecodeTopology {
+        let identities: [ObjectIdentifier]
+        let revisions: [UInt64]
+        let layers: [CBv2LayerCache]
+        let rowCount: Int
+
+        func matches(_ caches: [CBv2AttendingLayerCache]) -> Bool {
+            guard identities.count == caches.count else { return false }
+            for index in caches.indices {
+                if identities[index] != ObjectIdentifier(caches[index])
+                    || revisions[index] != layers[index].decodeRootTopologyRevision
+                {
+                    return false
+                }
+            }
+            return true
+        }
+    }
+
+    private var kvCachesTopology: KVCachesTopology?
+    private var compactDecodeTopology: CompactDecodeTopology?
 
     public init(_ model: any LanguageModel) {
         self.model = model
+        self.supportsCompactDecodeRoots =
+            model is any CBv2LanguageModelDecodeOutputCoversCacheMutations
     }
 
     public func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
@@ -48,31 +86,50 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
     public func compactDecodeEvaluationRoots(
         forwardOutput: MLXArray, caches: [CBv2AttendingLayerCache]
     ) -> [MLXArray]? {
-        guard model is any CBv2LanguageModelDecodeOutputCoversCacheMutations else {
-            return nil
+        guard supportsCompactDecodeRoots else { return nil }
+
+        let contiguous: [CBv2LayerCache]
+        let rowCount: Int
+        if let cached = compactDecodeTopology, cached.matches(caches) {
+            contiguous = cached.layers
+            rowCount = cached.rowCount
+        } else {
+            let validated = caches.compactMap { $0 as? CBv2LayerCache }
+            guard !validated.isEmpty,
+                validated.count == caches.count,
+                validated.allSatisfy({ $0.kind.sharesKVWithLayer == nil }),
+                let validatedRowCount = validated.first?.rows.count,
+                validatedRowCount > 0,
+                validated.allSatisfy({ $0.rows.count == validatedRowCount }),
+                validated.allSatisfy({ cache in
+                    cache.rows.allSatisfy {
+                        $0 is any CBv2DecodeRootCompactionCapableSequenceKV
+                    }
+                }),
+                let stateIdentity = validated[0].unifiedPositionStateIdentity,
+                validated.dropFirst().allSatisfy({
+                    $0.unifiedPositionStateIdentity == stateIdentity
+                })
+            else {
+                compactDecodeTopology = nil
+                return nil
+            }
+            contiguous = validated
+            rowCount = validatedRowCount
+            compactDecodeTopology = CompactDecodeTopology(
+                identities: caches.map(ObjectIdentifier.init),
+                revisions: validated.map(\.decodeRootTopologyRevision),
+                layers: validated,
+                rowCount: validatedRowCount)
         }
-        let contiguous = caches.compactMap { $0 as? CBv2LayerCache }
-        guard !contiguous.isEmpty,
-            contiguous.count == caches.count,
-            contiguous.allSatisfy({ $0.kind.sharesKVWithLayer == nil }),
-            let rowCount = contiguous.first?.rows.count,
-            rowCount > 0,
-            contiguous.allSatisfy({ $0.rows.count == rowCount }),
-            contiguous.allSatisfy({ cache in
-                cache.rows.allSatisfy {
-                    $0 is any CBv2DecodeRootCompactionCapableSequenceKV
-                }
-            }),
-            let stateIdentity = contiguous[0].unifiedPositionStateIdentity,
-            let offsets = contiguous[0].unifiedPositionOffsets,
-            contiguous.dropFirst().allSatisfy({
-                $0.unifiedPositionStateIdentity == stateIdentity
-            })
-        else { return nil }
+
+        guard let offsets = contiguous[0].unifiedPositionOffsets else { return nil }
 
         var roots = [forwardOutput, offsets]
         roots.reserveCapacity(2 + contiguous.count)
-        roots.append(contentsOf: contiguous.map(\.decodeRingWriteFenceEvaluationRoot))
+        for cache in contiguous {
+            roots.append(cache.decodeRingWriteFenceEvaluationRoot)
+        }
         if cbv2CompactDecodeRootMarksArmed {
             CBv2EngageMark.once(
                 "compact-decode-roots rows=\(rowCount) layers=\(contiguous.count) "
@@ -82,14 +139,25 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
     }
 
     private func asKVCaches(_ caches: [CBv2AttendingLayerCache]) -> [KVCache] {
-        caches.map { cache -> KVCache in
+        if let cached = kvCachesTopology, cached.matches(caches) {
+            return cached.values
+        }
+
+        var identities: [ObjectIdentifier] = []
+        var values: [KVCache] = []
+        identities.reserveCapacity(caches.count)
+        values.reserveCapacity(caches.count)
+        for cache in caches {
             guard let kv = cache as? KVCache else {
                 fatalError(
                     "CBv2 layer cache \(type(of: cache)) must conform to KVCache to drive "
                         + "\(type(of: model)) through callAsFunction(_:cache:)")
             }
-            return kv
+            identities.append(ObjectIdentifier(cache))
+            values.append(kv)
         }
+        kvCachesTopology = KVCachesTopology(identities: identities, values: values)
+        return values
     }
 }
 

@@ -56,6 +56,12 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     /// own no storage and borrow via `attendBorrowing`.
     public private(set) var rows: [CBv2SequenceKV]
 
+    /// Host-only version of the row/position topology used by the steppable
+    /// adapter's decode-root proof cache. Tensor values advance every step,
+    /// but this version changes only when the bound objects or shared position
+    /// topology changes.
+    var decodeRootTopologyRevision: UInt64 = 0
+
     /// Per-row absolute RoPE offsets `[B]` (int32, device array).
     ///
     /// REBUILT from host integers only on membership changes; ADVANCED
@@ -144,6 +150,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         positionOffsetsState = state
         usesUnifiedPositionOffsets = true
         advancesPositionOffsets = advances
+        decodeRootTopologyRevision &+= 1
     }
 
     // MARK: - Membership (the ONLY places positionOffsets is host-rebuilt)
@@ -152,11 +159,13 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         precondition(
             kind.sharesKVWithLayer == nil, "CBv2LayerCache: cannot add rows to a KV-shared layer")
         rows.append(row)
+        decodeRootTopologyRevision &+= 1
         rebuildPositionOffsets()
     }
 
     public func removeRow(at index: Int) {
         rows.remove(at: index)
+        decodeRootTopologyRevision &+= 1
         rebuildPositionOffsets()
     }
 
@@ -176,6 +185,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             kind.sharesKVWithLayer == nil || newRows.isEmpty,
             "CBv2LayerCache: KV-shared layers own no rows")
         rows = newRows
+        decodeRootTopologyRevision &+= 1
         if shouldRebuild { rebuildPositionOffsets() }
     }
 

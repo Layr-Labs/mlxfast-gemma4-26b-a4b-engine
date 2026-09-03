@@ -818,7 +818,7 @@ private let routeCsortPrefillHistKernel: MLXFast.MLXFastKernel = MLXFast.metalKe
 private let routeCsortPrefillScanKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
     name: "mlx_lm_route_csort128_scan_v3",
     inputNames: ["block_hist"],
-    outputNames: ["block_offset"],
+    outputNames: ["block_offset", "expert_offsets", "tile_offsets"],
     source: """
         constexpr uint WIDTH = \(routeCsortPrefillWidth);
         uint e = thread_position_in_threadgroup.x;
@@ -847,6 +847,27 @@ private let routeCsortPrefillScanKernel: MLXFast.MLXFastKernel = MLXFast.metalKe
             running += simd_totals[s];
         }
         running += lane_excl;
+
+        // The NAX expert kernel consumes the same exclusive expert prefix and
+        // an exclusive prefix of eight-row tiles. Expert `NE` is the terminal
+        // entry, so the 129-entry tables describe empty experts as well.
+        uint tile_count = (total + 7u) / 8u;
+        uint tile_lane_excl = simd_prefix_exclusive_sum(tile_count);
+        threadgroup uint simd_tile_totals[8];
+        if (lane == 31) {
+            simd_tile_totals[simd_id] = tile_lane_excl + tile_count;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint tile_running = 0u;
+        for (uint s = 0; s < simd_id; ++s) {
+            tile_running += simd_tile_totals[s];
+        }
+        tile_running += tile_lane_excl;
+        if (e <= (uint)NE) {
+            expert_offsets[e] = running;
+            tile_offsets[e] = tile_running;
+        }
+
         // Exclusive scan over blocks for this expert, offset by the bin base.
         // Column `e` of `block_offset` is read by the scatter only as
         // `block_offset[b * WIDTH + key]` for a key that occurs in block `b`,
@@ -877,10 +898,16 @@ private let routeCsortPrefillScanKernel: MLXFast.MLXFastKernel = MLXFast.metalKe
 /// Columns with a zero total are left unwritten, as the incumbent leaves
 /// them. Admitted for 128 experts, the 256-wide table and a block count
 /// divisible by eight.
+///
+/// NAX extension: emits the same `expert_offsets` / `tile_offsets` exclusive
+/// prefixes as `routeCsortPrefillScanKernel` (129 entries, terminal included)
+/// so the fused NAX MoE consumer sees identical tables whichever scan ran.
+/// The 8x128 layout has no `e == NE` thread, so part 0 writes columns
+/// `e < NE` plus the terminal entry from the last column.
 private let routeCsortPrefillScanKernelPg2: MLXFast.MLXFastKernel = MLXFast.metalKernel(
     name: "mlx_lm_route_csort128_scan_pg2",
     inputNames: ["block_hist"],
-    outputNames: ["block_offset"],
+    outputNames: ["block_offset", "expert_offsets", "tile_offsets"],
     source: """
         constexpr uint WIDTH = \(routeCsortPrefillWidth);
         constexpr uint PARTS = 8;
@@ -922,6 +949,32 @@ private let routeCsortPrefillScanKernelPg2: MLXFast.MLXFastKernel = MLXFast.meta
             running += simd_totals[s];
         }
         running += lane_excl;
+        // NAX prefixes: the same exclusive expert base and exclusive
+        // eight-row-tile base the incumbent v3 scan publishes. `running` here
+        // is still the bin base (earlier parts are added below for the block
+        // scan only), and `total` is identical across parts, so every part
+        // computes the same bases; part 0 publishes them once.
+        const uint expert_base = running;
+        uint tile_count = (total + 7u) / 8u;
+        uint tile_lane_excl = simd_prefix_exclusive_sum(tile_count);
+        threadgroup uint simd_tile_totals[COLS / 32];
+        if (part == 0 && lane == 31) {
+            simd_tile_totals[simd_id] = tile_lane_excl + tile_count;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint tile_base = 0u;
+        for (uint s = 0; s < simd_id; ++s) {
+            tile_base += simd_tile_totals[s];
+        }
+        tile_base += tile_lane_excl;
+        if (part == 0 && e < (uint)NE) {
+            expert_offsets[e] = expert_base;
+            tile_offsets[e] = tile_base;
+        }
+        if (part == 0 && e == COLS - 1) {
+            expert_offsets[NE] = expert_base + total;
+            tile_offsets[NE] = tile_base + tile_count;
+        }
         for (uint p = 0; p < part; ++p) {
             running += part_sum[p][e];
         }
@@ -975,9 +1028,17 @@ private let routeCsortPrefillScatterKernel: MLXFast.MLXFastKernel = MLXFast.meta
 
 /// Exact stable counting sort of a flat uint32 route table. Returns nil (fail
 /// closed onto `argSort`) unless every precondition of the kernels holds.
+private struct RouteCsortPrefillResult {
+    let rowOrder: MLXArray
+    let sortedKeys: MLXArray
+    let inverseOrder: MLXArray
+    let expertOffsets: MLXArray
+    let tileOffsets: MLXArray
+}
+
 private func routeCountingSortPrefill(
     _ indices: MLXArray, m: Int, numExperts: Int
-) -> (rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray)? {
+) -> RouteCsortPrefillResult? {
     let n = indices.size
     guard routeCsortPrefillEnabled,
         indices.dtype == .uint32,
@@ -999,54 +1060,60 @@ private func routeCountingSortPrefill(
         outputShapes: [[blocks, width]],
         outputDTypes: [.uint32]
     )[0]
-    let offsets: MLXArray
+    let scanOutputs: [MLXArray]
     // PROMPT-GLUE2 (pg2): the prompt plane's key table takes the eight-part
-    // scan; every other table keeps the incumbent dispatch.
+    // scan; every other table keeps the incumbent dispatch. Both scans emit
+    // the full NAX triple (block offsets plus the 129-entry expert/tile
+    // prefixes), so the scatter always reads scanOutputs[0] and the fused NAX
+    // MoE consumer always reads scanOutputs[1]/[2] from whichever ran.
     if Gemma4PromptGlue2V1.enabled, numExperts == 128, width == 256,
         blocks >= 8, blocks % 8 == 0, n / m >= Gemma4PromptGlue2V1.minRows
     {
-        offsets = routeCsortPrefillScanKernelPg2(
+        scanOutputs = routeCsortPrefillScanKernelPg2(
             [hist],
             template: [("NE", numExperts)],
             grid: (1024, 1, 1),
             threadGroup: (1024, 1, 1),
-            outputShapes: [[blocks, width]],
-            outputDTypes: [.uint32]
-        )[0]
+            outputShapes: [[blocks, width], [numExperts + 1], [numExperts + 1]],
+            outputDTypes: [.uint32, .uint32, .uint32]
+        )
         if Gemma4PromptGlue2V1.xcheck {
             let reference = routeCsortPrefillScanKernel(
                 [hist],
                 template: [("NE", numExperts)],
                 grid: (width, 1, 1),
                 threadGroup: (width, 1, 1),
-                outputShapes: [[blocks, width]],
-                outputDTypes: [.uint32]
-            )[0]
+                outputShapes: [[blocks, width], [numExperts + 1], [numExperts + 1]],
+                outputDTypes: [.uint32, .uint32, .uint32]
+            )
             // Only columns with a nonzero total are written by either kernel.
             let written = hist.sum(axis: 0) .> UInt32(0)
             Gemma4PromptGlue2V1.report(
-                offsets, reference: reference, site: "route-csort scan", mask: written)
+                scanOutputs[0], reference: reference[0], site: "route-csort scan",
+                mask: written)
         }
         Gemma4PromptGlue2V1.mark()
     } else {
-        offsets = routeCsortPrefillScanKernel(
+        scanOutputs = routeCsortPrefillScanKernel(
             [hist],
             template: [("NE", numExperts)],
             grid: (width, 1, 1),
             threadGroup: (width, 1, 1),
-            outputShapes: [[blocks, width]],
-            outputDTypes: [.uint32]
-        )[0]
+            outputShapes: [[blocks, width], [numExperts + 1], [numExperts + 1]],
+            outputDTypes: [.uint32, .uint32, .uint32]
+        )
     }
     let outputs = routeCsortPrefillScatterKernel(
-        [indices, offsets],
+        [indices, scanOutputs[0]],
         template: [("M", m)],
         grid: (blocks * width, 1, 1),
         threadGroup: (width, 1, 1),
         outputShapes: [[n], [n], [n]],
         outputDTypes: [.uint32, .uint32, .uint32]
     )
-    return (outputs[0], outputs[1], outputs[2])
+    return RouteCsortPrefillResult(
+        rowOrder: outputs[0], sortedKeys: outputs[1], inverseOrder: outputs[2],
+        expertOffsets: scanOutputs[1], tileOffsets: scanOutputs[2])
 }
 
 /// GLUE-FOLD carrier: the exact decode route table (`row_order`,
@@ -1314,6 +1381,732 @@ public final class SwitchGateUpFusedStorage {
     }
 }
 
+// MARK: - FLASH-MOE-PREFILL: transient tiled expert MLP
+
+/// Experimental and intentionally opt-in. The NAX kernel targets the exact
+/// Gemma 4 expert contract; the scalar kernel below remains its correctness
+/// fallback. Both consume the sorted expert plane and route products already
+/// produced above and never create a second regrouping structure.
+private let switchFlashMoEPrefillEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_PREFILL_FLASH_MOE"]
+    else { return false }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// One group owns one expert and walks that expert's contiguous sorted run.
+/// The 2816-element accumulator is threadgroup-local; the 64-element gate,
+/// up, and GeGLU tiles never leave threadgroup memory.
+private let switchFlashMoEScalarKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "gemma4_prefill_flash_moe_q4_g64_t64_v1",
+    inputNames: [
+        "x", "indices", "gate_up_weight", "gate_up_scales", "gate_up_biases",
+        "down_weight", "down_scales", "down_biases",
+    ],
+    outputNames: ["out"],
+    source: """
+        const uint tid = thread_position_in_threadgroup.x;
+        const uint expert = threadgroup_position_in_grid.x;
+        const uint assignment_count = indices_shape[0];
+
+        threadgroup uint bounds[2];
+        threadgroup T gate_tile[64];
+        threadgroup T up_tile[64];
+        threadgroup T h_tile[64];
+        threadgroup float y_accumulator[2816];
+
+        // `indices` is the existing stable expert-major route table. Since it
+        // is sorted, one cursor identifies this expert's complete run without
+        // building another boundary/index buffer.
+        uint cursor = 0u;
+        if (tid == 0u) {
+            while (cursor < assignment_count && indices[cursor] < expert) {
+                cursor++;
+            }
+            const uint begin = cursor;
+            while (cursor < assignment_count && indices[cursor] == expert) {
+                cursor++;
+            }
+            bounds[0] = begin;
+            bounds[1] = cursor;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint begin = bounds[0];
+        const uint end = bounds[1];
+        for (uint assignment = begin; assignment < end; assignment++) {
+            // Each lane owns 44 output elements. This accumulator is reset for
+            // one sorted assignment and retained across all 11 H tiles.
+            for (uint n = tid; n < 2816u; n += 64u) {
+                y_accumulator[n] = 0.0f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint tile_base = 0u; tile_base < 704u; tile_base += 64u) {
+                const uint j = tile_base + tid;
+                float gate_sum = 0.0f;
+                float up_sum = 0.0f;
+                for (uint k = 0u; k < 2816u; k++) {
+                    const float value = static_cast<float>(x[
+                        size_t(assignment) * 2816u + k]);
+                    gate_sum += value * flash_moe_q4<T>(
+                        gate_up_weight, gate_up_scales, gate_up_biases,
+                        expert, j, k, 1408u, 352u, 44u);
+                    up_sum += value * flash_moe_q4<T>(
+                        gate_up_weight, gate_up_scales, gate_up_biases,
+                        expert, 704u + j, k, 1408u, 352u, 44u);
+                }
+
+                // Match the two gathered QMM outputs' BF16 materialization
+                // before applying the existing tanh-approximate GeGLU math.
+                gate_tile[tid] = static_cast<T>(gate_sum);
+                up_tile[tid] = static_cast<T>(up_sum);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                const float gate = static_cast<float>(gate_tile[tid]);
+                const float up = static_cast<float>(up_tile[tid]);
+                const float gelu = 0.5f * gate * (1.0f + tanh(
+                    sqrt(2.0f / 3.14159265358979323846f)
+                        * (gate + 0.044715f * gate * gate * gate)));
+                h_tile[tid] = static_cast<T>(gelu * up);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                for (uint n = tid; n < 2816u; n += 64u) {
+                    float accumulator = y_accumulator[n];
+                    for (uint local_j = 0u; local_j < 64u; local_j++) {
+                        accumulator += static_cast<float>(h_tile[local_j])
+                            * flash_moe_q4<T>(
+                                down_weight, down_scales, down_biases,
+                                expert, n, tile_base + local_j,
+                                2816u, 88u, 11u);
+                    }
+                    y_accumulator[n] = accumulator;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            for (uint n = tid; n < 2816u; n += 64u) {
+                out[size_t(assignment) * 2816u + n] =
+                    static_cast<T>(y_accumulator[n]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    """,
+    header: """
+        template <typename T>
+        inline float flash_moe_q4(
+            const device uint* weight,
+            const device T* scales,
+            const device T* biases,
+            uint expert,
+            uint output_row,
+            uint input_index,
+            uint output_rows,
+            uint packed_columns,
+            uint group_columns) {
+            const size_t row = size_t(expert) * output_rows + output_row;
+            const uint word = weight[row * packed_columns + (input_index >> 3u)];
+            const uint q = (word >> ((input_index & 7u) * 4u)) & 0x0fu;
+            const size_t group = row * group_columns + (input_index >> 6u);
+            return static_cast<float>(scales[group]) * static_cast<float>(q)
+                + static_cast<float>(biases[group]);
+        }
+    """,
+    ensureRowContiguous: true
+)
+
+/// The custom-kernel compiler does not have the vendored MLX include path, so
+/// this is the small fixed-shape subset of the shipped NAX primitives needed by
+/// the Gemma M=8 route. The fragment coordinates and MPP descriptor are kept
+/// identical to `steel/gemm/nax.h`; only the generic surface is narrowed to the
+/// affine 4-bit, group-64 loader used here.
+private let switchFlashMoENAXHeader = """
+    #include <metal_simdgroup>
+    #include <metal_simdgroup_matrix>
+    #include <metal_stdlib>
+    #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+    using namespace metal;
+
+    namespace mlx {
+    namespace steel {
+
+    struct NAXFrag {
+        static constant constexpr const short kFragRows = 16;
+        static constant constexpr const short kFragCols = 16;
+        static constant constexpr const short kElemsPerFrag = 8;
+        static constant constexpr const short kElemRows = 2;
+        static constant constexpr const short kElemCols = 4;
+        static constant constexpr const short kElemRowsJump = 8;
+
+        template <typename U>
+        using dtype_frag_t = typename metal::vec<U, kElemsPerFrag>;
+
+        static inline short2 get_coord() {
+            const ushort simd_lane_id =
+                __metal_get_thread_index_in_simdgroup(ushort());
+            const short qid = simd_lane_id >> 2;
+            const short fm = ((qid & 4) | ((simd_lane_id >> 1) & 3));
+            const short fn = ((qid & 2) | (simd_lane_id & 1)) * 4;
+            return short2{fn, fm};
+        }
+
+        template <typename T, typename P>
+        static inline void load(
+            thread dtype_frag_t<T>& dst, P src, int str_x, int str_y,
+            short off_x, short off_y) {
+            const short2 sc = get_coord();
+            src += sc.y * str_x + sc.x * str_y;
+            for (short i = 0; i < kElemRows; ++i) {
+                for (short j = 0; j < kElemCols; ++j) {
+                    dst[i * kElemCols + j] = static_cast<T>(src[
+                        (off_x + i * kElemRowsJump) * str_x
+                            + (off_y + j) * str_y]);
+                }
+            }
+        }
+
+        template <typename T, typename P>
+        static inline void load_rows(
+            thread dtype_frag_t<T>& dst, P src, int str_x, int str_y,
+            short lim_x, short off_x, short off_y) {
+            const short2 sc = get_coord();
+            src += sc.y * str_x + sc.x * str_y;
+            const short rows = lim_x - sc.y;
+            for (short i = 0; i < kElemRows; ++i) {
+                const short r = off_x + i * kElemRowsJump;
+                for (short j = 0; j < kElemCols; ++j) {
+                    dst[i * kElemCols + j] = r < rows
+                        ? static_cast<T>(src[r * str_x + (off_y + j) * str_y])
+                        : T(0);
+                }
+            }
+        }
+
+        template <typename C, typename U>
+        static inline void store_safe(
+            const thread dtype_frag_t<C>& src, threadgroup U* dst, int str_x,
+            int str_y, short lim_x, short lim_y, short off_x, short off_y) {
+            const short2 sc = get_coord();
+            dst += sc.y * str_x + sc.x * str_y;
+            for (short i = 0; i < kElemRows; ++i) {
+                const short r = off_x + i * kElemRowsJump;
+                for (short j = 0; j < kElemCols; ++j) {
+                    const short c = off_y + j;
+                    if (r < lim_x - sc.y && c < lim_y - sc.x) {
+                        dst[r * str_x + c * str_y] = static_cast<U>(
+                            src[i * kElemCols + j]);
+                    }
+                }
+            }
+        }
+
+        template <typename C, typename U>
+        static inline void store_safe(
+            const thread dtype_frag_t<C>& src, device U* dst, int str_x,
+            int str_y, short lim_x, short lim_y, short off_x, short off_y) {
+            const short2 sc = get_coord();
+            dst += sc.y * str_x + sc.x * str_y;
+            for (short i = 0; i < kElemRows; ++i) {
+                const short r = off_x + i * kElemRowsJump;
+                for (short j = 0; j < kElemCols; ++j) {
+                    const short c = off_y + j;
+                    if (r < lim_x - sc.y && c < lim_y - sc.x) {
+                        dst[r * str_x + c * str_y] = static_cast<U>(
+                            src[i * kElemCols + j]);
+                    }
+                }
+            }
+        }
+
+        template <typename CType, typename AType, typename BType>
+        static inline void mma(
+            thread dtype_frag_t<CType>& C0, thread dtype_frag_t<CType>& C1,
+            const thread dtype_frag_t<AType>& A,
+            const thread dtype_frag_t<BType>& B0,
+            const thread dtype_frag_t<BType>& B1) {
+            constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+                16, 32, 16, false, true, true,
+                mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+            mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> gemm_op;
+            auto ct_a = gemm_op.template get_left_input_cooperative_tensor<
+                AType, BType, CType>();
+            auto ct_b = gemm_op.template get_right_input_cooperative_tensor<
+                AType, BType, CType>();
+            auto ct_c = gemm_op.template get_destination_cooperative_tensor<
+                decltype(ct_a), decltype(ct_b), CType>();
+            for (short i = 0; i < kElemsPerFrag; ++i) {
+                ct_a[i] = A[i];
+                ct_b[i] = B0[i];
+                ct_b[kElemsPerFrag + i] = B1[i];
+                ct_c[i] = C0[i];
+                ct_c[kElemsPerFrag + i] = C1[i];
+            }
+            gemm_op.run(ct_a, ct_b, ct_c);
+            for (short i = 0; i < kElemsPerFrag; ++i) {
+                C0[i] = ct_c[i];
+                C1[i] = ct_c[kElemsPerFrag + i];
+            }
+        }
+    };
+
+    template <typename T, short TILE_ROWS, short TILE_COLS>
+    struct NAXTile {
+        using NAXFrag_t = NAXFrag;
+        using frag_type = typename NAXFrag_t::template dtype_frag_t<T>;
+        static constant constexpr const short kTileRows = TILE_ROWS;
+        static constant constexpr const short kTileCols = TILE_COLS;
+        static constant constexpr const short kNumFrags = TILE_ROWS * TILE_COLS;
+        frag_type val_frags[kNumFrags];
+
+        inline void clear() {
+            for (short i = 0; i < kNumFrags; ++i) {
+                val_frags[i] = frag_type(0);
+            }
+        }
+
+        inline thread frag_type& frag_at(short i, short j) {
+            return val_frags[i * kTileCols + j];
+        }
+
+        inline const thread frag_type& frag_at(short i, short j) const {
+            return val_frags[i * kTileCols + j];
+        }
+
+        template <bool transpose>
+        inline thread frag_type& frag_at(
+            short i, short j, metal::bool_constant<transpose>) {
+            if constexpr (transpose) {
+                return frag_at(j, i);
+            }
+            return frag_at(i, j);
+        }
+
+        template <typename U>
+        inline void load(const device U* src, int ld) {
+            for (short i = 0; i < kTileRows; ++i) {
+                for (short j = 0; j < kTileCols; ++j) {
+                    NAXFrag_t::load(
+                        frag_at(i, j), src, ld, 1, i * 16, j * 16);
+                }
+            }
+        }
+
+        template <typename U>
+        inline void load_rows(const device U* src, int ld, short rows) {
+            for (short i = 0; i < kTileRows; ++i) {
+                for (short j = 0; j < kTileCols; ++j) {
+                    NAXFrag_t::load_rows(
+                        frag_at(i, j), src, ld, 1, rows, i * 16, j * 16);
+                }
+            }
+        }
+
+        template <typename U>
+        inline void load_rows(const threadgroup U* src, int ld, short rows) {
+            for (short i = 0; i < kTileRows; ++i) {
+                for (short j = 0; j < kTileCols; ++j) {
+                    NAXFrag_t::load_rows(
+                        frag_at(i, j), src, ld, 1, rows, i * 16, j * 16);
+                }
+            }
+        }
+
+        template <typename U>
+        inline void load(const threadgroup U* src, int ld) {
+            for (short i = 0; i < kTileRows; ++i) {
+                for (short j = 0; j < kTileCols; ++j) {
+                    NAXFrag_t::load(
+                        frag_at(i, j), src, ld, 1, i * 16, j * 16);
+                }
+            }
+        }
+
+        template <typename U>
+        inline void store_safe(
+            threadgroup U* dst, int ld, short2 limits) const {
+            for (short i = 0; i < kTileRows; ++i) {
+                for (short j = 0; j < kTileCols; ++j) {
+                    NAXFrag_t::store_safe(
+                        frag_at(i, j), dst, ld, 1, limits.y, limits.x,
+                        i * 16, j * 16);
+                }
+            }
+        }
+
+        template <typename U>
+        inline void store_safe(device U* dst, int ld, short2 limits) const {
+            for (short i = 0; i < kTileRows; ++i) {
+                for (short j = 0; j < kTileCols; ++j) {
+                    NAXFrag_t::store_safe(
+                        frag_at(i, j), dst, ld, 1, limits.y, limits.x,
+                        i * 16, j * 16);
+                }
+            }
+        }
+    };
+
+    template <class CTile, class ATile, class BTile>
+    inline void tile_matmad_nax(
+        thread CTile& C, thread ATile& A, thread BTile& B) {
+        static_assert(CTile::kTileRows == ATile::kTileRows);
+        static_assert(CTile::kTileCols == BTile::kTileCols);
+        static_assert(ATile::kTileCols == BTile::kTileRows);
+        for (short mm = 0; mm < CTile::kTileRows; ++mm) {
+            for (short nn = 0; nn < CTile::kTileCols; nn += 2) {
+                for (short kk = 0; kk < ATile::kTileCols; ++kk) {
+                    NAXFrag::mma(
+                        C.frag_at(mm, nn), C.frag_at(mm, nn + 1),
+                        A.frag_at(mm, kk), B.frag_at(kk, nn),
+                        B.frag_at(kk, nn + 1));
+                }
+            }
+        }
+    }
+
+    template <
+        typename T, short BROWS, short BCOLS, short DST_LD,
+        short REDUCTION_DIM, short TGP_SIZE, short GROUP_SIZE, short BITS>
+    struct QuantizedBlockLoader {
+        static_assert(BROWS == 64 && BCOLS == 64 && DST_LD == 72);
+        static_assert(REDUCTION_DIM == 1 && TGP_SIZE == 64);
+        static_assert(GROUP_SIZE == 64 && BITS == 4);
+
+        const device uint8_t* src;
+        const device T* scales;
+        const device T* biases;
+        threadgroup T* dst;
+        const int src_ld;
+
+        QuantizedBlockLoader(
+            const device uint8_t* src_, const device T* scales_,
+            const device T* biases_, int src_ld_, threadgroup T* dst_,
+            uint simd_gid, uint simd_lid)
+            : src(src_ + (simd_gid * 32u + simd_lid) * (src_ld_ / 2)),
+              scales(scales_ + (simd_gid * 32u + simd_lid) * (src_ld_ / 64)),
+              biases(biases_ + (simd_gid * 32u + simd_lid) * (src_ld_ / 64)),
+              dst(dst_ + (simd_gid * 32u + simd_lid) * DST_LD),
+              src_ld(src_ld_) {}
+
+        inline void load_unsafe() const {
+            const T scale = scales[0];
+            const T bias = biases[0];
+            for (short i = 0; i < 32; ++i) {
+                const uint8_t packed = src[i];
+                dst[2 * i] = static_cast<T>(scale * (packed & 0x0fu) + bias);
+                dst[2 * i + 1] = static_cast<T>(
+                    scale * ((packed >> 4) & 0x0fu) + bias);
+            }
+        }
+
+        inline void next() {
+            src += 32;
+            scales += 1;
+            biases += 1;
+        }
+    };
+
+    template <typename T, typename InPtr, typename OutPtr>
+    inline void flash_moe_qmm_t_nax(
+        const device uint32_t* weights, const device T* scales,
+        const device T* biases, InPtr input, OutPtr output,
+        threadgroup T* ws, uint expert, uint weight_row, int weight_rows,
+        int K, int output_ld, short valid_rows, uint simd_gid,
+        uint simd_lid) {
+        constexpr int BM = 16;
+        constexpr int BN = 64;
+        constexpr int BK = 64;
+        constexpr int WM = 1;
+        constexpr int WN = 2;
+        constexpr int BK_PADDED = 72;
+        const int K_PACKED_BYTES = K / 2;
+        const int K_GROUPS = K / 64;
+
+        const device uint8_t* weight_bytes =
+            reinterpret_cast<const device uint8_t*>(weights)
+            + (size_t(expert) * weight_rows + weight_row) * K_PACKED_BYTES;
+        const device T* scale_rows =
+            scales + (size_t(expert) * weight_rows + weight_row) * K_GROUPS;
+        const device T* bias_rows =
+            biases + (size_t(expert) * weight_rows + weight_row) * K_GROUPS;
+        QuantizedBlockLoader<
+            T, BN, BK, BK_PADDED, 1, WM * WN * 32, 64, 4>
+            loader(weight_bytes, scale_rows, bias_rows, K, ws,
+                simd_gid, simd_lid);
+
+        constexpr short TM = BM / WM / 16;
+        constexpr short TN = BN / WN / 16;
+        const short tn = static_cast<short>(simd_gid % WN) * (BN / WN);
+        NAXTile<float, TM, TN> d_tile;
+        d_tile.clear();
+
+        for (int k = 0; k < K; k += BK) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            loader.load_unsafe();
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int kk = 0; kk < BK; kk += 32) {
+                NAXTile<T, TM, 2> a_tile;
+                NAXTile<T, 2, TN> b_tile;
+                a_tile.load_rows(input + k + kk, K, valid_rows);
+                b_tile.load(ws + tn * BK_PADDED + kk, BK_PADDED);
+                tile_matmad_nax(d_tile, a_tile, b_tile);
+            }
+            loader.next();
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        d_tile.store_safe(output + tn, output_ld, short2(BN / WN, valid_rows));
+    }
+
+    } // namespace steel
+    } // namespace mlx
+
+    """
+
+private let switchFlashMoENAXKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "gemma4_prefill_flash_moe_q4_g64_nax_m8_v1",
+    inputNames: [
+        "x", "gate_up_weight", "gate_up_scales", "gate_up_biases",
+        "down_weight", "down_scales", "down_biases", "expert_offsets",
+        "tile_offsets",
+    ],
+    outputNames: ["out"],
+    source: """
+        const uint tid = thread_index_in_threadgroup;
+        const uint group = threadgroup_position_in_grid.x;
+        threadgroup uint route[3];
+        if (tid == 0u) {
+            if (group >= tile_offsets[128]) {
+                route[2] = 0u;
+            } else {
+                uint lo = 0u;
+                uint hi = 128u;
+                while (lo + 1u < hi) {
+                    const uint mid = (lo + hi) / 2u;
+                    if (tile_offsets[mid] <= group) {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                const uint begin = expert_offsets[lo]
+                    + (group - tile_offsets[lo]) * 8u;
+                route[0] = lo;
+                route[1] = begin;
+                route[2] = min(8u, expert_offsets[lo + 1u] - begin);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (route[2] == 0u) {
+            return;
+        }
+
+        const uint expert = route[0];
+        const uint assignment = route[1];
+        const short valid_rows = static_cast<short>(route[2]);
+        threadgroup bfloat16_t h_local[8 * 704];
+        threadgroup bfloat16_t ws[64 * 72];
+
+        for (uint tile = 0u; tile < 11u; ++tile) {
+            const uint base = tile * 64u;
+            mlx::steel::flash_moe_qmm_t_nax(
+                gate_up_weight, gate_up_scales, gate_up_biases,
+                x + assignment * 2816u, h_local + base, ws,
+                expert, base, 1408, 2816, 704, valid_rows,
+                simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            mlx::steel::flash_moe_qmm_t_nax(
+                gate_up_weight, gate_up_scales, gate_up_biases,
+                x + assignment * 2816u, ws, ws,
+                expert, 704u + base, 1408, 2816, 64, valid_rows,
+                simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint i = tid; i < uint(valid_rows) * 64u; i += 64u) {
+                const uint row = i / 64u;
+                const uint col = i % 64u;
+                const float gate = static_cast<float>(h_local[row * 704u + base + col]);
+                const float up = static_cast<float>(ws[row * 64u + col]);
+                const float gate2 = gate * gate;
+                const float gelu = 0.5f * gate * (1.0f + tanh(
+                    sqrt(2.0f / 3.14159265358979323846f)
+                        * (gate + 0.044715f * gate * gate2)));
+                h_local[row * 704u + base + col] = static_cast<bfloat16_t>(gelu * up);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        for (uint tile = 0u; tile < 44u; ++tile) {
+            const uint base = tile * 64u;
+            mlx::steel::flash_moe_qmm_t_nax(
+                down_weight, down_scales, down_biases, h_local,
+                out + assignment * 2816u + base, ws,
+                expert, base, 2816, 704, 2816, valid_rows,
+                simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    """,
+    header: switchFlashMoENAXHeader,
+    ensureRowContiguous: true
+)
+
+// MARK: - NAX-DOWN-PREFILL: specialized expert down-projection only
+
+/// NAX-DOWN-PREFILL. Replaces ONLY the large expert down projection
+/// (`[M, 704] x [704, 2816] -> [M, 2816]`) on the sorted routed-expert
+/// prefill plane with a specialized NAX kernel. Routing, sorting, the gate
+/// and up projections, and GeGLU stay exactly as dispatched today; the
+/// incumbent `downProj` gathered-QMM runs whenever this arm declines.
+///
+/// Tiling mirrors the fused kernel's down phase verbatim: one threadgroup
+/// per eight-row expert tile (physical BM = 16, logical rows <= 8 masked via
+/// `load_rows`/`store_safe`), BN = 64, BK = 64, WM = 1, WN = 2 (64 threads,
+/// 2 SIMDgroups). The K loop (704, 11 steps) and the per-element MMA
+/// accumulation order are unchanged from the incumbent gathered-QMM path,
+/// and dequantization is the same affine group-64 nibble formula evaluated
+/// in bfloat16, so the stored bf16 outputs match the incumbent's rounding
+/// boundary.
+///
+/// Routing comes from the already-computed PREFILL-CSORT-128 scan
+/// (`expert_offsets`/`tile_offsets`, 129 entries); no second sort or
+/// regrouping is introduced. Decode (lhs-index route) and speculative
+/// verification (no scan metadata, small rows) never qualify.
+///
+/// Kill switch: `DARKBLOOM_GEMMA4_PREFILL_NAX_DOWN=1` arms it; default OFF.
+/// Engage mark: `prefill-nax-down`.
+private let switchNaxDownPrefillEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_PREFILL_NAX_DOWN"]
+    else { return false }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// One threadgroup owns one eight-row expert tile (found by binary search
+/// over `tile_offsets`, exactly as the fused NAX MoE kernel routes) and
+/// streams all 44 BN = 64 down-projection tiles for those rows. `h` is the
+/// already-sorted GeGLU plane `[rows, 1, 704]`; `out` is `[rows, 1, 2816]`.
+/// Threadgroup memory is only the dequant staging `ws` (64 x 72 bf16) plus
+/// the 3-word route triple: 4608 * 2 + 12 = 9228 bytes, ~28% of the 32 KiB
+/// budget the repository's attention kernels treat as the limit.
+private let switchNaxDownPrefillKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "gemma4_prefill_nax_down_m8_v1",
+    inputNames: [
+        "h", "down_weight", "down_scales", "down_biases", "expert_offsets",
+        "tile_offsets",
+    ],
+    outputNames: ["out"],
+    source: """
+        const uint tid = thread_index_in_threadgroup;
+        const uint group = threadgroup_position_in_grid.x;
+        threadgroup uint route[3];
+        if (tid == 0u) {
+            if (group >= tile_offsets[128]) {
+                route[2] = 0u;
+            } else {
+                uint lo = 0u;
+                uint hi = 128u;
+                while (lo + 1u < hi) {
+                    const uint mid = (lo + hi) / 2u;
+                    if (tile_offsets[mid] <= group) {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                const uint begin = expert_offsets[lo]
+                    + (group - tile_offsets[lo]) * 8u;
+                route[0] = lo;
+                route[1] = begin;
+                route[2] = min(8u, expert_offsets[lo + 1u] - begin);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (route[2] == 0u) {
+            return;
+        }
+
+        const uint expert = route[0];
+        const uint assignment = route[1];
+        const short valid_rows = static_cast<short>(route[2]);
+        threadgroup bfloat16_t ws[64 * 72];
+
+        for (uint tile = 0u; tile < 44u; ++tile) {
+            const uint base = tile * 64u;
+            mlx::steel::flash_moe_qmm_t_nax(
+                down_weight, down_scales, down_biases, h + assignment * 704u,
+                out + assignment * 2816u + base, ws,
+                expert, base, 2816, 704, 2816, valid_rows,
+                simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    """,
+    header: switchFlashMoENAXHeader,
+    ensureRowContiguous: true
+)
+
+/// Exact production down-projection contract only. Returns nil (fail closed
+/// onto the incumbent `downProj` gathered-QMM) unless every geometric,
+/// dtype, quantization and routing assumption holds.
+private func switchNaxDownPrefill(
+    activated: MLXArray,
+    idx: MLXArray,
+    route: RouteCsortPrefillResult?,
+    down: QuantizedSwitchLinear?
+) -> MLXArray? {
+    guard switchNaxDownPrefillEnabled,
+        let route,
+        let down,
+        // Sorted prefill plane only: `[rows, 1, 704]` bf16 with the sorted
+        // expert key per row.
+        activated.ndim == 3,
+        activated.dim(1) == 1,
+        activated.dim(2) == 704,
+        activated.dtype == .bfloat16,
+        // Mirror the host's sorted right-hand-side floor (at least
+        // `4 * experts` rows): prefill rows qualify, the 64-assignment
+        // decode cohort and small speculative rectangles do not.
+        activated.dim(0) >= 512,
+        idx.ndim == 1,
+        idx.dtype == .uint32,
+        idx.size == activated.dim(0),
+        // Frozen target contract: affine Q4 group-64, no bias, exact packed
+        // shapes. Never re-quantized, never re-represented.
+        down.inputDims == 704,
+        down.outputDims == 2816,
+        down.numExperts == 128,
+        down.groupSize == 64,
+        down.bits == 4,
+        down.mode == .affine,
+        down.bias == nil,
+        down.weight.shape == [128, 2816, 88],
+        down.scales.shape == [128, 2816, 11],
+        down.weight.dtype == .uint32,
+        down.scales.dtype == .bfloat16
+    else { return nil }
+    guard let downBiases = down.biases,
+        downBiases.shape == [128, 2816, 11],
+        downBiases.dtype == .bfloat16,
+        route.expertOffsets.shape == [129],
+        route.tileOffsets.shape == [129],
+        route.expertOffsets.dtype == .uint32,
+        route.tileOffsets.dtype == .uint32
+    else { return nil }
+    CBv2EngageMark.once("prefill-nax-down")
+    let rows = activated.dim(0)
+    let groups = (rows + 7) / 8 + 128 - 1
+    return switchNaxDownPrefillKernel(
+        [
+            activated, down.weight, down.scales, downBiases,
+            route.expertOffsets, route.tileOffsets,
+        ],
+        grid: (groups * 64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[rows, 1, 2816]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 // MARK: - SwitchGLU
 
 /// Semantic profile required by the exact Gemma direct-reduction experiment.
@@ -1515,6 +2308,7 @@ public class SwitchGLU: Module {
         // layer per forward.
         var inverseOrder: MLXArray?
         var lhsIndices: MLXArray?
+        var flashRouteMetadata: RouteCsortPrefillResult?
         if doSort {
             if useLhsIndices {
                 x = x.flattened(start: 0, end: -3)
@@ -1547,22 +2341,128 @@ public class SwitchGLU: Module {
             } else if let sortedPlane {
                 // PRENORM-GATHER: the producer writes the sorted plane from
                 // the inverse order; `x` is only read if it declines.
-                let order = gatherSortOrder(indices: indices, numExperts: numExperts)
-                if let plane = sortedPlane(order.inverseOrder),
-                    plane.ndim == 3, plane.dim(0) == indices.size,
-                    plane.dim(1) == 1, plane.dim(2) == inputDims,
-                    plane.dtype == x.dtype
+                // FLASH-MOE-PREFILL and NAX-DOWN-PREFILL also need the scan's
+                // expert/tile prefixes. Reuse that result rather than sorting
+                // once for the public route tuple and again for the fused kernel.
+                if switchFlashMoEPrefillEnabled || switchNaxDownPrefillEnabled,
+                    let route = routeCountingSortPrefill(
+                        indices.flattened(), m: indices.dim(-1), numExperts: numExperts)
                 {
-                    x = plane
+                    if let plane = sortedPlane(route.inverseOrder),
+                        plane.ndim == 3, plane.dim(0) == indices.size,
+                        plane.dim(1) == 1, plane.dim(2) == inputDims,
+                        plane.dtype == x.dtype
+                    {
+                        x = plane
+                    } else {
+                        x = x.flattened(start: 0, end: -3)[route.rowOrder]
+                    }
+                    idx = route.sortedKeys
+                    inverseOrder = route.inverseOrder
+                    flashRouteMetadata = route
                 } else {
-                    x = x.flattened(start: 0, end: -3)[order.rowOrder]
+                    let order = gatherSortOrder(indices: indices, numExperts: numExperts)
+                    if let plane = sortedPlane(order.inverseOrder),
+                        plane.ndim == 3, plane.dim(0) == indices.size,
+                        plane.dim(1) == 1, plane.dim(2) == inputDims,
+                        plane.dtype == x.dtype
+                    {
+                        x = plane
+                    } else {
+                        x = x.flattened(start: 0, end: -3)[order.rowOrder]
+                    }
+                    idx = order.sortedKeys
+                    inverseOrder = order.inverseOrder
                 }
-                idx = order.sortedKeys
-                inverseOrder = order.inverseOrder
             } else {
                 (x, idx, inverseOrder) = gatherSort(
                     x: x, indices: indices, numExperts: numExperts)
             }
+        }
+
+        // FLASH-MOE-PREFILL: consume the already sorted expert plane directly.
+        // The 3-D sorted plane is only supplied by the prefill pre-norm
+        // producer; decode uses the lhs-index route-table form and therefore
+        // cannot enter this branch. Any failed storage or metadata check falls
+        // through to the existing gate/up -> GeGLU -> down sequence below.
+        let flashMoEAdmission = switchFlashMoEPrefillEnabled
+            && sortedPlane != nil
+            && doSort
+            && !useLhsIndices
+            && lhsIndices == nil
+            && inputDims == 2816
+            && hiddenDims == 704
+            && numExperts == 128
+            && indices.ndim == 2
+            && indices.dim(1) == 8
+            && indices.dtype == .uint32
+            && x.ndim == 3
+            && x.dim(0) == indices.size
+            && x.dim(1) == 1
+            && x.dim(2) == 2816
+            && x.dtype == .bfloat16
+            && idx.ndim == 1
+            && idx.size == x.dim(0)
+            && idx.dtype == .uint32
+
+        if flashMoEAdmission {
+            let down = downProj as? QuantizedSwitchLinear
+            if let fused = fusedGateUpDispatch(),
+                let down,
+                let downBiases = down.biases,
+                down.inputDims == 704,
+                down.outputDims == 2816,
+                down.numExperts == 128,
+                down.groupSize == 64,
+                down.bits == 4,
+                down.mode == .affine,
+                down.bias == nil,
+                down.weight.shape == [128, 2816, 88],
+                down.scales.shape == [128, 2816, 11],
+                downBiases.shape == [128, 2816, 11],
+                down.weight.dtype == .uint32,
+                down.scales.dtype == .bfloat16,
+                downBiases.dtype == .bfloat16
+            {
+                if let route = flashRouteMetadata,
+                    route.expertOffsets.shape == [numExperts + 1],
+                    route.tileOffsets.shape == [numExperts + 1],
+                    route.expertOffsets.dtype == .uint32,
+                    route.tileOffsets.dtype == .uint32
+                {
+                    CBv2EngageMark.once("prefill-flash-moe")
+                    let groups = (x.dim(0) + 7) / 8 + numExperts - 1
+                    let output = switchFlashMoENAXKernel(
+                        [
+                            x, fused.storage.weight, fused.storage.scales,
+                            fused.storage.biases, down.weight, down.scales, downBiases,
+                            route.expertOffsets, route.tileOffsets,
+                        ],
+                        grid: (groups * 64, 1, 1),
+                        threadGroup: (64, 1, 1),
+                        outputShapes: [x.shape],
+                        outputDTypes: [x.dtype]
+                    )[0]
+                    return (output, inverseOrder, true)
+                }
+
+                // Keep the original scalar prototype available when the route
+                // scan cannot provide its internal metadata.
+                CBv2EngageMark.once("prefill-flash-moe-scalar-fallback")
+                let output = switchFlashMoEScalarKernel(
+                    [
+                        x, idx, fused.storage.weight, fused.storage.scales,
+                        fused.storage.biases, down.weight, down.scales, downBiases,
+                    ],
+                    template: [("T", x.dtype)],
+                    grid: (numExperts, 1, 1),
+                    threadGroup: (64, 1, 1),
+                    outputShapes: [x.shape],
+                    outputDTypes: [x.dtype]
+                )[0]
+                return (output, inverseOrder, true)
+            }
+            CBv2EngageMark.once("prefill-flash-moe-fallback")
         }
 
         let xGate: MLXArray
@@ -1611,6 +2511,15 @@ public class SwitchGLU: Module {
                 let activated = xGateUp.flattened()[..<(xGateUp.size / 2)]
                     .reshaped(x.dim(0), 1, hiddenDims)
                 CBv2EngageMark.once("prefill-gateup-gelu-epilogue")
+                // NAX-DOWN-PREFILL: the sorted prefill plane's down
+                // projection only. Declines for decode, verification, and
+                // any off-contract geometry, leaving the incumbent below.
+                if let naxDown = switchNaxDownPrefill(
+                    activated: activated, idx: idx, route: flashRouteMetadata,
+                    down: downProj as? QuantizedSwitchLinear)
+                {
+                    return (naxDown, inverseOrder, true)
+                }
                 let downLhs: MLXArray? =
                     (idx.ndim == 1 && idx.size == 64) ? switchDownIdentity64 : nil
                 x = downProj(
@@ -1635,6 +2544,15 @@ public class SwitchGLU: Module {
             activated = activation(xGate) * xUp
         }
 
+        // NAX-DOWN-PREFILL: the sorted prefill plane's down projection only.
+        // Declines (nil) for decode, verification, and any off-contract
+        // geometry, preserving the established output graph.
+        if let naxDown = switchNaxDownPrefill(
+            activated: activated, idx: idx, route: flashRouteMetadata,
+            down: downProj as? QuantizedSwitchLinear)
+        {
+            return (naxDown, inverseOrder, true)
+        }
         // DOWN-LHS-IDENTITY: at the sorted [64] geometry the down projection
         // gathers activation row `assignment` for assignment `assignment`;
         // hand it that identity table instead of leaving `lhsIndices` nil,

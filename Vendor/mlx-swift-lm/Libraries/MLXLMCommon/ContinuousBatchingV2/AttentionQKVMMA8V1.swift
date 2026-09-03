@@ -448,7 +448,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_rsp(
   simdgroup_float8x8 A;
   simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
 
-#pragma unroll
+#pragma clang loop unroll_count(2)
   for (int gi = 0; gi < nGroups; ++gi) {
     const int g = g0 + gi;
     const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
@@ -550,7 +550,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
   simdgroup_float8x8 A;
   simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
 
-#pragma unroll
+#pragma clang loop unroll_count(2)
   for (int gi = 0; gi < nGroups; ++gi) {
     const int g = g0 + gi;
     const uint4 r0 = *((const device uint4*)(x0 + 64 * g));

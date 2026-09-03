@@ -1255,6 +1255,13 @@ public let switchGateUpFusePrefillEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+public let switchGateUpFuseDecodeEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DECODE_GATEUP_FUSE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// The fused gate/up affine 4-bit right-hand side of one expert layer plus the
 /// split projection arrays used outside the large sorted prefill path. A
 /// plain final class (not a `Module`, not an `MLXArray` tuple) so the module
@@ -1611,6 +1618,44 @@ public class SwitchGLU: Module {
                 let activated = xGateUp.flattened()[..<(xGateUp.size / 2)]
                     .reshaped(x.dim(0), 1, hiddenDims)
                 CBv2EngageMark.once("prefill-gateup-gelu-epilogue")
+                let downLhs: MLXArray? =
+                    (idx.ndim == 1 && idx.size == 64) ? switchDownIdentity64 : nil
+                x = downProj(
+                    activated, idx, lhsIndices: downLhs, sortedIndices: true)
+                return (x, inverseOrder, true)
+            } else if switchGateUpFuseDecodeEnabled, doSort, useLhsIndices, let lhsIndices,
+                x.dim(-1) == inputDims,
+                x.dtype == .bfloat16,
+                let fused = fusedGateUpDispatch()
+            {
+                CBv2EngageMark.once("decode-gateup-fuse")
+                let xGateUp = MLX.gatherQuantizedMM(
+                    x,
+                    fused.storage.weight,
+                    scales: fused.storage.scales,
+                    biases: fused.storage.biases,
+                    lhsIndices: lhsIndices,
+                    rhsIndices: idx,
+                    transpose: true,
+                    groupSize: fused.groupSize,
+                    bits: fused.bits,
+                    mode: fused.mode,
+                    sortedIndices: true
+                )
+                let blocks = hiddenDims / 16
+                let paired = xGateUp.reshaped(xGateUp.dim(0), blocks, 2, 16)
+                let g = paired[.ellipsis, 0, 0...].reshaped(xGateUp.dim(0), 1, hiddenDims)
+                let u = paired[.ellipsis, 1, 0...].reshaped(xGateUp.dim(0), 1, hiddenDims)
+                let activated: MLXArray
+                if let activationProduct {
+                    activated = activationProduct(g, u)
+                } else if isSiluActivation {
+                    activated = compiledSwiGLU(g, u)
+                } else if isGeluActivation {
+                    activated = geGLUProduct(g, u)
+                } else {
+                    activated = activation(g) * u
+                }
                 let downLhs: MLXArray? =
                     (idx.ndim == 1 && idx.size == 64) ? switchDownIdentity64 : nil
                 x = downProj(

@@ -25,6 +25,13 @@
 // On QKFUSE-001 the fused Q|K dispatch reads the same table: its entries are
 // per activation row and per 64-group of K, independent of N, so the
 // concatenated-N dispatch consumes the identical floats.
+//
+// QKV-VJOIN extends QKFUSE-001 to the third plane: sliding layers join V
+// into the fused dispatch (N = 8192 = 4096 + 2048 + 2048, store splits at
+// 4096 and 6144) under new `_vj` kernel bodies; full-attention layers are
+// k_eq_v and keep the qk9216 pair. Same per-column independence argument,
+// bit-identical outputs; `DARKBLOOM_GEMMA4_QKV_VJOIN=0` restores the
+// separate V dispatch next to the fused Q|K dispatch.
 
 import Foundation
 import MLX
@@ -630,6 +637,314 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     }
   }
 }
+
+// QKV-VJOIN: the MT body with a THREE-region store epilogue, one per fused
+// plane (columns below SPLIT1 belong to Q, [SPLIT1, SPLIT2) to K, the rest
+// to V). The compute loop is the MT body's text unchanged; each output
+// column still accumulates from its own plane row, so — the QKFUSE-001
+// argument — row r of the fused output is row r of whichever source plane
+// it came from and the join is bit-exact, not a reassociation. Output
+// tiles are eight columns wide and aligned to eight (n0 = 16 * tid.y,
+// tiles at n0 and n0 + 8); SPLIT1 and SPLIT2 are multiples of eight, so no
+// tile straddles a boundary and the branch is uniform per tile.
+template <typename T, int KS, int TILES, int KFIX, int SPLIT1 = 0, int SPLIT2 = 0>
+METAL_FUNC void qkv_mma8_affine4_g64_mt_vj(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const int N,
+    const int n0,
+    threadgroup float2* red,
+    uint simd_gid,
+    uint simd_lid,
+    device T* y2 = nullptr,
+    device T* y3 = nullptr) {
+  constexpr int K = KFIX;
+  constexpr int G = K / 64;
+  constexpr int gh = (G + 1) / 2;
+  constexpr int nGroups = (KS == 2) ? gh : G;
+  const int g0 = (KS == 2 && simd_gid == 1) ? gh : 0;
+  const mma8_coord c = mma8_lane(simd_lid);
+
+  const device uint8_t* wrow[TILES];
+  const device T* srow[TILES];
+  const device T* brow[TILES];
+  thread float acc0[TILES];
+  thread float acc1[TILES];
+#pragma clang loop unroll(full)
+  for (int t = 0; t < TILES; ++t) {
+    const int nt = n0 + t * 8;
+    wrow[t] = (const device uint8_t*)w + (nt + c.fm) * (K / 2) + 4 * c.fn;
+    srow[t] = scales + (nt + c.fm) * G;
+    brow[t] = biases + (nt + c.fm) * G;
+    acc0[t] = 0.0f;
+    acc1[t] = 0.0f;
+  }
+
+  const device T* x0 = x + c.fn * K + 8 * c.fm;
+  const device T* x1 = x0 + K;
+
+  simdgroup_float8x8 A;
+  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+  uint2 wv_next[TILES];
+  uint2 wv_next2[TILES];
+  T s_next[TILES];
+  T b_next[TILES];
+#pragma clang loop unroll(full)
+  for (int t = 0; t < TILES; ++t) {
+    wv_next[t] = *((const device uint2*)(wrow[t] + 32 * g0));
+    wv_next2[t] =
+        *((const device uint2*)(wrow[t] + 32 * (g0 + min(1, nGroups - 1))));
+    s_next[t] = srow[t][g0];
+    b_next[t] = brow[t][g0];
+  }
+
+#pragma unroll
+  for (int gi = 0; gi < nGroups; ++gi) {
+    const int g = g0 + gi;
+
+    uint2 wv_cur[TILES];
+    float s_cur[TILES];
+    float b_cur[TILES];
+#pragma clang loop unroll(full)
+    for (int t = 0; t < TILES; ++t) {
+      wv_cur[t] = wv_next[t];
+      s_cur[t] = float(s_next[t]);
+      b_cur[t] = float(b_next[t]);
+    }
+    const int g_next = g0 + min(gi + 1, nGroups - 1);
+    const int g_next2 = g0 + min(gi + 2, nGroups - 1);
+#pragma clang loop unroll(full)
+    for (int t = 0; t < TILES; ++t) {
+      wv_next[t] = wv_next2[t];
+      wv_next2[t] = *((const device uint2*)(wrow[t] + 32 * g_next2));
+      s_next[t] = srow[t][g_next];
+      b_next[t] = brow[t][g_next];
+    }
+
+    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+
+    float2 rs = float2(mma8_runsum4<T>(r0), mma8_runsum4<T>(r1));
+    rs += simd_shuffle_xor(rs, 2u);
+    rs += simd_shuffle_xor(rs, 4u);
+    rs += simd_shuffle_xor(rs, 16u);
+
+    MMA8_SETB(B0, x, lo)
+    MMA8_SETB(B1, x, hi)
+    MMA8_SETB(B2, y, lo)
+    MMA8_SETB(B3, y, hi)
+    MMA8_SETB(B4, z, lo)
+    MMA8_SETB(B5, z, hi)
+    MMA8_SETB(B6, w, lo)
+    MMA8_SETB(B7, w, hi)
+
+#pragma clang loop unroll(full)
+    for (int t = 0; t < TILES; ++t) {
+      const uint2 wv = wv_cur[t];
+      const float s = s_cur[t];
+      const float b = b_cur[t];
+
+      simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+      MMA8_STEP(B0, 0)
+      MMA8_STEP(B1, 1)
+      MMA8_STEP(B2, 2)
+      MMA8_STEP(B3, 3)
+      MMA8_STEP(B4, 4)
+      MMA8_STEP(B5, 5)
+      MMA8_STEP(B6, 6)
+      MMA8_STEP(B7, 7)
+
+      acc0[t] += s * C.thread_elements()[0] + rs.x * b;
+      acc1[t] += s * C.thread_elements()[1] + rs.y * b;
+    }
+  }
+
+  if (KS == 2) {
+    if (simd_gid == 1) {
+#pragma clang loop unroll(full)
+      for (int t = 0; t < TILES; ++t) {
+        red[t * 32 + simd_lid] = float2(acc0[t], acc1[t]);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_gid == 1) {
+      return;
+    }
+#pragma clang loop unroll(full)
+    for (int t = 0; t < TILES; ++t) {
+      const float2 other = red[t * 32 + simd_lid];
+      acc0[t] = acc0[t] + other.x;
+      acc1[t] = acc1[t] + other.y;
+    }
+  }
+
+#pragma clang loop unroll(full)
+  for (int t = 0; t < TILES; ++t) {
+    const int nt = n0 + t * 8;
+    if (SPLIT1 == 0) {
+      y[c.fn * N + nt + c.fm] = static_cast<T>(acc0[t]);
+      y[(c.fn + 1) * N + nt + c.fm] = static_cast<T>(acc1[t]);
+    } else {
+      // Fused Q||K||V plane. Both rows of a store pair share one column,
+      // and no eight-column tile straddles a multiple-of-eight boundary,
+      // so the branch is uniform across the threadgroup per tile.
+      const int col = nt + c.fm;
+      if (col < SPLIT1) {
+        y[c.fn * SPLIT1 + col] = static_cast<T>(acc0[t]);
+        y[(c.fn + 1) * SPLIT1 + col] = static_cast<T>(acc1[t]);
+      } else if (col < SPLIT2) {
+        const int n2 = SPLIT2 - SPLIT1;
+        const int c2 = col - SPLIT1;
+        y2[c.fn * n2 + c2] = static_cast<T>(acc0[t]);
+        y2[(c.fn + 1) * n2 + c2] = static_cast<T>(acc1[t]);
+      } else {
+        const int n3 = N - SPLIT2;
+        const int c3 = col - SPLIT2;
+        y3[c.fn * n3 + c3] = static_cast<T>(acc0[t]);
+        y3[(c.fn + 1) * n3 + c3] = static_cast<T>(acc1[t]);
+      }
+    }
+  }
+}
+
+// QKV-VJOIN: the rsp MT body with the same THREE-region store epilogue.
+// The run-sum table is indexed by activation row and 64-group of K only —
+// never by N — so the joined dispatch reads the identical entries the
+// separate Q, K and V rsp dispatches would, and every output word is the
+// same float sum in the same order.
+template <typename T, int KS, int TILES, int KFIX, int SPLIT1 = 0, int SPLIT2 = 0>
+METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp_vj(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    const device float* rs_table,
+    device T* y,
+    const int N,
+    const int n0,
+    threadgroup float2* red,
+    uint simd_gid,
+    uint simd_lid,
+    device T* y2 = nullptr,
+    device T* y3 = nullptr) {
+  constexpr int K = KFIX;
+  constexpr int G = K / 64;
+  constexpr int gh = (G + 1) / 2;
+  constexpr int nGroups = (KS == 2) ? gh : G;
+  const int g0 = (KS == 2 && simd_gid == 1) ? gh : 0;
+  const mma8_coord c = mma8_lane(simd_lid);
+
+  const device uint8_t* wrow[TILES];
+  const device T* srow[TILES];
+  const device T* brow[TILES];
+  thread float acc0[TILES];
+  thread float acc1[TILES];
+#pragma clang loop unroll(full)
+  for (int t = 0; t < TILES; ++t) {
+    const int nt = n0 + t * 8;
+    wrow[t] = (const device uint8_t*)w + (nt + c.fm) * (K / 2) + 4 * c.fn;
+    srow[t] = scales + (nt + c.fm) * G;
+    brow[t] = biases + (nt + c.fm) * G;
+    acc0[t] = 0.0f;
+    acc1[t] = 0.0f;
+  }
+
+  const device T* x0 = x + c.fn * K + 8 * c.fm;
+  const device T* x1 = x0 + K;
+
+  simdgroup_float8x8 A;
+  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+
+#pragma unroll
+  for (int gi = 0; gi < nGroups; ++gi) {
+    const int g = g0 + gi;
+    const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
+    const uint4 r1 = *((const device uint4*)(x1 + 64 * g));
+
+    const float2 rs = float2(
+        rs_table[c.fn * G + g], rs_table[(c.fn + 1) * G + g]);
+
+    MMA8_SETB(B0, x, lo)
+    MMA8_SETB(B1, x, hi)
+    MMA8_SETB(B2, y, lo)
+    MMA8_SETB(B3, y, hi)
+    MMA8_SETB(B4, z, lo)
+    MMA8_SETB(B5, z, hi)
+    MMA8_SETB(B6, w, lo)
+    MMA8_SETB(B7, w, hi)
+
+#pragma clang loop unroll(full)
+    for (int t = 0; t < TILES; ++t) {
+      const uint2 wv = *((const device uint2*)(wrow[t] + 32 * g));
+      const float s = float(srow[t][g]);
+      const float b = float(brow[t][g]);
+
+      simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
+      MMA8_STEP(B0, 0)
+      MMA8_STEP(B1, 1)
+      MMA8_STEP(B2, 2)
+      MMA8_STEP(B3, 3)
+      MMA8_STEP(B4, 4)
+      MMA8_STEP(B5, 5)
+      MMA8_STEP(B6, 6)
+      MMA8_STEP(B7, 7)
+
+      acc0[t] += s * C.thread_elements()[0] + rs.x * b;
+      acc1[t] += s * C.thread_elements()[1] + rs.y * b;
+    }
+  }
+
+  if (KS == 2) {
+    if (simd_gid == 1) {
+#pragma clang loop unroll(full)
+      for (int t = 0; t < TILES; ++t) {
+        red[t * 32 + simd_lid] = float2(acc0[t], acc1[t]);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_gid == 1) {
+      return;
+    }
+#pragma clang loop unroll(full)
+    for (int t = 0; t < TILES; ++t) {
+      const float2 other = red[t * 32 + simd_lid];
+      acc0[t] = acc0[t] + other.x;
+      acc1[t] = acc1[t] + other.y;
+    }
+  }
+
+#pragma clang loop unroll(full)
+  for (int t = 0; t < TILES; ++t) {
+    const int nt = n0 + t * 8;
+    if (SPLIT1 == 0) {
+      y[c.fn * N + nt + c.fm] = static_cast<T>(acc0[t]);
+      y[(c.fn + 1) * N + nt + c.fm] = static_cast<T>(acc1[t]);
+    } else {
+      // Fused Q||K||V plane. Both rows of a store pair share one column,
+      // and no eight-column tile straddles a multiple-of-eight boundary,
+      // so the branch is uniform across the threadgroup per tile.
+      const int col = nt + c.fm;
+      if (col < SPLIT1) {
+        y[c.fn * SPLIT1 + col] = static_cast<T>(acc0[t]);
+        y[(c.fn + 1) * SPLIT1 + col] = static_cast<T>(acc1[t]);
+      } else if (col < SPLIT2) {
+        const int n2 = SPLIT2 - SPLIT1;
+        const int c2 = col - SPLIT1;
+        y2[c.fn * n2 + c2] = static_cast<T>(acc0[t]);
+        y2[(c.fn + 1) * n2 + c2] = static_cast<T>(acc1[t]);
+      } else {
+        const int n3 = N - SPLIT2;
+        const int c3 = col - SPLIT2;
+        y3[c.fn * n3 + c3] = static_cast<T>(acc0[t]);
+        y3[(c.fn + 1) * n3 + c3] = static_cast<T>(acc1[t]);
+      }
+    }
+  }
+}
 """
 
     /// MMA-MT-001 arm. Default ON.
@@ -670,6 +985,17 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     public static let fuseQKEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_QKV_FUSE_QK"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// QKV-VJOIN arm. Default ON. Sliding layers join V into the fused Q|K
+    /// dispatch (N = 8192 = 4096 + 2048 + 2048, splits at 4096 and 6144).
+    /// `DARKBLOOM_GEMMA4_QKV_VJOIN=0` restores the separate V dispatch next
+    /// to the fused Q|K dispatch, byte for byte, in the same executable.
+    public static let vjoinEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_QKV_VJOIN"]
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
@@ -742,6 +1068,43 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
                 w_shape[0], int(tid.y) * 16, red,
                 simdgroup_index_in_threadgroup,
                 thread_index_in_simdgroup, y2);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
+    // QKV-VJOIN: sliding layers only (Q 4096 + K 2048 + V 2048 = 8192,
+    // splits at 4096 and 6144). Full-attention layers are k_eq_v and keep
+    // the qk9216 pair above.
+    private static let fusedSlidingQKVKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qkv8192_vj1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y", "y2", "y3"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            qkv_mma8_affine4_g64_mt_vj<T, 2, 2, 2816, 4096, 6144>(
+                w, scales, biases, x, y,
+                w_shape[0], int(tid.y) * 16, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup, y2, y3);
+            return;
+            """,
+        header: mma8KernelHeader,
+        ensureRowContiguous: true)
+
+    private static let fusedSlidingQKVRspKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qkv8192_rsp_vj1",
+        inputNames: ["x", "w", "scales", "biases", "rs_table"],
+        outputNames: ["y", "y2", "y3"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[64];
+            qkv_mma8_affine4_g64_mt_rsp_vj<T, 2, 2, 2816, 4096, 6144>(
+                w, scales, biases, x, rs_table, y,
+                w_shape[0], int(tid.y) * 16, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup, y2, y3);
             return;
             """,
         header: mma8KernelHeader,
@@ -905,6 +1268,13 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     nonisolated(unsafe) private static var fusedPlanes:
         [ObjectIdentifier: (MLXArray, MLXArray, MLXArray)] = [:]
 
+    // QKV-VJOIN: the three-plane concats live in their own table so a
+    // sliding layer's Q|K|V entry can never collide with a Q|K entry under
+    // the same ObjectIdentifier(q) key. Tuple stays three arrays — the
+    // concatenated weight, scale and bias planes.
+    nonisolated(unsafe) private static var fusedVJoinPlanes:
+        [ObjectIdentifier: (MLXArray, MLXArray, MLXArray)] = [:]
+
     /// QKFUSE-001. One dispatch for the layer's Q and K projections.
     ///
     /// Q and K read the SAME activation at decode (`queryInput === x` whenever
@@ -996,6 +1366,111 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
             outputShapes: [[batch, sequence, qWidth], [batch, sequence, kWidth]],
             outputDTypes: [x.dtype, x.dtype])
         return (outputs[0], outputs[1])
+    }
+
+    /// QKV-VJOIN. One dispatch for a sliding layer's Q, K and V projections.
+    ///
+    /// The QKFUSE-001 argument, extended to the third plane: "Row r of the
+    /// fused output is row r of whichever source plane it came from: the
+    /// tier accumulates each output column independently, so this is
+    /// bit-exact, not a reassociation." V's columns accumulate from V's own
+    /// plane rows with the identical expression tree and the identical
+    /// ascending-g order, over the same x fragments, so the V half equals
+    /// the separate v_proj dispatch bit for bit. Threadgroup count is
+    /// unchanged (1024 for 4096+2048+2048, the same 512+256+256 the three
+    /// dispatches launch), so the whole saving is one encoder per layer.
+    ///
+    /// The concatenation is a pure re-layout of the shipped quantized words.
+    /// No value is re-quantized and no numerical format changes. The cached
+    /// three-plane concat ([8192, 352] uint32 + [8192, 44] bf16 scales +
+    /// same-size biases) adds 12,976,128 bytes per sliding layer; under the
+    /// join the layer's Q|K two-plane entry (9,732,096 bytes) is never
+    /// built, so the net resident add is 3,244,032 bytes per layer,
+    /// 81,100,800 bytes across the 25 sliding layers.
+    ///
+    /// MMA-RS-001: `rsTable` is indexed by activation row and 64-group of K
+    /// only — never by N — so the joined dispatch reads the identical
+    /// entries the separate Q, K and V rsp dispatches would. Nil keeps the
+    /// non-rsp joined dispatch.
+    public static func fusedQKVMatmul(
+        x: MLXArray,
+        qWeight: MLXArray, qScales: MLXArray, qBiases: MLXArray?,
+        kWeight: MLXArray, kScales: MLXArray, kBiases: MLXArray?,
+        vWeight: MLXArray, vScales: MLXArray, vBiases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode,
+        cacheKey: ObjectIdentifier,
+        rsTable: MLXArray? = nil
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard enabled, fuseQKEnabled, vjoinEnabled, multiTileEnabled,
+            groupSize == Self.groupSize,
+            bits == Self.bits,
+            mode == .affine,
+            let qBiases, let kBiases, let vBiases,
+            x.dtype == .bfloat16,
+            qScales.dtype == x.dtype, qBiases.dtype == x.dtype,
+            kScales.dtype == x.dtype, kBiases.dtype == x.dtype,
+            vScales.dtype == x.dtype, vBiases.dtype == x.dtype,
+            qWeight.dtype == .uint32, kWeight.dtype == .uint32,
+            vWeight.dtype == .uint32,
+            x.ndim == 3,
+            x.dim(0) == batch, x.dim(1) == sequence, x.dim(2) == inputWidth,
+            x.size == batch * sequence * inputWidth,
+            qWeight.ndim == 2, kWeight.ndim == 2, vWeight.ndim == 2,
+            qWeight.dim(1) == inputWidth * Self.bits / 32,
+            kWeight.dim(1) == inputWidth * Self.bits / 32,
+            vWeight.dim(1) == inputWidth * Self.bits / 32
+        else { return nil }
+
+        // The kernels bake the splits as compile-time constants (4096 and
+        // 6144), so only the exact sliding geometry is admitted.
+        let qWidth = qWeight.dim(0)
+        let kWidth = kWeight.dim(0)
+        let vWidth = vWeight.dim(0)
+        guard qWidth == 4096, kWidth == 2048, vWidth == 2048,
+            qScales.shape == [qWidth, inputWidth / Self.groupSize],
+            qBiases.shape == qScales.shape,
+            kScales.shape == [kWidth, inputWidth / Self.groupSize],
+            kBiases.shape == kScales.shape,
+            vScales.shape == [vWidth, inputWidth / Self.groupSize],
+            vBiases.shape == vScales.shape
+        else { return nil }
+
+        let tableReady =
+            rsTable != nil
+            && rsTable!.dtype == .float32
+            && rsTable!.shape == [batch, inputWidth / Self.groupSize]
+
+        let kernel = tableReady ? fusedSlidingQKVRspKernel : fusedSlidingQKVKernel
+        let total = qWidth + kWidth + vWidth
+        let yTiles = total / outputsPerGroup
+        guard yTiles % tilesPerGroup == 0 else { return nil }
+
+        fusedLock.lock()
+        var plane = fusedVJoinPlanes[cacheKey]
+        if plane == nil {
+            let w = concatenated([qWeight, kWeight, vWeight], axis: 0)
+            let s = concatenated([qScales, kScales, vScales], axis: 0)
+            let b = concatenated([qBiases, kBiases, vBiases], axis: 0)
+            eval(w, s, b)
+            plane = (w, s, b)
+            fusedVJoinPlanes[cacheKey] = plane
+        }
+        fusedLock.unlock()
+        guard let (fw, fs, fb) = plane else { return nil }
+
+        let outputs = kernel(
+            tableReady ? [x, fw, fs, fb, rsTable!] : [x, fw, fs, fb],
+            template: [("T", x.dtype)],
+            grid: (simdWidth, (yTiles / tilesPerGroup) * simdGroups, 1),
+            threadGroup: (simdWidth, simdGroups, 1),
+            outputShapes: [
+                [batch, sequence, qWidth], [batch, sequence, kWidth],
+                [batch, sequence, vWidth]
+            ],
+            outputDTypes: [x.dtype, x.dtype, x.dtype])
+        return (outputs[0], outputs[1], outputs[2])
     }
 
     /// Q widths the fused kernels bake as a compile-time split point.

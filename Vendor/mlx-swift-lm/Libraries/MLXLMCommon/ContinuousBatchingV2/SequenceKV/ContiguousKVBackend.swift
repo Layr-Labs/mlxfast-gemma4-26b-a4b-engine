@@ -327,7 +327,17 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
                 return window * kind.kvHeads * kind.headDim * itemSize * 2
             case .full:
                 let slots = min(maxLength, max(1, promptLength + CBv2FullSequenceKV.initialSlack))
-                return slots * kind.kvHeads * kind.headDim * itemSize * 2
+                let native = slots * kind.kvHeads * kind.headDim * itemSize * 2
+                let mirror: Int = {
+                    guard CBv2D512FullKVQuant.enabled,
+                        kind.kvHeads == 2, kind.headDim == 512,
+                        let format = CBv2D512FullKVQuant.format,
+                        let planes = CBv2D512FullKVQuant.planes
+                    else { return 0 }
+                    return slots * planes.count * format.rowWords
+                        * MemoryLayout<UInt32>.size
+                }()
+                return native + mirror
             }
         }
     }
@@ -348,8 +358,18 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
                 return window * kind.kvHeads * kind.headDim * config.kvDType.size * 2
             case .full:
                 guard let entry = prefix[index] else { return 0 }
-                return maxLength * kind.kvHeads * kind.headDim
+                let native = maxLength * kind.kvHeads * kind.headDim
                     * (entry.keys.dtype.size + entry.values.dtype.size)
+                let mirror: Int = {
+                    guard CBv2D512FullKVQuant.enabled,
+                        kind.kvHeads == 2, kind.headDim == 512,
+                        let format = CBv2D512FullKVQuant.format,
+                        let planes = CBv2D512FullKVQuant.planes
+                    else { return 0 }
+                    return maxLength * planes.count * format.rowWords
+                        * MemoryLayout<UInt32>.size
+                }()
+                return native + mirror
             }
         }
     }

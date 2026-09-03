@@ -3670,6 +3670,156 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         ensureRowContiguous: true
     )
 
+    /// Quantized QK twins. The source is the incumbent qkSource with only the
+    /// operand load replaced: each packed value is reconstructed as
+    /// `static_cast<T>(q * scale + bias)` before the existing float
+    /// accumulation, preserving the native bf16 load boundary and XFOLD.
+    private static func qkQuantSource(
+        format: CBv2D512FullKVQuant.Format
+    ) -> String {
+        let bits = format.bits
+        let payloadWords = format.payloadWords
+        let rowWords = format.rowWords
+        let valuesPerWord = 32 / bits
+        let mask = (1 << bits) - 1
+        let dequant = format == .nf8
+            ? "NF8_LUT[q] * scale * 255.0f + bias"
+            : "float(q) * scale + bias"
+        let oldTile = """
+k_tile[tm] = *reinterpret_cast<const device T4*>(
+                mat + mat_offset + bn);
+            mat_offset += D;
+"""
+        let newTile = """
+                    #pragma clang loop unroll(full)
+                    for (int tn = 0; tn < 4; ++tn) {
+                        const int element = bn + tn;
+                        const int row_base = tm * ROW_WORDS;
+                        const uint32_t word = mat[
+                            row_base + element / VALUES_PER_WORD];
+                        const int shift = (element % VALUES_PER_WORD) * \(bits);
+                        const uint32_t q = (word >> uint32_t(shift))
+                            & uint32_t(\(mask));
+                        const uint32_t metadata =
+                            mat[row_base + PAYLOAD_WORDS + element / 64];
+                        const float scale = float(as_type<half>(
+                            ushort(metadata & 0xffffu)));
+                        const float bias = float(as_type<half>(
+                            ushort(metadata >> 16)));
+                        k_tile[tm][tn] = static_cast<T>(\(dequant));
+                    }
+                    mat_offset += D;
+"""
+        var source = qkSource
+        source = source.replacingOccurrences(
+            of: "const int row_capacity = int(params[2 + row]);",
+            with: "const int row_capacity = int(params[2 + row]);\n\n            constexpr int PAYLOAD_WORDS = \(payloadWords);\n            constexpr int ROW_WORDS = \(rowWords);\n            constexpr int VALUES_PER_WORD = \(valuesPerWord);"
+        )
+        source = source.replacingOccurrences(
+            of: "const device T* key_plane = k0;",
+            with: "const device uint32_t* key_plane = m0;"
+        )
+        for row in 1...7 {
+            source = source.replacingOccurrences(
+                of: "case \(row): key_plane = k\(row); break;",
+                with: "case \(row): key_plane = m\(row); break;"
+            )
+        }
+        source = source.replacingOccurrences(
+            of: "key_plane += size_t(kv_head) * size_t(row_capacity) * D;",
+            with: "key_plane += size_t(kv_head) * size_t(row_capacity) * ROW_WORDS;"
+        )
+        source = source.replacingOccurrences(
+            of: "const device T* mat = key_plane + size_t(out_row) * D;",
+            with: "const device uint32_t* mat = key_plane + size_t(out_row) * ROW_WORDS;"
+        )
+        source = source.replacingOccurrences(of: oldTile, with: newTile)
+        if source.contains("k_tile[tm] = *reinterpret_cast") {
+            source = source.replacingOccurrences(
+                of: "k_tile[tm] = *reinterpret_cast<const device T4*>(",
+                with: newTile
+            )
+            source = source.replacingOccurrences(
+                of: "mat + mat_offset + bn);", with: "")
+            source = source.replacingOccurrences(of: "mat_offset += D;", with: "")
+        }
+        return source
+    }
+
+    private static let q8QkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_qk_q8g64_xfold_v1",
+        inputNames: [
+            "queries",
+            "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
+            "params",
+        ],
+        outputNames: ["scores"],
+        source: qkQuantSource(format: .q8),
+        ensureRowContiguous: true
+    )
+
+    private static let q8QkFencedKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_qk_fenced_q8g64_xfold_v1",
+        inputNames: [
+            "queries",
+            "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
+            "params", "store_fence",
+        ],
+        outputNames: ["scores"],
+        source: qkQuantSource(format: .q8),
+        ensureRowContiguous: true
+    )
+
+    private static let q4QkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_qk_q4g64_xfold_v1",
+        inputNames: [
+            "queries",
+            "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
+            "params",
+        ],
+        outputNames: ["scores"],
+        source: qkQuantSource(format: .q4),
+        ensureRowContiguous: true
+    )
+
+    private static let q4QkFencedKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_qk_fenced_q4g64_xfold_v1",
+        inputNames: [
+            "queries",
+            "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
+            "params", "store_fence",
+        ],
+        outputNames: ["scores"],
+        source: qkQuantSource(format: .q4),
+        ensureRowContiguous: true
+    )
+
+    private static let nf8QkKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_qk_nf8g64_xfold_v1",
+        inputNames: [
+            "queries",
+            "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
+            "params",
+        ],
+        outputNames: ["scores"],
+        source: qkQuantSource(format: .nf8),
+        header: CBv2D512FullKVQuant.nf8LUTHeader,
+        ensureRowContiguous: true
+    )
+
+    private static let nf8QkFencedKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_qk_fenced_nf8g64_xfold_v1",
+        inputNames: [
+            "queries",
+            "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
+            "params", "store_fence",
+        ],
+        outputNames: ["scores"],
+        source: qkQuantSource(format: .nf8),
+        header: CBv2D512FullKVQuant.nf8LUTHeader,
+        ensureRowContiguous: true
+    )
+
     /// Dispatch 2 — softmax. A verbatim transcription of
     /// `softmax_single_row` (block_softmax_precise, AccT=float, N_READS=4)
     /// over the 128 score rows; the CALLER sizes the threadgroup exactly
@@ -3945,15 +4095,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// threads. Replays the stock GEMVTKernel<bf16,1,4,8,4,4,4> row-striding
     /// and butterfly for all 8 heads of the GQA group at once (shared V tile
     /// loads). params as dispatch 1.
-    private static let avKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1",
-        inputNames: [
-            "probs",
-            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
-            "params",
-        ],
-        outputNames: ["out"],
-        source: """
+    private static let avSource: String = """
             constexpr int D = 512;
             constexpr int GQA = 8;
 
@@ -4100,7 +4242,150 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
                     out_ptr[j] = static_cast<T>(result[j]);
                 }
             }
-        """,
+        """
+
+    private static let avKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_av_bf16_g8_xfold_v3_t\(avColumnTiles)_vec1",
+        inputNames: [
+            "probs",
+            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+            "params",
+        ],
+        outputNames: ["out"],
+        source: avSource,
+        ensureRowContiguous: true
+    )
+
+    /// Quantized AV twins. They retain the native probability load, XFOLD,
+    /// column tiling, and bf16 output boundary; only the V tile load reads
+    /// packed q8/q4 rows and reconstructs bf16 operands.
+    private static func avQuantSource(
+        format: CBv2D512FullKVQuant.Format
+    ) -> String {
+        let bits = format.bits
+        let payloadWords = format.payloadWords
+        let rowWords = format.rowWords
+        let valuesPerWord = 32 / bits
+        let mask = (1 << bits) - 1
+        let dequant = format == .nf8
+            ? "NF8_LUT[q] * scale * 255.0f + bias"
+            : "float(q) * scale + bias"
+        let oldTile = """
+v_tile[tm] = *reinterpret_cast<const device T4*>(
+            value_plane + size_t(bm + tm) * D + out_col);
+"""
+        let newTile = """
+                    #pragma clang loop unroll(full)
+                    for (int tn = 0; tn < 4; ++tn) {
+                        const int element = out_col + tn;
+                        const int row_base = (bm + tm) * ROW_WORDS;
+                        const uint32_t word = value_plane[
+                            row_base + element / VALUES_PER_WORD];
+                        const int shift = (element % VALUES_PER_WORD) * \(bits);
+                        const uint32_t q = (word >> uint32_t(shift))
+                            & uint32_t(\(mask));
+                        const uint32_t metadata =
+                            value_plane[row_base + PAYLOAD_WORDS + element / 64];
+                        const float scale = float(as_type<half>(
+                            ushort(metadata & 0xffffu)));
+                        const float bias = float(as_type<half>(
+                            ushort(metadata >> 16)));
+                        v_tile[tm][tn] = static_cast<T>(\(dequant));
+                    }
+        """
+        let oldTail = """
+v_tile[0][tn] = value_plane[
+                size_t(bm + tm) * D + out_col + tn];
+"""
+        let newTail = """
+                        const int element = out_col + tn;
+                        const int row_base = (bm + tm) * ROW_WORDS;
+                        const uint32_t word = value_plane[
+                            row_base + element / VALUES_PER_WORD];
+                        const int shift = (element % VALUES_PER_WORD) * \(bits);
+                        const uint32_t q = (word >> uint32_t(shift))
+                            & uint32_t(\(mask));
+                        const uint32_t metadata =
+                            value_plane[row_base + PAYLOAD_WORDS + element / 64];
+                        const float scale = float(as_type<half>(
+                            ushort(metadata & 0xffffu)));
+                        const float bias = float(as_type<half>(
+                            ushort(metadata >> 16)));
+                        v_tile[0][tn] = static_cast<T>(\(dequant));
+        """
+        var source = avSource
+        source = source.replacingOccurrences(
+            of: "const int row_capacity = int(params[2 + row]);",
+            with: "const int row_capacity = int(params[2 + row]);\n\n            constexpr int PAYLOAD_WORDS = \(payloadWords);\n            constexpr int ROW_WORDS = \(rowWords);\n            constexpr int VALUES_PER_WORD = \(valuesPerWord);\n            constexpr int KV_HEADS = 2;"
+        )
+        source = source.replacingOccurrences(
+            of: "const device T* value_plane = v0;",
+            with: "const device uint32_t* value_plane = m0;"
+        )
+        for row in 1...7 {
+            source = source.replacingOccurrences(
+                of: "case \(row): value_plane = v\(row); break;",
+                with: "case \(row): value_plane = m\(row); break;"
+            )
+        }
+        source = source.replacingOccurrences(
+            of: "value_plane += size_t(kv_head) * size_t(row_capacity) * D;",
+            with: "value_plane += size_t(KV_HEADS + kv_head) * size_t(row_capacity) * ROW_WORDS;"
+        )
+        source = source.replacingOccurrences(of: oldTile, with: newTile)
+        source = source.replacingOccurrences(of: oldTail, with: newTail)
+        if source.contains("v_tile[tm] = *reinterpret_cast") {
+            source = source.replacingOccurrences(
+                of: "v_tile[tm] = *reinterpret_cast<const device T4*>(",
+                with: newTile
+            )
+            source = source.replacingOccurrences(
+                of: "value_plane + size_t(bm + tm) * D + out_col);",
+                with: "")
+        }
+        if source.contains("v_tile[0][tn] = value_plane[") {
+            source = source.replacingOccurrences(
+                of: "v_tile[0][tn] = value_plane[", with: newTail)
+            source = source.replacingOccurrences(
+                of: "size_t(bm + tm) * D + out_col + tn];", with: "")
+        }
+        return source
+    }
+
+    private static let q8AvKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_av_q8g64_xfold_v1_t\(avColumnTiles)",
+        inputNames: [
+            "probs",
+            "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
+            "params",
+        ],
+        outputNames: ["out"],
+        source: avQuantSource(format: .q8),
+        ensureRowContiguous: true
+    )
+
+    private static let q4AvKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_av_q4g64_xfold_v1_t\(avColumnTiles)",
+        inputNames: [
+            "probs",
+            "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
+            "params",
+        ],
+        outputNames: ["out"],
+        source: avQuantSource(format: .q4),
+        ensureRowContiguous: true
+    )
+
+    private static let nf8AvKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_av_nf8g64_xfold_v1_t\(avColumnTiles)",
+        inputNames: [
+            "probs",
+            "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
+            "params",
+        ],
+        outputNames: ["out"],
+        source: avQuantSource(format: .nf8),
+        header: CBv2D512FullKVQuant.nf8LUTHeader,
         ensureRowContiguous: true
     )
 
@@ -5159,16 +5444,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// of `L * inv_freq`, and the same two rotation expressions. The ring
     /// slot receives the K row the standalone kernel would have handed the
     /// incumbent store, so dispatches 1...3 read identical bytes.
-    private static let ringStoreNormRopeKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_d512_ringstore_normrope_freqs_bf16_v1_vec1",
-        inputNames: [
-            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
-            "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
-            "params", "raw_queries", "raw_keys", "q_weight", "k_weight",
-            "position_offsets", "rope_freqs", "write_fence",
-        ],
-        outputNames: ["fence", "q_out", "k_out", "v_out"],
-        source: """
+    private static let ringStoreNormRopeSource: String = """
             constexpr int D = 512;
             constexpr int KV_ROWS = 16;
             constexpr int Q_HEADS = 16;
@@ -5292,8 +5568,287 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             if (z == 0 && lid == 0) {
                 fence[0] = write_fence[0] + 1;
             }
-        """,
-        ensureRowContiguous: true)
+        """
+
+    private static let ringStoreNormRopeKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "cbv2_ragged8_d512_ringstore_normrope_freqs_bf16_v1_vec1",
+            inputNames: [
+                "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+                "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+                "params", "raw_queries", "raw_keys", "q_weight", "k_weight",
+                "position_offsets", "rope_freqs", "write_fence",
+            ],
+            outputNames: ["fence", "q_out", "k_out", "v_out"],
+            source: ringStoreNormRopeSource,
+            ensureRowContiguous: true)
+
+    /// Add the two-plane q8/q4 mirror write to the exact norm/RoPE store
+    /// source. The native K/V stores and returned K/V rows are untouched; the
+    /// extra code consumes the post-transform bf16 values already produced by
+    /// the same threadgroup and writes packed rows before the existing fence.
+    private static func ringStoreNormRopeQuantSource(
+        format: CBv2D512FullKVQuant.Format,
+        planes: CBv2D512FullKVQuant.Planes
+    ) -> String {
+        let bits = format.bits
+        let payloadWords = format.payloadWords
+        let rowWords = format.rowWords
+        let mask = (1 << bits) - 1
+        let uniformQuantization = """
+            if (is_key) {
+                const int row_capacity = int(params[2 + batch_index]);
+                const device uint32_t* mirror_base = m0;
+                switch (batch_index) {
+                    case 1: mirror_base = m1; break;
+                    case 2: mirror_base = m2; break;
+                    case 3: mirror_base = m3; break;
+                    case 4: mirror_base = m4; break;
+                    case 5: mirror_base = m5; break;
+                    case 6: mirror_base = m6; break;
+                    case 7: mirror_base = m7; break;
+                    default: break;
+                }
+                const size_t key_base = size_t(kv_head)
+                    * size_t(row_capacity) * ROW_WORDS;
+                const size_t value_base = size_t(K_HEADS + kv_head)
+                    * size_t(row_capacity) * ROW_WORDS;
+                device uint32_t* key_out = const_cast<device uint32_t*>(
+                    mirror_base + key_base
+                    + size_t(key_length - 1) * ROW_WORDS);
+                device uint32_t* value_out = const_cast<device uint32_t*>(
+                    mirror_base + value_base
+                    + size_t(key_length - 1) * ROW_WORDS);
+
+                const int group = simd_group * 2 + lane / 16;
+                const int local = lane & 15;
+                float k_values[reads];
+                float v_values[reads];
+                float k_min = 3.402823466e+38F;
+                float k_max = -3.402823466e+38F;
+                float v_min = 3.402823466e+38F;
+                float v_max = -3.402823466e+38F;
+                for (int i = 0; i < reads; ++i) {
+                    const int element = lid * reads + i;
+                    k_values[i] = static_cast<float>(quant_key[element]);
+                    v_values[i] = static_cast<float>(quant_value[element]);
+                    k_min = min(k_min, k_values[i]);
+                    k_max = max(k_max, k_values[i]);
+                    v_min = min(v_min, v_values[i]);
+                    v_max = max(v_max, v_values[i]);
+                }
+                for (ushort step = 1; step < 16; step <<= 1) {
+                    k_min = min(k_min, simd_shuffle_xor(k_min, step));
+                    k_max = max(k_max, simd_shuffle_xor(k_max, step));
+                    v_min = min(v_min, simd_shuffle_xor(v_min, step));
+                    v_max = max(v_max, simd_shuffle_xor(v_max, step));
+                }
+                const half k_scale_h = half(max(
+                    (k_max - k_min) / float(\(mask)), 1.0e-6f));
+                const half v_scale_h = half(max(
+                    (v_max - v_min) / float(\(mask)), 1.0e-6f));
+                const half k_bias_h = half(k_min);
+                const half v_bias_h = half(v_min);
+                const float k_scale = static_cast<float>(k_scale_h);
+                const float v_scale = static_cast<float>(v_scale_h);
+                const float k_bias = static_cast<float>(k_bias_h);
+                const float v_bias = static_cast<float>(v_bias_h);
+
+                uint32_t k_word = 0u;
+                uint32_t v_word = 0u;
+                for (int i = 0; i < reads; ++i) {
+                    const float kq = metal::rint(
+                        (k_values[i] - k_bias) / k_scale);
+                    const float vq = metal::rint(
+                        (v_values[i] - v_bias) / v_scale);
+                    k_word |= uint32_t(clamp(kq, 0.0f, float(\(mask))))
+                        << (\(bits) * i);
+                    v_word |= uint32_t(clamp(vq, 0.0f, float(\(mask))))
+                        << (\(bits) * i);
+                }
+                if (\(bits) == 8) {
+                    key_out[group * \(payloadWords / 8) + local] = k_word;
+                    value_out[group * \(payloadWords / 8) + local] = v_word;
+                } else {
+                    const uint32_t k_partner = simd_shuffle(
+                        k_word, ushort(lane ^ 1));
+                    const uint32_t v_partner = simd_shuffle(
+                        v_word, ushort(lane ^ 1));
+                    if ((local & 1) == 0) {
+                        key_out[group * \(payloadWords / 8) + local / 2] =
+                            k_word | (k_partner << 16);
+                        value_out[group * \(payloadWords / 8) + local / 2] =
+                            v_word | (v_partner << 16);
+                    }
+                }
+                if (local == 0) {
+                    key_out[\(payloadWords) + group] =
+                        uint32_t(as_type<ushort>(k_scale_h))
+                        | (uint32_t(as_type<ushort>(k_bias_h)) << 16);
+                    value_out[\(payloadWords) + group] =
+                        uint32_t(as_type<ushort>(v_scale_h))
+                        | (uint32_t(as_type<ushort>(v_bias_h)) << 16);
+                }
+            }
+"""
+        // Keep this as token-level rewriting of the incumbent fp32 pack
+        // arithmetic: it avoids a second copy of the mirror-addressing and
+        // metadata code, while making the NF8 normalization unambiguous.
+        let nf8Quantization = uniformQuantization
+            .replacingOccurrences(of: "metal::rint", with: "nf8_nearest")
+            .replacingOccurrences(
+                of: " / k_scale)",
+                with: " / (k_scale * 255.0f))")
+            .replacingOccurrences(
+                of: " / v_scale)",
+                with: " / (v_scale * 255.0f))")
+        let quantization = format == .nf8 ? nf8Quantization : uniformQuantization
+        var source = ringStoreNormRopeSource
+        source = source.replacingOccurrences(
+            of: "constexpr int reads = 4;",
+            with: "constexpr int reads = 4;\n            constexpr int PAYLOAD_WORDS = \(payloadWords);\n            constexpr int ROW_WORDS = \(rowWords);"
+        )
+        source = source.replacingOccurrences(
+            of: "threadgroup T rounded[D];",
+            with: "threadgroup T rounded[D];\n            threadgroup T quant_key[D];\n            threadgroup T quant_value[D];"
+        )
+        source = source.replacingOccurrences(
+            of: "sharedv[i] = T(1) * normalized;",
+            with: "sharedv[i] = T(1) * normalized;\n                    quant_value[lid * reads + i] = sharedv[i];"
+        )
+        source = source.replacingOccurrences(
+            of: "key_mirror[pair + D / 2] = static_cast<T>(rx2);",
+            with: "key_mirror[pair + D / 2] = static_cast<T>(rx2);\n                        quant_key[pair] = static_cast<T>(rx1);\n                        quant_key[pair + D / 2] = static_cast<T>(rx2);"
+        )
+        source = source.replacingOccurrences(
+            of: "if (z == 0 && lid == 0) {",
+            with: "threadgroup_barrier(mem_flags::mem_threadgroup);\n\(quantization)            if (z == 0 && lid == 0) {"
+        )
+        if planes == .k {
+            source = source.replacingOccurrences(
+                of: "const size_t value_base = size_t(K_HEADS + kv_head)\n                    * size_t(row_capacity) * ROW_WORDS;\n",
+                with: "")
+            source = source.replacingOccurrences(
+                of: "device uint32_t* value_out = const_cast<device uint32_t*>(\n                    mirror_base + value_base\n                    + size_t(key_length - 1) * ROW_WORDS);\n",
+                with: "")
+            source = source.replacingOccurrences(
+                of: "                    value_out[group * \(payloadWords / 8) + local] = v_word;\n",
+                with: "")
+            source = source.replacingOccurrences(
+                of: "                    const uint32_t v_partner = simd_shuffle(\n                        v_word, ushort(lane ^ 1));\n",
+                with: "")
+            source = source.replacingOccurrences(
+                of: "                        value_out[group * \(payloadWords / 8) + local / 2] =\n                            v_word | (v_partner << 16);\n",
+                with: "")
+            source = source.replacingOccurrences(
+                of: "                    value_out[\(payloadWords) + group] =\n                        uint32_t(as_type<ushort>(v_scale_h))\n                        | (uint32_t(as_type<ushort>(v_bias_h)) << 16);\n",
+                with: "")
+        }
+        return source
+    }
+
+    /// The quantized store does not need the three model-facing normalized
+    /// outputs: the caller already has normalized `queries`, `keys`, and
+    /// `values` from the registered carrier. Keeping only the key threadgroups
+    /// leaves room for the eight per-row mirror buffers under Metal's 31
+    /// buffer-argument limit, while retaining the same native K/V writes and
+    /// post-transform mirror packing.
+    private static func ringStoreNormRopeQuantKeySource(
+        format: CBv2D512FullKVQuant.Format,
+        planes: CBv2D512FullKVQuant.Planes
+    ) -> String {
+        var source = ringStoreNormRopeQuantSource(format: format, planes: planes)
+        source = source.replacingOccurrences(
+            of: "device T* key_slot = k_out;",
+            with: "device T* key_slot = const_cast<device T*>(k0);"
+        )
+        source = source.replacingOccurrences(
+            of: "device T* value_slot = v_out;",
+            with: "device T* value_slot = const_cast<device T*>(v0);"
+        )
+        source = source.replacingOccurrences(
+            of: "const device T* input = is_key ? raw_keys : raw_queries;",
+            with: "const device T* input = raw_keys;"
+        )
+        source = source.replacingOccurrences(
+            of: "const device T* weight = is_key ? k_weight : q_weight;",
+            with: "const device T* weight = k_weight;"
+        )
+        source = source.replacingOccurrences(
+            of: "device T* key_mirror = k_out + (is_key ? local_row : 0) * D;",
+            with: ""
+        )
+        source = source.replacingOccurrences(
+            of: "device T* value_mirror = v_out + (is_key ? local_row : 0) * D;",
+            with: ""
+        )
+        source = source.replacingOccurrences(
+            of: "device T* output_row = is_key ? key_slot : (q_out + local_row * D);",
+            with: "device T* output_row = key_slot;"
+        )
+        source = source.replacingOccurrences(
+            of: "*reinterpret_cast<device T4*>(value_mirror + lid * reads) = sharedv;\n",
+            with: ""
+        )
+        source = source.replacingOccurrences(
+            of: "key_mirror[pair] = static_cast<T>(rx1);",
+            with: ""
+        )
+        source = source.replacingOccurrences(
+            of: "key_mirror[pair + D / 2] = static_cast<T>(rx2);",
+            with: ""
+        )
+        source = source.replacingOccurrences(
+            of: "const float L = static_cast<float>(position_offsets[batch_index]);",
+            with: "const float L = static_cast<float>(key_length - 1);"
+        )
+        return source
+    }
+
+    private static func makeQuantRingStoreKernel(
+        format: CBv2D512FullKVQuant.Format,
+        planes: CBv2D512FullKVQuant.Planes
+    ) -> MLXFast.MLXFastKernel {
+        MLXFast.metalKernel(
+            name: "cbv2_ragged8_d512_ringstore_normrope_\(format.name)_\(planes == .kv ? "kv" : "k")g64_v1",
+            inputNames: [
+                "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7",
+                "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+                "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
+                "params", "raw_keys", "k_weight", "rope_freqs", "write_fence",
+            ],
+            outputNames: ["fence"],
+            source: ringStoreNormRopeQuantKeySource(format: format, planes: planes),
+            header: format == .nf8 ? CBv2D512FullKVQuant.nf8LUTHeader : "",
+            ensureRowContiguous: true)
+    }
+
+    private static let ringStoreNormRopeQ8KVKernel =
+        makeQuantRingStoreKernel(format: .q8, planes: .kv)
+    private static let ringStoreNormRopeQ8KKernel =
+        makeQuantRingStoreKernel(format: .q8, planes: .k)
+    private static let ringStoreNormRopeQ4KVKernel =
+        makeQuantRingStoreKernel(format: .q4, planes: .kv)
+    private static let ringStoreNormRopeQ4KKernel =
+        makeQuantRingStoreKernel(format: .q4, planes: .k)
+    private static let ringStoreNormRopeNF8KVKernel =
+        makeQuantRingStoreKernel(format: .nf8, planes: .kv)
+    private static let ringStoreNormRopeNF8KKernel =
+        makeQuantRingStoreKernel(format: .nf8, planes: .k)
+
+    private static func quantRingStoreKernel(
+        format: CBv2D512FullKVQuant.Format,
+        planes: CBv2D512FullKVQuant.Planes
+    ) -> MLXFast.MLXFastKernel {
+        switch (format, planes) {
+        case (.q8, .kv): return ringStoreNormRopeQ8KVKernel
+        case (.q8, .k): return ringStoreNormRopeQ8KKernel
+        case (.q4, .kv): return ringStoreNormRopeQ4KVKernel
+        case (.q4, .k): return ringStoreNormRopeQ4KKernel
+        case (.nf8, .kv): return ringStoreNormRopeNF8KVKernel
+        case (.nf8, .k): return ringStoreNormRopeNF8KKernel
+        }
+    }
 
     /// WRITE-022 kill switch: `DARKBLOOM_GEMMA4_D512_STORE_DISPATCH=0` falls
     /// back to the v2 fold (and its own switch falls back to the append path).
@@ -5303,6 +5858,33 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
+
+    private struct D512QuantState {
+        let mirrors: [MLXArray]
+        let format: CBv2D512FullKVQuant.Format
+        let planes: CBv2D512FullKVQuant.Planes
+    }
+
+    private static func d512QuantMirrors(
+        rows: [CBv2FullSequenceKV], keyLength: Int
+    ) -> D512QuantState? {
+        guard CBv2D512FullKVQuant.enabled,
+            let format = CBv2D512FullKVQuant.format,
+            let planes = CBv2D512FullKVQuant.planes
+        else { return nil }
+        var mirrors: [MLXArray] = []
+        mirrors.reserveCapacity(rows.count)
+        for row in rows {
+            guard let mirror = row.d512QuantMirror(),
+                mirror.dtype == .uint32,
+                mirror.shape == [planes.count, kvHeads, mirror.dim(2), format.rowWords],
+                mirror.dim(2) >= keyLength
+            else { return nil }
+            mirrors.append(mirror)
+        }
+        return mirrors.count == batch ? D512QuantState(
+            mirrors: mirrors, format: format, planes: planes) : nil
+    }
 
     /// WRITE-022: the fused append as its own 32 KiB dispatch placed before
     /// the STOCK three-kernel chain (byte-for-byte dispatch 1-3), fence-
@@ -5355,23 +5937,23 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
         params.reserveCapacity(batch + 2)
         for row in fullRows {
-            let state = row.cbv2InnerState()
-            guard state.count == 2,
-                state[0].dtype == .bfloat16,
-                state[1].dtype == .bfloat16,
-                state[0].ndim == 4,
-                state[0].dim(0) == 1,
-                state[0].dim(1) == kvHeads,
-                state[0].dim(3) == headDim,
-                state[1].shape == state[0].shape,
-                state[1].dtype == state[0].dtype,
-                state[0].dim(2) >= keyLength
+            guard let state = row.d512NativeBuffers(),
+                state.keys.dtype == .bfloat16,
+                state.values.dtype == .bfloat16,
+                state.keys.ndim == 4,
+                state.keys.dim(0) == 1,
+                state.keys.dim(1) == kvHeads,
+                state.keys.dim(3) == headDim,
+                state.values.shape == state.keys.shape,
+                state.values.dtype == state.keys.dtype,
+                state.keys.dim(2) >= keyLength
             else { return nil }
-            keyBuffers.append(state[0])
-            valueBuffers.append(state[1])
-            params.append(UInt32(state[0].dim(2)))
+            keyBuffers.append(state.keys)
+            valueBuffers.append(state.values)
+            params.append(UInt32(state.keys.dim(2)))
         }
         let paramsArray = MLXArray(params)
+        var activeQuant = d512QuantMirrors(rows: fullRows, keyLength: keyLength)
 
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)
@@ -5391,34 +5973,62 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             let normRope = takeFullNormRope(
                 queries: queries, keys: keys, values: values)
         {
-            let stored = ringStoreNormRopeKernel(
-                keyBuffers + valueBuffers + [
-                    paramsArray,
-                    normRope.rawQueries,
-                    normRope.rawKeys,
-                    normRope.qWeight,
-                    normRope.kWeight,
-                    normRope.positionOffsets,
-                    normRope.ropeFrequencies,
-                    previousWriteFence,
-                ],
-                template: template,
-                grid: (128, 1, batch * kvHeads + batch * queryHeads),
-                threadGroup: (128, 1, 1),
-                outputShapes: [
-                    [1],
-                    [batch, queryHeads, 1, headDim],
-                    [batch, kvHeads, 1, headDim],
-                    [batch, kvHeads, 1, headDim],
-                ],
-                outputDTypes: [.int32, .bfloat16, .bfloat16, .bfloat16]
-            )
+            let stored: [MLXArray]
+            if let quant = activeQuant {
+                let kernel = quantRingStoreKernel(
+                    format: quant.format, planes: quant.planes)
+                stored = kernel(
+                    keyBuffers + valueBuffers + quant.mirrors + [
+                        paramsArray,
+                        normRope.rawKeys,
+                        normRope.kWeight,
+                        normRope.ropeFrequencies,
+                        previousWriteFence,
+                    ],
+                    template: template,
+                    grid: (128, 1, batch * kvHeads),
+                    threadGroup: (128, 1, 1),
+                    outputShapes: [[1]],
+                    outputDTypes: [.int32]
+                )
+                CBv2EngageMark.once(quant.format.engageMark)
+                CBv2EngageMark.once("d512-normrope-store")
+            } else {
+                stored = ringStoreNormRopeKernel(
+                    keyBuffers + valueBuffers + [
+                        paramsArray,
+                        normRope.rawQueries,
+                        normRope.rawKeys,
+                        normRope.qWeight,
+                        normRope.kWeight,
+                        normRope.positionOffsets,
+                        normRope.ropeFrequencies,
+                        previousWriteFence,
+                    ],
+                    template: template,
+                    grid: (128, 1, batch * kvHeads + batch * queryHeads),
+                    threadGroup: (128, 1, 1),
+                    outputShapes: [
+                        [1],
+                        [batch, queryHeads, 1, headDim],
+                        [batch, kvHeads, 1, headDim],
+                        [batch, kvHeads, 1, headDim],
+                    ],
+                    outputDTypes: [.int32, .bfloat16, .bfloat16, .bfloat16]
+                )
+                activeQuant = nil
+            }
             storeFence = stored[0]
-            liveQueries = stored[1]
-            normalizedKeys = stored[2]
-            normalizedValues = stored[3]
+            if activeQuant == nil {
+                liveQueries = stored[1]
+                normalizedKeys = stored[2]
+                normalizedValues = stored[3]
+            } else {
+                liveQueries = queries
+            }
             CBv2EngageMark.once("d512-normrope-store")
         } else {
+            activeQuant = nil
             storeFence = ringStoreKernel(
                 keyBuffers + valueBuffers
                     + [paramsArray, keys, values, previousWriteFence],
@@ -5431,15 +6041,43 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             liveQueries = queries
         }
 
+        // Explicitly armed local diagnostic only. Force the just-written
+        // mirror/native rows once per layer, after the store dispatch and
+        // before the fenced QK consumer. The production path never performs
+        // this host read.
+        if activeQuant != nil && CBv2D512FullKVQuant.verify {
+            _ = storeFence.asArray(Int32.self)
+            fullRows[0].verifyD512QuantMirrorNewest(position: keyLength - 1)
+        }
+
         let chunks = (keyLength + 63) / 64
-        let scores = qkFencedKernel(
-            [liveQueries] + keyBuffers + [paramsArray, storeFence],
-            template: template,
-            grid: (32, 4, batch * kvHeads * chunks),
-            threadGroup: (32, 4, 1),
-            outputShapes: [scratchShape],
-            outputDTypes: [.bfloat16]
-        )[0]
+        let scores: MLXArray
+        if let quant = activeQuant, !CBv2D512FullKVQuant.storeOnlyDiagnostic {
+            let kernel: MLXFast.MLXFastKernel
+            switch quant.format {
+            case .q8: kernel = q8QkFencedKernel
+            case .q4: kernel = q4QkFencedKernel
+            case .nf8: kernel = nf8QkFencedKernel
+            }
+            scores = kernel(
+                [liveQueries] + quant.mirrors + [paramsArray, storeFence],
+                template: template,
+                grid: (32, 4, batch * kvHeads * chunks),
+                threadGroup: (32, 4, 1),
+                outputShapes: [scratchShape],
+                outputDTypes: [.bfloat16]
+            )[0]
+                CBv2EngageMark.once(quant.format.engageMark)
+        } else {
+            scores = qkFencedKernel(
+                [liveQueries] + keyBuffers + [paramsArray, storeFence],
+                template: template,
+                grid: (32, 4, batch * kvHeads * chunks),
+                threadGroup: (32, 4, 1),
+                outputShapes: [scratchShape],
+                outputDTypes: [.bfloat16]
+            )[0]
+        }
 
         let softmaxThreads = ((keyLength + 3) / 4 + 31) / 32 * 32
         let probs = softmaxActive(
@@ -5455,7 +6093,27 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         // per-threadgroup pair partials) for the activation it stores.
         let output: MLXArray
         let oRunsum: MLXArray?
-        if oRunsumFoldEnabled, softmaxVecEnabled {
+        if let quant = activeQuant,
+            quant.planes == .kv,
+            !CBv2D512FullKVQuant.storeOnlyDiagnostic
+        {
+            let kernel: MLXFast.MLXFastKernel
+            switch quant.format {
+            case .q8: kernel = q8AvKernel
+            case .q4: kernel = q4AvKernel
+            case .nf8: kernel = nf8AvKernel
+            }
+            output = kernel(
+                [probs] + quant.mirrors + [paramsArray],
+                template: template,
+                grid: (32, avSimdgroups, batch * kvHeads * avColumnTiles),
+                threadGroup: (32, avSimdgroups, 1),
+                outputShapes: [[batch, queryHeads, 1, headDim]],
+                outputDTypes: [.bfloat16]
+            )[0]
+            oRunsum = nil
+            CBv2EngageMark.once(quant.format.engageMark)
+        } else if oRunsumFoldEnabled, softmaxVecEnabled {
             let attended = avVecORunsumKernel(
                 [probs] + valueBuffers + [paramsArray],
                 template: template,
@@ -5558,21 +6216,20 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
         params.reserveCapacity(batch + 2)
         for row in fullRows {
-            let state = row.cbv2InnerState()
-            guard state.count == 2,
-                state[0].dtype == .bfloat16,
-                state[1].dtype == .bfloat16,
-                state[0].ndim == 4,
-                state[0].dim(0) == 1,
-                state[0].dim(1) == kvHeads,
-                state[0].dim(3) == headDim,
-                state[1].shape == state[0].shape,
-                state[1].dtype == state[0].dtype,
-                state[0].dim(2) >= keyLength
+            guard let state = row.d512NativeBuffers(),
+                state.keys.dtype == .bfloat16,
+                state.values.dtype == .bfloat16,
+                state.keys.ndim == 4,
+                state.keys.dim(0) == 1,
+                state.keys.dim(1) == kvHeads,
+                state.keys.dim(3) == headDim,
+                state.values.shape == state.keys.shape,
+                state.values.dtype == state.keys.dtype,
+                state.keys.dim(2) >= keyLength
             else { return nil }
-            keyBuffers.append(state[0])
-            valueBuffers.append(state[1])
-            params.append(UInt32(state[0].dim(2)))
+            keyBuffers.append(state.keys)
+            valueBuffers.append(state.values)
+            params.append(UInt32(state.keys.dim(2)))
         }
         let paramsArray = MLXArray(params)
 
@@ -5660,16 +6317,15 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             fullRows.allSatisfy({ keyLength <= $0.maxLength })
         else { return nil }
         for row in fullRows {
-            let state = row.cbv2InnerState()
-            guard state.count == 2,
-                state[0].dtype == .bfloat16,
-                state[1].dtype == .bfloat16,
-                state[0].ndim == 4,
-                state[0].dim(0) == 1,
-                state[0].dim(1) == kvHeads,
-                state[0].dim(3) == headDim,
-                state[1].shape == state[0].shape,
-                state[1].dtype == state[0].dtype
+            guard let state = row.d512NativeBuffers(),
+                state.keys.dtype == .bfloat16,
+                state.values.dtype == .bfloat16,
+                state.keys.ndim == 4,
+                state.keys.dim(0) == 1,
+                state.keys.dim(1) == kvHeads,
+                state.keys.dim(3) == headDim,
+                state.values.shape == state.keys.shape,
+                state.values.dtype == state.keys.dtype
             else { return nil }
         }
 
@@ -5688,10 +6344,10 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             _ = row.update(
                 keys: keys[index ..< (index + 1)],
                 values: values[index ..< (index + 1)])
-            let state = row.cbv2InnerState()
-            keyBuffers.append(state[0])
-            valueBuffers.append(state[1])
-            params.append(UInt32(state[0].dim(2)))
+            guard let state = row.d512NativeBuffers() else { return nil }
+            keyBuffers.append(state.keys)
+            valueBuffers.append(state.values)
+            params.append(UInt32(state.keys.dim(2)))
         }
         return dispatchChain(
             queries: queries, keyBuffers: keyBuffers, valueBuffers: valueBuffers,
@@ -5762,21 +6418,20 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
         params.reserveCapacity(batch + 2)
         for row in fullRows {
-            let state = row.cbv2InnerState()
-            guard state.count == 2,
-                state[0].dtype == .bfloat16,
-                state[1].dtype == .bfloat16,
-                state[0].ndim == 4,
-                state[0].dim(0) == 1,
-                state[0].dim(1) == kvHeads,
-                state[0].dim(3) == headDim,
-                state[1].shape == state[0].shape,
-                state[1].dtype == state[0].dtype,
-                state[0].dim(2) >= keyLength
+            guard let state = row.d512NativeBuffers(),
+                state.keys.dtype == .bfloat16,
+                state.values.dtype == .bfloat16,
+                state.keys.ndim == 4,
+                state.keys.dim(0) == 1,
+                state.keys.dim(1) == kvHeads,
+                state.keys.dim(3) == headDim,
+                state.values.shape == state.keys.shape,
+                state.values.dtype == state.keys.dtype,
+                state.keys.dim(2) >= keyLength
             else { return nil }
-            keyBuffers.append(state[0])
-            valueBuffers.append(state[1])
-            params.append(UInt32(state[0].dim(2)))
+            keyBuffers.append(state.keys)
+            valueBuffers.append(state.values)
+            params.append(UInt32(state.keys.dim(2)))
         }
         return dispatchChain(
             queries: queries, keyBuffers: keyBuffers, valueBuffers: valueBuffers,

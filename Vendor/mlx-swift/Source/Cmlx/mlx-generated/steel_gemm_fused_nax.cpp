@@ -195,6 +195,13 @@ template <
       !transpose_a && transpose_b && metal::is_same_v<T, bfloat16_t>;
   bool c_bstride_zero = true;
 
+  // PREFILL-ATTN-TRAFFIC (at1) eligibility (signature and exactness argument
+  // in steel_gemm_fused.h; the loader-side transform lives in
+  // gemm_loop_softmax, gemm_nax.h).
+  constexpr bool kSoftmaxLoaderEligible =
+      !transpose_a && !transpose_b && metal::is_same_v<T, bfloat16_t>;
+  bool softmax_loader = false;
+
   // Adjust for batch
   if (has_batch) {
     const constant auto* A_bstrides = batch_strides;
@@ -270,35 +277,79 @@ template <
     C += tm * addmm_params->ldc + tn * addmm_params->fdc;
   }
 
+  const device T* sm_stats = nullptr;
+  if constexpr (kSoftmaxLoaderEligible) {
+    if (use_out_source) {
+      if (do_axpby && addmm_params->fdc == 0 && addmm_params->ldc == 4 &&
+          addmm_params->alpha == 1.0f &&
+          as_type<uint>(addmm_params->beta) == 0x80000000u) {
+        softmax_loader = true;
+        sm_stats = C;
+      }
+    }
+  }
+
   NAXTile<AccumType, TM, TN> Dtile;
 
   dispatch_bool(align_K, [&](auto kAlignedK) {
     dispatch_bool(align_M || !is_unaligned_sm, [&](auto kAlignedM) {
       dispatch_bool(align_N || !is_unaligned_sn, [&](auto kAlignedN) {
-        Dtile = gemm_loop<
-            T,
-            SM,
-            SN,
-            SK,
-            BK,
-            transpose_a,
-            transpose_b,
-            kAlignedM.value,
-            kAlignedN.value,
-            kAlignedK.value,
-            AccumType>(
-            A,
-            B,
-            params->lda,
-            params->ldb,
-            params->K,
-            params->gemm_k_iterations_aligned,
-            sgp_sm,
-            sgp_sn);
+        bool loop_done = false;
+        if constexpr (kSoftmaxLoaderEligible) {
+          if (softmax_loader) {
+            // PREFILL-ATTN-TRAFFIC (at1): the softmax-in-loader twin.
+            Dtile = gemm_loop_softmax<
+                T,
+                SM,
+                SN,
+                SK,
+                BK,
+                transpose_a,
+                transpose_b,
+                kAlignedM.value,
+                kAlignedN.value,
+                kAlignedK.value,
+                AccumType>(
+                A,
+                B,
+                params->lda,
+                params->ldb,
+                params->K,
+                params->gemm_k_iterations_aligned,
+                sgp_sm,
+                sgp_sn,
+                sm_stats);
+            loop_done = true;
+          }
+        }
+        if (!loop_done) {
+          Dtile = gemm_loop<
+              T,
+              SM,
+              SN,
+              SK,
+              BK,
+              transpose_a,
+              transpose_b,
+              kAlignedM.value,
+              kAlignedN.value,
+              kAlignedK.value,
+              AccumType>(
+              A,
+              B,
+              params->lda,
+              params->ldb,
+              params->K,
+              params->gemm_k_iterations_aligned,
+              sgp_sm,
+              sgp_sn);
+        }
         if ((DARKBLOOM_GEMMA4_NAX_SKIP_EMPTY == 0) ||
             ((kAlignedM.value || sgp_sm > 0) &&
              (kAlignedN.value || sgp_sn > 0))) {
-          if (use_out_source) {
+          // PREFILL-ATTN-TRAFFIC (at1): a consumed statistics operand adds
+          // nothing; the tile is stored as the plain matmul stores it.
+          if (use_out_source && !softmax_loader) {
             bool synthesized = false;
             if constexpr (kCausalBiasSynthEligible) {
               if (!do_axpby && kAlignedM.value && kAlignedN.value &&

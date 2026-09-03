@@ -2201,12 +2201,122 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
         return value >= 2
     }()
 
+    /// SLIDING-WALK TRANSFORMS. A clamped level, in the shape of the
+    /// `DARKBLOOM_CBV2_SLIDING_PREFETCH_DEPTH` ladder above, selecting which of
+    /// two independent bit-exact reformulations of the walk are emitted:
+    ///
+    ///   0  neither -- the promoted SPD2 emission, byte for byte
+    ///   1  PNIB only                                          (DEFAULT)
+    ///   2  PEEL-GUARD only
+    ///   3  PEEL-GUARD + PNIB
+    ///
+    /// Both transforms are bit-exact and both are compiled in, so any of the
+    /// four arms can be selected on a measuring box WITHOUT A REBUILD, and a
+    /// ranked regression can be bisected to a component after the fact.
+    ///
+    /// The default is ONE, not three, and that is a deliberate retreat. See
+    /// `residentPeelGuard` for why.
+    static let slidingWalkTransformLevel: Int = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_SLIDING_WALK_TRANSFORMS"], let value = Int(raw)
+        else { return 1 }
+        return min(max(value, 0), 3)
+    }()
+
+    /// PNIB -- PAIRED NIBBLE UNPACK. On at levels one and three.
+    ///
+    /// The walk unpacks eight 4-bit weights out of one `uint32` per lane per
+    /// token, twice (K for the score, V for the accumulate). The shipped form
+    /// is eight independent scalar chains of shift, mask, integer-to-float,
+    /// `fma`. The integer-to-float conversions are the part that does not
+    /// vectorise on its own, and there are sixteen of them per token step.
+    ///
+    /// This replaces the eight conversions with four `half2` extractions.
+    /// `0x6400` is `1024.0h`; OR-ing a 4-bit nibble `n` into the mantissa of
+    /// `1024.0h` yields exactly `1024 + n`, because every integer in
+    /// `[1024, 2047]` is exactly representable in binary16. Subtracting
+    /// `1024.0h` is then exact by Sterbenz's lemma, since the operands are
+    /// within a factor of two. So `float(nib)` is bit-identical to
+    /// `float(nibble)` and the SAME `fma(., scale, bias)` follows it, in the
+    /// SAME element order, feeding the SAME accumulation loop.
+    ///
+    /// This is a bit-exact reformulation of the UNPACK ONLY. It forms no
+    /// address, moves no load, changes no branch and reorders no accumulation,
+    /// so it is in none of the currencies this project has measured failing to
+    /// transfer.
+    ///
+    /// > There is a faster-looking variant that folds the constant into the
+    /// > bias as `bias2 = fma(scale, -1024.0f, bias)` and drops the half2
+    /// > subtract. It measures four fewer AIR instructions. It is NOT
+    /// > bit-exact: it rounds twice, and `1024 * scale + n * scale` is not
+    /// > `n * scale + bias` in float. Do not substitute it.
+    ///
+    /// Measured on the real walk body, `-fno-fast-math`: registers 83 -> 80 on
+    /// applegpu_g18p and 81 -> 81 on g17p, kernel text -60 B on g18p and +18 B
+    /// on g17p. It is the only arm here that costs no registers on EITHER
+    /// generation. Verified bit-identical to the shipped kernel on all thirteen
+    /// output buffers, on hardware, under both `-fno-fast-math` and
+    /// `-ffast-math`.
+    static var residentPairedNibbleUnpack: Bool {
+        slidingWalkTransformLevel == 1 || slidingWalkTransformLevel == 3
+    }
+
+    /// PEEL-GUARD. On at levels two and three. OFF BY DEFAULT.
+    ///
+    /// Every phase of every outer step with `token < N - 2 * PF * BLOCKS`
+    /// satisfies both `tok != N - 1` and `tok + PF * BLOCKS < N - 1`. The
+    /// largest `tok` such a step reaches is `token + (PF - 1) * BLOCKS`, and
+    /// `token <= N - 2 * PF * BLOCKS - 1`, so the largest re-issue address
+    /// tested is `N - 1 - BLOCKS`, strictly below `N - 1` for every
+    /// `BLOCKS >= 1`. Both predicates are therefore compile-time constants over
+    /// that range, and splitting the index set there gives a free body -- no
+    /// current-token test, no four selects, no re-issue branch -- for 124 of
+    /// the 128 token steps at the shipped `N = 1024`, `BLOCKS = 8`, `PF = 2`.
+    /// The index set is unchanged: both loops advance the same `token` by the
+    /// same stride and the tail resumes where the peeled loop exited. Proved
+    /// over 193,908 shapes; `2 * PF * BLOCKS` is the MINIMUM safe peel, a
+    /// one-step peel is unsound.
+    ///
+    /// > OFF BY DEFAULT, and the reason is a ranked measurement, not a local
+    /// > one. WALK-INSTR -- which retired the same per-token current-token test
+    /// > and the same re-issue branch from this same kernel, and which measured
+    /// > -2.84% in-kernel locally -- came back +0.49% SLOWER on the ranked box
+    /// > against a 0.28% detection bar. WRITE-021 paid -1.34% for an addressing
+    /// > perturbation in a neighbouring inner loop. This kernel punishes
+    /// > control and addressing restructuring on ranked hardware even when the
+    /// > restructuring is provably cheaper in issued instructions locally.
+    /// >
+    /// > PEEL-GUARD is in that same currency, and it carries the same register
+    /// > signature: WALK-INSTR's base-fold arm went 81 -> 84 on g17p, and
+    /// > PEEL-GUARD goes 81 -> 84 on g17p alone and 81 -> 86 combined with
+    /// > PNIB. Its local benefit is also sharply occupancy-dependent -- worth
+    /// > -5% to -6% net of an A/A null on an under-occupied GPU, and null to
+    /// > POSITIVE at one and two threadgroups per core, which is where the
+    /// > ranked dispatch actually sits.
+    /// >
+    /// > It is compiled in and one environment variable away, so it can be
+    /// > measured on the ranked box directly rather than inferred. It is not
+    /// > shipped on by default on this evidence.
+    static var residentPeelGuard: Bool { slidingWalkTransformLevel >= 2 }
+
     /// MLX keys its custom-kernel library cache by kernel NAME and re-JITs a
     /// name whose generated source changed (`backend/metal/custom_kernel.cpp`
     /// `:56-70`, `device.cpp:770-796`), so a changed body takes a changed
     /// name. Empty on the depth-one arm, which therefore keeps the incumbent
     /// registrations character for character.
-    private static let slidingPrefetchKey = slidingPrefetchDepth2 ? "_spd2" : ""
+    ///
+    /// Every distinct walk body gets a distinct suffix, so no changed body can
+    /// ever be served under an incumbent name: `""` for the shipped depth-one
+    /// walk, `"_spd2"` for the promoted depth-two walk, and one added token per
+    /// transform that is actually on. With both new transforms off the suffix
+    /// is byte-identical to the promoted `"_spd2"`, and on the depth-one arm to
+    /// the incumbent `""`.
+    private static let slidingPrefetchKey: String = {
+        var key = slidingPrefetchDepth2 ? "_spd2" : ""
+        if slidingPrefetchDepth2 && residentPeelGuard { key += "_pl1" }
+        if residentPairedNibbleUnpack { key += "_pn1" }
+        return key
+    }()
 
     /// The shipped depth-one ring walk, verbatim.
     private static let residentSlidingWalkDepth1 = """
@@ -2278,6 +2388,99 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                             + score_factor_lo * value_element;
                         acc_hi[element] = acc_hi[element] * old_factor_hi
                             + score_factor_hi * value_element;
+                    }
+                }
+            """
+
+    /// The shipped depth-one ring walk with PNIB. Identical in every respect
+    /// except the 4-bit unpack; kept in step with the depth-two arm so that
+    /// `DARKBLOOM_CBV2_SLIDING_PREFETCH_DEPTH=1` does not silently diverge from
+    /// the default depth-two emission.
+    private static let residentSlidingWalkDepth1Paired = """
+            uint slot = (start + uint(block)) % uint(N);
+                const bool prefetch_first = block < N - 1;
+                uint next_slot = slot + uint(BLOCKS);
+                if (next_slot >= uint(N)) next_slot -= uint(N);
+                uint32_t kw_pre = prefetch_first
+                    ? mkeys_w[slot * row_words + lane] : 0u;
+                uint32_t vw_pre = prefetch_first
+                    ? mvalues_w[slot * row_words + lane] : 0u;
+                uint32_t ktw_pre = prefetch_first
+                    ? mkeys_w[slot * row_words + payload_words + lane / 8] : 0u;
+                uint32_t vtw_pre = prefetch_first
+                    ? mvalues_w[slot * row_words + payload_words + lane / 8] : 0u;
+                for (int token = block; token < N; token += BLOCKS) {
+                    const bool current = token == N - 1;
+                    const uint32_t kw = current ? kword : kw_pre;
+                    const uint32_t vw = current ? vword : vw_pre;
+                    const uint32_t ktw = current
+                        ? (uint32_t(as_type<ushort>(khs))
+                            | (uint32_t(as_type<ushort>(khb)) << 16))
+                        : ktw_pre;
+                    const uint32_t vtw = current
+                        ? (uint32_t(as_type<ushort>(vhs))
+                            | (uint32_t(as_type<ushort>(vhb)) << 16))
+                        : vtw_pre;
+                    if (token + BLOCKS < N - 1) {
+                        kw_pre = mkeys_w[next_slot * row_words + lane];
+                        vw_pre = mvalues_w[next_slot * row_words + lane];
+                        ktw_pre =
+                            mkeys_w[next_slot * row_words + payload_words + lane / 8];
+                        vtw_pre =
+                            mvalues_w[next_slot * row_words + payload_words + lane / 8];
+                        next_slot += uint(BLOCKS);
+                        if (next_slot >= uint(N)) next_slot -= uint(N);
+                    }
+                    const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
+                    const float kb = float(as_type<half>(ushort(ktw >> 16)));
+                    const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
+                    const float vb = float(as_type<half>(ushort(vtw >> 16)));
+                    float score_lo = 0.0f;
+                    float score_hi = 0.0f;
+                    float key_el[values_per_lane];
+                    #pragma clang loop unroll(full)
+                    for (int p = 0; p < values_per_lane / 2; ++p) {
+                        const half2 nib = as_type<half2>(
+                            (((kw >> (4 * p)) & 0xfu)
+                             | (((kw >> (4 * p + 16)) & 0xfu) << 16))
+                            | 0x64006400u) - half2(1024.0h, 1024.0h);
+                        key_el[p] = fma(float(nib.x), ks, kb);
+                        key_el[p + values_per_lane / 2] = fma(float(nib.y), ks, kb);
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        score_lo += q_lo[element] * key_el[element];
+                        score_hi += q_hi[element] * key_el[element];
+                    }
+                    score_lo = simd_sum(score_lo);
+                    score_hi = simd_sum(score_hi);
+
+                    const float new_max_lo = max(max_lo, score_lo);
+                    const float new_max_hi = max(max_hi, score_hi);
+                    const float old_factor_lo = fast::exp(max_lo - new_max_lo);
+                    const float old_factor_hi = fast::exp(max_hi - new_max_hi);
+                    const float score_factor_lo = fast::exp(score_lo - new_max_lo);
+                    const float score_factor_hi = fast::exp(score_hi - new_max_hi);
+                    max_lo = new_max_lo;
+                    max_hi = new_max_hi;
+                    sum_lo = sum_lo * old_factor_lo + score_factor_lo;
+                    sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                    float val_el[values_per_lane];
+                    #pragma clang loop unroll(full)
+                    for (int p = 0; p < values_per_lane / 2; ++p) {
+                        const half2 nib = as_type<half2>(
+                            (((vw >> (4 * p)) & 0xfu)
+                             | (((vw >> (4 * p + 16)) & 0xfu) << 16))
+                            | 0x64006400u) - half2(1024.0h, 1024.0h);
+                        val_el[p] = fma(float(nib.x), vs, vb);
+                        val_el[p + values_per_lane / 2] = fma(float(nib.y), vs, vb);
+                    }
+                    #pragma clang loop unroll(full)
+                    for (int element = 0; element < values_per_lane; ++element) {
+                        acc_lo[element] = acc_lo[element] * old_factor_lo
+                            + score_factor_lo * val_el[element];
+                        acc_hi[element] = acc_hi[element] * old_factor_hi
+                            + score_factor_hi * val_el[element];
                     }
                 }
             """
@@ -2391,9 +2594,523 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 }
             """
 
+    /// SPD2 + PNIB. The depth-two walk with the paired nibble unpack and no
+    /// index-set change. This is the arm that isolates PNIB.
+    private static let residentSlidingWalkDepth2Paired = """
+            uint slot = (start + uint(block)) % uint(N);
+                // SLIDING-PREFETCH-DEPTH. `PF` iterations of the walk are outstanding
+                // instead of one. `kw_pre[u]` is a PHASE register, not a stage of a copy
+                // chain: the inner loop is fully unrolled at compile time, so the word
+                // loaded into `kw_pre[u]` on one outer step is consumed by that same
+                // `kw_pre[u]` PF token steps later with no register move in between. A
+                // rotating `A = B` pair would resolve B's load one step early and buy no
+                // latency cover at all.
+                //
+                // `block` is `simdgroup_index_in_threadgroup` over a `BLOCKS * 32` thread
+                // group, so `0 <= block < BLOCKS`; with `N % (PF * BLOCKS) == 0` the outer
+                // loop runs `N / (PF * BLOCKS)` times and the inner phase never steps past
+                // the ring, exactly as the one-stage walk did.
+                //
+                // A position `t` is walked, and is not the current token, precisely when
+                // `t < N - 1`. That one predicate is the seed guard, the re-issue guard,
+                // and the shipped `token + BLOCKS < N - 1` alike. The current token is
+                // served from `kword`/`vword` and its slot is the one this kernel stores
+                // into, so no address formed here is a slot the one-stage walk did not
+                // also read, in the same order, exactly once.
+                constexpr int PF = 2;
+                static_assert(N % (PF * BLOCKS) == 0,
+                    "depth-two walk needs an even number of token steps");
+                uint pf_slot = slot;
+                thread uint32_t kw_pre[PF];
+                thread uint32_t vw_pre[PF];
+                thread uint32_t ktw_pre[PF];
+                thread uint32_t vtw_pre[PF];
+                #pragma clang loop unroll(full)
+                for (int u = 0; u < PF; ++u) {
+                    const bool prefetch_first = block + u * BLOCKS < N - 1;
+                    kw_pre[u] = prefetch_first
+                        ? mkeys_w[pf_slot * row_words + lane] : 0u;
+                    vw_pre[u] = prefetch_first
+                        ? mvalues_w[pf_slot * row_words + lane] : 0u;
+                    ktw_pre[u] = prefetch_first
+                        ? mkeys_w[pf_slot * row_words + payload_words + lane / 8] : 0u;
+                    vtw_pre[u] = prefetch_first
+                        ? mvalues_w[pf_slot * row_words + payload_words + lane / 8] : 0u;
+                    pf_slot += uint(BLOCKS);
+                    if (pf_slot >= uint(N)) pf_slot -= uint(N);
+                }
+                uint next_slot = pf_slot;
+                for (int token = block; token < N; token += PF * BLOCKS) {
+                    #pragma clang loop unroll(full)
+                    for (int u = 0; u < PF; ++u) {
+                        const int tok = token + u * BLOCKS;
+                        const bool current = tok == N - 1;
+                        const uint32_t kw = current ? kword : kw_pre[u];
+                        const uint32_t vw = current ? vword : vw_pre[u];
+                        const uint32_t ktw = current
+                            ? (uint32_t(as_type<ushort>(khs))
+                                | (uint32_t(as_type<ushort>(khb)) << 16))
+                            : ktw_pre[u];
+                        const uint32_t vtw = current
+                            ? (uint32_t(as_type<ushort>(vhs))
+                                | (uint32_t(as_type<ushort>(vhb)) << 16))
+                            : vtw_pre[u];
+                        if (tok + PF * BLOCKS < N - 1) {
+                            kw_pre[u] = mkeys_w[next_slot * row_words + lane];
+                            vw_pre[u] = mvalues_w[next_slot * row_words + lane];
+                            ktw_pre[u] =
+                                mkeys_w[next_slot * row_words + payload_words + lane / 8];
+                            vtw_pre[u] =
+                                mvalues_w[next_slot * row_words + payload_words + lane / 8];
+                            next_slot += uint(BLOCKS);
+                            if (next_slot >= uint(N)) next_slot -= uint(N);
+                        }
+                        const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
+                        const float kb = float(as_type<half>(ushort(ktw >> 16)));
+                        const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
+                        const float vb = float(as_type<half>(ushort(vtw >> 16)));
+                        float score_lo = 0.0f;
+                        float score_hi = 0.0f;
+                        float key_el[values_per_lane];
+                        #pragma clang loop unroll(full)
+                        for (int p = 0; p < values_per_lane / 2; ++p) {
+                            const half2 nib = as_type<half2>(
+                                (((kw >> (4 * p)) & 0xfu)
+                                 | (((kw >> (4 * p + 16)) & 0xfu) << 16))
+                                | 0x64006400u) - half2(1024.0h, 1024.0h);
+                            key_el[p] = fma(float(nib.x), ks, kb);
+                            key_el[p + values_per_lane / 2] = fma(float(nib.y), ks, kb);
+                        }
+                        #pragma clang loop unroll(full)
+                        for (int element = 0; element < values_per_lane; ++element) {
+                            score_lo += q_lo[element] * key_el[element];
+                            score_hi += q_hi[element] * key_el[element];
+                        }
+                        score_lo = simd_sum(score_lo);
+                        score_hi = simd_sum(score_hi);
+
+                        const float new_max_lo = max(max_lo, score_lo);
+                        const float new_max_hi = max(max_hi, score_hi);
+                        const float old_factor_lo = fast::exp(max_lo - new_max_lo);
+                        const float old_factor_hi = fast::exp(max_hi - new_max_hi);
+                        const float score_factor_lo = fast::exp(score_lo - new_max_lo);
+                        const float score_factor_hi = fast::exp(score_hi - new_max_hi);
+                        max_lo = new_max_lo;
+                        max_hi = new_max_hi;
+                        sum_lo = sum_lo * old_factor_lo + score_factor_lo;
+                        sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                        float val_el[values_per_lane];
+                        #pragma clang loop unroll(full)
+                        for (int p = 0; p < values_per_lane / 2; ++p) {
+                            const half2 nib = as_type<half2>(
+                                (((vw >> (4 * p)) & 0xfu)
+                                 | (((vw >> (4 * p + 16)) & 0xfu) << 16))
+                                | 0x64006400u) - half2(1024.0h, 1024.0h);
+                            val_el[p] = fma(float(nib.x), vs, vb);
+                            val_el[p + values_per_lane / 2] = fma(float(nib.y), vs, vb);
+                        }
+                        #pragma clang loop unroll(full)
+                        for (int element = 0; element < values_per_lane; ++element) {
+                            acc_lo[element] = acc_lo[element] * old_factor_lo
+                                + score_factor_lo * val_el[element];
+                            acc_hi[element] = acc_hi[element] * old_factor_hi
+                                + score_factor_hi * val_el[element];
+                        }
+                    }
+                }
+            """
+
+    /// SPD2 + PEEL-GUARD. The depth-two walk with the index set split and the
+    /// shipped scalar unpack. This is the arm that isolates PEEL-GUARD.
+    private static let residentSlidingWalkDepth2Peeled = """
+            uint slot = (start + uint(block)) % uint(N);
+                // SLIDING-PREFETCH-DEPTH. `PF` iterations of the walk are outstanding
+                // instead of one. `kw_pre[u]` is a PHASE register, not a stage of a copy
+                // chain: the inner loop is fully unrolled at compile time, so the word
+                // loaded into `kw_pre[u]` on one outer step is consumed by that same
+                // `kw_pre[u]` PF token steps later with no register move in between. A
+                // rotating `A = B` pair would resolve B's load one step early and buy no
+                // latency cover at all.
+                //
+                // `block` is `simdgroup_index_in_threadgroup` over a `BLOCKS * 32` thread
+                // group, so `0 <= block < BLOCKS`; with `N % (PF * BLOCKS) == 0` the outer
+                // loop runs `N / (PF * BLOCKS)` times and the inner phase never steps past
+                // the ring, exactly as the one-stage walk did.
+                //
+                // A position `t` is walked, and is not the current token, precisely when
+                // `t < N - 1`. That one predicate is the seed guard, the re-issue guard,
+                // and the shipped `token + BLOCKS < N - 1` alike. The current token is
+                // served from `kword`/`vword` and its slot is the one this kernel stores
+                // into, so no address formed here is a slot the one-stage walk did not
+                // also read, in the same order, exactly once.
+                constexpr int PF = 2;
+                static_assert(N % (PF * BLOCKS) == 0,
+                    "depth-two walk needs an even number of token steps");
+                uint pf_slot = slot;
+                thread uint32_t kw_pre[PF];
+                thread uint32_t vw_pre[PF];
+                thread uint32_t ktw_pre[PF];
+                thread uint32_t vtw_pre[PF];
+                #pragma clang loop unroll(full)
+                for (int u = 0; u < PF; ++u) {
+                    const bool prefetch_first = block + u * BLOCKS < N - 1;
+                    kw_pre[u] = prefetch_first
+                        ? mkeys_w[pf_slot * row_words + lane] : 0u;
+                    vw_pre[u] = prefetch_first
+                        ? mvalues_w[pf_slot * row_words + lane] : 0u;
+                    ktw_pre[u] = prefetch_first
+                        ? mkeys_w[pf_slot * row_words + payload_words + lane / 8] : 0u;
+                    vtw_pre[u] = prefetch_first
+                        ? mvalues_w[pf_slot * row_words + payload_words + lane / 8] : 0u;
+                    pf_slot += uint(BLOCKS);
+                    if (pf_slot >= uint(N)) pf_slot -= uint(N);
+                }
+                uint next_slot = pf_slot;
+                // PEEL-GUARD. Every phase of every outer step with
+                // `token < N - 2*PF*BLOCKS` satisfies both `tok < N - 1` and
+                // `tok + PF*BLOCKS < N - 1`, because the largest `tok` such a
+                // step reaches is `token + (PF-1)*BLOCKS + BLOCKS - 1` and
+                // `block < BLOCKS`. Splitting the index set there makes the
+                // current-token test AND the re-issue test compile-time
+                // constants in the steady state; the last two outer steps run
+                // the shipped guarded body character for character.
+                int token = block;
+                for (; token < N - 2 * PF * BLOCKS; token += PF * BLOCKS) {
+                    #pragma clang loop unroll(full)
+                    for (int u = 0; u < PF; ++u) {
+                        const uint32_t kw = kw_pre[u];
+                        const uint32_t vw = vw_pre[u];
+                        const uint32_t ktw = ktw_pre[u];
+                        const uint32_t vtw = vtw_pre[u];
+                        kw_pre[u] = mkeys_w[next_slot * row_words + lane];
+                        vw_pre[u] = mvalues_w[next_slot * row_words + lane];
+                        ktw_pre[u] =
+                            mkeys_w[next_slot * row_words + payload_words + lane / 8];
+                        vtw_pre[u] =
+                            mvalues_w[next_slot * row_words + payload_words + lane / 8];
+                        next_slot += uint(BLOCKS);
+                        if (next_slot >= uint(N)) next_slot -= uint(N);
+                        const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
+                        const float kb = float(as_type<half>(ushort(ktw >> 16)));
+                        const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
+                        const float vb = float(as_type<half>(ushort(vtw >> 16)));
+                        float score_lo = 0.0f;
+                        float score_hi = 0.0f;
+                        #pragma clang loop unroll(full)
+                        for (int element = 0; element < values_per_lane; ++element) {
+                            const float key_element =
+                                fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
+                            score_lo += q_lo[element] * key_element;
+                            score_hi += q_hi[element] * key_element;
+                        }
+                        score_lo = simd_sum(score_lo);
+                        score_hi = simd_sum(score_hi);
+
+                        const float new_max_lo = max(max_lo, score_lo);
+                        const float new_max_hi = max(max_hi, score_hi);
+                        const float old_factor_lo = fast::exp(max_lo - new_max_lo);
+                        const float old_factor_hi = fast::exp(max_hi - new_max_hi);
+                        const float score_factor_lo = fast::exp(score_lo - new_max_lo);
+                        const float score_factor_hi = fast::exp(score_hi - new_max_hi);
+                        max_lo = new_max_lo;
+                        max_hi = new_max_hi;
+                        sum_lo = sum_lo * old_factor_lo + score_factor_lo;
+                        sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                        #pragma clang loop unroll(full)
+                        for (int element = 0; element < values_per_lane; ++element) {
+                            const float value_element =
+                                fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
+                            acc_lo[element] = acc_lo[element] * old_factor_lo
+                                + score_factor_lo * value_element;
+                            acc_hi[element] = acc_hi[element] * old_factor_hi
+                                + score_factor_hi * value_element;
+                        }
+                    }
+                }
+                for (; token < N; token += PF * BLOCKS) {
+                    #pragma clang loop unroll(full)
+                    for (int u = 0; u < PF; ++u) {
+                        const int tok = token + u * BLOCKS;
+                        const bool current = tok == N - 1;
+                        const uint32_t kw = current ? kword : kw_pre[u];
+                        const uint32_t vw = current ? vword : vw_pre[u];
+                        const uint32_t ktw = current
+                            ? (uint32_t(as_type<ushort>(khs))
+                                | (uint32_t(as_type<ushort>(khb)) << 16))
+                            : ktw_pre[u];
+                        const uint32_t vtw = current
+                            ? (uint32_t(as_type<ushort>(vhs))
+                                | (uint32_t(as_type<ushort>(vhb)) << 16))
+                            : vtw_pre[u];
+                        if (tok + PF * BLOCKS < N - 1) {
+                            kw_pre[u] = mkeys_w[next_slot * row_words + lane];
+                            vw_pre[u] = mvalues_w[next_slot * row_words + lane];
+                            ktw_pre[u] =
+                                mkeys_w[next_slot * row_words + payload_words + lane / 8];
+                            vtw_pre[u] =
+                                mvalues_w[next_slot * row_words + payload_words + lane / 8];
+                            next_slot += uint(BLOCKS);
+                            if (next_slot >= uint(N)) next_slot -= uint(N);
+                        }
+                        const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
+                        const float kb = float(as_type<half>(ushort(ktw >> 16)));
+                        const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
+                        const float vb = float(as_type<half>(ushort(vtw >> 16)));
+                        float score_lo = 0.0f;
+                        float score_hi = 0.0f;
+                        #pragma clang loop unroll(full)
+                        for (int element = 0; element < values_per_lane; ++element) {
+                            const float key_element =
+                                fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
+                            score_lo += q_lo[element] * key_element;
+                            score_hi += q_hi[element] * key_element;
+                        }
+                        score_lo = simd_sum(score_lo);
+                        score_hi = simd_sum(score_hi);
+
+                        const float new_max_lo = max(max_lo, score_lo);
+                        const float new_max_hi = max(max_hi, score_hi);
+                        const float old_factor_lo = fast::exp(max_lo - new_max_lo);
+                        const float old_factor_hi = fast::exp(max_hi - new_max_hi);
+                        const float score_factor_lo = fast::exp(score_lo - new_max_lo);
+                        const float score_factor_hi = fast::exp(score_hi - new_max_hi);
+                        max_lo = new_max_lo;
+                        max_hi = new_max_hi;
+                        sum_lo = sum_lo * old_factor_lo + score_factor_lo;
+                        sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                        #pragma clang loop unroll(full)
+                        for (int element = 0; element < values_per_lane; ++element) {
+                            const float value_element =
+                                fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
+                            acc_lo[element] = acc_lo[element] * old_factor_lo
+                                + score_factor_lo * value_element;
+                            acc_hi[element] = acc_hi[element] * old_factor_hi
+                                + score_factor_hi * value_element;
+                        }
+                    }
+                }
+            """
+
+    /// SPD2 + PEEL-GUARD + PNIB -- the default emission.
+    ///
+    /// The two transforms are super-additive on hardware: measured
+    /// individually at the fat threadgroup point they are worth about -5.3%
+    /// and -5.6% net of an A/A null, and together about -12.5%. PEEL-GUARD
+    /// shortens the dependent guard chain that PNIB's shorter unpack would
+    /// otherwise stall behind, and PNIB frees the registers PEEL-GUARD's
+    /// second loop body wants.
+    private static let residentSlidingWalkDepth2PeeledPaired = """
+            uint slot = (start + uint(block)) % uint(N);
+                // SLIDING-PREFETCH-DEPTH. `PF` iterations of the walk are outstanding
+                // instead of one. `kw_pre[u]` is a PHASE register, not a stage of a copy
+                // chain: the inner loop is fully unrolled at compile time, so the word
+                // loaded into `kw_pre[u]` on one outer step is consumed by that same
+                // `kw_pre[u]` PF token steps later with no register move in between. A
+                // rotating `A = B` pair would resolve B's load one step early and buy no
+                // latency cover at all.
+                //
+                // `block` is `simdgroup_index_in_threadgroup` over a `BLOCKS * 32` thread
+                // group, so `0 <= block < BLOCKS`; with `N % (PF * BLOCKS) == 0` the outer
+                // loop runs `N / (PF * BLOCKS)` times and the inner phase never steps past
+                // the ring, exactly as the one-stage walk did.
+                //
+                // A position `t` is walked, and is not the current token, precisely when
+                // `t < N - 1`. That one predicate is the seed guard, the re-issue guard,
+                // and the shipped `token + BLOCKS < N - 1` alike. The current token is
+                // served from `kword`/`vword` and its slot is the one this kernel stores
+                // into, so no address formed here is a slot the one-stage walk did not
+                // also read, in the same order, exactly once.
+                constexpr int PF = 2;
+                static_assert(N % (PF * BLOCKS) == 0,
+                    "depth-two walk needs an even number of token steps");
+                uint pf_slot = slot;
+                thread uint32_t kw_pre[PF];
+                thread uint32_t vw_pre[PF];
+                thread uint32_t ktw_pre[PF];
+                thread uint32_t vtw_pre[PF];
+                #pragma clang loop unroll(full)
+                for (int u = 0; u < PF; ++u) {
+                    const bool prefetch_first = block + u * BLOCKS < N - 1;
+                    kw_pre[u] = prefetch_first
+                        ? mkeys_w[pf_slot * row_words + lane] : 0u;
+                    vw_pre[u] = prefetch_first
+                        ? mvalues_w[pf_slot * row_words + lane] : 0u;
+                    ktw_pre[u] = prefetch_first
+                        ? mkeys_w[pf_slot * row_words + payload_words + lane / 8] : 0u;
+                    vtw_pre[u] = prefetch_first
+                        ? mvalues_w[pf_slot * row_words + payload_words + lane / 8] : 0u;
+                    pf_slot += uint(BLOCKS);
+                    if (pf_slot >= uint(N)) pf_slot -= uint(N);
+                }
+                uint next_slot = pf_slot;
+                // PEEL-GUARD. Every phase of every outer step with
+                // `token < N - 2*PF*BLOCKS` satisfies both `tok < N - 1` and
+                // `tok + PF*BLOCKS < N - 1`, because the largest `tok` such a
+                // step reaches is `token + (PF-1)*BLOCKS + BLOCKS - 1` and
+                // `block < BLOCKS`. Splitting the index set there makes the
+                // current-token test AND the re-issue test compile-time
+                // constants in the steady state; the last two outer steps run
+                // the shipped guarded body character for character.
+                int token = block;
+                for (; token < N - 2 * PF * BLOCKS; token += PF * BLOCKS) {
+                    #pragma clang loop unroll(full)
+                    for (int u = 0; u < PF; ++u) {
+                        const uint32_t kw = kw_pre[u];
+                        const uint32_t vw = vw_pre[u];
+                        const uint32_t ktw = ktw_pre[u];
+                        const uint32_t vtw = vtw_pre[u];
+                        kw_pre[u] = mkeys_w[next_slot * row_words + lane];
+                        vw_pre[u] = mvalues_w[next_slot * row_words + lane];
+                        ktw_pre[u] =
+                            mkeys_w[next_slot * row_words + payload_words + lane / 8];
+                        vtw_pre[u] =
+                            mvalues_w[next_slot * row_words + payload_words + lane / 8];
+                        next_slot += uint(BLOCKS);
+                        if (next_slot >= uint(N)) next_slot -= uint(N);
+                        const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
+                        const float kb = float(as_type<half>(ushort(ktw >> 16)));
+                        const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
+                        const float vb = float(as_type<half>(ushort(vtw >> 16)));
+                        float score_lo = 0.0f;
+                        float score_hi = 0.0f;
+                        float key_el[values_per_lane];
+                        #pragma clang loop unroll(full)
+                        for (int p = 0; p < values_per_lane / 2; ++p) {
+                            const half2 nib = as_type<half2>(
+                                (((kw >> (4 * p)) & 0xfu)
+                                 | (((kw >> (4 * p + 16)) & 0xfu) << 16))
+                                | 0x64006400u) - half2(1024.0h, 1024.0h);
+                            key_el[p] = fma(float(nib.x), ks, kb);
+                            key_el[p + values_per_lane / 2] = fma(float(nib.y), ks, kb);
+                        }
+                        #pragma clang loop unroll(full)
+                        for (int element = 0; element < values_per_lane; ++element) {
+                            score_lo += q_lo[element] * key_el[element];
+                            score_hi += q_hi[element] * key_el[element];
+                        }
+                        score_lo = simd_sum(score_lo);
+                        score_hi = simd_sum(score_hi);
+
+                        const float new_max_lo = max(max_lo, score_lo);
+                        const float new_max_hi = max(max_hi, score_hi);
+                        const float old_factor_lo = fast::exp(max_lo - new_max_lo);
+                        const float old_factor_hi = fast::exp(max_hi - new_max_hi);
+                        const float score_factor_lo = fast::exp(score_lo - new_max_lo);
+                        const float score_factor_hi = fast::exp(score_hi - new_max_hi);
+                        max_lo = new_max_lo;
+                        max_hi = new_max_hi;
+                        sum_lo = sum_lo * old_factor_lo + score_factor_lo;
+                        sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                        float val_el[values_per_lane];
+                        #pragma clang loop unroll(full)
+                        for (int p = 0; p < values_per_lane / 2; ++p) {
+                            const half2 nib = as_type<half2>(
+                                (((vw >> (4 * p)) & 0xfu)
+                                 | (((vw >> (4 * p + 16)) & 0xfu) << 16))
+                                | 0x64006400u) - half2(1024.0h, 1024.0h);
+                            val_el[p] = fma(float(nib.x), vs, vb);
+                            val_el[p + values_per_lane / 2] = fma(float(nib.y), vs, vb);
+                        }
+                        #pragma clang loop unroll(full)
+                        for (int element = 0; element < values_per_lane; ++element) {
+                            acc_lo[element] = acc_lo[element] * old_factor_lo
+                                + score_factor_lo * val_el[element];
+                            acc_hi[element] = acc_hi[element] * old_factor_hi
+                                + score_factor_hi * val_el[element];
+                        }
+                    }
+                }
+                for (; token < N; token += PF * BLOCKS) {
+                    #pragma clang loop unroll(full)
+                    for (int u = 0; u < PF; ++u) {
+                        const int tok = token + u * BLOCKS;
+                        const bool current = tok == N - 1;
+                        const uint32_t kw = current ? kword : kw_pre[u];
+                        const uint32_t vw = current ? vword : vw_pre[u];
+                        const uint32_t ktw = current
+                            ? (uint32_t(as_type<ushort>(khs))
+                                | (uint32_t(as_type<ushort>(khb)) << 16))
+                            : ktw_pre[u];
+                        const uint32_t vtw = current
+                            ? (uint32_t(as_type<ushort>(vhs))
+                                | (uint32_t(as_type<ushort>(vhb)) << 16))
+                            : vtw_pre[u];
+                        if (tok + PF * BLOCKS < N - 1) {
+                            kw_pre[u] = mkeys_w[next_slot * row_words + lane];
+                            vw_pre[u] = mvalues_w[next_slot * row_words + lane];
+                            ktw_pre[u] =
+                                mkeys_w[next_slot * row_words + payload_words + lane / 8];
+                            vtw_pre[u] =
+                                mvalues_w[next_slot * row_words + payload_words + lane / 8];
+                            next_slot += uint(BLOCKS);
+                            if (next_slot >= uint(N)) next_slot -= uint(N);
+                        }
+                        const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
+                        const float kb = float(as_type<half>(ushort(ktw >> 16)));
+                        const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
+                        const float vb = float(as_type<half>(ushort(vtw >> 16)));
+                        float score_lo = 0.0f;
+                        float score_hi = 0.0f;
+                        float key_el[values_per_lane];
+                        #pragma clang loop unroll(full)
+                        for (int p = 0; p < values_per_lane / 2; ++p) {
+                            const half2 nib = as_type<half2>(
+                                (((kw >> (4 * p)) & 0xfu)
+                                 | (((kw >> (4 * p + 16)) & 0xfu) << 16))
+                                | 0x64006400u) - half2(1024.0h, 1024.0h);
+                            key_el[p] = fma(float(nib.x), ks, kb);
+                            key_el[p + values_per_lane / 2] = fma(float(nib.y), ks, kb);
+                        }
+                        #pragma clang loop unroll(full)
+                        for (int element = 0; element < values_per_lane; ++element) {
+                            score_lo += q_lo[element] * key_el[element];
+                            score_hi += q_hi[element] * key_el[element];
+                        }
+                        score_lo = simd_sum(score_lo);
+                        score_hi = simd_sum(score_hi);
+
+                        const float new_max_lo = max(max_lo, score_lo);
+                        const float new_max_hi = max(max_hi, score_hi);
+                        const float old_factor_lo = fast::exp(max_lo - new_max_lo);
+                        const float old_factor_hi = fast::exp(max_hi - new_max_hi);
+                        const float score_factor_lo = fast::exp(score_lo - new_max_lo);
+                        const float score_factor_hi = fast::exp(score_hi - new_max_hi);
+                        max_lo = new_max_lo;
+                        max_hi = new_max_hi;
+                        sum_lo = sum_lo * old_factor_lo + score_factor_lo;
+                        sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                        float val_el[values_per_lane];
+                        #pragma clang loop unroll(full)
+                        for (int p = 0; p < values_per_lane / 2; ++p) {
+                            const half2 nib = as_type<half2>(
+                                (((vw >> (4 * p)) & 0xfu)
+                                 | (((vw >> (4 * p + 16)) & 0xfu) << 16))
+                                | 0x64006400u) - half2(1024.0h, 1024.0h);
+                            val_el[p] = fma(float(nib.x), vs, vb);
+                            val_el[p + values_per_lane / 2] = fma(float(nib.y), vs, vb);
+                        }
+                        #pragma clang loop unroll(full)
+                        for (int element = 0; element < values_per_lane; ++element) {
+                            acc_lo[element] = acc_lo[element] * old_factor_lo
+                                + score_factor_lo * val_el[element];
+                            acc_hi[element] = acc_hi[element] * old_factor_hi
+                                + score_factor_hi * val_el[element];
+                        }
+                    }
+                }
+            """
+
     private static var residentSlidingWalk: String {
-        slidingPrefetchDepth2
-            ? residentSlidingWalkDepth2 : residentSlidingWalkDepth1
+        guard slidingPrefetchDepth2 else {
+            return residentPairedNibbleUnpack
+                ? residentSlidingWalkDepth1Paired : residentSlidingWalkDepth1
+        }
+        switch (residentPeelGuard, residentPairedNibbleUnpack) {
+        case (false, false): return residentSlidingWalkDepth2
+        case (false, true): return residentSlidingWalkDepth2Paired
+        case (true, false): return residentSlidingWalkDepth2Peeled
+        case (true, true): return residentSlidingWalkDepth2PeeledPaired
+        }
     }
 
     /// F4: exact decode Q/K/V normalization and sliding RoPE in the resident

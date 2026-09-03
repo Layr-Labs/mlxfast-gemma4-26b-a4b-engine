@@ -1673,6 +1673,38 @@ private func gemma4AttentionFallback(
 ///     NAX pair (`affine_qmm_t_nax` vs `steel_gemm_fused_nax`) is not
 ///     executable off the accelerator and is carried on the argument above.
 ///
+/// ## PLANE-NN: the cached plane stored in the orientation the GEMM reads
+///
+/// `dequantized` writes a plane as `[N, K]` (one row per output column) and
+/// the GEMM consumes it as B = `[K, N]`. The transposed VIEW keeps the
+/// `[N, K]` strides, so `check_transpose` (`backend/metal/matmul.cpp`)
+/// reports B as transposed and the dispatch is `steel_gemm_fused_nt`
+/// (`steel_gemm_fused_nax_nt` on the accelerator): a B tile is addressed
+/// with unit stride along K. PLANE-NN (default on) materializes the cached
+/// plane row-contiguous in `[K, N]` once, when the cache entry is built
+/// (`contiguous()`: one strided copy of the same bf16 words, after which the
+/// `[N, K]` intermediate is released, so the cache holds the same bytes),
+/// and the identical `matmul` then dispatches the `nn` variant, whose B
+/// tiles are addressed with unit stride along N.
+///
+/// Exactness: `nn` and `nt` are one kernel text instantiated on
+/// `transpose_b`, and the flag selects only how a B tile is addressed -- the
+/// threadgroup strides `BlockMMA::B_str_k / B_str_n` off the accelerator,
+/// the `Btile.load` extents and the operand flag of `tile_matmad_nax` on it.
+/// The K walk (`bk` blocks in ascending order, 8- or 16-wide fragments) and
+/// the fp32 accumulation are shared, so every output word is the same; a
+/// different `bm/bn/bk/wm/wn` choice for one variant (`GEMM_TPARAM_MACRO`
+/// keys some device classes on the flags) only changes how many fragment
+/// steps run between two loads, per item 2 above. The pair is decidable
+/// here: `DARKBLOOM_GEMMA4_PLANE_NN_XCHECK=1` issues the transposed-view
+/// dispatch beside the cached plane's on the identical activations for
+/// every admitted projection and counts differing bf16 words (diagnostic;
+/// forces evaluation; the NAX pair is carried on the argument). Kill
+/// switch `DARKBLOOM_GEMMA4_PLANE_NN=0` (also `false`/`no`/`off`) restores
+/// the transposed view; with the plane cache off the per-call plane stays a
+/// view either way. Engage mark: `plane-nn`, fired where the contiguous
+/// plane is built.
+///
 /// Admission: affine mode, group size 64, 4- or 8-bit, bf16 activations and
 /// scales, no bias, and at least `minRows` activation rows. Decode (`[8, 1]`),
 /// the MTP verify rectangles and the one-row frontier tail of the final
@@ -1710,6 +1742,27 @@ private enum Gemma4PrefillDeqGEMMV1 {
         return value
     }()
 
+    /// PLANE-NN (see the section above). Default ON: the cached plane is a
+    /// row-contiguous `[K, N]` array and the prompt GEMM dispatches the `nn`
+    /// kernel. `DARKBLOOM_GEMMA4_PLANE_NN=0` keeps the transposed view.
+    static let planeNN: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PLANE_NN"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// `DARKBLOOM_GEMMA4_PLANE_NN_XCHECK=1`: bitwise cross-check of every
+    /// admitted projection's cached-plane dispatch against the transposed-view
+    /// dispatch on the same activations, plus one memory line per plane built
+    /// (diagnostic; forces evaluation, so it is never set on a timed run).
+    static let planeNNXcheck: Bool =
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_PLANE_NN_XCHECK"] == "1"
+    private static let xcheckLock = NSLock()
+    nonisolated(unsafe) private static var xcheckCalls = 0
+    nonisolated(unsafe) private static var xcheckDiffering = 0
+    nonisolated(unsafe) private static var planeBytes = 0
+
     private static let planeLock = NSLock()
     nonisolated(unsafe) private static var cachedTransposedPlanes: [ObjectIdentifier: MLXArray] = [:]
 
@@ -1731,11 +1784,31 @@ private enum Gemma4PrefillDeqGEMMV1 {
         // pass that reaches the table meanwhile); the table is then taken
         // only to insert. A pass that built the same plane concurrently
         // keeps the first entry — the same values from the same operation.
-        let p = dequantized(
+        let view = dequantized(
             quantized.weight, scales: quantized.scales, biases: biases,
             groupSize: quantized.groupSize, bits: quantized.bits, mode: quantized.mode
         ).transposed()
+        let p: MLXArray
+        if planeNN {
+            // PLANE-NN: one strided copy at build time; the GEMM then reads a
+            // row-contiguous [K, N] operand (the `nn` dispatch).
+            CBv2EngageMark.once("plane-nn")
+            p = view.contiguous()
+        } else {
+            p = view
+        }
         eval(p)
+        if planeNNXcheck {
+            xcheckLock.lock()
+            planeBytes += p.nbytes
+            let total = planeBytes
+            xcheckLock.unlock()
+            FileHandle.standardError.write(
+                Data(
+                    ("[plane-nn] plane \(p.shape) strides \(p.strides) bytes \(p.nbytes) "
+                        + "planes_total \(total) active \(MLX.Memory.activeMemory) "
+                        + "cache \(MLX.Memory.cacheMemory)\n").utf8))
+        }
         planeLock.lock()
         if let raced = cachedTransposedPlanes[key] {
             planeLock.unlock()
@@ -1782,6 +1855,33 @@ private enum Gemma4PrefillDeqGEMMV1 {
                     ("[xcheck] prefill-deq-gemm rows \(x.size / inputDims) "
                         + "K \(inputDims) N \(weight.dim(0)) bits \(quantized.bits) "
                         + "differing \(differing.item(Int32.self))\n").utf8))
+        }
+        if planeNNXcheck {
+            // Local diagnostics only: the transposed-view dispatch (the `nt`
+            // kernel) beside the cached plane's dispatch on the identical
+            // activations; differing bf16 words per call, with running totals.
+            let viewPlane = dequantized(
+                weight, scales: quantized.scales, biases: biases,
+                groupSize: quantized.groupSize, bits: quantized.bits, mode: quantized.mode
+            ).transposed()
+            let reference = MLX.matmul(x, viewPlane)
+            let differing = MLX.sum(
+                product.view(dtype: .uint16) .!= reference.view(dtype: .uint16),
+                stream: .default)
+            eval(product, reference, differing)
+            let d = Int(differing.item(Int32.self))
+            xcheckLock.lock()
+            xcheckCalls += 1
+            xcheckDiffering += d
+            let calls = xcheckCalls
+            let total = xcheckDiffering
+            xcheckLock.unlock()
+            FileHandle.standardError.write(
+                Data(
+                    ("[xcheck] plane-nn strides \(transPlane.strides) "
+                        + "rows \(x.size / inputDims) K \(inputDims) N \(weight.dim(0)) "
+                        + "bits \(quantized.bits) differing \(d) "
+                        + "(calls \(calls), total differing \(total))\n").utf8))
         }
         return product
     }

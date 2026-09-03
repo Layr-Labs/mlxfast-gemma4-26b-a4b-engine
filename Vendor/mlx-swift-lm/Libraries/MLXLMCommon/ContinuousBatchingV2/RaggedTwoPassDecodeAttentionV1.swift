@@ -3608,8 +3608,11 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
     ///
     /// Exactness: identical per-element `static_cast<float>` conversions and
     /// `static_cast<T>(... * normalizer)` store expressions, identical
-    /// simd_max/simd_sum reduction order, identical addresses; only the
-    /// memory transaction width changes. The scalar arm of every branch is
+    /// simd_max/simd_sum reduction order within a simdgroup, identical
+    /// addresses; only the memory transaction width and the cross-simdgroup
+    /// max combine change, and maximum is order-free. The normalizer's
+    /// cross-simdgroup sum keeps its serial order. The scalar arm of every
+    /// branch is
     /// the promoted source verbatim. The ranked decode key length runs
     /// 1024..1152, so about half the steps take the vector arm.
     ///
@@ -3624,7 +3627,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
     }()
 
     private static let softmaxVecKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_d512_softmax_bf16_v1_sv1",
+        name: "cbv2_ragged8_sdpa_d512_softmax_bf16_v1_sv1_smaxlane",
         inputNames: ["scores", "params"],
         outputNames: ["probs"],
         source: """
@@ -3672,10 +3675,21 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            maxval = -3.402823466e+38F;
-            for (int s = 0; s < num_simdgroups; ++s) {
-                const float sm = local_max[s];
-                maxval = (maxval < sm) ? sm : maxval;
+            // D512-SMAXLANE-026: the cross-simdgroup MAX combine, held in one
+            // lane-parallel `simd_max` instead of a serial walk of the
+            // threadgroup slots. The identity element is the same
+            // `-3.402823466e+38F` the serial walk seeded `maxval` with, so
+            // every lane reduces exactly the multiset {local_max[0 ..
+            // num_simdgroups - 1]} together with that seed. Maximum is
+            // associative and commutative over floats with no NaN, and these
+            // slots are simd maxima of softcapped logits, so the result is the
+            // same float the serial walk produced. Only the max half moves;
+            // the normalizer combine below stays serial because addition is
+            // not associative and reordering it would change the quotient.
+            {
+                const float slot = (simd_lane_id < num_simdgroups)
+                    ? local_max[simd_lane_id] : -3.402823466e+38F;
+                maxval = simd_max(slot);
             }
 
             float normalizer = 0.0f;

@@ -5057,6 +5057,46 @@ private let gemma4DenseGateUpJoinEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+/// DENSE-GEGLU-EPILOGUE. Fold the dense MLP's GeGLU into the store epilogue
+/// of the single prefill GEMM over the paired gate|up dequantized plane.
+///
+/// Mechanism. On the prefill road the dense gate/up projections are two
+/// `Gemma4PrefillDeqGEMMV1` dispatches over separately cached transposed bf16
+/// planes, followed by the shaped GeGLU product. This arm builds ONE
+/// 16-gate/16-up interleaved `[2816, 4224]` plane (a pure permutation of the
+/// same dequantized bytes; no weight is re-quantized or re-represented), runs
+/// one `MLX.matmul`, and the specialized kernel epilogue in
+/// `steel_gemm_fused[_nax]` closes GeGLU from the paired MMA fragments and
+/// stores the compact `[rows, 2112]` plane in the physical prefix of the
+/// ordinary `[rows, 4224]` allocation. The second GEMM dispatch, the standalone
+/// GeGLU dispatch, and one full read of the activation plane all disappear.
+///
+/// Exactness. The paired plane is a transposed view of a contiguous
+/// `[4224, 2816]` row-major matrix, exactly like the split planes, so the
+/// dispatch stays the same transpose_b steel GEMM with the same tile
+/// parameters (they depend on dtype/transposes, never on N; 4224 keeps every
+/// alignment predicate 2112 satisfies), and every output column's K-chain is
+/// bit-identical. The epilogue rounds each accumulator to bfloat16 at the same
+/// boundary as the two split stores, then reproduces the compiled GeGLU tape
+/// (`gemma4_dense_geglu_compiled_tape`, a dedicated copy of the promoted
+/// expert-path function) before storing the compact plane.
+///
+/// Admission mirrors the kernel-side uniform predicate exactly: nt bf16
+/// matmul, per-slice `M >= 512`, `N == 4224`, `K == 2816`, on the deq-GEMM
+/// road only (`x.size / 2816 >= Gemma4PrefillDeqGEMMV1.minRows`). Decode,
+/// verify, MTP rectangles and sub-floor chunks keep the incumbent paths.
+///
+/// Kill switch: `DARKBLOOM_GEMMA4_DENSE_GEGLU_EPILOGUE=0` (also false/no/off)
+/// never builds the paired plane, so the kernel predicate can never observe
+/// its geometry and the incumbent path runs exactly as before.
+/// Engage mark: `dense-geglu-epilogue-prefill`.
+private let gemma4DenseGeGLUEpilogueEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DENSE_GEGLU_EPILOGUE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 private class Gemma4MLP: Module {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
@@ -5077,6 +5117,110 @@ private class Gemma4MLP: Module {
 
     fileprivate func bindFusedGateUpStorage(_ storage: Gemma4DenseGateUpStorage) {
         fusedGateUpStorage = storage
+    }
+
+    // MARK: DENSE-GEGLU-EPILOGUE (prefill)
+
+    private static let pairedPlaneLock = NSLock()
+    nonisolated(unsafe) private static var cachedPairedGateUpPlanes:
+        [ObjectIdentifier: MLXArray] = [:]
+
+    /// Build the `[2816, 4224]` bf16 plane whose columns interleave one
+    /// 16-column gate block with the matching 16-column up block, as a
+    /// transposed view of a contiguous `[4224, 2816]` row-major matrix so the
+    /// matmul keeps the split planes' transpose_b dispatch. A pure
+    /// permutation of the same `dequantized` bytes the split planes hold; no
+    /// weight is re-quantized or re-represented.
+    private static func buildPairedGateUpPlane(
+        gate: QuantizedLinear, gateBiases: MLXArray,
+        up: QuantizedLinear, upBiases: MLXArray
+    ) -> MLXArray? {
+        guard gate.weight.shape == [2112, 704], up.weight.shape == [2112, 704],
+            gate.scales.shape == [2112, 44], up.scales.shape == [2112, 44],
+            gateBiases.shape == [2112, 44], upBiases.shape == [2112, 44]
+        else { return nil }
+        let gateDQ = dequantized(
+            gate.weight, scales: gate.scales, biases: gateBiases,
+            groupSize: gate.groupSize, bits: gate.bits, mode: gate.mode)
+        let upDQ = dequantized(
+            up.weight, scales: up.scales, biases: upBiases,
+            groupSize: up.groupSize, bits: up.bits, mode: up.mode)
+        let paired = MLX.stacked(
+            [
+                gateDQ.reshaped(132, 16, 2816),
+                upDQ.reshaped(132, 16, 2816),
+            ], axis: 1
+        ).reshaped(4224, 2816).transposed()
+        eval(paired)
+        return paired
+    }
+
+    /// Per-layer cache under the same DEQ-PLANE-LOCK-001 discipline as the
+    /// split planes; `DARKBLOOM_GEMMA4_PREFILL_DEQ_CACHE=0` restores a
+    /// dynamic build on every call.
+    private static func pairedGateUpPlane(
+        gate: QuantizedLinear, gateBiases: MLXArray,
+        up: QuantizedLinear, upBiases: MLXArray
+    ) -> MLXArray? {
+        guard Gemma4PrefillDeqGEMMV1.cacheEnabled else {
+            return buildPairedGateUpPlane(
+                gate: gate, gateBiases: gateBiases, up: up, upBiases: upBiases)
+        }
+        let key = ObjectIdentifier(gate)
+        pairedPlaneLock.lock()
+        let existing = cachedPairedGateUpPlanes[key]
+        pairedPlaneLock.unlock()
+        if let existing { return existing }
+        guard let paired = buildPairedGateUpPlane(
+            gate: gate, gateBiases: gateBiases, up: up, upBiases: upBiases)
+        else { return nil }
+        pairedPlaneLock.lock()
+        if let raced = cachedPairedGateUpPlanes[key] {
+            pairedPlaneLock.unlock()
+            return raced
+        }
+        cachedPairedGateUpPlanes[key] = paired
+        pairedPlaneLock.unlock()
+        return paired
+    }
+
+    /// One prefill GEMM over the paired gate|up plane whose kernel epilogue
+    /// closes GeGLU and stores the compact `[.., 2112]` activated plane in the
+    /// physical prefix of the ordinary `[.., 4224]` output allocation. The
+    /// Swift admission mirrors the kernel-side uniform predicate exactly;
+    /// a nil keeps the incumbent split road untouched.
+    fileprivate func zipPrefillGateUpGeGLU(_ x: MLXArray) -> MLXArray? {
+        guard gemma4DenseGeGLUEpilogueEnabled,
+            Gemma4PrefillDeqGEMMV1.enabled,
+            let gate = gateProj as? QuantizedLinear,
+            let up = upProj as? QuantizedLinear,
+            gate.bias == nil, up.bias == nil,
+            gate.groupSize == 64, up.groupSize == gate.groupSize,
+            gate.bits == 8, up.bits == gate.bits,
+            gate.mode == .affine, up.mode == gate.mode,
+            gate.weight.dtype == .uint32, up.weight.dtype == .uint32,
+            gate.weight.shape == [2112, 704], up.weight.shape == [2112, 704],
+            gate.scales.dtype == .bfloat16, up.scales.dtype == .bfloat16,
+            gate.scales.shape == [2112, 44], up.scales.shape == [2112, 44],
+            let gateBiases = gate.biases, gateBiases.dtype == .bfloat16,
+            gateBiases.shape == [2112, 44],
+            let upBiases = up.biases, upBiases.dtype == .bfloat16,
+            upBiases.shape == [2112, 44],
+            x.dtype == .bfloat16, x.ndim >= 2,
+            x.dim(-1) == 2816, x.dim(-2) >= 512,
+            x.size / 2816 >= Gemma4PrefillDeqGEMMV1.minRows,
+            let plane = Self.pairedGateUpPlane(
+                gate: gate, gateBiases: gateBiases, up: up, upBiases: upBiases)
+        else { return nil }
+        let joined = MLX.matmul(x, plane)
+        CBv2EngageMark.once("dense-geglu-epilogue-prefill")
+        // The specialized store writes the compact plane densely into the
+        // first physical half of the ordinary N=4224 allocation. Preserve
+        // that physical row stride when exposing the logical N=2112 result;
+        // slicing the last axis would retain the allocation's 4224 stride.
+        var activatedShape = x.shape
+        activatedShape[activatedShape.count - 1] = 2112
+        return joined.flattened()[..<(joined.size / 2)].reshaped(activatedShape)
     }
 
     /// DMLP-001: route only the pinned batch-eight/decode-one affine-8 dense
@@ -5108,6 +5252,11 @@ private class Gemma4MLP: Module {
         _ x: MLXArray,
         activationSums producerSums: CBv2DenseMLPQMVV1.ActivationSums? = nil
     ) -> MLXArray {
+        // DENSE-GEGLU-EPILOGUE: the exact prefill geometry closes GeGLU inside
+        // the single paired GEMM; every other rectangle falls through.
+        if let activated = zipPrefillGateUpGeGLU(x) {
+            return denseProjection(downProj, activated)
+        }
         // DMLP-002: one exact activation-sum prepass feeds both fallback
         // projections. If either projection is not the pinned affine8 cell,
         // the candidate arrays remain unevaluated and stock takes over.

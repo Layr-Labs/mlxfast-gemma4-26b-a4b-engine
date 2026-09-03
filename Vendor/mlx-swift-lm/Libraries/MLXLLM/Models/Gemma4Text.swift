@@ -6616,4 +6616,3 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
 
 // Ranked resample marker 3: this archive is a further ranked sample of the tree carried
 // by the preceding ranked submission of this content apart from any rotation item declared in its note.
-// Independent frontier sample 4: executable code and model behavior remain unchanged.

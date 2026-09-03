@@ -82,7 +82,7 @@ internal func gemma4ShouldSubmitDecodeAsyncEvalLadder(
     // The empty-set row is the control that matters: this is not "fewer is
     // always better", it is "the early pair carries all of the overlap".
     switch layerIndex {
-    case 0, 1:
+    case 0, 1, 2, 3:
         return true
     default:
         return false
@@ -138,7 +138,7 @@ private let gemma4LongPrefillChunkEvalLayers: Int = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL_LONG"],
         let value = Int(raw), value >= 0
-    else { return 6 }
+    else { return 3 }
     return value
 }()
 
@@ -4484,7 +4484,7 @@ private enum Gemma4FusedLayerGlue {
     /// features owned by this tail thread. The value remains in registers and
     /// feeds the expert RMS directly, deleting only the reduced `[8, 2816]`
     /// materialization and its standalone dispatch.
-    private static let deferredExpertValuesSource = """
+    private static let deferredExpertValuesIncumbent = """
             T expertv[4];
             const uint assignment_base = row * 8u;
             uint sorted_rows[8];
@@ -4506,9 +4506,93 @@ private enum Gemma4FusedLayerGlue {
             }
     """
 
+    /// `false` only when `DARKBLOOM_GEMMA4_EXPERT_TAIL_GATHER_VEC` is an
+    /// explicit off value. Off restores the incumbent gather, and with it the
+    /// incumbent names, byte for byte in the same executable.
+    private static let expertGatherVecEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_EXPERT_TAIL_GATHER_VEC"]
+        else { return true }
+        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "0", "false", "no", "off": return false
+        default: return true
+        }
+    }()
+
+    /// GLUE-C1-039. The incumbent walks `i` (the four contiguous features this
+    /// thread owns) outside and `slot` (the top-8 expert assignment) inside,
+    /// so the row read is a scalar at stride 1 and the gather costs 32 scalar
+    /// bf16 device loads per thread. Interchanged --- `slot` outside, the four
+    /// features held in four accumulators --- the four addresses per slot are
+    /// contiguous and become ONE aligned `vec<T, 4>`: 8 vector loads for the
+    /// same 32 elements. That gather is the single dominant term in this
+    /// kernel's traffic (64 %: the `sorted` plane is read exactly once per
+    /// dispatch, 64 x 2816 x 2 B = 360,448 B of ~565,000 B total).
+    ///
+    /// Exactness: this is NOT a reassociation. Projected onto any one output
+    /// feature `i`, the additions into its accumulator still arrive in slot
+    /// order 0...7; the interchange only interleaves four DISJOINT chains. The
+    /// summands are unchanged --- `(float)sorted[...] * (float)routed_weights[slot]`
+    /// rounded to T, per (i, slot), with no cross-feature dependency --- and
+    /// the loaded bf16 bits are the same whether fetched scalar or as lane `i`
+    /// of a vector over the same four contiguous addresses. MLX builds every
+    /// `MLXFast.metalKernel` with fast math OFF, so the written order is the
+    /// executed order in both forms.
+    ///
+    /// This is the shape the tree's own reference already ships: the legacy
+    /// `weighted_expert_unsort_vec8_v3` in `SwitchLayers.swift` is written
+    /// slot-outer over a vector accumulator, and reads this same `sorted`
+    /// buffer through this same `ensureRowContiguous` path with a SIXTEEN-byte
+    /// `vec<T, 8>` load. The scalar `i`-outer form here is the deviation; this
+    /// restores the reference form at half that alignment requirement.
+    ///
+    /// Alignment: the row stride is the literal 2816 = 4 x 704, so
+    /// `sorted_rows[slot] * 2816 = 0 (mod 4)`; `wbase = lid * 4 = 0 (mod 4)`;
+    /// so the element index is a multiple of 4 and the byte offset a multiple
+    /// of 8. `wbase + 3 <= 2815 < 2816`, so no vector straddles a row.
+    private static let deferredExpertValuesVec = """
+            T expertv[4];
+            const uint assignment_base = row * 8u;
+            uint sorted_rows[8];
+            T routed_weights[8];
+            for (uint slot = 0u; slot < 8u; ++slot) {
+                const uint assignment = assignment_base + slot;
+                sorted_rows[slot] = (uint)inverse[assignment];
+                routed_weights[slot] = route_weights[assignment];
+            }
+            {
+                T acc0 = static_cast<T>(0.0f);
+                T acc1 = static_cast<T>(0.0f);
+                T acc2 = static_cast<T>(0.0f);
+                T acc3 = static_cast<T>(0.0f);
+                for (uint slot = 0u; slot < 8u; ++slot) {
+                    const vec<T, 4> source =
+                        *reinterpret_cast<const device vec<T, 4>*>(
+                            sorted + sorted_rows[slot] * 2816u + wbase);
+                    const float weight = (float)routed_weights[slot];
+                    acc0 = acc0 + static_cast<T>((float)source[0] * weight);
+                    acc1 = acc1 + static_cast<T>((float)source[1] * weight);
+                    acc2 = acc2 + static_cast<T>((float)source[2] * weight);
+                    acc3 = acc3 + static_cast<T>((float)source[3] * weight);
+                }
+                expertv[0] = acc0;
+                expertv[1] = acc1;
+                expertv[2] = acc2;
+                expertv[3] = acc3;
+            }
+    """
+
+    private static let deferredExpertValuesSource =
+        expertGatherVecEnabled ? deferredExpertValuesVec : deferredExpertValuesIncumbent
+
+    /// Cumulative append, per this file's own `tbSuffix` precedent: MLX caches
+    /// pipelines by name and calls `clear_library` on a name/source mismatch,
+    /// so a changed body must take a changed name.
+    private static let gatherSuffix: String = expertGatherVecEnabled ? "_c1" : ""
+
     private static let deferredTailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_glue_deferred_expert_tail_2816_bf16_v1_nb1_vec1"
-            + tbSuffix,
+            + tbSuffix + gatherSuffix,
         inputNames: [
             "a", "sorted", "inverse", "route_weights", "res",
             "w1", "w2", "w3", "s",
@@ -4557,7 +4641,7 @@ private enum Gemma4FusedLayerGlue {
         MLXFast.metalKernel(
             name:
                 "gemma4_glue_deferred_expert_tail_chain_2816_bf16_v1_nb1_vec1_rs1"
-                + tbSuffix,
+                + tbSuffix + gatherSuffix,
             inputNames: [
                 "a", "sorted", "inverse", "route_weights", "res",
                 "w1", "w2", "w3", "s", "wn",
@@ -5057,6 +5141,46 @@ private let gemma4DenseGateUpJoinEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+/// DENSE-GEGLU-EPILOGUE. Fold the dense MLP's GeGLU into the store epilogue
+/// of the single prefill GEMM over the paired gate|up dequantized plane.
+///
+/// Mechanism. On the prefill road the dense gate/up projections are two
+/// `Gemma4PrefillDeqGEMMV1` dispatches over separately cached transposed bf16
+/// planes, followed by the shaped GeGLU product. This arm builds ONE
+/// 16-gate/16-up interleaved `[2816, 4224]` plane (a pure permutation of the
+/// same dequantized bytes; no weight is re-quantized or re-represented), runs
+/// one `MLX.matmul`, and the specialized kernel epilogue in
+/// `steel_gemm_fused[_nax]` closes GeGLU from the paired MMA fragments and
+/// stores the compact `[rows, 2112]` plane in the physical prefix of the
+/// ordinary `[rows, 4224]` allocation. The second GEMM dispatch, the standalone
+/// GeGLU dispatch, and one full read of the activation plane all disappear.
+///
+/// Exactness. The paired plane is a transposed view of a contiguous
+/// `[4224, 2816]` row-major matrix, exactly like the split planes, so the
+/// dispatch stays the same transpose_b steel GEMM with the same tile
+/// parameters (they depend on dtype/transposes, never on N; 4224 keeps every
+/// alignment predicate 2112 satisfies), and every output column's K-chain is
+/// bit-identical. The epilogue rounds each accumulator to bfloat16 at the same
+/// boundary as the two split stores, then reproduces the compiled GeGLU tape
+/// (`gemma4_dense_geglu_compiled_tape`, a dedicated copy of the promoted
+/// expert-path function) before storing the compact plane.
+///
+/// Admission mirrors the kernel-side uniform predicate exactly: nt bf16
+/// matmul, per-slice `M >= 512`, `N == 4224`, `K == 2816`, on the deq-GEMM
+/// road only (`x.size / 2816 >= Gemma4PrefillDeqGEMMV1.minRows`). Decode,
+/// verify, MTP rectangles and sub-floor chunks keep the incumbent paths.
+///
+/// Kill switch: `DARKBLOOM_GEMMA4_DENSE_GEGLU_EPILOGUE=0` (also false/no/off)
+/// never builds the paired plane, so the kernel predicate can never observe
+/// its geometry and the incumbent path runs exactly as before.
+/// Engage mark: `dense-geglu-epilogue-prefill`.
+private let gemma4DenseGeGLUEpilogueEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DENSE_GEGLU_EPILOGUE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 private class Gemma4MLP: Module {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
@@ -5077,6 +5201,110 @@ private class Gemma4MLP: Module {
 
     fileprivate func bindFusedGateUpStorage(_ storage: Gemma4DenseGateUpStorage) {
         fusedGateUpStorage = storage
+    }
+
+    // MARK: DENSE-GEGLU-EPILOGUE (prefill)
+
+    private static let pairedPlaneLock = NSLock()
+    nonisolated(unsafe) private static var cachedPairedGateUpPlanes:
+        [ObjectIdentifier: MLXArray] = [:]
+
+    /// Build the `[2816, 4224]` bf16 plane whose columns interleave one
+    /// 16-column gate block with the matching 16-column up block, as a
+    /// transposed view of a contiguous `[4224, 2816]` row-major matrix so the
+    /// matmul keeps the split planes' transpose_b dispatch. A pure
+    /// permutation of the same `dequantized` bytes the split planes hold; no
+    /// weight is re-quantized or re-represented.
+    private static func buildPairedGateUpPlane(
+        gate: QuantizedLinear, gateBiases: MLXArray,
+        up: QuantizedLinear, upBiases: MLXArray
+    ) -> MLXArray? {
+        guard gate.weight.shape == [2112, 704], up.weight.shape == [2112, 704],
+            gate.scales.shape == [2112, 44], up.scales.shape == [2112, 44],
+            gateBiases.shape == [2112, 44], upBiases.shape == [2112, 44]
+        else { return nil }
+        let gateDQ = dequantized(
+            gate.weight, scales: gate.scales, biases: gateBiases,
+            groupSize: gate.groupSize, bits: gate.bits, mode: gate.mode)
+        let upDQ = dequantized(
+            up.weight, scales: up.scales, biases: upBiases,
+            groupSize: up.groupSize, bits: up.bits, mode: up.mode)
+        let paired = MLX.stacked(
+            [
+                gateDQ.reshaped(132, 16, 2816),
+                upDQ.reshaped(132, 16, 2816),
+            ], axis: 1
+        ).reshaped(4224, 2816).transposed()
+        eval(paired)
+        return paired
+    }
+
+    /// Per-layer cache under the same DEQ-PLANE-LOCK-001 discipline as the
+    /// split planes; `DARKBLOOM_GEMMA4_PREFILL_DEQ_CACHE=0` restores a
+    /// dynamic build on every call.
+    private static func pairedGateUpPlane(
+        gate: QuantizedLinear, gateBiases: MLXArray,
+        up: QuantizedLinear, upBiases: MLXArray
+    ) -> MLXArray? {
+        guard Gemma4PrefillDeqGEMMV1.cacheEnabled else {
+            return buildPairedGateUpPlane(
+                gate: gate, gateBiases: gateBiases, up: up, upBiases: upBiases)
+        }
+        let key = ObjectIdentifier(gate)
+        pairedPlaneLock.lock()
+        let existing = cachedPairedGateUpPlanes[key]
+        pairedPlaneLock.unlock()
+        if let existing { return existing }
+        guard let paired = buildPairedGateUpPlane(
+            gate: gate, gateBiases: gateBiases, up: up, upBiases: upBiases)
+        else { return nil }
+        pairedPlaneLock.lock()
+        if let raced = cachedPairedGateUpPlanes[key] {
+            pairedPlaneLock.unlock()
+            return raced
+        }
+        cachedPairedGateUpPlanes[key] = paired
+        pairedPlaneLock.unlock()
+        return paired
+    }
+
+    /// One prefill GEMM over the paired gate|up plane whose kernel epilogue
+    /// closes GeGLU and stores the compact `[.., 2112]` activated plane in the
+    /// physical prefix of the ordinary `[.., 4224]` output allocation. The
+    /// Swift admission mirrors the kernel-side uniform predicate exactly;
+    /// a nil keeps the incumbent split road untouched.
+    fileprivate func zipPrefillGateUpGeGLU(_ x: MLXArray) -> MLXArray? {
+        guard gemma4DenseGeGLUEpilogueEnabled,
+            Gemma4PrefillDeqGEMMV1.enabled,
+            let gate = gateProj as? QuantizedLinear,
+            let up = upProj as? QuantizedLinear,
+            gate.bias == nil, up.bias == nil,
+            gate.groupSize == 64, up.groupSize == gate.groupSize,
+            gate.bits == 8, up.bits == gate.bits,
+            gate.mode == .affine, up.mode == gate.mode,
+            gate.weight.dtype == .uint32, up.weight.dtype == .uint32,
+            gate.weight.shape == [2112, 704], up.weight.shape == [2112, 704],
+            gate.scales.dtype == .bfloat16, up.scales.dtype == .bfloat16,
+            gate.scales.shape == [2112, 44], up.scales.shape == [2112, 44],
+            let gateBiases = gate.biases, gateBiases.dtype == .bfloat16,
+            gateBiases.shape == [2112, 44],
+            let upBiases = up.biases, upBiases.dtype == .bfloat16,
+            upBiases.shape == [2112, 44],
+            x.dtype == .bfloat16, x.ndim >= 2,
+            x.dim(-1) == 2816, x.dim(-2) >= 512,
+            x.size / 2816 >= Gemma4PrefillDeqGEMMV1.minRows,
+            let plane = Self.pairedGateUpPlane(
+                gate: gate, gateBiases: gateBiases, up: up, upBiases: upBiases)
+        else { return nil }
+        let joined = MLX.matmul(x, plane)
+        CBv2EngageMark.once("dense-geglu-epilogue-prefill")
+        // The specialized store writes the compact plane densely into the
+        // first physical half of the ordinary N=4224 allocation. Preserve
+        // that physical row stride when exposing the logical N=2112 result;
+        // slicing the last axis would retain the allocation's 4224 stride.
+        var activatedShape = x.shape
+        activatedShape[activatedShape.count - 1] = 2112
+        return joined.flattened()[..<(joined.size / 2)].reshaped(activatedShape)
     }
 
     /// DMLP-001: route only the pinned batch-eight/decode-one affine-8 dense
@@ -5108,6 +5336,11 @@ private class Gemma4MLP: Module {
         _ x: MLXArray,
         activationSums producerSums: CBv2DenseMLPQMVV1.ActivationSums? = nil
     ) -> MLXArray {
+        // DENSE-GEGLU-EPILOGUE: the exact prefill geometry closes GeGLU inside
+        // the single paired GEMM; every other rectangle falls through.
+        if let activated = zipPrefillGateUpGeGLU(x) {
+            return denseProjection(downProj, activated)
+        }
         // DMLP-002: one exact activation-sum prepass feeds both fallback
         // projections. If either projection is not the pinned affine8 cell,
         // the candidate arrays remain unevaluated and stock takes over.
@@ -7486,5 +7719,3 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
 
 // Ranked resample marker 36: this archive is a further ranked sample of the tree carried
 // by the preceding ranked submission of this content apart from any rotation item declared in its note.
-
-// Candidate EXP-019: decode ladder optimal {0,1} + prefill chunk eval 6-layer repeat cycle + HEAD-RELAYOUT rebase + lock-free precomputed prefill softmax + compact participants + periodic telemetry.

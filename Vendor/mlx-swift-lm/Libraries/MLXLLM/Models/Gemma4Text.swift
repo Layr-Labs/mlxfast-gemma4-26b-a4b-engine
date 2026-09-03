@@ -82,7 +82,7 @@ internal func gemma4ShouldSubmitDecodeAsyncEvalLadder(
     // The empty-set row is the control that matters: this is not "fewer is
     // always better", it is "the early pair carries all of the overlap".
     switch layerIndex {
-    case 0, 1:
+    case 0, 1, 2, 3:
         return true
     default:
         return false
@@ -138,7 +138,7 @@ private let gemma4LongPrefillChunkEvalLayers: Int = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL_LONG"],
         let value = Int(raw), value >= 0
-    else { return 6 }
+    else { return 3 }
     return value
 }()
 
@@ -7486,5 +7486,3 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
 
 // Ranked resample marker 36: this archive is a further ranked sample of the tree carried
 // by the preceding ranked submission of this content apart from any rotation item declared in its note.
-
-// Candidate EXP-019: decode ladder optimal {0,1} + prefill chunk eval 6-layer repeat cycle + HEAD-RELAYOUT rebase + lock-free precomputed prefill softmax + compact participants + periodic telemetry.

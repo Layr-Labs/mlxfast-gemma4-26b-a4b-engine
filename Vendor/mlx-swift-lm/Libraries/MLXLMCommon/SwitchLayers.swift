@@ -1525,7 +1525,25 @@ public class SwitchGLU: Module {
         // which otherwise materializes the same arange(64) on every call.
         let downLhs: MLXArray? =
             (doSort && idx.ndim == 1 && idx.size == 64) ? switchDownIdentity64 : nil
-        x = downProj(activated, idx, lhsIndices: downLhs, sortedIndices: doSort)
+        // MOE-DOWN-OCTET-001: at the exact batch-8 decode geometry with RAW
+        // sorted keys, the down plane takes the Swift-launched octet gather
+        // (run leaders serve up to eight same-expert rows per weight stream,
+        // pipelined loads, no exiting threadgroups). Any other geometry, a
+        // tagged key carrier, or a disabled kill switch falls through to the
+        // incumbent gather unchanged.
+        if useLhsIndices, !useExpertPrefixBounds,
+            let down = downProj as? QuantizedSwitchLinear,
+            down.bias == nil, down.groupSize == 64, down.bits == 4,
+            down.mode == .affine,
+            let downBiases = down.biases,
+            let octet = Gemma4MoEDownGatherOctetV1.matmul(
+                activated: activated, sortedKeys: idx,
+                weight: down.weight, scales: down.scales, biases: downBiases)
+        {
+            x = octet
+        } else {
+            x = downProj(activated, idx, lhsIndices: downLhs, sortedIndices: doSort)
+        }
         // Under `doSort` a producer above always assigned `inverseOrder`;
         // otherwise it is still nil, which is exactly what the old
         // `doSort ? inverseOrder : nil` produced.

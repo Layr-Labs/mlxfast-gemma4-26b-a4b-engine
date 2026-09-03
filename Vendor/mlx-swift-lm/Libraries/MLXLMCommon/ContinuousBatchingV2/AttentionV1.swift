@@ -854,23 +854,8 @@ enum CBv2AttentionV1 {
         {
             return nil
         }
-        // PROMPT-GLUE (pg1): the norm+RoPE kernel may already have packed
-        // these exact K/V arrays' mirrors; otherwise dispatch the pack.
-        let prepacked = Gemma4PromptGlueV1.takePackedMirrors(
-            keys: keys, values: values, rows: B, heads: keys.dim(1), n: keys.dim(2),
-            words: keys.dim(3) / 8 + keys.dim(3) / 64)
-        if let prepacked, Gemma4PromptGlueV1.xcheck {
-            let reference = CBv2WindowedSequenceKV.quantPackPairChunkBatchGPU(
-                keys: keys, values: values)
-            for (index, mirror) in prepacked.enumerated() {
-                Gemma4PromptGlueV1.report(
-                    mirror, reference: reference[index], site: "kv-mirror row \(index)")
-            }
-        }
-        let mirrors =
-            prepacked
-            ?? CBv2WindowedSequenceKV.quantPackPairChunkBatchGPU(
-                keys: keys, values: values)
+        let mirrors = CBv2WindowedSequenceKV.quantPackPairChunkBatchGPU(
+            keys: keys, values: values)
         var cachedKeys: [MLXArray] = []
         var cachedValues: [MLXArray] = []
         cachedKeys.reserveCapacity(B)

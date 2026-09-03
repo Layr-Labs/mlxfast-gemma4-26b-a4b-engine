@@ -2588,6 +2588,18 @@ public enum Gemma4MMAQuantizedGEMV {
         default: return true
         }
     }()
+    /// `true` selects the carry body with its provably dead final look-ahead
+    /// read removed. `false` selects the prior carry body for bisection.
+    private static let carryTailPrefetchElisionEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MMA_HEAD_CARRY_TAIL_PREFETCH"]
+        else { return true }
+        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "0", "false", "no", "off": return false
+        default: return true
+        }
+    }()
+
 
     /// MMA-HEAD-CARRY-013. The weight-operand register carry the frontier
     /// applied to the two attention matrix-unit tiers and to the dense down
@@ -2748,6 +2760,85 @@ public enum Gemma4MMAQuantizedGEMV {
 
         return result
     }()
+    /// Version 27 carry refinement: the last valid group has no following
+    /// group, so its look-ahead values cannot be consumed by a later trip.
+    /// Keeping the guard in the source transformation leaves every preceding
+    /// carry load, arithmetic statement, and loop order unchanged.
+    private static let sourceV27CarryTail: String = {
+        var result = sourceV27Carry
+
+        func replaceOnce(_ old: String, with new: String) {
+            let count = result.components(separatedBy: old).count
+            precondition(
+                count == 2, "sourceV27CarryTail replacement count \(count): \(old)")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+
+        replaceOnce(
+            """
+                const uint gNext = min(g + 1u, N_GROUPS - 1u);
+                const uint packedWordNext = carryWordBase + gNext * (GROUP / 8);
+                const device uint4* packedGroup =
+                    reinterpret_cast<const device uint4*>(w + packedWordNext);
+                carryLo0 = packedGroup[0];
+                carryHi0 = packedGroup[1];
+                packedGroup = reinterpret_cast<const device uint4*>(
+                    w + packedWordNext + carryTileStride);
+                carryLo1 = packedGroup[0];
+                carryHi1 = packedGroup[1];
+                packedGroup = reinterpret_cast<const device uint4*>(
+                    w + packedWordNext + carryTileStride * 2);
+                carryLo2 = packedGroup[0];
+                carryHi2 = packedGroup[1];
+                packedGroup = reinterpret_cast<const device uint4*>(
+                    w + packedWordNext + carryTileStride * 3);
+                carryLo3 = packedGroup[0];
+                carryHi3 = packedGroup[1];
+                carryS0 = fragmentSRow0[gNext];
+                carryS1 = fragmentSRow1[gNext];
+                carryS2 = fragmentSRow2[gNext];
+                carryS3 = fragmentSRow3[gNext];
+            """,
+            with: """
+                if (g + 1u < N_GROUPS) {
+                    const uint gNext = g + 1u;
+                    const uint packedWordNext = carryWordBase + gNext * (GROUP / 8);
+                    const device uint4* packedGroup =
+                        reinterpret_cast<const device uint4*>(w + packedWordNext);
+                    carryLo0 = packedGroup[0];
+                    carryHi0 = packedGroup[1];
+                    packedGroup = reinterpret_cast<const device uint4*>(
+                        w + packedWordNext + carryTileStride);
+                    carryLo1 = packedGroup[0];
+                    carryHi1 = packedGroup[1];
+                    packedGroup = reinterpret_cast<const device uint4*>(
+                        w + packedWordNext + carryTileStride * 2);
+                    carryLo2 = packedGroup[0];
+                    carryHi2 = packedGroup[1];
+                    packedGroup = reinterpret_cast<const device uint4*>(
+                        w + packedWordNext + carryTileStride * 3);
+                    carryLo3 = packedGroup[0];
+                    carryHi3 = packedGroup[1];
+                    carryS0 = fragmentSRow0[gNext];
+                    carryS1 = fragmentSRow1[gNext];
+                    carryS2 = fragmentSRow2[gNext];
+                    carryS3 = fragmentSRow3[gNext];
+                }
+            """)
+
+        return result
+    }()
+
+    private static let kernelV27CarryTail: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_carry_tail_fpmma_v1",
+            inputNames: ["x", "w", "scales", "biases", "xSums"],
+            outputNames: ["out"],
+            source: sourceV27CarryTail,
+            header: "#include <metal_simdgroup_matrix>\n",
+            ensureRowContiguous: true
+        )
+
 
     private static let kernelV27Carry: MLXFast.MLXFastKernel = MLXFast.metalKernel(
         name: "gemma4_mma_affine4_qmv_m8_v27_unroll_blocks_carry_fpmma_v2",
@@ -2831,8 +2922,13 @@ public enum Gemma4MMAQuantizedGEMV {
             switch version {
             case 27:
                 if carryEnabled {
-                    CBv2EngageMark.once("mma-head-carry")
-                    selected = kernelV27Carry
+                    if carryTailPrefetchElisionEnabled {
+                        CBv2EngageMark.once("mma-head-carry-tail-prefetch-elide")
+                        selected = kernelV27CarryTail
+                    } else {
+                        CBv2EngageMark.once("mma-head-carry")
+                        selected = kernelV27Carry
+                    }
                 } else {
                     selected = kernelV27
                 }

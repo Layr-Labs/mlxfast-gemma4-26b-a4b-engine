@@ -110,7 +110,31 @@ enum CBv2ComposedPrefillSDPAV1 {
     nonisolated(unsafe) private static var maskCache: [Int: MLXArray] = [:]
     private static let maskCacheLock = NSLock()
 
+    nonisolated(unsafe) private static let standard1024Mask: MLXArray = {
+        let qIndices = MLXArray(Int32(0) ..< Int32(1024)).expandedDimensions(axis: 1)
+        let kIndices = MLXArray(Int32(0) ..< Int32(1024)).expandedDimensions(axis: 0)
+        let mask = qIndices .>= kIndices
+        eval(mask)
+        return mask
+    }()
+
+    nonisolated(unsafe) private static let standard1024MaskBias: MLXArray = {
+        let qIndices = MLXArray(Int32(0) ..< Int32(1024)).expandedDimensions(axis: 1)
+        let kIndices = MLXArray(Int32(0) ..< Int32(1025)).expandedDimensions(axis: 0)
+        let padded = MLX.where(
+            qIndices .>= kIndices,
+            bfloat16NegativeZeroScalar,
+            bfloat16LowestScalar)
+        eval(padded)
+        let bias = padded[0..., 0 ..< 1024]
+        eval(bias)
+        return bias
+    }()
+
     private static func causalMask(L: Int, kL: Int) -> MLXArray {
+        if L == 1024 && kL == 1024 {
+            return standard1024Mask
+        }
         let key = L &* 1_000_003 &+ kL
         maskCacheLock.lock()
         if let hit = maskCache[key] {
@@ -158,6 +182,9 @@ enum CBv2ComposedPrefillSDPAV1 {
     nonisolated(unsafe) private static var maskBiasCache: [Int: MLXArray] = [:]
 
     private static func causalMaskBias(L: Int, kL: Int) -> MLXArray {
+        if maskSynthEnabled && L == 1024 && kL == 1024 {
+            return standard1024MaskBias
+        }
         let key = L &* 1_000_003 &+ kL
         maskCacheLock.lock()
         if let hit = maskBiasCache[key] {

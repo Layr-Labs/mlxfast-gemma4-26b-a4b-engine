@@ -3164,15 +3164,22 @@ public enum Gemma4MMAQuantizedGEMV {
     private static let relayoutLock = NSLock()
     nonisolated(unsafe) private static var relayoutPlanes:
         [ObjectIdentifier: (source: MLXArray, plane: MLXArray)] = [:]
+    nonisolated(unsafe) private static var fastCachedSource: MLXArray? = nil
+    nonisolated(unsafe) private static var fastCachedPlane: MLXArray? = nil
 
     /// The relaid twin of `w`, built and evaluated once per source array.
     private static func relayoutPlane(for w: MLXArray, k: Int, n: Int) -> MLXArray {
+        if fastCachedSource === w, let hit = fastCachedPlane {
+            return hit
+        }
         let key = ObjectIdentifier(w)
         relayoutLock.lock()
         defer { relayoutLock.unlock() }
         if let cached = relayoutPlanes[key], cached.source === w,
             cached.plane.shape == w.shape
         {
+            fastCachedSource = w
+            fastCachedPlane = cached.plane
             return cached.plane
         }
         let cells = n * (k / 64)
@@ -3187,6 +3194,8 @@ public enum Gemma4MMAQuantizedGEMV {
         )[0]
         eval(plane)
         relayoutPlanes[key] = (w, plane)
+        fastCachedSource = w
+        fastCachedPlane = plane
         return plane
     }
 

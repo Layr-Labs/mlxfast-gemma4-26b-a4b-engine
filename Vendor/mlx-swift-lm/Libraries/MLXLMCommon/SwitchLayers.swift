@@ -2,8 +2,16 @@ import Foundation
 import MLX
 import MLXNN
 
+private let _mlxBufferEnvInit: Void = {
+    setenv("MLX_MAX_MB_PER_BUFFER", "2048", 1)
+    setenv("MLX_MAX_OPS_PER_BUFFER", "1024", 1)
+}()
+
 /// Identity gather table for the sorted 64-assignment decode geometry.
-nonisolated(unsafe) private let switchDownIdentity64 = MLXArray((0..<64).map { UInt32($0) })
+nonisolated(unsafe) private let switchDownIdentity64: MLXArray = {
+    _ = _mlxBufferEnvInit
+    return MLXArray((0..<64).map { UInt32($0) })
+}()
 
 // Port of https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/switch_layers.py
 

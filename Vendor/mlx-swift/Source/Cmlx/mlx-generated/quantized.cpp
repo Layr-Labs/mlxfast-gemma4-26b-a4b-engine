@@ -4486,6 +4486,145 @@ template <
       w, scales, biases, x, y, Xs, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
+// DARKBLOOM PREFILL-GATHER-INDIRECT (portable twin of the NAX road; see
+// quantized_nax.h for the word layout). mlx::steel::BlockLoader with the row
+// of every staged element resolved once, at construction: on the stock path
+// row bi + i of the tile is src + (bi + i) * src_ld, BlockLoader's own
+// address; on the tagged path it is x_root + row(word) * src_ld. load_unsafe,
+// load_safe and next are BlockLoader's statements over that row table, so the
+// threadgroup tile holds the same words at the same slots and the MMA that
+// reads it is untouched.
+MLX_MTL_CONST uint32_t kGatherIndirectTagMask = 0xC0000000u;
+MLX_MTL_CONST uint32_t kGatherIndirectKeyMask = 0xFFu;
+MLX_MTL_CONST uint32_t kGatherIndirectRowMask = 0x3FFFFFu;
+MLX_MTL_CONST int kGatherIndirectRowShift = 8;
+
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short tgp_size,
+    short n_reads = (BCOLS * BROWS) / (tgp_size),
+    short TCOLS = BCOLS / n_reads,
+    short TROWS = tgp_size / TCOLS>
+struct GatherRhsBlockLoader {
+  STEEL_CONST short n_rows = (BROWS + TROWS - 1) / TROWS;
+  STEEL_CONST short vec_size = n_reads;
+
+  // Leading dimension for src
+  const int src_ld;
+  // Column offset of the current tile (BlockLoader's src advance)
+  int col;
+
+  // Thread location indices
+  const short thread_idx;
+  const short bi;
+  const short bj;
+
+  // threadgroup and device memory
+  threadgroup T* dst;
+  const device T* src_rows[n_rows];
+
+  struct alignas(sizeof(T)) ReadVector {
+    uint8_t v[sizeof(T) * vec_size];
+  };
+
+  /* Constructor */
+  METAL_FUNC GatherRhsBlockLoader(
+      const device T* x_tile,
+      const device T* x_root,
+      const device uint32_t* words,
+      const short valid_rows,
+      const bool indirect,
+      const int src_ld_,
+      threadgroup T* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]])
+      : src_ld(src_ld_),
+        col(0),
+        thread_idx(simd_group_id * 32 + simd_lane_id),
+        bi(thread_idx / TCOLS),
+        bj(vec_size * (thread_idx % TCOLS)),
+        dst(dst_ + bi * dst_ld + bj) {
+    STEEL_PRAGMA_UNROLL
+    for (short r = 0; r < n_rows; r++) {
+      const short row = bi + r * TROWS;
+      if (indirect) {
+        const uint32_t w = (row < valid_rows) ? words[row] : 0u;
+        src_rows[r] = x_root +
+            size_t((w >> kGatherIndirectRowShift) & kGatherIndirectRowMask) *
+                size_t(src_ld_) +
+            bj;
+      } else {
+        src_rows[r] = x_tile + row * src_ld_ + bj;
+      }
+    }
+  }
+
+  /* Load from device memory into threadgroup memory - without bound checking */
+  METAL_FUNC void load_unsafe() const {
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < BROWS; i += TROWS) {
+      *((threadgroup ReadVector*)(&dst[i * dst_ld])) =
+          *((const device ReadVector*)(&src_rows[i / TROWS][col]));
+    }
+  }
+
+  /* Load from device memory into threadgroup memory - with bound checking */
+  METAL_FUNC void load_safe(short2 src_tile_dim) const {
+    src_tile_dim = src_tile_dim - short2(bj, bi);
+
+    // Skip loading if thread has no valid reads
+    if (src_tile_dim.x <= 0 || src_tile_dim.y <= 0) {
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < BROWS; i += TROWS) {
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < vec_size; j++) {
+          dst[i * dst_ld + j] = T(0);
+        }
+      }
+      return;
+    }
+
+    // Use fast thread memory for bound checks
+    bool tmp_idx[vec_size];
+    T tmp_val[vec_size];
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < BROWS; i += TROWS) {
+      // Make sure tmp_idx only contains valid indices
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < vec_size; j++) {
+        tmp_idx[j] = (i < src_tile_dim.y) && (j < src_tile_dim.x);
+      }
+
+      // Read valid indices into tmp_val
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < vec_size; j++) {
+        tmp_val[j] = src_rows[i / TROWS][(tmp_idx[j] ? col + j : 0)];
+      }
+
+      // Zero out unneeded values
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < vec_size; j++) {
+        tmp_val[j] = tmp_idx[j] ? tmp_val[j] : T(0);
+      }
+
+      // Copy values to threadgroup memory
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < vec_size; j++) {
+        dst[i * dst_ld + j] = tmp_val[j];
+      }
+    }
+  }
+
+  /* Iteration helper */
+  METAL_FUNC void next() {
+    col += BCOLS;
+  }
+};
+
 template <
     typename T,
     int group_size,
@@ -4527,7 +4666,7 @@ template <
       BK_padded,
       transpose ? BK_padded : BN_padded>;
   using loader_x_t =
-      mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
+      GatherRhsBlockLoader<T, BM, BK, BK_padded, WM * WN * SIMD_SIZE>;
   using loader_w_t = QuantizedBlockLoader<
       T,
       transpose ? BN : BK,
@@ -4570,6 +4709,15 @@ template <
   const short2 tile_w =
       transpose ? short2(k_remain, tgp_bn) : short2(tgp_bn, k_remain);
 
+  // PREFILL-GATHER-INDIRECT admission: threadgroup uniform, read once. On
+  // the stock path the key mask is all ones and every expression below that
+  // carries it is the stock expression.
+  const device T* const x_root = x;
+  const bool gather_indirect =
+      (indices[y_row] & kGatherIndirectTagMask) == kGatherIndirectTagMask;
+  const uint32_t gather_key_mask =
+      gather_indirect ? kGatherIndirectKeyMask : 0xFFFFFFFFu;
+
   // Move x and output to the correct block
   auto wl = (const device uint8_t*)w;
   x += y_row_long * K;
@@ -4581,7 +4729,7 @@ template <
   // Do as many matmuls as necessary
   uint32_t index;
   short offset;
-  uint32_t index_next = indices[y_row];
+  uint32_t index_next = indices[y_row] & gather_key_mask;
   short offset_next = 0;
   int n = 0;
   while (n < tgp_bm) {
@@ -4590,9 +4738,9 @@ template <
     index = index_next;
     offset_next = tgp_bm;
     for (; n < tgp_bm; n++) {
-      if (indices[y_row + n] != index) {
+      if ((indices[y_row + n] & gather_key_mask) != index) {
         offset_next = n;
-        index_next = indices[y_row + n];
+        index_next = indices[y_row + n] & gather_key_mask;
         break;
       }
     }
@@ -4636,7 +4784,16 @@ template <
     };
 
     // Prepare threadgroup loading operations
-    thread loader_x_t loader_x(x, K, Xs, simd_group_id, simd_lane_id);
+    thread loader_x_t loader_x(
+        x,
+        x_root,
+        indices + y_row,
+        tgp_bm,
+        gather_indirect,
+        K,
+        Xs,
+        simd_group_id,
+        simd_lane_id);
     thread loader_w_t loader_w(
         wl + index * stride_w,
         scales + index * stride_s,

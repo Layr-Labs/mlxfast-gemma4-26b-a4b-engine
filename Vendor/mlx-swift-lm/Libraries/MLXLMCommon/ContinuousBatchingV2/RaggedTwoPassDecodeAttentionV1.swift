@@ -1730,7 +1730,7 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// removes only the global partial write/read and the second dispatch.
     private static let portQuantFusedWriteResidentKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_ey29_ey32_yp3_ey51_yrp1_ey82",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_ey29_ey32_yp3_ey51_yrp1_ey85",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -2201,12 +2201,24 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
         return value >= 2
     }()
 
+    /// PF2-TAIL-PEEL. Default on only inside the promoted depth-two arm.
+    /// Set `DARKBLOOM_CBV2_SLIDING_PREFETCH_PEEL=0` to restore the promoted
+    /// modulo-two walk and its `_spd2` registration byte for byte.
+    static let slidingPrefetchPeelEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_SLIDING_PREFETCH_PEEL"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// MLX keys its custom-kernel library cache by kernel NAME and re-JITs a
     /// name whose generated source changed (`backend/metal/custom_kernel.cpp`
     /// `:56-70`, `device.cpp:770-796`), so a changed body takes a changed
-    /// name. Empty on the depth-one arm, which therefore keeps the incumbent
-    /// registrations character for character.
-    private static let slidingPrefetchKey = slidingPrefetchDepth2 ? "_spd2" : ""
+    /// name. Empty on the depth-one arm, while peel-off keeps `_spd2`.
+    private static let slidingPrefetchKey =
+        slidingPrefetchDepth2
+        ? (slidingPrefetchPeelEnabled ? "_spd2_lp1" : "_spd2")
+        : ""
 
     /// The shipped depth-one ring walk, verbatim.
     private static let residentSlidingWalkDepth1 = """
@@ -2391,9 +2403,169 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 }
             """
 
+    /// PF2-TAIL-PEEL: preserve the promoted two-phase latency distance while
+    /// removing the current-token selects and guarded reissue from 62 of 64
+    /// outer trips. The final two trips retain the promoted boundary logic.
+    private static let residentSlidingWalkDepth2Peeled = """
+            uint slot = (start + uint(block)) % uint(N);
+                constexpr int PF = 2;
+                constexpr int OUTER = N / (PF * BLOCKS);
+                static_assert(N % (PF * BLOCKS) == 0,
+                    "peeled depth-two walk needs integral phase groups");
+                static_assert(OUTER >= 2,
+                    "peeled depth-two walk needs two boundary trips");
+                static_assert(PF * BLOCKS <= N - 1,
+                    "both depth-two seed positions must be historical");
+
+                uint pf_slot = slot;
+                thread uint32_t kw_pre[PF];
+                thread uint32_t vw_pre[PF];
+                thread uint32_t ktw_pre[PF];
+                thread uint32_t vtw_pre[PF];
+                #pragma clang loop unroll(full)
+                for (int u = 0; u < PF; ++u) {
+                    kw_pre[u] = mkeys_w[pf_slot * row_words + lane];
+                    vw_pre[u] = mvalues_w[pf_slot * row_words + lane];
+                    ktw_pre[u] =
+                        mkeys_w[pf_slot * row_words + payload_words + lane / 8];
+                    vtw_pre[u] =
+                        mvalues_w[pf_slot * row_words + payload_words + lane / 8];
+                    pf_slot += uint(BLOCKS);
+                    if (pf_slot >= uint(N)) pf_slot -= uint(N);
+                }
+                uint next_slot = pf_slot;
+                int token = block;
+
+                // The first OUTER-2 trips consume only historical rows and
+                // every same-phase successor is also historical. Loads and
+                // next_slot updates therefore follow the promoted order with
+                // no predicate in the hot loop.
+                for (; token < N - 2 * PF * BLOCKS; token += PF * BLOCKS) {
+                    #pragma clang loop unroll(full)
+                    for (int u = 0; u < PF; ++u) {
+                        const uint32_t kw = kw_pre[u];
+                        const uint32_t vw = vw_pre[u];
+                        const uint32_t ktw = ktw_pre[u];
+                        const uint32_t vtw = vtw_pre[u];
+                        kw_pre[u] = mkeys_w[next_slot * row_words + lane];
+                        vw_pre[u] = mvalues_w[next_slot * row_words + lane];
+                        ktw_pre[u] =
+                            mkeys_w[next_slot * row_words + payload_words + lane / 8];
+                        vtw_pre[u] =
+                            mvalues_w[next_slot * row_words + payload_words + lane / 8];
+                        next_slot += uint(BLOCKS);
+                        if (next_slot >= uint(N)) next_slot -= uint(N);
+                        const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
+                        const float kb = float(as_type<half>(ushort(ktw >> 16)));
+                        const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
+                        const float vb = float(as_type<half>(ushort(vtw >> 16)));
+                        float score_lo = 0.0f;
+                        float score_hi = 0.0f;
+                        #pragma clang loop unroll(full)
+                        for (int element = 0; element < values_per_lane; ++element) {
+                            const float key_element =
+                                fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
+                            score_lo += q_lo[element] * key_element;
+                            score_hi += q_hi[element] * key_element;
+                        }
+                        score_lo = simd_sum(score_lo);
+                        score_hi = simd_sum(score_hi);
+
+                        const float new_max_lo = max(max_lo, score_lo);
+                        const float new_max_hi = max(max_hi, score_hi);
+                        const float old_factor_lo = fast::exp(max_lo - new_max_lo);
+                        const float old_factor_hi = fast::exp(max_hi - new_max_hi);
+                        const float score_factor_lo = fast::exp(score_lo - new_max_lo);
+                        const float score_factor_hi = fast::exp(score_hi - new_max_hi);
+                        max_lo = new_max_lo;
+                        max_hi = new_max_hi;
+                        sum_lo = sum_lo * old_factor_lo + score_factor_lo;
+                        sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                        #pragma clang loop unroll(full)
+                        for (int element = 0; element < values_per_lane; ++element) {
+                            const float value_element =
+                                fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
+                            acc_lo[element] = acc_lo[element] * old_factor_lo
+                                + score_factor_lo * value_element;
+                            acc_hi[element] = acc_hi[element] * old_factor_hi
+                                + score_factor_hi * value_element;
+                        }
+                    }
+                }
+
+                // Penultimate phase 1 for block 7 must not load the live write
+                // slot, and final phase 1 for block 7 consumes the new token.
+                // Retain the promoted predicates for exactly these two trips.
+                #pragma clang loop unroll(disable)
+                for (; token < N; token += PF * BLOCKS) {
+                    #pragma clang loop unroll(full)
+                    for (int u = 0; u < PF; ++u) {
+                        const int tok = token + u * BLOCKS;
+                        const bool current = tok == N - 1;
+                        const uint32_t kw = current ? kword : kw_pre[u];
+                        const uint32_t vw = current ? vword : vw_pre[u];
+                        const uint32_t ktw = current
+                            ? (uint32_t(as_type<ushort>(khs))
+                                | (uint32_t(as_type<ushort>(khb)) << 16))
+                            : ktw_pre[u];
+                        const uint32_t vtw = current
+                            ? (uint32_t(as_type<ushort>(vhs))
+                                | (uint32_t(as_type<ushort>(vhb)) << 16))
+                            : vtw_pre[u];
+                        if (tok + PF * BLOCKS < N - 1) {
+                            kw_pre[u] = mkeys_w[next_slot * row_words + lane];
+                            vw_pre[u] = mvalues_w[next_slot * row_words + lane];
+                            ktw_pre[u] =
+                                mkeys_w[next_slot * row_words + payload_words + lane / 8];
+                            vtw_pre[u] =
+                                mvalues_w[next_slot * row_words + payload_words + lane / 8];
+                            next_slot += uint(BLOCKS);
+                            if (next_slot >= uint(N)) next_slot -= uint(N);
+                        }
+                        const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
+                        const float kb = float(as_type<half>(ushort(ktw >> 16)));
+                        const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
+                        const float vb = float(as_type<half>(ushort(vtw >> 16)));
+                        float score_lo = 0.0f;
+                        float score_hi = 0.0f;
+                        #pragma clang loop unroll(full)
+                        for (int element = 0; element < values_per_lane; ++element) {
+                            const float key_element =
+                                fma(float((kw >> (4 * element)) & 0xfu), ks, kb);
+                            score_lo += q_lo[element] * key_element;
+                            score_hi += q_hi[element] * key_element;
+                        }
+                        score_lo = simd_sum(score_lo);
+                        score_hi = simd_sum(score_hi);
+
+                        const float new_max_lo = max(max_lo, score_lo);
+                        const float new_max_hi = max(max_hi, score_hi);
+                        const float old_factor_lo = fast::exp(max_lo - new_max_lo);
+                        const float old_factor_hi = fast::exp(max_hi - new_max_hi);
+                        const float score_factor_lo = fast::exp(score_lo - new_max_lo);
+                        const float score_factor_hi = fast::exp(score_hi - new_max_hi);
+                        max_lo = new_max_lo;
+                        max_hi = new_max_hi;
+                        sum_lo = sum_lo * old_factor_lo + score_factor_lo;
+                        sum_hi = sum_hi * old_factor_hi + score_factor_hi;
+                        #pragma clang loop unroll(full)
+                        for (int element = 0; element < values_per_lane; ++element) {
+                            const float value_element =
+                                fma(float((vw >> (4 * element)) & 0xfu), vs, vb);
+                            acc_lo[element] = acc_lo[element] * old_factor_lo
+                                + score_factor_lo * value_element;
+                            acc_hi[element] = acc_hi[element] * old_factor_hi
+                                + score_factor_hi * value_element;
+                        }
+                    }
+                }
+            """
+
+
     private static var residentSlidingWalk: String {
-        slidingPrefetchDepth2
-            ? residentSlidingWalkDepth2 : residentSlidingWalkDepth1
+        if !slidingPrefetchDepth2 { return residentSlidingWalkDepth1 }
+        return slidingPrefetchPeelEnabled
+            ? residentSlidingWalkDepth2Peeled : residentSlidingWalkDepth2
     }
 
     /// F4: exact decode Q/K/V normalization and sliding RoPE in the resident
@@ -3052,6 +3224,9 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 CBv2EngageMark.once("kvq4-fused-live-write")
                 CBv2EngageMark.once("kvq4-resident-merge")
                 CBv2EngageMark.once("kvq4-resident-norm-rope")
+                if slidingPrefetchDepth2 && slidingPrefetchPeelEnabled {
+                    CBv2EngageMark.once("sliding-prefetch-pf2-tail-peel")
+                }
                 return (resident[0], resident[1])
             }
             let resident = portQuantFusedWriteResidentKernel(

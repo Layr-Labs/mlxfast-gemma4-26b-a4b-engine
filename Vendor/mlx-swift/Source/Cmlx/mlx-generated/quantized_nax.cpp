@@ -1536,6 +1536,128 @@ template <
 MLX_MTL_CONST bool kGatherRhsSegmentElide = true;
 MLX_MTL_CONST bool kGatherRhsSortedEndpointElide = true;
 
+// DARKBLOOM PREFILL-GATHER-INDIRECT. A tagged rhs index word carries, beside
+// its expert key, the row of the (un-sorted) activation buffer that stands in
+// for the sorted-plane row it labels:
+//   bits  0.. 7  expert key
+//   bits  8..29  activation row
+//   bits 30..31  tag (both set)
+// The host dispatch surface is not editable, so the tag is the only signal.
+// When the first word of a tile carries it, every A fragment element the
+// stock path reads from sorted-plane row R (at the same column) is read from
+// activation row (word(R) >> 8) & 0x3FFFFF instead. The sorted plane is by
+// definition x[row(R)], so every fragment register holds the same bfloat16
+// word; the weight loads, the MMA op sequence and the epilogue are untouched.
+// Untagged words leave the kernel on its stock path (the key mask folds to
+// all ones and no indirect load is issued).
+MLX_MTL_CONST uint32_t kGatherIndirectTagMask = 0xC0000000u;
+MLX_MTL_CONST uint32_t kGatherIndirectKeyMask = 0xFFu;
+MLX_MTL_CONST uint32_t kGatherIndirectRowMask = 0x3FFFFFu;
+MLX_MTL_CONST int kGatherIndirectRowShift = 8;
+
+// This lane's A row pointers for one simdgroup strip, resolved once from the
+// tagged words. Element (i, j) of fragment (mm, kk) is BaseNAXFrag::load's
+// element (i, j): row mm * kFragRows + sc.y + i * kFragRowsJump of the strip,
+// column col0 + kk * kFragCols + sc.x + j, with the row base taken from the
+// table instead of src + row * ld. load / load_frag_row / load_safe mirror
+// NAXTile::load, gather_rhs_load_frag_row and NAXTile::load_safe element for
+// element, including load_safe's row and column limits, so a placeholder
+// (row 0) entry for a row past the tile's M edge is never dereferenced.
+template <typename T, typename ATile>
+struct GatherRhsIndirectA {
+  STEEL_CONST short kTM = ATile::kTileRows;
+  STEEL_CONST short kTK = ATile::kTileCols;
+  STEEL_CONST short kThrRows = ATile::kFragThrRows;
+  STEEL_CONST short kThrCols = ATile::kFragThrCols;
+  STEEL_CONST short kLaneRows = kTM * kThrRows;
+
+  const device T* rows[kLaneRows];
+  short2 sc;
+
+  METAL_FUNC void init(
+      const device T* x_root,
+      const device uint32_t* words,
+      const int ld,
+      const short valid_rows) {
+    sc = ATile::NAXFrag_t::get_coord();
+    STEEL_PRAGMA_UNROLL
+    for (short mm = 0; mm < kTM; mm++) {
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < kThrRows; i++) {
+        const short r =
+            short(mm * ATile::kFragRows + i * ATile::kFragRowsJump) + sc.y;
+        const uint32_t w = (r < valid_rows) ? words[r] : 0u;
+        rows[mm * kThrRows + i] = x_root +
+            size_t((w >> kGatherIndirectRowShift) & kGatherIndirectRowMask) *
+                size_t(ld);
+      }
+    }
+  }
+
+  METAL_FUNC void load_frag(
+      const short mm,
+      const short kk,
+      thread ATile& Atile,
+      const int col0) const {
+    thread auto& dst = Atile.frag_at(mm, kk);
+    const int c = col0 + kk * ATile::kFragCols + sc.x;
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kThrRows; i++) {
+      const device T* row = rows[mm * kThrRows + i];
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < kThrCols; j++) {
+        dst[i * kThrCols + j] = static_cast<T>(row[c + j]);
+      }
+    }
+  }
+
+  METAL_FUNC void load(thread ATile& Atile, const int col0) const {
+    STEEL_PRAGMA_UNROLL
+    for (short mm = 0; mm < kTM; mm++) {
+      STEEL_PRAGMA_UNROLL
+      for (short kk = 0; kk < kTK; kk++) {
+        load_frag(mm, kk, Atile, col0);
+      }
+    }
+  }
+
+  METAL_FUNC void
+  load_frag_row(const short mm, thread ATile& Atile, const int col0) const {
+    STEEL_PRAGMA_UNROLL
+    for (short kk = 0; kk < kTK; kk++) {
+      load_frag(mm, kk, Atile, col0);
+    }
+  }
+
+  METAL_FUNC void
+  load_safe(thread ATile& Atile, const int col0, const short2 lim) const {
+    const short lx = lim.y - sc.y;
+    const short ly = lim.x - sc.x;
+    STEEL_PRAGMA_UNROLL
+    for (short mm = 0; mm < kTM; mm++) {
+      STEEL_PRAGMA_UNROLL
+      for (short kk = 0; kk < kTK; kk++) {
+        thread auto& dst = Atile.frag_at(mm, kk);
+        const int cb = col0 + kk * ATile::kFragCols + sc.x;
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < kThrRows; i++) {
+          const short r = short(mm * ATile::kFragRows + i * ATile::kFragRowsJump);
+          const device T* row = rows[mm * kThrRows + i];
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < kThrCols; j++) {
+            const short c = short(kk * ATile::kFragCols + j);
+            if ((r < lx) && (c < ly)) {
+              dst[i * kThrCols + j] = static_cast<T>(row[cb + j]);
+            } else {
+              dst[i * kThrCols + j] = T(0);
+            }
+          }
+        }
+      }
+    }
+  }
+};
+
 // Loads one 16-row fragment row of an A tile from device memory. The
 // address arithmetic matches NAXTile::load exactly for that fragment row
 // (row offset mm * kFragRows), so the loaded values are identical to the
@@ -1700,6 +1822,15 @@ template <
   const short2 tile_w =
       transpose ? short2(k_remain, tgp_bn) : short2(tgp_bn, k_remain);
 
+  // PREFILL-GATHER-INDIRECT admission: threadgroup uniform, read once. On
+  // the stock path the key mask is all ones and every expression below that
+  // carries it is the stock expression.
+  const device T* const x_root = x;
+  const bool gather_indirect =
+      (indices[y_row] & kGatherIndirectTagMask) == kGatherIndirectTagMask;
+  const uint32_t gather_key_mask =
+      gather_indirect ? kGatherIndirectKeyMask : 0xFFFFFFFFu;
+
   // Move x and output to the correct block
   auto wl = (const device uint8_t*)w;
   x += y_row_long * K;
@@ -1747,10 +1878,19 @@ template <
 
   using AccumType = float;
 
+  // PREFILL-GATHER-INDIRECT: this lane's A row pointers for its strip. The
+  // words of rows past the tile's M edge are never read (placeholders), and
+  // those rows are never loaded: the safe loads test the same row limit the
+  // stock loads test.
+  GatherRhsIndirectA<T, NAXTile<T, TM, TK>> a_ind;
+  if (gather_indirect) {
+    a_ind.init(x_root, indices + y_row + tm, K, short(max(0, tgp_bm - tm)));
+  }
+
   // Do as many matmuls as necessary
   uint32_t index;
   short offset;
-  uint32_t index_next = indices[y_row];
+  uint32_t index_next = indices[y_row] & gather_key_mask;
   short offset_next = 0;
   int n = 0;
   while (n < tgp_bm) {
@@ -1762,13 +1902,13 @@ template <
     // segment's expert matches the tile endpoint, sortedness proves that the
     // remaining suffix is one segment and the per-row probe can stop here.
     if (kGatherRhsSortedEndpointElide &&
-        indices[y_row + tgp_bm - 1] == index) {
+        (indices[y_row + tgp_bm - 1] & gather_key_mask) == index) {
       n = tgp_bm;
     } else {
       for (; n < tgp_bm; n++) {
-        if (indices[y_row + n] != index) {
+        if ((indices[y_row + n] & gather_key_mask) != index) {
           offset_next = n;
-          index_next = indices[y_row + n];
+          index_next = indices[y_row + n] & gather_key_mask;
           break;
         }
       }
@@ -1842,7 +1982,11 @@ template <
               for (short mm = 0; mm < TM; mm++) {
                 const short fr = short(mm * Dtile.kFragRows);
                 if (fr < seg_hi && short(fr + Dtile.kFragRows) > seg_lo) {
-                  gather_rhs_load_frag_row(mm, Atile, xn + kk1, K);
+                  if (gather_indirect) {
+                    a_ind.load_frag_row(mm, Atile, k * BK + kk1);
+                  } else {
+                    gather_rhs_load_frag_row(mm, Atile, xn + kk1, K);
+                  }
                   gather_rhs_mma_frag_row(
                       mm,
                       Dtile,
@@ -1863,9 +2007,17 @@ template <
               volatile int compiler_barrier;
 
               if constexpr (kAlignedM.value) {
-                Atile.load(xn + kk1, K);
+                if (gather_indirect) {
+                  a_ind.load(Atile, k * BK + kk1);
+                } else {
+                  Atile.load(xn + kk1, K);
+                }
               } else {
-                Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+                if (gather_indirect) {
+                  a_ind.load_safe(Atile, k * BK + kk1, short2(SK, sgp_sm));
+                } else {
+                  Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+                }
               }
 
               if constexpr (transpose) {
@@ -1908,7 +2060,11 @@ template <
               volatile int compiler_barrier;
 
               const short psk = min(int(SK), max(0, (BK - kk1)));
-              Atile.load_safe(xn + kk1, K, short2(psk, sgp_sm));
+              if (gather_indirect) {
+                a_ind.load_safe(Atile, K_it * BK + kk1, short2(psk, sgp_sm));
+              } else {
+                Atile.load_safe(xn + kk1, K, short2(psk, sgp_sm));
+              }
 
               if constexpr (transpose) {
                 Btile.template load<T, BK_padded, 1>(

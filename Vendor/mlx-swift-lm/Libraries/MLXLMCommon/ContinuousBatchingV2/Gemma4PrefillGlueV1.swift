@@ -598,6 +598,32 @@ public enum Gemma4PrefillGlueV1 {
         )[0]
     }
 
+    /// PREFILL-GATHER-INDIRECT: `rmsNorm(x, weight)` written once, un-sorted,
+    /// into the first `rows` rows of a `[rows * topK, 1, 2816]` allocation --
+    /// the shape the sorted right-hand-side gather is handed -- so that gather
+    /// can read each token row in place through its tagged keys instead of
+    /// from a plane that stores every row `topK` times. Rows `rows...` are
+    /// never written and never read. Same kernel and same stored expression
+    /// as `preNorm` / `preNormScatter`: `w * T(x * inv)` over `glue_inv_rms`.
+    /// Returns `nil` off the prefill plane or with PRENORM-GATHER off.
+    public static func preNormWide(
+        x: MLXArray, weight: MLXArray, topK: Int, eps epsIn: Float
+    ) -> MLXArray? {
+        guard prenormGatherEnabled,
+            let rows = planeRows(x, weight: weight, eps: epsIn),
+            topK >= 1
+        else { return nil }
+
+        return preNormKernel(
+            [x, weight],
+            template: [("T", x.dtype)],
+            grid: (threadsPerRow, rows, 1),
+            threadGroup: (threadsPerRow, 1, 1),
+            outputShapes: [[rows * topK, 1, axis]],
+            outputDTypes: [x.dtype]
+        )[0]
+    }
+
     // MARK: - branch tail (5 dispatches -> 1)
 
     private static let tailKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(

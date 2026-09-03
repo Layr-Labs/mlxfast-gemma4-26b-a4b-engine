@@ -570,22 +570,8 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// later phase a bounded fence before it builds a new engine.
     public func shutdown() async {
         beginRejectingSubmissions()
-        // DRAIN-QUIESCENT-001: releases that belong to this engine land after
-        // this call returns, on other threads (the drain's KV rows and
-        // temporaries, the engine/loop deinit chain, the last command
-        // buffers' completion handlers). With the free-buffer cache limit at
-        // zero every later release goes straight back to Metal, so the
-        // allocator's cache cannot be repopulated behind the phase close that
-        // follows. Nothing scored runs under the zero limit: the caller has
-        // collected every token it wants, and the next phase start installs
-        // its own limit before any charged work. Token output is untouched.
-        Memory.cacheLimit = 0
         if Self.fastAckShutdown {
             let loop = self.loop
-            // Cancel every live row now, so the detached drain completes at
-            // the next step boundary instead of running a begin-only cohort
-            // to its token ceiling or to `shutdownTimeout`.
-            loop.requestCancelAllLive()
             // .userInitiated: a starved lower-priority drain would leave the
             // engine loop thread alive (and any joiner waiting) through the
             // caller's next work — measured locally as a real regression.

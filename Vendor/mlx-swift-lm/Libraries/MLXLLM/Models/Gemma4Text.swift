@@ -26,6 +26,20 @@ private let gemma4CompiledDecodeSupported: Bool = {
     return true
 }()
 
+// INTERMEDIATE-KV-COMPACT-001: shared layers always point at an earlier
+// source slot in the valid KV map. Do not allocate or write unreachable
+// trailing tuple slots on the production shared-KV topology.
+@inline(__always)
+internal func resolveGemma4IntermediateKVCompactionEnabled(_ raw: String?) -> Bool {
+    guard let raw else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}
+
+private let gemma4IntermediateKVCompactionEnabled =
+    resolveGemma4IntermediateKVCompactionEnabled(
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_INTERMEDIATE_KV_COMPACT"])
+
+
 // MARK: - CBv2 B=8 decode graph-submission ladder
 
 /// Earlier graph submission is ON by default for the one scored decode
@@ -6154,8 +6168,10 @@ public class Gemma4TextModelInner: Module {
 
     // KV sharing mapping: for each layer, which earlier layer provides KVs
     let previousKvs: [Int]
+    // Highest intermediate slot referenced by `previousKvs`, plus one.
+    // Shared suffix entries therefore do not need their own tuple slots.
+    let intermediateKVCount: Int
     let firstKvSharedLayerIdx: Int
-
     /// Index of the last non-shared full-attention layer (-1 if none).
     /// Used by the shared-KV capture hook for the MTP drafter.
     let lastFullAttentionNonSharedIdx: Int
@@ -6208,6 +6224,9 @@ public class Gemma4TextModelInner: Module {
             }
         }
         self.previousKvs = kvMap
+        self.intermediateKVCount = gemma4IntermediateKVCompactionEnabled
+            ? (kvMap.max() ?? -1) + 1
+            : config.numHiddenLayers
 
         // Capture indices for MTP drafter: the last layer of each type that
         // still has its own K/V (not shared from an earlier layer).
@@ -6473,9 +6492,13 @@ public class Gemma4TextModelInner: Module {
             }
         }
 
-        // Forward through layers, tracking intermediate KV pairs for sharing
+        // INTERMEDIATE-KV-COMPACT-001: `previousKvs` bounds every read, so
+        // the shared suffix does not need a private tuple slot.
+        if intermediateKVCount < config.numHiddenLayers {
+            CBv2EngageMark.once("gemma4-intermediate-kv-compact")
+        }
         var intermediates = [(kv: (MLXArray, MLXArray)?, positionOffset: Gemma4.PositionOffset?)](
-            repeating: (nil, nil), count: config.numHiddenLayers)
+            repeating: (nil, nil), count: intermediateKVCount)
 
         // GLUE-003: one chain box per forward; layer L's fused tail hands
         // layer L+1 its input norm through it.
@@ -6535,7 +6558,9 @@ public class Gemma4TextModelInner: Module {
                     && !capturePreNorm && dFlashHiddenCapture == nil
             )
             h = out
-            intermediates[idx] = (kvPair, positionOffset)
+            if idx < intermediateKVCount {
+                intermediates[idx] = (kvPair, positionOffset)
+            }
             captureHook?(idx, kvPair)
             dFlashHiddenCapture?.capture(h, layer: idx)
 

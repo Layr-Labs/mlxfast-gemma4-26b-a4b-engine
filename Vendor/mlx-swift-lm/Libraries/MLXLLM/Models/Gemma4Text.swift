@@ -6842,6 +6842,8 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         if !config.tieWordEmbeddings {
             self._lmHead.wrappedValue = Linear(config.hiddenSize, config.vocabSize, bias: false)
         }
+
+        CBv2ComposedPrefillSDPAV1.warmupCommonMasks()
     }
 
     public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws

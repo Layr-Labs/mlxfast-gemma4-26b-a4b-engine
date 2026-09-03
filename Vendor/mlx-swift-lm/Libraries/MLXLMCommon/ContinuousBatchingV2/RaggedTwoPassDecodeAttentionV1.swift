@@ -3744,22 +3744,16 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         var array: MLXArray?
     }
     nonisolated(unsafe) private static var cachedD512Params = CachedD512Params()
-    private static let d512ParamsLock = NSLock()
 
     private static func getD512ParamsArray(params: [UInt32]) -> MLXArray {
         guard CBv2RaggedTwoPassDecodeAttentionV1.hostAllocTablesEnabled else {
             return MLXArray(params)
         }
-        d512ParamsLock.lock()
         if cachedD512Params.params == params, let arr = cachedD512Params.array {
-            d512ParamsLock.unlock()
             return arr
         }
-        d512ParamsLock.unlock()
         let arr = MLXArray(params)
-        d512ParamsLock.lock()
         cachedD512Params = CachedD512Params(params: params, array: arr)
-        d512ParamsLock.unlock()
         return arr
     }
 

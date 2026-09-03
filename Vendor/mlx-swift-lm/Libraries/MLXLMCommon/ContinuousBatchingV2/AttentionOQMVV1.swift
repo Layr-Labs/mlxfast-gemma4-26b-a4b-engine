@@ -32,6 +32,27 @@ public enum CBv2AttentionOQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// HALFDEQ-045 arm. Default ON.
+    /// Replaces integer-to-float conversion with exact bitwise OR into the
+    /// fp16 binade [1024, 2048) followed by 1024.0h subtraction.
+    /// `DARKBLOOM_GEMMA4_ATTN_MMA8_HALF_DEQUANT=0` restores the promoted macro.
+    public static let halfDequantEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ATTN_MMA8_HALF_DEQUANT"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let halfDequantKey = halfDequantEnabled ? "_hd1" : ""
+
+    private static let mma8StepMacro = halfDequantEnabled
+        ? """
+        #define MMA8_STEP(BB, J) A.thread_elements()[0] = float(as_type<half>(ushort(0x6400u | extract_bits(wv.x, 4 * (J), 4))) - 1024.0h); A.thread_elements()[1] = float(as_type<half>(ushort(0x6400u | extract_bits(wv.y, 4 * (J), 4))) - 1024.0h); simdgroup_multiply_accumulate(C, A, BB, C);
+        """
+        : """
+        #define MMA8_STEP(BB, J) A.thread_elements()[0] = float(extract_bits(wv.x, 4 * (J), 4)); A.thread_elements()[1] = float(extract_bits(wv.y, 4 * (J), 4)); simdgroup_multiply_accumulate(C, A, BB, C);
+        """
+
     private static let batch = 8
     private static let sequence = 1
     private static let outputWidth = 2816
@@ -210,7 +231,7 @@ inline float mma8_runsum4(uint4 r) {
 
 #define MMA8_SETB(BB, W, HI) BB.thread_elements()[0] = mma8_##HI<T>(r0.W); BB.thread_elements()[1] = mma8_##HI<T>(r1.W);
 
-#define MMA8_STEP(BB, J) A.thread_elements()[0] = float(extract_bits(wv.x, 4 * (J), 4)); A.thread_elements()[1] = float(extract_bits(wv.y, 4 * (J), 4)); simdgroup_multiply_accumulate(C, A, BB, C);
+\(mma8StepMacro)
 
 template <typename T, int KS, int KFIX>
 METAL_FUNC void attention_o_qmv_mma8_affine4_g64_impl(
@@ -404,7 +425,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
 """
 
     private static let mma8KernelK4096 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry_bfill_v4",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_carry_bfill_v4\(halfDequantKey)",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -421,7 +442,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
         ensureRowContiguous: true)
 
     private static let mma8KernelK8192 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_carry_bfill_v4",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_carry_bfill_v4\(halfDequantKey)",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -556,7 +577,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
     }
 
     private static let mma8RspKernelK4096 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_rsp_v1",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k4096_rsp_v1\(halfDequantKey)",
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -573,7 +594,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp(
         ensureRowContiguous: true)
 
     private static let mma8RspKernelK8192 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp_v1",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp_v1\(halfDequantKey)",
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -687,7 +708,7 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
 """
 
     private static let mma8Rsp2KernelK8192 = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp2_v1",
+        name: "cbv2_b8_l1_attention_o_mma8_affine4_g64_k8192_rsp2_v1\(halfDequantKey)",
         inputNames: ["x", "w", "scales", "biases", "rs_pairs"],
         outputNames: ["y"],
         source: """

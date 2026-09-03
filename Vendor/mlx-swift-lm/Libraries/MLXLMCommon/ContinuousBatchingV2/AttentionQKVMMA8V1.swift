@@ -49,6 +49,27 @@ public enum CBv2AttentionQKVMMA8V1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// HALFDEQ-045 arm. Default ON.
+    /// Replaces integer-to-float conversion with exact bitwise OR into the
+    /// fp16 binade [1024, 2048) followed by 1024.0h subtraction.
+    /// `DARKBLOOM_GEMMA4_QKV_MMA8_HALF_DEQUANT=0` restores the promoted macro.
+    public static let halfDequantEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_QKV_MMA8_HALF_DEQUANT"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    private static let halfDequantKey = halfDequantEnabled ? "_hd1" : ""
+
+    private static let mma8StepMacro = halfDequantEnabled
+        ? """
+        #define MMA8_STEP(BB, J) A.thread_elements()[0] = float(as_type<half>(ushort(0x6400u | extract_bits(wv.x, 4 * (J), 4))) - 1024.0h); A.thread_elements()[1] = float(as_type<half>(ushort(0x6400u | extract_bits(wv.y, 4 * (J), 4))) - 1024.0h); simdgroup_multiply_accumulate(C, A, BB, C);
+        """
+        : """
+        #define MMA8_STEP(BB, J) A.thread_elements()[0] = float(extract_bits(wv.x, 4 * (J), 4)); A.thread_elements()[1] = float(extract_bits(wv.y, 4 * (J), 4)); simdgroup_multiply_accumulate(C, A, BB, C);
+        """
+
     private static let batch = 8
     private static let sequence = 1
     private static let inputWidth = 2816
@@ -120,7 +141,7 @@ inline float mma8_runsum4(uint4 r) {
 
 #define MMA8_SETB(BB, W, HI) BB.thread_elements()[0] = mma8_##HI<T>(r0.W); BB.thread_elements()[1] = mma8_##HI<T>(r1.W);
 
-#define MMA8_STEP(BB, J) A.thread_elements()[0] = float(extract_bits(wv.x, 4 * (J), 4)); A.thread_elements()[1] = float(extract_bits(wv.y, 4 * (J), 4)); simdgroup_multiply_accumulate(C, A, BB, C);
+\(mma8StepMacro)
 
 template <typename T, int KS, int KFIX>
 METAL_FUNC void qkv_mma8_affine4_g64_impl(
@@ -649,7 +670,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     private static let tilesPerGroup = 2
 
     private static let multiTileKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_v4",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_v4\(halfDequantKey)",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -675,7 +696,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     }()
 
     private static let fusedSlidingKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_v1\(halfDequantKey)",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y", "y2"],
         source: """
@@ -692,7 +713,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         ensureRowContiguous: true)
 
     private static let fusedFullKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_v1\(halfDequantKey)",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y", "y2"],
         source: """
@@ -714,7 +735,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     // entries the separate Q and K rsp dispatches would; the SPLIT store
     // keeps QKFUSE-001's two-buffer layout.
     private static let fusedSlidingRspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_rsp_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk6144_rsp_v1\(halfDequantKey)",
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y", "y2"],
         source: """
@@ -731,7 +752,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         ensureRowContiguous: true)
 
     private static let fusedFullRspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_rsp_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_carry2_qk9216_rsp_v1\(halfDequantKey)",
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y", "y2"],
         source: """
@@ -748,7 +769,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         ensureRowContiguous: true)
 
     private static let mma8Kernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_carry2_bfill_v4",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_carry2_bfill_v4\(halfDequantKey)",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -805,7 +826,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         ensureRowContiguous: true)
 
     private static let multiTileRspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_rsp_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_mt2_k2816_rsp_v1\(halfDequantKey)",
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """
@@ -822,7 +843,7 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
         ensureRowContiguous: true)
 
     private static let mma8RspKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_rsp_v1",
+        name: "cbv2_b8_l1_qkv_mma8_affine4_g64_tight_k2816_rsp_v1\(halfDequantKey)",
         inputNames: ["x", "w", "scales", "biases", "rs_table"],
         outputNames: ["y"],
         source: """

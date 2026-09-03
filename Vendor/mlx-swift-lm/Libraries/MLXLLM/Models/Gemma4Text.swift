@@ -1784,6 +1784,31 @@ private enum Gemma4PrefillDeqGEMMV1 {
         ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_PREFILL_DEQ_GEMM_XCHECK"] == "1"
 }
 
+/// DGQMM seam: dequant-fused prefill GEMM in ONE kernel (no materialized
+/// bf16 plane — unlike `Gemma4PrefillDeqGEMMV1`, which caches the transposed
+/// plane but still pays N*K*2 bytes of DRAM per layer). Fail-closed guards;
+/// kill switch DARKBLOOM_GEMMA4_DGQMM_TILES=1 (default OFF).
+private enum Gemma4PrefillDGQMMSeamV1 {
+    @inline(__always)
+    static func apply(_ layer: Linear, _ x: MLXArray) -> MLXArray? {
+        guard CBv2PrefillDGQMMV1.dgEnabled,
+            let quantized = layer as? QuantizedLinear,
+            quantized.bias == nil,
+            quantized.mode == .affine,
+            quantized.groupSize == 64,
+            quantized.bits == 4,
+            x.dtype == .bfloat16, x.ndim >= 2,
+            let biases = quantized.biases,
+            quantized.scales.dtype == biases.dtype
+        else { return nil }
+        let inputDims = x.dim(-1)
+        guard inputDims > 0, x.size / inputDims >= 512 else { return nil }
+        return CBv2PrefillDGQMMV1.matmulDG(
+            x: x, weight: quantized.weight, scales: quantized.scales,
+            biases: biases, groupSize: 64, bits: 4, mode: .affine)
+    }
+}
+
 // MARK: - Attention
 
 /// QKFUSE-SLIDING. Default ON: sliding attention layers (vProj != nil) take
@@ -1923,7 +1948,7 @@ private class Gemma4Attention: Module {
                 bits: quantized.bits,
                 mode: quantized.mode,
                 rsTable: rsTable)
-        else { return Gemma4PrefillDeqGEMMV1.apply(layer, x) ?? layer(x) }
+        else { return Gemma4PrefillDGQMMSeamV1.apply(layer, x) ?? Gemma4PrefillDeqGEMMV1.apply(layer, x) ?? layer(x) }
         return projected
     }
 
@@ -1975,7 +2000,7 @@ private class Gemma4Attention: Module {
                 rsTable: CBv2AttentionOQMVV1.acceptRunsumTable(
                     carriedRunsum, for: x)
                     ?? CBv2AttentionOQMVV1.runsumTable(for: x))
-        else { return Gemma4PrefillDeqGEMMV1.apply(oProj, x) ?? oProj(x) }
+        else { return Gemma4PrefillDGQMMSeamV1.apply(oProj, x) ?? Gemma4PrefillDeqGEMMV1.apply(oProj, x) ?? oProj(x) }
         return projected
     }
 
@@ -4134,7 +4159,7 @@ private class Gemma4Router: Module {
         // projections use (its own admission floor keeps decode rows on the
         // incumbent quantized dispatch). Unquantized or off-contract routers
         // fall through untouched.
-        Gemma4PrefillDeqGEMMV1.apply(proj, normed) ?? proj(normed)
+        Gemma4PrefillDGQMMSeamV1.apply(proj, normed) ?? Gemma4PrefillDeqGEMMV1.apply(proj, normed) ?? proj(normed)
     }
 
     fileprivate func zipPartition(_ expertScores: MLXArray) -> MLXArray {
@@ -4286,7 +4311,7 @@ private class Gemma4MLP: Module {
                 bits: quantized.bits,
                 mode: quantized.mode,
                 activationSums: activationSums)
-        else { return Gemma4PrefillDeqGEMMV1.apply(layer, x) ?? layer(x) }
+        else { return Gemma4PrefillDGQMMSeamV1.apply(layer, x) ?? Gemma4PrefillDeqGEMMV1.apply(layer, x) ?? layer(x) }
         return tight
     }
 

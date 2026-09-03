@@ -127,6 +127,16 @@ public enum CBv2DenseMLPQMVV1 {
         else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
+    /// Removes the unconsumed second carry handoff at each SIMD group's
+    /// terminal valid iteration. Defaults on; disabling selects the original
+    /// two-deep carry source for attribution.
+    private static let mma8DownCarryTailEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_MLP_DOWN_CARRY_TAIL"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
 
     /// W4-LOAD (engage mark `mlp-w4-load`). The four packed affine-8 codes a
     /// lane owns for one output row are four CONTIGUOUS bytes at a 4-byte
@@ -819,6 +829,51 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
             """)
         return result
     }()
+    /// The two-deep carry's terminal iteration has no later consumer. Keep
+    /// the initial carry and every nonterminal handoff text-identical, but
+    /// omit the dead packed-word and metadata reload at each SIMD tail.
+    private static let mma8DownStaticKHeaderTail: String = {
+        var result = mma8DownStaticKHeader
+        func replaceOnce(_ old: String, with new: String) {
+            precondition(result.components(separatedBy: old).count == 2)
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        replaceOnce(
+            """
+                const int g_next = min(g + 1, G - 1);
+                wv_next = wv_next2;
+                wv_next2 = *((const device uint4*)(wrow + 64 * min(g + 2, G - 1)));
+                s_next = srow[g_next];
+                b_next = brow[g_next];
+            """,
+            with: """
+                if (gi + 1 < nGroups && g + 1 < G) {
+                    const int g_next = g + 1;
+                    wv_next = wv_next2;
+                    wv_next2 = *((const device uint4*)(wrow + 64 * (g + 2)));
+                    s_next = srow[g_next];
+                    b_next = brow[g_next];
+                }
+            """)
+        return result
+    }()
+
+    private static let mma8DownStaticKTailKernel = MLXFast.metalKernel(
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_carry2_tail_v1",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint3 tid = threadgroup_position_in_grid;
+            threadgroup float2 red[32];
+            gemma4_qmv_mma8_affine8_down_k2112_impl<T, 2>(
+                w, scales, biases, x, y,
+                w_shape[0], int(tid.y) * 8, red,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            """,
+        header: mma8DownStaticKHeaderTail,
+        ensureRowContiguous: true)
+
 
     private static let mma8DownStaticKKernel = MLXFast.metalKernel(
         name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_carry2_bfill_v4",
@@ -1287,7 +1342,14 @@ inline U qdot_affine8_registered_v4(
                 )[0]
             }
             let selectedMMA = !isGateUp && mma8DownStaticKEnabled
-                ? mma8DownStaticKKernel : mma8Kernel
+                ? (mma8DownCarryTailEnabled
+                    ? mma8DownStaticKTailKernel : mma8DownStaticKKernel)
+                : mma8Kernel
+            if !isGateUp && mma8DownStaticKEnabled
+                && mma8DownCarryTailEnabled
+            {
+                CBv2EngageMark.once("mlp-mma8-down-carry-tail")
+            }
             return selectedMMA(
                 [x, weight, scales, biases],
                 template: [("T", x.dtype)],

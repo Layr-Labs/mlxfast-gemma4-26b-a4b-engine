@@ -1102,39 +1102,31 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
     return x
 }
 
-// MARK: - GATEUP-FUSE-PREFILL: one gathered gate|up GEMM on the sorted prefill plane
+// MARK: - GATEUP-GEGLU-PREFILL: close the fused expert GEMM in its store epilogue
 
-/// GATEUP-FUSE-PREFILL. On the sorted routed-expert prefill plane the gate and
+/// GATEUP-GEGLU-PREFILL. On the sorted routed-expert prefill plane the gate and
 /// up projections are two `gather_qmm_rhs` dispatches (N = 704 each) over the
 /// same gathered activations `[rows * topK, 1, 2816]` and the same sorted
 /// expert keys; the activations (369 MB for the packed 8 x 1024 cohort) are
-/// therefore streamed from DRAM twice per layer. This arm issues ONE
-/// `gather_qmm_rhs` over a concatenated right-hand side (N = 1408: the gate
-/// columns followed by the up columns) and hands the shaped GeGLU the two
-/// column halves as strided views, so the activations are read once and one
-/// dispatch per layer disappears.
+/// therefore streamed from DRAM twice per layer. This arm issues one gather
+/// over a paired gate/up right-hand side and closes the rounded GeGLU directly
+/// from its MMA fragments. The activation is read once and both the second
+/// gather and the standalone shaped-GeGLU dispatch disappear.
 ///
-/// Storage. The concatenated `[experts, 1408, packed-in]` weight and its
-/// `[experts, 1408, groups]` scales and biases are the PRIMARY per-layer
-/// storage, built once at load (``SwitchGateUpFusedStorage``, bound from the
-/// model's sanitize pass). The module's `gate_proj` / `up_proj` parameters
-/// become zero-copy slices of that storage: rows `0..<704` and `704..<1408`
-/// of the output axis, each a contiguous `[704, packed-in]` matrix per
-/// expert with an expert stride of 1408 rows. The gathered decode and
-/// verification kernels address experts through the batch strides they are
-/// handed and require only the per-expert matrix to be contiguous, so they
-/// read the identical bytes through the views without a copy. Net resident
-/// weight memory therefore equals the split layout's exactly; nothing is
-/// duplicated.
+/// Storage. Adjacent 16-column gate/up blocks let both the NAX 64-column tile
+/// and portable 32-column tile own complete pairs without cross-threadgroup
+/// exchange. Decode and speculative verification still require contiguous
+/// split matrices, so the loaded gate/up arrays remain their primary storage
+/// and the paired prefill plane is one additional load-time copy. It contains
+/// the same frozen quantized bytes; no weight is re-quantized or represented in
+/// another numerical format.
 ///
 /// Exactness: every output column of the gathered quantized GEMM owns an
 /// independent K-chain -- the tile pipeline (bm/bn/bk, K-step order, per-group
-/// affine dequant `scale * nibble + bias`) is fixed by (K, group size, bits)
-/// and never by N -- and the concatenated weight, scales and biases are a pure
-/// copy of the split ones along the output axis. 1408 keeps every alignment
-/// predicate (32 and 64) that 704 satisfies, so the same pipeline is
-/// selected. The consumer receives the identical gate / up bytes through views
-/// with the identical shapes it saw before.
+/// affine dequant `scale * nibble + bias`) is unchanged. The epilogue rounds
+/// each accumulator to bfloat16 at the same boundary as the two stock GEMM
+/// outputs, then reproduces every bfloat16 temporary in `compiledGeGLU` before
+/// storing the compact 704-column plane.
 ///
 /// Routing. The fused right-hand side is dispatched exactly where the host
 /// would select the sorted right-hand-side kernel: a sorted plane without
@@ -1147,7 +1139,8 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
 ///
 /// Kill switch: `DARKBLOOM_GEMMA4_PREFILL_GATEUP_FUSE` set to
 /// `0`/`false`/`no`/`off` leaves the split arrays as loaded and restores the
-/// two split gathers. Engage mark: `prefill-gateup-fuse`.
+/// two split gathers. Engage marks: `prefill-gateup-fuse` and
+/// `prefill-gateup-gelu-epilogue`.
 public let switchGateUpFusePrefillEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_GEMMA4_PREFILL_GATEUP_FUSE"]
@@ -1155,8 +1148,8 @@ public let switchGateUpFusePrefillEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
-/// The concatenated `[gate ; up]` affine 4-bit right-hand side of one expert
-/// layer plus the two zero-copy views the split projections are bound to. A
+/// The fused gate/up affine 4-bit right-hand side of one expert layer plus the
+/// split projection arrays used outside the large sorted prefill path. A
 /// plain final class (not a `Module`, not an `MLXArray` tuple) so the module
 /// reflection that enumerates parameters treats it as an opaque value: it is
 /// never a parameter in its own right, never quantized again, never saved and
@@ -1192,22 +1185,24 @@ public final class SwitchGateUpFusedStorage {
             && gateBiases.dtype == .bfloat16 && upBiases.dtype == .bfloat16
         else { return nil }
         let n = 704
-        // Output axis (axis 1 of [experts, out, packed-in]): gate rows
-        // 0..<704 followed by up rows 704..<1408, for weight, scales and
-        // biases alike. Pure copies of the loaded planes; the split
-        // parameters below are slices sharing this storage, not copies.
-        let weight = concatenated([gateWeight, upWeight], axis: 1)
-        let scales = concatenated([gateScales, upScales], axis: 1)
-        let biases = concatenated([gateBiases, upBiases], axis: 1)
-        self.weight = weight
-        self.scales = scales
-        self.biases = biases
-        self.gateWeight = weight[0..., ..<n]
-        self.gateScales = scales[0..., ..<n]
-        self.gateBiases = biases[0..., ..<n]
-        self.upWeight = weight[0..., n...]
-        self.upScales = scales[0..., n...]
-        self.upBiases = biases[0..., n...]
+        // Pair one 16-column gate block with the matching up block. Both the
+        // NAX 64-column tile and portable 32-column tile then own complete
+        // gate/up pairs and can close GeGLU without cross-group exchange.
+        func paired16(_ gate: MLXArray, _ up: MLXArray, tail: Int) -> MLXArray {
+            let gateBlocks = gate.reshaped(128, n / 16, 16, tail)
+            let upBlocks = up.reshaped(128, n / 16, 16, tail)
+            return MLX.stacked([gateBlocks, upBlocks], axis: 2)
+                .reshaped(128, n * 2, tail)
+        }
+        self.weight = paired16(gateWeight, upWeight, tail: 352)
+        self.scales = paired16(gateScales, upScales, tail: 44)
+        self.biases = paired16(gateBiases, upBiases, tail: 44)
+        self.gateWeight = gateWeight
+        self.gateScales = gateScales
+        self.gateBiases = gateBiases
+        self.upWeight = upWeight
+        self.upScales = upScales
+        self.upBiases = upBiases
         self.hiddenDims = n
     }
 }
@@ -1500,8 +1495,17 @@ public class SwitchGLU: Module {
                     mode: fused.mode,
                     sortedIndices: true
                 )
-                xGate = xGateUp[.ellipsis, ..<hiddenDims]
-                xUp = xGateUp[.ellipsis, hiddenDims...]
+                // The specialized gathered-QMM epilogue stores the compact
+                // [rows, 704] GeGLU plane in the first physical half of the
+                // ordinary [rows, 1, 1408] output allocation.
+                let activated = xGateUp.flattened()[..<(xGateUp.size / 2)]
+                    .reshaped(x.dim(0), 1, hiddenDims)
+                CBv2EngageMark.once("prefill-gateup-gelu-epilogue")
+                let downLhs: MLXArray? =
+                    (idx.ndim == 1 && idx.size == 64) ? switchDownIdentity64 : nil
+                x = downProj(
+                    activated, idx, lhsIndices: downLhs, sortedIndices: true)
+                return (x, inverseOrder, true)
             } else {
                 xUp = upProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
                 xGate = gateProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)

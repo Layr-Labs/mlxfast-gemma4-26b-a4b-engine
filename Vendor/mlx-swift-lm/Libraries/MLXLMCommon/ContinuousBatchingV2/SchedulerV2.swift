@@ -237,6 +237,18 @@ public final class SchedulerV2 {
 
     public func record(for id: CBv2RequestID) -> CBv2ScheduledRequest? { byID[id] }
 
+    /// Batch twin of `record(for:)` for per-step hot loops (finalize,
+    /// launch-triple rebuild): one call site instead of N, returning the
+    /// same live `CBv2ScheduledRequest` references in `ids` order.
+    /// `CBv2ScheduledRequest` is a final class, so these are the identical
+    /// objects a repeated subscript would return — no snapshot/staleness
+    /// semantics differ under any interleaving (all loop-body mutations in
+    /// the rewired loops are per-id). Pure reads; ungated (no behavior
+    /// change possible, same rationale as the single-scan predicate dedup).
+    public func records(for ids: [CBv2RequestID]) -> [CBv2ScheduledRequest?] {
+        ids.map { byID[$0] }
+    }
+
     // MARK: Submission
 
     /// Enqueue a new request. Throws `CBv2SchedulerError.duplicateRequestID`

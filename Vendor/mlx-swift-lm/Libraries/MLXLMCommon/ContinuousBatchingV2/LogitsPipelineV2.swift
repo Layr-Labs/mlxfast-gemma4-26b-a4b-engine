@@ -623,4 +623,16 @@ public enum CBv2OrderOnlyLogits {
         defer { set(false) }
         return build()
     }
+
+    /// Twin of `withOrderOnly` for callers that already evaluated
+    /// `orderOnly(params)` for a same-step dispatch decision (see the
+    /// single-scan dedup in `launchChainedDecode`): reuses the value
+    /// instead of running the identical allSatisfy a second time.
+    public static func withPrecomputedOrderOnly<T>(
+        _ value: Bool, _ build: () -> T
+    ) -> T {
+        set(value)
+        defer { set(false) }
+        return build()
+    }
 }

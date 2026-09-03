@@ -3331,6 +3331,31 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
     private static let minKeyLength = 4
     private static let maxKeyLength = 4095
 
+    // Single-entry params cache for the shared [kL, D, per-row caps...]
+    // layout. All full-attention rows share one offset per step, so the
+    // layers of a step hit one entry; guarded by a lock, hit logic
+    // otherwise identical to a fresh allocation.
+    private struct CachedD512Params {
+        var params: [UInt32] = []
+        var array: MLXArray?
+    }
+    nonisolated(unsafe) private static var cachedD512Params = CachedD512Params()
+    private static let d512ParamsLock = NSLock()
+
+    private static func getD512ParamsArray(params: [UInt32]) -> MLXArray {
+        d512ParamsLock.lock()
+        if cachedD512Params.params == params, let arr = cachedD512Params.array {
+            d512ParamsLock.unlock()
+            return arr
+        }
+        d512ParamsLock.unlock()
+        let arr = MLXArray(params)
+        d512ParamsLock.lock()
+        cachedD512Params = CachedD512Params(params: params, array: arr)
+        d512ParamsLock.unlock()
+        return arr
+    }
+
     // MARK: NORMROPE-D512 / ORS-D512
 
     /// NORMROPE-D512 kill switch: `DARKBLOOM_GEMMA4_D512_NORMROPE` set to
@@ -5371,7 +5396,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             valueBuffers.append(state[1])
             params.append(UInt32(state[0].dim(2)))
         }
-        let paramsArray = MLXArray(params)
+        let paramsArray = getD512ParamsArray(params: params)
 
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)
@@ -5574,7 +5599,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
             valueBuffers.append(state[1])
             params.append(UInt32(state[0].dim(2)))
         }
-        let paramsArray = MLXArray(params)
+        let paramsArray = getD512ParamsArray(params: params)
 
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)
@@ -5792,7 +5817,7 @@ public enum CBv2RaggedComposedD512DecodeAttentionV1 {
         queries: MLXArray, keyBuffers: [MLXArray], valueBuffers: [MLXArray],
         params: [UInt32], keyLength: Int
     ) -> MLXArray {
-        let paramsArray = MLXArray(params)
+        let paramsArray = getD512ParamsArray(params: params)
 
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)

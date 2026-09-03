@@ -905,6 +905,60 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
     nonisolated(unsafe) private static var fusedPlanes:
         [ObjectIdentifier: (MLXArray, MLXArray, MLXArray)] = [:]
 
+    /// PREFILL-QK-JOIN. The concatenated Q|K packed plane this tier caches for
+    /// the decode dispatch, exposed so the prompt pass can dequantize one plane
+    /// instead of the two split planes. Same table, same lock idiom, same
+    /// concatenation, so a prompt pass that reaches it first simply builds the
+    /// entry the first decode step would otherwise build.
+    ///
+    /// Admission mirrors `fusedQKMatmul`'s plane guards exactly, minus the
+    /// activation-shape checks, which belong to the dispatch and not to the
+    /// weights. A nil return leaves every caller on its incumbent road.
+    public static func fusedQKPackedPlane(
+        cacheKey: ObjectIdentifier,
+        qWeight: MLXArray, qScales: MLXArray, qBiases: MLXArray?,
+        kWeight: MLXArray, kScales: MLXArray, kBiases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode
+    ) -> (weight: MLXArray, scales: MLXArray, biases: MLXArray)? {
+        guard enabled, fuseQKEnabled, multiTileEnabled,
+            groupSize == Self.groupSize,
+            bits == Self.bits,
+            mode == .affine,
+            let qBiases, let kBiases,
+            qScales.dtype == .bfloat16, qBiases.dtype == .bfloat16,
+            kScales.dtype == .bfloat16, kBiases.dtype == .bfloat16,
+            qWeight.dtype == .uint32, kWeight.dtype == .uint32,
+            qWeight.ndim == 2, kWeight.ndim == 2,
+            qWeight.dim(1) == inputWidth * Self.bits / 32,
+            kWeight.dim(1) == inputWidth * Self.bits / 32
+        else { return nil }
+
+        let qWidth = qWeight.dim(0)
+        let kWidth = kWeight.dim(0)
+        guard liveFusedSplit(qWidth), liveOutputWidth(kWidth),
+            qScales.shape == [qWidth, inputWidth / Self.groupSize],
+            qBiases.shape == qScales.shape,
+            kScales.shape == [kWidth, inputWidth / Self.groupSize],
+            kBiases.shape == kScales.shape
+        else { return nil }
+
+        fusedLock.lock()
+        var plane = fusedPlanes[cacheKey]
+        if plane == nil {
+            let w = concatenated([qWeight, kWeight], axis: 0)
+            let s = concatenated([qScales, kScales], axis: 0)
+            let b = concatenated([qBiases, kBiases], axis: 0)
+            eval(w, s, b)
+            plane = (w, s, b)
+            fusedPlanes[cacheKey] = plane
+        }
+        fusedLock.unlock()
+        guard let (fw, fs, fb) = plane else { return nil }
+        return (fw, fs, fb)
+    }
+
     /// QKFUSE-001. One dispatch for the layer's Q and K projections.
     ///
     /// Q and K read the SAME activation at decode (`queryInput === x` whenever

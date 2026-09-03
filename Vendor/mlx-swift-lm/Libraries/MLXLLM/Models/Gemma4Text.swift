@@ -4965,7 +4965,8 @@ private class Gemma4Experts: Module {
         topKIndices: MLXArray,
         topKWeights: MLXArray,
         isExpertPrefill: Bool,
-        sortedPlane: SwitchSortedPlaneProducer? = nil
+        sortedPlane: SwitchSortedPlaneProducer? = nil,
+        indirectPlane: SwitchIndirectPlaneProducer? = nil
     ) -> Output {
         // Flatten [B, S, H] and always enter SwitchGLU's combined API. It
         // selects direct sorted reduction only for the exact production
@@ -4981,7 +4982,9 @@ private class Gemma4Experts: Module {
             // Rectangular MTP verification explicitly passes false.
             isProductionPrefill: isExpertPrefill,
             // PRENORM-GATHER: the prefill producer of the sorted plane.
-            sortedPlane: sortedPlane)
+            sortedPlane: sortedPlane,
+            // PREFILL-GATHER-INDIRECT: the un-sorted token-row producer.
+            indirectPlane: indirectPlane)
         return Output(
             output: result.output.reshaped(B, S, H),
             unsortCarrier: result.carrier)
@@ -5659,6 +5662,7 @@ public class Gemma4DecoderLayer: Module {
                 indices: MLXArray,
                 weights: MLXArray,
                 sortedPlane: SwitchSortedPlaneProducer? = nil,
+                indirectPlane: SwitchIndirectPlaneProducer? = nil,
                 routeTable: SwitchRouteTable? = nil
             ) -> (
                 raw: MLXArray?,
@@ -5680,7 +5684,8 @@ public class Gemma4DecoderLayer: Module {
                     topKIndices: indices,
                     topKWeights: weights,
                     isExpertPrefill: isExpertPrefill,
-                    sortedPlane: sortedPlane)
+                    sortedPlane: sortedPlane,
+                    indirectPlane: indirectPlane)
                 return (result.output, nil, result.unsortCarrier)
             }
 
@@ -5763,6 +5768,18 @@ public class Gemma4DecoderLayer: Module {
                                 x: out,
                                 weight: expertNormWeight,
                                 inverseOrder: inverseOrder,
+                                topK: expertTopK,
+                                eps: normEps)
+                        },
+                        // PREFILL-GATHER-INDIRECT: the same expert pre-norm
+                        // written once, un-sorted, into a sorted-plane-shaped
+                        // buffer; the gate|up gather reads it through the
+                        // tagged keys. SwitchGLU falls back to the producer
+                        // above whenever it declines.
+                        indirectPlane: {
+                            Gemma4PrefillGlueV1.preNormWide(
+                                x: out,
+                                weight: expertNormWeight,
                                 topK: expertTopK,
                                 eps: normEps)
                         })

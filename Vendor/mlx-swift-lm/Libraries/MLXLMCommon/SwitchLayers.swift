@@ -1149,6 +1149,125 @@ public func gatherSortOrder(
 /// that gather.
 public typealias SwitchSortedPlaneProducer = (_ inverseOrder: MLXArray) -> MLXArray?
 
+// MARK: - PREFILL-GATHER-INDIRECT: the gate|up gather reads token rows in place
+
+/// PREFILL-GATHER-INDIRECT. On the sorted routed-expert prefill plane the
+/// gate|up gather (`gather_qmm_rhs`, sorted right-hand side) reads its A
+/// operand row by row from a `[rows * topK, 1, 2816]` plane that
+/// PRENORM-GATHER writes in expert order: every token row is stored `topK`
+/// times (369 MB for the packed 8 x 1024 cohort) and streamed back once. The
+/// host dispatch of that kernel is not editable, so the plane it is handed
+/// keeps its shape: the producer writes the expert pre-norm ONCE, un-sorted,
+/// into the first `rows` rows of an allocation of that same shape, and the
+/// sorted expert keys handed as `rhsIndices` are tagged words that also carry
+/// each sorted row's token row. The (editable) kernel resolves the tag: the A
+/// element the stock path reads from sorted row `R` is read from token row
+/// `rowOrder[R]` at the same column. The sorted plane is by definition
+/// `normed[rowOrder]`, so every A fragment holds the same bfloat16 word, and
+/// the weight loads, the MMA sequence and the GeGLU epilogue are the stock
+/// ones. The down projection keeps the raw sorted keys (its A operand, the
+/// compact GeGLU plane, is already in sorted order).
+///
+/// Word layout (`gemma4_prompt_gather_indirect_tag_v1`): bits 0..7 expert
+/// key, bits 8..29 token row, bits 30..31 tag. Admitted only where the fused
+/// gate|up sorted dispatch is admitted (`max(16, 4 * experts)` rows and up),
+/// for at most 256 experts and 2^22 token rows.
+///
+/// Kill switch: `DARKBLOOM_GEMMA4_PROMPT_GATHER_INDIRECT` set to
+/// `0`/`false`/`no`/`off` restores the PRENORM-GATHER sorted plane and the
+/// untagged keys. `DARKBLOOM_GEMMA4_PROMPT_GATHER_INDIRECT_XCHECK=1` also
+/// runs the incumbent (sorted plane, untagged keys) beside every engaged
+/// gather and reports differing output words (diagnostic only; forces
+/// evaluation). Engage mark: `prefill-gather-indirect`.
+public typealias SwitchIndirectPlaneProducer = () -> MLXArray?
+
+public let promptGatherIndirectEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_PROMPT_GATHER_INDIRECT"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+private let promptGatherIndirectXcheck: Bool =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_PROMPT_GATHER_INDIRECT_XCHECK"] == "1"
+
+/// Largest expert key space and token row count the tagged word can carry.
+private let promptGatherIndirectMaxExperts = 256
+private let promptGatherIndirectMaxRows = 1 << 22
+
+private let promptGatherIndirectTagKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "gemma4_prompt_gather_indirect_tag_v1",
+    inputNames: ["keys", "rows"],
+    outputNames: ["tagged"],
+    source: """
+        const uint i = thread_position_in_grid.x;
+        const uint n = (uint)keys_shape[0];
+        if (i < n) {
+            tagged[i] = 0xC0000000u | (keys[i] & 0xFFu)
+                | ((rows[i] & 0x3FFFFFu) << 8);
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+/// `0xC0000000 | key | (tokenRow << 8)` for every sorted position.
+private func promptGatherIndirectTag(keys: MLXArray, rows: MLXArray) -> MLXArray {
+    let n = keys.size
+    return promptGatherIndirectTagKernel(
+        [keys, rows],
+        grid: (n, 1, 1),
+        threadGroup: (min(256, n), 1, 1),
+        outputShapes: [[n]],
+        outputDTypes: [.uint32]
+    )[0]
+}
+
+/// Diagnostic: the incumbent gather (sorted plane gathered from the token
+/// rows, untagged keys) beside the indirect one, on the same inputs; and the
+/// gathered plane beside the PRENORM-GATHER producer's plane when available.
+private func promptGatherIndirectReport(
+    candidate: MLXArray, wide: MLXArray, tokenRows: Int, rowOrder: MLXArray,
+    keys: MLXArray, sortedReference: MLXArray?,
+    weight: MLXArray, scales: MLXArray, biases: MLXArray,
+    groupSize: Int, bits: Int, mode: QuantizationMode
+) {
+    let n = keys.size
+    let inputDims = wide.dim(2)
+    let plane = wide.reshaped(n, inputDims)[..<tokenRows][rowOrder]
+        .reshaped(n, 1, inputDims)
+    var planeLine = ""
+    if let sortedReference, sortedReference.shape == plane.shape,
+        sortedReference.dtype == plane.dtype
+    {
+        let planeDiff = MLX.sum(
+            plane.view(dtype: .uint16) .!= sortedReference.view(dtype: .uint16),
+            stream: .default)
+        eval(planeDiff)
+        planeLine = " plane-vs-prenorm-scatter differing \(planeDiff.item(Int32.self))"
+    }
+    let reference = MLX.gatherQuantizedMM(
+        plane, weight, scales: scales, biases: biases,
+        lhsIndices: nil, rhsIndices: keys, transpose: true,
+        groupSize: groupSize, bits: bits, mode: mode, sortedIndices: true)
+    let half = candidate.size / 2
+    let c = candidate.flattened()[..<half]
+    let r = reference.flattened()[..<half]
+    let differing = MLX.sum(
+        c.view(dtype: .uint16) .!= r.view(dtype: .uint16), stream: .default)
+    let cf = c.asType(.float32)
+    let rf = r.asType(.float32)
+    let maxRel = MLX.max(
+        MLX.abs(cf - rf) / MLX.maximum(MLX.abs(rf), MLXArray(Float(1e-6))),
+        stream: .default)
+    eval(candidate, reference, differing, maxRel)
+    FileHandle.standardError.write(
+        Data(
+            ("[xcheck] prefill-gather-indirect rows \(tokenRows) assignments \(n) "
+                + "compact words \(half) differing \(differing.item(Int32.self)) "
+                + "max rel \(maxRel.item(Float.self))\(planeLine)\n").utf8))
+}
+
 /// `numExperts` is the exclusive upper bound of the index key space; callers
 /// that know it (SwitchGLU) pass it so the counting-sort fast path can prove
 /// its 256-entry counter table covers every key. The default (`Int.max`)
@@ -1495,6 +1614,7 @@ public class SwitchGLU: Module {
     private func projectExperts(
         _ x: MLXArray, _ indices: MLXArray,
         sortedPlane: SwitchSortedPlaneProducer? = nil,
+        indirectPlane: SwitchIndirectPlaneProducer? = nil,
         routeTable: SwitchRouteTable? = nil
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
         let useLhsIndices =
@@ -1515,6 +1635,11 @@ public class SwitchGLU: Module {
         // layer per forward.
         var inverseOrder: MLXArray?
         var lhsIndices: MLXArray?
+        // PREFILL-GATHER-INDIRECT: set when `x` is the un-sorted token plane
+        // (first `indirectTokenRows` rows of a sorted-plane-shaped buffer) and
+        // the gate|up gather must read it through the tagged keys.
+        var indirectRowOrder: MLXArray?
+        var indirectTokenRows = 0
         if doSort {
             if useLhsIndices {
                 x = x.flattened(start: 0, end: -3)
@@ -1544,6 +1669,33 @@ public class SwitchGLU: Module {
                         indices: indices, numExperts: numExperts,
                         expertPrefixBounds: useExpertPrefixBounds)
                 }
+            } else if let indirectPlane,
+                promptGatherIndirectEnabled,
+                gateUpProj == nil,
+                x.dtype == .bfloat16,
+                indices.dtype == .uint32,
+                numExperts <= promptGatherIndirectMaxExperts,
+                indices.size >= 16,
+                indices.size / numExperts >= 4,
+                indices.size / indices.dim(-1) <= promptGatherIndirectMaxRows,
+                fusedGateUpDispatch() != nil,
+                let wide = indirectPlane(),
+                wide.ndim == 3, wide.dim(0) == indices.size,
+                wide.dim(1) == 1, wide.dim(2) == inputDims,
+                wide.dtype == .bfloat16
+            {
+                // PREFILL-GATHER-INDIRECT: the producer wrote the token rows
+                // once, un-sorted, into a sorted-plane-shaped buffer. The
+                // admission above is exactly the fused gate|up sorted
+                // dispatch's admission below, which is the only consumer of
+                // the tagged keys. Every other case takes PRENORM-GATHER.
+                let order = gatherSortOrder(indices: indices, numExperts: numExperts)
+                x = wide
+                idx = order.sortedKeys
+                inverseOrder = order.inverseOrder
+                indirectRowOrder = order.rowOrder
+                indirectTokenRows = indices.size / indices.dim(-1)
+                CBv2EngageMark.once("prefill-gather-indirect")
             } else if let sortedPlane {
                 // PRENORM-GATHER: the producer writes the sorted plane from
                 // the inverse order; `x` is only read if it declines.
@@ -1592,19 +1744,38 @@ public class SwitchGLU: Module {
                 let fused = fusedGateUpDispatch()
             {
                 CBv2EngageMark.once("prefill-gateup-fuse")
+                // PREFILL-GATHER-INDIRECT: tagged keys carry the token row of
+                // every sorted position; the kernel reads A through them.
+                let gateUpRhs: MLXArray
+                if let rowOrder = indirectRowOrder {
+                    gateUpRhs = promptGatherIndirectTag(keys: idx, rows: rowOrder)
+                } else {
+                    gateUpRhs = idx
+                }
                 let xGateUp = MLX.gatherQuantizedMM(
                     x,
                     fused.storage.weight,
                     scales: fused.storage.scales,
                     biases: fused.storage.biases,
                     lhsIndices: nil,
-                    rhsIndices: idx,
+                    rhsIndices: gateUpRhs,
                     transpose: true,
                     groupSize: fused.groupSize,
                     bits: fused.bits,
                     mode: fused.mode,
                     sortedIndices: true
                 )
+                if promptGatherIndirectXcheck, let rowOrder = indirectRowOrder,
+                    let inverseOrder
+                {
+                    promptGatherIndirectReport(
+                        candidate: xGateUp, wide: x, tokenRows: indirectTokenRows,
+                        rowOrder: rowOrder, keys: idx,
+                        sortedReference: sortedPlane?(inverseOrder),
+                        weight: fused.storage.weight, scales: fused.storage.scales,
+                        biases: fused.storage.biases, groupSize: fused.groupSize,
+                        bits: fused.bits, mode: fused.mode)
+                }
                 // The specialized gathered-QMM epilogue stores the compact
                 // [rows, 704] GeGLU plane in the first physical half of the
                 // ordinary [rows, 1, 1408] output allocation.
@@ -1617,6 +1788,14 @@ public class SwitchGLU: Module {
                     activated, idx, lhsIndices: downLhs, sortedIndices: true)
                 return (x, inverseOrder, true)
             } else {
+                // Unreachable with an indirect plane (its admission is the
+                // fused admission above); materialize the sorted plane so the
+                // split projections could never read the un-sorted rows.
+                if let rowOrder = indirectRowOrder {
+                    x = x.reshaped(indices.size, inputDims)[..<indirectTokenRows][rowOrder]
+                        .reshaped(indices.size, 1, inputDims)
+                    indirectRowOrder = nil
+                }
                 xUp = upProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
                 xGate = gateProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
             }
@@ -1747,9 +1926,11 @@ public class SwitchGLU: Module {
 
     public func callAsFunction(
         _ x: MLXArray, _ indices: MLXArray,
-        sortedPlane: SwitchSortedPlaneProducer? = nil
+        sortedPlane: SwitchSortedPlaneProducer? = nil,
+        indirectPlane: SwitchIndirectPlaneProducer? = nil
     ) -> MLXArray {
-        var projected = projectExperts(x, indices, sortedPlane: sortedPlane)
+        var projected = projectExperts(
+            x, indices, sortedPlane: sortedPlane, indirectPlane: indirectPlane)
         if let inverseOrder = projected.inverseOrder {
             projected.output = scatterUnsort(
                 x: projected.output, invOrder: inverseOrder, shape: indices.shape)
@@ -1823,7 +2004,8 @@ public class SwitchGLU: Module {
         weights: MLXArray,
         fuseSortedReduction: Bool,
         isProductionPrefill: Bool = true,
-        sortedPlane: SwitchSortedPlaneProducer? = nil
+        sortedPlane: SwitchSortedPlaneProducer? = nil,
+        indirectPlane: SwitchIndirectPlaneProducer? = nil
     ) -> (output: MLXArray, carrier: WeightedExpertUnsortCarrier?) {
         // At B=8 decode there are exactly 64 assignments (8 rows x top-k 8),
         // which is the sorting threshold and the minimum geometry accepted by
@@ -1836,12 +2018,16 @@ public class SwitchGLU: Module {
         else {
             return (
                 weightedExpertSum(
-                    callAsFunction(x, indices, sortedPlane: sortedPlane), weights),
+                    callAsFunction(
+                        x, indices, sortedPlane: sortedPlane,
+                        indirectPlane: indirectPlane),
+                    weights),
                 nil
             )
         }
 
-        let projected = projectExperts(x, indices, sortedPlane: sortedPlane)
+        let projected = projectExperts(
+            x, indices, sortedPlane: sortedPlane, indirectPlane: indirectPlane)
         guard projected.sorted,
             let inverseOrder = projected.inverseOrder,
             projected.output.ndim == 3,

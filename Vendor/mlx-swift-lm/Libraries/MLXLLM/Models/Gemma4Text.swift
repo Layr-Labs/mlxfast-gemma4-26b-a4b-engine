@@ -7487,4 +7487,4 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
 // Ranked resample marker 36: this archive is a further ranked sample of the tree carried
 // by the preceding ranked submission of this content apart from any rotation item declared in its note.
 
-// Candidate EXP-019: decode ladder optimal {0,1} + prefill chunk eval 6-layer repeat cycle + HEAD-RELAYOUT rebase + lock-free precomputed prefill softmax + compact participants + periodic telemetry.
+// Candidate EXP-023: prefill glue single-fence barrier elimination + record 1.651s decode ({0,1} ladder, lock-free LM head & D512 caches, sliding prefetch pf2 tail peel, RMS-XVEC) + 6-layer prefill repeat cadence.

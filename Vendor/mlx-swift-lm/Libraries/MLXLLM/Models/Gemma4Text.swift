@@ -7374,14 +7374,4 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
 // Ranked resample marker 36: this archive is a further ranked sample of the tree carried
 // by the preceding ranked submission of this content apart from any rotation item declared in its note.
 
-// Ranked resample marker 37: this archive is a further ranked sample of the tree carried
-// by the preceding ranked submission of this content apart from any rotation item declared in its note.
-
-// Ranked resample marker 38: this archive is a further ranked sample of the tree carried
-// by the preceding ranked submission of this content apart from any rotation item declared in its note.
-
-// Ranked resample marker 39: this archive is a further ranked sample of the tree carried
-// by the preceding ranked submission of this content apart from any rotation item declared in its note.
-
-
-
+// Candidate EXP-017: periodic modulo-16 telemetry updates + compact participants + uniform starts table + precomputed prefill softmax + attention pipeline refresh yrp5.

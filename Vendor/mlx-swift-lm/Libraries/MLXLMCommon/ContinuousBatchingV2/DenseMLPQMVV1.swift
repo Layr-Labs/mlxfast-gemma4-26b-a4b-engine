@@ -1158,7 +1158,7 @@ inline U qdot_affine8_registered_v4(
 
     @inline(__always)
     private static func liveShape(inDim: Int, outDim: Int) -> Bool {
-        (inDim == 2816 && outDim == 2112)
+        (inDim == 2816 && (outDim == 2112 || outDim == 4224))
             || (inDim == 2112 && outDim == 2816)
     }
 
@@ -1259,7 +1259,7 @@ inline U qdot_affine8_registered_v4(
         // never consumes DMLP-002's xSums table. With the gate/up arm off the
         // table is still built and consumed for the gate/up plane exactly as on
         // the tip -- the fall-through below is the promoted path unchanged.
-        let isGateUp = inDim == 2816 && outDim == 2112
+        let isGateUp = inDim == 2816 && (outDim == 2112 || outDim == 4224)
         if isGateUp ? mma8GateUpEnabled : mma8DownEnabled {
             // The census statement for this ticket is a SUBSTITUTION, not an
             // addition: with the gate/up arm on, this plane leaves the W4
@@ -1302,7 +1302,7 @@ inline U qdot_affine8_registered_v4(
         let yGroups = outDim / outputsPerGroup
         let useActivationSums = activationSums != nil
             && inDim == 2816
-            && outDim == 2112
+            && (outDim == 2112 || outDim == 4224)
         if w4Enabled {
             CBv2EngageMark.once("mlp-w4-load")
         }

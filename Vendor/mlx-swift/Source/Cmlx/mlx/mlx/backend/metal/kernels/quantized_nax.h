@@ -659,6 +659,50 @@ struct QuantizedBlockLoader {
     }
   }
 
+  struct PrefetchData {
+    uint8_t raw[n_reads * bytes_per_pack > 0 ? n_reads * bytes_per_pack : 1];
+    T scale;
+    T bias;
+    bool valid;
+  };
+
+  PrefetchData prefetch_unsafe() const {
+    PrefetchData d;
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      d.valid = false;
+      return d;
+    }
+    d.valid = true;
+    d.scale = *scales;
+    d.bias = *biases;
+    STEEL_PRAGMA_UNROLL
+    for (int i = 0; i < n_reads * bytes_per_pack; i++) {
+      d.raw[i] = src[i];
+    }
+    return d;
+  }
+
+  void commit_unsafe(const thread PrefetchData& d) const {
+    if (!d.valid) {
+      return;
+    }
+    if constexpr (bits == 4) {
+      T s[2] = {d.scale, d.scale / static_cast<T>(16.0f)};
+      STEEL_PRAGMA_UNROLL
+      for (int i = 0; i < n_reads; i++) {
+        const thread uint8_t* wp = &d.raw[i * bytes_per_pack];
+        threadgroup T* out = dst + i * pack_factor;
+        STEEL_PRAGMA_UNROLL
+        for (int j = 0; j < (pack_factor / 2); j++) {
+          out[2 * j] = s[0] * (wp[j] & 0x0f) + d.bias;
+          out[2 * j + 1] = s[1] * (wp[j] & 0xf0) + d.bias;
+        }
+      }
+    }
+  }
+
+
+
   void load_safe(short2 src_tile_dim) const {
     if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
       return;
@@ -1619,6 +1663,11 @@ METAL_FUNC void gather_rhs_mma_frag_row(
 #define DARKBLOOM_GEMMA4_NAX_GATHER_TILING 1
 #endif
 
+#ifndef DARKBLOOM_GEMMA4_GATHER_PREFETCH
+#define DARKBLOOM_GEMMA4_GATHER_PREFETCH 1
+#endif
+
+
 template <
     typename T,
     int group_size,
@@ -1795,88 +1844,206 @@ template <
 
     dispatch_bool(align_M || !is_unaligned_sm, [&](auto kAlignedM) {
       dispatch_bool(align_N || !is_unaligned_bn, [&](auto kAlignedN) {
-        for (int k = 0; k < K_it; k++) {
-          threadgroup_barrier(mem_flags::mem_threadgroup);
+        constexpr bool kUseGatherPrefetch =
+            DARKBLOOM_GEMMA4_GATHER_PREFETCH != 0 && bits == 4 && transpose &&
+            group_size == 64 && metal::is_same_v<T, bfloat>;
+        if constexpr (kUseGatherPrefetch) {
+          if (K_it > 0) {
+            // PROLOGUE: load initial slice k=0 into Ws
+            threadgroup_barrier(mem_flags::mem_threadgroup);
           if constexpr (kAlignedN.value) {
             loader_w.load_unsafe();
           } else {
             loader_w.load_safe(
                 transpose ? short2(BK, tgp_bn) : short2(tgp_bn, BK));
           }
-
           threadgroup_barrier(mem_flags::mem_threadgroup);
 
-          if (seg_partial && kAlignedM.value) {
-            // 16-row fragment-row granularity: only fragment rows that
-            // intersect [seg_lo, seg_hi) load A and issue MMA. Each live
-            // fragment row runs the exact op sequence of the stock path.
-            STEEL_PRAGMA_NO_UNROLL
-            for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-              NAXTile<T, TM, TK> Atile;
-              NAXTile<T, BR, BC> Btile;
-
-              volatile int compiler_barrier;
-
-              if constexpr (transpose) {
-                Btile.template load<T, BK_padded, 1>(
-                    Ws + tn * BK_padded + kk1);
-              } else {
-                Btile.template load<T, BN_padded, 1>(
-                    Ws + tn + kk1 * BN_padded);
+          for (int k = 0; k < K_it; k++) {
+            // 1. Issue DRAM read for slice k+1 into private registers
+            typename loader_w_t::PrefetchData prefetched;
+            const bool has_next = (k + 1 < K_it);
+            if (has_next) {
+              loader_w.next();
+              if constexpr (kAlignedN.value) {
+                prefetched = loader_w.prefetch_unsafe();
               }
+            }
 
-              STEEL_PRAGMA_UNROLL
-              for (short mm = 0; mm < TM; mm++) {
-                const short fr = short(mm * Dtile.kFragRows);
-                if (fr < seg_hi && short(fr + Dtile.kFragRows) > seg_lo) {
-                  gather_rhs_load_frag_row(mm, Atile, xn + kk1, K);
-                  gather_rhs_mma_frag_row(
-                      mm,
-                      Dtile,
-                      Atile,
-                      Btile,
-                      metal::bool_constant<transpose>{});
+            // 2. Concurrently compute MMA on slice k from Ws
+            if (seg_partial && kAlignedM.value) {
+              // 16-row fragment-row granularity: only fragment rows that
+              // intersect [seg_lo, seg_hi) load A and issue MMA. Each live
+              // fragment row runs the exact op sequence of the stock path.
+              STEEL_PRAGMA_NO_UNROLL
+              for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+                NAXTile<T, TM, TK> Atile;
+                NAXTile<T, BR, BC> Btile;
+
+                volatile int compiler_barrier;
+
+                if constexpr (transpose) {
+                  Btile.template load<T, BK_padded, 1>(
+                      Ws + tn * BK_padded + kk1);
+                } else {
+                  Btile.template load<T, BN_padded, 1>(
+                      Ws + tn + kk1 * BN_padded);
                 }
-              }
 
-              (void)compiler_barrier;
+                STEEL_PRAGMA_UNROLL
+                for (short mm = 0; mm < TM; mm++) {
+                  const short fr = short(mm * Dtile.kFragRows);
+                  if (fr < seg_hi && short(fr + Dtile.kFragRows) > seg_lo) {
+                    gather_rhs_load_frag_row(mm, Atile, xn + kk1, K);
+                    gather_rhs_mma_frag_row(
+                        mm,
+                        Dtile,
+                        Atile,
+                        Btile,
+                        metal::bool_constant<transpose>{});
+                  }
+                }
+
+                (void)compiler_barrier;
+              }
+            } else if (!seg_empty) {
+              STEEL_PRAGMA_NO_UNROLL
+              for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+                NAXTile<T, TM, TK> Atile;
+                NAXTile<T, BR, BC> Btile;
+
+                volatile int compiler_barrier;
+
+                if constexpr (kAlignedM.value) {
+                  Atile.load(xn + kk1, K);
+                } else {
+                  Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+                }
+
+                if constexpr (transpose) {
+                  Btile.template load<T, BK_padded, 1>(
+                      Ws + tn * BK_padded + kk1);
+                } else {
+                  Btile.template load<T, BN_padded, 1>(
+                      Ws + tn + kk1 * BN_padded);
+                }
+
+                tile_matmad_nax(
+                    Dtile,
+                    Atile,
+                    metal::bool_constant<false>{},
+                    Btile,
+                    metal::bool_constant<transpose>{});
+
+                (void)compiler_barrier;
+              }
             }
-          } else if (!seg_empty) {
-            STEEL_PRAGMA_NO_UNROLL
-            for (int kk1 = 0; kk1 < BK; kk1 += SK) {
-              NAXTile<T, TM, TK> Atile;
-              NAXTile<T, BR, BC> Btile;
 
-              volatile int compiler_barrier;
+            // 3. BARRIER 1: wait for all simdgroups to finish reading Ws for slice k
+            threadgroup_barrier(mem_flags::mem_threadgroup);
 
-              if constexpr (kAlignedM.value) {
-                Atile.load(xn + kk1, K);
+            // 4. COMMIT: dequantize prefetched registers into Ws for slice k+1
+            if (has_next) {
+              if constexpr (kAlignedN.value) {
+                loader_w.commit_unsafe(prefetched);
               } else {
-                Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+                loader_w.load_safe(
+                    transpose ? short2(BK, tgp_bn) : short2(tgp_bn, BK));
               }
-
-              if constexpr (transpose) {
-                Btile.template load<T, BK_padded, 1>(
-                    Ws + tn * BK_padded + kk1);
-              } else {
-                Btile.template load<T, BN_padded, 1>(
-                    Ws + tn + kk1 * BN_padded);
-              }
-
-              tile_matmad_nax(
-                  Dtile,
-                  Atile,
-                  metal::bool_constant<false>{},
-                  Btile,
-                  metal::bool_constant<transpose>{});
-
-              (void)compiler_barrier;
+              // 5. BARRIER 2: wait for all threads to see new Ws before next MMA
+              threadgroup_barrier(mem_flags::mem_threadgroup);
             }
+
+            xn += BK;
           }
 
-          xn += BK;
-          loader_w.next();
+          // The loop deliberately omitted the final pointer advance.
+          if (!align_K) {
+            loader_w.next();
+          }
         }
+      } else {
+          for (int k = 0; k < K_it; k++) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if constexpr (kAlignedN.value) {
+              loader_w.load_unsafe();
+            } else {
+              loader_w.load_safe(
+                  transpose ? short2(BK, tgp_bn) : short2(tgp_bn, BK));
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (seg_partial && kAlignedM.value) {
+              STEEL_PRAGMA_NO_UNROLL
+              for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+                NAXTile<T, TM, TK> Atile;
+                NAXTile<T, BR, BC> Btile;
+
+                volatile int compiler_barrier;
+
+                if constexpr (transpose) {
+                  Btile.template load<T, BK_padded, 1>(
+                      Ws + tn * BK_padded + kk1);
+                } else {
+                  Btile.template load<T, BN_padded, 1>(
+                      Ws + tn + kk1 * BN_padded);
+                }
+
+                STEEL_PRAGMA_UNROLL
+                for (short mm = 0; mm < TM; mm++) {
+                  const short fr = short(mm * Dtile.kFragRows);
+                  if (fr < seg_hi && short(fr + Dtile.kFragRows) > seg_lo) {
+                    gather_rhs_load_frag_row(mm, Atile, xn + kk1, K);
+                    gather_rhs_mma_frag_row(
+                        mm,
+                        Dtile,
+                        Atile,
+                        Btile,
+                        metal::bool_constant<transpose>{});
+                  }
+                }
+
+                (void)compiler_barrier;
+              }
+            } else if (!seg_empty) {
+              STEEL_PRAGMA_NO_UNROLL
+              for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+                NAXTile<T, TM, TK> Atile;
+                NAXTile<T, BR, BC> Btile;
+
+                volatile int compiler_barrier;
+
+                if constexpr (kAlignedM.value) {
+                  Atile.load(xn + kk1, K);
+                } else {
+                  Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+                }
+
+                if constexpr (transpose) {
+                  Btile.template load<T, BK_padded, 1>(
+                      Ws + tn * BK_padded + kk1);
+                } else {
+                  Btile.template load<T, BN_padded, 1>(
+                      Ws + tn + kk1 * BN_padded);
+                }
+
+                tile_matmad_nax(
+                    Dtile,
+                    Atile,
+                    metal::bool_constant<false>{},
+                    Btile,
+                    metal::bool_constant<transpose>{});
+
+                (void)compiler_barrier;
+              }
+            }
+
+            xn += BK;
+            loader_w.next();
+          }
+        }
+
 
         if (!align_K) {
           threadgroup_barrier(mem_flags::mem_threadgroup);

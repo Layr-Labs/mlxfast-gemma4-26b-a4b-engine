@@ -536,21 +536,32 @@ enum CBv2PrefillSoftmaxVecV1 {
         ensureRowContiguous: true
     )
 
-    nonisolated(unsafe) private static var memoizedParams: [Int: MLXArray] = [:]
-    private static let paramsLock = NSLock()
-
-    private static func getParams(axisSize: Int, numSimdgroups: Int) -> MLXArray {
-        paramsLock.lock()
-        if let hit = memoizedParams[axisSize] {
-            paramsLock.unlock()
-            return hit
+    // Pre-computed parameter arrays for all valid axisSize multiples of 4 up to maxKeyLength (4096).
+    // Direct index = axisSize >> 2. Completely lock-free, zero allocation, and zero mid-pass eval().
+    nonisolated(unsafe) private static let precomputedParams: [MLXArray?] = {
+        var table = [MLXArray?](repeating: nil, count: (maxKeyLength >> 2) + 1)
+        var toEval: [MLXArray] = []
+        for axis in stride(from: 4, through: maxKeyLength, by: 4) {
+            let tg = ((axis + 3) / 4 + 31) / 32 * 32
+            if tg > 0 && tg <= 1024 {
+                let nSimd = tg / 32
+                let arr = MLXArray([UInt32(axis), UInt32(nSimd)])
+                table[axis >> 2] = arr
+                toEval.append(arr)
+            }
         }
-        paramsLock.unlock()
+        eval(toEval)
+        return table
+    }()
+
+    @inline(__always)
+    private static func getParams(axisSize: Int, numSimdgroups: Int) -> MLXArray {
+        let idx = axisSize >> 2
+        if idx < precomputedParams.count, let arr = precomputedParams[idx] {
+            return arr
+        }
         let arr = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
         eval(arr)
-        paramsLock.lock()
-        memoizedParams[axisSize] = arr
-        paramsLock.unlock()
         return arr
     }
 

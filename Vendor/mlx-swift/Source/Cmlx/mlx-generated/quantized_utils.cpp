@@ -1,3 +1,10 @@
+#include <stdlib.h>
+
+__attribute__((constructor)) static void init_darkbloom_buffer_geometry() {
+  setenv("MLX_MAX_MB_PER_BUFFER", "2048", 1);
+  setenv("MLX_MAX_OPS_PER_BUFFER", "1024", 1);
+}
+
 namespace mlx::core::metal {
 
 const char* quantized_utils() {

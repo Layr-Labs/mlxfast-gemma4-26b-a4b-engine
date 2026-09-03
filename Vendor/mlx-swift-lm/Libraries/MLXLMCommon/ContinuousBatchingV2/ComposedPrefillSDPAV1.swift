@@ -536,24 +536,6 @@ enum CBv2PrefillSoftmaxVecV1 {
         ensureRowContiguous: true
     )
 
-    nonisolated(unsafe) private static var memoizedParams: [Int: MLXArray] = [:]
-    private static let paramsLock = NSLock()
-
-    private static func getParams(axisSize: Int, numSimdgroups: Int) -> MLXArray {
-        paramsLock.lock()
-        if let hit = memoizedParams[axisSize] {
-            paramsLock.unlock()
-            return hit
-        }
-        paramsLock.unlock()
-        let arr = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
-        eval(arr)
-        paramsLock.lock()
-        memoizedParams[axisSize] = arr
-        paramsLock.unlock()
-        return arr
-    }
-
     /// Runs the vectorized softmax, or returns nil to keep the caller on
     /// the stock `MLX.softmax(scores, axis: -1, precise: true)` call.
     /// `scores` may be any contiguous rank; it is treated as a flat
@@ -571,7 +553,7 @@ enum CBv2PrefillSoftmaxVecV1 {
         let threadgroupSize = ((axisSize + 3) / 4 + 31) / 32 * 32
         guard threadgroupSize > 0, threadgroupSize <= 1024 else { return nil }
         let numSimdgroups = threadgroupSize / 32
-        let paramsArray = getParams(axisSize: axisSize, numSimdgroups: numSimdgroups)
+        let paramsArray = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
 
         CBv2EngageMark.once("prefill-softmax-vec")
         return kernel(

@@ -1611,6 +1611,13 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   thread float bias_local[results_per_simdgroup];
   thread float result0[results_per_simdgroup] = {0};
   thread float result1[results_per_simdgroup] = {0};
+  // Full-block-only metadata broadcast: lanes 0, 8, 16, 24 own their 8-lane
+  // group. Convergent in the full-block loop (32/32 lanes); the tail below is
+  // left verbatim to avoid a divergent shuffle (K=704 tail: 24/32 active).
+  const ushort metadata_lane = ushort(
+      (simd_lid / scale_step_per_thread) * scale_step_per_thread);
+  const bool metadata_owner =
+      (simd_lid % scale_step_per_thread) == 0;
 
   const int in_vec_size_w = in_vec_size / 2;
   const int in_vec_size_g = in_vec_size / 64;
@@ -1629,8 +1636,14 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   for (; k <= in_vec_size - block_size; k += block_size) {
     for (int row = 0; row < results_per_simdgroup; row++) {
       packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
-      scale_local[row] = scales[row * in_vec_size_g];
-      bias_local[row] = biases[row * in_vec_size_g];
+      float scale_value = 0.0f;
+      float bias_value = 0.0f;
+      if (metadata_owner) {
+        scale_value = (float)scales[row * in_vec_size_g];
+        bias_value = (float)biases[row * in_vec_size_g];
+      }
+      scale_local[row] = simd_shuffle(scale_value, metadata_lane);
+      bias_local[row] = simd_shuffle(bias_value, metadata_lane);
     }
 
     float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);

@@ -57,6 +57,41 @@ internal func resolveCBv2CompactDecodeRootsEnabled(_ raw: String?) -> Bool {
 private let cbv2CompactDecodeRootsEnabled = resolveCBv2CompactDecodeRootsEnabled(
     ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_COMPACT_DECODE_ROOTS"])
 
+/// CHAIN-TRIPLE-CACHE kill switch. Host-side chained-decode metadata memo,
+/// ON by default: unset or any value other than `0`/`false`/`no`/`off`
+/// reuses the previous step's triple on an exact hit (only those explicit
+/// kill values keep the legacy per-step rebuild). A hit never skips
+/// `scheduler.plan()`, `isPureDecodePlan`, reserves, or ledger updates —
+/// those all still run in the caller. See `chainedDecodeMetadata(ids:)`.
+private let chainTripleCacheEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["MLXFAST_CHAIN_TRIPLE_CACHE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// LEASE-SCAN idle skip, ON by default: unset or any value other than
+/// `0`/`false`/`no`/`off` skips `processLeaseExpiry` when `leasesByID` is
+/// empty (only those explicit kill values force the legacy every-step
+/// scan). Exactly equivalent when it fires: with no leases every
+/// optional chain inside the scan yields nil and no request can expire.
+/// Non-empty lease tables always scan. This covers idle/edge steps; the
+/// steady-state per-row `expiredCause` scan is retained as-is.
+private let leaseScanIdleSkipEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["MLXFAST_LEASE_SCAN_IDLE_SKIP"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// USAGE-SNAPSHOT-BATCH kill switch, ON by default: unset or any value
+/// other than `0`/`false`/`no`/`off` batches a step's usage snapshots under
+/// one lock hold (only those explicit kill values keep the legacy per-row
+/// locking). Same values and keys either way.
+private let usageSnapshotBatchEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["MLXFAST_USAGE_SNAPSHOT_BATCH"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 /// Builds per-layer batch-facing cache views for a set of rows
 /// (`rowStates[b][layer]`, row order == batch row order). WS-A's
 /// `LayerCacheV2` conforms; see CONTRACT-ISSUES-B-scheduler.md §1.
@@ -615,6 +650,26 @@ public final class EngineLoopV2: @unchecked Sendable {
     private var running = false
     private var draining = false
 
+    /// CHAIN-TRIPLE-CACHE: single-step memo of the chained-decode launch
+    /// triple (ordered ids, row KV states, sampling params) plus the KV
+    /// identity fingerprint the hit check verifies. Engine-thread-confined
+    /// like `inFlight`/`kvStates` (only touched on the engine queue), so no
+    /// new synchronization. Holds one extra set of KV references for at most
+    /// one step; any membership, KV-identity, constraint, or MTP change
+    /// misses (fail closed) and the legacy rebuild runs instead.
+    private struct CBv2ChainedTripleMemo {
+        var ids: [CBv2RequestID] = []
+        var rowStates: [[CBv2SequenceKV?]] = []
+        var params: [CBv2SamplingParams] = []
+        var kvIdentities: [[ObjectIdentifier?]] = []
+        var valid = false
+    }
+    private var chainedTripleMemo = CBv2ChainedTripleMemo()
+
+    /// Steps since the last steady-path gauge publish (throttle state for
+    /// `publishGaugesThrottled`). Engine-thread-confined.
+    private var gaugeThrottleSteps = 0
+
     // MARK: ADMIT-COALESCE-001 (bounded admission coalescing)
 
     /// Width of the bounded admission-coalescing wait, in milliseconds, from
@@ -644,6 +699,26 @@ public final class EngineLoopV2: @unchecked Sendable {
             let value = Int(raw), value >= 0
         else { return 3 }
         return Swift.min(value, admitCoalesceWindowCapMS)
+    }()
+
+    /// Steady-path gauge-publish cadence from
+    /// `MLXFAST_PUBLISH_GAUGES_EVERY_N`. ON by default: unset or
+    /// unparseable publishes every 4th steady step; only an explicit
+    /// `0`/`false`/`no`/`off` (or `1`) restores the legacy every-step
+    /// publish. Values clamp to 1...64. Applies ONLY to the two steady
+    /// per-step sites (chained + general); drain/enqueue/idle/empty-plan/
+    /// donation sites call `publishGauges()` directly and stay exact, so
+    /// heartbeats never go stale across control transitions. Admission and
+    /// capacity decisions use the backend atomic reserve + requeue path,
+    /// never these gauges, so a ≤64-step staleness is telemetry-only.
+    static let publishGaugesEveryN: Int = {
+        if let raw = ProcessInfo.processInfo.environment[
+            "MLXFAST_PUBLISH_GAUGES_EVERY_N"]
+        {
+            if ["0", "false", "no", "off"].contains(raw.lowercased()) { return 1 }
+            if let value = Int(raw) { return Swift.max(1, Swift.min(value, 64)) }
+        }
+        return 4
     }()
 
     /// Monotonic origin of the current waiting batch: stamped by `enqueue`
@@ -1169,7 +1244,9 @@ public final class EngineLoopV2: @unchecked Sendable {
         // exactly one step apart (never widened by extra clock reads).
         let stepNow = config.clock.now()
         processCancellations()
-        processLeaseExpiry(now: stepNow)
+        if !leaseScanIdleSkipEnabled || !leasesByID.isEmpty {
+            processLeaseExpiry(now: stepNow)
+        }
 
         // Chained decode fast path: build step N+1 on step N's lazy tokens.
         // MTP guards: an MTP round step is never a chain base (its finalize
@@ -1211,7 +1288,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 chainedStepCount += 1
                 stepCount += 1
                 finalize(previous, now: stepNow)
-                publishGauges()
+                publishGaugesThrottled()
                 scheduleNextStep()
                 return
             }
@@ -1254,6 +1331,9 @@ public final class EngineLoopV2: @unchecked Sendable {
 
         // Chain broken (or nothing chained): finalize before re-planning so
         // the plan sees confirmed tokens and post-stop membership.
+        // CHAIN-TRIPLE-CACHE: membership may change below, so the single-step
+        // memo ends here (unread when the flag is off; fail closed otherwise).
+        chainedTripleMemo.valid = false
         if let previous = inFlight {
             inFlight = nil
             finalize(previous, now: stepNow)
@@ -1339,7 +1419,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         inFlight = mtpRoundNeeded(plan) ? executeMTPRound(plan) : executeMixed(plan)
         attachMTPMeasurement(measurement, to: inFlight, chained: false)
         stepCount += 1
-        publishGauges()
+        publishGaugesThrottled()
         scheduleNextStep()
     }
 
@@ -1580,6 +1660,77 @@ public final class EngineLoopV2: @unchecked Sendable {
         return scored.asArray(Int32.self).map(Int.init)
     }
 
+    /// CHAIN-TRIPLE-CACHE: resolve the chained-launch triple (row KV states
+    /// + sampling params) for already-validated `ids`, reusing the previous
+    /// step's memo on an exact hit. The caller still runs `scheduler.plan()`,
+    /// `isPureDecodePlan`, capacity reserves, and `markPendingSamples`, so
+    /// ledger/MTP/pending semantics are unchanged; this only avoids
+    /// rebuilding identical host arrays and re-reading immutable params.
+    /// A hit requires ALL of: flag enabled, memo valid, ordered ids equal,
+    /// MTP nil-or-target-only, every row's KV slots still the identical
+    /// objects (preemption/adoption/donation/rollback/id-reuse all change
+    /// identities and miss), and presence re-verified. Sampling params and
+    /// token constraints are immutable post-submit; the chain guard already
+    /// re-checked constraint-nil and `mtpWantsStep` this step before launch.
+    /// Anything ambiguous misses and the legacy rebuild below runs.
+    private func chainedDecodeMetadata(ids: [CBv2RequestID]) -> (
+        rowStates: [[CBv2SequenceKV?]], params: [CBv2SamplingParams]
+    ) {
+        if chainTripleCacheEnabled, chainedTripleMemo.valid,
+            chainedTripleMemo.ids == ids,
+            (mtp?.isTargetOnlyPolicy ?? true),
+            let hit = chainedTripleHit(ids: ids)
+        {
+            return hit
+        }
+        // Legacy rebuild (also the flag-OFF path, verbatim).
+        let rowStates = ids.map { kvStates[$0]! }  // presence pre-checked
+        // Batch record fetch (one call site instead of N subscripts; same
+        // live references — see `records(for:)`).
+        let batchRecords = scheduler.records(for: ids)
+        var params: [CBv2SamplingParams] = []
+        params.reserveCapacity(ids.count)
+        for maybeRec in batchRecords {
+            params.append(maybeRec!.request.sampling)  // presence pre-checked
+        }
+        if chainTripleCacheEnabled {
+            chainedTripleMemo = CBv2ChainedTripleMemo(
+                ids: ids, rowStates: rowStates, params: params,
+                kvIdentities: chainedTripleFingerprint(rowStates), valid: true)
+        }
+        return (rowStates, params)
+    }
+
+    /// Verify the memo against live `kvStates` without rebuilding params.
+    /// Returns the memoized triple on an exact identity match, else nil.
+    private func chainedTripleHit(ids: [CBv2RequestID]) -> (
+        rowStates: [[CBv2SequenceKV?]], params: [CBv2SamplingParams]
+    )? {
+        let memo = chainedTripleMemo
+        var current: [[CBv2SequenceKV?]] = []
+        current.reserveCapacity(ids.count)
+        for id in ids {
+            guard let rows = kvStates[id] else { return nil }
+            current.append(rows)
+        }
+        guard current.count == memo.kvIdentities.count else { return nil }
+        for (rows, want) in zip(current, memo.kvIdentities) {
+            guard rows.count == want.count else { return nil }
+            for (slot, fingerprint) in zip(rows, want) {
+                guard slot.map(ObjectIdentifier.init) == fingerprint else { return nil }
+            }
+        }
+        // Identities match, so these are the same objects the memo holds.
+        return (memo.rowStates, memo.params)
+    }
+
+    @inline(__always)
+    private func chainedTripleFingerprint(_ rowStates: [[CBv2SequenceKV?]])
+        -> [[ObjectIdentifier?]]
+    {
+        rowStates.map { $0.map { $0.map(ObjectIdentifier.init) } }
+    }
+
     /// Pure-decode step fed by the previous step's still-lazy tokens.
     private func launchChainedDecode(
         _ plan: CBv2StepPlan, feeding lazyTokens: MLXArray
@@ -1587,13 +1738,18 @@ public final class EngineLoopV2: @unchecked Sendable {
         let wallStartedNanos = DispatchTime.now().uptimeNanoseconds
         let buildStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         let ids = plan.assignments.map(\.id)
-        let rowStates = ids.map { kvStates[$0]! }  // presence pre-checked
-        var params: [CBv2SamplingParams] = []
-        params.reserveCapacity(ids.count)
-        for id in ids { params.append(scheduler.record(for: id)!.request.sampling) }
+        let (rowStates, params) = chainedDecodeMetadata(ids: ids)
 
         let inputs = lazyTokens.reshaped([ids.count, 1])
         let forwardStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        // SINGLE-SCAN DEDUP: the 6-field allSatisfy below is implemented
+        // character-identically by `admitsFusedGreedy` and `orderOnly`
+        // (greedy epsilon, no logprobs/bias/penalties), so evaluate it once
+        // and reuse the Bool for both the fused-head gate and the
+        // order-only scope instead of scanning the 8 params twice on the
+        // fallthrough. Ungated (no env flag): sharing one evaluation of
+        // identical predicates cannot change any dispatch decision.
+        let greedyOrderOnly = CBv2OrderOnlyLogits.orderOnly(params)
         // LGH-001. When the sampler would collapse to one `argMax` and the
         // model can end its head in a fused top-1, the step never builds the
         // [B, vocab] plane at all. Both sides fail closed, so anything else
@@ -1603,7 +1759,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         let stepLogprobs: CBv2StepLogprobs?
         if let fusedSampler = sampler as? CBv2FusedGreedySampler,
             let fusedModel = model as? CBv2ArgmaxDecodeSteppableModel,
-            fusedSampler.admitsFusedGreedy(params: params),
+            greedyOrderOnly,
             fusedModel.admitsArgmaxDecode(tokens: inputs)
         {
             let caches = eagerCaches(rowStates: rowStates)
@@ -1618,7 +1774,14 @@ public final class EngineLoopV2: @unchecked Sendable {
         } else {
             // Preserve the promoted SOFTCAP-SKIP fallback: callers that need
             // the ordinary logits plane still declare its order-only use.
-            let (last, innerState) = CBv2OrderOnlyLogits.withOrderOnly(params) {
+            // Reuses `greedyOrderOnly` (see above) instead of re-scanning.
+            // Debug-only agreement check: if the sampler-side predicate ever
+            // diverges from `orderOnly`, tests fail loudly here instead of
+            // silently changing dispatch in production (stripped in release).
+            if let fusedSampler = sampler as? CBv2FusedGreedySampler {
+                assert(fusedSampler.admitsFusedGreedy(params: params) == greedyOrderOnly)
+            }
+            let (last, innerState) = CBv2OrderOnlyLogits.withPrecomputedOrderOnly(greedyOrderOnly) {
                 decodeLogits(rowStates: rowStates, tokens: inputs)  // [B, vocab]
             }
             cacheInnerState = innerState
@@ -2070,9 +2233,14 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
 
         var finalizedPlainWork = false
+        // Batch record fetch (one call site instead of N subscripts; same
+        // live references in `sampledRows` order — see `records(for:)`).
+        // Interleaved loop-body mutations (`recordSampled`, `finishRequest`)
+        // are per-id, so upfront fetch is equivalent under every interleaving.
+        let stepRecords = scheduler.records(for: step.sampledRows)
         for (i, id) in step.sampledRows.enumerated() {
             if step.discard.contains(id) { continue }
-            guard let rec = scheduler.record(for: id) else { continue }
+            guard let rec = stepRecords[i] else { continue }
             finalizedPlainWork = true
             let token = Int(host[i])
             scheduler.recordSampled(id: id, token: token)
@@ -2192,6 +2360,16 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// token refreshes the decode lease; a confirmed prefill-chunk advance
     /// refreshes the prefill lease.
     private func refreshProgressLeases(_ step: CBv2InFlightStep, now: ContinuousClock.Instant) {
+        // USAGE-SNAPSHOT-BATCH (default ON, see `usageSnapshotBatchEnabled`):
+        // collect this step's snapshots, then publish under ONE stateLock
+        // hold instead of one lock per row. Same values, same keys; the
+        // watchdog observes an atomic per-step update rather than an
+        // incremental one, which is equivalent for wedge terminals (they
+        // attach same-step values either way).
+        // (Rebased: upstream replaced `step.participants` with the indexed
+        // `forEachParticipant`; batching adapted to the closure form —
+        // `return` replaces `continue`, no upfront count for reserve.)
+        var batchedSnapshots: [(CBv2RequestID, CBv2Usage)] = []
         step.forEachParticipant { id in
             guard let rec = scheduler.record(for: id) else { return }
             if var lease = leasesByID[id] {
@@ -2205,18 +2383,28 @@ public final class EngineLoopV2: @unchecked Sendable {
             // count with zero completion was already seeded at enqueue, so a
             // still-prefilling row needs no lock traffic here).
             if rec.generatedTokenCount > 0 {
-                setUsageSnapshot(
-                    id,
-                    CBv2Usage(
-                        promptTokens: rec.request.promptTokens.count,
-                        completionTokens: rec.generatedTokenCount))
+                let usage = CBv2Usage(
+                    promptTokens: rec.request.promptTokens.count,
+                    completionTokens: rec.generatedTokenCount)
+                if usageSnapshotBatchEnabled {
+                    batchedSnapshots.append((id, usage))
+                } else {
+                    setUsageSnapshot(id, usage)
+                }
             }
+        }
+        if usageSnapshotBatchEnabled, !batchedSnapshots.isEmpty {
+            setUsageSnapshots(batchedSnapshots)
         }
     }
 
     // MARK: Request completion
 
     func finishRequest(_ id: CBv2RequestID, reason: CBv2FinishReason) {
+        // CHAIN-TRIPLE-CACHE: the cohort changed; end the single-step memo
+        // (the next step's ordered-ids compare would miss anyway — this just
+        // closes the id-reuse window explicitly).
+        chainedTripleMemo.valid = false
         // Ids are legally reusable after finish: drop the per-id capacity
         // requeue count on EVERY finish path (including the error-finish
         // that exhausted it), or a reused id inherits the previous
@@ -2741,6 +2929,14 @@ public final class EngineLoopV2: @unchecked Sendable {
         stateLock.unlock()
     }
 
+    /// Batched twin of `setUsageSnapshot`: one `stateLock` hold for a whole
+    /// step's snapshots. See `refreshProgressLeases`.
+    private func setUsageSnapshots(_ pairs: [(CBv2RequestID, CBv2Usage)]) {
+        stateLock.lock()
+        for (id, usage) in pairs { usageSnapshots[id] = usage }
+        stateLock.unlock()
+    }
+
     private func clearUsageSnapshot(_ id: CBv2RequestID) {
         stateLock.lock()
         usageSnapshots.removeValue(forKey: id)
@@ -2756,6 +2952,15 @@ public final class EngineLoopV2: @unchecked Sendable {
     }
 
     // MARK: Gauges
+
+    /// Steady-path gauge publish honoring `publishGaugesEveryN` (default 4).
+    /// Event paths keep calling `publishGauges()` directly.
+    private func publishGaugesThrottled() {
+        gaugeThrottleSteps += 1
+        guard gaugeThrottleSteps >= Self.publishGaugesEveryN else { return }
+        gaugeThrottleSteps = 0
+        publishGauges()
+    }
 
     private func publishGauges() {
         // kvBytesCapacity carries the ADMISSION ceiling so a runtime

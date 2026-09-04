@@ -916,8 +916,86 @@ private let gemma4QKVNormRopeEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+private enum Gemma4DecodeOB3 {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_DECODE_OB3"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespaces).lowercased())
+    }()
+
+    static let key: String = enabled ? "_ob3d" : ""
+
+    /// Both forms leave `inverse_rms` holding the same float in every thread.
+    static let combine: String =
+        enabled
+        ? """
+        threadgroup float partials[32];
+                threadgroup T rounded[D];
+                constexpr uint decode_row_simds = (D / 4) / 32;
+                if (lane == 0) partials[simd_group] = sum;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                sum = simd_sum(lane < decode_row_simds ? partials[lane] : 0.0f);
+                const float inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+        """
+        : """
+        threadgroup float partials[32];
+                threadgroup float inverse_rms;
+                threadgroup T rounded[D];
+                if (simd_group == 0) partials[lane] = 0.0f;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (lane == 0) partials[simd_group] = sum;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simd_group == 0) {
+                    sum = simd_sum(partials[lane]);
+                    if (lane == 0) {
+                        inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+        """
+}
+
+private enum Gemma4PromptOB3 {
+    static let enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_PROMPT_OB3"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(
+            raw.trimmingCharacters(in: .whitespaces).lowercased())
+    }()
+
+    static let key: String = enabled ? "_ob3" : ""
+
+    /// The `inv_rms` staging row exists only for the incumbent's publish-back.
+    static let scratch: String = enabled ? "" : "threadgroup float inv_rms[RPT];"
+
+    /// Both forms leave `inverse_rms` holding the same float in every thread.
+    static let combine: String =
+        enabled
+        ? """
+        if (lane == 0) partials[slot][row_simd] = sum;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                sum = simd_sum(lane < row_simds ? partials[slot][lane] : 0.0f);
+                const float inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+        """
+        : """
+        if (row_simd == 0) partials[slot][lane] = 0.0f;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (lane == 0) partials[slot][row_simd] = sum;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (row_simd == 0) {
+                    sum = simd_sum(partials[slot][lane]);
+                    if (lane == 0) {
+                        inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                const float inverse_rms = inv_rms[slot];
+        """
+}
+
 private let gemma4QKVNormKernel = MLXFast.metalKernel(
-        name: "gemma4_b8_qkv_rms_norm_rope_v2_vec1",
+    name: "gemma4_b8_qkv_rms_norm_rope_v2_vec1\(Gemma4DecodeOB3.key)",
     inputNames: [
         "q", "k", "v", "q_weight", "k_weight",
         "position_offsets", "rope_log2_base", "rope_freqs",
@@ -969,20 +1047,7 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
         }
         sum = simd_sum(sum);
 
-        threadgroup float partials[32];
-        threadgroup float inverse_rms;
-        threadgroup T rounded[D];
-        if (simd_group == 0) partials[lane] = 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (lane == 0) partials[simd_group] = sum;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (simd_group == 0) {
-            sum = simd_sum(partials[lane]);
-            if (lane == 0) {
-                inverse_rms = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        \(Gemma4DecodeOB3.combine)
 
         if (weighted) {
             const T4 wv = *reinterpret_cast<const device T4*>(weight);
@@ -1070,7 +1135,7 @@ private let gemma4QKVNormKernel = MLXFast.metalKernel(
 /// threadgroup, and each row keeps its own 64 threads and its own two
 /// simdgroups, so the reduction tree is the stock one row for row.
 private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
-    name: "gemma4_qkv_rms_norm_head_major_v2",
+    name: "gemma4_qkv_rms_norm_head_major_v2\(Gemma4PromptOB3.key)",
     inputNames: [
         "q", "k", "q_weight", "k_weight",
         "position_offsets", "rope_freqs",
@@ -1079,6 +1144,7 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
     source: """
         constexpr uint reads = 4;
         constexpr uint row_threads = D / reads;
+        constexpr uint row_simds = row_threads / 32;
         const uint tid = thread_position_in_threadgroup.x;
         const uint slot = tid / row_threads;
         const uint lid = tid - slot * row_threads;
@@ -1087,7 +1153,7 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
         const uint row_simd = lid / 32;
 
         threadgroup float partials[RPT][32];
-        threadgroup float inv_rms[RPT];
+        \(Gemma4PromptOB3.scratch)
         threadgroup T rounded[RPT][D];
         threadgroup uint row_position[RPT];
 
@@ -1138,22 +1204,12 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
         }
         sum = simd_sum(sum);
 
-        // Slots 2..31 stay exactly zero, so the 32-lane combine returns the
-        // two simdgroup partials' sum whatever order the tree adds them in.
-        if (row_simd == 0) partials[slot][lane] = 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (lane == 0) partials[slot][row_simd] = sum;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (row_simd == 0) {
-            sum = simd_sum(partials[slot][lane]);
-            if (lane == 0) {
-                inv_rms[slot] = metal::precise::rsqrt(sum / float(D) + 1.0e-6f);
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Lanes at or above `row_simds` contribute exactly zero, so the
+        // 32-lane combine returns the simdgroup partials' sum whatever order
+        // the tree adds them in.
+        \(Gemma4PromptOB3.combine)
 
         if (row >= TOTAL_ROWS) return;
-        const float inverse_rms = inv_rms[slot];
         for (uint i = 0; i < reads; ++i) {
             const T normalized = T(float(input[i]) * inverse_rms);
             if (APPLY_ROPE) {
@@ -7487,4 +7543,4 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
 // Ranked resample marker 36: this archive is a further ranked sample of the tree carried
 // by the preceding ranked submission of this content apart from any rotation item declared in its note.
 
-// Candidate EXP-019: decode ladder optimal {0,1} + prefill chunk eval 6-layer repeat cycle + HEAD-RELAYOUT rebase + lock-free precomputed prefill softmax + compact participants + periodic telemetry.
+// Candidate EXP-029: crown 9e4840b rebase + prefill expert unsort tail chain 128-bit vectorization & register hoist + DECODE-OB3 1-barrier QKV norm reduction + record 1.650s decode ({0,1} ladder, lock-free LM head & D512 caches, branch-free steady sliding walk).

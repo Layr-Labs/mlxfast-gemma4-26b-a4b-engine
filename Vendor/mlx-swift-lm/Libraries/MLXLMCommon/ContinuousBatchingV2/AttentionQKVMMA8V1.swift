@@ -960,7 +960,6 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
             x.dim(0) == batch,
             x.dim(1) == sequence,
             x.dim(2) == inputWidth,
-            x.size == batch * sequence * inputWidth,
             values.dtype == .float32,
             values.shape == [batch, inputWidth / groupSize]
         else { return nil }
@@ -1014,7 +1013,6 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
             qWeight.dtype == .uint32, kWeight.dtype == .uint32,
             x.ndim == 3,
             x.dim(0) == batch, x.dim(1) == sequence, x.dim(2) == inputWidth,
-            x.size == batch * sequence * inputWidth,
             qWeight.ndim == 2, kWeight.ndim == 2,
             qWeight.dim(1) == inputWidth * Self.bits / 32,
             kWeight.dim(1) == inputWidth * Self.bits / 32
@@ -1103,7 +1101,6 @@ METAL_FUNC void qkv_mma8_affine4_g64_mt_rsp(
 
         let outputWidth = weight.dim(0)
         guard liveOutputWidth(outputWidth),
-            x.size == batch * sequence * inputWidth,
             scales.shape == [outputWidth, inputWidth / Self.groupSize],
             biases.shape == scales.shape
         else { return nil }

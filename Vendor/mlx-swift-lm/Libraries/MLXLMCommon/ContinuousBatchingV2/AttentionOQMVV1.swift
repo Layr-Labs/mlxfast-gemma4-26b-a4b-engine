@@ -769,7 +769,6 @@ METAL_FUNC void attention_o_qmv_mma8_affine4_g64_rsp2(
 
         let inDim = x.dim(2)
         guard liveInputWidth(inDim),
-            x.size == batch * sequence * inDim,
             weight.shape == [outputWidth, inDim * Self.bits / 32],
             scales.shape == [outputWidth, inDim / Self.groupSize],
             biases.shape == scales.shape

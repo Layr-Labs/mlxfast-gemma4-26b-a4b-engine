@@ -696,7 +696,7 @@ enum CBv2PrefillSoftmaxVecV1 {
     }()
 
     @inline(__always)
-    private static func getParams(axisSize: Int, numSimdgroups: Int) -> MLXArray {
+    static func getParams(axisSize: Int, numSimdgroups: Int) -> MLXArray {
         if let hit = precomputedParams[axisSize] {
             return hit
         }
@@ -908,7 +908,8 @@ enum CBv2PrefillAttnTrafficV1 {
         let rows = CBv2PrefillSoftmaxVecV1.rowsPerThreadgroup(
             axisSize: axisSize, threadgroupSize: threadgroupSize)
         guard rows >= 1, rows * threadgroupSize <= 1024 else { return nil }
-        let paramsArray = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
+        let paramsArray = CBv2PrefillSoftmaxVecV1.getParams(
+            axisSize: axisSize, numSimdgroups: numSimdgroups)
         var statsShape = scores.shape
         statsShape[statsShape.count - 1] = 4
 

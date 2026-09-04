@@ -197,7 +197,6 @@ public enum Gemma4MMAQuantizedGEMV {
             x.dim(0) == mRows,
             x.dim(1) == 1,
             x.dim(2) == 2816,
-            x.size == mRows * 2816,
             values.dtype == .float32,
             values.ndim == 1,
             values.size == mRows * (2816 / 64)
@@ -3239,7 +3238,7 @@ public enum Gemma4MMAQuantizedGEMV {
         guard x.ndim == 2 || (x.ndim == 3 && x.dim(1) == 1) else { return nil }
         guard x.dim(0) == mRows else { return nil }
         let k = x.dim(-1)
-        guard k > 0, x.size == mRows * k else { return nil }
+        guard k > 0 else { return nil }
 
         let n = w.dim(0)
         let selectedColsPerThreadgroup = version == 16 || version == 26 || version == 27

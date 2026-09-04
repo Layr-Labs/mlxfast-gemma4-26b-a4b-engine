@@ -1172,8 +1172,7 @@ inline U qdot_affine8_registered_v4(
             x.ndim == 3,
             x.dim(0) == batch,
             x.dim(1) == sequence,
-            x.dim(2) == 2816,
-            x.size == batch * sequence * 2816
+            x.dim(2) == 2816
         else { return nil }
         let blocks = 2816 / kBlock
         let values = activationSumKernel(
@@ -1202,7 +1201,6 @@ inline U qdot_affine8_registered_v4(
             x.dim(0) == batch,
             x.dim(1) == sequence,
             x.dim(2) == 2816,
-            x.size == batch * sequence * 2816,
             values.dtype == .float32,
             values.ndim == 1,
             values.size == blocks * simdWidth * batch
@@ -1242,7 +1240,6 @@ inline U qdot_affine8_registered_v4(
         guard liveShape(inDim: inDim, outDim: outDim),
             inDim % Self.groupSize == 0,
             outDim % outputsPerGroup == 0,
-            x.size == batch * sequence * inDim,
             weight.dim(1) == inDim * Self.bits / 32,
             scales.shape == [outDim, inDim / Self.groupSize],
             biases.shape == scales.shape

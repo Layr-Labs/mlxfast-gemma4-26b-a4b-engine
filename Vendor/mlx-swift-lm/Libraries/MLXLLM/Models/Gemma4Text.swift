@@ -1406,11 +1406,13 @@ private let gemma4QKVNormPrefillSlidingKernel = MLXFast.metalKernel(
 /// kernel's `per_lane` mapping), the serial min/max over those eight in the
 /// same order, the same `simd_shuffle_xor` 1/2/4 combine across the same
 /// eight lanes, `half` scale/bias, `rint` codes, and the same word layout at
-/// the same `(plane, head, token) * 36` offset of the same per-row mirror
-/// allocation. The mirror is therefore the pack kernel's output byte for
+/// the same offsets of the same per-row mirror allocation — whichever of the
+/// two KV-SPLIT placements `CBv2WindowedSequenceKV.mirrorLayoutDefs` selects,
+/// since the pack bodies and the attention bodies read the same constants. The mirror is therefore the pack kernel's output byte for
 /// byte, computed without re-reading the 67 MB of K/V it packs.
 private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
-    name: "gemma4_qkv_rms_norm_head_major_sliding_pack_pg1",
+    name: "gemma4_qkv_rms_norm_head_major_sliding_pack_pg1"
+        + CBv2WindowedSequenceKV.mirrorSplitKey,
     inputNames: [
         "q", "k", "v", "q_weight", "k_weight",
         "position_offsets", "rope_log2_base",
@@ -1421,6 +1423,9 @@ private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
         constexpr uint row_threads = D / reads;
         constexpr uint row_simds = row_threads / 32;
         constexpr uint mirror_row_words = D / 8 + D / 64;
+        \(CBv2WindowedSequenceKV.mirrorLayoutDefs(
+            payloadWords: "D / 8", rowWords: "mirror_row_words",
+            slots: "LK", indent: "        ", type: "uint"))
         const uint tid = thread_position_in_threadgroup.x;
         const uint slot = tid / row_threads;
         const uint lid = tid - slot * row_threads;
@@ -1564,7 +1569,7 @@ private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
                 case 7: mout = m7; break;
                 default: return;
             }
-            mout += (plane * (HK * LK) + mirror_h * LK + mirror_l) * mirror_row_words;
+            mout += (plane * HK + mirror_h) * LK * mirror_row_words;
             const threadgroup T* src = final_vals[slot];
 
             float vmin = 3.402823466e+38F;
@@ -1589,9 +1594,9 @@ private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
                 const float qv = metal::rint((float(src[lane * 8 + i]) - b) / s);
                 word |= uint32_t(clamp(qv, 0.0f, 15.0f)) << (4 * i);
             }
-            mout[lane] = word;
+            mout[mirror_l * kvq_pay_stride + lane] = word;
             if (lane % 8 == 0) {
-                mout[D / 8 + lane / 8] =
+                mout[kvq_meta_base + mirror_l * kvq_meta_stride + lane / 8] =
                     uint32_t(as_type<ushort>(hs)) | (uint32_t(as_type<ushort>(hb)) << 16);
             }
         }
@@ -1623,7 +1628,8 @@ private let gemma4QKVNormPrefillSlidingPackKernel = MLXFast.metalKernel(
 /// Every thread reaches every barrier (all row work is predicated), so the
 /// row count need not divide the rows per threadgroup.
 private let gemma4QKVNormPrefillSlidingPackKernelPg2 = MLXFast.metalKernel(
-    name: "gemma4_qkv_rms_norm_head_major_sliding_pack_pg2",
+    name: "gemma4_qkv_rms_norm_head_major_sliding_pack_pg2"
+        + CBv2WindowedSequenceKV.mirrorSplitKey,
     inputNames: [
         "q", "k", "v", "q_weight", "k_weight",
         "position_offsets", "rope_log2_base",
@@ -1634,6 +1640,9 @@ private let gemma4QKVNormPrefillSlidingPackKernelPg2 = MLXFast.metalKernel(
         constexpr uint row_threads = D / reads;
         constexpr uint row_simds = row_threads / 32;
         constexpr uint mirror_row_words = D / 8 + D / 64;
+        \(CBv2WindowedSequenceKV.mirrorLayoutDefs(
+            payloadWords: "D / 8", rowWords: "mirror_row_words",
+            slots: "LK", indent: "        ", type: "uint"))
         typedef vec<T, 4> T4;
         const uint tid = thread_position_in_threadgroup.x;
         const uint slot = tid / row_threads;
@@ -1809,7 +1818,7 @@ private let gemma4QKVNormPrefillSlidingPackKernelPg2 = MLXFast.metalKernel(
                 case 7: mout = m7; break;
                 default: return;
             }
-            mout += (plane * (HK * LK) + mirror_h * LK + mirror_l) * mirror_row_words;
+            mout += (plane * HK + mirror_h) * LK * mirror_row_words;
             const threadgroup T* src = stg;
 
             float vmin = 3.402823466e+38F;
@@ -1834,9 +1843,9 @@ private let gemma4QKVNormPrefillSlidingPackKernelPg2 = MLXFast.metalKernel(
                 const float qv = metal::rint((float(src[lane * 8 + i]) - b) / s);
                 word |= uint32_t(clamp(qv, 0.0f, 15.0f)) << (4 * i);
             }
-            mout[lane] = word;
+            mout[mirror_l * kvq_pay_stride + lane] = word;
             if (lane % 8 == 0) {
-                mout[D / 8 + lane / 8] =
+                mout[kvq_meta_base + mirror_l * kvq_meta_stride + lane / 8] =
                     uint32_t(as_type<ushort>(hs)) | (uint32_t(as_type<ushort>(hb)) << 16);
             }
         }
@@ -7242,7 +7251,29 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
         fuseDenseGateUpStorage(&sanitized)
         fuseExpertGateUpStorage(&sanitized)
+        relayoutExpertDownLaneBlock(sanitized)
         return sanitized
+    }
+
+    /// DOWN-LANEBLOCK: build each routed-expert layer's lane-blocked down
+    /// codes here, at load, and bind them beside the loaded plane. The loaded
+    /// arrays are left exactly as they are -- prefill's sorted down gather and
+    /// every non-decode consumer keep reading them row-major -- so this costs
+    /// one extra copy of the down codes per layer and nothing else. Layers or
+    /// checkpoints outside the exact production geometry, and the arm's
+    /// off-state, bind nothing and keep the incumbent gather.
+    private func relayoutExpertDownLaneBlock(_ sanitized: [String: MLXArray]) {
+        guard switchDownLaneBlockEnabled else { return }
+        let downWeightSuffix = ".experts.switch_glu.down_proj.weight"
+        for key in sanitized.keys where key.hasSuffix(downWeightSuffix) {
+            guard let layerIdx = extractLayerIdx(from: key),
+                layerIdx < model.layers.count,
+                let experts = model.layers[layerIdx].experts,
+                let downWeight = sanitized[key],
+                let storage = SwitchDownLaneBlockStorage(downWeight: downWeight)
+            else { continue }
+            experts.switchGLU.bindDownLaneBlockStorage(storage)
+        }
     }
 
     /// Make each dense layer's joined gate|up plane its primary storage.

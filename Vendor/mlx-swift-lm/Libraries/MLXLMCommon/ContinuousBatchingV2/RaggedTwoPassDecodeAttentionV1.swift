@@ -1367,7 +1367,8 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     }
 
     private static let portQuantReadKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-        name: "cbv2_ragged8_sdpa_ring_2pass_a_q4g64_d256_g2_port_b\(blocks)_v1",
+        name: "cbv2_ragged8_sdpa_ring_2pass_a_q4g64_d256_g2_port_b\(blocks)"
+            + "_v1\(CBv2WindowedSequenceKV.mirrorSplitKey)",
         inputNames: [
             "queries",
             "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7", "starts",
@@ -1389,6 +1390,9 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             // KVQ4: 4-bit payload in 32 words (8 nibbles each) plus one tail word
             // per 64-element group holding that group's fp16 (scale, bias).
             constexpr int row_words = D / 8 + D / 64;
+            \(CBv2WindowedSequenceKV.mirrorLayoutDefs(
+                payloadWords: "D / 8", rowWords: "row_words",
+                slots: "N", indent: "            "))
             const device uint32_t* mirror_w = m0;
             switch (batch_index) {
                 case 1: mirror_w = m1; break;
@@ -1421,20 +1425,22 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             float sum_exp_score = 0.0f;
             for (int token = block; token < N; token += BLOCKS) {
                 const device uint32_t* krow_w =
-                    mirror_w + (kv_head * N + slot) * row_words;
+                    mirror_w + kv_head * N * row_words;
                 const device uint32_t* vrow_w =
-                    mirror_w + ((KV_HEADS + kv_head) * N + slot) * row_words;
+                    mirror_w + (KV_HEADS + kv_head) * N * row_words;
                 // One lane owns 8 consecutive elements, so it sits wholly
                 // inside one 64-element group: group = (lane * 8) / 64.
                 const int group = lane / 8;
-                const uint32_t ktw = krow_w[D / 8 + group];
-                const uint32_t vtw = vrow_w[D / 8 + group];
+                const int meta_w = kvq_meta_base + slot * kvq_meta_stride + group;
+                const int pay_w = slot * kvq_pay_stride + lane;
+                const uint32_t ktw = krow_w[meta_w];
+                const uint32_t vtw = vrow_w[meta_w];
                 const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
                 const float kb = float(as_type<half>(ushort(ktw >> 16)));
                 const float vs = float(as_type<half>(ushort(vtw & 0xffffu)));
                 const float vb = float(as_type<half>(ushort(vtw >> 16)));
-                const uint32_t kw = krow_w[lane];
-                const uint32_t vw = vrow_w[lane];
+                const uint32_t kw = krow_w[pay_w];
+                const uint32_t vw = vrow_w[pay_w];
                 float score = 0.0f;
                 for (int element = 0; element < 8; ++element) {
                     score += q[element]
@@ -1474,7 +1480,8 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// next decode dispatch after this write completes.
     private static let portQuantFusedWriteKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_2pass_a_q4g64_d256_g2_regpack_vec4_carry_pair_b\(blocks)_v5",
+            name: "cbv2_ragged8_sdpa_ringwrite_2pass_a_q4g64_d256_g2_regpack_vec4_carry_pair"
+                + "_b\(blocks)_v5\(CBv2WindowedSequenceKV.mirrorSplitKey)",
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -1486,6 +1493,9 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 constexpr int values_per_lane = D / simd_width;
                 constexpr int payload_words = D / 8;
                 constexpr int row_words = payload_words + D / 64;
+                \(CBv2WindowedSequenceKV.mirrorLayoutDefs(
+                    payloadWords: "payload_words", rowWords: "row_words",
+                    slots: "N", indent: "                "))
                 constexpr int current_block = (N - 1) % BLOCKS;
 
                 const int kv_head = int(threadgroup_position_in_grid.x);
@@ -1587,18 +1597,18 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
 
                     {
                         device uint32_t* write_key =
-                            const_cast<device uint32_t*>(mkeys_w)
-                            + write_slot * row_words;
+                            const_cast<device uint32_t*>(mkeys_w);
                         device uint32_t* write_value =
-                            const_cast<device uint32_t*>(mvalues_w)
-                            + write_slot * row_words;
-                        write_key[lane] = kword;
-                        write_value[lane] = vword;
+                            const_cast<device uint32_t*>(mvalues_w);
+                        write_key[write_slot * kvq_pay_stride + lane] = kword;
+                        write_value[write_slot * kvq_pay_stride + lane] = vword;
                         if (lane % 8 == 0) {
-                            write_key[payload_words + lane / 8] =
+                            write_key[
+                                kvq_meta_base + write_slot * kvq_meta_stride + lane / 8] =
                                 uint32_t(as_type<ushort>(khs))
                                 | (uint32_t(as_type<ushort>(khb)) << 16);
-                            write_value[payload_words + lane / 8] =
+                            write_value[
+                                kvq_meta_base + write_slot * kvq_meta_stride + lane / 8] =
                                 uint32_t(as_type<ushort>(vhs))
                                 | (uint32_t(as_type<ushort>(vhb)) << 16);
                         }
@@ -1643,13 +1653,13 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 uint next_slot = slot + uint(BLOCKS);
                 if (next_slot >= uint(N)) next_slot -= uint(N);
                 uint32_t kw_pre = prefetch_first
-                    ? mkeys_w[slot * row_words + lane] : 0u;
+                    ? mkeys_w[slot * kvq_pay_stride + lane] : 0u;
                 uint32_t vw_pre = prefetch_first
-                    ? mvalues_w[slot * row_words + lane] : 0u;
+                    ? mvalues_w[slot * kvq_pay_stride + lane] : 0u;
                 uint32_t ktw_pre = prefetch_first
-                    ? mkeys_w[slot * row_words + payload_words + lane / 8] : 0u;
+                    ? mkeys_w[kvq_meta_base + slot * kvq_meta_stride + lane / 8] : 0u;
                 uint32_t vtw_pre = prefetch_first
-                    ? mvalues_w[slot * row_words + payload_words + lane / 8] : 0u;
+                    ? mvalues_w[kvq_meta_base + slot * kvq_meta_stride + lane / 8] : 0u;
                 for (int token = block; token < N; token += BLOCKS) {
                     const bool current = token == N - 1;
                     const uint32_t kw = current ? kword : kw_pre;
@@ -1663,12 +1673,12 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                             | (uint32_t(as_type<ushort>(vhb)) << 16))
                         : vtw_pre;
                     if (token + BLOCKS < N - 1) {
-                        kw_pre = mkeys_w[next_slot * row_words + lane];
-                        vw_pre = mvalues_w[next_slot * row_words + lane];
+                        kw_pre = mkeys_w[next_slot * kvq_pay_stride + lane];
+                        vw_pre = mvalues_w[next_slot * kvq_pay_stride + lane];
                         ktw_pre =
-                            mkeys_w[next_slot * row_words + payload_words + lane / 8];
+                            mkeys_w[kvq_meta_base + next_slot * kvq_meta_stride + lane / 8];
                         vtw_pre =
-                            mvalues_w[next_slot * row_words + payload_words + lane / 8];
+                            mvalues_w[kvq_meta_base + next_slot * kvq_meta_stride + lane / 8];
                         next_slot += uint(BLOCKS);
                         if (next_slot >= uint(N)) next_slot -= uint(N);
                     }
@@ -1730,7 +1740,8 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// removes only the global partial write/read and the second dispatch.
     private static let portQuantFusedWriteResidentKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_ey29_ey32_yp3_ey51_yrp1_ey82",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_ey29_ey32_yp3_ey51_yrp1_ey82"
+                + CBv2WindowedSequenceKV.mirrorSplitKey,
             inputNames: [
                 "queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -1744,6 +1755,9 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 constexpr int vectors_per_lane = values_per_lane / 4;
                 constexpr int payload_words = D / 8;
                 constexpr int row_words = payload_words + D / 64;
+                \(CBv2WindowedSequenceKV.mirrorLayoutDefs(
+                    payloadWords: "payload_words", rowWords: "row_words",
+                    slots: "N", indent: "                "))
                 constexpr int current_block = (N - 1) % BLOCKS;
                 constexpr int COLS = BLOCKS;
                 constexpr int sets = simd_width / COLS;
@@ -1841,18 +1855,16 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     }
 
                     device uint32_t* write_key =
-                        const_cast<device uint32_t*>(mkeys_w)
-                        + write_slot * row_words;
+                        const_cast<device uint32_t*>(mkeys_w);
                     device uint32_t* write_value =
-                        const_cast<device uint32_t*>(mvalues_w)
-                        + write_slot * row_words;
-                    write_key[lane] = kword;
-                    write_value[lane] = vword;
+                        const_cast<device uint32_t*>(mvalues_w);
+                    write_key[write_slot * kvq_pay_stride + lane] = kword;
+                    write_value[write_slot * kvq_pay_stride + lane] = vword;
                     if (lane % 8 == 0) {
-                        write_key[payload_words + lane / 8] =
+                        write_key[kvq_meta_base + write_slot * kvq_meta_stride + lane / 8] =
                             uint32_t(as_type<ushort>(khs))
                             | (uint32_t(as_type<ushort>(khb)) << 16);
-                        write_value[payload_words + lane / 8] =
+                        write_value[kvq_meta_base + write_slot * kvq_meta_stride + lane / 8] =
                             uint32_t(as_type<ushort>(vhs))
                             | (uint32_t(as_type<ushort>(vhb)) << 16);
                     }
@@ -1900,13 +1912,13 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 uint next_slot = slot + uint(BLOCKS);
                 if (next_slot >= uint(N)) next_slot -= uint(N);
                 uint32_t kw_pre = prefetch_first
-                    ? mkeys_w[slot * row_words + lane] : 0u;
+                    ? mkeys_w[slot * kvq_pay_stride + lane] : 0u;
                 uint32_t vw_pre = prefetch_first
-                    ? mvalues_w[slot * row_words + lane] : 0u;
+                    ? mvalues_w[slot * kvq_pay_stride + lane] : 0u;
                 uint32_t ktw_pre = prefetch_first
-                    ? mkeys_w[slot * row_words + payload_words + lane / 8] : 0u;
+                    ? mkeys_w[kvq_meta_base + slot * kvq_meta_stride + lane / 8] : 0u;
                 uint32_t vtw_pre = prefetch_first
-                    ? mvalues_w[slot * row_words + payload_words + lane / 8] : 0u;
+                    ? mvalues_w[kvq_meta_base + slot * kvq_meta_stride + lane / 8] : 0u;
                 for (int token = block; token < N; token += BLOCKS) {
                     const bool current = token == N - 1;
                     const uint32_t kw = current ? kword : kw_pre;
@@ -1920,12 +1932,12 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                             | (uint32_t(as_type<ushort>(vhb)) << 16))
                         : vtw_pre;
                     if (token + BLOCKS < N - 1) {
-                        kw_pre = mkeys_w[next_slot * row_words + lane];
-                        vw_pre = mvalues_w[next_slot * row_words + lane];
+                        kw_pre = mkeys_w[next_slot * kvq_pay_stride + lane];
+                        vw_pre = mvalues_w[next_slot * kvq_pay_stride + lane];
                         ktw_pre =
-                            mkeys_w[next_slot * row_words + payload_words + lane / 8];
+                            mkeys_w[kvq_meta_base + next_slot * kvq_meta_stride + lane / 8];
                         vtw_pre =
-                            mvalues_w[next_slot * row_words + payload_words + lane / 8];
+                            mvalues_w[kvq_meta_base + next_slot * kvq_meta_stride + lane / 8];
                         next_slot += uint(BLOCKS);
                         if (next_slot >= uint(N)) next_slot -= uint(N);
                     }
@@ -2242,13 +2254,13 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 uint next_slot = slot + uint(BLOCKS);
                 if (next_slot >= uint(N)) next_slot -= uint(N);
                 uint32_t kw_pre = prefetch_first
-                    ? mkeys_w[slot * row_words + lane] : 0u;
+                    ? mkeys_w[slot * kvq_pay_stride + lane] : 0u;
                 uint32_t vw_pre = prefetch_first
-                    ? mvalues_w[slot * row_words + lane] : 0u;
+                    ? mvalues_w[slot * kvq_pay_stride + lane] : 0u;
                 uint32_t ktw_pre = prefetch_first
-                    ? mkeys_w[slot * row_words + payload_words + lane / 8] : 0u;
+                    ? mkeys_w[kvq_meta_base + slot * kvq_meta_stride + lane / 8] : 0u;
                 uint32_t vtw_pre = prefetch_first
-                    ? mvalues_w[slot * row_words + payload_words + lane / 8] : 0u;
+                    ? mvalues_w[kvq_meta_base + slot * kvq_meta_stride + lane / 8] : 0u;
                 for (int token = block; token < N; token += BLOCKS) {
                     const bool current = token == N - 1;
                     const uint32_t kw = current ? kword : kw_pre;
@@ -2262,12 +2274,12 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                             | (uint32_t(as_type<ushort>(vhb)) << 16))
                         : vtw_pre;
                     if (token + BLOCKS < N - 1) {
-                        kw_pre = mkeys_w[next_slot * row_words + lane];
-                        vw_pre = mvalues_w[next_slot * row_words + lane];
+                        kw_pre = mkeys_w[next_slot * kvq_pay_stride + lane];
+                        vw_pre = mvalues_w[next_slot * kvq_pay_stride + lane];
                         ktw_pre =
-                            mkeys_w[next_slot * row_words + payload_words + lane / 8];
+                            mkeys_w[kvq_meta_base + next_slot * kvq_meta_stride + lane / 8];
                         vtw_pre =
-                            mvalues_w[next_slot * row_words + payload_words + lane / 8];
+                            mvalues_w[kvq_meta_base + next_slot * kvq_meta_stride + lane / 8];
                         next_slot += uint(BLOCKS);
                         if (next_slot >= uint(N)) next_slot -= uint(N);
                     }
@@ -2343,13 +2355,13 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 for (int u = 0; u < PF; ++u) {
                     const bool prefetch_first = block + u * BLOCKS < N - 1;
                     kw_pre[u] = prefetch_first
-                        ? mkeys_w[pf_slot * row_words + lane] : 0u;
+                        ? mkeys_w[pf_slot * kvq_pay_stride + lane] : 0u;
                     vw_pre[u] = prefetch_first
-                        ? mvalues_w[pf_slot * row_words + lane] : 0u;
+                        ? mvalues_w[pf_slot * kvq_pay_stride + lane] : 0u;
                     ktw_pre[u] = prefetch_first
-                        ? mkeys_w[pf_slot * row_words + payload_words + lane / 8] : 0u;
+                        ? mkeys_w[kvq_meta_base + pf_slot * kvq_meta_stride + lane / 8] : 0u;
                     vtw_pre[u] = prefetch_first
-                        ? mvalues_w[pf_slot * row_words + payload_words + lane / 8] : 0u;
+                        ? mvalues_w[kvq_meta_base + pf_slot * kvq_meta_stride + lane / 8] : 0u;
                     pf_slot += uint(BLOCKS);
                     if (pf_slot >= uint(N)) pf_slot -= uint(N);
                 }
@@ -2370,12 +2382,12 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                                 | (uint32_t(as_type<ushort>(vhb)) << 16))
                             : vtw_pre[u];
                         if (tok + PF * BLOCKS < N - 1) {
-                            kw_pre[u] = mkeys_w[next_slot * row_words + lane];
-                            vw_pre[u] = mvalues_w[next_slot * row_words + lane];
+                            kw_pre[u] = mkeys_w[next_slot * kvq_pay_stride + lane];
+                            vw_pre[u] = mvalues_w[next_slot * kvq_pay_stride + lane];
                             ktw_pre[u] =
-                                mkeys_w[next_slot * row_words + payload_words + lane / 8];
+                                mkeys_w[kvq_meta_base + next_slot * kvq_meta_stride + lane / 8];
                             vtw_pre[u] =
-                                mvalues_w[next_slot * row_words + payload_words + lane / 8];
+                                mvalues_w[kvq_meta_base + next_slot * kvq_meta_stride + lane / 8];
                             next_slot += uint(BLOCKS);
                             if (next_slot >= uint(N)) next_slot -= uint(N);
                         }
@@ -2439,12 +2451,12 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 thread uint32_t vtw_pre[PF];
                 #pragma clang loop unroll(full)
                 for (int u = 0; u < PF; ++u) {
-                    kw_pre[u] = mkeys_w[pf_slot * row_words + lane];
-                    vw_pre[u] = mvalues_w[pf_slot * row_words + lane];
+                    kw_pre[u] = mkeys_w[pf_slot * kvq_pay_stride + lane];
+                    vw_pre[u] = mvalues_w[pf_slot * kvq_pay_stride + lane];
                     ktw_pre[u] =
-                        mkeys_w[pf_slot * row_words + payload_words + lane / 8];
+                        mkeys_w[kvq_meta_base + pf_slot * kvq_meta_stride + lane / 8];
                     vtw_pre[u] =
-                        mvalues_w[pf_slot * row_words + payload_words + lane / 8];
+                        mvalues_w[kvq_meta_base + pf_slot * kvq_meta_stride + lane / 8];
                     pf_slot += uint(BLOCKS);
                     if (pf_slot >= uint(N)) pf_slot -= uint(N);
                 }
@@ -2462,12 +2474,12 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         const uint32_t vw = vw_pre[u];
                         const uint32_t ktw = ktw_pre[u];
                         const uint32_t vtw = vtw_pre[u];
-                        kw_pre[u] = mkeys_w[next_slot * row_words + lane];
-                        vw_pre[u] = mvalues_w[next_slot * row_words + lane];
+                        kw_pre[u] = mkeys_w[next_slot * kvq_pay_stride + lane];
+                        vw_pre[u] = mvalues_w[next_slot * kvq_pay_stride + lane];
                         ktw_pre[u] =
-                            mkeys_w[next_slot * row_words + payload_words + lane / 8];
+                            mkeys_w[kvq_meta_base + next_slot * kvq_meta_stride + lane / 8];
                         vtw_pre[u] =
-                            mvalues_w[next_slot * row_words + payload_words + lane / 8];
+                            mvalues_w[kvq_meta_base + next_slot * kvq_meta_stride + lane / 8];
                         next_slot += uint(BLOCKS);
                         if (next_slot >= uint(N)) next_slot -= uint(N);
                         const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
@@ -2528,12 +2540,12 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                                 | (uint32_t(as_type<ushort>(vhb)) << 16))
                             : vtw_pre[u];
                         if (tok + PF * BLOCKS < N - 1) {
-                            kw_pre[u] = mkeys_w[next_slot * row_words + lane];
-                            vw_pre[u] = mvalues_w[next_slot * row_words + lane];
+                            kw_pre[u] = mkeys_w[next_slot * kvq_pay_stride + lane];
+                            vw_pre[u] = mvalues_w[next_slot * kvq_pay_stride + lane];
                             ktw_pre[u] =
-                                mkeys_w[next_slot * row_words + payload_words + lane / 8];
+                                mkeys_w[kvq_meta_base + next_slot * kvq_meta_stride + lane / 8];
                             vtw_pre[u] =
-                                mvalues_w[next_slot * row_words + payload_words + lane / 8];
+                                mvalues_w[kvq_meta_base + next_slot * kvq_meta_stride + lane / 8];
                             next_slot += uint(BLOCKS);
                             if (next_slot >= uint(N)) next_slot -= uint(N);
                         }
@@ -2592,18 +2604,21 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 static_assert(PF * BLOCKS <= N - 1,
                     "both depth-two seed positions must be historical");
 
-                // RING-OFF: carry the ring cursor as a row-word offset
-                // rather than a slot index. `slot * row_words` is monotone
-                // on [0, N) and every advance is the same `BLOCKS` step, so
-                // the wrap compare is exact at `N * row_words` and every
-                // address below is the address the promoted walk computed.
-                constexpr uint ROW_W = uint(row_words);
+                // RING-OFF: carry the ring cursor as a payload-word offset
+                // rather than a slot index. `slot * kvq_pay_stride` is
+                // monotone on [0, N) and every advance is the same `BLOCKS`
+                // step, so the wrap compare is exact at `N * kvq_pay_stride`
+                // and every address below is the address the promoted walk
+                // computed. The metadata word is derived from the same
+                // cursor (KV-SPLIT rescales it to the metadata plane; with
+                // the split off it is a constant offset inside the record).
+                constexpr uint ROW_W = uint(kvq_pay_stride);
                 constexpr uint RING_W = uint(N) * ROW_W;
                 constexpr uint RING_STEP = uint(BLOCKS) * ROW_W;
                 static_assert(RING_W / ROW_W == uint(N),
                     "ring word span must not overflow a 32-bit cursor");
                 const uint pay_lane = uint(lane);
-                const uint meta_lane = uint(payload_words) + uint(lane) / 8u;
+                const uint meta_lane = uint(lane) / 8u;
                 uint pf_off = slot * ROW_W;
                 thread uint32_t kw_pre[PF];
                 thread uint32_t vw_pre[PF];
@@ -2614,9 +2629,11 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     kw_pre[u] = mkeys_w[pf_off + pay_lane];
                     vw_pre[u] = mvalues_w[pf_off + pay_lane];
                     ktw_pre[u] =
-                        mkeys_w[pf_off + meta_lane];
+                        mkeys_w[\(CBv2WindowedSequenceKV.mirrorMetaOffsetExpression(
+                            payloadOffset: "pf_off", laneGroup: "meta_lane"))];
                     vtw_pre[u] =
-                        mvalues_w[pf_off + meta_lane];
+                        mvalues_w[\(CBv2WindowedSequenceKV.mirrorMetaOffsetExpression(
+                            payloadOffset: "pf_off", laneGroup: "meta_lane"))];
                     pf_off += RING_STEP;
                     if (pf_off >= RING_W) pf_off -= RING_W;
                 }
@@ -2637,9 +2654,11 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                         kw_pre[u] = mkeys_w[next_off + pay_lane];
                         vw_pre[u] = mvalues_w[next_off + pay_lane];
                         ktw_pre[u] =
-                            mkeys_w[next_off + meta_lane];
+                            mkeys_w[\(CBv2WindowedSequenceKV.mirrorMetaOffsetExpression(
+                            payloadOffset: "next_off", laneGroup: "meta_lane"))];
                         vtw_pre[u] =
-                            mvalues_w[next_off + meta_lane];
+                            mvalues_w[\(CBv2WindowedSequenceKV.mirrorMetaOffsetExpression(
+                            payloadOffset: "next_off", laneGroup: "meta_lane"))];
                         next_off += RING_STEP;
                         if (next_off >= RING_W) next_off -= RING_W;
                         const float ks = float(as_type<half>(ushort(ktw & 0xffffu)));
@@ -2703,9 +2722,11 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                             kw_pre[u] = mkeys_w[next_off + pay_lane];
                             vw_pre[u] = mvalues_w[next_off + pay_lane];
                             ktw_pre[u] =
-                                mkeys_w[next_off + meta_lane];
+                                mkeys_w[\(CBv2WindowedSequenceKV.mirrorMetaOffsetExpression(
+                            payloadOffset: "next_off", laneGroup: "meta_lane"))];
                             vtw_pre[u] =
-                                mvalues_w[next_off + meta_lane];
+                                mvalues_w[\(CBv2WindowedSequenceKV.mirrorMetaOffsetExpression(
+                            payloadOffset: "next_off", laneGroup: "meta_lane"))];
                             next_off += RING_STEP;
                             if (next_off >= RING_W) next_off -= RING_W;
                         }
@@ -2767,6 +2788,9 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                 constexpr int vectors_per_lane = values_per_lane / 4;
                 constexpr int payload_words = D / 8;
                 constexpr int row_words = payload_words + D / 64;
+                \(CBv2WindowedSequenceKV.mirrorLayoutDefs(
+                    payloadWords: "payload_words", rowWords: "row_words",
+                    slots: "N", indent: "                "))
                 constexpr int current_block = (N - 1) % BLOCKS;
                 constexpr int COLS = BLOCKS;
                 constexpr int sets = simd_width / COLS;
@@ -2988,18 +3012,16 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
                     }
 
                     device uint32_t* write_key =
-                        const_cast<device uint32_t*>(mkeys_w)
-                        + write_slot * row_words;
+                        const_cast<device uint32_t*>(mkeys_w);
                     device uint32_t* write_value =
-                        const_cast<device uint32_t*>(mvalues_w)
-                        + write_slot * row_words;
-                    write_key[lane] = kword;
-                    write_value[lane] = vword;
+                        const_cast<device uint32_t*>(mvalues_w);
+                    write_key[write_slot * kvq_pay_stride + lane] = kword;
+                    write_value[write_slot * kvq_pay_stride + lane] = vword;
                     if (lane % 8 == 0) {
-                        write_key[payload_words + lane / 8] =
+                        write_key[kvq_meta_base + write_slot * kvq_meta_stride + lane / 8] =
                             uint32_t(as_type<ushort>(khs))
                             | (uint32_t(as_type<ushort>(khb)) << 16);
-                        write_value[payload_words + lane / 8] =
+                        write_value[kvq_meta_base + write_slot * kvq_meta_stride + lane / 8] =
                             uint32_t(as_type<ushort>(vhs))
                             | (uint32_t(as_type<ushort>(vhb)) << 16);
                     }
@@ -3178,7 +3200,8 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
 
     private static let portQuantFusedWriteResidentNormRopeKernel: MLXFast.MLXFastKernel =
         MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_v1_ey29_ey32_yp3_ey51_yrp1\(slidingPrefetchKey)",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_v1_ey29_ey32_yp3_ey51_yrp1\(slidingPrefetchKey)"
+                + CBv2WindowedSequenceKV.mirrorSplitKey,
             inputNames: [
                 "raw_queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",
@@ -3194,7 +3217,8 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
     /// fifth output, so the standalone prepass never runs on a sliding layer.
     private static let portQuantFusedWriteResidentNormRopeORunsumKernel:
         MLXFast.MLXFastKernel = MLXFast.metalKernel(
-            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_ors_v1_ey29_ey32_yp3_ey51_yrp1\(slidingPrefetchKey)",
+            name: "cbv2_ragged8_sdpa_ringwrite_q4g64_d256_g2_regpack_vec4_carry_pair_b8_resident_colred_vload_c3_f4_normrope_ors_v1_ey29_ey32_yp3_ey51_yrp1\(slidingPrefetchKey)"
+                + CBv2WindowedSequenceKV.mirrorSplitKey,
             inputNames: [
                 "raw_queries",
                 "m0", "m1", "m2", "m3", "m4", "m5", "m6", "m7",

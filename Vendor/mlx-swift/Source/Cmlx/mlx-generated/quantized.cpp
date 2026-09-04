@@ -1407,7 +1407,29 @@ METAL_FUNC void qmv_fast_crossrow_affine4_g64_m(
   }
 }
 
-template <typename T, int group_size, int bits>
+// DOWN-LANEBLOCK (C1). `laneblock` selects the lane-blocked placement of the
+// routed-expert down plane (K = 704, N = 2816, affine 4-bit / group 64):
+//
+//   incumbent   word(row, k) = row * (K/8) + k                 (row stride 352 B)
+//   lane-block  word(row, k) = (row/4) * 4*(K/8)
+//                            + (k/32) * 128 + (k%32) * 4 + (row%4)
+//
+// i.e. `[N/4][K-block][32 lane][4 row]`. Same 352 bytes per four rows, same
+// values, only placement: a lane's four row words become sixteen ADJACENT
+// bytes, so the simdgroup's four 128 B scalar runs collapse into one 512 B
+// run that starts 128 B aligned (row-group stride 1408 B = 11 x 128, block
+// stride 512 B, ragged tail `[24 lane][4 row]` at +1024 B). Nothing about the
+// per-(output, input) qdot terms, the accumulators, the K-loop order or the
+// simd_sum changes -- the SAME uint32 reaches the SAME `result[row]` in the
+// SAME iteration, so every output element keeps its incumbent add sequence.
+//
+// Preconditions the callers guarantee: bits == 4, group_size == 64,
+// out_vec_size == 2816 (so the "less than one tile" arm below is dead) and
+// out_row a multiple of results_per_simdgroup (out_row = tid.y * 8 +
+// simd_gid * 4, and min(out_vec_size - 4, out_row) preserves that at
+// out_vec_size = 2816). `laneblock == false` reproduces the incumbent
+// addressing byte for byte.
+template <typename T, int group_size, int bits, bool laneblock>
 METAL_FUNC void qmv_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1448,8 +1470,12 @@ METAL_FUNC void qmv_impl(
   }
 
   // In this case we need to properly guard all our reads because there isn't
-  // even 1 tile in the matrix
-  if (out_vec_size < (num_simdgroups * results_per_simdgroup)) {
+  // even 1 tile in the matrix. DOWN-LANEBLOCK never enters here: its only
+  // plane is out_vec_size = 2816, so the condition is already false; the
+  // `!laneblock` makes that structural instead of incidental, which keeps
+  // this arm's incumbent (row-major) addressing unreachable from a relaid
+  // plane.
+  if (!laneblock && out_vec_size < (num_simdgroups * results_per_simdgroup)) {
     ws +=
         out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
     scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
@@ -1513,8 +1539,20 @@ METAL_FUNC void qmv_impl(
 
   // In this case the last tile is moved back to redo some output values
   else {
-    ws += used_out_row * in_vec_size_w +
-        simd_lid * packs_per_thread * bytes_per_pack;
+    // DOWN-LANEBLOCK addressing, three numbers:
+    //   w_lane_step   this lane's offset inside a K-block:  4 B -> 16 B
+    //   w_row_stride  distance to the next cohort row's word: 352 B -> 4 B
+    //   w_block_step  distance to the next K-block:         128 B -> 512 B
+    // The row-group BASE is untouched -- out_row is a multiple of four, so
+    // (out_row / 4) * (4 * in_vec_size_w) == out_row * in_vec_size_w and the
+    // incumbent expression already names the start of the four-row block.
+    constexpr int w_lane_step = (laneblock ? results_per_simdgroup : 1) *
+        packs_per_thread * bytes_per_pack;
+    constexpr int w_block_step = (laneblock ? results_per_simdgroup : 1) *
+        (block_size * bytes_per_pack / pack_factor);
+    const int w_row_stride =
+        laneblock ? (packs_per_thread * bytes_per_pack) : in_vec_size_w;
+    ws += used_out_row * in_vec_size_w + simd_lid * w_lane_step;
     scales += used_out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
     biases += used_out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
     x += tid.x * in_vec_size + simd_lid * values_per_thread;
@@ -1525,7 +1563,7 @@ METAL_FUNC void qmv_impl(
       U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
 
       for (int row = 0; row < results_per_simdgroup; row++) {
-        auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+        auto wl = (const device uint8_t*)(ws + row * w_row_stride);
         const device T* sl = scales + row * in_vec_size_g;
         const device T* bl = biases + row * in_vec_size_g;
 
@@ -1535,7 +1573,7 @@ METAL_FUNC void qmv_impl(
             qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
       }
 
-      ws += block_size * bytes_per_pack / pack_factor;
+      ws += w_block_step;
       scales += block_size / group_size;
       biases += block_size / group_size;
       x += block_size;
@@ -1555,7 +1593,7 @@ METAL_FUNC void qmv_impl(
           U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
 
           for (int row = 0; row < results_per_simdgroup; row++) {
-            auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+            auto wl = (const device uint8_t*)(ws + row * w_row_stride);
             const device T* sl = scales + row * in_vec_size_g;
             const device T* bl = biases + row * in_vec_size_g;
 
@@ -1575,7 +1613,7 @@ METAL_FUNC void qmv_impl(
               x, x_thread, remaining);
 
           for (int row = 0; row < results_per_simdgroup; row++) {
-            auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+            auto wl = (const device uint8_t*)(ws + row * w_row_stride);
             const device T* sl = scales + row * in_vec_size_g;
             const device T* bl = biases + row * in_vec_size_g;
 
@@ -1596,7 +1634,13 @@ METAL_FUNC void qmv_impl(
   }
 }
 
-template <typename T, const int group_size, const int bits>
+// `laneblock` has the meaning documented on `qmv_impl`: the routed-expert down
+// plane's four cohort rows interleaved per lane. Here it also folds the four
+// scalar `uint` code loads into ONE `uint4` -- 16 B per lane, 512 B per
+// simdgroup, 128 B aligned -- which is the whole point of the placement. The
+// unpacked words land in the SAME `packed[row]` slots the incumbent filled, so
+// `qdot_affine4_pair_word`, the accumulators and the simd_sums are untouched.
+template <typename T, const int group_size, const int bits, bool laneblock>
 METAL_FUNC void qmv_affine4_g64_pair_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1630,7 +1674,17 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
 
-  ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  // DOWN-LANEBLOCK addressing (see `qmv_impl`): lane offset 4 B -> 16 B, row
+  // stride 352 B -> 4 B, block step 128 B -> 512 B. `out_row` is a multiple of
+  // results_per_simdgroup, so `out_row * in_vec_size_w` already names the
+  // start of the four-row block and the base term is unchanged.
+  constexpr int w_lane_step =
+      (laneblock ? results_per_simdgroup : 1) * bytes_per_thread;
+  constexpr int w_block_step =
+      (laneblock ? results_per_simdgroup : 1) * (block_size / 2);
+  const int w_row_stride = laneblock ? bytes_per_thread : in_vec_size_w;
+
+  ws += out_row * in_vec_size_w + simd_lid * w_lane_step;
   scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
   biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
   x0 += simd_lid * values_per_thread;
@@ -1640,10 +1694,22 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
 
   int k = 0;
   for (; k <= in_vec_size - block_size; k += block_size) {
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
-      scale_local[row] = scales[row * in_vec_size_g];
-      bias_local[row] = biases[row * in_vec_size_g];
+    if (laneblock) {
+      const uint4 packed_quad = *((const device uint4*)ws);
+      packed[0] = packed_quad.x;
+      packed[1] = packed_quad.y;
+      packed[2] = packed_quad.z;
+      packed[3] = packed_quad.w;
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        scale_local[row] = scales[row * in_vec_size_g];
+        bias_local[row] = biases[row * in_vec_size_g];
+      }
+    } else {
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        packed[row] = *((const device uint*)(ws + row * w_row_stride));
+        scale_local[row] = scales[row * in_vec_size_g];
+        bias_local[row] = biases[row * in_vec_size_g];
+      }
     }
 
     float sum0 = load_vector<T, float, values_per_thread, 4>(x0, x0_thread);
@@ -1658,7 +1724,7 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
       result1[row] += dot1;
     }
 
-    ws += block_size / 2;
+    ws += w_block_step;
     scales += block_size / 64;
     biases += block_size / 64;
     x0 += block_size;
@@ -1672,10 +1738,22 @@ METAL_FUNC void qmv_affine4_g64_pair_impl(
   const uint active_tail_lanes =
       uint((in_vec_size - k) / values_per_thread);
   if (simd_lid < active_tail_lanes) {
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      packed[row] = *((const device uint*)(ws + row * in_vec_size_w));
-      scale_local[row] = scales[row * in_vec_size_g];
-      bias_local[row] = biases[row * in_vec_size_g];
+    if (laneblock) {
+      const uint4 packed_quad = *((const device uint4*)ws);
+      packed[0] = packed_quad.x;
+      packed[1] = packed_quad.y;
+      packed[2] = packed_quad.z;
+      packed[3] = packed_quad.w;
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        scale_local[row] = scales[row * in_vec_size_g];
+        bias_local[row] = biases[row * in_vec_size_g];
+      }
+    } else {
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        packed[row] = *((const device uint*)(ws + row * w_row_stride));
+        scale_local[row] = scales[row * in_vec_size_g];
+        bias_local[row] = biases[row * in_vec_size_g];
+      }
     }
 
     float sum0 =
@@ -1872,7 +1950,20 @@ METAL_FUNC void qmv_affine4_g64_quad_stream_impl(
 // register discipline (one live x buffer), K-loop order, per-(output, input)
 // accumulators, and qdot_affine4_registered arithmetic are the quad's own, so
 // every output element's add sequence remains identical to stock qmv_impl.
-template <typename T, const int group_size, const int bits>
+//
+// `laneblock` has the meaning documented on `qmv_impl` and carried by
+// `qmv_affine4_g64_pair_impl`: the routed-expert down plane's four cohort rows
+// interleaved per lane, `[N/4][K-block][32 lane][4 row]`. It selects the same
+// three numbers here as there -- lane offset 4 B -> 16 B, cohort-row distance
+// 352 B -> 4 B, K-block step 128 B -> 512 B -- and folds the four scalar `uint`
+// code loads into ONE 16 B aligned `uint4`. The words land in the SAME
+// `packed[row]` slots the incumbent filled, so `qdot_affine4_registered_word`,
+// result0/1/2, the K-loop order and the simd_sums are untouched. This arm has
+// to carry the parameter because RUN-TRIPLE below hands it the SAME plane the
+// pair arm gets: a 3-run leader on a relaid plane that addressed row-major
+// would read another cohort's codes. `laneblock == false` reproduces the
+// incumbent addressing byte for byte.
+template <typename T, const int group_size, const int bits, bool laneblock>
 METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -1908,7 +1999,16 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
 
-  ws += out_row * in_vec_size_w + simd_lid * bytes_per_thread;
+  // DOWN-LANEBLOCK addressing (see `qmv_impl`). `out_row` is a multiple of
+  // results_per_simdgroup, so `out_row * in_vec_size_w` already names the start
+  // of the four-row block and the base term is unchanged.
+  constexpr int w_lane_step =
+      (laneblock ? results_per_simdgroup : 1) * bytes_per_thread;
+  constexpr int w_block_step =
+      (laneblock ? results_per_simdgroup : 1) * (block_size / 2);
+  const int w_row_stride = laneblock ? bytes_per_thread : in_vec_size_w;
+
+  ws += out_row * in_vec_size_w + simd_lid * w_lane_step;
   scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
   biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
   x0 += simd_lid * values_per_thread;
@@ -1920,11 +2020,22 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
 
   int k = 0;
   for (; k <= in_vec_size - block_size; k += block_size) {
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      packed[row] =
-          *((const device uint*)(ws + row * in_vec_size_w));
-      scale_local[row] = scales[row * in_vec_size_g];
-      bias_local[row] = biases[row * in_vec_size_g];
+    if (laneblock) {
+      const uint4 packed_quad = *((const device uint4*)ws);
+      packed[0] = packed_quad.x;
+      packed[1] = packed_quad.y;
+      packed[2] = packed_quad.z;
+      packed[3] = packed_quad.w;
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        scale_local[row] = scales[row * in_vec_size_g];
+        bias_local[row] = biases[row * in_vec_size_g];
+      }
+    } else {
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        packed[row] = *((const device uint*)(ws + row * w_row_stride));
+        scale_local[row] = scales[row * in_vec_size_g];
+        bias_local[row] = biases[row * in_vec_size_g];
+      }
     }
 
     float sum = load_vector<T, float, values_per_thread, 4>(x0, x_thread);
@@ -1943,7 +2054,7 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
           packed[row], x_thread, scale_local[row], bias_local[row], sum);
     }
 
-    ws += block_size / 2;
+    ws += w_block_step;
     scales += block_size / 64;
     biases += block_size / 64;
     x0 += block_size;
@@ -1956,11 +2067,22 @@ METAL_FUNC void qmv_affine4_g64_triple_stream_impl(
       0,
       values_per_thread);
   if (remaining > 0) {
-    for (int row = 0; row < results_per_simdgroup; row++) {
-      packed[row] =
-          *((const device uint*)(ws + row * in_vec_size_w));
-      scale_local[row] = scales[row * in_vec_size_g];
-      bias_local[row] = biases[row * in_vec_size_g];
+    if (laneblock) {
+      const uint4 packed_quad = *((const device uint4*)ws);
+      packed[0] = packed_quad.x;
+      packed[1] = packed_quad.y;
+      packed[2] = packed_quad.z;
+      packed[3] = packed_quad.w;
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        scale_local[row] = scales[row * in_vec_size_g];
+        bias_local[row] = biases[row * in_vec_size_g];
+      }
+    } else {
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        packed[row] = *((const device uint*)(ws + row * w_row_stride));
+        scale_local[row] = scales[row * in_vec_size_g];
+        bias_local[row] = biases[row * in_vec_size_g];
+      }
     }
 
     float sum =
@@ -3252,7 +3374,7 @@ template <typename T, const int group_size, const int bits, bool batched>
     if (first_m >= 8) {
       return;
     }
-    qmv_affine4_g64_pair_impl<T, 64, 4>(
+    qmv_affine4_g64_pair_impl<T, 64, 4, false>(
         w,
         scales,
         biases,
@@ -3324,7 +3446,7 @@ template <typename T, const int group_size, const int bits, bool batched>
         simd_lid);
     return;
   }
-  qmv_impl<T, group_size, bits>(
+  qmv_impl<T, group_size, bits, false>(
       w,
       scales,
       biases,
@@ -3905,6 +4027,19 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
   }
 }
 
+// DOWN-LANEBLOCK (C1) wire protocol. Bit 24 of a left-hand index says "the
+// weight buffer in buffer(0) is the lane-blocked copy of the K = 704 expert
+// down plane"; the low 24 bits are the activation row the incumbent read.
+// The sorted 64-assignment decode geometry indexes 64 activation rows, so the
+// spare bits cost nothing, and the flag rides the same dispatch as the plane
+// it describes -- there is no way to run one without the other. Only
+// `gather_qmv_gemma4_down_tile` interprets it, and the host only ever sets it
+// on the dispatch that provably reaches that arm (M == 1, batch 64,
+// in_vec_size 704, out_vec_size 2816, w_batch_ndims 1 -- exactly
+// `gemma4_pair_geometry` plus the K = 704 gate below).
+MLX_MTL_CONST uint gemma4_down_laneblock_flag = 0x01000000u;
+MLX_MTL_CONST uint gemma4_down_laneblock_index_mask = 0x00ffffffu;
+
 // KERN-DOWN-TILE: y-tile coarsening for the K = 704 expert down gather
 // (the only pair-geometry plane at that K; out_vec_size = 2816). The
 // frozen host launches grid (1, N/8 = 352, 64), so every 64-thread group
@@ -3914,8 +4049,9 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
 // unique bytes at 479-589 GB/s. Here only every span-th y-group survives
 // (the rest return before the scan); the survivor elects ONCE and then
 // walks its span consecutive 8-row y-tiles serially through the verbatim
-// pair impl -- or, for a pairless run position, the verbatim stock
-// qmv_impl -- with tid.y rewritten to the tile index (a strip-walk
+// pair impl -- or, for a 3-run leader, the verbatim triple-stream impl, or,
+// for a pairless run position, the verbatim stock qmv_impl -- with tid.y
+// rewritten to the tile index (a strip-walk
 // pattern). Tile u is served by survivor (u / span) * span
 // at loop step u % span and by no other group, so every output row keeps
 // the IDENTICAL qdot sequence, accumulator, simd_sum and store the
@@ -3926,7 +4062,10 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
 // would otherwise never be written. Verified uint16-exact vs the
 // per-assignment quantized_matmul oracle and vs the untiled arm at
 // K = 704, N = 2816, 64 assignments over 128 experts, M = 8, spans 4 and
-// 2, 3 seeds, NaN-filled outputs (parity-down-tile, 2026-08-28).
+// 2, 3 seeds, NaN-filled outputs (parity-down-tile, 2026-08-28). That run
+// predates both the RUN-TRIPLE election and the DOWN-LANEBLOCK placement
+// below, each of which is argued statically in its own header and neither of
+// which has been through the oracle.
 template <typename T, int group_size, int bits>
 METAL_FUNC void gather_qmv_gemma4_down_tile(
     const device uint32_t* w,
@@ -3967,56 +4106,218 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
       run_offset++;
     }
   }
-  // Odd positions are produced by the immediately preceding pair leader.
+  // Odd positions are produced by the immediately preceding leader.
   if ((run_offset & 1) != 0) {
+    return;
+  }
+  // RUN-TRIPLE (down plane, K = 704, N = 2816). The incumbent rule elected
+  // one leader per EVEN run_offset and handed it at most a PAIR, so a run of
+  // three same-expert assignments cost TWO weight streams (2 + 1) while the
+  // K = 2816 gate/up planes already collapse a 3-run into ONE stream through
+  // qmv_affine4_g64_triple_stream_impl (the RUN-QUAD arm below). Under the
+  // routing this decode actually sees -- 8 rows x top-8 over 128 experts,
+  // sorted into 64 assignments -- the per-layer run census is
+  // {1: 40.75, 2: 9.51, 3: 1.27, 4: 0.11} runs, and 3-runs are essentially
+  // the whole gap between the down plane's 53.02 streams/layer and the
+  // gate/up planes' 51.63 = the distinct-expert lower bound.
+  //
+  // The leader rule stays "every even run_offset" with ONE exception: the
+  // trailing even position of a 3-run is now produced by the triple leader
+  // two slots back, so it returns. `run_len` is the remaining forward run
+  // length capped at 4 -- the same quantity computed the same two ways as
+  // the RUN-QUAD arm below -- and it selects:
+  //
+  //   run_len == 1  -> singles walk (unchanged; elected only at offset 0)
+  //   run_len == 2  -> pair walk    (unchanged)
+  //   run_len == 3  -> TRIPLE walk  (new; was pair + singles = 2 streams)
+  //   run_len >= 4  -> pair walk, and the even leader at run_offset + 2 takes
+  //                    the rest. A run of FOUR therefore still splits 2 + 2,
+  //                    exactly as it does today, and deliberately so: the
+  //                    quad body would have to hold four x and four y tile
+  //                    bases live ACROSS the span loop (11 device pointers
+  //                    instead of the pair walk's 7) on top of the inlined
+  //                    body's own 11, and THIS is the arm the header above
+  //                    measures at ~390 GB/s against 479-589 GB/s for the
+  //                    same unique bytes at K = 2816 -- i.e. the arm whose
+  //                    limiter is residency, not bytes. 4-runs are 0.11 of
+  //                    51.63 runs/layer (0.05% of decode DRAM); 3-runs are
+  //                    1.27 (0.57%). The triple body is strictly SMALLER
+  //                    than the pair body it displaces (12 accumulators and
+  //                    one 8-float x buffer against the pair's 8
+  //                    accumulators and two 8-float x buffers: 32 thread
+  //                    values against 36), so the only new live state is
+  //                    tile_x2 / tile_y2.
+  //
+  // Coverage is exact -- every assignment is written once and only once. An
+  // ODD offset o is covered by the leader at o - 1, which has remaining >= 2
+  // hence run_len >= 2 hence spans o. A non-elected EVEN offset o has
+  // run_len == 1 with o >= 2, so remaining(o - 2) == 3 and the leader at
+  // o - 2 took the triple that spans o. A triple leader exists only when
+  // remaining == 3, so its o + 2 is the run's last position and is exactly
+  // the non-elected even offset above; a pair leader with run_len == 4 is
+  // followed by an elected leader at o + 2 (remaining >= 2). No overlap.
+  //
+  // REDUCTION ORDER IS UNCHANGED PER OUTPUT ELEMENT. Each output element
+  // y[assignment + i][row] is ONE row's dot product over K. The triple impl
+  // gives every (input row i, output row) pair its OWN accumulator
+  // result_i[row], walks K in the same ascending 256-value blocks, takes the
+  // same 24-active-lane K = 704 tail (load_vector_safe with remaining == 8
+  // is arithmetically load_vector: identical i += 4 loop, identical sum
+  // order, empty zero-fill), and closes with its own simd_sum and store. And
+  // qdot_affine4_registered_word is term-for-term the per-row expression of
+  // both qdot_affine4_pair_word (the arm a 3-run's first two assignments
+  // leave) and qdot_affine4_g64_word (the arm its third assignment leaves):
+  // same two 4-term groups in the same order, same nibble masks, same
+  // `scale * accum + sum * bias` close. Sharing the weight stream changes
+  // only WHICH THREAD LOADS the packed word, never any output's add
+  // sequence. Same argument, same three functions, as the RUN-QUAD arm's
+  // published parity claim at K = 2816.
+  //
+  // RUN-TRIPLE x DOWN-LANEBLOCK. The triple walk reads the SAME down codes
+  // the pair walk reads, so it takes the SAME `laneblock` template argument
+  // from the SAME flag, elected below. Every arm of this function that
+  // touches the down codes -- triple, pair, singles -- is dispatched through
+  // one `if (laneblock)`, so no run length can reach row-major addressing on
+  // a relaid plane.
+  uint run_len = 1;
+  if (expert_prefix_bounds) {
+    run_len = min(4u, ((route_word >> 14) & 0x3fu) + 1u);
+  } else {
+    while (run_len < 4 && assignment + run_len < 64 &&
+           rhs_indices[(assignment + run_len) * rhs_stride] == expert) {
+      run_len++;
+    }
+  }
+  // The lone trailing position of a 3-run: produced by the triple leader at
+  // run_offset - 2, which by construction saw remaining == 3.
+  if (run_offset >= 2u && run_len == 1u) {
     return;
   }
   const device uint32_t* tile_w = w + expert * w_stride;
   const device T* tile_scales = scales + expert * s_stride;
   const device T* tile_biases = biases + expert * b_stride;
+  // DOWN-LANEBLOCK carrier. The host hands this arm -- and only this arm --
+  // the lane-blocked copy of the down codes, and says so in the SAME dispatch
+  // by setting bit 24 of every left-hand index. The identity table the sorted
+  // 64-assignment decode passes carries values 0..63, so bits 8..31 are free;
+  // the plain table (kill switch off, or any other caller) leaves the bit
+  // clear and this arm keeps the incumbent row-major addressing. Layout and
+  // plane therefore travel together and can never disagree.
+  const uint lhs_word0 = lhs_indices[assignment * lhs_stride];
+  const bool laneblock = (lhs_word0 & gemma4_down_laneblock_flag) != 0u;
   const device T* tile_x0 =
-      x + lhs_indices[assignment * lhs_stride] * x_stride;
+      x + (lhs_word0 & gemma4_down_laneblock_index_mask) * x_stride;
   device T* tile_y0 = y + assignment * out_vec_size;
-  const bool has_pair = expert_prefix_bounds
-      ? (((route_word >> 14) & 0x3fu) + 1u) > 1u
-      : assignment + 1 < 64 &&
-          rhs_indices[(assignment + 1) * rhs_stride] == expert;
-  if (has_pair) {
-    const device T* tile_x1 =
-        x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
+  if (run_len >= 2u) {
+    const device T* tile_x1 = x +
+        (lhs_indices[(assignment + 1) * lhs_stride] &
+         gemma4_down_laneblock_index_mask) *
+            x_stride;
     device T* tile_y1 = y + (assignment + 1) * out_vec_size;
+    if (run_len == 3u) {
+      const device T* tile_x2 = x +
+          (lhs_indices[(assignment + 2) * lhs_stride] &
+           gemma4_down_laneblock_index_mask) *
+              x_stride;
+      device T* tile_y2 = y + (assignment + 2) * out_vec_size;
+      for (int t = 0; t < gemma4_down_tile_span; t++) {
+        uint3 tile_tid = tid;
+        tile_tid.y = tid.y + uint(t);
+        if (laneblock) {
+          qmv_affine4_g64_triple_stream_impl<T, group_size, bits, true>(
+              tile_w,
+              tile_scales,
+              tile_biases,
+              tile_x0,
+              tile_x1,
+              tile_x2,
+              tile_y0,
+              tile_y1,
+              tile_y2,
+              in_vec_size,
+              tile_tid,
+              simd_gid,
+              simd_lid);
+        } else {
+          qmv_affine4_g64_triple_stream_impl<T, group_size, bits, false>(
+              tile_w,
+              tile_scales,
+              tile_biases,
+              tile_x0,
+              tile_x1,
+              tile_x2,
+              tile_y0,
+              tile_y1,
+              tile_y2,
+              in_vec_size,
+              tile_tid,
+              simd_gid,
+              simd_lid);
+        }
+      }
+      return;
+    }
     for (int t = 0; t < gemma4_down_tile_span; t++) {
       uint3 tile_tid = tid;
       tile_tid.y = tid.y + uint(t);
-      qmv_affine4_g64_pair_impl<T, group_size, bits>(
-          tile_w,
-          tile_scales,
-          tile_biases,
-          tile_x0,
-          tile_x1,
-          tile_y0,
-          tile_y1,
-          in_vec_size,
-          tile_tid,
-          simd_gid,
-          simd_lid);
+      if (laneblock) {
+        qmv_affine4_g64_pair_impl<T, group_size, bits, true>(
+            tile_w,
+            tile_scales,
+            tile_biases,
+            tile_x0,
+            tile_x1,
+            tile_y0,
+            tile_y1,
+            in_vec_size,
+            tile_tid,
+            simd_gid,
+            simd_lid);
+      } else {
+        qmv_affine4_g64_pair_impl<T, group_size, bits, false>(
+            tile_w,
+            tile_scales,
+            tile_biases,
+            tile_x0,
+            tile_x1,
+            tile_y0,
+            tile_y1,
+            in_vec_size,
+            tile_tid,
+            simd_gid,
+            simd_lid);
+      }
     }
     return;
   }
   for (int t = 0; t < gemma4_down_tile_span; t++) {
     uint3 tile_tid = tid;
     tile_tid.y = tid.y + uint(t);
-    qmv_impl<T, group_size, bits>(
-        tile_w,
-        tile_scales,
-        tile_biases,
-        tile_x0,
-        tile_y0,
-        in_vec_size,
-        out_vec_size,
-        tile_tid,
-        simd_gid,
-        simd_lid);
+    if (laneblock) {
+      qmv_impl<T, group_size, bits, true>(
+          tile_w,
+          tile_scales,
+          tile_biases,
+          tile_x0,
+          tile_y0,
+          in_vec_size,
+          out_vec_size,
+          tile_tid,
+          simd_gid,
+          simd_lid);
+    } else {
+      qmv_impl<T, group_size, bits, false>(
+          tile_w,
+          tile_scales,
+          tile_biases,
+          tile_x0,
+          tile_y0,
+          in_vec_size,
+          out_vec_size,
+          tile_tid,
+          simd_gid,
+          simd_lid);
+    }
   }
 }
 
@@ -4057,6 +4358,12 @@ template <typename T, int group_size, int bits>
     // here -- the K = 704 down plane takes the y-tile-coarsened arm above.
     // Flip to false to return every plane to the incumbent per-y-group
     // election below; the two arms are bit-identical by construction.
+    //
+    // DOWN-LANEBLOCK rides this gate: the tile arm is the ONLY arm that reads
+    // the lane-block flag on the left-hand indices, so this must stay true
+    // while the host switch `DARKBLOOM_GEMMA4_DOWN_LANEBLOCK` is on. Flipping
+    // it off without also setting that variable to 0 would hand a relaid plane
+    // to the RUN-QUAD arms below, which address it row-major.
     constexpr bool gemma4_down_tile = true;
     if (gemma4_down_tile && in_vec_size == 704) {
       gather_qmv_gemma4_down_tile<T, group_size, bits>(
@@ -4122,14 +4429,22 @@ template <typename T, int group_size, int bits>
       const device uint32_t* run_w = w + expert * w_strides[0];
       const device T* run_scales = scales + expert * s_strides[0];
       const device T* run_biases = biases + expert * b_strides[0];
-      const device T* run_x0 =
-          x + lhs_indices[assignment * (uint)lhs_strides[0]] * x_strides[0];
+      // DOWN-LANEBLOCK: mask the layout flag out of every left-hand index in
+      // this block. Reached only at in_vec_size == 2816 while the K = 704 gate
+      // above routes the down plane to the tile arm, so the bit is never set
+      // here today; masking makes that independent of the gate.
+      const device T* run_x0 = x +
+          (lhs_indices[assignment * (uint)lhs_strides[0]] &
+           gemma4_down_laneblock_index_mask) *
+              x_strides[0];
       const device T* run_x1 = x +
-          lhs_indices[(assignment + 1) * (uint)lhs_strides[0]] * x_strides[0];
+          (lhs_indices[(assignment + 1) * (uint)lhs_strides[0]] &
+           gemma4_down_laneblock_index_mask) *
+              x_strides[0];
       device T* run_y0 = y + assignment * out_vec_size;
       device T* run_y1 = y + (assignment + 1) * out_vec_size;
       if (run_len == 2) {
-        qmv_affine4_g64_pair_impl<T, group_size, bits>(
+        qmv_affine4_g64_pair_impl<T, group_size, bits, false>(
             run_w,
             run_scales,
             run_biases,
@@ -4144,10 +4459,12 @@ template <typename T, int group_size, int bits>
         return;
       }
       const device T* run_x2 = x +
-          lhs_indices[(assignment + 2) * (uint)lhs_strides[0]] * x_strides[0];
+          (lhs_indices[(assignment + 2) * (uint)lhs_strides[0]] &
+           gemma4_down_laneblock_index_mask) *
+              x_strides[0];
       device T* run_y2 = y + (assignment + 2) * out_vec_size;
       if (run_len == 3) {
-        qmv_affine4_g64_triple_stream_impl<T, group_size, bits>(
+        qmv_affine4_g64_triple_stream_impl<T, group_size, bits, false>(
             run_w,
             run_scales,
             run_biases,
@@ -4164,7 +4481,9 @@ template <typename T, int group_size, int bits>
         return;
       }
       const device T* run_x3 = x +
-          lhs_indices[(assignment + 3) * (uint)lhs_strides[0]] * x_strides[0];
+          (lhs_indices[(assignment + 3) * (uint)lhs_strides[0]] &
+           gemma4_down_laneblock_index_mask) *
+              x_strides[0];
       device T* run_y3 = y + (assignment + 3) * out_vec_size;
       qmv_affine4_g64_quad_stream_impl<T, group_size, bits>(
           run_w,
@@ -4188,7 +4507,8 @@ template <typename T, int group_size, int bits>
     // Singleton experts and odd-run tails still need one ordinary QMV, but
     // their one-dimensional offsets are already resolved by this guard.
     const uint32_t single_lhs =
-        lhs_indices[assignment * (uint)lhs_strides[0]];
+        lhs_indices[assignment * (uint)lhs_strides[0]] &
+        gemma4_down_laneblock_index_mask;
     const device T* single_x = x + single_lhs * x_strides[0];
     const device uint32_t* single_w = w + expert * w_strides[0];
     const device T* single_scales = scales + expert * s_strides[0];
@@ -4200,7 +4520,12 @@ template <typename T, int group_size, int bits>
           single_w, single_scales, single_biases, single_x, single_y,
           in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
     } else {
-      qmv_impl<T, group_size, bits>(
+      // in_vec_size != 2816 here means the K = 704 down plane, which the
+      // gate above has already routed to `gather_qmv_gemma4_down_tile`; this
+      // fall-through is reachable only with `gemma4_down_tile` flipped off,
+      // and a relaid plane never reaches it (the host's flag is checked in
+      // the tile arm alone). Incumbent layout.
+      qmv_impl<T, group_size, bits, false>(
           single_w, single_scales, single_biases, single_x, single_y,
           in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
     }
@@ -4260,7 +4585,10 @@ template <typename T, int group_size, int bits>
         b_strides,
         tid);
   }
-  qmv_impl<T, group_size, bits>(
+  // Generic gather fall-through: reached only when `gemma4_pair_geometry` is
+  // false, i.e. never for the sorted 64-assignment decode dispatch the host
+  // hands the lane-blocked down plane to. Incumbent layout.
+  qmv_impl<T, group_size, bits, false>(
       w,
       scales,
       biases,

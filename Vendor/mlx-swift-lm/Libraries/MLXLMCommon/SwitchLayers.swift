@@ -1,9 +1,22 @@
 import Foundation
 import MLX
+import MLXFast
 import MLXNN
 
 /// Identity gather table for the sorted 64-assignment decode geometry.
 nonisolated(unsafe) private let switchDownIdentity64 = MLXArray((0..<64).map { UInt32($0) })
+
+/// DOWN-LANEBLOCK (C1) --- the same identity table with bit 24 set on every
+/// entry. Passing THIS table instead of ``switchDownIdentity64`` is how the
+/// host tells `gather_qmv_gemma4_down_tile` that buffer(0) holds the
+/// lane-blocked copy of the K = 704 expert down codes; the kernel masks the
+/// low 24 bits back out before using the value as an activation row. The flag
+/// and the plane travel in the same dispatch, so the layout the kernel decodes
+/// and the layout the buffer is in can never drift apart -- which is what
+/// makes ``switchDownLaneBlockEnabled`` a real kill switch and not a
+/// source-level flip that has to be mirrored inside the Metal library.
+nonisolated(unsafe) private let switchDownIdentity64LaneBlock = MLXArray(
+    (0 ..< 64).map { UInt32($0) | 0x0100_0000 })
 
 // Port of https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/switch_layers.py
 
@@ -1255,6 +1268,194 @@ public let switchGateUpFusePrefillEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+// MARK: - DOWN-LANEBLOCK (C1)
+
+/// DOWN-LANEBLOCK. The routed-expert down plane is the only weight plane in
+/// the decode step whose 128 B lane run is misaligned against the cache line:
+/// its row stride is `in_vec_size_w = 704 / 2 = 352 B`, and 352 % 64 = 32, so
+/// consecutive output rows start on alternating 64 B phases and a simdgroup's
+/// four code loads touch 10 lines to deliver 512 B -- 80% line utilisation,
+/// against 100% for gate/up (row stride 1408 B = 22 x 64). The measured
+/// 390 GB/s the down gather sustains against 479 GB/s for gate/up is the same
+/// 0.81 ratio.
+///
+/// The fix is a pure permutation of the codes: `[N/4][K-block][32 lane][4 row]`
+/// uint32, i.e. the four output rows a simdgroup serves are interleaved so
+/// that ONE lane's four row words are sixteen adjacent bytes. The simdgroup's
+/// four 128 B scalar runs become one 512 B run at a 128 B aligned start, the
+/// pair kernel reads it as a single `uint4`, and the ragged tail (K = 704
+/// leaves 96 B per row) is laid out `[24 lane][4 row]` so the block start
+/// stays aligned. Same bytes, same values, same count -- only placement.
+///
+/// Kill switch: `DARKBLOOM_GEMMA4_DOWN_LANEBLOCK` set to `0`/`false`/`no`/`off`
+/// skips the relayout entirely, so the plain identity table and the loaded
+/// plane reach the kernel and it decodes them row-major, exactly as today.
+/// `DARKBLOOM_GEMMA4_DOWN_LANEBLOCK_XCHECK=1` additionally samples the relaid
+/// plane against the module's own codes under the permutation, once per plane,
+/// and reports the differing-word count on stderr.
+public let switchDownLaneBlockEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DOWN_LANEBLOCK"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+public let switchDownLaneBlockXCheck: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DOWN_LANEBLOCK_XCHECK"]
+    else { return false }
+    return !["", "0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// One thread per destination lane slot `(expert, row group, k word)`. It
+/// reads the four cohort rows' words for that k (four 128 B contiguous runs
+/// across the threadgroup, since consecutive threads take consecutive k) and
+/// writes them as four adjacent words at a 16 B aligned destination, so the
+/// write side is one fully coalesced run.
+///
+/// Destination word, for source word `(row, k)` of an expert plane:
+///
+///     (row / 4) * (4 * ROW_WORDS) + (k / 32) * 128 + (k % 32) * 4 + (row % 4)
+///
+/// With ROW_WORDS = 88 that is a bijection on the 352 words of a four-row
+/// group: k < 32 lands in block 0 at +0, 32 <= k < 64 in block 1 at +128, and
+/// the 24 tail words in block 2 at +256, filling 256..351 exactly.
+nonisolated(unsafe) private let switchDownLaneBlockKernel: MLXFast.MLXFastKernel =
+    MLXFast.metalKernel(
+        name: "gemma4_down_relayout_laneblock_v1",
+        inputNames: ["w"],
+        outputNames: ["wr"],
+        source: """
+            constexpr uint ROW_WORDS = uint(KWORDS);
+            constexpr uint ROW_GROUPS = uint(NROWS) / 4u;
+            const uint cell = thread_position_in_grid.x;
+            if (cell >= uint(NEXPERTS) * ROW_GROUPS * ROW_WORDS) {
+                return;
+            }
+            const uint k = cell % ROW_WORDS;
+            const uint g = (cell / ROW_WORDS) % ROW_GROUPS;
+            const uint e = cell / (ROW_WORDS * ROW_GROUPS);
+            const uint plane_base = e * (uint(NROWS) * ROW_WORDS);
+            const device uint32_t* src =
+                w + plane_base + (g * 4u) * ROW_WORDS + k;
+            const uint dst = plane_base + g * (4u * ROW_WORDS)
+                + (k / 32u) * 128u + (k % 32u) * 4u;
+            wr[dst] = src[0];
+            wr[dst + 1u] = src[ROW_WORDS];
+            wr[dst + 2u] = src[2u * ROW_WORDS];
+            wr[dst + 3u] = src[3u * ROW_WORDS];
+            """,
+        ensureRowContiguous: true
+    )
+
+/// The lane-blocked copy of one layer's expert down codes, built once at load
+/// and retained for the life of the layer. A plain final class, like
+/// ``SwitchGateUpFusedStorage``, so module reflection treats it as an opaque
+/// value: never a parameter, never quantized again, never saved.
+///
+/// The original plane is NOT replaced. Prefill's sorted right-hand-side down
+/// gather (`gather_qmm_rhs`, taken at M = 1 with B / E >= 4) reads the codes
+/// row-major and is untouched by this arm, so both placements have to stay
+/// resident: +121 MiB per routed-expert layer.
+public final class SwitchDownLaneBlockStorage {
+    public let source: MLXArray
+    public let plane: MLXArray
+
+    /// Exact production geometry only: `[128, 2816, 88]` uint32, the packed
+    /// affine 4-bit / group-64 down plane of 704 -> 2816 over 128 experts.
+    /// Any other shape or dtype returns nil and the layer keeps the loaded
+    /// plane and the incumbent gather.
+    public init?(downWeight: MLXArray) {
+        guard switchDownLaneBlockEnabled,
+            downWeight.shape == [128, 2816, 88],
+            downWeight.dtype == .uint32
+        else { return nil }
+        let experts = 128
+        let rows = 2816
+        let rowWords = 88
+        let cells = experts * (rows / 4) * rowWords
+        let threads = 256
+        let relaid = switchDownLaneBlockKernel(
+            [downWeight],
+            template: [
+                ("NEXPERTS", experts), ("NROWS", rows), ("KWORDS", rowWords),
+            ],
+            grid: (((cells + threads - 1) / threads) * threads, 1, 1),
+            threadGroup: (threads, 1, 1),
+            outputShapes: [downWeight.shape],
+            outputDTypes: [.uint32]
+        )[0]
+        // Force the permutation at LOAD time. Left lazy it would land inside
+        // the first measured decode step instead.
+        eval(relaid)
+        self.source = downWeight
+        self.plane = relaid
+    }
+}
+
+private let switchDownLaneBlockXCheckLock = NSLock()
+nonisolated(unsafe) private var switchDownLaneBlockXChecked: Set<ObjectIdentifier> = []
+
+/// `_XCHECK`: sample the relaid plane against the codes the module actually
+/// holds, under the permutation above, once per plane. Diagnostic only --
+/// it reports, it does not decline.
+private func switchDownLaneBlockGCD(_ a: Int, _ b: Int) -> Int {
+    var x = a
+    var y = b
+    while y != 0 {
+        (x, y) = (y, x % y)
+    }
+    return x
+}
+
+private func switchDownLaneBlockVerify(weight: MLXArray, plane: MLXArray) {
+    let key = ObjectIdentifier(weight)
+    switchDownLaneBlockXCheckLock.lock()
+    let firstTime = switchDownLaneBlockXChecked.insert(key).inserted
+    switchDownLaneBlockXCheckLock.unlock()
+    guard firstTime else { return }
+    guard weight.ndim == 3, plane.shape == weight.shape else { return }
+
+    let experts = weight.dim(0)
+    let rows = weight.dim(1)
+    let rowWords = weight.dim(2)
+    let rowGroups = rows / 4
+    let cells = experts * rowGroups * rowWords
+    // The sampling stride must be COPRIME with `cells`, or whole phases of the
+    // permutation go unvisited and the check reports `differing 0` for a plane
+    // it never looked at. `cells / 1024` is 88 * 88 at this shape, so every
+    // sampled cell would land on `k % rowWords == 0`: block 0, lane 0 -- the
+    // one column the two placements agree on. Walking down to the nearest
+    // coprime stride makes `cell % cells` a full cycle, so `k` sweeps every
+    // lane phase, both K-blocks and the ragged tail.
+    var step = max(1, cells / 1024)
+    while step > 1 && switchDownLaneBlockGCD(step, cells) != 1 {
+        step -= 1
+    }
+    var sourceIndices = [Int32]()
+    var planeIndices = [Int32]()
+    var cell = 0
+    while cell < cells {
+        let k = cell % rowWords
+        let g = (cell / rowWords) % rowGroups
+        let expert = cell / (rowWords * rowGroups)
+        let planeBase = expert * rows * rowWords
+        for j in 0 ..< 4 {
+            sourceIndices.append(Int32(planeBase + (g * 4 + j) * rowWords + k))
+            planeIndices.append(
+                Int32(planeBase + g * 4 * rowWords + (k / 32) * 128 + (k % 32) * 4 + j))
+        }
+        cell += step
+    }
+    let expected = weight.flattened()[MLXArray(sourceIndices)]
+    let actual = plane.flattened()[MLXArray(planeIndices)]
+    let differing = sum(notEqual(expected, actual)).item(Int.self)
+    FileHandle.standardError.write(
+        Data(
+            ("[down-laneblock xcheck] sampled \(sourceIndices.count) words, "
+                + "differing \(differing)\n").utf8))
+}
+
 /// The fused gate/up affine 4-bit right-hand side of one expert layer plus the
 /// split projection arrays used outside the large sorted prefill path. A
 /// plain final class (not a `Module`, not an `MLXArray` tuple) so the module
@@ -1372,6 +1573,16 @@ public class SwitchGLU: Module {
         fusedGateUpStorage = storage
         fusedGateUpResolved = false
         fusedGateUpContract = nil
+    }
+
+    /// DOWN-LANEBLOCK: the lane-blocked copy of this layer's expert down
+    /// codes, bound at load beside the loaded plane. Only the sorted
+    /// 64-assignment decode gather reads it; every other consumer, prefill
+    /// included, keeps the loaded plane.
+    private var downLaneBlockStorage: SwitchDownLaneBlockStorage?
+
+    public func bindDownLaneBlockStorage(_ storage: SwitchDownLaneBlockStorage) {
+        downLaneBlockStorage = storage
     }
 
     /// Default SiLU GLU path -- uses the compiled fused (silu * up) kernel.
@@ -1641,11 +1852,77 @@ public class SwitchGLU: Module {
         // which otherwise materializes the same arange(64) on every call.
         let downLhs: MLXArray? =
             (doSort && idx.ndim == 1 && idx.size == 64) ? switchDownIdentity64 : nil
-        x = downProj(activated, idx, lhsIndices: downLhs, sortedIndices: doSort)
+        if let laneBlocked = downLaneBlockGather(
+            activated, idx, lhsIndices: downLhs, sortedIndices: doSort)
+        {
+            x = laneBlocked
+        } else {
+            x = downProj(activated, idx, lhsIndices: downLhs, sortedIndices: doSort)
+        }
         // Under `doSort` a producer above always assigned `inverseOrder`;
         // otherwise it is still nil, which is exactly what the old
         // `doSort ? inverseOrder : nil` produced.
         return (x, inverseOrder, doSort)
+    }
+
+    /// DOWN-LANEBLOCK: the decode down gather issued against the lane-blocked
+    /// plane, or nil when anything at all is off and the caller must keep the
+    /// incumbent `downProj` call.
+    ///
+    /// The guard reproduces `gemma4_pair_geometry` plus the `in_vec_size == 704`
+    /// gate term for term, because that conjunction is what proves the dispatch
+    /// lands in `gather_qmv_gemma4_down_tile` -- the one arm that reads the
+    /// lane-block flag:
+    ///
+    ///   x `[64, 1, 704]` bf16 ..... M = 1, x_batch_ndims = 1, batch 64
+    ///   idx `[64]` uint32 ......... batch_ndims = 1, batch_shape[0] = 64
+    ///   w `[128, 2816, 88]` ....... w_batch_ndims = 1, in 704, out 2816
+    ///   group 64 / 4 bit / affine . the template gate
+    ///
+    /// B = 64 and E = 128 give B / E = 0 < 4, so `GatherQMM::eval_gpu` declines
+    /// the sorted right-hand-side arm and, with M = 1 and transpose, routes to
+    /// `gather_qmv`; K = 704 is not a multiple of 512, so the `_fast` variant
+    /// never launches. Prefill's down gather has B / E >= 4, takes
+    /// `gather_qmm_rhs` and never reaches here, which is why the loaded plane
+    /// stays resident beside the relaid one.
+    private func downLaneBlockGather(
+        _ x: MLXArray, _ idx: MLXArray, lhsIndices: MLXArray?, sortedIndices: Bool
+    ) -> MLXArray? {
+        guard switchDownLaneBlockEnabled,
+            sortedIndices,
+            let storage = downLaneBlockStorage,
+            let lhs = lhsIndices, lhs === switchDownIdentity64,
+            let down = downProj as? QuantizedSwitchLinear,
+            let downBiases = down.biases,
+            down.bias == nil,
+            down.mode == .affine, down.bits == 4, down.groupSize == 64,
+            down.inputDims == 704, down.outputDims == 2816, down.numExperts == 128,
+            down.weight.shape == [128, 2816, 88], down.weight.dtype == .uint32,
+            down.scales.shape == [128, 2816, 11], down.scales.dtype == .bfloat16,
+            downBiases.shape == [128, 2816, 11], downBiases.dtype == .bfloat16,
+            storage.plane.shape == [128, 2816, 88], storage.plane.dtype == .uint32,
+            x.ndim == 3, x.dim(0) == 64, x.dim(1) == 1, x.dim(2) == 704,
+            x.dtype == .bfloat16,
+            idx.ndim == 1, idx.size == 64, idx.dtype == .uint32
+        else { return nil }
+
+        if switchDownLaneBlockXCheck {
+            switchDownLaneBlockVerify(weight: down.weight, plane: storage.plane)
+        }
+        CBv2EngageMark.once("down-laneblock")
+        return MLX.gatherQuantizedMM(
+            x,
+            storage.plane,
+            scales: down.scales,
+            biases: downBiases,
+            lhsIndices: switchDownIdentity64LaneBlock,
+            rhsIndices: idx,
+            transpose: true,
+            groupSize: down.groupSize,
+            bits: down.bits,
+            mode: down.mode,
+            sortedIndices: sortedIndices
+        )
     }
 
     /// Cached eligibility: the projection tensors are bound at load time and

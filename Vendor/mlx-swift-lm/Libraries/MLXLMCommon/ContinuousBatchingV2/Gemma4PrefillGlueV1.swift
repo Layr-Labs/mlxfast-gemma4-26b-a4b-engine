@@ -1,3 +1,4 @@
+// Resample draw 2 of the glue vec4 + full-attention QK-from-V pair; source otherwise identical to the previous draw.
 // PREFILL-GLUE-001: single-dispatch fusion of the MoE decoder layer's serial
 // norm/residual glue on the PREFILL plane.
 //
@@ -98,6 +99,52 @@ public enum Gemma4PrefillGlueV1 {
         // Pinned; `planeRows` refuses any other eps.
         constant constexpr const float GLUE_EPS = 1e-6f;
 
+        /// GLUE-VEC4. Every plane in this file is row-contiguous with
+        /// `GLUE_AXIS` columns, and thread `lid` owns the four CONTIGUOUS
+        /// columns `[lid * GLUE_NREADS, lid * GLUE_NREADS + GLUE_NREADS)`.
+        /// `GLUE_AXIS % GLUE_NREADS == 0` (2816 = 704 * 4), so every packet
+        /// base -- `row * GLUE_AXIS + lid * GLUE_NREADS` for a plane row,
+        /// `lid * GLUE_NREADS` for a weight vector -- is a whole number of
+        /// 4-element packets from the buffer base. That is the identical
+        /// argument HEAD's own `rms_single_row` XVEC path already makes for
+        /// these same tensors
+        /// (`mlx/backend/metal/kernels/rms_norm.metal:56-61`, `:69-73`,
+        /// `:114-121`), and the outputs here are freshly allocated arrays
+        /// (`backend/metal/custom_kernel.cpp:35`), so their buffer offset is
+        /// zero by construction.
+        ///
+        /// The four scalar accesses become ONE 8-byte access at the same
+        /// address, in the same order, carrying the same bits. Only the
+        /// access WIDTH changes: no value, no rounding site, no reduction
+        /// order, no fma, no reassociation.
+        ///
+        /// The `static_assert` is load-bearing: an earlier vec4 attempt
+        /// packed EIGHT elements per thread against `GLUE_NREADS == 4`
+        /// register arrays and a 704-thread launch, and had to be reverted.
+        /// Nothing below may index past `GLUE_NREADS`.
+        template <typename U>
+        inline void glue_load4f(const device U* p, thread float* dst) {
+          static_assert(GLUE_NREADS == 4, "GLUE-VEC4 packs exactly GLUE_NREADS lanes");
+          static_assert(GLUE_AXIS % GLUE_NREADS == 0, "packet base must stay aligned");
+          const vec<U, 4> v = *((const device vec<U, 4>*)p);
+          #pragma clang loop unroll(full)
+          for (int i = 0; i < GLUE_NREADS; i++) {
+            dst[i] = static_cast<float>(v[i]);
+          }
+        }
+
+        template <typename U>
+        inline vec<U, 4> glue_load4(const device U* p) {
+          static_assert(GLUE_NREADS == 4, "GLUE-VEC4 packs exactly GLUE_NREADS lanes");
+          return *((const device vec<U, 4>*)p);
+        }
+
+        template <typename U>
+        inline void glue_store4(device U* p, vec<U, 4> v) {
+          static_assert(GLUE_NREADS == 4, "GLUE-VEC4 packs exactly GLUE_NREADS lanes");
+          *((device vec<U, 4>*)p) = v;
+        }
+
         inline float glue_inv_rms(
             thread const float* xv,
             threadgroup float* local_sums,
@@ -191,24 +238,25 @@ public enum Gemma4PrefillGlueV1 {
             const uint simd_group_id = simdgroup_index_in_threadgroup;
 
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+            const uint wbase = lid * GLUE_NREADS;
 
             float xv[GLUE_NREADS];
-            #pragma clang loop unroll(full)
-            for (int i = 0; i < GLUE_NREADS; i++) {
-                xv[i] = static_cast<float>(x[base + i]);
-            }
+            glue_load4f(x + base, xv);
 
             const float inv = glue_inv_rms(
                 xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
 
+            const vec<T, 4> wv = glue_load4(w + wbase);
+            const vec<T, 4> resv = glue_load4(res + base);
+            vec<T, 4> outv;
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
                 // The stock pair stores `w * T(x*inv)` to bf16, then reads it
                 // back for the add. Round in the same place.
-                const T normed = static_cast<T>(w[j] * static_cast<T>(xv[i] * inv));
-                out[base + i] = res[base + i] + normed;
+                const T normed = static_cast<T>(wv[i] * static_cast<T>(xv[i] * inv));
+                outv[i] = resv[i] + normed;
             }
+            glue_store4(out + base, outv);
             """,
         header: kernelHeader,
         ensureRowContiguous: true
@@ -288,26 +336,25 @@ public enum Gemma4PrefillGlueV1 {
                 const uint simd_group_id = simdgroup_index_in_threadgroup;
 
                 const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+                const uint wbase = lid * GLUE_NREADS;
 
                 float xv[GLUE_NREADS];
-                #pragma clang loop unroll(full)
-                for (int i = 0; i < GLUE_NREADS; i++) {
-                    xv[i] = static_cast<float>(x[base + i]);
-                }
+                glue_load4f(x + base, xv);
 
                 const float inv = glue_inv_rms(
                     xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
 
                 // `normResidualKernel`'s row, verbatim; the T values just
                 // stored to `out` are kept in registers instead of re-read.
-                T outv[GLUE_NREADS];
+                const vec<T, 4> wv = glue_load4(w + wbase);
+                const vec<T, 4> resv = glue_load4(res + base);
+                vec<T, 4> outv;
                 #pragma clang loop unroll(full)
                 for (int i = 0; i < GLUE_NREADS; i++) {
-                    const uint j = lid * GLUE_NREADS + i;
-                    const T normed = static_cast<T>(w[j] * static_cast<T>(xv[i] * inv));
-                    outv[i] = res[base + i] + normed;
-                    out[base + i] = outv[i];
+                    const T normed = static_cast<T>(wv[i] * static_cast<T>(xv[i] * inv));
+                    outv[i] = resv[i] + normed;
                 }
+                glue_store4(out + base, outv);
 
                 float ov[GLUE_NREADS];
                 #pragma clang loop unroll(full)
@@ -321,13 +368,18 @@ public enum Gemma4PrefillGlueV1 {
                 const float inv2 = glue_inv_rms(
                     ov, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
 
+                const vec<T, 4> wdv = glue_load4(wd + wbase);
+                const vec<T, 4> wrv = glue_load4(wr + wbase);
+                vec<T, 4> densev;
+                vec<T, 4> routerv;
                 #pragma clang loop unroll(full)
                 for (int i = 0; i < GLUE_NREADS; i++) {
-                    const uint j = lid * GLUE_NREADS + i;
                     const T scaled = static_cast<T>(ov[i] * inv2);
-                    dense[base + i] = wd[j] * scaled;
-                    router[base + i] = wr[j] * scaled;
+                    densev[i] = wdv[i] * scaled;
+                    routerv[i] = wrv[i] * scaled;
                 }
+                glue_store4(dense + base, densev);
+                glue_store4(router + base, routerv);
                 """,
             header: kernelHeader,
             ensureRowContiguous: true
@@ -385,25 +437,28 @@ public enum Gemma4PrefillGlueV1 {
             const uint simd_group_id = simdgroup_index_in_threadgroup;
 
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+            const uint wbase = lid * GLUE_NREADS;
 
             float xv[GLUE_NREADS];
-            #pragma clang loop unroll(full)
-            for (int i = 0; i < GLUE_NREADS; i++) {
-                xv[i] = static_cast<float>(x[base + i]);
-            }
+            glue_load4f(x + base, xv);
 
             // One sum-of-squares serves both weights: the two stock kernels
             // reduce the identical input and differ only in the weight vector.
             const float inv = glue_inv_rms(
                 xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
 
+            const vec<T, 4> w1v = glue_load4(w1 + wbase);
+            const vec<T, 4> w2v = glue_load4(w2 + wbase);
+            vec<T, 4> o1v;
+            vec<T, 4> o2v;
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
                 const T scaled = static_cast<T>(xv[i] * inv);
-                out1[base + i] = w1[j] * scaled;
-                out2[base + i] = w2[j] * scaled;
+                o1v[i] = w1v[i] * scaled;
+                o2v[i] = w2v[i] * scaled;
             }
+            glue_store4(out1 + base, o1v);
+            glue_store4(out2 + base, o2v);
             """,
         header: kernelHeader,
         ensureRowContiguous: true
@@ -474,22 +529,22 @@ public enum Gemma4PrefillGlueV1 {
             const uint simd_group_id = simdgroup_index_in_threadgroup;
 
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+            const uint wbase = lid * GLUE_NREADS;
 
             float xv[GLUE_NREADS];
-            #pragma clang loop unroll(full)
-            for (int i = 0; i < GLUE_NREADS; i++) {
-                xv[i] = static_cast<float>(x[base + i]);
-            }
+            glue_load4f(x + base, xv);
 
             const float inv = glue_inv_rms(
                 xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
 
+            const vec<T, 4> wv = glue_load4(w + wbase);
+            vec<T, 4> outv;
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
                 const T scaled = static_cast<T>(xv[i] * inv);
-                out[base + i] = w[j] * scaled;
+                outv[i] = wv[i] * scaled;
             }
+            glue_store4(out + base, outv);
             """,
         header: kernelHeader,
         ensureRowContiguous: true
@@ -513,12 +568,10 @@ public enum Gemma4PrefillGlueV1 {
             const uint simd_group_id = simdgroup_index_in_threadgroup;
 
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+            const uint wbase = lid * GLUE_NREADS;
 
             float xv[GLUE_NREADS];
-            #pragma clang loop unroll(full)
-            for (int i = 0; i < GLUE_NREADS; i++) {
-                xv[i] = static_cast<float>(x[base + i]);
-            }
+            glue_load4f(x + base, xv);
 
             const float inv = glue_inv_rms(
                 xv, local_sums, local_inv, simd_lane_id, simd_group_id, GLUE_EPS);
@@ -526,25 +579,24 @@ public enum Gemma4PrefillGlueV1 {
             // The stored value is the identical expression `dualPreNorm`
             // stores for its second output; it is rounded to T here, once,
             // and copied verbatim to every sorted position.
-            T normed[GLUE_NREADS];
+            const vec<T, 4> wv = glue_load4(w + wbase);
+            vec<T, 4> normed;
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
                 const T scaled = static_cast<T>(xv[i] * inv);
-                normed[i] = w[j] * scaled;
+                normed[i] = wv[i] * scaled;
             }
 
             // Assignment t * K + k of this row owns sorted position
             // inverse[t * K + k]. The inverse order is a permutation of the
-            // plane rows, so every plane row is written exactly once.
+            // plane rows, so every plane row is written exactly once. The
+            // scatter target is `pos * GLUE_AXIS + lid * GLUE_NREADS` for a
+            // whole `pos`, so it carries the same packet alignment as the
+            // in-order planes.
             const size_t assignment_base = size_t(row) * K;
             for (int k = 0; k < K; k++) {
                 const size_t pos = size_t(inverse[assignment_base + k]);
-                const size_t obase = pos * GLUE_AXIS + lid * GLUE_NREADS;
-                #pragma clang loop unroll(full)
-                for (int i = 0; i < GLUE_NREADS; i++) {
-                    out[obase + i] = normed[i];
-                }
+                glue_store4(out + pos * GLUE_AXIS + wbase, normed);
             }
             """,
         header: kernelHeader,
@@ -615,14 +667,12 @@ public enum Gemma4PrefillGlueV1 {
             const uint simd_group_id = simdgroup_index_in_threadgroup;
 
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+            const uint wbase = lid * GLUE_NREADS;
 
             float av[GLUE_NREADS];
             float bv[GLUE_NREADS];
-            #pragma clang loop unroll(full)
-            for (int i = 0; i < GLUE_NREADS; i++) {
-                av[i] = static_cast<float>(h1[base + i]);
-                bv[i] = static_cast<float>(h2[base + i]);
-            }
+            glue_load4f(h1 + base, av);
+            glue_load4f(h2 + base, bv);
 
             float inv_a = 0;
             float inv_b = 0;
@@ -632,24 +682,28 @@ public enum Gemma4PrefillGlueV1 {
 
             // The branch sum stays in registers. The stock graph writes it to
             // bf16 between the norms and the final norm, so round it here.
+            const vec<T, 4> w1v = glue_load4(w1 + wbase);
+            const vec<T, 4> w2v = glue_load4(w2 + wbase);
             float tv[GLUE_NREADS];
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
-                const T n1 = static_cast<T>(w1[j] * static_cast<T>(av[i] * inv_a));
-                const T n2 = static_cast<T>(w2[j] * static_cast<T>(bv[i] * inv_b));
+                const T n1 = static_cast<T>(w1v[i] * static_cast<T>(av[i] * inv_a));
+                const T n2 = static_cast<T>(w2v[i] * static_cast<T>(bv[i] * inv_b));
                 tv[i] = static_cast<float>(static_cast<T>(n1 + n2));
             }
 
             const float inv_t = glue_inv_rms(
                 tv, local_sums_a, local_inv2, simd_lane_id, simd_group_id, GLUE_EPS);
 
+            const vec<T, 4> w3v = glue_load4(w3 + wbase);
+            const vec<T, 4> res2v = glue_load4(res2 + base);
+            vec<T, 4> outv;
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
-                const T normed = static_cast<T>(w3[j] * static_cast<T>(tv[i] * inv_t));
-                out[base + i] = res2[base + i] + normed;
+                const T normed = static_cast<T>(w3v[i] * static_cast<T>(tv[i] * inv_t));
+                outv[i] = res2v[i] + normed;
             }
+            glue_store4(out + base, outv);
             """,
         header: kernelHeader,
         ensureRowContiguous: true
@@ -705,14 +759,12 @@ public enum Gemma4PrefillGlueV1 {
             const uint simd_group_id = simdgroup_index_in_threadgroup;
 
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+            const uint wbase = lid * GLUE_NREADS;
 
             float av[GLUE_NREADS];
             float bv[GLUE_NREADS];
-            #pragma clang loop unroll(full)
-            for (int i = 0; i < GLUE_NREADS; i++) {
-                av[i] = static_cast<float>(h1[base + i]);
-                bv[i] = static_cast<float>(h2[base + i]);
-            }
+            glue_load4f(h1 + base, av);
+            glue_load4f(h2 + base, bv);
 
             float inv_a = 0;
             float inv_b = 0;
@@ -720,12 +772,13 @@ public enum Gemma4PrefillGlueV1 {
                 av, bv, local_sums_a, local_sums_b, local_inv2,
                 simd_lane_id, simd_group_id, GLUE_EPS, inv_a, inv_b);
 
+            const vec<T, 4> w1v = glue_load4(w1 + wbase);
+            const vec<T, 4> w2v = glue_load4(w2 + wbase);
             float tv[GLUE_NREADS];
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
-                const T n1 = static_cast<T>(w1[j] * static_cast<T>(av[i] * inv_a));
-                const T n2 = static_cast<T>(w2[j] * static_cast<T>(bv[i] * inv_b));
+                const T n1 = static_cast<T>(w1v[i] * static_cast<T>(av[i] * inv_a));
+                const T n2 = static_cast<T>(w2v[i] * static_cast<T>(bv[i] * inv_b));
                 tv[i] = static_cast<float>(static_cast<T>(n1 + n2));
             }
 
@@ -736,27 +789,32 @@ public enum Gemma4PrefillGlueV1 {
             // multiply reads it back and stores again. Both roundings are
             // explicit here, so `out` is the same array either way.
             const T scalar = s[0];
+            const vec<T, 4> w3v = glue_load4(w3 + wbase);
+            const vec<T, 4> res2v = glue_load4(res2 + base);
             float ov[GLUE_NREADS];
+            vec<T, 4> outv;
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
-                const T normed3 = static_cast<T>(w3[j] * static_cast<T>(tv[i] * inv_t));
-                const T summed = static_cast<T>(res2[base + i] + normed3);
+                const T normed3 = static_cast<T>(w3v[i] * static_cast<T>(tv[i] * inv_t));
+                const T summed = static_cast<T>(res2v[i] + normed3);
                 const T scaled = static_cast<T>(summed * scalar);
-                out[base + i] = scaled;
+                outv[i] = scaled;
                 ov[i] = static_cast<float>(scaled);
             }
+            glue_store4(out + base, outv);
 
             // The next layer's input norm, over exactly the bf16 values just
             // stored to `out`.
             const float inv_n = glue_inv_rms(
                 ov, local_sums_a, local_inv2, simd_lane_id, simd_group_id, GLUE_EPS);
 
+            const vec<T, 4> wnv = glue_load4(wn + wbase);
+            vec<T, 4> normedv;
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
-                normed[base + i] = wn[j] * static_cast<T>(ov[i] * inv_n);
+                normedv[i] = wnv[i] * static_cast<T>(ov[i] * inv_n);
             }
+            glue_store4(normed + base, normedv);
             """,
         header: kernelHeader,
         ensureRowContiguous: true
@@ -812,24 +870,42 @@ public enum Gemma4PrefillGlueV1 {
             const uint simd_lane_id = thread_index_in_simdgroup;
             const uint simd_group_id = simdgroup_index_in_threadgroup;
             const size_t base = size_t(row) * GLUE_AXIS + lid * GLUE_NREADS;
+            const uint wbase = lid * GLUE_NREADS;
             const uint assignment_base = row * 8;
 
             float av[GLUE_NREADS];
+            glue_load4f(h1 + base, av);
+
+            // The slot loop moves OUTSIDE the feature loop so the eight
+            // gathered rows are read one packet at a time instead of one
+            // element at a time. Accumulator `i` still receives the same
+            // eight addends in the same slot order 0..7, each rounded to T at
+            // the same place, so every reduction chain is bit-identical; only
+            // the load width and the loop nest change. The per-slot
+            // `inverse_order` / `route_weights` reads stop being repeated
+            // GLUE_NREADS times, which is a load count, not a value.
+            T acc[GLUE_NREADS];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < GLUE_NREADS; i++) {
+                acc[i] = (T)0;
+            }
+            for (uint slot = 0; slot < 8; ++slot) {
+                const uint assignment = assignment_base + slot;
+                const uint sorted_row = (uint)inverse_order[assignment];
+                const float rw = (float)route_weights[assignment];
+                const vec<T, 4> sv = glue_load4(
+                    sorted + size_t(sorted_row) * GLUE_AXIS + wbase);
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < GLUE_NREADS; i++) {
+                    const T weighted = (T)((float)sv[i] * rw);
+                    acc[i] = acc[i] + weighted;
+                }
+            }
+
             float bv[GLUE_NREADS];
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint feature = lid * GLUE_NREADS + i;
-                av[i] = static_cast<float>(h1[base + i]);
-                T accumulator = (T)0;
-                for (uint slot = 0; slot < 8; ++slot) {
-                    const uint assignment = assignment_base + slot;
-                    const uint sorted_row = (uint)inverse_order[assignment];
-                    const T weighted = (T)(
-                        (float)sorted[size_t(sorted_row) * GLUE_AXIS + feature]
-                        * (float)route_weights[assignment]);
-                    accumulator = accumulator + weighted;
-                }
-                bv[i] = static_cast<float>(accumulator);
+                bv[i] = static_cast<float>(acc[i]);
             }
 
             float inv_a = 0;
@@ -838,14 +914,15 @@ public enum Gemma4PrefillGlueV1 {
                 av, bv, local_sums_a, local_sums_b, local_inv2,
                 simd_lane_id, simd_group_id, GLUE_EPS, inv_a, inv_b);
 
+            const vec<T, 4> w1v = glue_load4(w1 + wbase);
+            const vec<T, 4> w2v = glue_load4(w2 + wbase);
             float tv[GLUE_NREADS];
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
                 const T n1 = static_cast<T>(
-                    w1[j] * static_cast<T>(av[i] * inv_a));
+                    w1v[i] * static_cast<T>(av[i] * inv_a));
                 const T n2 = static_cast<T>(
-                    w2[j] * static_cast<T>(bv[i] * inv_b));
+                    w2v[i] * static_cast<T>(bv[i] * inv_b));
                 tv[i] = static_cast<float>(static_cast<T>(n1 + n2));
             }
 
@@ -854,28 +931,32 @@ public enum Gemma4PrefillGlueV1 {
                 simd_lane_id, simd_group_id, GLUE_EPS);
 
             const T scalar = s[0];
+            const vec<T, 4> w3v = glue_load4(w3 + wbase);
+            const vec<T, 4> res2v = glue_load4(res2 + base);
             float ov[GLUE_NREADS];
+            vec<T, 4> outv;
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
                 const T normed3 = static_cast<T>(
-                    w3[j] * static_cast<T>(tv[i] * inv_t));
-                const T summed = static_cast<T>(res2[base + i] + normed3);
+                    w3v[i] * static_cast<T>(tv[i] * inv_t));
+                const T summed = static_cast<T>(res2v[i] + normed3);
                 const T scaled = static_cast<T>(summed * scalar);
-                out[base + i] = scaled;
+                outv[i] = scaled;
                 ov[i] = static_cast<float>(scaled);
             }
+            glue_store4(out + base, outv);
 
             const float inv_n = glue_inv_rms(
                 ov, local_sums_a, local_inv2,
                 simd_lane_id, simd_group_id, GLUE_EPS);
 
+            const vec<T, 4> wnv = glue_load4(wn + wbase);
+            vec<T, 4> normedv;
             #pragma clang loop unroll(full)
             for (int i = 0; i < GLUE_NREADS; i++) {
-                const uint j = lid * GLUE_NREADS + i;
-                normed[base + i] =
-                    wn[j] * static_cast<T>(ov[i] * inv_n);
+                normedv[i] = wnv[i] * static_cast<T>(ov[i] * inv_n);
             }
+            glue_store4(normed + base, normedv);
         """,
         header: kernelHeader,
         ensureRowContiguous: true

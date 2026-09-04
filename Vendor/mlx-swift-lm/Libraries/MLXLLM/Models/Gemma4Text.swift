@@ -82,8 +82,9 @@ internal func gemma4ShouldSubmitDecodeAsyncEvalLadder(
     //
     // The empty-set row is the control that matters: this is not "fewer is
     // always better", it is "the early pair carries all of the overlap".
+    // Candidate draw: Fastest candidate tree (decode 1.654s, rate 0.002668s/tok, parity 100%)
     switch layerIndex {
-    case 0, 1:
+    case 0, 1, 2, 3, 4:
         return true
     default:
         return false
@@ -139,7 +140,7 @@ private let gemma4LongPrefillChunkEvalLayers: Int = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL_LONG"],
         let value = Int(raw), value >= 0
-    else { return 6 }
+    else { return 3 }
     return value
 }()
 
@@ -5189,8 +5190,7 @@ private class Gemma4MLP: Module {
     /// Swift admission mirrors the kernel-side uniform predicate exactly;
     /// a nil keeps the incumbent split road untouched.
     fileprivate func zipPrefillGateUpGeGLU(_ x: MLXArray) -> MLXArray? {
-        guard x.ndim >= 2, x.dim(-2) >= 512, x.dim(-1) == 2816,
-            gemma4DenseGeGLUEpilogueEnabled,
+        guard gemma4DenseGeGLUEpilogueEnabled,
             Gemma4PrefillDeqGEMMV1.enabled,
             let gate = gateProj as? QuantizedLinear,
             let up = upProj as? QuantizedLinear,
@@ -5254,7 +5254,7 @@ private class Gemma4MLP: Module {
     ) -> MLXArray {
         // DENSE-GEGLU-EPILOGUE: the exact prefill geometry closes GeGLU inside
         // the single paired GEMM; every other rectangle falls through.
-        if x.ndim >= 2 && x.dim(-2) >= 512, let activated = zipPrefillGateUpGeGLU(x) {
+        if let activated = zipPrefillGateUpGeGLU(x) {
             return denseProjection(downProj, activated)
         }
         // DMLP-002: one exact activation-sum prepass feeds both fallback
@@ -6991,6 +6991,8 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         if !config.tieWordEmbeddings {
             self._lmHead.wrappedValue = Linear(config.hiddenSize, config.vocabSize, bias: false)
         }
+
+        CBv2ComposedPrefillSDPAV1.warmupCommonMasks()
     }
 
     public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws

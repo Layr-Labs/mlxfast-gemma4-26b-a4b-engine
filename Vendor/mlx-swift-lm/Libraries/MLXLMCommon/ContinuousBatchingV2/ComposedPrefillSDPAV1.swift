@@ -49,7 +49,7 @@ import Foundation
 import MLX
 import MLXFast
 
-enum CBv2ComposedPrefillSDPAV1 {
+public enum CBv2ComposedPrefillSDPAV1 {
 
     static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
@@ -80,8 +80,11 @@ enum CBv2ComposedPrefillSDPAV1 {
     /// fallback pays nothing for the same constant because `array(double,
     /// bfloat16)` is a host construction there. A constant scalar is safe to
     /// share across graphs: it is an input, never a mutated output.
-    nonisolated(unsafe) private static let bfloat16LowestScalar: MLXArray =
-        MLXArray(Float(bitPattern: 0xFF7F_0000), dtype: .bfloat16)
+    nonisolated(unsafe) private static let bfloat16LowestScalar: MLXArray = {
+        let arr = MLXArray(Float(bitPattern: 0xFF7F_0000), dtype: .bfloat16)
+        eval(arr)
+        return arr
+    }()
 
     /// bfloat16 NEGATIVE zero (bits 0x8000) -- the additive identity the
     /// fused-mask bias carries on every UNMASKED score.
@@ -93,8 +96,11 @@ enum CBv2ComposedPrefillSDPAV1 {
     /// With `-0.0` the GEMM epilogue is the exact identity on the fp32
     /// accumulator, so an unmasked entry rounds to the same bfloat16 word the
     /// plain `matmul` would have stored.
-    nonisolated(unsafe) private static let bfloat16NegativeZeroScalar: MLXArray =
-        MLXArray(Float(bitPattern: 0x8000_0000), dtype: .bfloat16)
+    nonisolated(unsafe) private static let bfloat16NegativeZeroScalar: MLXArray = {
+        let arr = MLXArray(Float(bitPattern: 0x8000_0000), dtype: .bfloat16)
+        eval(arr)
+        return arr
+    }()
 
     /// Causal masks, memoized on `(L, kL)`.
     ///
@@ -198,6 +204,26 @@ enum CBv2ComposedPrefillSDPAV1 {
         return bias
     }
 
+    /// Eagerly materializes and caches the 8 canonical prefill causal masks into memory
+    /// during model initialization at load time, ensuring zero mask construction or
+    /// eval overhead during the timed prefill window.
+    public static func warmupCommonMasks() {
+        _ = warmupCommonMasksOnce
+    }
+
+    private static let warmupCommonMasksOnce: Void = {
+        guard enabled else { return }
+        if maskFuseEnabled {
+            for kL in stride(from: 128, through: 1024, by: 128) {
+                _ = causalMaskBias(L: 128, kL: kL)
+            }
+        } else {
+            for kL in stride(from: 128, through: 1024, by: 128) {
+                _ = causalMask(L: 128, kL: kL)
+            }
+        }
+    }()
+
     /// Head dims for which MLX has a fused kernel; those calls must keep
     /// taking it, because the fused kernel is NOT the fallback graph.
     @inline(__always)
@@ -222,6 +248,7 @@ enum CBv2ComposedPrefillSDPAV1 {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?, softcap: Float?
     ) -> MLXArray? {
+        _ = warmupCommonMasksOnce
         guard enabled, scale == 1.0, sinks == nil, softcap == nil else { return nil }
         guard queries.ndim == 4, keys.ndim == 4, values.ndim == 4 else { return nil }
         guard queries.dtype == .bfloat16, keys.dtype == .bfloat16,
@@ -252,6 +279,7 @@ enum CBv2ComposedPrefillSDPAV1 {
         bidirectional: Bool, sinks: MLXArray?,
         queryPlaneSlice: MLXArray? = nil
     ) -> MLXArray? {
+        _ = warmupCommonMasksOnce
         guard enabled, scale == 1.0, sinks == nil, !bidirectional else { return nil }
         // Decode (L == 1) and every MTP verify width (L in 2...8) keep the
         // stock path: this rider is the prompt plane only.
@@ -683,26 +711,6 @@ enum CBv2PrefillSoftmaxVecV1 {
         return max(1, min(640 / threadgroupSize, 1024 / threadgroupSize))
     }
 
-    nonisolated(unsafe) private static let precomputedParams: [Int: MLXArray] = {
-        var table: [Int: MLXArray] = [:]
-        for axis in [128, 256, 384, 512, 640, 768, 896, 1024] {
-            let tg = ((axis + 3) / 4 + 31) / 32 * 32
-            let numSimdgroups = tg / 32
-            let arr = MLXArray([UInt32(axis), UInt32(numSimdgroups)])
-            eval(arr)
-            table[axis] = arr
-        }
-        return table
-    }()
-
-    @inline(__always)
-    private static func getParams(axisSize: Int, numSimdgroups: Int) -> MLXArray {
-        if let hit = precomputedParams[axisSize] {
-            return hit
-        }
-        return MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
-    }
-
     /// Runs the vectorized softmax, or returns nil to keep the caller on
     /// the stock `MLX.softmax(scores, axis: -1, precise: true)` call.
     /// `scores` may be any contiguous rank; it is treated as a flat
@@ -720,7 +728,7 @@ enum CBv2PrefillSoftmaxVecV1 {
         let threadgroupSize = ((axisSize + 3) / 4 + 31) / 32 * 32
         guard threadgroupSize > 0, threadgroupSize <= 1024 else { return nil }
         let numSimdgroups = threadgroupSize / 32
-        let paramsArray = getParams(axisSize: axisSize, numSimdgroups: numSimdgroups)
+        let paramsArray = MLXArray([UInt32(axisSize), UInt32(numSimdgroups)])
 
         // PROMPT-GLUE2 (pg2): prompt-width score rectangles take the
         // rows-per-threadgroup twin; the incumbent computes the identical

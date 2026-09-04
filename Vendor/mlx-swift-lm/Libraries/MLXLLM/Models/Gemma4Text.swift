@@ -5254,7 +5254,7 @@ private class Gemma4MLP: Module {
     ) -> MLXArray {
         // DENSE-GEGLU-EPILOGUE: the exact prefill geometry closes GeGLU inside
         // the single paired GEMM; every other rectangle falls through.
-        if let activated = zipPrefillGateUpGeGLU(x) {
+        if x.ndim >= 2 && x.dim(-2) >= 512, let activated = zipPrefillGateUpGeGLU(x) {
             return denseProjection(downProj, activated)
         }
         // DMLP-002: one exact activation-sum prepass feeds both fallback
@@ -6671,29 +6671,49 @@ public class Gemma4TextModelInner: Module {
         }
 
         // Extend cache array for shared layers (which get nil caches)
-        var fullCache: [KVCache?]
-        if let cache {
-            fullCache = cache.map { Optional($0) }
-            while fullCache.count < config.numHiddenLayers {
-                fullCache.append(nil)
+        // CBV2-DIRECT-CACHE-ACCESS: CBv2 supplies one cache per model layer,
+        // so its already-typed cache set does not need an optional wrapper or
+        // a padding traversal. Keep the boxed compatibility representation
+        // only for legacy cache providers, where shared layers are nil.
+        let cacheIsCBv2 = (cache?.first as? (any CBv2AttendingLayerCache)) != nil
+        let useDirectCBv2Cache =
+            cacheIsCBv2 && (cache?.count ?? 0) >= config.numHiddenLayers
+        if useDirectCBv2Cache {
+            CBv2EngageMark.once("gemma4-cbv2-direct-cache")
+        }
+        let isCBv2 = cacheIsCBv2
+        let directCache: [KVCache]? = useDirectCBv2Cache ? cache : nil
+        var fullCache: [KVCache?] = []
+        if directCache == nil {
+            if let cache {
+                fullCache = cache.map { Optional($0) }
+                while fullCache.count < config.numHiddenLayers {
+                    fullCache.append(nil)
+                }
+            } else {
+                fullCache = Array(repeating: nil, count: config.numHiddenLayers)
             }
-        } else {
-            fullCache = Array(repeating: nil, count: config.numHiddenLayers)
         }
 
-        // ContinuousBatchingV2 detection: v2 layer caches own attention AND
-        // masking, so the trunk builds no masks at all on that path (there is
-        // no padding and no shared frontier to mask). In v2 mode every layer
-        // (including KV-shared ones) has a cache object.
-        let isCBv2 = fullCache.contains { ($0 as? (any CBv2AttendingLayerCache)) != nil }
         // All-contiguous banks expose one position chain. Snapshot it before
         // the first layer advances the chain, then reuse that same lazy array
         // for every Q/K RoPE call in this forward.
         let unifiedCBv2PositionOffset: Gemma4.PositionOffset? = {
             guard isCBv2 else { return nil }
-            for case let entry? in fullCache {
-                if let offsets = (entry as? CBv2LayerCache)?.unifiedPositionOffsets {
-                    return .batch(offsets + 0)
+            if let directCache {
+                if let offsets = (directCache.first as? CBv2LayerCache)?.unifiedPositionOffsets {
+                    return schedulePrefill ? .batch(offsets + 0) : .batch(offsets)
+                }
+                for entry in directCache {
+                    if let offsets = (entry as? CBv2LayerCache)?.unifiedPositionOffsets {
+                        return schedulePrefill ? .batch(offsets + 0) : .batch(offsets)
+                    }
+                }
+            } else {
+                for case let entry? in fullCache {
+                    if let offsets = (entry as? CBv2LayerCache)?.unifiedPositionOffsets {
+                        return schedulePrefill ? .batch(offsets + 0) : .batch(offsets)
+                    }
                 }
             }
             return nil
@@ -6753,9 +6773,12 @@ public class Gemma4TextModelInner: Module {
             // cache object (attendBorrowing) instead of consuming raw K/V
             // tensors. Thread the source cache alongside the source's
             // captured (pre-update) position offsets.
+            let layerCache: KVCache? =
+                directCache != nil ? directCache![idx] : fullCache[idx]
             let v2SharedSource: (any CBv2AttendingLayerCache)? =
                 isCBv2 && prevIdx != idx
-                ? fullCache[prevIdx] as? (any CBv2AttendingLayerCache) : nil
+                ? (directCache != nil ? directCache![prevIdx] : fullCache[prevIdx])
+                    as? (any CBv2AttendingLayerCache) : nil
 
             let mask = maskByType[layer.layerType]
             // Prompt-path specializations, final layer only. Every earlier
@@ -6773,11 +6796,11 @@ public class Gemma4TextModelInner: Module {
                 batchSize: h.dim(0),
                 sequenceLength: h.dim(1),
                 outputTailRows: outputTailRows,
-                hasCapableCache: fullCache[idx] is any CBv2LastQueryPrefillLayerCache)
+                hasCapableCache: layerCache is any CBv2LastQueryPrefillLayerCache)
             let (out, kvPair, positionOffset) = layer(
                 h,
                 mask: mask,
-                cache: fullCache[idx],
+                cache: layerCache,
                 perLayerInput: perLayerInputs[idx],
                 sharedKV: sharedKV,
                 positionOffset: unifiedCBv2PositionOffset ?? sharedPositionOffset,

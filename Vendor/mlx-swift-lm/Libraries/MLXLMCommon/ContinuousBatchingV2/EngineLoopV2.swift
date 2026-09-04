@@ -323,7 +323,10 @@ public struct CBv2EngineLoopConfig: Sendable {
 final class CBv2InFlightStep {
     /// Every request that computed anything this step (KV release for any of
     /// these must be deferred until finalization — see CONTRACT-ISSUES §4).
-    let participants: Set<CBv2RequestID>
+    /// Plan-order participant IDs. Ranked cohorts contain at most eight rows,
+    /// so a compact array avoids both per-step Set construction and an enum
+    /// dispatch on every membership/lease walk.
+    let participants: [CBv2RequestID]
     /// Rows that sampled a token, in plan order (== row order of
     /// `sampledTokens`).
     let sampledRows: [CBv2RequestID]
@@ -359,15 +362,23 @@ final class CBv2InFlightStep {
     var mtpRound: CBv2MTPRoundInFlight?
 
     init(
-        participants: Set<CBv2RequestID>, sampledRows: [CBv2RequestID],
+        compactParticipants: [CBv2RequestID], sampledRows: [CBv2RequestID],
         sampledTokens: MLXArray?, evalTargets: [MLXArray],
         wallStartedNanos: UInt64
     ) {
-        self.participants = participants
+        self.participants = compactParticipants
         self.sampledRows = sampledRows
         self.sampledTokens = sampledTokens
         self.evalTargets = evalTargets
         self.wallStartedNanos = wallStartedNanos
+    }
+
+    func containsParticipant(_ id: CBv2RequestID) -> Bool {
+        participants.contains(id)
+    }
+
+    func forEachParticipant(_ body: (CBv2RequestID) -> Void) {
+        participants.forEach(body)
     }
 }
 
@@ -1191,7 +1202,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 invalidateAdoptedPrefix(id)
                 mtp?.invalidateCarry(id)
                 guard let state = kvStates.removeValue(forKey: id) else { continue }
-                if previous.participants.contains(id) {
+                if previous.containsParticipant(id) {
                     previous.deferredReleases.append(
                         (
                             id: id, state: state, rollbackOne: false, donation: nil
@@ -1607,8 +1618,8 @@ public final class EngineLoopV2: @unchecked Sendable {
             CBv2StepProfiler.record("v2.launch.total", seconds: now - buildStart)
         }
         let step = CBv2InFlightStep(
-            participants: Set(ids), sampledRows: ids, sampledTokens: sampled, evalTargets: [],
-            wallStartedNanos: wallStartedNanos)
+            compactParticipants: ids, sampledRows: ids, sampledTokens: sampled,
+            evalTargets: [], wallStartedNanos: wallStartedNanos)
         if let stepLogprobs { step.logprobSegments = [stepLogprobs] }
         return step
     }
@@ -1867,7 +1878,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         asyncEval(toEval)
 
         let step = CBv2InFlightStep(
-            participants: Set(work.map(\.rec.id)),
+            compactParticipants: work.map(\.rec.id),
             sampledRows: sampledRows,
             sampledTokens: sampledTokens,
             evalTargets: evalTargets,
@@ -2134,8 +2145,8 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// token refreshes the decode lease; a confirmed prefill-chunk advance
     /// refreshes the prefill lease.
     private func refreshProgressLeases(_ step: CBv2InFlightStep, now: ContinuousClock.Instant) {
-        for id in step.participants {
-            guard let rec = scheduler.record(for: id) else { continue }
+        step.forEachParticipant { id in
+            guard let rec = scheduler.record(for: id) else { return }
             if var lease = leasesByID[id] {
                 lease.recordProgress(
                     now: now,
@@ -2191,7 +2202,7 @@ public final class EngineLoopV2: @unchecked Sendable {
 
         if let state = kvStates.removeValue(forKey: id) {
             let donation = donationIntent(for: rec, reason: reason, state: state)
-            if let inFlight, inFlight.participants.contains(id) {
+            if let inFlight, inFlight.containsParticipant(id) {
                 // The in-flight step still references this state — fence the
                 // free behind its completion; roll back the wasted token iff
                 // that step sampled for this row.

@@ -128,15 +128,6 @@ public enum CBv2DenseMLPQMVV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    /// Gate/up compile-time K walk, unrolled by two. Off keeps the runtime-K
-    /// kernel for this plane; the down plane and its switch are unaffected.
-    private static let mma8GateUpStaticKEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_MLP_GATEUP_STATIC_K"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
     /// W4-LOAD (engage mark `mlp-w4-load`). The four packed affine-8 codes a
     /// lane owns for one output row are four CONTIGUOUS bytes at a 4-byte
     /// aligned address, so they can be fetched as ONE aligned 32-bit load
@@ -613,7 +604,7 @@ inline float mma8_runsum8(uint4 r) {
 // byte 0..255 and x is unscaled, exactly as the 8-bit `qdot` arm forms its
 // product; a bf16 x carries 8 significant bits and the code 8, so the product
 // needs at most 16 and is exact in fp32.
-#define MMA8_STEP8(BB, WLO, WHI, SH) A.thread_elements()[0] = float(extract_bits(wv.WLO, (SH), 8)); A.thread_elements()[1] = float(extract_bits(wv.WHI, (SH), 8)); simdgroup_multiply_accumulate(C, A, BB, C);
+#define MMA8_STEP8(BB, WLO, WHI, SH) A.thread_elements()[0] = float(as_type<half>(ushort(0x6400u | extract_bits(wv.WLO, (SH), 8))) - 1024.0h); A.thread_elements()[1] = float(as_type<half>(ushort(0x6400u | extract_bits(wv.WHI, (SH), 8))) - 1024.0h); simdgroup_multiply_accumulate(C, A, BB, C);
 
 // x is [8, K] with K % 64 == 0, w is packed [N, K / 4] uint32 (one byte per
 // code, so the row stride is K bytes and K % 64 == 0 keeps every `uint4` load
@@ -652,7 +643,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
   float acc0 = 0.0f;
   float acc1 = 0.0f;
   simdgroup_float8x8 A;
-  simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+  simdgroup_float8x8 B;
 
   for (int g = g_begin; g < g_end; ++g) {
     const uint4 r0 = *((const device uint4*)(x0 + 64 * g));
@@ -675,22 +666,22 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     const float b = float(brow[g]);
 
     simdgroup_float8x8 C = simdgroup_float8x8(0.0f);
-    MMA8_SETB(B0, x, lo)
-    MMA8_STEP8(B0, x, z, 0)
-    MMA8_SETB(B1, x, hi)
-    MMA8_STEP8(B1, x, z, 8)
-    MMA8_SETB(B2, y, lo)
-    MMA8_STEP8(B2, x, z, 16)
-    MMA8_SETB(B3, y, hi)
-    MMA8_STEP8(B3, x, z, 24)
-    MMA8_SETB(B4, z, lo)
-    MMA8_STEP8(B4, y, w, 0)
-    MMA8_SETB(B5, z, hi)
-    MMA8_STEP8(B5, y, w, 8)
-    MMA8_SETB(B6, w, lo)
-    MMA8_STEP8(B6, y, w, 16)
-    MMA8_SETB(B7, w, hi)
-    MMA8_STEP8(B7, y, w, 24)
+    MMA8_SETB(B, x, lo)
+    MMA8_STEP8(B, x, z, 0)
+    MMA8_SETB(B, x, hi)
+    MMA8_STEP8(B, x, z, 8)
+    MMA8_SETB(B, y, lo)
+    MMA8_STEP8(B, x, z, 16)
+    MMA8_SETB(B, y, hi)
+    MMA8_STEP8(B, x, z, 24)
+    MMA8_SETB(B, z, lo)
+    MMA8_STEP8(B, y, w, 0)
+    MMA8_SETB(B, z, hi)
+    MMA8_STEP8(B, y, w, 8)
+    MMA8_SETB(B, w, lo)
+    MMA8_STEP8(B, y, w, 16)
+    MMA8_SETB(B, w, hi)
+    MMA8_STEP8(B, y, w, 24)
 
     acc0 += s * C.thread_elements()[0] + rs.x * b;
     acc1 += s * C.thread_elements()[1] + rs.y * b;
@@ -715,7 +706,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
 """
 
     private static let mma8Kernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_v1",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_halfdeq_v1",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -799,10 +790,10 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
         // hand-off is register renaming in a fully unrolled body, not a copy.
         replaceOnce(
             """
-              simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+              simdgroup_float8x8 B;
             """,
             with: """
-              simdgroup_float8x8 B0, B1, B2, B3, B4, B5, B6, B7;
+              simdgroup_float8x8 B;
 
               uint4 wv_next = *((const device uint4*)(wrow + 64 * g0));
               uint4 wv_next2 =
@@ -830,7 +821,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     }()
 
     private static let mma8DownStaticKKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_carry2_bfill_v4",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_carry2_bfill_halfdeq_v7",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -843,66 +834,6 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
                 thread_index_in_simdgroup);
             """,
         header: mma8DownStaticKHeader,
-        ensureRowContiguous: true)
-
-    /// Gate/up: K = 2816, G = 44, 22 groups per simdgroup, unrolled by two.
-    private static let mma8GateUpStaticKHeader: String = {
-        var result = mma8KernelHeader
-        func replaceOnce(_ old: String, with new: String) {
-            precondition(result.components(separatedBy: old).count == 2)
-            result = result.replacingOccurrences(of: old, with: new)
-        }
-        replaceOnce(
-            "gemma4_qmv_mma8_affine8_g64_impl(",
-            with: "gemma4_qmv_mma8_affine8_g64_gateup_k2816_impl(")
-        replaceOnce(
-            """
-                device T* y,
-                const int K,
-                const int N,
-            """,
-            with: """
-                device T* y,
-                const int N,
-            """)
-        replaceOnce(
-            """
-              const int G = K / 64;
-              const int gh = (G + 1) / 2;
-              const int g_begin = (KS == 2 && simd_gid == 1) ? gh : 0;
-              const int g_end = (KS == 2 && simd_gid == 0) ? gh : G;
-            """,
-            with: """
-              constexpr int K = 2816;
-              constexpr int G = K / 64;
-              constexpr int gh = (G + 1) / 2;
-              constexpr int nGroups = (KS == 2) ? gh : G;
-              const int g0 = (KS == 2 && simd_gid == 1) ? gh : 0;
-            """)
-        replaceOnce(
-            "  for (int g = g_begin; g < g_end; ++g) {",
-            with: """
-              #pragma clang loop unroll_count(2)
-              for (int gi = 0; gi < nGroups; ++gi) {
-                const int g = g0 + gi;
-            """)
-        return result
-    }()
-
-    private static let mma8GateUpStaticKKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_gateup_k2816_u2_v1",
-        inputNames: ["x", "w", "scales", "biases"],
-        outputNames: ["y"],
-        source: """
-            const uint3 tid = threadgroup_position_in_grid;
-            threadgroup float2 red[32];
-            gemma4_qmv_mma8_affine8_g64_gateup_k2816_impl<T, 2>(
-                w, scales, biases, x, y,
-                w_shape[0], int(tid.y) * 8, red,
-                simdgroup_index_in_threadgroup,
-                thread_index_in_simdgroup);
-            """,
-        header: mma8GateUpStaticKHeader,
         ensureRowContiguous: true)
 
     /// One complete SIMD group per g64 group. Keep all lane results rather
@@ -1355,17 +1286,8 @@ inline U qdot_affine8_registered_v4(
                     outputDTypes: [x.dtype]
                 )[0]
             }
-            let selectedMMA: MLXFast.MLXFastKernel
-            if isGateUp {
-                if mma8GateUpStaticKEnabled {
-                    CBv2EngageMark.once("mlp-gateup-k2816-u2")
-                }
-                selectedMMA = mma8GateUpStaticKEnabled
-                    ? mma8GateUpStaticKKernel : mma8Kernel
-            } else {
-                selectedMMA = mma8DownStaticKEnabled
-                    ? mma8DownStaticKKernel : mma8Kernel
-            }
+            let selectedMMA = !isGateUp && mma8DownStaticKEnabled
+                ? mma8DownStaticKKernel : mma8Kernel
             return selectedMMA(
                 [x, weight, scales, biases],
                 template: [("T", x.dtype)],

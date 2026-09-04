@@ -2204,7 +2204,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             // Publish the reconciled usage once tokens start flowing (prompt
             // count with zero completion was already seeded at enqueue, so a
             // still-prefilling row needs no lock traffic here).
-            if rec.generatedTokenCount > 0 {
+            if rec.generatedTokenCount > 0 && rec.generatedTokenCount % 16 == 0 {
                 setUsageSnapshot(
                     id,
                     CBv2Usage(

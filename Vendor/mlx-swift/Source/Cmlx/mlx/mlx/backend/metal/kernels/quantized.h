@@ -3911,8 +3911,9 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
 // unique bytes at 479-589 GB/s. Here only every span-th y-group survives
 // (the rest return before the scan); the survivor elects ONCE and then
 // walks its span consecutive 8-row y-tiles serially through the verbatim
-// pair impl -- or, for a pairless run position, the verbatim stock
-// qmv_impl -- with tid.y rewritten to the tile index (a strip-walk
+// pair impl -- or, for a 3-run leader, the verbatim triple-stream impl, or,
+// for a pairless run position, the verbatim EXPERT-SINGLES impl -- with
+// tid.y rewritten to the tile index (a strip-walk
 // pattern). Tile u is served by survivor (u / span) * span
 // at loop step u % span and by no other group, so every output row keeps
 // the IDENTICAL qdot sequence, accumulator, simd_sum and store the
@@ -3923,7 +3924,9 @@ METAL_FUNC void qmv_affine4_g64_singles_impl(
 // would otherwise never be written. Verified uint16-exact vs the
 // per-assignment quantized_matmul oracle and vs the untiled arm at
 // K = 704, N = 2816, 64 assignments over 128 experts, M = 8, spans 4 and
-// 2, 3 seeds, NaN-filled outputs (parity-down-tile, 2026-08-28).
+// 2, 3 seeds, NaN-filled outputs (parity-down-tile, 2026-08-28). That run
+// predates the RUN-TRIPLE election below, which is argued statically (see
+// its own header) and has NOT been through the oracle.
 template <typename T, int group_size, int bits>
 METAL_FUNC void gather_qmv_gemma4_down_tile(
     const device uint32_t* w,
@@ -3964,8 +3967,84 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
       run_offset++;
     }
   }
-  // Odd positions are produced by the immediately preceding pair leader.
+  // Odd positions are produced by the immediately preceding leader.
   if ((run_offset & 1) != 0) {
+    return;
+  }
+  // RUN-TRIPLE (down plane, K = 704, N = 2816). The incumbent rule elected
+  // one leader per EVEN run_offset and handed it at most a PAIR, so a run of
+  // three same-expert assignments cost TWO weight streams (2 + 1) while the
+  // K = 2816 gate/up planes already collapse a 3-run into ONE stream through
+  // qmv_affine4_g64_triple_stream_impl (the RUN-QUAD arm below). Under the
+  // routing this decode actually sees -- 8 rows x top-8 over 128 experts,
+  // sorted into 64 assignments -- the per-layer run census is
+  // {1: 40.75, 2: 9.51, 3: 1.27, 4: 0.11} runs, and 3-runs are essentially
+  // the whole gap between the down plane's 53.0 streams/layer and the
+  // gate/up planes' 51.63 = the distinct-expert lower bound.
+  //
+  // The leader rule stays "every even run_offset" with ONE exception: the
+  // trailing even position of a 3-run is now produced by the triple leader
+  // two slots back, so it returns. `run_len` is the remaining forward run
+  // length capped at 4 -- the same quantity computed the same two ways as
+  // the RUN-QUAD arm below -- and it selects:
+  //
+  //   run_len == 1  -> singles walk (unchanged; elected only at offset 0)
+  //   run_len == 2  -> pair walk    (unchanged)
+  //   run_len == 3  -> TRIPLE walk  (new; was pair + singles = 2 streams)
+  //   run_len >= 4  -> pair walk, and the even leader at run_offset + 2 takes
+  //                    the rest. A run of FOUR therefore still splits 2 + 2,
+  //                    exactly as it does today, and deliberately so: the
+  //                    quad body would have to hold four x and four y tile
+  //                    bases live ACROSS the span loop (11 device pointers
+  //                    instead of the pair walk's 7) on top of the inlined
+  //                    body's own 11, and THIS is the arm the header above
+  //                    measures at ~390 GB/s against 479-589 GB/s for the
+  //                    same unique bytes at K = 2816 -- i.e. the arm whose
+  //                    limiter is residency, not bytes. 4-runs are 0.11 of
+  //                    51.63 runs/layer (0.05% of decode DRAM); 3-runs are
+  //                    1.27 (0.57%). The triple body is strictly SMALLER
+  //                    than the pair body it displaces (12 accumulators and
+  //                    one 8-float x buffer against the pair's 8
+  //                    accumulators and two 8-float x buffers: 32 thread
+  //                    values against 36), so the only new live state is
+  //                    tile_x2 / tile_y2.
+  //
+  // Coverage is exact -- every assignment is written once and only once. An
+  // ODD offset o is covered by the leader at o - 1, which has remaining >= 2
+  // hence run_len >= 2 hence spans o. A non-elected EVEN offset o has
+  // run_len == 1 with o >= 2, so remaining(o - 2) == 3 and the leader at
+  // o - 2 took the triple that spans o. A triple leader exists only when
+  // remaining == 3, so its o + 2 is the run's last position and is exactly
+  // the non-elected even offset above; a pair leader with run_len == 4 is
+  // followed by an elected leader at o + 2 (remaining >= 2). No overlap.
+  //
+  // REDUCTION ORDER IS UNCHANGED PER OUTPUT ELEMENT. Each output element
+  // y[assignment + i][row] is ONE row's dot product over K. The triple impl
+  // gives every (input row i, output row) pair its OWN accumulator
+  // result_i[row], walks K in the same ascending 256-value blocks, takes the
+  // same 24-active-lane K = 704 tail (load_vector_safe with remaining == 8
+  // is arithmetically load_vector: identical i += 4 loop, identical sum
+  // order, empty zero-fill), and closes with its own simd_sum and store. And
+  // qdot_affine4_registered_word is term-for-term the per-row expression of
+  // both qdot_affine4_pair_word (the arm a 3-run's first two assignments
+  // leave) and qdot_affine4_g64_word (the arm its third assignment leaves):
+  // same two 4-term groups in the same order, same nibble masks, same
+  // `scale * accum + sum * bias` close. Sharing the weight stream changes
+  // only WHICH THREAD LOADS the packed word, never any output's add
+  // sequence. Same argument, same three functions, as the RUN-QUAD arm's
+  // published parity claim at K = 2816.
+  uint run_len = 1;
+  if (expert_prefix_bounds) {
+    run_len = min(4u, ((route_word >> 14) & 0x3fu) + 1u);
+  } else {
+    while (run_len < 4 && assignment + run_len < 64 &&
+           rhs_indices[(assignment + run_len) * rhs_stride] == expert) {
+      run_len++;
+    }
+  }
+  // The lone trailing position of a 3-run: produced by the triple leader at
+  // run_offset - 2, which by construction saw remaining == 3.
+  if (run_offset >= 2u && run_len == 1u) {
     return;
   }
   const device uint32_t* tile_w = w + expert * w_stride;
@@ -3974,14 +4053,34 @@ METAL_FUNC void gather_qmv_gemma4_down_tile(
   const device T* tile_x0 =
       x + lhs_indices[assignment * lhs_stride] * x_stride;
   device T* tile_y0 = y + assignment * out_vec_size;
-  const bool has_pair = expert_prefix_bounds
-      ? (((route_word >> 14) & 0x3fu) + 1u) > 1u
-      : assignment + 1 < 64 &&
-          rhs_indices[(assignment + 1) * rhs_stride] == expert;
-  if (has_pair) {
+  if (run_len >= 2u) {
     const device T* tile_x1 =
         x + lhs_indices[(assignment + 1) * lhs_stride] * x_stride;
     device T* tile_y1 = y + (assignment + 1) * out_vec_size;
+    if (run_len == 3u) {
+      const device T* tile_x2 =
+          x + lhs_indices[(assignment + 2) * lhs_stride] * x_stride;
+      device T* tile_y2 = y + (assignment + 2) * out_vec_size;
+      for (int t = 0; t < gemma4_down_tile_span; t++) {
+        uint3 tile_tid = tid;
+        tile_tid.y = tid.y + uint(t);
+        qmv_affine4_g64_triple_stream_impl<T, group_size, bits>(
+            tile_w,
+            tile_scales,
+            tile_biases,
+            tile_x0,
+            tile_x1,
+            tile_x2,
+            tile_y0,
+            tile_y1,
+            tile_y2,
+            in_vec_size,
+            tile_tid,
+            simd_gid,
+            simd_lid);
+      }
+      return;
+    }
     for (int t = 0; t < gemma4_down_tile_span; t++) {
       uint3 tile_tid = tid;
       tile_tid.y = tid.y + uint(t);

@@ -3342,6 +3342,288 @@ public enum Gemma4MMAQuantizedGEMV {
         return outputs[0]
     }
 
+
+    // MARK: - HEAD-BTAB --- bfloat fragments from a byte table, rolled walk
+
+    /// HEAD-BTAB. The relaid decode head (`..._v27_argmax_rl1`) builds each
+    /// weight fragment element as `float(nibble)` (shift, mask, int->float
+    /// convert; 64 converts per lane per affine group) and each activation
+    /// fragment element as `float(x[...])` (a bf16 load widened), and feeds
+    /// fp32 operands to `simdgroup_multiply_accumulate`. The products of a
+    /// 4-bit code and a bf16 value are exact in fp32 whatever the operand
+    /// format, and the accumulation is the same fp32 chain, so the twin
+    /// `gemma4_mma_affine4_qmv_m8_v27_argmax_rl1_bt1` computes the same
+    /// partials with bfloat operands:
+    ///
+    ///   * the 256-entry threadgroup table `tabB[byte]` holds the bfloat pair
+    ///     `(bfloat(byte & 15), bfloat(byte >> 4))` as one word (each entry is
+    ///     `float(i) >> 16`, exact for 0...15); a lane's two fragment operands
+    ///     for tile `a` and slice `t` are the two nibbles of byte `t & 3` of
+    ///     its word `t / 4` of quarter `a`, i.e. ONE threadgroup load per pair
+    ///     and no convert;
+    ///   * the activation fragment takes the bf16 bits of `x` directly, no
+    ///     widening;
+    ///   * the 44-group walk is rolled: the five full eight-group blocks run in
+    ///     a loop whose groups are unrolled by four, and the tail block (four
+    ///     groups, guarded bias MMA) is peeled, so the straight-line body is a
+    ///     quarter of the incumbent's. The statements per group, their order,
+    ///     the scale close, the batched bias MMA and the top-1 fold are the
+    ///     incumbent's.
+    ///
+    /// Same grid (128 threads, `N / 128` threadgroups), same `[8, N / 128]`
+    /// partials, same second stage. Every rewrite pair and every roll anchor
+    /// must match exactly once, otherwise the twin is not built and the relaid
+    /// incumbent runs (soft gate, reported once on stderr).
+    /// `DARKBLOOM_GEMMA4_HEAD_BTAB=0` restores the incumbent kernel, name and
+    /// body byte for byte. `DARKBLOOM_GEMMA4_HEAD_BTAB_XCHECK=1` also runs the
+    /// relaid incumbent on the same inputs and reports differing partial words
+    /// on stderr (diagnostic only). Engage mark `head-btab`.
+    private static let btabEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_HEAD_BTAB"]
+        else { return true }
+        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "0", "false", "no", "off": return false
+        default: return true
+        }
+    }()
+
+    private static let btabXCheck: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_HEAD_BTAB_XCHECK"]
+        else { return false }
+        switch raw.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "", "0", "false", "no", "off": return false
+        default: return true
+        }
+    }()
+
+    /// The rewrite pairs applied to the relaid argmax body, in order; each
+    /// `old` must occur exactly once.
+    private static let btabPairs: [(String, String)] = [
+        (
+            """
+                    simdgroup_matrix<float, 8, 8> A0;
+                    simdgroup_matrix<float, 8, 8> A1;
+                    simdgroup_matrix<float, 8, 8> A2;
+                    simdgroup_matrix<float, 8, 8> A3;
+                    simdgroup_matrix<float, 8, 8> B;
+
+            """,
+            """
+                    simdgroup_matrix<bfloat, 8, 8> A0;
+                    simdgroup_matrix<bfloat, 8, 8> A1;
+                    simdgroup_matrix<bfloat, 8, 8> A2;
+                    simdgroup_matrix<bfloat, 8, 8> A3;
+                    simdgroup_matrix<bfloat, 8, 8> B;
+
+            """
+        ),
+        (
+            """
+            simdgroup_matrix<float, 8, 8> acc0 = simdgroup_matrix<float, 8, 8>(0.0f);
+
+            """,
+            """
+            // byte -> (bfloat(low nibble), bfloat(high nibble)) as one word
+            threadgroup uint tabB[256];
+            for (uint i = lid; i < 256u; i += N_SG * 32u) {
+                tabB[i] = (as_type<uint>(float(i & 15u)) >> 16u) | (as_type<uint>(float(i >> 4u)) & 0xFFFF0000u);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_matrix<float, 8, 8> acc0 = simdgroup_matrix<float, 8, 8>(0.0f);
+
+            """
+        ),
+        (
+            """
+                    const uint nibbleShift = 8u * (t & 3u);
+                    A0.thread_elements()[0] =
+                        float((packed0 >> nibbleShift) & 0xFu);
+                    A0.thread_elements()[1] =
+                        float((packed0 >> (nibbleShift + 4u)) & 0xFu);
+                    A1.thread_elements()[0] =
+                        float((packed1 >> nibbleShift) & 0xFu);
+                    A1.thread_elements()[1] =
+                        float((packed1 >> (nibbleShift + 4u)) & 0xFu);
+                    A2.thread_elements()[0] =
+                        float((packed2 >> nibbleShift) & 0xFu);
+                    A2.thread_elements()[1] =
+                        float((packed2 >> (nibbleShift + 4u)) & 0xFu);
+                    A3.thread_elements()[0] =
+                        float((packed3 >> nibbleShift) & 0xFu);
+                    A3.thread_elements()[1] =
+                        float((packed3 >> (nibbleShift + 4u)) & 0xFu);
+
+            """,
+            """
+                    const uint nibbleShift = 8u * (t & 3u);
+                    const uint pair0 = tabB[(packed0 >> nibbleShift) & 0xFFu];
+                    A0.thread_elements()[0] = as_type<bfloat>(ushort(pair0));
+                    A0.thread_elements()[1] = as_type<bfloat>(ushort(pair0 >> 16u));
+                    const uint pair1 = tabB[(packed1 >> nibbleShift) & 0xFFu];
+                    A1.thread_elements()[0] = as_type<bfloat>(ushort(pair1));
+                    A1.thread_elements()[1] = as_type<bfloat>(ushort(pair1 >> 16u));
+                    const uint pair2 = tabB[(packed2 >> nibbleShift) & 0xFFu];
+                    A2.thread_elements()[0] = as_type<bfloat>(ushort(pair2));
+                    A2.thread_elements()[1] = as_type<bfloat>(ushort(pair2 >> 16u));
+                    const uint pair3 = tabB[(packed3 >> nibbleShift) & 0xFFu];
+                    A3.thread_elements()[0] = as_type<bfloat>(ushort(pair3));
+                    A3.thread_elements()[1] = as_type<bfloat>(ushort(pair3 >> 16u));
+
+            """
+        ),
+        (
+            """
+                    B.thread_elements()[0] =
+                        float(x[fragmentCol * K + activationK]);
+                    B.thread_elements()[1] =
+                        float(x[(fragmentCol + 1) * K + activationK]);
+
+            """,
+            """
+                    B.thread_elements()[0] = x[fragmentCol * K + activationK];
+                    B.thread_elements()[1] = x[(fragmentCol + 1) * K + activationK];
+
+            """
+        )
+    ]
+
+    private static let btabLoopHead: String =
+            """
+            #pragma unroll
+            for (uint biasBlock = 0; biasBlock < N_GROUPS; biasBlock += 8) {
+                #pragma unroll
+                for (uint gg = 0; gg < 8; ++gg) {
+                    const uint g = biasBlock + gg;
+                    if (g >= N_GROUPS) continue;
+
+            """
+    private static let btabGroupEnd: String =
+            """
+                // One rank-8 bias MMA per eight groups instead of one rank-1 MMA
+                // per group.
+                // Transposed too: outT[n][m] += sum_gg BbT[n][gg] * XbT[gg][m].
+                }
+
+            """
+    private static let btabBiasStart: String =
+            """
+                {
+                    const uint biasCol0 = biasBlock + fragmentCol;
+
+            """
+    private static let btabBiasEnd: String =
+            """
+                            simdgroup_multiply_accumulate(acc0, BBm0, XBm, acc0);
+                    simdgroup_multiply_accumulate(acc1, BBm1, XBm, acc1);
+                    simdgroup_multiply_accumulate(acc2, BBm2, XBm, acc2);
+                    simdgroup_multiply_accumulate(acc3, BBm3, XBm, acc3);
+                }
+
+
+            }
+
+            """
+    private static let btabBiasIf: String =
+            """
+                    if (biasBlock + 8 <= N_GROUPS) {
+
+            """
+    private static let btabBiasElse: String =
+            """
+                    } else {
+
+            """
+    private static let btabBiasClose: String =
+            """
+                    }
+
+            """
+
+    /// The rolled walk: the five full eight-group blocks in a rolled loop
+    /// (groups unrolled by four, bias MMA unguarded), then the peeled tail
+    /// block (`N_GROUPS % 8` groups, guarded bias MMA). The group body is the
+    /// incumbent's text, emitted twice.
+    private static func btabRoll(_ source: String) -> String? {
+        func splitOnce(_ s: String, _ sep: String) -> (String, String)? {
+            let parts = s.components(separatedBy: sep)
+            guard parts.count == 2 else { return nil }
+            return (parts[0], parts[1])
+        }
+        guard case let (head, afterHead)? = splitOnce(source, btabLoopHead),
+            case let (groupBody, afterGroup)? = splitOnce(afterHead, btabGroupEnd),
+            case let (gap, afterBiasStart)? = splitOnce(afterGroup, btabBiasStart),
+            gap.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            case let (biasInner, tail)? = splitOnce(afterBiasStart, btabBiasEnd)
+        else { return nil }
+        let biasBlock = btabBiasStart + biasInner + btabBiasEnd
+        guard case let (biasPre, afterIf)? = splitOnce(biasBlock, btabBiasIf),
+            case let (ifBody, afterElse)? = splitOnce(afterIf, btabBiasElse),
+            let closeRange = afterElse.range(of: btabBiasClose)
+        else { return nil }
+        let elseBody = String(afterElse[..<closeRange.lowerBound])
+        let biasPost = String(afterElse[closeRange.upperBound...])
+        let full = biasPre + ifBody + biasPost
+        let tailBias = (biasPre + elseBody + biasPost)
+            .replacingOccurrences(of: "    }\n\n\n}\n", with: "    }\n}\n")
+        var body = "constexpr uint FULL_BLOCKS = N_GROUPS / 8;\n"
+        body += "#pragma unroll 1\n"
+        body += "for (uint biasBlock = 0; biasBlock < FULL_BLOCKS * 8; biasBlock += 8) {\n"
+        body += "    #pragma unroll 4\n"
+        body += "    for (uint gg = 0; gg < 8; ++gg) {\n"
+        body += "        const uint g = biasBlock + gg;\n"
+        body += groupBody
+        body += "    }\n"
+        body += full
+        body += "if (N_GROUPS % 8 != 0) {\n"
+        body += "    const uint biasBlock = FULL_BLOCKS * 8;\n"
+        body += "    #pragma unroll\n"
+        body += "    for (uint gg = 0; gg < N_GROUPS % 8; ++gg) {\n"
+        body += "        const uint g = biasBlock + gg;\n"
+        body += groupBody
+        body += "    }\n"
+        body += tailBias
+        return head + body + tail
+    }
+
+    /// The `_bt1` decode head twin, or nil when the switch is off, the
+    /// relayout is off, or a derivation did not match.
+    private static let btabArgmaxKernel: MLXFast.MLXFastKernel? = {
+        guard btabEnabled, relayoutEnabled, relayoutKernels != nil,
+            let relaid = relayoutRewrite(sourceV27Argmax, relayoutLanePairs)
+        else { return nil }
+        var result = relaid
+        for (old, new) in btabPairs {
+            guard result.components(separatedBy: old).count == 2 else {
+                FileHandle.standardError.write(
+                    Data("[head-btab] derivation mismatch; incumbent kept\n".utf8))
+                return nil
+            }
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        guard let rolled = btabRoll(result) else {
+            FileHandle.standardError.write(
+                Data("[head-btab] roll anchor mismatch; incumbent kept\n".utf8))
+            return nil
+        }
+        guard !rolled.contains("float(x["), !rolled.contains("float((packed"),
+            !rolled.contains("simdgroup_matrix<float, 8, 8> A"),
+            !rolled.contains("if (g >= N_GROUPS) continue;")
+        else {
+            FileHandle.standardError.write(
+                Data("[head-btab] leftover incumbent statement; incumbent kept\n".utf8))
+            return nil
+        }
+        return MLXFast.metalKernel(
+            name: "gemma4_mma_affine4_qmv_m8_v27_argmax_rl1_bt1",
+            inputNames: ["x", "w", "scales", "biases", "xSums"],
+            outputNames: ["pv", "pi"],
+            source: rolled,
+            header: "#include <metal_simdgroup_matrix>\n",
+            ensureRowContiguous: true)
+    }()
+
     // MARK: - LGH-001 --- fused top-1 selection (the logits are never stored)
 
     /// `false` only when `DARKBLOOM_GEMMA4_LOGITSLESS_HEAD` is an explicit off
@@ -3588,7 +3870,12 @@ public enum Gemma4MMAQuantizedGEMV {
         let plane: MLXArray
         if let relaid = relayoutKernels {
             CBv2EngageMark.once("head-relayout")
-            headKernel = relaid.argmax
+            if let btab = btabArgmaxKernel, x.dtype == .bfloat16 {
+                CBv2EngageMark.once("head-btab")
+                headKernel = btab
+            } else {
+                headKernel = relaid.argmax
+            }
             plane = relayoutPlane(for: w, k: k, n: n)
         } else {
             headKernel = kernelV27Argmax
@@ -3602,6 +3889,18 @@ public enum Gemma4MMAQuantizedGEMV {
             outputShapes: [[mRows * threadgroups], [mRows * threadgroups]],
             outputDTypes: [.float32, .uint32]
         )
+        if let relaid = relayoutKernels, btabArgmaxKernel != nil, btabXCheck {
+            let reference = relaid.argmax(
+                [flatX, plane, scales, biases, xSums],
+                template: [("T", x.dtype), ("K", k), ("N", n)],
+                grid: (threadgroups * threadsPerThreadgroup, 1, 1),
+                threadGroup: (threadsPerThreadgroup, 1, 1),
+                outputShapes: [[mRows * threadgroups], [mRows * threadgroups]],
+                outputDTypes: [.float32, .uint32]
+            )
+            relayoutReport("btab pv", candidate: partials[0], incumbent: reference[0])
+            relayoutReport("btab pi", candidate: partials[1], incumbent: reference[1])
+        }
         if relayoutKernels != nil, relayoutXCheck {
             let reference = kernelV27Argmax(
                 [flatX, w, scales, biases, xSums],

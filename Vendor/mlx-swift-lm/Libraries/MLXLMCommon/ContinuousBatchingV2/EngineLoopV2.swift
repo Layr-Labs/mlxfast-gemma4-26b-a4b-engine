@@ -324,6 +324,12 @@ private let cbv2CompactInflightParticipantsEnabled: Bool = {
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
+private let cbv2DetokBatchEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_DETOK_BATCH"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 private enum CBv2ParticipantIndex {
     case compact([CBv2RequestID])
     case hashed(Set<CBv2RequestID>)
@@ -588,6 +594,14 @@ public final class EngineLoopV2: @unchecked Sendable {
     // Engine-thread-confined state (internal, not private: the MTP round
     // driver in EngineLoopV2+MTP.swift is part of the loop).
     var detokenizers: [CBv2RequestID: CBv2IncrementalDetokenizer] = [:]
+    /// Deferred passthrough detokenization for the current finalize pass.
+    /// Reservations remain synchronous; one serial-queue block replays rows
+    /// in the same order as the incumbent per-row blocks.
+    private var pendingDetokBatch:
+        [(
+            stream: CBv2OutputStream?, detokenizer: (any CBv2IncrementalDetokenizer)?,
+            token: Int, isStopToken: Bool, logprobs: [CBv2TokenLogprob]?
+        )] = []
     var kvStates: [CBv2RequestID: [CBv2SequenceKV?]] = [:]
     /// Tokens skipped via prefix-cache adoption, reported in usage.
     private var prefixHitTokens: [CBv2RequestID: Int] = [:]
@@ -2031,6 +2045,23 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     // MARK: Finalization (deferred stop detection)
 
+    /// Submit one ordered detokenization block for this step instead of one
+    /// escaping closure and one libdispatch enqueue per passthrough row.
+    private func flushPendingDetokBatch() {
+        if pendingDetokBatch.isEmpty { return }
+        let batch = pendingDetokBatch
+        pendingDetokBatch.removeAll(keepingCapacity: true)
+        detokQueue.async {
+            for entry in batch {
+                let text =
+                    entry.isStopToken ? "" : (entry.detokenizer?.push([entry.token]) ?? "")
+                entry.stream?.emit(
+                    .delta(text: text, tokens: [entry.token], logprobs: entry.logprobs),
+                    consumingReservation: true)
+            }
+        }
+    }
+
     private func finalize(_ step: CBv2InFlightStep, now: ContinuousClock.Instant) {
         // THE host sync — overlapped with the successor step's GPU work when
         // chained. All-prefill steps block on their eval targets instead so
@@ -2106,12 +2137,10 @@ public final class EngineLoopV2: @unchecked Sendable {
             if rec.request.stopStrings.isEmpty {
                 let stream = stream(for: id)
                 stream?.reserveEmission()
-                detokQueue.async {
-                    let text = isStopToken ? "" : (detokenizer?.push([token]) ?? "")
-                    stream?.emit(
-                        .delta(text: text, tokens: [token], logprobs: logprobs),
-                        consumingReservation: true)
-                }
+                pendingDetokBatch.append(
+                    (stream: stream, detokenizer: detokenizer, token: token,
+                        isStopToken: isStopToken, logprobs: logprobs))
+                if !cbv2DetokBatchEnabled { flushPendingDetokBatch() }
             } else {
                 let detokStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
                 let text = isStopToken ? "" : (detokenizer?.push([token]) ?? "")
@@ -2142,6 +2171,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 finishRequest(id, reason: .length)
             }
         }
+        flushPendingDetokBatch()
 
         // MTP round steps: seed-carry capture + the verify accept-walk run
         // at this same host-sync boundary (their arrays rode the step's
@@ -2217,6 +2247,9 @@ public final class EngineLoopV2: @unchecked Sendable {
     // MARK: Request completion
 
     func finishRequest(_ id: CBv2RequestID, reason: CBv2FinishReason) {
+        // Terminal flush/finish work rides the same serial queue, so enqueue
+        // any pending delta batch before adding that terminal block.
+        flushPendingDetokBatch()
         // Ids are legally reusable after finish: drop the per-id capacity
         // requeue count on EVERY finish path (including the error-finish
         // that exhausted it), or a reused id inherits the previous

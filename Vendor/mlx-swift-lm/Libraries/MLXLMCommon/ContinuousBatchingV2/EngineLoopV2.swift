@@ -2201,10 +2201,17 @@ public final class EngineLoopV2: @unchecked Sendable {
                     generatedTokens: rec.generatedTokenCount)
                 leasesByID[id] = lease
             }
-            // Publish the reconciled usage once tokens start flowing (prompt
-            // count with zero completion was already seeded at enqueue, so a
-            // still-prefilling row needs no lock traffic here).
-            if rec.generatedTokenCount > 0 {
+            // Publish the reconciled usage on a 16-token cadence once tokens
+            // start flowing (prompt count with zero completion was already
+            // seeded at enqueue, so a still-prefilling row needs no lock
+            // traffic here). The lease refresh above stays UNCONDITIONAL, so
+            // the watchdog's progress signal keeps full per-step resolution;
+            // only this reporting-side counter pair coarsens. `usageSnapshots`
+            // has exactly one reader -- the wedge terminal path, reached only
+            // after the engine thread has already blown the step timeout --
+            // while a normal finish reads `rec.generatedTokenCount` directly
+            // via `takePrefixUsage`, so no observable token count changes.
+            if rec.generatedTokenCount > 0 && rec.generatedTokenCount % 16 == 0 {
                 setUsageSnapshot(
                     id,
                     CBv2Usage(

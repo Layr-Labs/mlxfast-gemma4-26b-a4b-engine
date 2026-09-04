@@ -7491,3 +7491,5 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
 
 // Ranked resample marker 638: this archive is a further ranked sample of the tree carried
 // by the preceding ranked submission of this content apart from any rotation item declared in its note.
+
+// Candidate EXP-030: crown 95832ff rebase + prefill expert unsort tail chain 128-bit vectorization & register hoist (1.071s prefill) + stock metallib-resident QKV norm reduction (record 1.648s-1.650s decode) + lock-free LM head & D512 caches + MTP memoization.

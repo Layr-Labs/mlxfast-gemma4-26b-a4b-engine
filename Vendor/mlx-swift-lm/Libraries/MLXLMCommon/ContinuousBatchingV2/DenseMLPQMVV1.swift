@@ -38,6 +38,8 @@ import MLX
 import MLXFast
 
 public enum CBv2DenseMLPQMVV1 {
+    // DENSE-INTDEQ-SR-001-R1: source-distinct retry after the ranked runner
+    // lost server communication before producing any score or parity receipt.
     public static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_DENSE_MLP_QMV"]
@@ -604,7 +606,7 @@ inline float mma8_runsum8(uint4 r) {
 // byte 0..255 and x is unscaled, exactly as the 8-bit `qdot` arm forms its
 // product; a bf16 x carries 8 significant bits and the code 8, so the product
 // needs at most 16 and is exact in fp32.
-#define MMA8_STEP8(BB, WLO, WHI, SH) A.thread_elements()[0] = float(as_type<half>(ushort(0x6400u | extract_bits(wv.WLO, (SH), 8))) - 1024.0h); A.thread_elements()[1] = float(as_type<half>(ushort(0x6400u | extract_bits(wv.WHI, (SH), 8))) - 1024.0h); simdgroup_multiply_accumulate(C, A, BB, C);
+#define MMA8_STEP8(BB, WLO, WHI, SH) A.thread_elements()[0] = float(extract_bits(wv.WLO, (SH), 8)); A.thread_elements()[1] = float(extract_bits(wv.WHI, (SH), 8)); simdgroup_multiply_accumulate(C, A, BB, C);
 
 // x is [8, K] with K % 64 == 0, w is packed [N, K / 4] uint32 (one byte per
 // code, so the row stride is K bytes and K % 64 == 0 keeps every `uint4` load
@@ -706,7 +708,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
 """
 
     private static let mma8Kernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_halfdeq_v1",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_intdeq_sr_v2",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
@@ -821,7 +823,7 @@ METAL_FUNC void gemma4_qmv_mma8_affine8_g64_impl(
     }()
 
     private static let mma8DownStaticKKernel = MLXFast.metalKernel(
-        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_carry2_bfill_halfdeq_v7",
+        name: "cbv2_b8_l1_dense_mlp_mma8_affine8_g64_down_k2112_carry2_bfill_intdeq_sr_v8",
         inputNames: ["x", "w", "scales", "biases"],
         outputNames: ["y"],
         source: """
